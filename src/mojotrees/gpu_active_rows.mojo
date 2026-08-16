@@ -160,6 +160,30 @@ policy because there is no capacity that grows. What does grow is the host
 cleared at every `reset_root`. A dataset larger than the buffers is not a
 resize, it is a different `GpuActiveRows`.
 
+Two partition planes, one host table
+------------------------------------
+`partition` and `enqueue_partition_desc` write the same device row buffer and
+only the first writes the host `LeafRangeTable`. The second routes rows from a
+step descriptor a device kernel filled, so the host does not know which leaf
+was split or how the rows fell, and updating the table from here would mean
+reading the device back -- which is the wait the resident plane exists to
+delete.
+
+The consequence is that a host table is *stale*, not wrong-looking, for the
+whole of a device-owned tree: its windows are in bounds, they tile the active
+prefix, and they describe the tree before the first split. That combination
+shipped a bug. `train_gpu`'s device-gradient round reads this table to advance
+the raw scores, read one that still said node 0 owned everything, and added the
+root's value to every row; tree 0 was bit-identical and every tree after it
+diverged, with nothing raised.
+
+So the table carries a validity state. `enqueue_partition_desc` poisons it,
+every accessor that returns a window refuses while poisoned, and
+`gpu_resident_round._publish_row_ranges` -- which replays the device's commit
+log onto it -- is the only thing that clears it, and only after checking that
+the replay covered every node the tree ended with. `LeafRangeTable` carries
+the argument, including the alternatives rejected.
+
 Empty leaves
 ------------
 An empty range is a first-class state, not an error. `partition` of an empty
@@ -2443,29 +2467,313 @@ struct LeafRangeTable(Copyable, Movable):
     by appending. Splitting a leaf costs at most two appends and no device
     work: the children's ranges are the two halves of the parent's, and the
     parent's becomes empty so the live ranges keep tiling `[0, n_active)`.
+
+    **Validity, and why this table has a validity state at all.** Two
+    partition planes write the device row buffer and only one of them writes
+    this table. `GpuActiveRows.partition` ends every split with `split()`
+    here, so the shipping plane leaves the table describing the tree it grew.
+    `GpuActiveRows.enqueue_partition_desc` routes rows from a step descriptor
+    a device kernel wrote, moves the windows in the device tree tables, and
+    touches nothing on the host. While that second plane owns the
+    partitioning, every window in this table is the window it held before the
+    tree grew -- which for a fresh tree means node 0 owning the entire active
+    prefix and every other node owning nothing.
+
+    That is not a hypothetical. It shipped. `train_gpu`'s device-gradient
+    round reads this table to advance the raw scores, was handed exactly that
+    stale table, and added the root's value to every row instead of each
+    row's own leaf value. Tree 0 was bit-identical, every tree after it
+    diverged, and nothing raised. The read was silently wrong because a
+    stale window is a perfectly well-formed window: it is in bounds, it tiles
+    the prefix, and it satisfies every invariant this struct can check.
+
+    So the invalidity is recorded explicitly rather than checked for.
+    `begin_descriptor_partition` poisons the table, every accessor that
+    returns a window refuses while poisoned, and
+    `end_descriptor_partition` -- which
+    `gpu_resident_round._publish_row_ranges` calls after replaying the
+    device's commit log -- is the only thing that clears it, and only after
+    verifying that the replay covered every node.
+
+    Rejected alternative: arming the poison from the caller, at the resident
+    round's first descriptor partition. The bug being guarded against is
+    precisely a caller that did not know it had a host table to maintain, so
+    a rule the callers have to remember is the rule that already failed. The
+    poison is armed by the code whose behavior creates the invalidity, and
+    `begin_descriptor_partition` is made load-bearing (it returns the row
+    bound the launch geometry is derived from) so that a future edit cannot
+    drop the arming and still compile.
+
+    Rejected alternative: keeping a second host copy of the windows updated
+    from the descriptor path. That is the bookkeeping the resident plane
+    exists to delete, and it would have to be updated from device state the
+    host has deliberately not read back.
     """
 
     var ranges: List[LeafRange]
     var n_rows: Int
     var n_active: Int
+    # True while a plane that does not maintain this table owns the
+    # partitioning. Named for the situation rather than for the mechanism
+    # ("invalid", "dirty") because the sentence a reader needs is *who* owns
+    # the windows, not that something is wrong.
+    var resident_owned: Bool
+    # Descriptor partitions armed since the last `reset_root`. Not used by
+    # any decision; it exists so a test can assert that the poisoned path was
+    # entered rather than assert that a read raised and hope the raise came
+    # from the poison. A test that only checks "reads raise" passes just as
+    # well when the arming silently did nothing and the read raised for some
+    # unrelated reason, which is the failure mode this repository has already
+    # shipped once (six resident-plane fixtures that all ran below the gate
+    # they were meant to exercise and compared the fallback against itself).
+    var desc_partitions: Int
 
     def __init__(out self, n_rows: Int):
         self.ranges = List[LeafRange]()
         self.n_rows = n_rows
         self.n_active = 0
+        self.resident_owned = False
+        self.desc_partitions = 0
 
     def reset_root(mut self, n_active: Int) raises:
-        """Start a new tree with `n_active` rows at node 0."""
+        """Start a new tree with `n_active` rows at node 0.
+
+        Clears the poison, and that is a decision worth defending rather than
+        an oversight. The claim the poison makes is "the windows in this table
+        describe an earlier state of the tree"; `reset_root` re-establishes
+        the one state the host can assert without reading the device, because
+        `GpuActiveRows.begin_tree` re-seeds the row buffer in the same call
+        and node 0 then genuinely owns `[0, n_active)` with no other node in
+        existence. Refusing to clear here would make the poison a lie in the
+        other direction: it would refuse the shipping plane, which is
+        entirely correct after a `begin_tree`, for the rest of the session.
+
+        It is also not a hole. The window in which a stale read does damage
+        runs from the last descriptor partition to the next `begin_tree`, and
+        the read that motivated all of this -- `update_raw_device` -- lives
+        inside it by contract: its docstring says "call after `grow_tree_gpu`
+        returns and before the next `begin_tree`".
+        """
         if n_active < 0 or n_active > self.n_rows:
             raise Error("active row count out of range")
         self.ranges.clear()
         self.ranges.append(LeafRange(0, n_active))
         self.n_active = n_active
+        self.resident_owned = False
+        self.desc_partitions = 0
 
-    def n_nodes(self) -> Int:
+    def is_resident_owned(self) -> Bool:
+        """Whether a descriptor-driven partition currently owns the windows,
+        so every window accessor below refuses. For tests and for a caller
+        that wants to branch rather than catch."""
+        return self.resident_owned
+
+    def _refuse_stale(self) raises:
+        """The one place the refusal is worded.
+
+        The text names the situation and the two files involved, because the
+        person who next reads it will be debugging a model that diverged after
+        the first boosting round and needs the sentence to point at the seam,
+        not to tell them a state is invalid.
+        """
+        raise Error(
+            "the device-resident partition owns the active-row windows and"
+            " this host table is stale: GpuActiveRows.enqueue_partition_desc"
+            " routed rows from the device step descriptor, which moves the"
+            " windows in the device tree tables and writes nothing here, so"
+            " every window below is the one it held before this tree grew"
+            " (node 0 owning the whole active prefix, every other node"
+            " owning nothing). Reading one attributes rows to the wrong leaf"
+            " without raising, which is how a device-gradient round once"
+            " added the root's value to every row and diverged every tree"
+            " after the first. gpu_resident_round._publish_row_ranges"
+            " replays the device commit log onto this table and is the only"
+            " thing that makes it readable again; run it first, or read the"
+            " windows out of the device tree tables instead."
+        )
+
+    def begin_descriptor_partition(mut self, max_count: Int) raises -> Int:
+        """Arm the poison for one descriptor-driven partition and return the
+        row bound the launch geometry is derived from.
+
+        Called by `GpuActiveRows.enqueue_partition_desc` and by nothing else.
+        It validates and returns `max_count` rather than returning nothing,
+        so that the arming is load-bearing: the partition cannot size a grid
+        without it, and an edit that deletes the call fails to compile
+        instead of quietly restoring the silent-divergence bug. Validation
+        lives here for the same reason -- there is then no version of the
+        entry point that checks its bound and skips the arming.
+
+        Idempotent by design. Every step of a resident tree calls this, dead
+        steps included, and re-arming an already-poisoned table is a no-op
+        apart from the counter.
+        """
+        if max_count < 1:
+            raise Error("a descriptor partition needs a positive row bound")
+        if max_count > self.n_rows:
+            raise Error("the row bound exceeds the row buffer")
+        self.resident_owned = True
+        self.desc_partitions += 1
+        return max_count
+
+    def end_descriptor_partition(
+        mut self,
+        n_nodes: Int,
+        leaf_nodes: List[Int],
+        leaf_windows: List[LeafRange],
+    ) raises:
+        """Clear the poison, after proving the replayed table is window for
+        window the frontier the device came home with.
+
+        `n_nodes` is the finished tree's node count and the two lists are the
+        device's own live frontier: `leaf_nodes[i]` owns `leaf_windows[i]`.
+        The caller reads both straight out of the downloaded snapshot
+        (`gpu_resident_round._publish_row_ranges`) and passes them as plain
+        integers and `LeafRange`s, so that this module never learns the
+        snapshot type -- `gpu_tree_tables` imports this file and must not be
+        imported back.
+
+        Four checks, in order of what each one can catch:
+
+        1. `len(self.ranges) == n_nodes`. The replay writes windows only for
+           the nodes its commit log names, so a log that came home short --
+           `_pick_and_commit_kernel` stops appending once the log is full --
+           leaves the tail of the tree with no window at all.
+
+        2. Every device leaf's window is byte for byte the window the replay
+           gave that node. Not just the count: `begin` too, because the
+           device computed it as `begin, begin + n_left` inside the commit
+           kernel while the replay recomputed it by walking `split` in commit
+           order, and those two arithmetics agreeing is the thing worth
+           checking. This is what makes un-poisoning a proof rather than an
+           argument, and it is what catches a commit missing from the
+           *middle* of the log. Such a log leaves a table that is structurally
+           impeccable: `_grow_to` back-fills the gap with empty ranges so the
+           node count is right, the parent whose commit went missing stays a
+           live leaf owning the rows its children should have, and the live
+           windows still tile the prefix. Nothing about it is malformed. What
+           is wrong is that the two back-filled children are empty here and
+           are real windows on the device, which this check sees at the first
+           of them. An earlier draft of this docstring claimed check 4 caught
+           that case. It does not.
+
+        3. Every node the device did *not* name as a live leaf owns nothing.
+           A backstop rather than a first line, and worth being honest about:
+           given check 2 and a device frontier that tiles, a non-live node
+           holding rows would have to overlap a leaf that already matched, so
+           check 4 would also refuse it. What this buys is the error message.
+           A snapshot whose frontier does not tile -- which
+           `TreeTablesSnapshot.check_invariants` is supposed to have refused
+           upstream -- fails here naming the node and the commit that should
+           have split it, rather than downstream as "ranges overlap".
+
+        4. `_check_invariants()`. The check that owns the relationship to
+           `n_active`, which nothing above mentions: a publish onto a table
+           whose root was never reset for this tree (`n_active` moves per tree
+           under bagging and GOSS) fails here, with the error that names the
+           actual problem rather than as two hundred individually wrong
+           leaves.
+
+        **What this does not prove, and it is the one gap worth naming.** The
+        device's `row_begin`/`row_count` and the replay's are both ultimately
+        derived from the same integer, the search record's left count off the
+        parent histogram's count plane. So this check catches a replay that
+        went wrong and cannot catch a left count that disagrees with the rows
+        `_scatter_kernel` actually routed left. The shipping plane has an
+        observation of that -- `MOJOTREES_GPU_VERIFY_ROWS` downloads
+        `total_dev` and compares -- and the descriptor path has no equivalent,
+        because reading `total_dev` per step is exactly the host wait the
+        resident plane exists to remove. Recorded rather than closed.
+
+        Clearing is unconditional once all four pass: there is then no
+        untouched node to scope around, and no window that is not the
+        device's.
+        """
+        if n_nodes < 1:
+            raise Error("a finished tree holds at least the root")
+        if len(leaf_nodes) != len(leaf_windows):
+            raise Error("each device leaf must come with exactly one window")
+        if len(self.ranges) != n_nodes:
+            raise Error(
+                "the device commit log was replayed onto ",
+                len(self.ranges),
+                " nodes but the tree ended with ",
+                n_nodes,
+                "; the untouched nodes have no active-row window, so"
+                " clearing the stale-table refusal here would be a lie",
+            )
+        # Marks the nodes the device calls live, so check 3 can require an
+        # empty window of everything else without a second search per node.
+        var is_live = List[Bool](capacity=n_nodes)
+        for _ in range(n_nodes):
+            is_live.append(False)
+        for i in range(len(leaf_nodes)):
+            var node = leaf_nodes[i]
+            if node < 0 or node >= n_nodes:
+                raise Error(
+                    "the device frontier names leaf ",
+                    node,
+                    " which is outside a tree of ",
+                    n_nodes,
+                    " nodes",
+                )
+            if is_live[node]:
+                raise Error(
+                    "the device frontier lists node ", node, " twice"
+                )
+            is_live[node] = True
+            var got = self.ranges[node].copy()
+            var want = leaf_windows[i].copy()
+            if got.begin != want.begin or got.end != want.end:
+                raise Error(
+                    "leaf ",
+                    node,
+                    " owns rows [",
+                    got.begin,
+                    ", ",
+                    got.end,
+                    ") in the replayed host table and [",
+                    want.begin,
+                    ", ",
+                    want.end,
+                    ") on the device; the replay does not describe the tree"
+                    " that was grown",
+                )
+        for n in range(n_nodes):
+            if not is_live[n] and not self.ranges[n].is_empty():
+                raise Error(
+                    "node ",
+                    n,
+                    " is not a live leaf on the device but owns ",
+                    self.ranges[n].count(),
+                    " rows in the replayed host table; the commit that split"
+                    " it is missing from the device commit log, so the two"
+                    " describe different trees",
+                )
+        self._check_invariants()
+        self.resident_owned = False
+
+    def n_nodes(self) raises -> Int:
+        """How many node ids have a window. Refuses while the resident
+        partition owns them: the host's count is as stale as the windows it
+        counts, and it is read as a loop bound by the raw-score update, which
+        would otherwise walk one node and call it the whole tree."""
+        if self.resident_owned:
+            self._refuse_stale()
         return len(self.ranges)
 
     def get(self, node: Int) raises -> LeafRange:
+        if self.resident_owned:
+            self._refuse_stale()
+        return self._get_raw(node)
+
+    def _get_raw(self, node: Int) raises -> LeafRange:
+        """`get` without the staleness refusal, for the replay that clears it.
+
+        `split` is the writer the poison exists to wait for, so it cannot be
+        subject to the poison; it reaches the parent's window through here.
+        Private, and the only two callers are in this struct.
+        """
         if node < 0 or node >= len(self.ranges):
             raise Error("leaf id has no active-row range")
         return self.ranges[node].copy()
@@ -2480,8 +2788,17 @@ struct LeafRangeTable(Copyable, Movable):
         """Hand the parent's range to its two children and return the left
         child's. `n_left` is the number of rows the partition sent left; the
         left child takes the parent's first `n_left` slots and the right
-        child the rest, which is exactly what the stable partition wrote."""
-        var r = self.get(parent)
+        child the rest, which is exactly what the stable partition wrote.
+
+        Permitted while the table is poisoned, and it has to be: this is the
+        call `gpu_resident_round._publish_row_ranges` replays to bring the
+        table back, so subjecting the writer to the reader's refusal would
+        make the poison unclearable. It reads the parent through `_get_raw`
+        for that reason. The refusals below are unchanged and still hold on
+        the replay, which is what makes a replay of a log that does not
+        describe a real growth an error rather than a rewrite.
+        """
+        var r = self._get_raw(parent)
         if n_left < 0 or n_left > r.count():
             raise Error("left row count is outside the parent's range")
         if left < 0 or right < 0:
@@ -2507,13 +2824,30 @@ struct LeafRangeTable(Copyable, Movable):
         self.ranges[parent] = LeafRange.empty()
         return LeafRange(r.begin, mid)
 
-    def total_active(self) -> Int:
+    def total_active(self) raises -> Int:
+        """Rows the live windows account for. Refuses while the resident
+        partition owns the windows, because it is a sum over exactly the
+        numbers that are stale."""
+        if self.resident_owned:
+            self._refuse_stale()
+        return self._total_active()
+
+    def _total_active(self) -> Int:
         var total = 0
         for i in range(len(self.ranges)):
             total += self.ranges[i].count()
         return total
 
     def check_invariants(self) raises:
+        """The live ranges must tile `[0, n_active)`. Refuses while the
+        resident partition owns them: a stale table passes this check, which
+        is the whole reason the poison had to be recorded rather than
+        detected."""
+        if self.resident_owned:
+            self._refuse_stale()
+        self._check_invariants()
+
+    def _check_invariants(self) raises:
         """The live ranges must tile `[0, n_active)`: inside the buffer,
         pairwise disjoint, and covering every active slot exactly once.
 
@@ -2521,6 +2855,10 @@ struct LeafRangeTable(Copyable, Movable):
         ranges all sit inside a buffer of that length. Tree growth here is a
         few hundred leaves at most, so the quadratic check is cheaper than
         sorting and is what a test wants to read.
+
+        Private so that `end_descriptor_partition` can run it on a table that
+        is still poisoned, which is the one moment the check has to be made
+        before the refusal is lifted rather than after.
         """
         for i in range(len(self.ranges)):
             var a = self.ranges[i].copy()
@@ -2531,7 +2869,7 @@ struct LeafRangeTable(Copyable, Movable):
             for k in range(i + 1, len(self.ranges)):
                 if a.overlaps(self.ranges[k]):
                     raise Error("active-row ranges overlap")
-        if self.total_active() != self.n_active:
+        if self._total_active() != self.n_active:
             raise Error("active-row ranges do not cover the active prefix")
 
 
@@ -2927,11 +3265,32 @@ struct GpuActiveRows(Movable):
         self.ctx.synchronize()
 
     def n_active(self) -> Int:
-        """Rows this tree grows on: the bag, or every row when unbagged."""
+        """Rows this tree grows on: the bag, or every row when unbagged.
+
+        Deliberately *not* refused while the resident partition owns the
+        windows, unlike everything that returns a window. A partition is a
+        permutation of the active prefix: it moves rows between leaves and
+        cannot change how many rows the tree grows on. `n_active` is set by
+        `begin_tree` and is exactly as true after thirty descriptor
+        partitions as it was before the first, so refusing it would be a
+        false alarm -- and it is the number the resident round passes back in
+        as the descriptor partition's own row bound.
+        """
         return self.ranges.n_active
 
     def range_of(self, node: Int) raises -> LeafRange:
+        """One node's window. Raises while a descriptor-driven partition owns
+        the windows; see `LeafRangeTable`."""
         return self.ranges.get(node)
+
+    def rows_stale(self) -> Bool:
+        """Whether the host row-range table is currently disowned by a
+        descriptor-driven partition, so `range_of`, `range_tiling`,
+        `check_frontier`, `download_range`, `partition` and
+        `enqueue_range_histogram` all refuse. Exposed so a caller can branch
+        instead of catching, and so a test can assert on the state rather
+        than only on the raise."""
+        return self.ranges.is_resident_owned()
 
     def set_feature_group(mut self, group: Int) raises:
         """How many feature slots one histogram threadgroup accumulates.
@@ -3408,15 +3767,32 @@ struct GpuActiveRows(Movable):
         integer count plane, exactly as the host path takes them off the
         record. It stays written so that `MOJOTREES_GPU_VERIFY_ROWS` remains
         meaningful for anyone who wants to check the two against each other.
+
+        **What this does to the host row-range table, and why the first line
+        of the body is the arming call.** This entry point moves rows between
+        leaves and updates no window in `self.ranges`. Every window that table
+        holds is therefore, from here on, a description of the tree before
+        this split -- well formed, in bounds, satisfying every invariant, and
+        wrong. `LeafRangeTable.begin_descriptor_partition` records that, and
+        every accessor that returns a window refuses until
+        `gpu_resident_round._publish_row_ranges` replays the device's commit
+        log and clears it.
+
+        The arming is done here, in the code whose behavior creates the
+        invalidity, rather than by the caller that knows it is starting a
+        resident tree. The bug this replaces was a caller that did not know
+        it had a host table to maintain, so a rule the callers have to
+        remember is the rule that already failed once. It is also load
+        bearing rather than advisory: `bound` is what the launch geometry is
+        derived from, so deleting the arming does not compile.
+
+        `bound` is `max_count`, validated. The validation moved into
+        `begin_descriptor_partition` with it so that there is no version of
+        this entry point that checks its bound and forgets to arm.
         """
-        if max_count < 1:
-            raise Error("a descriptor partition needs a positive row bound")
-        if max_count > self.n_rows:
-            raise Error("the row bound exceeds the row buffer")
+        var bound = self.ranges.begin_descriptor_partition(max_count)
         var threads = self.block_threads
-        var grid = _partition_grid(
-            max_count, threads, self.partition_block_cap
-        )
+        var grid = _partition_grid(bound, threads, self.partition_block_cap)
         var blocks = grid[0]
         var tiles = grid[1]
 
@@ -3426,7 +3802,7 @@ struct GpuActiveRows(Movable):
         # deliberately the widest legal one rather than an empty one, so that
         # a wiring mistake that left `use_desc` at zero would partition a real
         # range and be caught by a row check rather than silently do nothing.
-        var window = LeafRange(0, max_count)
+        var window = LeafRange(0, bound)
         var routing = RowRouting.numerical(0, 0, -1, False)
 
         var scanned = False
@@ -3435,22 +3811,22 @@ struct GpuActiveRows(Movable):
                 scanned = True
                 if threads == 128:
                     self._enqueue_scan_primitives[128](
-                        bins, window, routing, max_count, blocks, tiles,
+                        bins, window, routing, bound, blocks, tiles,
                         Int32(1),
                     )
                 elif threads == 256:
                     self._enqueue_scan_primitives[256](
-                        bins, window, routing, max_count, blocks, tiles,
+                        bins, window, routing, bound, blocks, tiles,
                         Int32(1),
                     )
                 elif threads == 512:
                     self._enqueue_scan_primitives[512](
-                        bins, window, routing, max_count, blocks, tiles,
+                        bins, window, routing, bound, blocks, tiles,
                         Int32(1),
                     )
                 elif threads == 1024:
                     self._enqueue_scan_primitives[1024](
-                        bins, window, routing, max_count, blocks, tiles,
+                        bins, window, routing, bound, blocks, tiles,
                         Int32(1),
                     )
                 else:
@@ -3464,7 +3840,7 @@ struct GpuActiveRows(Movable):
                 self.block_sums_dev.unsafe_ptr(),
                 Int32(self.n_rows),
                 Int32(0),
-                Int32(max_count),
+                Int32(bound),
                 Int32(0),
                 Int32(0),
                 Int32(-1),
@@ -3487,7 +3863,7 @@ struct GpuActiveRows(Movable):
                 self.block_sums_dev.unsafe_ptr(),
                 self.total_dev.unsafe_ptr(),
                 Int32(0),
-                Int32(max_count),
+                Int32(bound),
                 Int32(tiles),
                 Int32(blocks),
                 self.step_dev.unsafe_ptr(),
@@ -3504,7 +3880,7 @@ struct GpuActiveRows(Movable):
             self.rows_dev.unsafe_ptr(),
             self.scratch_dev.unsafe_ptr(),
             Int32(0),
-            Int32(max_count),
+            Int32(bound),
             self.step_dev.unsafe_ptr(),
             Int32(1),
             grid_dim=blocks,

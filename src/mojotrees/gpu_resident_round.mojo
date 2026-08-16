@@ -230,7 +230,7 @@ register) are both outside every arithmetic expression.
 from std.os import getenv
 from max.gpu.host import DeviceBuffer
 
-from .gpu_active_rows import STEP_WORDS
+from .gpu_active_rows import STEP_WORDS, LeafRange
 from .gpu_split_search import (
     GpuSplitParams,
     GpuSplitSearcher,
@@ -621,7 +621,50 @@ def _publish_row_ranges(
 
     This is host bookkeeping only. It enqueues nothing, transfers nothing and
     waits for nothing, and it costs one list write per node.
+
+    **It is also the only thing that lifts the table's staleness refusal, and
+    it lifts it only after proving the replayed table is the device's tree.**
+    `GpuActiveRows.enqueue_partition_desc` poisons the table on every step, so
+    between the first split of a resident tree and this function every window
+    accessor raises rather than returning a stale window. The
+    `end_descriptor_partition` call below is what ends that, and what it is
+    handed is the device's **own frontier**: the node id and the row window of
+    every live leaf, straight out of the snapshot that was already downloaded.
+    Comparing the replayed windows against those is the proof, and it costs
+    nothing -- `snap.leaves` is in host memory by the time this runs, and
+    until now nothing read its `row_begin`/`row_count` at all. See
+    `LeafRangeTable.end_descriptor_partition` for what each of its four checks
+    catches and for the one thing this comparison cannot prove.
+
+    Two checks are made here rather than there, and both are about the *log*
+    rather than about the table:
+
+    - `2 * len(commit_order) + 1 == next_node`, first. Every commit creates
+      exactly two nodes, so a log that accounts for fewer nodes than the tree
+      holds is a log the kernel stopped appending to once it was full. This is
+      checked before a single window is written, so a truncated log is refused
+      rather than half replayed.
+    - That each logged parent names two real children, in the loop. A commit
+      whose children are outside the node table cannot be replayed at all.
+
+    Why the frontier crosses as two plain lists rather than as the snapshot:
+    `gpu_tree_tables` imports `gpu_active_rows` (for `LeafRange`), so
+    `gpu_active_rows` cannot import it back. Node ids and `LeafRange`s are
+    both already in that direction's vocabulary. The lists are `n_live` long,
+    a few dozen entries at the default budget, built once per tree.
     """
+    if 2 * len(snap.commit_order) + 1 != snap.next_node:
+        raise Error(
+            "the device commit log holds ",
+            len(snap.commit_order),
+            " commits, which account for ",
+            2 * len(snap.commit_order) + 1,
+            " nodes, but the tree ended with ",
+            snap.next_node,
+            "; replaying a log that does not account for the whole tree"
+            " would leave the host row-range table describing a different"
+            " tree from the one the device grew",
+        )
     for k in range(len(snap.commit_order)):
         var parent = snap.commit_order[k]
         if parent < 0 or parent >= len(snap.nodes):
@@ -633,6 +676,21 @@ def _publish_row_ranges(
         _ = builder.rows.ranges.split(
             parent, left, right, snap.nodes[left].count
         )
+
+    # The device's own frontier, as the two lists the table can be checked
+    # against. `snap.leaves` is `[0, n_live)` in slot order and every row of
+    # it was written by the commit kernel, so this is the device's answer to
+    # "which node owns which rows" and not a second derivation of the host's.
+    var leaf_nodes = List[Int](capacity=len(snap.leaves))
+    var leaf_windows = List[LeafRange](capacity=len(snap.leaves))
+    for i in range(len(snap.leaves)):
+        leaf_nodes.append(snap.leaves[i].node)
+        leaf_windows.append(
+            LeafRange(snap.leaves[i].row_begin, snap.leaves[i].row_end())
+        )
+    builder.rows.ranges.end_descriptor_partition(
+        snap.next_node, leaf_nodes, leaf_windows
+    )
 
 
 def grow_tree_device_resident(
