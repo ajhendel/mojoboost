@@ -578,47 +578,75 @@ def test_the_default_parameter_is_float32_and_inert() raises:
     extra.check_derivative_precision()
 
 
-def test_float64_is_refused_by_name_until_a_trainer_carries_it() raises:
-    """Refuse rather than ignore. The switch is live through the
-    environment; the parameter is not wired to the fit yet, and a parameter
-    that trained a float32 model while reporting success is the silent
-    downgrade this package refuses everywhere else.
+def test_float64_is_accepted_now_that_a_trainer_carries_it() raises:
+    """The refusal is GONE, and this test is the record of why it existed.
 
-    **The `tree.mojo` change this docstring used to name has landed**
-    (`fc223da`), and this test did NOT have to be deleted. Its assertions
-    still pass and are still correct; only the reason changed. The snapshot
-    hop was never the thing standing between the parameter and a float64
-    fit. The OBJECTIVE is: `boosting.fill_grad_hess` and
-    `_fill_softmax_grad_hess` pick their row loop from a live `getenv`, so a
-    parameter-only float64 fit would store `Float64(Float32(g))` and read it
-    un-re-narrowed -- not float32, because accumulation order moves, and not
-    float64, because the low 29 significand bits are already gone. A third
-    numerical configuration is worse than either arm, so the refusal stands
-    until the objective half carries the parameter too.
+    It was called `test_float64_is_refused_by_name_until_a_trainer_carries_it`
+    and it asserted that `float64` raised. That was correct for as long as
+    the parameter reached the histogram and not the objective: a fit wired
+    only halfway would store `Float64(Float32(g))` and read it
+    un-re-narrowed, which is not float32 (accumulation order has moved) and
+    not float64 (the low 29 significand bits are already gone). A third
+    numerical configuration is worse than either arm, so refusing beat
+    ignoring.
 
-    That is the correction worth keeping: a test whose docstring predicts
-    its own deletion is making a claim about the code, and this one's claim
-    was wrong. `test_derivative_precision_wiring.test_the_objective_half_is_still_missing`
-    is the tripwire now, and its docstring carries the fit-level equality
-    test to write when the refusal finally lifts.
+    Both halves are now wired -- the histogram snapshot in `fc223da`, the
+    objective across thirty call sites after it -- so the refusal has nothing
+    left to protect and asserting it would pin a bug in place.
+
+    The claim it used to make is not dropped, it MOVED, and to a stronger
+    form:
+    `test_derivative_precision_wiring.test_the_parameter_and_the_environment_train_the_same_model`
+    compares full ensemble bits between the two entries, gated on the default
+    arm differing first, which is the assertion the halfway state could not
+    have passed.
+
+    Twice now a docstring in this file predicted its own deletion and was
+    wrong about the reason. Keeping the history here is cheaper than
+    rediscovering it: a test that predicts its own removal is making a claim
+    about the code, and that claim can be false.
     """
     var extra = ExtraTreeParams()
     extra.derivative_precision = DERIV_PRECISION_FLOAT64
-    assert_true(extra.is_active())
+    # Accepted by name now. `check_scalars` still has to pass it through,
+    # because a range check that only ran on the default value would let a
+    # typo reach the fit -- which is the failure the refusal was a blunt
+    # instrument against and is now the only thing standing there.
+    extra.check_derivative_precision()
+    extra.check_scalars(20)
+
+    # And the range check itself still bites. This is the assertion that
+    # matters after the lift: `float64` is a value, not an escape hatch, and
+    # anything outside the two named settings is still refused.
+    var bogus = ExtraTreeParams()
+    bogus.derivative_precision = 99
     with assert_raises():
-        extra.check_derivative_precision()
-    with assert_raises():
-        extra.check_scalars(20)
+        bogus.check_derivative_precision()
 
 
 def test_the_parameter_string_reaches_the_field() raises:
+    """Both settings parse, and only the two of them do.
+
+    `float64` used to raise here, for the same reason the refusal above used
+    to exist and with the same expiry. Now it has to reach the field, because
+    a string form that refused the value the trainers carry would make the
+    parameter unreachable from `parse_params` -- which is the surface a
+    config file and the CLI both go through.
+
+    The typo arm is the half that does not expire. `double` is what a user
+    coming from another library writes, and it must fail loudly rather than
+    resolving to a default and training the wrong precision in silence.
+    """
     var config = parse_params("derivative_precision=float32")
     assert_equal(
         config.booster.tree.extra.derivative_precision,
         DERIV_PRECISION_FLOAT32,
     )
-    with assert_raises():
-        _ = parse_params("derivative_precision=float64")
+    var wide = parse_params("derivative_precision=float64")
+    assert_equal(
+        wide.booster.tree.extra.derivative_precision,
+        DERIV_PRECISION_FLOAT64,
+    )
     with assert_raises():
         _ = parse_params("derivative_precision=double")
 
