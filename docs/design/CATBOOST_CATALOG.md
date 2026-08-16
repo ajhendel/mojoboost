@@ -3173,3 +3173,500 @@ cheaper than coordinating on an abstraction neither lane has seen.
 columns before `fit_bins`. All three are outside this lane's territory
 (`params.mojo`, `raw_data.mojo`, `binning.mojo`, `bindings/`) and are handed
 over as a diff in the lane report rather than applied here.
+
+### A22 note: CTR feature combinations, verified from source
+
+Numbering: A20 was the last entry on `perf-round-2` at `56b08c1`; `A21` was
+already taken by the `ranking-objectives` lane when this was written, so this
+lane takes **A22**. `ordered-boosting` and `survival-multitarget` had written
+nothing at that moment and may land on A21/A22 as well; renumber on merge.
+
+Status: **verified from CatBoost source**, `master`, read 2026-08-16 by the
+`ctr-combinations` lane. This entry discharges the four items A19 named as
+deliberately not built and left to this lane. A19 stands; A22 extends it from
+the complexity-1 projection to the general one.
+
+Files read, and every claim below cites one of them.
+
+- `catboost/private/libs/algo/projection.h` -- `TProjection`, `TBinFeature`,
+  `IsRedundant`, `IsSingleCatFeature`, `GetFullProjectionLength`, `operator<`.
+- `catboost/private/libs/algo/index_hash_calcer.h` and `.cpp` -- `CalcHashes`,
+  `ComputeReindexHash`, `UpdateReindexHash`.
+- `catboost/private/libs/algo/greedy_tensor_search.cpp` -- `AddSimpleCtrs`,
+  `AddTreeCtrs`, `AddCtrsToCandList`, `DropStatsForProjection`,
+  `SelectDatasetFeaturesForScoring`, `SelectFeaturesForScoring`,
+  `GreedyTensorSearchOblivious`, `GreedyTensorSearch`, `TrimOnlineCTRcache`,
+  `SelectCtrsToDropAfterCalc`, `MAX_ONLINE_CTR_FEATURES`.
+- `catboost/private/libs/algo/ctr_helper.h` and `.cpp` -- `TCtrHelper::GetCtrInfo`,
+  `TCtrHelper::InitCtrHelper`, `MakeCtrInfo`.
+- `catboost/private/libs/algo/online_ctr.cpp` -- `ComputeOnlineCTRs`'
+  single-cat shortcut and its general branch, `approxBucketsCount`, the
+  `topSize` resolution, `CalcFinalCtrs`.
+- `catboost/private/libs/options/cat_feature_options.h` and `.cpp` --
+  `SimpleCtrs`, `CombinationCtrs`, `MaxTensorComplexity`, `CtrLeafCountLimit`,
+  `StoreAllSimpleCtrs`, `TCatFeatureParams::Validate`.
+- `catboost/private/libs/options/catboost_options.cpp` -- `SetCtrDefaults`,
+  `CreateDefaultCounter`, `SetDefaultBinarizationsIfNeeded`, and the
+  `IsSmallIterationCount` override.
+- `catboost/private/libs/options/catboost_options.h` -- `IsSmallIterationCount`.
+- `catboost/private/libs/options/restrictions.h` -- `GetMaxTreeDepth`.
+- `catboost/libs/model/split.h` -- `IsTrueHistogram`, `IsTrueOneHotFeature`.
+- `catboost/libs/model/model_export/resources/ctr_calcer.py` -- `calc_hashes`.
+- `library/cpp/grid_creator/binarization.cpp` -- `MakeBinarizer`, `BestSplit`
+  (the exact DP), `TWeightedFeatureBin::UpdateBestSplitProperties` (the
+  greedy), `Penalty<MinEntropy>`. This last file is for the appendix at the
+  bottom, which is A15's territory and not this lane's.
+
+#### 1. A projection is not a tuple of categorical columns
+
+`TProjection` (`projection.h:61`) has **three** vectors, not one:
+
+```cpp
+struct TProjection {
+    TVector<int> CatFeatures;
+    TVector<TBinFeature> BinFeatures;      // {FloatFeature, SplitIdx}
+    TVector<TOneHotSplit> OneHotFeatures;  // {CatFeatureIdx, Value}
+};
+```
+
+and `CalcHashes` (`index_hash_calcer.cpp:70`) folds all three into one `ui64`
+per row, in that order, with `CalcHash` -- the same `MAGIC_MULT` fold A19
+already built as `ctr_combination_hash`. What is folded in differs per kind.
+
+| kind | folded value | citation |
+|---|---|---|
+| categorical, **training** | `(ui64)quantizedBin + 1` | `index_hash_calcer.cpp:104` |
+| categorical, **final CTR table** | `(int)originalHashedValue` | `index_hash_calcer.cpp:117` |
+| float split | `IsTrueHistogram(bin, SplitIdx)` = `bin > SplitIdx` | `:138`, `model/split.h:12` |
+| one-hot split | `IsTrueOneHotFeature(bin, Value)` = `bin == Value` | `:159`, `model/split.h:16` |
+
+Three things fall out and each is a way to get this wrong.
+
+**The float and one-hot members contribute a 0 or a 1, not a value.** A
+projection that names `f7 > bin 12` folds in the bit, so a projection over one
+categorical column and two float splits has a bucket space of `cardinality x 4`
+and not `cardinality x bins x bins`. `ctr_calcer.py:13-18` is the readable
+statement of the same loop and it merges `BinFeatures` and `OneHotFeatures`
+into one `binarized_indexes` list distinguished by a `check_value_equal` flag,
+which is the export format's spelling of the `>` versus `==` difference above.
+
+**The categorical fold is `+ 1` in training and is not `+ 1` in the final
+table.** Training folds the perfect-hash bin index plus one; `CalcFinalCtrs`
+passes a non-null `perfectHashedToHashedCatValuesMap` and folds the *original*
+hashed value instead. The two hash spaces are therefore different, and it does
+not matter because `ComputeReindexHash` renames every hash to a dense bucket id
+on each side separately and the model file carries the final side's map. It
+does matter to anyone who tries to compare a training bucket id against a model
+bucket id, which is a thing implementations do. Note also that
+`(int)origValsView[...]` narrows a `ui32` hash to a signed `int` before the
+implicit widening to `CalcHash`'s `ui64` parameter, so any original hash with
+the top bit set is sign-extended to `0xFFFFFFFF........`. That is CatBoost's
+arithmetic as written and it is stable, not a bug that changes answers, but it
+is not what a reimplementer would write.
+
+**The single-categorical projection does not go through `CalcHashes` at all.**
+`ComputeOnlineCTRs` (`online_ctr.cpp:626`) branches on `proj.IsSingleCatFeature()`
+and copies the quantized column straight into the hash array
+(`CopyCatColumnToHash`), no fold. So A19's remark that "a one-element
+projection is `calc_hash(0, v)` and NOT `v`" is right about the export path and
+is bypassed on the training path. Since `ComputeReindexHash` renames afterwards
+either way, the induced *partition* is identical and only the labels differ.
+The reason the shortcut exists is that it also gets to size the rehash table
+from the known cardinality (`:653`) instead of guessing it (`:680-687`).
+
+#### 2. Candidate enumeration is grown from the tree, not exhaustive
+
+This is the question that changes the cost by orders of magnitude, and the
+answer is unambiguous: **grown from the splits already in the current tree.**
+`AddTreeCtrs` (`greedy_tensor_search.cpp:491`) is the whole of it.
+
+```cpp
+TProjection binAndOneHotFeaturesTree;
+binAndOneHotFeaturesTree.BinFeatures    = currentTree.GetBinFeatures();
+binAndOneHotFeaturesTree.OneHotFeatures = currentTree.GetOneHotFeatures();
+seenProj.insert(binAndOneHotFeaturesTree);
+for (const auto& ctr : currentTree.GetUsedCtrs()) { seenProj.insert(ctr.Projection); }
+
+for (const auto& baseProj : seenProj) {
+    if (baseProj.IsEmpty()) continue;
+    for each available categorical feature f {
+        if (isOneHot(f) || rand() > Rsm) continue;
+        TProjection proj = baseProj;  proj.AddCatFeature(f);
+        if (proj.IsRedundant() || proj.GetFullProjectionLength() > MaxTensorComplexity) continue;
+        if (addedProjHash.contains(proj)) continue;
+        addedProjHash.insert(proj);
+        AddCtrsToCandList(*fold, *ctx, proj, candList);
+    }
+}
+```
+
+Five facts, each load-bearing.
+
+**The base set is `{ the tree's bin+one-hot splits as ONE projection } union
+{ the projection of every CTR already used in the tree }`.** So the bases at
+depth `d` number at most `d + 1`. There is no enumeration over subsets of the
+tree's splits; the whole set of float and one-hot splits in the tree is a
+single base.
+
+**One categorical feature is added per step.** A projection therefore only
+grows by walking down the tree, and a combination of four categorical columns
+can only be reached if a combination of three was itself chosen as a split
+earlier in the same tree. That is the greedy in "greedy tensor search". It is
+NOT exhaustive to depth 4, and the folklore reading -- "CatBoost tries all
+4-way combinations" -- is wrong.
+
+**`GetFullProjectionLength` counts the bin/one-hot blob as ONE**
+(`projection.h:138`): `CatFeatures.size() + (BinFeatures.size() + OneHotFeatures.size() > 0 ? 1 : 0)`.
+So `max_ctr_complexity = 4` permits four categorical columns, or three
+categorical columns plus arbitrarily many float and one-hot splits.
+
+**`AddSimpleCtrs` and `AddTreeCtrs` run at EVERY depth**, not once per tree:
+`GreedyTensorSearchOblivious` (`:1189`) calls `SelectFeaturesForScoring` inside
+the depth loop, and `SelectDatasetFeaturesForScoring` (`:997-1008`) calls both.
+`AddTreeCtrs` is skipped only at depth 0, where `currentSplitTree` is empty and
+every base is empty.
+
+**Each surviving projection expands into several split candidates.**
+`AddCtrsToCandList` (`:400`) emits one candidate per
+`(ctrIdx, targetBorder, prior)`, i.e.
+`sum over descriptions of GetTargetBorderCount x priors.size()`. At the CPU
+defaults with a binary target that is `Borders: 1 x 3` plus `Counter: 1 x 1`,
+so **four candidates per projection**, exactly as A19's `ctr_feature_count`
+already computes for the simple case.
+
+Two smaller mechanisms are attached to the same loop and are worth recording
+because they are the reason the above is survivable at all.
+`TrimOnlineCTRcache` (`:65`) clears a fold's entire CTR cache once it holds
+more than `MAX_ONLINE_CTR_FEATURES = 50` projections, and it runs at the top of
+every `GreedyTensorSearch` (`:1907`). `SelectCtrsToDropAfterCalc` (`:580`)
+reads `NMemInfo::GetMemInfo().RSS` against `cpu_used_ram_limit` and marks
+candidate sublists to be dropped immediately after scoring. **Both make
+CatBoost's memory behavior depend on the machine's live RSS**, which is a thing
+mojotrees must not copy if determinism across machines is to mean anything.
+
+There is also a default override nobody documents. `catboost_options.cpp:1046`:
+
+```cpp
+if (CatFeatureParams->MaxTensorComplexity.NotSet() && IsSmallIterationCount(BoostingOptions->IterationCount)) {
+    CatFeatureParams->MaxTensorComplexity = 1;
+}
+```
+
+and `IsSmallIterationCount(n)` is `n < 200` (`catboost_options.h:88`). So **a
+default CatBoost fit with fewer than 200 iterations does not build combinations
+at all.** Any comparison harness that fits 100 trees and believes it is
+measuring `max_ctr_complexity = 4` is measuring 1.
+
+#### 3. `ctr_leaf_count_limit` and the top-K reindex
+
+`ComputeReindexHash(topSize, reindexHash, begin, end)`
+(`index_hash_calcer.cpp:171`) has three branches.
+
+1. `topSize > learnSize`: assign ids in first-seen scan order. This is the
+   default path, because `ctr_leaf_count_limit` defaults to `Max<ui64>()`
+   (`cat_feature_options.cpp:236`).
+2. otherwise, count frequencies first; if the distinct count is `<= topSize`,
+   assign ids by **iterating the hash table** (`for (auto& it : reindexHash) it.second = counter++`).
+   Same partition as branch 1, different labels.
+3. otherwise, `std::nth_element` the distinct hashes by descending frequency,
+   keep the first `topSize`, number them `0 .. topSize-1`, and map every other
+   hash to `reindexHash.Size() - 1`.
+
+Branch 3 has two properties that matter more than the mechanism.
+
+**The overflow bucket is the last KEPT bucket, not a fresh one.** The code
+writes `*hash = reindexHash.Size() - 1` (`:222`) where `reindexHash.Size()` is
+`topSize`. The header comment two files up says "map other hash values to value
+`reindexHash.Size()`" (`index_hash_calcer.h:42`), which would be a fresh
+`topSize + 1`-th bucket. **The comment and the code disagree**, the code wins,
+and the consequence is that every rare combination is merged into the least
+frequent of the *kept* buckets rather than into a bucket of its own. Read that
+twice before reproducing it.
+
+**`std::nth_element` is not stable and the comparator only looks at the
+count.** Two hashes with equal frequency at the `topSize` boundary are kept or
+dropped according to the standard library's partition, which differs between
+libstdc++ and libc++ and between versions of each. That is a portability hazard
+for us and not for CatBoost, whose contract does not include reproducing across
+machines.
+
+`topSize` is resolved at `online_ctr.cpp:689`:
+
+```cpp
+ui64 topSize = catFeatureParams.CtrLeafCountLimit;
+if (proj.IsSingleCatFeature() && catFeatureParams.StoreAllSimpleCtrs) { topSize = Max<ui64>(); }
+```
+
+so `store_all_simple_ctr` (default false) can exempt a single column and can
+**never** exempt a combination. This is the source-level confirmation of A19's
+claim that the top-K reindex is optional for a single column and not optional
+for a wide one.
+
+The bucket-space estimate CatBoost itself computes is at `:680-687`:
+
+```cpp
+size_t approxBucketsCount = 1;
+for (auto cf : proj.CatFeatures) {
+    approxBucketsCount *= uniqueValuesCount(cf);
+    if (approxBucketsCount > learnSampleCount) break;
+}
+rehashHashVal->MakeEmpty(Min(learnSampleCount, approxBucketsCount));
+```
+
+-- the product of the cardinalities, capped at the row count, and note that it
+ignores the bin and one-hot members, which can each multiply it by 2.
+
+#### 4. A combination is routed to `TreeCtrs` and inherits nothing
+
+`TCtrHelper::GetCtrInfo` (`ctr_helper.h:54`) is five lines:
+
+```cpp
+if (projection.IsSingleCatFeature()) {
+    const int featureId = projection.CatFeatures[0];
+    if (PerFeatureCtrs.contains(featureId)) { return PerFeatureCtrs.at(featureId); }
+    else { return SimpleCtrs; }
+}
+return TreeCtrs;
+```
+
+and `IsSingleCatFeature()` (`projection.h:102`) requires `BinFeatures.empty() &&
+OneHotFeatures.empty() && CatFeatures.size() == 1`. So **one categorical column
+plus one float split is already a `TreeCtrs` projection**, not a simple one.
+
+`InitCtrHelper` (`ctr_helper.cpp:59-114`) fills `SimpleCtrs` from
+`catFeatureParams.SimpleCtrs` and `TreeCtrs` from
+`catFeatureParams.CombinationCtrs`, two separate option lists
+(`cat_feature_options.h:85-86`), each carrying its own priors, its own
+`ctr_binarization` and its own `target_binarization`, each passed through the
+same `MakeCtrInfo` independently. CatBoost warns about exactly this, twice, in
+`SetCtrDefaults` (`catboost_options.cpp:455-460`):
+
+```
+"Change of simpleCtr will not affect combinations ctrs."
+"Change of combinations ctrs will not affect simple ctrs"
+```
+
+On the CPU the two default lists happen to be built with identical content --
+`{Borders with priors {0,0.5,1}, Counter with prior {0}}` for both -- because
+`CreateDefaultCounter` ignores its `EProjectionType` argument on the CPU
+(`:394-395`). On the GPU they genuinely differ: `FeatureFreq` with `MinEntropy`
+binarization for simple, `FeatureFreq` with `Median` binarization for
+combinations (`:398-414`), and `SetDefaultBinarizationsIfNeeded` (`:418`)
+re-applies that split to any user list. So the *routing* is real everywhere and
+the *values* differ only off the CPU defaults. An implementation that shares one
+description list is correct at the CPU defaults and silently wrong the moment a
+user sets `simple_ctr`.
+
+The complexity bound itself is validated at `cat_feature_options.cpp:266-275`:
+`CB_ENSURE(MaxTensorComplexity.Get() < GetMaxTreeDepth())` with
+`GetMaxTreeDepth() == 16` (`restrictions.h:14`), and
+`CB_ENSURE(CtrLeafCountLimit.Get() > 0)`.
+
+#### 5. Derived bounds, and the honest answer about 1M rows
+
+Every number in this section is a **derived bound** from the loop structure
+above. This lane has no clock and measured nothing.
+
+Let `C` be the number of categorical columns wide enough to escape one-hot
+(`uniqueValues > one_hot_max_size`, `greedy_tensor_search.cpp:469`), `D` the
+tree depth, `n` the learn row count, and `P` the number of split candidates one
+projection expands into (4 at the CPU defaults with a binary target).
+
+**Projections considered per tree.** At depth `d` there are at most `d + 1`
+non-empty bases, so `AddTreeCtrs` considers at most `(d + 1) * C` projections
+and `AddSimpleCtrs` a further `C`. Summing over `d = 0 .. D-1`:
+
+    projections per tree  <=  C * D * (D + 3) / 2
+
+which at `D = 6` is `27C` and at `D = 8` is `44C`. Redundancy rejection and the
+complexity cap only reduce it. Split candidates are `P` times that: `108C` at
+`D = 6` and the CPU defaults.
+
+**Work per projection per fold.** Hashing is `(|cat| + |bin| + |onehot|)`
+multiply-add folds over `n` rows; `ComputeReindexHash` is `n` hash probes plus,
+in the top-K branch, a sort of the distinct set; and each of the `P`
+`(border, prior)` pairs is one `O(n)` online pass writing `n` bucket indices.
+So a projection costs **at least `6n` element operations** at the defaults, and
+produces `4n` bytes of CTR column.
+
+**Per tree, at `n = 10^6`, `C = 10`, `D = 6`, complexity 4.**
+`27 * 10 = 270` projections, `270 * 6 * 10^6 = 1.6 * 10^9` element operations,
+and `270 * 4 * 10^6 = 1.1 GB` of CTR columns if none were dropped -- which is
+precisely why `MAX_ONLINE_CTR_FEATURES = 50` exists and why
+`SelectCtrsToDropAfterCalc` reads live RSS. For scale, the histogram build of a
+50-feature 1M-row depth-6 tree in this repo is on the order of
+`n * F * D = 3 * 10^8` element operations. **The combination CTRs are a derived
+~5x the entire rest of the tree, from ten categorical columns.** Over a
+1000-tree fit that is `~1.6 * 10^12` element operations spent on candidate
+features that mostly lose.
+
+**So, plainly: at 1M rows the default `max_ctr_complexity = 4` is not
+affordable in this repo and should not be the default here.** The derived
+bounds say so and no measurement is needed to see the order of magnitude.
+Complexity 1 costs `C` projections per tree -- `6 * 10^7` element operations at
+the numbers above, comfortably under the histogram budget -- and is the setting
+CatBoost itself silently selects for any fit under 200 iterations. Complexity 2
+costs `C * (D + 1)` per tree, roughly `4 * 10^8`, which is the same order as the
+histogram build and is the first setting that has to be paid for rather than
+absorbed.
+
+**The bucket-space bound.** A projection of `k` categorical columns with
+cardinalities `m_1 .. m_k` and `b` binarized members has a bucket space of
+`2^b * prod(m_i)`. Four columns of 1000 levels is `10^12`. The *realized*
+bucket count is bounded by `min(n, distinct observed)`, and that bound is the
+problem rather than the reassurance: as the realized count approaches `n`,
+every bucket's ordered prefix holds zero or one row, `CalcCTR` returns the pure
+prior almost everywhere, and the feature is noise with a constant. `ctr_leaf_count_limit`
+is the only mechanism that bounds it, and **it is off by default**
+(`Max<ui64>()`). CatBoost's actual defences against a degenerate wide
+projection are the complexity cap, the one-hot cutoff, and the fact that the
+CTR value is quantized into 16 buckets regardless. This is a real hole in the
+default configuration and it is worth saying out loud rather than porting
+silently.
+
+#### 6. What mojotrees built for A22
+
+`src/mojotrees/ctr_combinations.mojo`, a new file, **off by default and reached
+by nothing**, with `tests/test_ctr_combinations.mojo` beside it. It imports
+`.ctr` and `std` and nothing else, and `.ctr` imports only `.rng`, so the module
+stays outside the `efb -> binning -> tree_parameters_extra` cycle for the same
+reason A19's does. No existing default moved. Classification: **(3) bit-moving
+when on** -- it manufactures projections and features that did not exist -- and
+a no-op when off.
+
+Built, and matching the source above.
+
+- `BinSplit` and `OneHotSplit`, with `is_true` reproducing `IsTrueHistogram`
+  (`bin > split_idx`) and `IsTrueOneHotFeature` (`bin == value`).
+- `Projection`, with `TProjection`'s sorted inserts, `is_redundant`,
+  `is_empty`, `is_single_cat_feature`, `has_single_feature` and
+  `full_projection_length` -- including the rule that the whole bin/one-hot set
+  counts as one.
+- `cat_value_train` (`bin + 1`) and `cat_value_final` (the original hash, with
+  the `(int)` sign extension reproduced and documented), the two halves of the
+  categorical fold.
+- `projection_row_hash`, the whole of `CalcHashes` for one row, in CatBoost's
+  order: categorical, then float splits as a bit, then one-hot splits as a bit.
+- `projection_hashes`, the bulk column-driven form.
+- `compute_reindex_hash` and `update_reindex_hash`, the top-K machinery,
+  including the overflow-into-the-last-kept-bucket rule.
+- `projection_bucket_space_bound`, `approxBucketsCount` including the `2^b`
+  factor CatBoost's version drops.
+- `simple_ctr_projections`, `tree_base_projections`, `grow_tree_ctr_projections`
+  -- `AddSimpleCtrs` and `AddTreeCtrs` without the Rsm coin flip and without
+  the RSS-reading drop policy.
+- `ctr_candidates_per_projection` and `ctr_candidate_count_bound`, which
+  compute the `P` and the `C * D * (D + 3) / 2` of section 5 rather than
+  asserting them.
+- `CtrRouting` and `ctr_info_for_projection`, `GetCtrInfo`'s five lines, with
+  `CtrRouting.catboost_cpu_defaults()` building the two lists **independently**
+  so that changing one cannot change the other, and `ctr_routing_warning`
+  carrying CatBoost's two warning strings verbatim.
+- `resolve_max_ctr_complexity`, the `iterations < 200` override, and
+  `check_max_ctr_complexity`, the `1 <= v < 16` bound.
+- `check_ctr_combination_trainer_support`, the same honest "unreached" refusal
+  A19's `check_ctr_trainer_support` is.
+
+`src/mojotrees/ctr.mojo` changed in exactly one place: `check_ctr_complexity`
+no longer refuses above 1. It now enforces CatBoost's own `1 <= v < 16` and
+points at this module. That was the guard A19 left for this lane to delete and
+it is the only edit to that file's behavior.
+
+**Divergences, deliberate and recorded.**
+
+1. **Enumeration order is canonical, not hash-set order.** CatBoost iterates
+   `seenProj`, a `THashSet<TProjection>`, so the order in which bases are
+   expanded is the table's bucket order. Ours sorts bases and candidates by
+   `TProjection::operator<`'s own key (cat features, then bin splits, then
+   one-hot splits, lexicographically) and emits in that order. The *set* of
+   candidates is identical; only the order is, and the order is what a
+   tie-breaking `SelectBestCandidate` would see. Ours does not depend on a
+   hash table's layout, so it is identical across `MOJOTREES_NUM_WORKERS` and
+   across machines. This is `ctr_permutation`'s keyed-sort discipline applied
+   to a different object.
+2. **The top-K tie-break is a total order, not `nth_element`.** Distinct hashes
+   are ordered by `(count descending, hash ascending)` with a stable merge
+   sort. The hashes are distinct by construction, so the key is a strict total
+   order and the kept set is the same on every machine and every standard
+   library. CatBoost's `nth_element` is not, and this is the one place where
+   matching CatBoost would cost us the determinism claim.
+3. **Bucket ids in the under-limit branch are first-seen order.** CatBoost's
+   branch 2 numbers them in hash-table iteration order. The partition is
+   identical; only the labels differ, and first-seen order makes branch 1 and
+   branch 2 agree with each other, which CatBoost's do not.
+4. **The overflow bucket rule IS reproduced**, `top_size - 1`, the last kept
+   bucket, because it changes which rows share a statistic and is therefore
+   behavior rather than labelling. It is reproduced with the discrepancy
+   against `index_hash_calcer.h:42` written into the docstring so nobody
+   "fixes" it by accident.
+5. **No Rsm coin flip and no RSS-driven dropping.** `AddSimpleCtrs` and
+   `AddTreeCtrs` each consult `ctx->LearnProgress->Rand.GenRandReal1() > Rsm`
+   per feature per level, off the run's single advancing RNG, so CatBoost's
+   candidate set for a given tree depends on every draw any earlier tree made.
+   Reproducing that would forfeit the determinism this repo requires, and
+   feature sampling in mojotrees already has its own keyed-stream mechanism.
+   The enumeration here returns the full candidate set and a sampler is the
+   caller's business. `SelectCtrsToDropAfterCalc` reads
+   `NMemInfo::GetMemInfo().RSS`, which makes CatBoost's answer depend on what
+   else is running on the machine; it is not ported and should never be.
+6. **`max_ctr_complexity` still defaults to CatBoost's 4 in `CtrParams`, and
+   the whole module is off.** Section 5's bound says 4 is unaffordable at 1M
+   rows. Changing the recorded CatBoost default would make a ported
+   configuration read differently from the configuration it was ported from,
+   which is worse; the place to state the position is the wiring lane's
+   default, and this note is the argument it should cite.
+
+**Not built, deliberately.** The Rsm coin flip and the RSS drop policy (item 5
+above); `PerFeatureCtrs`, which `GetCtrInfo` consults ahead of `SimpleCtrs` and
+which is a per-feature option surface rather than a mechanism; the actual
+`ComputeOnlineCTRs` call over a combination, which is A19's four loops taking
+this module's bucket ids as their `categories` argument and needs no new code
+here, only a caller; and the tree-level CTR cache with its 50-projection trim,
+which is a caching policy for a trainer that does not exist yet.
+
+#### Appendix: `ctr_target_border_count` and MinEntropy, for scoping
+
+Not this lane's territory (A15's), asked for as a scoping question, and the
+answer is: **the orchestrator's reading is correct, and the fix is much smaller
+than 500 lines at the default.**
+
+The two are genuinely different at one border. The greedy's
+`TWeightedFeatureBin::UpdateBestSplitProperties` (`binarization.cpp:1473-1493`)
+computes the weighted-median position `lb` by `LowerBound` on the cumulative
+weights and then scores **exactly two** candidate cuts, `lb` and `lb + 1`:
+
+```cpp
+const double scoreLeft  = CalcSplitScore(lb);
+const double scoreRight = CalcSplitScore(ub);   // ub = lb + 1
+BestSplit = scoreLeft >= scoreRight ? lb : ub;
+```
+
+The exact binarizer runs the banded DP at `binarization.cpp:193`. But at
+`maxBordersCount = 1` that DP does not run its main loop at all: `bins = 2`, the
+loop is `for (l = 0; l < bins - 2; ++l)`, and the whole computation collapses to
+the "Last match" block at `:630-667`. Written out, with `W` the cumulative
+weights of the `k` distinct target values and `P(w) = w * log(w + 1e-8)`
+(`:175`), it is:
+
+    threshold = argmin over i in [0, k-2] of  P(W[i]) + P(W[k-1] - W[i])
+    ties keep the smallest i        (the comparison at :649 is strict `<`)
+    border    = (values[t] + values[t+1]) / 2                    (:691)
+
+That is a **linear scan over the distinct target values, about ten lines**, not
+a dynamic program. The weights are the counts of each distinct target value
+(`SelectBorders` -> `BestSplit` -> `TExactBinarizer` ->
+`SplitWithGuaranteedOptimum` -> `BestSplit<float, type>(weight, 1, thresholds,
+E_RLM2)`), and `MinEntropy`'s argmin is invariant under scaling the weights, so
+the normalization question does not arise.
+
+**What it would take**, as a scoping estimate: implementing exact `MinEntropy`
+*restricted to one border* is ten lines plus a test, and it is the only case a
+default CTR comparison needs, since `ctr_target_border_count` defaults to 1.
+Implementing it for `borderCount >= 2` is the real DP -- `E_RLM2`'s
+divide-and-conquer band at `:560-627`, plus `E_Base`/`E_Base2`/`E_Linear_2L`
+/`E_DaC` which are alternative modes of the same recurrence -- and only the one
+mode CatBoost actually calls (`E_RLM2`) needs porting, which is roughly seventy
+lines. So the honest scope is: **one border, ten lines, unblocks the default
+comparison; all borders, one DP mode, ~seventy lines.** Neither is 500. It
+belongs to whichever lane owns `binning.mojo`'s `check_border_type`, which is
+not this one, and the `BORDER_MIN_ENTROPY` refusal is left standing here.
