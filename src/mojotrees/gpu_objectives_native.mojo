@@ -113,6 +113,20 @@ comptime HESS_FLOOR = Float32(1e-16)
 comptime SUM_THREADS = 256
 comptime SUM_BLOCKS = 256
 
+comptime SCALE_WINDOW_MAX = 64
+"""How many rounds' magnitude partials `GpuObjectiveState` can hold before
+the host has to fold them.
+
+The ceiling on `GpuHistogramBuilder.set_scale_refresh`, and the reason it is
+a ceiling rather than a limit nobody states: each unfolded round is one more
+round quantized on a scale derived from magnitudes that are that many rounds
+old, and the resolution given up grows with the staleness. Sixty-four is
+already far past anything defensible; it exists so the buffer arithmetic has
+a bound, not as an invitation.
+
+The cost is `SCALE_WINDOW_MAX * 2 * SUM_BLOCKS` Float32 of pinned host
+memory, 128 KB, once per training session and independent of `n_rows`."""
+
 # Default capacity of the node-value table `update_raw` uploads. A tree has
 # `2 * num_leaves - 1` nodes, so this covers num_leaves up to 1024 without a
 # caller having to think about it.
@@ -796,6 +810,23 @@ struct GpuObjectiveState(Movable):
     reader of `step_dev` and it still writes through a `map_to_host`
     mapping, which is a per-tree bidirectional transfer this lane counted
     and deliberately did not touch."""
+    var part_pending: Int
+    """How many magnitude reductions have been enqueued into `host_part` and
+    not yet folded.
+
+    Zero on every path that calls `magnitude_sums`, which enqueues and reads
+    in one call. Nonzero only between `enqueue_magnitudes` and
+    `read_magnitudes`, which is the pair that lets a caller amortize the
+    round's one device-to-host wait over several rounds. It is also the slot
+    index the next reduction lands in, which is why one counter serves as
+    both: slot `p` is written by the `p`-th enqueue since the last read, and
+    `read_magnitudes` folds slots `0 .. p-1` in that order and resets it.
+
+    Never larger than `SCALE_WINDOW_MAX`; `enqueue_magnitudes` refuses rather
+    than wrapping, because wrapping would silently fold one round's partials
+    as another round's and every scale after it would be wrong in a way no
+    assertion would catch."""
+
     var n_rows: Int
     var n_classes: Int
     var max_nodes: Int
@@ -868,9 +899,16 @@ struct GpuObjectiveState(Movable):
         self.part_dev = ctx.enqueue_create_buffer[DType.float32](
             2 * SUM_BLOCKS
         )
+        # `SCALE_WINDOW_MAX` slots rather than one, allocated unconditionally
+        # because the window is a runtime arm the builder chooses after this
+        # state is constructed and 64 KB of pinned memory is not worth a
+        # second allocation path. The device partial buffer stays ONE slot:
+        # the queue is in order, so kernel(j) writes it, copy(j) drains it
+        # into slot j, and only then does kernel(j+1) overwrite it.
         self.host_part = ctx.enqueue_create_host_buffer[DType.float32](
-            2 * SUM_BLOCKS
+            SCALE_WINDOW_MAX * 2 * SUM_BLOCKS
         )
+        self.part_pending = 0
         self.host_raw = ctx.enqueue_create_host_buffer[DType.float32](n_scores)
         self.stage_value = ctx.enqueue_create_host_buffer[DType.float32](
             max_nodes
@@ -1370,15 +1408,131 @@ struct GpuObjectiveState(Movable):
         `sum_abs_partials`, so a caller that needs the reduction split
         across a wait (`MagnitudeReader`) runs the same two halves this
         method runs back to back rather than a second copy of them.
+
+        **This is the unwindowed arm, kept expression for expression.** The
+        windowed pair below (`enqueue_magnitudes` / `read_magnitudes`) is
+        what a caller amortizing the wait uses, and at a window of one it is
+        this call split in half: same launch, same copy, same synchronize,
+        same fold, in that order. Keeping both reachable is what lets
+        `tests/test_gpu_scale_refresh.mojo` compare them at the tree level
+        rather than assert their equivalence in a docstring, which is the
+        only way an off-by-one in the slot arithmetic would ever be caught:
+        folding the wrong slot produces a *plausible* scale, not an error.
         """
+        if self.part_pending != 0:
+            raise Error(
+                "a windowed magnitude reduction has not been read;"
+                " magnitude_sums cannot share the readback buffer with it"
+            )
         enqueue_abs_sum(
             ctx, grad_dev, hess_dev, self.part_dev, self.n_rows
         )
         ctx.enqueue_copy(
             dst_ptr=self.host_part.unsafe_ptr(), src_buf=self.part_dev
         )
+        # Load-bearing. The destination is a pinned `HostBuffer`, and on
+        # Metal a copy into pinned memory is asynchronous (**measured** by
+        # execution, `gpu_tree_tables.download`: 64 of 64 stale words behind
+        # a slow kernel, 0 of 64 behind a fast one). Reading without this
+        # passes on a small fixture and corrupts a real fit.
         ctx.synchronize()
         return sum_abs_partials(self.host_part.unsafe_ptr())
+
+    def enqueue_magnitudes(
+        mut self,
+        ctx: DeviceContext,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        mut hess_dev: DeviceBuffer[DType.float32],
+    ) raises -> Int:
+        """Enqueue this round's magnitude reduction and its readback into the
+        next free window slot. **Does not synchronize.** Returns how many
+        slots are now pending.
+
+        The half of `magnitude_sums` that costs no wait. The copy is enqueued
+        here rather than in `read_magnitudes` so that it sits immediately
+        behind its own kernel in the queue: the device partial buffer is one
+        slot wide and every round overwrites it, so the copy that carries
+        round `j`'s partials out of it has to be ordered between kernel `j`
+        and kernel `j+1`. An in-order queue gives that; nothing else is
+        needed, and nothing else would be enough.
+
+        Each round lands in its own host slot, so a caller may leave up to
+        `SCALE_WINDOW_MAX` rounds unread and still recover every round's
+        magnitudes exactly. That is what makes the amortized arm *verifiable*
+        rather than merely cheaper: the rounds that reused a stale scale are
+        not rounds whose magnitudes were never measured, they are rounds
+        whose magnitudes were measured and read late.
+
+        The pinned-write hazard runs the other way here and is worth naming.
+        The usual rule is that a pinned buffer must not be rewritten while a
+        copy *out of* it is in flight; these are copies *into* it, each into a
+        distinct slot, and no slot is read until `read_magnitudes` has
+        synchronized. A caller that read a slot before that synchronize would
+        get the stale-word failure this file's other waits exist to prevent,
+        which is why the read is a method and the buffer is private to it.
+        """
+        if self.part_pending >= SCALE_WINDOW_MAX:
+            raise Error(
+                "the magnitude window is full; read it before enqueuing"
+                " another reduction"
+            )
+        enqueue_abs_sum(
+            ctx, grad_dev, hess_dev, self.part_dev, self.n_rows
+        )
+        ctx.enqueue_copy(
+            dst_ptr=self.host_part.unsafe_ptr().unsafe_offset(
+                self.part_pending * 2 * SUM_BLOCKS
+            ),
+            src_buf=self.part_dev,
+        )
+        self.part_pending += 1
+        return self.part_pending
+
+    def read_magnitudes(mut self, ctx: DeviceContext) raises -> List[
+        GradMagnitudes
+    ]:
+        """Fold every pending window slot, oldest first, and empty the window.
+
+        **One synchronize whatever the window holds**, which is the whole
+        point: a window of `N` rounds pays the round trip once instead of `N`
+        times. The wait is load-bearing for the reason `magnitude_sums` gives
+        and for every slot at once, since one drain covers every copy behind
+        it in an in-order queue.
+
+        Each slot is folded by `sum_abs_partials` over that slot's own 2 KB,
+        ascending block index, gradient plane then hessian plane, in Float64.
+        That is the same function, the same order, and the same width the
+        unwindowed call uses, so slot `j`'s totals are bit for bit the totals
+        `magnitude_sums` would have returned for round `j` had it waited
+        there. **The window changes when the host learns a round's
+        magnitudes. It does not change what they are.** Everything the
+        amortized arm gives up, it gives up in the scale *derivation*, which
+        is `GpuHistogramBuilder`'s decision and is argued there.
+
+        Returns oldest first, so element 0 is the oldest unread round and the
+        last element is the round that just enqueued. A caller deriving a
+        scale for the next window wants the maximum over the list; a caller
+        checking that the window it just closed was safe wants the maximum
+        over everything but the last. Both are in the caller because both are
+        policy, and this method is a transfer.
+        """
+        if self.part_pending < 1:
+            raise Error("no magnitude reductions are pending")
+        # See `magnitude_sums`: the destination is pinned, so this is the
+        # wait and not a formality.
+        ctx.synchronize()
+        var out = List[GradMagnitudes](capacity=self.part_pending)
+        var base = self.host_part.unsafe_ptr()
+        for slot in range(self.part_pending):
+            out.append(
+                sum_abs_partials(base.unsafe_offset(slot * 2 * SUM_BLOCKS))
+            )
+        self.part_pending = 0
+        return out^
+
+    def magnitudes_pending(self) -> Int:
+        """How many enqueued reductions `read_magnitudes` would fold."""
+        return self.part_pending
 
     def download_raw(mut self, ctx: DeviceContext) raises -> List[Float64]:
         """The current raw scores, row-major, as Float64.

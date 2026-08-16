@@ -113,50 +113,109 @@ repository benchmarks is 1,000,000 x 50 with `R = 100`, squared error, no
 bagging and no GOSS, which resolves to device gradients and the
 device-resident split plane.
 
-  phase                                    round trips   default arm
-  ---------------------------------------  ------------  -----------
-  builder, searcher and table construction  0             0
-  per round, `magnitude_sums` readback      R             100
-  per round, `upload_gradients`             0             0
-  per tree, `download_desc_tables`          R             100
-  per tree, `update_raw_device`             0             0
-  per tree, `begin_tree`                    0             0
-  per round, device validation scorer       R             0, off
-  ---------------------------------------  ------------  -----------
-  total on the default arm                  2R            200
+  phase                                    round trips        default arm
+  ---------------------------------------  -----------------  -----------
+  builder, searcher and table construction  0                  0
+  per round, magnitude window fold          ceil(R/N) [+1]     100
+  per round, `upload_gradients`             0                  0
+  per tree, `download_desc_tables`          R                  100
+  per tree, `update_raw_device`             0                  0
+  per tree, `begin_tree`                    0                  0
+  per round, device validation scorer       R                  0, off
+  ---------------------------------------  -----------------  -----------
+  total on the default arm                  R + ceil(R/N) [+1] 200
+
+`N` is `GpuHistogramBuilder.set_scale_refresh`'s cadence, the `scale_refresh`
+argument to `train_gpu`, and it is **1 by default**, which is why the default
+column still reads 200. The `+1` is the end-of-fit flush, which is a no-op
+and costs nothing at `N <= 1`. At `N = 8` the same fit is 100 + 13 + 1 = 114
+and at `N = 64`, the ceiling, it is 100 + 2 + 1 = 103. **Counted in source**,
+and countable on a run: `scale_readback_count` is the left column's first row
+and the round loop charges the profile's `syncs` from it rather than from a
+constant, so a profile taken at any cadence reports that cadence's count.
 
 Multiply by `K` for a multiclass fit, since a class is a tree and each pays
-both. **Estimated** at the ~458 microsecond per-round-trip constant
-**derived** from the depthwise A/B, 200 round trips is 0.09 seconds against a
-fit **measured** at about 2.58 seconds, or 3.5%. Each half on its own is
-about 0.046 seconds, which M0 does not resolve here: arm spreads run from
-0.02 in a quiet window to several tenths in a slow one, and the machine
-drifts two- to threefold between windows. Nothing was cut on the strength of
-this table and nothing should be until something can measure it.
+both; the window does not reach the softmax path, and
+`fill_softmax_gradients_device` says why. **Estimated** at the ~458
+microsecond per-round-trip constant **derived** from the depthwise A/B, 200
+round trips is 0.09 seconds against a fit **measured** at about 2.58 seconds,
+or 3.5%. Each half on its own is about 0.046 seconds, which M0 does not
+resolve here: arm spreads run from 0.02 in a quiet window to several tenths
+in a slow one, and the machine drifts two- to threefold between windows.
+Nothing was cut on the strength of this table and nothing should be until
+something can measure it. That applies to the cadence too: it is an arm and
+not a default, and it stays an arm until a measurement says otherwise.
 
-The two that remain, and what removing either would cost:
+The two remaining trips, what each would cost to remove, and which of them
+is actually reachable:
 
   **The scale readback**, once per round on the device-gradient arm.
   `GpuHistogramBuilder.fill_gradients_device` reduces `|grad|` and `|hess|` on
   the device and the host folds the partials in Float64 into
   `g_scale`/`h_scale`, which every histogram launch afterwards takes as a
   launch argument. Nothing can be enqueued until that answer is home, so it
-  is a round trip and not a drain. Removing it means the scale living in a
-  device buffer that the quantization and histogram kernels read, which is
-  three files this one does not own, and it moves where the Float64 fold
-  happens, which is an accuracy question before it is a speed one.
-  `_train_multiclass_gpu_batched` is the only mitigation that exists: a batch
-  of classes reduces together, so a round pays one readback per batch instead
-  of one per class. It is opt-in and nothing has measured it.
+  is a round trip and not a drain.
 
-  **The tree download**, once per tree. `grow_tree_device_resident` enqueues
-  a whole tree and reads the tables once at the end; the host needs that tree
-  to append it to the ensemble and to hand its leaf values to
-  `update_raw_device`. Removing it means several trees resident at once,
-  which that docstring says would be a matter of indexing rather than of
-  restructuring. It also says no further lane should be spent on the control
-  plane it describes, and this table is the arithmetic behind that sentence
-  rather than an argument against it.
+  Eliminating it outright -- the scale living in a device buffer the kernels
+  read, so the host never needs its value -- is **not possible**, and this is
+  a finding rather than a scoping decision. The host needs the number in
+  three places: as a `Float32` launch argument to nine kernels across
+  `gpu_active_rows`, `gpu_gradient_stream`, `gpu_categorical` and
+  `gpu_sparse`; as a staged `Float32` table in `gpu_leaf_batching` and
+  `gpu_multiclass_batch`; and as `Float32(1.0 / g_scale)` written into the
+  split searcher's parameter block by `gpu_split_search._stage_params`. The
+  first two are plumbing. The third is not: the obvious dodge -- pre-scale
+  the gradients on the device, which the power-of-two rule makes *bit-exact*
+  since `g * 2^k` is an exact Float32 product, and hand the kernels a scale of
+  1.0 -- fails because the gain and the leaf value are not homogeneous in the
+  scale. `G^2 / (H + lambda)` and `-G / (H + lambda)` both carry an unscaled
+  `lambda`, so a searcher told the scale is 1.0 computes a different gain and
+  chooses a different split. The host has to know the number.
+
+  So what this file does instead is change **how often** the host waits for
+  it, not whether it needs it: `set_scale_refresh` defers the readback across
+  `N` rounds, keeps every round's magnitudes measured exactly in its own slot
+  of a pinned window, and checks each closed window against the `2^30`
+  overflow bound so a reused scale can end a fit loudly but cannot corrupt
+  one quietly. The whole argument, including the two distinct ways it moves
+  histogram bits, is at `set_scale_refresh`. `_train_multiclass_gpu_batched`
+  remains the only mitigation on the softmax path: a batch of classes reduces
+  together, so a round pays one readback per batch instead of one per class.
+  It is opt-in and nothing has measured it.
+
+  **The tree download**, once per tree, and it is **still R**. The obvious
+  amortization -- download every `N` trees, since the host only needs a tree
+  to append it to the ensemble, to test it for degeneracy, and to hand its
+  leaf values to `update_raw_device` -- is blocked by where the code lives
+  rather than by what it does. Two hard dependencies, both outside this file:
+
+  - `grow_tree_device_resident` (`gpu_resident_round.mojo`) *always* ends in
+    `download_desc_tables` and returns a host `Tree`. A deferred mode is a
+    change to that function, not to this loop.
+  - `update_raw_device` needs `builder.rows.ranges`, the **host** leaf-range
+    mirror, and on the resident plane that mirror is only correct because
+    `_publish_row_ranges` replays the downloaded commit order onto it. Its own
+    docstring records the bug from assuming otherwise: without the replay the
+    update added the root's value to every row and every tree after the first
+    diverged. A device-sourced raw update reading `front_dev` and `node_f_dev`
+    directly is writable here, but it removes no round trip on its own,
+    because the tree still has to come home for the ensemble.
+
+  The rule the deferral would need, recorded so the lane that owns those
+  files does not have to re-derive it: **`N` must not exceed the early
+  stopping patience**, and where both are set it must be
+  `min(requested_N, early_stopping_rounds)`, falling back to 1 whenever
+  patience is 1. Early stopping compares `len(trees) - best_n_trees` against
+  `early_stopping_rounds` once per round (`_train_gpu_valid_rounds`), so a
+  batch of `N` undownloaded trees is `N` rounds in which that comparison
+  cannot be made and the stop is up to `N - 1` rounds late; the ensemble is
+  then truncated to `best_n_trees` anyway, so the *model* is unchanged and
+  only the work is wasted -- but only if `N <= patience`, because at `N >
+  patience` the loop can pass the stopping point and keep going for a whole
+  further batch, which is a silently defeated stop and worse than no change.
+  As it happens the validation loop is host-gradient only today, so it does
+  not reach the resident plane at all, which is exactly why the rule has to
+  be written down before the two paths meet rather than after.
 
 What is **not** a round trip, checked rather than assumed, because all three
 have been reported as waits at some point:
@@ -194,6 +253,18 @@ wait per tree from one making thirty-one. A wait count is the right first
 instrument here precisely because it does not need a quiet machine: it is a
 static property of the schedule, so it says whether a change is worth timing
 before anything is timed.
+
+One refinement since, and it is what keeps that true now that the schedule is
+not fixed. `PROF_GRAD_FILL` used to be charged `syncs=1` unconditionally,
+which was right while every round folded and became a fiction the moment
+`set_scale_refresh` let a fit fold every `N` rounds instead. The charge is now
+taken from `GpuHistogramBuilder.scale_readback_count`, read before and after
+the fill, so the column counts the waits that happened rather than the waits
+the default cadence would have made. That is the same failure this docstring
+names below for `arm_conditions` -- an instrument reporting a condition it
+cannot see -- caught on the way in rather than after it had cost a number.
+The cadence is a `train_gpu` argument and not an environment variable, so
+unlike every switch named below it is at least visible in the call.
 
 Two blind spots remain around it, both outside this file and both worth
 naming here because this is where the census lives.
@@ -2759,7 +2830,20 @@ def _train_gpu_rounds[
                 # rows whichever path produced its gradients.
                 refresh_bag(dev_bag, bagging, n, i)
                 var dev_grad_started = profile.clock()
+                var scale_reads_before = builder.scale_readback_count()
                 builder.fill_gradients_device(state, objective, alpha)
+                # Charged from the builder's own readback counter rather than
+                # from the constant 1 that used to sit here.
+                # `GpuHistogramBuilder.set_scale_refresh` lets a fit fold the
+                # magnitude window every `N` rounds instead of every round, so
+                # the number of rounds that wait is no longer the number of
+                # rounds. A fixed `syncs=1` would report the shipped cadence's
+                # count whatever cadence ran, which is exactly the "conditions
+                # inherited from a switch the instrument cannot see" failure
+                # this file's docstring says has already cost it a number once.
+                var scale_synced = (
+                    builder.scale_readback_count() != scale_reads_before
+                )
                 # `syncs=1`, and the comment this replaced said the opposite.
                 # It read "enqueued, not waited for", borrowed from the device
                 # histogram line, and it was wrong about this call:
@@ -2776,7 +2860,12 @@ def _train_gpu_rounds[
                 # was the count, so a wait census taken off a phase profile
                 # read zero here and the fit's most reducible round trip was
                 # invisible to the instrument that exists to find it.
-                profile.charge(PROF_GRAD_FILL, n, dev_grad_started, syncs=1)
+                profile.charge(
+                    PROF_GRAD_FILL,
+                    n,
+                    dev_grad_started,
+                    syncs=1 if scale_synced else 0,
+                )
                 profile.note_wall(dev_grad_started)
                 life.begin_tree()
                 var tree = grow_tree_gpu_profiled(
@@ -2826,6 +2915,13 @@ def _train_gpu_rounds[
                 trees.append(tree^)
                 life.end_round()
                 profile.note_wall(dev_post_started)
+            # The rounds the window was still holding when the loop stopped.
+            # A no-op at the shipped cadence, where the window is always
+            # empty here; at a wider one it is the round trip that makes the
+            # overflow check cover the *last* few rounds rather than every
+            # round but them. Outside the `for`, so a `break` on a degenerate
+            # tree and a fit that ran its full budget both reach it.
+            builder.flush_scale_window(state)
             profile.print_report()
             return Booster(
                 trees^,
@@ -2928,6 +3024,8 @@ def train_gpu(
     pair_alignment: Bool = True,
     min_tiles: Int = 0,
     rows_per_tile: Int = 0,
+    scale_refresh: Int = 1,
+    scale_headroom: Int = 0,
 ) raises -> Booster:
     """Train a boosted ensemble with tree growth on the GPU. Same contract
     as `train` (objectives, sample_weight, alpha, bagging, and GOSS
@@ -2972,6 +3070,26 @@ def train_gpu(
       produced. `rows_per_tile` is the only one that can ask for FEWER tiles
       than the occupancy term gives, which is what a re-test of the row-tile
       floor needs; see `gpu_tiling.row_tile_floor`.
+
+    `scale_refresh` and `scale_headroom` are the **one pair here that is not
+    a launch shape**, and they are on the same footing as `set_scale_shape`
+    rather than as the arms above: they can change a model, and at any
+    setting but the default they do. `scale_refresh` is how many rounds share
+    one fixed-point scale, so it is how many of the fit's `2R` round trips the
+    scale accounts for -- `R` at the default 1, `ceil(R/N) + 1` at `N`.
+    `scale_headroom` is how many bits of lattice resolution every round gives
+    up in exchange for room to reuse a scale safely. `1, 0` is the shipped
+    cadence and the shipped arithmetic; `0` selects the unwindowed reference
+    call. The rule, the overflow argument, the check that enforces it and the
+    two distinct ways the bits move are all at
+    `GpuHistogramBuilder.set_scale_refresh`, and nothing about them is
+    restated here.
+
+    They reach only the device-gradient arm, because the host-gradient arm
+    derives its scale from a host pass over the gradient lists and never
+    waits on the device for it. A bagged or GOSS fit therefore ignores both,
+    silently, which is correct and is the reason a fit's readback count has
+    to be read off the builder rather than derived from this signature.
 
     One hazard in how these defaults are spelled, since the calls below are
     unconditional: `GpuActiveRows.__init__` also sets every one of them, and
@@ -3035,6 +3153,9 @@ def train_gpu(
         builder.set_narrow_index(narrow_index)
         builder.set_pair_alignment(pair_alignment)
         builder.set_row_tiling(min_tiles, rows_per_tile)
+        # Not a launch shape. See the paragraph in this docstring and the
+        # whole argument at `GpuHistogramBuilder.set_scale_refresh`.
+        builder.set_scale_refresh(scale_refresh, scale_headroom)
         var life = NoLifecycle()
         return _train_gpu_rounds(
             builder,
@@ -3070,6 +3191,8 @@ def train_gpu(
     pair_alignment: Bool = True,
     min_tiles: Int = 0,
     rows_per_tile: Int = 0,
+    scale_refresh: Int = 1,
+    scale_headroom: Int = 0,
 ) raises -> Booster:
     """`train_gpu` on a caller-owned session: the builder borrows the
     session's context and its ledgers record the construction, and every
@@ -3118,6 +3241,10 @@ def train_gpu(
         builder.set_narrow_index(narrow_index)
         builder.set_pair_alignment(pair_alignment)
         builder.set_row_tiling(min_tiles, rows_per_tile)
+        # A session owns the context, not the round's numbers, so it cannot
+        # change this answer either -- but unlike the four above, this one is
+        # a number and not a shape. See `set_scale_refresh`.
+        builder.set_scale_refresh(scale_refresh, scale_headroom)
         var booster = _train_gpu_rounds(
             builder,
             session,
