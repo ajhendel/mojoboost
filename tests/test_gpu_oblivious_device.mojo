@@ -28,6 +28,7 @@ The device tests skip (passing) with no accelerator, so the census layer still
 runs on a CPU-only machine.
 """
 
+from std.os import setenv
 from std.sys import has_accelerator
 from std.testing import (
     assert_equal,
@@ -36,19 +37,35 @@ from std.testing import (
     TestSuite,
 )
 
+from mojotrees.binning import bin_equal_width, BinnedMatrix
 from mojotrees.categorical import CategoricalParams, CategoricalSpec
+from mojotrees.growth_policy import GROW_LEAFWISE, GROW_OBLIVIOUS
+from mojotrees.gpu_leaf_batching import DEFAULT_MAX_ITEMS, OBLIVIOUS_MAX_ITEMS
 from mojotrees.gpu_resident_round import (
     OBLIVIOUS_CATEGORICAL,
     OBLIVIOUS_DEPTH,
     OBLIVIOUS_LEAF_INDEX_RULE,
     OBLIVIOUS_LEVEL_HISTOGRAM,
+    OBLIVIOUS_LEVEL_LAUNCHES,
     OBLIVIOUS_NO_CPU_PEER,
     OBLIVIOUS_OK,
+    OBLIVIOUS_RECORDS,
     OBLIVIOUS_ROW_RANGES,
+    OBLIVIOUS_SPECULATION,
+    OBLIVIOUS_TABLES,
+    OBLIVIOUS_TRACE_MARK,
+    oblivious_device_supported,
     oblivious_launch_census,
+    oblivious_leaf_budget,
     oblivious_open_blockers,
     oblivious_reason_name,
+    oblivious_records_needed,
+    oblivious_schedule_launches,
 )
+from mojotrees.gpu_tree_tables import OBLIVIOUS_PLAN_ITEMS
+from mojotrees.histogram_gpu import GpuHistogramBuilder
+from mojotrees.train_gpu import grow_tree_gpu
+from mojotrees.tree import Tree, TreeParams, grow_tree
 from mojotrees.gpu_split_search import (
     DEFAULT_GAIN_FORM,
     GpuSplitParams,
@@ -122,6 +139,76 @@ def test_the_census_beats_leaf_wise_at_every_depth_it_admits() raises:
     assert_equal(oblivious_launch_census(0), 0)
 
 
+def test_the_batch_item_bound_is_the_census_precondition() raises:
+    # The one sizing number this mode cannot be left to a default on. A
+    # depth-6 level's last generation has 64 children; at the default bound of
+    # 32 that level needs two batches, which costs two command buffers and puts
+    # the tree exactly ON the measured knee.
+    assert_equal(DEFAULT_MAX_ITEMS, 32)
+    assert_equal(OBLIVIOUS_MAX_ITEMS, 64)
+    assert_equal(oblivious_launch_census(6, batch_max_items=64), 62)
+    assert_equal(oblivious_launch_census(6, batch_max_items=32), 64)
+    assert_true(oblivious_launch_census(6, batch_max_items=64) < _QUEUE_DEPTH)
+    assert_false(oblivious_launch_census(6, batch_max_items=32) < _QUEUE_DEPTH)
+    # And the reason validating at depth 5 would have shown nothing: a depth-5
+    # level tops out at 32 children, so the two bounds agree there.
+    assert_equal(
+        oblivious_launch_census(5, batch_max_items=32),
+        oblivious_launch_census(5, batch_max_items=64),
+    )
+    # The plan is twice a level wide, because a level builds both children of
+    # every leaf rather than one and a sibling.
+    assert_equal(OBLIVIOUS_PLAN_ITEMS, 2 * OBLIVIOUS_MAX_ITEMS)
+
+
+def test_the_schedule_as_built_is_counted_and_the_gap_is_named() raises:
+    # `oblivious_launch_census` is the registered model and is not edited after
+    # the fact; `oblivious_schedule_launches` is the built thing. They differ by
+    # one launch per level, which is the record-filing phase a level does not
+    # need, and both are under the knee at `max_items >= 64`.
+    assert_equal(OBLIVIOUS_LEVEL_LAUNCHES, 6)
+    assert_equal(oblivious_schedule_launches(6), 56)
+    assert_equal(oblivious_schedule_launches(6, batch_max_items=32), 58)
+    assert_equal(
+        oblivious_launch_census(6, batch_max_items=64)
+        - oblivious_schedule_launches(6),
+        6,
+    )
+    for d in range(1, 7):
+        assert_true(oblivious_schedule_launches(d) < _QUEUE_DEPTH)
+        assert_true(
+            oblivious_schedule_launches(d)
+            <= oblivious_launch_census(d, batch_max_items=64)
+        )
+    assert_equal(oblivious_schedule_launches(0), 0)
+    # A schedule with no batcher at all is the 176 shape the census names, and
+    # this is the same arithmetic from the other side.
+    assert_true(oblivious_schedule_launches(6, batch_max_items=-1) > 100)
+
+
+def test_num_leaves_does_not_bind_and_the_budget_says_so() raises:
+    # `num_leaves` is ignored under this mode. Every table the plane sizes comes
+    # from here, and the point of the assertion is that the answer does not
+    # move when `num_leaves` does.
+    for leaves in [2, 3, 31, 255]:
+        var params = _tree_params(max_depth=4, num_leaves=leaves)
+        assert_equal(oblivious_leaf_budget(params), 16)
+        assert_equal(oblivious_records_needed(params), 17)
+    assert_equal(
+        oblivious_leaf_budget(_tree_params(max_depth=6, num_leaves=31)), 64
+    )
+    assert_equal(
+        oblivious_records_needed(_tree_params(max_depth=6, num_leaves=31)), 65
+    )
+    # The leaf-wise default budget of 31 asks for 33 records and a depth-6
+    # oblivious tree needs 65, which is why the sizing had to be re-asked rather
+    # than inherited.
+    assert_true(
+        oblivious_records_needed(_tree_params(max_depth=6, num_leaves=31))
+        > 31 + 2
+    )
+
+
 def test_every_refusal_names_itself() raises:
     assert_equal(oblivious_reason_name(OBLIVIOUS_OK), String("ok"))
     var reasons = [
@@ -130,6 +217,9 @@ def test_every_refusal_names_itself() raises:
         OBLIVIOUS_ROW_RANGES,
         OBLIVIOUS_CATEGORICAL,
         OBLIVIOUS_NO_CPU_PEER,
+        OBLIVIOUS_TABLES,
+        OBLIVIOUS_SPECULATION,
+        OBLIVIOUS_RECORDS,
     ]
     for i in range(len(reasons)):
         var name = oblivious_reason_name(reasons[i])
@@ -145,21 +235,23 @@ def test_every_refusal_names_itself() raises:
     assert_equal(oblivious_reason_name(99), String("unknown"))
 
 
-def test_the_standing_blockers_are_listed_largest_first() raises:
-    # The census found two things the design assumed and the code does not
-    # provide, and a third that is not this backend's to close. The list is
-    # what a reader needs; the test is that it is not empty, that the census
-    # blocker is first, and that every entry names itself.
-    var open = oblivious_open_blockers()
-    assert_equal(len(open), 3)
-    assert_equal(open[0], OBLIVIOUS_LEVEL_HISTOGRAM)
-    assert_equal(open[1], OBLIVIOUS_ROW_RANGES)
-    assert_equal(open[2], OBLIVIOUS_NO_CPU_PEER)
-    for i in range(len(open)):
-        assert_true(oblivious_reason_name(open[i]) != String("unknown"))
-    # The cross-leaf reduction is not on the list: it is built and checked.
-    for i in range(len(open)):
-        assert_true(open[i] != OBLIVIOUS_OK)
+def test_the_standing_blockers_are_all_closed() raises:
+    # The list held three: the whole-level histogram build, the host row-range
+    # table, and the missing CPU comparator. Each is closed by something that
+    # now runs -- the batched level build behind
+    # `GpuHistogramBuilder.enqueue_desc_level_children`,
+    # `_publish_level_row_ranges` through `LeafRangeTable.set_window`, and
+    # `tree._grow_oblivious_levels`. An empty list something asserts is stronger
+    # than a deleted function nobody can ask.
+    assert_equal(len(oblivious_open_blockers()), 0)
+    # The two codes that can no longer be returned still name themselves, so a
+    # trace written before the closure still reads back.
+    assert_true(
+        oblivious_reason_name(OBLIVIOUS_ROW_RANGES) != String("unknown")
+    )
+    assert_true(
+        oblivious_reason_name(OBLIVIOUS_NO_CPU_PEER) != String("unknown")
+    )
 
 
 def test_the_leaf_index_rule_is_stated_in_one_place() raises:
@@ -652,6 +744,431 @@ def test_a_level_wider_than_the_reservation_is_refused() raises:
         except:
             refused = True
         assert_true(refused)
+
+
+# --- The level schedule, end to end ---------------------------------------
+#
+# Everything above tests one launch. What follows tests the schedule: the level
+# commit, the whole-prefix partition, the batched level build, and the host
+# row-range replay, by growing a tree with them and comparing it to the tree the
+# CPU oblivious grower builds from the same gradients.
+#
+# **The comparison is against `tree._grow_oblivious_levels`, not against another
+# device path**, and that is the accuracy gate for the mode. What can and cannot
+# be exact between the two backends is stated at `_assert_same_shape`: a
+# decision is discrete and is compared with no tolerance; a leaf value is a
+# Float64 Newton step on one side and a Float32 one over fixed-point sums on the
+# other, and no schedule can make those the same bits.
+
+
+comptime _OB_TRACE_PATH = "./.test_gpu_oblivious_device_trace.tmp"
+"""Where the level schedule's trace lands, so a test can count the trees it
+grew rather than assume it grew any."""
+
+
+def _truncate_trace() raises:
+    with open(_OB_TRACE_PATH, "w") as handle:
+        handle.write(String(""))
+
+
+def _read_trace() raises -> String:
+    return open(_OB_TRACE_PATH, "r").read()
+
+
+def _tree_params(
+    max_depth: Int,
+    num_leaves: Int = 31,
+    min_data: Int = 1,
+    policy: Int = GROW_OBLIVIOUS,
+) -> TreeParams:
+    # `num_leaves` is deliberately unrelated to the depth: it does not bind
+    # under this policy and two tests above pin that.
+    return TreeParams(
+        num_leaves,
+        min_data,
+        1.0,
+        1e-3,
+        max_depth=max_depth,
+        grow_policy=policy,
+    )
+
+
+def _dense(n_rows: Int, n_features: Int) -> List[Float64]:
+    """Column-major pseudo-random features, the shape `bin_equal_width`
+    takes. The same generator `tests/test_oblivious.mojo` uses, so the two
+    files disagree about nothing but the backend."""
+    var out = List[Float64](capacity=n_rows * n_features)
+    var state = UInt64(20260816)
+    for _ in range(n_rows * n_features):
+        state = state * 6364136223846793005 + 1442695040888963407
+        out.append(Float64(state >> 11) * (1.0 / 9007199254740992.0))
+    return out^
+
+
+def _grads(n_rows: Int, features: List[Float64]) -> List[Float64]:
+    """A gradient with real structure in the first four features, so a level
+    has something to disagree about and the chosen split is decided by the data
+    rather than by a tie. A near-tie is the one thing that can legitimately move
+    a split between a Float64 host scan and a Float32 device one, so the fixture
+    is built to avoid one rather than to hope."""
+    var out = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        out.append(
+            -(
+                3.0 * features[r]
+                - 2.0 * features[n_rows + r]
+                + 1.5 * features[2 * n_rows + r] * features[3 * n_rows + r]
+            )
+        )
+    return out^
+
+
+def _ones(n: Int) -> List[Float64]:
+    var out = List[Float64](capacity=n)
+    for _ in range(n):
+        out.append(1.0)
+    return out^
+
+
+@fieldwise_init
+struct _Pair(Movable):
+    var host: Tree
+    var device: Tree
+    var trace: String
+
+
+def _both_growers(
+    n_rows: Int, n_features: Int, n_bins: Int, params: TreeParams
+) raises -> _Pair:
+    """Grow one tree on each backend from the same binned matrix and the same
+    Float64 gradients, and return both with the device arm's trace.
+
+    The gradients are host Float64 on both sides. That is the point: the only
+    thing that differs between the two arms is the grower, not the objective,
+    not the round, and not the initialization. `upload_gradients` quantizes them
+    into the fixed-point domain the device accumulates in, which is the one
+    numeric difference the comparison has to survive.
+    """
+    var features = _dense(n_rows, n_features)
+    var data = bin_equal_width(features, n_rows, n_features, n_bins)
+    var grad = _grads(n_rows, features)
+    var hess = _ones(n_rows)
+    var host = grow_tree(data, grad, hess, params)
+
+    _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", _OB_TRACE_PATH)
+    _truncate_trace()
+    var builder = GpuHistogramBuilder(data)
+    builder.upload_gradients(grad, hess)
+    var device = grow_tree_gpu(builder, params)
+    var trace = _read_trace()
+    _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", "")
+    return _Pair(host^, device^, trace)
+
+
+def _assert_plane_ran(trace: String, label: String) raises:
+    """The level schedule executed, exactly once.
+
+    The positive control, and it is not a formality here. A refused
+    configuration raises rather than falling back, but a *routing* mistake --
+    the AUTO decision sending an oblivious fit to the host-scan grower, say --
+    would produce a tree that is still symmetric and still correct, and every
+    structural assertion below would pass while this function never ran.
+    """
+    assert_equal(
+        trace.count(OBLIVIOUS_TRACE_MARK),
+        1,
+        label
+        + ": the oblivious level schedule traced "
+        + String(trace.count(OBLIVIOUS_TRACE_MARK))
+        + " trees; zero means the fit never reached it and this comparison"
+        + " proves nothing",
+    )
+    assert_equal(
+        trace.count("status=running"),
+        0,
+        label + ": a tree came home while growth was still running",
+    )
+    assert_equal(
+        trace.count("status=pool_full") + trace.count("status=overflow"),
+        0,
+        label + ": the device tables were too small for the depth budget",
+    )
+    # The batched level build is what pays the partition's deferred copy-back,
+    # once per level, and the counter is incremented by the code that takes the
+    # fused branch rather than by a prediction of how often it should.
+    assert_equal(
+        trace.count("plane=device-oblivious"),
+        1,
+        label + ": the trace mark is not the one this plane writes",
+    )
+
+
+def _node_depths(tree: Tree) -> List[Int]:
+    var depths = List[Int](capacity=len(tree.feature))
+    depths.resize(len(tree.feature), 0)
+    for n in range(len(tree.feature)):
+        if tree.feature[n] >= 0:
+            depths[tree.left[n]] = depths[n] + 1
+            depths[tree.right[n]] = depths[n] + 1
+    return depths^
+
+
+def _assert_symmetric(tree: Tree, label: String) raises:
+    """Every internal node at one depth carries the same split.
+
+    THE marker of an oblivious tree in an ordinary binary representation, and
+    the assertion that keeps a leaf-wise grower from passing everything else in
+    this file."""
+    var depths = _node_depths(tree)
+    for d in range(len(tree.feature)):
+        var feature = -2
+        var threshold = 0
+        var default_left = False
+        for n in range(len(tree.feature)):
+            if depths[n] != d or tree.feature[n] < 0:
+                continue
+            if feature == -2:
+                feature = tree.feature[n]
+                threshold = tree.threshold_bin[n]
+                default_left = tree.default_left[n]
+                continue
+            assert_equal(
+                tree.feature[n], feature, label + ": level feature"
+            )
+            assert_equal(
+                tree.threshold_bin[n], threshold, label + ": level threshold"
+            )
+            assert_true(
+                tree.default_left[n] == default_left,
+                label + ": level missing direction",
+            )
+
+
+def _assert_same_shape(host: Tree, device: Tree, label: String) raises:
+    """Node for node, with no tolerance on anything discrete.
+
+    **What is exact and what is not, stated rather than assumed.** The split a
+    node makes -- its feature, its threshold bin, its missing direction -- and
+    the shape of the tree -- its node count, its child ids, the order node ids
+    were assigned in -- are *decisions*, and a decision is discrete. Those are
+    compared with `assert_equal` and no tolerance, because a different split is
+    not corrected by a later round the way a leaf value is. Node row counts are
+    exact integers on both sides and are compared the same way.
+
+    Leaf **values** are not compared as bit patterns and cannot be. The host
+    computes a Float64 Newton step from Float64 histogram sums; the device
+    computes a Float32 one from fixed-point Int32 sums dequantized by a power of
+    two. Those are two different arithmetics over two different quantizations of
+    the same data, and no amount of scheduling makes them the same bits. The
+    device plane's own bit-level comparison is against another *device* path
+    (`tests/test_gpu_tree_resident.mojo`); across backends this package's
+    standing convention is structural equality plus a tolerance, which is what
+    `tests/test_backend_equivalence.mojo` also asserts.
+    """
+    assert_equal(len(device.feature), len(host.feature), label + ": n_nodes")
+    assert_equal(device.n_leaves, host.n_leaves, label + ": n_leaves")
+    for i in range(len(host.feature)):
+        assert_equal(device.feature[i], host.feature[i], label + ": feature")
+        assert_equal(
+            device.threshold_bin[i],
+            host.threshold_bin[i],
+            label + ": threshold_bin",
+        )
+        assert_equal(device.left[i], host.left[i], label + ": left")
+        assert_equal(device.right[i], host.right[i], label + ": right")
+        assert_true(
+            device.default_left[i] == host.default_left[i],
+            label + ": default_left",
+        )
+        assert_equal(
+            device.missing_bin[i], host.missing_bin[i], label + ": missing_bin"
+        )
+        assert_equal(
+            Int(device.count[i]), Int(host.count[i]), label + ": node count"
+        )
+        var want = host.value[i]
+        var got = device.value[i]
+        var scale = abs(want) if abs(want) > 1.0 else 1.0
+        assert_true(
+            abs(got - want) <= 1e-4 * scale,
+            label
+            + ": leaf value "
+            + String(got)
+            + " against "
+            + String(want),
+        )
+
+
+def test_a_depth_three_tree_matches_the_cpu_grower_node_for_node() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        # The smallest depth at which the leaf numbering and the node-id order
+        # can disagree: at level 2 the leaves in node-id order carry leaf
+        # indices 0, 2, 1, 3, so a backend that numbered ascending node id
+        # would build a different tree here and an identical one at depth 2.
+        var run = _both_growers(400, 5, 16, _tree_params(max_depth=3))
+        _assert_plane_ran(run.trace, String("depth 3"))
+        _assert_symmetric(run.device, String("depth 3 device"))
+        _assert_same_shape(run.host, run.device, String("depth 3"))
+        assert_equal(run.device.n_leaves, 8)
+
+
+def test_a_depth_six_tree_matches_the_cpu_grower_node_for_node() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        # CatBoost's default depth, the widest level this mode admits, and the
+        # only depth at which the `max_items` precondition can bite. 64 leaves,
+        # 127 nodes, and the last level's 64 children built by one batch.
+        var run = _both_growers(2000, 6, 32, _tree_params(max_depth=6))
+        _assert_plane_ran(run.trace, String("depth 6"))
+        _assert_symmetric(run.device, String("depth 6 device"))
+        _assert_same_shape(run.host, run.device, String("depth 6"))
+        assert_equal(run.device.n_leaves, 64)
+        assert_equal(len(run.device.feature), 127)
+
+
+def test_the_windows_the_device_published_tile_the_prefix() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        # `_publish_level_row_ranges` is what makes the tree usable for a second
+        # round: `update_raw_device` reads the host row-range table, and a level
+        # partition leaves a parent's rows in two blocks that are not adjacent,
+        # so `LeafRangeTable.split` cannot replay it. The proof is that
+        # `end_descriptor_partition` lifted the staleness refusal at all -- it
+        # checks every window against the device's own frontier and runs the
+        # tiling invariant before it does -- so a table that can be READ here is
+        # a table that passed all four of its checks.
+        var n_rows = 600
+        var features = _dense(n_rows, 4)
+        var data = bin_equal_width(features, n_rows, 4, 16)
+        var grad = _grads(n_rows, features)
+        var builder = GpuHistogramBuilder(data)
+        builder.upload_gradients(grad, _ones(n_rows))
+        var tree = grow_tree_gpu(builder, _tree_params(max_depth=4))
+        # Reading at all is the assertion: every accessor refuses while the
+        # descriptor partition owns the windows.
+        var total = builder.rows.ranges.total_active()
+        assert_equal(total, n_rows)
+        assert_equal(builder.rows.ranges.n_nodes(), len(tree.feature))
+        builder.rows.ranges.check_invariants()
+        # And the windows are the leaves' own row counts, which is the number
+        # the raw-score update walks.
+        var leaf_rows = 0
+        for n in range(len(tree.feature)):
+            if tree.feature[n] < 0:
+                leaf_rows += builder.rows.ranges.get(n).count()
+        assert_equal(leaf_rows, n_rows)
+
+
+def test_a_second_round_of_gradients_still_grows_the_same_tree() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        # The failure `_publish_level_row_ranges` exists against was silent for
+        # exactly one round: correct trees, wrong scores, and every round after
+        # the first diverging. Growing two trees on one builder is the cheapest
+        # thing that would have caught it, because the second tree's
+        # `begin_tree` refuses outright if the copy-back debt or the staleness
+        # poison survived the first.
+        var n_rows = 500
+        var features = _dense(n_rows, 5)
+        var data = bin_equal_width(features, n_rows, 5, 16)
+        var grad = _grads(n_rows, features)
+        var hess = _ones(n_rows)
+        var params = _tree_params(max_depth=4)
+        var host = grow_tree(data, grad, hess, params)
+        var builder = GpuHistogramBuilder(data)
+        builder.upload_gradients(grad, hess)
+        var first = grow_tree_gpu(builder, params, [], 0)
+        var second = grow_tree_gpu(builder, params, [], 1)
+        _assert_same_shape(host, first, String("round 1"))
+        _assert_same_shape(host, second, String("round 2"))
+
+
+def test_the_default_item_bound_refuses_rather_than_landing_on_the_knee(
+) raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        # A builder whose batcher was opened for the leaf-wise plane holds 32
+        # items. A depth-6 level wants 64, and the refusal is by name rather
+        # than a silent second batch.
+        var n_rows = 300
+        var features = _dense(n_rows, 4)
+        var data = bin_equal_width(features, n_rows, 4, 16)
+        var builder = GpuHistogramBuilder(data)
+        builder.upload_gradients(_grads(n_rows, features), _ones(n_rows))
+        assert_true(builder.open_resident(64, DEFAULT_MAX_ITEMS))
+        assert_false(builder.oblivious_level_fits(64))
+        assert_equal(
+            oblivious_device_supported(_tree_params(max_depth=6), builder),
+            OBLIVIOUS_LEVEL_HISTOGRAM,
+        )
+        # Depth 5 wants 32 and fits at the default, which is exactly why a
+        # depth-5 validation would have shown nothing.
+        assert_true(builder.oblivious_level_fits(32))
+        assert_equal(
+            oblivious_device_supported(_tree_params(max_depth=5), builder),
+            OBLIVIOUS_OK,
+        )
+
+
+def test_the_speculation_and_a_level_build_refuse_to_combine() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        # `_pick_runner_up_kernel` publishes a leaf that is still live, and a
+        # plan that builds both of its children overwrites the histogram the
+        # next pick reads on a miss. Individually correct, jointly wrong, and
+        # refused rather than ordered.
+        var n_rows = 300
+        var features = _dense(n_rows, 4)
+        var data = bin_equal_width(features, n_rows, 4, 16)
+        var builder = GpuHistogramBuilder(data)
+        builder.upload_gradients(_grads(n_rows, features), _ones(n_rows))
+        assert_true(builder.open_resident(64, OBLIVIOUS_MAX_ITEMS))
+        assert_equal(
+            oblivious_device_supported(_tree_params(max_depth=6), builder),
+            OBLIVIOUS_OK,
+        )
+        _ = setenv("MOJOTREES_GPU_SPECULATION", "1")
+        var refused = oblivious_device_supported(
+            _tree_params(max_depth=6), builder
+        )
+        _ = setenv("MOJOTREES_GPU_SPECULATION", "")
+        assert_equal(refused, OBLIVIOUS_SPECULATION)
+
+
+def test_the_other_refusals_are_reachable_by_name() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 300
+        var features = _dense(n_rows, 4)
+        var data = bin_equal_width(features, n_rows, 4, 16)
+        var builder = GpuHistogramBuilder(data)
+        builder.upload_gradients(_grads(n_rows, features), _ones(n_rows))
+        assert_true(builder.open_resident(64, OBLIVIOUS_MAX_ITEMS))
+        # Depth 7 is 128 leaves: over the scan's per-leaf reservation and over
+        # the queue's knee whatever the schedule does.
+        assert_equal(
+            oblivious_device_supported(_tree_params(max_depth=7), builder),
+            OBLIVIOUS_DEPTH,
+        )
+        assert_equal(
+            oblivious_device_supported(_tree_params(max_depth=0), builder),
+            OBLIVIOUS_DEPTH,
+        )
+        # A policy that is not this one is not this plane's to grow.
+        assert_equal(
+            oblivious_device_supported(
+                _tree_params(max_depth=4, policy=GROW_LEAFWISE), builder
+            ),
+            OBLIVIOUS_TABLES,
+        )
 
 
 def main() raises:

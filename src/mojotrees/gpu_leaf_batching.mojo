@@ -197,6 +197,32 @@ comptime N_PLANES = PLANES_PER_HISTOGRAM
 # costs flat; it is not a claim about where batching stops paying.
 comptime DEFAULT_MAX_ITEMS = 32
 
+comptime OBLIVIOUS_MAX_ITEMS = 64
+"""Items a batcher serving `grow_policy = oblivious` must hold, and it is a
+measured number rather than a sizing preference.
+
+A depth-6 level's last generation offers `2 ** 6 = 64` children and one batch
+covers at most `max_items` of them. At `DEFAULT_MAX_ITEMS` that level needs two
+batches, which costs two extra command buffers, and
+`gpu_resident_round.oblivious_launch_census(6, batch_max_items=32)` lands the
+tree at **exactly 64** -- on the queue-depth knee rather than under it
+(`docs/GPU_PORTABILITY.md` 6.2; the enqueue-cost ladder in
+`bench/results/session3_2026-08-16/RESULTS.md` is flat at 6-7 microseconds
+through 64 and 14-17 beyond). At 64 the same census is **62**, under by two.
+
+**Depth 5 tops out at 32 children**, so a lane that validated only at depth 5
+would see the two arms agree and would learn nothing; that is why this constant
+exists rather than a comment asking the caller to think about it.
+
+The cost is small and is worth stating so nobody trades it away: the item table
+is `max_items * (ITEM_WORDS + SCALE_WORDS)` Int32 plus `max_items * n_features`
+for the per-item feature table, which at 64 items and 50 features is under 14
+kilobytes.
+
+It is also exactly `gpu_split_search.OBLIVIOUS_MAX_LEAVES`, and the agreement is
+not a coincidence: both are `2 ** 6`, both are CatBoost's default depth, and
+both stop where the queue does."""
+
 # --- Item table layout ---------------------------------------------------
 #
 # One row of Int32 per item, staged as a single copy per launch. The kernels

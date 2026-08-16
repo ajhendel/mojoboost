@@ -24,6 +24,31 @@
 > the search already makes, so a level costs one dispatch and not one per leaf
 > plus a reduce. Nothing below is measured.
 
+> **GPU half BUILT, 2026-08-16, `lane/oblivious-wire`.** The level schedule,
+> the level commit rule and the batched whole-level child build are wired and
+> reachable: `gpu_resident_round.grow_tree_device_oblivious`,
+> `gpu_tree_tables._commit_level_kernel`,
+> `histogram_gpu.enqueue_desc_level_children`, and the ordinary `grow_policy`
+> dispatch in `train_gpu`. All three of B5's standing blockers are closed and
+> `oblivious_open_blockers()` is empty. **B5's first kill criterion is
+> answered**: `oblivious_schedule_launches(6)` is **56** command buffers at
+> `max_items >= 64`, against the registered census's 62 and a queue that is 64
+> deep; the six-launch gap is one record-filing phase per level that a level
+> does not need, and the census is deliberately left unedited. **The
+> `max_items >= 64` precondition is enforced rather than documented** -- a
+> builder holding the leaf-wise default of 32 refuses by name
+> (`OBLIVIOUS_LEVEL_HISTOGRAM`), and depth 5 cannot see the difference because
+> a depth-5 level tops out at 32 children. **The accuracy gate is met
+> structurally and not bit-for-bit**, and the distinction is stated where it is
+> asserted (`tests/test_gpu_oblivious_device.mojo::_assert_same_shape`): the
+> device tree is node-for-node identical to `tree._grow_oblivious_levels` in
+> feature, threshold, missing direction, child ids, node ids and node row
+> counts at depths 3 and 6, with leaf values agreeing to 1e-4 relative. Bit
+> identity across backends is not reachable and is not claimed -- the host
+> Newton step is Float64 over Float64 sums and the device's is Float32 over
+> fixed-point Int32 sums. B4's "device vs host trees node-identical" should be
+> read that way. Nothing here is measured.
+
 ## Part B. `grow_policy = oblivious`
 
 ### B1. What it is

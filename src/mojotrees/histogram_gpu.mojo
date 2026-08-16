@@ -2403,9 +2403,50 @@ struct GpuHistogramBuilder(Movable):
             >= want_slots
         )
 
-    def open_resident(mut self, want_slots: Int) raises -> Bool:
+    def oblivious_level_fits(self, n_children: Int) raises -> Bool:
+        """Whether an open batcher can build a whole level of `n_children` in
+        one batch, and hold a slot for every one of them.
+
+        Two questions and both have to answer yes, because an oblivious level
+        builds every child from its own rows: `max_items` bounds how many item
+        rows one batch covers, and the pool bounds how many histograms can be
+        live at once. The widest level of a depth-`d` tree has `1 << d` children
+        and that is also the tree's leaf count, so the two bounds are asked
+        against the same number.
+
+        A builder with no batcher open answers False rather than guessing at the
+        budget: this is asked by `gpu_resident_round.oblivious_device_supported`
+        *after* `open_resident` has run, so "not open" here means the pool
+        declined, and a mode whose census depends on the batch width should not
+        be routed to on the strength of an allocation nobody made.
+
+        The item bound is the one that is easy to get wrong and expensive to get
+        wrong quietly; see `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`.
+        """
+        if n_children < 2:
+            return False
+        if len(self.batcher) == 0:
+            return False
+        return (
+            self.batcher[0].max_items >= n_children
+            and self.batcher[0].pool.capacity >= n_children
+        )
+
+    def open_resident(
+        mut self, want_slots: Int, max_items: Int = DEFAULT_MAX_ITEMS
+    ) raises -> Bool:
         """Allocate a slot pool deep enough to hold `want_slots` leaves at
         once, and report whether the resident path is available afterwards.
+
+        `max_items` is the widest batch the pool's batcher will ever be asked to
+        build, and it is a parameter rather than a constant because
+        `grow_policy = oblivious` needs it to be 64 and the default is 32. That
+        is not a preference: a depth-6 level's last generation has 64 children,
+        at the default bound it needs two batches, and
+        `gpu_resident_round.oblivious_launch_census(6, batch_max_items=32)` lands
+        the tree at exactly 64 command buffers -- on the queue-depth knee rather
+        than under it. See `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`. The leaf-wise
+        plane passes the default and is unchanged.
 
         All or nothing, and deliberately so. A leaf-wise frontier holds a
         slot per live leaf for the whole tree, so a pool one slot short does
@@ -2453,7 +2494,16 @@ struct GpuHistogramBuilder(Movable):
         if not self.resident_frontier_fits(want_slots):
             return False
         if len(self.batcher) > 0:
-            return self.batcher[0].pool.capacity >= want_slots
+            # Both dimensions, and the item bound is not decoration: a batcher
+            # opened for the leaf-wise plane holds 32 items and an oblivious
+            # tree would silently split its widest level into two batches,
+            # which is the one thing the census cannot absorb. A shallower
+            # request reuses; a wider one declines, exactly as a deeper slot
+            # request does.
+            return (
+                self.batcher[0].pool.capacity >= want_slots
+                and self.batcher[0].max_items >= max_items
+            )
         require_histogram_launchable(
             self.contract,
             self.caps,
@@ -2471,7 +2521,7 @@ struct GpuHistogramBuilder(Movable):
                 self.n_bins,
                 want_slots,
                 self.part_capacity,
-                DEFAULT_MAX_ITEMS,
+                max_items,
                 1,
             )
         )
@@ -2797,6 +2847,151 @@ struct GpuHistogramBuilder(Movable):
             left_record,
             right_record,
         )
+
+    # --- The oblivious level seam -----------------------------------------
+    #
+    # Four more forwarders, and they are the whole of `enqueue_desc_child`'s
+    # replacement under `grow_policy = oblivious`. The single-child build is
+    # two launches per parent; these are two launches per *level*, which is the
+    # difference between 176 command buffers on a depth-6 tree and 62. They sit
+    # here for the same language reason the six above do: each one needs the
+    # tree tables in `resident_tables`, the slot pool in `batcher`, and the row
+    # state in `rows` at once, and a caller outside cannot hold a mutable
+    # borrow of one field while passing a pointer derived from another.
+
+    def stage_desc_level_plan(
+        mut self, n_items: Int, max_rows: Int
+    ) raises -> Int:
+        """Fix the host half of the level plan for this tree, once.
+
+        Forwards to `GpuLeafBatcher.stage_device_plan`, which stages every item
+        dead and returns the packed tile count the batch's grid uses. Called
+        once per tree, before the first level commit, and not again: the
+        geometry is a function of the row bound, the feature width and the item
+        count, and none of the three moves inside a tree.
+
+        `n_items` is the widest level's child count, `1 << max_depth`, and not
+        the first level's. Every level fills or kills the same width; see
+        `gpu_tree_tables._kill_level_plan` for why the killing has to cover the
+        whole staged width and not just the level's own prefix.
+        """
+        if not self.has_gradients:
+            raise Error("call upload_gradients before staging a level plan")
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        return self.batcher[0].stage_device_plan(
+            n_items,
+            max_rows,
+            len(self.active),
+            self.caps,
+            Float32(self.g_scale),
+            Float32(self.h_scale),
+        )
+
+    def enqueue_desc_level(
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        mut fparams: DeviceBuffer[DType.float32],
+        level_record: Int,
+        level_depth: Int,
+        max_depth: Int,
+        gain_form: Int,
+    ) raises:
+        """Commit one oblivious level, writing the descriptor its partition
+        routes by and the plan its batched build accumulates from.
+
+        One launch. `gpu_tree_tables._commit_level_kernel` is the rule.
+        """
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        var pool = self.batcher[0].out_dev.copy()
+        var plan_items = self.batcher[0].plan_items
+        if plan_items < 2:
+            raise Error(
+                "no device-written plan is staged; call"
+                " stage_desc_level_plan before committing a level"
+            )
+        self.resident_tables[0].enqueue_level(
+            rec_i,
+            rec_f,
+            fparams,
+            pool.unsafe_ptr(),
+            self.rows.step_dev.unsafe_ptr(),
+            self.batcher[0].items_dev.unsafe_ptr(),
+            True,
+            level_record,
+            self.n_bins,
+            self.n_features * self.n_bins,
+            level_depth,
+            max_depth,
+            plan_items,
+            gain_form,
+        )
+
+    def enqueue_desc_stage_level_search(
+        mut self,
+        mut node_tbl: DeviceBuffer[DType.int32],
+        slot_cells: Int,
+        leaf_base: Int,
+        max_leaves: Int,
+    ) raises:
+        """Point the level's leaf search records at the level's pool slots."""
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        self.resident_tables[0].enqueue_stage_level_search(
+            node_tbl, slot_cells, leaf_base, max_leaves
+        )
+
+    def enqueue_desc_level_children(mut self) raises:
+        """Build every child of the level from its own rows. **Two launches,
+        whatever the level holds**, and they also pay the partition's deferred
+        copy-back.
+
+        This is the call `enqueue_desc_child` is replaced by, and the two are
+        alternatives rather than stages: that one builds the smaller child of one
+        parent and derives the larger by subtraction, which is two launches per
+        parent and 126 per depth-6 tree; this one accumulates all `2^(l+1)`
+        children of a level directly from the windows the level commit wrote,
+        which is two launches per level and 12 per tree. Both accumulate the same
+        per-`(row, feature)` quantized value into the same bin of the same slot
+        in fixed-point Int32, so they are bit-identical where they overlap; see
+        the plan-writing block of `gpu_tree_tables._pick_and_commit_kernel`.
+
+        The copy-back is carried inside the zeroing pass the batch has to launch
+        anyway (`gpu_leaf_batching._batch_copy_back_zero_kernel`), and paying it
+        anywhere else would cost a third partition launch per level -- six per
+        depth-6 tree, which is exactly the margin between 62 command buffers and
+        68. `GpuActiveRows.mark_copy_back_fused` is the bookkeeping half and is
+        called after the launch, never before: four refusals on that struct read
+        the flag this clears.
+
+        No `max_rows` argument, and that is not an omission. The batch's grid
+        comes from the geometry `stage_desc_level_plan` fixed for the tree, so
+        there is no per-level bound left for a caller to get wrong.
+        """
+        if not self.has_gradients:
+            raise Error(
+                "call upload_gradients before enqueue_desc_level_children"
+            )
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        var blocks = self.rows.copy_back_debt_blocks()
+        var rows_ptr = self.rows.rows_dev.copy()
+        var scratch_ptr = self.rows.scratch_dev.copy()
+        var desc_ptr = self.rows.step_dev.copy()
+        self.batcher[0].enqueue_device_plan_batch_fused(
+            self.bins_dev.unsafe_ptr(),
+            rows_ptr.unsafe_ptr(),
+            scratch_ptr.unsafe_ptr(),
+            desc_ptr.unsafe_ptr(),
+            self.grad_dev.unsafe_ptr(),
+            self.hess_dev.unsafe_ptr(),
+            blocks,
+        )
+        self.rows.mark_copy_back_fused()
 
     def download_desc_tables(mut self) raises -> TreeTablesSnapshot:
         """Bring the whole device tree state home.
