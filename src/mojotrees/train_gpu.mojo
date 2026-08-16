@@ -2758,6 +2758,10 @@ def train_gpu(
     objective_source: Int = OBJECTIVE_SOURCE_AUTO,
     split_search: Int = SPLIT_SEARCH_AUTO,
     row_unroll: Bool = True,
+    narrow_index: Bool = False,
+    pair_alignment: Bool = True,
+    min_tiles: Int = 0,
+    rows_per_tile: Int = 0,
 ) raises -> Booster:
     """Train a boosted ensemble with tree growth on the GPU. Same contract
     as `train` (objectives, sample_weight, alpha, bagging, and GOSS
@@ -2783,10 +2787,30 @@ def train_gpu(
     associative, so the histograms are identical and therefore so is every
     split chosen from them. See `GpuActiveRows.set_row_unroll`.
 
-    One hazard in how that default is spelled, since the call below is
-    unconditional: `GpuActiveRows.__init__` also sets `row_unroll = True`, and
-    for any fit that comes through here that initialization is dead. The
-    shipped default is therefore written in two places that agree today and
+    `narrow_index`, `pair_alignment`, `min_tiles`, and `rows_per_tile` are
+    the K1 hist-latency lane's arms, here for the identical reason and with
+    the identical guarantee: none of them can change a model.
+
+    - `narrow_index` forms the histogram row loop's two data-dependent
+      indices in Int32. Off by default, because nothing has measured it and
+      the wide form's expensive term may already be hoisted; see
+      `GpuActiveRows.set_narrow_index`. Exact under a bound on the dataset
+      shape, which that setter refuses to launch outside of, so this argument
+      raises rather than degrading on an oversized fit.
+    - `pair_alignment` states the 8-byte alignment the quantized gradient
+      pair's address has, instead of letting the width-2 load be annotated
+      `align 4`. On by default: it reads the same eight bytes and a truer
+      alignment cannot cost a backend anything.
+    - `min_tiles` and `rows_per_tile` request a row-tile geometry per node.
+      Zero on both, the default, is the geometry this trainer already
+      produced. `rows_per_tile` is the only one that can ask for FEWER tiles
+      than the occupancy term gives, which is what a re-test of the row-tile
+      floor needs; see `gpu_tiling.row_tile_floor`.
+
+    One hazard in how these defaults are spelled, since the calls below are
+    unconditional: `GpuActiveRows.__init__` also sets every one of them, and
+    for any fit that comes through here those initializations are dead. The
+    shipped defaults are therefore written in two places that agree today and
     could silently stop agreeing. If either moves, move both, and prefer
     changing the constructor and passing that through to changing only this
     signature."""
@@ -2834,6 +2858,17 @@ def train_gpu(
             round_has_constant_hessian(objective, sample_weight, goss)
         )
         builder.set_row_unroll(row_unroll)
+        # The three hist-latency arms, on the same footing and for the same
+        # reason: a launch shape reachable in the call so a benchmark can
+        # interleave arms in one process. None can change a model. The index
+        # width is exact under a bound on the dataset shape that
+        # `set_narrow_index` refuses to launch outside of; the pair alignment
+        # is an assertion about an address over the same eight bytes; the tile
+        # requests only change the order in which fixed-point Int32 adds are
+        # issued. See `GpuActiveRows`.
+        builder.set_narrow_index(narrow_index)
+        builder.set_pair_alignment(pair_alignment)
+        builder.set_row_tiling(min_tiles, rows_per_tile)
         var life = NoLifecycle()
         return _train_gpu_rounds(
             builder,
@@ -2865,6 +2900,10 @@ def train_gpu(
     objective_source: Int = OBJECTIVE_SOURCE_AUTO,
     split_search: Int = SPLIT_SEARCH_AUTO,
     row_unroll: Bool = True,
+    narrow_index: Bool = False,
+    pair_alignment: Bool = True,
+    min_tiles: Int = 0,
+    rows_per_tile: Int = 0,
 ) raises -> Booster:
     """`train_gpu` on a caller-owned session: the builder borrows the
     session's context and its ledgers record the construction, and every
@@ -2907,6 +2946,12 @@ def train_gpu(
         # A launch shape, not a number: see the session-free overload. A
         # session owns the context, so it cannot change this answer either.
         builder.set_row_unroll(row_unroll)
+        # The same three arms the session-free overload sets, from the same
+        # arguments. A session owns the context, not the geometry, so it
+        # cannot change these answers either.
+        builder.set_narrow_index(narrow_index)
+        builder.set_pair_alignment(pair_alignment)
+        builder.set_row_tiling(min_tiles, rows_per_tile)
         var booster = _train_gpu_rounds(
             builder,
             session,
