@@ -258,6 +258,27 @@ ORDERED_TS gap suggested. Equally: **nothing in this run says anything about
 CatBoost's Ordered mode**, because CatBoost on CPU never selects it and no arm
 passes `boosting_type=Ordered`. No row may be read as covering it.
 
+**Confirmed from CatBoost's source rather than assumed, 2026-08-16, and the
+usual reading of the threshold is backwards.** `boosting_options.cpp:16`
+constructs the default as Plain. `catboost_options.cpp:785-790` is the only
+place Ordered is installed as a default, and its condition includes
+`TaskType == GPU`; every arm here is CPU. `defaults_helper.h::UpdateBoostingTypeOption`
+hard-sets Plain when the option is unset and
+`(learnSampleCount >= 50000 || IterationCount < 500)`. **The 50,000 constant
+turns Ordered off, not on**, it is a disjunction, and the half that gets
+dropped in conversation is `IterationCount < 500`: at `BASE_PARAMS`'
+100 estimators that clause fires at **every** tier, so shrinking a scenario
+would not buy an Ordered row either. A future explicit Ordered arm is a third
+data point, not a correction to a wrong one.
+
+Two consequences worth recording while the source is open. CatBoost **refuses**
+Ordered together with a nonsymmetric grow policy rather than silently resolving
+to Plain (`catboost_options.cpp:1046-1050`). And on our side,
+`boosting.mojo:2481-2485` raises on ordered together with any bootstrap, so
+once MVS lands in `MOJOTREES_CATBOOST_MODE` **that arm can never also carry
+ordered** -- a mojotrees ordered row has to be its own arm. Clean refusal, but
+it forecloses a combination someone will otherwise try to build later.
+
 **"us in CatBoost mode" is not CatBoost mode.** `MOJOTREES_CATBOOST_MODE` sets
 seven keys and all seven are tree shape and regularization: `grow_policy`
 depthwise, `max_depth` 6, `num_leaves` 64, `min_data_in_leaf` 1,
@@ -295,6 +316,46 @@ Written down now so that none of them becomes a reason to take another run.
 4. **A never-executed path crashes on first execution.** Report it as the
    first-execution result it is. It is evidence about `a3cac1f`, which is what
    the run was for.
+
+## Four more device-policy defects, found by a tool, all deferred past the run
+
+`tools/refusal_consistency.py` (06, `71454cb`) compares what each of the four
+refusal layers *claims* for a parameter -- `device_policy`, the two GPU
+trainers, the `*_ok` flags in `bindings/_mojotrees.mojo`, and `sklearn.py` --
+and reports disagreements. It found five. One is this session's
+`score_function` block, found independently by a tool that did not know the
+report existed. **The other four are in device policy, which is this session's
+file, and all four were verified here rather than adopted.**
+
+- **`random_strength` is an unrouted refusal, and it is a live user-visible
+  wrong behavior.** `bindings/_mojotrees.mojo:991` refuses it on the GPU;
+  `device_policy` has no block for it; `Workload` has no field for it. So
+  `device='auto'` above the crossover routes a `random_strength` fit to the
+  GPU and then raises, when the entire purpose of `auto` is to choose a
+  backend that can run the fit. Explicit `gpu` should raise; `auto` should
+  take the CPU.
+- **`enable_bundle`, `linear_tree` and `forced_splits` are three gates that
+  cannot fire.** `device_policy.mojo:2269`, `:2280` and `:2290` test
+  `request.bundling`, `request.linear_tree` and `request.forced_splits`, and
+  the only production `Workload(...)`, at `sklearn.py:2068`, sets **none of
+  them**. Three POLICY_VERSION 5 blocks, written, versioned, and dead on the
+  only surface every benchmark and every pip user reaches. The trainers refuse
+  all three by name, so nothing returns a wrong answer; what happens is that
+  `auto` errors where it was designed to fall back.
+
+The comment at `sklearn.py:2104` is worth keeping as the record of how this
+survives review: it says the narrow fallback contract "cannot see
+`boosting_type` or `score_function` any more than it sees `enable_bundle` or
+`linear_tree`". This session wrote that sentence, naming these exact
+parameters, while editing the full path -- and did not check whether the full
+path could see them either. **Naming a blindness in one branch is not the same
+as testing for it in the branch you are editing.**
+
+**None of the four can reach this run**, and that was checked rather than
+assumed: the harness passes an explicit `--device`, and no arm sets
+`random_strength`, `enable_bundle`, `linear_tree` or a forced-split document.
+They are deferred past the run under the rule Andrew ratified for
+`BLOCK_SCORE_FUNCTION`, and for the same reason.
 
 ## One defect found before the window, and why it is not patched
 
