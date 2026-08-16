@@ -266,6 +266,7 @@ that:
   assigned codes and omits `MULTICLASS` and all seven reserved ones. The new
   `mojo.objective_names` block closes that; the Python mirror is left to its
   owner and is recorded here as the remaining duplicate.
+| A33 | **Reachability of A13/A14, A17/A18, A20, A28 and A29's ONNX half.** Not a CatBoost mechanism: the edge between a mechanism and a user. `python/mojotrees/features.py`, `python/mojotrees/onnx_export.py`, `python/mojotrees/_multi_target.py`, `bindings/catboost_reach_bindings.mojo` | Six native modules were compiled, tested and reached by no entry point (`tools/connectivity_audit.py`, 2026-08-16: eleven orphans of 108). Two edges closed four of them (`multi_target` reaches `target_matrix`, `text_features` reaches `text_processing`) and two more closed the rest | No. Nothing here changes an existing default, an existing objective or an existing fit; every mechanism it reaches is still off unless asked for by name | Yes, and it is the whole of bucket C for these six: a capability nobody can invoke is not a capability, and no comparison against CatBoost can be run through one | `multi_target.mojo`, `text_features.mojo` (entry points), `bindings/catboost_reach_bindings.mojo`, `python/mojotrees/{features,onnx_export,_multi_target}.py`, `sklearn.py` (2-D `y`, langevin refusals) | A33 note. **CONNECTED**: MultiRMSE (2-D `y`), text features, embedding features, ONNX export. **REFUSED BY NAME**: langevin, `diffusion_temperature`, `model_shrink_rate`, `model_shrink_mode` |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -4806,3 +4807,165 @@ this lane deliberately landed nothing under `bench/`.
   A7 gives the shape (a geometric rung ladder, three learning permutations at
   CatBoost's defaults), which says it is dearer than `Plain` and does not say
   by how much.
+### A33 note: built is not reached, and the six edges that changed it
+
+Status: this row verifies nothing about CatBoost. It records a property of
+**this** repository, measured by `tools/connectivity_audit.py` on 2026-08-16
+and re-measured after the change.
+
+#### 1. The finding
+
+The audit walks the import graph from the five roots a user can actually
+reach: `python/mojotrees/__init__.py`, `bindings/_mojotrees.mojo`,
+`src/mojotrees/__init__.mojo`, `capi/mojotrees_capi.mojo`,
+`cli/mojotrees_cli.mojo`. Before this change it reported **eleven of 108
+native modules that no root reaches**, nine of them PENDING rather than
+EXPERIMENTAL, which is the audit saying they are meant to be reachable and
+are waiting on a connecting change:
+
+    catboost_ranking  target_matrix  multi_target  survival
+    text_features     text_processing  embedding   langevin   onnx_export
+
+Two more, `backend` and `gpu_vendor_policy`, are unwired on purpose.
+
+The nine were not nine independent jobs, and seeing that is most of the
+work. Every one of them was written against an input type only the native
+API can construct -- a `BinnedMatrix`, a `TextBag`, an `EmbeddingMatrix`, a
+fitted `Model` -- and nothing at the Python boundary ever constructed one.
+So the missing thing was not nine mechanisms. It was a boundary.
+
+#### 2. What connected, and by which edge
+
+Two of the four edges below close two modules each, because two of the nine
+were tails of chains rather than separate decisions.
+
+| module | edge | traced path |
+|---|---|---|
+| `multi_target` | 2-D `y` on the regressor | `MojoTreesRegressor.fit` -> `_fit_multi_target` -> `_mojotrees.multi_rmse_fit` -> `catboost_reach_bindings.multi_rmse_fit` -> `multi_target.fit_multi_rmse` -> `train_multi_rmse` |
+| `target_matrix` | the same edge, transitively | `catboost_reach_bindings.multi_rmse_fit` builds `TargetMatrix(values, n_targets)` from the flat `n_rows * T` buffer |
+| `text_features` | a transform entry point | `mojotrees.features.text_features` -> `_mojotrees.text_features_open` -> `catboost_reach_bindings.text_features_open` -> `text_features.text_column_features` |
+| `text_processing` | the same edge, transitively | `text_column_features` calls `build_dictionary`, `digitize`, `TokenizerParams`, `DictionaryParams` |
+| `embedding` | a transform entry point | `mojotrees.features.embedding_features` -> `_mojotrees.embedding_features_into` -> `catboost_reach_bindings.embedding_features_into` -> `embedding.compute_online_features` |
+| `onnx_export` | a binding, which is all it ever needed | `mojotrees.onnx_export.save_model_onnx` -> `plan_text` -> `_mojotrees.onnx_plan_text` -> `catboost_reach_bindings.onnx_plan_text` -> `onnx_export.onnx_plan` |
+
+`onnx_export` deserves its own sentence, because it was the cheapest of the
+nine and the most embarrassing: `python/mojotrees/onnx_export.py` was a
+complete plan READER, and nothing in the package could write a plan. A
+module was parsing a file format the library had no way to emit.
+
+#### 3. What did NOT connect, and why, precisely
+
+**`langevin` (A13) and model shrinkage (A14).** Refused by name, in
+`sklearn._check_langevin`, which is where the user's parameter arrives. The
+mechanism is complete and tested -- the counter-based normal
+(`langevin_row_noise`), the per-row injection at CatBoost's own place in the
+round (`apply_langevin_noise`), the leaf-sum draws, the deferred fold
+(`ModelShrinkPlan.fold_into_trees`), and the default-rate coupling. What is
+missing is a caller: `BoosterParams` carries no `LangevinParams` and no
+`ModelShrinkParams` field, so `boosting.train`'s round loop never draws and
+never records, and `tree.mojo` has no leaf-sum call site for the second
+draw. **That is a trainer change, in two files this lane does not own.** A
+`langevin=False` or `model_shrink_rate=0.0` is accepted, because that is
+exactly what an untouched fit already is.
+
+Determinism, checked rather than assumed, because a noise mechanism is
+exactly where a sequential draw hides: it is counter-based and worker-count
+independent. `_langevin_row_stream(seed, tree_index)` mixes the seed against
+this module's own domain constant and the tree index by the golden-ratio
+increment; `langevin_row_noise(stream, row, output, n_outputs)` indexes
+`(row * n_outputs + output) * _NORMAL_STRIDE` off that start and consumes
+exactly two counters. Nothing advances a running state, so no draw depends
+on the order rows were visited in and `MOJOTREES_NUM_WORKERS` cannot move a
+bit. The leaf draw has a second domain constant so leaf `j` and row `j` of
+one tree never share a value. It diverges from CatBoost's own numbers on
+purpose (Box-Muller rather than the rejection-based polar form) and says so.
+
+**`survival` (A26/A27).** Not connected, and the blocker MOVED rather than
+cleared. It was blocked on the multi-column label contract, and that contract
+now has a Python wire: `multi_rmse_fit` takes `n_targets` columns and builds
+a `TargetMatrix`, which is exactly the shape `SurvivalAft`'s two bound
+columns need. What is missing now is narrower and nameable: `survival.mojo`
+has no `fit_*` entry point of its own, and nothing selects its objective
+codes. `objective_registry.mojo` is another lane's file.
+
+**`catboost_ranking` (A22-A25).** Left alone by instruction; it is a
+trainer-selection question that overlaps a lane working on objective codes.
+
+**`auto_learning_rate` (A12).** A different shape of defect, found by a
+parallel sweep and verified here. It is honored from the CLI
+(`cli/mojotrees_cli.mojo:375`) and from the C ABI
+(`capi/mojotrees_capi.mojo:425`), both of which build a `params.TrainConfig`
+and call `TrainConfig.resolved_learning_rate(n_rows)`. The Python extension
+never builds a `TrainConfig`: `_parse_params` returns a `BoosterParams`, so
+the resolution step is not on that path, and `auto_learning_rate` appears
+nowhere under `python/` or `bindings/`. Every benchmark and every pip user
+goes through the Python surface.
+
+The structural question that was asked about it has a third answer, and it
+is the cheap one: **nothing needs to move.** `resolved_learning_rate` is a
+two-line wrapper over the free function
+`auto_learning_rate.resolve_learning_rate(params, objective, n_estimators,
+n_rows, learning_rate)`, which is already importable from anywhere and
+already reachable. Neither "the Python path builds a `TrainConfig`" nor
+"`resolved_learning_rate` moves" is required. What is required is a parse
+(`auto_learning_rate` and `auto_learning_rate_task` into an
+`AutoLearningRateParams`) and one call at the point where the train row count
+is finally known, which is inside the `fit` bindings and not inside
+`_parse_params`. That is `bindings/_mojotrees.mojo` plus
+`python/mojotrees/sklearn.py`, both of which had two other lanes in them, so
+it is written up here rather than rushed. **It fails loudly today**
+(`MojoTreesRegressor(auto_learning_rate=True)` raises `TypeError`, because
+`_Base.__init__` has no such keyword and no catch-all), so nobody has been
+getting a silently ignored rate. Gap, not defect.
+
+#### 4. The blind-gate check, on what this lane touched
+
+For each parameter made reachable, the gates that decide behavior were
+grepped for its name. Two results worth recording.
+
+`num_targets` and the multi-output path appear in no device gate at all:
+`device_policy.mojo`, `train_gpu.mojo` and `gpu_split_search.mojo` do not
+mention a target count, and `resolve_device` takes `n_outputs` only as the
+class count. That is why `_fit_multi_target` refuses a non-CPU device by
+name instead of resolving one -- a gate that cannot see a parameter must not
+be asked about it.
+
+The text and embedding transforms are pre-binning feature generation, so
+there is no gate for them by construction: their output is a float column and
+nothing downstream of `fit_bins` can tell it from any other float column.
+That is CatBoost's design and it is stated here so that a later reader does
+not go looking for the gate that is missing.
+
+#### 5. What reachable does not mean
+
+Each of the six carries a live limitation, stated where the user meets it:
+
+- The multi-output fit grows **one tree per target per round**, so it is
+  bit-identical to `T` independent squared-error boosters and is **not**
+  CatBoost's `MultiRMSE`, whose shared tree structure is the entire modeling
+  content of the objective (A28). The estimator exposes `n_iter_` and
+  `n_trees_` separately because quoting the wrong one against CatBoost's
+  `tree_count_` is the easy mistake.
+- The text and embedding transforms produce columns from **fitted state** --
+  a dictionary, a NaiveBayes calcer, an LDA projection -- and the model
+  format has no section for any of it (A29). The caller keeps the transform
+  and re-runs it; a caller who does not is scoring a model against columns
+  that mean something else.
+- `naive_bayes`, `bm25`, `lda` and `knn` all read the target. Each is
+  computed strictly before-write over one permutation from the single
+  permutation layer (A21, `ordered_boosting.ordered_permutation`), built
+  natively from a seed rather than by the caller. `bow` is the one estimator
+  with no target in it.
+- ONNX export refuses, by name and all at once, everything `ai.onnx.ml`
+  opset 3 cannot reproduce, and `save_model_onnx` is deliberately not called
+  `save_model`: the mojotrees format round-trips a fit bit-identically and an
+  ONNX file does not.
+
+#### 6. One thing found on the way that is not this lane's
+
+`mojo package src/mojotrees` does not compile at head:
+`src/mojotrees/trainset.mojo:1275`, `Dataset.matches_binning` is declared
+without `raises` and calls `BinMapper.matches`, which raises. The extension
+build (`bindings/build.sh`'s `mojo build -I src -I bindings`) is unaffected
+and succeeds, which is why nothing has caught it. `trainset.mojo` is not this
+lane's file.

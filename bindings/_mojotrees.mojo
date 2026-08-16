@@ -135,6 +135,23 @@ from objective_bindings import (
     registry_objectives,
     registry_vocabulary,
 )
+# The four capabilities that were built and reachable from nothing: ONNX
+# export, MultiRMSE, text features, embedding features. See catalog A31 and
+# the module docstring of catboost_reach_bindings.mojo.
+from catboost_reach_bindings import (
+    embedding_feature_count,
+    embedding_features_into,
+    multi_rmse_fit,
+    multi_rmse_predict,
+    multi_rmse_shape,
+    onnx_export_refusals,
+    onnx_export_refusals_multiclass,
+    onnx_plan_text,
+    onnx_plan_text_multiclass,
+    text_features_open,
+    text_features_shape,
+    text_features_write,
+)
 
 from mojotrees.bagging import BaggingParams
 from mojotrees.categorical import CategoricalParams, CategoricalSpec
@@ -529,6 +546,23 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         m.def_function[startup_phase_contract]("startup_phase_contract")
         m.def_function[startup_environment]("startup_environment")
         m.def_function[native_clock_ns]("native_clock_ns")
+        # -- built but unreached until now (catboost_reach_bindings.mojo) --
+        m.def_function[onnx_plan_text]("onnx_plan_text")
+        m.def_function[onnx_plan_text_multiclass](
+            "onnx_plan_text_multiclass"
+        )
+        m.def_function[onnx_export_refusals]("onnx_export_refusals")
+        m.def_function[onnx_export_refusals_multiclass](
+            "onnx_export_refusals_multiclass"
+        )
+        m.def_function[multi_rmse_fit]("multi_rmse_fit")
+        m.def_function[multi_rmse_shape]("multi_rmse_shape")
+        m.def_function[multi_rmse_predict]("multi_rmse_predict")
+        m.def_function[text_features_open]("text_features_open")
+        m.def_function[text_features_shape]("text_features_shape")
+        m.def_function[text_features_write]("text_features_write")
+        m.def_function[embedding_feature_count]("embedding_feature_count")
+        m.def_function[embedding_features_into]("embedding_features_into")
         return m.finalize()
     except e:
         abort(String("failed to create _mojotrees module: ", e))

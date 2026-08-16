@@ -66,7 +66,7 @@ loop nesting) and are not split.
 
 from std.math import isfinite, isnan, sqrt
 
-from .binning import BinnedMatrix
+from .binning import BinMapper, BinnedMatrix, fit_bins
 from .boosting import BoosterParams
 from .gain import leaf_score, soft_threshold_l1
 from .histogram import (
@@ -531,3 +531,154 @@ def train_multi_rmse(
         params.learning_rate,
         params.tree.monotone.copy(),
     )
+
+
+# ---------------------------------------------------------------------------
+# The reachable entry point: raw matrix in, fitted multi-output model out
+# ---------------------------------------------------------------------------
+#
+# `train_multi_rmse` above takes a `BinnedMatrix`, which is a thing only the
+# native API can build. Everything below exists so that a Python caller can
+# hand over the same column-major float64 matrix every other fit takes, plus
+# a 2-D target, and get a model back that predicts. Without it the objective
+# is built, tested, and reachable by nobody; see catalog A31.
+#
+# The tree shape has NOT changed and the honest statement in this module's
+# docstring stands: this is `T` independent squared-error boosters and it is
+# not CatBoost's `MultiRMSE`. Making it reachable does not make it CatBoost.
+
+
+struct MultiTargetModel(Copyable, Movable):
+    """A fitted multi-output ensemble plus the bin edges it was fitted on.
+
+    The same pairing `model.Model` is (`mapper` + `booster`), and for the
+    same reason: the trees index bins, so a raw row cannot be scored without
+    the mapper that produced them. It is a separate struct rather than a
+    field on `Model` because `Model.booster` is a single-output `Booster` and
+    widening it is `model.mojo`'s decision, not this module's.
+    """
+
+    var mapper: BinMapper
+    var booster: MultiTargetBooster
+
+    def __init__(
+        out self, var mapper: BinMapper, var booster: MultiTargetBooster
+    ):
+        self.mapper = mapper^
+        self.booster = booster^
+
+    def n_targets(self) -> Int:
+        return self.booster.n_targets
+
+    def n_features(self) -> Int:
+        return self.mapper.n_features
+
+    def n_iterations(self) -> Int:
+        """Boosting rounds, which is `len(trees) // n_targets`. The number
+        comparable to CatBoost's `tree_count_`."""
+        return self.booster.n_iterations()
+
+    def predict(self, row: List[Float64]) raises -> List[Float64]:
+        """The `T` raw predictions for one raw example of length
+        `n_features`.
+
+        There is no response transform: `MultiRMSE` is a squared-error
+        family and its link is the identity, so raw and response are the
+        same number and no caller has to choose between them.
+        """
+        var bins = self.mapper.bin_row(row)
+        var t_count = self.booster.n_targets
+        var out = List[Float64](capacity=t_count)
+        for t in range(t_count):
+            out.append(self.booster.base_scores[t])
+        for i in range(len(self.booster.trees)):
+            out[i % t_count] += (
+                self.booster.learning_rate
+                * self.booster.trees[i].predict_bins(bins)
+            )
+        return out^
+
+
+def fit_multi_rmse[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    n_features: Int,
+    targets: TargetMatrix,
+    params: BoosterParams,
+    max_bins: Int = 255,
+    sample_weight: List[Float64] = [],
+    with_missing_values: Bool = False,
+    use_missing: Bool = True,
+    categorical_features: List[Int] = [],
+) raises -> MultiTargetModel:
+    """Fit `MultiRMSE` on a column-major raw feature matrix
+    (`features[f * n_rows + r]`) and a `TargetMatrix` of `n_rows * T`.
+
+    The binning half of `model.fit`, verbatim in shape, followed by
+    `train_multi_rmse`. It is CPU only and says so rather than resolving a
+    device: `train_gpu` has no multi-output round loop, so `device='gpu'` is
+    refused at the boundary above instead of being silently downgraded.
+
+    `with_missing_values` selects `MultiRMSEWithMissingValues`: a `NaN` in
+    the TARGET is a row that target does not train on, which is a different
+    thing from a `NaN` in `features`, where it is the missing-value marker
+    that `use_missing` governs.
+    """
+    if targets.n_targets < 1:
+        raise Error("fit_multi_rmse: n_targets must be at least 1")
+    targets.check_rows(n_rows)
+    var mapper = fit_bins(
+        features,
+        n_rows,
+        n_features,
+        max_bins,
+        use_missing=use_missing,
+        categorical_features=categorical_features,
+    )
+    var data = mapper.transform(features, n_rows)
+    var booster = train_multi_rmse(
+        data, targets, params, sample_weight, with_missing_values
+    )
+    return MultiTargetModel(mapper^, booster^)
+
+
+def predict_multi_rmse[
+    features_origin: ImmOrigin, //
+](
+    model: MultiTargetModel,
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    n_features: Int,
+) raises -> List[Float64]:
+    """Score a column-major raw matrix, returning `n_rows * T` row-major:
+    `out[r * T + t]`.
+
+    Row-major out because that is the layout `TargetMatrix` uses on the way
+    in, and a caller that hands over a `(n, T)` array should get one back
+    without transposing.
+    """
+    if n_features != model.mapper.n_features:
+        raise Error(
+            String(
+                "predict_multi_rmse: the model was fitted on ",
+                model.mapper.n_features,
+                " features and was handed ",
+                n_features,
+            )
+        )
+    if n_rows < 0:
+        raise Error("predict_multi_rmse: n_rows must not be negative")
+    var t_count = model.booster.n_targets
+    var out = List[Float64](capacity=n_rows * t_count)
+    var row = List[Float64](capacity=n_features)
+    for _ in range(n_features):
+        row.append(0.0)
+    for r in range(n_rows):
+        for f in range(n_features):
+            row[f] = features[f * n_rows + r]
+        var scores = model.predict(row)
+        for t in range(t_count):
+            out.append(scores[t])
+    return out^

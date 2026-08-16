@@ -292,57 +292,45 @@ CLASSIFICATION = {
     # a live guard on a connected module, which is a different thing from an
     # unreached one, and it belongs in the parity notes rather than in this
     # orphan table.
-    "embedding": (
-        PENDING,
-        "cpu_round_2",
-        "CatBoost's LDA and KNN embedding feature estimators. Catalog A20. "
-        "Needs a raw embedding column the ingestion path does not accept.",
-    ),
     "langevin": (
         PENDING,
         "cpu_round_2",
         "Stochastic Gradient Langevin Boosting and model shrinkage "
         "(langevin, diffusion_temperature, model_shrink_rate). The boosting "
-        "loop does not draw the noise or apply the shrinkage.",
+        "loop does not draw the noise or apply the shrinkage: BoosterParams "
+        "carries neither LangevinParams nor ModelShrinkParams, and the "
+        "leaf-sum draw has no call site in tree.mojo. Since 2026-08-16 all "
+        "four parameter names EXIST on the estimator and are refused there "
+        "by name (sklearn._check_langevin), so this is asked-and-refused "
+        "rather than unaskable. Wiring it is a trainer change.",
     ),
-    "multi_target": (
-        PENDING,
-        "cpu_round_2",
-        "CatBoost's MultiRMSE and MultiRMSEWithMissingValues. Blocked with "
-        "survival on the same thing target_matrix names.",
-    ),
-    "onnx_export": (
-        PENDING,
-        "cpu_round_2",
-        "ONNX export of the tree ensemble, arithmetic and refusals. No "
-        "binding registers it, so no Python caller can export.",
-    ),
+    # `embedding`, `multi_target`, `onnx_export`, `target_matrix`,
+    # `text_features` and `text_processing` were in this table until
+    # 2026-08-16, when lane/reachability-rest connected all six through one
+    # new sibling, `bindings/catboost_reach_bindings.mojo`, which
+    # `_mojotrees.mojo` imports and whose functions are in the def_function
+    # table. Catalog A31 records the edges. Two of the six were reached
+    # transitively rather than directly and that is the point of the shape:
+    # `target_matrix` through `multi_target`, `text_processing` through
+    # `text_features`, so two edges closed four modules.
+    #
+    # Reachable is not the same as complete, and each carries a live
+    # limitation stated where a user meets it rather than here:
+    # `multi_target` grows one tree per target per round and is therefore
+    # NOT CatBoost's MultiRMSE (catalog A28); the text and embedding
+    # transforms return columns whose FITTED state -- the dictionary, the
+    # calcer, the LDA projection -- is not written into a model file, so a
+    # caller keeps the transform; and `onnx_export` refuses by name
+    # everything ai.onnx.ml opset 3 cannot reproduce. Those are guards on
+    # connected modules, which is a different finding from an unreached one.
     "survival": (
         PENDING,
         "cpu_round_2",
-        "CatBoost's Cox and SurvivalAft objectives. Both need the "
-        "multi-column label contract target_matrix describes.",
-    ),
-    "target_matrix": (
-        PENDING,
-        "cpu_round_2",
-        "The multi-column label contract, and by its own docstring the "
-        "finding rather than the fix: every training entry point takes a "
-        "single target column. This is the head of the chain that reaches "
-        "multi_target and survival, so one connecting edge closes three.",
-    ),
-    "text_features": (
-        PENDING,
-        "cpu_round_2",
-        "CatBoost's text_features: the BoW, NaiveBayes and BM25 estimators. "
-        "Host-side feature generation nothing calls.",
-    ),
-    "text_processing": (
-        PENDING,
-        "cpu_round_2",
-        "The tokenizer, dictionary and digitizer behind text_features. "
-        "Reached only from that module, itself unreached, so it is the tail "
-        "of a two-module chain and not a separate decision.",
+        "CatBoost's Cox and SurvivalAft objectives. The multi-column label "
+        "contract they were blocked on now HAS a Python wire -- "
+        "_mojotrees.multi_rmse_fit takes n_targets columns and builds a "
+        "TargetMatrix -- so the blocker moved: survival.mojo has no fit_* "
+        "entry point of its own and nothing selects its objective codes.",
     ),
     "gpu_vendor_policy": (
         EXPERIMENTAL,
@@ -353,6 +341,29 @@ CLASSIFICATION = {
         "had. handoffs/migration_20_device_policy.md.",
     ),
     # -- Python modules ----------------------------------------------------
+    "mojotrees.features": (
+        EXPERIMENTAL,
+        "reachability_rest",
+        "Lazy submodule (_LAZY_SUBMODULES) like lgbm_model_io and for the "
+        "same reason: CatBoost's text_features and embedding_features are a "
+        "TRANSFORM, not a fit, so they are asked for by name and export "
+        "nothing at top level. Both reach native code -- text_features_open "
+        "and embedding_features_into in bindings/catboost_reach_bindings"
+        ".mojo -- and connecting them is what took src/mojotrees/"
+        "text_features.mojo, text_processing.mojo and embedding.mojo off "
+        "this list. Catalog A31.",
+    ),
+    "mojotrees.onnx_export": (
+        EXPERIMENTAL,
+        "reachability_rest",
+        "Lazy submodule (_LAZY_SUBMODULES). It was a plan READER with no "
+        "writer until 2026-08-16; save_model_onnx now reaches "
+        "_mojotrees.onnx_plan_text, which is what took "
+        "src/mojotrees/onnx_export.mojo off the native list. Not exported at "
+        "top level because `onnx` is an optional dependency and an export is "
+        "a separate artifact from save_model, which is the format that "
+        "round-trips a fit bit-identically. Catalog A31.",
+    ),
     "mojotrees.lgbm_model_io": (
         EXPERIMENTAL,
         "integration_C0",

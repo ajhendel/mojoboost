@@ -17,6 +17,7 @@ import tempfile as _tempfile
 import warnings as _warnings
 
 from . import _arrays, _compat, _eval, _validation, callback as _callback
+from . import _multi_target
 from . import preflight as _preflight
 from ._sklearn import NotFittedError, ParamsMixin as _ParamsMixin
 from ._sklearn import estimator_tags as _estimator_tags
@@ -606,6 +607,10 @@ class _Base(_ParamsMixin):
         tree_learner="serial",
         num_machines=1,
         top_k=20,
+        langevin=None,
+        diffusion_temperature=None,
+        model_shrink_rate=None,
+        model_shrink_mode=None,
     ):
         self.num_leaves = num_leaves
         self.max_leaves = max_leaves
@@ -731,6 +736,12 @@ class _Base(_ParamsMixin):
         self.tree_learner = tree_learner
         self.num_machines = num_machines
         self.top_k = top_k
+        # CatBoost's Langevin block. Accepted so the refusal can name the
+        # blocker instead of the argument; see `_check_langevin`.
+        self.langevin = langevin
+        self.diffusion_temperature = diffusion_temperature
+        self.model_shrink_rate = model_shrink_rate
+        self.model_shrink_mode = model_shrink_mode
         self._reset_fitted()
 
     def _interaction_buffers(self, n_features):
@@ -1450,6 +1461,61 @@ class _Base(_ParamsMixin):
                 "No, Bayesian, Bernoulli, MVS, or Poisson"
             )
 
+    def _check_langevin(self):
+        """CatBoost's `langevin` / `diffusion_temperature` /
+        `model_shrink_rate` / `model_shrink_mode`, refused by name with the
+        blocker rather than accepted and dropped.
+
+        **This is built and it is not reachable, and the two halves of that
+        sentence have different reasons.** `src/mojotrees/langevin.mojo`
+        holds the whole mechanism, tested: the counter-based normal draw
+        (`langevin_row_noise`), the per-row injection at CatBoost's own place
+        in the round (`apply_langevin_noise`, called from `DoBootstrap` on
+        the line after `Bootstrap`), the leaf-sum draw, the deferred shrink
+        fold (`ModelShrinkPlan.fold_into_trees`), and the coupling that makes
+        `langevin=True` install a default `model_shrink_rate`. What does not
+        exist is a CALLER. `BoosterParams` has no `LangevinParams` field and
+        no `ModelShrinkParams` field, so `boosting.train`'s round loop never
+        draws the noise and never records a shrink event, and `tree.mojo` has
+        no leaf-sum call site for the second draw. Wiring it is an edit to
+        `boosting.mojo` and `tree.mojo`, which is a trainer change and not a
+        parameter change.
+
+        A `False`/`0.0` is accepted, because that is exactly what an
+        untouched fit already is. Anything else raises.
+        """
+        if self.langevin:
+            raise ValueError(
+                "langevin=True is not reachable: the mechanism is built and "
+                "tested (src/mojotrees/langevin.mojo: apply_langevin_noise, "
+                "langevin_leaf_gradient_noise, langevin_leaf_newton_noise) "
+                "but no trainer calls it -- BoosterParams carries no "
+                "LangevinParams, so boosting.train's round loop never draws "
+                "the noise. Catalog A13."
+            )
+        if self.diffusion_temperature is not None:
+            raise ValueError(
+                "diffusion_temperature only scales langevin's noise, and "
+                "langevin itself is unreachable (see the langevin refusal). "
+                "Setting it alone would change nothing."
+            )
+        if self.model_shrink_rate is not None and float(
+            self.model_shrink_rate
+        ) != 0.0:
+            raise ValueError(
+                "model_shrink_rate is not reachable: the shrink plan is "
+                "built and exact (src/mojotrees/langevin.mojo: "
+                "ModelShrinkPlan.record, apply_model_shrinkage, "
+                "fold_into_trees) but no round loop records an event and no "
+                "fit folds the plan into the leaf values, because "
+                "BoosterParams carries no ModelShrinkParams. Catalog A14."
+            )
+        if self.model_shrink_mode is not None:
+            raise ValueError(
+                "model_shrink_mode selects between two shrink schedules and "
+                "neither runs; see the model_shrink_rate refusal."
+            )
+
     #: The four wire keys of ordered boosting and the native default each
     #: takes when the estimator names nothing. The numbers are
     #: `ordered_boosting.DEFAULT_*`, restated here because the wire mapping
@@ -1680,6 +1746,7 @@ class _Base(_ParamsMixin):
         seeds = self._resolve_seeds()
         self._check_n_jobs()
         self._check_catboost_only()
+        self._check_langevin()
         # THE BEHAVIOR FIX. `subsample < 1` with `subsample_freq` unset is a
         # silent no-op in LightGBM: bagging never runs, and the user who
         # asked for it is told nothing. Here an unset frequency becomes 1
@@ -3465,6 +3532,7 @@ class MojoTreesRegressor(_Base):
         fair_c=1.0,
         tweedie_variance_power=1.5,
         base_score=0.0,
+        num_targets=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -3475,6 +3543,10 @@ class MojoTreesRegressor(_Base):
         self.fair_c = fair_c
         self.tweedie_variance_power = tweedie_variance_power
         self.base_score = base_score
+        # CatBoost's MultiRMSE. `None` means "read it off y", which is what
+        # a 2-D y already says; naming it is a CHECK on what the caller
+        # believes and not a reshape instruction. See `_fit_multi_target`.
+        self.num_targets = num_targets
 
     def _resolve_objective(self):
         """The objective as spelled, from `objective` or from either vendor
@@ -3594,8 +3666,20 @@ class MojoTreesRegressor(_Base):
         round of `primary_metric` (an index or a name) on the first
         validation set.
 
+        A 2-D `y` of shape `(n_samples, n_targets)`, or `num_targets` above
+        1, takes the MultiRMSE path instead; see `_fit_multi_target` for
+        what that honors and what it refuses.
+
         Returns self.
         """
+        if _multi_target.is_multi_target(y, self.num_targets):
+            return self._fit_multi_target(
+                X, y, sample_weight, eval_set, eval_X, eval_y, callbacks
+            )
+        # A refit with a 1-D y after a multi-target one must not leave the
+        # multi-output handle behind: `predict` branches on its presence and
+        # would score the new fit through the old model.
+        self.__dict__.pop("_multi_model", None)
         objective = self._objective_code()
         eval_set = _eval_pairs(eval_set, eval_X, eval_y)
         _check_eval_arguments(
@@ -3709,6 +3793,137 @@ class MojoTreesRegressor(_Base):
             )
         self._record_fit(n_features, names, device)
         return self
+
+    def _fit_multi_target(
+        self, X, y, sample_weight, eval_set, eval_X, eval_y, callbacks
+    ):
+        """CatBoost's `MultiRMSE`: a 2-D target, one tree per target per
+        round, reached through `multi_target.fit_multi_rmse`.
+
+        **This is the connecting edge `target_matrix.TargetMatrix` was
+        written for and never got.** Its own docstring names the finding:
+        every training entry point in this repository takes a single target
+        column, so the wider label contract existed and nothing reached it,
+        and `multi_target` and `survival` were both blocked on that one
+        missing edge rather than on their own arithmetic. This closes it for
+        `MultiRMSE`. `Cox` and `SurvivalAft` still have no entry point of
+        their own -- the wire below carries `n_targets` columns and would
+        carry theirs unchanged, but `survival.mojo` has no `fit_*` and
+        nothing selects its objective codes.
+
+        **What it is not.** One tree per target per round is not CatBoost's
+        `MultiRMSE`, which grows one tree per round with a vector leaf value.
+        Because the derivative has no cross-target term, what this fits is
+        bit-identical to `n_targets` independent squared-error fits, and the
+        shared structure is the entire modeling content of the objective. It
+        is a real multi-output regression API under an honest name; see
+        catalog A28 and the head of `src/mojotrees/multi_target.mojo`.
+
+        **Not supported on a multi-target fit, and loudly rather than
+        quietly:** `save`, `booster_`, `feature_importances_`, pickling, and
+        `__sklearn_is_fitted__`. All of them read `self._model`, which is a
+        single-output `Model` handle and stays `None` here, so each raises
+        `NotFittedError` rather than answering about a model it is not
+        looking at. `serialize.mojo` has no `MultiTargetBooster` section and
+        widening the model format is not this edge's decision; see catalog
+        A29.
+        """
+        if eval_set is not None or eval_X is not None or eval_y is not None:
+            raise ValueError(
+                "a multi-target fit takes no eval_set: the metric-path "
+                "trainer is custom_metric.fit_with_metrics, which is "
+                "single-output, and multi_target.train_multi_rmse has no "
+                "validation loop"
+            )
+        if callbacks:
+            raise ValueError(
+                "a multi-target fit takes no callbacks: they are driven by "
+                "the metric-path round loop, which is single-output"
+            )
+        if _arrays.is_sparse(X):
+            raise TypeError(
+                "a multi-target fit takes a dense X: train_multi_rmse bins "
+                "through binning.fit_bins and the sparse binner has no "
+                "multi-output trainer behind it"
+            )
+        _multi_target.check_honored(self, str(self._resolve_objective()))
+        self._reset_fitted()
+        self.__dict__.pop("_multi_model", None)
+        Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
+        if cat_buf is not None:
+            raise ValueError(
+                "categorical features are not honored by a multi-target "
+                "fit: the category split path is in the single-output "
+                "grower's search only"
+            )
+        yb, n_targets = _multi_target.target_matrix(
+            y, self.num_targets, n_rows
+        )
+        params = _multi_target.wire_params(self)
+        wb = None
+        if sample_weight is not None:
+            wb = _arrays.check_sample_weight(sample_weight, n_rows)
+            params["weight_addr"] = _arrays.addr(wb)
+        device = _device_name(
+            self.device if self.device is not None else self.device_type
+        )
+        if device not in (None, "cpu", "auto"):
+            raise ValueError(
+                "a multi-target fit runs on the CPU: train_gpu has no "
+                "multi-output round loop; set device='cpu'"
+            )
+        self.__dict__["_multi_model"] = _mojotrees.multi_rmse_fit(
+            _addr(Xb),
+            n_rows,
+            n_features,
+            _addr(yb),
+            n_targets,
+            params,
+        )
+        del wb
+        shape = _mojotrees.multi_rmse_shape(self.__dict__["_multi_model"])
+        self.n_features_in_ = n_features
+        if names is not None:
+            self.feature_names_in_ = _arrays.name_array(names)
+        self.device_ = "cpu"
+        #: The target count the fit ran with, read back off the model rather
+        #: than off the argument.
+        self.n_targets_ = shape[0]
+        self.n_iter_ = shape[1]
+        self.best_iteration_ = shape[1]
+        #: `len(trees)`, which is `n_iter_ * n_targets_` and is NOT the
+        #: number comparable to CatBoost's `tree_count_`. Both are here
+        #: because quoting the wrong one is the easy mistake.
+        self.n_trees_ = shape[3]
+        return self
+
+    def _predict_multi_target(self, X, validate_features=False):
+        """`(n_samples, n_targets)` predictions from a multi-target fit.
+
+        No `raw_score`, no iteration slice, no leaf ordinals and no
+        contributions: `MultiRMSE`'s link is the identity so raw and response
+        are one number, and the other three have no multi-output native entry
+        point. Each is refused in `predict` by name rather than ignored.
+        """
+        model = self.__dict__["_multi_model"]
+        encoders = self._matrix_encoders(X)
+        Xb, n_rows, n_features, names = _arrays.check_X(X, encoders=encoders)
+        self._check_n_features(n_features)
+        self._check_feature_names(names, validate_features)
+        out = _out_buffer(n_rows * self.n_targets_)
+        _mojotrees.multi_rmse_predict(
+            model, _addr(Xb), n_rows, n_features, _addr(out)
+        )
+        if _arrays.have_numpy():
+            import numpy as np  # noqa: PLC0415
+
+            return np.asarray(out, dtype=np.float64).reshape(
+                (n_rows, self.n_targets_)
+            )
+        t = self.n_targets_
+        return [
+            [out[r * t + k] for k in range(t)] for r in range(n_rows)
+        ]
 
     def _distributed_world(self):
         """The world size a fit trains over: 1 for `tree_learner='serial'`
@@ -3833,7 +4048,30 @@ class MojoTreesRegressor(_Base):
         have a device path; contributions and sparse input do not, and say
         so instead of quietly running on the CPU.
 
-        `raw_score` and `pred_leaf` cannot be combined."""
+        `raw_score` and `pred_leaf` cannot be combined.
+
+        After a multi-target fit this returns `(n_samples, n_targets)` and
+        takes none of the flags below; see `_predict_multi_target`."""
+        if self.__dict__.get("_multi_model") is not None:
+            for flag, name in (
+                (raw_score, "raw_score"),
+                (pred_leaf, "pred_leaf"),
+                (pred_contrib, "pred_contrib"),
+            ):
+                if flag:
+                    raise ValueError(
+                        f"{name} has no multi-target path: MultiRMSE's link "
+                        "is the identity and no native entry point takes a "
+                        "multi-output model for leaves or contributions"
+                    )
+            if start_iteration or num_iteration is not None:
+                raise ValueError(
+                    "an iteration slice has no multi-target path: the "
+                    "ensemble is indexed (round, target) and no native "
+                    "entry point slices it"
+                )
+            self._refuse_device(device, "a multi-target model")
+            return self._predict_multi_target(X, validate_features)
         self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
         if _arrays.is_sparse(X):
             out, n_rows = self._sparse_scores(
