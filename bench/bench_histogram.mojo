@@ -91,8 +91,8 @@ def main() raises:
         var cg = 0.0
         var gg = 0.0
         for b in range(cpu_hist.n_bins):
-            cg += cpu_hist.grad[b]
-            gg += gpu_hist.grad[b]
+            cg += cpu_hist.grad_at(b)
+            gg += gpu_hist.grad_at(b)
         print("feature0 grad totals (cpu, gpu):", cg, gg)
 
         # The group the builder resolved for this dataset, read before the

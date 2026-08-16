@@ -1158,7 +1158,19 @@ tile size are runtime values here rather than compile-time ones.
 
 ## Defaults
 
-Matched to LightGBM so comparisons are apples to apples.
+Matched to LightGBM so comparisons are apples to apples. Not "mostly
+matched": every default below is LightGBM's own stock value, read from
+`include/LightGBM/config.h` at tag v4.7.0, and `tools/check_parity.py`
+asserts each one against that table on every run. A default that drifts off
+stock fails a gate rather than being noticed later in a result.
+
+`lambda_l2` was the last exception. It defaulted to 1.0 here against
+LightGBM's 0.0 until 2026-08-16, which meant every benchmark had to pin
+`lambda_l2` on both sides to compare the two libraries at all, and an arm
+labelled "LightGBM stock" was not on LightGBM's regularizer. It is 0.0 now.
+**Fits that did not set `lambda_l2` explicitly produce different leaf values
+and can take different splits than they did before that date**, because the
+parameter sits in the denominator of the Newton step `-T(G) / (H + l2)`.
 
 | Parameter | Default |
 |---|---|
@@ -1168,7 +1180,7 @@ Matched to LightGBM so comparisons are apples to apples.
 | `n_estimators` | 100 |
 | `min_data_in_leaf` | 20 |
 | `max_bin` | 255 |
-| `lambda_l2` | 1.0 (LightGBM's own default is 0; benchmarks set both to 1.0) |
+| `lambda_l2` | 0.0 (LightGBM's default; was 1.0 here until 2026-08-16) |
 | `lambda_l1` | 0.0 (LightGBM's default) |
 | `bagging_fraction` | 1.0 (LightGBM's default) |
 | `bagging_freq` | 0, meaning no bagging (LightGBM's default) |

@@ -1,0 +1,410 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "run_id": "20260816T130339Z-lam0-f32",
+  "job_index": 5,
+  "repeat": 2,
+  "scenario": "imbalanced_binary",
+  "scenario_title": "Imbalanced binary classification",
+  "tier": "standard",
+  "task": "binary",
+  "primary_metric": "average_precision",
+  "threads": 10,
+  "data": {
+    "dataset": "generated:imbalanced_binary",
+    "data_kind": "synthetic",
+    "pinned": true,
+    "generator": "imbalanced_binary",
+    "generator_kwargs": {
+      "n_rows": 300000,
+      "n_features": 40,
+      "positive_rate": 0.005
+    },
+    "task": "binary",
+    "split": {
+      "kind": "hash",
+      "train_fraction": 0.8,
+      "seed": 1900
+    },
+    "fallback_reason": "/private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1/bench/real_data/data/bank_marketing.zip is not on disk",
+    "train": {
+      "rows": 239807,
+      "features": 40,
+      "sparse": false,
+      "digest": "2795f0916cbf40c66e4d11f80cd7772d194207e6b1bacf0430bb7b9bfe2edb7c",
+      "missing_fraction": 0.0,
+      "label_mean": 0.004979003949008995,
+      "label_distinct": 2
+    },
+    "test": {
+      "rows": 60193,
+      "features": 40,
+      "sparse": false,
+      "digest": "58d34b3ae6d4c1b6f15d2d6071fadeb2a14c0991a369e488f43b2aebcfcc8f49",
+      "missing_fraction": 0.0
+    }
+  },
+  "params": {
+    "shared": {
+      "num_leaves": 31,
+      "max_depth": -1,
+      "learning_rate": 0.1,
+      "n_estimators": 100,
+      "min_data_in_leaf": 20,
+      "min_child_hess": 0.001,
+      "lambda_l1": 0.0,
+      "max_bin": 255,
+      "use_missing": true,
+      "objective": "binary"
+    },
+    "engine": {
+      "objective": "binary",
+      "num_leaves": 31,
+      "max_depth": -1,
+      "learning_rate": 0.1,
+      "min_data_in_leaf": 20,
+      "min_sum_hessian_in_leaf": 0.001,
+      "lambda_l1": 0.0,
+      "max_bin": 255,
+      "use_missing": true,
+      "num_threads": 10,
+      "deterministic": true,
+      "feature_pre_filter": false,
+      "enable_bundle": false,
+      "verbosity": -1,
+      "seed": 190019
+    },
+    "dataset": null,
+    "dataset_unavailable_reason": "LightGBM's Dataset and train take one dict, which is params_used",
+    "num_boost_round": 100
+  },
+  "caveats": [
+    "The real variant, bank_marketing, has ten categorical columns. They are passed as categorical to both engines, so this scenario overlaps with categorical_missing on real data. The synthetic variant is purely numeric and does not.",
+    "comparator stock+det@v2: LightGBM at stock defaults plus deterministic=true, registered at bench/results/PROFILE_PROTOCOL.md section C9, as amended 2026-08-16"
+  ],
+  "quality": {
+    "auc": 0.7258494497900803,
+    "average_precision": 0.012351556620952284,
+    "logloss": 0.03090542911365704
+  },
+  "baseline_quality": {
+    "auc": 0.5,
+    "average_precision": 0.004660158724222434,
+    "logloss": 0.02945798054688888
+  },
+  "predictions_sha256": "58f6b8b9c3f048e495ae7813f2afffe708ba165c61c3af6a0b56858a4ca4cf72",
+  "predictions_shape": [
+    60193
+  ],
+  "backend_proof": {
+    "source": "MOJOTREES_PHASE_PROFILE",
+    "requested": true,
+    "mode": "async",
+    "unavailable_reason": "the trainer printed its profile to this process's stdout; run.py parses it into this field"
+  },
+  "warmup": {
+    "elapsed_s": 0.004217084031552076,
+    "cpu_s": 0.0068310000000000315,
+    "parallel_efficiency": 1.6198396685697336
+  },
+  "engine": "lightgbm",
+  "engine_version": "4.7.0",
+  "device_requested": "cpu",
+  "device_used": "cpu",
+  "path": "dataset",
+  "phases": {
+    "import": {
+      "elapsed_s": 0.3554729160387069,
+      "cpu_s": 0.35378300000000007,
+      "parallel_efficiency": 0.9952460062005882
+    },
+    "binning": {
+      "elapsed_s": 0.27790870802709833,
+      "cpu_s": 1.029522,
+      "parallel_efficiency": 3.7045330724203627
+    },
+    "train": {
+      "elapsed_s": 1.180391417001374,
+      "cpu_s": 4.517652,
+      "parallel_efficiency": 3.8272491098558548
+    },
+    "predict_batch": {
+      "warmup": [
+        {
+          "elapsed_s": 0.06875395902898163,
+          "cpu_s": 0.37889399999999984,
+          "parallel_efficiency": 5.510868106377495
+        }
+      ],
+      "measured": [
+        {
+          "elapsed_s": 0.06428045802749693,
+          "cpu_s": 0.37041599999999963,
+          "parallel_efficiency": 5.762497831635684
+        },
+        {
+          "elapsed_s": 0.06108416698407382,
+          "cpu_s": 0.3659189999999999,
+          "parallel_efficiency": 5.990406648181094
+        },
+        {
+          "elapsed_s": 0.05947795795509592,
+          "cpu_s": 0.36755899999999997,
+          "parallel_efficiency": 6.179751501850418
+        }
+      ]
+    },
+    "predict_row": {
+      "warmup": [
+        {
+          "elapsed_s": 0.00017020804807543755,
+          "cpu_s": 0.00024400000000035504,
+          "parallel_efficiency": 1.4335397342211005
+        },
+        {
+          "elapsed_s": 0.00010845903307199478,
+          "cpu_s": 0.00018000000000029104,
+          "parallel_efficiency": 1.6596128040419424
+        }
+      ],
+      "measured": [
+        {
+          "elapsed_s": 0.0001317920396104455,
+          "cpu_s": 0.00019200000000019202,
+          "parallel_efficiency": 1.456840645062561
+        },
+        {
+          "elapsed_s": 8.504203287884593e-05,
+          "cpu_s": 0.00013599999999946988,
+          "parallel_efficiency": 1.5992091839246196
+        },
+        {
+          "elapsed_s": 0.0001009170082397759,
+          "cpu_s": 0.00015600000000048908,
+          "parallel_efficiency": 1.5458246604956578
+        },
+        {
+          "elapsed_s": 9.824999142438173e-05,
+          "cpu_s": 0.0001600000000010482,
+          "parallel_efficiency": 1.6284988698873573
+        },
+        {
+          "elapsed_s": 7.912499131634831e-05,
+          "cpu_s": 0.0001419999999985322,
+          "parallel_efficiency": 1.7946289489095089
+        },
+        {
+          "elapsed_s": 7.325003389269114e-05,
+          "cpu_s": 0.0001239999999995689,
+          "parallel_efficiency": 1.6928319812278145
+        },
+        {
+          "elapsed_s": 6.312498589977622e-05,
+          "cpu_s": 0.00011600000000022703,
+          "parallel_efficiency": 1.8376241728497282
+        },
+        {
+          "elapsed_s": 6.0375023167580366e-05,
+          "cpu_s": 0.00011000000000116472,
+          "parallel_efficiency": 1.8219454706599851
+        },
+        {
+          "elapsed_s": 6.87920255586505e-05,
+          "cpu_s": 0.00012199999999928934,
+          "parallel_efficiency": 1.7734613715549772
+        },
+        {
+          "elapsed_s": 8.962501306086779e-05,
+          "cpu_s": 0.0001449999999998397,
+          "parallel_efficiency": 1.6178519260171782
+        },
+        {
+          "elapsed_s": 6.504100747406483e-05,
+          "cpu_s": 0.00011799999999873023,
+          "parallel_efficiency": 1.814240039959142
+        },
+        {
+          "elapsed_s": 6.83749676682055e-05,
+          "cpu_s": 0.00011899999999975819,
+          "parallel_efficiency": 1.7404030167475082
+        },
+        {
+          "elapsed_s": 6.470800144597888e-05,
+          "cpu_s": 0.00011600000000022703,
+          "parallel_efficiency": 1.7926685635171253
+        },
+        {
+          "elapsed_s": 6.766599835827947e-05,
+          "cpu_s": 0.00011899999999975819,
+          "parallel_efficiency": 1.758638058802802
+        },
+        {
+          "elapsed_s": 6.354204379022121e-05,
+          "cpu_s": 0.00012199999999928934,
+          "parallel_efficiency": 1.9199886047427468
+        },
+        {
+          "elapsed_s": 6.645801477134228e-05,
+          "cpu_s": 0.00011900000000153454,
+          "parallel_efficiency": 1.7906041944071007
+        },
+        {
+          "elapsed_s": 7.050001295283437e-05,
+          "cpu_s": 0.0001289999999993796,
+          "parallel_efficiency": 1.829786897850397
+        },
+        {
+          "elapsed_s": 9.120895992964506e-05,
+          "cpu_s": 0.00014600000000086766,
+          "parallel_efficiency": 1.600719930514351
+        },
+        {
+          "elapsed_s": 6.36249897070229e-05,
+          "cpu_s": 0.00011499999999919908,
+          "parallel_efficiency": 1.807465911251934
+        },
+        {
+          "elapsed_s": 6.354204379022121e-05,
+          "cpu_s": 0.00011800000000050659,
+          "parallel_efficiency": 1.8570381587043974
+        }
+      ]
+    }
+  },
+  "histogram_builder": {
+    "requested": "auto",
+    "resolved": {
+      "value": null,
+      "unavailable_reason": "neither force flag was set, so LightGBM chose by timing both on the first iterations. 4.7 keeps that choice in the tree learner's share state and exposes no getter for it, and the log line that reports it is suppressed at verbosity -1."
+    },
+    "recorded": "requested only; see resolved.unavailable_reason"
+  },
+  "model": {
+    "num_trees": 100,
+    "current_iteration": 100,
+    "num_bin": 255,
+    "bins": {
+      "n_features": 40,
+      "total": 10200,
+      "max": 255,
+      "min": 255,
+      "mean": 255.0,
+      "sha256": "043135be12ca8f31940d762bbf633b661a47e1e5584572ac431ff591939882b4",
+      "counts": [
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255
+      ],
+      "counts_truncated": false
+    },
+    "size": {
+      "string_bytes": 349458,
+      "file_bytes": 349458,
+      "error": null,
+      "file_sha256": "03f73fe689c1c787c3e763b9eb04ab59a93686f6311b56377e22619434ebb3a8"
+    }
+  },
+  "transfers": {
+    "value": null,
+    "unavailable_reason": "cpu-only build"
+  },
+  "peak_rss_bytes": 794542080,
+  "predictions_path": "005-imbalanced_binary.lightgbm.cpu.t10.r2.npy",
+  "environment": {
+    "collected_at_utc": "2026-08-16T13:04:05Z",
+    "hostname": "Mac",
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "cpu": {
+      "arch": "arm64",
+      "system": "Darwin",
+      "release": "25.5.0",
+      "model": "Apple M4",
+      "physical_cores": 10,
+      "logical_cores": 10,
+      "memory_bytes": 17179869184,
+      "performance_cores": 4,
+      "efficiency_cores": 6
+    },
+    "versions": {
+      "python": "3.14.6",
+      "numpy": "2.5.2",
+      "scipy": "1.18.0",
+      "lightgbm": "4.7.0",
+      "mojo": "Mojo 1.0.0 (ed45d567)",
+      "max": null
+    },
+    "git": {
+      "commit": "f15d10748eae768f5530069e74471d58cc24cf5c",
+      "branch": "cpu-round-1",
+      "dirty": true,
+      "describe": "v0.1.0a3-277-gf15d107-dirty"
+    },
+    "accelerator": {
+      "gpu_available": false,
+      "probe_error": null,
+      "backend": "metal"
+    },
+    "machine_state": {
+      "load_average_1m": 5.66943359375,
+      "on_battery": false,
+      "thermal_pressure": "Note: No CPU power status has been recorded"
+    },
+    "env": {
+      "MOJOTREES_NUM_WORKERS": "10",
+      "MOJOTREES_PARALLEL_MIN_OPS": null,
+      "MOJOTREES_DISABLE_GPU": "1",
+      "MOJOTREES_BENCH_DATA": null,
+      "OMP_NUM_THREADS": "10",
+      "OPENBLAS_NUM_THREADS": "10",
+      "MKL_NUM_THREADS": "10",
+      "VECLIB_MAXIMUM_THREADS": "10",
+      "NUMEXPR_NUM_THREADS": "10"
+    },
+    "argv": [
+      "/private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1/bench/real_data/worker.py",
+      "--job",
+      "bench/results/cpu_float32_lambda0_2026-08-16/20260816T130339Z-lam0-f32/jobs/005-imbalanced_binary.lightgbm.cpu.t10.r2.json",
+      "--out",
+      "bench/results/cpu_float32_lambda0_2026-08-16/20260816T130339Z-lam0-f32/records/005-imbalanced_binary.lightgbm.cpu.t10.r2.json",
+      "--predictions",
+      "bench/results/cpu_float32_lambda0_2026-08-16/20260816T130339Z-lam0-f32/predictions/005-imbalanced_binary.lightgbm.cpu.t10.r2.npy"
+    ]
+  }
+}

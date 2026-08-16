@@ -1,0 +1,403 @@
+{
+  "run_id": "20260816T130526Z-lam0-f64",
+  "created_utc": "2026-08-16T13:05:26Z",
+  "arguments": {
+    "scenario": [
+      "imbalanced_binary",
+      "multiclass"
+    ],
+    "tier": "standard",
+    "variant": "auto",
+    "engine": [
+      "mojotrees"
+    ],
+    "device": [
+      "cpu"
+    ],
+    "threads": [
+      10
+    ],
+    "repeats": 3,
+    "predict_repeats": 3,
+    "timeout": 7200,
+    "out": "bench/results/cpu_float32_lambda0_2026-08-16",
+    "tag": "lam0-f64",
+    "allow_unpinned": false,
+    "no_data_digest": false,
+    "no_backend_proof": false,
+    "dry_run": false
+  },
+  "comparator": {
+    "id": "stock+det",
+    "version": 2,
+    "label": "LightGBM at stock defaults plus deterministic=true",
+    "registered": "bench/results/PROFILE_PROTOCOL.md section C9, as amended 2026-08-16",
+    "one_line": "stock+det@v2",
+    "lightgbm_passed": {
+      "deterministic": true,
+      "feature_pre_filter": false,
+      "enable_bundle": false,
+      "verbosity": -1,
+      "seed": 190019
+    },
+    "lightgbm_deviations_from_stock": {
+      "deterministic": {
+        "stock": false,
+        "here": true,
+        "why": "the comparator itself, and the only deviation that is not a feature-space pin. The mojotrees arm is reproducible across thread counts at no cost, so this is the setting that makes the two sides comparable rather than one that handicaps either. It does not fully succeed: in the first real-data run LightGBM produced two distinct prediction digests across three repeats on sparse_highdim with this already set and a fixed seed, while the mojotrees arm was bit-identical across all three",
+        "removed_when": "never, while it is the comparator. LightGBM's documentation records that it may slow training down, which is a cost on the comparator's side and is accepted deliberately in exchange for repeats that are repeats"
+      },
+      "feature_pre_filter": {
+        "stock": true,
+        "here": false,
+        "why": "on by default it deletes features that cannot satisfy min_data_in_leaf at Dataset construction, removing them from the matrix, from the pool feature_fraction samples, and from every feature index. That is a data change mojotrees does not make, so leaving it on compares two engines fitting different feature spaces. This is a load-bearing pin and not a leftover from the pinned configuration that was just removed",
+        "removed_when": "mojotrees implements the pre-filter, which a concurrent lane is doing. Not before"
+      },
+      "enable_bundle": {
+        "stock": true,
+        "here": false,
+        "why": "exclusive feature bundling merges mutually exclusive sparse features before binning, which is the same kind of feature-space change",
+        "removed_when": "mojotrees's EFB is applied by every trainer this harness reaches. It is reachable from Python now, but the ranking trainer refuses an active bundling switch by name (efb.check_bundling_honored), so turning it on for both engines would raise on the ranking scenario rather than compare it"
+      }
+    },
+    "lightgbm_harness_settings": {
+      "verbosity": "keeps LightGBM's log out of the stdout stream run.py parses for backend proof. The cost is that LightGBM's own report of which histogram builder it chose is suppressed with it",
+      "seed": "pins the fit so a repeat is a repeat"
+    },
+    "lightgbm_left_at_stock": {
+      "use_quantized_grad": false,
+      "bin_construct_sample_cnt": 200000,
+      "min_data_in_bin": 3,
+      "force_row_wise": false,
+      "force_col_wise": false,
+      "zero_as_missing": false,
+      "min_gain_to_split": 0.0,
+      "boost_from_average": true,
+      "lambda_l2": 0.0
+    },
+    "lightgbm_defaults_source": "microsoft/LightGBM include/LightGBM/config.h and docs/Parameters.rst, checked at tag v4.7.0 and at master on 2026-08-16",
+    "lightgbm_min_version": "4.0",
+    "reproducibility": {
+      "why_deterministic": "the mojotrees arm is reproducible across thread counts at no cost, so deterministic=true is the setting that makes the two sides comparable rather than one that handicaps either",
+      "known_limit": "it does not fully succeed. In the first real-data run LightGBM produced two distinct prediction digests across three repeats on sparse_highdim, with deterministic=true already set and a fixed seed, while the mojotrees arm was bit-identical across all three",
+      "documented_companion_setting_not_used": "LightGBM's documentation for deterministic says to set force_col_wise or force_row_wise as well. This comparator sets neither, because choosing the comparator's histogram algorithm for it is the larger distortion. The digests that disagreed above were taken with force_row_wise set, so the pairing was not delivering reproducibility either",
+      "gating": "thresholds.json gates the LightGBM side of the repeat determinism check as non-gating, so a repeat that moves is reported and not failed. The mojotrees side is gating"
+    },
+    "like_for_like": true,
+    "like_for_like_reason": "both engines fit the same feature space, from the same bins, with the same shared parameters, and neither runs quantized gradients. A speed ratio and an accuracy differential taken against this arm are comparable quantities, reported together",
+    "peers": {
+      "catboost": {
+        "id": "cb-default",
+        "version": 1,
+        "label": "CatBoost at its own defaults, at matched tree count and matched learning rate",
+        "registered": "bench/results/PROFILE_PROTOCOL.md section C9 names one comparator, LightGBM stock+det. This arm is a peer column reported beside it and is not a comparator: nothing is gated on it and no threshold is measured against it",
+        "one_line": "cb-default@v1",
+        "is_the_comparator": false,
+        "catboost_passed": {
+          "allow_writing_files": false,
+          "logging_level": "Silent",
+          "random_seed": 190019
+        },
+        "catboost_matched_from_base_params": {
+          "iterations": "n_estimators",
+          "learning_rate": "learning_rate"
+        },
+        "catboost_deviations_from_stock": {
+          "iterations": {
+            "stock": 1000,
+            "here": "BASE_PARAMS['n_estimators']",
+            "why": "a comparison at different budgets is not a comparison. All three engines are asked for the same number of boosting iterations, which is what makes a wall time per iteration and a metric at a fixed budget mean the same thing on each row",
+            "removed_when": "never, while this is a matched-budget column. A CatBoost-at-1000-iterations figure is a different measurement and belongs in a differently labelled row"
+          },
+          "learning_rate": {
+            "stock": "chosen by CatBoost from the iteration count and the dataset when it is not given one",
+            "here": "BASE_PARAMS['learning_rate']",
+            "why": "CatBoost auto-selects the learning rate, and the value it picks moves with the budget: 0.5 at 2 iterations, 0.4273 at 100 and 0.06573 at 1000, measured on this machine on 2026-08-16 at 20,000 rows by 20 features. Leaving it alone would compare two different models and read the difference as engine quality",
+            "removed_when": "never, while this is a matched-rate column. CatBoost's own auto rate is worth a separate row and it is not this one"
+          },
+          "allow_writing_files": {
+            "stock": true,
+            "here": false,
+            "why": "CatBoost writes a training log and a learn_error.tsv into a catboost_info directory under the working directory during fit. That is filesystem work inside the timed region that neither of the other two engines does, so leaving it on charges CatBoost for writing a log. It is a deviation rather than a harness setting because it removes work, not output",
+            "removed_when": "the other two engines are also measured writing a per-round log, which no scenario here asks for"
+          }
+        },
+        "catboost_harness_settings": {
+          "logging_level": "keeps CatBoost's per-iteration output off the stdout stream that run.py parses for backend proof. CatBoost prints a progress table by default and that stream is read, not discarded",
+          "random_seed": "pins the fit so a repeat is a repeat"
+        },
+        "catboost_left_at_stock": {
+          "grow_policy": "SymmetricTree",
+          "depth": 6,
+          "max_leaves": 64,
+          "min_data_in_leaf": 1,
+          "l2_leaf_reg": 3,
+          "border_count": 254,
+          "feature_border_type": "GreedyLogSum",
+          "nan_mode": "Min",
+          "bootstrap_type": "MVS",
+          "subsample": 0.8,
+          "sampling_frequency": "PerTree",
+          "rsm": 1,
+          "random_strength": 1,
+          "score_function": "Cosine",
+          "leaf_estimation_method": "Newton",
+          "leaf_estimation_iterations": 1,
+          "leaf_estimation_backtracking": "AnyImprovement",
+          "boost_from_average": true,
+          "boosting_type": "Plain",
+          "model_shrink_rate": 0,
+          "model_shrink_mode": "Constant",
+          "model_size_reg": 0.5,
+          "penalties_coefficient": 1,
+          "sparse_features_conflict_fraction": 0.0,
+          "bayesian_matrix_reg": 0.1,
+          "posterior_sampling": false,
+          "random_score_type": "NormalWithModelSizeDecrease",
+          "task_type": "CPU"
+        },
+        "catboost_defaults_source": "catboost.CatBoost.get_all_params() on catboost 1.2.10, read 2026-08-16 after a two-iteration RMSE fit on 20,000 rows by 20 features, task_type CPU. Cross-read against catboost/core.py's Pool.quantize docstring for border_count, feature_border_type, nan_mode and sparse_features_conflict_fraction",
+        "catboost_min_version": "1.2",
+        "catboost_refused_params": {
+          "border_count": "the binning budget. Stock is 254 borders and it stays stock, for the same reason max_bin is not pinned on the LightGBM side",
+          "max_bin": "a synonym for border_count in CatBoost's own API",
+          "dev_max_subset_size_for_build_borders": "CatBoost's own bin-construction sample cap, which is the direct counterpart of bin_construct_sample_cnt. Deriving it from the row count is the defect this list exists for",
+          "dev_efb_max_buckets": "a bundling knob, and bundling is left at stock",
+          "sparse_features_conflict_fraction": "exclusive feature bundling. Stock is 0.0, which is off, and that matches enable_bundle=false on the LightGBM side; pinning it here would be pinning it to what it already is",
+          "used_ram_limit": "CatBoost changes its blocking and its quantization strategy under a memory cap, so a limit derived from the data size makes the engine do different work at different scales",
+          "min_data_in_leaf": "a leaf-population rule. The column is CatBoost's defaults and its default is 1. Raising it to this harness's shared 20 would make the arm neither CatBoost's defaults nor ours",
+          "min_child_samples": "a synonym for min_data_in_leaf",
+          "subsample": "CatBoost's default bootstrap is MVS at 0.8. Pinning the fraction makes the arm something other than CatBoost's defaults, and matching it to a bagging fraction on our side would be matching a number across two different sampling methods",
+          "thread_count": "set from the runner's thread count by catboost_params itself, exactly as num_threads is on the LightGBM side. A second source for it is how one arm ends up on a different core count from the other two"
+        },
+        "determinism": {
+          "flag": "CatBoost has no `deterministic` parameter. LightGBM does, which is why the comparator is stock+det. There is no CatBoost setting that asks the library for reproducible reductions",
+          "what_is_pinned": "thread_count, to the same number the other engines get, and random_seed, to the same 190019 the comparator uses. That is the whole of it",
+          "status": "seeded, not guaranteed",
+          "observed": "checked rather than assumed, and it held everywhere it was looked at. On catboost 1.2.10, 20,000 rows by 20 features, 100 iterations at learning_rate 0.1 and random_seed 1234, the prediction digest was identical across three in-process repeats, across three separate processes, and across thread_count 1, 2, 4 and 8",
+          "what_that_does_not_establish": "one shape, one loss, one machine, and no dataset with missing values or categorical features. Bit-identity observed at 20,000 rows is not bit-identity at 1,000,000, where the parallel reductions are wider. The digests are recorded per repeat exactly so this is measured on every run rather than inherited from this note",
+          "precedent": "LightGBM produced two distinct prediction digests across three repeats on sparse_highdim with deterministic=true already set and a fixed seed. A flag being set is not reproducibility on either side, which is why both arms record a digest per repeat",
+          "gating": "not gating. This is a peer column: nothing in thresholds.json measures anything against it, and verify.py's differential pairs mojotrees with lightgbm and does not see these rows"
+        },
+        "unmatchable": {
+          "tree_shape": "CatBoost grows symmetric (oblivious) trees of depth 6, where every node at a level shares one split. mojotrees grows leaf-wise by default and has depthwise as its only other policy (src/mojotrees/growth_policy.mojo); it has no symmetric policy at all. So the CatBoost-mode mojotrees arm is depthwise at depth 6, which is the nearest reachable shape and is NOT the same tree. A symmetric tree is strictly more constrained than a depthwise one at the same depth, so this difference is expected to cost CatBoost accuracy and save it time, and neither side of that is measured here",
+          "row_sampling": "CatBoost's default bootstrap_type is MVS with subsample 0.8, so it subsamples rows on every tree. LightGBM and mojotrees do not subsample at their defaults. MVS is minimum-variance sampling weighted by gradient magnitude, not uniform bagging, so mojotrees's bagging_fraction is not an emulation of it and the CatBoost-mode arm does not try. The CatBoost arm therefore sees about 80 percent of the rows per tree and the other two see all of them",
+          "split_scoring": "CatBoost's default score_function is Cosine and its random_strength is 1, which adds seeded random noise to every split score. LightGBM and mojotrees score splits by gain with no perturbation. No parameter makes these the same rule",
+          "leaf_population": "CatBoost's min_data_in_leaf default is 1 and this harness's shared value is 20. The CatBoost arm is left at 1 because the column is 'CatBoost defaults'; the CatBoost-mode mojotrees arm is set to 1 to match it, and the plain mojotrees arm stays at 20",
+          "missing_values": "CatBoost's nan_mode default is Min, which sends every missing numeric value to the low side. LightGBM and mojotrees learn a default direction per split. The categorical_missing scenario is where this would show, and that scenario does not run CatBoost for a separate reason: see CATBOOST_SCENARIO_SUPPORT",
+          "binning_budget": "CatBoost's border_count is a count of thresholds and LightGBM's max_bin is a count of bins, so CatBoost's default 254 borders and this harness's shared max_bin of 255 describe the same granularity budget. They do not describe the same binning: CatBoost's GreedyLogSum picks well under the budget on ordinary data (125, 113 and 101 borders on the first three features of a uniform 20,000 by 20 matrix, read 2026-08-16), while LightGBM and mojotrees fill it. Whether either side reserves a bin for missing values is not something this harness has established",
+          "learning_rate_precision": "CatBoost stores learning_rate as a 32-bit float. A matched rate of 0.1 resolves to 0.10000000149011612 in get_all_params(), so the rates are matched to float32 and not exactly",
+          "multiclass_tree_count": "CatBoost builds one tree per iteration with a vector leaf value for MultiClass, where LightGBM and mojotrees build one tree per class per iteration. tree_count_ is 100 for a 100-iteration CatBoost multiclass fit and 700 for a seven-class LightGBM one. The matched quantity is the iteration count; the tree counts in the records are not comparable numbers on that scenario",
+          "categorical_encoding": "CatBoost splits categorical features on ordered target statistics (CTR), which is a different algorithm from LightGBM's and mojotrees's category-set split and uses the label to build the feature. No scenario in this suite runs CatBoost with categorical features, so this is recorded as the reason the comparison was not attempted rather than as a caveat on a number"
+        },
+        "scenarios_not_run": {
+          "ranking": "CatBoost has no lambdarank. Its ranking losses are YetiRank, YetiRankPairwise, QueryRMSE and PairLogit, and none of them is the loss LightGBM and mojotrees are asked for here. Running one of them would put a third objective in a column headed by the other two's, so this scenario has no CatBoost row",
+          "categorical_missing": "the harness hands every engine one float64 matrix with the categorical columns integer-coded into it, and CatBoost refuses cat_features on a floating-point array outright: \"'data' is numpy array of floating point numerical type, it means no categorical features\". Handing CatBoost a converted copy would give it different bytes from the other two engines, which is the one thing worker.py's data digest exists to prevent. The generator also drops values inside two categorical columns, and CatBoost has no representation for a missing category: it would have to be encoded as a level, which is a modelling decision made by the harness. So this scenario has no CatBoost row until the loader can produce an integer-typed categorical block whose digest both sides agree on"
+        },
+        "cost_warnings": {
+          "sparse_highdim": "expected to be the expensive cell by a wide margin. CatBoost's rsm default is 1, so it considers every feature at every split, and it grows symmetric trees. The smoke tier, 3,983 rows by 2,000 features and 100 iterations, took 8.5 seconds of fit on two threads on 2026-08-16 while ingestion took 0.011. The standard tier is 100,000 rows by 50,000 features, which is 25 times each dimension, so this cell may approach or exceed run.py's 7200 second per-run timeout. That is a real property of CatBoost on high-dimensional sparse data and not a harness defect, but the matrix should be scheduled knowing it: a timed-out cell is an infrastructure failure and takes the whole run's exit code with it"
+        },
+        "rows": {
+          "us in CatBoost mode vs CatBoost defaults": "engine mojotrees_catboost_mode against engine catboost. The mojotrees side takes MOJOTREES_CATBOOST_MODE over BASE_PARAMS; the CatBoost side is unchanged between the two rows",
+          "our defaults vs CatBoost defaults": "engine mojotrees against engine catboost. The same mojotrees arm the comparator row uses, so one mojotrees record serves both the headline and this row"
+        },
+        "mojotrees_catboost_mode": {
+          "grow_policy": "depthwise",
+          "max_depth": 6,
+          "num_leaves": 64,
+          "min_data_in_leaf": 1,
+          "min_child_hess": 0.0,
+          "lambda_l1": 0.0,
+          "lambda_l2": 3.0
+        },
+        "mojotrees_catboost_mode_reasons": {
+          "grow_policy": "the nearest reachable shape to SymmetricTree, and not the same one. See CATBOOST_UNMATCHABLE['tree_shape']",
+          "max_depth": "CatBoost's depth default",
+          "num_leaves": "CatBoost's resolved max_leaves, which is 2**depth. Set so the leaf cap does not bind before the depth cap does",
+          "min_data_in_leaf": "CatBoost's min_data_in_leaf default",
+          "min_child_hess": "CatBoost has no minimum-hessian rule, so ours is turned off rather than left at 1e-3, which would be a constraint CatBoost is not under",
+          "lambda_l1": "CatBoost applies no L1 to leaf values at its defaults",
+          "lambda_l2": "CatBoost's l2_leaf_reg default of 3"
+        },
+        "matched": "tree count and learning rate. Both rows run the same number of boosting iterations and the same learning rate on both sides, because a comparison at different budgets is not a comparison and because CatBoost picks its own learning rate from the budget when it is not given one"
+      }
+    },
+    "peers_are_not_comparators": "the headline row is stock+det. Nothing under `peers` gates anything, nothing in thresholds.json is measured against it, and verify.py's differential pairs mojotrees with lightgbm and does not see the peer rows",
+    "phase_shape": {
+      "mojotrees": {
+        "ingest": "row-major to column-major transpose of the caller's array",
+        "binning": "Dataset.construct(), the quantile binning pass",
+        "train": "boosting rounds over an already binned matrix",
+        "e2e": "ingest + binning + train"
+      },
+      "lightgbm": {
+        "ingest": "not separable. LightGBM's ingestion is inside Dataset.construct() and it has always been counted in the binning phase",
+        "binning": "Dataset.construct(), which contains its ingestion",
+        "train": "boosting rounds over an already constructed Dataset",
+        "e2e": "binning + train"
+      },
+      "catboost": {
+        "ingest": "Pool(X, label=y): conversion of the caller's array into CatBoost's own object layout, and nothing else. The pool is not quantized when it returns",
+        "binning": "null. CatBoost bins inside fit, and pre-quantizing to separate it changes the model above a few hundred thousand rows",
+        "train": "fit(), which contains CatBoost's quantization",
+        "e2e": "ingest + train"
+      }
+    }
+  },
+  "environment": {
+    "collected_at_utc": "2026-08-16T13:05:26Z",
+    "hostname": "Mac",
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "cpu": {
+      "arch": "arm64",
+      "system": "Darwin",
+      "release": "25.5.0",
+      "model": "Apple M4",
+      "physical_cores": 10,
+      "logical_cores": 10,
+      "memory_bytes": 17179869184,
+      "performance_cores": 4,
+      "efficiency_cores": 6
+    },
+    "versions": {
+      "python": "3.14.6",
+      "numpy": "2.5.2",
+      "scipy": "1.18.0",
+      "lightgbm": "4.7.0",
+      "mojo": "Mojo 1.0.0 (ed45d567)",
+      "max": null
+    },
+    "git": {
+      "commit": "f15d10748eae768f5530069e74471d58cc24cf5c",
+      "branch": "cpu-round-1",
+      "dirty": true,
+      "describe": "v0.1.0a3-277-gf15d107-dirty"
+    },
+    "accelerator": {
+      "gpu_available": null,
+      "probe_error": "ModuleNotFoundError: No module named 'mojotrees'",
+      "backend": "metal"
+    },
+    "machine_state": {
+      "load_average_1m": 5.3251953125,
+      "on_battery": false,
+      "thermal_pressure": "Note: No CPU power status has been recorded"
+    },
+    "env": {
+      "MOJOTREES_NUM_WORKERS": null,
+      "MOJOTREES_PARALLEL_MIN_OPS": null,
+      "MOJOTREES_DISABLE_GPU": null,
+      "MOJOTREES_BENCH_DATA": null,
+      "OMP_NUM_THREADS": null,
+      "OPENBLAS_NUM_THREADS": null,
+      "MKL_NUM_THREADS": null,
+      "VECLIB_MAXIMUM_THREADS": null,
+      "NUMEXPR_NUM_THREADS": null
+    },
+    "argv": [
+      "bench/real_data/run.py",
+      "--scenario",
+      "imbalanced_binary",
+      "--scenario",
+      "multiclass",
+      "--engine",
+      "mojotrees",
+      "--device",
+      "cpu",
+      "--repeats",
+      "3",
+      "--tag",
+      "lam0-f64",
+      "--out",
+      "bench/results/cpu_float32_lambda0_2026-08-16"
+    ]
+  },
+  "jobs": [
+    {
+      "scenario": "imbalanced_binary",
+      "tier": "standard",
+      "variant": "auto",
+      "engine": "mojotrees",
+      "device": "cpu",
+      "threads": 10,
+      "repeat": 0,
+      "predict_repeats": 3,
+      "allow_unpinned": false,
+      "data_digest": true,
+      "backend_proof": true,
+      "job_index": 0
+    },
+    {
+      "scenario": "imbalanced_binary",
+      "tier": "standard",
+      "variant": "auto",
+      "engine": "mojotrees",
+      "device": "cpu",
+      "threads": 10,
+      "repeat": 1,
+      "predict_repeats": 3,
+      "allow_unpinned": false,
+      "data_digest": true,
+      "backend_proof": true,
+      "job_index": 1
+    },
+    {
+      "scenario": "imbalanced_binary",
+      "tier": "standard",
+      "variant": "auto",
+      "engine": "mojotrees",
+      "device": "cpu",
+      "threads": 10,
+      "repeat": 2,
+      "predict_repeats": 3,
+      "allow_unpinned": false,
+      "data_digest": true,
+      "backend_proof": true,
+      "job_index": 2
+    },
+    {
+      "scenario": "multiclass",
+      "tier": "standard",
+      "variant": "auto",
+      "engine": "mojotrees",
+      "device": "cpu",
+      "threads": 10,
+      "repeat": 0,
+      "predict_repeats": 3,
+      "allow_unpinned": false,
+      "data_digest": true,
+      "backend_proof": true,
+      "job_index": 3
+    },
+    {
+      "scenario": "multiclass",
+      "tier": "standard",
+      "variant": "auto",
+      "engine": "mojotrees",
+      "device": "cpu",
+      "threads": 10,
+      "repeat": 1,
+      "predict_repeats": 3,
+      "allow_unpinned": false,
+      "data_digest": true,
+      "backend_proof": true,
+      "job_index": 4
+    },
+    {
+      "scenario": "multiclass",
+      "tier": "standard",
+      "variant": "auto",
+      "engine": "mojotrees",
+      "device": "cpu",
+      "threads": 10,
+      "repeat": 2,
+      "predict_repeats": 3,
+      "allow_unpinned": false,
+      "data_digest": true,
+      "backend_proof": true,
+      "job_index": 5
+    }
+  ],
+  "sequential": true,
+  "note": "Runs are sequential. Timings from a run whose manifest says otherwise are timings of a contended machine."
+}

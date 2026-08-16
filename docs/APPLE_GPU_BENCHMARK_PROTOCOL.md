@@ -136,8 +136,10 @@ Parameter matching cannot make the engines identical, and the record does
 not pretend otherwise. Every measurement carries a `comparability` list
 naming the differences that survive:
 
-- LightGBM's `min_data_in_bin=3` has no mojotrees equivalent, so bin edges
-  can differ.
+- `min_data_in_bin=3` is LightGBM's default and is mojotrees's default too
+  now, so it is no longer one of these differences. Bin edges can still
+  differ above 200000 rows, because both engines fit their edges from a
+  sample of that size and the two samples are not the same rows.
 - LightGBM's exclusive feature bundling is forced off, because mojotrees
   has none.
 - XGBoost grows depth-wise by default; leaf-wise growth is approximated

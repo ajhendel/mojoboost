@@ -939,6 +939,30 @@ def test_ranker_validation_relevance_is_checked() raises:
         )
 
 
+def _wide_rank_features() -> List[Float64]:
+    """`_rank_features` with three queries instead of two.
+
+    The raw entry points bin their own features, so a fixture handed to one
+    of them is subject to the binner's stock `min_data_in_bin` of 3, and the
+    two-query version puts only two rows behind each of its four feature
+    levels -- so the binner merges them in pairs and the model can no longer
+    tell grade 0 from grade 1. Three queries put three rows behind each
+    level, which is the population the stock rule asks for, and the four
+    levels survive as four bins. The fixture is widened rather than the
+    binner pinned because what this test is about is that the raw entry
+    points bin at all, and it should say so at the defaults a user gets.
+    """
+    return [0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0]
+
+
+def _wide_rank_labels() -> List[Int]:
+    return [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]
+
+
+def _wide_rank_targets() -> List[Float64]:
+    return [0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0]
+
+
 def test_raw_feature_entry_points_bin_their_validation_sets() raises:
     def logloss(
         metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
@@ -967,7 +991,7 @@ def test_raw_feature_entry_points_bin_their_validation_sets() raises:
     var probs = fitted.model.predict_proba(row)
     assert_true(probs[1] > probs[0] and probs[1] > probs[2])
 
-    var valid_groups = groups_from_counts([4, 4])
+    var valid_groups = groups_from_counts([4, 4, 4])
 
     def ndcg_metric(
         metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
@@ -978,23 +1002,26 @@ def test_raw_feature_entry_points_bin_their_validation_sets() raises:
         return ndcg(pred, grades, valid_groups, 3)
 
     var rank_valid: List[RawValidSet] = [
-        RawValidSet("valid", _rank_features(), 8, _rank_targets())
+        RawValidSet("valid", _wide_rank_features(), 12, _wide_rank_targets())
     ]
     var rank_metrics: List[CustomMetric] = [
         CustomMetric("ndcg", higher_is_better=True)
     ]
     var ranked = fit_ranker_with_metrics(
-        _rank_features(),
-        8,
+        _wide_rank_features(),
+        12,
         1,
-        _rank_labels(),
-        [4, 4],
+        _wide_rank_labels(),
+        [4, 4, 4],
         rank_valid^,
         _params(20),
         MetricSuite(rank_metrics^, ndcg_metric, 0),
         early_stopping_rounds=3,
     )
-    assert_true(abs(ranked.best_score - 1.0) < 1e-12)
+    # Exactly 1.0, not close to it: an ideal ordering makes every query's
+    # `dcg / best` the identical quotient of identical sums, and three of
+    # those over three queries is 3.0 / 3.0.
+    assert_equal(ranked.best_score, 1.0)
     var top: List[Float64] = [3.0]
     var bottom: List[Float64] = [0.0]
     assert_true(

@@ -55,6 +55,8 @@ from .validation import check_booster_ranges, check_max_bin
 from .growth_policy import parse_grow_policy
 from .tree_parameters_extra import (
     check_extra_option_supported,
+    check_feature_pre_filter,
+    parse_derivative_precision,
     parse_monotone_method,
 )
 
@@ -71,16 +73,23 @@ comptime SUPPORTED_KEYS = String(
     " min_data_in_leaf, min_sum_hessian_in_leaf, lambda_l1, lambda_l2,"
     " max_depth, grow_policy, feature_fraction, feature_fraction_bynode,"
     " feature_fraction_bylevel, feature_fraction_seed, min_gain_to_split,"
-    " max_delta_step, path_smooth, extra_trees, extra_seed,"
+    " max_delta_step, path_smooth, extra_trees, extra_seed, random_strength,"
     " monotone_penalty, monotone_constraints_method, cegb_tradeoff,"
     " cegb_penalty_split, linear_tree, linear_lambda, enable_bundle,"
-    " max_conflict_rate,"
+    " max_conflict_rate, feature_pre_filter,"
     " data_sample_strategy, max_bin, alpha, fair_c,"
-    " tweedie_variance_power, device, use_missing"
+    " tweedie_variance_power, device, use_missing,"
+    " use_quantized_grad, num_grad_quant_bins, quant_train_renew_leaf,"
+    " stochastic_rounding, leaf_estimation_iterations,"
+    " derivative_precision"
 )
 
-# Parameters that name a real LightGBM feature this parser does not cover,
-# reported as unsupported instead of as unknown so the message can say why.
+# Parameters that name a real feature this parser does not cover, reported as
+# unsupported instead of as unknown so the message can say why. Almost all of
+# them are LightGBM's; `bootstrap_type`, `bagging_temperature` and
+# `bootstrap_seed` are CatBoost's Bayesian bootstrap (`sampling.mojo`), which
+# needs a `BayesianBootstrapParams` handed to a trainer exactly as GOSS needs a
+# `GossParams`, so a parameter string cannot select it either.
 #
 # `feature_contri`, `cegb_penalty_feature_coupled`, and
 # `cegb_penalty_feature_lazy` are per-feature vectors, which a
@@ -98,7 +107,8 @@ comptime _MOJO_API_ONLY = String(
     " label_gain sigmoid eval_at ndcg_eval_at class_weight is_unbalance"
     " unbalance unbalanced_sets scale_pos_weight feature_contri"
     " feature_contrib fc fp feature_penalty cegb_penalty_feature_coupled"
-    " cegb_penalty_feature_lazy"
+    " cegb_penalty_feature_lazy bootstrap_type bagging_temperature"
+    " bootstrap_seed"
 )
 
 
@@ -545,6 +555,86 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.extra.extra_trees = _parse_bool(key, value)
         elif key == "extra_seed":
             config.booster.tree.extra.extra_seed = _parse_int(key, value)
+        # CatBoost's `random_strength`, the only name on this surface that is
+        # not LightGBM's. 0.0, the default, is LightGBM's behavior exactly. A
+        # positive value parses and then fails validation with a sentence
+        # naming what is missing (`ExtraTreeParams.check_random_strength`),
+        # which is the same refuse-rather-than-ignore path
+        # `use_quantized_grad` takes below: the noise needs a per-tree scale
+        # off the ensemble's gradients that no trainer computes in this
+        # build, and a split search cannot reconstruct it from a histogram.
+        elif key == "random_strength":
+            config.booster.tree.extra.random_strength = _parse_f64(key, value)
+        # CatBoost's `leaf_estimation_iterations`, the second name here that
+        # is not LightGBM's. 1, the default, is LightGBM's behavior exactly:
+        # one Newton step per leaf. It parses and is range-checked, so a
+        # configuration that spells out the setting mojotrees matches ports
+        # across unchanged.
+        #
+        # A value above 1 parses and is then refused, by the same
+        # refuse-rather-than-ignore rule `random_strength` and
+        # `use_quantized_grad` take, for a reason particular to this surface:
+        # a parameter string is the entry point for `cli/`, for every
+        # `bindings/_mojotrees.mojo` fit including the sparse, custom,
+        # multiclass, ranking and GPU ones, and for the sklearn wrapper, while
+        # `boosting._estimate_leaf_values` is reached only from the dense
+        # single-output CPU trainers. A string accepted here would therefore
+        # be honored by some fits and silently dropped by most, which is worse
+        # than either. The Mojo API route named in the message is exact and is
+        # not refused.
+        elif key == "leaf_estimation_iterations":
+            var iters = _parse_int(key, value)
+            if iters > 1:
+                raise Error(
+                    "leaf_estimation_iterations > 1 cannot be set from a"
+                    " parameter string: this string reaches the sparse,"
+                    " custom-objective, multiclass, ranking and GPU trainers,"
+                    " none of which implement extra Newton steps, so it would"
+                    " be honored by some fits and dropped by others. Set it"
+                    " from the Mojo API instead, on"
+                    " TreeParams.extra.leaf_estimation_iterations, which"
+                    " boosting.train, boosting.train_more and"
+                    " boosting.train_with_valid honor and every other trainer"
+                    " refuses by name"
+                )
+            config.booster.tree.extra.leaf_estimation_iterations = iters
+        # LightGBM's quantized-training family. The four names and no others:
+        # LightGBM has no scale-rule, seed, or accumulator-width parameter,
+        # and this surface is exactly LightGBM's, so mojotrees's three extra
+        # decisions are `MOJOTREES_*` environment overrides instead of keys.
+        # `use_quantized_grad=true` parses and then fails validation with a
+        # sentence naming what is missing (`ExtraTreeParams.
+        # check_quantized_grad`), which is the package's refuse-rather-than-
+        # ignore rule; it is not accepted here and dropped later.
+        elif key == "use_quantized_grad":
+            config.booster.tree.extra.use_quantized_grad = _parse_bool(
+                key, value
+            )
+        elif key == "num_grad_quant_bins":
+            config.booster.tree.extra.num_grad_quant_bins = _parse_int(
+                key, value
+            )
+        elif key == "quant_train_renew_leaf":
+            config.booster.tree.extra.quant_train_renew_leaf = _parse_bool(
+                key, value
+            )
+        elif key == "stochastic_rounding":
+            config.booster.tree.extra.stochastic_rounding = _parse_bool(
+                key, value
+            )
+        # `derivative_precision`, which is not a LightGBM parameter name:
+        # LightGBM fixes the same choice at compile time with
+        # `SCORE_T_USE_DOUBLE`. It is a key rather than a `MOJOTREES_*`
+        # override because it changes a fit's numbers, which is where this
+        # package draws that line. `float32` is the default and is LightGBM's
+        # profile; `float64` parses and then fails validation with a sentence
+        # naming the environment variable that does reach the trainer
+        # (`ExtraTreeParams.check_derivative_precision`), which is the same
+        # refuse-rather-than-ignore path `use_quantized_grad` takes above.
+        elif key == "derivative_precision":
+            config.booster.tree.extra.derivative_precision = (
+                parse_derivative_precision(value)
+            )
         elif (
             key == "monotone_penalty"
             or key == "monotone_splits_penalty"
@@ -585,6 +675,19 @@ def parse_params(spec: String) raises -> TrainConfig:
             # waits for `_validate`, because `device=` may be named after this
             # key in the same string.
             config.booster.bundling.enabled = _parse_bool(key, value)
+        elif key == "feature_pre_filter":
+            # `false` is not an unimplemented option, it is the option
+            # mojotrees implements: LightGBM prefilters at Dataset
+            # construction, and our split search rejects the same candidates
+            # as it scans. `true` is still refused, because prefiltering also
+            # removes features from the pool `feature_fraction` samples and so
+            # can change the trees rather than only their cost.
+            #
+            # This branch exists so the name reaches its own checker. Without
+            # it the key falls through to the unknown-key path and reports
+            # `unknown parameter 'feature_pre_filter'`, which is a worse
+            # message than the explicit refusal it replaced.
+            check_feature_pre_filter(_parse_bool(key, value))
         elif key == "max_conflict_rate":
             config.booster.bundling.params.max_conflict_rate = _parse_f64(
                 key, value

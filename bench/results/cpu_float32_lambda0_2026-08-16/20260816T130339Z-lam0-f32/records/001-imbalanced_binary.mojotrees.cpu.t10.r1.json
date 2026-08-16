@@ -1,0 +1,404 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "run_id": "20260816T130339Z-lam0-f32",
+  "job_index": 1,
+  "repeat": 1,
+  "scenario": "imbalanced_binary",
+  "scenario_title": "Imbalanced binary classification",
+  "tier": "standard",
+  "task": "binary",
+  "primary_metric": "average_precision",
+  "threads": 10,
+  "data": {
+    "dataset": "generated:imbalanced_binary",
+    "data_kind": "synthetic",
+    "pinned": true,
+    "generator": "imbalanced_binary",
+    "generator_kwargs": {
+      "n_rows": 300000,
+      "n_features": 40,
+      "positive_rate": 0.005
+    },
+    "task": "binary",
+    "split": {
+      "kind": "hash",
+      "train_fraction": 0.8,
+      "seed": 1900
+    },
+    "fallback_reason": "/private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1/bench/real_data/data/bank_marketing.zip is not on disk",
+    "train": {
+      "rows": 239807,
+      "features": 40,
+      "sparse": false,
+      "digest": "2795f0916cbf40c66e4d11f80cd7772d194207e6b1bacf0430bb7b9bfe2edb7c",
+      "missing_fraction": 0.0,
+      "label_mean": 0.004979003949008995,
+      "label_distinct": 2
+    },
+    "test": {
+      "rows": 60193,
+      "features": 40,
+      "sparse": false,
+      "digest": "58d34b3ae6d4c1b6f15d2d6071fadeb2a14c0991a369e488f43b2aebcfcc8f49",
+      "missing_fraction": 0.0
+    }
+  },
+  "params": {
+    "shared": {
+      "num_leaves": 31,
+      "max_depth": -1,
+      "learning_rate": 0.1,
+      "n_estimators": 100,
+      "min_data_in_leaf": 20,
+      "min_child_hess": 0.001,
+      "lambda_l1": 0.0,
+      "max_bin": 255,
+      "use_missing": true,
+      "objective": "binary"
+    },
+    "engine": {
+      "objective": "binary",
+      "num_leaves": 31,
+      "max_depth": -1,
+      "learning_rate": 0.1,
+      "min_data_in_leaf": 20,
+      "min_child_hess": 0.001,
+      "lambda_l1": 0.0,
+      "device": "cpu",
+      "n_estimators": 100
+    },
+    "dataset": {
+      "max_bin": 255,
+      "use_missing": true
+    },
+    "dataset_unavailable_reason": null,
+    "num_boost_round": 100
+  },
+  "caveats": [
+    "The real variant, bank_marketing, has ten categorical columns. They are passed as categorical to both engines, so this scenario overlaps with categorical_missing on real data. The synthetic variant is purely numeric and does not.",
+    "comparator stock+det@v2: LightGBM at stock defaults plus deterministic=true. This arm answers nothing to LightGBM's deterministic: mojotrees is reproducible across thread counts with no parameter and no cost, which is why that is the setting the comparator carries."
+  ],
+  "quality": {
+    "auc": 0.7147968615010354,
+    "average_precision": 0.010217821470117973,
+    "logloss": 0.032001055031077384
+  },
+  "baseline_quality": {
+    "auc": 0.5,
+    "average_precision": 0.004660158724222434,
+    "logloss": 0.02945798054688888
+  },
+  "predictions_sha256": "231689d6ad40433dba8ffea2ccd2e28d765acfdedac3ac01ecb5a49d946e8d4e",
+  "predictions_shape": [
+    60193
+  ],
+  "backend_proof": {
+    "source": "MOJOTREES_PHASE_PROFILE",
+    "requested": true,
+    "mode": "async",
+    "unavailable_reason": "the trainer printed its profile to this process's stdout; run.py parses it into this field"
+  },
+  "warmup": {
+    "elapsed_s": 0.0018834169604815543,
+    "cpu_s": 0.004819999999999991,
+    "parallel_efficiency": 2.5591783981639455
+  },
+  "engine": "mojotrees",
+  "engine_version": "0.1.0",
+  "device_requested": "cpu",
+  "device_used": "cpu",
+  "path": "dataset",
+  "phases": {
+    "import": {
+      "elapsed_s": 0.03628674999345094,
+      "cpu_s": 0.013913999999999982,
+      "parallel_efficiency": 0.3834457481728507
+    },
+    "binning": {
+      "elapsed_s": 0.03284562501357868,
+      "cpu_s": 0.10639400000000004,
+      "parallel_efficiency": 3.239213744783842
+    },
+    "train": {
+      "elapsed_s": 2.0838666670024395,
+      "cpu_s": 8.054641,
+      "parallel_efficiency": 3.8652381784033647
+    },
+    "predict_batch": {
+      "warmup": [
+        {
+          "elapsed_s": 0.3662317499984056,
+          "cpu_s": 0.37048200000000087,
+          "parallel_efficiency": 1.011605356448789
+        }
+      ],
+      "measured": [
+        {
+          "elapsed_s": 0.32331641600467265,
+          "cpu_s": 0.32684400000000124,
+          "parallel_efficiency": 1.0109106244555106
+        },
+        {
+          "elapsed_s": 0.30086162500083447,
+          "cpu_s": 0.3043800000000001,
+          "parallel_efficiency": 1.0116943295747867
+        },
+        {
+          "elapsed_s": 0.33767216600244865,
+          "cpu_s": 0.34250000000000114,
+          "parallel_efficiency": 1.0142973999151517
+        }
+      ]
+    },
+    "predict_row": {
+      "warmup": [
+        {
+          "elapsed_s": 0.0003679160145111382,
+          "cpu_s": 0.0008540000000003545,
+          "parallel_efficiency": 2.3211819173870203
+        },
+        {
+          "elapsed_s": 0.00018233299488201737,
+          "cpu_s": 0.00018300000000159855,
+          "parallel_efficiency": 1.003658170151885
+        }
+      ],
+      "measured": [
+        {
+          "elapsed_s": 0.00016729201888665557,
+          "cpu_s": 0.0010760000000011871,
+          "parallel_efficiency": 6.431866906515149
+        },
+        {
+          "elapsed_s": 6.962503539398313e-05,
+          "cpu_s": 0.000204000000000093,
+          "parallel_efficiency": 2.9299805572195416
+        },
+        {
+          "elapsed_s": 4.6083994675427675e-05,
+          "cpu_s": 0.00010400000000032605,
+          "parallel_efficiency": 2.256748806886301
+        },
+        {
+          "elapsed_s": 4.21669683419168e-05,
+          "cpu_s": 8.499999999855845e-05,
+          "parallel_efficiency": 2.0157958549290047
+        },
+        {
+          "elapsed_s": 4.1624996811151505e-05,
+          "cpu_s": 0.00032500000000013074,
+          "parallel_efficiency": 7.807808405959131
+        },
+        {
+          "elapsed_s": 3.69579647667706e-05,
+          "cpu_s": 0.00012199999999928934,
+          "parallel_efficiency": 3.3010475757848323
+        },
+        {
+          "elapsed_s": 3.995798761025071e-05,
+          "cpu_s": 7.899999999949614e-05,
+          "parallel_efficiency": 1.9770765427443522
+        },
+        {
+          "elapsed_s": 4.412501584738493e-05,
+          "cpu_s": 9.199999999864872e-05,
+          "parallel_efficiency": 2.0849850868461752
+        },
+        {
+          "elapsed_s": 3.908301005139947e-05,
+          "cpu_s": 8.00000000005241e-05,
+          "parallel_efficiency": 2.0469252469375627
+        },
+        {
+          "elapsed_s": 4.029198316857219e-05,
+          "cpu_s": 8.100000000155205e-05,
+          "parallel_efficiency": 2.010325470023828
+        },
+        {
+          "elapsed_s": 4.75830165669322e-05,
+          "cpu_s": 0.0005839999999999179,
+          "parallel_efficiency": 12.273286608015695
+        },
+        {
+          "elapsed_s": 4.2458006646484137e-05,
+          "cpu_s": 0.00035100000000021225,
+          "parallel_efficiency": 8.266991969800303
+        },
+        {
+          "elapsed_s": 3.5959004890173674e-05,
+          "cpu_s": 0.00017000000000066962,
+          "parallel_efficiency": 4.727605797765683
+        },
+        {
+          "elapsed_s": 3.533298149704933e-05,
+          "cpu_s": 7.300000000043383e-05,
+          "parallel_efficiency": 2.066058308906937
+        },
+        {
+          "elapsed_s": 3.929203376173973e-05,
+          "cpu_s": 7.500000000071338e-05,
+          "parallel_efficiency": 1.9087838633016745
+        },
+        {
+          "elapsed_s": 5.41249755769968e-05,
+          "cpu_s": 0.00022199999999905629,
+          "parallel_efficiency": 4.101618478944989
+        },
+        {
+          "elapsed_s": 4.2417028453201056e-05,
+          "cpu_s": 0.0001390000000007774,
+          "parallel_efficiency": 3.2769858019200204
+        },
+        {
+          "elapsed_s": 6.799999391660094e-05,
+          "cpu_s": 0.0004170000000005558,
+          "parallel_efficiency": 6.132353489795724
+        },
+        {
+          "elapsed_s": 6.550003308802843e-05,
+          "cpu_s": 0.00014799999999937086,
+          "parallel_efficiency": 2.259540843291896
+        },
+        {
+          "elapsed_s": 3.679102519527078e-05,
+          "cpu_s": 9.099999999939712e-05,
+          "parallel_efficiency": 2.4734293082731087
+        }
+      ]
+    }
+  },
+  "histogram_builder": {
+    "requested": "feature_major",
+    "resolved": "feature_major",
+    "recorded": "resolved; mojotrees has one histogram construction and no parameter to select another"
+  },
+  "model": {
+    "num_trees": 100,
+    "current_iteration": 100,
+    "num_bin": 255,
+    "bins": {
+      "n_features": 40,
+      "total": 10200,
+      "max": 255,
+      "min": 255,
+      "mean": 255.0,
+      "sha256": "043135be12ca8f31940d762bbf633b661a47e1e5584572ac431ff591939882b4",
+      "counts": [
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255
+      ],
+      "counts_truncated": false
+    },
+    "size": {
+      "string_bytes": 623666,
+      "file_bytes": 623666,
+      "error": null,
+      "file_sha256": "de8cc3e2208e99cb46df56cfa27a3803e24cb42ea531e0638d1fa4a8a193be88"
+    }
+  },
+  "transfers": {
+    "value": null,
+    "unavailable_reason": "mojotrees does not expose host-to-device transfer time to Python. Instrumenting it is a change to src/mojotrees/histogram_gpu.mojo and train_gpu.mojo, listed in the handoff."
+  },
+  "peak_rss_bytes": 597344256,
+  "predictions_path": "001-imbalanced_binary.mojotrees.cpu.t10.r1.npy",
+  "environment": {
+    "collected_at_utc": "2026-08-16T13:03:48Z",
+    "hostname": "Mac",
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "cpu": {
+      "arch": "arm64",
+      "system": "Darwin",
+      "release": "25.5.0",
+      "model": "Apple M4",
+      "physical_cores": 10,
+      "logical_cores": 10,
+      "memory_bytes": 17179869184,
+      "performance_cores": 4,
+      "efficiency_cores": 6
+    },
+    "versions": {
+      "python": "3.14.6",
+      "numpy": "2.5.2",
+      "scipy": "1.18.0",
+      "lightgbm": "4.7.0",
+      "mojo": "Mojo 1.0.0 (ed45d567)",
+      "max": null
+    },
+    "git": {
+      "commit": "f15d10748eae768f5530069e74471d58cc24cf5c",
+      "branch": "cpu-round-1",
+      "dirty": true,
+      "describe": "v0.1.0a3-277-gf15d107-dirty"
+    },
+    "accelerator": {
+      "gpu_available": false,
+      "probe_error": null,
+      "backend": "metal"
+    },
+    "machine_state": {
+      "load_average_1m": 4.4794921875,
+      "on_battery": false,
+      "thermal_pressure": "Note: No CPU power status has been recorded"
+    },
+    "env": {
+      "MOJOTREES_NUM_WORKERS": "10",
+      "MOJOTREES_PARALLEL_MIN_OPS": null,
+      "MOJOTREES_DISABLE_GPU": "1",
+      "MOJOTREES_BENCH_DATA": null,
+      "OMP_NUM_THREADS": "10",
+      "OPENBLAS_NUM_THREADS": "10",
+      "MKL_NUM_THREADS": "10",
+      "VECLIB_MAXIMUM_THREADS": "10",
+      "NUMEXPR_NUM_THREADS": "10"
+    },
+    "argv": [
+      "/private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1/bench/real_data/worker.py",
+      "--job",
+      "bench/results/cpu_float32_lambda0_2026-08-16/20260816T130339Z-lam0-f32/jobs/001-imbalanced_binary.mojotrees.cpu.t10.r1.json",
+      "--out",
+      "bench/results/cpu_float32_lambda0_2026-08-16/20260816T130339Z-lam0-f32/records/001-imbalanced_binary.mojotrees.cpu.t10.r1.json",
+      "--predictions",
+      "bench/results/cpu_float32_lambda0_2026-08-16/20260816T130339Z-lam0-f32/predictions/001-imbalanced_binary.mojotrees.cpu.t10.r1.npy"
+    ]
+  }
+}

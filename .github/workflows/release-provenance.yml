@@ -124,6 +124,13 @@ jobs:
 
       - name: Build and test the wheel
         env:
+          # Stated rather than relied on. packaging/build_target.sh already
+          # defaults to `baseline`, and this line is here so that a reader of
+          # the release workflow can see which CPU the published artifact is
+          # compiled for without opening another file. `native` here would
+          # publish a wheel compiled for this runner's CPU; on the self-hosted
+          # M4 that means +bf16, +i8mm and +sme2, none of which exists on an M1.
+          MOJOTREES_BUILD_TARGET: baseline
           MOJOTREES_MACOS_TARGET: ${{ inputs.macos_target }}
         run: packaging/macos/build_release_wheel.sh
 

@@ -1,0 +1,59 @@
+==================================================================
+ARM: C1 baseline 250000 x 50, cpu+lightgbm interleaved, 5 repeats, lgbm 10 threads
+CMD: pixi run -e bench bench-train-gpu 250000 50 reg 5 cpu,lightgbm
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 02:57:31 EDT
+--- box state BEFORE ---
+ 2:57  up 5 days, 17:46, 1 user, load averages: 4.38 2.94 2.57
+top processes by cpu:
+ 20.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.4 claude
+  5.2 /Applications/Visual Studio Code.app/Contents/MacOS/Code
+other mojo/pixi builds running:
+--- output ---
+✨ Pixi task (bench-train-gpu in bench): mojo run -I src bench/bench_train_gpu.mojo 250000 50 reg 5 cpu,lightgbm
+mojotrees gpu-vs-cpu bench: 250000 rows x 50 features, reg seed 0
+binning_s: 0.04188
+arms: cpu,lightgbm
+repeats: 5
+lightgbm_threads: 10
+lightgbm_binning_s: 0.24229683401063085
+lightgbm_params: bin_construct_sample_cnt=250000 boost_from_average=True enable_bundle=False feature_pre_filter=False force_row_wise=True lambda_l1=0.0 lambda_l2=1.0 learning_rate=0.1 max_bin=255 max_depth=-1 min_data_in_bin=1 min_data_in_leaf=20 min_gain_to_split=0.0 min_sum_hessian_in_leaf=0.001 num_leaves=31 num_threads=10 objective=regression seed=190019 use_missing=True verbose=-1 verbosity=-1 zero_as_missing=False
+run 1 cpu train_s: 1.944605
+run 1 lightgbm train_s: 1.071996
+run 2 cpu train_s: 1.649185
+run 2 lightgbm train_s: 1.087441
+run 3 cpu train_s: 1.661251
+run 3 lightgbm train_s: 1.098412
+run 4 cpu train_s: 1.665806
+run 4 lightgbm train_s: 1.050375
+run 5 cpu train_s: 1.693058
+run 5 lightgbm train_s: 1.059293
+cpu_train_s_samples: 1.944605 1.649185 1.661251 1.665806 1.693058
+cpu_train_s: 1.649185
+cpu_train_s_median: 1.665806
+cpu_train_s_max: 1.944605
+cpu_spread_pct: 17.9
+cpu_spread_pct_of_median: 17.7
+cpu_n_trees: 100
+cpu_train_loss: 0.0035767495276741723
+lightgbm_train_s_samples: 1.071996 1.087441 1.098412 1.050375 1.059293
+lightgbm_train_s: 1.050375
+lightgbm_train_s_median: 1.071996
+lightgbm_train_s_max: 1.098412
+lightgbm_spread_pct: 4.6
+lightgbm_spread_pct_of_median: 4.5
+lightgbm_n_trees: 100
+lightgbm_train_loss: 0.0036040838861823286
+lightgbm_speedup_x: 1.5700916339402593
+lightgbm_vs_cpu: resolved delta_pct -36.3 noise_floor_pct 17.9
+json_summary: {"n_rows":250000,"n_features":50,"objective":"reg","n_classes":0,"seed":0,"repeats":5,"binning_s":0.04188,"arms":[{"name":"cpu","samples_s":[1.944605,1.649185,1.661251,1.665806,1.693058],"min_s":1.649185,"median_s":1.665806,"max_s":1.944605,"spread_pct_of_min":17.9,"spread_pct_of_median":17.7,"n_trees":100,"train_loss":0.0035767495276741723},{"name":"lightgbm","samples_s":[1.071996,1.087441,1.098412,1.050375,1.059293],"min_s":1.050375,"median_s":1.071996,"max_s":1.098412,"spread_pct_of_min":4.6,"spread_pct_of_median":4.5,"n_trees":100,"train_loss":0.0036040838861823286}],"comparisons":[{"arm":"lightgbm","baseline":"cpu","speedup_x":1.5700916339402593,"delta_pct":-36.3,"noise_floor_pct":17.9,"verdict":"resolved"}],"lightgbm":{"threads":10,"binning_s":0.24229683401063085,"params":"bin_construct_sample_cnt=250000 boost_from_average=True enable_bundle=False feature_pre_filter=False force_row_wise=True lambda_l1=0.0 lambda_l2=1.0 learning_rate=0.1 max_bin=255 max_depth=-1 min_data_in_bin=1 min_data_in_leaf=20 min_gain_to_split=0.0 min_sum_hessian_in_leaf=0.001 num_leaves=31 num_threads=10 objective=regression seed=190019 use_missing=True verbose=-1 verbosity=-1 zero_as_missing=False"}}
+--- box state AFTER ---
+ 2:57  up 5 days, 17:47, 1 user, load averages: 4.51 3.06 2.62
+top processes by cpu:
+ 11.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  2.9 claude
+  1.7 claude
+other mojo/pixi builds running:
+finished: 2026-08-16 02:57:52 EDT  exit=0
+

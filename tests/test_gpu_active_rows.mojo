@@ -774,13 +774,13 @@ def _range_histogram_case(strategy: Int) raises:
         for i in range(hist_size):
             # Counts are exact integers on both sides.
             assert_equal(
-                Int(src.unsafe_load(2 * hist_size + i)), want.count[i]
+                Int(src.unsafe_load(2 * hist_size + i)), want.count_at(i)
             )
-            total_count += want.count[i]
+            total_count += want.count_at(i)
             var got_g = Float64(src.unsafe_load(i)) * g_inv
             var got_h = Float64(src.unsafe_load(hist_size + i)) * h_inv
-            assert_true(abs(got_g - want.grad[i]) < 1e-3)
-            assert_true(abs(got_h - want.hess[i]) < 1e-3)
+            assert_true(abs(got_g - want.grad_at(i)) < 1e-3)
+            assert_true(abs(got_h - want.hess_at(i)) < 1e-3)
         # Every row of the node landed in exactly one bin of every feature.
         assert_equal(total_count, len(node_rows) * n_features)
 

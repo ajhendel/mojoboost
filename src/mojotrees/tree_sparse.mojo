@@ -498,14 +498,14 @@ def _node_histogram(
         return raw^
     var out = Histogram.zeroed(bundles.n_features, bundles.source_bins(data))
     expand_bundled_histogram(
-        out.grad,
-        out.hess,
-        out.count,
+        out._grad,
+        out._hess,
+        out._count,
         out.n_bins,
         bundles.plan,
-        raw.grad,
-        raw.hess,
-        raw.count,
+        raw._grad,
+        raw._hess,
+        raw._count,
         raw.n_bins,
         features,
     )

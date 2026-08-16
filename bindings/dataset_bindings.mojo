@@ -33,6 +33,7 @@ from std.python import PythonObject
 from binding_support import (
     csc_from_params,
     f64_buffer,
+    f64_view,
     flag,
     index_within,
     int_buffer,
@@ -46,7 +47,6 @@ from binding_support import (
 )
 
 from mojotrees.efb import feature_bin_count
-from mojotrees.raw_data import RawData
 from mojotrees.trainset import Dataset
 
 
@@ -169,13 +169,20 @@ def dataset_create_reference(
     This is the wrong constructor for a cross-validation fold, whose
     held-out rows must not have shaped the binning. `dataset_subset` with
     `shared_binning=0` is that one.
+
+    The matrix is borrowed rather than copied, on the contract
+    `binding_support.f64_view` states: `basic.Dataset` holds the array it took
+    the address of for the whole synchronous call, and the reference's mapper
+    only reads it. `keep_raw` still copies, because that is the caller asking
+    the dataset to outlive their buffer.
     """
     var ref_dataset = reference.downcast_value_ptr[Dataset]()
     var nr = Int(py=n_rows)
     var nf = ref_dataset[].num_feature()
-    var dataset = Dataset.from_reference(
+    var dataset = Dataset.from_reference_dense(
         ref_dataset[],
-        RawData.dense(f64_buffer(Int(py=x_addr), nr * nf), nr, nf),
+        f64_view(Int(py=x_addr), nr * nf),
+        nr,
         _optional_column(params, "label_addr", nr),
         _optional_column(params, "weight_addr", nr),
         _group_counts(params),

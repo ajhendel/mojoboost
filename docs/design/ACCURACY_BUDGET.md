@@ -1,11 +1,24 @@
 # The accuracy budget: what bit-identity was hiding, and what each relaxation costs
 
-Status (Aug 15 2026): a design document. Nothing described here is
-implemented, and no production code was written or run to produce it. Every
-number below comes from standalone numerical experiments in NumPy, written
-for this document, described in section 3, and reproducible from the scripts
-named there. Nothing here is a measurement of mojotrees. The distinction
-matters throughout and is marked at every claim.
+Status (Aug 15 2026, revised Aug 16 2026): a design document. Nothing
+described here is implemented, and no production code was written or run to
+produce it. Every number below comes from standalone numerical experiments in
+NumPy, written for this document and described in section 3. Nothing here is a
+measurement of mojotrees. The distinction matters throughout and is marked at
+every claim.
+
+One correction to the paragraph above, which said the experiments were
+"reproducible from the scripts named there". They are not. Section 3 states
+that the scripts live "under `.exp/` in this worktree and are not committed",
+and there is no `.exp/` directory on any branch of this repository. The
+experiments are reproducible from section 3's *descriptions*, by rebuilding
+them, which is a weaker claim and the true one. Section 5's subsection on the
+`+0.08 percent` figure works through what that costs in one specific case.
+
+The Aug 16 revision added the provenance labels and the spending rule at the
+end of section 1, the quotation of `thresholds.json`'s preamble, the
+provenance subsection in section 5, and candidate 3b in section 6.1. Nothing
+in the original analysis was withdrawn.
 
 Toolchain and hardware are irrelevant to almost everything here, because
 almost everything here is IEEE-754 arithmetic that any conforming
@@ -32,6 +45,44 @@ imbalanced binary, five percent relative on multiclass logloss, one point
 absolute on AUC for the sparse and categorical scenarios. Those tolerances
 were chosen before any run and each carries its reasoning in the file. They
 are the budget. This document spends against them.
+
+That file's own preamble is the clearest statement anywhere in this project
+of why those numbers are a gate and the timings next to them are not, and it
+is quoted rather than paraphrased because the paraphrase loses the argument:
+
+> Correctness thresholds. These gate; timings do not.
+>
+> Two kinds of number get confused in benchmark suites. A quality
+> difference between two engines fitting the same objective on the same
+> bins is small, stable, and reproducible, so a threshold on it is a real
+> test: cross it and something is wrong. A timing is none of those things
+> on a laptop with a thermal budget, so a threshold on it is a coin toss
+> wearing a lab coat. verify.py reads this file and decides pass or fail.
+> report.py prints the timings and decides nothing.
+>
+> Every value here was chosen before any run, from what the two
+> implementations are known to differ by, and each carries its reasoning.
+> Loosening one after seeing a result is allowed and has to be done in a
+> commit that says so; editing one to make today's run green is how a
+> suite stops meaning anything.
+>
+> Directions. `max_worse` is how much worse mojotrees may be than
+> LightGBM on the primary metric. Being better is not capped, but being
+> much better is checked too: `implausible_better` catches the case where
+> the two engines were not actually given the same problem, which looks
+> like a win and is a bug.
+
+Three things in that preamble do work for this document specifically. The
+first is `implausible_better`, which is why several arms in section 5 that
+score *better* than the exact reference are reported as suspicious rather
+than as wins. The second is the last sentence of the second paragraph, which
+is the procedure this whole document is an attempt to obey in advance: state
+the tolerance and its reasoning before the run, not after. The third is the
+distinction the file draws between a threshold on a quality metric and a
+threshold on a timing, which is exactly the distinction between what this
+document can price and what it cannot. Every accuracy number here is a
+quality number. Not one performance number in this document is a
+measurement, and section 12 says so again at the end.
 
 **Determinism is not the same thing as identity, and we are keeping it.**
 The rule to work within is *deterministic on a given toolchain, not
@@ -92,6 +143,118 @@ harness being run first, with a before arm and an after arm, at least three
 repeats, on the same machine. Section 12 says what that costs. A relaxation
 adopted without it is not a priced relaxation, it is an unpriced one with a
 document attached.
+
+### How to read a number in this document
+
+Every figure below carries one of four provenance labels, and a figure
+without one is a defect in this document rather than a fact about the
+library. The labels are used in the tables of sections 4 through 11 and in
+the summary table of section 11.
+
+- **measured.** Produced by running mojotrees, on named hardware, with the
+  record committed under `bench/`. **Almost nothing in this document is
+  measured in this sense, and section 12 is entirely about that.**
+- **simulated.** Produced by running one of the standalone NumPy models of
+  section 3. Faithful to the arithmetic, not to the code, and on synthetic
+  data. Most numbers in this document are simulated. Where the earlier text
+  says "experiment A measures", read "experiment A simulates"; the word
+  choice is the original author's and the meaning is this one.
+- **derived bound.** Arithmetic over bytes, counts, ranges, or error terms.
+  A bound, not a prediction, and stated as such. The int16 overflow
+  thresholds and the sequential-versus-blocked summation error bounds are of
+  this kind, and they are the most reliable numbers here because nothing had
+  to be run to get them.
+- **fitted.** A parameter extracted from a set of points by regression, whose
+  usefulness depends on the fit's range. The per-row cost figures quoted from
+  the depth-wise sweep are of this kind.
+
+A fifth category is used where it applies, and it is the honest label for
+more of the planning material this document was assembled from than anyone
+would like: **unsourced.** A number nobody can trace to a run. It stays in
+the text, marked, rather than being deleted or dressed up, because deleting
+it loses the fact that somebody once believed it.
+
+### The rule for spending this budget
+
+The budget is only a budget if there is a rule for who may draw on it. There
+is, it is short, and it is the operational form of `docs/NUMERICS.md`
+section 1.3.
+
+**Who may move bits.** Anybody, on any lane, on any branch. Moving bits is
+not a privileged operation and does not need an exception granted in advance.
+What is privileged is *landing* a bit-moving change on the trunk, and that is
+gated by evidence rather than by authority.
+
+**What evidence.** All three of the following, and the first is a veto rather
+than a contribution.
+
+1. **Determinism, proven, not asserted.** Identical output at
+   `MOJOTREES_NUM_WORKERS` of 1, 3 and 8, and run to run. This is `docs/NUMERICS.md`
+   part 1.1 and it is not tradable against anything in this document. A test
+   that proves it ships with the change. A test whose gated path never opened
+   proves nothing, and this project has already shipped two of those.
+2. **Held-out parity, from a run.** A before arm and an after arm of
+   `bench/real_data`, at least three repeats, one machine, pinned data, inside
+   the thresholds quoted above. **A verdict in this document does not
+   substitute for that run.** Every "take it" here is a statement about a
+   mechanism and an order of magnitude, from a NumPy model, on synthetic data.
+   It is a reason to spend the machine time, not a reason to skip it.
+3. **A characterization of what moved.** How many values, on which arrays, by
+   how many units in the last place. For anything that moved by more than a
+   few ulps, why, and section 10's leaf-value example is the reason the "why"
+   is required: a near-zero leaf value can move 93 ulps from a one-bit change
+   upstream and mean nothing, and the ulp count alone will not tell you which
+   case you are in.
+
+**What lands in the same commit.** Four things, together.
+
+- The change.
+- The determinism test for it.
+- The re-baselined `tests/test_golden_bits.mojo`, with the ulp movement
+  stated in the commit message.
+- The threshold reasoning, if a threshold in `thresholds.json` had to move.
+  Loosening one is allowed and has to be its own stated act, per the preamble
+  quoted above. A threshold edited to make a run green is the failure this
+  document exists to make expensive.
+
+**What does not land.** A bit-moving change whose golden fixture was
+regenerated without a statement. A bit-moving change justified by a section
+of this document and no run. A relaxation that buys speed and costs
+determinism, at any price, including a price this document would otherwise
+call cheap. Determinism is the one line that a speed mandate does not move,
+and the reason is not sentiment. It is that a nondeterministic trainer cannot
+be bisected, so the next numerical defect after that one costs an unbounded
+amount to find.
+
+**One promise part 1.3 does not touch, and the round will hit it.** The
+`compatibility/` directory holds saved models from released versions together
+with `.expected.tsv` files of their raw scores as IEEE-754 bit patterns, and
+its README states that the fixtures' "value comes from never being
+regenerated". That is the retired rule, still standing, and it is standing
+correctly, because it is a different promise. It is not identity between two
+of our implementations. It is that a model file written by a shipped release
+still predicts what it predicted, which is a promise to users who have models
+on disk, and no speed mandate reaches it.
+
+The line is exactly here. **A change that moves only training bits does not
+touch those fixtures**, because they exercise load and predict and never
+train, and every candidate in this document except the score-update questions
+in `docs/NUMERICS.md` sections 4.1 and 8 is of that kind. **A change that
+moves prediction bits does touch them**, and it does not get to re-baseline
+them, and this document has no budget line for that. If the `--fp-mode`
+question of `docs/NUMERICS.md` section 8 is ever re-opened, this is the
+constraint that decides it, and it is a larger obstacle than anything in
+section 8's own list of four. Whoever re-opens it should start here.
+
+**One asymmetry worth stating, because it decides the order of work.** The
+three conditions are cheap for a change that improves accuracy and expensive
+for one that degrades it, and that is deliberate. Candidates 1, 3, 5 and 6
+below move the answer *toward* exact. They still owe conditions 1 and 3, and
+condition 2 is a formality for them in the sense that nobody expects it to
+fail, though it is not waived by that expectation. Candidate 2 spends real
+budget in the channel that does not self-correct, and for that one condition
+2 is the whole decision. Land the cheap ones first, so that when the harness
+does move, there is one candidate to point at.
 
 ## 2. The two channels, which is the framing everything else hangs on
 
@@ -169,7 +332,7 @@ exact. Reports the gap between the two orders relative to the sum of
 absolute values in the cell, which is the right normalization because a
 histogram cell's error matters against the gradient scale that the split
 search compares it to, not against the cell's own value. Run over
-well-conditioned, mean-zero, adversarially cancelling, and heavy-tailed
+well-conditioned, mean-zero, adversarially canceling, and heavy-tailed
 inputs at 256, 4,096, and 65,536 values per cell, plus a distributional
 sweep over 2,000 independent cells per configuration.
 
@@ -313,7 +476,8 @@ Cell `(f, b)` becomes
 instead of one ascending pass. Float64 addition is not associative, so this
 is a different value.
 
-The textbook bound says which direction. Sequential summation of `n` values
+**Provenance: derived bound.** The textbook bound says which direction.
+Sequential summation of `n` values
 has error at most `(n - 1) * eps * sum|x|` with `eps = 2^-53`. Blocked
 summation into `B` blocks has error at most `(n/B - 1 + B - 1) * eps *
 sum|x|`, because each block accumulates `n/B` values and the fold accumulates
@@ -323,10 +487,11 @@ factor of 64. **Blocking is not a loss of accuracy. It is a gain, and the
 gain grows with the block count, up to `B = sqrt(n)` where the two terms
 balance.**
 
-The worst-case bounds are loose, so experiment A measures the gap directly.
+The worst-case bounds are loose, so experiment A simulates the gap directly.
 Over 2,000 independent cells at 4,096 values per cell and 12 blocks, the gap
 between the ascending answer and the blocked answer, relative to the cell's
-`sum|x|`:
+`sum|x|`. **Provenance: simulated for the first five columns, derived bound
+for the last.**
 
 | cell size | blocks | median gap | p99 | max | worst-case bound |
 | --- | --- | --- | --- | --- | --- |
@@ -365,9 +530,23 @@ no first-round effect to compound.
 `histogram.mojo` lines 108 to 110 give three reasons to refuse row blocks:
 the block count would enter the result, `MOJOTREES_NUM_WORKERS` would stop
 being a scheduling knob, and sibling subtraction would stop being exact. The
-first two are true and are exactly the bit-identity constraint that has been
-lifted, subject to one condition stated below. The third is false, and it
-was false before this change.
+three do not have the same status and an earlier draft of this section
+flattened them, so they are separated here.
+
+**The first is true and no longer a refusal.** The block count entering the
+result means the answer differs from the answer a serial pass gives, which is
+identity with past output, which part 1.3 of `docs/NUMERICS.md` has retired.
+Priced below at two or three Float64 ulps, in the direction of exact.
+
+**The second is true and is still a refusal, and it is the one that matters.**
+`MOJOTREES_NUM_WORKERS` ceasing to be a pure scheduling knob is a breach of
+part 1.1, which is not tradable at any price in this document. The docstring
+is right about the hazard and right that it is serious. It is wrong only in
+treating it as unavoidable, and the condition stated below is exactly how it
+is avoided, by deriving the block count from the node's row count so that the
+worker count never reaches the arithmetic.
+
+**The third is false, and it was false before this change.**
 
 CPU sibling subtraction is `parent[c] - small[c]` in Float64, where the
 parent was accumulated over a row order that interleaves both children. It
@@ -382,7 +561,8 @@ and the same child accumulated directly.
 | blocked, 12 (proposed) | 4,096 | 50 percent | 4.52e-17 | 3.92e-17 |
 | blocked, 12 (proposed) | 65,536 | 10 percent | 4.07e-17 | 5.12e-17 |
 
-Nonzero everywhere for the shipped path, and **four times smaller under
+**Provenance: simulated, experiment G.** Nonzero everywhere for the shipped
+path, and **four times smaller under
 blocking**. The blocked fold makes sibling subtraction more consistent, not
 less. Exactness of sibling subtraction is a property of the integer paths
 (`gpu_active_rows`, `gpu_leaf_batching`, `quantized_gradient.subtract_quantized`),
@@ -431,7 +611,16 @@ candidate here whose numerical error is *smaller* than what ships today.
 
 The two obligations that come with it: derive the block count from row count
 rather than worker count, and correct the sibling-subtraction claim in
-`histogram.mojo`.
+`histogram.mojo`. The second is owned by whichever lane owns that file, not by
+this document, and it is a correction to a claim of exactness rather than a
+softening of a warning. The worker-count warning in the same docstring should
+survive the edit, because it is still right.
+
+Note also what candidate 3b does to this candidate's guard. Under Int32 cells
+the fold order stops mattering at all, since integer addition is associative,
+and the obligation to fix the block count and the fold order goes away rather
+than being maintained. That is an argument for sequencing 3b close behind this
+one, and it is made in section 6.1.
 
 ## 5. Candidate 2: packed int16 gradient and hessian in one 32-bit atomic (GPU)
 
@@ -584,6 +773,62 @@ above it that are equivalent to a perturbation of `1e-9` or smaller. Those
 give 0.00 to 0.08 percent in the mean with a worst single seed of 0.46
 percent. **Read that as the harness's resolution. This experiment cannot
 distinguish anything below roughly a tenth of a percent in the mean.**
+
+### Provenance of the +0.08 percent figure, which is quoted more widely than it deserves
+
+The `magnitude-sum 2^30` row above, at **+0.08 percent** on held-out logloss,
+has escaped this table. It circulates in the CPU round 1 planning material as
+the accuracy cost of Int32 fixed-point histogram cells, and a lane brief
+attached it to the shared power-of-two scale rule of candidate 3b. It should
+not be used that way, and this subsection exists so that the next person to
+quote it has to read why first.
+
+**Provenance: simulated, and the producing run is not in the repository.**
+The number was produced by experiment F, one of the standalone NumPy models
+of section 3, which that section states plainly lived "under `.exp/` in this
+worktree" and were "not committed, because a committed benchmark script
+implies a committed result and there is no committed result here." There is
+no `.exp/` directory on this branch, nothing matching it has ever been added
+in this repository's history, and `+0.08 percent` appears in exactly one
+place in the tree, which is the table above. **The run cannot be reproduced
+from this repository.** The mechanism it modeled can be, by rebuilding
+experiment F from section 3's description, and that is a different thing.
+
+**Three further reasons not to lean on it, in descending order of how much
+they matter.**
+
+First, and this is decisive on its own, **the figure is smaller than the
+experiment's own stated resolution.** The paragraph immediately above puts
+that resolution at "roughly a tenth of a percent in the mean", and 0.08 is
+below a tenth. It is not a small effect. It is a number inside the noise
+band, and the same paragraph already says that arms in this group span 0.00
+to 0.08 percent with a worst single seed at 0.46 percent. Quoting the top of
+that range as a point estimate is quoting the noise.
+
+Second, **it does not describe a change.** The `magnitude-sum 2^30` arm *is*
+the scheme the GPU already ships, scored against an exact Float64 reference.
+So the figure is at most an upper bound on the total distance from exact
+arithmetic to today's device histogram, not the incremental cost of adopting
+fixed-point cells on the CPU, which is what the planning material uses it
+for. The incremental cost of candidate 3b is smaller than this by
+construction, since the shipped scheme is one end of it.
+
+Third, **its sign column says "no".** The per-seed signs are inconsistent,
+which section 2 establishes is what noise looks like and what an absorbed
+leaf-channel error looks like, as distinct from the split-channel effects in
+the same table that point the same way on five or six seeds out of six.
+
+**What the honest statement is.** The measured accuracy cost of Int32
+fixed-point histogram cells at the shipped `2^30` magnitude-sum scale is
+**unknown**, because nobody has measured it on mojotrees, and the one number
+in circulation is a simulated figure below its own experiment's resolution
+from a script that is not in the repository. What is known, and is a derived
+bound rather than a simulation, is section 5's per-cell error table: Int32 at
+`2^30` sits at `4.9e-08` of the node's gradient magnitude against Float64's
+`7.1e-19`, which is eleven orders of magnitude coarser than the CPU and four
+orders of magnitude finer than anything experiment B's flip curve can
+resolve. That is the sentence to quote. It is less satisfying than a
+percentage and it is the one that is true.
 
 Three readings.
 
@@ -819,6 +1064,177 @@ is a per-round synchronization, which is a fixed cost that does not shrink
 as the data gets smaller and therefore matters most exactly where the
 current GPU path is weakest.
 
+### 6.1 Candidate 3b: Int32 fixed-point histogram cells on the CPU, at one shared power-of-two scale
+
+Candidate 3 changes how the device picks its scale. This is the other half of
+the same rule, and it is a separate candidate because it is a change to the
+CPU and because it costs something candidate 3 does not. It is live in CPU
+round 1 and it is the item the `+0.08 percent` figure has been attached to,
+which the subsection in section 5 above deals with.
+
+#### What is proposed
+
+The CPU histogram cell is 24 bytes, a Float64 gradient plane, a Float64
+hessian plane, and an integer count
+(`apple_cpu_policy.HISTOGRAM_BYTES_PER_CELL = 24`, verified in the source).
+The GPU cell is already Int32 fixed point at
+`quantized_gradient.FIXED_ONE = 2^30` divided by `sum|g|`, and
+`quantized_gradient.mojo` records that the same constant is spelled three
+times across the device modules.
+
+The proposal is to make the CPU cell Int32 fixed point at the *same* scale,
+with the scale a power of two under candidate 3's rule, chosen once per round
+and used by whichever backend runs. Three Int32 planes is 12 bytes, half the
+cell.
+
+#### What it costs, and what it buys
+
+**Cost, in per-cell error. Provenance: simulated, experiment D.** Maximum
+per-cell error relative to the node's `sum|g|`, from the table in section 5,
+restricted to the two schemes at issue:
+
+| scheme | 1M rows | 100k rows | 10k rows | 1k rows |
+| --- | --- | --- | --- | --- |
+| Float64 ascending (CPU today) | 7.1e-19 | 1.2e-18 | 6.7e-19 | 1.1e-18 |
+| Int32 at `2^30` (GPU today, proposed for CPU) | 4.9e-08 | 1.5e-08 | 4.9e-09 | 1.8e-09 |
+
+**That is eleven orders of magnitude coarser, and it is the largest single
+accuracy give in this document that is still being recommended.** It is
+recommended anyway, and the reason is the second column of the comparison.
+Experiment B's flip curve does not leave zero until a perturbation of `1e-3`,
+which is four to five orders of magnitude above `4.9e-08`, and even at `1e-3`
+the flipped candidate holds 99.99 percent of the winner's gain. **Provenance
+of that comparison: simulated, experiment B, and it is the load-bearing
+number for this verdict.** If the flip curve is wrong, this candidate is
+wrong, and nothing else in this section rescues it.
+
+**Cost, in the power-of-two rounding, on top of the above. Provenance:
+derived bound, with a simulated realization.** A power-of-two scale is at most
+a factor of two below the arbitrary scale it replaces, so at most one bit of
+the accumulator's dynamic range is wasted and the per-cell error at most
+doubles. Section 6's table puts the realized worst case at 1.9x over four
+node sizes. The derived bound is 2x and it is tight.
+
+**Cost, in a reduction the CPU does not do today.** The scale needs `sum|g|`
+over the round's gradients, which is one pass over `n` Float64 values per
+round that the CPU histogram path does not currently make. **Provenance:
+derived bound.** At 1,000,000 rows that is 8 MB read per round for the
+gradient plane, against the 208 MB of gradient traffic the same document's
+section 7 derives for the histogram build itself at interleave width four, so
+it is under four percent of the traffic it sits next to. Whether it costs
+four percent of the *time* is not derivable and is not claimed.
+
+**Buys, and this is the part that makes it worth the eleven orders of
+magnitude.**
+
+1. **Integer addition is associative, so order-independence stops being a
+   convention and becomes a property.** Candidate 1's whole obligation, that
+   the fold order be a fixed function of the block count and the block count a
+   fixed function of the row count, exists because Float64 addition is not
+   associative. In Int32 it does not matter what order the partials fold in,
+   or how many blocks there are, or which finished first. **Taken together
+   with candidate 1, this candidate removes candidate 1's only guard.** That
+   is worth more than it sounds, because a guard that has to be maintained by
+   everyone who touches the scheduler is a guard that will eventually not be.
+2. **CPU and GPU histograms become bit-identical rather than
+   Float32-agreeing.** `docs/NUMERICS.md` section 1.4 currently scopes the
+   determinism promise per backend, and `hybrid_leaf_scheduler`'s
+   `MODE_MIRROR` has to establish agreement on the target hardware before it
+   will interchange a host histogram with a device one. Under a shared
+   integer scale that becomes structural. This is the single largest
+   simplification available to the hybrid path and it is not an accuracy
+   argument at all.
+3. **Half the cell, which doubles the L1-clamped interleave width.** Section 7
+   derives that for the Float32 variant and the derivation is identical here,
+   since both cells are 12 bytes. Five slices at 24 bytes floors to width
+   four; ten slices at 12 bytes floors to width eight.
+
+#### Overflow, which is where candidate 2 died and this one does not
+
+The reason to spell this out is that candidate 2 failed on exactly this
+arithmetic and the two look similar from a distance. **Provenance: derived
+bound, exact.**
+
+At the magnitude-sum scale, every row's quantized magnitude is
+`|g_r| * 2^30 / sum|g|`, so the sum of absolute quantized values over *all*
+bins of a feature is bounded by `2^30`, and no single bin can exceed that.
+Int32 holds `2^31 - 1`. The headroom is a factor of two, plus the rounding
+residue that `quantized_gradient.mojo` already bounds at `:1053` as
+`FIXED_ONE + rows * residue_per_row(mode)`. The scale was chosen at `2^30`
+rather than `2^31` for precisely this reason.
+
+That is a whole-node bound and it holds at every node size, which is what
+candidate 2's int16 accumulator could not have. The int16 limit of 32,767
+against the same `2^30` numerator gives a per-bin share of `3.05e-5`, which
+no useful node satisfies. **Int32 works at the shipped scale and int16 does
+not, and the difference is fifteen bits, not a tuning choice.**
+
+#### The guard, which is about where the exponent is computed
+
+A shared scale is only shared if both backends compute the same one, and they
+will not if they each reduce `sum|g|` themselves. The CPU would reduce in
+Float64 and the device in Float32 over a different order, and the two answers
+differ by far more than the last ulp that candidate 3 analyzes. A power-of-two
+scale converts that into a discrete failure rather than a small one: the two
+backends agree on the exponent except when `sum|g|` falls near a power of
+two, and then they disagree by a factor of two, which is a visible change in
+every cell.
+
+**So the rule has to be that the exponent is computed once, by one
+deterministic reduction, and passed to whichever backend runs.** Not
+recomputed per backend, and not recomputed per node. Candidate 3 states the
+weaker version of this for the device alone and it is enough there; here it
+is load-bearing, because two backends are involved rather than one.
+
+The second guard is that something has to stay Float64. `docs/ARCHITECTURE.md`
+line 157 names the CPU as "the reference implementation the GPU path is
+verified against", and if the CPU becomes fixed point at the device's scale
+then the oracle and the thing under test are the same computation, and the
+differential tests compare a path to itself. **A Float64 histogram path has to
+survive as a test-only reference even if no trainer reaches it.** That is a
+requirement on the test suite, not on the trainer, and it is cheap, and it is
+the kind of thing that gets dropped in a speed round and noticed two rounds
+later.
+
+#### What nobody has measured
+
+**The end-to-end accuracy cost of this on mojotrees is unknown.** No run
+exists. The `+0.08 percent` figure does not supply it, for the four reasons
+in section 5's provenance subsection, the first of which is that it is below
+its own experiment's resolution. Experiment F's `magnitude-sum 2^30` and
+`magnitude-sum 2^30, power of two` arms are the closest simulated proxies and
+both come in at or under the resolution floor with inconsistent per-seed
+signs, which supports "no detectable effect" and does not support any
+particular number.
+
+Two more specific gaps. **The Float32 leaf values that fall out of a
+fixed-point histogram have never been priced**, and section 12 already lists
+that as unpriced for the device; making the CPU fixed point extends the same
+unpriced quantity to the backend that currently has none of it. And **nothing
+has looked at what a `4.9e-08` cell error does to `min_data_in_leaf` and
+`min_sum_hessian_in_leaf` at the boundary**, where a constraint check is a
+comparison against a threshold rather than a gain comparison, and a
+comparison against a threshold has no near-tie damping of the kind experiment
+B measures. That is a small surface and it is a different mechanism from
+everything else in this document.
+
+#### Verdict
+
+**Take it, after candidate 1, and instead of candidate 4'.** It is the same
+12-byte cell as candidate 4' and therefore the same traffic argument, and the
+two are mutually exclusive. Candidate 4' is more accurate, at `3e-10` against
+this candidate's `4.9e-08`. This candidate is more useful, because Float32 is
+no more associative than Float64 and buys neither the order-independence nor
+the cross-backend identity. **Both errors are far enough below the flip curve
+that the accuracy difference between them is not a reason to choose, so
+choose on the property, and the property says Int32.**
+
+The three obligations that come with it, restated so they can be checked off.
+Compute the scale exponent once from a deterministic reduction and pass it,
+never recompute per backend. Keep a Float64 histogram path as a test-only
+reference. And land it after candidate 1, since on its own it halves the task
+parallelism it depends on, for the reason section 7 gives.
+
 ## 7. Candidate 4: Float32 histogram accumulation instead of fixed-point Int32
 
 ### On the GPU, this is mostly moot, and the reason is worth stating precisely
@@ -924,7 +1340,106 @@ gradients the accumulator can start absorbing small addends entirely
 another reason the ordering matters, but the worst case is worth a bound
 before anyone relies on it.
 
+**Superseded by candidate 3b, added later. Read section 6.1 before acting on
+this verdict.** Both candidates produce a 12-byte cell and both therefore make
+the identical traffic and interleave-width argument, so they are alternatives
+rather than complements. Float32 cells are the more accurate of the two by
+two orders of magnitude and buy nothing else. Int32 cells at a shared
+power-of-two scale are the coarser of the two and buy exact
+order-independence, which retires candidate 1's fold-order guard, and
+bit-identity between the CPU and the device, which retires the per-hardware
+check `hybrid_leaf_scheduler`'s `MODE_MIRROR` has to make. Both errors sit
+orders of magnitude below the flip curve's knee, so the accuracy difference
+between them is not a reason to choose either one. The caveat in the paragraph
+above is a further point against Float32 and does not apply to Int32 at all,
+since integer accumulation cannot absorb an addend.
+
 ## 8. Candidate 5: the split gain, its cancellation, and the form that removes it
+
+> **STOP. The cross form below is INVALID when `lambda_l1 > 0`, and this
+> section as originally written never mentions L1 anywhere.**
+>
+> The identity it rests on requires `GL + GR = G`. Under L1 the gain is built
+> from the soft-thresholded `T(GL)`, `T(GR)` and `T(G)`, and **soft
+> thresholding is not additive**: `T(GL) + T(GR) != T(G)` in general. The
+> algebra that cancels the parent term therefore does not hold.
+>
+> Applied anyway this is not rounding noise, it is a **systematic bias**.
+> Measured by the GPU campaign: **1.6e-04 relative error at a parent-to-gain
+> ratio of 293, where the shipped form sits at 1.0e-05** — and the median and
+> the p99 agree to two figures, which is what a bias looks like and is not
+> what rounding looks like.
+>
+> **Any implementation must refuse itself whenever `lambda_l1 != 0` and fall
+> back to the shipped form.** The GPU arm does exactly that, landed at
+> `09b35f6` on `perf-round-2`, implemented in `gpu_split_search.mojo` only.
+>
+> No CPU lane has implemented this and none should without reading the four
+> corrections immediately below.
+
+### Both worked examples below were computed at `lambda_l2 = 1`, and the default is becoming 0
+
+This section's algebra was written when mojotrees defaulted `lambda_l2` to
+1.0. That default is being changed to **0.0** to match LightGBM stock, so the
+two worked expressions have degenerate forms that a reader will otherwise
+have to derive:
+
+- **The split-tie correction term**, `lambda_l2 * G^2 / ((H + 2*lambda_l2) *
+  (H + lambda_l2))`, carries `lambda_l2` as a factor of its numerator, so at
+  `lambda_l2 = 0` it is **identically zero**. The cross form and the shipped
+  form then agree exactly on that term rather than differing by it.
+- **The many-versus-many categorical offset**, `G^2 (2a - lambda_l2) / (S (H
+  + lambda_l2))` with `a = cat_l2`, collapses to `2 * cat_l2 * G^2 / (S * H)`.
+  Note the `G^2` survives; a shorthand of this that drops it is wrong.
+
+**The conclusions of this section are unchanged.** Both terms get smaller or
+vanish at `lambda_l2 = 0`, which does not reverse any comparison the section
+makes. What changes is that the numbers quoted alongside them describe a
+configuration this project is about to stop shipping, and a stale number that
+still reads as current is the failure mode this document exists to prevent.
+
+**`GAIN_FORM_CROSS` is unaffected.** Its refusal is keyed on `lambda_l1`, not
+`lambda_l2`, so nothing about the L1 warning at the top of this section needs
+re-checking against the new default.
+
+### Four corrections to this section, from the campaign that implemented it
+
+Reported by the GPU campaign after building the arm. **Recorded here rather
+than rewritten into the analysis below**, so that the original reasoning stays
+legible next to what implementing it actually taught. Provenance: measured by
+that campaign on its own instrument, relayed here, **not independently
+verified by the CPU campaign**.
+
+1. **It does not cover the categorical many-versus-many walk.** That walk
+   scores children at `lambda_l2 + cat_l2` while the parent sits at
+   `lambda_l2`. The general offset is `G^2 (2a - lambda_l2) / (S (H +
+   lambda_l2))`.
+2. **"Never worse" is too strong.** At a centered node the cross form is a few
+   percent *worse* on the median.
+3. **The three obligations this section states all dissolve.** Sending
+   `best_gain` to negative infinity, relocating `min_gain_to_split`, and
+   recomputing `SPLIT_TIE_RELATIVE` are all unnecessary: converting back to
+   gain units costs one node constant, and that constant cancels against
+   `lambda_l2 / (H + lambda_l2) * P`, not against `P`.
+4. **The effect is larger than the "up to 20x" stated below** — about **1000x
+   on the median** over all candidates.
+
+### Two related retractions carried here so they are not lost
+
+- **The "free accuracy win" from dropping `- parent_score` stays retracted.**
+  It recovers nothing. Rounding is monotone, so subtracting a common constant
+  preserves order, and Sterbenz makes that subtraction exactly representable
+  in the near-tie regime. The section already says this; it is repeated here
+  because the claim was relayed between campaigns once before being withdrawn.
+- **Candidate 3 landing removed two of candidate 6's reasons.** With a
+  power-of-two scale, dequantization is exact *and* the float subtraction is
+  itself exact by Sterbenz whenever the left child holds between half and
+  twice the total. What survives is stronger and independent of scale shape:
+  the error is the two `Int32 -> Float32` casts, each rounding by `2^-24`
+  **of the node total**. A revived fixed-point lane should build from that
+  argument and not from this budget's.
+
+---
 
 This candidate was not in the original brief. It is also the one where I got
 the analysis wrong twice before getting it right, so the reasoning is set out
@@ -1216,15 +1731,22 @@ contain.
 
 ## 11. The budget in one table
 
+Every "error introduced" cell is **simulated** unless the cell says otherwise,
+and every "held-out estimate" cell is **simulated** without exception. **Not
+one number in this table is measured on mojotrees.** That is the single most
+important thing about the table and it is stated here rather than in a
+footnote.
+
 | # | candidate | channel | error introduced | compounds | held-out estimate | verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | row-block private histograms, fixed fold (CPU) | both | 2 to 3 Float64 ulps, *toward* exact | no | none detectable | **take it** |
-| 2 | packed int16 in threadgroup memory, max-abs rule at `B = 16`, Int32 globally | both, split dominates | 4e-5 to 8e-4 relative; about 2 percent of effective sample size | through the split channel only | 0.4 percent logloss, 1.8 percent RMSE, inside tolerance | **take it with a guard** |
+| 1 | row-block private histograms, fixed fold (CPU) | both | 2 to 3 Float64 ulps, *toward* exact (derived bound agrees) | no | none detectable | **take it** |
+| 2 | packed int16 in threadgroup memory, max-abs rule at `B = 16`, Int32 globally | both, split dominates | 4e-5 to 8e-4 relative; about 2 percent of effective sample size (derived bound) | through the split channel only | 0.4 percent logloss, 1.8 percent RMSE, inside tolerance | **take it with a guard** |
 | 2' | int16 by narrowing the shipped magnitude-sum scale to `2^14` | both, split dominates | 1e-4 to 7e-4 relative; noise ratio grows with node size | same | +4.3 percent logloss, same sign on 6 of 6 seeds, outside tolerance | **not worth it** |
 | 2'' | int16 as the global histogram representation | same as 2 | same as 2 | same | same as 2 | **not worth it** (needs per-leaf bit width for no extra saving) |
-| 3 | power-of-two device scale | both | up to 1 bit, measured 1.9x worst; dequantization becomes exact | no | none detectable | **take it** |
+| 3 | power-of-two device scale | both | up to 1 bit (derived bound), realized 1.9x worst; dequantization becomes exact | no | none detectable | **take it** |
+| 3b | Int32 fixed-point CPU cells at one shared power-of-two scale | both | 4.9e-08 relative against Float64's 7.1e-19, 11 orders coarser; 4 to 5 orders under the flip curve | no | **unknown, and the `+0.08 percent` in circulation does not supply it** (section 5) | **take it** (after 1, instead of 4') |
 | 4 | Float32 histogram accumulation on the GPU | both | 100x tighter than shipped, but costs order-independence | no | none, and breaks three invariants | **not worth it** |
-| 4' | Float32 histogram cells on the CPU | both | 3e-10 relative | no | none detectable | **take it with a guard** (after 1) |
+| 4' | Float32 histogram cells on the CPU | both | 3e-10 relative | no | none detectable | **superseded by 3b**, which is the same 12 bytes and buys order-independence and cross-backend identity that Float32 cannot |
 | 5 | cancellation-free gain form | split only | never worse; up to 20x tighter at high `parent / gain` | fixes an error in the channel that does not self-correct | improvement, not a cost | **take it** |
 | 6 | integer right-hand subtraction in the device scan | split only | 20 to 45 percent tighter *with* candidate 5; up to 2x worse *without* it | same | improvement, not a cost | **take it with a guard** (only with 5) |
 
@@ -1313,5 +1835,16 @@ device split search, which section 10 argues is keyed to the wrong parameter.
 scenarios, before and after, three repeats, one machine, pinned data. That
 harness exists, its thresholds were chosen before any run, and it has never
 produced a committed record. Until it does, the strongest statement this
-document supports is that candidates 1, 3, 5, and 6 are very unlikely to move
-a metric, and that is a statement about mechanisms, not a measurement.
+document supports is that candidates 1, 3, 3b, 5, and 6 are very unlikely to
+move a metric, and that is a statement about mechanisms, not a measurement.
+
+**Candidate 3b is the weakest of those five and should be read as the one to
+watch.** The other four either move the answer toward exact or leave it
+where it is. 3b gives up eleven orders of magnitude of per-cell resolution on
+the CPU in exchange for order-independence and cross-backend identity, and
+the argument that this is safe rests entirely on experiment B's flip curve
+being right about where selection starts to move. That curve is simulated, on
+synthetic histograms, and it is the load-bearing number in this document.
+Nobody has tested it against the code. If one thing here is going to turn out
+wrong, the honest bet is that it is that curve, and candidate 3b is where the
+consequences would land.

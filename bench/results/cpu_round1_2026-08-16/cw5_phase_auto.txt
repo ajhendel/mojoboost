@@ -1,0 +1,109 @@
+==================================================================
+ARM: CW5 phase profile by node size class, 1000000 x 50, auto workers
+CMD: pixi run -e bench bench-train-gpu 1000000 50 reg 1 cpu
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 03:44:30 EDT
+--- box state BEFORE ---
+ 3:44  up 5 days, 18:33, 1 user, load averages: 3.51 9.84 14.12
+top processes by cpu:
+  7.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  1.0 /usr/sbin/cfprefsd
+  0.8 claude
+  0.6 /Applications/Docker.app/Contents/MacOS/com.docker.backend
+other mojo/pixi builds running:
+--- output ---
+✨ Pixi task (bench-train-gpu in bench): mojo run -I src bench/bench_train_gpu.mojo 1000000 50 reg 1 cpu
+mojotrees gpu-vs-cpu bench: 1000000 rows x 50 features, reg seed 0
+binning_s: 0.159362
+arms: cpu
+repeats: 1
+warning: fewer than 3 repeats cannot separate a real difference from machine drift; pass a repeat count of 3 or more before reporting a delta
+phase_profile begin label=train scope=fit mode=async trees=100 nodes=6100 root_rows=1000000 dataset_rows=1000000
+phase_profile classes root=all large>1/8 medium>1/64 small>1/512 tiny<=1/512
+phase_profile columns kind phase class calls dispatches syncs rows slots cells nanos ns_per_krow ns_per_kslot ns_per_kcell pct
+phase_profile row histogram root 100 200 0 100000000 5000000000 1275000 1369063000 13690.63 273.813 1073774.902 22.111
+phase_profile row histogram large 256 512 0 65523962 3276198100 3264000 1149322000 17540.484 350.81 352120.711 18.562
+phase_profile row histogram medium 1321 2642 0 57308612 2865430600 16842750 1511148000 26368.602 527.372 89720.978 24.406
+phase_profile row histogram small 1145 2290 0 9043058 452152900 14598750 844809000 93420.721 1868.414 57868.585 13.644
+phase_profile row histogram tiny 278 556 0 299256 14962800 3544500 93474000 312354.64 6247.093 26371.562 1.51
+phase_profile row hist_alloc root 100 0 0 100000000 0 1275000 39000 0.39 0.0 30.588 0.001
+phase_profile row hist_alloc large 256 0 0 65523962 0 6528000 93000 1.419 0.0 14.246 0.002
+phase_profile row hist_alloc medium 1321 0 0 57308612 0 33685500 297000 5.182 0.0 8.817 0.005
+phase_profile row hist_alloc small 1145 0 0 9043058 0 29197500 176000 19.462 0.0 6.028 0.003
+phase_profile row hist_alloc tiny 278 0 0 299256 0 7089000 41000 137.006 0.0 5.784 0.001
+phase_profile row subtract root 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row subtract large 1092 1092 0 416200703 0 13923000 13868000 33.32 0.0 996.05 0.224
+phase_profile row subtract medium 1495 1495 0 87862593 0 19061250 18046000 205.389 0.0 946.737 0.291
+phase_profile row subtract small 386 386 0 3150220 0 4921500 4957000 1573.541 0.0 1007.213 0.08
+phase_profile row subtract tiny 27 27 0 35221 0 344250 341000 9681.724 0.0 990.559 0.006
+phase_profile row partition root 200 400 0 200000000 0 0 211671000 1058.355 0.0 0.0 3.419
+phase_profile row partition large 1239 2478 0 453021625 0 0 502334000 1108.852 0.0 0.0 8.113
+phase_profile row partition medium 1331 2662 0 83685318 0 0 158850000 1898.182 0.0 0.0 2.566
+phase_profile row partition small 317 634 0 2700401 0 0 15112000 5596.206 0.0 0.0 0.244
+phase_profile row partition tiny 13 26 0 16281 0 0 133000 8169.031 0.0 0.0 0.002
+phase_profile row split_search root 100 100 0 100000000 0 1275000 3810000 38.1 0.0 2988.235 0.062
+phase_profile row split_search large 1348 1348 0 481724665 0 17187000 41220000 85.568 0.0 2398.324 0.666
+phase_profile row split_search medium 2816 2816 0 145171205 0 35904000 86075000 592.921 0.0 2397.365 1.39
+phase_profile row split_search small 1531 1531 0 12193278 0 19520250 45784000 3754.856 0.0 2345.462 0.739
+phase_profile row split_search tiny 305 305 0 334477 0 3888750 8252000 24671.353 0.0 2122.019 0.133
+phase_profile row convert root 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row convert large 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row convert medium 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row convert small 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row convert tiny 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row transfer root 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row transfer large 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row transfer medium 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row transfer small 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row transfer tiny 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row host_sync root 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row host_sync large 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row host_sync medium 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row host_sync small 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row host_sync tiny 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row grad_fill root 100 0 0 100000000 0 0 55638000 556.38 0.0 0.0 0.899
+phase_profile row grad_fill large 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row grad_fill medium 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row grad_fill small 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row grad_fill tiny 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row score_update root 100 0 0 100000000 0 0 57167000 571.67 0.0 0.0 0.923
+phase_profile row score_update large 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row score_update medium 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row score_update small 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile row score_update tiny 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile phase histogram all 3100 6200 0 232174888 11608744400 39525000 4967816000 21396.87 427.937 125687.944 80.233
+phase_profile phase hist_alloc all 3100 0 0 232174888 0 77775000 646000 2.782 0.0 8.306 0.01
+phase_profile phase subtract all 3000 3000 0 507248737 0 38250000 37212000 73.36 0.0 972.863 0.601
+phase_profile phase partition all 3100 6200 0 739423625 0 0 888100000 1201.071 0.0 0.0 14.343
+phase_profile phase split_search all 6100 6100 0 739423625 0 77775000 185141000 250.386 0.0 2380.469 2.99
+phase_profile phase convert all 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile phase transfer all 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile phase host_sync all 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0
+phase_profile phase grad_fill all 100 0 0 100000000 0 0 55638000 556.38 0.0 0.0 0.899
+phase_profile phase score_update all 100 0 0 100000000 0 0 57167000 571.67 0.0 0.0 0.923
+phase_profile class all root 700 700 0 700000000 5000000000 3825000 1697388000 2424.84 339.478 443761.569 27.414
+phase_profile class all large 4191 5430 0 1481994917 3276198100 40902000 1706837000 1151.716 520.981 41729.915 27.566
+phase_profile class all medium 8284 9615 0 431336340 2865430600 105493500 1774416000 4113.764 619.249 16820.145 28.658
+phase_profile class all small 4524 4841 0 36130015 452152900 68238000 910838000 25210.009 2014.447 13347.959 14.711
+phase_profile class all tiny 901 914 0 984491 14962800 14866500 102241000 103851.635 6833.013 6877.274 1.651
+phase_profile totals attributed_ns=6191720000 wall_ns=6206826000 unattributed_ns=15106000 unattributed_pct=0.243 dispatches=21500 syncs=0 calls=18600
+phase_profile end
+run 1 cpu train_s: 6.20863
+cpu_train_s_samples: 6.20863
+cpu_train_s: 6.20863
+cpu_train_s_median: 6.20863
+cpu_train_s_max: 6.20863
+cpu_spread_pct: 0.0
+cpu_spread_pct_of_median: 0.0
+cpu_n_trees: 100
+cpu_train_loss: 0.0035182733926987743
+json_summary: {"n_rows":1000000,"n_features":50,"objective":"reg","n_classes":0,"seed":0,"repeats":1,"binning_s":0.159362,"arms":[{"name":"cpu","samples_s":[6.20863],"min_s":6.20863,"median_s":6.20863,"max_s":6.20863,"spread_pct_of_min":0.0,"spread_pct_of_median":0.0,"n_trees":100,"train_loss":0.0035182733926987743}],"comparisons":[]}
+--- box state AFTER ---
+ 3:44  up 5 days, 18:34, 1 user, load averages: 3.62 9.56 13.94
+top processes by cpu:
+  7.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  1.9 claude
+  1.7 claude
+other mojo/pixi builds running:
+finished: 2026-08-16 03:44:47 EDT  exit=0
+

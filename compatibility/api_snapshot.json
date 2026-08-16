@@ -75,11 +75,19 @@
       "MOJOTREES_BINNING_SELECT_MIN_ROWS",
       "MOJOTREES_CONST_HESSIAN",
       "MOJOTREES_CONST_HESSIAN_VERIFY",
+      "MOJOTREES_CPU_BIN_LAYOUT",
       "MOJOTREES_CPU_COMPACT_MIN_ROWS",
       "MOJOTREES_CPU_CORE_POOL",
       "MOJOTREES_CPU_FEATURE_GROUP",
+      "MOJOTREES_CPU_QUANT_GRAD",
+      "MOJOTREES_CPU_QUANT_SCALE",
+      "MOJOTREES_CPU_ROW_BLOCKS",
+      "MOJOTREES_CPU_ROW_BLOCK_AMORTIZE",
+      "MOJOTREES_CPU_ROW_MAJOR",
       "MOJOTREES_CPU_TASKS_PER_CORE",
+      "MOJOTREES_CPU_TASK_FLOOR",
       "MOJOTREES_DASK_BACKEND",
+      "MOJOTREES_DERIVATIVE_PRECISION",
       "MOJOTREES_DISABLE_GPU",
       "MOJOTREES_DISTRIBUTED_BASE_PORT",
       "MOJOTREES_DISTRIBUTED_CONNECT_TIMEOUT",
@@ -97,6 +105,7 @@
       "MOJOTREES_GPU_BLOCK_THREADS",
       "MOJOTREES_GPU_CLASS_BATCH",
       "MOJOTREES_GPU_CLASS_BATCH_BYTES",
+      "MOJOTREES_GPU_COMPACTION_TRACE",
       "MOJOTREES_GPU_FEATURE_GROUP",
       "MOJOTREES_GPU_FUSE_PARTITION_TAIL",
       "MOJOTREES_GPU_GRAD_LAYOUT",
@@ -105,9 +114,11 @@
       "MOJOTREES_GPU_MIN_TILES",
       "MOJOTREES_GPU_OBJECTIVE",
       "MOJOTREES_GPU_PACKED_DOWNLOAD",
+      "MOJOTREES_GPU_PACKED_GRADS",
       "MOJOTREES_GPU_PHASE_TRACE",
       "MOJOTREES_GPU_QUANTIZED_GRADS",
       "MOJOTREES_GPU_READBACK",
+      "MOJOTREES_GPU_ROW_COMPACTION",
       "MOJOTREES_GPU_ROW_TILE",
       "MOJOTREES_GPU_SCAN_PRIMITIVES",
       "MOJOTREES_GPU_SPARSE_SKIP_FREQ",
@@ -131,10 +142,10 @@
       "MOJOTREES_GPU_VALID_SCORING",
       "MOJOTREES_GPU_VERIFY_ROWS",
       "MOJOTREES_GPU_WARMUP",
-      "MOJOTREES_HIST_CACHE_BYTES",
       "MOJOTREES_LEAF_SCORE_UPDATE",
       "MOJOTREES_MACOS_DEPLOYMENT_TARGET",
       "MOJOTREES_NUM_WORKERS",
+      "MOJOTREES_OBLIVIOUS_TRACE",
       "MOJOTREES_PARALLEL_MIN_OPS",
       "MOJOTREES_PARALLEL_MIN_TASK_OPS",
       "MOJOTREES_PHASE_PROFILE",
@@ -143,9 +154,13 @@
     ],
     "read_directly": [
       "MOJOTREES_AUTO_MIN_CELLS",
+      "MOJOTREES_CPU_BIN_LAYOUT",
       "MOJOTREES_CPU_CORE_POOL",
       "MOJOTREES_CPU_FEATURE_GROUP",
+      "MOJOTREES_CPU_ROW_BLOCK_AMORTIZE",
+      "MOJOTREES_CPU_TASK_FLOOR",
       "MOJOTREES_DASK_BACKEND",
+      "MOJOTREES_DERIVATIVE_PRECISION",
       "MOJOTREES_DISABLE_GPU",
       "MOJOTREES_DIST_MACHINES",
       "MOJOTREES_DIST_MODE",
@@ -175,6 +190,7 @@
       "MOJOTREES_GPU_VALID_SCORING",
       "MOJOTREES_GPU_WARMUP",
       "MOJOTREES_LEAF_SCORE_UPDATE",
+      "MOJOTREES_OBLIVIOUS_TRACE",
       "MOJOTREES_PHASE_PROFILE",
       "MOJOTREES_STARTUP_TRACE"
     ],
@@ -183,11 +199,19 @@
       "MOJOTREES_BINNING_SELECT_MIN_ROWS",
       "MOJOTREES_CONST_HESSIAN",
       "MOJOTREES_CONST_HESSIAN_VERIFY",
+      "MOJOTREES_CPU_BIN_LAYOUT",
       "MOJOTREES_CPU_COMPACT_MIN_ROWS",
       "MOJOTREES_CPU_CORE_POOL",
       "MOJOTREES_CPU_FEATURE_GROUP",
+      "MOJOTREES_CPU_QUANT_GRAD",
+      "MOJOTREES_CPU_QUANT_SCALE",
+      "MOJOTREES_CPU_ROW_BLOCKS",
+      "MOJOTREES_CPU_ROW_BLOCK_AMORTIZE",
+      "MOJOTREES_CPU_ROW_MAJOR",
       "MOJOTREES_CPU_TASKS_PER_CORE",
+      "MOJOTREES_CPU_TASK_FLOOR",
       "MOJOTREES_DASK_BACKEND",
+      "MOJOTREES_DERIVATIVE_PRECISION",
       "MOJOTREES_DISTRIBUTED_BASE_PORT",
       "MOJOTREES_DISTRIBUTED_CONNECT_TIMEOUT",
       "MOJOTREES_DISTRIBUTED_PROVIDER",
@@ -203,6 +227,7 @@
       "MOJOTREES_GPU_BATCH_SLOTS",
       "MOJOTREES_GPU_CLASS_BATCH",
       "MOJOTREES_GPU_CLASS_BATCH_BYTES",
+      "MOJOTREES_GPU_COMPACTION_TRACE",
       "MOJOTREES_GPU_FEATURE_GROUP",
       "MOJOTREES_GPU_FUSE_PARTITION_TAIL",
       "MOJOTREES_GPU_GRAD_LAYOUT",
@@ -210,9 +235,11 @@
       "MOJOTREES_GPU_MIN_TILES",
       "MOJOTREES_GPU_OBJECTIVE",
       "MOJOTREES_GPU_PACKED_DOWNLOAD",
+      "MOJOTREES_GPU_PACKED_GRADS",
       "MOJOTREES_GPU_PHASE_TRACE",
       "MOJOTREES_GPU_QUANTIZED_GRADS",
       "MOJOTREES_GPU_READBACK",
+      "MOJOTREES_GPU_ROW_COMPACTION",
       "MOJOTREES_GPU_SCAN_PRIMITIVES",
       "MOJOTREES_GPU_SPARSE_SKIP_FREQ",
       "MOJOTREES_GPU_SPECULATION",
@@ -235,9 +262,9 @@
       "MOJOTREES_GPU_VALID_SCORING",
       "MOJOTREES_GPU_VERIFY_ROWS",
       "MOJOTREES_GPU_WARMUP",
-      "MOJOTREES_HIST_CACHE_BYTES",
       "MOJOTREES_LEAF_SCORE_UPDATE",
       "MOJOTREES_MACOS_DEPLOYMENT_TARGET",
+      "MOJOTREES_OBLIVIOUS_TRACE",
       "MOJOTREES_PARALLEL_MIN_TASK_OPS",
       "MOJOTREES_PHASE_PROFILE",
       "MOJOTREES_STARTUP_REPORT_FD",
@@ -245,10 +272,7 @@
     ]
   },
   "meta": {
-    "carried": [
-      "numerical_contracts",
-      "platforms.tiers"
-    ],
+    "carried": [],
     "generated_by": "tools/api_snapshot.py",
     "library_version": "0.1.0",
     "schema_version": 2,
@@ -262,7 +286,7 @@
   },
   "mojo": {
     "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
-    "export_count": 598,
+    "export_count": 599,
     "export_source": "src/mojotrees/__init__.mojo",
     "exports_by_module": {
       "alternate_boosting": [
@@ -581,6 +605,7 @@
       "growth_policy": [
         "GROW_DEPTHWISE",
         "GROW_LEAFWISE",
+        "GROW_OBLIVIOUS",
         "grow_policy_name",
         "parse_grow_policy"
       ],
@@ -989,17 +1014,6 @@
     "objective_codes": {},
     "package": "mojotrees"
   },
-  "numerical_contracts": [
-    "pred_contrib rows sum to the raw score exactly",
-    "predict(num_iteration=k) equals a k-round fit; [0,k) plus [k,n) equals the whole raw score",
-    "save and load round trips bit-exactly",
-    "all-ones sample_weight equals no sample_weight, bit-identically",
-    "no callbacks means no boundary crossing and a bit-identical model",
-    "a sparse fit equals the dense fit with gaps filled with zeros",
-    "a repeat run on the same device is bit-identical",
-    "worker count does not change a CPU result",
-    "CPU and GPU agree within a Float32 tolerance with exact integer counts, and are not bit-identical to each other"
-  ],
   "parameter_string": {
     "parser": "src/mojotrees/params.mojo parse_params",
     "supported_keys": [
@@ -1023,6 +1037,7 @@
       "path_smooth",
       "extra_trees",
       "extra_seed",
+      "random_strength",
       "monotone_penalty",
       "monotone_constraints_method",
       "cegb_tradeoff",
@@ -1031,13 +1046,20 @@
       "linear_lambda",
       "enable_bundle",
       "max_conflict_rate",
+      "feature_pre_filter",
       "data_sample_strategy",
       "max_bin",
       "alpha",
       "fair_c",
       "tweedie_variance_power",
       "device",
-      "use_missing"
+      "use_missing",
+      "use_quantized_grad",
+      "num_grad_quant_bins",
+      "quant_train_renew_leaf",
+      "stochastic_rounding",
+      "leaf_estimation_iterations",
+      "derivative_precision"
     ],
     "used_by": [
       "capi",
@@ -1707,7 +1729,7 @@
       },
       "reg_lambda": {
         "canonical": "lambda_l2",
-        "fallback_default": 1.0,
+        "fallback_default": 0.0,
         "sites": 2
       },
       "subsample": {
@@ -1754,7 +1776,7 @@
       "importance_type": "split",
       "interaction_constraints": null,
       "lambda_l1": 0.0,
-      "lambda_l2": 1.0,
+      "lambda_l2": 0.0,
       "learning_rate": 0.1,
       "linear_lambda": 0.0,
       "linear_tree": false,
@@ -1826,5 +1848,16 @@
     "mojo_toolchain": ">=1.0.0,<2",
     "requires_python": ">=3.14",
     "snapshot_schema": 2
-  }
+  },
+  "numerical_contracts": [
+    "pred_contrib rows sum to the raw score exactly",
+    "predict(num_iteration=k) equals a k-round fit; [0,k) plus [k,n) equals the whole raw score",
+    "save and load round trips bit-exactly",
+    "all-ones sample_weight equals no sample_weight, bit-identically",
+    "no callbacks means no boundary crossing and a bit-identical model",
+    "a sparse fit equals the dense fit with gaps filled with zeros",
+    "a repeat run on the same device is bit-identical",
+    "worker count does not change a CPU result",
+    "CPU and GPU agree within a Float32 tolerance with exact integer counts, and are not bit-identical to each other"
+  ]
 }

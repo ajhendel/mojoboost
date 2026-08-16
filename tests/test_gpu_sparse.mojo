@@ -172,10 +172,10 @@ def test_gpu_sparse_histogram_matches_cpu_sparse_histogram() raises:
         var got = builder.build(grad, hess)
         assert_equal(got.n_features, want.n_features)
         assert_equal(got.n_bins, want.n_bins)
-        for i in range(len(want.count)):
-            assert_equal(got.count[i], want.count[i])
-            assert_true(abs(got.grad[i] - want.grad[i]) <= 1e-3)
-            assert_true(abs(got.hess[i] - want.hess[i]) <= 1e-3)
+        for i in range(want.n_cells()):
+            assert_equal(got.count_at(i), want.count_at(i))
+            assert_true(abs(got.grad_at(i) - want.grad_at(i)) <= 1e-3)
+            assert_true(abs(got.hess_at(i) - want.hess_at(i)) <= 1e-3)
 
 
 def test_gpu_sparse_tree_matches_cpu_sparse_tree() raises:

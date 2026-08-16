@@ -54,7 +54,6 @@ it, not a second opinion.
 |---|---|---|---|
 | `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference the CPU/GPU equivalence test compares against. Test-only by design |
 | `gpu_vendor_policy` | EXPERIMENTAL | consolidation_K2 | CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / gpu_amd_policy twins (f23bd1b). Reached only from its test until a discrete-GPU trainer consults it; that is the same status the twins had. handoffs/migration_20_device_policy.md |
-| `histogram_cache_policy` | PENDING | connect_04 | Was reached only from hybrid_leaf_scheduler, which was deleted 2026-08-16; now has no importer at all. Delete candidate |
 
 Three shapes recur and are worth naming, because they change what a fix
 costs:
@@ -101,10 +100,19 @@ overflow guard and no packed plan, `gpu_bin_packing` nothing at all,
 `hybrid_leaf_scheduler` a report that moves no histogram, and
 `histogram_cache_policy` only what that report reads. Their rows stay at
 `deferred` with the reach written into the evidence.
-*Dated note, 2026-08-16.* One of those seven, `hybrid_leaf_scheduler`, has
-since been deleted rather than connected, and `histogram_cache_policy` —
-which only that module imported — is now an orphan with no importer at all.
-The paragraph above stands as the record of what was true at that snapshot.
+*Dated note, 2026-08-16.* Two of those seven are gone rather than
+connected. `hybrid_leaf_scheduler` was deleted by the GPU campaign once the
+device-resident plane made its premise obsolete, and `histogram_cache_policy`
+— which only that module imported — was deleted by the CPU campaign
+immediately afterwards, having become an orphan with no importer at all. Its
+row is removed from the table above rather than left at PENDING, because a
+module that does not exist cannot be pending connection.
+
+The paragraph above stands as the record of what was true at that snapshot,
+and it is worth leaving intact for one reason: it argued that being *reached*
+is not the same as being *called*, and listed both modules among the four
+that were reached and not exercised. Both were deleted within the day. That
+is the distinction paying for itself.
 
 `CLASSIFICATION` in `tools/connectivity_audit.py` still carries
 entries for all seven; they are now judgments about modules that are no

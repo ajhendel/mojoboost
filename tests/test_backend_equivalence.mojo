@@ -64,9 +64,9 @@ def test_gpu_matches_cpu_histogram() raises:
         assert_equal(cpu.n_features, gpu.n_features)
         assert_equal(cpu.n_bins, gpu.n_bins)
         for i in range(cpu.n_features * cpu.n_bins):
-            assert_equal(cpu.count[i], gpu.count[i])
-            assert_true(_close(cpu.grad[i], gpu.grad[i], g_mag))
-            assert_true(_close(cpu.hess[i], gpu.hess[i], h_mag))
+            assert_equal(cpu.count_at(i), gpu.count_at(i))
+            assert_true(_close(cpu.grad_at(i), gpu.grad_at(i), g_mag))
+            assert_true(_close(cpu.hess_at(i), gpu.hess_at(i), h_mag))
 
 
 def test_gpu_builder_reuse_is_deterministic() raises:
@@ -91,9 +91,9 @@ def test_gpu_builder_reuse_is_deterministic() raises:
         var b = builder.build(grad, hess)
         # Integer accumulation makes repeat builds bit-identical.
         for i in range(a.n_features * a.n_bins):
-            assert_equal(a.grad[i], b.grad[i])
-            assert_equal(a.hess[i], b.hess[i])
-            assert_equal(a.count[i], b.count[i])
+            assert_equal(a.grad_at(i), b.grad_at(i))
+            assert_equal(a.hess_at(i), b.hess_at(i))
+            assert_equal(a.count_at(i), b.count_at(i))
 
 
 def test_model_predict_batch_matches_across_devices() raises:

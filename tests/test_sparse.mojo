@@ -230,9 +230,40 @@ def test_conversions_round_trip() raises:
 # ------------------------------------------------------------------ binning
 
 
+def _assert_same_edges(sm: BinMapper, dm: BinMapper, what: String) raises:
+    """Edge for edge, offset for offset, bit for bit. No tolerance: the two
+    fitters are required to compute the same doubles, not close ones."""
+    assert_equal(sm.n_features, dm.n_features, String(what, ": n_features"))
+    assert_equal(sm.n_bins, dm.n_bins, String(what, ": n_bins"))
+    assert_equal(len(sm.edges), len(dm.edges), String(what, ": edge count"))
+    for i in range(len(dm.edges)):
+        assert_equal(
+            sm.edges[i].to_bits(),
+            dm.edges[i].to_bits(),
+            String(what, ": edge ", i),
+        )
+    for f in range(dm.n_features + 1):
+        assert_equal(
+            sm.edge_offsets[f],
+            dm.edge_offsets[f],
+            String(what, ": offset ", f),
+        )
+    for f in range(dm.n_features):
+        assert_equal(
+            sm.missing_bin[f],
+            dm.missing_bin[f],
+            String(what, ": missing bin ", f),
+        )
+
+
 def test_sparse_binning_matches_dense_exactly() raises:
     # Sparse binning indexes the implied dense sorted column instead of
-    # materializing it, so the edges must come out bit-identical.
+    # materializing it, so the edges must come out bit-identical -- **at the
+    # arguments the caller passed, the defaults included**. This runs at the
+    # stock defaults, so `min_data_in_bin=3` is live on both sides: 900 rows
+    # at 15% density is roughly 136 mostly-singleton levels per column, which
+    # the level-merging rule collapses, and it collapsed only on the dense
+    # side until `fit_bins_csc` was given the argument.
     var n_rows = 900
     var n_features = 13
     var dense = _sparse_dense(n_rows, n_features, 0.15, UInt64(2))
@@ -241,13 +272,104 @@ def test_sparse_binning_matches_dense_exactly() raises:
     for max_bins in [2, 7, 64, 255]:
         var dm = fit_bins(dense, n_rows, n_features, max_bins)
         var sm = fit_bins_csc(csc, max_bins)
-        assert_equal(sm.n_features, dm.n_features)
-        assert_equal(sm.n_bins, dm.n_bins)
-        assert_equal(len(sm.edges), len(dm.edges))
-        for i in range(len(dm.edges)):
-            assert_equal(sm.edges[i], dm.edges[i])
-        for f in range(n_features + 1):
-            assert_equal(sm.edge_offsets[f], dm.edge_offsets[f])
+        _assert_same_edges(sm, dm, String("default, max_bins=", max_bins))
+
+
+def _level_dense(
+    n_rows: Int, n_features: Int, n_levels: Int, per_level: Int
+) -> List[Float64]:
+    """Column-major, mostly zeros, with `n_levels` distinct nonzero values
+    each held by exactly `per_level` rows and none of them zero.
+
+    Deliberately low cardinality, so the fit takes the branch that gives each
+    level a bin. That is the branch `min_data_in_bin` merges in, and it is
+    the branch `_sparse_dense` never reaches at a wide bin budget.
+    """
+    var out = List[Float64](capacity=n_rows * n_features)
+    out.resize(n_rows * n_features, 0.0)
+    var stored = n_levels * per_level
+    for f in range(n_features):
+        for i in range(stored):
+            # 7 and `n_rows` are coprime and `7 * stored < n_rows`, so the
+            # rows a column writes are distinct and no level loses a row to
+            # an overwrite.
+            var r = (7 * i + 13 * f) % n_rows
+            var level = i // per_level
+            out[f * n_rows + r] = (
+                Float64(level) - Float64(n_levels) / 2.0 + 0.5
+            )
+    return out^
+
+
+def test_sparse_binning_honors_min_data_in_bin() raises:
+    # 24 nonzero levels of two rows each plus 552 implicit zeros, so the
+    # levels branch runs and the implicit zeros are the biggest level by two
+    # orders of magnitude -- which is the case the sparse side got wrong,
+    # since it is the level whose count only exists implicitly.
+    var n_rows = 600
+    var n_features = 5
+    var dense = _level_dense(n_rows, n_features, 24, 2)
+    var csc = csc_from_dense(dense, n_rows, n_features)
+
+    var edges_at = List[Int]()
+    var mins: List[Int] = [1, 3, 9, 40]
+    for i in range(len(mins)):
+        var m = mins[i]
+        var dm = fit_bins(dense, n_rows, n_features, 64, min_data_in_bin=m)
+        var sm = fit_bins_csc(csc, 64, min_data_in_bin=m)
+        _assert_same_edges(sm, dm, String("min_data_in_bin=", m))
+        edges_at.append(len(sm.edges))
+    # The proof that the sweep is not measuring nothing: the edge count has
+    # to fall as the minimum rises, or every arm above would agree for the
+    # trivial reason that the setting never reached a column.
+    for i in range(1, len(edges_at)):
+        assert_true(
+            edges_at[i] < edges_at[i - 1],
+            String(
+                "min_data_in_bin must cut bins: ",
+                edges_at[i - 1],
+                " then ",
+                edges_at[i],
+            ),
+        )
+
+
+def test_sparse_binning_honors_the_row_sample() raises:
+    # `bin_construct_sample_cnt` changes which rows are read, and on a sparse
+    # column it also changes how many of the rows read are absent. The sparse
+    # fit must draw the same rows the dense fit draws and reach the same
+    # edges; the second assertion is the gate check, since a sample the
+    # column never saw would leave the two arms trivially equal.
+    var n_rows = 1_200
+    var n_features = 6
+    var dense = _sparse_dense(n_rows, n_features, 0.3, UInt64(23))
+    var csc = csc_from_dense(dense, n_rows, n_features)
+
+    for cnt in [200, 500, 1_199]:
+        var dm = fit_bins(
+            dense,
+            n_rows,
+            n_features,
+            32,
+            min_data_in_bin=1,
+            bin_construct_sample_cnt=cnt,
+        )
+        var sm = fit_bins_csc(
+            csc, 32, min_data_in_bin=1, bin_construct_sample_cnt=cnt
+        )
+        _assert_same_edges(sm, dm, String("sample_cnt=", cnt))
+
+    var full = fit_bins_csc(csc, 32, min_data_in_bin=1)
+    var drawn = fit_bins_csc(
+        csc, 32, min_data_in_bin=1, bin_construct_sample_cnt=200
+    )
+    var moved = len(full.edges) != len(drawn.edges)
+    if not moved:
+        for i in range(len(full.edges)):
+            if full.edges[i].to_bits() != drawn.edges[i].to_bits():
+                moved = True
+                break
+    assert_true(moved, "the sample never reached the sparse columns")
 
 
 def test_sparse_binned_matrix_matches_dense() raises:
@@ -292,7 +414,7 @@ def test_implicit_zero_is_a_numerical_zero() raises:
         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
     ]
     var hist = build_histogram_sparse(data, grad, grad)
-    assert_equal(hist.count[zero_bin], 4)
+    assert_equal(hist.count_at(zero_bin), 4)
 
 
 def test_explicit_zeros_match_implicit_zeros() raises:
@@ -508,20 +630,20 @@ def test_sparse_histogram_matches_dense() raises:
     assert_equal(got.n_features, want.n_features)
     assert_equal(got.n_bins, want.n_bins)
     # Counts are integer on both paths and must match exactly.
-    _assert_counts_equal(want.count, got.count)
+    _assert_counts_equal(want._count, got._count)
     # Gradient and hessian sums differ only by the rounding of one
     # subtraction per (feature, default bin).
-    assert_true(_max_abs_diff(want.grad, got.grad) < 1e-9)
-    assert_true(_max_abs_diff(want.hess, got.hess) < 1e-9)
+    assert_true(_max_abs_diff(want._grad, got._grad) < 1e-9)
+    assert_true(_max_abs_diff(want._hess, got._hess) < 1e-9)
 
     var rows = List[Int]()
     for r in range(0, n_rows, 3):
         rows.append(r)
     var want_sub = build_histogram_subset(binned, grad, hess, rows)
     var got_sub = build_histogram_sparse_subset(sparse, grad, hess, rows)
-    _assert_counts_equal(want_sub.count, got_sub.count)
-    assert_true(_max_abs_diff(want_sub.grad, got_sub.grad) < 1e-9)
-    assert_true(_max_abs_diff(want_sub.hess, got_sub.hess) < 1e-9)
+    _assert_counts_equal(want_sub._count, got_sub._count)
+    assert_true(_max_abs_diff(want_sub._grad, got_sub._grad) < 1e-9)
+    assert_true(_max_abs_diff(want_sub._hess, got_sub._hess) < 1e-9)
 
 
 def test_sparse_histogram_grouped_matches_masked() raises:
@@ -541,10 +663,10 @@ def test_sparse_histogram_grouped_matches_masked() raises:
         all_rows.append(r)
     var masked = build_histogram_sparse_subset(sparse, grad, hess, all_rows)
     var grouped = build_histogram_sparse(sparse, grad, hess)
-    _assert_counts_equal(masked.count, grouped.count)
-    for i in range(len(masked.grad)):
-        assert_equal(masked.grad[i], grouped.grad[i])
-        assert_equal(masked.hess[i], grouped.hess[i])
+    _assert_counts_equal(masked._count, grouped._count)
+    for i in range(masked.n_cells()):
+        assert_equal(masked.grad_at(i), grouped.grad_at(i))
+        assert_equal(masked.hess_at(i), grouped.hess_at(i))
 
 
 def test_sparse_histogram_rejects_bad_input() raises:
@@ -1049,6 +1171,11 @@ def test_worker_settings_do_not_change_results() raises:
 
     _ = setenv("MOJOTREES_NUM_WORKERS", "1")
     var mapper = fit_bins_csc(csc, 16)
+    # The sampled fit as well as the plain one: `bin_construct_sample_cnt`
+    # draws its rows once, serially, before any feature is dispatched, and
+    # `min_data_in_bin` counts levels inside a column. Neither may reach the
+    # worker count, and 300 of 600 rows is a draw that actually happened.
+    var sampled = fit_bins_csc(csc, 16, bin_construct_sample_cnt=300)
     var sparse = transform_csc(mapper, csc)
     var serial_hist = build_histogram_sparse(sparse, grad, hess)
     var serial_tree = grow_tree_sparse(sparse, grad, hess, params.tree)
@@ -1059,15 +1186,17 @@ def test_worker_settings_do_not_change_results() raises:
         _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "1")
         var m = fit_bins_csc(csc, 16)
         for i in range(len(m.edges)):
-            assert_equal(m.edges[i], mapper.edges[i])
+            assert_equal(m.edges[i].to_bits(), mapper.edges[i].to_bits())
+        var ms = fit_bins_csc(csc, 16, bin_construct_sample_cnt=300)
+        _assert_same_edges(ms, sampled, String("sampled, workers=", workers))
         var s = transform_csc(m, csc)
         for i in range(s.nnz()):
             assert_equal(s.bin[i], sparse.bin[i])
         var h = build_histogram_sparse(s, grad, hess)
-        for i in range(len(h.grad)):
-            assert_equal(h.grad[i], serial_hist.grad[i])
-            assert_equal(h.hess[i], serial_hist.hess[i])
-            assert_equal(h.count[i], serial_hist.count[i])
+        for i in range(h.n_cells()):
+            assert_equal(h.grad_at(i), serial_hist.grad_at(i))
+            assert_equal(h.hess_at(i), serial_hist.hess_at(i))
+            assert_equal(h.count_at(i), serial_hist.count_at(i))
         var t = grow_tree_sparse(s, grad, hess, params.tree)
         _assert_same_tree(serial_tree.tree, t.tree, 0.0)
         for r in range(n_rows):

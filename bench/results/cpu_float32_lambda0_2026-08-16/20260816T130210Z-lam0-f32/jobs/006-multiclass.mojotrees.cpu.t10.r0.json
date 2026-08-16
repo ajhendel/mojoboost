@@ -1,0 +1,15 @@
+{
+  "scenario": "multiclass",
+  "tier": "standard",
+  "variant": "auto",
+  "engine": "mojotrees",
+  "device": "cpu",
+  "threads": 10,
+  "repeat": 0,
+  "predict_repeats": 3,
+  "allow_unpinned": false,
+  "data_digest": true,
+  "backend_proof": true,
+  "job_index": 6,
+  "run_id": "20260816T130210Z-lam0-f32"
+}

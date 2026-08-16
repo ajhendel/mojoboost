@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "status": "error",
+  "run_id": "20260816T130105Z-lam0-f32",
+  "job_index": 5,
+  "repeat": 2,
+  "scenario": "imbalanced_binary",
+  "tier": "standard",
+  "engine": "lightgbm",
+  "device_requested": "cpu",
+  "threads": 10,
+  "error": {
+    "type": "ModuleNotFoundError",
+    "message": "No module named 'lightgbm'",
+    "traceback": "Traceback (most recent call last):\n  File \"/private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1/bench/real_data/worker.py\", line 261, in main\n    record, predictions = run_job(job)\n                          ~~~~~~~^^^^^\n  File \"/private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1/bench/real_data/worker.py\", line 177, in run_job\n    engine.load()\n    ~~~~~~~~~~~^^\n  File \"/private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1/bench/real_data/engines.py\", line 574, in load\n    import lightgbm\nModuleNotFoundError: No module named 'lightgbm'\n"
+  },
+  "environment": {
+    "collected_at_utc": "2026-08-16T13:01:16Z",
+    "hostname": "Mac",
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "cpu": {
+      "arch": "arm64",
+      "system": "Darwin",
+      "release": "25.5.0",
+      "model": "Apple M4",
+      "physical_cores": 10,
+      "logical_cores": 10,
+      "memory_bytes": 17179869184,
+      "performance_cores": 4,
+      "efficiency_cores": 6
+    },
+    "versions": {
+      "python": "3.14.6",
+      "numpy": "2.4.4",
+      "scipy": "1.17.1",
+      "lightgbm": null,
+      "mojo": null,
+      "max": null
+    },
+    "git": {
+      "commit": "f15d10748eae768f5530069e74471d58cc24cf5c",
+      "branch": "cpu-round-1",
+      "dirty": true,
+      "describe": "v0.1.0a3-277-gf15d107-dirty"
+    },
+    "accelerator": {
+      "gpu_available": false,
+      "probe_error": null,
+      "backend": "metal"
+    },
+    "machine_state": {
+      "load_average_1m": 4.3818359375,
+      "on_battery": false,
+      "thermal_pressure": "Note: No CPU power status has been recorded"
+    },
+    "env": {
+      "MOJOTREES_NUM_WORKERS": "10",
+      "MOJOTREES_PARALLEL_MIN_OPS": null,
+      "MOJOTREES_DISABLE_GPU": "1",
+      "MOJOTREES_BENCH_DATA": null,
+      "OMP_NUM_THREADS": "10",
+      "OPENBLAS_NUM_THREADS": "10",
+      "MKL_NUM_THREADS": "10",
+      "VECLIB_MAXIMUM_THREADS": "10",
+      "NUMEXPR_NUM_THREADS": "10"
+    },
+    "argv": [
+      "/private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1/bench/real_data/worker.py",
+      "--job",
+      "bench/results/cpu_float32_lambda0_2026-08-16/20260816T130105Z-lam0-f32/jobs/005-imbalanced_binary.lightgbm.cpu.t10.r2.json",
+      "--out",
+      "bench/results/cpu_float32_lambda0_2026-08-16/20260816T130105Z-lam0-f32/records/005-imbalanced_binary.lightgbm.cpu.t10.r2.json",
+      "--predictions",
+      "bench/results/cpu_float32_lambda0_2026-08-16/20260816T130105Z-lam0-f32/predictions/005-imbalanced_binary.lightgbm.cpu.t10.r2.npy"
+    ]
+  }
+}

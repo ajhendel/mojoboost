@@ -374,7 +374,10 @@ def fit[
             "model.fit (use custom_metric.fit_with_metrics, which fits and"
             " predicts linear leaves)"
         )
-    var backend = resolve_device(device, n_rows, n_features, 1)
+    # The objective is part of every crossover rule in `device_policy`, and
+    # this entry point holds it and used to drop it, so `device='auto'` could
+    # never select the accelerator from here.
+    var backend = resolve_device(device, n_rows, n_features, 1, objective)
     var mapper = fit_bins(
         features,
         n_rows,
@@ -440,6 +443,19 @@ def fit_multiclass[
         check_linear_tree_unconnected(
             "model.fit_multiclass (use custom_metric.fit_multiclass_with_metrics)"
         )
+    # OBJECTIVE_UNSPECIFIED, not `_MULTICLASS`, and the difference is a bug I
+    # shipped and then measured. `objective_registry.MULTICLASS` is -1, a
+    # registry sentinel meaning "this fit is multiclass"; `device_policy`
+    # reads the same argument as a trainer objective code and -2 is its
+    # "caller did not name one". So passing -1 made every multiclass GPU fit
+    # raise "objective code -1 is not one the built-in trainers implement",
+    # which bench/real_data caught on the first run after the patch.
+    #
+    # Unspecified is also the honest answer rather than merely the working
+    # one: the softmax path grows one tree per class and each of those trees
+    # carries a single-output objective this entry point does not know. If
+    # the crossover rules should gate on multiclass as such, that is a case
+    # `device_policy` needs to add, not a sentinel this caller can smuggle in.
     var backend = resolve_device(device, n_rows, n_features, n_classes)
     var mapper = fit_bins(
         features,

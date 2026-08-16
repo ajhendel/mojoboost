@@ -1,23 +1,40 @@
 # Floating point numerics and contraction policy
 
-This document states what bit-level reproducibility mojotrees promises, names
-the one optimizer transformation most likely to break that promise quietly,
-records the two times it did break it during the perf-round-2 optimization
-round, and sets the convention every multiply-add on the numerics path is
-expected to follow.
+This document states what bit-level reproducibility mojotrees promises and
+what it deliberately does not promise, names the one optimizer transformation
+most likely to move a result quietly, records the three times it did so during
+the perf-round-2 optimization round, and sets the convention every
+multiply-add on the numerics path is expected to follow.
 
-It was written after those two incidents, on `perf-round-2` at commit
-`cd5a5ea`, against Mojo 1.0.0 build `ed45d567`. The compiler behavior in
+It was written after the first two of those incidents, on `perf-round-2` at
+commit `cd5a5ea`, against Mojo 1.0.0 build `ed45d567`. The compiler behavior in
 section 3 was measured on that build on an Apple M4, host and device. It has
 not been measured on any other toolchain, any other host architecture, or any
 other GPU vendor, and nothing here should be read as a claim about NVIDIA or
 AMD device compilers.
 
+**Section 1 was rewritten during CPU round 1 to state the settled accuracy
+policy, which is narrower than the one this document originally carried.**
+Sections 4, 7, 8 and 10 were written under the stricter rule. Where a
+paragraph's reasoning rested on the half of that rule which has now been
+retired, the paragraph carries a note saying so rather than being deleted,
+because the measurement it reports is still a measurement and the reasoning is
+still worth reading with its date attached.
+
 ## 1. The promise
 
-mojotrees promises that training and prediction are **bit-identical across
-runs**, subject to a scope that has to be stated exactly, because the scope is
-what makes the promise testable.
+The policy has three parts. They are not one promise in three wordings, and
+the difference between them is most of the content of this section. Part one
+is about a single toolchain and is absolute. Part two is where accuracy is
+actually defined, and it is defined against a comparator rather than against
+this project's own history. Part three is a permission rather than a promise,
+and it replaces a stricter rule this document used to state.
+
+### 1.1 Deterministic on a given toolchain and across worker counts
+
+**Training and prediction are bit-identical run to run, machine to machine,
+and at every worker count, on one toolchain.** This part is not negotiable and
+it is the property every test in this project asserts.
 
 Held fixed:
 
@@ -36,17 +53,95 @@ Allowed to vary, with the results still required to be bit-identical:
   it is derived from device attributes rather than from the data;
 - machine load, thermal state, and wall clock.
 
-The scope is deliberately narrow in one direction and deliberately wide in the
-other. Wide, because a result that changes when the thread count changes is not
-reproducible in any useful sense, and the whole parallel design of this package
-is built so that the schedule cannot reach the arithmetic. Every parallel
-accumulation on the numerics path either sums into per-row slots that no other
-task touches, or accumulates in integers, where addition is associative.
-`histogram.mojo` says this in its own docstrings, and `quantized_gradient.mojo`
-is the fixed-point path that exists precisely to buy it on the GPU.
+The second scope is deliberately wide, because a result that changes when the
+thread count changes is not reproducible in any useful sense, and the whole
+parallel design of this package is built so that the schedule cannot reach the
+arithmetic. Every parallel accumulation on the numerics path either sums into
+per-row slots that no other task touches, or accumulates in integers, where
+addition is associative. `quantized_gradient.mojo` is the fixed-point path that
+exists precisely to buy this on the GPU.
 
-Narrow in the other direction, because **CPU and GPU are not bit-identical to
-each other and are not intended to be.** The GPU histogram path carries
+There is a consequence of part 1.1 that constrains CPU round 1 directly and is
+easy to lose while reading part 1.3. A parallel decomposition is allowed to
+change the arithmetic. What it changes the arithmetic *to* must be a function
+of the data and of the resolved policy and of nothing else. A row-block
+histogram fold is permitted under this policy; a row-block fold whose block
+count is derived from the resolved worker count is not, because two runs at
+different worker counts would then disagree and `require_identical_predictions`
+in `bench/real_data/thresholds.json` would be the thing that caught it.
+`docs/design/ACCURACY_BUDGET.md` section 4 states the specific rule, which is
+to derive the block count from the node's row count alone and to fold the
+partials in ascending block order regardless of which block finished first.
+
+### 1.2 Accuracy is held-out parity with LightGBM, inside pre-registered thresholds
+
+**Accuracy is defined against a comparator on real data, at tolerances written
+down before any run.** It is not defined against this project's own previous
+bytes. The tolerances live in `bench/real_data/thresholds.json`, and that
+file's own preamble draws the distinction that makes it a gate rather than a
+scoreboard. It is quoted here rather than paraphrased, because the paraphrase
+loses the argument:
+
+> Two kinds of number get confused in benchmark suites. A quality
+> difference between two engines fitting the same objective on the same
+> bins is small, stable, and reproducible, so a threshold on it is a real
+> test: cross it and something is wrong. A timing is none of those things
+> on a laptop with a thermal budget, so a threshold on it is a coin toss
+> wearing a lab coat. verify.py reads this file and decides pass or fail.
+> report.py prints the timings and decides nothing.
+
+and, on the only legitimate way a threshold moves:
+
+> Every value here was chosen before any run, from what the two
+> implementations are known to differ by, and each carries its reasoning.
+> Loosening one after seeing a result is allowed and has to be done in a
+> commit that says so; editing one to make today's run green is how a
+> suite stops meaning anything.
+
+The same file restates part 1.1 as a test, through
+`defaults.determinism.mojotrees.require_identical_predictions`, whose stated
+rationale is that "a digest that moves is a regression in that property and is
+worth failing over even when the metrics are unchanged."
+
+### 1.3 Identity with past output is not a promise
+
+**A change may move bits deliberately.** It is allowed to produce a different
+model from the one this library produced yesterday, on three conditions, all of
+which have to hold together.
+
+1. **It stays deterministic under 1.1.** A change that moves bits and also
+   makes the answer depend on the schedule is refused on the second ground
+   whatever its merits on the first.
+2. **It stays inside the accuracy thresholds of 1.2**, and the evidence for
+   that is a before arm and an after arm of `bench/real_data` on one machine,
+   not an argument from mechanism. An argument from mechanism is what decides
+   whether the run is worth taking, not what discharges it.
+3. **The golden fixture is re-baselined in the same commit, with the ulp
+   movement stated.** How many values moved, on which arrays, by how many units
+   in the last place, and for any that moved by more than a few, why. A commit
+   that moves bits and leaves `tests/test_golden_bits.mojo` green did not move
+   the bits it believes it moved. A commit that regenerates the fixture without
+   characterizing the diff has spent the evidence rather than the budget.
+
+`docs/design/ACCURACY_BUDGET.md` is the standing record of what each known
+relaxation costs and who may authorize it.
+
+**The retired half of the old rule was not a mistake and is not being called
+one.** Until this round the promise was identity with past output as well as
+determinism, and it earned its keep. It is what caught both of the incidents in
+sections 4.1 and 4.2, neither of which any tolerance test would have seen, and
+the third in section 4.3 was found by an audit that only got written because
+the first two had happened. Three real defects, one invariant. It is being
+traded, deliberately, under a directive that says the project optimizes for
+speed and accuracy only, that accuracy is not negotiable, and that identity
+with past output is. The trade is written down here rather than assumed so that
+the next person to read a one-ulp diff knows which rule they are standing
+under.
+
+### 1.4 All three parts are scoped per backend
+
+**CPU and GPU are not bit-identical to each other and are not intended to
+be.** The GPU histogram path carries
 gradients in Float32 and accumulates in Int32 fixed point; the CPU path carries
 Float64. `histogram_gpu.mojo` states the resulting contract directly, that
 agreement with the CPU builder is to Float32 precision and not bit-exact, while
@@ -56,9 +151,115 @@ two have been shown to agree bit for bit on the target hardware, which is a
 hardware claim and never an assumption. (The hybrid leaf scheduler built its
 `MODE_MIRROR` gate on it too, until that module was deleted on 2026-08-16.)
 
-So the promise is **per backend**. Within a backend it is bitwise. Across
-backends it is to Float32 precision on the float planes and exact on the
-integer planes.
+So part 1.1 is **per backend**. Within a backend it is bitwise. Across backends
+it is to Float32 precision on the float planes and exact on the integer planes,
+and `thresholds.json` prices that separately under `defaults.device_agreement`
+rather than folding it into the determinism gate.
+
+### 1.5 Per-row derivatives are Float32, and two consequences follow
+
+The CPU path stores per-row gradients and hessians at **Float32** precision,
+matching LightGBM's `score_t`. Scores, leaf values, gains and histogram cells
+stay Float64. The narrowing is applied at the objective and **again at every
+read site**, which makes it idempotent and is what keeps the gathered and
+ungathered accumulation paths adding identical Float64s.
+
+This is the default and not the only setting; §1.6 has the measured trade that
+made it a switch, and what `derivative_precision = "float64"` changes. Both
+properties below are properties of the Float32 default.
+
+Two properties follow that a reader should not have to discover from a test.
+
+**Sample-weight scaling is exact only to Float32 precision.** The code forms
+`score_t(g * w)`; anything computing `score_t(g) * w` instead gets a different
+number, by up to two Float32 ulps. So doubling a sample weight does not
+exactly double its gradient. This is a property of the product and not a
+loosened test: `tests/test_objectives.mojo` asserts the identity to about ten
+Float32 ulps because that is the bound the arithmetic actually supports.
+
+**Any path that reads a derivative must narrow it too, or it stops agreeing
+with the others.** This is not redundant with narrowing at the source: GOSS
+reweighting and sample weights multiply a stored derivative, and the product
+is a Float64 that generally is not Float32-representable. `histogram_sparse`
+and the row-major kernels both had to be corrected for exactly this, and both
+failures presented as a builder disagreeing with the dense reference rather
+than as anything that looked like a precision problem.
+
+### 1.6 It is a measured trade, and therefore a switch: `derivative_precision`
+
+Float32 is not free, and the numbers below are the reason this is a parameter
+rather than a constant. They are the first `bench/real_data` run after the
+narrowing landed, comparing the run before it against the run after it on the
+same scenarios, same seeds, same binning.
+
+**What it bought.** Agreement between this package's own CPU and accelerator
+arms, which is what makes a backend claim checkable at all:
+
+| scenario | metric | before Float32 | after Float32 |
+|---|---|---|---|
+| dense_regression | rmse, CPU vs GPU | 1.6e-04 | **7.9e-09** |
+| dense_regression | mae, CPU vs GPU | 2.0e-04 | 6.2e-09 |
+
+Four orders of magnitude on RMSE. The device carries gradients in Float32 and
+accumulates in Int32 fixed point (§1.4); a CPU path carrying Float64
+derivatives was disagreeing with it for that reason and no other.
+
+**What it cost.** Accuracy on the imbalanced binary scenario, on the CPU arm
+alone. The accelerator arm barely moved, so this is a precision effect and not
+two backends drifting:
+
+| scenario | metric | before Float32 | after Float32 | change |
+|---|---|---|---|---|
+| imbalanced_binary | average_precision, CPU arm | 0.0136 | 0.0123 | **-9.4% relative** |
+| imbalanced_binary | auc, CPU arm | 0.7339 | 0.7279 | -0.006 absolute |
+| imbalanced_binary | average_precision, CPU vs GPU | 0.00497 | **0.0736** | wider |
+| imbalanced_binary | auc, CPU vs GPU | 0.00317 | 0.0054 | wider |
+
+The CPU-vs-GPU columns widen on this scenario while narrowing on
+`dense_regression`, which is the same fact seen twice: the CPU arm moved and
+the accelerator arm did not.
+
+Provenance: **measured**, `bench/real_data`, one run per side, on the
+scenario's synthetic variant at a 0.5 percent positive rate (the real variant,
+`bank_marketing`, sits near an average precision of 0.68 and is not where this
+shows). Two runs are two runs and not a distribution; average precision on a
+rare class is dominated by the ordering of a few hundred rows and is the
+noisiest number in the harness. Read the direction, not the third digit.
+
+**The decision, and it did not change.** Float32 stays the default. It is
+LightGBM's own profile (`typedef float score_t`, `include/LightGBM/meta.h`),
+and on `imbalanced_binary` it puts this package *at* LightGBM's average
+precision and AUC rather than above them, which is the parity the project is
+aiming at. A number that moves toward the comparator is not a regression even
+when it moves down.
+
+**But a measured trade becomes a switch.** `derivative_precision` takes
+`float32` (the default, everything above) or `float64`, and `float64` keeps
+per-row gradients and hessians at full Float64 through the objective and every
+read site. Reach it with `MOJOTREES_DERIVATIVE_PRECISION=float64`, which is
+read once per fit by `histogram.ConstHessianSettings.resolve()` and once per
+round by `boosting.fill_grad_hess`.
+
+**What `float64` buys and what it costs, for a reader deciding.** It buys back
+the accuracy in the second table on a rare-class ranking metric, and it buys
+an exact sample-weight identity (§1.5's first property is a Float32 property
+and does not apply). It costs, in order of size:
+
+- **Agreement with the accelerator**, which is the first table run backwards.
+  A `float64` CPU fit and a device fit are not comparable to the precision
+  §1.4 claims, and `bench/real_data`'s `device_agreement` gate is calibrated
+  for the Float32 default.
+- **Speed.** The gathered `(gradient, hessian)` pair buffer packs two Float32
+  into one Float64 word, so it cannot carry a Float64 derivative and does not
+  run; and the row-blocked private histograms have that buffer as their only
+  row source on the subset arm, so blocking is off in *both* builders (both,
+  because one-sided blocking is what produced a four-ulp leaf-value
+  disagreement between the bagged and whole-dataset paths). A timing taken
+  under `float64` is not a timing of this package's CPU path.
+- **Bit identity with any published number**, all of which are Float32.
+
+What it does not cost: determinism across worker counts, which §1.1 promises
+at both settings and `tests/test_derivative_precision.mojo` checks at both.
 
 ## 2. What contraction is, and why it is the hazard
 
@@ -98,6 +299,45 @@ per-thread value and not when it is a launch argument; contracts in one function
 and not in the next after inlining changes how many uses a product has. None of
 this is stable across compiler versions, and none of it is written down in the
 source unless somebody writes it down.
+
+### 2.1 Which of that survives section 1.3
+
+Part 1.3 retires identity with past output, and a reader could reasonably ask
+whether contraction is still worth a document. It is, and the reason is worth
+stating precisely, because it changes what the rest of this document is asking
+for.
+
+**Contraction never threatens part 1.1.** It is a compile-time decision. A
+binary that contracts a site contracts it on every run, at every worker count,
+on every machine on that toolchain. Determinism, the part that is not
+negotiable, is not what contraction is a hazard to and never was.
+
+What it is a hazard to is two other things, and both survive intact.
+
+**Two paths that must agree with each other.** Section 4.3 is the whole
+argument. A device trainer whose raw scores depended on whether the run was
+bagged, and a device prediction that disagreed with the update the trainer had
+applied to the same tree, are defects under any policy, because neither
+version of the answer is being chosen. Nothing in part 1.3 makes it acceptable
+for the tiled and atomic GPU strategies to disagree, or for
+`hybrid_leaf_scheduler`'s host replica to stop matching the device it is
+mirroring. Part 1.3 permits bits to move; it does not permit two things that
+claim to be the same computation to be different computations.
+
+**Bits moving without anybody deciding.** Read part 1.3 carefully and the
+permission it grants is narrow. A change may move bits *deliberately*, priced,
+with the fixture re-baselined and the movement stated. Contraction is the
+mechanism by which bits move when nobody decided anything, because a refactor
+that is arithmetically identical changes what the optimizer emits. That is the
+one thing part 1.3 has no procedure for, since there is nothing to state and
+nobody to state it. So the enforcement in section 7 is not weakened by the new
+policy. Its job changes from "prove nothing moved" to "prove that whatever
+moved, somebody meant it", and the fixture is the same fixture either way.
+
+The practical effect is on section 6's four rules. Rule one, decide the
+semantics and say so in the code, is now the load-bearing one. Rule four, pin
+it with a bit comparison, is unchanged. What has gone is the unstated fifth
+rule, that a diff in the golden fixture ends the discussion.
 
 ## 3. What Mojo 1.0.0 exposes, measured
 
@@ -324,6 +564,19 @@ correct. It is there because fused is what this project's existing bits are, and
 the existing bits came from an expression the compiler happened to contract. The
 fix preserves the bits; it does not justify them.
 
+**Under part 1.3 that justification has expired, and the call is deferred
+rather than made here.** The only reason this `fma` exists is to reproduce
+bytes the project no longer promises. Removing it would move the raw score of
+every round on every CPU fit by up to one unit in the last place, which
+compounds into a different model, so it is exactly the kind of change part 1.3
+permits and exactly the kind it requires a priced run and a re-baseline for. It
+also has a cost on the other side that is easy to miss: `test_round_overhead`
+compares `_add_by_leaf` against `_add_by_traversal`, and the two agree only
+because the `fma` matches what the traversal expression contracts to. Removing
+the `fma` without settling the traversal arm's semantics turns that test from a
+proof into a coincidence. The same question, one level up and for the whole
+package at once, is section 8's.
+
 ### 4.2 GPU, the leaf id that stopped being a launch argument
 
 `gpu_objectives_native.mojo` has a per-leaf kernel that computes `raw[i] +
@@ -395,6 +648,19 @@ on an optimizer rather than relocating it, and that the CPU golden fixture is
 untouched. There is no GPU golden fixture yet; there should be, and that is the
 obvious next piece of enforcement.
 
+Two of those three reasons still stand under part 1.3 and one has changed
+status. Section 2.1's first hazard, two paths that must agree, is the reason
+this was a defect, and it is untouched by the new policy. The fix direction is
+still the right one. **"The CPU golden fixture is untouched" was a reason under
+the old rule and is not one under the new rule**, and it is worth noticing that
+it was the weakest of the three even then. It said only that the change had
+been confined to a backend the fixture did not cover, which is a statement
+about the fixture's coverage rather than about the change. Under part 1.3 the
+change would still have landed, and would additionally have owed a priced
+before-and-after arm, which it did not get. The absence of a GPU golden fixture
+is why the third condition of part 1.3 currently has nothing to bind on the
+device path.
+
 ## 5. The convention at each kind of site
 
 What follows is an audit of every place on the numerics path where a floating
@@ -439,7 +705,18 @@ Float32 and shipping the step.
 
 The two forms are not equal to each other. A host `fma(lr, value, raw)` in
 Float64 and a device `raw + round(lr32 * value32)` in Float32 are different
-numbers, which is exactly the per-backend scoping of section 1.
+numbers, which is exactly the per-backend scoping of section 1.4.
+
+The convention is descriptive rather than chosen, and section 4.1's note says
+why that matters now. **Fused is what the compiler happened to do, and the
+whole "intended" column of this table means "intended to keep matching what it
+happened to do".** That was the right column to have under the old rule. Under
+part 1.3 it is a set of open questions with a default answer, and the default
+answer is worth keeping only because changing it costs a re-baseline and buys
+nothing on its own. If a change in this round needs one of these sites moved,
+move it and pay part 1.3's three conditions. Do not treat the word "intended"
+here as a decision somebody made about the arithmetic, because at most two
+sites in this whole table is that true.
 
 ### 5.2 Gradients and hessians
 
@@ -618,6 +895,18 @@ the product to a `var`, on a bits round trip, or on widening to Float64. Section
 compare `to_bits()`. A tolerance test would have passed for both incidents in
 section 4.
 
+**Five, which is new with part 1.3. If the pin then fails, say what moved
+before you change it.** A red golden fixture is now the start of a decision
+rather than the end of one. The decision has three questions and they go in
+order. Is the change still deterministic across worker counts, which is the
+part that is not negotiable. Does held-out parity survive `thresholds.json`,
+which needs the harness run and not an argument. And what exactly moved, in
+units in the last place, on which arrays. Answer all three in the commit
+message and re-baseline in that same commit. Answer none of them and
+re-baseline anyway and the fixture has stopped being evidence, which is the
+failure mode section 7.2 item 6 was already written to prevent and which the
+new policy makes cheaper to fall into rather than harder.
+
 Two additional rules follow from the audit.
 
 **Prefer a form that cannot contract at all over a form that currently does not.**
@@ -654,6 +943,24 @@ document does commit to is the **relationship**: any change that moves a golden
 value is a change to the model this package produces, and must be treated as
 such, whatever the change was nominally about.
 
+**Part 1.3 changes what "treated as such" means and it is worth being exact
+about the difference, because it is easy to over-read in either direction.**
+Under the old rule a golden diff was a stop. The change did not land, or it
+landed with the diff explained away, and in practice it was a refusal. Under
+the new rule a golden diff is a bill. The change may land, and what it owes is
+the three conditions of part 1.3, of which the fixture re-baseline is only the
+third. The fixture's job is unchanged and its authority is unchanged. It is
+still the only instrument in the project that can tell you a model moved, since
+no tolerance test can, and section 2.1's second hazard is precisely that
+without it bits move with nobody deciding. What has changed is the default
+verdict on the evidence it produces, and nothing else.
+
+One thing that follows and should be said out loud, because a fixture whose
+baseline is expected to move invites it. **The fixture is not weakened by being
+re-baselined. It is weakened by being re-baselined without a statement.** Its
+value has always been the git history of its values, not the values, and the
+history is only readable if every movement in it carries what moved and why.
+
 ### 7.2 Toolchain bumps
 
 Golden values are pinned to a toolchain version. They are expected to move when
@@ -666,7 +973,15 @@ The procedure is:
    diff on a toolchain bump is information, not a bug, until it is examined.
 2. **Do not regenerate as part of an unrelated change.** A toolchain bump is its
    own commit. Regenerating goldens inside a feature branch hides exactly the
-   signal this whole document exists to preserve.
+   signal this whole document exists to preserve. Part 1.3 does not contradict
+   this and the two rules are easy to read as contradicting, so the seam is
+   worth naming. Part 1.3 requires a *deliberate* bit-moving change to
+   re-baseline **in the same commit**, because the movement and its
+   justification belong to one another. This item forbids re-baselining in a
+   commit that was **not** about moving bits. The test is whether the commit
+   message states the movement as one of the things the commit is for. If it
+   does, same commit. If the movement is a surprise the author is absorbing on
+   the way past, stop and split it out, and find out why it moved first.
 3. **Record both versions.** The old and the new `mojo --version`, including the
    build hash, go in the commit message. `ed45d567` is the build these values
    were established against.
@@ -696,16 +1011,25 @@ start.
 The reasoning is not that fused is better arithmetic. In several places it is
 better, since it rounds once instead of twice, but that is not why.
 
-**The reason is that the project's existing golden bits were produced under
-`contract=fast`.** Every recorded result, every model in the fixtures, every
-comparison in `test_round_overhead`, and the entire GPU validation record in
-`docs/GPU_VALIDATION.md` came out of a default build. Turning contraction off
-globally would move all of them at once, which is a large deliberate change to
-what this package computes, and it would need to be justified on its own terms
-rather than smuggled in as a hardening measure.
+**The first reason this section gave has expired and is retracted here rather
+than edited out.** It read, in full, that "the project's existing golden bits
+were produced under `contract=fast`", that every recorded result, every model
+in the fixtures, every comparison in `test_round_overhead`, and the entire GPU
+validation record in `docs/GPU_VALIDATION.md` came out of a default build, and
+that turning contraction off globally would move all of them at once. Every
+factual clause in that is still true. Section 10 measures it, and all six
+golden fixtures fail under `contract=off`. What has gone is the inference.
+Moving every model at once was a refusal under the old rule and is a priced
+decision under part 1.3, and the price, by
+`docs/design/ACCURACY_BUDGET.md`'s reckoning, is one unit in the last place per
+site, which is thirteen orders of magnitude below where that document's
+perturbation curve leaves zero. **The stated reason for this decision no longer
+supports the decision.** `docs/design/ACCURACY_BUDGET.md` section 10 argues on
+that basis that the question should be re-opened on its own terms, and it is
+right that it should be, and this document is not the place it gets settled.
 
-**The second reason is that it would not actually deliver what it appears to
-promise.** `contract=off` removes the optimizer's freedom to fuse, but it does
+**The reason that survives is that it would not actually deliver what it
+appears to promise.** `contract=off` removes the optimizer's freedom to fuse, but it does
 not remove the two mechanisms that actually bit us. `boosting.mojo:1201`'s
 explicit `fma` is unaffected by the flag, correctly, since it is a fused
 operation and not a contraction. And the GPU incident's per-leaf reference kernel
@@ -727,12 +1051,28 @@ exposure is at sites nobody has yet decided the semantics of.
    flag is per compilation and not per module, so a program built without it
    picks up contraction in library code that was precompiled with it, as section
    3.1 measured.
-3. A single commit regenerating every golden value under section 7.2's
-   procedure, with the diff characterized.
-4. A note in `docs/GPU_VALIDATION.md`, since the Metal record would no longer
+3. A before-and-after run of `bench/real_data`, which is condition 2 of part
+   1.3 and is the only thing that can establish that moving every model at once
+   stays inside `thresholds.json`. Section 10 characterizes the movement on the
+   fixtures but says nothing about a held-out metric, and a global flip of the
+   floating-point mode is the largest single bit-moving change available to
+   this project, so it is the last one that should be discharged by argument.
+4. A single commit regenerating every golden value under section 7.2's
+   procedure, with the diff characterized, which is condition 3.
+5. A note in `docs/GPU_VALIDATION.md`, since the Metal record would no longer
    describe the shipped configuration.
+6. An answer for `compatibility/fixtures/`, which is the item that has no
+   answer today and is the reason this is harder than the other five put
+   together. Those fixtures hold raw scores from released versions as bit
+   patterns and their README states that their value comes from never being
+   regenerated. Part 1.3 does not reach them, deliberately, because they are a
+   promise to users with models on disk rather than a promise about our own
+   history. A global change of the floating-point mode moves prediction bits
+   and would break every one of them, and the choice would be between
+   admitting the promise is broken and finding a way not to move prediction.
+   `docs/design/ACCURACY_BUDGET.md` section 1 states the line.
 
-Until all four are done, `contract=off` should be treated as a **diagnostic**
+Until all six are done, `contract=off` should be treated as a **diagnostic**
 rather than a setting. Building a suite both ways and diffing the results is a
 cheap way to enumerate which sites are contraction-sensitive, and it is the
 recommended first move when investigating an unexplained bit difference.
@@ -841,12 +1181,27 @@ Measured, on Mojo 1.0.0 build `ed45d567` on an Apple M4:
   a reason to read this fixture's failures by array name before reacting to a
   distance.
 
-  The consequence for section 1's promise is direct. Bit-determinism here is
-  contingent on the default floating-point mode as well as on the toolchain
-  version, and a build that sets `--fp-mode contract=off` is a different
-  numerical build of this library, not a differently optimized one. Section 8's
-  decision to stay at the default is therefore not a preference. Changing it
-  would move every model this library has ever fitted.
+  The consequence for section 1.1 is direct and is unchanged by the new
+  policy. The floating-point mode is one of the things held fixed, alongside
+  the toolchain version, and a build that sets `--fp-mode contract=off` is a
+  different numerical build of this library rather than a differently optimized
+  one. Two builds at different settings are as unrelated to each other as CPU
+  and GPU are, and section 1.4's per-backend scoping is the right analogy.
+
+  The consequence for section 8 is where the new policy bites. Changing the
+  flag would move every model this library has ever fitted, and under the old
+  rule that sentence was the end of the argument. Under part 1.3 it is the
+  size of the bill, not a refusal, and the size is what makes it worth a
+  before-and-after run of `bench/real_data` rather than a paragraph. Note also
+  what the shape of these six failures says about how such a run should be
+  read. Three fixtures moved a raw score by one ulp, which is the
+  expected effect. Three moved a leaf value, one of them by 93 ulps and two of
+  them across zero. Read by ulp count alone, that looks like a second and
+  larger effect. It is the same effect, amplified by cancellation in a
+  quantity that is numerically nothing, and a held-out metric would not see
+  it at all. **Ulp counts are the right unit for stating what moved and the
+  wrong unit for deciding whether it matters.** That is the division of labor
+  between part 1.3's condition 3 and its condition 2.
 
 - that `--fp-mode contract=fast|off` exists on `mojo build` and `mojo run`, is
   rejected for any other feature or value, and is absent from `mojo package` and

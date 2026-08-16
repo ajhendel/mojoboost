@@ -1,8 +1,30 @@
 """Training benchmark for mojotrees.
 
 Generates a deterministic synthetic dataset with counter-based splitmix64
-(bit-identical to bench_lightgbm.py), then times quantile binning and
-boosted training with the library defaults (LightGBM-matched).
+(bit-identical to bench_lightgbm.py), then times ingestion, quantile binning
+and boosted training with the library defaults (LightGBM-matched).
+
+Three phases, and the first one is new
+--------------------------------------
+`ingest_s` is the row-major to column-major transpose, and it is here so that
+this file's total and `bench_lightgbm.py`'s total span the same work.
+
+LightGBM's `binning_s` in that file is `lgb.Dataset(X, ...).construct()` over
+`make_data`'s array, which is C-ordered, so their figure has always contained
+their ingestion. This one's did not: the matrix was generated column-major,
+in the layout `fit_bins` wants, so a benchmark comparing the two totals was
+charging LightGBM for a transpose and charging mojotrees for nothing. The
+generator now writes the same values in the row-major order a caller's NumPy
+array actually arrives in, and the transpose that follows is timed.
+
+The values are unchanged: `raw[r * n_features + f]` holds the counter that
+used to be written straight into `features[f * n_rows + r]`, and the
+transpose puts it back in that slot. The binned matrix, the trees, and the
+loss are the same bytes they were.
+
+`total_s` still means binning plus training, so a figure recorded before this
+change still means what it meant. `e2e_s` is the one to read against
+LightGBM's `total_s`.
 
 Usage: mojo run -I src bench/bench_train.mojo \
     [n_rows] [n_features] [reg|binary] [seed]
@@ -19,6 +41,7 @@ from mojotrees.boosting import (
     BoosterParams,
     train,
 )
+from mojotrees.trainset import to_column_major
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -61,11 +84,30 @@ def main() raises:
     if n_features < 4:
         raise Error("need at least 4 features")
 
-    # Column-major features: value at (row r, feature f) is uniform(f * n_rows + r).
-    var features = List[Float64](capacity=n_rows * n_features)
+    # The caller's matrix, in the layout a caller's matrix arrives in: C
+    # order, `raw[r * n_features + f]`. Value at (row r, feature f) is still
+    # uniform(f * n_rows + r), the same counter bench_lightgbm.py uses, so
+    # the two harnesses train on identical numbers.
     var seed_offset = UInt64(seed) * 0x9E3779B97F4A7C15
-    for k in range(n_rows * n_features):
-        features.append(_uniform(seed_offset + UInt64(k)))
+    var raw = List[Float64](unsafe_uninit_length=n_rows * n_features)
+    for r in range(n_rows):
+        for f in range(n_features):
+            raw[r * n_features + f] = _uniform(
+                seed_offset + UInt64(f * n_rows + r)
+            )
+
+    # Ingestion: the transpose into `features[f * n_rows + r]`, which is what
+    # the binner reads and what the Python wrapper's `_arrays.column_major`
+    # produces for a NumPy caller. Timed, because LightGBM's Dataset
+    # construction pays it and this harness used to skip it.
+    var t_ingest = perf_counter_ns()
+    var features = to_column_major(raw, n_rows, n_features)
+    var t_ingest_end = perf_counter_ns()
+    # The source matrix is dead here and a million by fifty of it is 400 MB.
+    # A benchmark that holds it through training measures the memory pressure
+    # (the same reason bench_lightgbm.py's `make_data` generates column by
+    # column rather than as one whole-array expression).
+    _ = raw^
 
     # Target uses features 0..3 plus a noise stream at counters >= n_rows * n_features.
     var noise_base = seed_offset + UInt64(n_rows * n_features)
@@ -115,9 +157,14 @@ def main() raises:
             loss += d * d
     loss /= Float64(n_rows)
 
+    print("ingest_s:", Float64(t_ingest_end - t_ingest) / 1e9)
     print("binning_s:", Float64(t1 - t0) / 1e9)
     print("train_s:", Float64(t2 - t1) / 1e9)
+    # `total_s` is binning plus training, unchanged, so that figures recorded
+    # before ingestion was timed still compare. `e2e_s` adds the transpose and
+    # is the line that spans the same work as bench_lightgbm.py's `total_s`.
     print("total_s:", Float64(t2 - t0) / 1e9)
+    print("e2e_s:", Float64(t2 - t_ingest) / 1e9)
     print("n_trees:", len(booster.trees))
     if objective == BINARY_LOGISTIC:
         print("train_logloss:", loss)

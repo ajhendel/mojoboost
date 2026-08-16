@@ -1,0 +1,264 @@
+==================================================================
+ARM: C4 core pool=default pair 1, 1000000 x 50, cpu arm only, 3 repeats
+CMD: pixi run -e bench bench-train-gpu 1000000 50 reg 3 cpu
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 03:02:22 EDT
+--- box state BEFORE ---
+ 3:02  up 5 days, 17:51, 1 user, load averages: 4.62 3.31 2.81
+top processes by cpu:
+ 15.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  3.1 /Applications/Visual Studio Code.app/Contents/MacOS/Code
+  2.1 claude
+other mojo/pixi builds running:
+--- output ---
+✨ Pixi task (bench-train-gpu in bench): mojo run -I src bench/bench_train_gpu.mojo 1000000 50 reg 3 cpu
+mojotrees gpu-vs-cpu bench: 1000000 rows x 50 features, reg seed 0
+binning_s: 0.178693
+arms: cpu
+repeats: 3
+run 1 cpu train_s: 6.020908
+run 2 cpu train_s: 6.114664
+run 3 cpu train_s: 6.191949
+cpu_train_s_samples: 6.020908 6.114664 6.191949
+cpu_train_s: 6.020908
+cpu_train_s_median: 6.114664
+cpu_train_s_max: 6.191949
+cpu_spread_pct: 2.8
+cpu_spread_pct_of_median: 2.8
+cpu_n_trees: 100
+cpu_train_loss: 0.0035182733926987743
+json_summary: {"n_rows":1000000,"n_features":50,"objective":"reg","n_classes":0,"seed":0,"repeats":3,"binning_s":0.178693,"arms":[{"name":"cpu","samples_s":[6.020908,6.114664,6.191949],"min_s":6.020908,"median_s":6.114664,"max_s":6.191949,"spread_pct_of_min":2.8,"spread_pct_of_median":2.8,"n_trees":100,"train_loss":0.0035182733926987743}],"comparisons":[]}
+--- box state AFTER ---
+ 3:02  up 5 days, 17:52, 1 user, load averages: 4.03 3.30 2.83
+top processes by cpu:
+ 13.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  2.6 claude
+  1.7 /Applications/Visual Studio Code.app/Contents/MacOS/Code
+other mojo/pixi builds running:
+finished: 2026-08-16 03:02:52 EDT  exit=0
+
+==================================================================
+ARM: C4 core pool=performance pair 1, 1000000 x 50, cpu arm only, 3 repeats
+CMD: pixi run -e bench bench-train-gpu 1000000 50 reg 3 cpu
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 03:02:52 EDT
+--- box state BEFORE ---
+ 3:02  up 5 days, 17:52, 1 user, load averages: 4.03 3.30 2.83
+top processes by cpu:
+ 13.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  2.6 claude
+  1.7 /Applications/Visual Studio Code.app/Contents/MacOS/Code
+other mojo/pixi builds running:
+--- output ---
+✨ Pixi task (bench-train-gpu in bench): mojo run -I src bench/bench_train_gpu.mojo 1000000 50 reg 3 cpu
+mojotrees gpu-vs-cpu bench: 1000000 rows x 50 features, reg seed 0
+binning_s: 0.116928
+arms: cpu
+repeats: 3
+run 1 cpu train_s: 7.166898
+run 2 cpu train_s: 7.0043
+run 3 cpu train_s: 7.546633
+cpu_train_s_samples: 7.166898 7.0043 7.546633
+cpu_train_s: 7.0043
+cpu_train_s_median: 7.166898
+cpu_train_s_max: 7.546633
+cpu_spread_pct: 7.7
+cpu_spread_pct_of_median: 7.6
+cpu_n_trees: 100
+cpu_train_loss: 0.0035182733926987743
+json_summary: {"n_rows":1000000,"n_features":50,"objective":"reg","n_classes":0,"seed":0,"repeats":3,"binning_s":0.116928,"arms":[{"name":"cpu","samples_s":[7.166898,7.0043,7.546633],"min_s":7.0043,"median_s":7.166898,"max_s":7.546633,"spread_pct_of_min":7.7,"spread_pct_of_median":7.6,"n_trees":100,"train_loss":0.0035182733926987743}],"comparisons":[]}
+--- box state AFTER ---
+ 3:03  up 5 days, 17:52, 1 user, load averages: 4.51 3.50 2.92
+top processes by cpu:
+ 99.3 ugrep
+  8.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  3.1 claude
+  2.5 claude
+other mojo/pixi builds running:
+finished: 2026-08-16 03:03:25 EDT  exit=0
+
+==================================================================
+ARM: C4 core pool=default pair 2, 1000000 x 50, cpu arm only, 3 repeats
+CMD: pixi run -e bench bench-train-gpu 1000000 50 reg 3 cpu
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 03:03:25 EDT
+--- box state BEFORE ---
+ 3:03  up 5 days, 17:52, 1 user, load averages: 4.51 3.50 2.92
+top processes by cpu:
+ 96.9 ugrep
+  8.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  3.0 claude
+  2.3 claude
+other mojo/pixi builds running:
+--- output ---
+✨ Pixi task (bench-train-gpu in bench): mojo run -I src bench/bench_train_gpu.mojo 1000000 50 reg 3 cpu
+mojotrees gpu-vs-cpu bench: 1000000 rows x 50 features, reg seed 0
+binning_s: 0.206213
+arms: cpu
+repeats: 3
+run 1 cpu train_s: 9.290302
+run 2 cpu train_s: 10.000011
+run 3 cpu train_s: 9.654781
+cpu_train_s_samples: 9.290302 10.000011 9.654781
+cpu_train_s: 9.290302
+cpu_train_s_median: 9.654781
+cpu_train_s_max: 10.000011
+cpu_spread_pct: 7.6
+cpu_spread_pct_of_median: 7.4
+cpu_n_trees: 100
+cpu_train_loss: 0.0035182733926987743
+json_summary: {"n_rows":1000000,"n_features":50,"objective":"reg","n_classes":0,"seed":0,"repeats":3,"binning_s":0.206213,"arms":[{"name":"cpu","samples_s":[9.290302,10.000011,9.654781],"min_s":9.290302,"median_s":9.654781,"max_s":10.000011,"spread_pct_of_min":7.6,"spread_pct_of_median":7.4,"n_trees":100,"train_loss":0.0035182733926987743}],"comparisons":[]}
+--- box state AFTER ---
+ 3:04  up 5 days, 17:53, 1 user, load averages: 4.47 3.61 2.98
+top processes by cpu:
+ 98.1 ugrep
+ 16.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.2 /Applications/Visual Studio Code.app/Contents/MacOS/Code
+  5.9 claude
+other mojo/pixi builds running:
+finished: 2026-08-16 03:04:07 EDT  exit=0
+
+==================================================================
+ARM: C4 core pool=performance pair 2, 1000000 x 50, cpu arm only, 3 repeats
+CMD: pixi run -e bench bench-train-gpu 1000000 50 reg 3 cpu
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 03:04:07 EDT
+--- box state BEFORE ---
+ 3:04  up 5 days, 17:53, 1 user, load averages: 4.47 3.61 2.98
+top processes by cpu:
+ 97.9 ugrep
+ 14.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.0 /Applications/Visual Studio Code.app/Contents/MacOS/Code
+  3.8 claude
+  3.6 claude
+other mojo/pixi builds running:
+--- output ---
+✨ Pixi task (bench-train-gpu in bench): mojo run -I src bench/bench_train_gpu.mojo 1000000 50 reg 3 cpu
+mojotrees gpu-vs-cpu bench: 1000000 rows x 50 features, reg seed 0
+binning_s: 0.208164
+arms: cpu
+repeats: 3
+run 1 cpu train_s: 9.141043
+run 2 cpu train_s: 11.16796
+run 3 cpu train_s: 11.399994
+cpu_train_s_samples: 9.141043 11.16796 11.399994
+cpu_train_s: 9.141043
+cpu_train_s_median: 11.16796
+cpu_train_s_max: 11.399994
+cpu_spread_pct: 24.7
+cpu_spread_pct_of_median: 20.2
+cpu_n_trees: 100
+cpu_train_loss: 0.0035182733926987743
+json_summary: {"n_rows":1000000,"n_features":50,"objective":"reg","n_classes":0,"seed":0,"repeats":3,"binning_s":0.208164,"arms":[{"name":"cpu","samples_s":[9.141043,11.16796,11.399994],"min_s":9.141043,"median_s":11.16796,"max_s":11.399994,"spread_pct_of_min":24.7,"spread_pct_of_median":20.2,"n_trees":100,"train_loss":0.0035182733926987743}],"comparisons":[]}
+--- box state AFTER ---
+ 3:04  up 5 days, 17:54, 1 user, load averages: 6.31 4.14 3.21
+top processes by cpu:
+112.4 mojo
+ 97.0 ugrep
+ 12.9 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+ 12.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.0 claude
+other mojo/pixi builds running:
+52159 pixi run bash /Users/andrewhendel/CascadeProjects/mojotrees/.claude/worktrees/agent-a7235a6cd24f137da/tools/run_tests.sh cpu test_gpu_resident_gate test_golden_bits
+52407 mojo run -I build -I tests tests/test_gpu_resident_gate.mojo
+finished: 2026-08-16 03:04:55 EDT  exit=0
+
+==================================================================
+ARM: C4 core pool=default pair 3, 1000000 x 50, cpu arm only, 3 repeats
+CMD: pixi run -e bench bench-train-gpu 1000000 50 reg 3 cpu
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 03:04:55 EDT
+--- box state BEFORE ---
+ 3:04  up 5 days, 17:54, 1 user, load averages: 6.31 4.14 3.21
+top processes by cpu:
+106.6 mojo
+ 97.3 ugrep
+ 14.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+  3.7 /Applications/Visual Studio Code.app/Contents/MacOS/Code
+other mojo/pixi builds running:
+52159 pixi run bash /Users/andrewhendel/CascadeProjects/mojotrees/.claude/worktrees/agent-a7235a6cd24f137da/tools/run_tests.sh cpu test_gpu_resident_gate test_golden_bits
+52407 mojo run -I build -I tests tests/test_gpu_resident_gate.mojo
+--- output ---
+✨ Pixi task (bench-train-gpu in bench): mojo run -I src bench/bench_train_gpu.mojo 1000000 50 reg 3 cpu
+mojotrees gpu-vs-cpu bench: 1000000 rows x 50 features, reg seed 0
+binning_s: 0.474523
+arms: cpu
+repeats: 3
+run 1 cpu train_s: 12.070612
+run 2 cpu train_s: 14.568691
+run 3 cpu train_s: 13.04679
+cpu_train_s_samples: 12.070612 14.568691 13.04679
+cpu_train_s: 12.070612
+cpu_train_s_median: 13.04679
+cpu_train_s_max: 14.568691
+cpu_spread_pct: 20.7
+cpu_spread_pct_of_median: 19.1
+cpu_n_trees: 100
+cpu_train_loss: 0.0035182733926987743
+json_summary: {"n_rows":1000000,"n_features":50,"objective":"reg","n_classes":0,"seed":0,"repeats":3,"binning_s":0.474523,"arms":[{"name":"cpu","samples_s":[12.070612,14.568691,13.04679],"min_s":12.070612,"median_s":13.04679,"max_s":14.568691,"spread_pct_of_min":20.7,"spread_pct_of_median":19.1,"n_trees":100,"train_loss":0.0035182733926987743}],"comparisons":[]}
+--- box state AFTER ---
+ 3:05  up 5 days, 17:55, 1 user, load averages: 8.44 5.12 3.63
+top processes by cpu:
+132.3 mojo
+ 93.9 ugrep
+ 11.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.3 claude
+  5.3 claude
+other mojo/pixi builds running:
+52560 pixi run bash /Users/andrewhendel/CascadeProjects/mojotrees/.claude/worktrees/agent-a7235a6cd24f137da/tools/run_tests.sh gpu test_gpu_tree_resident
+52789 mojo run -I build -I tests tests/test_gpu_tree_resident.mojo
+finished: 2026-08-16 03:05:55 EDT  exit=0
+
+==================================================================
+ARM: C4 core pool=performance pair 3, 1000000 x 50, cpu arm only, 3 repeats
+CMD: pixi run -e bench bench-train-gpu 1000000 50 reg 3 cpu
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 03:05:55 EDT
+--- box state BEFORE ---
+ 3:05  up 5 days, 17:55, 1 user, load averages: 8.44 5.12 3.63
+top processes by cpu:
+119.4 mojo
+ 95.2 ugrep
+  9.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.7 claude
+  4.2 claude
+other mojo/pixi builds running:
+52560 pixi run bash /Users/andrewhendel/CascadeProjects/mojotrees/.claude/worktrees/agent-a7235a6cd24f137da/tools/run_tests.sh gpu test_gpu_tree_resident
+52789 mojo run -I build -I tests tests/test_gpu_tree_resident.mojo
+--- output ---
+✨ Pixi task (bench-train-gpu in bench): mojo run -I src bench/bench_train_gpu.mojo 1000000 50 reg 3 cpu
+mojotrees gpu-vs-cpu bench: 1000000 rows x 50 features, reg seed 0
+binning_s: 0.279908
+arms: cpu
+repeats: 3
+run 1 cpu train_s: 10.554228
+run 2 cpu train_s: 23.011913
+run 3 cpu train_s: 14.687602
+cpu_train_s_samples: 10.554228 23.011913 14.687602
+cpu_train_s: 10.554228
+cpu_train_s_median: 14.687602
+cpu_train_s_max: 23.011913
+cpu_spread_pct: 118.0
+cpu_spread_pct_of_median: 84.8
+cpu_n_trees: 100
+cpu_train_loss: 0.0035182733926987743
+json_summary: {"n_rows":1000000,"n_features":50,"objective":"reg","n_classes":0,"seed":0,"repeats":3,"binning_s":0.279908,"arms":[{"name":"cpu","samples_s":[10.554228,23.011913,14.687602],"min_s":10.554228,"median_s":14.687602,"max_s":23.011913,"spread_pct_of_min":118.0,"spread_pct_of_median":84.8,"n_trees":100,"train_loss":0.0035182733926987743}],"comparisons":[]}
+--- box state AFTER ---
+ 3:07  up 5 days, 17:56, 1 user, load averages: 13.52 7.36 4.60
+top processes by cpu:
+359.1 mojo
+ 88.6 /Users/andrewhendel/CascadeProjects/mojotrees/.claude/worktrees/agent-a6ba399fd522a698c/.pixi/envs/default/bin/mojo
+ 87.1 ugrep
+ 85.9 mojo
+ 13.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.1 claude
+other mojo/pixi builds running:
+53326 pixi run bash /Users/andrewhendel/CascadeProjects/mojotrees/.claude/worktrees/agent-a7235a6cd24f137da/tools/run_tests.sh gpu test_gpu_training test_gpu_tree_tables test_backend_equivalence test_gpu_split_search test_gpu_fma_consistency
+53514 mojo run -I build -I tests tests/test_gpu_training.mojo
+53515 mojo run -I build -I tests tests/test_backend_equivalence.mojo
+54176 /bin/zsh -c source /Users/andrewhendel/.claude/shell-snapshots/snapshot-zsh-1786823259899-cmigzs.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'mkdir -p /Users/andrewhendel/CascadeProjects/mojotrees/.claude/worktrees/agent-a6ba399fd522a698c/build && pixi run build-pkg 2>&1 | tail -25' < /dev/null && pwd -P >| /tmp/claude-c338-cwd
+54179 pixi run build-pkg
+54190 /Users/andrewhendel/CascadeProjects/mojotrees/.claude/worktrees/agent-a6ba399fd522a698c/.pixi/envs/default/bin/mojo precompile -I src src/mojotrees -o build/mojotrees.mojopkg
+finished: 2026-08-16 03:07:10 EDT  exit=0
+

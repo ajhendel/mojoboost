@@ -33,6 +33,8 @@ from binding_support import (
     csc_from_params,
     csr_from_params,
     f64_buffer,
+    f64_view,
+    f64_view_mut,
     int_buffer,
     int_buffer_from_f64,
 )
@@ -181,6 +183,8 @@ from mojotrees.metrics import (
 )
 from mojotrees.trainset import (
     Dataset,
+    has_infinite,
+    transpose_to_column_major,
     train_dataset as mojo_train_dataset,
     train_dataset_multiclass as mojo_train_dataset_multiclass,
     train_dataset_ranker_advanced as mojo_train_dataset_ranker_advanced,
@@ -282,6 +286,10 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         m.def_function[dataset_chunks_num_data]("dataset_chunks_num_data")
         m.def_function[dataset_chunks_finish]("dataset_chunks_finish")
         m.def_function[dataset_create]("dataset_create")
+        # Ingestion: the transpose every C-ordered caller pays before
+        # binning, and the infinity check that used to be a second pass.
+        m.def_function[ingest_column_major]("ingest_column_major")
+        m.def_function[buffer_has_infinite]("buffer_has_infinite")
         m.def_function[dataset_num_data]("dataset_num_data")
         m.def_function[dataset_num_feature]("dataset_num_feature")
         m.def_function[dataset_num_bin]("dataset_num_bin")
@@ -515,37 +523,58 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         abort(String("failed to create _mojotrees module: ", e))
 
 
-def _f64_view(addr: Int, n: Int) raises -> Span[Float64, ImmUntrackedOrigin]:
-    """Borrow a float64 buffer (NumPy's X) instead of copying it.
+def ingest_column_major(
+    src_addr: PythonObject,
+    dst_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+) raises -> PythonObject:
+    """Transpose a caller's row-major float64 matrix into a column-major one.
 
-    The feature matrix is the one input where the copy is worth avoiding,
-    and not for the reason it looks like: `f64_buffer` moves it at memory
-    speed, a low single-digit percentage of an ingest. What the copy costs
-    is *space*. It doubles the resident footprint of the matrix for as long
-    as binning runs, so a 5,000,000 x 100 fit holds 4 GB of NumPy plus 4 GB
-    of Mojo, and on a machine that can afford one of those but not both the
-    difference is not a percentage.
+    `src_addr` is a C-ordered `(n_rows, n_features)` float64 buffer, which is
+    what NumPy hands out by default, and `dst_addr` is a Fortran-ordered
+    buffer of the same shape that the caller has already allocated. Returns 1
+    when any value was `+inf` or `-inf` and 0 otherwise; `NaN` is the
+    missing-value marker and is not reported.
 
-    Borrowing is sound here because the matrix is read, never written, and
-    is dead early: `fit_bins` and `BinMapper.transform` are the only things
-    that look at it, and after transform the trainer works on the binned
-    `UInt8` matrix. It stays alive throughout because the Python wrapper
-    holds the array it took the address of (see `_arrays.column_major`,
-    whose contract is exactly that) for the whole call.
+    This exists because ingestion used to be two serial NumPy passes over the
+    whole matrix and is now one parallel tiled pass. `np.asfortranarray`
+    transposes on one thread with one side of the copy strided, and
+    `np.isinf(Xa).any()` then reads the result again and materializes an
+    `n_rows * n_features` byte array to reduce. At 1,000,000 x 50 that second
+    pass is 400 MB read and 50 MB allocated to answer a question this one
+    answers from a register.
 
-    The origin is untracked because the owner is on the other side of the
-    boundary and Mojo cannot see it. That is the same contract `f64_buffer`
-    already relies on for its source pointer; the difference is only how
-    long it has to hold, which is the length of one call either way.
-
-    Not every input can do this. A buffer that outlives the call must be
-    copied, so `dataset_create` still takes `f64_buffer` -- a `Dataset` keeps
-    its matrix -- and so do the validation sets, which `RawValidSet` owns.
+    Neither the values nor their positions differ from what NumPy produced. A
+    transpose does no arithmetic, so there is nothing here for a worker count
+    to reassociate; see `trainset.transpose_to_column_major`.
     """
-    if addr == 0 or n < 0:
-        raise Error("invalid buffer")
-    var p = Pointer[Float64, ImmUntrackedOrigin](unsafe_from_address=addr)
-    return Span[Float64, ImmUntrackedOrigin](unsafe_ptr=p, length=n)
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var n = nr * nf
+    var found = transpose_to_column_major(
+        f64_view(Int(py=src_addr), n),
+        f64_view_mut(Int(py=dst_addr), n),
+        nr,
+        nf,
+    )
+    return PythonObject(1 if found else 0)
+
+
+def buffer_has_infinite(
+    addr: PythonObject, n: PythonObject
+) raises -> PythonObject:
+    """1 when the float64 buffer holds `+inf` or `-inf`, 0 otherwise.
+
+    The half of `ingest_column_major` that a caller whose matrix is already
+    column-major needs on its own: that matrix is binned where it lies and
+    never transposed, but it still has to be rejected if it holds an
+    infinity. Parallel, and it allocates nothing, which is the difference
+    from `np.isinf(buf).any()`.
+    """
+    return PythonObject(
+        1 if has_infinite(f64_view(Int(py=addr), Int(py=n))) else 0
+    )
 
 
 def _row[
@@ -784,7 +813,7 @@ def fit(
     """Train a single-output model. Buffers are float64; X is column-major."""
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var target = f64_buffer(Int(py=y_addr), nr)
     # The device is read before the parameters because bundling is applied
     # by the dense CPU trainer and not by the GPU one, so `_parse_params`
@@ -899,7 +928,7 @@ def distributed_train_local(
     `fit` returns."""
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var target = f64_buffer(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, cpu=True)
     var weights = _parse_weights(params, nr)
@@ -942,7 +971,7 @@ def fit_custom(
     """
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var target = f64_buffer(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_custom")
     var weights = _parse_weights(params, nr)
@@ -1030,7 +1059,7 @@ def fit_with_metrics(
     """
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var target = f64_buffer(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_with_metrics")
     var weights = _parse_weights(params, nr)
@@ -1265,7 +1294,7 @@ def fit_multiclass_with_metrics(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var nc = Int(py=n_classes)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_multiclass_with_metrics")
     var weights = _parse_weights(params, nr)
@@ -1329,7 +1358,7 @@ def fit_ranker_with_metrics(
     """
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_ranker_with_metrics")
     var advanced = _parse_advanced_rank_params(params)
@@ -1513,7 +1542,7 @@ def fit_multiclass(
     """Train a multiclass model. Labels arrive as float64 in 0..n_classes-1."""
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     # Read the device first, for the reason `fit` does.
     var device = _parse_device(params)
@@ -1734,7 +1763,7 @@ def fit_ranker(
     so this stays within the argument count the other fits use."""
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_ranker")
     var weights = _parse_weights(params, nr)
@@ -1826,7 +1855,7 @@ def predict_range(
     var nf = Int(py=n_features)
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
     var raw = Int(py=raw_score) != 0
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -1858,7 +1887,7 @@ def predict_proba_range(
     var nf = Int(py=n_features)
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
     var raw = Int(py=raw_score) != 0
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -1956,7 +1985,7 @@ def predict_leaf(
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
     if rng.n_iterations() == 0 or nr == 0:
         return PythonObject(None)
-    _leaf_host(model, _f64_view(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr)
+    _leaf_host(model, f64_view(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr)
     return PythonObject(None)
 
 
@@ -1980,7 +2009,7 @@ def predict_leaf_multiclass(
     if rng.n_iterations() == 0 or nr == 0:
         return PythonObject(None)
     _leaf_multiclass_host(
-        model, _f64_view(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr
+        model, f64_view(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr
     )
     return PythonObject(None)
 
@@ -2010,7 +2039,7 @@ def predict_contrib(
         return PythonObject(None)
     var explainer = ContribExplainer.for_booster(m[].booster, nf)
     var width = explainer.width()
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -2046,7 +2075,7 @@ def predict_contrib_multiclass(
         return PythonObject(None)
     var explainer = ContribExplainer.for_multiclass(m[].booster, nf)
     var width = explainer.width()
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -2212,7 +2241,7 @@ def predict_batch(
         m[].n_iterations(), params["start"], params["stop"]
     )
     var device = _predict_device(params, nr, nf, 1, m[].mapper.n_bins)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     _store(
         m[].predict_batch(
             features, nr, rng, Int(py=params["raw_score"]) != 0, device
@@ -2249,7 +2278,7 @@ def predict_proba_batch(
         m[].n_iterations(), params["start"], params["stop"]
     )
     var device = _predict_device(params, nr, nf, k, m[].mapper.n_bins)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     _store(
         m[].predict_batch(
             features, nr, rng, Int(py=params["raw_score"]) != 0, device
@@ -2287,7 +2316,7 @@ def predict_leaf_batch(
         return PythonObject(None)
     var device = _predict_device(params, nr, nf, 1, m[].mapper.n_bins)
     var name = PythonObject(mojo_device_name(device))
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     if device == GPU_DEVICE:
         _store_ints(
             leaf_indices_gpu(
@@ -2323,7 +2352,7 @@ def predict_leaf_multiclass_batch(
         return PythonObject(None)
     var device = _predict_device(params, nr, nf, k, m[].mapper.n_bins)
     var name = PythonObject(mojo_device_name(device))
-    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
     if device == GPU_DEVICE:
         _store_ints(
             leaf_indices_multiclass_gpu(
@@ -2501,7 +2530,7 @@ def gpu_validation_open(
         var nf = Int(py=n_features)
         var support = gpu_predict_support(nr, nf, 1, m[].mapper.n_bins)
         support.raise_if_blocked()
-        var features = _f64_view(Int(py=x_addr), nr * nf)
+        var features = f64_view(Int(py=x_addr), nr * nf)
         var columns = _validation_columns(params, nr)
         var handle = GpuValidation(
             m[].mapper.transform(features, nr), columns[0], columns[1], 1
@@ -2530,7 +2559,7 @@ def gpu_validation_open_multiclass(
         var k = m[].booster.n_classes
         var support = gpu_predict_support(nr, nf, k, m[].mapper.n_bins)
         support.raise_if_blocked()
-        var features = _f64_view(Int(py=x_addr), nr * nf)
+        var features = f64_view(Int(py=x_addr), nr * nf)
         var columns = _validation_columns(params, nr)
         var handle = GpuValidation(
             m[].mapper.transform(features, nr), columns[0], columns[1], k
@@ -2924,10 +2953,23 @@ def dataset_create(
     `keep_raw` retains the raw matrix inside the dataset, which is what
     `dataset_subset` needs and the only thing here that copies it; 0 is the
     default and drops it after binning, as this entry point always did.
+
+    The matrix is **borrowed**, not copied. It used to arrive through
+    `f64_buffer`, which allocated and filled a second `n_rows * n_features`
+    buffer that `Dataset.__init__` then only read: 400 MB at 1,000,000 x 50,
+    on top of the caller's NumPy array and the column-major buffer the
+    wrapper had already built, so a dataset construction held three copies of
+    the matrix at once. It holds two now. Under `keep_raw` it used to hold
+    four, because the constructor copies its own retained matrix regardless;
+    that copy is the one that has to exist and it is now the only one.
+
+    The borrow is sound on the same contract `fit` relies on: `basic.Dataset`
+    holds the array it took the address of in `self._x`, and the call is
+    synchronous, so the buffer outlives the binning that reads it.
     """
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = f64_buffer(Int(py=x_addr), nr * nf)
+    var features = f64_view(Int(py=x_addr), nr * nf)
 
     var label = List[Float64]()
     if Int(py=params["label_addr"]) != 0:

@@ -17,7 +17,9 @@ changed rule rather than as a changed golden value.
 from std.testing import assert_equal, assert_false, assert_raises, assert_true
 from std.testing import TestSuite
 
+from mojotrees.boosting import BoosterParams
 from mojotrees.cegb import cegb_split_cost
+from mojotrees.tree import TreeParams
 from mojotrees.tree_parameters_extra import (
     DEFAULT_EXTRA_SEED,
     MONOTONE_ADVANCED,
@@ -35,6 +37,7 @@ from mojotrees.tree_parameters_extra import (
     cat_side_cap,
     cat_sort_key,
     check_extra_option_supported,
+    check_feature_pre_filter,
     extra_candidate_index,
     extra_split_stream,
     extra_threshold_index,
@@ -593,10 +596,16 @@ def test_forced_splits_reject_malformed_documents() raises:
 
 
 def test_deferred_options_are_rejected_by_name() raises:
-    # `feature_pre_filter` is a Dataset construction step mojotrees does not
-    # perform, so the name is refused rather than ignored.
+    # `feature_pre_filter` is no longer refused by name. `false` is the
+    # behavior mojotrees has -- our split search rejects the same candidates
+    # LightGBM's Dataset prefilter would drop -- so the name is accepted and
+    # the *value* is what decides. `true` is still refused, because
+    # prefiltering also removes features from the pool `feature_fraction`
+    # samples and so can change the trees and not only their cost.
+    check_extra_option_supported("feature_pre_filter")
+    check_feature_pre_filter(False)
     with assert_raises():
-        check_extra_option_supported("feature_pre_filter")
+        check_feature_pre_filter(True)
     # Forced splits are implemented and reachable from the Mojo API, but a
     # parameter string cannot carry a document, so every LightGBM spelling of
     # the key is refused with that path named.
@@ -706,6 +715,83 @@ def test_bundle_validation_rejects_rather_than_clamps() raises:
     )
     with assert_raises():
         out_of_range.check(4, 31, -1, 20)
+
+
+# ---------------------------------------------------------------------------
+# stock defaults
+# ---------------------------------------------------------------------------
+
+
+def test_defaults_are_lightgbms_stock_values() raises:
+    """Every default is LightGBM's own, read from
+    `include/LightGBM/config.h` at tag v4.7.0.
+
+    `tools/check_parity.py` asserts the same table by reading the source,
+    which catches a default someone edits. This asserts it by *constructing*
+    the parameters, which catches a default someone routes around: a
+    `default()` that stops being what a caller who says nothing gets fails
+    here and nowhere else.
+
+    Float comparisons are on the bits. A default is a literal, not a
+    computation, so there is no ulp to allow for, and a tolerance here would
+    accept exactly the drift the test exists to catch.
+    """
+    var tree = TreeParams.default()
+    assert_equal(tree.num_leaves, 31)
+    assert_equal(tree.min_data_in_leaf, 20)
+    assert_equal(tree.max_depth, -1)
+    assert_equal(tree.lambda_reg.to_bits(), Float64(0.0).to_bits())
+    assert_equal(tree.lambda_l1.to_bits(), Float64(0.0).to_bits())
+    assert_equal(tree.min_child_hess.to_bits(), Float64(1e-3).to_bits())
+    assert_equal(tree.feature_fraction.to_bits(), Float64(1.0).to_bits())
+    assert_equal(
+        tree.feature_fraction_bynode.to_bits(), Float64(1.0).to_bits()
+    )
+    assert_equal(tree.feature_fraction_seed, 2)
+
+    var booster = BoosterParams.default()
+    assert_equal(booster.n_estimators, 100)
+    assert_equal(booster.learning_rate.to_bits(), Float64(0.1).to_bits())
+
+    var extra = ExtraTreeParams()
+    assert_equal(extra.min_gain_to_split.to_bits(), Float64(0.0).to_bits())
+    assert_equal(extra.max_delta_step.to_bits(), Float64(0.0).to_bits())
+    assert_equal(extra.path_smooth.to_bits(), Float64(0.0).to_bits())
+    assert_equal(extra.monotone_penalty.to_bits(), Float64(0.0).to_bits())
+    assert_false(extra.extra_trees)
+    assert_equal(extra.extra_seed, DEFAULT_EXTRA_SEED)
+    assert_equal(DEFAULT_EXTRA_SEED, 6)
+    assert_false(extra.use_quantized_grad)
+    assert_equal(extra.num_grad_quant_bins, 4)
+    assert_false(extra.quant_train_renew_leaf)
+    assert_true(extra.stochastic_rounding)
+
+
+def test_default_lambda_l2_reaches_the_leaf_formula() raises:
+    """The default is 0.0 *in the arithmetic*, not merely in the field.
+
+    Asserting `lambda_reg == 0.0` proves the literal and nothing else. The
+    parameter's whole job is to sit in the denominator of the Newton step,
+    so this feeds the default through `raw_leaf_output` and checks the
+    unregularized value comes out: G = -4, H = 4, so -(-4) / (4 + 0) = 1.0
+    exactly, where the old default of 1.0 gave -(-4) / 5 = 0.8.
+
+    Both sides are single IEEE operations on exactly representable inputs,
+    so each is the correctly rounded quotient and equals the literal it is
+    compared against, 0.8 included. The comparison is on bits rather than
+    within a tolerance because the difference this catches is 25 percent of
+    the leaf, not an ulp of it.
+    """
+    var tree = TreeParams.default()
+    assert_equal(
+        raw_leaf_output(-4.0, 4.0, tree.lambda_l1, tree.lambda_reg).to_bits(),
+        Float64(1.0).to_bits(),
+    )
+    # The value the same leaf had under the default this replaced, stated so
+    # that the size of the move is on the page rather than inferred.
+    assert_equal(
+        raw_leaf_output(-4.0, 4.0, 0.0, 1.0).to_bits(), Float64(0.8).to_bits()
+    )
 
 
 def main() raises:

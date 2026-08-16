@@ -1,52 +1,163 @@
-"""The six scenarios, and the parameter alignment between the two engines.
+"""The six scenarios, and the one comparator both benchmarks run against.
 
 A differential benchmark is only worth reading if the two libraries were
-asked for the same model. That is not the same as passing the same
-parameter dict, because the defaults differ, some parameters exist on one
-side only, and a few of LightGBM's defaults silently change the data rather
-than the model. This module is where every one of those is pinned down, in
-one place, with the reason written next to it.
+asked for the same model, and if a reader can tell from the result which
+configuration produced it. This module holds both: the scenarios, and the
+comparator, in one place, with the reason written next to every entry.
 
-The alignment, and why each entry is here:
+## The comparator
 
-- `lambda_l2 = 1.0`. mojotrees defaults to 1.0 and LightGBM to 0.0, so this
-  has to be set explicitly on both sides or the comparison is between two
-  different regularisers. The rest of bench/ uses 1.0 and so does this.
-- `enable_bundle = false` for LightGBM. Exclusive feature bundling merges
-  sparse features before binning. mojotrees has no EFB, so leaving it on
-  compares two different feature spaces.
-- `feature_pre_filter = false` for LightGBM. On by default, it deletes
-  features that cannot satisfy `min_data_in_leaf` at Dataset construction
-  time. That is a data change, not a training change, and mojotrees does
-  not do it.
-- `bin_construct_sample_cnt` raised to the training row count. LightGBM
-  builds bin edges from a 200000-row subsample by default; mojotrees bins
-  from every row. Left alone this is the largest single source of split
-  divergence on anything above 200000 rows, and it also makes LightGBM's
-  binning time look better than a like-for-like measurement would.
-- `zero_as_missing = false`. Both engines' default, restated because the
-  sparse scenario is exactly where the other setting would be tempting.
-  A stored zero and an absent entry are both the value zero on both sides.
-- `min_data_in_bin = 1`, against LightGBM's default of 3. mojotrees's
-  numerical binner has no minimum-population rule at all, which is
-  `min_data_in_bin = 1` (`src/mojotrees/binning.mojo`, and the
-  `min_data_in_bin` row of `docs/LIGHTGBM_PARITY.md`). At LightGBM's
-  default the two engines bin low-cardinality columns differently:
-  LightGBM merges levels that mojotrees keeps apart, which leaves
-  mojotrees with more bins and therefore more histogram work per node on
-  exactly those columns. Setting it to 1 moves LightGBM onto our rule,
-  so it makes the timing comparison stricter against us rather than
-  laxer, which is the direction an alignment is allowed to move in.
-- `force_row_wise = true` for LightGBM. Without it LightGBM spends the
-  first iterations timing both histogram strategies, which lands in the
-  training measurement as a one-off cost that has nothing to do with the
-  steady state.
-- `deterministic = true` and a fixed `seed` for LightGBM, so a repeat run
-  is a repeat run.
-- Threads are matched by count, not by parameter name: LightGBM reads
-  `num_threads`, mojotrees reads the MOJOTREES_NUM_WORKERS environment
-  variable, and the runner sets both from one number before either library
-  is imported.
+Registered as section C9 of `bench/results/PROFILE_PROTOCOL.md` on
+2026-08-16, before any measurement was taken under it:
+
+**There is exactly one comparator, LightGBM at stock defaults plus
+`deterministic=true`, labelled `stock+det`.** One arm, one label. No other
+LightGBM configuration is published, and speed and accuracy are always
+reported together against it.
+
+`deterministic=true` is the only deviation from pure stock that is not a
+feature-space pin, and a reader will ask why it is there, so the answer
+belongs next to it rather than in a commit message. **It is on because our
+arm is reproducible across thread counts at no cost, so it is the setting
+that makes the two sides comparable rather than one that handicaps
+either.** A comparator whose repeats move is a comparator whose repeat
+spread is partly its own nondeterminism, and the differential check reads
+one repeat as the cell.
+
+It does not fully succeed, and that belongs beside the claim rather than
+arriving as a surprise: **in the first real-data run LightGBM produced two
+distinct prediction digests across three repeats on `sparse_highdim`, with
+`deterministic=true` already set and a fixed seed**, while the mojotrees
+arm was bit-identical across all three. So the flag is on to give the
+comparator its best chance at reproducibility, and the best chance is not
+a guarantee. `thresholds.json` gates the LightGBM side of the determinism
+check as non-gating for that reason.
+
+Everything else LightGBM does is left at its own default, and
+`LIGHTGBM_STOCK_DEFAULTS` records what those defaults are and where they
+were read, so a result can state what ran without anyone having to open
+the LightGBM source to find out.
+
+Every deviation from stock now has to be declared in
+`LIGHTGBM_DEVIATIONS_FROM_STOCK` with a reason and an exit condition, and
+`selfcheck.check_params` fails if the resolved dict deviates anywhere that
+dict does not name. That is the structural part: a pin can no longer be
+added by editing one dict.
+
+## What came out, and why the direction matters
+
+The comparator used to carry six more settings, every one of them chosen
+to match mojotrees or to match this harness rather than to match a user.
+All six are gone:
+
+- `min_data_in_bin = 1`, which forced LightGBM onto our old binner's
+  no-minimum-population rule. mojotrees now defaults to LightGBM's 3
+  (`src/mojotrees/binning.mojo`, and the `min_data_in_bin` row of
+  `docs/LIGHTGBM_PARITY.md`), so both merge the same rare levels.
+- `bin_construct_sample_cnt` at the training row count, which forced
+  LightGBM to fit its bin edges from every row while mojotrees fit them
+  from a 200000-row subsample. That is the pin *inverted*: the comparator
+  was doing strictly more binning work than we were, and every binning
+  ratio measured under it is wrong in our favor. mojotrees's default is
+  LightGBM's 200000 now, so neither library bins rows the other does not.
+  They do not draw the *same* 200000 rows (different streams, see the
+  `bin_construct_sample_cnt` row of `docs/LIGHTGBM_PARITY.md`), so above
+  200000 rows the two fit different edges from equally sized samples. That
+  is a real difference, it is stated, and no parameter fixes it.
+- `force_row_wise = true`, which chose LightGBM's histogram builder for
+  it. Stock LightGBM times both on the first iterations and keeps the
+  winner, which is what a user gets, so the comparator now runs against
+  whichever builder LightGBM itself decides is faster. That is the
+  strongest honest comparator and it retires the largest open caveat in
+  `bench/results/INSTRUCTION_AUDIT.md`. The cost is that the resolved
+  builder is no longer recoverable from a record; `engines._histogram_builder`
+  records that as a null with the reason rather than echoing the request.
+
+  **One open question comes with it, and it is not settled here.**
+  LightGBM's own documentation for `deterministic` says "you should also
+  set `force_col_wise=true` or `force_row_wise=true`", so dropping the
+  forced builder drops the companion setting its determinism advice names.
+  The evidence above is that the pairing did not deliver reproducibility
+  anyway: the `sparse_highdim` repeats that disagreed were taken with
+  `force_row_wise=true` and `deterministic=true` both set. Choosing the
+  comparator's algorithm for it is the larger distortion of the two, so
+  the builder pin goes and the observation is recorded in
+  `comparator_block()` where a reader meets it.
+- `zero_as_missing`, `min_gain_to_split` and `boost_from_average`, which
+  restated LightGBM's own defaults. They are recorded in
+  `LIGHTGBM_STOCK_DEFAULTS` instead of passed, which documents the same
+  fact without putting three parameters in every result's parameter
+  string that the comparator did not need.
+
+All four made the comparison easier for us in at least one respect, so a
+number taken before this change is not comparable with one taken after it
+and both benchmarks' old figures are marked "pinned configuration,
+superseded" rather than deleted.
+
+A fifth came out on 2026-08-16, out of `BASE_PARAMS` rather than out of the
+LightGBM dict, and it is the same kind of thing:
+
+- `lambda_l2 = 1.0`, set on **both** sides. **Superseded 2026-08-16.** The
+  reasoning it was set under was correct for the world it was written in
+  and is kept here rather than deleted: mojotrees defaulted `lambda_l2` to
+  1.0 and LightGBM defaults it to 0.0, so leaving each engine on its own
+  default would have compared two different regularizers, and pinning both
+  to one value was the only way to ask the two libraries for the same
+  model. What changed is not that argument but its premise. mojotrees's
+  default is LightGBM's 0.0 now (`TreeParams.default()` in
+  `src/mojotrees/tree.mojo`), because the policy is that our defaults *are*
+  LightGBM stock and an arm labelled `stock+det` carrying a non-stock
+  regularizer is not stock. With the premise gone the pin is gone: both
+  engines take 0.0 by saying nothing, `lambda_l2` is recorded in
+  `LIGHTGBM_STOCK_DEFAULTS` instead of passed, and `tools/check_parity.py`
+  fails if either default drifts back.
+
+  **Numbers move across this change, and not slightly.** `lambda_l2` is the
+  denominator of every leaf value and every split gain, `-T(G) / (H + l2)`,
+  so on a node with small hessian removing it is a large multiplicative
+  change to the leaf and it reorders which candidate split wins. Every
+  accuracy figure taken before 2026-08-16 is on the old regularizer on both
+  sides and is not comparable with one taken after; a difference across the
+  boundary is this pin coming out, not a regression in anything else.
+  `COMPARATOR_VERSION` is bumped for exactly that reason.
+
+## What is still set, and what it would take to unset it
+
+- `deterministic = true`. The comparator itself, framed above.
+- `feature_pre_filter = false`. On by default, it deletes features that
+  cannot satisfy `min_data_in_leaf` at Dataset construction time, which
+  removes them from the matrix, from the pool `feature_fraction` samples,
+  and from every feature index. That is a data change, not a training
+  change, and mojotrees does not do it, so leaving it on compares two
+  engines fitting different feature spaces. It comes out the day mojotrees
+  implements the filter and not before; a lane is on it.
+- `enable_bundle = false`, for the same reason and not for a different
+  one. Exclusive feature bundling merges mutually exclusive sparse
+  features before binning, which is again a change to the feature space.
+  mojotrees's EFB is reachable from Python now
+  (`bindings/_mojotrees.mojo` parses `enable_bundle`), so this is closer
+  to coming out than it was, but it cannot come out yet: the ranking
+  trainer does not apply a bundling plan at all and refuses an active
+  switch by name (`efb.check_bundling_honored`), so turning bundling on
+  for both engines would raise on one of the six scenarios rather than
+  compare it.
+- `verbosity = -1` and a fixed `seed`. Neither changes the model or the
+  work. The first keeps LightGBM's log out of the harness's stdout, which
+  the backend-proof parser reads; the second makes a repeat a repeat.
+
+Threads are matched by count, not by parameter name: LightGBM reads
+`num_threads`, mojotrees reads the MOJOTREES_NUM_WORKERS environment
+variable, and the runner sets both from one number before either library
+is imported.
+
+## What is NOT in the comparator
+
+`use_quantized_grad`. C9 was first registered as stock plus
+`use_quantized_grad=true`, with every mojotrees arm quantized, and that
+version was withdrawn the same day and before any measurement was taken
+under it. The amendment is at the top of C9. Nothing here sets it, on
+either side, and the CPU quantized-gradient lane continues on its own
+merits without gating publication of anything.
 
 Where a scenario cannot be aligned, it says so in `caveats` and the caveat
 is copied into every result record it produces. Silence about a known
@@ -56,7 +167,15 @@ difference is the failure mode this file exists to prevent.
 import copy
 
 #: Parameters both engines get, under the names both engines accept.
-#: These are LightGBM's defaults except for lambda_l2, which is mojotrees's.
+#: Every one of these is LightGBM's stock default, stated rather than
+#: assumed: the point of passing them is that a result's parameter string
+#: says what ran, not that either engine needed telling.
+#:
+#: `lambda_l2` was the exception until 2026-08-16, when it was 1.0 here
+#: because that was mojotrees's default. It is not in this dict any more
+#: and must not come back: mojotrees defaults it to LightGBM's 0.0 now, so
+#: a value here would be a pin rather than a restatement. See the module
+#: docstring for what that pin was for and why its premise is gone.
 BASE_PARAMS = {
     "num_leaves": 31,
     "max_depth": -1,
@@ -65,29 +184,695 @@ BASE_PARAMS = {
     "min_data_in_leaf": 20,
     "min_child_hess": 1e-3,
     "lambda_l1": 0.0,
-    "lambda_l2": 1.0,
     "max_bin": 255,
     "use_missing": True,
 }
 
-#: LightGBM-only parameters that exist to remove a difference, not to tune.
-#: Every one is justified in the module docstring.
+#: The comparator's identity, carried by every run and every published
+#: table. Bump `COMPARATOR_VERSION` when the resolved dict changes in a way
+#: that makes two numbers non-comparable, which is any change to
+#: `LIGHTGBM_ALIGNMENT` other than a comment, and any change to a value in
+#: `BASE_PARAMS` or to which keys it holds. The second half was learned on
+#: 2026-08-16: `lambda_l2` reached LightGBM through `BASE_PARAMS`, not
+#: through `LIGHTGBM_ALIGNMENT`, so a rule naming only the alignment dict
+#: would have let the comparator's regularizer change without a bump.
+COMPARATOR_ID = "stock+det"
+#: v2 as of 2026-08-16: `lambda_l2` came out of `BASE_PARAMS`, so the
+#: LightGBM side moved from a pinned 1.0 to its own stock 0.0. That changes
+#: every leaf value and some split choices on both engines, which is the
+#: definition of non-comparable, so a v1 number and a v2 number are not the
+#: same measurement.
+COMPARATOR_VERSION = 2
+COMPARATOR_LABEL = "LightGBM at stock defaults plus deterministic=true"
+COMPARATOR_REGISTERED = (
+    "bench/results/PROFILE_PROTOCOL.md section C9, as amended 2026-08-16"
+)
+
+#: Where every LightGBM default quoted in this module was read, so that a
+#: reader can check the table rather than trust it.
+LIGHTGBM_DEFAULTS_SOURCE = (
+    "microsoft/LightGBM include/LightGBM/config.h and docs/Parameters.rst, "
+    "checked at tag v4.7.0 and at master on 2026-08-16"
+)
+
+#: The minimum LightGBM this harness will run as the comparator.
+#:
+#: LightGBM does not reject a parameter it does not know: it logs "Unknown
+#: parameter" and trains anyway, and this harness runs at verbosity -1
+#: where that line never appears. A build predating `deterministic` would
+#: therefore run nondeterministically and record itself as `stock+det`.
+#: 4.0 is also the floor for `Dataset.feature_num_bin`, which `_bin_profile`
+#: needs. Both adapters check before anything is fitted.
+LIGHTGBM_MIN_VERSION = (4, 0)
+
+#: What the comparator is: LightGBM's stock defaults, plus one switch.
+#:
+#: Five entries and no more. Every one of them is either the switch C9
+#: names, a deviation declared in `LIGHTGBM_DEVIATIONS_FROM_STOCK` with an
+#: exit condition, or a harness setting that changes neither the model nor
+#: the work. `selfcheck.check_comparator` fails if this dict grows an entry
+#: that is none of those, which is what stops a seventh setting from
+#: arriving as a one-line edit the way the previous six did.
 LIGHTGBM_ALIGNMENT = {
-    "enable_bundle": False,
-    "feature_pre_filter": False,
-    "zero_as_missing": False,
-    "force_row_wise": True,
     "deterministic": True,
+    "feature_pre_filter": False,
+    "enable_bundle": False,
     "verbosity": -1,
     "seed": 190019,
+}
+
+#: The three entries above that differ from LightGBM's stock default, each
+#: with the condition that removes it.
+LIGHTGBM_DEVIATIONS_FROM_STOCK = {
+    "deterministic": {
+        "stock": False,
+        "here": True,
+        "why": (
+            "the comparator itself, and the only deviation that is not a "
+            "feature-space pin. The mojotrees arm is reproducible across "
+            "thread counts at no cost, so this is the setting that makes the "
+            "two sides comparable rather than one that handicaps either. It "
+            "does not fully succeed: in the first real-data run LightGBM "
+            "produced two distinct prediction digests across three repeats "
+            "on sparse_highdim with this already set and a fixed seed, while "
+            "the mojotrees arm was bit-identical across all three"
+        ),
+        "removed_when": (
+            "never, while it is the comparator. LightGBM's documentation "
+            "records that it may slow training down, which is a cost on the "
+            "comparator's side and is accepted deliberately in exchange for "
+            "repeats that are repeats"
+        ),
+    },
+    "feature_pre_filter": {
+        "stock": True,
+        "here": False,
+        "why": (
+            "on by default it deletes features that cannot satisfy "
+            "min_data_in_leaf at Dataset construction, removing them from "
+            "the matrix, from the pool feature_fraction samples, and from "
+            "every feature index. That is a data change mojotrees does not "
+            "make, so leaving it on compares two engines fitting different "
+            "feature spaces. This is a load-bearing pin and not a leftover "
+            "from the pinned configuration that was just removed"
+        ),
+        "removed_when": (
+            "mojotrees implements the pre-filter, which a concurrent lane is "
+            "doing. Not before"
+        ),
+    },
+    "enable_bundle": {
+        "stock": True,
+        "here": False,
+        "why": (
+            "exclusive feature bundling merges mutually exclusive sparse "
+            "features before binning, which is the same kind of feature-space "
+            "change"
+        ),
+        "removed_when": (
+            "mojotrees's EFB is applied by every trainer this harness "
+            "reaches. It is reachable from Python now, but the ranking "
+            "trainer refuses an active bundling switch by name "
+            "(efb.check_bundling_honored), so turning it on for both engines "
+            "would raise on the ranking scenario rather than compare it"
+        ),
+    },
+}
+
+#: Entries that are in the dict but are not a deviation from anything: they
+#: change what the run reports, not what it computes.
+LIGHTGBM_HARNESS_SETTINGS = {
+    "verbosity": (
+        "keeps LightGBM's log out of the stdout stream run.py parses for "
+        "backend proof. The cost is that LightGBM's own report of which "
+        "histogram builder it chose is suppressed with it"
+    ),
+    "seed": "pins the fit so a repeat is a repeat",
+}
+
+#: LightGBM parameters this harness deliberately does NOT set, with the
+#: default it will therefore use. Recorded rather than passed. Two reasons:
+#: a parameter set to its own default is noise in every result's parameter
+#: string, and a reader still needs to know what ran. Every value here was
+#: read at LIGHTGBM_DEFAULTS_SOURCE.
+#:
+#: `use_quantized_grad` is in this table on purpose. C9 was first
+#: registered with it turned on and that version was withdrawn the same
+#: day, so a reader who has seen the first text needs to be able to
+#: confirm from the run itself that the comparator is not quantized.
+#: `lambda_l2` is in this table as of 2026-08-16 for the same reason as
+#: `use_quantized_grad`: it used to be set, to 1.0, on both sides, and a
+#: reader who has seen a run from before then needs to be able to confirm
+#: from the run itself which regularizer produced the numbers in front of
+#: them. Both engines take 0.0 now by saying nothing.
+LIGHTGBM_STOCK_DEFAULTS = {
+    "use_quantized_grad": False,
+    "bin_construct_sample_cnt": 200000,
+    "min_data_in_bin": 3,
+    "force_row_wise": False,
+    "force_col_wise": False,
+    "zero_as_missing": False,
     "min_gain_to_split": 0.0,
-    # 1, not LightGBM's default of 3: mojotrees's numerical binner has no
-    # minimum-population rule, so 3 would have LightGBM merging levels we
-    # keep. The merge is in LightGBM's favor on speed, so correcting it
-    # costs us and the comparison gets harder, not easier. See the
-    # docstring.
-    "min_data_in_bin": 1,
     "boost_from_average": True,
+    "lambda_l2": 0.0,
+}
+
+# ---------------------------------------------------------------------------
+# The CatBoost peer arm. Everything below this line is reported BESIDE the
+# comparator above and never instead of it.
+# ---------------------------------------------------------------------------
+#
+# The headline row is `stock+det` and nothing in this section touches it.
+# `LIGHTGBM_ALIGNMENT`, `BASE_PARAMS`, `COMPARATOR_ID` and
+# `comparator_block()`'s existing fields are unchanged; the only addition to
+# the block is a `peers` key, so a table that already prints the comparator
+# prints the peer arm with it and a table that does not is unaffected.
+#
+# Two rows are produced, both against the same CatBoost arm:
+#
+#   "us in CatBoost mode vs CatBoost defaults"   engine mojotrees_catboost_mode
+#   "our defaults vs CatBoost defaults"          engine mojotrees
+#
+# Both at matched tree count and matched learning rate, which for CatBoost is
+# not a formality: CatBoost picks `learning_rate` itself from the iteration
+# count and the dataset when it is not given one. Measured on this machine on
+# 2026-08-16 at 20,000 rows by 20 features, CatBoost 1.2.10 resolved
+# `learning_rate` to 0.5 at 2 iterations, 0.4273 at 100 and 0.06573 at 1000.
+# A run that left it alone would compare two different models and call the
+# difference a benchmark.
+
+#: The peer arm's identity. Read beside `comparator_id()`, never in place of
+#: it. Bump the version when `CATBOOST_ALIGNMENT` or `CATBOOST_MATCHED`
+#: changes in a way that makes two CatBoost numbers non-comparable.
+CATBOOST_ARM_ID = "cb-default"
+CATBOOST_ARM_VERSION = 1
+CATBOOST_ARM_LABEL = (
+    "CatBoost at its own defaults, at matched tree count and matched "
+    "learning rate"
+)
+CATBOOST_ARM_REGISTERED = (
+    "bench/results/PROFILE_PROTOCOL.md section C9 names one comparator, "
+    "LightGBM stock+det. This arm is a peer column reported beside it and "
+    "is not a comparator: nothing is gated on it and no threshold is "
+    "measured against it"
+)
+
+#: Where every CatBoost default in `CATBOOST_LEFT_AT_STOCK` was read.
+#:
+#: Not from the documentation page, and the distinction matters. CatBoost's
+#: docs list `learning_rate` as "depends on the dataset and the number of
+#: iterations" and `boosting_type` as "depends on the dataset size and the
+#: task type", neither of which is a value a record can carry. The table
+#: below is what the library itself resolved, read back through
+#: `CatBoost.get_all_params()` after a two-iteration fit, which is the C++
+#: side's own answer rather than a transcription of prose.
+#:
+#: Two consequences of reading it this way, both stated rather than hidden.
+#: `get_all_params()` omits `thread_count`, so the resolved thread count is
+#: recorded separately by the adapter. And a value that CatBoost derives from
+#: the data is the value for *that* fit: `learning_rate` and `boosting_type`
+#: are both in that class, which is why this harness pins the first and
+#: records the second per run instead of asserting either here.
+CATBOOST_DEFAULTS_SOURCE = (
+    "catboost.CatBoost.get_all_params() on catboost 1.2.10, read 2026-08-16 "
+    "after a two-iteration RMSE fit on 20,000 rows by 20 features, "
+    "task_type CPU. Cross-read against catboost/core.py's Pool.quantize "
+    "docstring for border_count, feature_border_type, nan_mode and "
+    "sparse_features_conflict_fraction"
+)
+
+#: The minimum CatBoost this harness will run as the peer arm.
+#:
+#: 1.2 is the floor for `CatBoost.get_all_params()` returning the resolved
+#: plist this module's defaults table was read from, and for
+#: `Pool.quantize()` being a separate public step, which is what lets the
+#: arm report binning apart from training at all.
+CATBOOST_MIN_VERSION = (1, 2)
+
+#: What CatBoost is passed. Three entries and no more, and the same rule
+#: applies here as to `LIGHTGBM_ALIGNMENT`: every one is either declared as a
+#: deviation from stock with a reason and an exit condition, or as a harness
+#: setting that changes neither the model nor the work.
+#:
+#: The two matched parameters are deliberately NOT here. They come from
+#: `BASE_PARAMS` through `CATBOOST_MATCHED`, so that "matched tree count and
+#: matched learning rate" is a structural property of the translation rather
+#: than two numbers copied into a second dict where they can drift.
+CATBOOST_ALIGNMENT = {
+    "allow_writing_files": False,
+    "logging_level": "Silent",
+    "random_seed": 190019,
+}
+
+#: The two shared parameters that are forced onto the CatBoost arm, and the
+#: `BASE_PARAMS` key each is taken from. `selfcheck.check_catboost_arm`
+#: proves the resolved dict carries the same value the other two engines get.
+CATBOOST_MATCHED = {
+    "iterations": "n_estimators",
+    "learning_rate": "learning_rate",
+}
+
+#: Every entry in `CATBOOST_ALIGNMENT` and `CATBOOST_MATCHED` that differs
+#: from CatBoost's own default, with the condition that removes it.
+CATBOOST_DEVIATIONS_FROM_STOCK = {
+    "iterations": {
+        "stock": 1000,
+        "here": "BASE_PARAMS['n_estimators']",
+        "why": (
+            "a comparison at different budgets is not a comparison. All "
+            "three engines are asked for the same number of boosting "
+            "iterations, which is what makes a wall time per iteration and "
+            "a metric at a fixed budget mean the same thing on each row"
+        ),
+        "removed_when": (
+            "never, while this is a matched-budget column. A CatBoost-at-"
+            "1000-iterations figure is a different measurement and belongs "
+            "in a differently labelled row"
+        ),
+    },
+    "learning_rate": {
+        "stock": "chosen by CatBoost from the iteration count and the "
+                 "dataset when it is not given one",
+        "here": "BASE_PARAMS['learning_rate']",
+        "why": (
+            "CatBoost auto-selects the learning rate, and the value it "
+            "picks moves with the budget: 0.5 at 2 iterations, 0.4273 at "
+            "100 and 0.06573 at 1000, measured on this machine on "
+            "2026-08-16 at 20,000 rows by 20 features. Leaving it alone "
+            "would compare two different models and read the difference as "
+            "engine quality"
+        ),
+        "removed_when": (
+            "never, while this is a matched-rate column. CatBoost's own "
+            "auto rate is worth a separate row and it is not this one"
+        ),
+    },
+    "allow_writing_files": {
+        "stock": True,
+        "here": False,
+        "why": (
+            "CatBoost writes a training log and a learn_error.tsv into a "
+            "catboost_info directory under the working directory during "
+            "fit. That is filesystem work inside the timed region that "
+            "neither of the other two engines does, so leaving it on "
+            "charges CatBoost for writing a log. It is a deviation rather "
+            "than a harness setting because it removes work, not output"
+        ),
+        "removed_when": (
+            "the other two engines are also measured writing a per-round "
+            "log, which no scenario here asks for"
+        ),
+    },
+}
+
+#: Entries that change what the run reports rather than what it computes.
+CATBOOST_HARNESS_SETTINGS = {
+    "logging_level": (
+        "keeps CatBoost's per-iteration output off the stdout stream that "
+        "run.py parses for backend proof. CatBoost prints a progress table "
+        "by default and that stream is read, not discarded"
+    ),
+    "random_seed": "pins the fit so a repeat is a repeat",
+}
+
+#: CatBoost parameters this harness deliberately does NOT set, with the value
+#: CatBoost therefore resolves. Recorded rather than passed, and read at
+#: CATBOOST_DEFAULTS_SOURCE.
+#:
+#: `boosting_type` is in this table with the value it resolved to on the
+#: shape it was read on, and it is the one entry that is not a constant:
+#: CatBoost chooses Plain or Ordered from the dataset size and the task, so
+#: the adapter records the resolved value per run and this row is the reading
+#: rather than the rule.
+CATBOOST_LEFT_AT_STOCK = {
+    "grow_policy": "SymmetricTree",
+    "depth": 6,
+    "max_leaves": 64,
+    "min_data_in_leaf": 1,
+    "l2_leaf_reg": 3,
+    "border_count": 254,
+    "feature_border_type": "GreedyLogSum",
+    "nan_mode": "Min",
+    "bootstrap_type": "MVS",
+    "subsample": 0.8,
+    "sampling_frequency": "PerTree",
+    "rsm": 1,
+    "random_strength": 1,
+    "score_function": "Cosine",
+    "leaf_estimation_method": "Newton",
+    "leaf_estimation_iterations": 1,
+    "leaf_estimation_backtracking": "AnyImprovement",
+    "boost_from_average": True,
+    "boosting_type": "Plain",
+    "model_shrink_rate": 0,
+    "model_shrink_mode": "Constant",
+    "model_size_reg": 0.5,
+    "penalties_coefficient": 1,
+    "sparse_features_conflict_fraction": 0.0,
+    "bayesian_matrix_reg": 0.1,
+    "posterior_sampling": False,
+    "random_score_type": "NormalWithModelSizeDecrease",
+    "task_type": "CPU",
+}
+
+#: The differences between CatBoost's defaults and this harness's shared
+#: parameters that NO parameter closes. This is the field to read before
+#: quoting either CatBoost row.
+#:
+#: A peer column is only worth having if a reader can tell what it is a
+#: column of. Every entry below is a place where "CatBoost defaults" and
+#: "our defaults" are answering the same question with a different model,
+#: and none of them is fixed by passing something.
+CATBOOST_UNMATCHABLE = {
+    "tree_shape": (
+        "CatBoost grows symmetric (oblivious) trees of depth 6, where every "
+        "node at a level shares one split. mojotrees grows leaf-wise by "
+        "default and has depthwise as its only other policy "
+        "(src/mojotrees/growth_policy.mojo); it has no symmetric policy at "
+        "all. So the CatBoost-mode mojotrees arm is depthwise at depth 6, "
+        "which is the nearest reachable shape and is NOT the same tree. "
+        "A symmetric tree is strictly more constrained than a depthwise one "
+        "at the same depth, so this difference is expected to cost CatBoost "
+        "accuracy and save it time, and neither side of that is measured "
+        "here"
+    ),
+    "row_sampling": (
+        "CatBoost's default bootstrap_type is MVS with subsample 0.8, so it "
+        "subsamples rows on every tree. LightGBM and mojotrees do not "
+        "subsample at their defaults. MVS is minimum-variance sampling "
+        "weighted by gradient magnitude, not uniform bagging, so mojotrees's "
+        "bagging_fraction is not an emulation of it and the CatBoost-mode "
+        "arm does not try. The CatBoost arm therefore sees about 80 percent "
+        "of the rows per tree and the other two see all of them"
+    ),
+    "split_scoring": (
+        "CatBoost's default score_function is Cosine and its "
+        "random_strength is 1, which adds seeded random noise to every "
+        "split score. LightGBM and mojotrees score splits by gain with no "
+        "perturbation. No parameter makes these the same rule"
+    ),
+    "leaf_population": (
+        "CatBoost's min_data_in_leaf default is 1 and this harness's shared "
+        "value is 20. The CatBoost arm is left at 1 because the column is "
+        "'CatBoost defaults'; the CatBoost-mode mojotrees arm is set to 1 "
+        "to match it, and the plain mojotrees arm stays at 20"
+    ),
+    "missing_values": (
+        "CatBoost's nan_mode default is Min, which sends every missing "
+        "numeric value to the low side. LightGBM and mojotrees learn a "
+        "default direction per split. The categorical_missing scenario is "
+        "where this would show, and that scenario does not run CatBoost for "
+        "a separate reason: see CATBOOST_SCENARIO_SUPPORT"
+    ),
+    "binning_budget": (
+        "CatBoost's border_count is a count of thresholds and LightGBM's "
+        "max_bin is a count of bins, so CatBoost's default 254 borders and "
+        "this harness's shared max_bin of 255 describe the same granularity "
+        "budget. They do not describe the same binning: CatBoost's "
+        "GreedyLogSum picks well under the budget on ordinary data (125, "
+        "113 and 101 borders on the first three features of a uniform "
+        "20,000 by 20 matrix, read 2026-08-16), while LightGBM and "
+        "mojotrees fill it. Whether either side reserves a bin for missing "
+        "values is not something this harness has established"
+    ),
+    "learning_rate_precision": (
+        "CatBoost stores learning_rate as a 32-bit float. A matched rate of "
+        "0.1 resolves to 0.10000000149011612 in get_all_params(), so the "
+        "rates are matched to float32 and not exactly"
+    ),
+    "multiclass_tree_count": (
+        "CatBoost builds one tree per iteration with a vector leaf value "
+        "for MultiClass, where LightGBM and mojotrees build one tree per "
+        "class per iteration. tree_count_ is 100 for a 100-iteration "
+        "CatBoost multiclass fit and 700 for a seven-class LightGBM one. "
+        "The matched quantity is the iteration count; the tree counts in "
+        "the records are not comparable numbers on that scenario"
+    ),
+    "categorical_encoding": (
+        "CatBoost splits categorical features on ordered target statistics "
+        "(CTR), which is a different algorithm from LightGBM's and "
+        "mojotrees's category-set split and uses the label to build the "
+        "feature. No scenario in this suite runs CatBoost with categorical "
+        "features, so this is recorded as the reason the comparison was not "
+        "attempted rather than as a caveat on a number"
+    ),
+}
+
+#: Whether each scenario runs the CatBoost arm, and the exact reason when it
+#: does not. A scenario that does not run it is a skip with a stated cause,
+#: never an absence.
+CATBOOST_SCENARIO_SUPPORT = {
+    "dense_regression": None,
+    "imbalanced_binary": None,
+    "multiclass": None,
+    "sparse_highdim": None,
+    "ranking": (
+        "CatBoost has no lambdarank. Its ranking losses are YetiRank, "
+        "YetiRankPairwise, QueryRMSE and PairLogit, and none of them is the "
+        "loss LightGBM and mojotrees are asked for here. Running one of "
+        "them would put a third objective in a column headed by the other "
+        "two's, so this scenario has no CatBoost row"
+    ),
+    "categorical_missing": (
+        "the harness hands every engine one float64 matrix with the "
+        "categorical columns integer-coded into it, and CatBoost refuses "
+        "cat_features on a floating-point array outright: \"'data' is numpy "
+        "array of floating point numerical type, it means no categorical "
+        "features\". Handing CatBoost a converted copy would give it "
+        "different bytes from the other two engines, which is the one thing "
+        "worker.py's data digest exists to prevent. The generator also "
+        "drops values inside two categorical columns, and CatBoost has no "
+        "representation for a missing category: it would have to be encoded "
+        "as a level, which is a modelling decision made by the harness. So "
+        "this scenario has no CatBoost row until the loader can produce an "
+        "integer-typed categorical block whose digest both sides agree on"
+    ),
+}
+
+#: What running the CatBoost arm is expected to cost, where that is worth
+#: knowing before a matrix is committed to rather than after it times out.
+#:
+#: A cost note is not a caveat on a number. It is a warning to whoever
+#: schedules the run, and it is here rather than in a lane report so that
+#: the manifest carries it.
+CATBOOST_SCENARIO_COST = {
+    "sparse_highdim": (
+        "expected to be the expensive cell by a wide margin. CatBoost's rsm "
+        "default is 1, so it considers every feature at every split, and it "
+        "grows symmetric trees. The smoke tier, 3,983 rows by 2,000 "
+        "features and 100 iterations, took 8.5 seconds of fit on two "
+        "threads on 2026-08-16 while ingestion took 0.011. The standard "
+        "tier is 100,000 rows by 50,000 features, which is 25 times each "
+        "dimension, so this cell may approach or exceed run.py's 7200 "
+        "second per-run timeout. That is a real property of CatBoost on "
+        "high-dimensional sparse data and not a harness defect, but the "
+        "matrix should be scheduled knowing it: a timed-out cell is an "
+        "infrastructure failure and takes the whole run's exit code with it"
+    ),
+}
+
+#: What `deterministic=true` buys the comparator, and what CatBoost has
+#: instead, which is less.
+#:
+#: The honest form of this is the one the LightGBM entry already takes: say
+#: what the setting does and does not buy, rather than claiming
+#: reproducibility because a flag was set. CatBoost has no such flag at all,
+#: so its like-for-like is a fixed thread count plus a fixed seed and that is
+#: weaker: nothing in it is a promise by the library, only two inputs held
+#: still.
+CATBOOST_DETERMINISM = {
+    "flag": (
+        "CatBoost has no `deterministic` parameter. LightGBM does, which is "
+        "why the comparator is stock+det. There is no CatBoost setting that "
+        "asks the library for reproducible reductions"
+    ),
+    "what_is_pinned": (
+        "thread_count, to the same number the other engines get, and "
+        "random_seed, to the same 190019 the comparator uses. That is the "
+        "whole of it"
+    ),
+    "status": "seeded, not guaranteed",
+    "observed": (
+        "checked rather than assumed, and it held everywhere it was looked "
+        "at. On catboost 1.2.10, 20,000 rows by 20 features, 100 iterations "
+        "at learning_rate 0.1 and random_seed 1234, the prediction digest "
+        "was identical across three in-process repeats, across three "
+        "separate processes, and across thread_count 1, 2, 4 and 8"
+    ),
+    "what_that_does_not_establish": (
+        "one shape, one loss, one machine, and no dataset with missing "
+        "values or categorical features. Bit-identity observed at 20,000 "
+        "rows is not bit-identity at 1,000,000, where the parallel "
+        "reductions are wider. The digests are recorded per repeat exactly "
+        "so this is measured on every run rather than inherited from this "
+        "note"
+    ),
+    "precedent": (
+        "LightGBM produced two distinct prediction digests across three "
+        "repeats on sparse_highdim with deterministic=true already set and "
+        "a fixed seed. A flag being set is not reproducibility on either "
+        "side, which is why both arms record a digest per repeat"
+    ),
+    "gating": (
+        "not gating. This is a peer column: nothing in thresholds.json "
+        "measures anything against it, and verify.py's differential pairs "
+        "mojotrees with lightgbm and does not see these rows"
+    ),
+}
+
+#: mojotrees's side of "us in CatBoost mode": every CatBoost default this
+#: library has a knob for, and nothing invented for the ones it does not.
+#:
+#: The entries are canonical `shared_params` names, applied over
+#: `BASE_PARAMS` before translation, so the CatBoost-mode arm and the plain
+#: arm differ in exactly this dict and a reader can diff two records to see
+#: it. What is deliberately absent is as much of the definition as what is
+#: present: there is no bagging entry, because CatBoost's MVS is not uniform
+#: row sampling and a bagging_fraction of 0.8 would be an imitation of the
+#: number rather than of the method.
+MOJOTREES_CATBOOST_MODE = {
+    "grow_policy": "depthwise",
+    "max_depth": 6,
+    "num_leaves": 64,
+    "min_data_in_leaf": 1,
+    "min_child_hess": 0.0,
+    "lambda_l1": 0.0,
+    "lambda_l2": 3.0,
+}
+
+#: Why each entry above is what it is, carried into the record beside the
+#: dict so the arm explains itself where it is read.
+MOJOTREES_CATBOOST_MODE_REASONS = {
+    "grow_policy": (
+        "the nearest reachable shape to SymmetricTree, and not the same "
+        "one. See CATBOOST_UNMATCHABLE['tree_shape']"
+    ),
+    "max_depth": "CatBoost's depth default",
+    "num_leaves": (
+        "CatBoost's resolved max_leaves, which is 2**depth. Set so the leaf "
+        "cap does not bind before the depth cap does"
+    ),
+    "min_data_in_leaf": "CatBoost's min_data_in_leaf default",
+    "min_child_hess": (
+        "CatBoost has no minimum-hessian rule, so ours is turned off rather "
+        "than left at 1e-3, which would be a constraint CatBoost is not "
+        "under"
+    ),
+    "lambda_l1": "CatBoost applies no L1 to leaf values at its defaults",
+    "lambda_l2": "CatBoost's l2_leaf_reg default of 3",
+}
+
+#: The CatBoost parameters this harness refuses to be handed.
+#:
+#: `bin_construct_sample_cnt` at the training row count made the LightGBM
+#: comparator fit its bin edges from every row while mojotrees fit them from
+#: a subsample, which is strictly more binning work on the comparator's side,
+#: and it was caught only after a ratio had been published. The names below
+#: are the CatBoost shapes of the same defect. Refused by name here and
+#: checked statically by `selfcheck.check_no_row_count_injection`, because a
+#: rule that lives only in a comment survives exactly until the next call
+#: site.
+CATBOOST_REFUSED_PARAMS = {
+    "border_count": (
+        "the binning budget. Stock is 254 borders and it stays stock, for "
+        "the same reason max_bin is not pinned on the LightGBM side"
+    ),
+    "max_bin": "a synonym for border_count in CatBoost's own API",
+    "dev_max_subset_size_for_build_borders": (
+        "CatBoost's own bin-construction sample cap, which is the direct "
+        "counterpart of bin_construct_sample_cnt. Deriving it from the row "
+        "count is the defect this list exists for"
+    ),
+    "dev_efb_max_buckets": "a bundling knob, and bundling is left at stock",
+    "sparse_features_conflict_fraction": (
+        "exclusive feature bundling. Stock is 0.0, which is off, and that "
+        "matches enable_bundle=false on the LightGBM side; pinning it here "
+        "would be pinning it to what it already is"
+    ),
+    "used_ram_limit": (
+        "CatBoost changes its blocking and its quantization strategy under "
+        "a memory cap, so a limit derived from the data size makes the "
+        "engine do different work at different scales"
+    ),
+    "min_data_in_leaf": (
+        "a leaf-population rule. The column is CatBoost's defaults and its "
+        "default is 1. Raising it to this harness's shared 20 would make "
+        "the arm neither CatBoost's defaults nor ours"
+    ),
+    "min_child_samples": "a synonym for min_data_in_leaf",
+    "subsample": (
+        "CatBoost's default bootstrap is MVS at 0.8. Pinning the fraction "
+        "makes the arm something other than CatBoost's defaults, and "
+        "matching it to a bagging fraction on our side would be matching a "
+        "number across two different sampling methods"
+    ),
+    "thread_count": (
+        "set from the runner's thread count by catboost_params itself, "
+        "exactly as num_threads is on the LightGBM side. A second source "
+        "for it is how one arm ends up on a different core count from the "
+        "other two"
+    ),
+}
+
+#: What each engine's timed phases actually contain, so that three engines'
+#: lines can be read against each other.
+#:
+#: This is not bookkeeping. The end-to-end headline includes ingestion, and
+#: the three libraries put ingestion and binning in different places:
+#: LightGBM's `Dataset.construct()` contains both, mojotrees times a
+#: transpose and a binning pass separately, and CatBoost's `Pool()` contains
+#: NEITHER binning nor anything else beyond the conversion.
+#:
+#: The CatBoost row is the one that needed finding out, and the finding is
+#: recorded here rather than folded in. `Pool(X, label=y)` leaves the pool
+#: unquantized -- `Pool.is_quantized()` is False immediately after it, and
+#: `Pool.quantize()` is a separate public call that flips it -- so CatBoost's
+#: binning happens inside `fit` and there is no CatBoost step that
+#: corresponds to `Dataset.construct()`.
+#:
+#: Splitting it out was tried and rejected on evidence, which is the part
+#: worth keeping. Calling `Pool.quantize()` before `fit` produces a
+#: DIFFERENT MODEL above a few hundred thousand rows: at 300,000 rows by 20
+#: features on catboost 1.2.10, fitting from a raw pool, from a pool
+#: quantized with the default seed, and from a pool quantized with this
+#: harness's seed gave three distinct prediction digests and 51 against 50
+#: borders on feature 0. CatBoost builds its borders from a sampled subset
+#: whose draw depends on the quantization seed, which the fit path and the
+#: explicit path do not share. So the CatBoost arm does not pre-quantize,
+#: its `binning` is null with this reason, and its binning time is inside
+#: `train` where CatBoost itself puts it. At 20,000 rows the three digests
+#: agreed, which is why this had to be checked at a size where the sampling
+#: bites rather than at the size that was convenient.
+PHASE_SHAPE = {
+    "mojotrees": {
+        "ingest": "row-major to column-major transpose of the caller's array",
+        "binning": "Dataset.construct(), the quantile binning pass",
+        "train": "boosting rounds over an already binned matrix",
+        "e2e": "ingest + binning + train",
+    },
+    "lightgbm": {
+        "ingest": (
+            "not separable. LightGBM's ingestion is inside "
+            "Dataset.construct() and it has always been counted in the "
+            "binning phase"
+        ),
+        "binning": "Dataset.construct(), which contains its ingestion",
+        "train": "boosting rounds over an already constructed Dataset",
+        "e2e": "binning + train",
+    },
+    "catboost": {
+        "ingest": (
+            "Pool(X, label=y): conversion of the caller's array into "
+            "CatBoost's own object layout, and nothing else. The pool is "
+            "not quantized when it returns"
+        ),
+        "binning": (
+            "null. CatBoost bins inside fit, and pre-quantizing to separate "
+            "it changes the model above a few hundred thousand rows"
+        ),
+        "train": "fit(), which contains CatBoost's quantization",
+        "e2e": "ingest + train",
+    },
 }
 
 #: Where each shared parameter ends up on each side, by the name it ends up
@@ -129,7 +914,9 @@ SHARED_PARAM_ROUTING = {
         ("train", "min_child_hess"),
     ),
     "lambda_l1": (("train", "lambda_l1"), ("train", "lambda_l1")),
-    "lambda_l2": (("train", "lambda_l2"), ("train", "lambda_l2")),
+    # No `lambda_l2` row: it left BASE_PARAMS on 2026-08-16 and neither
+    # engine is handed it any more. A row here with no BASE_PARAMS key
+    # would describe a route nothing travels.
     "max_bin": (("train", "max_bin"), ("dataset", "max_bin")),
     "use_missing": (("train", "use_missing"), ("dataset", "use_missing")),
 }
@@ -157,6 +944,260 @@ RANKING_PARAMS = {
 #: is never reported as a benchmark; `standard` is the default; `large` is
 #: opt-in and is the only tier that supports a scaling claim.
 TIERS = ("smoke", "standard", "large")
+
+
+def comparator_id():
+    """The one-line identity of the comparator, for a table header, a
+    parameter summary, or a CSV column."""
+    return f"{COMPARATOR_ID}@v{COMPARATOR_VERSION}"
+
+
+def comparator_block():
+    """Everything a published table has to state about what it was measured
+    against, as a dict, from the same constants the run uses.
+
+    This exists because the alternative is a convention. Four
+    comparator-configuration incidents in three days, three of them caught
+    only after a number had been published, all shared one property: the
+    result recorded the number and not the configuration that produced it.
+    A margin against a throttled comparator, a binning ratio against a
+    comparator forced to bin every row, a speculation figure that was a
+    tautology over a conditioned subset, and a gain form invalid under L1.
+    Every one of those numbers was real and every one was quoted for a
+    question it could not answer.
+
+    So the runner writes this into the manifest, into `records.json`, and
+    into a column of every CSV row, and prints it before the first cell
+    runs. A results file without it is missing a field rather than missing
+    a convention.
+
+    `reproducibility` is the field to read second. `deterministic=true` is
+    the whole of the deviation from stock that is not a feature-space pin,
+    and it is on because it costs the mojotrees arm nothing and gives the
+    comparator its best chance at repeats that are repeats. It is not a
+    guarantee, and the evidence that it is not is recorded here rather than
+    left to be rediscovered.
+    """
+    return {
+        "id": COMPARATOR_ID,
+        "version": COMPARATOR_VERSION,
+        "label": COMPARATOR_LABEL,
+        "registered": COMPARATOR_REGISTERED,
+        "one_line": comparator_id(),
+        "lightgbm_passed": dict(LIGHTGBM_ALIGNMENT),
+        "lightgbm_deviations_from_stock": copy.deepcopy(
+            LIGHTGBM_DEVIATIONS_FROM_STOCK
+        ),
+        "lightgbm_harness_settings": dict(LIGHTGBM_HARNESS_SETTINGS),
+        "lightgbm_left_at_stock": dict(LIGHTGBM_STOCK_DEFAULTS),
+        "lightgbm_defaults_source": LIGHTGBM_DEFAULTS_SOURCE,
+        "lightgbm_min_version": ".".join(str(p) for p in LIGHTGBM_MIN_VERSION),
+        "reproducibility": {
+            "why_deterministic": (
+                "the mojotrees arm is reproducible across thread counts at "
+                "no cost, so deterministic=true is the setting that makes "
+                "the two sides comparable rather than one that handicaps "
+                "either"
+            ),
+            "known_limit": (
+                "it does not fully succeed. In the first real-data run "
+                "LightGBM produced two distinct prediction digests across "
+                "three repeats on sparse_highdim, with deterministic=true "
+                "already set and a fixed seed, while the mojotrees arm was "
+                "bit-identical across all three"
+            ),
+            "documented_companion_setting_not_used": (
+                "LightGBM's documentation for deterministic says to set "
+                "force_col_wise or force_row_wise as well. This comparator "
+                "sets neither, because choosing the comparator's histogram "
+                "algorithm for it is the larger distortion. The digests that "
+                "disagreed above were taken with force_row_wise set, so the "
+                "pairing was not delivering reproducibility either"
+            ),
+            "gating": (
+                "thresholds.json gates the LightGBM side of the repeat "
+                "determinism check as non-gating, so a repeat that moves is "
+                "reported and not failed. The mojotrees side is gating"
+            ),
+        },
+        "like_for_like": True,
+        "like_for_like_reason": (
+            "both engines fit the same feature space, from the same bins, "
+            "with the same shared parameters, and neither runs quantized "
+            "gradients. A speed ratio and an accuracy differential taken "
+            "against this arm are comparable quantities, reported together"
+        ),
+        # Reported BESIDE the comparator and never instead of it. Added as
+        # one key rather than as a second mechanism, so that every place
+        # that already writes the comparator -- the manifest, records.json,
+        # the CSV column, the console banner -- carries the peer arm with
+        # it and cannot carry one without the other.
+        "peers": peer_arms_block(),
+        "peers_are_not_comparators": (
+            "the headline row is stock+det. Nothing under `peers` gates "
+            "anything, nothing in thresholds.json is measured against it, "
+            "and verify.py's differential pairs mojotrees with lightgbm and "
+            "does not see the peer rows"
+        ),
+        "phase_shape": copy.deepcopy(PHASE_SHAPE),
+    }
+
+
+def catboost_arm_id():
+    """The one-line identity of the CatBoost peer arm."""
+    return f"{CATBOOST_ARM_ID}@v{CATBOOST_ARM_VERSION}"
+
+
+def catboost_arm_block():
+    """Everything a published table has to state about the CatBoost column.
+
+    Same rule as `comparator_block`, for the same reason: a results file
+    cannot fail to state its configuration. The fields a reader needs first
+    are `determinism`, because CatBoost has no `deterministic` flag and its
+    like-for-like is therefore weaker than the comparator's, and
+    `unmatchable`, because "CatBoost defaults" and "our defaults" answer the
+    same question with different models in seven places no parameter closes.
+    """
+    return {
+        "id": CATBOOST_ARM_ID,
+        "version": CATBOOST_ARM_VERSION,
+        "label": CATBOOST_ARM_LABEL,
+        "registered": CATBOOST_ARM_REGISTERED,
+        "one_line": catboost_arm_id(),
+        "is_the_comparator": False,
+        "catboost_passed": dict(CATBOOST_ALIGNMENT),
+        "catboost_matched_from_base_params": dict(CATBOOST_MATCHED),
+        "catboost_deviations_from_stock": copy.deepcopy(
+            CATBOOST_DEVIATIONS_FROM_STOCK
+        ),
+        "catboost_harness_settings": dict(CATBOOST_HARNESS_SETTINGS),
+        "catboost_left_at_stock": dict(CATBOOST_LEFT_AT_STOCK),
+        "catboost_defaults_source": CATBOOST_DEFAULTS_SOURCE,
+        "catboost_min_version": ".".join(str(p) for p in CATBOOST_MIN_VERSION),
+        "catboost_refused_params": dict(CATBOOST_REFUSED_PARAMS),
+        "determinism": copy.deepcopy(CATBOOST_DETERMINISM),
+        "unmatchable": dict(CATBOOST_UNMATCHABLE),
+        "scenarios_not_run": {
+            name: reason
+            for name, reason in CATBOOST_SCENARIO_SUPPORT.items()
+            if reason
+        },
+        "cost_warnings": dict(CATBOOST_SCENARIO_COST),
+        "rows": {
+            "us in CatBoost mode vs CatBoost defaults": (
+                "engine mojotrees_catboost_mode against engine catboost. "
+                "The mojotrees side takes MOJOTREES_CATBOOST_MODE over "
+                "BASE_PARAMS; the CatBoost side is unchanged between the "
+                "two rows"
+            ),
+            "our defaults vs CatBoost defaults": (
+                "engine mojotrees against engine catboost. The same "
+                "mojotrees arm the comparator row uses, so one mojotrees "
+                "record serves both the headline and this row"
+            ),
+        },
+        "mojotrees_catboost_mode": dict(MOJOTREES_CATBOOST_MODE),
+        "mojotrees_catboost_mode_reasons": dict(
+            MOJOTREES_CATBOOST_MODE_REASONS
+        ),
+        "matched": (
+            "tree count and learning rate. Both rows run the same number of "
+            "boosting iterations and the same learning rate on both sides, "
+            "because a comparison at different budgets is not a comparison "
+            "and because CatBoost picks its own learning rate from the "
+            "budget when it is not given one"
+        ),
+    }
+
+
+def peer_arms_block():
+    """Every arm reported beside the comparator, keyed by engine name.
+
+    A dict rather than a list so that a record can be looked up by the
+    engine that wrote it, and so that adding a fourth engine is one entry
+    rather than a second mechanism.
+    """
+    return {"catboost": catboost_arm_block()}
+
+
+def peer_banner():
+    """The peer arms on the console, under the comparator banner.
+
+    Short enough to read and specific enough to check, in the shape
+    `run.comparator_banner` already uses. The full block goes into the
+    manifest and into records.json.
+    """
+    block = catboost_arm_block()
+    passed = " ".join(
+        f"{key}={value}" for key, value in sorted(block["catboost_passed"].items())
+    )
+    matched = " ".join(
+        f"{key}=BASE_PARAMS[{source!r}]"
+        for key, source in sorted(block["catboost_matched_from_base_params"].items())
+    )
+    return (
+        f"peer arm {block['one_line']}: {block['label']}\n"
+        f"  reported beside the comparator, never instead of it. "
+        f"{block['registered']}\n"
+        f"  catboost gets: {passed}\n"
+        f"  matched from BASE_PARAMS: {matched}\n"
+        f"  everything else is CatBoost's own default "
+        f"({block['catboost_defaults_source']})\n"
+        f"  determinism: {block['determinism']['status']}. "
+        f"{block['determinism']['flag']}\n"
+        f"  observed: {block['determinism']['observed']}\n"
+        f"  binning: {PHASE_SHAPE['catboost']['binning']}"
+    )
+
+
+def check_catboost_version(version):
+    """Raise unless this CatBoost is new enough to be the peer arm.
+
+    Called before anything is fitted, for the same reason the LightGBM
+    guard is: an engine that silently ignores a parameter and trains anyway
+    produces a record that names a configuration it did not run.
+    """
+    parts = []
+    for piece in str(version).split(".")[:2]:
+        digits = "".join(c for c in piece if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 2:
+        parts.append(0)
+    if tuple(parts) < CATBOOST_MIN_VERSION:
+        want = ".".join(str(p) for p in CATBOOST_MIN_VERSION)
+        raise RuntimeError(
+            f"the CatBoost peer arm is {CATBOOST_ARM_LABEL} and this harness "
+            f"needs CatBoost {want} or newer. This environment has {version}. "
+            "Below 1.2 the resolved parameter list this arm records is not "
+            "readable back through get_all_params(), so a record would state "
+            "defaults nobody checked."
+        )
+
+
+def check_lightgbm_version(version):
+    """Raise unless this LightGBM is new enough to be the comparator.
+
+    LightGBM does not reject a parameter it does not know: it logs
+    "Unknown parameter" and trains anyway, and this harness runs at
+    verbosity -1 where that line never appears. An unguarded old build
+    would therefore ignore `deterministic`, train nondeterministically, and
+    record itself as `stock+det`. Called before anything is fitted.
+    """
+    parts = []
+    for piece in str(version).split(".")[:2]:
+        digits = "".join(c for c in piece if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 2:
+        parts.append(0)
+    if tuple(parts) < LIGHTGBM_MIN_VERSION:
+        want = ".".join(str(p) for p in LIGHTGBM_MIN_VERSION)
+        raise RuntimeError(
+            f"the comparator is {COMPARATOR_LABEL} and this harness needs "
+            f"LightGBM {want} or newer. This environment has {version}, "
+            "which would log 'Unknown parameter' at a verbosity this harness "
+            "suppresses and then train without it, producing a comparator "
+            "that records itself as stock+det and was not."
+        )
 
 
 def _scenario(**kw):
@@ -363,12 +1404,37 @@ def shared_params(spec, extra=None):
 
 def lightgbm_params(spec, threads, extra=None):
     """`shared_params` translated into a LightGBM parameter dict, plus the
-    alignment settings.
+    comparator.
 
-    `bin_construct_sample_cnt` is filled in by the caller through `extra`
-    once the training row count is known, because it has to be at least
-    that count for LightGBM to bin from every row the way mojotrees does.
+    `extra` carries what the scenario cannot know, which after the C9
+    change is `num_class` and nothing else. It used to carry
+    `bin_construct_sample_cnt` at the training row count, injected by both
+    engine adapters, which forced LightGBM to fit its bin edges from every
+    row while mojotrees fit them from a 200000-row subsample. Both
+    injection sites are gone. A caller that puts it back is pinning the
+    comparator to a fit mojotrees is not doing, in the direction that
+    flatters us, so the two binning parameters are refused by name here
+    rather than merely not passed. A refusal is the only form of this rule
+    that survives somebody adding a third call site.
     """
+    for refused in ("bin_construct_sample_cnt", "min_data_in_bin"):
+        if refused in (extra or {}):
+            raise ValueError(
+                f"{refused} was passed to the comparator. Both are stock in "
+                f"{COMPARATOR_LABEL} and pinning either compares two "
+                "different binnings: see LIGHTGBM_STOCK_DEFAULTS and C9."
+            )
+    # `lambda_l2` joins them as of 2026-08-16. It was pinned to 1.0 on both
+    # sides for as long as mojotrees's default was 1.0, and the pin came out
+    # with the default. Setting it here again puts the comparator back on a
+    # non-stock regularizer under a label that says stock.
+    if "lambda_l2" in (extra or {}):
+        raise ValueError(
+            "lambda_l2 was passed to the comparator. It is stock (0.0) in "
+            f"{COMPARATOR_LABEL} and in mojotrees, and pinning it compares "
+            "an arm labelled stock against a regularizer no default "
+            "produces: see LIGHTGBM_STOCK_DEFAULTS and the module docstring."
+        )
     shared = shared_params(spec, extra)
     params = {
         "objective": shared["objective"],
@@ -377,8 +1443,9 @@ def lightgbm_params(spec, threads, extra=None):
         "learning_rate": shared["learning_rate"],
         "min_data_in_leaf": shared["min_data_in_leaf"],
         "min_sum_hessian_in_leaf": shared["min_child_hess"],
+        # No `lambda_l2`: stock on both sides since 2026-08-16, so it is
+        # recorded in LIGHTGBM_STOCK_DEFAULTS rather than passed.
         "lambda_l1": shared["lambda_l1"],
-        "lambda_l2": shared["lambda_l2"],
         "max_bin": shared["max_bin"],
         "use_missing": shared["use_missing"],
         "num_threads": int(threads),
@@ -407,6 +1474,11 @@ def mojotrees_params(spec, device, extra=None):
     MOJOTREES_NUM_WORKERS, which the runner sets in the environment before
     the extension is imported, and a parameter here would suggest there are
     two ways to set it.
+
+    Nothing on this side answers the comparator's `deterministic`, and
+    that is the point of the setting rather than an omission: mojotrees is
+    reproducible across thread counts with no parameter and no cost, so
+    there is nothing here to turn on.
     """
     shared = shared_params(spec, extra)
     params = {
@@ -416,8 +1488,10 @@ def mojotrees_params(spec, device, extra=None):
         "learning_rate": shared["learning_rate"],
         "min_data_in_leaf": shared["min_data_in_leaf"],
         "min_child_hess": shared["min_child_hess"],
+        # No `lambda_l2`, for the same reason as on the LightGBM side: the
+        # estimator's own default is LightGBM's 0.0 now, so passing it
+        # would restate a default rather than align anything.
         "lambda_l1": shared["lambda_l1"],
-        "lambda_l2": shared["lambda_l2"],
         "device": device,
     }
     for key in CATEGORICAL_PARAMS:
@@ -443,3 +1517,184 @@ def dataset_params(spec):
     on `train`, so they are separated here rather than at the call site."""
     shared = shared_params(spec)
     return {"max_bin": shared["max_bin"], "use_missing": shared["use_missing"]}
+
+
+#: The CatBoost loss for each task this harness runs. Ranking is absent and
+#: that is the reason ranking has no CatBoost row: see
+#: CATBOOST_SCENARIO_SUPPORT.
+CATBOOST_LOSS = {
+    "regression": "RMSE",
+    "binary": "Logloss",
+    "multiclass": "MultiClass",
+}
+
+
+#: Scenarios where the CatBoost arm runs, but only up to a tier. Distinct
+#: from `CATBOOST_SCENARIO_SUPPORT`, which answers "can this arm run this
+#: problem at all"; this answers "at what size does running it stop being a
+#: measurement and start being a timeout".
+#:
+#: A cap is not a quality judgement about CatBoost and it is not a skip for
+#: convenience. It exists because an arm that times out is an *infrastructure
+#: failure*, and `run.py` reports infrastructure failure by refusing to give
+#: the run a quality verdict at all -- so one uncapped peer cell can take the
+#: exit code of a matrix whose comparator rows all succeeded. Declaring the
+#: bound up front turns that into a skip with a reason, which is a result.
+CATBOOST_TIER_CAP = {
+    "sparse_highdim": (
+        "smoke",
+        "the standard tier is 100,000 rows by 50,000 features and the large "
+        "tier is 200,000 by 500,000. CatBoost builds borders per feature and "
+        "grows symmetric trees over the full feature set, and neither shape "
+        "has been shown to complete here inside any timeout this harness "
+        "sets. The smoke tier, 5,000 by 2,000, is where the CatBoost row on "
+        "this scenario is a measurement rather than a timeout, so that is "
+        "where it runs. This is a declared bound, not an observed limit: "
+        "nobody has timed CatBoost at the standard tier to find out how far "
+        "over it goes",
+    ),
+}
+
+#: Tiers in increasing size, so a cap can be compared rather than matched.
+TIER_ORDER = ("smoke", "standard", "large")
+
+
+def catboost_tier_ok(scenario, tier):
+    """(ok, reason). Whether the CatBoost arm runs this scenario at `tier`.
+
+    Separate from `catboost_supports` on purpose. Support is a property of
+    the problem and does not vary with size; this varies only with size. A
+    caller that asks one and not the other gets a wrong answer in one
+    direction each, so `run.py` asks both.
+    """
+    scenario_id = scenario["id"] if isinstance(scenario, dict) else scenario
+    capped = CATBOOST_TIER_CAP.get(scenario_id)
+    if capped is None:
+        return True, None
+    max_tier, reason = capped
+    if TIER_ORDER.index(tier) <= TIER_ORDER.index(max_tier):
+        return True, None
+    return False, (
+        f"the CatBoost arm on {scenario_id} is capped at the {max_tier} "
+        f"tier and this is {tier}: {reason}"
+    )
+
+
+def catboost_supports(scenario):
+    """(runs, reason). Whether the CatBoost arm runs this scenario.
+
+    Takes a scenario id or a resolved spec. A scenario with no entry at all
+    is refused rather than assumed to run: an unlisted scenario is one
+    nobody decided about, and defaulting it to "yes" is how an engine ends
+    up in a table on a problem it was never checked against.
+    """
+    scenario_id = scenario["id"] if isinstance(scenario, dict) else scenario
+    if scenario_id not in CATBOOST_SCENARIO_SUPPORT:
+        return False, (
+            f"{scenario_id} has no entry in CATBOOST_SCENARIO_SUPPORT, so "
+            "nobody has decided whether the CatBoost arm can run it"
+        )
+    reason = CATBOOST_SCENARIO_SUPPORT[scenario_id]
+    return (reason is None), reason
+
+
+def catboost_params(spec, threads, extra=None):
+    """`shared_params` translated into a CatBoost parameter dict.
+
+    Only three things reach CatBoost that are not the problem statement:
+    `CATBOOST_ALIGNMENT`, the thread count, and the two matched parameters
+    in `CATBOOST_MATCHED`. Everything else is CatBoost's own default and is
+    recorded in `CATBOOST_LEFT_AT_STOCK` rather than passed.
+
+    The refusal list is the point of this function existing rather than the
+    adapter building the dict itself. `bin_construct_sample_cnt` at the
+    training row count made the LightGBM comparator do strictly more binning
+    work than mojotrees did, in our favor, and it was caught only after a
+    ratio had been published. `CATBOOST_REFUSED_PARAMS` is the same defect
+    in CatBoost's vocabulary -- `border_count`, `max_bin`,
+    `dev_max_subset_size_for_build_borders`, `used_ram_limit` and the
+    leaf-population and sampling knobs -- and every one of them is refused
+    by name here, because a refusal is the only form of this rule that
+    survives somebody adding a third call site.
+
+    `extra` carries what the scenario cannot know, which is `num_class` and
+    nothing else.
+    """
+    for refused, why in CATBOOST_REFUSED_PARAMS.items():
+        if refused in (extra or {}):
+            raise ValueError(
+                f"{refused} was passed to the CatBoost peer arm. It is stock "
+                f"in {CATBOOST_ARM_LABEL}: {why}. See "
+                "CATBOOST_REFUSED_PARAMS and CATBOOST_LEFT_AT_STOCK."
+            )
+    task = spec["task"]
+    if task not in CATBOOST_LOSS:
+        raise ValueError(
+            f"the CatBoost peer arm has no loss for task {task!r}: "
+            + str(CATBOOST_SCENARIO_SUPPORT.get(spec.get("id"), "unlisted"))
+        )
+    shared = shared_params(spec, extra)
+    params = {
+        "loss_function": CATBOOST_LOSS[task],
+        # Matched, and read from BASE_PARAMS rather than restated, so the
+        # three engines cannot be asked for different budgets by an edit to
+        # one dict.
+        "iterations": int(shared[CATBOOST_MATCHED["iterations"]]),
+        "learning_rate": float(shared[CATBOOST_MATCHED["learning_rate"]]),
+        # The same quantity MOJOTREES_NUM_WORKERS and num_threads carry on
+        # the other two arms, set from one number by the runner.
+        "thread_count": int(threads),
+    }
+    params.update(CATBOOST_ALIGNMENT)
+    if task == "multiclass":
+        params["classes_count"] = int(shared["num_class"])
+    for key, value in (extra or {}).items():
+        if key in ("num_class", "n_classes"):
+            continue
+        params[key] = value
+    return params
+
+
+def mojotrees_catboost_mode_params(spec, device, extra=None):
+    """The "us in CatBoost mode" arm: `mojotrees_params` with
+    `MOJOTREES_CATBOOST_MODE` applied over the shared defaults.
+
+    Applied as a scenario-level override rather than as a second translator,
+    so this arm and the plain one go through exactly the same code and a
+    reader diffing two records sees `MOJOTREES_CATBOOST_MODE` and nothing
+    else.
+
+    What this arm is NOT: a claim that mojotrees can be made into CatBoost.
+    It cannot. mojotrees has no symmetric-tree policy, so this is depthwise
+    at depth 6, and it does no row sampling, where CatBoost's default MVS
+    takes 80 percent of the rows per tree. Both are in
+    `CATBOOST_UNMATCHABLE` and both travel with the record.
+
+    The override is applied to the resolved dict rather than to the
+    scenario's `params`, and that is a correction rather than a shortcut.
+    `mojotrees_params` builds an explicit dict and copies through only the
+    categorical, ranking and multiclass blocks, so a scenario-level
+    `grow_policy` is dropped on the floor: the first version of this
+    function set it that way and produced an arm with CatBoost's depth and
+    mojotrees's growth, which is neither of the two things the row claims to
+    compare. `selfcheck.check_catboost_arm` caught it by diffing the two
+    resolved dicts against `MOJOTREES_CATBOOST_MODE`, and that check is the
+    reason this comment can be specific.
+    """
+    params = mojotrees_params(spec, device, extra)
+    params.update(MOJOTREES_CATBOOST_MODE)
+    return params
+
+
+# The peer arms are added to the scenarios they can run, and a scenario that
+# cannot run them says why in `catboost_arm_block()["scenarios_not_run"]`
+# rather than simply not appearing. Written as a loop over
+# CATBOOST_SCENARIO_SUPPORT so that a scenario added without a support
+# decision fails `selfcheck.check_catboost_arm` instead of silently
+# defaulting to one.
+for _scenario_id, _reason in CATBOOST_SCENARIO_SUPPORT.items():
+    if _reason is None:
+        SCENARIOS[_scenario_id]["engines"] = list(
+            SCENARIOS[_scenario_id]["engines"]
+        ) + ["catboost", "mojotrees_catboost_mode"]
+del _scenario_id, _reason

@@ -26,11 +26,16 @@ the same resolved-versus-indistinguishable verdict every other arm gets.
 `__name__` guard: importing this module must generate no data and train
 nothing.
 
-The parameter alignment is not restated here. It is imported from
-bench/real_data/scenarios.py, which is where every entry is justified next
-to the reason it exists, so the two comparisons in this repository cannot
-drift apart by one of them being edited. One entry is dropped rather than
-inherited and `SPEED_EXCLUDED_ALIGNMENT` says which and why.
+The comparator is not restated here. It is imported whole from
+bench/real_data/scenarios.py, where every entry is justified next to the
+reason it exists, so the two comparisons in this repository cannot drift
+apart by one of them being edited. Nothing is dropped on the way in: this
+file used to exclude one entry and that is what made the two comparisons
+two comparators.
+
+That comparator is **LightGBM at stock defaults plus `deterministic=true`**,
+labelled `stock+det`, and `params_summary` puts its id in the parameter
+line of every result so a number cannot travel without it.
 
 Usage: python bench/bench_lightgbm.py [--rows N] [--features N]
        [--objective reg|binary] [--threads N] [--repeats N] [--rounds N]
@@ -70,17 +75,22 @@ scenarios = _load_scenarios()
 MASK = np.uint64(0xFFFFFFFFFFFFFFFF)
 INV_2_53 = 1.0 / 9007199254740992.0
 
-#: Alignment keys deliberately not inherited from scenarios.LIGHTGBM_ALIGNMENT.
+#: Nothing is excluded from scenarios.LIGHTGBM_ALIGNMENT any more, and that
+#: is the point.
 #:
-#: `deterministic` is a reproducibility setting, and LightGBM's own
-#: documentation records that it can slow training down. The real_data
-#: differential wants it because a repeat run there has to be a repeat run of
-#: the same fit. Here the measured quantity *is* the wall time, so switching
-#: on a setting whose cost lands entirely on the comparator's side of the
-#: comparison would hand mojotrees an advantage that came from the harness
-#: rather than from the code. The fit is still pinned by `seed`, which is
-#: inherited and costs nothing.
-SPEED_EXCLUDED_ALIGNMENT = ("deterministic",)
+#: This file used to drop `deterministic`, because LightGBM's own
+#: documentation says it can slow training down and the cost would have
+#: landed entirely on the comparator's side of a speed comparison. The
+#: consequence was that this repository ran two LightGBM configurations
+#: under one name: a speed figure from here and an accuracy figure from
+#: bench/real_data were not taken against the same engine.
+#:
+#: C9 allows exactly one comparator and `deterministic` is now what it is
+#: **for**, so the exclusion is gone rather than inverted. The reasoning
+#: moved with it: the mojotrees arms are reproducible across thread counts
+#: at no cost, so the flag is what lets the comparator's repeats mean the
+#: same thing ours do, not a handicap laid on it. The wall time it costs is
+#: paid deliberately and in the open.
 
 #: The name each mojotrees default arrives under from the Mojo harness,
 #: against the canonical `scenarios.BASE_PARAMS` key it has to equal.
@@ -154,11 +164,21 @@ def make_data(n_rows: int, n_features: int, objective: str, seed: int = 0):
 
 
 def lgbm_params(objective: str, threads: int, n_rows: int) -> dict:
-    """The parameter dict, aligned to mojotrees's defaults.
+    """The parameter dict: the one comparator, and the shared parameters.
 
-    The shared values come from `scenarios.BASE_PARAMS` and the settings
-    that exist to remove a difference come from
-    `scenarios.LIGHTGBM_ALIGNMENT`, minus `SPEED_EXCLUDED_ALIGNMENT`.
+    The shared values come from `scenarios.BASE_PARAMS` and the comparator
+    comes whole from `scenarios.LIGHTGBM_ALIGNMENT`, with nothing dropped
+    and nothing added here. That is what makes a speed figure from this
+    file and an accuracy figure from `bench/real_data` figures about the
+    same engine.
+
+    `n_rows` is accepted and unused. It is kept in the signature because
+    both callers pass it and because its former use is the thing worth
+    naming: it set `bin_construct_sample_cnt` to the row count, which made
+    the comparator fit its bin edges from every row while mojotrees fit
+    them from a 200000-row subsample. Every binning number recorded under
+    that pin describes a constraint this repository imposed on LightGBM,
+    not the stock comparison, and it ran in our favor.
 
     `threads` of 0 leaves `num_threads` unset, which is LightGBM's own
     default of one thread per physical core. Any other value pins it. The
@@ -166,6 +186,12 @@ def lgbm_params(objective: str, threads: int, n_rows: int) -> dict:
     MOJOTREES_NUM_WORKERS does on the mojotrees side; nothing here can
     check it, which is why the resolved number is printed.
     """
+    # Before the dict is built, not after it is trained on. An old
+    # LightGBM logs "Unknown parameter" and trains without the setting, and
+    # this arm runs at verbosity -1 where that line never appears, so the
+    # guard is the only thing between a stale environment and a comparator
+    # that records itself as stock+det and was not.
+    scenarios.check_lightgbm_version(lgb.__version__)
     base = scenarios.BASE_PARAMS
     params = {
         "objective": "binary" if objective == "binary" else "regression",
@@ -175,22 +201,10 @@ def lgbm_params(objective: str, threads: int, n_rows: int) -> dict:
         "min_data_in_leaf": base["min_data_in_leaf"],
         "min_sum_hessian_in_leaf": base["min_child_hess"],
         "lambda_l1": base["lambda_l1"],
-        "lambda_l2": base["lambda_l2"],
         "max_bin": base["max_bin"],
         "use_missing": base["use_missing"],
-        # mojotrees has no feature bundling; keep the comparison honest.
-        # This one is in the alignment too, restated because it is the
-        # single largest structural difference between the two engines.
-        "enable_bundle": False,
-        "verbose": -1,
     }
-    for key, value in scenarios.LIGHTGBM_ALIGNMENT.items():
-        if key in SPEED_EXCLUDED_ALIGNMENT:
-            continue
-        params[key] = value
-    # LightGBM bins from a 200000-row subsample by default and mojotrees
-    # bins from every row, so the sample count has to follow the row count.
-    params["bin_construct_sample_cnt"] = int(n_rows)
+    params.update(scenarios.LIGHTGBM_ALIGNMENT)
     if threads > 0:
         params["num_threads"] = int(threads)
     return params
@@ -203,8 +217,15 @@ def params_summary(params: dict) -> str:
     recorded was taken under a parameter set that was written down in one
     file and read from another, and the only defense against that is the
     run stating what it actually used.
+
+    `comparator` leads the line, in the same key=value shape as the rest,
+    because the parameters say what was passed and the comparator id says
+    which agreed configuration they are. A result whose parameter string
+    carries no comparator was taken before C9 and is not comparable with
+    one that does.
     """
-    return " ".join(f"{k}={params[k]}" for k in sorted(params))
+    resolved = dict(params, comparator=scenarios.comparator_id())
+    return " ".join(f"{k}={resolved[k]}" for k in sorted(resolved))
 
 
 def check_alignment(mojo_defaults: dict) -> None:
@@ -222,7 +243,19 @@ def check_alignment(mojo_defaults: dict) -> None:
         if canonical is None:
             problems.append(f"{name}: no canonical counterpart in BASE_PARAMS")
             continue
-        want = scenarios.BASE_PARAMS[canonical]
+        # `lambda_l2` left BASE_PARAMS when our default became LightGBM's
+        # stock 0.0, so a canonical name may now live only in the stock
+        # table. Falling back keeps the guard alive instead of trading a
+        # KeyError for a deleted check.
+        want = scenarios.BASE_PARAMS.get(
+            canonical, scenarios.LIGHTGBM_STOCK_DEFAULTS.get(canonical)
+        )
+        if want is None:
+            problems.append(
+                f"{name}: {canonical} is in neither BASE_PARAMS nor"
+                " LIGHTGBM_STOCK_DEFAULTS"
+            )
+            continue
         if isinstance(want, bool) or isinstance(value, bool):
             same = bool(value) == bool(want)
         else:
@@ -383,6 +416,199 @@ class InterleavedArm:
         if self.booster is None:
             raise RuntimeError("loss requested before any training run")
         return train_loss(self.booster, self.X, self.y, self.objective)[1]
+
+
+def _catboost_spec(objective: str) -> dict:
+    """The minimal scenario spec `scenarios.catboost_params` needs.
+
+    Built here rather than restated, for the same reason the comparator is
+    imported whole: the peer arm's parameters have to be the ones
+    `bench/real_data` uses, or this repository is running two CatBoost
+    configurations under one name the way it once ran two LightGBM ones.
+
+    `id` is a label rather than a registered scenario. This file's dataset
+    is `make_data`, which is bench_train.mojo's generator and is not one of
+    the six, so the id says that instead of borrowing a scenario name whose
+    thresholds and caveats do not apply here.
+    """
+    task = "binary" if objective == "binary" else "regression"
+    return {
+        "id": "bench_train_synthetic",
+        "task": task,
+        "objective": task,
+        "params": {},
+    }
+
+
+def catboost_params(objective: str, threads: int, rounds: int) -> dict:
+    """The CatBoost peer arm's parameter dict, at a matched tree count.
+
+    Everything except the round count comes whole from
+    `scenarios.catboost_params`: `CATBOOST_ALIGNMENT`, the matched learning
+    rate, the thread count, and the loss. Nothing is added here and nothing
+    is dropped.
+
+    `iterations` is overridden with the harness's round count for the one
+    reason the whole arm exists: a comparison at different budgets is not a
+    comparison. In the interleaved path the two numbers cannot diverge:
+    `check_alignment` refuses to run unless the mojotrees round count equals
+    `BASE_PARAMS['n_estimators']`, which is the same value
+    `scenarios.catboost_params` puts in, so the override is the identity
+    there and is written out anyway so that a caller which reaches this
+    function directly still gets a matched budget rather than a silently
+    different one.
+
+    CatBoost picks its own learning rate from the iteration count and the
+    dataset when it is not given one, so the rate is pinned by
+    `scenarios.catboost_params` and is not this function's business.
+    """
+    params = scenarios.catboost_params(_catboost_spec(objective), threads)
+    params["iterations"] = int(rounds)
+    return params
+
+
+def catboost_params_summary(params: dict) -> str:
+    """The resolved parameters on one line, with the arm's id leading.
+
+    `arm` leads rather than `comparator`, and that is the point of the
+    difference: a CatBoost number is not a number against the comparator.
+    The comparator is LightGBM at `stock+det` and this line must not be
+    mistaken for one taken against it.
+    """
+    resolved = dict(
+        params,
+        arm=scenarios.catboost_arm_id(),
+        comparator_is_still=scenarios.comparator_id(),
+    )
+    return " ".join(f"{k}={resolved[k]}" for k in sorted(resolved))
+
+
+class CatBoostInterleavedArm:
+    """The CatBoost peer arm, in the shape `InterleavedArm` established.
+
+    Reported beside the LightGBM arm and never instead of it. Same data,
+    same round count, same thread count, same repeat reduction.
+
+    **Its `train` is not the same span of work as the LightGBM arm's, and
+    that is a property of CatBoost rather than of this class.** The
+    LightGBM arm constructs its Dataset in the constructor, so its timed
+    call is boosting only. CatBoost's `Pool` is ingestion only -- it comes
+    back unquantized -- and CatBoost bins inside `fit`, so this arm's timed
+    call is binning plus boosting. Pre-quantizing the pool to move the
+    binning out was tried in the real-data harness and rejected: it
+    produces a different model above a few hundred thousand rows, because
+    CatBoost draws its border-construction sample under a quantization seed
+    the fit path does not share. `phase_shape()` states this and `summary()`
+    carries it, so a reader cannot pick the two `train` numbers up as
+    comparable.
+
+    The comparable quantity across all three arms is end to end: ingestion
+    plus binning plus boosting. `ingest_s` here plus the caller's timed
+    `train` is that total for this arm, in the same way `binning_s` plus the
+    timed `train` is that total for the LightGBM arm.
+
+    Determinism is seeded and not guaranteed. CatBoost has no
+    `deterministic` flag; `scenarios.CATBOOST_DETERMINISM` says what is
+    pinned instead and what was observed.
+    """
+
+    def __init__(
+        self,
+        n_rows: int,
+        n_features: int,
+        objective: str,
+        threads: int,
+        seed: int,
+        **mojo_defaults,
+    ):
+        if objective not in ("reg", "binary"):
+            raise ValueError(
+                "the catboost arm handles 'reg' and 'binary'. Multiclass "
+                "would need the harness's quantile bucketing replicated "
+                "here, and ranking has no CatBoost row at all: CatBoost has "
+                "no lambdarank"
+            )
+        check_alignment(mojo_defaults)
+        import catboost  # deferred: this module's lightgbm arm must import
+        # and run in an environment where catboost is not installed.
+
+        scenarios.check_catboost_version(catboost.__version__)
+        self.catboost = catboost
+        self.version = catboost.__version__
+        self.objective = objective
+        self.rounds = int(mojo_defaults.get("rounds", 100))
+        self.threads = int(threads)
+        self.X, self.y = make_data(n_rows, n_features, objective, seed)
+        self.params = catboost_params(objective, threads, self.rounds)
+        t0 = time.perf_counter()
+        self.pool = catboost.Pool(self.X, label=self.y)
+        # Named ingest_s and not binning_s. It is the conversion into
+        # CatBoost's own layout and nothing else; the pool is unquantized
+        # when this returns.
+        self.ingest_s = time.perf_counter() - t0
+        self.model = None
+
+    def summary(self) -> str:
+        return catboost_params_summary(self.params)
+
+    def phase_shape(self) -> str:
+        """What this arm's timed call contains, on one line, for the
+        result record. Never omitted: two `train` numbers that span
+        different work and carry no note is exactly how a benchmark
+        produces a real number for a question it cannot answer."""
+        shape = scenarios.PHASE_SHAPE["catboost"]
+        return (
+            f"catboost ingest={shape['ingest']}; train={shape['train']}; "
+            f"binning={shape['binning']}; e2e={shape['e2e']}"
+        )
+
+    def resolved_threads(self) -> int:
+        return int(self.params["thread_count"])
+
+    def train(self) -> int:
+        """One fit, which contains CatBoost's binning. Returns the tree
+        count; the caller holds the clock.
+
+        A fresh model per call rather than a refit: CatBoost continues an
+        existing model rather than replacing it, so reusing one would make
+        the second repeat a 200-tree run.
+        """
+        self.model = self.catboost.CatBoost(self.params)
+        self.model.fit(self.pool)
+        return int(self.model.tree_count_)
+
+    def loss(self) -> float:
+        """The training loss of the most recent `train`, outside any timed
+        region, in the same definition `train_loss` uses for LightGBM."""
+        if self.model is None:
+            raise RuntimeError("loss requested before any training run")
+        if self.objective == "binary":
+            p = np.asarray(
+                self.model.predict(self.X, prediction_type="Probability")
+            )[:, 1]
+            p = np.clip(p, 1e-15, 1.0 - 1e-15)
+            return float(
+                -np.mean(
+                    self.y * np.log(p) + (1.0 - self.y) * np.log(1.0 - p)
+                )
+            )
+        pred = self.model.predict(self.X)
+        return float(np.mean((pred - self.y) ** 2))
+
+    def resolved_params(self) -> dict:
+        """What CatBoost itself resolved, read back from the fitted model.
+
+        Worth a method rather than a comment because CatBoost derives
+        defaults from the data. `learning_rate` is the one that matters and
+        this arm pins it; `boosting_type` is chosen from the dataset size
+        and is only knowable this way. `get_all_params()` omits
+        `thread_count`, which is put back here.
+        """
+        if self.model is None:
+            raise RuntimeError("resolved parameters requested before a fit")
+        resolved = dict(self.model.get_all_params())
+        resolved["thread_count"] = self.resolved_threads()
+        return resolved
 
 
 def main():

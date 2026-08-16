@@ -459,14 +459,28 @@ comptime HOST_SUBTRACT_DISPATCHES = 1
 """`histogram.subtract_histogram_into` fans its element-wise subtraction out
 once (`dispatch_rows`)."""
 
-comptime HOST_PARTITION_DISPATCHES = 0
-"""`tree.partition_rows_into` runs serially: it imports no dispatcher and
-makes no fan-out. Zero is the measurement-relevant fact here, not an absence
-of instrumentation, which is why it is written down."""
+comptime HOST_PARTITION_DISPATCHES = 2
+"""`tree.partition_rows_into` fans out twice. It plans row blocks once
+(`plan_row_blocks(n, 3 * n)`, tree.mojo:673) and then runs them twice, once
+to count per block and once to scatter (`run_row_blocks` at tree.mojo:701 and
+:731), which is the two-pass shape its own docstring describes.
 
-comptime HOST_SPLIT_SEARCH_DISPATCHES = 0
-"""`split.find_best_split` and `tree._search` run serially: split.mojo imports
-nothing from parallel.mojo."""
+**This constant was 0 until 2026-08-16, and its docstring asserted that the
+partition "runs serially: it imports no dispatcher and makes no fan-out".**
+That was false when written or became false afterwards; `tree.mojo:87`
+imports `plan_row_blocks` and `run_row_blocks` from `parallel.mojo`. The old
+docstring called zero "the measurement-relevant fact here, not an absence of
+instrumentation", which is exactly the sentence that stopped anyone
+rechecking it."""
+
+comptime HOST_SPLIT_SEARCH_DISPATCHES = 1
+"""`split.find_best_split` fans its per-feature scan out once
+(`dispatch_features`, split.mojo:762), on a `split_scan_ops` estimate.
+
+**This constant was 0 until 2026-08-16, and its docstring asserted that
+"split.mojo imports nothing from parallel.mojo".** `split.mojo:98` is
+`from .parallel import dispatch_features`. The parallel split scan landed in
+round 2 and this constant was not updated with it."""
 
 
 # ---------------------------------------------------------------------------

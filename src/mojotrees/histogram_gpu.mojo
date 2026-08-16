@@ -2106,7 +2106,7 @@ struct GpuHistogramBuilder(Movable):
                 i += 1
 
         dispatch_rows(decode, hist_size, 3 * hist_size)
-        return Histogram(g^, h^, c^, self.n_features, self.n_bins)
+        return Histogram.from_planes(g^, h^, c^, self.n_features, self.n_bins)
 
     def build_leaf(mut self, leaf: Int) raises -> Histogram:
         """Build the histogram of the rows currently assigned to `leaf`, over
@@ -2815,7 +2815,7 @@ struct GpuHistogramBuilder(Movable):
             gp.unsafe_store(i, Float64(src.unsafe_load(g0 + i)) * g_inv)
             hp.unsafe_store(i, Float64(src.unsafe_load(h0 + i)) * h_inv)
             cp.unsafe_store(i, Int(src.unsafe_load(c0 + i)))
-        return Histogram(g^, h^, c^, self.n_features, self.n_bins)
+        return Histogram.from_planes(g^, h^, c^, self.n_features, self.n_bins)
 
     def _build_leaves_batched(
         mut self, nodes: List[Int]

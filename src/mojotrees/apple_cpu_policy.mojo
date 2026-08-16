@@ -5,14 +5,30 @@ A pure policy layer for the multicore CPU backend, in the same shape as
 plan out. It allocates nothing, dispatches nothing, and touches no dataset,
 so every decision below can be exercised and asserted on any machine.
 
-Nothing here changes a result. Every quantity it produces is a scheduling or
-a memory-traffic decision: how many tasks a loop is split into, whether an
-accumulation gathers its gradients into a scratch buffer first, how many
-features one inner loop interleaves. The kernels in `histogram.mojo` and the
-dispatch shapes in `parallel.mojo` keep each feature's summation inside one
-task and each row block in ascending order whatever this module answers, so
-the output is bit-identical at every setting (see the invariants in
+**One quantity here changes a result and the rest do not**, and the split is
+worth reading before touching anything in this file.
+
+Everything except the row-block count is a scheduling or a memory-traffic
+decision: how many tasks a loop is split into, whether an accumulation
+gathers its gradients into a scratch buffer first, how many features one
+inner loop interleaves. The kernels in `histogram.mojo` and the dispatch
+shapes in `parallel.mojo` keep each feature's summation inside one task and
+each row block in ascending order whatever this module answers, so the output
+is bit-identical at every one of those settings (see the invariants in
 `handoffs/performance_13_apple_cpu.md`).
+
+`AccumulationPlan.row_blocks` is the exception. A blocked accumulation folds
+per-block partial sums, and Float64 addition is not associative, so the block
+count is part of the value. That is why `plan_row_block_count` takes the
+workload shape and nothing else: not the core count, not the core pool, not
+`MOJOTREES_NUM_WORKERS`, not the task count. Determinism across worker counts
+and across machines is preserved by keeping every machine fact out of that one
+function, and by the fold running in ascending block order however many tasks
+the blocks are dispatched over. `MOJOTREES_CPU_ROW_BLOCKS` and
+`MOJOTREES_CPU_ROW_BLOCK_AMORTIZE` are explicit requests for a different
+summation order and are the only two variables named in this file that move
+bits. Both stay workload-only: neither can be set to a value that makes the
+block count depend on the worker count, the task count or the machine.
 
 What this module encodes
 ------------------------
@@ -96,8 +112,8 @@ refuses. So the floor stands, the ladder is selected against it, and
 declines to choose. A measurement that resolves this belongs in
 `bench/apple/cpu_plan.json`, not in a constant nobody verified.
 
-Environment contract (all optional, all scheduling-only)
---------------------------------------------------------
+Environment contract (all optional; all scheduling-only but the last two)
+-------------------------------------------------------------------------
 - `MOJOTREES_CPU_TASKS_PER_CORE`: positive integer, auto-mode fan-out per
   core. Default `DEFAULT_TASKS_PER_CORE`.
 - `MOJOTREES_CPU_CORE_POOL`: `all` (default) counts every physical core;
@@ -112,6 +128,27 @@ Environment contract (all optional, all scheduling-only)
 - `MOJOTREES_CPU_COMPACT_MIN_ROWS`: row count below which a subset
   accumulation skips the gradient/hessian gather. Default
   `DEFAULT_COMPACT_MIN_ROWS`.
+- `MOJOTREES_CPU_ROW_BLOCKS`: how many contiguous row blocks a subset
+  accumulation splits a node into, each with a private histogram folded in
+  ascending block order. Unset (or `0`) means the derived count; `1` turns
+  blocking off and reproduces the feature-partition accumulation exactly; `N
+  >= 2` forces N blocks, bypassing the amortization floor and the byte budget
+  and clamped only by the node's row count and `MAX_ROW_BLOCKS`.
+  **This one moves bits.** Two different block counts are two different
+  summation orders and produce two different Float64 histograms. `1` is the
+  off switch a bisection wants.
+- `MOJOTREES_CPU_ROW_BLOCK_AMORTIZE`: the amortization ratio the derived
+  block count comes from, `N` or `N/D`, default `8` (which is `8/1`). It sets
+  `row_block_min_rows(bins) = floor(2 * N * bins / D)`, so `8` is 4,080 rows
+  a block at 255 bins and `1/8` is 63. **This one moves bits too**, and by
+  exactly the same mechanism: it changes the block count, and a block count
+  is a summation order. It is the *rule* where `MOJOTREES_CPU_ROW_BLOCKS` is
+  the *answer*, which is what a sweep across node sizes needs, since one
+  forced count is right at one node size and wrong at every other. Unset it
+  is byte-identical to what shipped. An unparsable or non-positive value is
+  refused at the raising planner entry points rather than silently meaning
+  the default, because an arm recorded under the wrong label is worse than an
+  arm that did not run.
 
 `MOJOTREES_NUM_WORKERS` and `MOJOTREES_PARALLEL_MIN_OPS` keep their meanings
 from `parallel.mojo` and override everything here: an explicit worker count
@@ -136,6 +173,28 @@ there is deliberately no global cache and no invalidation hook to forget:
 whoever resolves it owns it, and dropping it and resolving again is the
 whole of the invalidation story. A caller that must see a mid-process change
 either resolves again or uses the unresolved form.
+
+The unresolved sentinel, and why it exists
+------------------------------------------
+`ResolvedCpuPolicy.unresolved()` is a policy that says "I am not a snapshot".
+Every resolved method on it, and `derive_accumulation_plan_with` given it,
+falls back to reading the environment live, so it answers exactly what the
+unresolved free functions answer.
+
+It exists so that a threading parameter can be *defaulted*. The call chain
+from the booster down to a histogram build passes through modules that
+different lanes and different campaigns own, and a snapshot parameter with no
+default would force every one of those call sites to change at once. With the
+sentinel as the default, a caller that has a snapshot passes it and reads
+nothing; a caller that has not been wired yet passes nothing and behaves
+exactly as it did before, down to which `getenv` runs. That is deliberately a
+staging device and not a destination: a hot call site left on the sentinel is
+still paying per-dispatch, and the point of the parameter is to be filled in.
+
+The sentinel carries a zeroed profile rather than a detected one, because
+detecting the machine to build a value nobody will consult would be the cost
+this whole mechanism exists to remove. Nothing may read those zeros: every
+method checks `resolved` first and re-reads the machine when it is False.
 """
 
 from std.sys.info import (
@@ -230,6 +289,157 @@ choose, which is the point of deriving a width instead of naming one."""
 # wall-time A/B settles it. `MOJOTREES_CPU_FEATURE_GROUP` is how it is swept,
 # and `bench/apple/cpu_plan.json` states the comparison that would move it.
 comptime TASK_BALANCE_FACTOR = 2
+
+# Row blocking: the second axis of the accumulation decomposition.
+#
+# The feature group is the first axis and it has a hard ceiling. At width `W`
+# over `A` active features the dispatch has `ceil(A / W)` units and no more,
+# which at the default shape (50 features, width 2) is 25 whatever the node's
+# row count is. That ceiling does not fall with node size either, so a node
+# with a thousandth of the rows still pays 25 scheduling events. Splitting a
+# node's rows into blocks and giving each block a private histogram adds an
+# independent axis: the unit count becomes `blocks * groups`, and it grows
+# with the row count instead of being capped by the feature count.
+#
+# **The block count is a pure function of the workload shape.** Rows, bins,
+# and active features go in; nothing about the machine, the core count, the
+# core pool, `MOJOTREES_NUM_WORKERS`, or the task count is consulted. That is
+# not a stylistic choice. A block fold sums `(block 0's rows) + (block 1's
+# rows) + ...` and Float64 addition is not associative, so the block count is
+# part of the *value*, not part of the schedule. A block count that varied
+# with the worker count would make the output vary with the worker count,
+# which is the one thing this round will not trade. Everything else about the
+# dispatch -- how many tasks the units are cut into, which core runs which
+# unit -- stays free to vary, because a unit is never split and the fold is
+# always in ascending block order.
+#
+# What the constants below bound.
+#
+# `ROW_BLOCK_AMORTIZE` is the ratio of accumulate work to per-block overhead
+# a block must clear. One block costs `active * bins` cells zeroed and
+# `active * bins` cells read back in the fold, and earns `block_rows *
+# active` accumulates, so requiring
+#
+#     block_rows * active >= ROW_BLOCK_AMORTIZE * 2 * active * bins
+#
+# gives `block_rows >= 2 * ROW_BLOCK_AMORTIZE * bins`, which is
+# `row_block_min_rows`. The `active` cancels, which is why the floor is
+# stated in bins alone. At 255 bins and a ratio of 8 that is 4,080 rows per
+# block, so a node needs 8,160 rows before it blocks at all, and the
+# zero-and-fold overhead is at most an eighth of the accumulation it buys.
+# The ratio is not measured; it is the fraction of the work this decomposition
+# is allowed to spend on itself.
+#
+# `MAX_ROW_BLOCK_SCRATCH_BYTES` bounds the private histograms. Blocks hold
+# `blocks * active * bins` cells of three Float64 planes, which at 50
+# features and 255 bins is 306 KB per block, so this cap is what stops a
+# million-row node from asking for 245 blocks and 75 MB. It is a byte budget
+# rather than a block count because the shape that matters is the product.
+# `MAX_ROW_BLOCKS` is the absolute ceiling underneath it, for a narrow shape
+# whose cells are cheap enough that the byte budget would allow thousands.
+# `ROW_BLOCK_AMORTIZE` is a *ratio*, and the two constants below are its
+# numerator and denominator so that the ratio can be swept below 1 without the
+# derivation losing its units. The default is 8/1, which is exactly the 8 this
+# repository shipped, so `row_block_min_rows(255)` is 4,080 unchanged.
+#
+# Why sub-unit values have to be reachable. LightGBM's comparable number is
+# `min_block_size = min(0.3 * num_bin / elems_per_row + 1, 1024)` floored at
+# 32, which at 255 bins is 77 rows, 53 times smaller than ours. That is not
+# the same quantity -- theirs is a floor on a *work-stealing chunk* whose
+# private histogram count comes from the thread count, ours is the private
+# histogram count itself -- so it cannot be adopted, because a block count
+# that came from the thread count would make the output depend on
+# `MOJOTREES_NUM_WORKERS`. But it does say that nobody has established which
+# side of 4,080 the answer is on, and a knob that bottomed out at 510 rows
+# (ratio 1) could not even reach the region the question is about.
+# `MOJOTREES_CPU_ROW_BLOCK_AMORTIZE` therefore accepts `N` and `N/D`, so
+# `1/8` is a 63-row floor at 255 bins and the whole span is sweepable.
+#
+# The ratio remains a statement about work only. Nothing about the machine
+# enters it, so every setting still gives a block count that is a function of
+# `rows`, `n_bins` and `n_active` alone.
+comptime ROW_BLOCK_AMORTIZE = 8
+comptime ROW_BLOCK_AMORTIZE_DEN = 1
+comptime MAX_ROW_BLOCKS = 64
+comptime MAX_ROW_BLOCK_SCRATCH_BYTES = 16 * 1024 * 1024
+
+# Planes and bytes per plane in the private block scratch. Three planes:
+# gradient, hessian, and count. The count plane is carried as Float64 rather
+# than as `Int` because the scratch is one `List[Float64]` (the caller's
+# gradient/hessian gather buffer, whose tail this borrows), and a count is an
+# integer below 2^53 at every step of the fold, so every partial sum is
+# exactly representable and the conversion back to `Int` is exact. The
+# hessian plane is allocated even under the constant-hessian specialization,
+# which does not write it: sizing the scratch from `const_hessian` would make
+# the *block count* depend on it through the byte budget, and the block count
+# is part of the value.
+comptime ROW_BLOCK_PLANES = 3
+comptime ROW_BLOCK_PLANE_BYTES = 8
+
+# How a private block cell is *laid out*, which is a different question from
+# how much room it is allocated. `ROW_BLOCK_PLANES` above is the allocation
+# and the byte budget, and it stays at 3 unconditionally so that the block
+# count remains a value independent of `const_hessian` (the paragraph above
+# says why that matters). These two say how many of those three slots the
+# kernel actually addresses, and that they are addressed *interleaved*:
+# cell `c` occupies `[c * stride, c * stride + stride)` rather than living on
+# three planes a megabyte apart.
+#
+# This is LightGBM's `hist_t` layout. `include/LightGBM/bin.h` declares
+# `typedef double hist_t`, `kHistEntrySize = 2 * sizeof(hist_t)` and
+# `GET_GRAD(hist, i) = hist[(i) << 1]`, `GET_HESS(hist, i) = hist[((i) << 1)
+# + 1]`: one 16-byte (gradient, hessian) cell, no count plane. Its
+# constant-hessian arm keeps the same 16 bytes and spends the second slot on
+# a count (`hist_cnt_t* cnt = reinterpret_cast<hist_cnt_t*>(hess)` in
+# `src/io/dense_bin.hpp`), which is the arm `ROW_BLOCK_CELL_FLOATS_CONST_H`
+# names.
+#
+# The general arm keeps a third slot for an exact count where LightGBM
+# derives one from the hessian. That divergence is deliberate and is argued
+# at `histogram.derived_count`: derived counts are exact only when every
+# hessian is `CONSTANT_HESSIAN`, and mojotrees exposes `Histogram.count_at`
+# to a distributed integer allreduce and to the C ABI, neither of which can
+# take a rounded count. Both arms still get the property the interleave is
+# for -- one cache line touched per (row, feature) instead of three.
+comptime ROW_BLOCK_CELL_FLOATS = 3
+comptime ROW_BLOCK_CELL_FLOATS_CONST_H = 2
+
+# LightGBM's cell, for the arithmetic in reports and for the one place the
+# constant-hessian arm's stride is compared against it.
+comptime LGBM_HIST_ENTRY_FLOATS = 2
+comptime LGBM_HIST_ENTRY_BYTES = 16
+
+# One gathered per-row derivative pair, `(gradient, hessian)` as two Float32
+# rather than two Float64. LightGBM's `score_t` is `float`
+# (`include/LightGBM/meta.h`), so its `ordered_gradients` / `ordered_hessians`
+# are 4 bytes per row per plane and this is the same 8 bytes per row. The
+# buffer they live in is still typed `List[Float64]`, because its type is
+# fixed by a signature `tree.mojo` owns; two Float32 per Float64 word is how
+# the narrowing is taken without that signature moving. See
+# `histogram._gather_pairs`.
+comptime SCORE_T_BYTES = 4
+comptime GATHERED_PAIR_BYTES = 2 * SCORE_T_BYTES
+
+# One binned value, `UInt8` in `binning.BinnedMatrix`.
+comptime BINNED_VALUE_BYTES = 1
+
+# How far ahead the scatter loop issues its software prefetch, in rows.
+# LightGBM's `DenseBin::ConstructHistogramInner` uses `const data_size_t
+# pf_offset = 64 / sizeof(VAL_T)` and prefetches `data_[data_indices[i +
+# pf_offset]]`, so at one byte per binned value this is 64 rows. A fixed 64
+# rather than `ASSUMED_CACHE_LINE_BYTES` on purpose: through a row-id list
+# the address is scattered, so the distance is buying latency cover and not
+# line coverage, and the number that has been tuned against real hardware is
+# LightGBM's.
+comptime PREFETCH_ROW_DISTANCE = 64 // BINNED_VALUE_BYTES
+
+# There is deliberately no unroll constant here. An earlier version of this
+# lane's brief called for a four-row unroll of the scatter loop alongside the
+# prefetch, on the understanding that LightGBM had one.
+# `DenseBin::ConstructHistogramInner` does not: its prefetching loop and its
+# tail loop are both scalar, one row per iteration. The unroll was withdrawn
+# rather than kept as an unattributed invention.
+
 
 # Below this many rows a node's gradients and hessians are small enough to
 # stay in cache across every feature's pass, so gathering them into a
@@ -396,6 +606,295 @@ def env_compact_min_rows() -> Int:
     return _env_int("MOJOTREES_CPU_COMPACT_MIN_ROWS", DEFAULT_COMPACT_MIN_ROWS)
 
 
+def env_row_blocks() -> Int:
+    """The requested row-block count, or 0 when nothing is requested.
+
+    Zero rather than a default, on the same grounds as `env_feature_group`:
+    an explicit request means something different from the derived answer. It
+    bypasses the amortization floor and the byte budget, because those are
+    exactly the estimates the knob exists to test, and it is still clamped by
+    the node's row count (a block cannot be shorter than a row) and by
+    `MAX_ROW_BLOCKS`.
+
+    **This knob moves bits, and it is one of the two in this file that do**
+    (`MOJOTREES_CPU_ROW_BLOCK_AMORTIZE` is the other, and reaches the same
+    block count through the rule rather than through the answer).
+    Every other variable here is a scheduling decision that leaves the output
+    identical. The block count is a summation order, so `1` and `4` produce
+    two different Float64 histograms -- neither less accurate than the other,
+    see `histogram.mojo`'s module docstring -- and a fit that sets it is not
+    comparable cell for cell with a fit that does not. `1` is the off switch
+    and reproduces the pre-blocking accumulation exactly, which is what a
+    bisection wants; `0` and unset both mean "derive".
+    """
+    return _env_int("MOJOTREES_CPU_ROW_BLOCKS", 0)
+
+
+@fieldwise_init
+struct RowBlockAmortize(Copyable, Movable):
+    """The amortization ratio, as a rational and a note on where it came from.
+
+    Two integers rather than one because the interesting half of the sweep is
+    below 1: the default 8 puts 4,080 rows in a block at 255 bins, and the
+    question this exists to settle is whether that is roughly right or fifty
+    times too conservative, which is a ratio near 1/6. An integer-only knob
+    could not express the answer, so it could not ask the question.
+
+    `recognized` is False only for a value the parser refused. The value it
+    then carries is the default, so a non-raising caller still plans something
+    sane, and `check_row_block_amortize` is what turns the refusal into an
+    error at the raising entry points. That split exists because
+    `row_block_min_rows` and `plan_row_block_count` are non-raising public
+    functions and adding `raises` to them would propagate into callers this
+    lane does not own -- while a benchmark arm that asked for `1/8`, was
+    silently given 8, and got recorded under the wrong label is the exact
+    failure this project has already thrown two results away for.
+    """
+
+    var num: Int
+    var den: Int
+
+    var recognized: Bool
+    """False when the environment held something this parser refused."""
+
+    @staticmethod
+    def default() -> RowBlockAmortize:
+        """8/1, the shipped ratio."""
+        return RowBlockAmortize(ROW_BLOCK_AMORTIZE, ROW_BLOCK_AMORTIZE_DEN, True)
+
+    def describe(self) -> String:
+        if self.den == 1:
+            return String(self.num)
+        return String(self.num, "/", self.den)
+
+
+def parse_row_block_amortize(spec: String) -> RowBlockAmortize:
+    """`N` or `N/D` into a ratio; anything else is refused.
+
+    Empty means the default and is *recognized*, since unset is a valid state
+    and the whole point of the default is that it is byte-identical to today.
+    A zero or negative numerator or denominator is refused rather than
+    clamped: `0` would mean an infinitely small block and `-1` means the
+    caller mistyped, and neither is an arm anybody meant to run.
+    """
+    if spec.byte_length() == 0:
+        return RowBlockAmortize.default()
+    var slash = spec.find("/")
+    var num_text: String
+    var den_text: String
+    if slash < 0:
+        num_text = spec.copy()
+        den_text = String("1")
+    else:
+        num_text = String(spec[byte=0:slash])
+        den_text = String(spec[byte = slash + 1 :])
+    try:
+        var num = Int(num_text)
+        var den = Int(den_text)
+        if num <= 0 or den <= 0:
+            return RowBlockAmortize(
+                ROW_BLOCK_AMORTIZE, ROW_BLOCK_AMORTIZE_DEN, False
+            )
+        return RowBlockAmortize(num, den, True)
+    except:
+        return RowBlockAmortize(
+            ROW_BLOCK_AMORTIZE, ROW_BLOCK_AMORTIZE_DEN, False
+        )
+
+
+def env_row_block_amortize() -> RowBlockAmortize:
+    """`MOJOTREES_CPU_ROW_BLOCK_AMORTIZE`, or the shipped 8/1 when unset.
+
+    **This moves bits**, for the same reason `MOJOTREES_CPU_ROW_BLOCKS` does
+    and by the same mechanism: it changes the block count, a block count is a
+    summation order, and Float64 addition is not associative. It is a second
+    spelling of that one knob rather than a new kind of thing -- `ROW_BLOCKS`
+    names a count directly, this names the rule that derives one -- and the
+    rule is what a sweep across node sizes actually wants, since a single
+    forced count is wrong at every node size but one.
+
+    What it emphatically does not do is admit a machine fact. The ratio goes
+    into `row_block_min_rows_at`, which sees `n_bins` and nothing else, and
+    the count it produces is still a function of `rows`, `n_bins` and
+    `n_active`. There is no value of this variable that makes the block count
+    depend on the worker count, the task count, or the core count, and
+    `test_row_block_size.mojo` asserts that at every swept setting.
+    """
+    return parse_row_block_amortize(getenv("MOJOTREES_CPU_ROW_BLOCK_AMORTIZE"))
+
+
+def checked_row_block_amortize() raises -> RowBlockAmortize:
+    """`env_row_block_amortize`, raising if the value was refused.
+
+    Called from the raising planner entry points, so a mistyped arm fails at
+    the first histogram plan of the fit rather than running the default under
+    the wrong label. `env_feature_group` refuses in the same spirit; the only
+    difference is that this one refuses from a separate function, because the
+    arithmetic helpers it feeds must stay non-raising.
+
+    It returns the ratio rather than only checking it, so the raising path
+    reads the environment once rather than twice.
+    """
+    var a = env_row_block_amortize()
+    if a.recognized:
+        return a^
+    raise Error(
+        "MOJOTREES_CPU_ROW_BLOCK_AMORTIZE must be a positive integer `N` or a"
+        ' positive ratio `N/D`, e.g. "8" (the default), "1", or "1/8". Got "',
+        getenv("MOJOTREES_CPU_ROW_BLOCK_AMORTIZE"),
+        '"',
+    )
+
+
+def row_block_min_rows_at(amortize: RowBlockAmortize, n_bins: Int) -> Int:
+    """`row_block_min_rows` with the ratio already read.
+
+    `floor(2 * num * n_bins / den)`, derived in the constant's comment: a
+    block zeroes `active * n_bins` cells and the fold reads them back, against
+    `block_rows * active` accumulates, and `active` cancels out of the ratio.
+    Never below 1, so a degenerate `n_bins` cannot divide by zero downstream.
+
+    Floor and not round, because the floor is the direction that makes the
+    knob monotone: a smaller ratio must never produce a larger block.
+    """
+    if n_bins <= 0:
+        return 1
+    var den = amortize.den if amortize.den > 0 else 1
+    var num = amortize.num if amortize.num > 0 else 1
+    var m = (2 * num * n_bins) // den
+    return m if m > 0 else 1
+
+
+def row_block_min_rows(n_bins: Int) -> Int:
+    """Fewest rows a block must hold to be worth its private histogram.
+
+    The live-reading form: it consults `MOJOTREES_CPU_ROW_BLOCK_AMORTIZE` at
+    the moment it is asked, exactly as the other unresolved free functions in
+    this module consult theirs. Unset, this is `2 * ROW_BLOCK_AMORTIZE *
+    n_bins` and therefore 4,080 at 255 bins, unchanged.
+    """
+    return row_block_min_rows_at(env_row_block_amortize(), n_bins)
+
+
+def max_row_blocks_for_cells(cells: Int) -> Int:
+    """Blocks the scratch budget allows for a private histogram of `cells`
+    cells, never below 1 and never above `MAX_ROW_BLOCKS`.
+
+    `cells` is `active * n_bins`, the compact active-slice shape the blocked
+    kernel keeps its partials in -- not `n_features * n_bins`, since an
+    excluded feature's slice is never accumulated and never folded.
+    """
+    if cells <= 0:
+        return 1
+    var per_block = cells * ROW_BLOCK_PLANES * ROW_BLOCK_PLANE_BYTES
+    var by_bytes = MAX_ROW_BLOCK_SCRATCH_BYTES // per_block
+    if by_bytes < 1:
+        by_bytes = 1
+    return by_bytes if by_bytes < MAX_ROW_BLOCKS else MAX_ROW_BLOCKS
+
+
+def plan_row_block_count(
+    requested: Int,
+    rows: Int,
+    n_bins: Int,
+    n_active: Int,
+    rows_are_indirect: Bool,
+) -> Int:
+    """How many row blocks one accumulation splits its node into.
+
+    1 means no blocking: the accumulation runs the feature-partition kernel
+    that shipped, cell for cell as it always did. Anything above 1 selects the
+    blocked kernel and is therefore a statement about the *value*, so read the
+    argument list twice: `rows`, `n_bins`, `n_active`, `rows_are_indirect`,
+    and an explicit request. No core count, no worker count, no task count,
+    no machine. That is what makes the result independent of
+    `MOJOTREES_NUM_WORKERS` and identical on every machine on this toolchain.
+
+    `rows_are_indirect` no longer reaches this decision, and the parameter is
+    kept only because it is part of the plan's argument list. **Both builders
+    block, on this one rule.** The full-dataset builder used to be excluded
+    here, on the grounds that it has no caller-owned scratch and would have to
+    allocate the private histograms per call. That was a cost argument against
+    a *correctness* property: while only one builder blocked, the two
+    disagreed by a few ulp on the same rows, which made "growing on a bag is
+    growing on the dataset of those rows" false and was measured as a
+    four-ulp leaf value in `test_bagged_tree_equals_tree_on_subset_dataset`.
+    The cost is answered instead of accepted:
+    `histogram.build_histogram_into_scratch` lets a caller hand its buffer in,
+    and the full builder is reached once per tree rather than once per node.
+    """
+    return plan_row_block_count_at(
+        env_row_block_amortize(),
+        requested,
+        rows,
+        n_bins,
+        n_active,
+        rows_are_indirect,
+    )
+
+
+def plan_row_block_count_at(
+    amortize: RowBlockAmortize,
+    requested: Int,
+    rows: Int,
+    n_bins: Int,
+    n_active: Int,
+    rows_are_indirect: Bool,
+) -> Int:
+    """`plan_row_block_count` with the amortization ratio already read.
+
+    The one copy of the rule. Read the arguments once more: a ratio, a
+    request, and three numbers about the workload. Still no core count, no
+    worker count, no task count, no machine, at any setting of the ratio --
+    which is the property that has to survive this knob existing, since a
+    knob that could make the block count machine-dependent would have traded
+    away determinism across `MOJOTREES_NUM_WORKERS` to ask a question about
+    block sizes.
+    """
+    if rows <= 0 or n_bins <= 0 or n_active <= 0:
+        return 1
+    var ceiling = max_row_blocks_for_cells(n_active * n_bins)
+    var blocks: Int
+    if requested > 0:
+        blocks = requested
+        if blocks > MAX_ROW_BLOCKS:
+            blocks = MAX_ROW_BLOCKS
+    else:
+        blocks = rows // row_block_min_rows_at(amortize, n_bins)
+        if blocks > ceiling:
+            blocks = ceiling
+    if blocks > rows:
+        blocks = rows
+    if blocks < 2:
+        return 1
+    return blocks
+
+
+def row_block_geometry(rows: Int, blocks: Int) -> Int:
+    """Rows per block for `blocks` contiguous ascending blocks over `rows`.
+
+    Ceiling division, exactly as `parallel._blocks_for` does it, so a caller
+    that recounts `ceil(rows / chunk)` gets a block count with no empty
+    trailing block. The recount is `row_block_count_from_chunk`.
+    """
+    if blocks <= 1 or rows <= 0:
+        return rows if rows > 0 else 1
+    return (rows + blocks - 1) // blocks
+
+
+def row_block_count_from_chunk(rows: Int, chunk: Int) -> Int:
+    """Blocks of `chunk` rows that `rows` actually needs.
+
+    Ceiling division can leave a trailing block empty (10 rows over 4 blocks
+    gives a chunk of 3 and a fourth block with nothing in it), and an empty
+    block is a zeroed private histogram that the fold then reads back. Recount
+    so every block has work.
+    """
+    if rows <= 0 or chunk <= 0:
+        return 1
+    return (rows + chunk - 1) // chunk
+
+
 def core_pool_name(pool: Int) -> String:
     if pool == CORE_POOL_PERFORMANCE:
         return String("performance")
@@ -528,16 +1027,18 @@ def cpu_profile() -> CpuProfile:
 
 @fieldwise_init
 struct ResolvedCpuPolicy(Copyable, Movable):
-    """One reading of the machine and of this module's four variables.
+    """One reading of the machine and of this module's six variables.
 
-    The same four questions `env_tasks_per_core`, `env_core_pool`,
-    `env_feature_group`, and `env_compact_min_rows` answer, plus one
+    The same six questions `env_tasks_per_core`, `env_core_pool`,
+    `env_feature_group`, `env_compact_min_rows`, `env_row_blocks`, and
+    `env_row_block_amortize` answer,
+    plus one
     `CpuProfile.detect()`, resolved together so a fit pays for them once
     instead of once per dispatch. Every method here is the resolved twin of a
     free function above and computes the identical answer from the identical
     numbers; the difference is only when the environment was read.
 
-    Held by value and copied freely: it is five machine counts and four small
+    Held by value and copied freely: it is five machine counts and five small
     integers, so passing it down a call chain costs nothing worth measuring
     and no lifetime has to be reasoned about. It is a snapshot, so a
     `setenv` after `resolve()` is not observed by it; that is the documented
@@ -551,23 +1052,55 @@ struct ResolvedCpuPolicy(Copyable, Movable):
     var feature_group: Int
     var compact_min_rows: Int
 
+    var row_blocks: Int
+    """The snapshot of `MOJOTREES_CPU_ROW_BLOCKS`, 0 for "derive".
+
+    Carried here for the same reason as the other four -- one read per fit
+    instead of one per node -- and with one difference worth stating: this and
+    `row_block_amortize` are the two values on this snapshot that can change
+    an output. A fit that
+    resolves the snapshot and then `setenv`s this variable keeps accumulating
+    at the resolved block count, which is the documented snapshot contract and
+    is also the safer of the two behaviours: a block count that changed
+    mid-fit would move bits between one node and the next."""
+
+    var row_block_amortize: RowBlockAmortize
+    """The snapshot of `MOJOTREES_CPU_ROW_BLOCK_AMORTIZE`, default 8/1.
+
+    The second value on this snapshot that can change an output, and the same
+    snapshot contract applies: a `setenv` after `resolve()` is not observed,
+    so the block count cannot move between one node of a fit and the next."""
+
+    var resolved: Bool
+    """Whether the five fields above and the profile were actually read.
+
+    False only for `unresolved()`, the sentinel a defaulted threading
+    parameter carries. Every method below tests it before touching a field,
+    so an unresolved policy answers what a live read answers rather than
+    answering from the zeros it carries. See "The unresolved sentinel" in the
+    module docstring."""
+
     @staticmethod
     def resolve() raises -> ResolvedCpuPolicy:
-        """Detect the machine and read all four variables, once.
+        """Detect the machine and read all five variables, once.
 
-        Raises for an off-ladder `MOJOTREES_CPU_FEATURE_GROUP`, at the one
-        point the snapshot is taken, rather than once per node."""
+        Raises for an off-ladder `MOJOTREES_CPU_FEATURE_GROUP` or an
+        unparsable `MOJOTREES_CPU_ROW_BLOCK_AMORTIZE`, at the one point the
+        snapshot is taken, rather than once per node."""
         return ResolvedCpuPolicy(
             CpuProfile.detect(),
             env_tasks_per_core(),
             env_core_pool(),
             env_feature_group(),
             env_compact_min_rows(),
+            env_row_blocks(),
+            checked_row_block_amortize(),
+            True,
         )
 
     @staticmethod
     def of(profile: CpuProfile) raises -> ResolvedCpuPolicy:
-        """A policy around an already-detected profile, reading the four
+        """A policy around an already-detected profile, reading the five
         variables now. For a caller that has a `CpuProfile` in hand (a
         synthetic one in a test, or one it detected itself) and wants the
         resolved methods without a second detection."""
@@ -577,16 +1110,45 @@ struct ResolvedCpuPolicy(Copyable, Movable):
             env_core_pool(),
             env_feature_group(),
             env_compact_min_rows(),
+            env_row_blocks(),
+            checked_row_block_amortize(),
+            True,
+        )
+
+    @staticmethod
+    def unresolved() -> ResolvedCpuPolicy:
+        """The sentinel: no detection, no `getenv`, no answer of its own.
+
+        Cheap by construction, because it is what a defaulted parameter
+        builds at every unwired call site: a handful of integer stores and
+        not one system query. It is not raising, which is what lets it be a
+        default argument at all -- `resolve()` raises on an off-ladder
+        feature group, and a default that could raise would move that refusal
+        to a place no caller asked for it.
+        """
+        return ResolvedCpuPolicy(
+            CpuProfile(0, 0, 0, 0, False, 0, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            RowBlockAmortize(0, 0, False),
+            False,
         )
 
     def dispatch_cores(self) -> Int:
         """`CpuProfile.dispatch_cores` against the resolved pool."""
+        if not self.resolved:
+            return CpuProfile.detect().dispatch_cores()
         if self.core_pool == CORE_POOL_PERFORMANCE:
             return _positive_or(self.profile.performance_cores, 1)
         return _positive_or(self.profile.physical_cores, 1)
 
     def max_auto_tasks(self) -> Int:
         """`CpuProfile.max_auto_tasks` against the resolved knobs."""
+        if not self.resolved:
+            return CpuProfile.detect().max_auto_tasks()
         return _positive_or(
             _positive_or(self.tasks_per_core, DEFAULT_TASKS_PER_CORE)
             * self.dispatch_cores(),
@@ -600,6 +1162,8 @@ struct ResolvedCpuPolicy(Copyable, Movable):
         cache estimate alone: the balance rule bounds it by how many groups
         the dispatch can still spread over the cores.
         """
+        if not self.resolved:
+            return plan_feature_group(CpuProfile.detect(), n_bins, n_active)
         return _plan_group(
             self.profile.l1d_bytes,
             self.dispatch_cores(),
@@ -612,6 +1176,8 @@ struct ResolvedCpuPolicy(Copyable, Movable):
         """One line naming the snapshot, for benchmark headers. Distinct from
         `CpuProfile.describe`, which re-reads the environment to print it and
         so would report a live value next to a resolved plan."""
+        if not self.resolved:
+            return String("unresolved (live reads)")
         return String(
             "cores=",
             self.profile.physical_cores,
@@ -629,6 +1195,10 @@ struct ResolvedCpuPolicy(Copyable, Movable):
             self.feature_group,
             " compact_min_rows=",
             self.compact_min_rows,
+            " row_blocks=",
+            self.row_blocks,
+            " row_block_amortize=",
+            self.row_block_amortize.describe(),
         )
 
 
@@ -837,8 +1407,70 @@ struct AccumulationPlan(Copyable, Movable):
     skipped. Two indirect loads and two sequential stores per row, counted
     as two ops."""
 
+    var row_blocks: Int
+    """Contiguous ascending row blocks the node is split into, each with its
+    own private histogram. **1 means the feature-partition kernel**, which is
+    what shipped and which this field leaves untouched. Above 1 selects the
+    blocked kernel, and it is the one field on this plan that is part of the
+    result rather than part of the schedule: a fold over blocks is a different
+    Float64 from a single ascending sum. `plan_row_block_count` derives it
+    from the workload shape alone, never from the machine."""
+
+    var block_rows: Int
+    """Rows in each block but the last; the last holds the remainder. Equal to
+    `n_rows_touched` when `row_blocks` is 1."""
+
+    var block_cells: Int
+    """Cells in one block's private histogram, `n_active * n_bins`. The
+    compact active-slice shape, not the full `n_features * n_bins` output: an
+    excluded feature is never accumulated and never folded, so it gets no
+    private storage. Zero when `row_blocks` is 1."""
+
+    var block_ops: Int
+    """Work estimate for the blocked zero-and-accumulate dispatch: one op per
+    accumulated (row, active feature) plus one per zeroed private cell, so
+    `n_active * rows + row_blocks * block_cells`. Zero when `row_blocks` is
+    1, where `active_ops` is the estimate instead."""
+
+    var fold_ops: Int
+    """Work estimate for the fold, in histogram-op equivalents.
+
+    `ROW_BLOCK_PLANES * (row_blocks + 1) * block_cells`: every partial cell is
+    read once and every output cell written once, on each of three planes.
+    Counted per plane rather than per cell for exactly the reason
+    `subtract_ops` gives -- the pass is memory-bound, and a per-cell estimate
+    keeps it serial well past the point where three streams saturate one
+    core. That is not a hypothetical here: at 50 features, 255 bins and three
+    blocks a per-cell estimate is 51,000, which is below the 65,536 crossover,
+    so the fold would run single-threaded on the critical path of every node
+    in the band where blocking first engages. Zero when `row_blocks` is 1."""
+
     def total_ops(self) -> Int:
-        return self.active_ops + self.excluded_ops + self.gather_ops
+        return (
+            self.active_ops
+            + self.excluded_ops
+            + self.gather_ops
+            + self.block_ops
+            + self.fold_ops
+        )
+
+    def blocked(self) -> Bool:
+        """Whether this plan selects the row-blocked accumulation. The one
+        predicate any caller should branch on, so "more than one block" is
+        spelled once."""
+        return self.row_blocks > 1
+
+    def block_scratch_floats(self) -> Int:
+        """Float64 slots the private histograms need, `row_blocks *
+        block_cells * ROW_BLOCK_PLANES`. Zero for an unblocked plan.
+
+        Named here rather than at the kernel because the plan is what decides
+        the block count, and a scratch sized from a different number than the
+        kernel indexes with is the failure mode this whole struct exists to
+        make impossible."""
+        if self.row_blocks <= 1:
+            return 0
+        return self.row_blocks * self.block_cells * ROW_BLOCK_PLANES
 
     def describe(self) -> String:
         var compact = String("yes") if self.compact_rows else String("no")
@@ -855,6 +1487,16 @@ struct AccumulationPlan(Copyable, Movable):
             self.excluded_ops,
             " gather_ops=",
             self.gather_ops,
+            " row_blocks=",
+            self.row_blocks,
+            " block_rows=",
+            self.block_rows,
+            " block_cells=",
+            self.block_cells,
+            " block_ops=",
+            self.block_ops,
+            " fold_ops=",
+            self.fold_ops,
         )
 
 
@@ -878,14 +1520,17 @@ def derive_accumulation_plan(
     gradient and the hessian per row, so it wants at least two active
     features and enough rows that the pass is not pure overhead.
 
-    Raises only for an off-ladder `MOJOTREES_CPU_FEATURE_GROUP`; every
-    workload shape, including a degenerate one, produces a plan.
+    Raises only for an off-ladder `MOJOTREES_CPU_FEATURE_GROUP` or an
+    unparsable `MOJOTREES_CPU_ROW_BLOCK_AMORTIZE`; every workload shape,
+    including a degenerate one, produces a plan.
     """
     return _derive_plan(
         profile.l1d_bytes,
         profile.dispatch_cores(),
         env_feature_group(),
         env_compact_min_rows(),
+        env_row_blocks(),
+        checked_row_block_amortize(),
         n_features,
         n_active,
         n_bins,
@@ -907,12 +1552,27 @@ def derive_accumulation_plan_with(
     Identical arithmetic on identical inputs; the only difference is that the
     two variables come from the snapshot rather than from a fresh `getenv`,
     and no `CpuProfile.detect()` happens here at all.
+
+    Given the unresolved sentinel this is `derive_accumulation_plan` over a
+    fresh detection, so a call site that has not been handed a snapshot yet
+    keeps exactly the behaviour it had, including the `getenv` it had.
     """
+    if not policy.resolved:
+        return derive_accumulation_plan(
+            CpuProfile.detect(),
+            n_features,
+            n_active,
+            n_bins,
+            n_rows_touched,
+            rows_are_indirect,
+        )
     return _derive_plan(
         policy.profile.l1d_bytes,
         policy.dispatch_cores(),
         policy.feature_group,
         policy.compact_min_rows,
+        policy.row_blocks,
+        policy.row_block_amortize.copy(),
         n_features,
         n_active,
         n_bins,
@@ -926,6 +1586,8 @@ def _derive_plan(
     dispatch_cores: Int,
     feature_group: Int,
     compact_min_rows: Int,
+    row_blocks: Int,
+    row_block_amortize: RowBlockAmortize,
     n_features: Int,
     n_active: Int,
     n_bins: Int,
@@ -934,7 +1596,16 @@ def _derive_plan(
 ) raises -> AccumulationPlan:
     """The one copy of the plan arithmetic, with every variable already
     read. `dispatch_cores` is here because the width now depends on how many
-    groups the schedule can balance, not only on what L1 holds."""
+    groups the schedule can balance, not only on what L1 holds.
+
+    Note which arguments reach the row-block decision and which do not.
+    `dispatch_cores` feeds `_plan_group` and nothing else; the block count is
+    derived from `rows`, `bins`, `active`, the amortization ratio and the
+    explicit request alone. A machine fact must never reach it, because the
+    block count is a summation order rather than a schedule (see
+    `plan_row_block_count`). `row_block_amortize` is a workload rule and not a
+    machine fact, which is the whole reason it was allowed in here.
+    """
     var active = n_active if n_active > 0 else 0
     var rows = n_rows_touched if n_rows_touched > 0 else 0
     var bins = n_bins if n_bins > 0 else 0
@@ -951,6 +1622,21 @@ def _derive_plan(
         l1d_bytes, dispatch_cores, feature_group, bins, active
     )
 
+    # The requested block count first, then the geometry, then a recount from
+    # the chunk so no block comes out empty. The recount can only lower the
+    # count, and it can lower it to 1, which is the unblocked path again.
+    var blocks = plan_row_block_count_at(
+        row_block_amortize, row_blocks, rows, bins, active, rows_are_indirect
+    )
+    var chunk = row_block_geometry(rows, blocks)
+    if blocks > 1:
+        blocks = row_block_count_from_chunk(rows, chunk)
+    var cells = active * bins
+    if blocks <= 1:
+        blocks = 1
+        chunk = rows
+        cells = 0
+
     return AccumulationPlan(
         group,
         feature_group_count(active, group),
@@ -958,6 +1644,11 @@ def _derive_plan(
         active * (bins + rows),
         excluded * bins,
         2 * rows if compact else 0,
+        blocks,
+        chunk,
+        cells,
+        (active * rows + blocks * cells) if blocks > 1 else 0,
+        (ROW_BLOCK_PLANES * (blocks + 1) * cells) if blocks > 1 else 0,
     )
 
 
@@ -1050,3 +1741,121 @@ def describe_cpu_policy(profile: CpuProfile, plan: AccumulationPlan) -> String:
         dispatch_utilization_percent(plan.group_count, cores),
         "%",
     )
+
+
+# ---------------------------------------------------------------------------
+# Bin layout: which copy of the binned matrix an accumulation reads
+# ---------------------------------------------------------------------------
+#
+# `BinnedMatrix` can carry two views of the same bytes. The feature-major one
+# is the original, `bins[f * n_rows + r]`, one contiguous column per feature.
+# The row-major one is `binning.BinnedMatrix.build_row_major`'s record array,
+# one contiguous fixed-width record per row holding every feature's bin, with
+# features of at most 16 bins packed two to a byte. LightGBM calls the second
+# a `MultiValBin` and selects between them with `force_row_wise` /
+# `force_col_wise`.
+#
+# **Nothing in this section moves a bit.** The two layouts hold the same bin
+# ids and an accumulation over either visits the same rows in the same order
+# and adds the same Float64 into the same cell, so the histogram is identical
+# to the bit. In particular the layout choice must never reach
+# `plan_row_block_count`: the block count *is* part of the value (see this
+# module's docstring), so the two arms are run against **one** plan and differ
+# only in which array their inner loop loads from.
+#
+# How the choice is made is deliberately not arithmetic here. LightGBM's
+# entire auto rule is one timed histogram construction with each builder at
+# the start of the fit, keeping the faster for the whole fit and printing
+# which it chose; `histogram.choose_bin_layout_timed` is that probe. A cost
+# model over traffic was drafted for this decision and is recorded in the
+# lane report rather than in code, because a model nobody measured would be
+# tuning by another name -- and because the timed shot is strictly better
+# information than the model on the machine that is actually running.
+
+comptime BIN_LAYOUT_FEATURE_MAJOR = 0
+"""Accumulate from `bins[f * n_rows + r]`, the column-major matrix."""
+
+comptime BIN_LAYOUT_ROW_MAJOR = 1
+"""Accumulate from `row_bins[r * row_stride + row_byte[f]]`, the record
+array."""
+
+comptime BIN_LAYOUT_AUTO = 2
+"""Unresolved: the caller should time both and keep the faster. Never
+returned by `resolve_bin_layout` when the row-major view is unavailable."""
+
+
+def bin_layout_name(layout: Int) -> String:
+    """The name a benchmark header or a trace line prints for a layout."""
+    if layout == BIN_LAYOUT_ROW_MAJOR:
+        return String("row")
+    if layout == BIN_LAYOUT_AUTO:
+        return String("auto")
+    return String("feature")
+
+
+def env_bin_layout() raises -> Int:
+    """`MOJOTREES_CPU_BIN_LAYOUT`: `auto` (default), `feature`, or `row`.
+
+    Scheduling-only, like every variable in this file but the two row-block
+    ones (`MOJOTREES_CPU_ROW_BLOCKS` and
+    `MOJOTREES_CPU_ROW_BLOCK_AMORTIZE`): it selects which array the inner loop loads
+    from and cannot change a cell. `feature` is the off switch for the whole
+    row-major path and reproduces the accumulation that shipped, which is what
+    a bisection wants.
+
+    Raises on an unrecognized value rather than silently meaning `auto`,
+    because a benchmark arm that quietly ran the other layout is exactly the
+    result this campaign has already had to throw away twice.
+    """
+    var s = getenv("MOJOTREES_CPU_BIN_LAYOUT")
+    if s.byte_length() == 0 or s == "auto":
+        return BIN_LAYOUT_AUTO
+    if s == "feature" or s == "col" or s == "0":
+        return BIN_LAYOUT_FEATURE_MAJOR
+    if s == "row" or s == "1":
+        return BIN_LAYOUT_ROW_MAJOR
+    raise Error(
+        'MOJOTREES_CPU_BIN_LAYOUT must be "auto", "feature" or "row". Got "',
+        s,
+        '"',
+    )
+
+
+def resolve_bin_layout(requested: Int, row_major_available: Bool) -> Int:
+    """The layout a build should run, given the request and what exists.
+
+    Availability wins over the request in one direction only: without a
+    row-major view there is nothing to read, so `row` degrades to
+    `feature` rather than raising -- a matrix that was binned before the view
+    was ever asked for is a normal thing for a caller to hold, and refusing to
+    build its histogram would be a worse answer than building it the way it
+    was always built. `auto` with no view available resolves the same way, so
+    the timed probe is only ever reached with both arms runnable.
+    """
+    if not row_major_available:
+        return BIN_LAYOUT_FEATURE_MAJOR
+    if requested == BIN_LAYOUT_ROW_MAJOR:
+        return BIN_LAYOUT_ROW_MAJOR
+    if requested == BIN_LAYOUT_FEATURE_MAJOR:
+        return BIN_LAYOUT_FEATURE_MAJOR
+    return BIN_LAYOUT_AUTO
+
+
+def histogram_line_floats(cache_line_bytes: Int) -> Int:
+    """Float64 slots in one cache line, never below 1.
+
+    The padding unit for a per-block private histogram. LightGBM pads the same
+    buffers to `num_bin_aligned_` for the same reason: two blocks whose
+    partials share a line make two cores fight over it on every store, and
+    `n_bins * ROW_BLOCK_PLANE_BYTES` is 2,040 bytes at 255 bins, which is not
+    a multiple of a 128-byte line.
+    """
+    var n = cache_line_bytes // ROW_BLOCK_PLANE_BYTES
+    return n if n > 0 else 1
+
+
+def align_cells_up(cells: Int, unit: Int) -> Int:
+    """`cells` rounded up to a multiple of `unit`, for the padding above."""
+    if unit <= 1 or cells <= 0:
+        return cells if cells > 0 else 0
+    return ((cells + unit - 1) // unit) * unit

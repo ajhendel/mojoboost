@@ -107,6 +107,59 @@ def f64_buffer(addr: Int, n: Int) raises -> List[Float64]:
     return out^
 
 
+def f64_view(addr: Int, n: Int) raises -> Span[Float64, ImmUntrackedOrigin]:
+    """Borrow a float64 buffer (NumPy's X) instead of copying it.
+
+    The feature matrix is the one input where the copy is worth avoiding,
+    and not for the reason it looks like: `f64_buffer` moves it at memory
+    speed, a low single-digit percentage of an ingest. What the copy costs
+    is *space*. It doubles the resident footprint of the matrix for as long
+    as binning runs, so a 5,000,000 x 100 fit holds 4 GB of NumPy plus 4 GB
+    of Mojo, and on a machine that can afford one of those but not both the
+    difference is not a percentage.
+
+    Borrowing is sound where the matrix is read, never written, and is dead
+    early: `fit_bins` and `BinMapper.transform` are the only things that look
+    at it, and after transform the trainer works on the binned `UInt8`
+    matrix. It stays alive throughout because the Python wrapper holds the
+    array it took the address of (see `_arrays.column_major`, whose contract
+    is exactly that) for the whole call.
+
+    The origin is untracked because the owner is on the other side of the
+    boundary and Mojo cannot see it. That is the same contract `f64_buffer`
+    already relies on for its source pointer; the difference is only how
+    long it has to hold, which is the length of one call either way.
+
+    Not every input can do this. A buffer that outlives the call must be
+    copied, so the validation sets, which `RawValidSet` owns, still take
+    `f64_buffer`. `dataset_create` and `dataset_create_reference` used to be
+    on that list and no longer are: `Dataset` bins the matrix where it lies
+    and retains it only under `keep_raw`, which it copies for itself.
+    """
+    if addr == 0 or n < 0:
+        raise Error("invalid buffer")
+    var p = Pointer[Float64, ImmUntrackedOrigin](unsafe_from_address=addr)
+    return Span[Float64, ImmUntrackedOrigin](unsafe_ptr=p, length=n)
+
+
+def f64_view_mut(
+    addr: Int, n: Int
+) raises -> Span[Float64, MutUntrackedOrigin]:
+    """`f64_view` for a buffer the caller wants written.
+
+    The one thing this library writes into a caller's memory that is not an
+    output vector: the column-major feature buffer `_arrays.column_major`
+    allocates and then hands to the binner. The wrapper allocates it because
+    the wrapper has to return it and keep it alive; the transpose that fills
+    it belongs on this side because it is `n_rows * n_features` doubles of
+    work and NumPy would do it on one thread.
+    """
+    if addr == 0 or n < 0:
+        raise Error("invalid buffer")
+    var p = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=addr)
+    return Span[Float64, MutUntrackedOrigin](unsafe_ptr=p, length=n)
+
+
 def int_buffer_from_f64(addr: Int, n: Int) raises -> List[Int]:
     """Copy a float64 buffer holding whole numbers into an int list. The
     Python layer normalizes integer columns to float64 before they cross,

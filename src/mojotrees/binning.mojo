@@ -36,38 +36,170 @@ and absent from the model.
 
 So before any boundary is computed, a column is asked how many distinct
 values it has. If there are no more of them than the feature has ordinary
-bins, it gets an edge between every adjacent pair and the boundaries are not
-consulted at all: one bin per level, whatever each level's population, and
-the rest of the budget left unspent. That is LightGBM's `GreedyFindBin` in
-the `num_distinct_values <= max_bin` case at `min_data_in_bin` of 1, which is
-the minimum-population rule this binner has for numerical features (see
-docs/LIGHTGBM_PARITY.md; LightGBM's default of 3 would merge some of those
-levels back together).
+bins, the boundaries are not consulted at all and the levels are walked in
+order, cutting once a bin has accumulated `min_data_in_bin` rows. That is
+LightGBM's `GreedyFindBin` in the `num_distinct_values <= max_bin` case. At
+`min_data_in_bin` of 1 it is one bin per level whatever each level's
+population; at the default of 3, which is LightGBM's, levels holding one or
+two rows merge into their neighbour and levels holding three or more still
+each take a bin of their own (see `min_data_in_bin` below, and
+docs/LIGHTGBM_PARITY.md).
 
 `collect_distinct` answers the question for the dense fit and
 `distinct_levels_sorted` for the sparse one, which has sorted its stored
 values already. The two are required to agree, because a sparse matrix and
 its dense form must bin identically, and they are tested against each other.
+**They do not agree at the default any more**: `sparse.fit_bins_csc` takes
+neither `min_data_in_bin` nor `bin_construct_sample_cnt`, so it still fits at
+1 and at every row. That is a live gap, not a design, and it is recorded in
+docs/LIGHTGBM_PARITY.md.
 
 A column with more levels than bins is refused within its first few hundred
 rows, so an ordinary continuous column pays a few hundred probes to ask and
 then takes the quantile path exactly as before, edges unchanged bit for bit.
-Measured at 250,000 x 100 continuous, four workers, that costs 0.0276 s
+Measured at 250,000 x 100 continuous, four workers, that cost 0.0276 s
 against 0.0270 s without asking, which is inside the run-to-run spread. On a
-column that does have few levels it is not a cost at all: 250,000 x 100 with
-twenty levels each fits in 0.0100 s through the levels against 0.0924 s
-through the boundaries, because the boundary path pays for a bucket table
-and a second pass to resolve its ties and this one is a single scan.
+column that does have few levels the levels path was much the cheaper of the
+two when it was measured, because the boundary path pays for a bucket table
+and a second pass to resolve its ties and this one is a single scan. **Those
+low-cardinality numbers were taken at `min_data_in_bin` of 1 and no longer
+describe the default.** The scan now also counts each level (`counts` out of
+`collect_distinct`), which is one L1 increment per row and no second pass, so
+the advantage should survive; the size of it has to be re-measured before it
+is quoted again, and this module quotes no ratio for it.
 
 Full parity is still a further step, and stops at the same place it did.
 Past the bin budget LightGBM keeps counting, and spends the counts: a value
 populous enough to deserve a bin of its own takes one (`is_big_count_value`),
 and the target bin size is recomputed from what budget is left as it goes.
-This binner uses quantile boundaries there. Doing it LightGBM's way needs
-distinct values with counts for every column, which LightGBM affords by
-binning a sample of at most `bin_construct_sample_cnt` rows rather than all
-of them; that sampling is deferred here, so the counts would have to come off
-the full column.
+This binner uses quantile boundaries there, capped as LightGBM caps them (see
+`min_data_in_bin` below), and does not implement the big-count rule.
+
+min_data_in_bin
+---------------
+LightGBM's minimum population for a numerical bin, verified against
+`GreedyFindBin` in `src/io/bin.cpp` on LightGBM master rather than against
+any description of it. It enters in two places and this binner honors both:
+
+- In the `num_distinct_values <= max_bin` branch, LightGBM walks the levels
+  in order accumulating their counts and cuts only once the accumulator has
+  reached `min_data_in_bin`, resetting it at each cut. So adjacent levels are
+  merged until they hold enough rows between them, and the last bin may hold
+  fewer (nothing merges backwards). The levels path here does exactly that.
+- In the other branch, LightGBM first shrinks the budget itself:
+  `max_bin = max(1, min(max_bin, total_cnt / min_data_in_bin))`. The quantile
+  path here applies the same cap to `n_ordinary`, which puts at least
+  `min_data_in_bin` values in the average bin. What it does *not* do is
+  LightGBM's per-level greedy inside that budget, which is the same gap the
+  paragraph above names.
+
+The default is LightGBM's 3. 1 is still reachable and is the value at which
+**both branches are the code they were before this option existed**: at 1
+every level's count already clears the accumulator, so the levels path cuts
+between every adjacent pair, and `total_cnt / 1` never binds because the
+quantile branch is only reached when there are more distinct values than
+bins. Both are guarded on `min_data_in_bin <= 1` so that setting runs the
+same instructions rather than the same arithmetic, and
+`tests/test_binning.mojo` proves a fit at 1 with `bin_construct_sample_cnt=0`
+is edge for edge the fit this module produced before either option existed.
+
+What 3 does to the number of bins, as a bound rather than a measurement. Let
+a column have `L` levels holding `N` rows between them. At 1 it gets `L`
+bins. At 3 every closed bin except possibly the last holds at least 3 rows,
+and no closed bin can absorb more than 3 levels (three levels hold at least
+three rows), so
+
+    ceil(L / 3)  <=  bins  <=  min(L, floor(N / 3) + 1)
+
+and the merge reaches **only levels holding one or two rows**: a level of 3
+or more closes its bin on its own. A column of 20 levels in 250,000 rows is
+untouched. A column of 136 singleton levels in 900 rows goes from 136 bins to
+about 46. Sparse and near-unique integer columns move; ordinary
+low-cardinality ones do not.
+
+Counting the levels is not a pass any more. `collect_distinct` returns a
+count per level from the scan it was already doing, at one L1 increment per
+row, because at a default of 3 a separate `count_levels` pass would be paid
+by every low-cardinality column rather than by the few that asked for the
+option. `count_levels` remains as the independent reference the fused counts
+are tested against.
+
+Fitting from a sample
+---------------------
+`bin_construct_sample_cnt` fits the edges from a subsample of the rows rather
+than from all of them, which is what LightGBM does. The default is LightGBM's
+200,000. 0 means every row, which is what this module used to default to; a
+positive value at or above `n_rows` also means every row, so nothing below
+200,000 rows is sampled at all.
+
+What the sample does and does not save, as arithmetic rather than a claim.
+The matrix is column-major and the sample is a set of *rows*, so a sampled
+column is a strided gather, not a shorter read. With a sampling rate `p` and
+eight doubles to a 64-byte line, the fraction of lines a column still has to
+touch is `1 - (1 - p)^8`: at 200,000 of 1,000,000 rows that is 83 percent of
+the bytes for 20 percent of the values, and at 200,000 of 10,000,000 it is 15
+percent of the bytes for 2 percent of the values. So the saving is in the
+per-value work -- the `isnan` test, the distinct probe, and the rank
+selection or sort that follows -- and only becomes a saving in memory traffic
+well below a fifth. The gather also costs an indirection per value and
+defeats the unit-stride prefetch the full read gets.
+
+The sample is a set of row indices drawn **once per fit**, before any feature
+is touched, and every feature is fit from the same rows -- LightGBM samples
+rows, not values. It is drawn by Knuth's selection sampling with a
+counter-based splitmix64 draw per row (`rng.uniform(seed * GOLDEN + r)`), so
+the draw for row r does not depend on how many rows were selected before it,
+the result is exactly `bin_construct_sample_cnt` indices in ascending order,
+and it is identical at every worker count and on every machine on this
+toolchain. It does not reproduce LightGBM's own indices: LightGBM draws from
+a 32-bit LCG in `include/LightGBM/utils/random.h` seeded by
+`data_random_seed`, and matching that stream is a separate promise this
+module does not make.
+
+Two consequences, both of them LightGBM's too, and both real:
+
+- A level that no sampled row carries is not a level the fit can see, so a
+  rare value can lose the bin it would have had. That is the whole trade.
+- Missingness is decided from the sample as well: a column whose only `NaN`s
+  fall outside the sample reserves no missing bin, and `transform` then bins
+  those `NaN`s as 0.0 (the `missing_type = None` rule below).
+
+Categorical features are unaffected: `categorical.fit_categorical_spec` fits
+its tables from the full column, so a sampled fit cannot lose a category.
+
+feature_pre_filter
+------------------
+LightGBM's, and off here rather than on. At `True`, `fit_bins` counts each
+feature's bins on the same sample it fit the edges from and drops the features
+that have no usable split at all: `need_filter` is `NeedFilter` from
+`src/io/bin.cpp` and `filter_count` is the `filter_cnt` of
+`src/io/dataset_loader.cpp`, which is `min_data_in_leaf` **scaled to the
+sample** and truncated (`min_data_in_leaf * total_sample_size / num_data`, so 4
+at the stock 20, 200,000 and 1,000,000, not 20). The survivors are
+`BinMapper.usable`, which is LightGBM's `used_features`, and `transform`
+carries the list onto the `BinnedMatrix` because a grower is handed the matrix
+and nothing else.
+
+Dropping is not skipping. LightGBM removes the feature from the Dataset, so it
+is gone from the pool `feature_fraction` samples and the fraction is taken of
+what is left (`src/treelearner/col_sampler.hpp`), which changes the trees and
+not only their cost. `sampling.select_tree_features` takes the pool for exactly
+that reason. What is *not* renumbered is the matrix: every column is still
+binned and every feature keeps its id, so a dropped feature reads 0 in an
+importance vector rather than vanishing from it, which is also what LightGBM
+does (`GBDT::FeatureImportance` sizes its result by `num_total_features`).
+
+Three things here are not LightGBM's, and the parity contract says so:
+
+- The default. LightGBM's is `true`; this is `False`, because `False` has to
+  remain the fit that preceded the option.
+- At `False` mojotrees keeps one-bin features, which LightGBM drops from
+  `used_features` whatever the flag says. So `False` is "keep everything",
+  not LightGBM's `false`.
+- All features filtered raises here. LightGBM warns and continues.
+
+`sparse.fit_bins_csc` and `external_memory` build their own mappers and do not
+take the flag, so a prefiltered fit is the dense path only.
 
 Missing values
 --------------
@@ -171,7 +303,9 @@ from .parallel import (
     dispatch_feature_ranges,
     dispatch_feature_rows,
     dispatch_features,
+    dispatch_rows,
 )
+from .rng import GOLDEN, uniform
 from .tree_parameters_extra import ForcedSplits
 
 
@@ -195,6 +329,122 @@ comptime MAX_EDGE = 1e300
 # narrows to `UInt8` while `BinMapper.bin_value` returns an `Int`: above it
 # the two disagree silently, by a whole leaf rather than by a rounding step.
 comptime MAX_BINS = 256
+
+comptime DEFAULT_MIN_DATA_IN_BIN = 3
+"""`fit_bins`'s minimum population for a numerical bin. LightGBM's default.
+
+This was 1 until the stock-defaults decision, and 1 is still the value at
+which the levels path cuts between every adjacent level and the quantile
+budget is never capped. It is reachable, and `tests/test_binning.mojo` proves
+that a fit at `min_data_in_bin=1` with `bin_construct_sample_cnt=0` is edge
+for edge the fit this module produced before either option existed. What
+changed is which of the two a caller who says nothing gets: mojotrees's
+defaults are LightGBM's, because a default is what a user actually
+experiences and a comparison between two libraries at their own defaults is
+the only one a user can act on."""
+
+comptime DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT = 200_000
+"""Rows `fit_bins` fits its edges from. LightGBM's default; 0 means every row.
+
+Was 0. See `DEFAULT_MIN_DATA_IN_BIN` for why it is LightGBM's number now.
+Below 200,000 rows this is the full-column fit either way, because a sample
+that would cover the matrix is not drawn at all."""
+
+comptime DEFAULT_DATA_RANDOM_SEED = 1
+"""LightGBM's `data_random_seed`, which seeds its bin-construction sample.
+The name and the default are carried over; the stream is not (see the module
+docstring). Fixed, never derived from a clock or a global, so the sampled fit
+that is now the default is the same fit on every machine and at every
+`MOJOTREES_NUM_WORKERS`."""
+
+comptime DEFAULT_MIN_DATA_IN_LEAF = 20
+"""LightGBM's `min_data_in_leaf` default, repeated here because `filter_count`
+scales it and this module cannot import the grower's parameter bundle without
+closing the `efb -> binning -> tree_parameters_extra` cycle. A caller who sets
+`min_data_in_leaf` must pass the same number to `fit_bins`, exactly as a
+LightGBM user must reconstruct the Dataset after changing it."""
+
+
+def filter_count(
+    min_data_in_leaf: Int, total_sample_size: Int, num_data: Int
+) raises -> Int:
+    """LightGBM's `filter_cnt`, the row count the prefilter tests against.
+
+    Verified against `src/io/dataset_loader.cpp`, which computes it twice
+    with the same expression (`DatasetLoader::ConstructBinMappersFromTextData`
+    and `DatasetLoader::CostructFromSampleData`):
+
+        const data_size_t filter_cnt = static_cast<data_size_t>(
+          static_cast<double>(config_.min_data_in_leaf * total_sample_size)
+          / num_dist_data);
+
+    So it is `min_data_in_leaf` scaled from the whole dataset down to the
+    bin-construction sample, truncated toward zero, and *not* `min_data_in_leaf`
+    itself. The multiplication is integer and only the division is floating
+    point, which is reproduced here rather than approximated: at
+    `min_data_in_leaf=20`, a 200,000-row sample and 1,000,000 rows it is 4, and
+    at `total_sample_size == num_data` -- every fit that reads every row, which
+    is every fit below `bin_construct_sample_cnt` rows -- it is exactly
+    `min_data_in_leaf`.
+
+    A zero or negative `num_data` has no scaling to do and is refused rather
+    than divided by.
+    """
+    if num_data < 1:
+        raise Error("num_data must be positive")
+    if total_sample_size < 0:
+        raise Error("total_sample_size must be nonnegative")
+    if min_data_in_leaf < 0:
+        raise Error("min_data_in_leaf must be nonnegative")
+    return Int(
+        Float64(min_data_in_leaf * total_sample_size) / Float64(num_data)
+    )
+
+
+def need_filter(
+    cnt_in_bin: List[Int],
+    total_cnt: Int,
+    filter_cnt: Int,
+    categorical: Bool = False,
+) -> Bool:
+    """LightGBM's `NeedFilter` from `src/io/bin.cpp`, transcribed.
+
+    True when the feature has no usable split at all: no prefix of its bins
+    leaves at least `filter_cnt` rows on both sides. LightGBM's loop stops one
+    short of the last bin, so the last bin's population never enters a prefix
+    and a reserved missing bin (which numerical binning puts last) only ever
+    contributes to `total_cnt`.
+
+    Categorical features take LightGBM's other branch: a categorical split is
+    one category against the rest rather than a prefix, so with more than two
+    bins there is always some partition to try and the answer is False without
+    looking. With at most two bins the single bin (not the prefix) is tested,
+    which for two bins is the same arithmetic.
+
+    Note that the prefix sums are non-decreasing, so `total_cnt - sum_left` is
+    non-increasing: the first prefix to reach `filter_cnt` is also the one with
+    the most rows left on the right, and no later prefix can succeed where it
+    failed. The loop is kept in LightGBM's shape anyway, because the bin counts
+    are at most 256 numbers and a transcription is worth more here than the
+    early exit.
+    """
+    var n = len(cnt_in_bin)
+    if n < 2:
+        return True
+    if not categorical:
+        var sum_left = 0
+        for i in range(n - 1):
+            sum_left += cnt_in_bin[i]
+            if sum_left >= filter_cnt and total_cnt - sum_left >= filter_cnt:
+                return False
+        return True
+    if n > 2:
+        return False
+    for i in range(n - 1):
+        var sum_left = cnt_in_bin[i]
+        if sum_left >= filter_cnt and total_cnt - sum_left >= filter_cnt:
+            return False
+    return True
 
 
 def _avoid_inf(x: Float64) -> Float64:
@@ -501,11 +751,34 @@ def collect_distinct(
     limit: Int,
     mut table: List[UInt64],
     mut slots: List[Int],
+    mut hits: List[Int],
     mut out: List[Float64],
+    mut counts: List[Int],
 ) -> Bool:
-    """The ascending distinct values of `col[0, n_valid)` when there are at
-    most `limit` of them; `False`, with `out` empty, as soon as there is one
-    more.
+    """The ascending distinct values of `col[0, n_valid)`, and how many rows
+    each holds, when there are at most `limit` of them; `False`, with `out`
+    and `counts` empty, as soon as there is one more.
+
+    Counting here rather than in a second pass
+    ------------------------------------------
+    `min_data_in_bin` needs a count per level, and its default is now 3, so
+    the levels branch needs those counts on every low-cardinality column
+    rather than on the few that asked for the option. `count_levels` answers
+    the same question in a separate pass, at a binary search over the level
+    table per row; this loop already visits every row and already knows which
+    slot the row's level lives in, so the count is one L1 increment on a line
+    the probe just touched.
+
+    The arithmetic, which is why this is not a tidiness change. At 250,000
+    rows and 100 columns of 20 levels the scan does 25e6 probes. A separate
+    counting pass would add 25e6 x ceil(log2(20)) = 1.25e8 dependent,
+    branchy comparisons and a second streaming read of every column; the
+    fused increment adds 25e6 L1 read-modify-writes and no second read.
+    Neither number is measured, and the orchestrator has the clock.
+
+    `hits` is per *slot* and `counts` is per *level*, ascending with `out`.
+    `hits` is caller-owned scratch for the same reason `table` is: it is
+    cleared by the slots that were recorded rather than by its length.
 
     This is what lets a column with few enough levels get a bin per level
     instead of a bin per quantile boundary, which is LightGBM's
@@ -531,15 +804,20 @@ def collect_distinct(
     feature.
     """
     out.clear()
+    counts.clear()
     if limit < 1 or limit > MAX_BINS or n_valid < 1:
         return False
-    if len(table) != DISTINCT_SLOTS:
+    if len(table) != DISTINCT_SLOTS or len(hits) != DISTINCT_SLOTS:
         table.clear()
         table.resize(DISTINCT_SLOTS, _KEY_EMPTY)
+        hits.clear()
+        hits.resize(DISTINCT_SLOTS, 0)
         slots.clear()
     var tp = table.unsafe_ptr()
+    var hp = hits.unsafe_ptr()
     for i in range(len(slots)):
         tp.unsafe_store(slots[i], _KEY_EMPTY)
+        hp.unsafe_store(slots[i], 0)
     slots.clear()
 
     var cp = col.unsafe_ptr()
@@ -549,7 +827,9 @@ def collect_distinct(
         if v == 0.0:
             # `-0.0` and `0.0` are one value to every comparison an edge is
             # built from, so they have to be one level here too; their bit
-            # patterns differ, so the key alone would make them two.
+            # patterns differ, so the key alone would make them two. The
+            # count follows the normalization, so both signs land on one
+            # level and in one counter.
             v = 0.0
         var k = order_key(v)
         # Fibonacci scramble, then take the top bits: the low bits of a key
@@ -558,12 +838,14 @@ def collect_distinct(
         while True:
             var cur = tp.unsafe_load(s)
             if cur == k:
+                hp.unsafe_store(s, hp.unsafe_load(s) + 1)
                 break
             if cur == _KEY_EMPTY:
                 if len(out) >= limit:
                     full = True
                     break
                 tp.unsafe_store(s, k)
+                hp.unsafe_store(s, 1)
                 slots.append(s)
                 out.append(v)
                 break
@@ -576,6 +858,17 @@ def collect_distinct(
     # At most `limit` values, so this is a sort of a few hundred at the very
     # most, once per column.
     sort(out)
+    # The table is still populated, so each sorted level finds its own
+    # counter by the probe that put it there. `limit` probes at the very
+    # most, and every key is present, so the walk terminates.
+    counts.resize(len(out), 0)
+    var np = counts.unsafe_ptr()
+    for j in range(len(out)):
+        var k = order_key(out[j])
+        var s = Int((k * UInt64(0x9E37_79B9_7F4A_7C15)) >> DISTINCT_SHIFT)
+        while tp.unsafe_load(s) != k:
+            s = (s + 1) & (DISTINCT_SLOTS - 1)
+        np.unsafe_store(j, hp.unsafe_load(s))
     return True
 
 
@@ -611,6 +904,103 @@ def distinct_levels_sorted(
             return False
         out.append(v)
     return True
+
+
+def count_levels(
+    col: List[Float64],
+    n_valid: Int,
+    levels: List[Float64],
+    mut counts: List[Int],
+):
+    """`counts[j]` = how many of `col[0, n_valid)` equal `levels[j]`.
+
+    `levels` is what `collect_distinct` returned for this same column, so it
+    is ascending and every value in the column is one of its entries; the
+    search below therefore always lands inside the array and the counts sum
+    to `n_valid`.
+
+    **`fit_bins` does not call this.** `collect_distinct` counts as it scans
+    (see its docstring for why a second pass was not affordable once
+    `min_data_in_bin` defaulted to 3). What this is now is the independent
+    reference those fused counts are checked against: it answers the same
+    question by a different mechanism -- a binary search over the level table
+    instead of a hash slot -- and `tests/test_binning.mojo` requires the two
+    to agree count for count. Deleting it would leave the fused counter
+    checked only against itself.
+
+    `-0.0` needs no normalizing on the way in: it compares equal to `0.0`,
+    which is the entry `collect_distinct` stored, so the search converges on
+    the same slot for both signs.
+
+    Non-raising, because the dense fitter calls this from inside a worker
+    closure that cannot raise.
+    """
+    counts.clear()
+    var m = len(levels)
+    if m <= 0 or n_valid <= 0:
+        return
+    counts.resize(m, 0)
+    var lp = levels.unsafe_ptr()
+    var np = counts.unsafe_ptr()
+    var vp = col.unsafe_ptr()
+    for i in range(n_valid):
+        var v = vp.unsafe_load(i)
+        # First index whose level is not below `v`, which is `v`'s own level.
+        # At most `log2(MAX_BINS)` steps over a table that fits in L1.
+        var left = 0
+        var right = m
+        while left < right:
+            var mid = (left + right) // 2
+            if lp.unsafe_load(mid) < v:
+                left = mid + 1
+            else:
+                right = mid
+        if left < m:
+            np.unsafe_store(left, np.unsafe_load(left) + 1)
+
+
+def bin_construct_sample_rows(
+    n_rows: Int, sample_cnt: Int, seed: Int
+) raises -> List[Int]:
+    """The rows a sampled edge fit reads, ascending, or empty for "every row".
+
+    Knuth's selection sampling: row r of the `left` still to be considered is
+    taken when `uniform < need / left`, which selects exactly `sample_cnt`
+    rows in one pass and in ascending order. The `need >= left` shortcut at
+    the end is what makes "exactly" true rather than "in expectation".
+
+    Determinism, which is the property this has to have. The draw for row r is
+    `uniform(seed * GOLDEN + r)`, a counter-based splitmix64 draw that depends
+    on r alone: it does not read a clock, a global, or a running RNG state, so
+    it is the same draw however many rows were selected before it. The loop is
+    serial and runs once per fit, before any feature is dispatched, so the
+    sample is identical at every `MOJOTREES_NUM_WORKERS`. `splitmix64` is
+    64-bit integer arithmetic and the comparison is one multiply and one
+    compare on `Float64`, with no accumulation for a compiler to reassociate,
+    so it is the same set of rows on every machine on this toolchain.
+
+    An empty result means every row, which is the caller's fast path: it is
+    returned both for `sample_cnt <= 0` and for a sample that would cover the
+    matrix anyway.
+    """
+    var out = List[Int]()
+    if n_rows < 1 or sample_cnt <= 0 or sample_cnt >= n_rows:
+        return out^
+    out.reserve(sample_cnt)
+    var base = UInt64(seed) * GOLDEN
+    var need = sample_cnt
+    for r in range(n_rows):
+        if need <= 0:
+            break
+        var left = n_rows - r
+        if need >= left:
+            out.append(r)
+            need -= 1
+            continue
+        if uniform(base + UInt64(r)) * Float64(left) < Float64(need):
+            out.append(r)
+            need -= 1
+    return out^
 
 
 def _bucket_shift(span: UInt64) -> UInt64:
@@ -826,14 +1216,180 @@ def _sized_missing_bins(var table: List[Int], n_features: Int) -> List[Int]:
     return no_missing_bins(n_features)
 
 
+def all_features(n_features: Int) -> List[Int]:
+    """`[0, 1, ..., n_features - 1]`, the unfiltered feature pool."""
+    var out = List[Int](capacity=n_features)
+    for f in range(n_features):
+        out.append(f)
+    return out^
+comptime ROW_MAJOR_PACK_MAX_BINS = 16
+"""Most bins a feature may use and still be stored in half a byte.
+
+Two features per byte, `(n + 1) / 2` bytes for `n` packable features. A bin id
+is a small integer, so packing is lossless by construction: 16 bins are the
+ids 0..15 and a nibble holds exactly those. A feature that reaches 17 bins
+needs id 16, which does not fit, and stays a whole byte.
+"""
+
+comptime ROW_MAJOR_TILE_BYTES = 32 * 1024
+"""Row-record bytes one transpose tile writes before moving on.
+
+The transpose reads a column contiguously and writes it with a `row_stride`
+stride, so the tile is sized by its *write* window: `tile_rows * row_stride`
+bytes stay hot across the whole feature loop, and each of those bytes is
+fetched once rather than once per feature. 32 KiB is a conservative floor for
+a private L1, chosen on the same grounds as
+`apple_cpu_policy.ASSUMED_L1D_BYTES`: too small costs some locality, too large
+thrashes. Untuned, and no measurement here justifies a different number.
+"""
+
+
+def env_row_major_bins() -> Bool:
+    """`MOJOTREES_CPU_ROW_MAJOR`: build the row-major view at fit time.
+
+    **Off by default, and that is a decision rather than an oversight.** The
+    view is one extra copy of the binned matrix (see
+    `BinnedMatrix.row_major_bytes`, and the memory paragraph on the struct),
+    and nothing in this round has measured it. A default that doubles a user's
+    bin-matrix footprint on the strength of an unmeasured argument is exactly
+    the kind of thing this campaign refuses; the orchestrator's timed arms
+    decide whether it becomes one.
+    """
+    return _env_int("MOJOTREES_CPU_ROW_MAJOR", 0) != 0
+
+
+def _row_major_widths(
+    bins: List[UInt8], n_rows: Int, n_features: Int, mut width_of: List[Int]
+) raises:
+    """Each feature's observed bin count into `width_of[f]`, one parallel max
+    per column.
+
+    A free function rather than a method because the caller is `mut self` and
+    a closure capturing a pointer whose origin is `self.bins` while `self` is
+    mutable is a borrow Mojo will not carry into a parallel task. Taking the
+    column array as its own argument gives the pointer its own origin.
+    """
+    var width_p = width_of.unsafe_ptr()
+    var bins_p = bins.unsafe_ptr()
+
+    def scan_feature(f: Int) {imm}:
+        var col = f * n_rows
+        var hi = 0
+        for r in range(n_rows):
+            var v = Int(bins_p.unsafe_load(col + r))
+            if v > hi:
+                hi = v
+        width_p.unsafe_store(f, hi + 1)
+
+    dispatch_features(scan_feature, n_features, n_features * n_rows)
+
+
+def _row_major_fill(
+    bins: List[UInt8],
+    n_rows: Int,
+    n_features: Int,
+    stride: Int,
+    byte_of: List[Int],
+    shift_of: List[Int],
+    mut rm: List[UInt8],
+) raises:
+    """The transpose itself, into a `rm` already sized and zeroed.
+
+    Row-tiled so the strided writes stay inside one hot window across the
+    whole feature loop; see `BinnedMatrix.build_row_major` for why the window
+    is sized by `ROW_MAJOR_TILE_BYTES` and why this is a second pass rather
+    than a fusion into the binning tile.
+    """
+    var bins_p = bins.unsafe_ptr()
+    var rm_p = rm.unsafe_ptr()
+    var byte_p = byte_of.unsafe_ptr()
+    var shift_p = shift_of.unsafe_ptr()
+    var tile = ROW_MAJOR_TILE_BYTES // stride
+    if tile < 1:
+        tile = 1
+
+    def fill_rows(start: Int, end: Int) {imm}:
+        var t0 = start
+        while t0 < end:
+            var t1 = t0 + tile
+            if t1 > end:
+                t1 = end
+            for f in range(n_features):
+                var col = f * n_rows
+                var bo = byte_p.unsafe_load(f)
+                var sh = shift_p.unsafe_load(f)
+                # The record starts zeroed and a byte is written by at most
+                # two features of the same row, and a row's record belongs to
+                # exactly one task, so the OR that merges a pair of nibbles
+                # needs no atomic. An unpacked feature has `sh == 0` and owns
+                # its byte outright, so one store covers both cases with no
+                # branch in the row loop.
+                for r in range(t0, t1):
+                    var v = Int(bins_p.unsafe_load(col + r))
+                    var idx = r * stride + bo
+                    rm_p.unsafe_store(
+                        idx, rm_p.unsafe_load(idx) | UInt8(v << sh)
+                    )
+            t0 = t1
+
+    dispatch_rows(fill_rows, n_rows, n_rows * n_features)
+
+
 struct BinnedMatrix(Copyable, Movable):
-    """Column-major binned feature matrix.
+    """Binned feature matrix, in one or two layouts of the same bytes.
 
     Bin for (row r, feature f) is stored at `bins[f * n_rows + r]`. `cats`
     records which features are categorical, so split finding knows to search
     category partitions rather than ordinal thresholds; an empty spec means
     every feature is numerical. `missing_bin[f]` is the bin reserved for
     missing values of feature f, or -1 when that feature reserves none.
+
+    `usable` is the ascending pool a tree may split on, LightGBM's
+    `used_features`. It is every feature unless the matrix came from a mapper
+    fit with `feature_pre_filter=True`, and it rides on the matrix rather than
+    on the mapper alone because a grower is handed the matrix and nothing else
+    -- the same reason `map_forced_splits` exists. The columns are *not*
+    renumbered: a filtered feature keeps its id, its column, and its slot in an
+    importance vector.
+    The row-major view
+    ------------------
+    `build_row_major` adds a second copy of the same bin ids laid out the
+    other way round: one fixed-width **record** per row, `row_stride` bytes,
+    holding every feature's bin for that row. Feature f's bin lives in byte
+    `row_byte[f]` of the record, in the nibble selected by `row_shift[f]` and
+    `row_mask[f]`. `row_bin_at(r, f) == bin_at(r, f)` for every cell; the two
+    arrays are the same information and neither is authoritative.
+
+    This is LightGBM's `MultiValBin`, the layout behind `force_row_wise`. It
+    exists because a histogram build over a node's row list reads every
+    feature of one row: feature-major that is one cache line per (row,
+    feature), row-major it is one line per row for all of them.
+
+    **Which builder reads which, and this paragraph is here for the GPU
+    reader.** `histogram.build_histogram*` and every `_accumulate_subset*`
+    kernel except the `_row_major` ones read `bins`, the feature-major array,
+    and always have. Only `histogram.build_histogram_subset_row_major*` reads
+    `row_bins`. **Every GPU path reads `bins`.** The device histogram kernels
+    upload and scatter the feature-major array, `train_gpu`'s resident data
+    plane holds the feature-major array, and nothing on the device has ever
+    been handed `row_bins` -- a device scatter wants the coalesced column, not
+    the record. So a GPU lane considering a group-major or feature-blocked
+    device layout is deciding a *separate* question from this one, and turning
+    `MOJOTREES_CPU_ROW_MAJOR` on cannot change a device result. It costs the
+    device fit the memory below and nothing else.
+
+    **Memory cost, stated in bytes because a user with a ceiling needs to find
+    it without reading the source.** The row-major view is one extra copy of
+    the bin matrix, `n_rows * row_stride` bytes, against the feature-major
+    `n_rows * n_features` bytes it does not replace. At the headline shape,
+    **1,000,000 rows by 50 features: 50 MB feature-major, plus 50 MB
+    row-major with no feature packable, plus as little as 25 MB when every
+    feature fits in 4 bits** -- so a fit's bin-matrix footprint goes from 50 MB
+    to between 75 MB and 100 MB. Packing recovers half a byte per packable
+    feature per row and nothing else: it does not shrink `bins`. `row_stride`
+    and `row_major_bytes()` report the realized figure for a given dataset,
+    and `build_row_major` is opt-in (`MOJOTREES_CPU_ROW_MAJOR`) precisely
+    because this is a cost a user must choose.
     """
 
     var bins: List[UInt8]
@@ -842,6 +1398,44 @@ struct BinnedMatrix(Copyable, Movable):
     var n_bins: Int
     var cats: CategoricalSpec
     var missing_bin: List[Int]
+    var usable: List[Int]
+
+    var row_bins: List[UInt8]
+    """The record array, `n_rows * row_stride` bytes. Empty until
+    `build_row_major` runs."""
+
+    var row_stride: Int
+    """Bytes in one row's record, 0 when the view is not built."""
+
+    var row_byte: List[Int]
+    """Byte offset of feature f inside a record."""
+
+    var row_shift: List[Int]
+    """Right shift applied to that byte for feature f: 0 for a whole byte or
+    a low nibble, 4 for a high nibble."""
+
+    var row_mask: List[Int]
+    """Mask applied after the shift: 255 for a whole byte, 15 for a
+    nibble."""
+
+    var feature_bins: List[Int]
+    """Bins feature f actually uses, `max observed bin + 1`.
+
+    Observed from the data rather than declared by the mapper, so a feature
+    that reserves 255 bins and uses four is compacted like a four-bin feature
+    and packs like one. It is a function of `bins` alone, so two matrices with
+    the same bytes always get the same layout.
+    """
+
+    var bin_offset: List[Int]
+    """Cumulative `feature_bins`, length `n_features + 1`.
+
+    LightGBM's `group_bin_boundaries_` idea: feature f's cells in a *compact*
+    histogram start at `bin_offset[f]`, so a private accumulator costs
+    `sum_f feature_bins[f]` cells rather than `n_features * n_bins`. Only the
+    row-major blocked kernel's private partials use it; the output histogram
+    keeps its `f * n_bins + b` shape, which every other file indexes with.
+    """
 
     def __init__(
         out self,
@@ -856,6 +1450,14 @@ struct BinnedMatrix(Copyable, Movable):
         self.n_bins = n_bins
         self.cats = CategoricalSpec.none()
         self.missing_bin = no_missing_bins(n_features)
+        self.usable = all_features(n_features)
+        self.row_bins = []
+        self.row_stride = 0
+        self.row_byte = []
+        self.row_shift = []
+        self.row_mask = []
+        self.feature_bins = []
+        self.bin_offset = []
 
     def __init__(
         out self,
@@ -865,15 +1467,29 @@ struct BinnedMatrix(Copyable, Movable):
         n_bins: Int,
         var cats: CategoricalSpec,
         var missing_bin: List[Int] = [],
+        var usable: List[Int] = [],
     ):
         """A `missing_bin` table of the wrong length (the empty default
-        included) means no feature reserves a missing bin."""
+        included) means no feature reserves a missing bin. An empty `usable`
+        (the default) means nothing was prefiltered, so every feature is
+        usable."""
         self.bins = bins^
         self.n_rows = n_rows
         self.n_features = n_features
         self.n_bins = n_bins
         self.cats = cats^
         self.missing_bin = _sized_missing_bins(missing_bin^, n_features)
+        if len(usable) > 0:
+            self.usable = usable^
+        else:
+            self.usable = all_features(n_features)
+        self.row_bins = []
+        self.row_stride = 0
+        self.row_byte = []
+        self.row_shift = []
+        self.row_mask = []
+        self.feature_bins = []
+        self.bin_offset = []
 
     def bin_at(self, row: Int, feature: Int) -> Int:
         return Int(self.bins[feature * self.n_rows + row])
@@ -881,6 +1497,161 @@ struct BinnedMatrix(Copyable, Movable):
     def is_missing(self, row: Int, feature: Int) -> Bool:
         """Whether (row, feature) holds a missing value."""
         return self.bin_at(row, feature) == self.missing_bin[feature]
+
+    def usable_features(self) -> List[Int]:
+        """The pool `feature_fraction` draws from, ascending. Pass it to
+        `sampling.select_tree_features`; it is every feature unless the fit
+        prefiltered, and passing every feature is the same draw as passing
+        nothing."""
+        return self.usable.copy()
+    def has_row_major(self) -> Bool:
+        """Whether the row-major view is built and the right size.
+
+        The size check is not paranoia: a `BinnedMatrix` is copied and
+        serialized in several places, and a kernel that indexed a stale record
+        array would read garbage bins rather than fail.
+        """
+        return (
+            self.row_stride > 0
+            and self.n_rows > 0
+            and self.n_features > 0
+            and len(self.row_bins) == self.n_rows * self.row_stride
+            and len(self.row_byte) == self.n_features
+            and len(self.row_shift) == self.n_features
+            and len(self.row_mask) == self.n_features
+            and len(self.feature_bins) == self.n_features
+            and len(self.bin_offset) == self.n_features + 1
+        )
+
+    def row_bin_at(self, row: Int, feature: Int) -> Int:
+        """The bin at (row, feature), read from the record array.
+
+        Equal to `bin_at(row, feature)` for every cell of a built view. This
+        is the reference the tests compare the kernels against; the kernels
+        inline the same three operations with the per-feature constants
+        hoisted out of the row loop.
+        """
+        var raw = Int(self.row_bins[row * self.row_stride + self.row_byte[feature]])
+        return (raw >> self.row_shift[feature]) & self.row_mask[feature]
+
+    def row_major_bytes(self) -> Int:
+        """Bytes the row-major view occupies, 0 when it is not built. The
+        number the memory paragraph above is about, for this dataset."""
+        return len(self.row_bins)
+
+    def packed_feature_count(self) -> Int:
+        """Features stored in half a byte. 0 when the view is not built."""
+        var n = 0
+        for f in range(len(self.row_mask)):
+            if self.row_mask[f] == 15:
+                n += 1
+        return n
+
+    def compact_bin_count(self) -> Int:
+        """`sum_f feature_bins[f]`, the cell count of a compact histogram over
+        every feature. 0 when the view is not built."""
+        if len(self.bin_offset) != self.n_features + 1:
+            return 0
+        return self.bin_offset[self.n_features]
+
+    def build_row_major(mut self) raises:
+        """Build (or rebuild) the row-major record array from `bins`.
+
+        Three passes, none of which touches a Float64 and none of which can
+        change a bin id:
+
+        1. **Widths.** Each feature's observed bin count, one parallel max
+           over its column. Derived from the data rather than from the
+           `BinMapper`, so a `BinnedMatrix` assembled by `efb`, by
+           `serialize`, or by a test gets the same treatment as one that came
+           out of `transform`, and so a feature that reserves many bins and
+           uses few is packed on what it uses.
+        2. **Layout.** Features needing more than `ROW_MAJOR_PACK_MAX_BINS`
+           bins take a whole byte each, in ascending feature order, at the
+           front of the record; the rest take half a byte each, two to a byte,
+           in ascending feature order, after them. `row_stride` is
+           `unpacked + (packable + 1) / 2`. Splitting the record this way
+           rather than interleaving keeps the assignment a two-line rule and
+           costs nothing: a record is read through `row_byte[f]`, so nothing
+           downstream cares what order the bytes are in, and at any feature
+           count where the record spans more than a cache line the packed half
+           is the dense half either way.
+        3. **Transpose.** Row-tiled, `ROW_MAJOR_TILE_BYTES` of record window
+           at a time, feature-major inside the tile so the *reads* stay
+           sequential down each column and the *writes* stay inside a window
+           that is still hot when the next feature arrives. Dispatched over
+           disjoint ascending row ranges; a row's record is written by exactly
+           one task, so the two features sharing a byte are written by the
+           same task and the OR that merges them needs no atomic.
+
+        The fused alternative -- writing the record inside `transform`'s
+        binning tile -- was rejected on write traffic, and the arithmetic is
+        worth keeping: that loop is dispatched per (feature, row range), so a
+        fixed feature walks the whole record array with a `row_stride` stride.
+        At 1,000,000 rows by 50 features the array is 50 MB and a 128-byte
+        line holds two of that feature's bytes, so each of the 50 features
+        pulls ~25 MB of lines, ~1.25 GB of read-for-ownership traffic against
+        the 100 MB (one read of `bins`, one write of `row_bins`) the tiled
+        pass moves. A second pass that moves a twelfth of the traffic is not a
+        second pass worth fusing away.
+        """
+        var nf = self.n_features
+        var nr = self.n_rows
+        var byte_of = List[Int]()
+        var shift_of = List[Int]()
+        var mask_of = List[Int]()
+        var width_of = List[Int]()
+        var offsets = List[Int]()
+        var rm = List[UInt8]()
+        var stride = 0
+
+        if nf > 0 and nr > 0 and len(self.bins) == nr * nf:
+            width_of.resize(nf, 1)
+            _row_major_widths(self.bins, nr, nf, width_of)
+
+            byte_of.resize(nf, 0)
+            shift_of.resize(nf, 0)
+            mask_of.resize(nf, 255)
+            var whole = 0
+            for f in range(nf):
+                if width_of[f] > ROW_MAJOR_PACK_MAX_BINS:
+                    byte_of[f] = whole
+                    whole += 1
+            var packed = 0
+            for f in range(nf):
+                if width_of[f] <= ROW_MAJOR_PACK_MAX_BINS:
+                    byte_of[f] = whole + (packed >> 1)
+                    shift_of[f] = 4 if (packed & 1) == 1 else 0
+                    mask_of[f] = 15
+                    packed += 1
+            stride = whole + ((packed + 1) >> 1)
+
+            offsets.append(0)
+            for f in range(nf):
+                offsets.append(offsets[f] + width_of[f])
+
+            rm.resize(nr * stride, UInt8(0))
+            _row_major_fill(
+                self.bins, nr, nf, stride, byte_of, shift_of, rm
+            )
+
+        self.row_bins = rm^
+        self.row_stride = stride
+        self.row_byte = byte_of^
+        self.row_shift = shift_of^
+        self.row_mask = mask_of^
+        self.feature_bins = width_of^
+        self.bin_offset = offsets^
+
+    def drop_row_major(mut self):
+        """Release the row-major view and its `row_major_bytes()`."""
+        self.row_bins = []
+        self.row_stride = 0
+        self.row_byte = []
+        self.row_shift = []
+        self.row_mask = []
+        self.feature_bins = []
+        self.bin_offset = []
 
 
 struct BinMapper(Copyable, Movable):
@@ -897,6 +1668,17 @@ struct BinMapper(Copyable, Movable):
     A numerical feature with `missing_bin[f] >= 0` reserves that bin for
     missing values, so its k edges give ordinary bins 0..k and a missing bin
     at k + 1. `missing_bin[f] = -1` means no reservation.
+
+    `usable` is the ascending list of feature ids a tree may split on, which is
+    every feature unless `fit_bins` ran with `feature_pre_filter=True`. It is
+    LightGBM's `used_features`: `Dataset::Construct` builds exactly this list
+    (`src/io/dataset.cpp`, from `!BinMapper::is_trivial()`) and it is the pool
+    `feature_fraction` samples from. It is *not* a renumbering. The matrix keeps
+    every column and every feature keeps its own id, so a filtered feature is
+    still binned, still predicted through, and still occupies its own slot in an
+    importance vector -- which is what LightGBM does too, because
+    `GBDT::FeatureImportance` sizes its result by `max_feature_idx_ + 1 =
+    num_total_features` rather than by the used count.
     """
 
     var edges: List[Float64]
@@ -905,6 +1687,7 @@ struct BinMapper(Copyable, Movable):
     var n_bins: Int
     var cats: CategoricalSpec
     var missing_bin: List[Int]
+    var usable: List[Int]
 
     def __init__(
         out self,
@@ -919,6 +1702,7 @@ struct BinMapper(Copyable, Movable):
         self.n_bins = n_bins
         self.cats = CategoricalSpec.all_numerical(n_features)
         self.missing_bin = no_missing_bins(n_features)
+        self.usable = all_features(n_features)
 
     def __init__(
         out self,
@@ -928,15 +1712,36 @@ struct BinMapper(Copyable, Movable):
         n_bins: Int,
         var cats: CategoricalSpec,
         var missing_bin: List[Int] = [],
+        var usable: List[Int] = [],
     ):
         """A `missing_bin` table of the wrong length (the empty default
-        included) means no feature reserves a missing bin."""
+        included) means no feature reserves a missing bin. An empty `usable`
+        (the default) means no feature was prefiltered, so every feature is
+        usable."""
         self.edges = edges^
         self.edge_offsets = edge_offsets^
         self.n_features = n_features
         self.n_bins = n_bins
         self.cats = cats^
         self.missing_bin = _sized_missing_bins(missing_bin^, n_features)
+        if len(usable) > 0:
+            self.usable = usable^
+        else:
+            self.usable = all_features(n_features)
+
+    def usable_features(self) -> List[Int]:
+        """The pool `feature_fraction` draws from, ascending. Every feature
+        unless the fit prefiltered."""
+        return self.usable.copy()
+
+    def is_usable(self, feature: Int) -> Bool:
+        """Whether `feature` survived the prefilter. Linear in the usable
+        count, which is what keeps the representation a plain ascending list
+        rather than a second per-feature table."""
+        for i in range(len(self.usable)):
+            if self.usable[i] == feature:
+                return True
+        return False
 
     def has_missing(self) -> Bool:
         """Whether any feature reserves a missing bin."""
@@ -972,6 +1777,14 @@ struct BinMapper(Copyable, Movable):
             return False
         for i in range(len(self.missing_bin)):
             if self.missing_bin[i] != other.missing_bin[i]:
+                return False
+        # A prefiltered mapper and an unfiltered one bin every value the same
+        # way but do not offer the same features to a tree, so `train_more`
+        # must not accept one for the other.
+        if len(self.usable) != len(other.usable):
+            return False
+        for i in range(len(self.usable)):
+            if self.usable[i] != other.usable[i]:
                 return False
         for f in range(self.n_features):
             if self.cats.is_cat(f) != other.cats.is_cat(f):
@@ -1113,14 +1926,24 @@ struct BinMapper(Copyable, Movable):
             n_rows,
             n_features * n_rows * (1 + _log2_ceil(self.n_bins)),
         )
-        return BinnedMatrix(
+        var out = BinnedMatrix(
             bins^,
             n_rows,
             n_features,
             self.n_bins,
             self.cats.copy(),
             self.missing_bin.copy(),
+            self.usable.copy(),
         )
+        # The row-major view, at fit time, off unless asked for. Its widths
+        # come from the bins this call just wrote, so it is built here rather
+        # than fused into the tile above: the packing decision needs each
+        # feature's realized bin count, which does not exist until the last
+        # tile has run. See `BinnedMatrix.build_row_major` for the write
+        # traffic that makes the second pass the cheap way round anyway.
+        if env_row_major_bins():
+            out.build_row_major()
+        return out^
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
         """Bin one example (length n_features) for prediction."""
@@ -1141,6 +1964,11 @@ def fit_bins[
     max_bins: Int = 255,
     categorical_features: List[Int] = [],
     use_missing: Bool = True,
+    min_data_in_bin: Int = DEFAULT_MIN_DATA_IN_BIN,
+    bin_construct_sample_cnt: Int = DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT,
+    data_random_seed: Int = DEFAULT_DATA_RANDOM_SEED,
+    feature_pre_filter: Bool = False,
+    min_data_in_leaf: Int = DEFAULT_MIN_DATA_IN_LEAF,
 ) raises -> BinMapper:
     """Fit quantile (equal-frequency) bin edges on a column-major feature
     matrix. Edges are midpoints between distinct values at quantile
@@ -1154,13 +1982,52 @@ def fit_bins[
     any `NaN` reserves its highest bin for missing values and fits its edges
     over the remaining `max_bins - 1` bins from the non-missing values alone,
     so `NaN` never enters a quantile comparison. `use_missing=False` reserves
-    nothing and bins `NaN` as 0.0, matching LightGBM's `use_missing=false`."""
+    nothing and bins `NaN` as 0.0, matching LightGBM's `use_missing=false`.
+
+    `min_data_in_bin` is LightGBM's minimum population for a numerical bin
+    and `bin_construct_sample_cnt` fits the edges from a subsample of the
+    rows, seeded by `data_random_seed`. Both change which bins exist, and
+    both now default to **LightGBM's** values, 3 and 200,000, rather than to
+    the 1 and 0 at which this function is the function it was before they
+    existed. Passing `min_data_in_bin=1, bin_construct_sample_cnt=0` restores
+    that fit exactly, and a test says so. The module docstring states what
+    each honors and what it does not.
+
+    `feature_pre_filter` is LightGBM's, and `min_data_in_leaf` is the number it
+    scales (see `filter_count`); it has no other use here, so a caller who
+    leaves the filter off never has to keep the two in step. At `True` the fit
+    additionally counts each feature's bins on the same sample it fit the edges
+    from, runs `need_filter` on those counts, and returns a `BinMapper` whose
+    `usable` list omits every feature LightGBM's `Dataset::Construct` would
+    have left out of `used_features` -- the trivial ones (one bin) and the
+    filtered ones. **Off is the exact fit this function has always produced**:
+    no counting pass runs, no allocation is made for it, and `usable` is every
+    feature.
+
+    Two divergences from LightGBM, both deliberate and both on the record:
+
+    - LightGBM drops a one-bin feature from `used_features` whatever
+      `feature_pre_filter` says. mojotrees drops nothing at `False`, because
+      `False` has to stay bit-identical to the fit that preceded this argument
+      and dropping constant columns from the `feature_fraction` pool is not a
+      bit-identical change. So mojotrees's `False` is "keep everything", not
+      LightGBM's `false`.
+    - LightGBM warns and continues when every feature is trivial. There is
+      nowhere to warn to here and a fit with no usable feature has no tree to
+      grow, so this raises instead.
+    """
     if max_bins < 2 or max_bins > MAX_BINS:
         raise Error("max_bins must be in [2, ", MAX_BINS, "]")
     if n_rows < 1:
         raise Error("n_rows must be positive")
     if len(features) != n_rows * n_features:
         raise Error("features length must equal n_rows * n_features")
+    if min_data_in_bin < 1:
+        raise Error("min_data_in_bin must be positive")
+    if bin_construct_sample_cnt < 0:
+        raise Error("bin_construct_sample_cnt must be non-negative")
+    if feature_pre_filter and min_data_in_leaf < 0:
+        raise Error("min_data_in_leaf must be nonnegative")
 
     var cats = fit_categorical_spec(
         features, n_rows, n_features, categorical_features, max_bins
@@ -1183,6 +2050,29 @@ def fit_bins[
     var select_min_rows = env_select_min_rows()
     ref spec = cats
 
+    # Drawn once, before any feature is dispatched, so every feature is fit
+    # from the same rows and the sample cannot depend on the worker count.
+    # Empty means every row, which is the default and keeps the column loop
+    # below the loop it has always been.
+    var sample = bin_construct_sample_rows(
+        n_rows, bin_construct_sample_cnt, data_random_seed
+    )
+    var sampled = len(sample) > 0
+    var n_sample = len(sample) if sampled else n_rows
+    var sample_p = sample.unsafe_ptr()
+
+    # LightGBM's prefilter state. `filter_cnt` is drawn once, from the same two
+    # sizes for every feature, so it cannot depend on which task fit a column.
+    # Both buffers are unallocated when the filter is off, which is what keeps
+    # that path allocation-for-allocation the path it was.
+    var n_flags = n_features if feature_pre_filter else 0
+    var filter_cnt = 0
+    if feature_pre_filter:
+        filter_cnt = filter_count(min_data_in_leaf, n_sample, n_rows)
+    var trivial = List[Int](capacity=n_flags)
+    trivial.resize(n_flags, 0)
+    var trivial_p = trivial.unsafe_ptr()
+
     def do_range(f_start: Int, f_end: Int) {imm}:
         # One set of scratch buffers per task rather than per feature: each is
         # emptied and refilled between features, keeping the capacity it
@@ -1191,7 +2081,11 @@ def fit_bins[
         # column it saw before, in the same order, so the edges are unchanged.
         # `bucket_counts` and `bucket_keys` are the rank-selection tables and
         # stay empty (and unallocated) on a task that never takes that path.
-        var col = List[Float64](capacity=n_rows)
+        # `n_sample` values at most, which is the sample when one was drawn
+        # and `n_rows` when it was not. At the stock 200,000 against a
+        # 1,000,000-row fit that is 1.6 MB reserved per task instead of 8 MB,
+        # and the difference is first-touched memory, not just address space.
+        var col = List[Float64](capacity=n_sample)
         var idxs = List[Int]()
         var ranks = List[Int]()
         var vals = List[Float64]()
@@ -1204,29 +2098,85 @@ def fit_bins[
         var bucket_keys = List[UInt64]()
         var dist_table = List[UInt64]()
         var dist_slots = List[Int]()
+        var dist_hits = List[Int]()
         var dist_vals = List[Float64]()
+        var level_counts = List[Int]()
+        # Per-bin populations, refilled per feature and only when the prefilter
+        # asked for them.
+        var cnt_in_bin = List[Int]()
         for f in range(f_start, f_end):
             # Categorical columns never enter quantile binning.
             if spec.is_cat(f):
                 counts_p.unsafe_store(f, 0)
+                if feature_pre_filter:
+                    # mojotrees's categorical layout is LightGBM's: bin 0 is
+                    # the unknown/missing dummy and the i-th kept code is bin
+                    # i + 1, so the counts line up bin for bin with the vector
+                    # `NeedFilter` was written against.
+                    var nb = spec.n_categories(f) + 1
+                    cnt_in_bin.clear()
+                    cnt_in_bin.resize(nb, 0)
+                    var cbase = f * n_rows
+                    if sampled:
+                        for i in range(n_sample):
+                            var r = sample_p.unsafe_load(i)
+                            var b = spec.bin_of(
+                                f, feat_p.unsafe_load(cbase + r)
+                            )
+                            if b >= 0 and b < nb:
+                                cnt_in_bin[b] += 1
+                    else:
+                        for r in range(n_rows):
+                            var b = spec.bin_of(
+                                f, feat_p.unsafe_load(cbase + r)
+                            )
+                            if b >= 0 and b < nb:
+                                cnt_in_bin[b] += 1
+                    trivial_p.unsafe_store(
+                        f,
+                        1 if need_filter(
+                            cnt_in_bin, n_sample, filter_cnt, True
+                        ) else 0,
+                    )
                 continue
             # NaN is dropped before any ordering, so it never takes part in a
             # quantile comparison, and a column that has any gives up one bin
             # to hold its missing values.
             col.clear()
             var base = f * n_rows
-            for r in range(n_rows):
-                var v = feat_p.unsafe_load(base + r)
-                if not isnan(v):
-                    col.append(v)
+            if sampled:
+                # The same rows for every feature, in ascending order, so a
+                # sampled fit differs from a full one only in which values it
+                # sees and never in the order it sees them.
+                for i in range(n_sample):
+                    var v = feat_p.unsafe_load(
+                        base + sample_p.unsafe_load(i)
+                    )
+                    if not isnan(v):
+                        col.append(v)
+            else:
+                for r in range(n_rows):
+                    var v = feat_p.unsafe_load(base + r)
+                    if not isnan(v):
+                        col.append(v)
             var n_valid = len(col)
-            var reserve = use_missing and n_valid < n_rows
+            # Missingness is decided from what was read, which is the whole
+            # column unless a sample was drawn. `n_sample == n_rows` when it
+            # was not, so this is the test it has always been.
+            var reserve = use_missing and n_valid < n_sample
             var n_ordinary = max_bins - 1 if reserve else max_bins
 
             below.clear()
             above.clear()
             if collect_distinct(
-                col, n_valid, n_ordinary, dist_table, dist_slots, dist_vals
+                col,
+                n_valid,
+                n_ordinary,
+                dist_table,
+                dist_slots,
+                dist_hits,
+                dist_vals,
+                level_counts,
             ):
                 # Few enough levels that every one of them can have its own
                 # bin, so cut between each adjacent pair and let the budget
@@ -1236,11 +2186,40 @@ def fit_bins[
                 # so it used to be swallowed by its neighbour however far
                 # away that neighbour was. This is LightGBM's rule for the
                 # same case.
-                for j in range(len(dist_vals) - 1):
-                    below.append(dist_vals[j])
-                    above.append(dist_vals[j + 1])
+                if min_data_in_bin <= 1:
+                    for j in range(len(dist_vals) - 1):
+                        below.append(dist_vals[j])
+                        above.append(dist_vals[j + 1])
+                else:
+                    # LightGBM's `GreedyFindBin` in the same branch: walk the
+                    # levels accumulating their counts and cut only once the
+                    # accumulator has reached the minimum, resetting it at
+                    # each cut. Adjacent levels merge until they hold enough
+                    # rows between them; the final bin keeps whatever is left,
+                    # because nothing merges backwards. `level_counts` came
+                    # out of the scan above, not out of a second pass.
+                    var acc = 0
+                    for j in range(len(dist_vals) - 1):
+                        acc += level_counts[j]
+                        if acc >= min_data_in_bin:
+                            below.append(dist_vals[j])
+                            above.append(dist_vals[j + 1])
+                            acc = 0
             else:
-                quantile_boundary_indices(n_valid, n_ordinary, idxs)
+                # LightGBM's other branch shrinks the budget before it cuts:
+                # `max_bin = max(1, min(max_bin, total_cnt / min_data_in_bin))`.
+                # At the default of 1 the cap cannot bind here -- this branch
+                # is reached only when the column has more distinct values
+                # than ordinary bins, so `n_valid > n_ordinary` -- and the
+                # guard keeps the default on the same instructions anyway.
+                var n_ord = n_ordinary
+                if min_data_in_bin > 1:
+                    var cap = n_valid // min_data_in_bin
+                    if cap < 1:
+                        cap = 1
+                    if cap < n_ord:
+                        n_ord = cap
+                quantile_boundary_indices(n_valid, n_ord, idxs)
                 if n_valid >= select_min_rows:
                     # The ranks the boundaries ask about, ascending and
                     # unique. `idxs` is non-decreasing, so appending `idx - 1`
@@ -1305,6 +2284,39 @@ def fit_bins[
             # k edges give ordinary bins 0..k, so the missing bin is k + 1.
             missing_p.unsafe_store(f, n_out + 1 if reserve else -1)
 
+            if feature_pre_filter:
+                # LightGBM builds `cnt_in_bin` from the distinct values it
+                # already counted; the edges are the same edges either way, so
+                # counting the sample through them gives the same vector. The
+                # reserved missing bin goes last, which is where LightGBM puts
+                # its NaN bin, and `need_filter`'s prefix loop stops one short
+                # of the last bin, so a missing-heavy column is not rescued by
+                # its own missing rows.
+                var nb = n_out + 2 if reserve else n_out + 1
+                cnt_in_bin.clear()
+                cnt_in_bin.resize(nb, 0)
+                for i in range(n_valid):
+                    var v = col[i]
+                    # The bin `bin_value` lands on: the number of edges
+                    # strictly below `v`.
+                    var lo = 0
+                    var hi = n_out
+                    while lo < hi:
+                        var mid = (lo + hi) // 2
+                        if v <= edge_buf[mid]:
+                            hi = mid
+                        else:
+                            lo = mid + 1
+                    cnt_in_bin[lo] += 1
+                if reserve:
+                    cnt_in_bin[nb - 1] = n_sample - n_valid
+                trivial_p.unsafe_store(
+                    f,
+                    1 if need_filter(
+                        cnt_in_bin, n_sample, filter_cnt, False
+                    ) else 0,
+                )
+
     # A feature costs a copy of its column plus resolving order statistics in
     # it, so the estimate carries a comparison count rather than the row count
     # alone. It stays the sort's estimate: it decides only how the work is
@@ -1322,8 +2334,34 @@ def fit_bins[
         for i in range(counts[f]):
             edges.append(scratch[base + i])
         offsets.append(len(edges))
+
+    # `used_features` (src/io/dataset.cpp): the ascending ids that survived,
+    # built serially in feature order from per-feature flags each task wrote
+    # only into its own slots, so the list is the same at every worker count.
+    var usable = List[Int]()
+    if feature_pre_filter:
+        for f in range(n_features):
+            if trivial[f] == 0:
+                usable.append(f)
+        if len(usable) == 0:
+            raise Error(
+                "feature_pre_filter dropped every feature: none of them has a"
+                " bin boundary leaving at least ",
+                filter_cnt,
+                " rows on both sides (min_data_in_leaf=",
+                min_data_in_leaf,
+                " scaled to a ",
+                n_sample,
+                "-row sample of ",
+                n_rows,
+                " rows). Lower min_data_in_leaf or min_data_in_bin, or turn"
+                " the filter off. LightGBM warns and continues here; there is"
+                " nothing to warn to and no tree to grow",
+            )
+    else:
+        usable = all_features(n_features)
     return BinMapper(
-        edges^, offsets^, n_features, max_bins, cats^, missing_bin^
+        edges^, offsets^, n_features, max_bins, cats^, missing_bin^, usable^
     )
 
 

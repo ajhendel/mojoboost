@@ -78,6 +78,7 @@ mapper codec is the point. `Dataset.from_binned_dense` and
 read from a file carries no raw matrix, so it cannot be `subset`.
 """
 
+from std.math import isinf
 from std.memory import unsafe_memcpy
 
 from .bagging import BaggingParams
@@ -94,6 +95,7 @@ from .boosting_sparse import train_multiclass_sparse, train_sparse
 from .device import CPU_DEVICE, GPU_DEVICE, resolve_device
 from .goss import GossParams
 from .model import Model, MulticlassModel
+from .parallel import plan_row_blocks, run_row_blocks
 from .ranking import RankerParams, groups_from_counts, train_ranker
 from .ranking_advanced import (
     AdvancedRankParams,
@@ -113,6 +115,170 @@ from .validation import (
     check_required_length,
     check_shape,
 )
+
+
+comptime INGEST_TILE_BYTES = 32 * 1024
+"""Source bytes one ingest tile holds while the feature loop walks it.
+
+`transpose_to_column_major` reads the caller's row-major matrix and writes a
+column-major one, so exactly one of the two sides can be sequential. The
+write is chosen, because a column of the destination is `n_rows` contiguous
+doubles and a whole column-run is one stream; the read is then strided by
+`n_features * 8` bytes and would touch a fresh cache line per element if it
+ran the full height of the matrix. Tiling the rows bounds that: a tile of
+`tile_rows * n_features * 8` source bytes is fetched once and then read
+`n_features` times from cache, once per column pass.
+
+32 KiB, and the same number and the same reasoning as
+`binning.ROW_MAJOR_TILE_BYTES`, which tiles the mirror-image transpose of the
+binned matrix: a conservative floor for a private L1, on the grounds
+`apple_cpu_policy.ASSUMED_L1D_BYTES` states. **Untuned. Nothing here measured
+it**, and the only claim being made for it is the one arithmetic supports,
+that a tiled read of a tile that fits in L1 fetches each source line once
+instead of once per feature.
+"""
+
+
+def transpose_to_column_major[
+    src_origin: ImmOrigin, dst_origin: MutOrigin, //
+](
+    src: Span[Float64, src_origin],
+    dst: Span[Float64, dst_origin],
+    n_rows: Int,
+    n_features: Int,
+) raises -> Bool:
+    """Write `src[r * n_features + f]` into `dst[f * n_rows + r]`, and say
+    whether any value was infinite.
+
+    This is the whole of ingestion for a caller holding a C-ordered matrix,
+    which is what NumPy hands out by default and therefore what nearly every
+    `fit(X, y)` starts from. `binning.fit_bins` reads
+    `features[f * n_rows + r]`, so somebody has to do this; the point of
+    doing it here is that it is **one** pass rather than the two the NumPy
+    side took (`asfortranarray`, then `isinf(...).any()` over the result),
+    and that the pass is parallel and tiled rather than serial and strided.
+
+    Returning the infinity flag from the same pass is not a convenience. The
+    caller has to reject `+inf` and `-inf` before binning (`NaN` is the
+    missing-value marker and is allowed; see `binning.mojo`), and asking that
+    question afterwards means a second full read of `n_rows * n_features`
+    doubles plus a bool array of `n_rows * n_features` bytes to reduce. Asked
+    here, it is one compare on a value already in a register.
+
+    Determinism: the row blocks are disjoint and each destination slot is
+    written by exactly one task, so nothing is reassociated and no value is
+    combined with any other. The result is byte-identical at every
+    `MOJOTREES_NUM_WORKERS`, and it is the same bytes the caller passed in --
+    a transpose moves values between slots and does no arithmetic on them.
+    The infinity flag is an OR over per-block flags, which is
+    order-independent for the same reason.
+    """
+    if n_rows < 1 or n_features < 1:
+        raise Error("matrix must have positive dimensions")
+    if len(src) != n_rows * n_features:
+        raise Error("source length must equal n_rows * n_features")
+    if len(dst) != n_rows * n_features:
+        raise Error("destination length must equal n_rows * n_features")
+
+    var src_p = src.unsafe_ptr()
+    var dst_p = dst.unsafe_ptr()
+    var tile = INGEST_TILE_BYTES // (n_features * 8)
+    if tile < 1:
+        tile = 1
+
+    # The block plan is taken explicitly rather than through `dispatch_rows`
+    # because each block needs a slot of its own to record whether it saw an
+    # infinity, and a block id is what indexes it. Same geometry either way.
+    var blocks = plan_row_blocks(n_rows, n_rows * n_features)
+    var saw = List[Int](capacity=blocks.n_blocks)
+    saw.resize(blocks.n_blocks, 0)
+    var saw_p = saw.unsafe_ptr()
+
+    def fill(b: Int) {imm}:
+        var start = blocks.start(b)
+        var end = blocks.end(b)
+        var bad = 0
+        var t0 = start
+        while t0 < end:
+            var t1 = t0 + tile
+            if t1 > end:
+                t1 = end
+            for f in range(n_features):
+                var col = f * n_rows
+                for r in range(t0, t1):
+                    var v = src_p.unsafe_load(r * n_features + f)
+                    dst_p.unsafe_store(col + r, v)
+                    if isinf(v):
+                        bad = 1
+            t0 = t1
+        if bad != 0:
+            saw_p.unsafe_store(b, 1)
+
+    run_row_blocks(blocks, fill)
+
+    var any_inf = False
+    for b in range(blocks.n_blocks):
+        if saw[b] != 0:
+            any_inf = True
+    return any_inf
+
+
+def to_column_major[
+    src_origin: ImmOrigin, //
+](
+    src: Span[Float64, src_origin], n_rows: Int, n_features: Int
+) raises -> List[Float64]:
+    """`transpose_to_column_major` into a freshly allocated buffer.
+
+    For a caller that owns both sides, a benchmark or a test. The Python
+    boundary does not come this way: there the destination is the NumPy
+    array the wrapper must hand back, so the binding transposes into a buffer
+    the caller already allocated and nothing here allocates a third copy of
+    the matrix.
+
+    The infinity flag is dropped; a caller who has to reject infinities
+    should call `transpose_to_column_major` and read it.
+    """
+    var out = List[Float64](unsafe_uninit_length=n_rows * n_features)
+    _ = transpose_to_column_major(src, out, n_rows, n_features)
+    return out^
+
+
+def has_infinite[
+    values_origin: ImmOrigin, //
+](values: Span[Float64, values_origin]) raises -> Bool:
+    """True when any value is `+inf` or `-inf`. `NaN` is not infinite.
+
+    The check on its own, for the one input shape that needs no transpose:
+    a caller whose matrix is already column-major, whose buffer is therefore
+    handed to the binner as it lies. It is a parallel read with no
+    allocation, which is what the NumPy expression it replaces
+    (`np.isinf(Xa).any()`) is not: that one materializes an
+    `n_rows * n_features` byte array before reducing it.
+    """
+    var n = len(values)
+    if n == 0:
+        return False
+    var p = values.unsafe_ptr()
+    var blocks = plan_row_blocks(n, n)
+    var saw = List[Int](capacity=blocks.n_blocks)
+    saw.resize(blocks.n_blocks, 0)
+    var saw_p = saw.unsafe_ptr()
+
+    def scan(b: Int) {imm}:
+        var bad = 0
+        for i in range(blocks.start(b), blocks.end(b)):
+            if isinf(p.unsafe_load(i)):
+                bad = 1
+        if bad != 0:
+            saw_p.unsafe_store(b, 1)
+
+    run_row_blocks(blocks, scan)
+
+    for b in range(blocks.n_blocks):
+        if saw[b] != 0:
+            return True
+    return False
 
 
 def _check_labels(label: List[Float64], n_rows: Int) raises:
@@ -722,6 +888,84 @@ struct Dataset(Copyable, Movable, Writable):
             reference.use_missing,
         )
 
+    @staticmethod
+    def from_reference_dense[
+        features_origin: ImmOrigin, //
+    ](
+        reference: Dataset,
+        features: Span[Float64, features_origin],
+        n_rows: Int,
+        var label: List[Float64] = [],
+        var weight: List[Float64] = [],
+        var group: List[Int] = [],
+        var init_score: List[Float64] = [],
+        keep_raw: Bool = False,
+    ) raises -> Dataset:
+        """`from_reference` over a **borrowed** dense column-major matrix.
+
+        The same constructor, taking the matrix the way the dense
+        `Dataset.__init__` takes it. `from_reference` requires a `RawData`,
+        which owns its values, so a caller holding a matrix on the other side
+        of the Python boundary had to copy `n_rows * n_features` doubles into
+        one before the reference's mapper could read them -- and then, unless
+        `keep_raw` asked for it, that copy was dropped the moment binning
+        finished. This one reads the caller's buffer where it lies and copies
+        only when `keep_raw` means the dataset has to outlive it.
+
+        Sparse input still goes through `from_reference`: a CSC matrix is
+        already the representation the sparse binner reads, so there is no
+        copy there to remove.
+        """
+        if reference.is_sparse:
+            raise Error(
+                "a dense dataset cannot be binned by a sparse reference's"
+                " mapper"
+            )
+        _check_columns(
+            n_rows,
+            reference.n_features,
+            label,
+            weight,
+            group,
+            init_score,
+            reference.feature_names,
+            reference.categorical_features,
+        )
+        if len(features) != n_rows * reference.n_features:
+            raise Error("features length must equal n_rows * n_features")
+
+        var mapper = reference.mapper.copy()
+        var data = mapper.transform(features, n_rows)
+        var kept: RawData
+        if keep_raw:
+            var owned = List[Float64](unsafe_uninit_length=len(features))
+            unsafe_memcpy(
+                dest=owned.unsafe_ptr(),
+                src=features.unsafe_ptr(),
+                count=len(features),
+            )
+            kept = RawData.dense(owned^, n_rows, reference.n_features)
+        else:
+            kept = RawData.none()
+        return Dataset(
+            mapper^,
+            data^,
+            _empty_sparse_binned(reference.n_features),
+            False,
+            kept^,
+            True,
+            n_rows,
+            reference.n_features,
+            label^,
+            weight^,
+            group^,
+            init_score^,
+            reference.feature_names.copy(),
+            reference.categorical_features.copy(),
+            reference.max_bin,
+            reference.use_missing,
+        )
+
     def write_to(self, mut writer: Some[Writer]):
         writer.write(
             "Dataset(n_rows=",
@@ -1016,10 +1260,23 @@ def train_dataset_multiclass(
         )
         return MulticlassModel(dataset.mapper.copy(), sparse_booster^)
 
+    # NOT `MULTICLASS`, and this is a bug that shipped and was measured.
+    # `objective_registry.MULTICLASS` is -1, a registry code meaning "this fit
+    # is a softmax fit". `device_policy` reads the same argument as a *trainer*
+    # objective, where -2 is OBJECTIVE_UNSPECIFIED and -1 is simply a code no
+    # trainer implements, so passing it made every multiclass GPU fit raise
+    # "objective code -1 is not one the built-in trainers implement". The
+    # first bench/real_data run after the patch found it here and in
+    # `model.fit_multiclass`, which had it for the same reason.
+    #
+    # Unspecified is the honest answer as well as the working one: a softmax
+    # fit grows one tree per class and each carries a single-output objective
+    # this entry point never sees. If the crossover rules should gate on
+    # multiclass as such, that is a case `device_policy` adds, not a code a
+    # caller can smuggle through an Int.
     var backend = resolve_device(
-        device, dataset.n_rows, dataset.n_features, n_classes, MULTICLASS
-    )  # MULTICLASS is the registry's code for a softmax fit, which this
-    # entry point is by construction and takes no objective argument for.
+        device, dataset.n_rows, dataset.n_features, n_classes
+    )
     var booster: MulticlassBooster
     if backend == GPU_DEVICE:
         booster = train_multiclass_gpu(

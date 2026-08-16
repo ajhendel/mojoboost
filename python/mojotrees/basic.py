@@ -327,10 +327,15 @@ class _Config:
         # keeps 'auto' on the CPU. The name resolved here travels in the
         # params dict and the trainer resolves it again natively, so no
         # decision is made in Python.
+        # The objective is part of every crossover rule in `device_policy`,
+        # and this call used to omit it while writing `params["objective"]`
+        # two statements later, so `device='auto'` could never select the
+        # accelerator from here.
         device = self.base._resolve_device(
             dataset.num_data(),
             n_features,
             self.n_classes if self.task == _eval.MULTICLASS else 1,
+            objective_code=int(self.objective_code),
             sparse=bool(getattr(dataset, "is_sparse", False)),
         )
         params = self.base._params(
@@ -1323,7 +1328,7 @@ class Booster:
                 return default
             return float(base._resolve_alias(name, alias, default))
 
-        lambda_l2 = _leaf("lambda_l2", "reg_lambda", 1.0)
+        lambda_l2 = _leaf("lambda_l2", "reg_lambda", 0.0)
         lambda_l1 = _leaf("lambda_l1", "reg_alpha", 0.0)
         max_delta_step = float(getattr(base, "max_delta_step", 0.0) or 0.0)
         path_smooth = float(getattr(base, "path_smooth", 0.0) or 0.0)

@@ -196,7 +196,7 @@ def test_categorical_marking_is_validated() raises:
 def test_more_categories_than_bins_is_rejected_in_search() raises:
     # A spec that claims more categories than the histogram has bins is
     # corrupt; the search must say so rather than read past the slice.
-    var hist = Histogram(
+    var hist = Histogram.from_planes(
         [0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0], [1, 1, 1, 1], 1, 4
     )
     var spec = CategoricalSpec([True], [0, 1, 2, 3, 4], [0, 5])
@@ -213,7 +213,7 @@ def test_onehot_search_isolates_one_category() raises:
     var grad: List[Float64] = [0.0, -4.0, 8.0, -4.0]
     var hess: List[Float64] = [0.0, 4.0, 4.0, 4.0]
     var count: List[Int] = [0, 4, 4, 4]
-    var hist = Histogram(grad^, hess^, count^, 1, 4)
+    var hist = Histogram.from_planes(grad^, hess^, count^, 1, 4)
     var spec = CategoricalSpec([True], [10, 20, 30], [0, 3])
 
     var split = find_best_split(
@@ -246,7 +246,7 @@ def test_sorted_search_groups_non_adjacent_categories() raises:
         grad.append(-6.0 if b % 2 == 0 else 6.0)
         hess.append(6.0)
         count.append(6)
-    var hist = Histogram(grad^, hess^, count^, 1, 7)
+    var hist = Histogram.from_planes(grad^, hess^, count^, 1, 7)
     var spec = CategoricalSpec([True], [0, 1, 2, 3, 4, 5], [0, 6])
 
     var split = find_best_split(
@@ -277,7 +277,7 @@ def test_max_cat_threshold_caps_the_set_size() raises:
         grad.append(Float64(b) - 10.5)
         hess.append(10.0)
         count.append(10)
-    var hist = Histogram(grad^, hess^, count^, 1, 21)
+    var hist = Histogram.from_planes(grad^, hess^, count^, 1, 21)
     var codes = List[Int]()
     for c in range(20):
         codes.append(c)
@@ -298,7 +298,7 @@ def test_max_cat_threshold_caps_the_set_size() raises:
 
 
 def test_categorical_rejects_monotonic_constraints() raises:
-    var hist = Histogram(
+    var hist = Histogram.from_planes(
         [0.0, 1.0, -1.0], [0.0, 1.0, 1.0], [0, 1, 1], 1, 3
     )
     var spec = CategoricalSpec([True], [0, 1], [0, 2])

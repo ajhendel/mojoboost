@@ -20,15 +20,22 @@ Growth also carries each frontier leaf's branch feature set, the features
 split on between the root and that leaf. When feature interaction
 constraints are configured, the branch set determines which features the
 leaf may split on; see interaction.mojo for the rule. With no constraints
-the branch sets stay empty and the allow masks stay empty, so the
-unconstrained path is unchanged.
+the allow mask is empty for every branch, so the branch set is never read;
+growth then leaves the branch sets empty too rather than building a list per
+split that nothing consumes, and the unconstrained path allocates nothing
+for interaction constraints at all.
 
 Feature subsampling (see sampling.mojo) draws one feature set per tree from
 `tree_index` and the seed, then optionally a set per depth and a set per
 node, in that order. Only the tree's set is ever accumulated into histograms,
 so excluded features cost nothing and sibling subtraction stays exact; the
 per-depth and per-node sets narrow the split search on top of that. Both
-inner fractions default to 1.0, which passes the tree's set through untouched.
+inner fractions default to 1.0, which passes the tree's set through
+untouched -- and when the tree's set is every feature (the default
+`feature_fraction`), a node's set is left empty instead of copied, since the
+empty list already means "every feature" to the split scan, the CEGB costing
+and the profile's cell count. That is the same selection with no per-node
+list allocation; a node draws only when some fraction actually narrows it.
 
 Exclusive feature bundling (see efb.mojo) is a histogram layout and nothing
 more. `grow_tree` optionally takes a `BundledMatrix`, and then each node's
@@ -79,12 +86,17 @@ from .efb import (
     expand_bundled_histogram,
 )
 from .histogram import (
+    ConstHessianSettings,
     Histogram,
     build_histogram_into,
     build_histogram_subset_into_scratch,
     subtract_histogram_into,
 )
-from .parallel import plan_row_blocks, run_row_blocks
+from .parallel import (
+    DispatchSettings,
+    plan_row_blocks_with,
+    run_row_blocks,
+)
 from .phase_profile import (
     HOST_HIST_DISPATCHES,
     HOST_PARTITION_DISPATCHES,
@@ -117,18 +129,33 @@ from .sampling import (
 )
 from .growth_policy import (
     GROW_LEAFWISE,
+    GROW_OBLIVIOUS,
+    OBLIVIOUS_MAX_DEPTH,
     GrowthSchedule,
     LeafCandidate,
+    ObliviousTrace,
+    SharedSplitAudit,
     check_grow_policy,
 )
-from .split import SplitInfo, find_best_split, soft_threshold_l1
+from .split import (
+    SplitInfo,
+    find_best_split,
+    find_best_split_shared,
+    soft_threshold_l1,
+)
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 
 
 struct TreeParams(Copyable, Movable):
     """Tree growth hyperparameters. `lambda_reg` is LightGBM's lambda_l2 and
-    `lambda_l1` its lambda_l1; both default to LightGBM's own defaults except
-    lambda_reg, which mojotrees defaults to 1.0 (see README). `constraints`
+    `lambda_l1` its lambda_l1; both default to LightGBM's own default, which
+    is 0.0 for each. `lambda_reg` defaulted to 1.0 until 2026-08-16, the last
+    tree default in this library that was not LightGBM's; it made every
+    benchmark arm carry an explicit `lambda_l2` to keep the two engines on
+    one regularizer, and it is stock now, so nothing has to be pinned to
+    compare them.
+
+    `constraints`
     holds LightGBM's interaction_constraints and defaults to unconstrained.
     `feature_fraction`, `feature_fraction_bynode`, and
     `feature_fraction_seed` are LightGBM's feature subsampling parameters
@@ -163,7 +190,16 @@ struct TreeParams(Copyable, Movable):
     split at one depth before any deeper one, `num_leaves` staying a hard
     bound and the last level admitted as a gain-ranked prefix. LightGBM has
     no such switch, so it is an extension rather than a parity row. The
-    default leaves every fit bit-identical."""
+    default leaves every fit bit-identical.
+
+    `GROW_OBLIVIOUS` is CatBoost's symmetric tree: one split is searched
+    across a whole level and applied to every leaf of it. `max_depth` binds
+    and is REQUIRED (a level count is the only bound there is);
+    `num_leaves` does not bind and is ignored, because a level splits
+    entirely or not at all. See `growth_policy.mojo` and
+    `docs/design/OBLIVIOUS.md`. Only the dense CPU grower
+    (`grow_tree_leaves_profiled`) implements it; every other grower refuses
+    the code rather than growing a tree that is not symmetric."""
 
     var num_leaves: Int
     var min_data_in_leaf: Int
@@ -217,11 +253,18 @@ struct TreeParams(Copyable, Movable):
 
     @staticmethod
     def default() -> TreeParams:
-        # LightGBM defaults (min_child_hess mirrors min_sum_hessian_in_leaf,
-        # lambda_l1 defaults to 0, interaction and monotonic constraints to
-        # none, both feature fractions to 1.0, and max_depth to -1, as in
-        # LightGBM).
-        return TreeParams(31, 20, 1.0, 1e-3, 0.0)
+        # LightGBM's stock defaults, every one of them, read from
+        # include/LightGBM/config.h at v4.7.0: num_leaves 31,
+        # min_data_in_leaf 20, lambda_l2 0.0 (`lambda_reg` here),
+        # min_sum_hessian_in_leaf 1e-3 (`min_child_hess`), lambda_l1 0.0.
+        # The remaining fields default in the signature above, also to
+        # LightGBM's values: max_depth -1, both feature fractions 1.0,
+        # interaction and monotonic constraints none.
+        #
+        # `tools/check_parity.py` asserts every number on this line against
+        # LightGBM's, so a default cannot drift off stock without failing a
+        # gate. Changing one is a change to every fit that did not set it.
+        return TreeParams(31, 20, 0.0, 1e-3, 0.0)
 
 
 struct Tree(Copyable, Movable):
@@ -350,6 +393,33 @@ struct Tree(Copyable, Movable):
                     "); feature contributions need every node's training row"
                     " count",
                 )
+
+    def reserve_nodes(mut self, n_nodes: Int):
+        """Size the ten per-node arrays for a tree of at most `n_nodes` nodes.
+
+        `_add_node` appends to ten separately allocated `List`s, each of which
+        doubles on its own schedule, so a grower that does not call this pays
+        ten independent geometric reallocation sequences per tree: for a
+        31-leaf tree that is ten lists times six doublings, and every doubling
+        copies what is already there. A grower knows its node budget before it
+        starts -- a tree with `num_leaves` leaves has exactly
+        `2 * num_leaves - 1` nodes at most -- so one reservation per tree
+        replaces all of it.
+
+        Reserve only; it never shrinks, never resizes, and leaves the tree's
+        length and contents alone, so calling it changes no value anywhere."""
+        if n_nodes <= 0:
+            return
+        self.feature.reserve(n_nodes)
+        self.threshold_bin.reserve(n_nodes)
+        self.left.reserve(n_nodes)
+        self.right.reserve(n_nodes)
+        self.value.reserve(n_nodes)
+        self.split_gain.reserve(n_nodes)
+        self.default_left.reserve(n_nodes)
+        self.missing_bin.reserve(n_nodes)
+        self.cat_offset.reserve(n_nodes)
+        self.count.reserve(n_nodes)
 
     def _add_node(mut self, value: Float64, count: Float64) -> Int:
         """Append a leaf holding `value`, covered by `count` training rows.
@@ -650,6 +720,7 @@ def partition_rows_into(
     rows: List[Int],
     split: SplitInfo,
     missing_bin: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """Route each of `rows` to the left or right child of `split`.
 
@@ -670,7 +741,13 @@ def partition_rows_into(
     # Each row is touched twice, and each touch is an indirect load of a bin
     # through a row id, so a row costs roughly three histogram ops rather than
     # one; the estimate is scaled up to match.
-    var blocks = plan_row_blocks(n, 3 * n)
+    # The last hot per-node dispatch that was still reading the environment.
+    # Every other one in the grower takes the fit-scoped snapshot; this one
+    # called the live `plan_row_blocks`, so a fit paid one `getenv` sweep --
+    # and, above the crossover, a whole `CpuProfile.detect()` -- per split.
+    # Unresolved settings fall through to the live path, so the default keeps
+    # every caller outside the grower working unchanged.
+    var blocks = plan_row_blocks_with(settings, n, 3 * n)
     var rows_p = rows.unsafe_ptr()
     var bins_p = data.bins.unsafe_ptr().unsafe_offset(
         split.feature * data.n_rows
@@ -731,6 +808,522 @@ def partition_rows_into(
     run_row_blocks(blocks, scatter_block)
 
 
+def fill_identity_rows(
+    mut rows: List[Int],
+    n: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """`rows` becomes `[0, 1, ..., n)`, filled over row blocks.
+
+    The grower's root row list, and the one row list in a tree that no
+    partition produces. It was also the last per-row pass in the partition
+    phase still running on one core: `n` stores per tree, 8 MB of them at a
+    million rows, and a hundred rounds of that in a fit.
+
+    Elementwise over disjoint ascending blocks, so `rows[i] == i` whatever the
+    block count and whatever `MOJOTREES_NUM_WORKERS` says. Nothing is
+    accumulated and nothing is reassociated: the list is identical index for
+    index to the one the serial loop wrote, at every worker count and on every
+    machine.
+
+    The block plan is charged one op per row. A fill is one store per row with
+    no indirection, which is the cheapest per-row work in this file, so it
+    reaches the parallel path later than the partition does on the same `n` --
+    deliberately, since a fill that fits in the dispatch overhead should stay
+    on one core.
+
+    The length is taken without initializing the new elements, which is what
+    the caller's next act -- writing every one of them -- makes safe, and it
+    is worth a pass: `resize(n, 0)` writes `8 * n` bytes of zeros that the
+    fill then immediately overwrites, so the root list cost `16 MB` of stores
+    at a million rows where it needs `8 MB`. `Int` is trivially destructible,
+    so shrinking this way cannot leak, and no element is readable before the
+    fill covers it.
+    """
+    if n < 0:
+        raise Error("row count must be nonnegative")
+    rows.resize(unsafe_uninit_length=n)
+    if n == 0:
+        return
+    var p = rows.unsafe_ptr()
+    var blocks = plan_row_blocks_with(settings, n, n)
+
+    def fill_block(b: Int) {imm}:
+        for i in range(blocks.start(b), blocks.end(b)):
+            p.unsafe_store(i, i)
+
+    run_row_blocks(blocks, fill_block)
+
+
+def _fill_identity_i32(
+    mut buf: List[Int32],
+    n: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """`buf[0 : n) = [0, n)`, over row blocks. `RowArena.root_identity`'s
+    body, split out so the closure captures a pointer into a plain list
+    argument rather than into a field of `self`."""
+    if n <= 0:
+        return
+    var p = buf.unsafe_ptr()
+    var blocks = plan_row_blocks_with(settings, n, n)
+
+    def fill_block(b: Int) {imm}:
+        for i in range(blocks.start(b), blocks.end(b)):
+            p.unsafe_store(i, Int32(i))
+
+    run_row_blocks(blocks, fill_block)
+
+
+def _fill_from_i32(
+    mut buf: List[Int32],
+    src_rows: List[Int],
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """`buf[0 : len(src_rows)) = src_rows`, narrowed to `Int32`, over row
+    blocks. `RowArena.root_from_bag`'s body, split out for the same reason."""
+    var n = len(src_rows)
+    if n <= 0:
+        return
+    var p = buf.unsafe_ptr()
+    var s = src_rows.unsafe_ptr()
+    var blocks = plan_row_blocks_with(settings, n, n)
+
+    def fill_block(b: Int) {imm}:
+        for i in range(blocks.start(b), blocks.end(b)):
+            p.unsafe_store(i, Int32(s.unsafe_load(i)))
+
+    run_row_blocks(blocks, fill_block)
+
+
+@fieldwise_init
+struct LeafSpan(Copyable, Movable):
+    """One node's rows, as a window into a `RowArena` rather than a list.
+
+    `side` names which of the arena's two buffers holds them: 0 for `a`, 1 for
+    `b`. A span is meaningless without it, which is why the three travel
+    together and why a leaf state carries a `LeafSpan` and not a bare pair of
+    integers.
+    """
+
+    var begin: Int
+    var count: Int
+    var side: Int
+
+    @always_inline
+    def end(self) -> Int:
+        return self.begin + self.count
+
+
+@fieldwise_init
+struct ArenaPartition(Copyable, Movable):
+    """The two child spans `partition_arena_span` produced. Both name the
+    buffer the parent's did not, and together they cover the parent's window
+    exactly: `left.begin == parent.begin`, `right.begin == left.end()`, and
+    `right.end() == parent.end()`."""
+
+    var left: LeafSpan
+    var right: LeafSpan
+
+
+struct RowArena(Movable):
+    """A row-id permutation and its double buffer, owned once and reused.
+
+    Growth today allocates two fresh `List[Int]` per split and one fresh
+    `List[Int]` of every row per tree. At a million rows that is 8 MB for the
+    root plus, over a 31-leaf tree, one write of every internal node's rows
+    into a freshly faulted page -- around 48 MB of first-touch traffic and 61
+    allocations per tree, times a hundred rounds.
+
+    An arena replaces all of it with two `Int32` arrays of `n_rows`, allocated
+    once and never freed until the arena is. Each leaf owns a disjoint window
+    of one of them, and a split rewrites the parent's window into *the same
+    window of the other buffer*, left side first. Nothing is allocated, and
+    the children's spans are `(begin, n_left)` and `(begin + n_left, n -
+    n_left)` on the opposite side.
+
+    Two buffers rather than one, which is the whole reason this is not
+    `gpu_active_rows.partition_range_host` with the types changed. That
+    function scatters into a scratch and then copies the window back so the
+    result lands in the buffer it started in, which is what a device-resident
+    permutation with one canonical address needs. On the host nothing needs a
+    canonical address -- a leaf state can carry which buffer it is in -- so the
+    copy-back pass is pure loss: one extra read and one extra write of every
+    row at every split, which over a balanced 31-leaf tree at a million rows
+    is 40 MB per tree of traffic that buys nothing. Ping-pong deletes it. The
+    partition itself is the same algorithm, and both produce the same bytes.
+
+    **Element type.** `Int32` halves every row-id load and store against the
+    `List[Int]` lists it replaces, and a bin matrix is indexed by an `Int`
+    row anyway so nothing downstream widens. It bounds a dataset at 2^31 rows,
+    which is the same bound `gpu_active_rows` already imposes on any fit that
+    reaches the device.
+
+    **Order.** The partition is stable and order-preserving: each side comes
+    out in ascending position order, exactly the order `partition_rows_into`
+    leaves its two lists in. That is not a nicety. Histogram accumulation
+    visits a node's rows in the order the row list gives them and sums
+    `Float64` in that order, so a partition that permuted a side would move
+    every histogram cell below it. The equality is checked element for element
+    in `tests/test_cpu_partition.mojo`.
+    """
+
+    var a: List[Int32]
+    var b: List[Int32]
+    var n: Int
+    """Rows the arena is currently sized for. The buffers are never shrunk, so
+    `len(a)` can exceed this after a smaller dataset."""
+
+    def __init__(out self):
+        self.a = List[Int32]()
+        self.b = List[Int32]()
+        self.n = 0
+
+    def ensure(mut self, n: Int) raises:
+        """Size both buffers for `n` rows, growing only.
+
+        A booster holding one arena across a fit allocates here on the first
+        tree and never again, which is the point of the type. `n` above 2^31
+        is refused rather than truncated into an `Int32`.
+        """
+        if n < 0:
+            raise Error("row count must be nonnegative")
+        if n > 2147483647:
+            raise Error(
+                "row arena holds Int32 row ids and cannot address ",
+                n,
+                " rows",
+            )
+        if len(self.a) < n:
+            self.a.resize(n, Int32(0))
+        if len(self.b) < n:
+            self.b.resize(n, Int32(0))
+        self.n = n
+
+    def root_identity(
+        mut self,
+        n: Int,
+        settings: DispatchSettings = DispatchSettings.unresolved(),
+    ) raises -> LeafSpan:
+        """Fill buffer `a` with `[0, n)` and return the root's span.
+
+        The arena form of `fill_identity_rows`, and the same argument: it is
+        elementwise over disjoint ascending blocks, so the buffer is identical
+        at every worker count. Half the stores of the `List[Int]` form,
+        because the ids are `Int32`.
+        """
+        self.ensure(n)
+        _fill_identity_i32(self.a, n, settings)
+        return LeafSpan(0, n, 0)
+
+    def root_from_bag(
+        mut self,
+        bag: List[Int],
+        settings: DispatchSettings = DispatchSettings.unresolved(),
+    ) raises -> LeafSpan:
+        """Fill buffer `a` with `bag` and return the root's span.
+
+        The bagged root. `bag` is ascending and duplicate-free by
+        `sampling.check_row_set`, which the grower has already enforced, and
+        this copies it position for position, so the arena root is the bag in
+        the bag's own order.
+        """
+        var n = len(bag)
+        self.ensure(n)
+        _fill_from_i32(self.a, bag, settings)
+        return LeafSpan(0, n, 0)
+
+    def row_at(self, span: LeafSpan, i: Int) raises -> Int:
+        """The `i`-th row id of `span`. For tests and for the few per-node
+        consumers that read a handful of rows; a bulk consumer takes the
+        window."""
+        if i < 0 or i >= span.count:
+            raise Error("row index escapes the span")
+        var j = span.begin + i
+        return Int(self.a[j]) if span.side == 0 else Int(self.b[j])
+
+    def span_rows(self, span: LeafSpan) raises -> List[Int]:
+        """`span` materialized as the `List[Int]` the rest of the package
+        still speaks.
+
+        A bridge, and it is worth being exact about what it costs and who
+        needs it. Two consumers on the CPU path take a whole node's row ids as
+        a `List[Int]` and cannot take a window of `Int32`:
+
+        - `histogram.build_histogram_subset_into_scratch`, which already takes
+          a `(rows, row_start, row_count)` window and so needs only an
+          `Int32` overload of that window, not a new calling convention;
+        - `cegb.prepare_cegb_node` and `cegb.cegb_commit_split`, which read
+          rows only when a lazy penalty is configured and return immediately
+          otherwise.
+
+        Until those exist, a caller that wants the arena and one of them pays
+        `8 * count` bytes and one allocation here, which is exactly the cost
+        the arena removed. That is why the grower does not call this on its
+        hot path and why this function is not the integration: it is what a
+        test uses to compare the arena against the shipped partition, and what
+        a CEGB-configured node can use without a new histogram signature.
+        """
+        if span.begin < 0 or span.count < 0 or span.end() > self.n:
+            raise Error("span escapes the arena")
+        var out = List[Int](capacity=span.count)
+        out.resize(span.count, 0)
+        if span.side == 0:
+            for i in range(span.count):
+                out[i] = Int(self.a[span.begin + i])
+        else:
+            for i in range(span.count):
+                out[i] = Int(self.b[span.begin + i])
+        return out^
+
+
+def _partition_span_into(
+    src: List[Int32],
+    mut dst: List[Int32],
+    begin: Int,
+    n: Int,
+    data: BinnedMatrix,
+    split: SplitInfo,
+    missing_bin: Int,
+    settings: DispatchSettings,
+) raises -> Int:
+    """`src[begin : begin + n)` routed into `dst[begin : begin + n)`, left side
+    first, returning the left count.
+
+    `partition_arena_span`'s body, with the two buffers named rather than
+    selected out of the arena. Split out for two reasons: the closures capture
+    pointers into plain list arguments instead of into fields of a struct,
+    which is what the origin checker will carry into a parallel closure; and
+    the source is `read` while only the destination is `mut`, which states in
+    the signature that ping-pong never writes the window it is reading.
+    """
+    var blocks = plan_row_blocks_with(settings, n, 3 * n)
+    var src_p = src.unsafe_ptr()
+    var dst_p = dst.unsafe_ptr()
+    var bins_p = data.bins.unsafe_ptr().unsafe_offset(
+        split.feature * data.n_rows
+    )
+    var is_cat = split.is_categorical
+    var default_left = split.default_left
+    var threshold = split.bin
+
+    @always_inline
+    def goes_left(bin: Int) {imm} -> Bool:
+        if is_cat:
+            return split.goes_left(bin)
+        if bin == missing_bin:
+            return default_left
+        return bin <= threshold
+
+    var left_counts = List[Int](capacity=blocks.n_blocks)
+    left_counts.resize(blocks.n_blocks, 0)
+    var counts_p = left_counts.unsafe_ptr()
+
+    def count_block(b: Int) {imm}:
+        var c = 0
+        for i in range(blocks.start(b), blocks.end(b)):
+            var r = Int(src_p.unsafe_load(begin + i))
+            if goes_left(Int(bins_p.unsafe_load(r))):
+                c += 1
+        counts_p.unsafe_store(b, c)
+
+    run_row_blocks(blocks, count_block)
+
+    # Exclusive prefix sum over the per-block left counts, in place.
+    var total_left = 0
+    for b in range(blocks.n_blocks):
+        var c = left_counts[b]
+        left_counts[b] = total_left
+        total_left += c
+
+    def scatter_block(b: Int) {imm}:
+        var start = blocks.start(b)
+        var li = begin + counts_p.unsafe_load(b)
+        var ri = begin + total_left + (start - counts_p.unsafe_load(b))
+        for i in range(start, blocks.end(b)):
+            var r = src_p.unsafe_load(begin + i)
+            if goes_left(Int(bins_p.unsafe_load(Int(r)))):
+                dst_p.unsafe_store(li, r)
+                li += 1
+            else:
+                dst_p.unsafe_store(ri, r)
+                ri += 1
+
+    run_row_blocks(blocks, scatter_block)
+    return total_left
+
+
+def partition_arena_span(
+    mut arena: RowArena,
+    span: LeafSpan,
+    data: BinnedMatrix,
+    split: SplitInfo,
+    missing_bin: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> ArenaPartition:
+    """Route `span`'s rows to the left or right child of `split`, in place.
+
+    `partition_rows_into` with the two freshly allocated `List[Int]` sides
+    replaced by one window of the arena's *other* buffer: the left side lands
+    at `span.begin` and the right at `span.begin + n_left`, so the two
+    children partition the parent's window with no gap and no allocation. The
+    parent's own window is left untouched, which is what lets a caller that
+    has not finished with it -- a CEGB commit, a diagnostic -- still read it.
+
+    Routing is the same rule, and it is the rule and not a copy of it: a
+    categorical split routes by set membership; otherwise rows in the
+    feature's missing bin follow the split's default direction instead of the
+    threshold, and a feature with no missing bin (-1) has none of them.
+
+    Two passes, same as `partition_rows_into`: count per block, exclusive
+    prefix-sum the per-block left counts, then scatter. Block b's rows land at
+    `begin + prefix_left[b]` on the left and at `begin + n_left + (local_start
+    - prefix_left[b])` on the right. Both sides therefore come out in
+    ascending position order whatever the block count -- the result is
+    identical to the serial single-pass partition, index for index, and
+    identical to `partition_rows_into`'s `left` followed by its `right`, also
+    index for index. `tests/test_cpu_partition.mojo` asserts exactly that,
+    with integer equality and no tolerance, because it is the property the
+    whole design rests on: histogram accumulation sums `Float64` in row-list
+    order, so a side that came out permuted would move every histogram cell
+    beneath this node and every leaf value under it.
+
+    **Against LightGBM's `DataPartition::Split`.** LightGBM keeps one global
+    `indices_` array with a `(leaf_begin_, leaf_count_)` per leaf, which is
+    the same structure as one `RowArena` buffer and a `LeafSpan` per leaf.
+    Its runner differs from this one in two places, and both differences are
+    deliberate here:
+
+    - *Per-thread temporary buffers.* LightGBM's threads each append their
+      left and right rows into thread-local arrays, because a thread does not
+      know where its rows belong until every earlier thread has finished. This
+      partition counts first and prefix-sums the per-block counts, so each
+      block knows its exact destination offsets before it writes a single row
+      and scatters straight into disjoint ranges of the destination. That
+      removes the temporaries rather than reorganizing them: it changes
+      neither the block plan (`plan_row_blocks_with`, unchanged, on the
+      unchanged three-ops-per-row estimate) nor who owns a buffer, because
+      there is no buffer to own. The trade is one extra read of the split
+      feature's bins -- one `UInt8` per row -- against one fewer write of
+      every row id, which is four bytes.
+    - *The final ordered copy-back.* In LightGBM that pass is what reassembles
+      the thread-local arrays into `indices_` in block order, and it is what
+      makes their partition stable. Here the prefix-summed scatter is already
+      the ordered write, so a copy-back would only move the result back to the
+      address it started at. `partition_arena_span_inplace` is that variant,
+      for a caller that needs the single-array invariant; this one ping-pongs
+      instead and hands the children the other buffer, which is one read and
+      one write of every row per split cheaper. See that function for the
+      arithmetic.
+
+    `settings` is the fit's dispatch snapshot and is threaded to the one
+    `plan_row_blocks_with` below, exactly as `partition_rows_into` threads it.
+    A partition that dropped it would put a `getenv` sweep and a core
+    detection back on the per-split path.
+    """
+    if span.side != 0 and span.side != 1:
+        raise Error("span side must be 0 or 1")
+    if span.begin < 0 or span.count < 0 or span.end() > arena.n:
+        raise Error("span escapes the arena")
+    if split.feature < 0 or split.feature >= data.n_features:
+        raise Error("split feature out of range")
+
+    var begin = span.begin
+    var n = span.count
+    var dst_side = 1 - span.side
+    if n == 0:
+        return ArenaPartition(
+            LeafSpan(begin, 0, dst_side), LeafSpan(begin, 0, dst_side)
+        )
+
+    # The two buffers are named by the branch rather than selected into a
+    # variable, because `a` and `b` are distinct fields and one of them has to
+    # be the mutable argument while the other stays a read-only one.
+    var total_left: Int
+    if span.side == 0:
+        total_left = _partition_span_into(
+            arena.a, arena.b, begin, n, data, split, missing_bin, settings
+        )
+    else:
+        total_left = _partition_span_into(
+            arena.b, arena.a, begin, n, data, split, missing_bin, settings
+        )
+
+    return ArenaPartition(
+        LeafSpan(begin, total_left, dst_side),
+        LeafSpan(begin + total_left, n - total_left, dst_side),
+    )
+
+
+def _copy_span(
+    src: List[Int32],
+    mut dst: List[Int32],
+    begin: Int,
+    n: Int,
+    settings: DispatchSettings,
+) raises:
+    """`dst[begin : begin + n) = src[begin : begin + n)`, over row blocks.
+    Elementwise over disjoint ascending blocks, so the window is identical at
+    every block count."""
+    if n <= 0:
+        return
+    var src_p = src.unsafe_ptr()
+    var dst_p = dst.unsafe_ptr()
+    var blocks = plan_row_blocks_with(settings, n, n)
+
+    def copy_block(b: Int) {imm}:
+        for i in range(blocks.start(b), blocks.end(b)):
+            dst_p.unsafe_store(begin + i, src_p.unsafe_load(begin + i))
+
+    run_row_blocks(blocks, copy_block)
+
+
+def partition_arena_span_inplace(
+    mut arena: RowArena,
+    span: LeafSpan,
+    data: BinnedMatrix,
+    split: SplitInfo,
+    missing_bin: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> ArenaPartition:
+    """`partition_arena_span` with LightGBM's ordered copy-back, so both
+    children come out on the side their parent was on.
+
+    LightGBM's `DataPartition::Split` finishes by copying the partitioned
+    range back into the global `indices_` array, and `gpu_active_rows.
+    partition_range_host` does the same for the device's single resident
+    permutation. This is that contract: one array is canonical, a leaf's rows
+    are always at `indices[begin : begin + count)` of it, and a caller never
+    has to track which buffer a span is in. The result is byte for byte what
+    `partition_arena_span` produces -- same routing, same stable order, same
+    left count -- landed at the same addresses instead of the mirrored ones.
+
+    **It costs a full extra pass over the window**: one read and one write of
+    every row id per split. Over a 31-leaf tree at a million rows the sum of
+    internal node sizes is around 5 million rows, so at four bytes a row that
+    is a **derived bound** of 5e6 x 8 = 40 MB of extra traffic per tree, and
+    4 GB over a 100-round fit, buying only that the result lands at the
+    address it started at. Nothing on the CPU path needs that: a `_LeafState`
+    can carry its span's side in the same word it carries its depth. So
+    `partition_arena_span` is the one a grower should call, and this exists
+    for a caller that has to hold the single-array invariant -- a diagnostic
+    comparing against the device, or a consumer that indexes one canonical
+    buffer.
+    """
+    var got = partition_arena_span(
+        arena, span, data, split, missing_bin, settings
+    )
+    if span.count > 0:
+        if span.side == 0:
+            _copy_span(arena.b, arena.a, span.begin, span.count, settings)
+        else:
+            _copy_span(arena.a, arena.b, span.begin, span.count, settings)
+    return ArenaPartition(
+        LeafSpan(got.left.begin, got.left.count, span.side),
+        LeafSpan(got.right.begin, got.right.count, span.side),
+    )
+
+
 struct _HistPool(Movable):
     """Free-list of histogram buffers of one shape.
 
@@ -741,6 +1334,31 @@ struct _HistPool(Movable):
     around 600 KB per node: large enough that the allocator hands back fresh
     pages and faults them in every time. Recycling keeps that cost to the
     first few nodes of the first tree.
+
+    **The free list needs no cap, and this paragraph is here so the idea is
+    not re-proposed.** Follow the counts. The first tree allocates on the root
+    take and on every split thereafter, so it creates exactly `num_leaves + 1`
+    buffers and never more; from the second tree on it creates none, because
+    the frontier drain at the end of a tree returns every buffer it held. The
+    free list is therefore self-bounding at `num_leaves + 1`, which is the
+    same number that is *live* in the frontier at the end of every tree. A cap
+    below that would not lower the high-water mark by one byte -- the buffers
+    it refused to keep are ones the very next tree has to hold simultaneously
+    anyway -- it would only reintroduce the per-tree allocation this pool
+    exists to remove.
+
+    The residency it does imply, as a derived bound rather than a
+    measurement: `(num_leaves + 1) * 24 * n_features * n_bins` bytes, the 24
+    being `Float64` gradient plus `Float64` hessian plus `Int` count per cell.
+    At the benchmark shape (31 leaves, 50 features, 255 bins) that is 9.3 MiB
+    against a 50 MB binned matrix, and it scales with `num_leaves` rather than
+    with rows. If that ceiling ever becomes the problem, the thing to change
+    is the frontier holding one histogram per leaf, not this free list.
+
+    Allocation is also not a speed cost here, and that is measured rather than
+    argued: the in-run phase profile puts `hist_alloc` at 0.005 percent of the
+    serial round at 1,000,000 x 50 (bench/results/cpu_round1_2026-08-16). The
+    pool is already doing its job.
     """
 
     var free: List[Histogram]
@@ -801,10 +1419,27 @@ struct GrowScratch(Movable):
 
     var pool: _HistPool
     var pairs: List[Float64]
+    var settings: DispatchSettings
 
-    def __init__(out self, n_features: Int, n_bins: Int):
+    def __init__(out self, n_features: Int, n_bins: Int) raises:
         self.pool = _HistPool(n_features, n_bins)
         self.pairs = List[Float64]()
+        # The scheduling environment, read once here and then never again for
+        # the life of this scratch. Every dispatch the grower makes -- the
+        # histogram builds, the sibling subtractions, the split scans -- takes
+        # this snapshot instead of re-reading `getenv` and re-detecting the
+        # core counts per call, which is what they all did before.
+        #
+        # A snapshot does not depend on the histogram shape, so `prepare` does
+        # not rebuild it: pointing a scratch at a different matrix does not
+        # change what the machine is or what the user asked for.
+        #
+        # One behaviour change worth naming rather than discovering: an
+        # off-ladder `MOJOTREES_CPU_FEATURE_GROUP` is refused by
+        # `env_feature_group`, and that refusal now surfaces when the scratch
+        # is constructed rather than at the first histogram build. Earlier,
+        # and with the same message.
+        self.settings = DispatchSettings.resolve()
 
     def prepare(mut self, n_features: Int, n_bins: Int) raises:
         """Point this scratch at a histogram shape, discarding pooled buffers
@@ -840,14 +1475,27 @@ def _leaf_value(
     var g = 0.0
     var h = 0.0
     for b in range(hist.n_bins):
-        g += hist.grad[base + b]
-        h += hist.hess[base + b]
+        g += hist.grad_at(base + b)
+        h += hist.hess_at(base + b)
     var value = -soft_threshold_l1(g, lambda_l1) / (h + lambda_reg)
     if max_delta_step <= 0.0 and path_smooth <= 0.0:
         return value
     return finish_leaf_output(
         value, max_delta_step, path_smooth, n_data, parent_output
     )
+
+
+def _scan_cells(features: List[Int], n_features: Int, n_bins: Int) -> Int:
+    """The cells one node's split scan reads, for `PhaseProfile.charge`.
+
+    A node's feature list is empty exactly when it did not draw one, and an
+    empty list means every feature to the scan -- the same convention
+    `find_best_split` and `prepare_cegb_node` use. A drawn list is never
+    empty (`sampling.selection_count` floors at 2), so the two cases cannot
+    be confused. Resolving it here keeps the charge equal to what the scan
+    actually reads instead of charging zero for an undrawn node."""
+    var n_active = len(features) if len(features) > 0 else n_features
+    return n_active * n_bins
 
 
 def _search(
@@ -867,6 +1515,7 @@ def _search(
     grower_applies_extra: Bool = False,
     cegb: CegbNodeCosts = CegbNodeCosts.inactive(),
     grower_applies_cegb: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises -> SplitInfo:
     """Best split for one node. `allowed` is the node's interaction-constraint
     allow mask and `features` its subsampled feature ids; empty means every
@@ -940,6 +1589,7 @@ def _search(
         tree_index=tree_index,
         parent_output=parent_output,
         cegb=cegb,
+        settings=settings,
     )
 
 
@@ -955,14 +1605,14 @@ def _expand_bundled(
     taken from a struct field carries that field's origin.
     """
     expand_bundled_histogram(
-        hist.grad,
-        hist.hess,
-        hist.count,
+        hist._grad,
+        hist._hess,
+        hist._count,
         hist.n_bins,
         bundled.plan,
-        scratch.grad,
-        scratch.hess,
-        scratch.count,
+        scratch._grad,
+        scratch._hess,
+        scratch._count,
         scratch.n_bins,
         features,
     )
@@ -978,6 +1628,8 @@ def _hist_full(
     features: List[Int],
     columns: List[Int],
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """Accumulate every row into `hist`, which is always per feature.
 
@@ -1005,10 +1657,14 @@ def _hist_full(
     exactly what it would have seen on the three-plane path.
     """
     if not bundled.active:
-        build_histogram_into(hist, data, grad, hess, features, const_hessian)
+        build_histogram_into(
+            hist, data, grad, hess, features, const_hessian, settings,
+            const_hessian_env,
+        )
         return
     build_histogram_into(
-        scratch, bundled.data, grad, hess, columns, const_hessian
+        scratch, bundled.data, grad, hess, columns, const_hessian, settings,
+        const_hessian_env,
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -1027,6 +1683,8 @@ def _hist_subset(
     features: List[Int],
     columns: List[Int],
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """`_hist_full` for a row subset. Row ids index the original matrix and the
     bundled one identically, because bundling rearranges columns and never
@@ -1050,14 +1708,544 @@ def _hist_subset(
     if not bundled.active:
         build_histogram_subset_into_scratch(
             hist, pairs, data, grad, hess, rows, start, count, features,
-            const_hessian,
+            const_hessian, settings, const_hessian_env,
         )
         return
     build_histogram_subset_into_scratch(
         scratch, pairs, bundled.data, grad, hess, rows, start, count, columns,
-        const_hessian,
+        const_hessian, settings, const_hessian_env,
     )
     _expand_bundled(hist, scratch, bundled, features)
+
+
+def _check_oblivious(params: TreeParams, data: BinnedMatrix) raises:
+    """What `grow_policy = oblivious` refuses, asked once per tree before the
+    root histogram rather than part way down a level.
+
+    Every item here is refused rather than half-applied, which is this
+    package's rule for a parameter whose meaning does not survive the mode
+    (see `find_best_split`'s treatment of `extra_trees` on categoricals).
+
+    - `max_depth` is REQUIRED and is the only bound. A level splits entirely
+      or not at all, so `num_leaves` cannot be met exactly and is ignored.
+      CatBoost resolves the same collision by overwriting `max_leaves` with
+      `1 << depth` and raising if the user set a different value
+      (`catboost/private/libs/options/catboost_options.cpp`: "max_leaves
+      option works only with lossguide tree growing"); `TreeParams` cannot
+      tell a defaulted `num_leaves` from an explicit one, so we ignore it and
+      say so here and in the module docstring rather than raise on a value
+      the caller never chose.
+    - A categorical feature's candidates are category *sets*, ordered by that
+      node's own gradient/hessian ratios inside `find_best_categorical_split`.
+      There is no one set to share across a level without a different search,
+      so the combination is refused rather than searched per leaf and
+      averaged into something that is not a partition.
+    - Forced splits describe a specific asymmetric binary tree; applying one
+      to a single leaf of a level is exactly the thing this mode does not do.
+    - `extra_trees` draws one threshold per node, and the CEGB penalties that
+      read the ensemble ledger are charged per node. Both are refused by
+      `find_best_split_shared` too; asked here so the message arrives before
+      any work.
+    """
+    if params.max_depth <= 0:
+        raise Error(
+            "grow_policy=oblivious requires max_depth > 0: a symmetric tree"
+            " is bounded by its depth and by nothing else (num_leaves does"
+            " not bind, because a level splits entirely or not at all)."
+            " CatBoost's own default is depth=6"
+        )
+    if params.max_depth > OBLIVIOUS_MAX_DEPTH:
+        raise Error(
+            "grow_policy=oblivious refuses max_depth > ",
+            OBLIVIOUS_MAX_DEPTH,
+            ": depth d costs 2^(d+1) - 1 nodes unconditionally, so ",
+            params.max_depth,
+            " would build a tree of that size whatever the data does",
+        )
+    if data.cats.any_categorical():
+        raise Error(
+            "grow_policy=oblivious is implemented for numerical thresholds"
+            " only; a categorical feature is searched as category partitions"
+            " whose order comes from one node's own statistics, and a level"
+            " shares one split"
+        )
+    if not params.extra.forced.is_empty():
+        raise Error(
+            "forced splits describe an asymmetric binary tree and"
+            " grow_policy=oblivious applies one split to every leaf of a"
+            " level; the two cannot both hold"
+        )
+    if params.extra.extra_trees:
+        raise Error(
+            "extra_trees draws one threshold per node and a level of an"
+            " oblivious tree has one split for every node in it"
+        )
+    if params.extra.penalties.cegb.is_active():
+        raise Error(
+            "the CEGB penalties are charged per node against a ledger that"
+            " spans the ensemble; grow_policy=oblivious commits one split per"
+            " level and that accounting is not written"
+        )
+
+
+def _grow_oblivious_levels(
+    mut profile: PhaseProfile,
+    mut scratch: GrowScratch,
+    mut tree: Tree,
+    mut frontier: List[_LeafState],
+    mut bundle_scratch: Histogram,
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    params: TreeParams,
+    tree_features: List[Int],
+    tree_columns: List[Int],
+    value_feature: Int,
+    per_node_draw: Bool,
+    signs: List[Int],
+    constrained: Bool,
+    bundling: BundledMatrix,
+    const_hessian: Bool,
+    const_h_env: ConstHessianSettings,
+    hist_cells: Int,
+    tree_index: Int,
+) raises -> Int:
+    """Grow the rest of an oblivious tree from a frontier holding its root,
+    and answer the finished leaf count.
+
+    One level at a time. The level is the whole frontier -- every leaf of an
+    oblivious tree sits at the same depth by construction, which this asserts
+    rather than assumes -- and it costs exactly:
+
+      1 shared split search  (`split.find_best_split_shared`, one dispatch)
+      L partitions           (leaf by leaf, row order preserved)
+      L histogram builds     (the smaller child of each pair)
+      L subtractions         (the larger child, derived)
+
+    against a depth-wise level's L searches for the same L partitions,
+    builds, and subtractions. **Derived bound, not a measurement:** search
+    dispatches per tree fall from `num_leaves - 1` to `max_depth`, which at
+    depth 6 is 63 to 6. Nothing else about the per-level work changes, so
+    this removes fan-out and barrier cost and no arithmetic.
+
+    Leaf numbering and node-id order, which are a cross-backend contract
+    --------------------------------------------------------------------
+    **Leaf index is the bit pattern of a row's outcomes with the FIRST
+    level's outcome as the LEAST significant bit**: a leaf at depth d has
+    index `sum_l b_l * 2^l`, where `b_l` is 0 if the row went left at level l
+    and 1 if it went right. That is CatBoost's numbering
+    (`catboost/private/libs/algo/index_calcer.cpp`:
+    `const ui32 splitWeight = 1 << splitParams.Depth;` and
+    `indices[doc] += cmpOp(...) * level`), and it is what the device
+    implements, so it is not ours to choose. Concretely: the left child keeps
+    its parent's index and the right child adds `1 << level_depth`.
+
+    **Node ids are assigned level by level, over the level's leaves in
+    ascending LEAF INDEX, left child before right.** That is NOT ascending
+    node id: at level 2 the leaves in node-id order are indices 0, 2, 1, 3,
+    so the two orders first diverge when level 2's children are created, and
+    a depth-3 tree already tells them apart. Host and device must agree on
+    node ids or the node-identity test between them fails on trees that are
+    both correct, which is why this is written down here rather than left to
+    whatever the container did.
+
+    The frontier itself is the same `_LeafState` list the leaf-wise loop
+    keeps, with the same convention: a split replaces its parent's slot with
+    the left child and appends the right. `leaf_ix` below is maintained in
+    exact lockstep with it (slot i keeps the left child's index, the append
+    carries the right child's), which is what lets the order above be read
+    off the frontier without storing anything in `_LeafState` that the other
+    two policies would have to carry. The `_LeafState.split` field is unused
+    in this mode -- there is no per-leaf best split -- and is left as "none"
+    rather than filled with a number no one may read.
+
+    Empty leaves, which are a property of the mode and not a bug
+    ------------------------------------------------------------
+    A leaf that was illegal at the chosen candidate is split anyway, and its
+    split may send every one of its rows one way. The empty child is a real
+    leaf of the tree: it is never reached by a training row, it can be
+    reached at prediction time, and it emits 0.0 (clamped into its parent's
+    monotone interval). That is CatBoost's answer too -- `CalcAverage` in
+    `catboost/private/libs/algo_helpers/online_predictor.h` returns 0 for a
+    child of zero weight -- and it also avoids the 0/0 that `_leaf_value`
+    would produce at `lambda_l2 = 0`. The consequence a caller has to know:
+    an oblivious tree can carry nodes whose cover is 0, so
+    `Tree.check_node_counts` (and therefore exact feature contributions)
+    will refuse such a tree. Nothing else reads node covers that way.
+
+    CatBoost deletes a level whose every leaf produced an empty child and
+    stops growth there (`greedy_tensor_search.cpp`,
+    `GetRedundantSplitIdx(GetIsLeafEmpty(...))`). That rule is unreachable
+    here and is deliberately not implemented: a chosen split must have a
+    strictly positive summed gain, a leaf with an empty child contributes
+    either zero (it failed `min_child_hess`/`min_data_in_leaf`) or exactly
+    0.0 (both minima are off, and the candidate's two terms then equal the
+    parent term), so a level in which every leaf had an empty child sums to
+    0.0 and is never chosen. Building the check would be building a gate that
+    cannot open.
+    """
+    var trace = ObliviousTrace.resolve()
+    var max_delta_step = params.extra.max_delta_step
+    var path_smooth = params.extra.path_smooth
+    var n_leaves = len(frontier)
+    var level_depth = 0
+    if len(frontier) != 1:
+        raise Error(
+            "oblivious growth starts from the root alone; this frontier holds",
+            " ",
+            len(frontier),
+            " leaves",
+        )
+    # Leaf index per frontier slot, the root's being 0. Maintained in lockstep
+    # with `frontier` below: the split writes the left child's index into the
+    # parent's slot and appends the right child's, exactly as the frontier
+    # does with the states themselves.
+    var leaf_ix = List[Int](capacity=1)
+    leaf_ix.append(0)
+
+    while level_depth < params.max_depth:
+        # The level in ascending LEAF INDEX, which is the cross-backend
+        # contract and is not ascending node id (see the docstring).
+        # Selection sort: a level is at most 2^max_depth wide and this keeps
+        # the order checkable by eye, which is the argument
+        # `growth_policy.rank_level` makes for the same shape.
+        var order = List[Int](capacity=len(frontier))
+        var last_ix = -1
+        while len(order) < len(frontier):
+            var best = -1
+            for i in range(len(frontier)):
+                if leaf_ix[i] <= last_ix:
+                    continue
+                if best < 0 or leaf_ix[i] < leaf_ix[best]:
+                    best = i
+            if best < 0:
+                break
+            last_ix = leaf_ix[best]
+            order.append(best)
+        if len(order) != len(frontier):
+            raise Error("oblivious frontier holds a repeated leaf index")
+        for k in range(len(order)):
+            if frontier[order[k]].depth != level_depth:
+                raise Error(
+                    "oblivious frontier leaf ",
+                    frontier[order[k]].node,
+                    " sits at depth ",
+                    frontier[order[k]].depth,
+                    " in a level at depth ",
+                    level_depth,
+                    "; every leaf of a symmetric tree sits at the same depth",
+                )
+
+        var level_rows = 0
+        for k in range(len(order)):
+            level_rows += len(frontier[order[k]].rows)
+        # If the level as a whole cannot make two legal children then no leaf
+        # in it can, so every candidate would sum to 0.0 and nothing would be
+        # chosen. Answering it here costs one comparison instead of a scan.
+        if level_rows < 2 * params.min_data_in_leaf or level_rows < 2:
+            trace.stop(tree_index, level_depth, String("level too small"))
+            break
+
+        # Leaf index 0 is the all-left path, whose node is the first one
+        # created at every level, so `order[0]` is also the level's lowest
+        # node id and the key below does not depend on the ordering rule.
+        var level_node = frontier[order[0]].node
+
+        # One feature draw for the whole level, keyed by its lowest node id.
+        # A per-node draw would give the leaves of one level different
+        # candidate sets, and they have to agree on one split.
+        var level_features = List[Int]()
+        if per_node_draw:
+            level_features = select_split_features(
+                tree_features,
+                params.feature_fraction_bylevel,
+                params.feature_fraction_bynode,
+                params.feature_fraction_seed,
+                tree_index,
+                level_depth,
+                level_node,
+            )
+
+        # The level's interaction-constraint mask is the INTERSECTION over
+        # its leaves: the shared split lands in every branch, so a feature
+        # any one of them forbids is forbidden for the level.
+        var allowed = List[Bool]()
+        if constrained:
+            allowed.resize(data.n_features, True)
+            for k in range(len(order)):
+                var mask = params.constraints.allowed_features(
+                    frontier[order[k]].branch
+                )
+                if len(mask) == 0:
+                    continue
+                for f in range(data.n_features):
+                    if f >= len(mask) or not mask[f]:
+                        allowed[f] = False
+
+        # The level's histograms, moved out of the frontier in the order the
+        # split will be applied in. That order is what fixes the cross-leaf
+        # sum's addend order, and so its value, independently of the worker
+        # count.
+        var level_hists = List[Histogram](capacity=len(order))
+        var level_bounds = List[OutputBounds](capacity=len(order))
+        var level_outputs = List[Float64](capacity=len(order))
+        for k in range(len(order)):
+            level_hists.append(frontier[order[k]].take_hist())
+            level_bounds.append(frontier[order[k]].bounds.copy())
+            level_outputs.append(tree.value[frontier[order[k]].node])
+
+        var audit = SharedSplitAudit.none()
+        var search_started = profile.clock()
+        var split = find_best_split_shared(
+            audit,
+            level_hists,
+            lambda_reg=params.lambda_reg,
+            min_child_hess=params.min_child_hess,
+            min_data_in_leaf=params.min_data_in_leaf,
+            lambda_l1=params.lambda_l1,
+            allowed=allowed,
+            features=level_features,
+            missing_bins=data.missing_bin,
+            monotone=signs,
+            bounds=level_bounds,
+            parent_outputs=level_outputs,
+            extra=params.extra,
+            n_rows=level_rows,
+            depth=level_depth,
+            node=level_node,
+            tree_index=tree_index,
+            settings=scratch.settings,
+        )
+        # One charge for the level, at the level's row count, over the cells
+        # the one dispatch read: the per-node figure times the leaves folded
+        # into it.
+        profile.charge(
+            PROF_SPLIT_SEARCH,
+            level_rows,
+            search_started,
+            dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
+            cells=len(order)
+            * _scan_cells(level_features, data.n_features, data.n_bins),
+        )
+
+        if not split.found or not (split.gain > 0.0):
+            while len(level_hists) > 0:
+                scratch.pool.give(level_hists.pop())
+            trace.stop(tree_index, level_depth, String("no positive gain"))
+            break
+        trace.level(
+            tree_index,
+            level_depth,
+            split.feature,
+            split.bin,
+            split.gain,
+            audit,
+        )
+
+        var split_missing_bin = -1 if split.is_categorical else (
+            data.missing_bin[split.feature]
+        )
+        var split_sign = monotone_sign(signs, split.feature)
+        var child_depth = level_depth + 1
+        # Exactly two nodes per leaf of this level, known before the loop.
+        tree.reserve_nodes(len(tree.feature) + 2 * len(order))
+
+        for k in range(len(order)):
+            var i = order[k]
+            var parent_node = frontier[i].node
+            var parent_ix = leaf_ix[i]
+            var parent_rows = len(frontier[i].rows)
+
+            var left_rows = List[Int]()
+            var right_rows = List[Int]()
+            if parent_rows > 0:
+                var part_started = profile.clock()
+                partition_rows_into(
+                    left_rows,
+                    right_rows,
+                    data,
+                    frontier[i].rows,
+                    split,
+                    split_missing_bin,
+                    scratch.settings,
+                )
+                profile.charge(
+                    PROF_PARTITION,
+                    parent_rows,
+                    part_started,
+                    dispatches=HOST_PARTITION_DISPATCHES,
+                )
+
+            var builds_left = len(left_rows) <= len(right_rows)
+            var built_rows = len(left_rows) if builds_left else len(right_rows)
+            var derived_rows = (
+                len(right_rows) if builds_left else len(left_rows)
+            )
+            var alloc_started = profile.clock()
+            var left_hist = scratch.pool.take()
+            var right_hist = scratch.pool.take()
+            profile.charge(
+                PROF_HIST_ALLOC,
+                built_rows,
+                alloc_started,
+                cells=2 * hist_cells,
+            )
+            # A pooled buffer's contents are undefined. The bundled builders
+            # write only the sampled features' slices, and a child with no
+            # rows is not built at all, so both cases zero the buffer here
+            # rather than inherit another node's statistics. The derived
+            # sibling is fully written by the subtraction either way.
+            var hist_started = profile.clock()
+            if builds_left:
+                if built_rows == 0 or bundling.active:
+                    left_hist.reset()
+                if built_rows > 0:
+                    _hist_subset(
+                        left_hist, bundle_scratch, scratch.pairs, data,
+                        bundling, grad, hess, left_rows, 0, len(left_rows),
+                        tree_features, tree_columns, const_hessian,
+                        scratch.settings, const_h_env,
+                    )
+                    profile.note_node()
+                    profile.charge(
+                        PROF_HISTOGRAM,
+                        built_rows,
+                        hist_started,
+                        dispatches=HOST_HIST_DISPATCHES,
+                        slots_per_row=len(tree_columns),
+                        cells=hist_cells,
+                    )
+                var sub_started = profile.clock()
+                subtract_histogram_into(
+                    right_hist, level_hists[k], left_hist, const_hessian,
+                    scratch.settings, const_h_env,
+                )
+                profile.note_node()
+                profile.charge(
+                    PROF_SUBTRACT,
+                    derived_rows,
+                    sub_started,
+                    dispatches=HOST_SUBTRACT_DISPATCHES,
+                    cells=hist_cells,
+                )
+            else:
+                if bundling.active:
+                    right_hist.reset()
+                _hist_subset(
+                    right_hist, bundle_scratch, scratch.pairs, data, bundling,
+                    grad, hess, right_rows, 0, len(right_rows), tree_features,
+                    tree_columns, const_hessian, scratch.settings, const_h_env,
+                )
+                profile.note_node()
+                profile.charge(
+                    PROF_HISTOGRAM,
+                    built_rows,
+                    hist_started,
+                    dispatches=HOST_HIST_DISPATCHES,
+                    slots_per_row=len(tree_columns),
+                    cells=hist_cells,
+                )
+                var sub_started = profile.clock()
+                subtract_histogram_into(
+                    left_hist, level_hists[k], right_hist, const_hessian,
+                    scratch.settings, const_h_env,
+                )
+                profile.note_node()
+                profile.charge(
+                    PROF_SUBTRACT,
+                    derived_rows,
+                    sub_started,
+                    dispatches=HOST_SUBTRACT_DISPATCHES,
+                    cells=hist_cells,
+                )
+
+            var parent_bounds = frontier[i].bounds.copy()
+            var parent_output = tree.value[parent_node]
+            # A child with no rows emits 0.0, clamped like any other value so
+            # a monotone interval still bounds what it can emit.
+            var left_value = parent_bounds.clamp(0.0)
+            if len(left_rows) > 0:
+                left_value = parent_bounds.clamp(
+                    _leaf_value(
+                        left_hist,
+                        params.lambda_reg,
+                        params.lambda_l1,
+                        value_feature,
+                        len(left_rows),
+                        parent_output,
+                        max_delta_step,
+                        path_smooth,
+                    )
+                )
+            var right_value = parent_bounds.clamp(0.0)
+            if len(right_rows) > 0:
+                right_value = parent_bounds.clamp(
+                    _leaf_value(
+                        right_hist,
+                        params.lambda_reg,
+                        params.lambda_l1,
+                        value_feature,
+                        len(right_rows),
+                        parent_output,
+                        max_delta_step,
+                        path_smooth,
+                    )
+                )
+            if split_sign != MONOTONE_FREE and left_value > right_value:
+                var mid = midpoint(left_value, right_value)
+                left_value = mid
+                right_value = mid
+            var children = child_bounds(
+                parent_bounds, split_sign, left_value, right_value
+            )
+            var left_node = tree._add_node(left_value, Float64(len(left_rows)))
+            var right_node = tree._add_node(
+                right_value, Float64(len(right_rows))
+            )
+            tree.left[parent_node] = left_node
+            tree.right[parent_node] = right_node
+            tree._set_split(parent_node, split, split_missing_bin)
+
+            var branch = List[Int]()
+            if constrained:
+                branch = extend_branch(frontier[i].branch, split.feature)
+
+            # No per-leaf split is searched in this mode, so the field stays
+            # "none" rather than carrying a number no consumer may read.
+            frontier[i] = _LeafState(
+                left_node,
+                left_rows^,
+                left_hist^,
+                SplitInfo(-1, -1, 0.0, False),
+                branch.copy(),
+                depth=child_depth,
+                bounds=children.left.copy(),
+                forced=-1,
+            )
+            frontier.append(
+                _LeafState(
+                    right_node,
+                    right_rows^,
+                    right_hist^,
+                    SplitInfo(-1, -1, 0.0, False),
+                    branch^,
+                    depth=child_depth,
+                    bounds=children.right.copy(),
+                    forced=-1,
+                )
+            )
+            # The left child keeps its parent's index (its outcome bit at this
+            # level is 0) and the right child sets the bit for THIS level,
+            # which is the level's own power of two. First level, lowest bit.
+            leaf_ix[i] = parent_ix
+            leaf_ix.append(parent_ix + (1 << level_depth))
+            n_leaves += 1
+
+        while len(level_hists) > 0:
+            scratch.pool.give(level_hists.pop())
+        level_depth += 1
+
+    return n_leaves
 
 
 def grow_tree(
@@ -1246,9 +2434,24 @@ def grow_tree_leaves_profiled(
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
     const_hessian: Bool = False,
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises -> Tree:
     """Grow one tree, leaf-wise by default or depth-wise under
     `params.grow_policy == GROW_DEPTHWISE`.
+
+    `const_hessian_env` is the fit's constant-hessian snapshot
+    (`histogram.ConstHessianSettings`), the counterpart of the dispatch
+    snapshot `scratch.settings` carries. It is threaded into every histogram
+    build and every sibling subtraction below, so a resolved value makes a
+    whole tree of nodes read `MOJOTREES_CONST_HESSIAN` and
+    `MOJOTREES_CONST_HESSIAN_VERIFY` exactly zero times. The default sentinel
+    is resolved **once here**, at the top of the tree, rather than being
+    passed down as the sentinel: an unwired caller then pays two `getenv`
+    calls per tree instead of two per node, which is the behaviour every
+    caller that has not been wired gets and is already a strict improvement on
+    the per-node reads. A boosting loop that holds one across the fit passes
+    it and pays them once per fit; `parallel.DispatchSettings` states the same
+    staging argument for its own `resolved` flag.
 
     `profile` is the phase and node-size attribution instrument
     (phase_profile.mojo), and it is off unless `MOJOTREES_PHASE_PROFILE` says
@@ -1351,6 +2554,21 @@ def grow_tree_leaves_profiled(
     every constraint exactly as a leaf-wise one does. Forced splits still go
     first in both modes.
 
+    `GROW_OBLIVIOUS` is the exception, and it leaves this loop entirely.
+    CatBoost's symmetric tree searches ONE split across a whole level and
+    applies it to every leaf of that level, so there is no per-leaf best split
+    to pick between and nothing for `GrowthSchedule` to order. It runs in
+    `_grow_oblivious_levels` below, which this function hands the root
+    frontier to and returns from before the loop; everything before that
+    point -- validation, feature selection, the root histogram and value -- is
+    shared, and the loop below is untouched. The tree that comes out is an
+    ordinary `Tree` with the same split repeated across a level, so predict,
+    dump, serialization, model I/O, monotone constraints and interaction
+    constraints all work on it without knowing the mode existed. `max_depth`
+    binds and is required; `num_leaves` does not bind and is ignored; a
+    categorical matrix, forced splits, `extra_trees` and the ledger-reading
+    CEGB penalties are refused (`_check_oblivious`).
+
     `const_hessian` is the caller's declaration that every entry of `hess` is
     exactly `histogram.CONSTANT_HESSIAN`, which lets the histogram builders
     accumulate two planes instead of three and reconstruct the hessian plane
@@ -1396,6 +2614,8 @@ def grow_tree_leaves_profiled(
     there is a traffic decision and cannot move a bit on its own.
     """
     check_grow_policy(params.grow_policy)
+    if params.grow_policy == GROW_OBLIVIOUS:
+        _check_oblivious(params, data)
     params.constraints.check_features(data.n_features)
     params.monotone.check_features(data.n_features)
     check_feature_fractions(
@@ -1439,6 +2659,21 @@ def grow_tree_leaves_profiled(
     # Empty unless a feature is actually constrained, which keeps split search
     # on its unconstrained path and the fit bit-identical.
     var signs = params.monotone.active_signs()
+    # Whether any node's branch feature set is ever read. It is read only by
+    # `InteractionConstraints.allowed_features`, which answers "every feature"
+    # -- the empty mask -- for any branch when no groups are configured, so
+    # with no constraints the sets stay empty and no branch list is built.
+    var constrained = not params.constraints.is_empty()
+    # The two constant-hessian environment answers, resolved at most once for
+    # this tree instead of once per histogram build and once per subtraction.
+    # A squared-error round declares a constant hessian, so without this every
+    # node pays two `getenv` calls and two `String` allocations to re-derive a
+    # decision that was fixed before the fit started; see
+    # `histogram.ConstHessianSettings`. A caller that carries one across the
+    # fit passes it and nothing here reads the environment at all.
+    var const_h_env = const_hessian_env.copy()
+    if not const_h_env.resolved:
+        const_h_env = ConstHessianSettings.resolve()
     var tree_features = select_tree_features(
         data.n_features,
         params.feature_fraction,
@@ -1457,10 +2692,40 @@ def grow_tree_leaves_profiled(
     # Leaf-value totals must come from a feature the histograms accumulated,
     # which under bundling means one whose slice the expansion wrote.
     var value_feature = tree_features[0]
+    # Whether any node needs a feature draw of its own at all.
+    #
+    # With both inner fractions at 1.0 -- the default -- `select_split_features`
+    # copies `tree_features` twice, once for the level draw and once for the
+    # node draw, and hands back a list the caller is already holding. When the
+    # tree's own set is *every* feature, the empty list means exactly that same
+    # set to all three consumers downstream (`_search` and so `find_best_split`,
+    # `prepare_cegb_node`, and the profile's cell count, which is resolved
+    # through `_scan_cells`), so the two copies are removed by not making them.
+    #
+    # No bit moves: `find_best_split` reads feature `i_feature` directly under
+    # its `use_all` arm and reads `features[i_feature]`, which is `i_feature`
+    # for an ascending complete list, otherwise; the scan order, the active
+    # count and the tie-breaking are the same either way. `select_tree_features`
+    # returns an ascending list without repeats, so `len(tree_features) ==
+    # data.n_features` is exactly "the tree may split on every feature".
+    #
+    # `check_feature_fractions` above has already validated all three fractions
+    # for this tree, so skipping the per-node re-validation cannot let a bad
+    # value through.
+    var per_node_draw = (
+        params.feature_fraction_bylevel < 1.0
+        or params.feature_fraction_bynode < 1.0
+        or len(tree_features) != data.n_features
+    )
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
         List[Float64](), List[Float64](), 0,
     )
+    # A leaf-wise tree stops at `num_leaves` leaves, and a binary tree with L
+    # leaves has 2L - 1 nodes, so this is an exact upper bound on what
+    # `_add_node` will append. One reservation per tree in place of ten
+    # independent doubling sequences; see `Tree.reserve_nodes`.
+    tree.reserve_nodes(2 * params.num_leaves - 1)
 
     # The tree's own root row count is the denominator every node size class
     # in this tree is taken against (phase_profile.mojo). Under bagging or
@@ -1510,10 +2775,8 @@ def grow_tree_leaves_profiled(
     )
     if len(bag) == 0:
         var root_list_started = profile.clock()
-        root_rows = List[Int](capacity=data.n_rows)
-        root_rows.resize(data.n_rows, 0)
-        for r in range(data.n_rows):
-            root_rows[r] = r
+        root_rows = List[Int]()
+        fill_identity_rows(root_rows, data.n_rows, scratch.settings)
         # The identity permutation is row-list construction, which is the same
         # kind of work a split's two child lists are, so it goes to the same
         # phase rather than disappearing into the unattributed remainder.
@@ -1526,7 +2789,8 @@ def grow_tree_leaves_profiled(
         var root_hist_started = profile.clock()
         _hist_full(
             root_hist, bundle_scratch, data, bundling, grad, hess,
-            tree_features, tree_columns, const_hessian,
+            tree_features, tree_columns, const_hessian, scratch.settings,
+            const_h_env,
         )
         profile.note_node()
         profile.charge(
@@ -1554,7 +2818,7 @@ def grow_tree_leaves_profiled(
         _hist_subset(
             root_hist, bundle_scratch, scratch.pairs, data, bundling, grad,
             hess, bag, 0, len(bag), tree_features, tree_columns,
-            const_hessian,
+            const_hessian, scratch.settings, const_h_env,
         )
         profile.note_node()
         profile.charge(
@@ -1594,15 +2858,17 @@ def grow_tree_leaves_profiled(
     # more would walk rows for features that are never scanned, and costing
     # fewer makes `CegbNodeCosts.delta_of` raise for a feature the scan asks
     # about.
-    var root_features = select_split_features(
-        tree_features,
-        params.feature_fraction_bylevel,
-        params.feature_fraction_bynode,
-        params.feature_fraction_seed,
-        tree_index,
-        0,
-        0,
-    )
+    var root_features = List[Int]()
+    if per_node_draw:
+        root_features = select_split_features(
+            tree_features,
+            params.feature_fraction_bylevel,
+            params.feature_fraction_bynode,
+            params.feature_fraction_seed,
+            tree_index,
+            0,
+            0,
+        )
     var root_costs = prepare_cegb_node(
         cegb_config,
         ledger,
@@ -1628,17 +2894,19 @@ def grow_tree_leaves_profiled(
         grower_applies_extra=True,
         cegb=root_costs,
         grower_applies_cegb=carries_cegb,
+        settings=scratch.settings,
     )
     # The scan reads one bin at a time over the node's own feature draw, so
-    # its cells are `len(root_features) * n_bins` and not the buffer's full
+    # its cells are that draw's width times `n_bins` and not the buffer's full
     # shape. That distinction is the whole reason `cells` is recorded per
-    # charge rather than derived from the dataset.
+    # charge rather than derived from the dataset. `_scan_cells` resolves the
+    # undrawn case, where the empty list means every feature.
     profile.charge(
         PROF_SPLIT_SEARCH,
         len(root_rows),
         root_search_started,
         dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
-        cells=len(root_features) * data.n_bins,
+        cells=_scan_cells(root_features, data.n_features, data.n_bins),
     )
 
     var frontier = List[_LeafState]()
@@ -1654,6 +2922,58 @@ def grow_tree_leaves_profiled(
         )
     )
     var n_leaves = 1
+
+    if params.grow_policy == GROW_OBLIVIOUS:
+        # Oblivious growth is not a frontier order (growth_policy.mojo), so it
+        # builds no `GrowthSchedule` -- the constructor refuses the code -- and
+        # never enters the loop below. Everything ABOVE this line is shared:
+        # the validation, the feature selection, the root's rows, histogram
+        # and value, and the frontier that holds it. Everything BELOW it is a
+        # per-leaf split loop that has no meaning when a level takes one
+        # split. Returning from here rather than branching inside that loop is
+        # what leaves the default path the path that shipped, instruction for
+        # instruction, rather than a path with a policy test in it.
+        #
+        # The root's own `_search` above is redundant in this mode: a level of
+        # one leaf is searched again by `find_best_split_shared`, which for
+        # L = 1 is `find_best_split` with the illegal-leaf rule that cannot
+        # change a single-leaf answer. That is one extra feature dispatch per
+        # tree, against `max_depth` shared searches; removing it means putting
+        # a policy test around the shared root block, which is a worse trade.
+        n_leaves = _grow_oblivious_levels(
+            profile,
+            scratch,
+            tree,
+            frontier,
+            bundle_scratch,
+            data,
+            grad,
+            hess,
+            params,
+            tree_features,
+            tree_columns,
+            value_feature,
+            per_node_draw,
+            signs,
+            constrained,
+            bundling,
+            const_hessian,
+            const_h_env,
+            hist_cells,
+            tree_index,
+        )
+        tree.n_leaves = n_leaves
+        leaves.clear()
+        leaves.covers_all_rows = len(bag) == 0
+        leaves.node = List[Int](capacity=len(frontier))
+        leaves.rows = List[List[Int]](capacity=len(frontier))
+        for i in range(len(frontier)):
+            leaves.node.append(frontier[i].node)
+            leaves.rows.append(frontier[i].take_rows())
+            scratch.pool.give(frontier[i].take_hist())
+        profile.end_tree(tree_started)
+        return tree^
+
     var schedule = GrowthSchedule(params.grow_policy)
 
     while n_leaves < params.num_leaves:
@@ -1742,6 +3062,7 @@ def grow_tree_leaves_profiled(
             frontier[best_i].rows,
             split,
             split_missing_bin,
+            scratch.settings,
         )
         profile.charge(
             PROF_PARTITION,
@@ -1803,7 +3124,8 @@ def grow_tree_leaves_profiled(
             _hist_subset(
                 left_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, left_rows, 0, len(left_rows), tree_features,
-                tree_columns, const_hessian,
+                tree_columns, const_hessian, scratch.settings,
+                const_h_env,
             )
             profile.note_node()
             profile.charge(
@@ -1816,7 +3138,8 @@ def grow_tree_leaves_profiled(
             )
             var sub_started = profile.clock()
             subtract_histogram_into(
-                right_hist, parent_hist, left_hist, const_hessian
+                right_hist, parent_hist, left_hist, const_hessian,
+                scratch.settings, const_h_env,
             )
             # Filed at the *derived* child's size: it is that child's
             # histogram that comes out, and the point of the trick is that a
@@ -1835,7 +3158,8 @@ def grow_tree_leaves_profiled(
             _hist_subset(
                 right_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, right_rows, 0, len(right_rows), tree_features,
-                tree_columns, const_hessian,
+                tree_columns, const_hessian, scratch.settings,
+                const_h_env,
             )
             profile.note_node()
             profile.charge(
@@ -1848,7 +3172,8 @@ def grow_tree_leaves_profiled(
             )
             var sub_started = profile.clock()
             subtract_histogram_into(
-                left_hist, parent_hist, right_hist, const_hessian
+                left_hist, parent_hist, right_hist, const_hessian,
+                scratch.settings, const_h_env,
             )
             profile.note_node()
             profile.charge(
@@ -1947,20 +3272,32 @@ def grow_tree_leaves_profiled(
 
         # Both children inherit the same branch feature set, so they share one
         # allow mask, and both sit one edge below the leaf that was split.
-        var branch = extend_branch(frontier[best_i].branch, split.feature)
+        #
+        # The branch set exists only to be read by
+        # `InteractionConstraints.allowed_features`, which returns the empty
+        # mask for every branch when no groups are configured. With no
+        # constraints the set is therefore never read, and extending it would
+        # copy a list per split for a value nothing consumes -- so it is left
+        # empty, which is what the module docstring says the unconstrained
+        # path does.
+        var branch = List[Int]()
+        if constrained:
+            branch = extend_branch(frontier[best_i].branch, split.feature)
         var allowed = params.constraints.allowed_features(branch)
         var child_depth = frontier[best_i].depth + 1
         # Each child draws its own per-node feature set from its node id, out
         # of the set its depth drew from the tree's.
-        var left_features = select_split_features(
-            tree_features,
-            params.feature_fraction_bylevel,
-            params.feature_fraction_bynode,
-            params.feature_fraction_seed,
-            tree_index,
-            child_depth,
-            left_node,
-        )
+        var left_features = List[Int]()
+        if per_node_draw:
+            left_features = select_split_features(
+                tree_features,
+                params.feature_fraction_bylevel,
+                params.feature_fraction_bynode,
+                params.feature_fraction_seed,
+                tree_index,
+                child_depth,
+                left_node,
+            )
         var left_costs = prepare_cegb_node(
             cegb_config,
             ledger,
@@ -1987,23 +3324,26 @@ def grow_tree_leaves_profiled(
             grower_applies_extra=True,
             cegb=left_costs,
             grower_applies_cegb=carries_cegb,
+            settings=scratch.settings,
         )
         profile.charge(
             PROF_SPLIT_SEARCH,
             len(left_rows),
             left_search_started,
             dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
-            cells=len(left_features) * data.n_bins,
+            cells=_scan_cells(left_features, data.n_features, data.n_bins),
         )
-        var right_features = select_split_features(
-            tree_features,
-            params.feature_fraction_bylevel,
-            params.feature_fraction_bynode,
-            params.feature_fraction_seed,
-            tree_index,
-            child_depth,
-            right_node,
-        )
+        var right_features = List[Int]()
+        if per_node_draw:
+            right_features = select_split_features(
+                tree_features,
+                params.feature_fraction_bylevel,
+                params.feature_fraction_bynode,
+                params.feature_fraction_seed,
+                tree_index,
+                child_depth,
+                right_node,
+            )
         var right_costs = prepare_cegb_node(
             cegb_config,
             ledger,
@@ -2030,13 +3370,14 @@ def grow_tree_leaves_profiled(
             grower_applies_extra=True,
             cegb=right_costs,
             grower_applies_cegb=carries_cegb,
+            settings=scratch.settings,
         )
         profile.charge(
             PROF_SPLIT_SEARCH,
             len(right_rows),
             right_search_started,
             dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
-            cells=len(right_features) * data.n_bins,
+            cells=_scan_cells(right_features, data.n_features, data.n_bins),
         )
 
         frontier[best_i] = _LeafState(

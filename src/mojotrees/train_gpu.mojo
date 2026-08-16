@@ -463,7 +463,7 @@ def _count_left(
         else:
             go_left = split.goes_left(b)
         if go_left:
-            total += hist.count[base + b]
+            total += hist.count_at(base + b)
     return total
 
 

@@ -43,7 +43,7 @@ grower's histogram count, one host synchronization per split, off by
 default), `MOJOTREES_GPU_TRACE` and `MOJOTREES_GPU_STAGING_SLOTS`
 (gpu_runtime.mojo).
 
-Four dispatch shapes are provided. All of them keep every floating-point
+Five dispatch shapes are provided. All of them keep every floating-point
 summation order independent of the task count, so every result is
 bit-identical to the serial path on every machine and at every worker
 setting:
@@ -73,6 +73,12 @@ setting:
   in-order blocks reproduce the serial result exactly. It is deliberately
   not used for histogram accumulation, which would need a cross-block
   reduction.
+- `dispatch_regions` runs several *independent* unit spaces under one
+  fan-out. It is `dispatch_feature_ranges` over the concatenation of the
+  regions, with the callback told which region each range came from, so a
+  caller that would otherwise make three `sync_parallelize` calls in a row
+  makes one. See "One fan-out, several regions" below; the independence
+  requirement there is a correctness precondition, not advice.
 
 Task count comes from the workload shape rather than from the item count.
 One task per item balances perfectly but pays a scheduling event per item,
@@ -115,13 +121,184 @@ the fan-out: the per-task floor is the right one, and it is now separately
 named and separately overridable. State the honest work; let the two grains
 decide.
 
-Neither grain has been measured against the other. `DEFAULT_MIN_TASK_OPS`
+Neither grain has been measured against the other, and neither has been
+measured against a kernel. What *has* been measured, once, is the thing both
+of them are trading against: see "What a fan-out costs, measured" below, and
+note that it makes the per-task floor the more suspect of the two, since the
+cost of a fan-out rises with its width. `DEFAULT_MIN_TASK_OPS`
 equals `PARALLEL_MIN_OPS`, which reproduces the fan-out this module has
 always chosen everywhere except the degenerate one-task window above, and
 `MOJOTREES_PARALLEL_MIN_TASK_OPS` is there so a sweep can lower it without a
 rebuild. Lowering it is the single knob that decides how much of an
 asymmetric machine a mid-sized loop reaches, and bench/bench_profile.mojo on
 an idle machine is what would settle it.
+
+The core floor, and why the grain alone leaves cores idle
+---------------------------------------------------------
+`MIN_TASKS_ABOVE_GRAIN = 2` was the admission that the per-task grain and the
+crossover cannot both be `PARALLEL_MIN_OPS`: for any total between one grain
+and two, the grain permits no legal split, so a floor had to be bolted on.
+Two was the smallest floor that is actually parallel. It is not the right
+floor, and the reason is arithmetic on the numbers this module already holds.
+
+A loop that clears the crossover has been declared worth a fan-out. A
+`sync_parallelize` is one wake of the pool and one barrier at the end, and
+that cost is paid in full the moment the loop is declared parallel at all --
+it does not shrink because the work was handed to three tasks instead of ten.
+So having paid it, a task count below the core count leaves cores idle for
+the whole of the barrier it already bought. The split scan is the worked
+example: `split_scan_ops(50, 255, two_sided)` is 216,750, and
+`216,750 // 65,536` is 3, so a fifty-feature node fans three ways at every
+node size in a fit, on any machine, leaving seven of ten cores idle behind a
+barrier that was paid for regardless. Nothing about the node's size enters
+that number, which is what makes it a defect in the rule rather than a
+mis-tuning of it.
+
+The floor is therefore `dispatch_cores`, not 2: once the crossover is
+cleared, use the machine that was woken, and go past one task per core only
+when the grain independently says each of those tasks still holds a full
+grain of work. `MIN_TASKS_ABOVE_GRAIN` survives as the floor under the floor,
+for a machine that reports one core.
+
+What bounds this from above -- the reason it is one task per core and not
+`max_auto_tasks` -- was that nothing had measured the marginal cost of a
+task, so the smallest defensible step past "not enough tasks to fill the
+machine" was "exactly enough". Something has now: the sweep in "What a
+fan-out costs, measured" prices an empty fan-out at every width this module
+can choose, and it rises monotonically with the width. That does not repeal
+the floor, which is an argument about idle cores rather than about task cost,
+but it does mean the floor is now the first thing to A/B rather than the
+last. What bounds it from below is the one measurement this
+module does hold, and it is worth writing down because it is easy to lose:
+bench/bench_threshold.mojo forces its parallel arm with
+`MOJOTREES_PARALLEL_MIN_OPS=1` alone. Under the single-grain rule that read
+*both* questions from that variable, so the arm that established the
+crossover was a `max_auto_tasks`-way fan-out -- at the crossover row, 65,536
+ops over 40 tasks, about 1,638 ops each -- and it beat the serial path by
+1.2-1.6x on Apple M4, AMD Zen4 and Neoverse-N2. A task of 1,638 ops paid for
+its scheduling event on all three. The floor here gives a loop sitting
+exactly at the crossover `PARALLEL_MIN_OPS / dispatch_cores` ops per task,
+which at ten cores is 6,554, four times larger than the task size that was
+measured to win. Two caveats on leaning on that: the shape measured was
+histogram accumulation over independent features, not a row-block split, and
+since the two grains were separated that harness no longer reproduces the arm
+it recorded (it now forces a two-task fan-out), so the number cannot be
+re-taken without also setting `MOJOTREES_PARALLEL_MIN_TASK_OPS=1`.
+
+This floor cannot make any loop parallel that was serial before it: the
+crossover is untouched and is tested first. It cannot lower any task count
+either, since it only ever raises `by_grain`. What it can do is over-fan a
+loop that has just cleared the crossover, and that is the risk it carries.
+
+What a fan-out costs, measured
+------------------------------
+Every paragraph above this one was written against an unknown constant, and
+several of them say so. `bench/bench_dispatch_cost.mojo` measures it: R
+`sync_parallelize` calls whose body is one padded store, divided by R, at a
+sweep of task counts, with a no-fan-out control that prices the body. It is
+the CPU counterpart of `bench_launch_cost.mojo` and it exists for the same
+reason -- a per-event cost nobody has measured turns every argument about
+scheduling into arithmetic over a variable.
+
+**One run, 2026-08-16, Apple M4 (10 physical / 4 performance), load average
+5.05 on a shared box, minimum of five trials of 2000 dispatches each:**
+
+    tasks   1      2      4      8     10     16     25     32     40
+    us   0.06   4.84  39.44  51.94 130.50 244.06 276.89 396.23 293.04
+
+with the control (the same body, called 40 times, no `sync_parallelize`) at
+0.02 us. Read it for its two orders of magnitude and its shape, not for its
+digits: the box was loaded, a barrier-synchronized fan-out finishes when its
+slowest task is scheduled, and an idle machine would give smaller numbers.
+The 40-task row coming in under the 32-task row is that noise showing.
+
+Three things survive the noise, and all three are mechanism rather than
+tuning:
+
+- **The pool is already persistent.** A one-task `sync_parallelize` costs 60
+  nanoseconds. Creating a thread costs tens of microseconds on any operating
+  system, so no thread is being created here; the runtime holds its workers
+  across calls and the one-task case never leaves the calling thread. A
+  hand-rolled persistent pool in this module would therefore replace a
+  persistent pool with a persistent pool. That is the whole of the argument
+  against building one, and it is why this module still has exactly one
+  primitive under it.
+- **What is paid per dispatch is the wake, and it scales with the width.**
+  From 60 nanoseconds at one task to ~5 microseconds at two and ~130 at ten,
+  with an empty body and therefore no work to imbalance. Every microsecond in
+  that row is fan-out. A wider fan-out is a dearer fan-out, monotonically
+  across the measured range, which is the opposite of what a cost model that
+  treats the fan-out as a fixed price would predict.
+- **Therefore the number of dispatches is a first-class quantity**, not an
+  accounting detail. `phase_profile`'s `HOST_*_DISPATCHES` constants are the
+  count, and `dispatch_regions` below is the instrument for lowering it.
+
+What this measurement does **not** settle, and must not be used to claim: it
+does not price any real kernel, it does not say whether the core floor above
+is a win or a loss, and it cannot be turned into a speedup for anything. It
+prices one event. `MOJOTREES_CPU_TASK_FLOOR=0` against the default is still
+the A/B that answers the floor, and this number is the reason that A/B is
+now worth running first rather than last: the floor raised the *width* of
+exactly the dispatches whose work is smallest (the split scan 3 to 10, the
+small-node histogram 4 to 10, the medium-node partition 2 to 10), and the
+column above is monotone increasing in width.
+
+One fan-out, several regions
+----------------------------
+`dispatch_regions` exists because of the row above. Two consecutive
+dispatches of ten tasks pay the ten-task wake twice; one dispatch over the
+union of their units pays it once and hands each task a longer run. The
+saving is exactly one fan-out at the merged width, which is a count a caller
+can state and a reader can check, and it is the only thing this shape claims.
+
+The precondition is **independence**, and it is a correctness precondition
+rather than a performance one. Two regions may be fused only when no unit of
+either reads storage any unit of the other writes. A pipeline must not be
+fused: the row-blocked histogram accumulates per `(block, group)` unit and
+then folds the per-block partials per output slot, and the fold reads every
+block, so those two dispatches are a dependency and the barrier between them
+is load-bearing. Fusing them would not be slower, it would be wrong.
+
+What is safely fusible is a set of *siblings*: the two children of a split
+searched for their best feature, the several leaves of a depth-wise level
+accumulated at once, a zeroing pass over features nobody accumulates beside
+an accumulation over the features somebody does. Each of those is one output
+range per unit and no cross-unit read, which is the same contract
+`dispatch_feature_ranges` already states for one region.
+
+Exactness is unchanged and for the same reason. A unit is never split across
+tasks, a task walks its regions in ascending region order, and every unit
+runs exactly once. So a fused dispatch executes each region's units in the
+same grouping discipline the region's own `dispatch_feature_ranges` would
+have, and any caller that was bit-identical across task counts before is
+bit-identical across fusions. What *does* change is the work estimate: a
+fused call passes the sum of the regions' estimates, so a pair that sat below
+the crossover separately can clear it together. That is the correct decision
+-- the crossover is a statement about the total work behind one scheduling
+event, and after fusion there is one event -- but it is a change in the
+answer and is called out here rather than discovered.
+
+Who carries the snapshot
+------------------------
+`DispatchSettings.resolve()` is called once per fit, in each CPU trainer in
+`boosting.mojo`, next to where the fit's `GrowScratch` is built. From there it
+travels as a `settings` argument, defaulted to `DispatchSettings.unresolved()`
+so that a call site that has not been wired keeps the live reads it always
+had. Wired today:
+
+- `boosting.fill_grad_hess` and the score update (`_add_tree_scores`,
+  `_add_by_leaf`, `_add_by_traversal`), which is every per-round dispatch the
+  CPU trainers make.
+- Every dispatch in `histogram.mojo` except the frozen replica builder: the
+  accumulation planner, the excluded-feature zeroing, the gradient gather,
+  both accumulation ladders, and the sibling subtraction.
+- The split scan in `split.mojo`.
+
+Not wired, and this is the gap that matters: `tree.mojo` is what calls the
+histogram builders and the split scan once per node, and it does not hold a
+snapshot to pass. Until it does, those entry points take the sentinel and the
+per-node reads are still made. The receiving half is here so that filling it
+in is one field on `GrowScratch` and five argument passes.
 
 Nesting. These dispatches are not reentrant-aware: a `sync_parallelize`
 inside a task would oversubscribe the machine with no scheduler to arbitrate
@@ -153,13 +330,13 @@ comptime PARALLEL_MIN_OPS = 1 << 16
 # quantity in its own right.
 comptime DEFAULT_MIN_TASK_OPS = PARALLEL_MIN_OPS
 
-# Tasks a loop gets when it has cleared the crossover but does not hold a
-# whole per-task grain per task. One is not an option: a one-task fan-out
-# runs the same work on the same core as the serial path and pays a
-# scheduling event for the privilege, so a rule that answers 1 here has
-# decided nothing. Two is the smallest answer that is actually parallel, and
-# the crossover measurement is evidence for exactly this size, having found a
-# fanned-out loop of `PARALLEL_MIN_OPS` beating the serial path.
+# Floor under the core floor. A loop that has cleared the crossover is fanned
+# out over at least `dispatch_cores` tasks (see "The core floor" in the module
+# docstring); this is what that floor falls back to on a machine that reports
+# one core, and it is the reason a fan-out is never one task. One is not an
+# option: a one-task fan-out runs the same work on the same core as the serial
+# path and pays a scheduling event for the privilege, so a rule that answers 1
+# here has decided nothing.
 comptime MIN_TASKS_ABOVE_GRAIN = 2
 
 # Denominator of the elementwise per-row cost weight (see
@@ -201,6 +378,46 @@ def env_parallel_min_task_ops() -> Int:
     the whole-loop crossover."""
     var n = _env_int("MOJOTREES_PARALLEL_MIN_TASK_OPS", DEFAULT_MIN_TASK_OPS)
     return n if n > 0 else DEFAULT_MIN_TASK_OPS
+
+
+def env_core_floor() -> Bool:
+    """Whether the core floor in `_cap_tasks` is applied. On by default.
+
+    `MOJOTREES_CPU_TASK_FLOOR=0` reverts the fan-out rule to the one that
+    shipped before the floor existed, where the task count came from the
+    grain alone and bottomed out at `MIN_TASKS_ABOVE_GRAIN`.
+
+    **This exists because the floor is unmeasured.** It was derived from the
+    observation that a `sync_parallelize` pays its wake and its barrier in
+    full the moment the loop is declared parallel, so a task count below the
+    core count leaves cores idle behind a cost already bought. That argument
+    is sound and it is still an argument. It changes the task count for every
+    caller whose work sits between one grain and the machine ceiling --
+    the split scan 3 to 10, the gradient fill 3 to 10 at a million rows, the
+    row partition at medium nodes 2 to 10, the histogram at small nodes 4 to
+    10 -- and none of those has been timed.
+
+    The histogram at small nodes is the one to watch: it was measured at
+    1.20x with four tasks, which is poor enough that the cause could be
+    imbalance, which more tasks fix, or barrier cost, which more tasks make
+    worse. Arithmetic cannot separate those and this flag is what lets a
+    measurement do it.
+
+    A second measurement now leans on the answer without settling it.
+    `bench/bench_dispatch_cost.mojo` prices an *empty* fan-out at every width
+    (see "What a fan-out costs, measured" in the module docstring) and finds
+    it rising monotonically with the width -- with no body, and therefore no
+    imbalance to explain any of it. That says the cost this flag turns off is
+    real and grows with exactly the quantity the flag raises. It does not say
+    the floor is a net loss, because it prices none of the work the extra
+    cores go on to do. It says: run the A/B, and run it early.
+
+    It is deliberately NOT a `DispatchSettings` field on the unresolved path
+    only: both paths honor it, so an A/B does not accidentally compare a
+    snapshot arm against a live arm.
+    """
+    var s = getenv("MOJOTREES_CPU_TASK_FLOOR")
+    return s != "0"
 
 
 def elementwise_row_ops(n_rows: Int) -> Int:
@@ -273,6 +490,27 @@ struct DispatchSettings(Copyable, Movable):
     var min_ops: Int
     var min_task_ops: Int
 
+    var core_floor: Bool
+    """Whether the core floor in `_cap_tasks` applies, from
+    `MOJOTREES_CPU_TASK_FLOOR`. Carried in the snapshot rather than read at
+    the dispatch so that the resolved and live paths answer the same question
+    the same way; see `env_core_floor` for why the flag exists at all."""
+
+    var resolved: Bool
+    """Whether this value is a snapshot or the sentinel.
+
+    False only for `unresolved()`, which is what a defaulted threading
+    parameter carries at a call site nobody has wired yet. `plan_tasks_with`
+    and every `*_with` dispatch below test it first and fall through to the
+    live rule, so an unresolved settings value is indistinguishable from not
+    having passed one -- same answer, same `getenv` calls, same order.
+
+    Its purpose is staging, not policy. A parameter that had no default would
+    have to be filled in at every call site in the package in one commit,
+    across files that three different lanes own; with a default, the
+    receiving half lands first and each call site is wired when its owner can
+    wire it. A hot call site still holding the sentinel is not finished."""
+
     @staticmethod
     def resolve() raises -> DispatchSettings:
         """One detection of the machine and one read of each variable.
@@ -285,9 +523,23 @@ struct DispatchSettings(Copyable, Movable):
             env_num_workers(),
             env_parallel_min_ops(),
             env_parallel_min_task_ops(),
+            env_core_floor(),
+            True,
+        )
+
+    @staticmethod
+    def unresolved() -> DispatchSettings:
+        """The sentinel. No machine detection and no `getenv`, so building one
+        costs a few integer stores; it is what every defaulted `settings`
+        parameter in this package constructs, once per call, on a path that
+        then goes on to read the environment live exactly as it always did."""
+        return DispatchSettings(
+            ResolvedCpuPolicy.unresolved(), 0, 0, 0, True, False
         )
 
     def describe(self) -> String:
+        if not self.resolved:
+            return String("unresolved (live reads)")
         return String(
             self.policy.describe(),
             " workers=",
@@ -296,25 +548,57 @@ struct DispatchSettings(Copyable, Movable):
             self.min_ops,
             " min_task_ops=",
             self.min_task_ops,
+            " core_floor=",
+            self.core_floor,
         )
 
 
 @always_inline
-def _cap_tasks(total_ops: Int, min_task_ops: Int, max_auto: Int) -> Int:
+def _cap_tasks(
+    total_ops: Int, min_task_ops: Int, dispatch_cores: Int, max_auto: Int
+) -> Int:
     """Task count for a loop that has already cleared the crossover.
 
     The one copy of the fan-out rule, so the resolved and the unresolved
-    entry points cannot drift. No task holds less than `min_task_ops`, the
-    machine's ceiling is never exceeded, and the answer is never 1, because
-    the caller has already decided this loop is worth parallelizing and one
-    task does not parallelize it.
+    entry points cannot drift. Three bounds, in this order:
+
+    - the grain, `total_ops // min_task_ops`, which is how many tasks may hold
+      a full per-task grain of work;
+    - the core floor, `dispatch_cores`, raising that answer when the grain
+      would leave cores idle behind a barrier the loop has already been
+      declared worth paying (see "The core floor" in the module docstring),
+      and never below `MIN_TASKS_ABOVE_GRAIN` so a one-core machine still gets
+      something that is actually parallel;
+    - the machine's ceiling, `max_auto`, which binds last and binds
+      absolutely, so a policy that has capped the fan-out is never overridden
+      by the floor.
+
+    Monotone in `total_ops` and monotone in the machine, and it never returns
+    1: the caller has already decided this loop is worth parallelizing and one
+    task does not parallelize it. It is a scheduling decision only -- every
+    dispatch shape in this module is documented to give the same values at
+    every task count -- so this can be retuned without moving an output.
     """
     var by_grain = max_auto
     if min_task_ops > 0:
         by_grain = total_ops // min_task_ops
-    if by_grain < MIN_TASKS_ABOVE_GRAIN:
-        by_grain = MIN_TASKS_ABOVE_GRAIN
+    # `dispatch_cores` arrives already reduced to MIN_TASKS_ABOVE_GRAIN when
+    # the caller resolved `MOJOTREES_CPU_TASK_FLOOR=0`, so the floor is off
+    # without this function reading anything. `_cap_tasks` stays pure, which
+    # is what lets the snapshot path call it without touching the
+    # environment.
+    var floor = dispatch_cores
+    if floor < MIN_TASKS_ABOVE_GRAIN:
+        floor = MIN_TASKS_ABOVE_GRAIN
+    if by_grain < floor:
+        by_grain = floor
     return by_grain if by_grain < max_auto else max_auto
+
+
+def _effective_cores(dispatch_cores: Int, floor_on: Bool) -> Int:
+    """`dispatch_cores` when the core floor is on, and the pre-floor value
+    when it is off. One place, so the live and snapshot paths cannot drift."""
+    return dispatch_cores if floor_on else MIN_TASKS_ABOVE_GRAIN
 
 
 def plan_tasks_with(
@@ -327,7 +611,13 @@ def plan_tasks_with(
     per-node path should be reaching this form; `plan_tasks` remains for
     callers that have no snapshot to hand and for tests that change a
     variable between calls.
+
+    The unresolved sentinel falls through to `plan_tasks`, so a defaulted
+    `settings` parameter reads the environment exactly as the call site did
+    before the parameter existed.
     """
+    if not settings.resolved:
+        return plan_tasks(n_items, total_ops)
     if n_items <= 1:
         return 1
     if settings.num_workers == 1:
@@ -339,6 +629,9 @@ def plan_tasks_with(
         n_tasks = _cap_tasks(
             total_ops,
             settings.min_task_ops,
+            _effective_cores(
+                settings.policy.dispatch_cores(), settings.core_floor
+            ),
             settings.policy.max_auto_tasks(),
         )
     if n_tasks < 1:
@@ -367,10 +660,16 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
     the whole-loop crossover the loop stays serial. Above it the task count is
     capped so that no task holds less than the per-task floor: fanning 100k
     cheap ops across 40 workers costs far more in scheduling than the 2.5k ops
-    each one would run. Having cleared the crossover the answer is never 1,
-    because a one-task fan-out is the serial path plus a scheduling event. An
-    explicit `MOJOTREES_NUM_WORKERS` bypasses all of it, so tests can force
-    the parallel path at any size.
+    each one would run.
+
+    Having cleared the crossover the answer is at least one task per core, and
+    so is never 1: a one-task fan-out is the serial path plus a scheduling
+    event, and a three-task fan-out on ten cores is seven idle cores behind a
+    barrier that has already been paid for. That floor is "The core floor" in
+    the module docstring, and it is the reason the grain alone -- which for
+    the split scan answers 3 at every node size in a fit -- is not the whole
+    rule. An explicit `MOJOTREES_NUM_WORKERS` bypasses all of it, so tests can
+    force the parallel path at any size.
 
     The per-core ceiling comes from `apple_cpu_policy`, which decides how many
     cores to count on a machine whose cores are not all the same speed. Its
@@ -392,10 +691,16 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
         var grain = env_parallel_min_ops()
         if total_ops < grain:
             return 1
+        # One detection, two questions asked of it. `cpu_profile()` is
+        # `CpuProfile.detect()` and re-reads the machine every call, so binding
+        # it here is what keeps the live path at the one detection it has
+        # always made rather than two.
+        var profile = cpu_profile()
         n_tasks = _cap_tasks(
             total_ops,
             env_parallel_min_task_ops(),
-            cpu_profile().max_auto_tasks(),
+            _effective_cores(profile.dispatch_cores(), env_core_floor()),
+            profile.max_auto_tasks(),
         )
     if n_tasks < 1:
         n_tasks = 1
@@ -491,6 +796,150 @@ def dispatch_features_with[FuncType: def (Int) -> None](
             func(f)
 
     dispatch_feature_ranges_with(settings, do_range, n_features, total_ops)
+
+
+def region_units(sizes: List[Int]) -> Int:
+    """Units a `dispatch_regions` call covers: the sum of the region sizes,
+    with a non-positive size counted as zero.
+
+    Public because a caller has to hand `dispatch_regions` a work estimate for
+    the same union, and computing the two from different arithmetic is how a
+    fan-out ends up sized against a unit space it does not have.
+    """
+    var total = 0
+    for i in range(len(sizes)):
+        if sizes[i] > 0:
+            total += sizes[i]
+    return total
+
+
+def dispatch_regions[FuncType: def (Int, Int, Int) -> None](
+    func: FuncType, sizes: List[Int], total_ops: Int
+) raises:
+    """Run `func(region, start, end)` over contiguous ranges covering every
+    region's units, under one fan-out.
+
+    **THIS HAS NO CALLER, DELIBERATELY, AND THAT IS DECLARED HERE RATHER THAN
+    LEFT TO BE DISCOVERED.** It is a receiving half. This repository found
+    three built-tested-never-wired mechanisms in a single night --
+    `DispatchSettings`, `gpu_gradient_stream.HostGradientStage`, and eight
+    functions in `apple_cpu_policy` -- each of which passed its tests because
+    the tests called it directly while no production call site existed, and
+    each of which had its benefit claimed in a commit message. This one says
+    so instead.
+
+    The named cross-lane edit that wires it is `split.find_best_split_pair`:
+    hoist the per-node state `scan_feature` closes over into a context struct,
+    and replace the two per-child `dispatch_features_with` calls with one
+    `dispatch_regions_with` over both children, leaving both serial ascending
+    folds unchanged. That is bit-identical by construction -- same per-feature
+    scan, same fold order, same strict `>` tie-break.
+
+    Why it is worth wiring, as a derived bound rather than a measurement: the
+    split search fans out once per node at width 10 regardless of node size,
+    which is 6,001 fan-outs per fit behind the smallest per-node work in the
+    round. Fusing a split's two children halves that count, for a derived 44
+    percent of the split-search phase, which is itself at most 27 percent of
+    the parallel round.
+
+    **If that edit is not sequenced, delete this rather than leave it.** An
+    unwired receiving half that nobody has committed to wiring is exactly the
+    pathology described above.
+
+    `sizes[r]` is how many units region `r` holds; a region of zero or fewer
+    units is skipped and still occupies its index, so a caller may pass a
+    fixed-length vector with an inactive region zeroed rather than renumbering
+    its regions. `total_ops` is the work estimate for the **union**, in the
+    usual histogram-op equivalents, and `region_units` is the matching unit
+    count.
+
+    **The regions must be independent.** No unit of any region may read
+    storage that a unit of another region writes. This is the same contract
+    `dispatch_feature_ranges` states within one region, extended across
+    regions, and it is what makes fusing two dispatches into one legal rather
+    than merely cheaper. A producer and its consumer -- the row-blocked
+    histogram's accumulate and its fold, a count pass and the scatter that
+    reads its prefix sums -- are a dependency, the barrier between them is
+    load-bearing, and fusing them is a correctness bug and not a tuning
+    regression. See "One fan-out, several regions" in the module docstring.
+
+    What it is worth is one fan-out at the merged width, which the caller can
+    count. What it cannot do is change a result: a unit is never split across
+    tasks, every unit runs exactly once, and a task walks its regions in
+    ascending region order, so each region's units are grouped exactly as its
+    own `dispatch_feature_ranges` would have grouped them. What it does
+    change is the go/no-go decision, since the estimate is now the union's;
+    that is deliberate and is documented in the module docstring.
+
+    The serial path calls `func(r, 0, sizes[r])` for each non-empty region in
+    ascending order, which is the same shape a task gets, so there is one body
+    to test rather than two.
+    """
+    _run_regions(func, sizes, plan_tasks(region_units(sizes), total_ops))
+
+
+def dispatch_regions_with[FuncType: def (Int, Int, Int) -> None](
+    settings: DispatchSettings,
+    func: FuncType,
+    sizes: List[Int],
+    total_ops: Int,
+) raises:
+    """`dispatch_regions` against an already-resolved snapshot."""
+    _run_regions(
+        func, sizes, plan_tasks_with(settings, region_units(sizes), total_ops)
+    )
+
+
+def _run_regions[FuncType: def (Int, Int, Int) -> None](
+    func: FuncType, sizes: List[Int], n_tasks: Int
+) raises:
+    """The split itself, with the task count already chosen. One copy, so the
+    resolved and unresolved entry points hand out identical ranges."""
+    var n_regions = len(sizes)
+    # Prefix offsets over the concatenated unit space: `offsets[r]` is the
+    # flat id of region r's first unit and `offsets[n_regions]` is the total.
+    # Built once here rather than rescanned inside every task, and held in a
+    # local whose lifetime spans the whole `sync_parallelize`, which is
+    # synchronous.
+    var offsets = List[Int](capacity=n_regions + 1)
+    offsets.append(0)
+    var running = 0
+    for r in range(n_regions):
+        if sizes[r] > 0:
+            running += sizes[r]
+        offsets.append(running)
+    var n_units = running
+    if n_units <= 0:
+        return
+    if n_tasks <= 1:
+        for r in range(n_regions):
+            if sizes[r] > 0:
+                func(r, 0, sizes[r])
+        return
+
+    var off_p = offsets.unsafe_ptr()
+
+    # The same even split `_run_feature_ranges` uses, over the union: task w
+    # takes flat [w * n // tasks, (w + 1) * n // tasks) and cuts it at every
+    # region boundary it crosses. `plan_tasks` has clamped n_tasks to n_units,
+    # so no task comes out with an empty flat range; a task *can* still emit
+    # no call for a given region, which is the point.
+    def do_range(w: Int) {imm}:
+        var lo = (w * n_units) // n_tasks
+        var hi = ((w + 1) * n_units) // n_tasks
+        for r in range(n_regions):
+            var r0 = off_p.unsafe_load(r)
+            var r1 = off_p.unsafe_load(r + 1)
+            if r1 <= lo:
+                continue
+            if r0 >= hi:
+                break
+            var s = (lo - r0) if lo > r0 else 0
+            var e = (hi - r0) if hi < r1 else (r1 - r0)
+            if s < e:
+                func(r, s, e)
+
+    sync_parallelize(do_range, n_tasks)
 
 
 def dispatch_feature_rows[FuncType: def (Int, Int, Int) -> None](

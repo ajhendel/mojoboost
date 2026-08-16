@@ -1806,7 +1806,7 @@ struct GpuSparseHistogramBuilder(Movable):
             gp.unsafe_store(i, Float64(src.unsafe_load(i)) * g_inv)
             hp.unsafe_store(i, Float64(src.unsafe_load(hist_size + i)) * h_inv)
             cp.unsafe_store(i, Int(src.unsafe_load(2 * hist_size + i)))
-        return Histogram(g^, h^, c^, self.n_features, self.n_bins)
+        return Histogram.from_planes(g^, h^, c^, self.n_features, self.n_bins)
 
     def build_leaf(mut self, leaf: Int) raises -> Histogram:
         """Build the histogram of the rows currently assigned to `leaf`, over

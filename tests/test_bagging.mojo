@@ -5,6 +5,24 @@ node for node and bit for bit, the tree grown on a dataset physically
 holding only those rows. Everything else here (fraction = 1, reproducibility,
 seed sensitivity, zero-weight rows, tiny datasets) rests on that.
 
+One qualification that WAS here and is no longer true, kept as history
+because it is the shape of a defect worth recognizing again. For a while
+"bit for bit" held against the *subset* builder but only structurally
+against the whole-dataset builder, because the subset builder folded
+contiguous row blocks while the whole-dataset builder still summed flat. The
+two reassociated a node's rows differently and a leaf value moved by four
+ulp. That is fixed at the cause: both builders now block on one plan, and
+`test_bagged_tree_equals_tree_on_subset_dataset` asserts bit identity against
+both. The assertion was restored rather than the tolerance widened.
+
+It is worth naming what that defect was, since nothing in the determinism
+contract caught it. Results stayed invariant across `MOJOTREES_NUM_WORKERS`
+and across task counts the whole time, because the block count came from the
+node's row count and never from the machine. What broke was an unwritten
+property -- that growing on a bag is growing on the dataset of those rows --
+and no test asserted it until this one went red. See the "row blocks" section
+of `src/mojotrees/histogram.mojo`.
+
 CPU/GPU equivalence lives in tests/test_gpu_training.mojo, which needs an
 accelerator.
 """
@@ -58,8 +76,9 @@ def _gather(values: List[Float64], rows: List[Int]) -> List[Float64]:
     return out^
 
 
-def _assert_same_tree(a: Tree, b: Tree) raises:
-    """Identical structure and bit-identical leaf values."""
+def _assert_same_structure(a: Tree, b: Tree) raises:
+    """Identical structure: the same splits on the same features in the same
+    places. Says nothing about the leaf values."""
     assert_equal(a.n_leaves, b.n_leaves)
     assert_equal(len(a.feature), len(b.feature))
     for i in range(len(a.feature)):
@@ -67,7 +86,13 @@ def _assert_same_tree(a: Tree, b: Tree) raises:
         assert_equal(a.threshold_bin[i], b.threshold_bin[i])
         assert_equal(a.left[i], b.left[i])
         assert_equal(a.right[i], b.right[i])
-        assert_equal(a.value[i], b.value[i])
+
+
+def _assert_same_tree(a: Tree, b: Tree) raises:
+    """Identical structure and bit-identical leaf values."""
+    _assert_same_structure(a, b)
+    for i in range(len(a.feature)):
+        assert_equal(a.value[i].to_bits(), b.value[i].to_bits())
 
 
 def _grad_hess(
@@ -250,8 +275,8 @@ def test_train_rejects_invalid_bagging() raises:
 
 def test_bagged_tree_equals_tree_on_subset_dataset() raises:
     # The equivalence that defines bagging: growing on a bag is growing on
-    # the dataset of those rows. Histogram accumulation visits bag rows in
-    # the same order either way, so leaf values agree bit for bit.
+    # the dataset of those rows. It is asserted here against both builders,
+    # and it is *not* the same assertion against each -- see below.
     var n_rows = 2_000
     var n_features = 4
     var features = _make_features(n_rows, n_features)
@@ -264,10 +289,36 @@ def test_bagged_tree_equals_tree_on_subset_dataset() raises:
 
     var bagged = grow_tree(data, gh[0], gh[1], params, bag)
     var subset = _subset_matrix(data, bag)
-    var reference = grow_tree(
-        subset, _gather(gh[0], bag), _gather(gh[1], bag), params
+    var sub_grad = _gather(gh[0], bag)
+    var sub_hess = _gather(gh[1], bag)
+
+    # Bit for bit, against the same rows of the same size of matrix grown
+    # through the same builder. This is the part that is about bagging: it
+    # says the bag indirection gathers the right rows in the right order and
+    # adds them in the right order, and nothing else here would catch a bag
+    # that was off by a row.
+    var all_rows = List[Int](capacity=len(bag))
+    for i in range(len(bag)):
+        all_rows.append(i)
+    var reference_bagged = grow_tree(
+        subset, sub_grad, sub_hess, params, all_rows
     )
-    _assert_same_tree(bagged, reference)
+    _assert_same_tree(bagged, reference_bagged)
+
+    # Bit for bit again, against the whole-dataset builder. This assertion
+    # was downgraded to structure-only when the subset builder began folding
+    # contiguous row blocks while the whole-dataset builder still summed flat:
+    # the two orders are different sequences of Float64 additions, and the
+    # observed spread on this fixture was four ulp on a leaf value. It is
+    # restored because the cause is fixed rather than because the tolerance
+    # was widened -- both builders now block on one plan
+    # (`apple_cpu_policy.plan_row_block_count`, which no longer looks at
+    # whether the rows arrive through a row-id list), so they perform the
+    # identical additions in the identical order. If this goes red again,
+    # the two builders have diverged and it is that, not this test, that is
+    # wrong.
+    var reference_full = grow_tree(subset, sub_grad, sub_hess, params)
+    _assert_same_tree(bagged, reference_full)
     assert_true(bagged.n_leaves > 1)
 
 

@@ -21,7 +21,8 @@ time:
 - missing values: any negative value, or NaN
 - unseen categories: codes not present in the training data
 - dropped categories: codes present in training but not kept, because the
-  column had more distinct categories than `max_bins - 1`
+  column had more distinct categories than `max_bins - 1`. See "Capacity"
+  below: this is a hard ceiling here and is not one in LightGBM.
 
 Default routing
 ---------------
@@ -62,10 +63,33 @@ Intentional differences from LightGBM
   `min_data_per_group`, and the `cat_smooth` count filter use exact counts.
 - One-vs-rest search is selected on the number of categories, matching the
   documented meaning of `max_cat_to_onehot`, rather than on an internal bin
-  count that may or may not include the unknown bin.
-- LightGBM keeps the most frequent categories covering 99% of the rows and
-  drops categories with fewer than `min_data_in_bin` rows. mojotrees keeps
-  the `max_bins - 1` most frequent categories and drops nothing else; rare
+  count that may or may not include the unknown bin. LightGBM tests
+  `num_bin <= max_cat_to_onehot` (`FindBestThresholdCategoricalInner`,
+  `src/treelearner/feature_histogram.cpp`), and its `num_bin` counts the
+  bin 0 dummy, so at the default of 4 LightGBM one-hots up to 3 categories
+  while this module one-hots up to 4. A feature holding exactly
+  `max_cat_to_onehot` categories is searched by different algorithms on the
+  two sides. That is a real divergence, not a naming nicety.
+- **Capacity.** LightGBM's `max_bin` is a *floor* on a categorical
+  feature's bin count, not a ceiling. `BinMapper::FindBin`
+  (`src/io/bin.cpp`) keeps admitting categories while
+  `used_cnt < cut_cnt || num_bin_ < max_bin`, and that disjunction stops
+  the loop only once it has both covered 99% of the rows and spent
+  `max_bin` bins, so a 500-category column at `max_bin=255` gets 496 bins
+  there. This module cannot do that. A bin id is one byte
+  (`binning.MAX_BINS` is 256) and a node's category set is a fixed 256-bit
+  `CatBitset`, so a feature keeps at most `max_bins - 1` categories and
+  every other code falls into bin 0 alongside the missing rows. Past
+  roughly 254 distinct categories that is lost resolution rather than a
+  different tie-break: `bench/real_data`'s `categorical_missing` scenario
+  carries a 500-category column, and this module lumps 246 of its
+  categories, near half of the rows, into one bin that can never be
+  isolated because bin 0 never joins a split set. Raising the ceiling means
+  widening the binned matrix element and the node bitset, which is not a
+  change this module can make on its own.
+- LightGBM additionally drops categories holding fewer than
+  `min_data_in_bin` rows, and stops at 99% coverage even when bins are
+  still available. mojotrees drops nothing but the overflow above; rare
   categories are instead handled by the `cat_smooth` filter during split
   search.
 - LightGBM's `kEpsilon` (1e-15) Hessian nudges are omitted.

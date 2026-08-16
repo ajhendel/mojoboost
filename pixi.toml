@@ -6,6 +6,42 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
+# Build flags, and why this file sets none of them.
+#
+# Read from `mojo build --help` and `mojo build --print-effective-target` on
+# Mojo 1.0.0 rather than assumed from clang, because the toolchain's defaults
+# are not clang's:
+#
+#   * `--optimization-level` defaults to **3**. There is no missing `-O3`.
+#   * `--target-cpu` and `--target-features` default to the **host**. On the
+#     M4 this resolves to `--target-cpu apple-m4` with `+sme2,+i8mm,+bf16,
+#     +dotprod,+fullfp16` and the rest of the chip's feature set. So every
+#     `mojo build` and `mojo run` named below is already a native build, and
+#     `--mcpu=native` or `--march=native` would only restate the default.
+#     Mojo also accepts `--march`, `--mcpu`, `--mtune`, `--target-triple`,
+#     `--target-features` and `--target-accelerator`; none is needed to get
+#     host codegen, because host codegen is what you get by omitting them.
+#   * `--fp-mode contract=fast` is the **default**, and it fuses `a + b*c`
+#     into an FMA across statements. `contract=off` exists and is not set:
+#     turning it off moves bits in every objective, every split gain and
+#     every leaf value, so it is a deliberate golden re-baseline rather than
+#     a build-file edit, and it would cost speed rather than buy it.
+#   * `mojo precompile` accepts **no codegen flags at all**: no `-O`, no
+#     `--target-*`, no `--fp-mode`, no `--march`. Its own help says a
+#     `.mojopkg` holds non-elaborated code and is architecture-independent by
+#     construction. `build-pkg` below therefore has nothing to tune; codegen
+#     happens later, inside whichever `mojo build` or `mojo run` imports it.
+#
+# The consequence of the host default is a PORTABILITY question rather than a
+# speed one, and it does not live in this file. `bindings/build.sh`,
+# `capi/build.sh` and `cli/build.sh` emit real machine code and pass no target
+# flags, so a shipped extension is compiled for the CPU of whatever machine or
+# CI runner built it. A baseline (`--target-cpu x86-64-v2` and an ARM
+# equivalent) belongs in those scripts, not here, and is not this file's to
+# set. `print-target` records what a given machine actually resolved to, which
+# is the fact a benchmark result or a wheel provenance line should carry.
+print-target = "mojo build --print-effective-target"
+
 # Precompile the package once.  Every test then runs against `-I build`
 # instead of recompiling all sixty modules of `src/mojotrees` inside its own
 # process, and precompiling is a stricter check than the suite is: it
@@ -104,6 +140,14 @@ max = ">=26.5.0,<27"
 python = ">=3.11"
 numpy = "*"
 lightgbm = "*"
+# The CatBoost peer arm of bench/real_data. It is a peer column reported
+# beside the comparator and never instead of it: the one comparator is
+# LightGBM at stock defaults plus deterministic=true, and nothing is gated
+# on CatBoost. 1.2 is the floor because below it the resolved parameter list
+# the arm records is not readable back through `get_all_params()`, and a
+# record that states defaults nobody checked is worse than one that states
+# none. See bench/real_data/scenarios.py, CATBOOST_MIN_VERSION.
+catboost = ">=1.2"
 
 [feature.bench.tasks]
 bench-lgbm = "python bench/bench_lightgbm.py"

@@ -10,6 +10,14 @@ cd "$(dirname "$0")/.."
 
 bindings/build.sh
 
+# The extension is compiled for the baseline CPU that packaging/build_target.sh
+# pins, not for the build machine. This is the check that the pin held, run on
+# the object rather than on the wheel because it is the cheapest place to catch
+# it and because the failure it catches (a native build) is invisible in every
+# Mach-O header. packaging/macos/inspect_wheel.py runs the same check on the
+# finished wheel as C14, covering the bundled runtime as well.
+python3 packaging/isa_baseline.py python/mojotrees/_mojotrees.so
+
 PKG=python/mojotrees
 LIBS=(
     libKGENCompilerRTShared

@@ -346,7 +346,7 @@ def _run_shape(n_rows: Int, n_features: Int, rounds: Int) raises:
     var child = builder.histogram_from_host()
     var child_rows = 0
     for b in range(child.n_bins):
-        child_rows += child.count[b]
+        child_rows += child.count_at(b)
     print("  hist_child_rows:", child_rows)
 
     var params = BoosterParams(rounds, 0.1, TreeParams.default())

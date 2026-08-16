@@ -128,9 +128,9 @@ def _assert_same_bits(a: Histogram, b: Histogram) raises:
     assert_equal(a.n_features, b.n_features)
     assert_equal(a.n_bins, b.n_bins)
     for i in range(a.n_features * a.n_bins):
-        assert_equal(_bits(a.grad[i]), _bits(b.grad[i]))
-        assert_equal(_bits(a.hess[i]), _bits(b.hess[i]))
-        assert_equal(a.count[i], b.count[i])
+        assert_equal(_bits(a.grad_at(i)), _bits(b.grad_at(i)))
+        assert_equal(_bits(a.hess_at(i)), _bits(b.hess_at(i)))
+        assert_equal(a.count_at(i), b.count_at(i))
 
 
 def _reset_env():
@@ -213,7 +213,7 @@ def _full_matches_at_group(group: String) raises:
     # the other arm produced: a check that would fail if both arms were
     # broken the same way.
     for i in range(n_features * n_bins):
-        assert_equal(_bits(two.hess[i]), _bits(Float64(two.count[i])))
+        assert_equal(_bits(two.hess_at(i)), _bits(Float64(two.count_at(i))))
 
 
 def test_full_build_is_bit_identical_at_every_group_width() raises:
@@ -266,9 +266,9 @@ def test_full_build_with_feature_subset_leaves_excluded_slices_zero() raises:
             continue
         for b in range(n_bins):
             var i = f * n_bins + b
-            assert_equal(_bits(two.grad[i]), _bits(0.0))
-            assert_equal(_bits(two.hess[i]), _bits(0.0))
-            assert_equal(two.count[i], 0)
+            assert_equal(_bits(two.grad_at(i)), _bits(0.0))
+            assert_equal(_bits(two.hess_at(i)), _bits(0.0))
+            assert_equal(two.count_at(i), 0)
     _reset_env()
 
 
@@ -293,7 +293,7 @@ def _subset_matches(compact_min_rows: String, group: String) raises:
 
     var total = 0
     for i in range(n_features * n_bins):
-        total += two.count[i]
+        total += two.count_at(i)
     assert_equal(total, n_features * len(rows))
 
 
@@ -367,9 +367,9 @@ def test_sibling_subtraction_is_bit_identical() raises:
     # stays visible.
     var direct = build_histogram_subset(data, grad, hess, right, [], True)
     for i in range(n_features * n_bins):
-        assert_equal(direct.count[i], two.count[i])
-        assert_equal(_bits(direct.hess[i]), _bits(two.hess[i]))
-        assert_equal(_bits(two.hess[i]), _bits(Float64(two.count[i])))
+        assert_equal(direct.count_at(i), two.count_at(i))
+        assert_equal(_bits(direct.hess_at(i)), _bits(two.hess_at(i)))
+        assert_equal(_bits(two.hess_at(i)), _bits(Float64(two.count_at(i))))
     _reset_env()
 
 

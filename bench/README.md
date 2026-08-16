@@ -15,10 +15,42 @@ noise; the remaining features are pure noise.
 
 Parameters match on both sides (mojotrees defaults): 100 boosting rounds,
 `num_leaves=31`, `learning_rate=0.1`, `min_data_in_leaf=20`,
-`min_sum_hessian_in_leaf=1e-3`, `lambda_l2=1.0`, `max_bin=255`. LightGBM
-additionally runs with `enable_bundle=false` (mojotrees has no EFB yet) and
-`force_row_wise=true`. The table below records the original single-threaded
-mojotrees baseline. The current implementation parallelizes histogram
+`min_sum_hessian_in_leaf=1e-3`, `lambda_l2=0.0`, `max_bin=255`.
+
+**There is exactly one comparator: `stock+det`, LightGBM at its own
+defaults plus `deterministic=true`.** It is registered as section C9 of
+[`results/PROFILE_PROTOCOL.md`](results/PROFILE_PROTOCOL.md) and it is
+defined in one place, `real_data/scenarios.py`, from which both this
+directory's LightGBM driver and the real-data harness import it whole. No
+other LightGBM configuration is published, and speed and accuracy are
+reported together against it.
+
+`deterministic=true` is the only deviation from pure stock that is not a
+feature-space pin. It is there because our arm is reproducible across
+thread counts at no cost, so it is the setting that makes the two sides
+comparable rather than one that handicaps either. It does not fully
+succeed. In the first real-data run LightGBM produced two distinct
+prediction digests across three repeats on `sparse_highdim` with
+`deterministic=true` already set and a fixed seed, while our arm was
+bit-identical across all three.
+
+Two switches are pinned off, both feature-space differences rather than
+tuning: `feature_pre_filter` (LightGBM deletes columns at Dataset
+construction and mojotrees does not, and a lane is implementing it) and
+`enable_bundle` (mojotrees's EFB is not applied by every trainer these
+benchmarks reach). Everything else is LightGBM's own default, including
+`min_data_in_bin`, `bin_construct_sample_cnt`, and the histogram builder,
+which stock LightGBM picks for itself by timing both.
+
+**Every LightGBM figure in this file predates that comparator.** They were
+taken against a configuration pinned to `min_data_in_bin=1`,
+`bin_construct_sample_cnt` at the row count and `force_row_wise=true`; the
+binning pin in particular made the comparator do strictly more binning work
+than mojotrees did. Read them as history and re-measure before quoting.
+`real_data/results/RESULTS_TEMPLATE.md` carries the banner to mark them
+with.
+
+The table below records the original single-threaded mojotrees baseline. The current implementation parallelizes histogram
 accumulation across features, so new runs should record available CPU cores
 and compare against both 1-thread and machine-wide LightGBM.
 
@@ -163,7 +195,8 @@ single-core work moves.
 | `split_scan` | best-split search over a built histogram |
 | `partition` | routing a node's rows to its two children |
 | `grow_tree` | one whole tree, as an integration check on the above |
-| `predict` | scoring every row through a grown tree |
+| `predict_batch` | the shipped batch scorer, `Booster.predict_batch_range` |
+| `predict_row_serial` | this benchmark's own serial loop over `Tree.predict_row` for one tree |
 
 It prints a machine header first (ISA, core counts, SIMD width, and the
 scheduler's resolved task counts), which must accompany any number taken from
@@ -172,7 +205,93 @@ it.
 ```sh
 pixi run bench-profile                  # 100000 rows x 100 features, 3 reps
 pixi run bench-profile 200000 50 5      # rows, features, reps
+pixi run bench-profile 200000 50 5 8    # ... and the predict ensemble size
 ```
+
+#### The stage formerly called `predict`
+
+There is no stage named `predict` any more, and **a number recorded under
+that name is a `predict_row_serial` number**. It was this benchmark's own
+serial loop calling `Tree.predict_row` once per row over a single tree,
+which is serial in both columns by construction, so the roughly 1.0x
+speedup it reported was a property of that loop and told you nothing about
+the library. In particular it was never evidence that batch prediction fails
+to parallelize.
+
+`predict_batch` is the stage that measures the shipped path.
+`Booster.predict_batch_range` fans out over row blocks with
+`parallel.dispatch_rows`, and until this stage existed nothing in the
+repository had measured what that fan-out is worth. Its ensemble is
+`pred_trees` (default 8) copies of the one grown tree, which costs a row
+what an ensemble of distinct trees of that shape costs it.
+
+#### Stages that are not the shipped call
+
+A stage name is not a claim that the library calls that code. Three stages
+allocate per call where the grower recycles, and at small node sizes the
+allocation is the larger term:
+
+- `hist_full`, `hist_subset50`, `hist_subset10` allocate a fresh `Histogram`
+  per call (25,600 cells at 24 bytes = 614,400 bytes at 100 features and 256
+  bins) and the subset pair buffer per call. The grower takes a pooled buffer
+  and one shared `pairs` list.
+- `hist_subtract` allocates its result; the grower calls
+  `subtract_histogram_into`. Since the subtraction is one SIMD sweep over the
+  same 614,400 bytes, this stage may be allocation-dominated, and no run has
+  established what share is which.
+- `partition` allocates two `List[Int]`; the grower reuses its buffers.
+
+They are left that way so numbers already recorded under those names stay
+comparable. Use the ladder below when the question is what a node costs the
+grower.
+
+#### The node-size ladder
+
+`hist_full` / `hist_subset50` / `hist_subset10` are all the node sizes the
+old table had: at 1,000,000 rows that is 1,000,000, 500,000 and 100,000. A
+default 31-leaf tree spends most of its nodes far below the smallest of
+those, so the table was silent about them, which left two explanations of the
+gap between well-scaling kernels and a poorly-scaling `grow_tree` -- per-node
+fixed cost, and nodes falling below the grain floor and running serial --
+that nothing could tell apart.
+
+The second table times the node histogram at 100,000 / 30,000 / 10,000 /
+3,000 / 1,000 / 300 rows through
+`histogram.build_histogram_subset_into_scratch` with a recycled output
+buffer and a recycled pair buffer, which is the call the grower makes. Its
+columns:
+
+| Column | Meaning |
+|---|---|
+| `serial_s`, `auto_s`, `speedup` | as in the main table |
+| `serial_tasks`, `auto_tasks` | the **resolved** task count of the accumulation dispatch in each arm, from `plan_tasks` on the same two arguments `dispatch_feature_ranges` passes |
+| `gather_blocks` | resolved row blocks of the gradient/hessian gather, or 0 when the plan declined to compact |
+| `group_width`, `group_count`, `active_ops`, `compact` | the `AccumulationPlan` the kernel derived |
+
+`auto_tasks` is the column that earns the table. A 1.0x speedup is ambiguous
+between "fanned out and gained nothing" and "never fanned out"; a resolved
+count of 1 settles it. `serial_tasks` is there so the serial arm is proven
+serial rather than assumed.
+
+Two structural facts the columns will expose, both arithmetic rather than
+measurement. The accumulation's work estimate is
+`n_active * (n_bins + n_rows)` and the grain floor is 65,536, so with 256
+bins a node stays serial below about 1,055 rows at 50 features and below
+about 400 at 100. And the task count is clamped to `group_count`, which is
+`ceil(n_active / group_width)`, so at 50 features and `group_width` 2 no
+histogram build can use more than 25 tasks however large the node is.
+
+Row lists are strided rather than contiguous, following `hist_subset50` and
+`hist_subset10`. A real node's rows are ascending but clustered by the split
+feature's bin, so the ladder bounds a real node's time from above rather than
+estimating it.
+
+This is still a microbenchmark. The in-run complement -- real trees, every
+node, a size breakdown, and the share of a whole fit -- is
+`src/mojotrees/phase_profile.mojo`, reached with `MOJOTREES_PHASE_PROFILE=async`
+on any run that trains. It cannot answer the resolved-task-count question:
+its host `dispatches` column is a structural constant charged per call site,
+not the count the scheduler chose.
 
 Sweeping the tasks-per-core constant and rerunning this is how it should be
 settled; it is currently an unmeasured starting value of 4. **This no longer
@@ -438,11 +557,28 @@ slow and the two sets are not interchangeable to better than about a percent.
 the model serialize-and-reload round trip it otherwise performs inside the
 timed call and which mojotrees pays no counterpart to. And the parameters now
 come from `real_data/scenarios.py`, which adds the binning alignment the
-standalone script was missing (`min_data_in_bin=1`, `feature_pre_filter=false`
-and `bin_construct_sample_cnt` at the row count); `deterministic` is the one
-entry deliberately not inherited, because it is a reproducibility setting
-whose documented cost would land entirely on the comparator's side of a speed
-comparison.
+standalone script was missing. That alignment was three settings when this
+paragraph was written (`min_data_in_bin=1`, `feature_pre_filter=false` and
+`bin_construct_sample_cnt` at the row count) and is two now
+(`feature_pre_filter=false` and `enable_bundle=false`, both feature-space
+pins), because mojotrees's binner defaults to LightGBM's own
+`min_data_in_bin=3`
+and 200000-row sample, so pinning either would make the comparator bin
+differently from the subject rather than the same. Numbers recorded under
+the old pins were measured against a constraint this repository imposed.
+
+`deterministic` used to be the one entry deliberately **not** inherited
+here, on the grounds that its documented cost would land entirely on the
+comparator's side of a speed comparison. That exclusion is gone, and with
+it the situation it created. This repository was running two LightGBM
+configurations under one name, so a speed figure from this driver and an
+accuracy figure from `real_data` were not figures about the same engine.
+`deterministic=true` is now the comparator, on both, for the reason given
+at the top of this file, which is that our arm is reproducible across
+thread counts at no cost, so the flag is what makes the two sides comparable rather than a
+handicap on the comparator. The wall time it costs LightGBM is paid
+deliberately and in the open, and every figure taken before it is not
+comparable with one taken after.
 
 `bench-lgbm` itself now takes `--repeats` and reports minimum, median,
 maximum and spread under the same reduction, so even the separate-process
@@ -1252,8 +1388,11 @@ exist.
 
 ## Caveats
 
-- LightGBM's `min_data_in_bin=3` (its default) has no mojotrees equivalent;
-  both still fit 255-bin quantile histograms.
+- `min_data_in_bin=3` is now the default on **both** sides, so it is no
+  longer a difference. It was one when this table was measured, and the
+  numbers above were taken with mojotrees at no minimum population, so they
+  describe a mojotrees that kept low-cardinality levels LightGBM merged.
+  Both still fit 255-bin quantile histograms.
 - Losses differ slightly because tree growth diverges after the first
   floating-point tie; the ~4% MSE gap in mojotrees's favor is within
   seed-to-seed variation, not a quality claim.
