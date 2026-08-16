@@ -755,6 +755,40 @@ def _mean_loss(
     return total / Float64(len(target))
 
 
+def _renewal_membership_usable(
+    tree: Tree, leaves: LeafMembership, n_used: Int
+) -> Bool:
+    """Whether `leaves` can stand in for walking the tree once per row.
+
+    Three tests, all O(number of leaves) and none of them touching a row:
+
+    - the membership names as many leaves as the tree has, and at least one;
+    - every name is a leaf of *this* tree (in range, and `feature < 0`);
+    - the row lists together hold exactly the `n_used` rows renewal would
+      otherwise iterate, which is the bag when there is one and the dataset
+      when there is not.
+
+    That is a shape check, not a provenance check: a membership left over from
+    a differently-grown tree of the same shape and the same row count would
+    pass it. It does not need to be more than that, because the only callers
+    that pass a membership are the two round loops in this file, which pass the
+    one the grower filled in for this tree two statements earlier. Every other
+    caller passes nothing, gets the default empty membership, fails the first
+    test, and takes the traversal it always took.
+    """
+    var n_leaves = leaves.n_leaves()
+    if n_leaves == 0 or n_leaves != tree.n_leaves:
+        return False
+    var n_nodes = len(tree.feature)
+    var total = 0
+    for l in range(n_leaves):
+        var node = leaves.node[l]
+        if node < 0 or node >= n_nodes or tree.feature[node] >= 0:
+            return False
+        total += len(leaves.rows[l])
+    return total == n_used
+
+
 def _renew_leaf_values(
     mut tree: Tree,
     data: BinnedMatrix,
@@ -765,6 +799,7 @@ def _renew_leaf_values(
     bag: List[Int] = [],
     monotone: List[Int] = [],
     extra: ExtraTreeParams = ExtraTreeParams(),
+    leaves: LeafMembership = LeafMembership(),
 ) raises:
     """LightGBM's RenewTreeOutput for QUANTILE and L1: replace each leaf's
     Newton value with the alpha-percentile of the residuals
@@ -785,7 +820,34 @@ def _renew_leaf_values(
     for. The parent's output is the value its node still carries -- renewal
     rewrites leaves only, so an internal node holds the finished value it was
     grown with. The bundle defaults to inactive, so a caller that does not
-    pass one renews exactly as before."""
+    pass one renews exactly as before.
+
+    `leaves` is the membership the grower handed back for this very tree (see
+    `tree.LeafMembership`), and passing it is what stops this from walking the
+    whole tree once per row to recover a leaf the partition already named. It
+    is optional and defaults to empty; a caller that passes nothing takes the
+    traversal unchanged. `_renewal_membership_usable` decides, and a membership
+    that does not pass it falls back rather than raising.
+
+    The two routes build the *same list*, not merely the same multiset, and
+    that distinction is the whole of the argument. Renewal buckets residuals
+    per leaf and then takes a percentile of each bucket, and
+    `_weighted_percentile` accumulates a weighted cdf in the order `_argsort`
+    leaves its input in, so a bucket permuted by a tie would give a different
+    Float64. The traversal fills bucket `node` by sweeping rows in ascending
+    order and appending the ones that route there, so bucket `node` comes out
+    in ascending row order. `partition_rows_into` keeps each side ascending at
+    every split, so `leaves.rows[l]` is ascending too, and it is exactly the
+    set of rows that route to `leaves.node[l]` -- the partition and
+    `leaf_index_row` apply the same three tests to the same bins. Same
+    elements, same order, therefore the same bits out. The finishing loop below
+    is untouched and still runs in node order, so nothing else about this
+    function moves either.
+
+    This holds under bagging as well as without it. `bag` is ascending and
+    duplicate-free, growth partitions the bag rather than the dataset, and the
+    traversal route iterates `bag` in order; so the per-leaf lists agree there
+    for the same reason."""
     var n_nodes = len(tree.feature)
     var bounds = node_bounds(tree, monotone)
     var finish = extra.needs_leaf_finish()
@@ -806,12 +868,33 @@ def _renew_leaf_values(
         leaf_residuals.append(List[Float64]())
         leaf_weights.append(List[Float64]())
     var n_used = len(bag) if len(bag) > 0 else data.n_rows
-    for i in range(n_used):
-        var r = bag[i] if len(bag) > 0 else i
-        var node = tree.leaf_index_row(data, r)
-        leaf_residuals[node].append(target[r] - raw[r])
-        if len(weights) > 0:
-            leaf_weights[node].append(weights[r])
+    var weighted = len(weights) > 0
+    if _renewal_membership_usable(tree, leaves, n_used):
+        # The leaf is read off the partition instead of re-derived by walking
+        # the tree. Each list is also sized once, at its exact final length,
+        # rather than doubled into: a leaf holding a million rows costs one
+        # allocation here where the appending form costs about twenty and
+        # copies about two million Float64 moving between them. Reserving
+        # changes no element and no order.
+        for l in range(leaves.n_leaves()):
+            var node = leaves.node[l]
+            ref rows = leaves.rows[l]
+            var n_l = len(rows)
+            leaf_residuals[node].reserve(n_l)
+            if weighted:
+                leaf_weights[node].reserve(n_l)
+            for i in range(n_l):
+                var r = rows[i]
+                leaf_residuals[node].append(target[r] - raw[r])
+                if weighted:
+                    leaf_weights[node].append(weights[r])
+    else:
+        for i in range(n_used):
+            var r = bag[i] if len(bag) > 0 else i
+            var node = tree.leaf_index_row(data, r)
+            leaf_residuals[node].append(target[r] - raw[r])
+            if weighted:
+                leaf_weights[node].append(weights[r])
     for node in range(n_nodes):
         if tree.feature[node] >= 0 or len(leaf_residuals[node]) == 0:
             continue
@@ -1257,10 +1340,34 @@ def _add_by_leaf(
     written out by hand, so a compiler that ever stopped contracting there
     would be caught rather than silently accepted.
 
-    Rows are independent accumulators and each appears in exactly one leaf, so
-    a row is added to once here as it was once there. Leaves are handed out to
-    blocks, and blocks touch disjoint sets of rows, so the block count changes
-    nothing.
+    Why the split below cannot move a bit, which is the property to preserve.
+    A row's update is a single independent read-modify-write of its own slot:
+    one `fma` reading `raw[slot]` and writing `raw[slot]`, with `learning_rate`
+    a scalar and `value` a per-leaf constant read out of `tree.value`. Nothing
+    is accumulated across rows -- there is no running sum, no shared
+    accumulator, no reduction to combine -- and each row appears in exactly one
+    leaf's row list, so no row is written twice and no row reads a slot another
+    row writes. A partition of the (leaf, row) pairs into blocks therefore
+    reassociates nothing: every slot receives the same one `fma` with the same
+    two operands whatever block it landed in, so the result is identical at one
+    block and at sixty. **Any change here that introduces an accumulation
+    spanning two rows breaks this and is wrong.**
+
+    The blocks are row blocks, not leaf blocks. The index space is the
+    *concatenation* of the leaves' row lists -- position `p` names leaf `l` and
+    its `p - start[l]`-th row -- and `dispatch_rows_with` cuts that flat range
+    into equal contiguous pieces. A block may begin and end in the middle of a
+    leaf, and may span several whole leaves; it walks the leaves it overlaps
+    and does each one's slice.
+
+    Splitting by leaf instead, which is what this did, made the round's score
+    update as long as its single largest leaf. Leaf-wise growth does not make
+    equal leaves: `num_leaves` is at most a few hundred while `min_data_in_leaf`
+    is twenty, so one leaf may legitimately hold nearly every row, and a
+    schedule whose smallest indivisible unit is a leaf can never use more
+    workers than the reciprocal of that leaf's row share no matter how many
+    cores the machine has. Cutting inside a leaf removes that floor: the
+    longest block is now `ceil(total / n_blocks)` rows by construction.
 
     The caller must have checked `leaves.covers_all_rows`; this adds nothing
     to a row no leaf holds.
@@ -1268,8 +1375,29 @@ def _add_by_leaf(
     var n_leaves = leaves.n_leaves()
     var raw_p = raw.unsafe_ptr()
 
-    def apply(l_start: Int, l_end: Int) {imm}:
-        for l in range(l_start, l_end):
+    # Prefix sum over leaf sizes: `start[l]` is where leaf `l`'s rows begin in
+    # the concatenation, and `start[n_leaves]` is the total row count. The tree
+    # has at most `num_leaves` leaves -- 31 by default, a few hundred at the
+    # extreme -- so this is a few hundred integer adds per round against the
+    # millions of row updates below it. The total is taken from the row lists
+    # rather than from `n_rows` so that the split covers exactly what is there.
+    var start = List[Int](capacity=n_leaves + 1)
+    start.append(0)
+    var total = 0
+    for l in range(n_leaves):
+        total += len(leaves.rows[l])
+        start.append(total)
+
+    def apply(p_start: Int, p_end: Int) {imm}:
+        # First leaf this block reaches. A linear scan over at most a few
+        # hundred ascending offsets, run once per block, not once per row.
+        # `start` is read through the capture rather than through a raw
+        # pointer taken before the dispatch, because a pointer would not keep
+        # the list alive past its last use and the block runs after that.
+        var l = 0
+        while l < n_leaves and start[l + 1] <= p_start:
+            l += 1
+        while l < n_leaves and start[l] < p_end:
             var value = tree.value[leaves.node[l]]
             # A `ref` binding, because `leaves.rows[l]` in an expression
             # materializes a copy of the row list and a pointer taken from
@@ -1277,17 +1405,27 @@ def _add_by_leaf(
             # reference is the list the grower handed back.
             ref rows = leaves.rows[l]
             var rows_p = rows.unsafe_ptr()
-            for i in range(len(rows)):
+            var base = start[l]
+            var i0 = p_start - base
+            if i0 < 0:
+                i0 = 0
+            var i1 = p_end - base
+            var n_l = len(rows)
+            if i1 > n_l:
+                i1 = n_l
+            for i in range(i0, i1):
                 var slot = Int(rows_p.unsafe_load(i)) * stride + offset
                 raw_p.unsafe_store(
                     slot, fma(learning_rate, value, raw_p.unsafe_load(slot))
                 )
+            l += 1
 
-    # The index space split over blocks is the leaves, not the rows, because a
-    # leaf's rows are the contiguous unit here. Leaf-wise growth does not make
-    # equal leaves, so the blocks are not equal work; that imbalance has not
-    # been measured and is the obvious thing to revisit.
-    dispatch_rows_with(settings, apply, n_leaves, n_rows * _LEAF_ROW_OPS)
+    # `total`, not `n_leaves`, is the item count: `plan_tasks` clamps the task
+    # count to the number of items, so a 31-leaf tree used to cap the fan-out
+    # at 31 tasks (and at one task per leaf, still unequal ones). The work
+    # estimate is left at `n_rows * _LEAF_ROW_OPS`, unchanged, so the
+    # serial/parallel crossover sits exactly where it did.
+    dispatch_rows_with(settings, apply, total, n_rows * _LEAF_ROW_OPS)
 
 
 def _add_tree_scores(
@@ -1468,9 +1606,14 @@ def _boost_rounds(
         )
         var post_started = profile.clock()
         if renews:
+            # The membership growth just handed back, so renewal reads each
+            # row's leaf off the partition instead of walking the tree once
+            # per row for a leaf that was already named. Same residual per
+            # row, same per-leaf order, same values (see
+            # `_renew_leaf_values`).
             _renew_leaf_values(
                 tree, data, target, raw, renew_w, renew_a, bag, signs,
-                params.tree.extra,
+                params.tree.extra, leaves,
             )
 
         # A single-leaf tree with a near-zero value means the objective has
@@ -1484,8 +1627,9 @@ def _boost_rounds(
                 continue
             break
 
-        # One pass over every training row per round, serial, over every row
-        # whether or not it was in the bag. Its own phase because it belongs
+        # One pass over every training row per round, over every row whether
+        # or not it was in the bag, and split into equal row blocks whichever
+        # of the two routes it takes. Its own phase because it belongs
         # to no node, is invisible to any per-tree instrument, and would
         # otherwise land in the unattributed remainder where nobody would look
         # for it. Charged at `n`, the dataset, not at the bag, which is what
@@ -1810,9 +1954,14 @@ def train_with_valid(
             const_hessian,
         )
         if renews:
+            # The membership growth just handed back, so renewal reads each
+            # row's leaf off the partition instead of walking the tree once
+            # per row for a leaf that was already named. Same residual per
+            # row, same per-leaf order, same values (see
+            # `_renew_leaf_values`).
             _renew_leaf_values(
                 tree, data, target, raw, renew_w, renew_a, bag, signs,
-                params.tree.extra,
+                params.tree.extra, leaves,
             )
         # Under any row sampler a degenerate tree indicts the sample, not
         # the run.

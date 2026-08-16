@@ -30,6 +30,17 @@ the route arrives at the same numbers.
    batch large enough to cross the parallel grain and again with the worker
    count forced.
 
+4. The two things the round loop does with the membership it now keeps. The
+   score update is split by *rows* rather than by leaves, so a round is no
+   longer as long as its single largest leaf; and leaf renewal (L1, QUANTILE,
+   MAPE) reads each row's leaf off the membership instead of walking the tree
+   once per row. Both are equalities again and both are checked against the
+   route they replaced. The schedule half of the first is proved rather than
+   assumed: the fixture grows a deliberately lopsided tree and the test
+   asserts that a block boundary really did fall inside a leaf, which is the
+   thing the old leaf-wise split could never do. The renewal half asserts the
+   gate that chooses the route, in both directions.
+
 `MOJOTREES_NUM_WORKERS` is set and cleared around the tests that need a
 particular task count, so the file leaves the environment as it found it.
 """
@@ -53,9 +64,13 @@ from mojotrees import (
 )
 from mojotrees.boosting import (
     IterationRange,
+    _LEAF_ROW_OPS,
     _add_by_leaf,
     _add_by_traversal,
+    _renew_leaf_values,
+    _renewal_membership_usable,
 )
+from mojotrees.parallel import plan_row_blocks
 from mojotrees.cegb import CegbLedger
 from mojotrees.histogram import (
     Histogram,
@@ -69,6 +84,7 @@ from mojotrees.tree import (
     grow_tree_leaves,
     grow_tree_with_cegb,
 )
+from mojotrees.tree_parameters_extra import ExtraTreeParams
 from support import _make_features, _uniform
 
 
@@ -432,6 +448,358 @@ def test_both_updates_match_the_hand_written_previous_update() raises:
     _add_by_leaf(strided_leaf, tree, leaves, learning_rate, n, n_classes, 1)
     for i in range(n * n_classes):
         _assert_same_float(strided_previous[i], strided_leaf[i])
+
+
+def _skewed_tree(
+    mut leaves: LeafMembership,
+    mut scratch: GrowScratch,
+    data: BinnedMatrix,
+    n: Int,
+    num_leaves: Int,
+) raises -> Tree:
+    """A tree whose leaves are deliberately of very unequal size.
+
+    The gradient is a spike. Rows in the top bins of feature 0 carry a large
+    and varying gradient; every other row carries exactly zero. A leaf holding
+    only zero-gradient rows has zero gain on every split of it, so growth
+    refuses to cut the bulk and spends its whole budget subdividing the spike,
+    leaving one leaf with the large majority of the dataset in it. That is the
+    shape the row-blocked score update exists for, and a fixture with sixteen
+    even leaves would not exercise it.
+    """
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    for r in range(n):
+        var x0 = data.bin_at(r, 0)
+        grad.append(
+            4.0 + 2.0 * _uniform(UInt64(r) + 13) if x0 >= 28 else 0.0
+        )
+        hess.append(1.0)
+    var ledger = CegbLedger.none()
+    return grow_tree_leaves(
+        leaves, ledger, scratch, data, grad, hess,
+        TreeParams(num_leaves, 8, 1.0, 1e-9),
+    )
+
+
+def _leaf_sizes(leaves: LeafMembership) raises -> List[Int]:
+    var out = List[Int](capacity=leaves.n_leaves())
+    for l in range(leaves.n_leaves()):
+        out.append(len(leaves.rows[l]))
+    return out^
+
+
+def test_leaf_update_cuts_inside_a_leaf_and_moves_no_bits() raises:
+    """The score update is split by rows, not by leaves, and the split is
+    proved to have landed inside a leaf rather than assumed to have.
+
+    Splitting by leaf made the round's update as long as its largest leaf.
+    This fixture has one leaf holding a large majority of the rows, so a
+    leaf-wise split could not have used more than a couple of workers on it
+    however many were asked for. The assertions are in two halves:
+
+    1. The schedule. `_add_by_leaf` splits [0, total) -- the concatenation of
+       the leaves' row lists -- with `plan_row_blocks`, so the same call with
+       the same two numbers reproduces its block geometry exactly. At least
+       one block boundary is asserted to fall strictly inside a leaf, which is
+       the thing the old schedule could never do and is therefore the proof
+       that the new path ran. It is asserted, not assumed: if the fixture ever
+       stopped producing an uneven tree this test would fail rather than pass
+       for nothing.
+    2. The bits. The same update written out by hand, serially, one row at a
+       time in row order, compared with `to_bits()` and no tolerance.
+    """
+    var n = 4000
+    var f = _features(n, 4)
+    var data = bin_equal_width(f, n, 4, 32)
+
+    _ = setenv("MOJOTREES_NUM_WORKERS", "8")
+    var leaves = LeafMembership()
+    var scratch = GrowScratch(data.n_features, data.n_bins)
+    var tree = _skewed_tree(leaves, scratch, data, n, 16)
+
+    var sizes = _leaf_sizes(leaves)
+    var total = 0
+    var largest = 0
+    for l in range(len(sizes)):
+        total += sizes[l]
+        if sizes[l] > largest:
+            largest = sizes[l]
+    assert_equal(total, n)
+    # The fixture has to be lopsided for this test to mean anything: one leaf
+    # holding at least a fifth of the rows is already more than eight even
+    # workers' share, so a leaf-wise split of it could not have been balanced.
+    assert_true(largest * 5 > n)
+
+    # The block geometry `_add_by_leaf` will use, from the same helper with
+    # the same arguments. `MOJOTREES_NUM_WORKERS=8` is set, so this is eight
+    # blocks whatever machine it runs on.
+    var blocks = plan_row_blocks(total, n * _LEAF_ROW_OPS)
+    assert_equal(blocks.n_blocks, 8)
+
+    # Leaf offsets in the concatenation: `starts[l]` is where leaf l begins.
+    var starts = List[Int](capacity=len(sizes) + 1)
+    starts.append(0)
+    var acc = 0
+    for l in range(len(sizes)):
+        acc += sizes[l]
+        starts.append(acc)
+
+    var cuts_inside_a_leaf = 0
+    for b in range(1, blocks.n_blocks):
+        var boundary = blocks.start(b)
+        var on_a_leaf_edge = False
+        for l in range(len(starts)):
+            if starts[l] == boundary:
+                on_a_leaf_edge = True
+        if not on_a_leaf_edge:
+            cuts_inside_a_leaf += 1
+    # The whole claim of the change: a block begins in the middle of a leaf.
+    assert_true(cuts_inside_a_leaf > 0)
+
+    var learning_rate = 0.1
+    var start = List[Float64](capacity=n)
+    for r in range(n):
+        start.append(0.25 + 0.001 * Float64(r))
+
+    var previous = start.copy()
+    for r in range(n):
+        previous[r] += learning_rate * tree.predict_row(data, r)
+
+    var by_leaf = start.copy()
+    _add_by_leaf(by_leaf, tree, leaves, learning_rate, n, 1, 0)
+    _ = setenv("MOJOTREES_NUM_WORKERS", "")
+
+    for r in range(n):
+        _assert_same_float(previous[r], by_leaf[r])
+
+
+def test_leaf_update_identical_at_one_three_and_eight_workers() raises:
+    """Determinism across the worker count, which is the round's contract.
+
+    A row's update is one independent `fma` into its own slot, so cutting a
+    leaf's rows across blocks cannot reassociate anything and the answer must
+    not depend on how many blocks there are. Three worker counts against one
+    serial reference, bit for bit. The strided form is included because
+    multiclass rounds take it and its slot arithmetic is the one place a block
+    could collide with another block's output.
+    """
+    var n = 4000
+    var f = _features(n, 4)
+    var data = bin_equal_width(f, n, 4, 32)
+
+    var leaves = LeafMembership()
+    var scratch = GrowScratch(data.n_features, data.n_bins)
+    var tree = _skewed_tree(leaves, scratch, data, n, 16)
+
+    var learning_rate = 0.1
+    var start = List[Float64](capacity=n)
+    for r in range(n):
+        start.append(0.25 + 0.001 * Float64(r))
+
+    var previous = start.copy()
+    for r in range(n):
+        previous[r] += learning_rate * tree.predict_row(data, r)
+
+    var n_classes = 3
+    var strided_start = List[Float64](capacity=n * n_classes)
+    for r in range(n):
+        for k in range(n_classes):
+            strided_start.append(0.5 * Float64(k) + 0.001 * Float64(r))
+    var strided_previous = strided_start.copy()
+    for r in range(n):
+        strided_previous[r * n_classes + 2] += (
+            learning_rate * tree.predict_row(data, r)
+        )
+
+    var counts: List[String] = ["1", "3", "8"]
+    for w in range(len(counts)):
+        _ = setenv("MOJOTREES_NUM_WORKERS", counts[w])
+        var got = start.copy()
+        _add_by_leaf(got, tree, leaves, learning_rate, n, 1, 0)
+        var strided_got = strided_start.copy()
+        _add_by_leaf(
+            strided_got, tree, leaves, learning_rate, n, n_classes, 2
+        )
+        _ = setenv("MOJOTREES_NUM_WORKERS", "")
+        for r in range(n):
+            _assert_same_float(previous[r], got[r])
+        for i in range(n * n_classes):
+            _assert_same_float(strided_previous[i], strided_got[i])
+
+
+def _renewal_column(n: Int, seed: UInt64, scale: Float64, shift: Float64
+) raises -> List[Float64]:
+    """One deterministic Float64 column for the renewal fixtures."""
+    var out = List[Float64](capacity=n)
+    for r in range(n):
+        out.append(shift + scale * _uniform(UInt64(r) + seed))
+    return out^
+
+
+def _assert_renewal_matches_traversal(
+    data: BinnedMatrix,
+    n: Int,
+    num_leaves: Int,
+    alpha: Float64,
+    weighted: Bool,
+    bag: List[Int],
+) raises:
+    """Renew the same tree twice, once off the membership and once by walking
+    the tree per row, and compare every node bit for bit.
+
+    The tree is grown twice rather than copied, from the same inputs, because
+    renewal rewrites `tree.value` in place. Growth is deterministic, so the
+    two start from the same tree; `_assert_same_tree` on the unrenewed pair
+    would be the same assertion made twice, and the renewed pair is what
+    matters.
+    """
+    var target = _renewal_column(n, 909, 3.0, 0.0)
+    var raw = _renewal_column(n, 30011, 0.5, -0.25)
+    var weights = List[Float64]()
+    if weighted:
+        weights = _renewal_column(n, 700001, 1.0, 0.25)
+
+    var leaves_a = LeafMembership()
+    var scratch_a = GrowScratch(data.n_features, data.n_bins)
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    for r in range(n):
+        grad.append(2.0 * _uniform(UInt64(r) + 41) - 1.0)
+        hess.append(1.0)
+    var ledger_a = CegbLedger.none()
+    var by_membership = grow_tree_leaves(
+        leaves_a, ledger_a, scratch_a, data, grad, hess,
+        TreeParams(num_leaves, 8, 1.0, 1e-9), bag,
+    )
+
+    var leaves_b = LeafMembership()
+    var scratch_b = GrowScratch(data.n_features, data.n_bins)
+    var ledger_b = CegbLedger.none()
+    var by_traversal = grow_tree_leaves(
+        leaves_b, ledger_b, scratch_b, data, grad, hess,
+        TreeParams(num_leaves, 8, 1.0, 1e-9), bag,
+    )
+    _assert_same_tree(by_membership, by_traversal)
+
+    var n_used = len(bag) if len(bag) > 0 else n
+    # The gate, asserted rather than assumed: this is what decides which of
+    # the two routes each call below takes.
+    assert_true(_renewal_membership_usable(by_membership, leaves_a, n_used))
+
+    var no_monotone = List[Int]()
+    _renew_leaf_values(
+        by_membership, data, target, raw, weights, alpha, bag, no_monotone,
+        ExtraTreeParams(), leaves_a,
+    )
+    # No membership argument: the empty default fails the gate, so this one
+    # walks the tree per row exactly as it always did.
+    _renew_leaf_values(
+        by_traversal, data, target, raw, weights, alpha, bag, no_monotone,
+    )
+    _assert_same_tree(by_membership, by_traversal)
+
+
+def test_renewal_off_membership_matches_the_per_row_walk() raises:
+    """Unweighted renewal (`_percentile`) and weighted renewal
+    (`_weighted_percentile`), at three worker counts.
+
+    The weighted form is the one that can tell the difference: it stable-sorts
+    each leaf's residuals and then accumulates a weighted cdf in that order,
+    so a bucket that came out permuted would give a different Float64 even
+    with the same elements in it. Both routes fill each bucket in ascending
+    row order, which is why they agree.
+
+    The worker count is swept because the trees on both sides are grown under
+    it, and a renewal route that somehow depended on the schedule would show
+    up as a tree difference here.
+    """
+    var n = 2000
+    var f = _features(n, 4)
+    var data = bin_equal_width(f, n, 4, 32)
+    var empty_bag = List[Int]()
+
+    var counts: List[String] = ["1", "3", "8"]
+    for w in range(len(counts)):
+        _ = setenv("MOJOTREES_NUM_WORKERS", counts[w])
+        _assert_renewal_matches_traversal(
+            data, n, 12, 0.5, False, empty_bag
+        )
+        _assert_renewal_matches_traversal(
+            data, n, 12, 0.5, True, empty_bag
+        )
+        # A quantile other than the median, which is the QUANTILE objective's
+        # own case and interpolates between two straddling residuals.
+        _assert_renewal_matches_traversal(
+            data, n, 12, 0.85, True, empty_bag
+        )
+        _ = setenv("MOJOTREES_NUM_WORKERS", "")
+
+
+def test_renewal_off_membership_matches_under_bagging() raises:
+    """Renewal over a bag. The membership names the bag alone, the traversal
+    route iterates the bag alone, and both fill each leaf in ascending row
+    order, so the two agree here for the same reason they do on the full
+    dataset. `covers_all_rows` is False on this membership and renewal does
+    not care: unlike the score update it never had to reach a row outside the
+    bag."""
+    var n = 2000
+    var f = _features(n, 4)
+    var data = bin_equal_width(f, n, 4, 32)
+    var bag = List[Int]()
+    for r in range(0, n, 3):
+        bag.append(r)
+
+    var counts: List[String] = ["1", "3", "8"]
+    for w in range(len(counts)):
+        _ = setenv("MOJOTREES_NUM_WORKERS", counts[w])
+        _assert_renewal_matches_traversal(data, n, 12, 0.5, False, bag)
+        _assert_renewal_matches_traversal(data, n, 12, 0.5, True, bag)
+        _ = setenv("MOJOTREES_NUM_WORKERS", "")
+
+
+def test_renewal_gate_refuses_a_membership_that_does_not_fit() raises:
+    """The gate is a shape check and it says no when the shape is wrong.
+
+    Three refusals: the empty membership every unwired caller passes, a
+    membership grown on a bag when renewal was asked for the whole dataset,
+    and the whole-dataset membership when renewal was asked for a bag. Each
+    would have bucketed the wrong rows, and each falls back to the traversal
+    instead.
+    """
+    var n = 800
+    var f = _features(n, 4)
+    var data = bin_equal_width(f, n, 4, 32)
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    for r in range(n):
+        grad.append(2.0 * _uniform(UInt64(r) + 91) - 1.0)
+        hess.append(1.0)
+    var bag = List[Int]()
+    for r in range(0, n, 2):
+        bag.append(r)
+
+    var full = LeafMembership()
+    var scratch = GrowScratch(data.n_features, data.n_bins)
+    var ledger = CegbLedger.none()
+    var full_tree = grow_tree_leaves(
+        full, ledger, scratch, data, grad, hess, TreeParams(8, 5, 1.0, 1e-3)
+    )
+
+    var bagged = LeafMembership()
+    var bagged_tree = grow_tree_leaves(
+        bagged, ledger, scratch, data, grad, hess,
+        TreeParams(8, 5, 1.0, 1e-3), bag,
+    )
+
+    var nothing = LeafMembership()
+    assert_true(not _renewal_membership_usable(full_tree, nothing, n))
+    # Right tree shape, wrong row count on both sides of the bag question.
+    assert_true(not _renewal_membership_usable(full_tree, full, len(bag)))
+    assert_true(not _renewal_membership_usable(bagged_tree, bagged, n))
+    # And the two that do fit.
+    assert_true(_renewal_membership_usable(full_tree, full, n))
+    assert_true(_renewal_membership_usable(bagged_tree, bagged, len(bag)))
 
 
 def test_leaf_membership_covers_the_bag_only_under_bagging() raises:
