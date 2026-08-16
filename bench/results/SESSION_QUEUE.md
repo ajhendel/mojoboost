@@ -82,8 +82,20 @@ microseconds regardless of byte count. What the lanes are removing, per tree:
   changes; the float parameter block and monotone vector are fit-constant, the
   feature table and allow mask move only when `feature_fraction` is active
   (`lane/search-tables-per-fit`)
-- two uploads in `GpuNativeObjectives.update_raw_ranges`, packed into one if a
-  32-bit bitcast is expressible (`lane/raw-update-copies`)
+- **LANDED**, two uploads in `GpuNativeObjectives.update_raw_ranges` packed into
+  one; the step went into the descriptor's existing padding word, so it costs
+  zero extra bytes and drops a whole device plane from that arm
+  (`lane/raw-update-copies`)
+- **LANDED but NOT IN THIS A/B**, the two-copy gradient upload fused into one
+  (`lane/gradient-upload-drains`). `grad_dev` and `hess_dev` are now
+  `create_sub_buffer` windows onto one `2 * n_rows` allocation and no file
+  outside `histogram_gpu.mojo` changed. **It has no environment override and
+  `train_gpu` does not forward its setter, so it is ON in both arms below and
+  its effect is not measured by them.** That is deliberate rather than an
+  oversight: the lane corrected my estimate from 0.137 to **0.046 seconds**,
+  about 1.4 percent, which is inside this machine's noise and could never be
+  resolved on its own under M0. It is recorded as an unmeasured saving rather
+  than pretended into a table.
 
 **Registered prediction, per M3:** roughly fourteen fewer waits per tree, at 458
 microseconds over 100 trees, is an **estimated** 0.64 seconds, taking a 3.17
@@ -243,3 +255,29 @@ so far.
 - `stage_frontier` still uploads three tables. Untouched on purpose: it stages an
   arbitrary test-built frontier that no scalar describes, so the reset-kernel
   trick does not apply to it. It is not on the per-tree path.
+
+### The copies that are still there, found by lanes and deliberately not taken
+
+Listed so the next round starts from a list rather than from another audit. None
+of these is on the default 1M leaf-wise path, which is why none was taken.
+
+- `histogram_gpu.stage_from_device` — two copies plus its own `synchronize`,
+  once per round per class, hybrid leaf scheduling only. Both planes are now
+  adjacent in this direction too, so it is **one line** from costing one wait
+  instead of two. Left alone so a second unmeasured arm would not confound the
+  first in the same commit.
+- `histogram_gpu.set_features` — `map_to_host`, which copies in **both**
+  directions, per feature-set change, so per tree under column subsampling. The
+  only `map_to_host` left in that file, and exactly the "per-tree constant that
+  should cross once" case the portability doc names.
+- `gpu_objectives_native.update_raw` — still writes through a bidirectional
+  `map_to_host` on the non-compacted arm, strictly worse than the staged copy
+  the range arms use. Different arm, so documented rather than churned.
+- `gpu_sparse.GpuSparseHistogramBuilder` — carries the identical unfused
+  gradient upload, three waits per round. Same fix, different file.
+- `gpu_gradient_stream.HostGradientStage` — same two-copy upload and a
+  `synchronize`, and it has **no callers anywhere** in `src/`, `bench/` or
+  `tests/`. Dead code duplicating `stage_gradients`. Deleting it is a
+  correctness-neutral simplification, not a performance change.
+- The session ledger charges `SLOT_GRAD` and `SLOT_HESS` separately. Bytes are
+  still right; the allocation count those entries imply is now one high.
