@@ -250,6 +250,13 @@ CatBoost-mode arm uses 3), under a leaf-wise queue comparing gains across
 parents, and beside `random_strength`, whose units Cosine changes. This gate
 sees none of those three.
 
+**The middle one is met on a default fit**, which is the part that keeps
+getting lost: `lossguide` is the stock `grow_policy` and `lossguide` is the
+leaf-wise queue, so `sqrt(a) - sqrt(p)` versus `a - p` across different
+parents is the ordinary case rather than an exotic one. Cosine is not inert at
+our defaults. Two sessions read `split.mojo` as saying it was on 2026-08-16;
+the sentence there has been corrected at the source.
+
 **Soft uncertainty** is a workload nobody has measured or documented as
 covered, most often an objective outside the set `device.mojo` names
 (squared error, binary logistic, poisson, huber, quantile, L1). It never

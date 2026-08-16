@@ -131,6 +131,16 @@ compares gains from different parents, or beside one of the absolute costs
 (`min_gain_to_split`, `feature_contri`, CEGB, `random_strength`) whose units
 it has changed. That is a result, not a reason to leave it out; see A10.
 
+**Read the second of those three conditions before quoting the first
+sentence.** `lossguide` is the stock `grow_policy` (`sklearn.py`, `_Base`),
+and `lossguide` is the leaf-wise queue. So the cross-parent condition is met
+on a DEFAULT fit, and `sqrt(a) - sqrt(p)` does not order the same way as
+`a - p` across different parents. **Cosine is not a no-op at our defaults and
+never was.** The paragraph above is accurate and was still read twice, by two
+sessions on 2026-08-16, as saying that it is -- the caveat and the headline
+sat close enough together that the caveat lost. The identity is per parent,
+full stop; `lambda_l2 = 0` is necessary for it and nowhere near sufficient.
+
 Nothing on the default path is conditional on it. The selector is read once
 per node into a `Bool`, the branch that reads it is loop-invariant for the
 whole scan, and `_split_gain` is not touched. The two extra accumulator
