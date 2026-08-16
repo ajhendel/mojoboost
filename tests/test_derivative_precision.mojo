@@ -584,9 +584,23 @@ def test_float64_is_refused_by_name_until_a_trainer_carries_it() raises:
     that trained a float32 model while reporting success is the silent
     downgrade this package refuses everywhere else.
 
-    When the one-field change in `tree.mojo` lands, this test is the thing
-    that has to be deleted, which is deliberate: it fails loudly the moment
-    the refusal stops being true.
+    **The `tree.mojo` change this docstring used to name has landed**
+    (`fc223da`), and this test did NOT have to be deleted. Its assertions
+    still pass and are still correct; only the reason changed. The snapshot
+    hop was never the thing standing between the parameter and a float64
+    fit. The OBJECTIVE is: `boosting.fill_grad_hess` and
+    `_fill_softmax_grad_hess` pick their row loop from a live `getenv`, so a
+    parameter-only float64 fit would store `Float64(Float32(g))` and read it
+    un-re-narrowed -- not float32, because accumulation order moves, and not
+    float64, because the low 29 significand bits are already gone. A third
+    numerical configuration is worse than either arm, so the refusal stands
+    until the objective half carries the parameter too.
+
+    That is the correction worth keeping: a test whose docstring predicts
+    its own deletion is making a claim about the code, and this one's claim
+    was wrong. `test_derivative_precision_wiring.test_the_objective_half_is_still_missing`
+    is the tripwire now, and its docstring carries the fit-level equality
+    test to write when the refusal finally lifts.
     """
     var extra = ExtraTreeParams()
     extra.derivative_precision = DERIV_PRECISION_FLOAT64

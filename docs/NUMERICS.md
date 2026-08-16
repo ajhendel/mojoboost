@@ -234,11 +234,32 @@ aiming at. A number that moves toward the comparator is not a regression even
 when it moves down.
 
 **But a measured trade becomes a switch.** `derivative_precision` takes
-`float32` (the default, everything above) or `float64`, and `float64` keeps
-per-row gradients and hessians at full Float64 through the objective and every
-read site. Reach it with `MOJOTREES_DERIVATIVE_PRECISION=float64`, which is
-read once per fit by `histogram.ConstHessianSettings.resolve()` and once per
-round by `boosting.fill_grad_hess`.
+`float32` (the default, everything above) or `float64`. Reach it with
+`MOJOTREES_DERIVATIVE_PRECISION=float64`, which is read once per fit by
+`histogram.ConstHessianSettings.resolve()` and once per round by
+`boosting.fill_grad_hess`.
+
+> **Correction, 2026-08-16. This paragraph used to say `float64` keeps
+> derivatives at full Float64 "through the objective and every read site".
+> That is true on the dense CPU path and false on two others**, and the
+> difference is silent. An audit of every fit path found that
+> `tree_sparse.grow_tree_sparse` passes `narrow=True` at all five of its
+> `histogram_sparse` call sites and `distributed.mojo` does the same at nine
+> `build_histogram` sites, both ignoring the setting. On those paths the
+> objective widens and the histogram re-narrows, so GOSS and weighted rounds
+> accumulate `Float32(w*g)` where the arm the user asked for accumulates
+> `w*g`. **A `float64` sparse or distributed fit pays the switch's full cost
+> and gets much of the Float32 arm's precision.** Until that is fixed, read
+> everything below as a statement about dense CPU fits. The GPU path cannot
+> honor it at all and refuses instead, which is the behavior the other two
+> paths should have had.
+>
+> The parameter form of this setting remains refused by name, and the reason
+> is now narrower than it was: the snapshot hop landed in `fc223da`, so what
+> stands between the parameter and a float64 fit is the objective --
+> `fill_grad_hess` and `_fill_softmax_grad_hess` select their row loop from a
+> live `getenv`. A parameter-only float64 fit would store
+> `Float64(Float32(g))` and read it un-re-narrowed, which is neither arm.
 
 **What `float64` buys and what it costs, for a reader deciding.** It buys back
 the accuracy in the second table on a rare-class ranking metric, and it buys
