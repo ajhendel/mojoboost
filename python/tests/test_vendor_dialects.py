@@ -358,7 +358,15 @@ def test_ranker_accepts_the_objective_it_trains(objective):
         # honored, and its tests are in test_catboost_reachability.py. An
         # unknown value still refuses by name, which is what belongs here.
         {"score_function": "NewtonCosine"},
-        {"bootstrap_type": "Bayesian"},
+        # `bootstrap_type="Bayesian"` is NOT in this list any more: it is
+        # honored, and its tests are in test_catboost_reachability.py.
+        # `bootstrap_type="Bernoulli"` still refuses by name, which is what
+        # belongs here.
+        {"bootstrap_type": "Bernoulli"},
+        # A temperature with no `bootstrap_type="Bayesian"` beside it names
+        # nothing: the knob belongs to that type and no other reads it. This
+        # row now tests a refusal about a missing companion parameter rather
+        # than about a missing edge, which is why it stayed.
         {"bagging_temperature": 1.0},
         {"tree_method": "exact"},
     ],

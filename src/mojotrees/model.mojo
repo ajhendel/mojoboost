@@ -35,6 +35,7 @@ from .gpu_predict import (
     predict_raw_multiclass_gpu,
 )
 from .objective import GradHessFn, train_custom
+from .sampling import BootstrapParams, check_bootstrap_honored
 from .train_gpu import train_gpu, train_multiclass_gpu
 
 
@@ -368,6 +369,7 @@ def fit[
     goss: GossParams = GossParams.disabled(),
     use_missing: Bool = True,
     categorical_features: List[Int] = [],
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Model:
     """Fit on a column-major raw feature matrix (`features[f * n_rows + r]`).
     `alpha` is the target quantile for QUANTILE and the huber transition
@@ -381,7 +383,17 @@ def fit[
     without it they are binned as 0.0. `categorical_features` lists the
     feature indices to treat as integer-coded categoricals: they are split by
     category set rather than by threshold, and missing, unseen, and dropped
-    categories route right (see categorical.mojo)."""
+    categories route right (see categorical.mojo).
+
+    `bootstrap` is CatBoost's `bootstrap_type` (see sampling.mojo): MVS, which
+    is CatBoost's real CPU default, or the Bayesian bootstrap. It is the one
+    argument here that is honored on ONE backend only. `boosting.train` draws
+    it once per round; `train_gpu` takes no bundle at all and its round loop
+    never calls `sampling.bootstrap_round`, so an enabled bootstrap that
+    resolves to the GPU raises rather than training an unsampled model and
+    reporting a sampled one. `device` is resolved before the refusal fires, so
+    `device='auto'` on a shape the policy sends to the accelerator raises too;
+    that is the honest answer, not an oversight."""
     if params.linear.is_active():
         # The binned-only trainers under this entry point do not carry the
         # raw matrix; the metric path does. Refusing is the rule for a
@@ -405,6 +417,19 @@ def fit[
     var data = mapper.transform(features, n_rows)
     var booster: Booster
     if backend == GPU_DEVICE:
+        # `train_gpu` has no `bootstrap` argument and its round loop does not
+        # call `sampling.bootstrap_round`, so the draw would never be taken.
+        # Naming the GPU beats `check_bootstrap_honored`'s generic message
+        # here, because the caller may not have chosen the GPU at all --
+        # `resolve_device` may have chosen it for them from `AUTO_DEVICE`.
+        if bootstrap.enabled():
+            raise Error(
+                "bootstrap_type is not implemented on the GPU: train_gpu"
+                " takes no bootstrap bundle and its round loop never draws"
+                " one, so the fit would be unsampled. This fit resolved to"
+                " the GPU (device='gpu', or device='auto' on a shape the"
+                " policy sends there); set device='cpu' or drop bootstrap_type"
+            )
         booster = train_gpu(
             data,
             target,
@@ -425,6 +450,7 @@ def fit[
             alpha,
             bagging,
             goss,
+            bootstrap=bootstrap,
         )
     return Model(mapper^, booster^)
 
@@ -445,6 +471,7 @@ def fit_multiclass[
     goss: GossParams = GossParams.disabled(),
     use_missing: Bool = True,
     categorical_features: List[Int] = [],
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> MulticlassModel:
     """Fit a softmax multiclass model on a column-major raw feature matrix
     (`features[f * n_rows + r]`), labels in 0..n_classes-1. `device` carries
@@ -454,7 +481,18 @@ def fit_multiclass[
     tree in that round, and `goss` draws its gradient-based sample on the
     same once-per-round schedule; both draw identical rows on either device.
     `use_missing` and `categorical_features` carry the same meaning as in
-    `fit`."""
+    `fit`.
+
+    `bootstrap` is accepted and REFUSED when enabled, on either backend:
+    neither `boosting.train_multiclass` nor `train_multiclass_gpu` takes the
+    bundle and neither round loop calls `sampling.bootstrap_round`, so a
+    softmax fit would silently be unsampled. The argument exists so that the
+    refusal is by name at the entry point a caller actually reaches, rather
+    than a parameter this signature quietly has no slot for. CatBoost agrees
+    about the shape of this hole: `SetNotSpecifiedOptionsToDefaults` excludes
+    the multiclass-only losses from the MVS default and falls back to the
+    Bayesian bootstrap for them (catalog A11, section 1)."""
+    check_bootstrap_honored(bootstrap, String("model.fit_multiclass"))
     if params.linear.is_active():
         check_linear_tree_unconnected(
             "model.fit_multiclass (use custom_metric.fit_multiclass_with_metrics)"
@@ -508,6 +546,7 @@ def fit_custom[
     base_score: Float64 = 0.0,
     use_missing: Bool = True,
     categorical_features: List[Int] = [],
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Model:
     """Fit a caller-supplied objective on a column-major raw feature matrix
     (`features[f * n_rows + r]`), the `fit` counterpart of `train_custom`
@@ -517,7 +556,14 @@ def fit_custom[
     since the framework does not know the inverse link. CPU only: there is
     no `device` argument, use `train_custom_gpu` on a pre-binned matrix for
     GPU tree growth. `use_missing` and `categorical_features` carry the same
-    meaning as in `fit`."""
+    meaning as in `fit`.
+
+    `bootstrap` is accepted and REFUSED when enabled. `objective.train_custom`
+    takes no bundle, and the exclusion is not merely a wiring gap:
+    `boosting._check_bootstrap` refuses `bootstrap_type` beside a custom
+    objective outright, because a callback's derivatives are the caller's and
+    a draw would rescale them without the caller's knowledge."""
+    check_bootstrap_honored(bootstrap, String("model.fit_custom"))
     if params.linear.is_active():
         check_linear_tree_unconnected("model.fit_custom")
     var mapper = fit_bins(

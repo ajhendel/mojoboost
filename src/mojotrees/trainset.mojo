@@ -119,6 +119,7 @@ from .ranking_advanced import (
     train_ranker_advanced,
 )
 from .raw_data import RawData
+from .sampling import BootstrapParams, check_bootstrap_honored
 from .sparse import CscMatrix, CsrMatrix, SparseBinnedMatrix, transform_csc
 from .train_gpu import train_gpu, train_multiclass_gpu
 from .validation import (
@@ -1373,6 +1374,7 @@ def train_dataset(
     device: Int = CPU_DEVICE,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Model:
     """Train a single-output model on an already binned dataset.
 
@@ -1385,6 +1387,15 @@ def train_dataset(
     A sparse dataset trains through the sparse grower, which reads the
     matrix it holds. The model that comes back is an ordinary one either
     way: it serializes, loads, and predicts on dense rows identically.
+
+    `bootstrap` is CatBoost's `bootstrap_type` (see sampling.mojo) and is
+    honored on the **dense CPU** arm alone, which is the arm that calls
+    `boosting.train`. The sparse grower and `train_gpu` take no bundle and
+    their loops never call `sampling.bootstrap_round`, so an enabled bundle
+    on either raises rather than training an unsampled model and reporting a
+    sampled one. This is the same rule `model.fit` keeps, and it is here
+    because `bench/real_data`'s dense arm trains through a `Dataset`, not
+    through `model.fit`.
     """
     _check_labels(dataset.label, dataset.n_rows)
     # Catalog A19's refusal, and it is the one that still holds. The CTR
@@ -1401,6 +1412,9 @@ def train_dataset(
     if dataset.is_sparse:
         if device == GPU_DEVICE:
             _no_gpu_for_sparse()
+        check_bootstrap_honored(
+            bootstrap, String("a sparse Dataset fit (boosting_sparse)")
+        )
         booster = train_sparse(
             dataset.sparse_data,
             dataset.label,
@@ -1422,6 +1436,14 @@ def train_dataset(
     if backend == GPU_DEVICE:
         if len(dataset.init_score) != 0:
             raise Error("init_score is a CPU training path; use device='cpu'")
+        if bootstrap.enabled():
+            raise Error(
+                "bootstrap_type is not implemented on the GPU: train_gpu"
+                " takes no bootstrap bundle and its round loop never draws"
+                " one, so the fit would be unsampled. This fit resolved to"
+                " the GPU (device='gpu', or device='auto' on a shape the"
+                " policy sends there); set device='cpu' or drop bootstrap_type"
+            )
         booster = train_gpu(
             dataset.data,
             dataset.label,
@@ -1443,6 +1465,7 @@ def train_dataset(
             bagging,
             goss,
             dataset.init_score,
+            bootstrap=bootstrap,
         )
     return Model(dataset.mapper.copy(), booster^)
 
