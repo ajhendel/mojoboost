@@ -129,11 +129,20 @@ from .sampling import (
 )
 from .growth_policy import (
     GROW_LEAFWISE,
+    GROW_OBLIVIOUS,
+    OBLIVIOUS_MAX_DEPTH,
     GrowthSchedule,
     LeafCandidate,
+    ObliviousTrace,
+    SharedSplitAudit,
     check_grow_policy,
 )
-from .split import SplitInfo, find_best_split, soft_threshold_l1
+from .split import (
+    SplitInfo,
+    find_best_split,
+    find_best_split_shared,
+    soft_threshold_l1,
+)
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 
 
@@ -175,7 +184,16 @@ struct TreeParams(Copyable, Movable):
     split at one depth before any deeper one, `num_leaves` staying a hard
     bound and the last level admitted as a gain-ranked prefix. LightGBM has
     no such switch, so it is an extension rather than a parity row. The
-    default leaves every fit bit-identical."""
+    default leaves every fit bit-identical.
+
+    `GROW_OBLIVIOUS` is CatBoost's symmetric tree: one split is searched
+    across a whole level and applied to every leaf of it. `max_depth` binds
+    and is REQUIRED (a level count is the only bound there is);
+    `num_leaves` does not bind and is ignored, because a level splits
+    entirely or not at all. See `growth_policy.mojo` and
+    `docs/design/OBLIVIOUS.md`. Only the dense CPU grower
+    (`grow_tree_leaves_profiled`) implements it; every other grower refuses
+    the code rather than growing a tree that is not symmetric."""
 
     var num_leaves: Int
     var min_data_in_leaf: Int
@@ -1687,6 +1705,536 @@ def _hist_subset(
     _expand_bundled(hist, scratch, bundled, features)
 
 
+def _check_oblivious(params: TreeParams, data: BinnedMatrix) raises:
+    """What `grow_policy = oblivious` refuses, asked once per tree before the
+    root histogram rather than part way down a level.
+
+    Every item here is refused rather than half-applied, which is this
+    package's rule for a parameter whose meaning does not survive the mode
+    (see `find_best_split`'s treatment of `extra_trees` on categoricals).
+
+    - `max_depth` is REQUIRED and is the only bound. A level splits entirely
+      or not at all, so `num_leaves` cannot be met exactly and is ignored.
+      CatBoost resolves the same collision by overwriting `max_leaves` with
+      `1 << depth` and raising if the user set a different value
+      (`catboost/private/libs/options/catboost_options.cpp`: "max_leaves
+      option works only with lossguide tree growing"); `TreeParams` cannot
+      tell a defaulted `num_leaves` from an explicit one, so we ignore it and
+      say so here and in the module docstring rather than raise on a value
+      the caller never chose.
+    - A categorical feature's candidates are category *sets*, ordered by that
+      node's own gradient/hessian ratios inside `find_best_categorical_split`.
+      There is no one set to share across a level without a different search,
+      so the combination is refused rather than searched per leaf and
+      averaged into something that is not a partition.
+    - Forced splits describe a specific asymmetric binary tree; applying one
+      to a single leaf of a level is exactly the thing this mode does not do.
+    - `extra_trees` draws one threshold per node, and the CEGB penalties that
+      read the ensemble ledger are charged per node. Both are refused by
+      `find_best_split_shared` too; asked here so the message arrives before
+      any work.
+    """
+    if params.max_depth <= 0:
+        raise Error(
+            "grow_policy=oblivious requires max_depth > 0: a symmetric tree"
+            " is bounded by its depth and by nothing else (num_leaves does"
+            " not bind, because a level splits entirely or not at all)."
+            " CatBoost's own default is depth=6"
+        )
+    if params.max_depth > OBLIVIOUS_MAX_DEPTH:
+        raise Error(
+            "grow_policy=oblivious refuses max_depth > ",
+            OBLIVIOUS_MAX_DEPTH,
+            ": depth d costs 2^(d+1) - 1 nodes unconditionally, so ",
+            params.max_depth,
+            " would build a tree of that size whatever the data does",
+        )
+    if data.cats.any_categorical():
+        raise Error(
+            "grow_policy=oblivious is implemented for numerical thresholds"
+            " only; a categorical feature is searched as category partitions"
+            " whose order comes from one node's own statistics, and a level"
+            " shares one split"
+        )
+    if not params.extra.forced.is_empty():
+        raise Error(
+            "forced splits describe an asymmetric binary tree and"
+            " grow_policy=oblivious applies one split to every leaf of a"
+            " level; the two cannot both hold"
+        )
+    if params.extra.extra_trees:
+        raise Error(
+            "extra_trees draws one threshold per node and a level of an"
+            " oblivious tree has one split for every node in it"
+        )
+    if params.extra.penalties.cegb.is_active():
+        raise Error(
+            "the CEGB penalties are charged per node against a ledger that"
+            " spans the ensemble; grow_policy=oblivious commits one split per"
+            " level and that accounting is not written"
+        )
+
+
+def _grow_oblivious_levels(
+    mut profile: PhaseProfile,
+    mut scratch: GrowScratch,
+    mut tree: Tree,
+    mut frontier: List[_LeafState],
+    mut bundle_scratch: Histogram,
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    params: TreeParams,
+    tree_features: List[Int],
+    tree_columns: List[Int],
+    value_feature: Int,
+    per_node_draw: Bool,
+    signs: List[Int],
+    constrained: Bool,
+    bundling: BundledMatrix,
+    const_hessian: Bool,
+    const_h_env: ConstHessianSettings,
+    hist_cells: Int,
+    tree_index: Int,
+) raises -> Int:
+    """Grow the rest of an oblivious tree from a frontier holding its root,
+    and answer the finished leaf count.
+
+    One level at a time. The level is the whole frontier -- every leaf of an
+    oblivious tree sits at the same depth by construction, which this asserts
+    rather than assumes -- and it costs exactly:
+
+      1 shared split search  (`split.find_best_split_shared`, one dispatch)
+      L partitions           (leaf by leaf, row order preserved)
+      L histogram builds     (the smaller child of each pair)
+      L subtractions         (the larger child, derived)
+
+    against a depth-wise level's L searches for the same L partitions,
+    builds, and subtractions. **Derived bound, not a measurement:** search
+    dispatches per tree fall from `num_leaves - 1` to `max_depth`, which at
+    depth 6 is 63 to 6. Nothing else about the per-level work changes, so
+    this removes fan-out and barrier cost and no arithmetic.
+
+    Leaf numbering and node-id order, which are a cross-backend contract
+    --------------------------------------------------------------------
+    **Leaf index is the bit pattern of a row's outcomes with the FIRST
+    level's outcome as the LEAST significant bit**: a leaf at depth d has
+    index `sum_l b_l * 2^l`, where `b_l` is 0 if the row went left at level l
+    and 1 if it went right. That is CatBoost's numbering
+    (`catboost/private/libs/algo/index_calcer.cpp`:
+    `const ui32 splitWeight = 1 << splitParams.Depth;` and
+    `indices[doc] += cmpOp(...) * level`), and it is what the device
+    implements, so it is not ours to choose. Concretely: the left child keeps
+    its parent's index and the right child adds `1 << level_depth`.
+
+    **Node ids are assigned level by level, over the level's leaves in
+    ascending LEAF INDEX, left child before right.** That is NOT ascending
+    node id: at level 2 the leaves in node-id order are indices 0, 2, 1, 3,
+    so the two orders first diverge when level 2's children are created, and
+    a depth-3 tree already tells them apart. Host and device must agree on
+    node ids or the node-identity test between them fails on trees that are
+    both correct, which is why this is written down here rather than left to
+    whatever the container did.
+
+    The frontier itself is the same `_LeafState` list the leaf-wise loop
+    keeps, with the same convention: a split replaces its parent's slot with
+    the left child and appends the right. `leaf_ix` below is maintained in
+    exact lockstep with it (slot i keeps the left child's index, the append
+    carries the right child's), which is what lets the order above be read
+    off the frontier without storing anything in `_LeafState` that the other
+    two policies would have to carry. The `_LeafState.split` field is unused
+    in this mode -- there is no per-leaf best split -- and is left as "none"
+    rather than filled with a number no one may read.
+
+    Empty leaves, which are a property of the mode and not a bug
+    ------------------------------------------------------------
+    A leaf that was illegal at the chosen candidate is split anyway, and its
+    split may send every one of its rows one way. The empty child is a real
+    leaf of the tree: it is never reached by a training row, it can be
+    reached at prediction time, and it emits 0.0 (clamped into its parent's
+    monotone interval). That is CatBoost's answer too -- `CalcAverage` in
+    `catboost/private/libs/algo_helpers/online_predictor.h` returns 0 for a
+    child of zero weight -- and it also avoids the 0/0 that `_leaf_value`
+    would produce at `lambda_l2 = 0`. The consequence a caller has to know:
+    an oblivious tree can carry nodes whose cover is 0, so
+    `Tree.check_node_counts` (and therefore exact feature contributions)
+    will refuse such a tree. Nothing else reads node covers that way.
+
+    CatBoost deletes a level whose every leaf produced an empty child and
+    stops growth there (`greedy_tensor_search.cpp`,
+    `GetRedundantSplitIdx(GetIsLeafEmpty(...))`). That rule is unreachable
+    here and is deliberately not implemented: a chosen split must have a
+    strictly positive summed gain, a leaf with an empty child contributes
+    either zero (it failed `min_child_hess`/`min_data_in_leaf`) or exactly
+    0.0 (both minima are off, and the candidate's two terms then equal the
+    parent term), so a level in which every leaf had an empty child sums to
+    0.0 and is never chosen. Building the check would be building a gate that
+    cannot open.
+    """
+    var trace = ObliviousTrace.resolve()
+    var max_delta_step = params.extra.max_delta_step
+    var path_smooth = params.extra.path_smooth
+    var n_leaves = len(frontier)
+    var level_depth = 0
+    if len(frontier) != 1:
+        raise Error(
+            "oblivious growth starts from the root alone; this frontier holds",
+            " ",
+            len(frontier),
+            " leaves",
+        )
+    # Leaf index per frontier slot, the root's being 0. Maintained in lockstep
+    # with `frontier` below: the split writes the left child's index into the
+    # parent's slot and appends the right child's, exactly as the frontier
+    # does with the states themselves.
+    var leaf_ix = List[Int](capacity=1)
+    leaf_ix.append(0)
+
+    while level_depth < params.max_depth:
+        # The level in ascending LEAF INDEX, which is the cross-backend
+        # contract and is not ascending node id (see the docstring).
+        # Selection sort: a level is at most 2^max_depth wide and this keeps
+        # the order checkable by eye, which is the argument
+        # `growth_policy.rank_level` makes for the same shape.
+        var order = List[Int](capacity=len(frontier))
+        var last_ix = -1
+        while len(order) < len(frontier):
+            var best = -1
+            for i in range(len(frontier)):
+                if leaf_ix[i] <= last_ix:
+                    continue
+                if best < 0 or leaf_ix[i] < leaf_ix[best]:
+                    best = i
+            if best < 0:
+                break
+            last_ix = leaf_ix[best]
+            order.append(best)
+        if len(order) != len(frontier):
+            raise Error("oblivious frontier holds a repeated leaf index")
+        for k in range(len(order)):
+            if frontier[order[k]].depth != level_depth:
+                raise Error(
+                    "oblivious frontier leaf ",
+                    frontier[order[k]].node,
+                    " sits at depth ",
+                    frontier[order[k]].depth,
+                    " in a level at depth ",
+                    level_depth,
+                    "; every leaf of a symmetric tree sits at the same depth",
+                )
+
+        var level_rows = 0
+        for k in range(len(order)):
+            level_rows += len(frontier[order[k]].rows)
+        # If the level as a whole cannot make two legal children then no leaf
+        # in it can, so every candidate would sum to 0.0 and nothing would be
+        # chosen. Answering it here costs one comparison instead of a scan.
+        if level_rows < 2 * params.min_data_in_leaf or level_rows < 2:
+            trace.stop(tree_index, level_depth, String("level too small"))
+            break
+
+        # Leaf index 0 is the all-left path, whose node is the first one
+        # created at every level, so `order[0]` is also the level's lowest
+        # node id and the key below does not depend on the ordering rule.
+        var level_node = frontier[order[0]].node
+
+        # One feature draw for the whole level, keyed by its lowest node id.
+        # A per-node draw would give the leaves of one level different
+        # candidate sets, and they have to agree on one split.
+        var level_features = List[Int]()
+        if per_node_draw:
+            level_features = select_split_features(
+                tree_features,
+                params.feature_fraction_bylevel,
+                params.feature_fraction_bynode,
+                params.feature_fraction_seed,
+                tree_index,
+                level_depth,
+                level_node,
+            )
+
+        # The level's interaction-constraint mask is the INTERSECTION over
+        # its leaves: the shared split lands in every branch, so a feature
+        # any one of them forbids is forbidden for the level.
+        var allowed = List[Bool]()
+        if constrained:
+            allowed.resize(data.n_features, True)
+            for k in range(len(order)):
+                var mask = params.constraints.allowed_features(
+                    frontier[order[k]].branch
+                )
+                if len(mask) == 0:
+                    continue
+                for f in range(data.n_features):
+                    if f >= len(mask) or not mask[f]:
+                        allowed[f] = False
+
+        # The level's histograms, moved out of the frontier in the order the
+        # split will be applied in. That order is what fixes the cross-leaf
+        # sum's addend order, and so its value, independently of the worker
+        # count.
+        var level_hists = List[Histogram](capacity=len(order))
+        var level_bounds = List[OutputBounds](capacity=len(order))
+        var level_outputs = List[Float64](capacity=len(order))
+        for k in range(len(order)):
+            level_hists.append(frontier[order[k]].take_hist())
+            level_bounds.append(frontier[order[k]].bounds.copy())
+            level_outputs.append(tree.value[frontier[order[k]].node])
+
+        var audit = SharedSplitAudit.none()
+        var search_started = profile.clock()
+        var split = find_best_split_shared(
+            audit,
+            level_hists,
+            lambda_reg=params.lambda_reg,
+            min_child_hess=params.min_child_hess,
+            min_data_in_leaf=params.min_data_in_leaf,
+            lambda_l1=params.lambda_l1,
+            allowed=allowed,
+            features=level_features,
+            missing_bins=data.missing_bin,
+            monotone=signs,
+            bounds=level_bounds,
+            parent_outputs=level_outputs,
+            extra=params.extra,
+            n_rows=level_rows,
+            depth=level_depth,
+            node=level_node,
+            tree_index=tree_index,
+            settings=scratch.settings,
+        )
+        # One charge for the level, at the level's row count, over the cells
+        # the one dispatch read: the per-node figure times the leaves folded
+        # into it.
+        profile.charge(
+            PROF_SPLIT_SEARCH,
+            level_rows,
+            search_started,
+            dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
+            cells=len(order)
+            * _scan_cells(level_features, data.n_features, data.n_bins),
+        )
+
+        if not split.found or not (split.gain > 0.0):
+            while len(level_hists) > 0:
+                scratch.pool.give(level_hists.pop())
+            trace.stop(tree_index, level_depth, String("no positive gain"))
+            break
+        trace.level(
+            tree_index,
+            level_depth,
+            split.feature,
+            split.bin,
+            split.gain,
+            audit,
+        )
+
+        var split_missing_bin = -1 if split.is_categorical else (
+            data.missing_bin[split.feature]
+        )
+        var split_sign = monotone_sign(signs, split.feature)
+        var child_depth = level_depth + 1
+        # Exactly two nodes per leaf of this level, known before the loop.
+        tree.reserve_nodes(len(tree.feature) + 2 * len(order))
+
+        for k in range(len(order)):
+            var i = order[k]
+            var parent_node = frontier[i].node
+            var parent_ix = leaf_ix[i]
+            var parent_rows = len(frontier[i].rows)
+
+            var left_rows = List[Int]()
+            var right_rows = List[Int]()
+            if parent_rows > 0:
+                var part_started = profile.clock()
+                partition_rows_into(
+                    left_rows,
+                    right_rows,
+                    data,
+                    frontier[i].rows,
+                    split,
+                    split_missing_bin,
+                    scratch.settings,
+                )
+                profile.charge(
+                    PROF_PARTITION,
+                    parent_rows,
+                    part_started,
+                    dispatches=HOST_PARTITION_DISPATCHES,
+                )
+
+            var builds_left = len(left_rows) <= len(right_rows)
+            var built_rows = len(left_rows) if builds_left else len(right_rows)
+            var derived_rows = (
+                len(right_rows) if builds_left else len(left_rows)
+            )
+            var alloc_started = profile.clock()
+            var left_hist = scratch.pool.take()
+            var right_hist = scratch.pool.take()
+            profile.charge(
+                PROF_HIST_ALLOC,
+                built_rows,
+                alloc_started,
+                cells=2 * hist_cells,
+            )
+            # A pooled buffer's contents are undefined. The bundled builders
+            # write only the sampled features' slices, and a child with no
+            # rows is not built at all, so both cases zero the buffer here
+            # rather than inherit another node's statistics. The derived
+            # sibling is fully written by the subtraction either way.
+            var hist_started = profile.clock()
+            if builds_left:
+                if built_rows == 0 or bundling.active:
+                    left_hist.reset()
+                if built_rows > 0:
+                    _hist_subset(
+                        left_hist, bundle_scratch, scratch.pairs, data,
+                        bundling, grad, hess, left_rows, 0, len(left_rows),
+                        tree_features, tree_columns, const_hessian,
+                        scratch.settings, const_h_env,
+                    )
+                    profile.note_node()
+                    profile.charge(
+                        PROF_HISTOGRAM,
+                        built_rows,
+                        hist_started,
+                        dispatches=HOST_HIST_DISPATCHES,
+                        slots_per_row=len(tree_columns),
+                        cells=hist_cells,
+                    )
+                var sub_started = profile.clock()
+                subtract_histogram_into(
+                    right_hist, level_hists[k], left_hist, const_hessian,
+                    scratch.settings, const_h_env,
+                )
+                profile.note_node()
+                profile.charge(
+                    PROF_SUBTRACT,
+                    derived_rows,
+                    sub_started,
+                    dispatches=HOST_SUBTRACT_DISPATCHES,
+                    cells=hist_cells,
+                )
+            else:
+                if bundling.active:
+                    right_hist.reset()
+                _hist_subset(
+                    right_hist, bundle_scratch, scratch.pairs, data, bundling,
+                    grad, hess, right_rows, 0, len(right_rows), tree_features,
+                    tree_columns, const_hessian, scratch.settings, const_h_env,
+                )
+                profile.note_node()
+                profile.charge(
+                    PROF_HISTOGRAM,
+                    built_rows,
+                    hist_started,
+                    dispatches=HOST_HIST_DISPATCHES,
+                    slots_per_row=len(tree_columns),
+                    cells=hist_cells,
+                )
+                var sub_started = profile.clock()
+                subtract_histogram_into(
+                    left_hist, level_hists[k], right_hist, const_hessian,
+                    scratch.settings, const_h_env,
+                )
+                profile.note_node()
+                profile.charge(
+                    PROF_SUBTRACT,
+                    derived_rows,
+                    sub_started,
+                    dispatches=HOST_SUBTRACT_DISPATCHES,
+                    cells=hist_cells,
+                )
+
+            var parent_bounds = frontier[i].bounds.copy()
+            var parent_output = tree.value[parent_node]
+            # A child with no rows emits 0.0, clamped like any other value so
+            # a monotone interval still bounds what it can emit.
+            var left_value = parent_bounds.clamp(0.0)
+            if len(left_rows) > 0:
+                left_value = parent_bounds.clamp(
+                    _leaf_value(
+                        left_hist,
+                        params.lambda_reg,
+                        params.lambda_l1,
+                        value_feature,
+                        len(left_rows),
+                        parent_output,
+                        max_delta_step,
+                        path_smooth,
+                    )
+                )
+            var right_value = parent_bounds.clamp(0.0)
+            if len(right_rows) > 0:
+                right_value = parent_bounds.clamp(
+                    _leaf_value(
+                        right_hist,
+                        params.lambda_reg,
+                        params.lambda_l1,
+                        value_feature,
+                        len(right_rows),
+                        parent_output,
+                        max_delta_step,
+                        path_smooth,
+                    )
+                )
+            if split_sign != MONOTONE_FREE and left_value > right_value:
+                var mid = midpoint(left_value, right_value)
+                left_value = mid
+                right_value = mid
+            var children = child_bounds(
+                parent_bounds, split_sign, left_value, right_value
+            )
+            var left_node = tree._add_node(left_value, Float64(len(left_rows)))
+            var right_node = tree._add_node(
+                right_value, Float64(len(right_rows))
+            )
+            tree.left[parent_node] = left_node
+            tree.right[parent_node] = right_node
+            tree._set_split(parent_node, split, split_missing_bin)
+
+            var branch = List[Int]()
+            if constrained:
+                branch = extend_branch(frontier[i].branch, split.feature)
+
+            # No per-leaf split is searched in this mode, so the field stays
+            # "none" rather than carrying a number no consumer may read.
+            frontier[i] = _LeafState(
+                left_node,
+                left_rows^,
+                left_hist^,
+                SplitInfo(-1, -1, 0.0, False),
+                branch.copy(),
+                depth=child_depth,
+                bounds=children.left.copy(),
+                forced=-1,
+            )
+            frontier.append(
+                _LeafState(
+                    right_node,
+                    right_rows^,
+                    right_hist^,
+                    SplitInfo(-1, -1, 0.0, False),
+                    branch^,
+                    depth=child_depth,
+                    bounds=children.right.copy(),
+                    forced=-1,
+                )
+            )
+            # The left child keeps its parent's index (its outcome bit at this
+            # level is 0) and the right child sets the bit for THIS level,
+            # which is the level's own power of two. First level, lowest bit.
+            leaf_ix[i] = parent_ix
+            leaf_ix.append(parent_ix + (1 << level_depth))
+            n_leaves += 1
+
+        while len(level_hists) > 0:
+            scratch.pool.give(level_hists.pop())
+        level_depth += 1
+
+    return n_leaves
+
+
 def grow_tree(
     data: BinnedMatrix,
     grad: List[Float64],
@@ -1993,6 +2541,21 @@ def grow_tree_leaves_profiled(
     every constraint exactly as a leaf-wise one does. Forced splits still go
     first in both modes.
 
+    `GROW_OBLIVIOUS` is the exception, and it leaves this loop entirely.
+    CatBoost's symmetric tree searches ONE split across a whole level and
+    applies it to every leaf of that level, so there is no per-leaf best split
+    to pick between and nothing for `GrowthSchedule` to order. It runs in
+    `_grow_oblivious_levels` below, which this function hands the root
+    frontier to and returns from before the loop; everything before that
+    point -- validation, feature selection, the root histogram and value -- is
+    shared, and the loop below is untouched. The tree that comes out is an
+    ordinary `Tree` with the same split repeated across a level, so predict,
+    dump, serialization, model I/O, monotone constraints and interaction
+    constraints all work on it without knowing the mode existed. `max_depth`
+    binds and is required; `num_leaves` does not bind and is ignored; a
+    categorical matrix, forced splits, `extra_trees` and the ledger-reading
+    CEGB penalties are refused (`_check_oblivious`).
+
     `const_hessian` is the caller's declaration that every entry of `hess` is
     exactly `histogram.CONSTANT_HESSIAN`, which lets the histogram builders
     accumulate two planes instead of three and reconstruct the hessian plane
@@ -2038,6 +2601,8 @@ def grow_tree_leaves_profiled(
     there is a traffic decision and cannot move a bit on its own.
     """
     check_grow_policy(params.grow_policy)
+    if params.grow_policy == GROW_OBLIVIOUS:
+        _check_oblivious(params, data)
     params.constraints.check_features(data.n_features)
     params.monotone.check_features(data.n_features)
     check_feature_fractions(
@@ -2344,6 +2909,58 @@ def grow_tree_leaves_profiled(
         )
     )
     var n_leaves = 1
+
+    if params.grow_policy == GROW_OBLIVIOUS:
+        # Oblivious growth is not a frontier order (growth_policy.mojo), so it
+        # builds no `GrowthSchedule` -- the constructor refuses the code -- and
+        # never enters the loop below. Everything ABOVE this line is shared:
+        # the validation, the feature selection, the root's rows, histogram
+        # and value, and the frontier that holds it. Everything BELOW it is a
+        # per-leaf split loop that has no meaning when a level takes one
+        # split. Returning from here rather than branching inside that loop is
+        # what leaves the default path the path that shipped, instruction for
+        # instruction, rather than a path with a policy test in it.
+        #
+        # The root's own `_search` above is redundant in this mode: a level of
+        # one leaf is searched again by `find_best_split_shared`, which for
+        # L = 1 is `find_best_split` with the illegal-leaf rule that cannot
+        # change a single-leaf answer. That is one extra feature dispatch per
+        # tree, against `max_depth` shared searches; removing it means putting
+        # a policy test around the shared root block, which is a worse trade.
+        n_leaves = _grow_oblivious_levels(
+            profile,
+            scratch,
+            tree,
+            frontier,
+            bundle_scratch,
+            data,
+            grad,
+            hess,
+            params,
+            tree_features,
+            tree_columns,
+            value_feature,
+            per_node_draw,
+            signs,
+            constrained,
+            bundling,
+            const_hessian,
+            const_h_env,
+            hist_cells,
+            tree_index,
+        )
+        tree.n_leaves = n_leaves
+        leaves.clear()
+        leaves.covers_all_rows = len(bag) == 0
+        leaves.node = List[Int](capacity=len(frontier))
+        leaves.rows = List[List[Int]](capacity=len(frontier))
+        for i in range(len(frontier)):
+            leaves.node.append(frontier[i].node)
+            leaves.rows.append(frontier[i].take_rows())
+            scratch.pool.give(frontier[i].take_hist())
+        profile.end_tree(tree_started)
+        return tree^
+
     var schedule = GrowthSchedule(params.grow_policy)
 
     while n_leaves < params.num_leaves:
