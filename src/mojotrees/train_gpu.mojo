@@ -2962,7 +2962,15 @@ def train_gpu(
     It cannot change a model. Both arms visit the same rows and add the same
     fixed-point integers into the same bins, and integer addition is
     associative, so the histograms are identical and therefore so is every
-    split chosen from them. See `GpuActiveRows.set_row_unroll`."""
+    split chosen from them. See `GpuActiveRows.set_row_unroll`.
+
+    One hazard in how that default is spelled, since the call below is
+    unconditional: `GpuActiveRows.__init__` also sets `row_unroll = True`, and
+    for any fit that comes through here that initialization is dead. The
+    shipped default is therefore written in two places that agree today and
+    could silently stop agreeing. If either moves, move both, and prefer
+    changing the constructor and passing that through to changing only this
+    signature."""
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
     else:
