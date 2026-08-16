@@ -368,3 +368,235 @@ Leaf-wise, at 1,000,000 x 50, resolved by M0, against a LightGBM arm measured in
 the same process in the same window with its own spread reported. Nothing else.
 Not depthwise, which grows a different tree and is an opt-in by S2. Not a
 projection from a wait count, however well the wait count has behaved.
+
+---
+
+# CPU round 1 protocol, registered 2026-08-16, before any of it ran
+
+The CPU backend has never had a round of its own. Round 2 improved it 1.63x as
+a side effect of work aimed elsewhere, and the stage profile that would say
+where the remaining time goes has been taken for the GPU and not for the CPU.
+This section registers the rules for the CPU round before its first
+measurement, for the same reason M0 through M6 were registered: so the lanes
+are chosen by a rule agreed in advance rather than by whichever number turns
+out to be the most interesting.
+
+It inherits **M0** (resolved / consistent / indistinguishable) and **M1**
+(quiet box) unchanged and refers to them by name. It does not restate them.
+
+## C0. What this round is for, and what it is not for
+
+**Target: parity with LightGBM at ten threads at 1,000,000 x 50, with no
+regression at 50,000.** Not a win. A CPU win over LightGBM is not expected and
+will not be claimed if it happens once; LightGBM is a mature C++ implementation
+of this exact algorithm and the honest goal is to stop losing to it.
+
+The CPU path is not a consolation prize. It is the fallback for small data,
+where the GPU's fixed cost loses outright; for every configuration the device
+refuses; and for every machine without Metal. Its floor is a product floor.
+
+**Provenance labels are mandatory** and use the Sweep II vocabulary above:
+measured / fitted / derived bound / estimated. Lanes in this round cannot
+measure anything, because the orchestrator takes every timing, so a lane's
+numbers may only ever be labelled **derived bound** or **estimated**.
+
+## C-ops. Operating conditions, which changed after this round was planned
+
+Two conditions differ from every previous round and both weaken the isolation
+this protocol used to be able to assume. They are recorded here rather than
+discovered in a postmortem.
+
+1. **One shared working tree, no per-lane worktrees and no branch checkouts.**
+   Lanes edit `/Users/andrewhendel/CascadeProjects/mojotrees` directly, on
+   `perf-round-2`, concurrently with each other and with the GPU campaign.
+   File-disjointness is therefore the *only* isolation mechanism in this round.
+   There is no branch to throw away if a lane goes wrong, so a lane that edits
+   a file it does not own is not a merge conflict, it is damage to somebody
+   else's in-flight work. The file ownership table is load-bearing.
+2. **A second orchestrator is running the GPU campaign on the same box.**
+   Agreed with it, in writing, before this round starts:
+   - `/tmp/mojotrees-bench.lock` gains a `mode:` field. `timing` is exclusive
+     and short and outranks `lanes`; `lanes` is long, yieldable, and is a
+     notice that the box is dirty rather than a claim on it. Neither session
+     times against a lock it does not hold.
+   - The lock covers **compiling lanes**, not only benchmark runs. Two numbers
+     have already been discarded in this project for being taken while agents
+     compiled, one at 18.6 percent spread.
+   - `boosting.round_has_constant_hessian`,
+     `histogram.objective_has_constant_hessian` and
+     `histogram.CONSTANT_HESSIAN` are GPU-visible contracts. No CPU lane
+     changes their signature or semantics.
+   - **Golden re-baselines are serialized and land alone.** The GPU campaign's
+     re-baseline goes first. Ours follow one at a time, each with its ulp
+     movement stated in its own commit. Two re-baselines landing together
+     produce a fixture whose next failure nobody can attribute.
+
+## C1. What Phase 0 measures, in this order, before any lane starts
+
+No optimization lane starts until this exists, per the precedent set above.
+
+1. **Baseline, interleaved.** Our CPU against LightGBM at ten threads, in one
+   process, five repeats, at 1,000,000 / 250,000 / 50,000 x 50. The `cpu` and
+   `lightgbm` arms of `bench/bench_train_gpu.mojo` already do exactly this and
+   are used rather than rebuilt.
+2. **R1 re-taken.** Our CPU at `MOJOTREES_NUM_WORKERS=1` against LightGBM at
+   `num_threads=1`, same shape. Decides the lane order, per C2.
+3. **The CPU stage profile.** `bench/bench_profile.mojo` at 1,000,000 x 50,
+   serial against auto, every stage. Decides which stage the round attacks,
+   per C5.
+4. **The builder discriminator.** LightGBM `force_col_wise` against
+   `force_row_wise` at ten threads. Decides L4, per C3.
+5. **The core pool.** `MOJOTREES_CPU_CORE_POOL=performance` against the
+   default. Per C4.
+
+## C2. R1, restated, and what it is allowed to decide
+
+R1 above already fired once, on 2026-08-15: ours 15.96 at one worker against
+LightGBM's 8.82 at one thread, **1.81x**, which is the "between" branch. That
+branch says both the inner loop and parallel efficiency contribute, take the
+interleaved histogram cells first because it is exact and cheap, and
+**re-measure before committing to row blocks**.
+
+It is re-taken rather than inherited because Session III demonstrated that this
+machine's regimes move a comparator by a factor of two, and 1.81x was taken in
+a window whose state was not recorded.
+
+- **Within 1.3x**: the serial inner loop is competitive, the deficit is
+  parallel efficiency, and **L3 (row-block private histograms) leads**.
+- **Above 2.0x**: the inner loop is the problem and **L1 and L2 lead**.
+- **Between**: both contribute. **L2 first**, then re-measure before L3.
+
+Registered before the data: the ratio is expected to reproduce between 1.6x and
+2.0x, so the middle branch fires again and L2 leads. **estimated.** If it lands
+outside 1.3x to 2.0x the plan changes and this line is what says so.
+
+The second number R1 produces is the one worth more: our multicore scaling was
+15.96 to 6.98, **2.29x on ten cores**, against LightGBM's 8.82 to 2.86,
+**3.08x**. Both of us scale badly on a four-performance-core part. The gap
+between 2.29 and 3.08 is what L3 exists to close, and it is a bounded prize:
+closing it entirely, with the serial inner loop untouched, puts us at 5.18
+seconds against LightGBM's 2.86. **derived bound.** So L3 alone cannot reach
+parity, and neither can L1, L2 and L5 alone. This round needs both halves, and
+saying so now prevents a later result being read as a failure when it was
+always arithmetically insufficient on its own.
+
+## C3. The builder discriminator, and the one thing it is allowed to authorize
+
+LightGBM chooses between a column-wise and a row-wise histogram builder and
+picks by a cost model at dataset construction. We have only the column-wise
+shape. L4 would add a row-major `UInt8` copy of the matrix used for histogram
+construction only, LightGBM's `MultiValDense` shape, chosen by a chooser, with
+the column matrix retained for partition and predict.
+
+That is a large additive lane and it does not start on a hunch.
+
+- **`force_row_wise` materially faster than `force_col_wise` for LightGBM at
+  this shape, resolved by M0**: the row-wise builder is worth building and L4
+  is authorized.
+- **Indistinguishable, or `force_col_wise` faster**: L4 does not start, and
+  the reason is recorded rather than left as an unexplored option.
+
+Registered before the data: at 50 dense features and 255 bins the two are
+expected to be close, with `force_col_wise` favored, because row-wise wins on
+sparse and high-feature-count data and this shape is neither. **estimated.**
+The prediction is that **L4 does not start**, and it is written down so that
+choosing not to build it later reads as a rule firing rather than as a lane
+being quietly dropped.
+
+## C4. The core pool, and what a single-shape result may not do
+
+`MOJOTREES_CPU_CORE_POOL=performance` restricts the pool to the four
+performance cores. On a 4P + 6E part, six efficiency cores that finish late are
+a tail on every barrier, and excluding them can win despite using fewer cores.
+
+Same rule R4 already set for the feature-group width: **do not change a default
+on a single-shape result.** A pool setting must win at 1,000,000 *and* not
+regress at 250,000 and 50,000 before it becomes the default. If it wins at one
+shape only it stays an environment variable and the shape it won at is recorded
+beside it.
+
+## C5. The stage profile, and what it is allowed to redirect
+
+`bench/bench_profile.mojo` reports, per stage, a serial time and an auto time.
+Two different questions come out of it and the round must not confuse them:
+
+- **the serial column** is what L1, L2 and L5 move.
+- **the ratio of the two** is what L3 and the core pool move.
+
+The rule: **the round attacks stages in descending order of serial time, and
+within a stage the choice between an inner-loop lane and a scheduling lane is
+made by that stage's serial-to-auto ratio**, not by which lane is already
+written. A stage below 5 percent of the serial total does not get a lane in
+this round however unsatisfying its ratio is, because a lane costs a day and
+cannot return more than the stage contains.
+
+Registered before the data: `hist_full` plus the two `hist_subset` stages are
+expected to dominate the serial column, at or above half of it, and
+`partition` to be the next largest. **estimated.** If the histogram stages come
+out below a third of the serial total, then L1, L2, L3 and L5 are all aimed at
+the wrong place and this round is replanned rather than executed.
+
+The instrument's own docstring warns that a single run of it is an estimate and
+not a measurement. It is run at the same repeat count as everything else here,
+and if a stage's repeats disagree by more than the effect being attributed to
+it, that stage is reported as unresolved rather than ranked.
+
+## C6. The exactness and determinism contract every lane inherits
+
+Stated once, written into every lane brief verbatim.
+
+- **Determinism across `MOJOTREES_NUM_WORKERS` (1, 3, 8) is required** and each
+  lane writes a test that proves it for its own change. Determinism on a given
+  toolchain, run to run and machine to machine, is not negotiable in this
+  round. Bit-identity with *past* output is.
+- **Exact comparisons only.** `to_bits()` or integer equality. No tolerances.
+  A test that needed a tolerance is a test that did not establish what it
+  claims.
+- **A test for a gated path must prove the gate opened**: assert a counter, a
+  trace line, or a path marker. Never assume it. This project has already
+  shipped a test whose six fixtures all ran below the gate and verified
+  nothing.
+- **Any change that moves a multiply relative to an add is a numerics change.**
+  FMA contraction has cost this project two results. If bits move, the lane
+  says so and stops; it does not regenerate the golden fixture on its own
+  initiative, because re-baselines are serialized under C-ops.
+
+## C7. What is allowed to be called a result at the end of this round
+
+Two things, and nothing else.
+
+1. **A speed claim**: our CPU at 1,000,000 x 50, resolved by M0 over at least
+   five interleaved repeats, against a LightGBM arm taken in the same process
+   in the same window with its own spread reported, *and* the 50,000 and
+   250,000 shapes reported beside it whether or not they moved in our favor. A
+   headline that omits the shape that regressed is not a result.
+2. **A null**: a lane that landed, is correct, is tested, and moved nothing.
+   Reported as loudly as a win, per S4 and M3. Round 2's upload collapse is the
+   precedent: thirteen copies per tree removed for sixteen milliseconds, and
+   the honest report of that is worth more than the lane was.
+
+Explicitly not a result: a per-stage improvement in `bench_profile.mojo` that
+does not show up in the end-to-end interleaved comparison. The stage profile is
+an instrument for choosing lanes, not for scoring them.
+
+## C8. Thermal drift, which is this round's largest measurement hazard
+
+Both arms of this round's headline comparison are the ten-core CPU arm. The GPU
+campaign measured that arm drifting **2.80 to 3.50 seconds across five
+back-to-back runs** as heat accumulated, while its own GPU arm held 2.7 percent
+across the same sequence. This round does not get to sit behind a thermally
+stable arm the way that comparison did.
+
+Therefore, and registered before any data:
+
+- Every CPU-versus-LightGBM comparison is **interleaved within one process**,
+  never taken as sequential blocks per arm. Drift then hits both arms alike
+  instead of accumulating into whichever ran last.
+- **The repeats are reported in the order they ran**, so a monotone rise across
+  a sequence is visible as a trend rather than absorbed into a spread. If both
+  arms rise together across five repeats, that is the machine and not a result.
+- Thermal state is captured before and after each session, per the session
+  conditions above.
+- A comparison whose two arms straddle a regime change is **discarded, not
+  corrected**. Session III established that the regimes move a comparator by a
+  factor of 2.2 and there is no correction factor that survives that.
