@@ -361,6 +361,31 @@ under repetition and the ten-core CPU arm is not. That is a real property and it
 is why any single head-to-head number depends on how long the machine has been
 working.
 
+### A caveat on every LightGBM number in this repository, found the same night
+
+`scenarios.LIGHTGBM_ALIGNMENT` pins **`force_row_wise = True`**. Found by the CPU
+campaign orchestrator reading the params line its own smoke test printed.
+
+So every LightGBM figure this project has ever recorded — the 2.767 that framed a
+week of work, the 2.662 standalone above, and the 2.883 in-process median used as
+the comparator here — was taken against a builder **we forced**, not against
+whatever LightGBM would have chosen.
+
+The pin is methodologically right and should stay: on auto, LightGBM spends its
+first iterations timing both strategies and that one-off lands inside the
+measured region. But the consequence has to travel with the margin. "Ahead by 5
+to 11 percent" is precisely "ahead of LightGBM with `force_row_wise` pinned", and
+if the column-wise builder is materially faster at this shape then the margin is
+against a handicapped configuration.
+
+That is the same class of error as the throttled comparator withdrawn above,
+reached from a different direction, and it would be found by the first outside
+reader who ran LightGBM themselves.
+
+**Unresolved. The CPU campaign is measuring `force_row_wise` against
+`force_col_wise` at 1,000,000 x 50, both pinned. Until that lands, every margin
+in this file carries this caveat.**
+
 ### The three sentences that are now supportable
 
 1. At 1,000,000 x 50 in a fast window, resident leaf-wise is **2.58 seconds**.
@@ -368,7 +393,8 @@ working.
    seconds** depending on how it is run and how warm the machine is.
 3. We are **consistently ahead by 5 to 11 percent, and that margin is not
    resolved** under this project's own rule, because the comparator's spread is
-   wider than the margin.
+   wider than the margin -- and it is a margin against LightGBM with
+   `force_row_wise` pinned, per the caveat above.
 
 Not "1.14x behind". Not "1.50x ahead". Both of those were this project's
 headline within the last twenty-four hours and neither survives.
