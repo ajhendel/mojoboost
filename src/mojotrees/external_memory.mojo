@@ -153,7 +153,7 @@ from .sparse import (
     fit_bins_csc,
     transform_csc,
 )
-from .train_gpu import train_gpu
+from .train_gpu import train_gpu, train_multiclass_gpu
 
 
 comptime EXT_MAGIC = "mojotrees_extmem"
@@ -1998,16 +1998,30 @@ def train_external_multiclass(
             "init_score is not supported for multiclass training: one offset"
             " per row cannot say what each class starts from"
         )
-    _ = resolve_device(device, data.n_rows, data.n_features, n_classes)
-    var booster = train_multiclass(
-        data,
-        _int_labels(fields.label, n_classes),
-        n_classes,
-        params,
-        fields.weight,
-        bagging,
-        goss,
+    var backend = resolve_device(
+        device, data.n_rows, data.n_features, n_classes
     )
+    var booster: MulticlassBooster
+    if backend == GPU_DEVICE:
+        booster = train_multiclass_gpu(
+            data,
+            _int_labels(fields.label, n_classes),
+            n_classes,
+            params,
+            fields.weight,
+            bagging,
+            goss,
+        )
+    else:
+        booster = train_multiclass(
+            data,
+            _int_labels(fields.label, n_classes),
+            n_classes,
+            params,
+            fields.weight,
+            bagging,
+            goss,
+        )
     return MulticlassModel(dataset.mapper.copy(), booster^)
 
 
