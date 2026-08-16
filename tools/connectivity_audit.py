@@ -281,19 +281,17 @@ CLASSIFICATION = {
         "CatBoost ranking objectives and eval metrics (QueryRMSE, PairLogit, "
         "YetiRank, NDCG, PFound). No trainer selects them.",
     ),
-    "ctr": (
-        PENDING,
-        "cpu_round_2",
-        "Ordered target statistics, the simple CTR projection. Catalog A19. "
-        "Parked until binning or the trainer asks for a CTR column.",
-    ),
-    "ctr_combinations": (
-        PENDING,
-        "cpu_round_2",
-        "CTR feature combinations, CatBoost's TProjection above complexity 1. "
-        "Catalog A30, extending A19. Its parameter max_ctr_complexity is "
-        "refused rather than ignored while this is unreached.",
-    ),
+    # `ctr` and `ctr_combinations` were here until 2026-08-16, when
+    # lane/ctr-dataset connected them: `binning` imports `ctr_columns`,
+    # `ctr_columns` imports `ctr` and `ctr_combinations`, and a shipping root
+    # reaches `binning`. They are no longer orphans and their rows are gone
+    # from docs/INTEGRATION_INVENTORY.md. Note that reachable is NOT the same
+    # as usable here -- an enabled CTR bundle is still refused at the trainer
+    # boundary by `ctr.check_ctr_model_support`, because the fitted tables are
+    # model state and `serialize.mojo` has no section for them. That refusal is
+    # a live guard on a connected module, which is a different thing from an
+    # unreached one, and it belongs in the parity notes rather than in this
+    # orphan table.
     "embedding": (
         PENDING,
         "cpu_round_2",

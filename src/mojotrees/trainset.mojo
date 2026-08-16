@@ -82,7 +82,22 @@ from std.math import isinf
 from std.memory import unsafe_memcpy
 
 from .bagging import BaggingParams
-from .binning import BinMapper, BinnedMatrix, fit_bins
+from .binning import (
+    BinMapper,
+    BinnedMatrix,
+    append_ctr_columns,
+    ctr_slot_columns,
+    fit_bins,
+)
+from .ctr import check_ctr_model_support
+from .ctr_columns import (
+    SimpleCtrConfig,
+    build_ctr_train_columns,
+    ctr_train_permutation,
+    fit_ctr_tables,
+    plan_ctr_columns,
+    target_classes,
+)
 from .boosting import (
     Booster,
     BoosterParams,
@@ -287,6 +302,22 @@ def _check_labels(label: List[Float64], n_rows: Int) raises:
     check_required_length(len(label), n_rows, "label")
 
 
+def _check_ctr_label(label: List[Float64], n_rows: Int) raises:
+    """A CTR column is a statistic of the target, so an enabled bundle needs a
+    label at construction time and not at train time.
+
+    Without one there is nothing to take a statistic of, and every column would
+    be the pure prior repeated -- a constant feature that a split search would
+    quietly find no gain in. Refusing here says so where the caller can fix it.
+    """
+    if len(label) != n_rows:
+        raise Error(
+            "ordered target statistics need a label at dataset construction:"
+            " a ctr column is a statistic of the target (catalog A19), so it"
+            " cannot be built from the features alone"
+        )
+
+
 def _int_labels(label: List[Float64], n_classes: Int) raises -> List[Int]:
     """Class codes from a float64 label column: `validation.check_class_codes`
     (whole numbers in `[0, n_classes)`, at least two classes)."""
@@ -404,6 +435,109 @@ def _subset_group(
     return counts^
 
 
+def _feature_category_counts(mapper: BinMapper) -> List[Int]:
+    """`n_categories` per base feature, 0 for a numerical one.
+
+    The two plain lists `ctr_columns.plan_ctr_columns` takes come from here and
+    from `mapper.cats.is_categorical`. They are lists rather than the
+    `CategoricalSpec` itself so that `ctr_columns.mojo` never has to import
+    `.categorical`, which imports `.tree_parameters_extra`; keeping that module
+    at `.ctr`'s depth is what keeps it importable from `binning.mojo` without
+    touching the `efb -> binning -> tree_parameters_extra` cycle.
+    """
+    var out = List[Int](capacity=mapper.n_features)
+    for f in range(mapper.n_features):
+        out.append(mapper.cats.n_categories(f))
+    return out^
+
+
+def _is_categorical_flags(mapper: BinMapper) -> List[Bool]:
+    """`is_cat` per base feature, normalized to the full width. A spec built by
+    `CategoricalSpec.none()` is empty, and `is_cat` already answers False past
+    its end; this makes the width explicit so `plan_ctr_columns` can check the
+    two lists against each other."""
+    var out = List[Bool](capacity=mapper.n_features)
+    for f in range(mapper.n_features):
+        out.append(mapper.cats.is_cat(f))
+    return out^
+
+
+def _build_ctr(
+    mut mapper: BinMapper,
+    mut data: BinnedMatrix,
+    label: List[Float64],
+    mut config: SimpleCtrConfig,
+) raises:
+    """Turn every wide categorical column into CTR columns, both halves.
+
+    The **only** place both halves of catalog A19 are called, and the order is
+    the whole of the train/predict separation. It is not rearrangeable.
+
+    1. **Target borders** (`SimpleCtrConfig.resolve_target_borders`). First,
+       because the plan's shape depends on the class count: one border means two
+       classes and `Borders` emits `n_classes - 1` columns.
+    2. **Plan** (`plan_ctr_columns`). Which categorical columns escape the
+       one-hot cutoff, and which `(type, target border, prior)` column each one
+       produces, in `AllocateCtrData` order. Four per column at CatBoost's CPU
+       defaults with a binary target.
+    3. **Category buckets** (`binning.ctr_slot_columns`). Read out of the binned
+       matrix **once**, and handed to both halves unchanged.
+    4. **Permutation** (`ctr_train_permutation`). One, for the dataset, computed
+       once and in full before any column is built. A keyed block sort, so it is
+       the same permutation at every `MOJOTREES_NUM_WORKERS` and on every
+       machine, and nothing here consumes it in an order-dependent way.
+    5. **Training columns** (`build_ctr_train_columns` ->
+       `binning.append_ctr_columns`). The ordered prefix, denominator
+       `totalCount + 1`, `ui8` out. This runs while `mapper` is still bare,
+       which is what makes it *impossible* for the inference formula to reach
+       the matrix the trees are grown on.
+    6. **Inference tables** (`fit_ctr_tables` -> `BinMapper.attach_ctr`). The
+       static tables over the whole learn set, denominator `t + PriorDenom`,
+       attached last. From this point the mapper appends the *static* columns to
+       anything it transforms or bins -- right for a validation set, a
+       prediction batch and a scored row, and never asked of step 5's matrix.
+
+    Steps 5 and 6 read the same array from step 3 and differ in nothing but
+    which function runs over it, which is the cleanest statement of A19's
+    asymmetry this wiring can make.
+    """
+    if not config.is_active():
+        return
+    # Before anything is planned, because the plan's shape depends on the class
+    # count: one target border means two classes, and `Borders` emits
+    # `n_classes - 1` columns. The config keeps what it resolved, so the dataset
+    # records the borders its columns were actually built from.
+    config.resolve_target_borders(label)
+    config.validate()
+    var tables = plan_ctr_columns(
+        config, _is_categorical_flags(mapper), _feature_category_counts(mapper)
+    )
+    if not tables.is_active():
+        # No categorical column was wide enough to escape the one-hot cutoff,
+        # so CatBoost would build no CTRs here either and the permutation it
+        # keys off (`IsPermutationNeeded`'s `hasCtrs`) would be off as well.
+        # Nothing is attached and the dataset is the one it would have been.
+        return
+    var borders = config.target_borders.copy()
+    var n_rows = data.n_rows
+    var classes = target_classes(label, borders)
+
+    # Read once, used by both halves, and this is the clearest statement of the
+    # asymmetry the wiring exists to get right: the ordered build and the static
+    # fit are handed the SAME slot-major array of category buckets and differ in
+    # nothing but which function runs over it.
+    var cat = ctr_slot_columns(data.bins, n_rows, tables)
+
+    var permutation = ctr_train_permutation(config, n_rows)
+    var ctr_bins = build_ctr_train_columns(
+        tables, cat, n_rows, classes, permutation
+    )
+    append_ctr_columns(data, ctr_bins, tables.n_columns())
+
+    fit_ctr_tables(tables, cat, n_rows, classes)
+    mapper.attach_ctr(tables^)
+
+
 struct Dataset(Copyable, Movable, Writable):
     """A binned feature matrix, dense or sparse, and the columns that go
     with it."""
@@ -425,6 +559,17 @@ struct Dataset(Copyable, Movable, Writable):
     var max_bin: Int
     var use_missing: Bool
 
+    var ctr: SimpleCtrConfig
+    """The ordered-target-statistic configuration this dataset was built with,
+    catalog A19. `SimpleCtrConfig.disabled()` by default, in which case nothing
+    below it ever runs and the binned matrix is byte-identical to the one this
+    type held before CTRs existed.
+
+    `n_features` stays the **raw** feature count whether or not CTRs are on, so
+    every column check, every subset and every caller reading it keeps its
+    meaning. The binned width is `n_total_features()`.
+    """
+
     def __init__[
         features_origin: ImmOrigin, //
     ](
@@ -441,6 +586,7 @@ struct Dataset(Copyable, Movable, Writable):
         max_bin: Int = 255,
         use_missing: Bool = True,
         keep_raw: Bool = False,
+        var ctr: SimpleCtrConfig = SimpleCtrConfig.disabled(),
     ) raises:
         """Bin a column-major raw feature matrix (`features[f * n_rows + r]`)
         and take ownership of the columns that describe its rows.
@@ -450,6 +596,11 @@ struct Dataset(Copyable, Movable, Writable):
         re-binned over part of its rows (`subset`), which is the one thing
         that needs the raw values after construction; it costs one extra
         `n_rows * n_features` buffer for as long as the dataset lives.
+
+        `ctr` is catalog A19's ordered target statistics and is off by default.
+        An active one needs a `label`, because the columns it builds are
+        statistics of the target; it is refused without one rather than
+        producing a column of pure priors.
         """
         _check_columns(
             n_rows,
@@ -464,7 +615,7 @@ struct Dataset(Copyable, Movable, Writable):
         if len(features) != n_rows * n_features:
             raise Error("features length must equal n_rows * n_features")
 
-        self.mapper = fit_bins(
+        var mapper = fit_bins(
             features,
             n_rows,
             n_features,
@@ -472,7 +623,17 @@ struct Dataset(Copyable, Movable, Writable):
             use_missing=use_missing,
             categorical_features=categorical_features,
         )
-        self.data = self.mapper.transform(features, n_rows)
+        # The base matrix, binned while the mapper still carries no CTR tables,
+        # so `transform` cannot append the inference columns to the matrix the
+        # trees will be grown on. `_build_ctr` then appends the ordered columns
+        # and attaches the tables, in that order.
+        var data = mapper.transform(features, n_rows)
+        if ctr.is_active():
+            _check_ctr_label(label, n_rows)
+            _build_ctr(mapper, data, label, ctr)
+        self.mapper = mapper^
+        self.data = data^
+        self.ctr = ctr^
         self.sparse_data = _empty_sparse_binned(n_features)
         self.is_sparse = False
         if keep_raw:
@@ -519,6 +680,7 @@ struct Dataset(Copyable, Movable, Writable):
         var categorical_features: List[Int],
         max_bin: Int,
         use_missing: Bool,
+        var ctr: SimpleCtrConfig = SimpleCtrConfig.disabled(),
     ):
         """Assemble a dataset from a binning that has already happened.
 
@@ -526,6 +688,11 @@ struct Dataset(Copyable, Movable, Writable):
         here, so that every dataset, however it was built, is assembled in
         one place. Nothing is validated here, because everything was
         validated on the way in.
+
+        `ctr` records the configuration the columns were built from; the fitted
+        tables themselves live on `mapper` and are what a model would have to
+        carry. It defaults to disabled so that every existing call site of this
+        constructor keeps its meaning without an argument.
         """
         self.mapper = mapper^
         self.data = data^
@@ -543,6 +710,7 @@ struct Dataset(Copyable, Movable, Writable):
         self.categorical_features = categorical_features^
         self.max_bin = max_bin
         self.use_missing = use_missing
+        self.ctr = ctr^
 
     @staticmethod
     def from_raw(
@@ -556,6 +724,7 @@ struct Dataset(Copyable, Movable, Writable):
         max_bin: Int = 255,
         use_missing: Bool = True,
         keep_raw: Bool = False,
+        var ctr: SimpleCtrConfig = SimpleCtrConfig.disabled(),
     ) raises -> Dataset:
         """Bin a `RawData`, dense or sparse, and own the result.
 
@@ -569,6 +738,13 @@ struct Dataset(Copyable, Movable, Writable):
         no copy for coming this way rather than through the dense
         constructor. It is retained afterwards only when `keep_raw` asks for
         it, and dropped otherwise.
+
+        `ctr` (catalog A19) is refused on sparse input, by name. A CTR column
+        is dense by construction -- every row of a categorical column has a
+        bucket, `categorical.UNKNOWN_BIN` included, so every row has a
+        statistic and there is no default value a `SparseBinnedMatrix` column
+        could be built around. Appending it would silently densify the matrix
+        the sparse path exists to avoid.
         """
         var n_rows = raw.n_rows
         var n_features = raw.n_features
@@ -589,9 +765,20 @@ struct Dataset(Copyable, Movable, Writable):
         var data = _empty_binned(n_features)
         var sparse_data = _empty_sparse_binned(n_features)
         if is_sparse:
+            if ctr.is_active():
+                raise Error(
+                    "ordered target statistics are a dense-matrix mechanism:"
+                    " every row of a categorical column has a bucket, so a ctr"
+                    " column has a value in every row and no default bin a"
+                    " sparse column could be stored around. Build the dataset"
+                    " from a dense matrix, or leave ctr disabled"
+                )
             sparse_data = raw.transform_sparse(mapper)
         else:
             data = raw.transform_dense(mapper)
+            if ctr.is_active():
+                _check_ctr_label(label, n_rows)
+                _build_ctr(mapper, data, label, ctr)
         var kept: RawData
         if keep_raw:
             kept = raw^
@@ -614,6 +801,7 @@ struct Dataset(Copyable, Movable, Writable):
             categorical_features^,
             max_bin,
             use_missing,
+            ctr^,
         )
 
     @staticmethod
@@ -861,8 +1049,20 @@ struct Dataset(Copyable, Movable, Writable):
         var data = _empty_binned(n_features)
         var sparse_data = _empty_sparse_binned(n_features)
         if is_sparse:
+            if mapper.has_ctr():
+                raise Error(
+                    "a reference carrying ctr tables cannot bin a sparse"
+                    " matrix: `transform_csc` has no ctr arm, and a ctr column"
+                    " is dense in every row (catalog A19)"
+                )
             sparse_data = transform_csc(mapper, raw.csc)
         else:
+            # The reference's mapper carries the fitted CTR tables, so
+            # `transform_dense` -> `BinMapper.transform` appends the
+            # **static-table** columns here. That is exactly what a validation
+            # set wants: it is scored by a model trained on the reference, and
+            # the model's trees threshold the inference statistic, not an
+            # ordered prefix these rows had no part in.
             data = raw.transform_dense(mapper)
         var kept: RawData
         if keep_raw:
@@ -886,6 +1086,7 @@ struct Dataset(Copyable, Movable, Writable):
             reference.categorical_features.copy(),
             reference.max_bin,
             reference.use_missing,
+            reference.ctr.copy(),
         )
 
     @staticmethod
@@ -964,6 +1165,7 @@ struct Dataset(Copyable, Movable, Writable):
             reference.categorical_features.copy(),
             reference.max_bin,
             reference.use_missing,
+            reference.ctr.copy(),
         )
 
     def write_to(self, mut writer: Some[Writer]):
@@ -1015,6 +1217,32 @@ struct Dataset(Copyable, Movable, Writable):
         """Whether the raw input was retained (`keep_raw=True`), which is
         what `subset` needs."""
         return not self.raw.is_empty()
+
+    def has_ctr(self) -> Bool:
+        """Whether this dataset carries ordered-target-statistic columns
+        (catalog A19). False for every dataset built without an active
+        `SimpleCtrConfig`, which is every dataset built before this existed."""
+        return self.mapper.has_ctr()
+
+    def n_ctr_columns(self) -> Int:
+        """CTR columns appended to the binned matrix, 0 when CTRs are off.
+
+        Four per categorical column wide enough to escape the one-hot cutoff, at
+        CatBoost's CPU defaults with a binary target:
+        `Borders x 3 priors + Counter x 1`.
+        """
+        if not self.mapper.has_ctr():
+            return 0
+        return self.mapper.ctr.n_columns()
+
+    def n_total_features(self) -> Int:
+        """Columns of the binned matrix: `n_features + n_ctr_columns()`.
+
+        `n_features` stays the raw width, which is what a caller supplies and
+        what every column check compares against. A tree grown on this dataset
+        may reference any id below this number.
+        """
+        return self.n_features + self.n_ctr_columns()
 
     def feature_name(self, index: Int) raises -> String:
         """One feature's name, LightGBM's `Column_<i>` for a dataset built
@@ -1094,6 +1322,12 @@ struct Dataset(Copyable, Movable, Writable):
             self.max_bin,
             self.use_missing,
             keep_raw,
+            # The CTR columns are refitted over the selected rows, exactly as
+            # the bin edges are, and for the same reason: an ordered target
+            # statistic taken over rows this fold does not hold is the same leak
+            # a quantile taken over them would be. `from_raw` reruns the whole
+            # five-step build.
+            self.ctr.copy(),
         )
 
     def subset_shared_binning(
@@ -1153,6 +1387,16 @@ def train_dataset(
     way: it serializes, loads, and predicts on dense rows identically.
     """
     _check_labels(dataset.label, dataset.n_rows)
+    # Catalog A19's refusal, and it is the one that still holds. The CTR
+    # columns build, reach the histogram and score a raw row, but the
+    # tables they score from are fitted model state and
+    # `serialize._write_mapper` has no section for them -- so a model
+    # produced here would save without them and load scoring wrong.
+    # Refusing to produce it is strictly better than producing one that
+    # cannot be saved honestly. `serialize.mojo` and the format version
+    # belong to the model-export lane (catalog A29); when it lands, this
+    # call is what it deletes.
+    check_ctr_model_support(dataset.has_ctr())
     var booster: Booster
     if dataset.is_sparse:
         if device == GPU_DEVICE:
@@ -1236,6 +1480,16 @@ def train_dataset_multiclass(
     and reporting a run that sampled.
     """
     _check_labels(dataset.label, dataset.n_rows)
+    # Catalog A19's refusal, and it is the one that still holds. The CTR
+    # columns build, reach the histogram and score a raw row, but the
+    # tables they score from are fitted model state and
+    # `serialize._write_mapper` has no section for them -- so a model
+    # produced here would save without them and load scoring wrong.
+    # Refusing to produce it is strictly better than producing one that
+    # cannot be saved honestly. `serialize.mojo` and the format version
+    # belong to the model-export lane (catalog A29); when it lands, this
+    # call is what it deletes.
+    check_ctr_model_support(dataset.has_ctr())
     if len(dataset.init_score) != 0:
         raise Error(
             "init_score is not supported for multiclass training: one offset"
@@ -1311,6 +1565,16 @@ def train_dataset_ranker(
     holds the per-query row counts. CPU only, as `ranking.fit_ranker` is,
     and dense only: `train_ranker` reads a `BinnedMatrix`."""
     _check_labels(dataset.label, dataset.n_rows)
+    # Catalog A19's refusal, and it is the one that still holds. The CTR
+    # columns build, reach the histogram and score a raw row, but the
+    # tables they score from are fitted model state and
+    # `serialize._write_mapper` has no section for them -- so a model
+    # produced here would save without them and load scoring wrong.
+    # Refusing to produce it is strictly better than producing one that
+    # cannot be saved honestly. `serialize.mojo` and the format version
+    # belong to the model-export lane (catalog A29); when it lands, this
+    # call is what it deletes.
+    check_ctr_model_support(dataset.has_ctr())
     if dataset.is_sparse:
         raise Error(
             "LambdaRank has no sparse trainer: train_ranker reads a dense"
@@ -1357,6 +1621,16 @@ def train_dataset_ranker_advanced(
     if not advanced_ranking_requested(rank_params, positions):
         return train_dataset_ranker(dataset, params, rank_params.base, bagging)
     _check_labels(dataset.label, dataset.n_rows)
+    # Catalog A19's refusal, and it is the one that still holds. The CTR
+    # columns build, reach the histogram and score a raw row, but the
+    # tables they score from are fitted model state and
+    # `serialize._write_mapper` has no section for them -- so a model
+    # produced here would save without them and load scoring wrong.
+    # Refusing to produce it is strictly better than producing one that
+    # cannot be saved honestly. `serialize.mojo` and the format version
+    # belong to the model-export lane (catalog A29); when it lands, this
+    # call is what it deletes.
+    check_ctr_model_support(dataset.has_ctr())
     if dataset.is_sparse:
         raise Error(
             "LambdaRank has no sparse trainer: train_ranker reads a dense"
@@ -1422,6 +1696,16 @@ def update_dataset(
             " this one is binned differently"
         )
     _check_labels(dataset.label, dataset.n_rows)
+    # Catalog A19's refusal, and it is the one that still holds. The CTR
+    # columns build, reach the histogram and score a raw row, but the
+    # tables they score from are fitted model state and
+    # `serialize._write_mapper` has no section for them -- so a model
+    # produced here would save without them and load scoring wrong.
+    # Refusing to produce it is strictly better than producing one that
+    # cannot be saved honestly. `serialize.mojo` and the format version
+    # belong to the model-export lane (catalog A29); when it lands, this
+    # call is what it deletes.
+    check_ctr_model_support(dataset.has_ctr())
     return train_more(
         model.booster,
         dataset.data,
@@ -1470,6 +1754,16 @@ def update_dataset_multiclass(
             " this one is binned differently"
         )
     _check_labels(dataset.label, dataset.n_rows)
+    # Catalog A19's refusal, and it is the one that still holds. The CTR
+    # columns build, reach the histogram and score a raw row, but the
+    # tables they score from are fitted model state and
+    # `serialize._write_mapper` has no section for them -- so a model
+    # produced here would save without them and load scoring wrong.
+    # Refusing to produce it is strictly better than producing one that
+    # cannot be saved honestly. `serialize.mojo` and the format version
+    # belong to the model-export lane (catalog A29); when it lands, this
+    # call is what it deletes.
+    check_ctr_model_support(dataset.has_ctr())
     if len(dataset.init_score) != 0:
         raise Error(
             "init_score is not supported for multiclass training: one offset"

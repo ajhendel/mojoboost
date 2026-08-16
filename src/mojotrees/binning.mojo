@@ -299,6 +299,23 @@ from std.memory import bitcast
 from std.os import getenv
 
 from .categorical import CategoricalSpec, fit_categorical_spec
+
+# Ordered target statistics (catalog A19), the columns half. `ctr_columns`
+# imports `.ctr` and `.ctr_combinations`; `.ctr` imports `.rng`; `.rng` imports
+# nothing. So the whole transitive set added here is `{ctr_columns, ctr,
+# ctr_combinations, rng}` and `rng` was already imported below -- nothing in
+# that set reaches back into `binning`, `categorical` or
+# `tree_parameters_extra`, so the `efb -> binning -> tree_parameters_extra`
+# cycle is untouched. This was checked in the direction that matters: no file
+# under `src/mojotrees` imports `binning` *from* `ctr*`, and `ctr_columns`
+# deliberately takes `List[Bool]`/`List[Int]` rather than a `CategoricalSpec`
+# so that it never needs `.categorical` (which does import
+# `tree_parameters_extra`).
+from .ctr_columns import (
+    CtrTables,
+    ctr_predict_columns,
+    ctr_predict_row,
+)
 from .parallel import (
     _env_int,
     dispatch_feature_ranges,
@@ -1784,6 +1801,103 @@ def all_features(n_features: Int) -> List[Int]:
     for f in range(n_features):
         out.append(f)
     return out^
+
+
+# ---------------------------------------------------------------------------
+# CTR columns in a binned matrix (catalog A19), the four helpers the two
+# append paths share. All of them are no-ops on an inactive `CtrTables`.
+# ---------------------------------------------------------------------------
+
+
+def ctr_slot_columns(
+    bins: List[UInt8], n_rows: Int, tables: CtrTables
+) raises -> List[Int]:
+    """The category bucket of every CTR source column, slot-major.
+
+    `out[s * n_rows + r]` is row `r`'s bin of the categorical feature at slot
+    `s`, which is `tables.source_features[s]`. This is the one place a
+    categorical column is read out of the binned matrix, and it is the input
+    both halves take: `ctr_columns.build_ctr_train_columns` runs the ordered
+    prefix over it and `ctr_columns.ctr_predict_columns` runs the static table
+    over it, so the *only* difference between train and predict is which
+    function is handed this array.
+
+    A bin here is `categorical.CategoricalSpec.bin_of`'s answer: 0 for missing,
+    unknown or table-evicted, and `i + 1` for the i-th kept category. Bucket 0
+    is a real bucket with real statistics, which is why CatBoost's
+    absent-category arm is unreachable from this wiring.
+
+    Cost: `n_slots * n_rows` `Int`s, `8 * C * n` bytes, transient.
+    """
+    var out = List[Int]()
+    if not tables.is_active():
+        return out^
+    var n_slots = tables.n_slots()
+    out.resize(n_slots * n_rows, 0)
+    for s in range(n_slots):
+        var f = tables.source_features[s]
+        var src = f * n_rows
+        var dst = s * n_rows
+        for r in range(n_rows):
+            out[dst + r] = Int(bins[src + r])
+    return out^
+
+
+def ctr_extend_cats(cats: CategoricalSpec, n_extra: Int) -> CategoricalSpec:
+    """`cats` widened by `n_extra` numerical features.
+
+    A CTR column is numeric: its value is already a bucket index in
+    `[0, ctr_border_count]` and a tree thresholds it ordinally, which is the
+    entire point of the mechanism. So the extra slots are `False` with an empty
+    category slice, and the split search treats them as it treats any other
+    binned numeric feature.
+    """
+    # A spec with no information at all (`CategoricalSpec.none()`, which a
+    # `BinnedMatrix` built by the four-argument constructor holds) already
+    # answers "numerical" for every index past its end, so widening it would
+    # only invent slots. Leave it alone.
+    if len(cats.offsets) == 0:
+        return cats.copy()
+    var flags = cats.is_categorical.copy()
+    for _ in range(n_extra):
+        flags.append(False)
+    var offsets = cats.offsets.copy()
+    var last = offsets[len(offsets) - 1]
+    for _ in range(n_extra):
+        offsets.append(last)
+    return CategoricalSpec(flags^, cats.codes.copy(), offsets^)
+
+
+def ctr_extend_missing(missing_bin: List[Int], n_extra: Int) -> List[Int]:
+    """`missing_bin` widened by `n_extra` entries of -1.
+
+    A CTR column has no missing value to reserve a bin for. Every row of a
+    categorical column has a bucket -- missing raw values land in
+    `categorical.UNKNOWN_BIN` -- so every row of a CTR column has a statistic,
+    and there is no third state.
+    """
+    var out = missing_bin.copy()
+    for _ in range(n_extra):
+        out.append(-1)
+    return out^
+
+
+def ctr_extend_usable(
+    usable: List[Int], n_base: Int, n_extra: Int
+) -> List[Int]:
+    """`usable` widened with the CTR column ids, still ascending.
+
+    CTR columns are always usable: they exist to be split on, and a prefilter
+    that dropped one would be dropping the mechanism rather than a trivial
+    column. Every base id is below `n_base` and the new ids start at `n_base`,
+    so appending keeps the list ascending, which `usable_features` requires.
+    """
+    var out = usable.copy()
+    for i in range(n_extra):
+        out.append(n_base + i)
+    return out^
+
+
 comptime ROW_MAJOR_PACK_MAX_BINS = 16
 """Most bins a feature may use and still be stored in half a byte.
 
@@ -2341,6 +2455,77 @@ struct BinnedMatrix(Copyable, Movable):
         self.bin_offset = []
 
 
+def _rebuild_row_major(mut matrix: BinnedMatrix, build_view: Bool) raises:
+    """Drop the row-major view and rebuild it under the environment policy.
+
+    The same three-way policy `BinMapper.transform` applies at the end of a fit:
+    `auto` offers the budget, an explicit `1` passes none, an explicit `0` does
+    not build. Factored out because appending CTR columns has to redo the
+    decision -- the packing widths are a function of every column's realized bin
+    count, so four new 16-bin columns can change which features fit in a nibble.
+    """
+    matrix.drop_row_major()
+    var mode = ROW_MAJOR_OFF if not build_view else env_row_major_mode()
+    if mode == ROW_MAJOR_ON:
+        matrix.build_row_major(0)
+    elif mode == ROW_MAJOR_AUTO:
+        matrix.build_row_major(row_major_budget_bytes())
+
+
+def append_ctr_columns(
+    mut matrix: BinnedMatrix,
+    ctr_bins: List[UInt8],
+    n_ctr_columns: Int,
+    build_view: Bool = True,
+) raises:
+    """Append CTR columns to a binned matrix, in place, whichever half made them.
+
+    After this call `matrix.n_features` counts them, so every histogram builder,
+    every split search and every grower sees ordinary binned numeric features and
+    needs no edit: `histogram.build_histogram_into_scratch` reads
+    `data.bins[f * n_rows + r]`, which is where these bytes now are, and
+    `data.usable` now offers the new ids to a split search.
+
+    `ctr_bins` is column-major, `ctr_bins[c * n_rows + r]`, and every byte in it
+    is already a bucket index -- the training half because `ctr.ctr_train_bin`
+    returns CatBoost's `ui8` directly, the inference half because
+    `ctr.ctr_predict_bucket` truncates the unquantized value. There is no
+    binarization pass over CTR values on either side, for the reason
+    `ctr.check_ctr_border_type` states.
+
+    Two callers, and the difference between them is the whole mechanism.
+
+    - **Training**: `trainset._build_ctr` hands it
+      `ctr_columns.build_ctr_train_columns`' output -- the ordered prefix of one
+      permutation, denominator `totalCount + 1`, read-before-write so row `i`
+      never sees its own target. Swapping the read and the write inside
+      `ctr.ordered_ctr_borders_binary` is the single edit that would silently
+      turn this back into ordinary target encoding.
+    - **Inference**: `BinMapper.transform` hands it
+      `ctr_columns.ctr_predict_columns`' output -- the static tables over the
+      whole learn set, denominator `t + PriorDenom`, truncated by
+      `EmulateUi8Rounding`'s rule.
+
+    A `BinMapper` can only ever make the second call: it holds no permutation
+    and no target, so it *cannot* evaluate the training formula. That is the
+    train/predict separation enforced by what the type owns rather than by a
+    comment.
+    """
+    if n_ctr_columns < 1:
+        return
+    var n_rows = matrix.n_rows
+    if len(ctr_bins) != n_ctr_columns * n_rows:
+        raise Error("ctr column buffer must be n_ctr_columns * n_rows bytes")
+    var n_base = matrix.n_features
+    for i in range(len(ctr_bins)):
+        matrix.bins.append(ctr_bins[i])
+    matrix.n_features = n_base + n_ctr_columns
+    matrix.cats = ctr_extend_cats(matrix.cats, n_ctr_columns)
+    matrix.missing_bin = ctr_extend_missing(matrix.missing_bin, n_ctr_columns)
+    matrix.usable = ctr_extend_usable(matrix.usable, n_base, n_ctr_columns)
+    _rebuild_row_major(matrix, build_view)
+
+
 struct BinMapper(Copyable, Movable):
     """Per-feature bin edges fit on training data.
 
@@ -2376,6 +2561,18 @@ struct BinMapper(Copyable, Movable):
     var missing_bin: List[Int]
     var usable: List[Int]
 
+    var ctr: CtrTables
+    """Fitted ordered-target-statistic tables, catalog A19. `CtrTables.none()`
+    unless `attach_ctr` put some here, which nothing does by default.
+
+    **`n_features` does not count CTR columns.** A raw row and a raw matrix stay
+    exactly as wide as the caller's data, which is what keeps every existing
+    call site of `transform` and `bin_row` correct without an edit; the *binned*
+    width is `n_total_features()`. The tables are model state (they are read off
+    the target), and `ctr_columns.check_ctr_serializable` refuses to let them
+    reach a writer that would silently drop them.
+    """
+
     def __init__(
         out self,
         var edges: List[Float64],
@@ -2390,6 +2587,7 @@ struct BinMapper(Copyable, Movable):
         self.cats = CategoricalSpec.all_numerical(n_features)
         self.missing_bin = no_missing_bins(n_features)
         self.usable = all_features(n_features)
+        self.ctr = CtrTables.none()
 
     def __init__(
         out self,
@@ -2415,6 +2613,57 @@ struct BinMapper(Copyable, Movable):
             self.usable = usable^
         else:
             self.usable = all_features(n_features)
+        self.ctr = CtrTables.none()
+
+    def n_total_features(self) -> Int:
+        """Columns a binned matrix or a binned row has: the base features plus
+        the CTR columns. Equal to `n_features` unless CTR tables are attached,
+        so nothing that reads `n_features` today changes meaning."""
+        if not self.ctr.is_active():
+            return self.n_features
+        return self.n_features + self.ctr.n_columns()
+
+    def has_ctr(self) -> Bool:
+        return self.ctr.is_active()
+
+    def attach_ctr(mut self, var tables: CtrTables) raises:
+        """Take ownership of the fitted CTR tables, after the training columns
+        have already been built.
+
+        **Order matters and this is the whole of the train/predict separation.**
+        A mapper with tables attached appends the *static-table* CTR columns to
+        everything it transforms or bins, which is right for a validation set, a
+        prediction batch and a scored row and would be catastrophically wrong for
+        the matrix the trees are grown on. The dataset path therefore transforms
+        the base matrix while the mapper is still bare, appends the *ordered*
+        columns with `append_ctr_train_columns`, fits the tables, and calls this
+        last. After this call the mapper can no longer produce the training
+        matrix, and nothing asks it to.
+
+        A `Model` built from a mapper in this state predicts correctly and saves
+        incorrectly; `ctr.check_ctr_model_support` is what stops the second from
+        happening, at the trainer boundary in `trainset.mojo`.
+        """
+        if tables.is_active():
+            if tables.n_base_features != self.n_features:
+                raise Error(
+                    "ctr tables were planned for a different feature count"
+                )
+            if tables.n_columns() > 0:
+                var need = tables.columns[0].n_buckets()
+                for i in range(tables.n_columns()):
+                    var b = tables.columns[i].n_buckets()
+                    if b > need:
+                        need = b
+                if need > self.n_bins:
+                    raise Error(
+                        "ctr columns need ",
+                        need,
+                        " bins and this binning reserves only ",
+                        self.n_bins,
+                        ": raise max_bin to at least ctr_border_count + 1",
+                    )
+        self.ctr = tables^
 
     def usable_features(self) -> List[Int]:
         """The pool `feature_fraction` draws from, ascending. Every feature
@@ -2486,6 +2735,13 @@ struct BinMapper(Copyable, Movable):
         for i in range(len(self.cats.offsets)):
             if self.cats.offsets[i] != other.cats.offsets[i]:
                 return False
+        # Two mappers that bin the base features identically still disagree
+        # about a CTR column if their fitted tables differ, and a CTR column's
+        # bin id would then mean two different things -- the exact failure the
+        # rest of this function exists to prevent. `train_more` must not accept
+        # one for the other.
+        if not self.ctr.matches(other.ctr):
+            return False
         return True
 
     def bin_value(self, feature: Int, v: Float64) -> Int:
@@ -2639,6 +2895,32 @@ struct BinMapper(Copyable, Movable):
             self.missing_bin.copy(),
             self.usable.copy(),
         )
+        # The INFERENCE half of catalog A19, and it runs here and only here.
+        #
+        # `self.ctr` is `CtrTables.none()` unless `attach_ctr` was called, and
+        # `attach_ctr` is called only *after* the fit that produced this mapper
+        # has already built its training matrix. So this branch is dead during a
+        # fit, by construction rather than by a flag, and it is live for exactly
+        # the matrices that should get static-table columns: a validation set
+        # binned through `Dataset.from_reference`, and every raw matrix handed to
+        # `Model.predict_batch`.
+        #
+        # `ctr_predict_columns` reads the tables `CalcFinalCtrs` built over the
+        # whole learn set with the denominator `t + PriorDenom` and truncates
+        # with `EmulateUi8Rounding`'s rule. It is a different formula over
+        # different data from the one that made the training columns, which is
+        # A19's central warning and the reason the two paths do not share a line
+        # of code.
+        #
+        # Cost when inactive: one `is_active()` load and a not-taken branch. No
+        # allocation, no pass, and the matrix is byte-identical to the one this
+        # function returned before CTRs existed.
+        if self.ctr.is_active():
+            var cat = ctr_slot_columns(out.bins, n_rows, self.ctr)
+            var extra = ctr_predict_columns(self.ctr, cat, n_rows)
+            append_ctr_columns(
+                out, extra, self.ctr.n_columns(), build_view=False
+            )
         # The row-major view, at fit time. Its widths come from the bins this
         # call just wrote, so it is built here rather than fused into the tile
         # above: the packing decision needs each feature's realized bin count,
@@ -2661,12 +2943,32 @@ struct BinMapper(Copyable, Movable):
         return out^
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
-        """Bin one example (length n_features) for prediction."""
+        """Bin one example for prediction.
+
+        The raw row is `n_features` long -- the caller's own feature count,
+        which CTRs do not change. The result is `n_total_features()` long,
+        because a CTR column is not something a caller can supply: its value is
+        a statistic of the training target and the mapper is the only thing that
+        holds it.
+
+        This is why `Model.predict`, `Model.predict_raw`, `Model.leaf_indices`
+        and their multiclass counterparts score a CTR model with no edit to
+        `model.mojo`: they all bin through here, and the trees index the vector
+        this returns.
+        """
         if len(row) != self.n_features:
             raise Error("row length must equal n_features")
-        var out = List[Int](capacity=self.n_features)
+        var out = List[Int](capacity=self.n_total_features())
         for f in range(self.n_features):
             out.append(self.bin_value(f, row[f]))
+        if self.ctr.is_active():
+            # The static-table half again, one row at a time. Same tables, same
+            # formula and same truncation as `ctr_predict_columns` takes in
+            # bulk, so a row scored singly and the same row scored in a batch
+            # get the same bin.
+            var extra = ctr_predict_row(self.ctr, out)
+            for i in range(len(extra)):
+                out.append(extra[i])
         return out^
 
 
