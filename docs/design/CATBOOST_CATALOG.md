@@ -177,6 +177,7 @@ chosen. Building it would be building a gate that cannot open.
 | A14 | Model shrinkage: `model_shrink_rate`, `model_shrink_mode` (**verified from source**, see the A13/A14 note) | At the top of every iteration after the first, every accumulated raw score is multiplied by `1 - rate * learning_rate` (Constant) or `1 - rate / iteration` (Decreasing); the products are folded back into the leaf values of the already-grown trees at the end of the fit | Only when on | Yes, `langevin.mojo`, off by default. Built as a deferred fold (strictly less work than CatBoost's per-round rescale of the model, and exact) | CPU (`langevin.mojo`) | (1) as built, off; (3) when on. Refused beside continued training and beside `init_score`, both of which CatBoost also refuses |
 | A15 | `feature_border_type` / `border_count` (`library/cpp/grid_creator/binarization.cpp`, `catboost/libs/data/quantization.cpp`) | CatBoost's float quantization: seven border-selection algorithms, `GreedyLogSum` by default, bounded by `border_count` thresholds | New mode; bit-moving on the arm that selects it, exact on the arm that does not | Yes, opt-in `border_type`, default stays the LightGBM/mojotrees quantile fit | CPU (`binning.mojo`) | A15 note. **BUILT**, five of seven types, `binning.fit_bins(border_type=...)` |
 | A16 | `one_hot_max_size` (`catboost/private/libs/options/cat_feature_options.cpp`, `catboost/private/libs/algo/greedy_tensor_search.cpp`) | CatBoost's categorical one-hot threshold, default 2, `<=` on the count of real categories seen on learn | New mode; bit-moving only when set | Yes, opt-in `CategoricalParams.one_hot_max_size`, default off | CPU (`categorical.mojo`) | A16 note. **BUILT**. It also settles the owed `max_cat_to_onehot` off-by-one, see A12 |
+| A17 | Ordered target statistics, the simple (single-cat-feature) projection (`catboost/private/libs/algo/online_ctr.{h,cpp}`, `.../ctr_helper.{h,cpp}`, `.../fold.cpp`, `.../split.cpp`, `catboost/libs/model/online_ctr.h`) -- **verified from source**, see the A17 note | The mechanism A5 named. A categorical value becomes a *numeric* feature whose value at row `i` is a target statistic over the rows that precede `i` in a random permutation, quantized to 16 buckets. Four CTR types, three priors, an unshuffled fold 0, and a separate non-online table for inference | Yes -- it adds features that did not exist | Yes. This is the one mechanism that makes a categorical CatBoost comparison possible at all, and `bench/real_data` runs no such scenario today because we had no counterpart | CPU (`ctr.mojo`, new file; `categorical.mojo` untouched) | A17 note. **BUILT, off by default, unreached.** (3) when on. Deterministic under the seed, across `MOJOTREES_NUM_WORKERS`, and across machines, by a keyed sort rather than a shuffle |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -1792,3 +1793,390 @@ CatBoost's *boundary* and not CatBoost's *other side*. A fit with
 `one_hot_max_size = 2` is CatBoost-shaped in which features get one-hot and
 LightGBM-shaped in what the rest get. Anyone reading a comparison against
 CatBoost has to hold both halves.
+
+### A17 note: ordered target statistics, verified from source
+
+Read 2026-08-16 from `github.com/catboost/catboost` at `master`. This note
+discharges A5, which was written from the paper, was marked *verify*, and is
+wrong in three places that are named below. A5's row is left standing so the
+diff is readable; **A17 supersedes it.**
+
+Files read, and every claim below cites one of them.
+
+- `catboost/private/libs/algo/online_ctr.h` -- `CalcCTR`, `CalcNormalization`,
+  `ComputeOnlineCTRs`, `CalcFinalCtrsAndSaveToModel`, `SIMPLE_CLASSES_COUNT`.
+- `catboost/private/libs/algo/online_ctr.cpp` -- `CalcOnlineCTRSimple`,
+  `CalcOnlineCTRClasses`, `CalcOnlineCTRMean`, `CalcOnlineCTRCounter`,
+  `CalcStatsForEachBlock`, `SumCtrsFromBlocks`, `CalcQuantizedCtrs`,
+  `CountOnlineCTRTotal`, `CalcFinalCtrsImpl`, `CalcFinalCtrs`.
+- `catboost/private/libs/algo/ctr_helper.h` -- `TCtrInfo`,
+  `GetTargetBorderCount`, `TCtrHelper::GetCtrInfo`.
+- `catboost/private/libs/algo/ctr_helper.cpp` -- `MakeCtrInfo`,
+  `TCtrHelper::InitCtrHelper`.
+- `catboost/private/libs/algo/fold.cpp` -- `InitPermutationData`,
+  `TFold::BuildPlainFold`, `TFold::BuildDynamicFold`, `TFold::AssignTarget`.
+- `catboost/private/libs/algo/learn_context.cpp` -- `IsPermutationNeeded`,
+  `CountLearningFolds`, `TFoldsCreationParams`, the fold-construction loop,
+  the `AveragingFold` construction.
+- `catboost/private/libs/algo/train.cpp` -- the per-tree fold draw.
+- `catboost/private/libs/algo/split.cpp` and `split.h` --
+  `TSplit::GetModelSplit`'s CTR branch, `EmulateUi8Rounding`, `GetBucketCount`.
+- `catboost/libs/model/online_ctr.h` -- `TModelCtr::Calc`, `TModelCtr`'s
+  fields.
+- `catboost/libs/model/hash.h` -- `CalcHash`.
+- `catboost/libs/model/target_classifier.h` -- `GetTargetClass`,
+  `GetClassesCount`.
+- `catboost/libs/model/model_export/resources/ctr_calcer.py` -- the reference
+  inference calculator, which is the readable statement of the predict path.
+- `catboost/private/libs/ctr_description/ctr_type.h` and `.cpp` -- `ECtrType`,
+  `NeedTarget`, `NeedTargetClassifier`, `IsPermutationDependentCtrType`.
+- `catboost/private/libs/options/cat_feature_options.h` and `.cpp` --
+  `GetDefaultPriors`, `TCatFeatureParams`'s constructor (the defaults).
+- `catboost/private/libs/options/catboost_options.cpp` -- `SetCtrDefaults`,
+  `CreateDefaultCounter`.
+- `catboost/private/libs/options/boosting_options.cpp` -- `permutation_count`.
+- `catboost/private/libs/options/defaults_helper.h` --
+  `DefaultFoldPermutationBlockSize`.
+- `catboost/libs/data/objects_grouping.cpp` -- `NCB::Shuffle`.
+
+#### The arithmetic, which is smaller than the folklore
+
+One inline function is the whole of it
+(`online_ctr.h:128`, and it is eight lines including the signature):
+
+```cpp
+inline ui8 CalcCTR(float countInClass, int totalCount, float prior, float shift, float norm, int borderCount) {
+    float ctr = (countInClass + prior) / (totalCount + 1);
+    return (ctr + shift) / norm * borderCount;
+}
+```
+
+Three things fall straight out of it.
+
+**The training denominator is `totalCount + 1`, not `totalCount + priorDenom`.**
+There is no `prior_denom` in the training path at all. It exists in the option
+surface (`GetDefaultPriors` returns pairs, `{0, 1} {0.5, 1} {1, 1}`) and it is
+refused at load time on the CPU -- `MakeCtrInfo` does
+`CB_ENSURE(denom == 1.0, "Error: CPU could use only 1 as denom for ctrs currently")`
+and then stores only `prior[0]` into `TCtrInfo::Priors`. So on the CPU the
+second element of every prior pair is a checked constant. It survives into the
+model as a real field (`TModelCtr::PriorDenom`) because the GPU path can set
+it, and `split.cpp:79` writes `PriorDenom = 1.0f` unconditionally on the CPU.
+
+**The return value is a `ui8` bin index, not a ratio.** The training-time CTR
+feature is already quantized when it is produced. There is no separate
+binarization pass over CTR values, and this is why the CPU refuses anything but
+uniform CTR binarization
+(`ctr_helper.cpp:29`, `"Error: CPU supports only uniform binarization for CTRS"`).
+`(ctr + shift) / norm` lands in `[0, 1]`, the multiply by `borderCount` lands
+in `[0, borderCount]`, and the implicit `float -> ui8` conversion truncates.
+That is `borderCount + 1` buckets, which is exactly what
+`GetBucketCount` returns for a CTR candidate (`split.cpp`,
+`return splitCandidate.Ctr.BorderCount + 1;`).
+
+**`shift` and `norm` exist only to map a prior outside `[0, 1]` back into it**
+(`CalcNormalization`, `online_ctr.cpp:102`):
+
+```cpp
+float left = Min(0.0f, prior);  float right = Max(1.0f, prior);
+(*shift)[i] = -left;            (*norm)[i] = (right - left);
+```
+
+At every default prior (`0`, `0.5`, `1`) that is `shift = 0, norm = 1`, so the
+normalization is the identity for a stock fit and only bites for a
+user-supplied negative or greater-than-one prior.
+
+#### Defaults, all from source
+
+| thing | value | citation |
+|---|---|---|
+| `simple_ctr` for every loss except PairLogit | `Borders` with priors `{0, 0.5, 1}` **and** `Counter` with prior `{0}` | `catboost_options.cpp::SetCtrDefaults`, `default:` arm |
+| `simple_ctr` for `PairLogit`/`PairLogitPairwise` | `Counter` only | same, the PairLogit arm |
+| `combinations_ctr` | the same two, built by the same arms | same |
+| CPU default `Counter` construction | `TCtrDescription(ECtrType::Counter, GetDefaultPriors(Counter))` | `CreateDefaultCounter`, CPU branch |
+| GPU default counter is a **different type** | `FeatureFreq`, not `Counter` | `CreateDefaultCounter`, GPU branch |
+| `ctr_border_count` | **15** | `TCtrDescription(type, priors)` delegates to `TBinarizationOptions(EBorderSelectionType::Uniform, 15)` |
+| `ctr_target_border_count` | **1** (so two target classes) | `TargetBinarization("target_binarization", TBinarizationOptions(EBorderSelectionType::MinEntropy, 1))` |
+| `counter_calc_method` | **`SkipTest`** | `CounterCalcMethod("counter_calc_method", ECounterCalc::SkipTest)` |
+| `max_ctr_complexity` | **4** | `MaxTensorComplexity("max_ctr_complexity", 4)` |
+| `one_hot_max_size` | 2 | already A16 |
+| `permutation_count` | **4** | `boosting_options.cpp`, `PermutationCount("permutation_count", 4)` |
+| `fold_permutation_block` | `min(256, docCount / 1000 + 1)` when unset | `defaults_helper.h::DefaultFoldPermutationBlockSize` |
+| `ctr_leaf_count_limit` | `Max<ui64>()`, i.e. no limit | `cat_feature_options.cpp` |
+| `store_all_simple_ctr` | false | same |
+
+**A5 was wrong that there is one CTR.** At the defaults a single categorical
+column produces `Borders x 3 priors x 1 target border = 3` features **plus**
+`Counter x 1 prior = 1`, so **four** numeric features per categorical column,
+each quantized to 16 buckets. That number, not the mechanism, is the reason
+CTRs are expensive.
+
+#### The four CTR types, and which loop each one runs
+
+Dispatch is `ComputeOnlineCTRs`' final `ExecRange`
+(`online_ctr.cpp:732-800`). The branch is on the type **and on the target
+class count**, which is the part that is easy to miss.
+
+- **`Borders` with exactly 2 target classes** -> `CalcOnlineCTRSimple`.
+  `goodCount` is the running count of class-1 rows for this category among
+  earlier rows, `totalCount` is the running count of all of them. This is the
+  default path for a binary target and the one that matters.
+- **`Buckets`, and `Borders` with more than 2 classes** -> `CalcOnlineCTRClasses`.
+  Per category it keeps a running count per class. `UpdateGoodCount` is the
+  only difference between the two types
+  (`online_ctr.cpp:115`) -- `Buckets` sets `goodCount = curCount` (the count of
+  *this* class), `Borders` does `goodCount -= curCount` walking down from the
+  total (the count of classes *above* this border). One emits
+  `targetClassesCount` features, the other `targetClassesCount - 1`
+  (`GetTargetBorderCount`).
+- **`BinarizedTargetMeanValue`** -> `CalcOnlineCTRMean`. The accumulator is a
+  `(Sum, Count)` pair and the increment is
+  `elem.Add(float(permutedTargetClass[docId]) / targetBorderCount)`, i.e. the
+  running mean of the *class index normalized to [0, 1]*, not of the raw
+  target. `GetTargetBorderCount` returns 1 for it, so it is one feature.
+- **`Counter`** -> `CalcOnlineCTRCounter`, and **it is not online at all.**
+  `counterCTRTotal` is filled once by `CountOnlineCTRTotal` over the whole
+  array before any row is emitted, and the denominator is
+  `*MaxElement(counterCTRTotal...)` -- the largest category's count, not the
+  row count. Every row of a category therefore gets the *same* value, and that
+  value is `(fullCount + prior) / (maxCount + 1)`. `IsPermutationDependentCtrType`
+  says so directly (`Counter` and `FeatureFreq` return false). A5's "counters"
+  clause was right that they exist and wrong to file them under "ordered".
+
+`counter_calc_method` decides only how much data feeds that one count.
+`SkipTest` (the default) counts `learnSampleCount` rows; `Full` counts
+`hashArr.size()`, learn plus every test set
+(`online_ctr.cpp:716-728`). It is a **train-time transduction switch**, and at
+its default CatBoost does not look at the test features. On the final table the
+same switch appears again in `CalcFinalCtrs` (`totalSampleCount +=
+GetTestSampleCount()` under `Full`).
+
+#### The permutation machinery, which is the actual heart
+
+**How many.** `CountLearningFolds` is
+`return isPermutationNeededForLearning ? Max<ui32>(1, permutationCount - 1) : 1;`
+so at the default `permutation_count = 4` there are **3** learning folds, not
+4. The fourth is spent on the separate `AveragingFold`, built by its own
+`BuildPlainFold` call in `learn_context.cpp:575`.
+
+**When there is a permutation at all.** `IsPermutationNeeded` is a three-line
+function and its first line is the one that matters:
+
+```cpp
+if (hasTime) { return false; }
+if (hasCtrs) { return true; }
+return isOrderedBoosting && !isAveragingFold;
+```
+
+So `has_time` **disables the permutation entirely** and the CTR degenerates to
+a prefix statistic in dataset order, which is the correct behavior for a
+genuinely time-ordered pool. And `hasCtrs` is not "the user asked for CTRs", it
+is
+`CalcMaxCategoricalFeaturesUniqueValuesCountOnLearn() > OneHotMaxSize` --
+**the presence of a categorical column too wide to one-hot is what turns the
+permutation on**, for plain boosting as much as ordered. This is the coupling
+between A16 and A17 and it runs in the direction people do not expect.
+
+**Fold 0 is the identity.** The fold loop passes `shuffle = (foldIdx != 0)`
+(`learn_context.cpp:502` for ordered boosting, `:529` for plain). The
+`shuffle = false` branch of `InitPermutationData` builds
+`std::iota(learnPermutation.begin(), learnPermutation.end(), 0)` and comments
+that it exists only because "implementation requires permutation vectors to
+exist even if they are not shuffled". One of the three learning folds is
+therefore dataset order.
+
+**The permutation is a BLOCK permutation, not a shuffle of rows.** `NCB::Shuffle`
+with `permuteBlockSize > 1` shuffles `blocksCount` block indices and then
+copies each block's rows out **in their original relative order**
+(`objects_grouping.cpp:205-217`). With the default block size
+`min(256, n/1000 + 1)`, a 1M-row pool is permuted in blocks of 256 and a
+10k-row pool in blocks of 11; only below 1000 rows is it a true row shuffle.
+The consequence is that **a row's ordered prefix is not a uniform random
+subset**: rows in the same block always see each other in the same relative
+order. That is a deliberate cache concession and it weakens the ordering
+guarantee the paper argues for.
+
+**One permutation per tree, drawn per tree.**
+`train.cpp:208`,
+`TFold* takenFold = &ctx->LearnProgress->Folds[ctx->LearnProgress->Rand.GenRand() % foldCount];`
+-- the tree *structure* is searched against one randomly chosen fold's CTR
+values and derivatives. The leaf *values* come from `AveragingFold`, a fourth
+fold that is permuted only if `IsAverageFoldPermuted`. So a tree is grown
+against one permutation and valued against another.
+
+**What a row is allowed to see.** In `CalcOnlineCTRSimple`'s inner loop
+(`online_ctr.cpp:300-307`) the read happens **before** the write, in
+permutation order:
+
+```cpp
+auto& elem = ctrArrSimple[enumeratedCatFeatures[docOffset + docIdx]].N;
+goodCount[...] = elem[1];
+totalCount[...] = elem[0] + elem[1];
+++elem[permutedTargetClass[docOffset + docIdx]];
+```
+
+Row `i` sees the rows strictly before it in the permutation, and never its own
+target. The first occurrence of a category sees `countInClass = totalCount = 0`
+and gets the pure prior. That read-then-write ordering is the entire leakage
+argument.
+
+#### Train versus predict, which is where implementations go wrong
+
+They are **different formulas with different types over different data**, and
+the two are reconciled by a third piece of arithmetic.
+
+|  | training | inference |
+|---|---|---|
+| function | `CalcCTR` (`online_ctr.h:128`) | `TModelCtr::Calc` (`model/online_ctr.h:289`) |
+| formula | `((c + prior) / (t + 1) + shift) / norm * borderCount` | `((c + PriorNum) / (t + PriorDenom) + Shift) * Scale` |
+| result type | `ui8`, a bucket index | `float`, an unquantized value |
+| denominator | `t + 1`, hard-coded | `t + PriorDenom`, serialized |
+| counts come from | the **online prefix** in one permutation | a **static table** over the whole learn set |
+| unseen category | cannot occur; the first row of a category is the prefix's own zero state | occurs, and yields `calc(0, 0)`, the pure prior (`ctr_calcer.py:35`) |
+
+The reconciliation is two lines in `split.cpp:78-82`:
+
+```cpp
+split.OnlineCtr.Ctr.PriorNum  = priors[Ctr.PriorIdx];
+split.OnlineCtr.Ctr.PriorDenom = 1.0f;
+split.OnlineCtr.Ctr.Shift     = shift[Ctr.PriorIdx];
+split.OnlineCtr.Ctr.Scale     = ctrInfo.BorderCount / norm[Ctr.PriorIdx];
+split.OnlineCtr.Border        = EmulateUi8Rounding(BinBorder);
+```
+
+`Scale = borderCount / norm` folds the training multiply into the inference
+scale, so the two produce the same real number and the training one then
+truncates. The truncation is put back at the *threshold* instead of the value
+by `EmulateUi8Rounding(value) { return value + 0.999999f; }` (`split.h:512`):
+a training comparison `bin > BinBorder` on integers becomes an inference
+comparison `x > BinBorder + 0.999999f` on the unquantized float. The name says
+what it is. **This is the asymmetry to get right, and it is not the one people
+warn about**; the folklore warning is "use full counts at predict time", which
+is true but is the easy half.
+
+The static table is `CalcFinalCtrsImpl` (`online_ctr.cpp:875`). It is a plain
+loop over all `totalSampleCount` rows with no permutation and no prefix, and
+for `Counter` it ends with
+`result->CounterDenominator = *MaxElement(...)`. The inference-side lookup that
+consumes it is `ctr_calcer.py:22-67`, which is worth reading once because it
+states in twenty lines what the C++ spreads over three files -- including that
+`Borders` at two classes reads `ctr_history[bucket*2+1]` against
+`ctr_history[bucket*2] + ctr_history[bucket*2+1]`, while `Borders` above two
+classes sums classes `> target_border_idx` into `good_count` and *all* classes
+into `total_count`, and `Buckets` takes one class as `good_count` against the
+same total.
+
+#### The target classifier
+
+`Borders`, `Buckets` and `BinarizedTargetMeanValue` all need one
+(`NeedTargetClassifier`); `Counter` and `FeatureFreq` do not, and CatBoost
+still keeps a fake classifier at index 0 for them, with a comment calling it a
+dirty hack (`ctr_helper.h:22`). The classifier itself is four lines
+(`target_classifier.h:24`):
+
+```cpp
+int resClass = 0;
+while (resClass < Borders.ysize() && target > Borders[resClass]) { ++resClass; }
+return resClass;
+```
+
+Strict `>`, ascending borders, `classesCount = borders + 1`. At the default
+`ctr_target_border_count = 1` there is one border, chosen by **MinEntropy** over
+the target, and two classes. Border *selection* is A15's mechanism, not this
+one, so A17 takes borders as an input and does not re-derive them.
+
+#### What mojotrees built
+
+`src/mojotrees/ctr.mojo`, a new file, **off by default and reached by
+nothing**, with `tests/test_ctr.mojo` beside it (48 tests, all analytical, all
+run). It imports `.rng` and `std.math` and nothing else from the package, so it
+cannot participate in the `efb -> binning -> tree_parameters_extra` cycle;
+`categorical.mojo` is unchanged and no existing default moved. Classification:
+**(3) bit-moving when on** -- it manufactures features that did not exist --
+and a no-op when off.
+
+Built, and matching the source above.
+
+- `CtrParams`, defaulting `enabled = False` and otherwise carrying CatBoost's
+  verified numbers (`ctr_border_count = 15`, `target_border_count = 1`,
+  `permutation_count = 4`, `counter_calc_method = SkipTest`,
+  `max_ctr_complexity = 4`), so a port of a default CatBoost configuration
+  reads the same even though ours refuses to run.
+- `calc_normalization`, `ctr_train_bin`, `ctr_predict_value`,
+  `ctr_predict_scale`, `ctr_predict_border` -- the five pieces of arithmetic
+  above, each a transcription with the file and line in its docstring.
+- `ordered_ctr_borders_binary`, `ordered_ctr_classes`, `ordered_ctr_mean`,
+  `counter_ctr` -- the four loops, read-before-write, in permutation order.
+- `final_ctr_class_table`, `final_ctr_mean_table`, `final_ctr_counter_table`
+  and the three `predict_ctr_*` readers, which are the inference half and are
+  tested against the training half on the same data.
+- `target_class`, `ctr_feature_count` (the "four features per column" number
+  above, computed rather than asserted).
+- `default_permutation_block_size` and `ctr_permutation`.
+- `ctr_combination_hash`, `ctr_projection_hash` -- `CalcHash` from
+  `model/hash.h`, left in place for the combinations lane and used by nothing
+  here.
+- Guards that refuse rather than ignore -- `CtrParams.validate`,
+  `check_ctr_prior_denom` (the CPU `denom == 1` rule, by name),
+  `check_ctr_border_type` (uniform only, by name), `check_ctr_complexity`, and
+  `check_ctr_trainer_support`, which raises on an *enabled* bundle because
+  nothing appends CTR columns to a design matrix yet. That last one is the
+  honest statement of "unreached"; deleting it is the first step of the wiring
+  lane rather than a side effect of it.
+
+**Divergences, deliberate and recorded.**
+
+1. **The permutation is a keyed sort, not a Fisher-Yates shuffle.**
+   `ctr_permutation` gives block `b` the key `splitmix64(stream + b)` and sorts
+   blocks ascending by `(key, b)`. CatBoost's `CreateShuffledIndices` is a
+   sequential draw whose result depends on the order the draws are consumed in.
+   Ours does not, so it is order-independent, parallelizable without changing
+   its answer, and identical across `MOJOTREES_NUM_WORKERS` and across
+   machines by construction rather than by discipline. It uses no
+   floating-point at any point, so it is also immune to the FMA and
+   x87-versus-SSE differences that would otherwise make "across machines"
+   an unearned claim. It is a *different* permutation from CatBoost's for the
+   same seed, and that is fine -- nothing here claims bit-identity with
+   CatBoost.
+2. **Fold 0 is the identity here too**, matching `foldIdx != 0`, so the
+   `permutation_index = 0` caller gets dataset order.
+3. **The online accumulation runs in row order, sequentially.** CatBoost
+   parallelizes it (`CalcStatsForEachBlock` + `SumCtrsFromBlocks` +
+   `CalcQuantizedCtrs`, with each block seeded from the exclusive prefix of the
+   blocks before it) and gets away with it *because the accumulators are
+   integers* -- the count of earlier rows in a category is exact under any
+   blocking, so CatBoost's `Borders`/`Buckets`/`Counter` values do not move
+   with `thread_count`. That escape does **not** extend to
+   `BinarizedTargetMeanValue`, whose accumulator is a `float` sum, and
+   accordingly CatBoost leaves `CalcOnlineCTRMean` serial. Ours is serial for
+   all four, which is deterministic for the same reason and stricter than it
+   needs to be for three of them. The integer-block-prefix parallelization is
+   available later, exactly, for the three; it is not available for the mean.
+4. **The accumulators are `Int` and `Float64`, and only the final
+   `ctr_train_bin` narrows to Float32** to reproduce CatBoost's `float`
+   truncation. Accumulating in Float64 and narrowing once is strictly more
+   accurate than accumulating in Float32; the bucket index is the same except
+   where the exact value sits within one ULP of a bucket edge.
+
+**Not built, deliberately.** Combinations (`max_ctr_complexity` > 1 -- the next
+lane, see below), `FloatTargetMeanValue`, the GPU-only `FeatureFreq`,
+`ctr_leaf_count_limit`'s top-K reindexing, `PriorEstimation`, per-feature CTR
+descriptions, `ctr_history_unit = Group`, and the `Dynamic` (ordered boosting)
+fold shape, which is A7 and a different mechanism.
+
+**Left in place for the combinations lane, explicitly.** `ctr_combination_hash`
+is `CalcHash` verbatim and is what a projection over several categorical
+columns folds with; `ctr_projection_hash` folds a list of hashed values with it
+in order, which is `calc_hashes`' cat-feature loop
+(`ctr_calcer.py:9-19`). `CtrParams.max_ctr_complexity` exists, defaults to
+CatBoost's 4, and `check_ctr_complexity` refuses anything above 1 **by name**
+so the next lane deletes a guard rather than discovering an assumption. Every
+CTR entry point takes an already-hashed `List[Int]` category code per row
+rather than a column of raw categories, precisely so a combination -- which is
+a hash of several columns -- is the same input shape as a single column. What
+is **not** there: the binarized-feature half of `calc_hashes` (a projection may
+include *float* splits, `TProjection::BinFeatures`, hashed as `0`/`1` against a
+border), the candidate enumeration in `greedy_tensor_search.cpp` that decides
+which combinations to try, and the `ctr_leaf_count_limit` top-K reindexing that
+keeps a wide combination's bucket count bounded. That last one is not optional
+for combinations the way it is for a single column.
