@@ -110,7 +110,7 @@ def build_matrix(args):
             for engine in args.engine:
                 if engine not in spec["engines"]:
                     continue
-                if engine in ("catboost", "mojotrees_catboost_mode"):
+                if engine in scenarios.CATBOOST_ENGINES:
                     ok, reason = scenarios.catboost_tier_ok(spec, args.tier)
                     if not ok:
                         jobs.append(
@@ -492,10 +492,11 @@ def main(argv=None):
     parser.add_argument("--variant", choices=("auto", "real", "synthetic"), default="auto")
     parser.add_argument(
         "--engine", action="append", choices=tuple(engines.ENGINES),
-        help="repeatable; mojotrees and lightgbm by default. The peer arms "
-             "'catboost' and 'mojotrees_catboost_mode' are selectable but "
-             "never default: the headline is against the comparator and a "
-             "peer arm must not be able to join it by accident",
+        help="repeatable; mojotrees and lightgbm by default. The peer arms ("
+             + ", ".join(scenarios.PEER_ENGINES)
+             + ") are selectable but never default: the headline is against "
+               "the comparator and a peer arm must not be able to join it by "
+               "accident",
     )
     parser.add_argument(
         "--device", action="append", choices=("cpu", "gpu"),

@@ -546,15 +546,23 @@ CATBOOST_LEFT_AT_STOCK = {
 CATBOOST_UNMATCHABLE = {
     "tree_shape": (
         "CatBoost grows symmetric (oblivious) trees of depth 6, where every "
-        "node at a level shares one split. mojotrees grows leaf-wise by "
-        "default and has depthwise as its only other policy "
-        "(src/mojotrees/growth_policy.mojo); it has no symmetric policy at "
-        "all. So the CatBoost-mode mojotrees arm is depthwise at depth 6, "
-        "which is the nearest reachable shape and is NOT the same tree. "
-        "A symmetric tree is strictly more constrained than a depthwise one "
-        "at the same depth, so this difference is expected to cost CatBoost "
-        "accuracy and save it time, and neither side of that is measured "
-        "here"
+        "node at a level shares one split. mojotrees now HAS a symmetric "
+        "policy -- GROW_OBLIVIOUS in src/mojotrees/growth_policy.mojo, "
+        "landed 2026-08-16 -- so the old claim here that it had none is "
+        "withdrawn. But it is not reachable from this harness: "
+        "python/mojotrees/sklearn.py validates grow_policy against "
+        "_GROW_POLICIES, which carries 'leafwise' (alias 'lossguide') and "
+        "'depthwise' and nothing else, and every arm in bench/real_data goes "
+        "through that surface. So the CatBoost-mode mojotrees arm is STILL "
+        "depthwise at depth 6 and still NOT the same tree, and the reason "
+        "has changed from 'we cannot' to 'the Python layer does not expose "
+        "it yet'. A symmetric tree is strictly more constrained than a "
+        "depthwise one at the same depth, so this difference is expected to "
+        "cost CatBoost accuracy and save it time, and neither side of that "
+        "is measured here. This is the one entry in this table that is "
+        "expected to STOP being unmatchable: wiring symmetrictree through "
+        "_GROW_POLICIES closes it, and then this row becomes a matched "
+        "parameter instead of a caveat"
     ),
     "row_sampling": (
         "CatBoost's default bootstrap_type is MVS with subsample 0.8, so it "
@@ -744,8 +752,11 @@ MOJOTREES_CATBOOST_MODE = {
 #: dict so the arm explains itself where it is read.
 MOJOTREES_CATBOOST_MODE_REASONS = {
     "grow_policy": (
-        "the nearest reachable shape to SymmetricTree, and not the same "
-        "one. See CATBOOST_UNMATCHABLE['tree_shape']"
+        "the nearest shape this harness can REACH, and not the same one. "
+        "Reachable is the operative word since 2026-08-16: a symmetric "
+        "policy now exists in the Mojo package but sklearn.py's "
+        "_GROW_POLICIES does not expose it, so depthwise remains the "
+        "closest this arm can ask for. See CATBOOST_UNMATCHABLE['tree_shape']"
     ),
     "max_depth": "CatBoost's depth default",
     "num_leaves": (
@@ -1559,6 +1570,26 @@ CATBOOST_TIER_CAP = {
 TIER_ORDER = ("smoke", "standard", "large")
 
 
+#: Every engine name that is a CatBoost-shaped peer arm, in one place.
+#:
+#: This exists because the same tuple was written out by hand in three files
+#: -- the scenario engine lists here, the tier cap in `run.py`, and the
+#: wiring check in `selfcheck.py` -- and a fourth arm added to two of the
+#: three would run at an uncapped tier, or be capped and never checked, with
+#: nothing failing. `CATBOOST_TIER_CAP` bounds a scenario; this bounds who
+#: the bound applies to.
+#:
+#: `mojotrees_catboost_mode` is deliberately NOT here. It is us shaped toward
+#: CatBoost, not CatBoost, so it neither takes CatBoost's tier caps nor
+#: carries CatBoost's parameters. It is a peer arm by `ENGINE_ARM` and that
+#: is the only list it belongs to.
+CATBOOST_ENGINES = ("catboost", "catboost_lossguide")
+
+#: The peer arms as a group, for callers that mean "anything reported beside
+#: the comparator rather than as it".
+PEER_ENGINES = CATBOOST_ENGINES + ("mojotrees_catboost_mode",)
+
+
 def catboost_tier_ok(scenario, tier):
     """(ok, reason). Whether the CatBoost arm runs this scenario at `tier`.
 
@@ -1665,10 +1696,12 @@ def mojotrees_catboost_mode_params(spec, device, extra=None):
     else.
 
     What this arm is NOT: a claim that mojotrees can be made into CatBoost.
-    It cannot. mojotrees has no symmetric-tree policy, so this is depthwise
-    at depth 6, and it does no row sampling, where CatBoost's default MVS
-    takes 80 percent of the rows per tree. Both are in
-    `CATBOOST_UNMATCHABLE` and both travel with the record.
+    It cannot. This is depthwise at depth 6 -- a symmetric policy now exists
+    in the Mojo package but `python/mojotrees/sklearn.py` does not expose it,
+    and this harness only reaches what that file validates -- and it does no
+    row sampling, where CatBoost's default MVS takes 80 percent of the rows
+    per tree. Both are in `CATBOOST_UNMATCHABLE` and both travel with the
+    record.
 
     The override is applied to the resolved dict rather than to the
     scenario's `params`, and that is a correction rather than a shortcut.
@@ -1696,5 +1729,5 @@ for _scenario_id, _reason in CATBOOST_SCENARIO_SUPPORT.items():
     if _reason is None:
         SCENARIOS[_scenario_id]["engines"] = list(
             SCENARIOS[_scenario_id]["engines"]
-        ) + ["catboost", "mojotrees_catboost_mode"]
+        ) + list(PEER_ENGINES)
 del _scenario_id, _reason

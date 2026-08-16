@@ -685,7 +685,7 @@ def check_catboost_arm():
                 )
 
     # 4. The wiring the runner needs.
-    for engine in ("catboost", "mojotrees_catboost_mode"):
+    for engine in scenarios.PEER_ENGINES:
         check(
             engine in engines.ENGINES,
             f"{engine} is named by a scenario and is not in engines.ENGINES",
