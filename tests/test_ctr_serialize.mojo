@@ -18,6 +18,14 @@ What each test pins:
   `n_total_features() - 1`, which the loader's topology check refused before
   this lane widened it. The test asserts such a split exists, so the previous
   point is not vacuous.
+- **The split-search pool survives, and continued training works.** A
+  CatBoost-mode fit drops the replaced source column from `BinMapper.usable`,
+  the v5 `usable` section carries that, and `BinMapper.matches` therefore
+  holds across a save and a load. It did not before the section existed, and
+  `update_dataset` -- which gates on `matches` -- refused a model off disk
+  with a reason that was not the real one. Both the field and the
+  `save -> load -> update_dataset` path are asserted, the second by running
+  it.
 - **Version 4 still loads, and still gets written.** A model without CTR
   tables and without linear leaves declares v4 byte for byte as before, and a
   v4 file loads to `CtrTables.none()`, which is what its absence means.
@@ -50,7 +58,12 @@ from mojotrees.serialize import (
     save_model,
     save_multiclass_model,
 )
-from mojotrees.trainset import Dataset, train_dataset, train_dataset_multiclass
+from mojotrees.trainset import (
+    Dataset,
+    train_dataset,
+    train_dataset_multiclass,
+    update_dataset,
+)
 from mojotrees.tree import TreeParams
 
 comptime _CTR_PATH = "./.test_ctr_model.tmp"
@@ -58,6 +71,7 @@ comptime _CTR_MC_PATH = "./.test_ctr_multiclass.tmp"
 comptime _PLAIN_PATH = "./.test_ctr_plain_model.tmp"
 comptime _BAD_PATH = "./.test_ctr_bad_version.tmp"
 comptime _DS_PATH = "./.test_ctr_dataset.tmp"
+comptime _CTR_MORE_PATH = "./.test_ctr_train_more.tmp"
 
 comptime _N_ROWS = 240
 comptime _N_CATEGORIES = 8
@@ -170,43 +184,36 @@ def test_a_ctr_model_round_trips_exactly() raises:
     #    the file does not carry and the reader rebuilds.
     assert_true(loaded.mapper.ctr.matches(model.mapper.ctr))
 
-    # PRODUCT DEFECT, pinned here rather than asserted away. `usable` is the
-    # one BinMapper field the v5 file does not carry, and since the
-    # CTR-replacement lane a CatBoost-mode fit MUTATES it: `trainset.
-    # _build_ctr` calls `mapper.drop_usable(replaced)` to take the replaced
-    # source column out of the split-search pool. `serialize` writes no
-    # `usable` section, and the loader's BinMapper constructor reads an empty
-    # `usable` as "nothing was prefiltered" and rebuilds a FULL pool. So a
-    # saved CatBoost-mode CTR model loads back with a pool it did not have.
+    # THE DEFECT THIS BLOCK USED TO PIN, now asserted fixed. A CatBoost-mode
+    # fit MUTATES `usable`: `trainset._build_ctr` calls
+    # `mapper.drop_usable(replaced)` to take the replaced source column out of
+    # the split-search pool. The v5 file carried no `usable` section, and the
+    # loader's BinMapper constructor reads an empty `usable` as "nothing was
+    # prefiltered" and rebuilt a FULL pool, so a saved CatBoost-mode model
+    # loaded back with a pool it did not have.
     #
-    # `BinMapper.matches` compares the field, and `matches` is on the LOAD
-    # path -- trainset, model_editing and external_memory all call
-    # `model.mapper.matches(dataset.mapper)` on a model that may have come
-    # off disk. So `save -> load -> train_more` on such a model now refuses
-    # with "this one is binned differently", which is not why it refused:
-    # the binning is bit-identical and only the pool differs.
+    # `BinMapper.matches` compares the field and `matches` is on the LOAD path
+    # -- trainset, model_editing and external_memory all call
+    # `model.mapper.matches(dataset.mapper)` on a model that may have come off
+    # disk -- so `save -> load -> update_dataset` refused with "this one is
+    # binned differently", which was not why it refused. It failed CLOSED, as
+    # a spurious refusal, never open as a wrong score: parts 2 and 3 below
+    # passed bit for bit throughout, because nothing on the inference path
+    # reads `usable`.
     #
-    # Bounded honestly: predictions are NOT affected. `bin_row`, `predict`,
-    # `predict_raw`, dumps and contributions never read `usable`, and part 2
-    # and part 3 below still pass bit for bit. This fails CLOSED, as a
-    # spurious refusal, not open as a wrong score. The remedy is a `usable`
-    # section in serialize.mojo, which that file's own comment already calls
-    # for; it is not this lane's to make. When it lands, this whole block
-    # collapses back to `assert_true(loaded.mapper.matches(model.mapper))`
-    # and the `assert_true(not ...)` line below is what will say so.
+    # `serialize._write_usable` / `_read_usable` carry the field now. Column 1
+    # is the wide categorical one, replaced by its CTR columns, so the fit's
+    # pool is exactly `[0]` and the load's must be too.
     assert_equal(len(model.mapper.usable), 1)
     assert_equal(model.mapper.usable[0], 0)
-    assert_equal(len(loaded.mapper.usable), 2)
-    assert_true(not loaded.mapper.matches(model.mapper))
+    assert_equal(len(loaded.mapper.usable), 1)
+    assert_equal(loaded.mapper.usable[0], 0)
 
-    # And the round-trip claim itself is kept, not dropped: restore the one
-    # field the file does not carry and the mappers must be equal. This still
-    # discriminates over every other field -- edges, edge offsets, missing
-    # bins, category codes, the CTR tables -- so a SECOND field failing to
-    # round trip fails here.
-    var restored = loaded.mapper.copy()
-    restored.drop_usable([1])
-    assert_true(restored.matches(model.mapper))
+    # The round-trip claim, whole, with nothing restored by hand first. This
+    # discriminates over every field -- edges, edge offsets, missing bins,
+    # category codes, the CTR tables, and now the pool -- so a field failing
+    # to round trip fails here.
+    assert_true(loaded.mapper.matches(model.mapper))
 
     assert_equal(loaded.mapper.ctr.n_columns(), 4)
     assert_equal(
@@ -348,6 +355,48 @@ def test_a_table_set_whose_lookup_is_not_derived_refuses() raises:
     assert_true(planned.is_active())
     with assert_raises():
         check_ctr_serializable(planned)
+
+
+def test_a_loaded_ctr_model_takes_more_rounds() raises:
+    """`save -> load -> update_dataset`, which is the path the pool reset
+    broke and the one the `usable` section exists for.
+
+    `update_dataset` gates on `model.mapper.matches(dataset.mapper)`. Before
+    the section, the loaded mapper's pool came back as every feature while the
+    dataset's was the narrowed one the CatBoost fit produced, so this refused
+    with "this one is binned differently" on a model whose binning was
+    bit-identical. Running it is the proof; reading `matches` is not.
+    """
+    var dataset = _ctr_dataset()
+    var model = train_dataset(dataset, BINARY_LOGISTIC, _params())
+    save_model(model, _CTR_MORE_PATH)
+    var loaded = load_model(_CTR_MORE_PATH)
+    remove(_CTR_MORE_PATH)
+
+    # The gate itself, both directions: the model off disk against the
+    # dataset it was trained from is the comparison `update_dataset` makes.
+    assert_true(loaded.mapper.matches(dataset.mapper))
+
+    var before = len(loaded.booster.trees)
+    assert_equal(before, 12)
+    var added = update_dataset(
+        loaded, dataset, BoosterParams(3, 0.2, TreeParams(8, 5, 1.0, 1e-3))
+    )
+    assert_equal(added, 3)
+    assert_equal(len(loaded.booster.trees), before + 3)
+
+    # Not vacuous in the other direction either: the appended rounds are the
+    # ones an uninterrupted fit would have grown, so the continued model is
+    # the fifteen-round model and the CTR columns kept meaning what they meant.
+    var whole = train_dataset(
+        dataset,
+        BINARY_LOGISTIC,
+        BoosterParams(15, 0.2, TreeParams(8, 5, 1.0, 1e-3)),
+    )
+    assert_equal(len(whole.booster.trees), len(loaded.booster.trees))
+    for r in range(_N_ROWS):
+        var row = _raw_row(r)
+        assert_true(loaded.predict_raw(row) == whole.predict_raw(row))
 
 
 def main() raises:

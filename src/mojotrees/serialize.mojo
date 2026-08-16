@@ -112,34 +112,45 @@ trees satisfy, which a consumer may need to know and cannot recover; so, as
 of v4, are split gains, which are a property of how the tree was grown that
 nothing downstream can rederive.
 
-**`BinMapper.usable` is in that absent set, and it is the one absence that
-does not announce itself.** Every other one shows up as a value a consumer can
-test for -- no gains, no covers, no names, no CTR tables. `usable` instead
-comes back FULL: `BinMapper.__init__` treats an empty list as "nothing was
+**`BinMapper.usable` USED TO BE in that absent set, and it was the one absence
+that did not announce itself.** Every other one shows up as a value a consumer
+can test for -- no gains, no covers, no names, no CTR tables. `usable` instead
+came back FULL: `BinMapper.__init__` treats an empty list as "nothing was
 prefiltered" and fills in every feature, so a mapper whose pool had columns
-removed loads with a pool that silently has them back. Two things remove
-columns from it today: `feature_pre_filter`, and CatBoost-mode CTR replacement
+removed loaded with a pool that silently had them back. Two things remove
+columns from it: `feature_pre_filter`, and CatBoost-mode CTR replacement
 through `BinMapper.drop_usable`, which drops a categorical column whose CTR
 columns stand in for it.
 
-This is INERT as the code stands, and the reason is worth stating so the next
-person can check whether it still holds rather than trust this sentence.
-`usable` is read at fit time only -- it is the pool
-`sampling.select_tree_features` draws a tree's features from, reached through
-`BinnedMatrix.usable_features` -- and a loaded model never grows a tree. So no
-prediction, dump, or contribution path can observe the reset.
+**It stopped being inert, which is what this paragraph existed to predict.**
+`BinMapper.matches` compares the field, and `matches` is on the LOAD path:
+`trainset.update_dataset`, `model_editing._check_refit_dataset` and
+`external_memory.update_external*` all call it on a model that may have come
+off disk. A saved CatBoost-mode CTR model therefore failed
+`save -> load -> update_dataset` with "this one is binned differently", which
+was not why it refused -- the binning was bit-identical and only the pool
+differed. It failed CLOSED, as a spurious refusal, and never as a wrong score:
+`bin_row`, `predict`, `predict_raw`, dumps and contributions read no `usable`.
 
-**It stops being inert the moment anything on the load path reads `usable`,
-and that is the note this paragraph exists for.** A model whose feature pool
-silently resets on load is harmless until one caller reads it, and the caller
-who adds that read is the one who needs to know. If you are adding it: write
-the section, do not work around the reset. `is_usable` and `usable_features`
-are the two accessors to grep for.
+**The remedy this note asked for is the one taken: the section is written.**
+`_write_usable` / `_read_usable` below carry the pool whenever it is narrower
+than every feature, and `_model_version` makes such a file declare v5, because
+a v4 reader cannot skip a section it does not know. Deriving the pool on load
+instead was considered and is UNSOUND: `feature_pre_filter` removes columns
+for a reason the CTR tables say nothing about, so a derivation from the tables
+would restore a prefiltered column and disagree with the fit that wrote the
+file. `is_usable` and `usable_features` are the two accessors to grep for.
 """
 
 from std.memory import bitcast
 
-from .binning import MAX_BINS, BinMapper, BinnedMatrix, no_missing_bins
+from .binning import (
+    MAX_BINS,
+    BinMapper,
+    BinnedMatrix,
+    all_features,
+    no_missing_bins,
+)
 # The CTR state and its two writer guards. A fitted CTR table is MODEL STATE
 # -- it is built from the target -- so a model that lost it keeps every tree
 # referencing its CTR columns and bins those columns as if the feature were
@@ -845,6 +856,111 @@ def _read_ctr(mut r: _TokenReader, version: Int) raises -> CtrTables:
     return tables^
 
 
+# The v5 `usable` section. `BinMapper.usable` is LightGBM's `used_features`:
+# the ascending pool a tree's split search may draw from, which is every
+# feature unless something narrowed it. Two things narrow it, and only one of
+# them leaves a trace anywhere else in the file.
+comptime _USABLE_SECTION_TAG = "usable"
+
+
+def _usable_is_full(mapper: BinMapper) -> Bool:
+    """Whether this mapper's pool is `all_features(n_features)`, which is what
+    an unnarrowed mapper holds and what the reader assumes on a file with no
+    `usable` section.
+
+    Compared elementwise rather than by length alone. `usable` is ascending
+    and bounded by `n_features`, so length would in fact be enough today, but
+    the section exists precisely because this field is not derivable from
+    something else, and a writer that decided by proxy would be one more
+    place to get that wrong.
+    """
+    if len(mapper.usable) != mapper.n_features:
+        return False
+    for f in range(mapper.n_features):
+        if mapper.usable[f] != f:
+            return False
+    return True
+
+
+def _write_usable(mut out: String, mapper: BinMapper):
+    """v5: the optional `usable` section, or nothing at all when the pool is
+    every feature.
+
+    **Why a section and not a derivation.** The obvious alternative is to
+    rebuild the pool on load from the `ctr` section, since CatBoost-mode CTR
+    replacement (`trainset._build_ctr` -> `BinMapper.drop_usable`) is one of
+    the two things that narrows it and the CTR tables name exactly the source
+    columns it dropped. That derivation is unsound and would be worse than
+    the absence it replaced. The OTHER narrowing is
+    `binning.fit_bins(feature_pre_filter=True)`, LightGBM's Dataset-time
+    prefilter, which drops a feature whose every bin boundary would leave a
+    child under `min_data_in_leaf`. It is implemented and reachable from the
+    Mojo API (`tree_parameters_extra.check_feature_pre_filter` says so at
+    length), it writes nothing anywhere else in the file, and it can narrow a
+    mapper that has no CTR tables at all. A loader deriving the pool from the
+    tables would hand such a model back every prefiltered column, and would do
+    it silently -- the same failure as the reset, with a mechanism that looks
+    deliberate. So the field is written.
+
+    Skipping the section when the pool is full keeps every model that never
+    prefiltered and never replaced a categorical column writing exactly the
+    bytes it wrote before this section existed, and lets `_model_version`
+    keep declaring v4 for one.
+
+    A count of zero is legal and means an empty pool. `fit_bins` refuses to
+    prefilter everything away, but `drop_usable` on a one-feature mapper can
+    reach it, and an empty list is the one value `BinMapper.__init__` cannot
+    be handed -- it reads empty as "fill in every feature" -- so the reader
+    below assigns the field rather than routing it through the constructor.
+    """
+    if _usable_is_full(mapper):
+        return
+    out += _USABLE_SECTION_TAG + " " + String(len(mapper.usable))
+    for i in range(len(mapper.usable)):
+        out += " " + String(mapper.usable[i])
+    out += "\n"
+
+
+def _read_usable(
+    mut r: _TokenReader, version: Int, n_features: Int
+) raises -> List[Int]:
+    """Read the optional `usable` section. Absent -- every file before v5, and
+    every v5 file whose pool was never narrowed -- means every feature, which
+    is what `all_features` is.
+
+    Ascending and in range are checked rather than trusted:
+    `sampling.select_tree_features` draws from this list by position and
+    `BinMapper.is_usable` scans it, so an out-of-range id would offer a split
+    search a feature the mapper cannot bin.
+    """
+    if version < CURRENT_FORMAT_VERSION or r.peek() != _USABLE_SECTION_TAG:
+        return all_features(n_features)
+    _ = r.next()
+    var n = r.next_int()
+    if n < 0 or n > n_features:
+        raise Error(
+            "corrupt usable section: ",
+            n,
+            " entries for a mapper with ",
+            n_features,
+            " features",
+        )
+    var out = List[Int](capacity=n)
+    var prev = -1
+    for _ in range(n):
+        var f = r.next_int()
+        if f < 0 or f >= n_features:
+            raise Error("corrupt usable section: feature id out of range")
+        if f <= prev:
+            raise Error(
+                "corrupt usable section: feature ids are not strictly"
+                " ascending"
+            )
+        prev = f
+        out.append(f)
+    return out^
+
+
 def _write_monotone(mut out: String, monotone: MonotoneConstraints):
     """Write the monotonic constraint vector, or nothing at all when the model
     carries none. Skipping the section keeps unconstrained models' files
@@ -897,7 +1013,7 @@ def save_model(
     var out = String("")
     out += _MAGIC
     out += " "
-    out += _model_version(model.booster.linear, model.mapper.ctr)
+    out += _model_version(model.mapper, model.booster.linear)
     out += "\n"
 
     _write_feature_names(out, feature_names)
@@ -910,6 +1026,7 @@ def save_model(
     _write_mapper(out, model.mapper)
     _write_categorical(out, model.mapper.cats)
     _write_ctr(out, model.mapper.ctr)
+    _write_usable(out, model.mapper)
     _write_monotone(out, model.booster.monotone)
     _write_trees(out, model.booster.trees)
     out += linear_section_text(model.booster.linear)
@@ -918,17 +1035,25 @@ def save_model(
         f.write(out)
 
 
-def _model_version(linear: LinearEnsemble, ctr: CtrTables) -> String:
-    """The version token a model file declares: v5 when it carries either
-    optional v5 section, v4 when it carries neither.
+def _model_version(mapper: BinMapper, linear: LinearEnsemble) -> String:
+    """The version token a model file declares: v5 when it carries any
+    optional v5 section, v4 when it carries none.
 
     Keeping the bump conditional is the point, and it is the same point
     `linear_tree.linear_model_format_version` makes: a model with constant
-    leaves and no CTR tables stays readable by a build that knows about
-    neither, so the version is a statement about the file rather than about
-    the binary that wrote it.
+    leaves, no CTR tables and an unnarrowed feature pool stays readable by a
+    build that knows about none of the three, so the version is a statement
+    about the file rather than about the binary that wrote it.
+
+    The `usable` section is a v5 trigger for the same reason the other two
+    are: a v4 reader meeting it has no way to skip it, and would read its
+    count as the next section's tag. A prefiltered model with constant leaves
+    and no CTRs therefore declares v5, which is the honest answer -- the file
+    carries something a v4 build cannot parse.
     """
-    if linear.is_active() or ctr.is_active():
+    if linear.is_active() or mapper.ctr.is_active():
+        return String(_VERSION_5)
+    if not _usable_is_full(mapper):
         return String(_VERSION_5)
     return String(_VERSION)
 
@@ -939,16 +1064,19 @@ def _mapper_section_version(mapper: BinMapper) -> Int:
     A prepared table reuses the model format's mapper section verbatim and
     records which revision of it the file carries, so the number has to
     follow what was actually written and not what this build is capable of
-    writing. A mapper with fitted CTR tables would need v5; every other
-    mapper writes the v4 section unchanged, and a build that predates v5
-    keeps reading the tables it writes today.
+    writing. A mapper with fitted CTR tables would need v5, and so does one
+    whose split-search pool was narrowed, because both write a section a v4
+    reader cannot skip; every other mapper writes the v4 section unchanged,
+    and a build that predates v5 keeps reading the tables it writes today.
 
     `save_dataset` refuses a CTR mapper outright
-    (`check_ctr_dataset_serializable`), so the v5 arm is unreachable from
-    there right now. It is written as the condition rather than as the
-    constant 4 so that wiring the dataset path is one change and not two.
+    (`check_ctr_dataset_serializable`), so that arm is unreachable from
+    there. The `usable` arm is NOT: `fit_bins(feature_pre_filter=True)`
+    narrows the pool of a mapper with no CTR tables at all, and a prepared
+    table built from one is saveable today. That is the whole reason this
+    returns a condition rather than the constant 4.
     """
-    if mapper.has_ctr():
+    if mapper.has_ctr() or not _usable_is_full(mapper):
         return CURRENT_FORMAT_VERSION
     return _BASE_FORMAT_VERSION
 
@@ -965,7 +1093,7 @@ def save_multiclass_model(
     var out = String("")
     out += _MAGIC
     out += " "
-    out += _model_version(model.booster.linear, model.mapper.ctr)
+    out += _model_version(model.mapper, model.booster.linear)
     out += "\n"
 
     _write_feature_names(out, feature_names)
@@ -981,6 +1109,7 @@ def save_multiclass_model(
     _write_mapper(out, model.mapper)
     _write_categorical(out, model.mapper.cats)
     _write_ctr(out, model.mapper.ctr)
+    _write_usable(out, model.mapper)
     _write_monotone(out, model.booster.monotone)
     _write_trees(out, model.booster.trees)
     out += linear_section_text(model.booster.linear)
@@ -1057,6 +1186,10 @@ def _read_mapper(mut r: _TokenReader, version: Int) raises -> BinMapper:
     # planned for this feature count and that their buckets fit these bins.
     var ctr = _read_ctr(r, version)
     mapper.attach_ctr(ctr^)
+    # v5: the split-search pool, read here for the same reason -- it is a
+    # mapper field, and the constructor above cannot express it (an empty
+    # list means "fill in every feature" there, which is why it is assigned).
+    mapper.usable = _read_usable(r, version, n_features)
     return mapper^
 
 
@@ -1549,6 +1682,12 @@ def save_dataset(dataset: Dataset, path: String) raises:
 
     _write_mapper(out, dataset.mapper)
     _write_categorical(out, dataset.mapper.cats)
+    # No `ctr` section here -- `check_ctr_dataset_serializable` above refused
+    # a CTR mapper -- but the pool travels, because a prefiltered table read
+    # back has to offer a grower the features the fit offered it. `_read_ctr`
+    # inside `_read_mapper` sees `usable` where it looks for `ctr` and
+    # correctly reports absent.
+    _write_usable(out, dataset.mapper)
 
     if dataset.is_sparse:
         out += "sparse "
@@ -1695,6 +1834,17 @@ def load_dataset(path: String) raises -> Dataset:
             n_bins,
             mapper.cats.copy(),
             missing_bin^,
+            # The matrix's pool is the mapper's, which is the invariant
+            # `BinMapper.transform` establishes for a matrix built in memory
+            # (it passes `self.usable.copy()` to this same constructor).
+            # Restoring it here is what makes the `usable` section useful
+            # rather than merely present: a grower reads the pool off the
+            # MATRIX (`BinnedMatrix.usable_features`), so a mapper that
+            # remembered a narrowing while its matrix forgot would pass
+            # `matches` and then search columns the fit had removed.
+            # `SparseBinnedMatrix` has no pool field, so there is nothing to
+            # do on that branch.
+            mapper.usable_features(),
         )
 
     var label = _read_f64_column(r, "label")
