@@ -142,6 +142,30 @@ bindings/build.sh
 EXT=$PKG/_mojotrees.so
 [ -f "$EXT" ] || die "bindings/build.sh did not produce $EXT"
 
+# --- 3b. The instruction set, checked here rather than on the wheel ---------
+#
+# `mojo build` defaults --target-cpu to the HOST. bindings/build.sh now pins a
+# baseline through packaging/build_target.sh, and this is the check that the
+# pin held. It runs here, on the freshly built object, for one reason: the
+# check needs a disassembler, and this build host has binutils while the
+# machine a wheel is later inspected on may not. packaging/linux/inspect_wheel.py
+# is deliberately stdlib-only so that a Linux wheel can be examined from the
+# macOS laptop this project is developed on, and adding a check that shells out
+# to objdump would take that property away. So the ELF side of the ISA check
+# lives on the build path, and the macOS side lives in
+# packaging/macos/inspect_wheel.py as C14, where otool is always present.
+#
+# GitHub's ubuntu-22.04 x86 fleet mixes Intel (AVX-512 capable) with AMD EPYC
+# (not), and its ARM runners are Neoverse-class with SVE and bf16. Without the
+# pin, two runs of .github/workflows/release-linux.yml on one commit can produce
+# two different products, and neither the wheel nor its ELF headers record which
+# one you got.
+note "checking the instruction set baseline of $EXT"
+python3 packaging/isa_baseline.py "$EXT" --verbose \
+    || die "the extension contains instructions outside the target baseline.
+Read the report above: it names the feature and quotes the instruction. The fix
+is packaging/build_target.sh, not this script. Do not publish this wheel."
+
 # --- 4. Stage the runtime closure ------------------------------------------
 #
 # The macOS builder copies a hard-coded list of four dylibs. This one does not,

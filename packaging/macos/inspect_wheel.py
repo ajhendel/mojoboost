@@ -4,8 +4,13 @@
     python3 packaging/macos/inspect_wheel.py python/dist/<wheel> [--json out.json]
                                              [--report-only]
 
-NOT EXECUTED. This script has never been run: it needs a wheel, and no wheel has
-been built by this lane. Every number it will print is a future number.
+NEVER RUN ON A RELEASE WHEEL. It has now been run twice, on 2026-08-16, against
+two synthetic wheels assembled by hand around a real `_mojotrees.so`, to prove
+that C14 below passes a baseline-compiled extension and refuses a native one.
+That exercised C14, C1, C2, C3, C9, C10, C13 and the content scans; it did not
+exercise anything about a wheel produced by packaging/build_wheel.sh, because no
+release wheel has been built. Every number this prints about a real artifact is
+still a future number.
 
 Standard library only, and it reads the wheel as a zip, so it never installs or
 imports what it is inspecting and it runs on a bare checkout.
@@ -41,6 +46,17 @@ C8, C9, C11
     zip, not only the Mach-O objects: caches, test data, scratch files,
     machine-specific paths, and secret-shaped strings.
 
+C14 Was this compiled for a CPU the platform tag does not promise? This is the
+    one check here that no header can answer, and it is the reason it was added.
+    `mojo build` defaults `--target-cpu` to the HOST, and both release workflows
+    build on a self-hosted M4, whose feature set includes `+bf16`, `+i8mm` and
+    `+sme2`. None of the three exists on an M1. Mach-O records nothing about
+    this: `cpusubtype` stays `ARM64_ALL` whatever `-mcpu` was given, so C1 and
+    C2 above pass a wheel that SIGILLs on every Mac older than the build
+    machine. The check disassembles instead, in packaging/isa_baseline.py, and
+    the fix when it fires is packaging/build_target.sh rather than anything in
+    this file.
+
 Exit status is 0 when every check passes and 1 otherwise, unless --report-only
 is given, which prints the same report and always exits 0. A check that cannot
 run is a failure, not a skip.
@@ -61,6 +77,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MATRIX_DIR = ROOT / "packaging" / "matrix"
 
 sys.path.insert(0, str(MATRIX_DIR))
+sys.path.insert(0, str(ROOT / "packaging"))
 try:
     # The repository's only Mach-O load command parser, and its list of strings
     # that must not survive a build. Imported, never copied.
@@ -69,6 +86,17 @@ except ImportError as exc:  # pragma: no cover - a broken checkout, not a case
     raise SystemExit(
         f"cannot import packaging/matrix/validate_artifact.py ({exc}). "
         "This script is a companion to that one and does not duplicate it."
+    )
+try:
+    # The repository's only instruction-set baseline table and disassembly
+    # reader. Same rule: imported, never copied, so there is one place to fix a
+    # rule and one place a target is written down.
+    from isa_baseline import scan_blob
+except ImportError as exc:  # pragma: no cover - a broken checkout, not a case
+    raise SystemExit(
+        f"cannot import packaging/isa_baseline.py ({exc}). C14 cannot run "
+        "without it, and a check that cannot run is a failure here, so this "
+        "script refuses to start rather than print a report missing one line."
     )
 
 CPU_TYPE_ARM64 = 0x0100000C
@@ -519,6 +547,74 @@ def inspect(path: Path, rep: Report) -> dict:
              "the user's Mac has no reason to have. Either bundle it or link",
              "it differently; do not publish a wheel that needs it."]
             if foreign else [],
+        )
+
+        # C14. The instruction set, which is the only property of this wheel
+        # that no load command records. See the header, and
+        # packaging/isa_baseline.py for the rule table and its limits.
+        #
+        # Every Mach-O in the package is scanned, not only the extension: a
+        # bundled MAX runtime library that uses an instruction the tag does not
+        # promise breaks the install just as thoroughly, and the operator has to
+        # see it even though no flag in this repository can change it. Those
+        # findings are reported and do not fail the check, because the remedy is
+        # to raise the wheel's declared floor or to change what is bundled.
+        rep.section("instruction set baseline")
+        isa_bad: list[str] = []
+        isa_notes: list[str] = []
+        isa_data: dict[str, dict] = {}
+        profile_name = None
+        for name in objects:
+            result = scan_blob(name[len(pkg):], blobs[name])
+            profile = result["profile"]
+            profile_name = profile.name if profile else profile_name
+            isa_data[name[len(pkg):]] = {
+                "instructions": result["instructions"],
+                "error": result["error"],
+                "vendored": result["vendored"],
+                "features": {k: v["count"] for k, v in result["hits"].items()},
+            }
+            short = name[len(pkg):]
+            if result["error"]:
+                # Not a skip. A disassembler that is missing or an output format
+                # this parser cannot read produces zero findings, which is what
+                # a clean artifact also produces.
+                isa_bad.append(f"{short}: CHECK COULD NOT RUN: {result['error']}")
+                continue
+            print(f"  {short}: {result['instructions']} instructions, "
+                  f"baseline {profile.name} ({profile.target})")
+            for feature, slot in sorted(result["hits"].items()):
+                line = (f"{short}: {feature} x{slot['count']}, e.g. "
+                        f"{slot['examples'][0]}")
+                (isa_notes if result["vendored"] else isa_bad).append(line)
+                print(f"      {'note' if result['vendored'] else 'OUTSIDE'} "
+                      f"{feature}: {slot['count']}")
+                for ex in slot["examples"]:
+                    print(f"          {ex}")
+        data["isa_baseline"] = {"profile": profile_name, "objects": isa_data}
+        rep.check(
+            "C14",
+            not isa_bad,
+            "every object this project compiles is within the "
+            f"{profile_name or 'unknown'} instruction set baseline: "
+            f"{isa_bad or 'yes'}",
+            ([
+                "`mojo build` defaults --target-cpu to the HOST. Both release",
+                "workflows build on a self-hosted M4, whose feature set has",
+                "+bf16, +i8mm and +sme2; an M1 has none of them and an M2 or M3",
+                "has no +sme2. Nothing in the Mach-O header records this, which",
+                "is why C1 and C2 pass a wheel that SIGILLs on an older Mac.",
+                "The fix is packaging/build_target.sh, which pins apple-m1 by",
+                "default. A failure here means MOJOTREES_BUILD_TARGET=native was",
+                "set for this build, or a build path was added that does not",
+                "source that file. Do not publish this wheel.",
+            ] if isa_bad else []) + ([
+                "Advisory, in a library this project does not compile:",
+            ] + isa_notes + [
+                "No build flag here changes these. If one of them is above the",
+                "floor the platform tag promises, the wheel's real floor is that",
+                "library's, and the tag is the thing that is wrong.",
+            ] if isa_notes else []),
         )
 
         # --- content scans ---------------------------------------------
