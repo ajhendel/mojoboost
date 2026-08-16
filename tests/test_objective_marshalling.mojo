@@ -237,6 +237,17 @@ def _workload(objective: Int, n_outputs: Int) raises -> PythonObject:
     Built rather than modelled: the point of this test is what the binding
     does to a value on its way through, so the value has to actually go
     through it.
+
+    `ordered_boosting` and `score_function` are REQUIRED keys on this
+    mapping, not optional ones: `basic_bindings.mojo` reads them with no
+    default, deliberately, so that a stale sender cannot silently mean "L2,
+    plain boosting". This helper did not send them for the two hours after
+    they became required, and the consequence is worth recording, because it
+    is the reason three tests in this file failed at once: the missing key
+    raised a CPython `KeyError` inside `decide_device_workload`, so all
+    three died at the CALL and not one of their assertions ever ran. Every
+    assertion in them was true the whole time. A fixture is a claim about
+    the caller too.
     """
     var w = Python.import_module("builtins").dict()
     w["n_rows"] = PythonObject(1000)
@@ -248,6 +259,8 @@ def _workload(objective: Int, n_outputs: Int) raises -> PythonObject:
     w["categorical"] = PythonObject(0)
     w["has_missing"] = PythonObject(0)
     w["uses_validation"] = PythonObject(0)
+    w["ordered_boosting"] = PythonObject(0)
+    w["score_function"] = PythonObject(0)  # split.SCORE_L2
     return w^
 
 
@@ -318,6 +331,16 @@ def test_python_boundary_carries_real_codes_unchanged() raises:
     )
     assert_equal(_field(report, String("objective")), String("1"))
     assert_equal(_field(report, String("objective_known")), String("true"))
+
+    # The two keys the fixture stopped sending, asserted on the way back out.
+    # `_workload` had gone stale against a required key and the failure that
+    # produced was a CPython KeyError at the call, in three tests at once,
+    # with no assertion reached and nothing naming the key. These two lines
+    # are what turns the next such drift into a named, single failure: they
+    # read the echo of exactly the fields those keys feed, so a mapping that
+    # silently stopped carrying them fails here and says which.
+    assert_equal(_field(report, String("ordered_boosting")), String("false"))
+    assert_equal(_field(report, String("score_function")), String("0"))
 
 
 def main() raises:

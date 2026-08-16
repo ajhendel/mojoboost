@@ -1,10 +1,15 @@
 """The seven reserved objective codes, and the two things a reserved code
 must get right before any trainer is connected to it.
 
-**UNRUN.** This file was written on 2026-08-16 and has never been executed:
-the round's test budget was closed while it was being written. It has not
-been compiled either, so treat a compile error here as expected rather than
-as a finding about the registry.
+This file was written on 2026-08-16 and for its first day could not run at
+all: it imported `from testing` rather than `from std.testing` and had no
+`def main()`, so it did not parse and the suite counted it as a test while
+never evaluating a line of it. `tools/audit_test_structure.py` now gates
+exactly that shape, and the freeze in `tools/api_snapshot.py` records this
+file by name as the pin on the codes, so a deletion is a snapshot diff
+rather than a silent loss of the only two-sided check on the numbers.
+
+Run with `bash tools/run_tests.sh cpu test_objective_reserved_codes`.
 
 What it pins:
 
@@ -30,7 +35,13 @@ that mattered enough to register early: unregistered it fell through to
 `LINK_IDENTITY`, which is right for `COX` and silently wrong for it.
 """
 
-from testing import assert_equal, assert_false, assert_raises, assert_true
+from std.testing import (
+    assert_equal,
+    assert_false,
+    assert_raises,
+    assert_true,
+    TestSuite,
+)
 
 from mojotrees.objective_registry import (
     COX,
@@ -265,3 +276,7 @@ def test_the_names_refuse_with_the_trainer_rather_than_resolve() raises:
         _ = objective_code_from_name(String("yetirank"))
     with assert_raises(contains="train_multi_rmse"):
         _ = objective_code_from_name(String("multi_rmse"))
+
+
+def main() raises:
+    TestSuite.discover_tests[__functions_in_module()]().run()

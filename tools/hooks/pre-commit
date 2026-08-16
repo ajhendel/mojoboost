@@ -11,6 +11,15 @@
 #   docs/INTEGRATION_INVENTORY.md     python3 tools/audit_integration.py
 #   tools/connectivity_audit.py       python3 tools/audit_integration.py
 #   tools/default_refusal_audit.py    python3 tools/default_refusal_audit.py --check
+#   tests/test_*.mojo                 python3 tools/audit_test_structure.py
+#
+# The last of those is not a generated artifact but a shape: a `tests/test_*.
+# mojo` must define a `def main()` that reaches the suite, and must import
+# from `std.testing`. `tests/test_objective_reserved_codes.mojo` did neither,
+# so it could not parse, ran nothing, and was still counted as a test by
+# every glob in the repository for as long as it existed. That check is
+# structural and reads the files as text; it does NOT prove they compile,
+# which is what the suite is for.
 #
 # The last two are one gate over a pair that must agree: the CLASSIFICATION
 # table in `connectivity_audit.py` is where a judgment about an unreachable
@@ -67,6 +76,11 @@ while IFS= read -r path; do
     docs/INTEGRATION_INVENTORY.md)   want integration ;;
     tools/connectivity_audit.py)     want integration ;;
     tools/default_refusal_audit.py)  want defaults ;;
+    # A glob rather than a fixed path: this gate owns a shape across a
+    # directory, not one generated file. `tests/support.mojo` is a helper
+    # with no `def main()` by design and is deliberately not matched.
+    tests/test_*.mojo)               want tests ;;
+    tools/audit_test_structure.py)   want tests ;;
   esac
 done <<< "$staged"
 
@@ -106,6 +120,8 @@ Regenerate or fix, then commit again:
   pixi.toml                         edit until tools/check_pixi_tasks.py passes
   docs/INTEGRATION_INVENTORY.md     python3 tools/audit_integration.py --table
   tools/connectivity_audit.py       prints the corrected table; paste it in
+  tests/test_*.mojo                 add the missing def main() / fix the
+                                    import; the message names the file
 
 If the failure is somebody else's drift rather than yours, say so in the
 commit message rather than sweeping it into your snapshot regeneration, and
