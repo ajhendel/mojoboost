@@ -102,6 +102,39 @@ window" in this repository's results are defined by their effect on the numbers
 and not by a reading. Every result labelled by regime should be read with that in
 mind.
 
+## The gap in the narrow lock, measured
+
+Holding `mode: timing` does not make the box quiet. It stops the other session
+*timing*; it does not stop them compiling, by design.
+
+**Measured by the CPU campaign, 2026-08-16, while it held the lock and the GPU
+campaign compiled six lanes:** the same configuration measured 6.115, then
+9.655, then 13.047 seconds across three pairs twelve minutes apart, with load
+climbing 4.6 to 6.3. A **2.1x degradation of the arm under an uncontested
+timing lock.**
+
+So the lock is necessary and not sufficient. The patch, agreed between both
+campaigns and preferred to reinstating a lanes mode: **a courtesy pause on
+request.** Whoever needs a genuinely clean window asks, names the length, and
+the other launches nothing and reports when in-flight compiles have drained. A
+compile cannot be killed mid-flight, so the drain interval is real and gets
+reported rather than papered over.
+
+And the corollary, which is cheaper than any protocol: **do not take a
+measurement while your own lanes are running either.** Both campaigns have now
+lost numbers to their own builds, not just to each other's.
+
+### The salvageable half, which is the strongest argument for pairing
+
+Across that 58 percent shift in level, the **within-pair ratio held**: +17.2
+percent and +15.7 percent. Adjacent pairing survives a regime change; absolute
+levels do not.
+
+That is the in-process interleaving rule arrived at from the failure side, and
+it is why the rule below is stated as a preference in the protocol and should be
+read as close to mandatory. A ratio taken from adjacent arms is worth having
+even from a contaminated window. An absolute second from the same window is not.
+
 ## What to do when you could not get a quiet box
 
 Do not silently publish. Two options, in order of preference:
