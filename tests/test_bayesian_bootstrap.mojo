@@ -483,9 +483,13 @@ def test_bootstrap_type_values() raises:
     assert_equal(canonical_bootstrap_type(String("no")), "no")
     assert_equal(canonical_bootstrap_type(String("none")), "no")
     assert_equal(canonical_bootstrap_type(String("bayesian")), "bayesian")
+    # `mvs` moved out of the refusal list the day the sampler landed. It is
+    # CatBoost's actual CPU default for both of our headline objectives, so
+    # this assertion is the difference between claiming the peer column and
+    # having it.
+    assert_equal(canonical_bootstrap_type(String("mvs")), "mvs")
     for value in [
         String("bernoulli"),
-        String("mvs"),
         String("poisson"),
         String("Bayesian"),
         String(""),
@@ -509,12 +513,15 @@ def test_parameter_names_resolve() raises:
     ]:
         assert_true(is_sampling_param(name))
         assert_equal(canonical_sampling_param(name), name)
-    # CatBoost spells row bagging `subsample`, which already resolves to the
-    # sampler mojotrees implements it as; it must not be captured by the
-    # bootstrap names.
-    assert_equal(
-        canonical_sampling_param(String("subsample")), "bagging_fraction"
-    )
+    # `subsample` is now the CANONICAL name for row bagging rather than an
+    # alias resolving to LightGBM's `bagging_fraction`, and it is ONE key
+    # shared by every sampler that selects rows. That is CatBoost's own
+    # shape: one `subsample` option, read by Bernoulli, MVS and Poisson, and
+    # refused by Bayesian -- which is this file's sampler and which weights
+    # every row rather than selecting any. So the assertion that matters here
+    # is unchanged in force and only in spelling: `subsample` must resolve to
+    # the row-selection key and must NOT be captured by the bootstrap names.
+    assert_equal(canonical_sampling_param(String("subsample")), "subsample")
 
 
 def test_row_count_and_tree_index_are_validated() raises:

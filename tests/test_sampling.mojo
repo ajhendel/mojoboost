@@ -157,23 +157,23 @@ def test_bylevel_rejects_bad_fractions_and_depths() raises:
 
 def test_alias_table_accepts_the_spellings_the_audit_flags() raises:
     # The two the parity audit records as missing.
-    assert_equal(canonical_sampling_param("colsample_bytree"), "feature_fraction")
+    assert_equal(canonical_sampling_param("colsample_bytree"), "colsample_bytree")
     assert_equal(
-        canonical_sampling_param("colsample_bynode"), "feature_fraction_bynode"
+        canonical_sampling_param("colsample_bynode"), "colsample_bynode"
     )
     # XGBoost's per-level name, which mojotrees adds.
     assert_equal(
         canonical_sampling_param("colsample_bylevel"),
-        "feature_fraction_bylevel",
+        "colsample_bylevel",
     )
     # LightGBM's own row-sampling aliases.
-    assert_equal(canonical_sampling_param("subsample"), "bagging_fraction")
-    assert_equal(canonical_sampling_param("sub_row"), "bagging_fraction")
-    assert_equal(canonical_sampling_param("subsample_freq"), "bagging_freq")
+    assert_equal(canonical_sampling_param("subsample"), "subsample")
+    assert_equal(canonical_sampling_param("sub_row"), "subsample")
+    assert_equal(canonical_sampling_param("subsample_freq"), "subsample_freq")
     assert_equal(
         canonical_sampling_param("bagging_fraction_seed"), "bagging_seed"
     )
-    assert_equal(canonical_sampling_param("sub_feature"), "feature_fraction")
+    assert_equal(canonical_sampling_param("sub_feature"), "colsample_bytree")
     assert_equal(
         canonical_sampling_param("pos_subsample"), "pos_bagging_fraction"
     )
@@ -188,7 +188,7 @@ def test_alias_table_accepts_the_spellings_the_audit_flags() raises:
     )
     # `bagging` alone is the row fraction, not a class fraction, so the three
     # spellings must not collapse into each other.
-    assert_equal(canonical_sampling_param("bagging"), "bagging_fraction")
+    assert_equal(canonical_sampling_param("bagging"), "subsample")
 
 
 def test_every_canonical_name_resolves_to_itself() raises:

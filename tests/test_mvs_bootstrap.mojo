@@ -321,11 +321,21 @@ def test_rows_above_the_threshold_are_kept_at_exactly_one() raises:
     from Bernoulli bagging. If it were missing, every row would go through the
     probabilistic branch and `rows_kept_certainly` would stay 0.
 
-    The fixture is a ramp, so the largest magnitudes are far above any
-    threshold that keeps half the rows, and the audit proves the branch was
-    taken rather than assuming it.
+    **The subsample here is 0.8 and it cannot be 0.5.** That is arithmetic
+    about the fixture, not a tuning choice, and the first version of this
+    test used 0.5 and failed for it. When the threshold `T` sits above every
+    magnitude the solve reduces to `sum(m_i)/T = subsample * n`, so
+    `T = mean(m) / subsample`. A linear ramp has `mean = max/2`, which puts
+    `T = max/(2*subsample)`: at `subsample = 0.5` the threshold lands
+    exactly ON the top magnitude, `>` is false, and **not one row is kept
+    certainly** -- correctly. Certain keeps need `subsample > 0.5` on a ramp,
+    and 0.8 is CatBoost's own default, so this exercises the shipping regime
+    rather than a contrived one. At 0.8 the solve puts `T` near 81 against a
+    top magnitude near 200 and 119 of the 200 rows are certain.
+
+    The audit proves the branch was taken rather than assuming it.
     """
-    var params = MvsBootstrapParams.enable_with_reg(1.0, 0.5, 11)
+    var params = MvsBootstrapParams.enable_with_reg(1.0, 0.8, 11)
     var grads = _ramp_gradients(FIXTURE_ROWS)
     var audit = MvsAudit.empty()
     var w = _draw(params, grads, FIXTURE_ROWS, 0, 0.0, audit)
@@ -727,11 +737,22 @@ def test_multi_output_gradients_use_the_l2_norm() raises:
     assert_equal(wide_audit.blocks_guarded, 0)
 
     # And a buffer that is genuinely different does differ, so the assertion
-    # above is not passing because both sides are constant.
+    # above is not passing because every weight vector this fixture can
+    # produce is the same one.
+    #
+    # The control must be NON-CONSTANT, and that is a property of MVS rather
+    # than an accident of this fixture. A second constant buffer at a
+    # different magnitude produces the IDENTICAL weight vector: with every
+    # magnitude equal, the solve puts the threshold at that magnitude over
+    # the subsample, so every row draws the same probability whatever the
+    # constant is, and the draw itself is keyed on (seed, tree, row) and
+    # never on the value. MVS is scale-invariant on a constant buffer. The
+    # first version of this control used `_constant_gradients(N_ROWS, 0.25)`
+    # and failed for exactly that reason -- the two vectors were equal
+    # because they had to be, not because the norm collapsed.
     var other_audit = MvsAudit.empty()
     var other_w = _draw(
-        params, _constant_gradients(N_ROWS, 0.25), N_ROWS, 0, 0.0,
-        other_audit, 1,
+        params, _ramp_gradients(N_ROWS), N_ROWS, 0, 0.0, other_audit, 1
     )
     assert_true(_differ(other_w, narrow_w))
 
