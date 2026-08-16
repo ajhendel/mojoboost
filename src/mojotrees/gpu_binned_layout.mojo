@@ -64,66 +64,189 @@ layouts are the corners of that space:
                           features of one row in one byte; a 3-bit block puts
                           two features and two thirds of a third.
 
-Why blocking is the interesting axis, not compression
------------------------------------------------------
-Per (row, feature) the current histogram kernel moves, in the worst case,
+The row-side argument this module used to make, and why it is dead
+------------------------------------------------------------------
+Per (row, feature) the histogram kernel moves, in the worst case,
 
     1 byte   the bin
     4 bytes  the row index `rows[begin + j]`
-    4 bytes  `grad[r]`
-    4 bytes  `hess[r]`
+    8 bytes  the quantized gradient pair `gq[2 * r]`, `gq[2 * r + 1]`
 
-because `grid.x` is the feature: the row index, the gradient, and the hessian
-are re-read once per feature. The bin is one byte of thirteen. Halving it to
-four bits removes 3.8% of that traffic in the best case, which is why
-compression on its own is a poor bet and why this module refuses to assume
-otherwise.
+This module used to argue from those numbers that blocking is the whole
+game: `grid.x` was the feature, so the twelve row-side bytes were re-read
+once per feature, and a block of `G` features would read them once and spend
+them `G` times, taking the per-(row, feature) cost from thirteen bytes to
+`w/8 + 12/G`.
 
-Blocking removes the other twelve bytes instead. A block of `G` features
-loads the row index, the gradient, and the hessian once and accumulates `G`
-histograms from them, so the per-(row, feature) cost becomes
-`w/8 + 12/G` bytes. At `G = 4` that is 4 bytes against 13, and 3.5 with
-4-bit bins. The two levers compose, and compression helps blocking twice
-over:
+That argument is dead, and the module must not be read as still making it.
+`gpu_active_rows._range_hist_atomic_kernel` is now parameterized on `GROUP`:
+one threadgroup owns `GROUP` feature slots, loads `rows[begin + j]` and the
+gradient pair once, and spends them `GROUP` times. **The row-side
+amortization a blocked layout was going to buy is already bought, by a launch
+shape, on the layout that ships.** `histogram_gpu` takes the rung from
+`gpu_tiling.free_feature_group`, which is 8 at 64 bins and 2 on Metal at 256,
+and `GpuActiveRows.set_feature_group` moves it at run time. A blocked storage
+layout adds nothing to that term. What is left for it is the bin gather
+alone, which is the smaller half of a smaller number than the old reading
+implied.
 
-- a narrower width puts more of a block's row into one memory sector, which
-  is what makes a wide block coalesce at all;
-- a narrower width bounds the block's *shared memory*, because a feature of
-  width `w` needs only `2^w` histogram slots, not `n_bins`. A block of 4-bit
-  features needs 16 slots per feature where a block of 8-bit features needs
-  256, so a 4-bit block can be sixteen times wider under the same
-  threadgroup budget.
+What the bin gather actually costs
+----------------------------------
+The gather is `bins[f * n_rows + r]` with `r = rows[begin + j]` and
+`j = tile_begin + thread_idx.x`. Consecutive threads take consecutive `j`,
+and a node's rows stay ascending (`gpu_active_rows.mojo` partitions stably),
+so **at a fixed feature the warp's reads are ascending, and at the root
+exactly contiguous**: 32 threads read 32 consecutive bytes. Feature-major is
+already coalesced across threads, which is the axis a GPU coalesces on. The
+intuition that one thread's `G` accesses are `n_rows` apart and therefore
+uncoalesced is a CPU-shaped intuition; each of those `G` accesses is
+separately warp-contiguous, and the device never sees them as one thread's
+working set.
 
-That second point is the real argument for packing, and it is an argument
-about shared memory rather than about bandwidth.
+Write `S` for the device's memory sector, `rho = count / n_rows` for a node's
+row fraction, `w` for the storage width, and `G` for the block width. A
+sector of a feature-major column holds `k = S / (w/8)` rows; a sector of a
+`G`-wide block holds `k / G` of them. Per feature per node the two layouts
+touch (DERIVED BOUND, from `sectors_touched`):
 
-Where each layout wins, and why one answer is wrong
----------------------------------------------------
-Write `S` for the device's memory sector, `count` for a node's rows, and
-recall that a node's rows stay in ascending order (`gpu_active_rows.mojo`
-partitions stably), so a node of `count` rows out of `n_rows` reads an
-ascending subset with average stride `n_rows / count`.
+    feature-major   min(rho, 1/S) * n_rows
+    blocked         min(rho, G/S) * n_rows / G       (for G * w/8 <= S)
 
-- Feature-major, one feature, `count` rows: the reads walk a column of
-  `n_rows * w / 8` bytes and touch `min(count, ceil(n_rows * w / 8 / S))`
-  sectors. Near the root the second term binds and compression pays in full.
-  Below roughly `count < n_rows * w / (8 * S)` the first term binds, every
-  read is its own sector whatever the width, and compression buys nothing on
-  this axis at all.
-- Row-major and blocked: a node's row is `G * w / 8` contiguous bytes, so
-  deep nodes stop paying a whole sector per feature. This is the layout that
-  fixes the deep-node regime, and it is also the layout the prediction kernel
-  already wants.
-- Feature subsampling pushes the other way. `set_features` narrows `grid.x`
-  and a feature-major column that is not active is never touched. A block
-  with `a` of its `G` features active still pulls all `G` widths' worth of
-  every row it reads, so blocked layouts waste `(G - a) / G` of their bin
-  traffic under `colsample`. `subsample_waste` computes it.
+so the blocked layout's advantage on the bin term is exactly
 
-So the honest position is that the best layout depends on the node, on the
-feature sample, and on the device's sector size, and that no single layout
-dominates. This module builds all of them and prices them; it does not pick
-one.
+    clamp(G / (rho * S), 1, G)
+
+and it is **1.0 for every node with rho >= G/S**. Feature-blocking is a
+deep-node change and nothing else. At the root the two layouts touch the
+identical number of sectors because they move the identical bytes, and a
+`G`-fold advantage only appears once a node's rows are sparse enough that a
+feature-major sector carries one wanted row instead of many.
+
+What the sum over a tree says, and it is smaller than it looks
+--------------------------------------------------------------
+A node comparison is the wrong denominator, because a level of `2^d` nodes
+covers all `n_rows` between them however deep it is. `layout_tree_cost` sums
+`layout_node_cost` over a balanced tree of depth `D` and is what any layout
+argument here has to be built on. Two sector models are priced, because the
+two-regime `min` is a bound and an occupancy model
+`E[distinct] = M * (1 - (1 - rho)^k)` over `M = n_rows / k` sectors is an
+equally defensible reading of the same gather. They turn out to agree within
+about 15%, and in both directions, so the model choice is not what the answer
+hangs on.
+
+`S` is. At `G = GROUP = 8`, 100 features all active, width 8, 1M rows, bin
+plus row-side sectors (DERIVED BOUND under each model, both reproducible from
+`layout_tree_cost`):
+
+    S      D     min-model    occupancy model
+    32     5       2.03x          1.88x
+    64     5       1.47x          1.59x
+    128    5       1.15x          1.31x
+    128    6       1.47x          1.60x
+
+`S` for an Apple M4 is **UNMEASURED**, this module refuses to default it, and
+it moves the claim by 1.8x across the plausible range.
+
+Then the coupling that closes it. The advantage needs a wide `G`; a wide `G`
+is only useful up to the launch group `GROUP` that consumes it, because a
+launch block spanning several storage blocks gets locality `min(G, GROUP)`
+and one sitting inside a wider block gets `GROUP` and no more; and `GROUP` is
+bounded by threadgroup memory at `GROUP * BIN_CAP * 12` bytes.
+`gpu_tiling.free_feature_group` therefore returns 8 at 64 bins and **2 on
+Metal at 256, 1 everywhere else**. At the bin count this project defaults to,
+the whole table above collapses to (DERIVED BOUND, same computation):
+
+    G = GROUP = 2     S = 32    D = 5     1.12x / 1.11x
+                      S = 64    D = 5     1.00x / 1.06x
+                      S = 128   D = 5     1.00x / 1.02x
+                      (min-model / occupancy model, as above)
+    GROUP = 1         any S,    any D     1.00x at G = 1, and worse
+                                          than 1.00x at every wider G
+
+That last row is not an approximation and it is the sharpest thing here. At
+`GROUP = 1` a launch owns one feature, so it fetches a `G`-wide row and uses
+one byte of it; the block is then walked again for each of the other lanes,
+and in the streaming regime it pays for the whole block every time. A blocked
+layout under a group of 1 is a `G`-fold *regression*, not a tie. Every
+backend that is not Metal takes `GROUP = 1` at the default bin count.
+
+Two more subtractions, both against. Feature subsampling inverts the sign: a
+random `feature_fraction` leaves every storage block live while narrowing
+feature-major's active columns, so at 0.5 the blocked layout **loses** 1.12x
+and at 0.25 it loses 1.77x (occupancy model, `S = 128`, `D = 5`,
+`G = GROUP = 8`, DERIVED BOUND; the min-model says 1.27x and 2.00x).
+And nothing in either model touches the three shared atomics per
+(row, feature), which are identical under both layouts and dilute whatever
+the memory win is by an unmeasured fraction.
+
+The verdict: the GPU histogram path reads feature-major
+-------------------------------------------------------
+At the bin count this project defaults to, the modeled advantage is 1.00x on
+every backend but Metal and 1.00x to 1.12x on Metal, under both sector
+models, before the atomics dilute it and before feature subsampling inverts
+it. The configuration where it is worth 1.5x to 2x needs 64 bins or fewer,
+`GROUP` at 8, no feature subsampling, and a sector size nobody has measured.
+That is not a paper case that holds; it is a paper case with a live condition
+attached to it. So this module answers `LAYOUT_UNDECIDED`, as it was built
+to, and the device histogram path keeps `bins[f * n_rows + r]`.
+
+The contract the histogram kernel is handed
+-------------------------------------------
+Written down because it is now a decision and not an accident, and because a
+reader of the kernel should not have to re-derive it:
+
+    buffer        one `UInt8` per cell, `n_rows * n_features` of them
+    address       bins[f * n_rows + r], f the feature id, r the row id
+    stride        1 byte between adjacent rows of one feature
+                  n_rows bytes between adjacent features of one row
+    order         `rows[begin ..< begin + count]` ascending, so consecutive
+                  threads read ascending and, at the root, adjacent bytes
+    ownership     `histogram_gpu.GpuHistogramBuilder` uploads it once with
+                  `enqueue_copy` and never rewrites it; it is exactly
+                  `BinnedMatrix.bins`, byte for byte, with no transform
+    who else      the partition kernel and the prediction kernel index the
+                  same buffer the same way, so this contract is not the
+                  histogram path's alone to change
+
+What a change would have cost, for the record: a relayout is a host pass of
+`n_rows * n_features` byte reads and the same number of strided writes, once
+per session, plus the same upload. At 1M by 100 that is 100 MB each way,
+ESTIMATED at tens of milliseconds for a cache-hostile transpose, against a
+GPU training run of seconds. The transform is not what made this a bad trade
+and it should not be cited as though it were; what made it a bad trade is
+that the win is 1.00x at the default bin count and that three kernel families
+index this buffer, not one.
+
+This is the GPU's answer to the layout question, and it is deliberately not
+the CPU's. `binning.BinnedMatrix` is gaining a row-major bin view for the CPU
+builder, which walks rows and holds one row's features in cache, so locality
+*within a walker* is what the CPU pays for. A device kernel is
+thread-per-row: locality within a thread is worth nothing to it, and
+coalescing *across threads at a fixed feature* is worth everything. The two
+campaigns should not be expected to converge, and the GPU histogram path
+reading feature-major while the CPU histogram path reads row-major is the
+correct outcome rather than an inconsistency to reconcile.
+
+A full row-major view is refused on a second and independent ground, which
+belongs to the histogram kernel rather than to this module: a threadgroup
+needs `3 * k * BIN_CAP * 4` bytes of shared memory for `k` feature slots,
+which is 3 KiB per feature at 256 bins, so a 32 KiB threadgroup holds at most
+eight slots however the buffer is laid out. A row-major record wider than
+that is fetched and mostly discarded, and the record is re-read
+`ceil(n_features / 8)` times. Row-major on the device is not a layout the
+histogram kernel could exploit even if the sector arithmetic favored it.
+
+What would decide it, cheaply
+-----------------------------
+The whole disagreement reduces to one measurable: how many sectors a
+scattered ascending gather of `rho * n_rows` one-byte reads actually touches.
+That is measurable **with the kernel that already ships and no new layout**,
+by timing a one-feature histogram at fixed `count` while varying `n_rows`,
+hence `rho`. The `min` model predicts a hard knee at `rho = 1/S`; the
+occupancy model predicts a smooth curve with no knee. Whichever curve comes
+back also hands over `S`, and `layout_tree_cost` then answers the layout
+question outright instead of bracketing it. Until that exists, see
+`bench/apple/bin_layout_plan.json`.
 
 What this module refuses to decide
 ----------------------------------
@@ -135,9 +258,18 @@ verdict is `LAYOUT_UNDECIDED`, and it stays undecided: there is no default
 threshold, no width heuristic that fires on its own, and no automatic
 fallback that would pick a layout on this module's authority. Lower transfer
 and cache traffic can and does lose to bit extraction, and which way it goes
-on an M4's unified memory is not derivable from anything written here. See
-`bench/apple/bin_layout_plan.json` for the measurements that have to exist
-before a threshold is allowed to.
+on an M4's unified memory is not derivable from anything written here.
+
+Compression, separately
+-----------------------
+The bin is one byte of thirteen. Halving it to four bits removes 3.8% of the
+per-(row, feature) traffic in the best case, which is why compression on its
+own is a poor bet. Its real argument is *shared memory*: a feature of width
+`w` needs `2^w` histogram slots, not `n_bins`, so a block of 4-bit features
+needs 16 slots per feature where 8-bit features need 256, and a narrow block
+can be sixteen times wider under the same threadgroup budget. That is an
+occupancy argument, not a bandwidth one, and it is orthogonal to the blocking
+question this module just answered.
 
 Semantics this layout does not touch
 ------------------------------------
@@ -236,13 +368,24 @@ comptime BLOCK_ALIGN_BYTES = 16
 # batched kernels size their partial buffers with.
 comptime BYTES_PER_HIST_SLOT = BYTES_PER_PARTIAL_CELL
 
-# The *row side* of a histogram build: the Int32 active-row index, the
-# Float32 gradient, and the Float32 hessian. Today all three are re-read once
-# per feature, because `grid.x` is the feature; under a blocked layout they
-# are read once per block instead, which is the traffic blocking exists to
-# remove.
-comptime ROW_SIDE_ARRAYS = 3
+# The *row side* of a histogram build. Two shapes, because the shipping
+# kernel has two row loops:
+#
+#   quantized (the default)  the Int32 active-row index, read contiguously
+#                            out of the compacted range, plus the Int32
+#                            gradient/hessian pair, read as one eight-byte
+#                            scattered access at `gq[2 * r]`;
+#   float                    the Int32 active-row index plus two separate
+#                            four-byte scattered planes, `grad[r]`, `hess[r]`.
+#
+# Either way the row side is read once per *launch block* of `GROUP` feature
+# slots, not once per feature and not once per storage block. `GROUP` is a
+# launch shape (`GpuActiveRows.set_feature_group`) and is independent of any
+# storage layout, which is why this term is no longer an argument for
+# blocking; see the module docstring.
+comptime ROW_SIDE_FLOAT_ARRAYS = 2
 comptime BYTES_ROW_SIDE_ELEM = 4
+comptime BYTES_GRAD_PAIR = 8
 
 # A caller that has not established its device's memory sector passes this,
 # and every sector-denominated cost comes back unmeasured rather than
@@ -1394,6 +1537,109 @@ def sectors_touched(
     return streamed
 
 
+def sectors_touched_occupancy(
+    count: Int, span_bytes: Int, bytes_per_access: Int, sector_bytes: Int
+) -> Int:
+    """The same gather under an occupancy model instead of the two-regime
+    bound, and it is here because the two disagree about the layout question.
+
+    `sectors_touched` returns `min(scattered, streamed)`, which is a bound
+    with a hard knee at `count = span / sector`. The smooth answer is the
+    expected number of distinct sectors a `count`-element subset of the
+    `n = span / bytes_per_access` slots touches, when a sector holds
+    `k = sector / bytes_per_access` of them:
+
+        E[distinct] = M * (1 - (1 - rho)^k)      M = n / k, rho = count / n
+
+    The bound is tight for a sector carrying many wanted rows, which is almost
+    surely touched, and loose for one carrying few, which is often empty. Both
+    layouts have sectors of both kinds at different depths, so the correction
+    does **not** run consistently in either layout's favor: summed over a
+    tree it moves the feature-major-versus-blocked ratio by up to about 15%
+    and in both directions, depending on the sector size (see the module
+    docstring's table). That is small enough that the model choice is not what
+    the layout decision turns on, and it is only knowable because both are
+    computed. Reporting one and not the other would have been picking a
+    layout by picking an approximation.
+
+    Neither model is measured. Which one describes a device is decidable, and
+    the module docstring says with what: hold `count` fixed, vary `n_rows`,
+    and look for the knee. Returns 0 for `SECTOR_BYTES_UNKNOWN`, the same way
+    `sectors_touched` does, so an unmeasured device stays unmeasured.
+    """
+    if sector_bytes <= 0:
+        return 0
+    if count <= 0 or span_bytes <= 0 or bytes_per_access <= 0:
+        return 0
+    var per_access = (bytes_per_access + sector_bytes - 1) // sector_bytes
+    if per_access > 1:
+        # One access spans several sectors and no two accesses share one, so
+        # the occupancy question does not arise.
+        return count * per_access
+    var slots = span_bytes // bytes_per_access
+    if slots < 1:
+        slots = 1
+    if count >= slots:
+        return (span_bytes + sector_bytes - 1) // sector_bytes
+    var k = sector_bytes // bytes_per_access
+    if k < 1:
+        k = 1
+    var m = (slots + k - 1) // k
+    var rho = Float64(count) / Float64(slots)
+    # (1 - rho)^k without pow(), so this stays exact at the ends: rho = 0
+    # gives 0 touched and rho = 1 gives every sector touched.
+    var empty = 1.0
+    var base = 1.0 - rho
+    var e = k
+    var acc = base
+    while e > 0:
+        if e & 1 == 1:
+            empty *= acc
+        acc *= acc
+        e >>= 1
+    var touched = Float64(m) * (1.0 - empty)
+    var out = Int(touched + 0.5)
+    if out < 1:
+        out = 1
+    if out > m:
+        out = m
+    return out
+
+
+# Which of the two gather models a cost is priced under. There is no default
+# in `decide_layout`: a caller states the model the way it states the sector
+# size, because both are claims about a device.
+comptime SECTOR_MODEL_BOUND = 0
+comptime SECTOR_MODEL_OCCUPANCY = 1
+
+
+def sector_model_name(model: Int) -> String:
+    if model == SECTOR_MODEL_BOUND:
+        return String("bound")
+    if model == SECTOR_MODEL_OCCUPANCY:
+        return String("occupancy")
+    return String("unknown")
+
+
+def sectors_under(
+    model: Int,
+    count: Int,
+    span_bytes: Int,
+    bytes_per_access: Int,
+    sector_bytes: Int,
+) raises -> Int:
+    """`sectors_touched` or `sectors_touched_occupancy`, by name."""
+    if model == SECTOR_MODEL_BOUND:
+        return sectors_touched(
+            count, span_bytes, bytes_per_access, sector_bytes
+        )
+    if model == SECTOR_MODEL_OCCUPANCY:
+        return sectors_touched_occupancy(
+            count, span_bytes, bytes_per_access, sector_bytes
+        )
+    raise Error("unknown sector model")
+
+
 @fieldwise_init
 struct LayoutNodeCost(Copyable, Movable):
     """The work one node's histogram costs under one layout.
@@ -1401,10 +1647,16 @@ struct LayoutNodeCost(Copyable, Movable):
     `bin_sectors` and `row_sectors` are memory sectors, not bytes: what a
     device pays for a scattered read is the sector, however few of its bytes
     are wanted. `decode_ops` is the ALU work `gpu_bin_packing.decode_cost`
-    charges per element, zero at width 8. `launches` is one per touched
-    block. `shared_bytes` is the widest touched block's threadgroup
-    allocation, which is an occupancy input rather than a time, so it is
-    reported and never folded into a duration.
+    charges per element, zero at width 8. `launches` is one per *launch
+    block*, which is `ceil(active / feature_group)` and has nothing to do with
+    how many storage blocks the layout has. `shared_bytes` is the widest
+    touched block's threadgroup allocation, which is an occupancy input rather
+    than a time, so it is reported and never folded into a duration.
+
+    Not modelled here at all: the three shared atomic adds per (row, feature).
+    They are identical under every layout in this module, so they cancel in a
+    comparison, but they do *not* cancel in a speedup: a layout that halves
+    this cost moves the run time by less than half, by an unmeasured amount.
     """
 
     var bin_sectors: Int
@@ -1425,32 +1677,55 @@ def layout_node_cost(
     node_rows: Int,
     active: List[Int],
     sector_bytes: Int,
+    feature_group: Int = 1,
+    model: Int = SECTOR_MODEL_BOUND,
+    quantized: Bool = True,
 ) raises -> LayoutNodeCost:
     """Price one node's histogram under `plan` for one active feature set.
 
-    The three terms, per touched block:
+    The three terms:
 
-    - **bins.** The block's rows are `G * w` bits each, contiguous, spread
-      over the block's `data(b)` bytes. `sectors_touched` decides which
-      regime the node is in.
-    - **row side.** The Int32 active-row index and the Float32 gradient and
-      hessian, read once per row *per block* rather than once per row per
-      feature. This is the term blocking attacks and the reason a blocked
-      layout can win while moving more bin bytes than a feature-major one.
+    - **bins**, per *pass* over a touched storage block, and the pass count is
+      where the launch group enters. A launch owning `feature_group` slots
+      spends `min(G, feature_group)` contiguous bytes of each row it fetches
+      and leaves the rest of the sector on the floor, so a block of `G`
+      features under a narrower group is walked `ceil(live / min(G, group))`
+      times and pays for its sectors on each walk. This is the whole reason
+      `G` and `GROUP` want to be the same number: a `G` wider than the group
+      is a `G`-fold streaming regression, not a saving, and a `G` narrower
+      than the group leaves the group's locality unused.
+    - **row side**, per *launch block*, not per storage block. This is the
+      correction that killed the argument this module used to make for
+      blocking. `gpu_active_rows._range_hist_atomic_kernel[GROUP, BIN_CAP]`
+      owns `GROUP` feature slots per threadgroup and reads `rows[begin + j]`
+      and the gradient pair once for all of them, so the row side is divided
+      by `feature_group` on *every* layout including the feature-major one
+      that ships. Charging it once per storage block, as this function used
+      to, handed a blocked layout a saving the launch shape had already
+      taken, and tilted every comparison toward the candidate.
+      `feature_group` defaults to 1 so an unstated group is the pessimistic
+      answer rather than a flattering one; the shipping default comes from
+      `gpu_tiling.free_feature_group`.
     - **decode.** `decode_cost(w).alu_ops` per decoded element, over the
       active features only.
 
+    `quantized` selects between the kernel's two row loops: the default reads
+    the interleaved Int32 pair `gq[2 * r]` as one eight-byte scattered access,
+    and `quantized=False` reads `grad[r]` and `hess[r]` as two separate
+    four-byte ones. The active-row index itself is a contiguous walk of the
+    compacted range under both, not a scatter, and is charged as such.
+
     What is deliberately not modelled: L2 residency across blocks (a small
     node's row side may be cached after the first block, which would make
-    the row-side term an overestimate), the partition kernel's own bin reads,
-    and the once-per-session pack and upload. The first is the largest
-    unknown in the model and is the first question in
-    `bench/apple/bin_layout_plan.json`.
+    the row-side term an overestimate), the shared atomics, the partition
+    kernel's own bin reads, and the once-per-session pack and upload.
     """
     if node_rows < 0 or node_rows > plan.n_rows:
         raise Error("node row count out of range")
     if len(active) == 0:
         raise Error("active feature set must not be empty")
+    if feature_group < 1:
+        raise Error("feature group must be at least one slot")
 
     var live = List[Int](capacity=plan.n_blocks())
     live.resize(plan.n_blocks(), 0)
@@ -1461,26 +1736,28 @@ def layout_node_cost(
         live[plan.block_of[f]] += 1
 
     var bin_sectors = 0
-    var row_sectors = 0
     var decode_ops = 0
-    var launches = 0
     var shared = 0
-    # `rows`, `grad`, and `hess` are Int32/Float32 arrays of n_rows; all
-    # three have the same extent and the same per-access width, so one
-    # sector count covers each of them.
-    var row_span = plan.n_rows * BYTES_ROW_SIDE_ELEM
 
     for b in range(plan.n_blocks()):
         if live[b] == 0:
             continue
-        launches += 1
-        var row_bits = plan.block_row_bits(b)
-        var row_bytes = (row_bits + 7) // 8
-        bin_sectors += sectors_touched(
-            node_rows, plan.block_data_bytes(b), row_bytes, sector_bytes
-        )
-        row_sectors += ROW_SIDE_ARRAYS * sectors_touched(
-            node_rows, row_span, BYTES_ROW_SIDE_ELEM, sector_bytes
+        # The lanes one launch consumes in one pass, and how many passes the
+        # block's live lanes therefore take. A launch narrower than the block
+        # fetches the block's whole row and uses part of it, so the block is
+        # walked again for the rest.
+        var lanes = plan.block_size[b]
+        if feature_group < lanes:
+            lanes = feature_group
+        var passes = (live[b] + lanes - 1) // lanes
+        var pass_bits = lanes * plan.block_width[b]
+        var pass_bytes = (pass_bits + 7) // 8
+        bin_sectors += passes * sectors_under(
+            model,
+            node_rows,
+            plan.block_data_bytes(b),
+            pass_bytes,
+            sector_bytes,
         )
         var per_element = decode_cost(plan.block_width[b]).alu_ops
         decode_ops += node_rows * live[b] * per_element
@@ -1488,9 +1765,109 @@ def layout_node_cost(
         if need > shared:
             shared = need
 
+    # One launch per `feature_group` active slots, and the row side once per
+    # launch. `grid.x` is the slot group in the shipping kernel, so this is
+    # the launch count as well as the row-side multiplier.
+    var launches = (len(active) + feature_group - 1) // feature_group
+
+    # The compacted row range is contiguous, so its own extent is what the
+    # index walk spans, not the whole `n_rows` array.
+    var index_span = node_rows * BYTES_ROW_SIDE_ELEM
+    var row_once = sectors_under(
+        model, node_rows, index_span, BYTES_ROW_SIDE_ELEM, sector_bytes
+    )
+    if quantized:
+        row_once += sectors_under(
+            model,
+            node_rows,
+            plan.n_rows * BYTES_GRAD_PAIR,
+            BYTES_GRAD_PAIR,
+            sector_bytes,
+        )
+    else:
+        row_once += ROW_SIDE_FLOAT_ARRAYS * sectors_under(
+            model,
+            node_rows,
+            plan.n_rows * BYTES_ROW_SIDE_ELEM,
+            BYTES_ROW_SIDE_ELEM,
+            sector_bytes,
+        )
+    var row_sectors = launches * row_once
+
     return LayoutNodeCost(
         bin_sectors, row_sectors, decode_ops, launches, shared
     )
+
+
+@fieldwise_init
+struct LayoutTreeCost(Copyable, Movable):
+    """The same units as `LayoutNodeCost`, summed over a whole tree.
+
+    A node comparison is the wrong denominator for this decision and
+    `decide_layout` says so in its own docstring. A level of `2^d` nodes
+    covers all `n_rows` between them however deep it is, so the layouts'
+    relative cost is set by how the row mass is spread across depths and not
+    by any one node. This is the sum that answers it.
+    """
+
+    var bin_sectors: Int
+    var row_sectors: Int
+    var decode_ops: Int
+    var launches: Int
+
+    def total_sectors(self) -> Int:
+        return self.bin_sectors + self.row_sectors
+
+
+def layout_tree_cost(
+    plan: BinLayoutPlan,
+    depth: Int,
+    active: List[Int],
+    sector_bytes: Int,
+    feature_group: Int = 1,
+    model: Int = SECTOR_MODEL_BOUND,
+    quantized: Bool = True,
+) raises -> LayoutTreeCost:
+    """Sum `layout_node_cost` over a balanced tree of `depth` levels.
+
+    Level `d` holds `2^d` nodes of `n_rows / 2^d` rows each, root included, so
+    the walk covers every depth the histogram builder visits and weights each
+    by how many nodes are there. Balanced is an idealization in two directions
+    that partly cancel: leaf-wise growth makes some nodes much smaller than
+    `2^-d` (which favors a blocked layout, since its advantage is
+    `clamp(G / (rho * S), 1, G)` and rises as `rho` falls), and sibling
+    subtraction builds only the smaller child of a pair (which favors it
+    again, for the same reason). Both errors point the same way, so this sum
+    is a **lower** bound on a blocked layout's advantage under a fixed sector
+    model, and not a central estimate.
+
+    What it is not is a lower bound on the advantage full stop, because the
+    choice of sector model moves the answer further than either idealization
+    does. Compute it under both `SECTOR_MODEL_BOUND` and
+    `SECTOR_MODEL_OCCUPANCY` and read the pair, not either one.
+    """
+    if depth < 0:
+        raise Error("tree depth must not be negative")
+
+    var bin_sectors = 0
+    var row_sectors = 0
+    var decode_ops = 0
+    var launches = 0
+    var nodes = 1
+    for _ in range(depth + 1):
+        var node_rows = plan.n_rows // nodes
+        if node_rows < 1:
+            break
+        var cost = layout_node_cost(
+            plan, node_rows, active, sector_bytes, feature_group, model,
+            quantized,
+        )
+        bin_sectors += nodes * cost.bin_sectors
+        row_sectors += nodes * cost.row_sectors
+        decode_ops += nodes * cost.decode_ops
+        launches += nodes * cost.launches
+        nodes *= 2
+    return LayoutTreeCost(bin_sectors, row_sectors, decode_ops, launches)
 
 
 @fieldwise_init
@@ -1637,6 +2014,8 @@ def decide_layout(
     active: List[Int],
     amortize_nodes: Int,
     costs: MeasuredLayoutCosts,
+    feature_group: Int = 1,
+    model: Int = SECTOR_MODEL_BOUND,
 ) raises -> LayoutVerdict:
     """Compare two plans over one representative node, with the build cost
     amortized across `amortize_nodes` nodes.
@@ -1647,11 +2026,15 @@ def decide_layout(
     no decision to lean on.
 
     Even fully measured this is a *node* comparison with a linear build
-    amortization. It ignores how the node mix changes with depth (shallow
-    nodes stream and deep nodes gather, and the two regimes prefer different
-    layouts), the partition kernel's own bin reads, and the prediction path
-    entirely. A policy that consumed this as a training-run verdict would be
-    over-reading it; the staged benchmark in
+    amortization, and a node is the wrong denominator: shallow nodes stream,
+    deep nodes gather, and the two regimes prefer different layouts, so which
+    layout wins a tree is set by how the row mass spreads across depths.
+    `layout_tree_cost` is the sum that answers that and is what a layout
+    argument should be built on. Still outside both: the partition kernel's
+    own bin reads, the prediction path, the shared atomics, and the choice
+    between the two sector models, which moves the answer across the decision
+    line on its own. A policy that consumed this as a training-run verdict
+    would be over-reading it; the staged benchmark in
     `bench/apple/bin_layout_plan.json` is what closes those gaps.
     """
     if amortize_nodes < 1:
@@ -1669,10 +2052,10 @@ def decide_layout(
         return LayoutVerdict(LAYOUT_UNDECIDED, LAYOUT_OK, 0.0, 0.0)
 
     var cand_node = layout_node_cost(
-        candidate, node_rows, active, costs.sector_bytes
+        candidate, node_rows, active, costs.sector_bytes, feature_group, model
     )
     var base_node = layout_node_cost(
-        baseline, node_rows, active, costs.sector_bytes
+        baseline, node_rows, active, costs.sector_bytes, feature_group, model
     )
     var share = Float64(amortize_nodes)
     var cand_build = costs.evaluate_build(layout_build_cost(candidate))
