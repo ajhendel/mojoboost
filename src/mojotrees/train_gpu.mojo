@@ -142,6 +142,17 @@ from .gpu_predict import (
     GpuPredictor,
     flatten_trees,
 )
+from .gpu_resident_round import (
+    RESIDENT_NO_POOL,
+    RESIDENT_OK,
+    RESIDENT_TABLES,
+    grow_tree_device_resident,
+    resident_round_record_slots,
+    resident_round_reason_name,
+    resident_round_refusal_detail,
+    resident_round_requested,
+    resident_round_supported,
+)
 from .gpu_runtime import GpuSession, NoLifecycle, RoundLifecycle
 from .gpu_split_search import (
     GpuSplitParams,
@@ -670,6 +681,14 @@ def _search_record_slots(params: TreeParams, n_features: Int) -> Int:
     by both ceilings above and never below the two a single split needs.
     """
     if params.grow_policy != GROW_DEPTHWISE:
+        # The device-owned growth plane (gpu_resident_round.mojo) reduces
+        # over the whole frontier on the device, so every live leaf needs a
+        # record of its own, plus two scratch records the child searches
+        # write into. Off unless `MOJOTREES_GPU_TREE_RESIDENT=1`, and a
+        # searcher this size is harmless to the shipping loops, which use
+        # the first two slots and leave the rest staged and unread.
+        if resident_round_requested():
+            return resident_round_record_slots(params.num_leaves, n_features)
         return 2
     var slots = 2 * params.num_leaves
     if slots > MAX_LEVEL_RECORDS:
@@ -1098,6 +1117,42 @@ def _grow_tree_gpu_device_search(
         and params.min_data_in_leaf >= 1
         and builder.open_resident(params.num_leaves)
     ):
+        # The device-owned growth plane, which is a second control plane
+        # beside this one rather than a change to it: it grows the same tree
+        # with the frontier, the tree and the slot pool all resident, and it
+        # waits once per tree where the loop below waits once per split. It
+        # is off unless `MOJOTREES_GPU_TREE_RESIDENT=1`, it refuses by name
+        # every configuration it cannot express, and it falls back here
+        # rather than approximating any of them. See gpu_resident_round.mojo.
+        if resident_round_requested():
+            var why = resident_round_supported(
+                params, builder, cache.searchers[0].max_records
+            )
+            if why == RESIDENT_OK and not builder.open_resident_tables(
+                params.num_leaves
+            ):
+                why = RESIDENT_NO_POOL
+            if why == RESIDENT_OK:
+                return grow_tree_device_resident(
+                    builder,
+                    cache.searchers[0],
+                    split_params,
+                    params,
+                    tree_features,
+                    n_root,
+                )
+            if tree_index == 0:
+                # Once per fit rather than once per tree: a caller who asked
+                # for the plane and did not get it should be told exactly
+                # once, and told which layer refused.
+                var detail = resident_round_reason_name(why)
+                if why == RESIDENT_TABLES:
+                    detail = resident_round_refusal_detail(params)
+                print(
+                    "resident_round unavailable, using the device-search"
+                    " resident loop:",
+                    detail,
+                )
         return _device_search_resident(
             profile,
             builder,

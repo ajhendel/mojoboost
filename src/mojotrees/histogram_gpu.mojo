@@ -154,6 +154,7 @@ from .categorical import CatBitset, CategoricalSpec, cat_empty
 from .gpu_active_rows import MAX_ROWS, GpuActiveRows, LeafRange, RowRouting
 from .gpu_binned_layout import check_layout_support
 from .gpu_frontier import LeafWorkItem
+from .gpu_tree_tables import DeviceTreeTables, TreeTablesSnapshot
 from .gpu_multiclass_batch import GpuClassBatch
 from .gpu_output_planes import BatchEligibility
 from .gpu_histogram_specializations import (
@@ -359,6 +360,12 @@ struct GpuHistogramBuilder(Movable):
     # what holds a move-only value here; there is no second batcher and no
     # second output pool anywhere.
     var batcher: List[GpuLeafBatcher]
+    # The device tree tables a device-owned growth loop commits into, held
+    # for the life of the fit in a one-element list exactly as `batcher` is.
+    # Empty unless `open_resident_tables` was called, which only
+    # `gpu_resident_round.mojo` does; nothing on the shipping path allocates
+    # or reads it.
+    var resident_tables: List[DeviceTreeTables]
     # The specialization level asked for, from
     # `MOJOTREES_GPU_HIST_SPECIALIZATION`. `SPEC_LEVEL_BASELINE` is the
     # default and means every launch below is the one that shipped.
@@ -514,6 +521,7 @@ struct GpuHistogramBuilder(Movable):
         self.device_api = device_api^
         self.device_arch = device_arch^
         self.batcher = List[GpuLeafBatcher]()
+        self.resident_tables = List[DeviceTreeTables]()
         self.tiling = derive_tiling(
             self.caps, data.n_rows, data.n_features, data.n_bins, strategy
         )
@@ -1686,6 +1694,235 @@ struct GpuHistogramBuilder(Movable):
         self.batcher[0].pool.check_live(slot)
         self.batcher[0].pool.check_subtractable(parent_slot, slot)
         self.enqueue_leaf(node, resident_slot=slot, subtract_from_slot=parent_slot)
+
+    def open_resident_tables(mut self, num_leaves: Int) raises -> Bool:
+        """Open, or reuse, the device tree tables a device-owned growth loop
+        commits into, and report whether they are available.
+
+        The same shape and the same reasoning as `open_resident`, which is
+        deliberate: both are per-fit state whose dimensions come from the leaf
+        budget and not from the data, both are held in a one-element list so
+        that "not open" is a length rather than a sentinel, and both reuse an
+        already-open instance when it is deep enough. `DeviceTreeTables` costs
+        eleven buffers and one synchronization to construct, so building one
+        per tree would put a host wait back into every tree that this whole
+        lane exists to take out of every split.
+
+        It lives on the builder rather than on the growth loop for one
+        practical reason: the builder is the object a fit already threads
+        through every tree, and giving the new loop somewhere to keep per-fit
+        state without adding a parameter to the shipping grower is what keeps
+        that grower to a single new call site.
+
+        A shallower request reuses; a deeper one declines rather than
+        reusing, since tables sized for a smaller budget would overflow and
+        the commit kernel would report `TREE_OVERFLOW` rather than corrupt
+        anything. In a single fit `num_leaves` does not move, so the deeper
+        branch is unreachable today and is written so that a caller who
+        varied the budget between trees gets a decline instead of a stopped
+        tree.
+        """
+        if num_leaves < 2:
+            return False
+        if len(self.resident_tables) > 0:
+            return self.resident_tables[0].leaf_capacity >= num_leaves
+        self.resident_tables.append(
+            DeviceTreeTables(
+                self.ctx, num_leaves, self.n_features, self.missing_bin.copy()
+            )
+        )
+        return True
+
+    def enqueue_desc_child(mut self, max_rows: Int) raises:
+        """Build the child named by the step descriptor into the pool slot the
+        step descriptor names, subtracting it from its sibling's slot.
+
+        The device-owned counterpart of `enqueue_resident_leaf_subtracting`,
+        and the place where the second holdout of `gpu_tree_tables` is
+        closed. That method takes a node, a destination slot and a slot to
+        subtract from, and the caller gets all three from the *host* slot pool
+        through `acquire_resident` and `reown_resident`. On this path the
+        device's `slot_owner` vector is the authority instead: the commit
+        kernel takes the lowest free slot, reassigns the parent's, and writes
+        both into the descriptor, so there is nothing left for the host pool
+        to decide and it is not consulted. `pool.check_live` is therefore not
+        called here, and could not be: the host pool holds no owners at all on
+        this path, because nothing on it ever acquired.
+
+        That is a real loss of a check and it is worth naming. On the host
+        path a slot handed to two live leaves would be caught by
+        `HistogramSlotPool.check_live` at the launch that did it. Here the
+        equivalent check is `TreeTablesSnapshot.check_invariants`, which
+        asserts that no two live leaves share a histogram slot and that the
+        slot pool and the frontier agree about every owner; the difference is
+        that it runs once per tree, at the download, rather than once per
+        split. That is the trade the whole lane is: checks that cost a
+        synchronization move to the one synchronization there is.
+
+        `max_rows` is an upper bound on the built child's rows, which the
+        active row count supplies. See `GpuActiveRows.enqueue_desc_histogram`
+        for why a bound is enough and for why this path always takes the
+        atomic strategy.
+
+        Enqueues only: no transfer and no synchronization.
+        """
+        if not self.has_gradients:
+            raise Error("call upload_gradients before enqueue_desc_child")
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        var n_slots = len(self.active)
+        var pool_slots = self.batcher[0].pool.capacity
+        var pool = self.batcher[0].out_dev.unsafe_ptr()
+        self.rows.enqueue_desc_histogram(
+            pool_slots,
+            max_rows,
+            self.bins_dev.unsafe_ptr(),
+            self.grad_dev.unsafe_ptr(),
+            self.hess_dev.unsafe_ptr(),
+            self.feat_dev.unsafe_ptr(),
+            pool,
+            n_slots,
+            Float32(self.g_scale),
+            Float32(self.h_scale),
+            self.caps,
+        )
+
+    def enqueue_desc_partition(mut self, max_count: Int) raises:
+        """Partition the window the step descriptor names, by the split the
+        step descriptor names.
+
+        `apply_split` with every argument removed, because on this path a
+        kernel chose all of them. It is the first holdout of
+        `gpu_tree_tables` closed, and it is the one that actually blocked a
+        one-wait-per-tree loop: everything else the host does per split is
+        bookkeeping it could in principle defer, while the partition genuinely
+        needs the chosen split before it can run.
+
+        No range table is updated, because there is no host range table on
+        this path: the frontier's windows live in the device tree tables and
+        the commit kernel moves them. `GpuActiveRows.ranges` therefore still
+        describes the root and nothing else for the whole of a device-owned
+        tree, and `range_of`, `check_frontier`, `download_range` and
+        `snapshot_rows` must not be used against it. That is stated here
+        rather than defended against, because defending against it would mean
+        maintaining a second copy of the windows on the host, which is exactly
+        the bookkeeping the lane removes.
+        """
+        self.rows.enqueue_partition_desc(
+            self.bins_dev.unsafe_ptr(), max_count
+        )
+
+    # --- The device-owned tree seam ---------------------------------------
+    #
+    # Six forwarders that belong, conceptually, to `gpu_resident_round.mojo`:
+    # they are the growth loop's launches, in the loop's order, and this
+    # struct has no opinion about any of them. They are methods here because
+    # every one of them needs two different parts of this builder at once --
+    # the tree tables in `resident_tables` and the step descriptor in
+    # `rows.step_dev` -- and Mojo will not let a caller outside hold a mutable
+    # borrow of one field of an object while passing a pointer derived from
+    # another. Inside a method body the two are disjoint field borrows and the
+    # call is fine. That is the whole reason, and it is a language constraint
+    # rather than a design: the growth loop reads better in one place, and
+    # `gpu_resident_round.mojo` is where it lives.
+
+    def desc_tables_open(self) -> Bool:
+        """Whether `open_resident_tables` has run on this builder."""
+        return len(self.resident_tables) > 0
+
+    def enqueue_desc_begin_tree(mut self, n_active: Int) raises:
+        """Reset the device tree tables to a one-leaf frontier owning
+        `[0, n_active)` with the root's histogram in pool slot 0.
+
+        Slot 0 is not a convention this picks, it is what
+        `HistogramSlotPool.acquire` and the commit kernel's own upward scan
+        both hand out first, so a tree that starts anywhere else would have a
+        frontier the commit kernel could not have produced.
+
+        Does not synchronize; see `DeviceTreeTables.begin_tree` for the
+        staging-lifetime argument that makes that safe here.
+        """
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        self.resident_tables[0].begin_tree(n_active, root_slot=0, wait=False)
+
+    def enqueue_desc_seed_root(
+        mut self, mut rec_f: DeviceBuffer[DType.float32], record: Int
+    ) raises:
+        """Copy the root's Newton value from its search record into node 0."""
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        self.resident_tables[0].enqueue_seed_root_value(rec_f, record)
+
+    def enqueue_desc_step(
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        num_leaves: Int,
+        max_depth: Int,
+        min_data_in_leaf: Int,
+    ) raises:
+        """One pick-and-commit step, writing the descriptor the partition and
+        the child histogram will read."""
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        self.resident_tables[0].enqueue_step(
+            rec_i,
+            rec_f,
+            self.rows.step_dev.unsafe_ptr(),
+            num_leaves,
+            max_depth,
+            min_data_in_leaf,
+        )
+
+    def enqueue_desc_stage_search(
+        mut self,
+        mut node_tbl: DeviceBuffer[DType.int32],
+        slot_cells: Int,
+        left_record: Int,
+        right_record: Int,
+    ) raises:
+        """Point the searcher's two scratch records at the children's pool
+        slots."""
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        self.resident_tables[0].enqueue_stage_child_search(
+            node_tbl,
+            self.rows.step_dev.unsafe_ptr(),
+            slot_cells,
+            left_record,
+            right_record,
+        )
+
+    def enqueue_desc_copy_records(
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        left_record: Int,
+        right_record: Int,
+    ) raises:
+        """Move the two scratch records into the frontier slots that own
+        them."""
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        self.resident_tables[0].enqueue_copy_records(
+            rec_i,
+            rec_f,
+            self.rows.step_dev.unsafe_ptr(),
+            left_record,
+            right_record,
+        )
+
+    def download_desc_tables(mut self) raises -> TreeTablesSnapshot:
+        """Bring the whole device tree state home.
+
+        **This is the device-owned growth loop's one host synchronization per
+        tree.** Everything the loop enqueued finishes here, and everything it
+        decided is decoded from what comes back.
+        """
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        return self.resident_tables[0].download()
 
     def enqueue_resident_subtract(
         mut self, parent_slot: Int, child_slot: Int, dst_slot: Int
