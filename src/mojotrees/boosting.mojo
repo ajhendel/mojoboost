@@ -2072,7 +2072,13 @@ def _fill_softmax_grad_hess(
     mut hess: List[Float64],
 ):
     """One-vs-rest gradients and hessians for class `k` from row-major
-    softmax probabilities."""
+    softmax probabilities.
+
+    Rounded to `histogram.score_t` for the same reason `fill_grad_hess` is:
+    LightGBM's derivatives are `float`, the histogram kernels narrow every
+    derivative they read anyway, and narrowing at the source is what keeps
+    this class's numbers the same whichever accumulation path a node takes.
+    """
     grad.clear()
     hess.clear()
     var factor = Float64(n_classes) / Float64(n_classes - 1)
@@ -2080,7 +2086,7 @@ def _fill_softmax_grad_hess(
         var p = prob[r * n_classes + k]
         var y = 1.0 if labels[r] == k else 0.0
         var w = weights[r] if len(weights) > 0 else 1.0
-        grad.append(w * (p - y))
+        grad.append(score_t(w * (p - y)))
         # LightGBM softmax hessian: (k / (k - 1)) * p * (1 - p), floored
         # (multiclass_objective.hpp, factor_). At two classes the factor is
         # 2, which is where the old hardcoded 2.0 came from; at seven
@@ -2091,7 +2097,7 @@ def _fill_softmax_grad_hess(
         var h = factor * p * (1.0 - p)
         if h < 1e-16:
             h = 1e-16
-        hess.append(w * h)
+        hess.append(score_t(w * h))
 
 
 def _multiclass_goss_select(
