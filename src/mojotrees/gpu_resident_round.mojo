@@ -216,7 +216,7 @@ register) are both outside every arithmetic expression.
 from std.os import getenv
 from max.gpu.host import DeviceBuffer
 
-from .gpu_active_rows import STEP_WORDS
+from .gpu_active_rows import STEP_WORDS, LeafRange
 from .gpu_split_search import (
     GpuSplitParams,
     GpuSplitSearcher,
@@ -609,35 +609,35 @@ def _publish_row_ranges(
     waits for nothing, and it costs one list write per node.
 
     **It is also the only thing that lifts the table's staleness refusal, and
-    it lifts it only after proving the replay was complete.**
+    it lifts it only after proving the replayed table is the device's tree.**
     `GpuActiveRows.enqueue_partition_desc` poisons the table on every step, so
     between the first split of a resident tree and this function every window
     accessor raises rather than returning a stale window. The
-    `end_descriptor_partition` call below is what ends that, and it checks two
-    things before it does: that the replay wrote a window for every node the
-    tree ended with (`snap.next_node` of them), and that those windows tile
-    the active prefix. See `LeafRangeTable.end_descriptor_partition` for why
-    both are needed and what each one catches.
+    `end_descriptor_partition` call below is what ends that, and what it is
+    handed is the device's **own frontier**: the node id and the row window of
+    every live leaf, straight out of the snapshot that was already downloaded.
+    Comparing the replayed windows against those is the proof, and it costs
+    nothing -- `snap.leaves` is in host memory by the time this runs, and
+    until now nothing read its `row_begin`/`row_count` at all. See
+    `LeafRangeTable.end_descriptor_partition` for what each of its four checks
+    catches and for the one thing this comparison cannot prove.
 
-    Does the replay in fact cover every node? Yes, and the argument is short
-    enough to state. `_pick_and_commit_kernel` advances `CTR_NEXT_NODE` by
-    exactly two per commit and hands the two new ids to the parent it logged,
-    so the finished tree's node ids are `0` (the root, whose window
-    `reset_root` wrote) together with the two children of each logged commit,
-    and there are `1 + 2 * commits` of them. The loop below visits every
-    logged commit and `LeafRangeTable.split` writes both children of each, so
-    the replay covers the tree exactly when the log holds every commit.
+    Two checks are made here rather than there, and both are about the *log*
+    rather than about the table:
 
-    That last clause is the check immediately below, and it is the one that
-    has to be made here rather than in the table. The kernel stops appending
-    to the log once it is full, and a *missing* commit is invisible to the
-    table: `_grow_to` back-fills the gap with empty ranges, and the parent
-    whose commit went missing stays a live leaf owning the rows its children
-    should have, so the node count and the tiling both come out right on a
-    table that is wrong. The identity `2 * len(commit_order) + 1 ==
-    next_node` is what sees it, because every commit creates exactly two
-    nodes; nothing downstream can reconstruct it once the log has been
-    replayed and thrown away.
+    - `2 * len(commit_order) + 1 == next_node`, first. Every commit creates
+      exactly two nodes, so a log that accounts for fewer nodes than the tree
+      holds is a log the kernel stopped appending to once it was full. This is
+      checked before a single window is written, so a truncated log is refused
+      rather than half replayed.
+    - That each logged parent names two real children, in the loop. A commit
+      whose children are outside the node table cannot be replayed at all.
+
+    Why the frontier crosses as two plain lists rather than as the snapshot:
+    `gpu_tree_tables` imports `gpu_active_rows` (for `LeafRange`), so
+    `gpu_active_rows` cannot import it back. Node ids and `LeafRange`s are
+    both already in that direction's vocabulary. The lists are `n_live` long,
+    a few dozen entries at the default budget, built once per tree.
     """
     if 2 * len(snap.commit_order) + 1 != snap.next_node:
         raise Error(
@@ -662,7 +662,21 @@ def _publish_row_ranges(
         _ = builder.rows.ranges.split(
             parent, left, right, snap.nodes[left].count
         )
-    builder.rows.ranges.end_descriptor_partition(snap.next_node)
+
+    # The device's own frontier, as the two lists the table can be checked
+    # against. `snap.leaves` is `[0, n_live)` in slot order and every row of
+    # it was written by the commit kernel, so this is the device's answer to
+    # "which node owns which rows" and not a second derivation of the host's.
+    var leaf_nodes = List[Int](capacity=len(snap.leaves))
+    var leaf_windows = List[LeafRange](capacity=len(snap.leaves))
+    for i in range(len(snap.leaves)):
+        leaf_nodes.append(snap.leaves[i].node)
+        leaf_windows.append(
+            LeafRange(snap.leaves[i].row_begin, snap.leaves[i].row_end())
+        )
+    builder.rows.ranges.end_descriptor_partition(
+        snap.next_node, leaf_nodes, leaf_windows
+    )
 
 
 def grow_tree_device_resident(

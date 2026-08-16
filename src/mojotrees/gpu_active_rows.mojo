@@ -2616,53 +2616,140 @@ struct LeafRangeTable(Copyable, Movable):
         self.desc_partitions += 1
         return max_count
 
-    def end_descriptor_partition(mut self, expected_nodes: Int) raises:
-        """Clear the poison, after proving the replay wrote every window.
+    def end_descriptor_partition(
+        mut self,
+        n_nodes: Int,
+        leaf_nodes: List[Int],
+        leaf_windows: List[LeafRange],
+    ) raises:
+        """Clear the poison, after proving the replayed table is window for
+        window the frontier the device came home with.
 
-        `expected_nodes` is the finished tree's node count (`next_node` from
-        the device snapshot). Two checks:
+        `n_nodes` is the finished tree's node count and the two lists are the
+        device's own live frontier: `leaf_nodes[i]` owns `leaf_windows[i]`.
+        The caller reads both straight out of the downloaded snapshot
+        (`gpu_resident_round._publish_row_ranges`) and passes them as plain
+        integers and `LeafRange`s, so that this module never learns the
+        snapshot type -- `gpu_tree_tables` imports this file and must not be
+        imported back.
 
-        1. `len(self.ranges) == expected_nodes`. The replay writes windows
-           only for the nodes its commit log names, so a log that came home
-           short -- `_pick_and_commit_kernel` stops appending once the log is
-           full -- leaves the tail of the tree with no window at all. This is
-           what catches that, and it is the check that makes the difference
-           between un-poisoning because the replay ran and un-poisoning
-           because the replay reached every node.
+        Four checks, in order of what each one can catch:
 
-        2. `_check_invariants()`. The live windows must still tile
-           `[0, n_active)`. The case this catches that check 1 does not is a
-           publish onto a table whose root was never reset for this tree:
-           `n_active` changes per tree under bagging and GOSS, and a stale
-           one makes coverage fail here rather than make every subsequent
-           window silently describe the wrong prefix.
+        1. `len(self.ranges) == n_nodes`. The replay writes windows only for
+           the nodes its commit log names, so a log that came home short --
+           `_pick_and_commit_kernel` stops appending once the log is full --
+           leaves the tail of the tree with no window at all.
 
-        **What neither check catches, stated because the docstring that
-        claimed otherwise was wrong.** A commit missing from the *middle* of
-        the log. `_grow_to` back-fills the gap with empty ranges as soon as a
-        later commit names a higher id, so the node count comes out right; and
-        the parent whose commit went missing simply stays a live leaf owning
-        the rows its children should have, so coverage comes out right too.
-        Nothing about that table is malformed. It is caught one level up, in
-        `gpu_resident_round._publish_row_ranges`, by the identity
-        `2 * len(commit_order) + 1 == next_node`: every commit creates exactly
-        two nodes, so the log accounts for the whole tree or it does not.
+        2. Every device leaf's window is byte for byte the window the replay
+           gave that node. Not just the count: `begin` too, because the
+           device computed it as `begin, begin + n_left` inside the commit
+           kernel while the replay recomputed it by walking `split` in commit
+           order, and those two arithmetics agreeing is the thing worth
+           checking. This is what makes un-poisoning a proof rather than an
+           argument, and it is what catches a commit missing from the
+           *middle* of the log. Such a log leaves a table that is structurally
+           impeccable: `_grow_to` back-fills the gap with empty ranges so the
+           node count is right, the parent whose commit went missing stays a
+           live leaf owning the rows its children should have, and the live
+           windows still tile the prefix. Nothing about it is malformed. What
+           is wrong is that the two back-filled children are empty here and
+           are real windows on the device, which this check sees at the first
+           of them. An earlier draft of this docstring claimed check 4 caught
+           that case. It does not.
 
-        Clearing is unconditional once both pass, rather than scoped to the
-        nodes the replay touched, because there is then no untouched node to
-        scope around: every id below `expected_nodes` has a window.
+        3. Every node the device did *not* name as a live leaf owns nothing.
+           A backstop rather than a first line, and worth being honest about:
+           given check 2 and a device frontier that tiles, a non-live node
+           holding rows would have to overlap a leaf that already matched, so
+           check 4 would also refuse it. What this buys is the error message.
+           A snapshot whose frontier does not tile -- which
+           `TreeTablesSnapshot.check_invariants` is supposed to have refused
+           upstream -- fails here naming the node and the commit that should
+           have split it, rather than downstream as "ranges overlap".
+
+        4. `_check_invariants()`. The check that owns the relationship to
+           `n_active`, which nothing above mentions: a publish onto a table
+           whose root was never reset for this tree (`n_active` moves per tree
+           under bagging and GOSS) fails here, with the error that names the
+           actual problem rather than as two hundred individually wrong
+           leaves.
+
+        **What this does not prove, and it is the one gap worth naming.** The
+        device's `row_begin`/`row_count` and the replay's are both ultimately
+        derived from the same integer, the search record's left count off the
+        parent histogram's count plane. So this check catches a replay that
+        went wrong and cannot catch a left count that disagrees with the rows
+        `_scatter_kernel` actually routed left. The shipping plane has an
+        observation of that -- `MOJOTREES_GPU_VERIFY_ROWS` downloads
+        `total_dev` and compares -- and the descriptor path has no equivalent,
+        because reading `total_dev` per step is exactly the host wait the
+        resident plane exists to remove. Recorded rather than closed.
+
+        Clearing is unconditional once all four pass: there is then no
+        untouched node to scope around, and no window that is not the
+        device's.
         """
-        if expected_nodes < 1:
+        if n_nodes < 1:
             raise Error("a finished tree holds at least the root")
-        if len(self.ranges) != expected_nodes:
+        if len(leaf_nodes) != len(leaf_windows):
+            raise Error("each device leaf must come with exactly one window")
+        if len(self.ranges) != n_nodes:
             raise Error(
                 "the device commit log was replayed onto ",
                 len(self.ranges),
                 " nodes but the tree ended with ",
-                expected_nodes,
+                n_nodes,
                 "; the untouched nodes have no active-row window, so"
                 " clearing the stale-table refusal here would be a lie",
             )
+        # Marks the nodes the device calls live, so check 3 can require an
+        # empty window of everything else without a second search per node.
+        var is_live = List[Bool](capacity=n_nodes)
+        for _ in range(n_nodes):
+            is_live.append(False)
+        for i in range(len(leaf_nodes)):
+            var node = leaf_nodes[i]
+            if node < 0 or node >= n_nodes:
+                raise Error(
+                    "the device frontier names leaf ",
+                    node,
+                    " which is outside a tree of ",
+                    n_nodes,
+                    " nodes",
+                )
+            if is_live[node]:
+                raise Error(
+                    "the device frontier lists node ", node, " twice"
+                )
+            is_live[node] = True
+            var got = self.ranges[node].copy()
+            var want = leaf_windows[i].copy()
+            if got.begin != want.begin or got.end != want.end:
+                raise Error(
+                    "leaf ",
+                    node,
+                    " owns rows [",
+                    got.begin,
+                    ", ",
+                    got.end,
+                    ") in the replayed host table and [",
+                    want.begin,
+                    ", ",
+                    want.end,
+                    ") on the device; the replay does not describe the tree"
+                    " that was grown",
+                )
+        for n in range(n_nodes):
+            if not is_live[n] and not self.ranges[n].is_empty():
+                raise Error(
+                    "node ",
+                    n,
+                    " is not a live leaf on the device but owns ",
+                    self.ranges[n].count(),
+                    " rows in the replayed host table; the commit that split"
+                    " it is missing from the device commit log, so the two"
+                    " describe different trees",
+                )
         self._check_invariants()
         self.resident_owned = False
 
