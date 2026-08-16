@@ -501,27 +501,48 @@ is not a phase behind the control plane, it is the entire margin.
 per-row cost is even with LightGBM's, our fixed cost is about one second
 behind, and the win, if it comes, comes from the histogram kernel.**
 
-#### The automatic split-search gate is tuned for the wrong growth policy
+#### The automatic split-search gate was protecting the losing arm, and is withdrawn
 
-The GPU's automatic split search compares `normalized_split_work`
+The GPU's automatic split search compared `normalized_split_work`
 (`n_rows * active_features * (n_bins/255) * (num_leaves/31)`) against a
-threshold of 50,000,000 and sends anything below it to the host scan. So
-250,000 x 50 is 12.5 million and both GPU arms took the host scan there,
-while 1,000,000 and 2,000,000 took the device search. **Measured**, five
-repeats each at 250,000 x 50:
+threshold of 50,000,000 and sent anything below it to the **host scan**:
+download the node's whole `3 * n_features * n_bins` histogram, block on the
+device, dequantize it to Float64, and scan it on the CPU. A second, lower
+threshold of 12,500,000 applied to depth-wise growth.
 
-| arm | automatic (host scan) | device search forced |
-|---|---|---|
-| GPU leaf-wise | 1.967 | 2.268 |
-| GPU depth-wise | 1.909 | **1.214** |
+**Measured 2026-08-16**, four shapes, the two arms interleaved in one process,
+five repeats each, box verified quiet at every shape boundary:
 
-The gate is right for leaf-wise, which is 15 percent worse on the device
-search at this size, and wrong for depth-wise, which is 36 percent better
-because only the device search batches a level into one search and one host
-wait. The threshold was measured for leaf-wise and is applied to both. At
-1.214 seconds, depth-wise at 250,000 rows is 1.19x behind LightGBM rather
-than 1.87x, so the older statement that the GPU simply loses below a million
-rows was substantially the gate's doing rather than the hardware's.
+| shape | normalized work | host scan | device search | ratio |
+|---|---|---|---|---|
+| 100,000 x 50 | 5.0M | 1.695 | **0.918** | **1.85x** |
+| 250,000 x 100 | 25.0M | 2.494 | **1.862** | **1.34x** |
+| 463,715 x 90 | 41.7M | 3.041 | **2.309** | **1.32x** |
+| 700,000 x 100 | 70.0M | 4.041 | **3.128** | **1.29x** |
+
+Every shape resolved with disjoint ranges: at each one the device search's
+slowest repeat beat the host scan's fastest. The range spans both retired
+thresholds, so neither is a boundary the sweep failed to bracket.
+
+**The threshold's premise was inverted, which is the finding rather than the
+margin.** A profitability gate assumes the cheaper path is not worth its fixed
+cost below some size. The device search's advantage is *largest at the
+smallest shape* and shrinks as the work grows -- which is what you see when
+the thing being avoided is per node rather than per row: fewer rows means the
+per-node download, block and dequantization dominate more, not less. There is
+no size at which the host scan becomes the better choice, so both thresholds
+were withdrawn and neither was replaced. There is no measured value to install
+because there is no crossover to record.
+
+What survives the withdrawal is **eligibility**, which is a different question
+and has the same answer at every size: the device search is declined for a
+configuration it cannot express (`TreeParams.extra`,
+`feature_fraction_bylevel`), for a resident frontier that does not fit, and on
+hardware nobody has measured it on. Those three still route to the host scan,
+which is why the host scan is still here.
+
+Read the scope precisely: this compares two **GPU** arms. It says nothing
+about the CPU/GPU crossover, which is a separate gate and is unchanged.
 
 #### From the earlier profile run, at other shapes
 
@@ -941,22 +962,16 @@ split decisions identical, on every shape except the largest.
 136-byte record per node instead of the histogram, Float32 gains that can
 flip near-tie decisions, bit-deterministic run to run), growing over a
 device-resident frontier so that a split builds one histogram and subtracts
-for the sibling, and the automatic policy selects that path by itself on an
-observed Apple M4 once `normalized_split_work` reaches 50,000,000, which
-1,000,000 rows by 50 features at the default bins and leaves hits exactly.
-Below that threshold the host scan is what runs. The threshold was measured
-for leaf-wise growth and is applied to depth-wise growth as well, where it
-is wrong by a wide margin; see
-[Where the speed stands](#where-the-speed-stands). On an M4 with
-`bench-train-gpu` over 100 trees, the device scan is about 24% behind at
-50000 rows by 100 features (3.03 to 3.06 s over three runs against the host
-scan's 2.43 to 2.49 s), which is the expected direction, since a device scan
-replaces a per-node histogram download with a per-node kernel launch and
-that trade only pays once the accumulation is large enough to dominate the
-launch. At 250000 by 100 a single run put the two at 3.15 s and 3.22 s,
-which is 2% apart and unrepeated, so read it as no measured difference
-rather than as a win. The default stays on the host scan, because nothing
-measured so far pays for split decisions that can differ from the CPU's.
+for the sibling, and and since 2026-08-16 the automatic policy selects that
+path for **every eligible shape** on an observed Apple M4, at any size. It
+used to require `normalized_split_work >= 50,000,000`; that threshold and its
+depth-wise sibling were withdrawn when the sweep they were owed found no
+crossover at any shape from 5.0M to 70.0M, with the device search winning
+everywhere and winning by more at the smaller shapes. See
+[Where the speed stands](#where-the-speed-stands) for the numbers. The host
+scan still runs for a configuration the device kernel cannot express, for a
+resident frontier that does not fit, and on hardware nobody has measured --
+eligibility, not size.
 To repeat or refute any of that, run
 `pixi run bench-train-gpu 50000 100 reg 5 gpu-host,gpu-device`, which
 alternates the two arms inside one process and prints each arm's own spread
@@ -1243,8 +1258,9 @@ search commits a planned level and searches it in one launch pair, so a
 level costs one host wait instead of one per split, about 5 waits per tree
 rather than 30. The row partition and the histogram build are still per
 node (`docs/design/GPU_LEVELWISE.md` describes what remains). Batching only
-exists on the device split search, so a shape the automatic policy sends to
-the host scan gets none of it.
+exists on the device split search, and since the size threshold was withdrawn
+on 2026-08-16 every eligible shape gets it; a fit the policy declines on
+eligibility grounds still does not.
 
 That is why depth-wise is the fastest GPU arm this project has measured.
 **Measured** on an Apple M4, 1,000,000 x 50, five repeats: 2.587 seconds
