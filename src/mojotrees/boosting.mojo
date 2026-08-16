@@ -710,6 +710,24 @@ def round_has_constant_hessian(
     likewise not an exclusion. If either sampler ever grew a per-row weight,
     this reasoning would fail and this is where it would have to be revisited.
 
+    **A fourth exclusion exists and is not visible from here.** CatBoost's
+    Bayesian bootstrap (`sampling.BayesianBootstrapParams`) keeps every row and
+    gives each a random weight per tree, and that weight multiplies the row's
+    derivatives exactly as a `sample_weight` does, so a bootstrapped fit has a
+    per-row hessian under every objective. It is the case the paragraph above
+    predicted. This function cannot test for it, because the configuration is
+    not among its three inputs and widening the signature would change a
+    contract the device trainers bind to; so a caller that turns the bootstrap
+    on carries the exclusion itself, either by passing the effective per-row
+    weights (the bootstrap draw times the user's weights, which is the vector
+    `sampling.refresh_bayesian_bootstrap` builds and what CatBoost's
+    `CalcWeightedData` computes) as `sample_weight` -- in which case the first
+    exclusion above already refuses -- or by calling
+    `sampling.check_bayesian_bootstrap_hessian_declaration` on whatever this
+    returned, which raises rather than letting the two-plane path be taken by
+    omission. No trainer in the repository enables it today; the wiring lane
+    that does must do one of those two things.
+
     A custom objective is excluded by `objective_has_constant_hessian`
     returning False for `CUSTOM`, but no trainer should rely on that alone: the
     callback's hessians are whatever the caller returns, and
