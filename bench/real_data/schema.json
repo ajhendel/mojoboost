@@ -4,50 +4,156 @@
   "title": "mojotrees real-data differential result record",
   "description": "One record per measured run. run.py writes one file per run under records/ and concatenates them into records.json; records.csv is a flat projection of the same records and is derived, never authoritative. Two conventions run through the schema. A measurement that could not be taken is an object with a null value and an unavailable_reason, never an omitted field and never an estimate. And a timing is always a list of samples or a single measured phase, never a pre-averaged number, so the reader can see the spread that produced it.",
   "type": "object",
-  "required": ["schema_version", "status", "scenario", "engine"],
+  "required": [
+    "schema_version",
+    "status",
+    "scenario",
+    "engine"
+  ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {
+      "const": 1
+    },
     "status": {
-      "enum": ["ok", "error", "timeout", "skipped"],
+      "enum": [
+        "ok",
+        "error",
+        "timeout",
+        "skipped"
+      ],
       "description": "A run that did not complete is recorded, not dropped."
     },
-    "run_id": {"type": ["string", "null"]},
-    "job_index": {"type": ["integer", "null"]},
-    "repeat": {"type": ["integer", "null"], "description": "Whole-process repeat index."},
-    "scenario": {"type": "string"},
-    "scenario_title": {"type": "string"},
-    "tier": {"enum": ["smoke", "standard", "large"]},
-    "task": {"enum": ["regression", "binary", "multiclass", "ranking"]},
-    "primary_metric": {"type": "string"},
-    "threads": {"type": "integer", "minimum": 1},
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "job_index": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "repeat": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Whole-process repeat index."
+    },
+    "scenario": {
+      "type": "string"
+    },
+    "scenario_title": {
+      "type": "string"
+    },
+    "tier": {
+      "enum": [
+        "smoke",
+        "standard",
+        "large"
+      ]
+    },
+    "task": {
+      "enum": [
+        "regression",
+        "binary",
+        "multiclass",
+        "ranking"
+      ]
+    },
+    "primary_metric": {
+      "type": "string"
+    },
+    "threads": {
+      "type": "integer",
+      "minimum": 1
+    },
     "engine": {
-      "enum": ["mojotrees", "lightgbm", "catboost", "mojotrees_catboost_mode"],
+      "enum": [
+        "mojotrees",
+        "lightgbm",
+        "catboost",
+        "mojotrees_catboost_mode"
+      ],
       "description": "Four names, two rows. `mojotrees` against `lightgbm` is the comparator row and is the only one anything is gated on. `catboost` is a peer arm reported beside it, and `mojotrees_catboost_mode` is the mojotrees side of the second peer row, differing from `mojotrees` by exactly scenarios.MOJOTREES_CATBOOST_MODE. engines.ENGINE_ARM maps each name to subject, comparator, peer or peer_subject."
     },
-    "engine_version": {"type": ["string", "null"]},
-    "device_requested": {"enum": ["cpu", "gpu", "auto"]},
+    "engine_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "device_requested": {
+      "enum": [
+        "cpu",
+        "gpu",
+        "auto"
+      ]
+    },
     "device_used": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "What the engine resolved to, which can differ from what was asked for. The sparse path is cpu whatever was requested. A label, not evidence: it is Booster.device_, which the Python side sets from its own policy resolution while the trainer resolves the device again natively. See backend_proof."
     },
     "backend_proof": {
       "type": "object",
       "description": "Evidence from the trainer of which backend actually ran, as distinct from device_used, which is what the Python side resolved. Collected by turning the trainer's phase profile on for the measured fit only; the trainer prints it to the worker's stdout and run.py parses it back. `labels` are the report labels of the entry points that emitted a block, and train_gpu and grow_tree_gpu are literals in the GPU trainer's source that no CPU path can print. `transfer_calls` and `syncs` count work a host fit performs zero of. Any one of the three is enough for verify.py; none of them is a driver-level kernel count, and none of them attests a physical device, only the code path. An `unavailable_reason` with no counters means nobody looked, which is a different state from having looked and found nothing.",
       "properties": {
-        "source": {"type": "string"},
-        "requested": {"type": "boolean"},
-        "mode": {"type": "string"},
-        "blocks": {"type": "integer"},
-        "labels": {"type": "array", "items": {"type": "string"}},
-        "modes_seen": {"type": "array", "items": {"type": "string"}},
-        "trees": {"type": "integer"},
-        "nodes": {"type": "integer"},
-        "transfer_calls": {"type": "integer"},
-        "convert_calls": {"type": "integer"},
-        "host_sync_calls": {"type": "integer"},
-        "syncs": {"type": "integer"},
-        "dispatches": {"type": "integer"},
-        "unavailable_reason": {"type": ["string", "null"]}
+        "source": {
+          "type": "string"
+        },
+        "requested": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "blocks": {
+          "type": "integer"
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "modes_seen": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "trees": {
+          "type": "integer"
+        },
+        "nodes": {
+          "type": "integer"
+        },
+        "transfer_calls": {
+          "type": "integer"
+        },
+        "convert_calls": {
+          "type": "integer"
+        },
+        "host_sync_calls": {
+          "type": "integer"
+        },
+        "syncs": {
+          "type": "integer"
+        },
+        "dispatches": {
+          "type": "integer"
+        },
+        "unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "path": {
@@ -56,148 +162,327 @@
     },
     "data": {
       "type": "object",
-      "required": ["data_kind", "dataset"],
+      "required": [
+        "data_kind",
+        "dataset"
+      ],
       "properties": {
-        "data_kind": {"enum": ["real", "synthetic"]},
-        "dataset": {"type": "string"},
-        "pinned": {"type": "boolean"},
-        "pin_reason": {"type": ["string", "null"]},
+        "data_kind": {
+          "enum": [
+            "real",
+            "synthetic"
+          ]
+        },
+        "dataset": {
+          "type": "string"
+        },
+        "pinned": {
+          "type": "boolean"
+        },
+        "pin_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "fallback_reason": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "Why the generator was used when real data was asked for. Null when nothing fell back. A fallback is never silent."
         },
-        "generator": {"type": "string"},
-        "generator_kwargs": {"type": "object"},
-        "split": {"type": "object"},
-        "source": {"type": "object"},
-        "categorical_feature": {"type": "array", "items": {"type": "integer"}},
-        "category_vocab_sha256": {"type": "string"},
-        "train": {"$ref": "#/$defs/part"},
-        "test": {"$ref": "#/$defs/part"}
+        "generator": {
+          "type": "string"
+        },
+        "generator_kwargs": {
+          "type": "object"
+        },
+        "split": {
+          "type": "object"
+        },
+        "source": {
+          "type": "object"
+        },
+        "categorical_feature": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "category_vocab_sha256": {
+          "type": "string"
+        },
+        "train": {
+          "$ref": "#/$defs/part"
+        },
+        "test": {
+          "$ref": "#/$defs/part"
+        }
       }
     },
     "params": {
       "type": "object",
-      "required": ["shared", "engine"],
+      "required": [
+        "shared",
+        "engine"
+      ],
       "description": "The canonical parameters and the dicts the engine actually passed, both recorded so a reader can check the alignment rather than trust it. `engine` is returned by the adapter that used it rather than rebuilt from the scenario, because the adapter adds parameters the scenario module cannot know: the row-count-dependent bin_construct_sample_cnt on the LightGBM side and n_estimators on the mojotrees one. A record that rebuilt the dict omitted exactly those.",
       "properties": {
-        "shared": {"type": "object"},
-        "engine": {"type": "object"},
+        "shared": {
+          "type": "object"
+        },
+        "engine": {
+          "type": "object"
+        },
         "dataset": {
-          "type": ["object", "null"],
+          "type": [
+            "object",
+            "null"
+          ],
           "description": "The separate Dataset dict where the engine takes one. Null with dataset_unavailable_reason where it does not: LightGBM's Dataset and train share one dict, and mojotrees's estimator path takes the binning settings as keywords."
         },
-        "dataset_unavailable_reason": {"type": ["string", "null"]},
+        "dataset_unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "num_boost_round": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "description": "The round count the engine was asked for. A call argument rather than a parameter on the LightGBM side, so it would not otherwise appear anywhere in the record."
         }
       }
     },
     "engine_resolved_params": {
-      "type": ["object", "null"],
-      "description": "The parameter list the library itself resolved, read back from the fitted model, as distinct from `params.engine`, which is what was passed in. Present on the CatBoost rows and null elsewhere. It is there because CatBoost derives several defaults from the data: `learning_rate` is chosen from the iteration count and the dataset when it is not given one (0.5 at 2 iterations, 0.4273 at 100, 0.0657 at 1000 on one 20,000-row shape), and `boosting_type` is chosen from the dataset size. This harness pins the first and records the second per run. CatBoost.get_all_params() omits thread_count, so the adapter puts it back."
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "The parameter list the library itself resolved, read back from the fitted model, as distinct from `params.engine`, which is what was passed in. Present on the CatBoost rows and null elsewhere. It is there because CatBoost derives several defaults from the data: `learning_rate` is chosen from the iteration count and the dataset when it is not given one (0.5 at 2 iterations, 0.4273 at 100, 0.0657 at 1000 on one 20,000-row shape), and `boosting_type` is chosen from the dataset size. This harness pins NEITHER as of 2026-08-16: cb-shipped lets CatBoost resolve its own learning rate, so this field is the only place a record says what rate the CatBoost row actually trained at. See scenarios.CATBOOST_DELIBERATE_DIVERGENCE. CatBoost.get_all_params() omits thread_count, so the adapter puts it back."
     },
     "engine_resolved_params_source": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Where engine_resolved_params was read, or why it could not be."
     },
     "histogram_builder": {
       "type": "object",
       "description": "Which histogram construction the engine ran. Row-wise and col-wise are different algorithms over the same bins, so a training time is not reproducible without it. `resolved` is a string when the request settles the question and an unavailable measurement when it does not, which is LightGBM's auto mode: 4.7 keeps that choice in the tree learner's share state and exposes no getter.",
       "properties": {
-        "requested": {"type": ["string", "null"]},
-        "resolved": {
-          "oneOf": [{"type": "string"}, {"$ref": "#/$defs/optional_measurement"}]
+        "requested": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "recorded": {"type": "string"}
+        "resolved": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/optional_measurement"
+            }
+          ]
+        },
+        "recorded": {
+          "type": "string"
+        }
       }
     },
     "caveats": {
       "type": "array",
-      "items": {"type": "string"},
+      "items": {
+        "type": "string"
+      },
       "description": "Known ways this run is not a like-for-like comparison. Copied into every record the scenario produces and reprinted by report.py."
     },
     "quality": {
       "type": "object",
-      "additionalProperties": {"type": ["number", "null"]},
+      "additionalProperties": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
       "description": "Computed by quality.py from the predictions. Never an engine's own metric output."
     },
     "baseline_quality": {
       "type": "object",
-      "additionalProperties": {"type": ["number", "null"]},
+      "additionalProperties": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
       "description": "The trivial model's score on the same test set, so agreement between two bad models can be told apart from agreement between two good ones."
     },
-    "predictions_sha256": {"type": "string"},
-    "predictions_shape": {"type": "array", "items": {"type": "integer"}},
-    "predictions_path": {"type": "string"},
-    "warmup": {"$ref": "#/$defs/phase"},
+    "predictions_sha256": {
+      "type": "string"
+    },
+    "predictions_shape": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      }
+    },
+    "predictions_path": {
+      "type": "string"
+    },
+    "warmup": {
+      "$ref": "#/$defs/phase"
+    },
     "phases": {
       "type": "object",
       "properties": {
-        "import": {"$ref": "#/$defs/phase"},
+        "import": {
+          "$ref": "#/$defs/phase"
+        },
         "ingest": {
           "$ref": "#/$defs/phase",
           "description": "Getting the caller's array into the library's own layout, where that is a step the library exposes separately from binning. Present only on the CatBoost rows: Pool(X, label=y) converts and does not quantize. LightGBM's ingestion is inside Dataset.construct() and is counted in its binning phase, and mojotrees's is the transpose bench_train.mojo times as ingest_s. scenarios.PHASE_SHAPE states this per engine so the three end-to-end lines can be read against each other."
         },
         "binning": {
-          "oneOf": [{"$ref": "#/$defs/phase"}, {"type": "null"}],
+          "oneOf": [
+            {
+              "$ref": "#/$defs/phase"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "description": "Null on a path that bins inside fit, with binning_unavailable_reason alongside. That is every CatBoost row: pre-quantizing the Pool to expose the number changes the model above a few hundred thousand rows, because CatBoost draws its border-construction sample under a quantization seed the fit path does not share."
         },
-        "binning_unavailable_reason": {"type": "string"},
+        "binning_unavailable_reason": {
+          "type": "string"
+        },
         "encode": {
-          "oneOf": [{"$ref": "#/$defs/phase"}, {"type": "null"}],
+          "oneOf": [
+            {
+              "$ref": "#/$defs/phase"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "description": "The harness re-encoding its canonical float64 matrix into a container the engine will accept, plus the hash that proves the re-encoding lossless. Present only on a CatBoost row whose scenario declares categorical features, and null with encode_unavailable_reason everywhere else. It exists because catboost/core.py refuses cat_features on a floating-point array by dtype, so the categorical block has to become int64 and the container has to become mixed. Counted in e2e, because the row does not exist without it, and named separately because it is a HARNESS-CONVERSION cost rather than a property of CatBoost: a user whose categories already live in an integer column pays none of it. Subtract it before quoting a per-iteration figure. peak_rss_bytes on such a row also includes a full extra copy of the matrix. See scenarios.CATBOOST_CATEGORICAL_ENCODING."
         },
-        "encode_unavailable_reason": {"type": ["string", "null"]},
-        "train": {"$ref": "#/$defs/phase"},
-        "predict_batch": {"$ref": "#/$defs/samples"},
-        "predict_row": {"$ref": "#/$defs/samples"}
+        "encode_unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "train": {
+          "$ref": "#/$defs/phase"
+        },
+        "predict_batch": {
+          "$ref": "#/$defs/samples"
+        },
+        "predict_row": {
+          "$ref": "#/$defs/samples"
+        }
       }
     },
     "model": {
       "type": "object",
       "properties": {
-        "num_trees": {"type": ["integer", "null"]},
+        "num_trees": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "num_trees_note": {
           "type": "string",
           "description": "Present when the count is not comparable across engines. CatBoost builds one tree per iteration with a vector leaf value for MultiClass, where LightGBM and mojotrees build one per class per iteration, so a 100-iteration seven-class fit is 100 trees on one side and 700 on the other. The matched quantity is the iteration count."
         },
-        "current_iteration": {"type": ["integer", "null"]},
+        "current_iteration": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "num_bin": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "description": "Bins reserved per feature. mojotrees reports it directly; LightGBM has no such scalar, so its record carries the largest per-feature count, which is the closest analogue. Null only with num_bin_unavailable_reason beside it."
         },
-        "num_bin_unavailable_reason": {"type": "string"},
+        "num_bin_unavailable_reason": {
+          "type": "string"
+        },
         "bins": {
           "oneOf": [
             {
               "type": "object",
-              "required": ["n_features", "total", "sha256"],
+              "required": [
+                "n_features",
+                "total",
+                "sha256"
+              ],
               "properties": {
-                "n_features": {"type": "integer"},
-                "total": {"type": "integer"},
-                "max": {"type": "integer"},
-                "min": {"type": "integer"},
-                "mean": {"type": "number"},
-                "sha256": {"type": "string"},
+                "n_features": {
+                  "type": "integer"
+                },
+                "total": {
+                  "type": "integer"
+                },
+                "max": {
+                  "type": "integer"
+                },
+                "min": {
+                  "type": "integer"
+                },
+                "mean": {
+                  "type": "number"
+                },
+                "sha256": {
+                  "type": "string"
+                },
                 "source": {
                   "type": "string",
                   "description": "Present when the counts did not come from Dataset.feature_num_bin. The CatBoost rows read CatBoost.get_borders() off the fitted model and add one per feature to turn thresholds into bins, because CatBoost has no queryable binned dataset: its Pool is not quantized and its borders only become readable after a fit."
                 }
               }
             },
-            {"$ref": "#/$defs/optional_measurement"}
+            {
+              "$ref": "#/$defs/optional_measurement"
+            }
           ],
           "description": "The per-feature bin counts, reduced to the distribution plus a digest of the exact vector. This is the field that lets the binning alignment be checked by measurement instead of by reading scenarios.py. mojotrees and LightGBM both expose Dataset.feature_num_bin under that name and with that meaning; CatBoost does not, and its rows say where the counts came from in `source` rather than letting a reader assume all three came from the same kind of object. Note that CatBoost's GreedyLogSum picks well under its border budget on ordinary data where the other two fill theirs, so a lower total here is a binning difference and not a smaller budget."
         },
         "size": {
           "type": "object",
           "properties": {
-            "string_bytes": {"type": ["integer", "null"]},
-            "file_bytes": {"type": ["integer", "null"]},
-            "file_sha256": {"type": "string"},
-            "error": {"type": ["string", "null"]}
+            "string_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "file_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "file_sha256": {
+              "type": "string"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         }
       }
@@ -207,7 +492,10 @@
       "description": "Host-to-device transfer time. Currently unavailable on both engines and recorded as such rather than estimated."
     },
     "peak_rss_bytes": {
-      "type": ["integer", "null"],
+      "type": [
+        "integer",
+        "null"
+      ],
       "description": "Peak resident set of the worker process, in bytes on every platform. Meaningful because each run has its own process."
     },
     "environment": {
@@ -217,83 +505,196 @@
     "worker": {
       "type": "object",
       "properties": {
-        "returncode": {"type": "integer"},
-        "wall_s": {"type": "number"},
-        "stderr_tail": {"type": "string"}
+        "returncode": {
+          "type": "integer"
+        },
+        "wall_s": {
+          "type": "number"
+        },
+        "stderr_tail": {
+          "type": "string"
+        }
       }
     },
     "error": {
       "type": "object",
       "properties": {
-        "type": {"type": "string"},
-        "message": {"type": "string"},
-        "traceback": {"type": "string"},
-        "stderr": {"type": "string"}
+        "type": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "traceback": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
       }
     },
-    "skip_reason": {"type": "string"}
+    "skip_reason": {
+      "type": "string"
+    },
+    "engine_resolved_params_drift": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "Where this fit's get_all_params() disagrees with scenarios.CATBOOST_LEFT_AT_STOCK, one message per key. An empty list means a live fit agreed with this harness's transcription of CatBoost's defaults; a non-empty one means the transcription is wrong or CatBoost has moved a default, and the resolved-parity table beside it is reasoning from a stale premise. Present on the CatBoost rows and null elsewhere. Recorded rather than raised: a CatBoost upgrade is a thing to find out about from a record, not a reason to lose a cell."
+    }
   },
   "$defs": {
     "phase": {
       "type": "object",
-      "required": ["elapsed_s"],
+      "required": [
+        "elapsed_s"
+      ],
       "properties": {
-        "elapsed_s": {"type": ["number", "null"], "description": "Wall time, perf_counter."},
-        "cpu_s": {"type": ["number", "null"], "description": "Process CPU time across all threads."},
+        "elapsed_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Wall time, perf_counter."
+        },
+        "cpu_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Process CPU time across all threads."
+        },
         "parallel_efficiency": {
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "description": "cpu_s divided by elapsed_s. Near 1 on a single-threaded run; a run configured for N threads that reports 1 did not get them."
         }
       }
     },
     "samples": {
       "type": "object",
-      "required": ["measured"],
+      "required": [
+        "measured"
+      ],
       "properties": {
-        "warmup": {"type": "array", "items": {"$ref": "#/$defs/phase"}},
-        "measured": {"type": "array", "items": {"$ref": "#/$defs/phase"}}
+        "warmup": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/phase"
+          }
+        },
+        "measured": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/phase"
+          }
+        }
       },
       "description": "Warmup calls and measured calls kept apart. Aggregation happens in report.py, not here."
     },
     "optional_measurement": {
       "type": "object",
-      "required": ["value"],
+      "required": [
+        "value"
+      ],
       "properties": {
-        "value": {"type": ["number", "null"]},
-        "unit": {"type": "string"},
-        "unavailable_reason": {"type": "string"}
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "unit": {
+          "type": "string"
+        },
+        "unavailable_reason": {
+          "type": "string"
+        }
       }
     },
     "part": {
       "type": "object",
       "properties": {
-        "rows": {"type": "integer"},
-        "features": {"type": "integer"},
-        "sparse": {"type": "boolean"},
-        "nnz": {"type": "integer"},
-        "density": {"type": "number"},
-        "missing_fraction": {"type": "number"},
-        "queries": {"type": "integer"},
-        "label_mean": {"type": "number"},
-        "label_distinct": {"type": "integer"},
+        "rows": {
+          "type": "integer"
+        },
+        "features": {
+          "type": "integer"
+        },
+        "sparse": {
+          "type": "boolean"
+        },
+        "nnz": {
+          "type": "integer"
+        },
+        "density": {
+          "type": "number"
+        },
+        "missing_fraction": {
+          "type": "number"
+        },
+        "queries": {
+          "type": "integer"
+        },
+        "label_mean": {
+          "type": "number"
+        },
+        "label_distinct": {
+          "type": "integer"
+        },
         "digest": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "sha256 of the CANONICAL form: the float64 feature matrix, then the float64 label, then the int64 group vector, fed to one running hash by measure.canonical_digest. Every engine builds its data independently and equal digests are what makes the arms comparable; verify.py fails a scenario whose arms disagree, with no per-engine exemption. It is NOT necessarily a digest of the bytes an engine physically received -- read `encoding` beside it for that -- and since 2026-08-16 it does not claim to be."
         },
         "encoding": {
           "type": "object",
           "description": "Which physical container this engine was handed, and the in-run proof that the container did not change a value. Two questions that used to be one field: `digest` says the arms were given the same problem, and this says what shape each of them got it in. The canonical form is `float64_matrix` and most rows carry exactly that with is_canonical true. A CatBoost row on a categorical scenario carries `mixed_frame_int64_categorical`, because catboost/core.py refuses cat_features on a floating-point array by dtype and the numeric columns cannot become integers. THE FIELD TO READ IS agrees_with_canonical: true means the adapter reconstructed the canonical form out of the container it built, hashed it with the same function, and got the same digest, so the engine was given the same values in a different container. false means it was given different data and nothing on that scenario is comparable. null means the run computed no canonical digest (--no-data-digest) and there was nothing to compare against; the per-column losslessness checks in `proof` still ran. See scenarios.CATBOOST_CATEGORICAL_ENCODING for the argument and worker.CANONICAL_ENCODING for the rule.",
           "properties": {
-            "form": {"type": "string"},
-            "is_canonical": {"type": "boolean"},
-            "agrees_with_canonical": {"type": ["boolean", "null"]},
-            "contract": {"type": "string"},
-            "container": {"type": "string"},
-            "categorical_columns": {"type": "array", "items": {"type": "integer"}},
-            "categorical_dtype": {"type": "string"},
-            "numeric_dtype": {"type": "string"},
-            "canonical_digest_recomputed": {"type": ["string", "null"]},
-            "proof": {"type": "object"}
+            "form": {
+              "type": "string"
+            },
+            "is_canonical": {
+              "type": "boolean"
+            },
+            "agrees_with_canonical": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "contract": {
+              "type": "string"
+            },
+            "container": {
+              "type": "string"
+            },
+            "categorical_columns": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "categorical_dtype": {
+              "type": "string"
+            },
+            "numeric_dtype": {
+              "type": "string"
+            },
+            "canonical_digest_recomputed": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "proof": {
+              "type": "object"
+            }
           }
         }
       }

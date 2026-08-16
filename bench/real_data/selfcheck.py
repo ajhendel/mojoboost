@@ -839,10 +839,18 @@ def check_catboost_arm():
                     "reason. Every key this arm does not match carries the "
                     "reason it does not",
                 )
-            # A not_reached key that names the scenarios which WOULD reach it
-            # must not have any of them scheduled for this arm. This is the
-            # coupling that stops `one_hot_max_size` staying unset the day
-            # somebody turns a categorical scenario back on.
+            # `required_when_scenarios` names the scenarios that would make a
+            # key live, and what it demands depends on the verdict.
+            #
+            # not_reached: none of them may be scheduled for this arm, or the
+            # key is reached and unmatched.
+            #
+            # matched: the key must be NAMED in MOJOTREES_CATBOOST_MODE rather
+            # than agreeing through CATBOOST_PARAM_MAP's declared default,
+            # because a match by coincidence is one default change away from a
+            # silent divergence. This is what keeps `max_cat_to_onehot=2` set:
+            # it is inert on all three scenarios this arm runs today, so
+            # nothing else in this file would notice it being deleted.
             for reachable in entry.get("required_when_scenarios", ()):
                 live = (
                     scenarios.MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT.get(
@@ -850,14 +858,26 @@ def check_catboost_arm():
                     )
                     is None
                 )
-                check(
-                    not live,
-                    f"{row['catboost']} is declared not_reached because no "
-                    f"scenario this arm runs reaches it, and {reachable} now "
-                    "runs it. Either set the matching key in "
-                    "MOJOTREES_CATBOOST_MODE and move this row to matched, or "
-                    "record why the two arms may differ on it",
-                )
+                if row["status"] == "not_reached":
+                    check(
+                        not live,
+                        f"{row['catboost']} is declared not_reached because "
+                        f"no scenario this arm runs reaches it, and "
+                        f"{reachable} now runs it. Either set the matching "
+                        "key in MOJOTREES_CATBOOST_MODE and move this row to "
+                        "matched, or record why the two arms may differ on it",
+                    )
+                else:
+                    check(
+                        row["mojotrees"] in scenarios.MOJOTREES_CATBOOST_MODE,
+                        f"{row['catboost']} -> {row['mojotrees']} is matched "
+                        "and required_when_scenarios names "
+                        f"{reachable}, and MOJOTREES_CATBOOST_MODE does not "
+                        f"set {row['mojotrees']}. It agrees by default rather "
+                        "than by being asked for, so one default change on "
+                        "either side makes the two arms differ with nothing "
+                        "recording it",
+                    )
         # The old teeth, kept. A mode entry the translator drops produces no
         # diff against the plain arm and must still fail: the parity table
         # would catch it only for keys CatBoost also resolves, and
@@ -947,6 +967,42 @@ def check_catboost_arm():
                 f"CATBOOST_PARAM_MAP[{key!r}] is matched and names no key on "
                 "our side",
             )
+    # The two mechanisms for the learning rate are mutually exclusive, and
+    # half-wiring both is an arm that runs a rate neither engine chose.
+    _readback_keys = set(scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK)
+    _unset_keys = set(scenarios.MOJOTREES_CATBOOST_MODE_UNSET)
+    check(
+        not (_readback_keys & _unset_keys),
+        f"{sorted(_readback_keys & _unset_keys)} is both taken from CatBoost's "
+        "read-back and removed from the parameters. Removals run before the "
+        "read-back is applied, so the key would be set anyway and the removal "
+        "would look effective while doing nothing. See "
+        "CATBOOST_LEARNING_RATE_TRANSITION",
+    )
+    check(
+        not (_unset_keys & set(scenarios.MOJOTREES_CATBOOST_MODE)),
+        f"{sorted(_unset_keys & set(scenarios.MOJOTREES_CATBOOST_MODE))} is "
+        "both set by MOJOTREES_CATBOOST_MODE and removed by "
+        "MOJOTREES_CATBOOST_MODE_UNSET. The removal wins and the value is "
+        "dead, which reads as a pin that is not one",
+    )
+    for _key in _unset_keys:
+        check(
+            _key in scenarios.MOJOTREES_CATBOOST_MODE_REASONS,
+            f"{_key} is removed from the CatBoost-mode parameters with no "
+            "reason recorded beside it in MOJOTREES_CATBOOST_MODE_REASONS",
+        )
+    check(
+        bool(scenarios.CATBOOST_LEARNING_RATE_TRANSITION.get("today"))
+        and bool(
+            scenarios.CATBOOST_LEARNING_RATE_TRANSITION.get(
+                "where_the_comparison_lives"
+            )
+        ),
+        "CATBOOST_LEARNING_RATE_TRANSITION does not say how the arm gets the "
+        "rate today or where the comparison against CatBoost's own value "
+        "lives, and two mechanisms are in flight for that one value",
+    )
     check(
         set(scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK.values())
         <= set(scenarios.CATBOOST_PARAM_MAP),

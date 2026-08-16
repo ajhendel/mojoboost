@@ -89,12 +89,32 @@ Two rows, both against the same CatBoost arm:
 | us in CatBoost mode vs CatBoost defaults | `mojotrees_catboost_mode` | `catboost` |
 | our defaults vs CatBoost defaults | `mojotrees` | `catboost` |
 
-Both at **matched tree count and matched learning rate**. The learning rate
-is not a formality here. CatBoost picks its own from the iteration count and
-the dataset when it is not given one, and the value it picks moves with the
-budget: 0.5 at 2 iterations, 0.4273 at 100 and 0.06573 at 1000, measured at
-20,000 rows by 20 features. A run that left it alone would compare two
-different models.
+Both at a **matched tree count** and at **each engine's own learning rate**.
+The second half changed on 2026-08-16, the arm id moved from `cb-default` to
+`cb-shipped` to mark it, and every CatBoost number taken under the old id is
+superseded rather than re-labelled.
+
+CatBoost picks its own rate from the iteration count and the dataset when it is
+not given one, and the value moves with the budget: 0.5 at 2 iterations, 0.4273
+at 100 and 0.06573 at 1000, measured at 20,000 rows by 20 features. This
+harness used to pin it to 0.1 so all three arms ran one rate; it does not any
+more, so the CatBoost column trains at whatever CatBoost chose for that cell
+and the two arms beside it train at 0.1.
+
+> **Do not read the CatBoost accuracy column as an engine claim.** At a fixed
+> 100-tree budget an engine training at roughly 0.43 walks much further down
+> its loss curve than one training at 0.1, so this column can improve against
+> `cb-default@v1` without a single line of CatBoost running faster or fitting
+> better. The difference is a learning rate multiplied by a budget. Read it as
+> an out-of-the-box claim, which is what it is: a user who asks CatBoost for
+> 100 trees gets CatBoost's rate and a user who asks LightGBM for 100 trees
+> gets 0.1.
+
+The `mojotrees_catboost_mode` row takes CatBoost's **resolved** rate for the
+same cell, read off the fitted CatBoost model, so "us in CatBoost's shape" is
+CatBoost's own number rather than a transcription. Every record carries
+`params.resolved_parity`, which is the key-by-key diff between the two engines'
+resolved dicts; read it before quoting either row.
 
 ### Determinism, which is weaker here than on the comparator
 
