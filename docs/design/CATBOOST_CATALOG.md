@@ -177,6 +177,153 @@ chosen. Building it would be building a gate that cannot open.
 | A14 | Model shrinkage: `model_shrink_rate`, `model_shrink_mode` (**verified from source**, see the A13/A14 note) | At the top of every iteration after the first, every accumulated raw score is multiplied by `1 - rate * learning_rate` (Constant) or `1 - rate / iteration` (Decreasing); the products are folded back into the leaf values of the already-grown trees at the end of the fit | Only when on | Yes, `langevin.mojo`, off by default. Built as a deferred fold (strictly less work than CatBoost's per-round rescale of the model, and exact) | CPU (`langevin.mojo`) | (1) as built, off; (3) when on. Refused beside continued training and beside `init_score`, both of which CatBoost also refuses |
 | A15 | `feature_border_type` / `border_count` (`library/cpp/grid_creator/binarization.cpp`, `catboost/libs/data/quantization.cpp`) | CatBoost's float quantization: seven border-selection algorithms, `GreedyLogSum` by default, bounded by `border_count` thresholds | New mode; bit-moving on the arm that selects it, exact on the arm that does not | Yes, opt-in `border_type`, default stays the LightGBM/mojotrees quantile fit | CPU (`binning.mojo`) | A15 note. **BUILT**, five of seven types, `binning.fit_bins(border_type=...)` |
 | A16 | `one_hot_max_size` (`catboost/private/libs/options/cat_feature_options.cpp`, `catboost/private/libs/algo/greedy_tensor_search.cpp`) | CatBoost's categorical one-hot threshold, default 2, `<=` on the count of real categories seen on learn | New mode; bit-moving only when set | Yes, opt-in `CategoricalParams.one_hot_max_size`, default off | CPU (`categorical.mojo`) | A16 note. **BUILT**. It also settles the owed `max_cat_to_onehot` off-by-one, see A12 |
+| A17 | Model save/load and interchange export (`catboost/libs/model/model_export/`: `cbm`, `json`, `onnx`, `coreml`, `python`, `cpp`) | CatBoost saves every fitted artifact the model needs to score, CTR tables and text dictionaries included, and can additionally emit an ONNX `ai.onnx.ml` tree ensemble | No. Nothing here changes a trained model; the whole rule is that a reloaded model scores **bit-identically** | Yes, and it is bucket C: an arm we cannot save is an arm nobody can ship, and an export that silently drops fitted state is a wrong comparison that looks fine | `serialize.mojo` (mine), `onnx_export.mojo` (new, mine) | A17 note. **Enumeration is the deliverable.** Format: NO version bump needed for A8/A11-A16; ONNX exporter BUILT for the numerical/expressible subset and REFUSES the rest by name |
+
+### A17 note: what must serialize, what is merely recorded, and where ONNX stops
+
+Written 2026-08-16 against `bfd6187`. Everything in the two tables below was
+read out of the tree; the `state`/`parameter` column is a judgment about what
+prediction consumes, and it is the column this lane exists to get right.
+
+**The distinction.** A thing is **state** when the fitted model cannot produce
+its trained scores without the exact value, so the file must carry it. A thing
+is a **parameter** when it only shaped which trees got grown; it is worth
+recording for provenance and for continued training, and a loaded model
+predicts correctly without it. Section 7.5 of
+[docs/COMPATIBILITY_POLICY.md](../COMPATIBILITY_POLICY.md) already draws this
+line; this note applies it to the CatBoost campaign's additions.
+
+**The trap this note is about.** A CTR table and a text dictionary are fitted
+*from the training target*. They look like preprocessing configuration and
+they are not: they are as much model state as a leaf value. Anything that
+transforms a raw column into a model input using a number learned from `y` is
+state. That test, not the module a thing happens to live in, is what decides
+the column.
+
+#### Table 1. Campaign items, classified
+
+| Item | Catalog | Status in the tree at `bfd6187` | State or parameter | Serialized today? |
+|---|---|---|---|---|
+| Symmetric / oblivious trees | A8 | `GROW_OBLIVIOUS` is a `TreeParams.grow_policy` code (`tree.mojo:224`); the grown tree is an ordinary `Tree`, no extra fields | **Parameter.** The shape is materialized into the generic flat arrays, so nothing is lost | Yes, as an ordinary tree. The *fact* that it is oblivious is not recorded and cannot be recovered |
+| MVS bootstrap | A11 | `sampling.mojo`, `MvsBootstrapParams:1021` | **Parameter.** Its only residue is that `Tree.count` covers sampled rows, which is already serialized | n/a |
+| Bayesian bootstrap | A4 | `sampling.mojo` | **Parameter** | n/a |
+| Langevin / `diffusion_temperature` | A13 | `langevin.mojo:232`, **unwired** (only `tests/test_langevin.mojo` imports it) | **Parameter.** Seeded noise on derivatives; leaves absorb the result | n/a |
+| Model shrinkage | A14 | `langevin.mojo:562,751`, **unwired**. `ModelShrinkPlan.fold_into_trees:838` multiplies `Tree.value` and returns the residual the base score owes | **Parameter, *after* the fold.** Before the fold it is state; the fold is what makes it a parameter, which is the whole reason the deferred design is the right one. **Caveat:** `split_gain` is deliberately not scaled (`langevin.mojo:869`), so a shrunk model's gains and values are on different scales, and a consumer reading both must know | n/a, and correctly so |
+| Automatic `learning_rate` | A12 | `auto_learning_rate.mojo`, wired through `params.mojo:73` | **STATE.** The resolved number depends on `n_rows` and `n_iterations`; re-deriving it at load time from `auto=True` would give a different rate on different data. It lands in `Booster.learning_rate` | Yes. `serialize.mojo:543`, and see the learning-rate hazard below |
+| `feature_border_type` / `border_count` | A15 | `binning.fit_bins(border_type=...)`; **not a `BinMapper` field** | **Parameter**, whose entire effect is baked into `BinMapper.edges`, which is state | Edges yes; the type no |
+| `one_hot_max_size` | A16 | `CategoricalParams:191`; selects a search algorithm, leaves no residue beyond an ordinary `CatBitset` | **Parameter** | Resulting bitsets yes; the knob no |
+| Cosine `score_function` | A10 | `split.mojo` | **Parameter** | n/a |
+| `derivative_precision` | — | gradient staging | **Parameter** | n/a |
+| Ordered target statistics / CTRs | A5 | **Does not exist.** `params.mojo:983` *refuses* `max_ctr_complexity` with the reason | **STATE when it lands.** Fitted from `y`; a model without its CTR tables scores wrong, silently | No, and it must become a format section, see below |
+| Ordered boosting / fold ladder | A7 | Not built | **Parameter.** The permutation ladder is a training scheme; the shipped model is the plain one | n/a |
+| Ranking objectives / `group_id` | — | `ranking.mojo`. `RankGroups:108` is a training argument, not a `Booster` field | **Parameter** | n/a, correctly |
+| Ranking **position bias** | — | `ranking_advanced.mojo:469`, `PositionBiasState` | **STATE, and it is outside the file today.** Per-position offsets fitted by a Newton step. The source says so at `ranking_advanced.mojo:2062`; the returned struct is the only copy | **No. This is the one live gap** |
+| Survival objectives | — | **Do not exist.** No file, no objective code | **Parameter** when they land (AFT's distribution and scale shape gradients only; the score is a risk score) | n/a |
+| Multi-target objectives | — | **Do not exist.** `objective_is_multi_output` is satisfied only by multiclass | **STATE-shaped format change.** `Tree.value` is one `Float64` per node. Either one tree per target per round, as multiclass already does, or vector leaves, which is a real format change | n/a |
+| Text features + dictionaries + estimators | — | **Do not exist.** Exhaustive grep for `tokeniz\|dictionar\|ngram\|bag_of_words\|feature_calcer` finds nothing but prose | **STATE when they land.** A dictionary is fitted vocabulary; a BM25 or naive-Bayes estimator is fitted from `y` | No |
+| Embedding features | — | **Do not exist** | **STATE when they land** (any fitted projection or LDA-style estimator) | No |
+
+#### Table 2. The minimum sufficient scoring set, as it stands
+
+Everything a loaded model must have to reproduce `Model.predict` exactly:
+
+```
+BinMapper.edges, .edge_offsets, .n_features, .n_bins, .missing_bin
+CategoricalSpec.is_categorical, .codes, .offsets
+Booster.base_score            | MulticlassBooster.base_scores + .n_classes
+Booster.learning_rate
+Booster.objective             (selects the inverse link; implicit for multiclass)
+MonotoneConstraints.signs     (not needed to score; a property the model satisfies)
+Tree.{feature, threshold_bin, left, right, value, n_leaves,
+      default_left, missing_bin, cat_offset, cat_bitset, count, split_gain}
+LinearEnsemble.*              (only when active; format v5)
+```
+
+`serialize.mojo` writes every one of these. **The headline finding is therefore
+that nothing merged at `bfd6187` needs a format change.** A8, A10 through A16
+all reduce either to a tree the existing writer already handles or to a knob
+prediction never reads. The format bump this lane was expected to need is not
+owed yet. It becomes owed the moment CTRs, text features, or multi-target
+leaves land, and Table 1 says which.
+
+#### Three hazards found while enumerating, none of them mine to fix
+
+**H1. The objective code is the file format.** `Booster.objective` is an `Int`
+(`boosting.mojo:1498`) written as a decimal integer (`serialize.mojo:541`) and
+read back as one (`serialize.mojo:941`). The constants at
+`objective_registry.mojo:239-263` are literal on-disk values. **Renumbering one
+silently reinterprets every model file ever written** -- a Poisson model
+becomes a Huber model, applies the wrong inverse link, and raises nothing.
+Under migration rule R6 this is "repurpose a field", which a version bump may
+not do. Owner: the `objective-marshaller` lane. What is owed is a comment at
+the constants saying they are frozen, and a snapshot key; `mojo.objective_codes`
+already exists in `compatibility/api_snapshot.json`, which is the right gate.
+
+**H2. A multiclass file records no objective at all.** `save_model` writes
+`objective <code>`; `save_multiclass_model` writes `multiclass <K>` instead
+(`serialize.mojo:581`). Softmax is the only multiclass objective today, so the
+implication holds -- and it stops holding the day a second one exists. This is
+an addition under R6 (a new optional token), not a break, and it should be made
+before a second multiclass objective, not after.
+
+**H3. `BinMapper.usable` is dropped on load.** `_write_mapper`
+(`serialize.mojo:349`) does not write it and `_read_mapper` reconstructs the
+mapper with an empty `usable`, which the constructor defaults to all features
+(`binning.mojo:2290`). Prediction never reads `usable`, so **no score changes**.
+What breaks is `BinMapper.matches` (`binning.mojo:2320`, which compares
+`usable` at `:2344`) and therefore `train_more` on a reloaded
+`feature_pre_filter=True` model. It is a real round-trip loss with a bounded
+blast radius, and fixing it is an optional-section addition.
+
+#### Determinism, checked rather than assumed
+
+The rule is that a serialized format must not depend on hash iteration order.
+**There is no `Dict[` anywhere in `src/`** -- every table in this package is a
+`List` or a flat `(values, offsets)` CSR pair, and `CategoricalSpec.codes` is
+additionally required to be strictly ascending within each feature's slice,
+which `_read_categorical` enforces on the way in (`serialize.mojo:697`). So the
+format is order-deterministic by construction, across `MOJOTREES_NUM_WORKERS`
+and across machines, and floats travel as IEEE-754 bit patterns so no rounding
+enters. **When CTRs and text dictionaries land, this is the property they will
+be most likely to break**, because a vocabulary is the natural place to reach
+for a map: the section must be written in a sorted order fixed by the file, not
+by whatever the builder happened to iterate.
+
+#### ONNX: what the operator can express, and what this lane refuses
+
+See [MODEL_EXPORT.md](MODEL_EXPORT.md) for the full boundary. The short form:
+
+- The target is `ai.onnx.ml.TreeEnsembleRegressor` at **ml opset 3**, whose
+  `nodes_values_as_tensor` / `target_weights_as_tensor` / `base_values_as_tensor`
+  attributes carry `double`, so thresholds and leaf values export without
+  narrowing. `ai.onnx.ml` opset 5 deprecates it in favor of `TreeEnsemble`.
+  Verified 2026-08-16 from the ONNX operator reference.
+- `bin <= threshold_bin` converts to `x <= edges[threshold_bin]` **exactly**,
+  because `bin(x)` is the first `b` with `x <= edges[b]`.
+- NaN routing converts exactly to `nodes_missing_value_tracks_true`, including
+  the `use_missing=False` case where mojotrees bins NaN as `0.0`: that
+  destination is a per-node constant the exporter computes.
+- **Leaf values are stored unscaled.** Every predict path does
+  `s += learning_rate * tree_value` (`boosting.mojo:1573`). An exporter that
+  copies `Tree.value` straight into `target_weights` produces a model that
+  loads, validates, and scores wrong by a factor of `learning_rate`. This is
+  the single most likely silent defect in the whole export and it is why
+  `onnx_export.mojo` does the multiply in one place.
+- **Refused, by name:** categorical features of any kind, linear leaves, the
+  `CUSTOM` objective outside raw mode, and (when they land) CTR features, text
+  features, embedding features, and vector leaves.
+
+**One measured finding worth carrying beyond this lane.**
+`Booster.predict_raw_bins` writes `s += learning_rate * value`, which the
+compiler contracts into a **fused multiply-add**. Any consumer that forms the
+product first -- an ONNX graph, a reimplementation, a differential harness --
+does two roundings where mojotrees does one, and cannot be bit-identical to
+`Model.predict_raw` however correct it is. Observed while building
+`tests/test_onnx_export.mojo`: one ULP on a 20-tree squared-error fit, and
+pinned to the fused multiply rather than to leaf selection or summation order
+by re-running at `learning_rate = 1.0`, where the product is exact and the two
+agree bit for bit. Anyone writing a bit-identity claim against the CPU
+predictor should know this is in the way.
 
 ### A4 note: Bayesian bootstrap, verified from source
 
