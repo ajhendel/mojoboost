@@ -140,6 +140,15 @@ max = ">=26.5.0,<27"
 python = ">=3.11"
 numpy = "*"
 lightgbm = "*"
+# bench/real_data/selfcheck.py's categorical fixture needs pandas, and the
+# CatBoost adapter needs it to hand CatBoost a mixed float-and-integer frame:
+# numpy has no mixed dtype and an object array of a million rows is not a
+# container this harness will build. It was declared only under `pytest` and
+# passed here by accident, because catboost happens to depend on pandas. An
+# accidental dependency is one `catboost` release away from being a missing
+# one, and the failure would look like a broken fixture rather than a missing
+# declaration.
+pandas = "*"
 # The CatBoost peer arm of bench/real_data. It is a peer column reported
 # beside the comparator and never instead of it: the one comparator is
 # LightGBM at stock defaults plus deterministic=true, and nothing is gated

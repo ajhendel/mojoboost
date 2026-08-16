@@ -44,3 +44,8 @@ bench/apple/metal_traces/
 
 # Agent worktrees: real git worktrees, never repo content.
 .claude/worktrees/
+
+# `mojo precompile` drops this beside the manifest. It is a build artifact
+# of a compile, not content, and it reappears every time anyone verifies the
+# package builds.
+mojotrees.mojoc
