@@ -13,6 +13,8 @@ Silicon Macs, written in [Mojo](https://www.modular.com/mojo).
 > [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md) and
 > [docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md), report failures, and do
 > not rely on unvalidated hardware or parameter combinations in production.
+> On speed specifically, [Where the speed stands](#where-the-speed-stands)
+> gives the current numbers against LightGBM in both directions.
 
 mojotrees is a from-scratch GBDT library in the LightGBM family. It uses
 histogram-based split finding and leaf-wise (best-first) tree growth. Its
@@ -28,8 +30,9 @@ welcomes contributors without transferring their copyright.
 
 Development has made extensive use of AI-assisted coding tools under human
 direction and review. Andrew remains accountable for what the project claims,
-merges, releases, and supports. The project treats reproducible evidence—not
-who or what typed a change—as the standard for correctness and performance.
+merges, releases, and supports. The project treats reproducible evidence,
+not who or what typed a change, as the standard for correctness and
+performance.
 
 - [Authors and attribution](AUTHORS.md)
 - [Project origin and stewardship](docs/PROJECT_ORIGIN.md)
@@ -115,10 +118,15 @@ written out, in [docs/INSTALLATION.md](docs/INSTALLATION.md#the-first-five-minut
 `device="cpu"` is the default and the dependable backend. `device="gpu"`
 requires an available supported accelerator and raises on unsupported
 hardware or workloads rather than silently falling back. `device="auto"`
-resolves to the CPU on every machine and every workload today, because its
-crossover heuristic is deliberately disabled until end-to-end benchmark
-evidence establishes a trustworthy threshold. Read
-[Device selection](#device-selection) before using it.
+still resolves to the CPU in practice, but no longer because the crossover
+table is empty: `crossover_rules()` now holds one rule, scoped to Metal on
+an Apple M4 for unweighted squared error at 1,000,000 rows by 50 features
+and above. The reason a defaulted `fit(device="auto")` does not reach it is
+narrower and is a real gap rather than a policy: a hardware-scoped rule can
+match only a profile that names the hardware, and `DeviceCapabilities.detect()`
+opens no device, so `resolve_device` sees an unidentified machine, warns,
+and keeps the CPU. Read [Device selection](#device-selection) before using
+it.
 
 The two backends are not a primary and a port. On an accelerator the GPU
 owns the data plane, and the CPU owns the control plane, small data, and
@@ -355,6 +363,63 @@ def main() raises:
 
 Lower-level entry points `train`, `train_with_valid`, and
 `train_multiclass` operate on pre-binned matrices.
+
+### Where the speed stands
+
+Correctness, determinism, portability, memory, and accuracy are the parts
+of this project that are good and measured. Speed is the part that is
+behind, and this section says by how much rather than leaving a reader to
+find out from a benchmark file.
+
+Every number here is Apple M4, Mojo 1.0.0, 100 rounds, 31 leaves, 255 bins,
+squared error, seconds of training time with binning excluded, median of
+three with the arms interleaved. The record is
+[`bench/results/profile_2026-08-15/RESULTS.md`](bench/results/profile_2026-08-15/RESULTS.md),
+taken under the rules committed beforehand in
+[`bench/results/PROFILE_PROTOCOL.md`](bench/results/PROFILE_PROTOCOL.md).
+
+| shape | our CPU | our GPU | LightGBM, 10 threads |
+|---|---|---|---|
+| 1,000,000 x 50 | 6.98 | **3.58** | **2.86** |
+| 250,000 x 50 | **1.66** | 1.89 | **1.00** |
+| 50,000 x 50 | **0.564** | 1.63 | 0.594 |
+
+Read plainly:
+
+- **At the headline shape we lose.** LightGBM is 2.44x our CPU and 1.25x
+  our GPU at 1,000,000 x 50. Those gaps were 4.06x and 1.46x before this
+  round's work, so they are closing, and they are still gaps.
+- **At 50,000 rows on the CPU we win**, 0.564 against 0.594. It is a narrow
+  win and it is the shape a new user is most likely to try first.
+- **We bin 3.2x faster**, 0.377s against LightGBM's 1.207s, on the same
+  data. Binning is excluded from the table above, so this is a column we win
+  outright and it is separate from every training figure here.
+- **The GPU beats our own CPU only at a million rows**, by 1.85x. Below
+  that it loses to our own CPU, because it carries roughly 1.5 seconds of
+  fixed cost per fit that does not scale with rows.
+- **The GPU wins multiclass**, 15.30 against the CPU's 25.47 at 465,000 rows
+  by 54 features over 7 classes, so 1.63x. That is the first honest
+  multiclass measurement in the project; every earlier one was a CPU fit
+  wearing a GPU label, and the dispatch bug behind that is fixed.
+- **Serially we are 1.81x behind**, 15.96 at one worker against LightGBM's
+  8.82 at one thread, so the deficit is not only threading. We do get 2.29x
+  from ten cores where LightGBM gets 3.08x, so both are true at once: the
+  inner loop is slower and the parallel scaling is worse.
+
+The dominant GPU cost is now located and not yet fixed. The first Metal
+timeline this project has taken
+([docs/METAL_TIMELINE.md](docs/METAL_TIMELINE.md)) says the GPU is idle for
+76.5% of a training span at 200,000 rows and 87.5% at 50,000, at the
+device's Maximum clock rather than a downclock. The host blocks on 94.1% of
+blits and on 2 compute kernels out of 18,701, which is 32.1 serialization
+points per round. One blocking readback costs 606 microseconds of wall
+clock, of which 3.7 microseconds is the GPU moving bytes. Compute of every
+kind is 22.9% of a round, so even an infinitely fast histogram kernel leaves
+most of the round in place.
+
+Nothing here has been measured on any device other than one Apple M4. No
+NVIDIA or AMD hardware has ever executed this code
+([docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md)).
 
 ## Sparse input
 
@@ -772,14 +837,31 @@ and every objective they cover: the sample is chosen on the host from
 Float64 gradients and handed to the device as the tree's row list, so the
 two backends sample identically.
 
-`auto`'s size heuristic ships disabled, so `auto` currently always
-resolves to the CPU. No benchmark on any device has established a
-workload size where end-to-end GPU training beats the CPU trainer, and
-shipping a crossover threshold before then would be a performance claim
-with nothing behind it. `MOJOTREES_AUTO_MIN_CELLS` enables it as an
+`crossover_rules()` holds exactly one rule, and it is the smallest claim
+the records support. `auto` selects the GPU when the API is Metal, the
+Apple generation is M4, the objective is squared error, the output count is
+one, and the shape is at least 1,000,000 rows by 50 features. That rule
+rests on two interleaved CPU against GPU records at exactly that shape
+(`bench/results/apple_m4_large_scaling_2026-08-14.md` and the 2026-08-15
+section of [docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md)), and every
+other backend, Apple generation, objective, smaller shape, and multiclass
+falls through to the CPU because nothing measured them.
+
+In practice a defaulted `fit(device="auto")` still gets the CPU with a
+warning, on the very machine the rule was measured on, and this is a real
+gap rather than caution. A hardware-scoped rule can match only a device
+profile that names the hardware, and `DeviceCapabilities.detect()` opens no
+device, so it yields an unidentified profile that no scoped rule can match.
+Only a caller holding an open `DeviceContext` and feeding `from_profile`
+reaches a profile the rule can see, and the trainers do not yet pass what
+they read. Until they do, `auto` reports `WARN_UNKNOWN_HARDWARE` and keeps
+the CPU, which is the honest answer to "I do not know what device this is".
+
+`MOJOTREES_AUTO_MIN_CELLS` is the escape hatch, an
 integer cell count (`n_rows * n_features`) at or above which `auto`
-chooses the GPU, which is the knob for running the crossover benchmark
-that would justify a default. `MOJOTREES_DISABLE_GPU=1` makes the library
+chooses the GPU. A run that reaches the GPU through it is reported with
+`EVIDENCE_ENV` and a warning, never as a validated choice.
+`MOJOTREES_DISABLE_GPU=1` makes the library
 report no accelerator, so `gpu` raises and `auto` chooses the CPU on a
 machine that has one; it pins a mixed fleet to the CPU and exercises the
 unavailable-GPU path in tests.
@@ -873,9 +955,13 @@ tile size are runtime values here rather than compile-time ones.
 1. Connect what is already written. The repository has grown faster than
    its call graph: several capability families are implemented, compile,
    and are reached by no entry point at all, including packed-bin GPU
-   layout, class-batched multiclass rounds, hybrid CPU and GPU leaf
+   layout, hybrid CPU and GPU leaf
    placement, the sparse and categorical GPU kernels,
-   DART and random forest, CEGB, and LightGBM model file interop. The
+   DART and random forest, CEGB, and LightGBM model file interop.
+   Class-batched multiclass rounds have since gained a call site behind
+   `MOJOTREES_GPU_CLASS_BATCH`, and batching seven classes measured
+   indistinguishable from the sequential schedule (15.45 against 15.30
+   seconds), so that one is reached, measured, and not worth turning on. The
    current list, with what blocks each one, is
    [docs/INTEGRATION_INVENTORY.md](docs/INTEGRATION_INVENTORY.md).
    Registering the four auxiliary modules in `bindings/` is the single
@@ -883,9 +969,11 @@ tile size are runtime values here rather than compile-time ones.
 2. Close the remaining v1 gaps in the parity contract
    ([docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md)). Sparse input
    landed for training and prediction; the gaps left there are a reachable
-   sparse GPU kernel, custom objectives, and `eval_set` from Python. Bring
-   `device="auto"` a measured crossover, so that it may choose the GPU on
-   evidence rather than on a guess
+   sparse GPU kernel, custom objectives, and `eval_set` from Python.
+   `device="auto"` now has one measured crossover rule; what it still needs
+   is a device profile a hardware-scoped rule can match, because
+   `DeviceCapabilities.detect()` opens no device and so the rule cannot fire
+   through `resolve_device`
 3. Validate the same GPU source on NVIDIA and AMD hardware
    ([procedure](docs/GPU_VALIDATION.md); neither has been run). The kernels
    already scale past one threadgroup per feature and tile themselves from
@@ -1368,9 +1456,12 @@ categorical model trains on either device and the two agree to the Float32
 tolerance every other backend-equivalence test uses
 (`test_gpu_categorical_splits_match_cpu` in tests/test_categorical.mojo,
 which skips itself without an accelerator). The paths that are CPU-only are
-CPU-only for other reasons: multiclass, ranking, and Python objective or
-metric callbacks all raise for `device="gpu"` before training starts,
-whether or not a feature is categorical.
+CPU-only for other reasons: ranking and Python objective or metric callbacks
+raise for `device="gpu"` before training starts, whether or not a feature is
+categorical. Multiclass is no longer among them; it trains on the device
+through `train_multiclass_gpu` and, at 465,000 rows by 54 features over
+7 classes, wins by 1.63x
+([`bench/results/profile_2026-08-15/RESULTS.md`](bench/results/profile_2026-08-15/RESULTS.md)).
 
 `bench/compare_categorical_lightgbm.py` fits both libraries on the same
 matrix, with and without the columns marked categorical, and reports held-out
@@ -1954,9 +2045,21 @@ checkout.
 Reproducible from `bench/` (methodology, exact parameters, and caveats in
 [bench/README.md](bench/README.md)). Both drivers generate bit-identical
 synthetic data from the same splitmix64 stream and train with matched
-parameters. The table below preserves the original single-thread baseline;
-rerun the commands for current multicore results. 100,000 rows x 100
-features, 100 rounds, Apple M4:
+parameters.
+
+The current numbers, and the honest reading of them, are under
+[Where the speed stands](#where-the-speed-stands) above. The record behind
+them is
+[`bench/results/profile_2026-08-15/RESULTS.md`](bench/results/profile_2026-08-15/RESULTS.md).
+In one line: 2.44x behind LightGBM on the CPU and 1.25x behind on the GPU
+at 1,000,000 x 50, ahead of LightGBM at 50,000 rows on the CPU, and 3.2x
+ahead on binning.
+
+The table below is the original single-threaded baseline at a different
+shape and a different revision. It is kept because it is what several
+earlier statements in this repository were derived from, not because it
+describes the library today. 100,000 rows x 100 features, 100 rounds,
+Apple M4:
 
 | | mojotrees (1 thread) | LightGBM (1 thread) |
 |---|---|---|
@@ -1966,8 +2069,10 @@ features, 100 rounds, Apple M4:
 | Binary: training | 3.50 s | 2.32 s |
 | Binary: train logloss | 0.267034 | 0.267168 |
 
-The original implementation was within 1.5x of single-threaded LightGBM on
-training and faster at binning, before multicore histogram accumulation.
+That baseline was within 1.5x of single-threaded LightGBM on training and
+faster at binning, before multicore histogram accumulation. The serial ratio
+measured since, at 1,000,000 x 50, is 1.81x rather than 1.5x, so do not
+carry the 1.5x forward to any other shape.
 
 ```sh
 pixi run bench                 # mojotrees

@@ -8,16 +8,36 @@ Apple Silicon Mac.**
 That headline is the goal of the Apple Silicon work, and part of it is real
 today. mojotrees trains a complete model on the Metal GPU through
 `device="gpu"`, with device resident tree growth and bit deterministic
-histograms. What is not established is the acceleration. The only end to end
-Apple measurement in this repository (Apple M4, `bench/bench_train_gpu.mojo`)
-came out **slower** than the multicore CPU trainer at every shape that was
-tried, so `device="auto"` deliberately resolves to the CPU and this example
-makes no speed claim anywhere. `TIMINGS.md` next to this file is the table
-that would change that, and every cell in it is empty until somebody runs it.
+histograms.
 
-Until those cells are filled, treat the headline as a statement of direction
-and use the tour below for what it actually demonstrates, which is a working
-GPU capable GBDT that runs on the Mac you already own.
+The acceleration is now measured, and it is real at one end of the size
+range and absent at the other. On an Apple M4, 100 rounds, 31 leaves, 255
+bins, squared error, seconds of training with binning excluded, median of
+three interleaved arms
+(`bench/results/profile_2026-08-15/RESULTS.md`):
+
+| shape | our CPU | our GPU |
+| --- | --- | --- |
+| 1,000,000 x 50 | 6.98 | **3.58** |
+| 250,000 x 50 | **1.66** | 1.89 |
+| 50,000 x 50 | **0.564** | 1.63 |
+
+So the GPU is 1.85x the CPU at a million rows and loses to it below that,
+because it carries roughly 1.5 seconds of fixed cost per fit that does not
+scale with rows. Multiclass is the clearer win: 15.30s against the CPU's
+25.47s at 465,000 rows by 54 features over 7 classes, which is 1.63x.
+
+Two things this does not say. It does not say mojotrees is fast against
+LightGBM, which at 1,000,000 x 50 trains the same model in 2.86s and is
+still ahead of both our backends. And it says nothing about any Apple part
+other than this one M4. `TIMINGS.md` next to this file is the per-machine
+table, and every cell in it is still empty until somebody runs it on their
+own hardware.
+
+With that in hand, treat the headline as accurate at the large end and as a
+statement of direction at the small end, and use the tour below for what it
+actually demonstrates, which is a working GPU capable GBDT that runs on the
+Mac you already own.
 
 The whole tour is one script.
 
@@ -118,13 +138,20 @@ Estimators take `device="cpu"`, `device="gpu"`, or `device="auto"`, and
 `device_type` is accepted as the LightGBM spelling of the same parameter.
 Fitting records the backend that ran on `device_`.
 
-`auto` resolves to the CPU today. The size heuristic that would send large
-workloads to the GPU is disabled by default, because no measurement on any
-device has established a shape where the GPU trainer wins and a shipped
-crossover threshold would be a performance claim with nothing behind it. To
-run the experiment that would justify one, set `MOJOTREES_AUTO_MIN_CELLS` to
-a number of cells (`n_rows * n_features`) at or above which `auto` should
-pick the GPU. `0` means whenever the GPU path covers the workload.
+`auto` resolves to the CPU today, and the reason is worth getting right
+because it is no longer "there is no evidence". One crossover rule is
+installed, scoped to Metal on an M4 for unweighted squared error at
+1,000,000 rows by 50 features and above, on the records quoted at the top of
+this file. What stops it firing is that `DeviceCapabilities.detect()` opens
+no device, so the machine is reported as unidentified and a rule scoped to
+an Apple generation cannot match it. `auto` therefore warns and keeps the
+CPU, even on the M4 the rule was measured on. That is a wiring gap and it is
+written down rather than hidden.
+
+`MOJOTREES_AUTO_MIN_CELLS` is the escape hatch: a number of cells
+(`n_rows * n_features`) at or above which `auto` should pick the GPU. `0`
+means whenever the GPU path covers the workload. A GPU chosen through it is
+reported as resting on the environment rather than on evidence.
 
 `device="gpu"` either runs on the GPU or raises. It never falls back
 quietly, which is why an unexpected CPU fit is not something that can happen
@@ -185,17 +212,23 @@ The tour prints the inputs that decide the backend, in the vocabulary of
 | `auto` | The GPU when the complete GPU path covers the workload and the size heuristic selects it, the CPU otherwise. The heuristic is off by default. |
 
 What the GPU path covers today is single output training with squared error,
-binary logistic, poisson, huber, quantile, and L1. Multiclass grows one tree
-per class per round on the CPU only, so `device="gpu"` raises for it and
-`auto` chooses the CPU.
+binary logistic, poisson, huber, quantile, and L1, and multiclass. Multiclass
+grows one tree per class per round through a device resident builder, so
+`device="gpu"` trains it on the accelerator rather than raising, and on an M4
+it is the shape the GPU wins by the largest margin.
 
-**NOT AVAILABLE YET.** A structured, machine readable version of that
-explanation, with the crossover rules it applied and the reason for the
-answer, is separate work.
+A structured, machine readable version of that explanation, with the
+crossover rules it applied and the reason for the answer, is available. It
+never raises: a request that would fail comes back with `would_raise=True`
+and the message in `error`.
 
 ```python
-from mojotrees import explain_device_choice     # NOT IMPLEMENTED
-report = explain_device_choice(X)               # NOT IMPLEMENTED
+from mojotrees import explain_device_choice
+
+report = explain_device_choice(X, y, device="auto")
+report.to_dict()["resolved"]        # "cpu" or "gpu"
+[r.code for r in report.reasons]    # the stable reason codes
+report.validated                    # True only for a GPU chosen by a rule
 ```
 
 ## Step 6. Save and load
@@ -273,9 +306,10 @@ assuming anything about hardware other than the Apple M4 it was written from.
 
 That is deliberate. An explicit GPU request either runs on the GPU or raises,
 so a silent CPU fit cannot be mistaken for an accelerated one. The message
-names the reason. Common ones are no accelerator in this build, a multiclass
-objective, an `eval_set` (validation scores on the CPU), a sparse matrix
-(there is no sparse GPU kernel), and a Python objective callback.
+names the reason. Common ones are no accelerator in this build, an
+`eval_set` (validation scores on the CPU), a sparse matrix from the Python
+estimators, and a Python objective callback. Multiclass used to be on this
+list and is not any more; it trains on the device.
 
 Ask for `device="auto"` when you want the library to choose, or `device="cpu"`
 when you want the dependable path.
@@ -324,13 +358,12 @@ work when they are present.
 | Shown as a placeholder | State |
 | --- | --- |
 | `pip install mojotrees` | Not published. No PyPI release, no downloadable wheel. |
-| `predict(..., device="gpu")` | Not implemented. Prediction is CPU only. |
-| `explain_device_choice(X)` | Not implemented. |
-| `device="auto"` choosing the GPU | Implemented but disabled. Needs `MOJOTREES_AUTO_MIN_CELLS`, and a measured crossover before any default changes. |
+| `predict(..., device="gpu")` | Implemented. `predict`, `predict_proba`, and the ranker's `predict` take `device=`, and the device entry points are registered in the extension. Contributions and sparse input have no device path and refuse an explicit `"gpu"`. This row is retired. |
+| `explain_device_choice(X)` | Implemented and re-exported from `mojotrees`. This row is retired. |
+| `device="auto"` choosing the GPU | One measured rule exists and cannot fire, because `DeviceCapabilities.detect()` opens no device and a hardware-scoped rule cannot match an unidentified profile. `MOJOTREES_AUTO_MIN_CELLS` is the escape hatch until a trainer passes the profile it reads. |
 | Early stopping with `device="gpu"` | Raises. Validation is scored on the CPU. |
-| Multiclass on the GPU | Raises. One tree per class per round is CPU only. |
-| Sparse input on the GPU | Raises. There is no sparse GPU kernel. |
-| Any Apple GPU speedup claim | Unmeasured except on one M4, where the GPU trainer was slower. `TIMINGS.md` is empty. |
+| Sparse input on the GPU from Python | The estimators keep the CPU. `train_gpu_sparse` exists and is reachable from the Mojo API; its crossover is unmeasured, so `auto` keeps the CPU there too. |
+| Any Apple GPU speedup claim beyond one M4 | Measured on exactly one machine, and `TIMINGS.md` is empty for every other. On that machine the GPU is 1.85x our CPU at 1,000,000 x 50 and slower than it below about a million rows. |
 
 Every row above is a real limit today, checked against the code rather than
 guessed at. The rows disappear from this table as the work lands, and this

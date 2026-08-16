@@ -389,9 +389,12 @@ raises when no accelerator is available or when the GPU path does not
 cover the workload, rather than falling back silently. Sparse input, an
 `eval_set`, and a Python objective callback are the workloads it does not
 cover today, and each says so by name. `device="auto"` picks for you and
-currently always picks the CPU, because no benchmark has established a
-workload size where end-to-end GPU training wins and no crossover threshold
-ships enabled. `gpu_available()` reports whether this build can train on an
+currently always picks the CPU. That is no longer for want of evidence: one
+crossover rule ships, scoped to Metal on an Apple M4 for squared error at
+1,000,000 rows by 50 features and above, where the GPU trains in 3.58s
+against the CPU's 6.98s. It cannot fire, because the capability probe opens
+no device and a rule scoped to particular hardware cannot match a profile
+that names none. `gpu_available()` reports whether this build can train on an
 accelerator, which is decided when the extension is compiled rather than on
 the machine that runs it.
 
@@ -469,7 +472,7 @@ using the instructions above.
 | `RuntimeError: device 'gpu' requested but no accelerator is available` | This build has no GPU path. Availability is fixed when the extension is compiled, not at runtime |
 | `RuntimeError: validation metrics are scored on the CPU` | An `eval_set` with `device="gpu"`. Use `device="cpu"` or `"auto"` |
 | `RuntimeError: sparse input trains on the CPU` | There is no sparse GPU kernel. Use `device="cpu"`, `"auto"`, or densify |
-| `device="auto"` chose the CPU and said nothing | Expected. The crossover table is empty, so `auto` keeps the CPU everywhere |
+| `device="auto"` chose the CPU and said nothing | Expected. One crossover rule ships, and it is scoped to hardware the capability probe never identifies, so no rule matches and `auto` keeps the CPU everywhere |
 
 Each case, with the full message and what to do about it, is in
 [docs/INSTALLATION.md](https://github.com/mojotrees/mojotrees/blob/main/docs/INSTALLATION.md#when-something-goes-wrong).

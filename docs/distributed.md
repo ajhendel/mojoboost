@@ -376,14 +376,18 @@ ideas. Multiclass grows one tree per class per round, which is the same
 algorithm run `n_classes` times. Both are straightforward extensions and
 neither is prototyped.
 
-**Distributed GPU training.** Not started, and deliberately gated. Single-node
-GPU training exists (`train_gpu.mojo`) but the only end-to-end measurement,
-Apple M4, is slower than the four-worker CPU trainer at every size tested, and
-no benchmark on any device has yet shown the GPU winning. Adding a network
-layer under a backend that has not yet been shown to be worth using on one
-node would be building on an unproven foundation. The gate is a discrete-GPU
-benchmark where single-node GPU training beats single-node CPU training. Until
-that exists, distributed work stays on the CPU.
+**Distributed GPU training.** Not started, and still gated, though the gate's
+original wording no longer describes the evidence. Single-node GPU training
+exists (`train_gpu.mojo`) and on an Apple M4 it now beats the CPU trainer at
+the large end: 3.58s against 6.98s at 1,000,000 rows by 50 features, and
+15.30s against 25.47s on multiclass. It loses below about a million rows
+(1.89 against 1.66 at 250,000), and no NVIDIA or AMD device has executed this
+code at all. The gate that remains is therefore narrower and sharper than
+"the GPU has never won": it is a **discrete-GPU** measurement, on hardware
+this project has never run on, at a shape a distributed job would actually
+use. A network layer under a backend measured only on one integrated Apple
+part would be extrapolating across both the interconnect and the device.
+Until that exists, distributed work stays on the CPU.
 
 ## 10. Testing
 

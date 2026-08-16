@@ -269,6 +269,16 @@ So the round is worth about 3 to 4 percent end to end at this shape, and the
 GPU backend is about 2.8 times the CPU one. The 0.56x figure that circulated
 before this round is stale by a wide margin and should not be quoted.
 
+**The 2.8x in the paragraph above is itself now stale, and in our own
+disfavor.** A second round landed on 2026-08-15 and moved the CPU further
+than it moved the GPU: 11.36 to **6.98** on the CPU and 4.10 to **3.58** on
+the GPU at the same shape, so the GPU is **1.85x** the CPU rather than 2.8x.
+Neither figure was wrong when it was taken; the ratio fell because the CPU
+got 1.63x faster while the GPU got 1.15x faster. The record is
+`bench/results/profile_2026-08-15/RESULTS.md`, taken under the rules
+committed beforehand in `bench/results/PROFILE_PROTOCOL.md`. Quote 1.85x, or
+better, quote the two seconds figures and let a reader form the ratio.
+
 Per change, isolated by setting one escape hatch at a time from the
 all-on configuration:
 
@@ -293,6 +303,116 @@ the 100-feature case where it loses by 36 percent, the strategy-forced arms
 showing the loss is not the reduction kernel, and the observation that the
 whole loss happened inside the region `MIN_ROWS_PER_TILE_BIN_FACTOR` calls
 safe.
+
+Three claims that appear elsewhere in this repository are refuted by the two
+tables above and should not be repeated. The row-tile floor does not help; it
+measured 4.11 against 5.03 and is opt-in for that reason. Block primitives in
+the split search did not help; 5.07 against 5.03 is inside the spread, which
+the protocol requires be recorded as indistinguishable rather than as a small
+win. And bit-packed bins cannot cut memory traffic 3 to 8x by the mechanism
+usually named for it: four-bit bins against one-byte bins is 2.00x and no
+arithmetic makes it more. Whether a four-byte packed load beats four one-byte
+loads is a separate and still unmeasured question on every backend
+(`docs/NVIDIA_GPU.md`, `docs/AMD_GPU.md`).
+
+## Apple M4, 2026-08-15: the second performance round, and the first GPU timeline
+
+Two things landed the same day and they have to be read together, because
+the second one changes how the first one should be interpreted.
+
+The full record is `bench/results/profile_2026-08-15/RESULTS.md`, taken under
+the pre-registered rules in `bench/results/PROFILE_PROTOCOL.md`, and the
+timeline is written up in `docs/METAL_TIMELINE.md` with the reduced captures
+in `bench/results/metal_timeline_2026-08-15/`. Everything below is seconds of
+training time with binning excluded, 100 rounds, 31 leaves, 255 bins, squared
+error, median of three with the arms interleaved.
+
+| shape | our CPU | our GPU | LightGBM, 10 threads |
+|---|---|---|---|
+| 1,000,000 x 50 | 6.98 | **3.58** | **2.86** |
+| 250,000 x 50 | **1.66** | 1.89 | **1.00** |
+| 50,000 x 50 | **0.564** | 1.63 | 0.594 |
+
+The GPU is 1.85x our own CPU at a million rows, 0.83x at 250,000, and 0.33x
+at 50,000. The device carries about 1.5 seconds of fixed cost per fit, which
+is what those three numbers imply and which the timeline below then
+attributes.
+
+Binning, excluded from the table: ours 0.377s against LightGBM's 1.207s, so
+we bin 3.2x faster.
+
+Multiclass, 465,000 rows by 54 features over 7 classes, measured honestly for
+the first time now that `train_dataset_multiclass` no longer discards the
+device it resolved:
+
+| arm | median | spread |
+|---|---|---|
+| our CPU | 25.47 | 7.7 percent |
+| our GPU | **15.30** | 0.1 percent |
+| our GPU, `MOJOTREES_GPU_CLASS_BATCH=7` | 15.45 | 0.8 percent |
+
+**The GPU wins multiclass by 1.63x**, resolved well outside the noise floor,
+and class batching at seven is indistinguishable from the sequential
+schedule.
+
+### What the timeline says, and why it does not contradict the phase profile
+
+The stage-level phase profile attributes **49.3 percent of device work** to
+the histogram at 1,000,000 x 50. The Metal timeline says **compute of every
+kind is 22.9 percent of a round** at 200,000 rows. Both are correct and they
+are not the same statement, because they have different denominators. The
+phase profile measures where attributed device work is charged and cannot see
+time in which no phase is running at all. The timeline measures the whole
+wall-clock span, idle included. So the histogram is about half of the work
+the device does, and the device does work for less than a quarter of the
+round.
+
+That is the correction, and it matters because "the histogram kernel is the
+dominant cost of a GPU round" was inferred from the first number and is
+false. An infinitely fast histogram kernel leaves roughly four fifths of the
+round untouched.
+
+What the round is actually spending is host round trips:
+
+```
+GPU idle inside the training span   76.5% at 200,000 rows, 87.5% at 50,000
+GPU performance state               Maximum for 77.9% of the capture
+host blocks on blits                3,206 of 3,406  (94.1%)
+host blocks on compute kernels      2 of 18,701     ( 0.0%)
+serialization points per round      32.1
+one blocking readback, median       606.1 us, of which 3.7 us is bytes moving
+enqueue (the commit call), median    12.62 us
+completion notification, median     101.33 us
+serialized turnaround, median       285 us
+```
+
+Thirty-two blocking readbacks at 606 microseconds is 20.16 milliseconds of a
+23.50 millisecond round, or 85.8 percent. The idleness is not a downclock:
+the device sat at its Maximum performance state for 77.9 percent of the
+capture.
+
+Two consequences worth stating plainly. The `transfer` phase is not a
+transfer cost, because the GPU spends 0.65 percent of the span moving bytes;
+it is the phase the wait gets charged to. And the right target is the
+**count** of synchronizations rather than the cost of one, since removing a
+synchronization is worth 606 microseconds while making one faster is worth at
+most the 158 microseconds of idle queue wait inside it.
+
+One limitation, and it is a property of the device rather than the method.
+This M4 exposes Instruments exactly one GPU counter, `RT Unit Active`, which
+is about the raytracing unit. There is no occupancy, ALU, bandwidth, or cache
+counter to read, so **no kernel in this repository can today be called
+latency-bound or bandwidth-bound on the basis of a measurement**. Section 5
+of `docs/METAL_TIMELINE.md` narrows the histogram kernel's DRAM traffic to
+somewhere between 21.6 and roughly 120 GB/s and cannot do better.
+
+One incidental finding that bears on every benchmark in this file. Two of the
+four captures ran entirely at the device's Minimum GPU performance state
+while the other two ran mostly at Maximum. That is the most plausible
+mechanism yet identified for the two-to-three-fold drift this repository
+fights on Apple silicon, and it means an interleaved comparison can still be
+invalid if the two arms straddle a clock transition. Print the performance
+state before comparing two captures.
 
 ## Recording a result
 

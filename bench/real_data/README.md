@@ -5,11 +5,38 @@ shapes, on pinned public datasets or deterministic generators, measuring
 quality, time, memory, and model size, and separating the numbers that can
 fail a build from the numbers that cannot.
 
-**Nothing in this directory has been run.** It was written as a harness and
-committed unexecuted. There are no results here, no numbers in this README,
-and no numbers anywhere else in the repository that came from it. When it is
-first run, the results land under `results/` and are not committed either;
-`results/README.md` explains why.
+**It has been run once, on 2026-08-15, and the run is not committed.** The
+sentence here used to read "Nothing in this directory has been run", and that
+stopped being true when `results/20260815T023123Z` was produced. Results are
+gitignored by design (`results/README.md` explains why), so the run is
+readable only on the machine that took it, and nothing from it is quoted as a
+result anywhere in this repository. There are still no numbers in this
+README.
+
+That run is nonetheless cited twice in the source tree, and for one reason
+worth knowing about before reading any record from this harness. It is the
+run in which covertype's CPU and GPU arms came back with byte-identical
+`predictions_sha256`, which is what exposed
+`trainset.train_dataset_multiclass` resolving the device and discarding the
+answer. `backend_proof.py` exists because of it.
+
+### What a GPU run of this harness does and does not produce
+
+Three of the six scenarios declare `devices=["cpu", "gpu"]`
+(`dense_regression`, `imbalanced_binary`, `multiclass`). The other three
+declare the CPU only, because `ranking` and `categorical_missing` and
+`sparse_highdim` have no accelerator path the harness is willing to compare.
+A `--device gpu` run therefore records those three as **skipped, with the
+reason attached**, which is a different record from a failure and must not be
+read as one.
+
+Two corrections follow, because both readings have circulated. "The GPU
+errored on four of six scenarios" is wrong twice over: the scenarios without
+a GPU arm are three, not four, and they are skipped rather than errored. And
+the error records that do exist in that run are not a GPU story at all. They
+came from a package rename that had not propagated, and they hit **all six**
+scenarios on **both** backends. An error that lands on the CPU arm too is
+evidence about the harness environment, not about the accelerator.
 
 ## The six scenarios
 

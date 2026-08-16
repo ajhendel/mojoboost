@@ -28,16 +28,39 @@ measured is a chip we know one thing about.
 ## What we already know
 
 `bench/bench_train_gpu.mojo` has been run end to end on an Apple M4 against
-the multicore CPU trainer. The GPU trainer was slower at every shape that was
-tried, and the structural reason is understood, which is that each per leaf
-histogram build scans all rows to filter by leaf id. Device side row
-compaction is the work that would change that.
+the multicore CPU trainer, several times, and the answer has changed since
+this section was first written. It used to read "The GPU trainer was slower
+at every shape that was tried", and that is no longer true. In seconds of
+training with binning excluded, 100 rounds, 31 leaves, 255 bins, squared
+error, median of three interleaved arms
+(`bench/results/profile_2026-08-15/RESULTS.md`):
 
-That result is why `device="auto"` resolves to the CPU, why no crossover
-threshold ships, and why this table starts empty rather than starting with a
-headline. It is also why filling this table is worth doing. A second data
-point on different silicon is the cheapest way to learn whether the M4 result
-is about the chip or about the kernel.
+| shape | CPU | GPU |
+| --- | --- | --- |
+| 1,000,000 x 50 | 6.98 | **3.58** |
+| 250,000 x 50 | **1.66** | 1.89 |
+| 50,000 x 50 | **0.564** | 1.63 |
+
+Multiclass, 465,000 x 54 over 7 classes: CPU 25.47, GPU **15.30**.
+
+The structural reason for the small-shape losses is also better understood
+than "each per leaf histogram build scans all rows", which order-preserving
+row compaction has since addressed. The first Metal timeline
+(`docs/METAL_TIMELINE.md`) finds the GPU idle for 87.5% of a training span at
+50,000 rows, at the device's Maximum clock, because the host blocks on 32
+readbacks per round at about 606 microseconds each. Those round trips cost
+what they cost whatever the row count, which is the 1.5 seconds of fixed
+per-fit cost the table above implies.
+
+One crossover rule now ships from these records, scoped to Metal on an M4 at
+the largest shape. `device="auto"` still resolves to the CPU because that
+rule cannot match a device profile that names no hardware, which is a wiring
+gap rather than a missing measurement.
+
+This table still starts empty, and filling it is still worth doing, because
+every number above is one machine. A second data point on different silicon
+is the cheapest way to learn whether the M4 result is about the chip or about
+the kernel.
 
 ## How to produce a row
 
