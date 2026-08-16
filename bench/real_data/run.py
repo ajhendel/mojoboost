@@ -5,6 +5,14 @@ time.
     python bench/real_data/run.py --tier smoke
     python bench/real_data/run.py --scenario dense_regression --device cpu gpu
     python bench/real_data/run.py --tier standard --threads 1 --threads 8
+    python bench/real_data/run.py --arms frontier
+
+A cell's identity is (scenario, tier, variant, ARM, device, threads, repeat).
+`arm` defaults to the engine name, so the cross-product matrix above is one
+arm per engine and renders exactly the labels it always did; `--arms` names a
+module whose `arms()` returns cells that vary the parameters WITHIN an engine,
+which is what a frontier sweep is and what the identity had no room for. See
+"The arm dimension" below.
 
 Runs are sequential and that is not negotiable. Two training runs sharing a
 machine share its memory bandwidth, its cache, and on a laptop its thermal
@@ -119,147 +127,399 @@ CELL_ORDER = {
 }
 
 
-def build_matrix(args):
+# ---------------------------------------------------------------------------
+# The arm dimension.
+# ---------------------------------------------------------------------------
+#
+# A job's identity was (scenario, tier, variant, engine, device, threads,
+# repeat), and an ARM is a variation on the parameters WITHIN one engine, so
+# two arms of one engine collided: one identity, one cell key, one output
+# filename, and the second arm's record overwrote the first's. Nothing said so.
+#
+# The dimension is `arm`, a name, and it DEFAULTS TO THE ENGINE NAME. That
+# default is what makes this change invisible to the existing matrix: every
+# job the old builder produced now carries `arm == engine`, `label()` renders
+# the same string it always did, and every file under `jobs/`, `records/` and
+# `predictions/` keeps the name it had. A frontier arm carries its own id and
+# is addressable end to end.
+#
+# Beside it a job carries what makes the arm an arm:
+#
+#   arm_params          overrides folded into the engine's training params
+#   arm_dataset_params  overrides folded into the binning params (max_bin)
+#   arm_env             per-CELL environment, applied by `run_job`
+#   axis                which axis of a sweep this arm moves, or None
+#
+# `engines.build` takes the first two; `run_job` applies the third; `worker.py`
+# writes `arm` and `axis` onto the record. `report.py` and `verify.py` should
+# read `record.get("arm")` with a fallback to `record["engine"]`, which is what
+# a record written before this change carries.
+#
+# NOTE the word `arm` is already used by `engines.ENGINE_ARM` for a different
+# thing -- the ROLE of an engine in the comparison, subject / comparator /
+# peer. That mapping is untouched and is still keyed by engine name. A record
+# carries both: `arm` is which cell this is, `ENGINE_ARM[engine]` is what the
+# cell is for.
+
+#: An arm's identity includes its RESOLVED parameters, per backend.
+#:
+#: **The rule (Andrew, 2026-08-16): if a backend resolves a parameter
+#: differently from another, that backend's cell is a DECLARED SKIP with the
+#: reason, never the same arm name carrying a different model.** It is the
+#: arm dimension above, one level deeper. The dimension stops two arms of one
+#: engine from colliding on a name; this stops one arm from wearing the same
+#: name across two backends that did not train the same thing.
+#:
+#: The case that produced it: `random_strength` is refused on the GPU when it
+#: is NAMED and declines to 0.0 when it arrives as a CatBoost-mode default,
+#: because no device round loop computes the per-tree score scale. So a GPU
+#: cell of a symmetric-tree arm is either an infrastructure failure or a
+#: different regularizer under the CPU cell's name, and a reader comparing the
+#: two would see a backend difference and be looking at a model difference.
+#:
+#: Each entry names the parameter and BOTH values, the way the scenario
+#: support tables do, because "GPU skipped" does not tell the next person
+#: whether this is a gap with a scheduled exit or a permanent difference.
+#:
+#: `applies` reads the arm's resolved training parameters. It is deliberately
+#: a predicate over what the harness ASKED FOR rather than a copy of
+#: `device_policy`: this table's job is to keep a cell off the schedule, and
+#: the native policy remains the authority on what a fit may do.
+DEVICE_PARAMETER_DIVERGENCE = (
+    {
+        "parameter": "random_strength",
+        "device": "gpu",
+        "applies": lambda params: float(params.get("random_strength", 0.0)) > 0.0,
+        # A callable, because the value the arm asked for is the whole point
+        # of the sentence: "GPU resolves it to 0.0 where this arm asks for
+        # 1.0" is the skip a reader can act on, and "where this arm asks for
+        # the value it asked for" is not.
+        "cpu_value": lambda params: params.get("random_strength"),
+        "device_value": "0.0",
+        "why": (
+            "the per-split draw is staged on the device but its per-tree "
+            "SCALE is computed only by the dense CPU round loops "
+            "(boosting._round_random_score_scale), so `_parse_params` "
+            "declares random_strength_ok as `device == cpu and not sparse`. "
+            "A named value is refused there by name; a value inherited from "
+            "the symmetrictree mode default declines to 0.0 in silence. "
+            "Either way the GPU cell is not this arm"
+        ),
+        "exit": (
+            "a gap with an exit: a device round loop that computes the scale "
+            "would close it. Until one does, the CPU cell is the arm"
+        ),
+    },
+    {
+        "parameter": "derivative_precision",
+        "device": "gpu",
+        "applies": lambda params: (
+            str(params.get("derivative_precision", "float32")).lower()
+            == "float64"
+        ),
+        "cpu_value": "float64",
+        "device_value": "float32",
+        "why": (
+            "gradients and hessians are carried as Float32 on the device and "
+            "there is no Float64 there, so "
+            "histogram.check_device_derivative_precision refuses the request "
+            "by name at every shape rather than computing the narrow answer "
+            "under the wide label"
+        ),
+        "exit": (
+            "PERMANENT on this hardware. The missing thing is a datatype the "
+            "device does not have, and it is not fixable by threading"
+        ),
+    },
+)
+
+
+def backend_divergence(arm_params, device, resolved=None):
+    """The reason this arm is not the same arm on `device`, or None.
+
+    Two modes, and the returned sentence says which one it is in rather than
+    letting a reader assume the stronger one:
+
+    - `resolved` given: a per-fit RESOLVED-CONFIGURATION record, with
+      provenance per value on the same axis as `catboost_value_source`. That
+      is the real input, because it answers "what did this backend actually
+      resolve" instead of "did something fall back". The other campaign is
+      building it; this function takes it when it is there.
+    - `resolved` absent: the coarse mode. The declared table above, read
+      against what the arm asked for. It cannot see a parameter nobody
+      thought to declare, and the sentence says so.
+
+    Nothing here is a quality judgement and nothing here is a fallback. A
+    divergence is a skip with a reason, which is a result; running the cell
+    anyway would be a row.
+    """
+    mode = "resolved" if resolved else "declared"
+    for rule in DEVICE_PARAMETER_DIVERGENCE:
+        if rule["device"] != device:
+            continue
+        if resolved:
+            # The resolved record answers directly: what did this backend
+            # resolve this parameter to, and was that the request.
+            entry = (resolved.get(rule["parameter"]) or {})
+            if not entry or entry.get("agrees_with_request", True):
+                continue
+            cpu_value = entry.get("requested")
+            device_value = entry.get("resolved")
+        else:
+            if not rule["applies"](arm_params):
+                continue
+            cpu_value = rule["cpu_value"]
+            if callable(cpu_value):
+                cpu_value = cpu_value(arm_params)
+            device_value = rule["device_value"]
+            if callable(device_value):
+                device_value = device_value(arm_params)
+        return (
+            f"{device} resolves {rule['parameter']} to {device_value} where "
+            f"this arm asks for {cpu_value}, so the two cells are not the "
+            f"same arm and must not share its name. {rule['why']}. "
+            f"{rule['exit']}. "
+            f"[{mode} mode: "
+            + (
+                "read off the run's per-fit resolved-configuration record"
+                if resolved
+                else "read off run.DEVICE_PARAMETER_DIVERGENCE against what "
+                "the arm asked for, because no per-fit "
+                "resolved-configuration record was available; a parameter "
+                "not in that table is not checked"
+            )
+            + "]"
+        )
+    return None
+
+
+def _engine_skip_reason(spec, scenario_id, engine, device, engines_in_run, tier):
+    """Why this (engine, device) cell must not be scheduled, or None.
+
+    Lifted out of `build_matrix` unchanged so that the arm path and the
+    engine path answer it with one function rather than two copies. **The
+    ORDER of these tests is load-bearing and is not an implementation
+    detail**; see the comment on the `mojotrees_catboost_mode` case.
+    """
+    # The CatBoost-mode arm has a DEPENDENCY on the CatBoost arm that no
+    # other pair in this matrix has: it takes CatBoost's resolved learning
+    # rate for the same cell, so without a CatBoost cell in the same run it
+    # raises rather than trains. Declared as a skip here because a raising
+    # cell is an infrastructure failure and this harness answers one by
+    # withholding the quality verdict for the whole matrix -- so
+    # `--engine mojotrees_catboost_mode` on its own would suppress the
+    # verdict rather than report a scheduling mistake.
+    if engine == "mojotrees_catboost_mode" and "catboost" not in engines_in_run:
+        return (
+            "the CatBoost-mode arm takes CatBoost's RESOLVED learning rate "
+            "for this same cell, which cb-shipped no longer pins, so the "
+            "catboost arm has to run in the same run and write it. Add "
+            "catboost to --engine, or read "
+            "scenarios.CATBOOST_LEARNING_RATE_TRANSITION for why there is no "
+            "fallback"
+        )
+    if engine in scenarios.CATBOOST_ENGINES:
+        ok, reason = scenarios.catboost_tier_ok(spec, tier)
+        if not ok:
+            return reason
+    if device != "cpu":
+        if device not in spec["devices"]:
+            return f"{scenario_id} declares no {device} support"
+        if engine == "lightgbm":
+            return (
+                "LightGBM runs on the CPU in this harness; a cpu-vs-gpu row "
+                "is a mojotrees-internal comparison and is labelled as one"
+            )
+        # The same treatment for the two arms below, and it was missing
+        # until 2026-08-16: both refuse a non-CPU device somewhere further
+        # in, so without these they were SCHEDULED and then failed at load
+        # or fit time. A failing peer cell is an infrastructure failure, and
+        # this harness answers an infrastructure failure by withholding the
+        # quality verdict for the whole matrix -- so twenty-four cells
+        # nobody wanted could have taken the exit code of a run whose
+        # comparator rows all succeeded. Found by `--dry-run` before the
+        # window rather than inside it.
+        if engine in scenarios.CATBOOST_ENGINES:
+            return (
+                "CatBoost runs on the CPU in this harness: its GPU training "
+                "is a different quantization (border_count capped at 255 "
+                "against 65535) and so is not the same measurement. "
+                "CatBoostEngine.load refuses it by name"
+            )
+        # The pairing ground is stated first and the device block second, and
+        # the order is the point. This arm exists to be read against
+        # CatBoost, CatBoost is CPU-only above, so a GPU row here has nothing
+        # to pair against no matter what the device can compute.
+        # BLOCK_SCORE_FUNCTION is why it cannot run there today; the pairing
+        # is why it should not be scheduled there even after a lane teaches
+        # the device split search the Cosine ratio and the block goes away.
+        # Written this way so that landing Cosine on the device does not
+        # silently add a column to a comparison matrix.
+        #
+        # DEVICE_PARAMETER_DIVERGENCE is checked AFTER this function returns
+        # None, never before it, so a resolved-parameter divergence can never
+        # absorb this reason or reorder its two halves.
+        if engine == "mojotrees_catboost_mode":
+            return (
+                "the CatBoost-mode arm is read against CatBoost, and "
+                "CatBoost is CPU-only in this harness, so a GPU row here has "
+                "no counterpart to be read against; separately, the arm sets "
+                "score_function=Cosine and the device split search computes "
+                "G^2/(H+lambda) only, so device_policy blocks it today "
+                "(BLOCK_SCORE_FUNCTION). The first reason outlives the second"
+            )
+    return None
+
+
+def _job(scenario_id, engine, device, threads, repeat, args, arm):
+    """One runnable job. `arm` is the normalized arm dict."""
+    return {
+        "scenario": scenario_id,
+        "tier": arm["tier"],
+        "variant": arm["variant"],
+        "engine": engine,
+        # The new dimension. Defaults to the engine name, which is what
+        # keeps every existing filename and every existing label identical.
+        "arm": arm["id"],
+        "axis": arm["axis"],
+        "axis_value": arm["axis_value"],
+        "arm_block": arm["block"],
+        "arm_params": dict(arm["params"]),
+        "arm_dataset_params": dict(arm["dataset_params"]),
+        "arm_env": dict(arm["env"]),
+        "device": device,
+        "threads": threads,
+        "repeat": repeat,
+        "predict_repeats": args.predict_repeats,
+        "allow_unpinned": args.allow_unpinned,
+        "data_digest": not args.no_data_digest,
+        "backend_proof": not args.no_backend_proof,
+        # Filled in by `main`, which knows the run directory and this
+        # function does not. The run's collected CatBoost.get_all_params(),
+        # which the CatBoost-mode arm cannot build without.
+        "catboost_readback_path": None,
+    }
+
+
+def _normalize_arm(arm, engine, scenario_id, args):
+    """An arm dict with every field this module reads, defaults filled in.
+
+    An engine with no arm is an arm: its id is the engine name and its
+    override dicts are empty. That is what makes the whole engine path below
+    a special case of the arm path rather than a second implementation.
+    """
+    arm = dict(arm or {})
+    arm.setdefault("id", engine)
+    arm.setdefault("scenario", scenario_id)
+    arm.setdefault("tier", args.tier)
+    arm.setdefault("variant", args.variant)
+    arm.setdefault("engine", engine)
+    arm.setdefault("axis", None)
+    arm.setdefault("axis_value", None)
+    arm.setdefault("block", None)
+    arm.setdefault("params", {})
+    arm.setdefault("dataset_params", {})
+    arm.setdefault("env", {})
+    arm.setdefault("skip", None)
+    return arm
+
+
+def build_matrix(args, arms=None):
+    """The job matrix.
+
+    Without `arms` this is the cross product it has always been, one arm per
+    engine, and every job it produces is byte-for-byte the job the previous
+    version produced plus the arm fields (`arm == engine`, empty overrides).
+
+    With `arms` -- a list of arm dicts, as `frontier.arms()` returns -- each
+    arm is one cell of the matrix and carries its own scenario, tier,
+    variant, engine, device and parameter overrides. The skip rules are the
+    same function in both paths.
+    """
     jobs = []
-    for scenario_id in args.scenario:
-        spec = scenarios.resolve(scenario_id, args.tier, args.variant)
-        for device in args.device:
-            for engine in args.engine:
-                if engine not in spec["engines"]:
-                    continue
-                # The CatBoost-mode arm has a DEPENDENCY on the CatBoost arm
-                # that no other pair in this matrix has: it takes CatBoost's
-                # resolved learning rate for the same cell, so without a
-                # CatBoost cell in the same run it raises rather than trains.
-                # Declared as a skip here because a raising cell is an
-                # infrastructure failure and this harness answers one by
-                # withholding the quality verdict for the whole matrix -- so
-                # `--engine mojotrees_catboost_mode` on its own would suppress
-                # the verdict rather than report a scheduling mistake.
-                if engine == "mojotrees_catboost_mode" and (
-                    "catboost" not in args.engine
-                ):
-                    jobs.append(
-                        _skip(
-                            scenario_id, engine, device, args,
-                            "the CatBoost-mode arm takes CatBoost's RESOLVED "
-                            "learning rate for this same cell, which cb-shipped "
-                            "no longer pins, so the catboost arm has to run in "
-                            "the same run and write it. Add catboost to "
-                            "--engine, or read "
-                            "scenarios.CATBOOST_LEARNING_RATE_TRANSITION for "
-                            "why there is no fallback",
+    # Which engines are in THIS run, for the one skip that is a property of
+    # the run rather than of the cell: the CatBoost-mode arm cannot be built
+    # unless a CatBoost cell runs beside it. Read off the arms when there are
+    # arms, because `--engine` does not describe an arm list.
+    engines_in_run = (
+        set(args.engine)
+        if arms is None
+        else {arm["engine"] for arm in arms}
+    )
+    if arms is None:
+        for scenario_id in args.scenario:
+            spec = scenarios.resolve(scenario_id, args.tier, args.variant)
+            for device in args.device:
+                for engine in args.engine:
+                    if engine not in spec["engines"]:
+                        continue
+                    arm = _normalize_arm(None, engine, scenario_id, args)
+                    jobs.extend(
+                        _cell(
+                            spec, scenario_id, engine, device, args, arm,
+                            engines_in_run,
                         )
                     )
-                    continue
-                if engine in scenarios.CATBOOST_ENGINES:
-                    ok, reason = scenarios.catboost_tier_ok(spec, args.tier)
-                    if not ok:
-                        jobs.append(
-                            _skip(scenario_id, engine, device, args, reason)
-                        )
-                        continue
-                if device != "cpu":
-                    if device not in spec["devices"]:
-                        jobs.append(
-                            _skip(
-                                scenario_id, engine, device, args,
-                                f"{scenario_id} declares no {device} support",
-                            )
-                        )
-                        continue
-                    if engine == "lightgbm":
-                        jobs.append(
-                            _skip(
-                                scenario_id, engine, device, args,
-                                "LightGBM runs on the CPU in this harness; a "
-                                "cpu-vs-gpu row is a mojotrees-internal "
-                                "comparison and is labelled as one",
-                            )
-                        )
-                        continue
-                    # The same treatment for the two arms below, and it was
-                    # missing until 2026-08-16: both refuse a non-CPU device
-                    # somewhere further in, so without these they were
-                    # SCHEDULED and then failed at load or fit time. A failing
-                    # peer cell is an infrastructure failure, and this harness
-                    # answers an infrastructure failure by withholding the
-                    # quality verdict for the whole matrix -- so twenty-four
-                    # cells nobody wanted could have taken the exit code of a
-                    # run whose comparator rows all succeeded. Found by
-                    # `--dry-run` before the window rather than inside it.
-                    if engine in scenarios.CATBOOST_ENGINES:
-                        jobs.append(
-                            _skip(
-                                scenario_id, engine, device, args,
-                                "CatBoost runs on the CPU in this harness: its "
-                                "GPU training is a different quantization "
-                                "(border_count capped at 255 against 65535) "
-                                "and so is not the same measurement. "
-                                "CatBoostEngine.load refuses it by name",
-                            )
-                        )
-                        continue
-                    # The pairing ground is stated first and the device block
-                    # second, and the order is the point. This arm exists to be
-                    # read against CatBoost, CatBoost is CPU-only above, so a
-                    # GPU row here has nothing to pair against no matter what
-                    # the device can compute. BLOCK_SCORE_FUNCTION is why it
-                    # cannot run there today; the pairing is why it should not
-                    # be scheduled there even after a lane teaches the device
-                    # split search the Cosine ratio and the block goes away.
-                    # Written this way so that landing Cosine on the device
-                    # does not silently add a column to a comparison matrix.
-                    if engine == "mojotrees_catboost_mode":
-                        jobs.append(
-                            _skip(
-                                scenario_id, engine, device, args,
-                                "the CatBoost-mode arm is read against "
-                                "CatBoost, and CatBoost is CPU-only in this "
-                                "harness, so a GPU row here has no counterpart "
-                                "to be read against; separately, the arm sets "
-                                "score_function=Cosine and the device split "
-                                "search computes G^2/(H+lambda) only, so "
-                                "device_policy blocks it today "
-                                "(BLOCK_SCORE_FUNCTION). The first reason "
-                                "outlives the second",
-                            )
-                        )
-                        continue
-                for threads in args.threads:
-                    for repeat in range(args.repeats):
-                        jobs.append(
-                            {
-                                "scenario": scenario_id,
-                                "tier": args.tier,
-                                "variant": args.variant,
-                                "engine": engine,
-                                "device": device,
-                                "threads": threads,
-                                "repeat": repeat,
-                                "predict_repeats": args.predict_repeats,
-                                "allow_unpinned": args.allow_unpinned,
-                                "data_digest": not args.no_data_digest,
-                                "backend_proof": not args.no_backend_proof,
-                                # Filled in by `main`, which knows the run
-                                # directory and this function does not. The
-                                # run's collected CatBoost.get_all_params(),
-                                # which the CatBoost-mode arm cannot build
-                                # without.
-                                "catboost_readback_path": None,
-                            }
-                        )
+    else:
+        for declared in arms:
+            engine = declared["engine"]
+            scenario_id = declared["scenario"]
+            arm = _normalize_arm(declared, engine, scenario_id, args)
+            device = declared.get("device", "cpu")
+            if arm["skip"]:
+                # A skip the arm itself declared. Kept as the arm's own
+                # sentence rather than restated here, which is the rule
+                # `frontier.check()` enforces from the other side.
+                jobs.append(_skip(scenario_id, engine, device, args, arm["skip"], arm))
+                continue
+            spec = scenarios.resolve(scenario_id, arm["tier"], arm["variant"])
+            if engine not in spec["engines"]:
+                jobs.append(
+                    _skip(
+                        scenario_id, engine, device, args,
+                        f"{scenario_id} declares no {engine} arm", arm,
+                    )
+                )
+                continue
+            jobs.extend(
+                _cell(
+                    spec, scenario_id, engine, device, args, arm,
+                    engines_in_run,
+                )
+            )
     for index, job in enumerate(jobs):
         job["job_index"] = index
     return jobs
 
 
-def _skip(scenario_id, engine, device, args, reason):
+def _cell(spec, scenario_id, engine, device, args, arm, engines_in_run):
+    """The jobs for one (arm, device) cell: one skip, or one per repeat."""
+    reason = _engine_skip_reason(
+        spec, scenario_id, engine, device, engines_in_run, arm["tier"]
+    )
+    if reason is not None:
+        return [_skip(scenario_id, engine, device, args, reason, arm)]
+    # Second, and never first. See _engine_skip_reason's closing comment.
+    reason = backend_divergence(arm["params"], device)
+    if reason is not None:
+        return [_skip(scenario_id, engine, device, args, reason, arm)]
+    repeats = int(arm.get("repeats") or args.repeats)
+    return [
+        _job(scenario_id, engine, device, threads, repeat, args, arm)
+        for threads in args.threads
+        for repeat in range(repeats)
+    ]
+
+
+def _skip(scenario_id, engine, device, args, reason, arm=None):
+    arm = arm or _normalize_arm(None, engine, scenario_id, args)
     return {
         "scenario": scenario_id,
-        "tier": args.tier,
-        "variant": args.variant,
+        "tier": arm["tier"],
+        "variant": arm["variant"],
         "engine": engine,
+        "arm": arm["id"],
+        "axis": arm["axis"],
         "device": device,
         "threads": args.threads[0],
         "repeat": 0,
@@ -268,10 +528,34 @@ def _skip(scenario_id, engine, device, args, reason):
 
 
 def label(job):
+    """The cell's name, and the stem of its three filenames.
+
+    `arm` sits where `engine` used to and defaults to the engine name, so a
+    matrix with no arms renders exactly the strings it rendered before. A
+    frontier arm renders its own id, which is what stops two arms of one
+    engine writing one file.
+    """
     return (
-        f"{job['scenario']}.{job['engine']}.{job['device']}."
-        f"t{job['threads']}.r{job['repeat']}"
+        f"{job['scenario']}.{_safe(job.get('arm') or job['engine'])}."
+        f"{job['device']}.t{job['threads']}.r{job['repeat']}"
     )
+
+
+def _safe(name):
+    """An arm id as one path segment.
+
+    Arm ids are written by hand in a plan file, so this refuses a separator
+    rather than rewriting one: a silently mangled id is an id that no longer
+    matches the plan it came from.
+    """
+    text = str(name)
+    for bad in ("/", os.sep, "\\", "\n", "\t", " "):
+        if bad in text:
+            raise ValueError(
+                f"arm id {text!r} contains {bad!r}, and an arm id is a path "
+                "segment as well as a name. Rename the arm"
+            )
+    return text
 
 
 def run_job(job, run_dir, run_id, timeout):
@@ -296,6 +580,43 @@ def run_job(job, run_dir, run_id, timeout):
         env["MOJOTREES_DISABLE_GPU"] = "1"
     else:
         env.pop("MOJOTREES_DISABLE_GPU", None)
+        # A GPU cell must not inherit a float64 derivative setting EITHER
+        # WAY, and this is where that is enforced.
+        #
+        # `histogram.check_device_derivative_precision` refuses the request
+        # from both entries, the parameter and a live environment read, and it
+        # says which of the two is the likelier mistake: a variable exported
+        # for a CPU A/B and then left set for a GPU run. This process holds
+        # whatever the operator's shell held, and `subprocess` copies it into
+        # every child, so a variable nobody typed for this run would decide a
+        # cell of it. The parameter is the door now
+        # (`derivative_precision` on the estimator and on the parameter
+        # string); the variable is unset here so that a GPU cell cannot fail
+        # on something the job file does not mention.
+        env.pop("MOJOTREES_DERIVATIVE_PRECISION", None)
+    # The arm's own environment, applied per CELL. Last, so that a
+    # per-cell setting is visible in the job file that produced it; and
+    # REFUSED where it would overwrite something this runner owns, because a
+    # thread count or a GPU switch quietly replaced by an arm is a cell whose
+    # label no longer describes it.
+    for key, value in (job.get("arm_env") or {}).items():
+        if key in THREAD_ENV or key == "MOJOTREES_DISABLE_GPU":
+            raise ValueError(
+                f"arm {job.get('arm')!r} sets {key}, which run.py owns: the "
+                "thread count comes from --threads and the GPU switch from "
+                "--device, and an arm that moved either would be measuring "
+                "something its label does not say"
+            )
+        if key == "MOJOTREES_DERIVATIVE_PRECISION":
+            raise ValueError(
+                f"arm {job.get('arm')!r} sets MOJOTREES_DERIVATIVE_PRECISION. "
+                "That is a parameter now, not a variable: pass "
+                "derivative_precision in the arm's params, where it travels "
+                "in the job file and in the record instead of being inherited "
+                "by whatever else this process starts. See "
+                "docs/COMPATIBILITY_POLICY.md section 9.5.1"
+            )
+        env[key] = str(value)
 
     started = time.time()
     proc = subprocess.run(
@@ -322,6 +643,8 @@ def run_job(job, run_dir, run_id, timeout):
             "status": "error",
             "scenario": job["scenario"],
             "engine": job["engine"],
+            "arm": job.get("arm") or job["engine"],
+            "axis": job.get("axis"),
             "device_requested": job["device"],
             "threads": job["threads"],
             "repeat": job["repeat"],
@@ -355,6 +678,10 @@ def run_job(job, run_dir, run_id, timeout):
 CSV_COLUMNS = (
     "run_id", "comparator", "scenario", "tier", "task", "data_kind",
     "dataset", "pinned",
+    # `arm` before `engine` because it is the finer of the two: a spreadsheet
+    # sorted on `engine` alone puts two arms of one engine in one block, which
+    # is the collision the arm dimension exists to remove.
+    "arm", "axis", "axis_value",
     "engine", "engine_version", "device_requested", "device_used",
     "backend_proof", "threads",
     "histogram_builder", "repeat", "status", "primary_metric",
@@ -429,6 +756,12 @@ def _flat(record):
         "data_kind": data.get("data_kind"),
         "dataset": data.get("dataset"),
         "pinned": data.get("pinned"),
+        # The fallback is what makes a record written before the arm
+        # dimension readable in the same sheet as one written after: it
+        # carried no `arm`, and its arm WAS its engine.
+        "arm": record.get("arm") or record.get("engine"),
+        "axis": record.get("axis"),
+        "axis_value": record.get("axis_value"),
         "engine": record.get("engine"),
         "engine_version": record.get("engine_version"),
         "device_requested": record.get("device_requested"),
@@ -493,7 +826,7 @@ def _cell_error(record):
     error = record.get("error") or {}
     name = record.get("label") or ".".join(
         str(record.get(key))
-        for key in ("scenario", "engine", "device_requested", "threads")
+        for key in ("scenario", "arm", "device_requested", "threads")
     )
     return (
         name,
@@ -624,6 +957,14 @@ def main(argv=None):
              "its CPU twin's prediction digest",
     )
     parser.add_argument(
+        "--arms", default=None, metavar="MODULE",
+        help="a module in bench/real_data/ exposing arms(), e.g. `frontier`. "
+             "Each arm is one cell and carries its own scenario, tier, "
+             "variant, engine, device and parameter overrides, so --scenario, "
+             "--engine and --device do not apply. Without it the matrix is "
+             "the cross product it has always been, one arm per engine",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="write the matrix and the job files, run nothing",
     )
@@ -634,7 +975,35 @@ def main(argv=None):
     args.device = args.device or ["cpu"]
     args.threads = args.threads or [default_threads()]
 
-    jobs = build_matrix(args)
+    arms = None
+    arms_source = None
+    if args.arms:
+        # Imported by name from this directory rather than taken as a path,
+        # so an arm list is a module in the repository with a `check()` beside
+        # it and not a file somebody points at.
+        import importlib
+
+        module = importlib.import_module(args.arms)
+        if not hasattr(module, "arms"):
+            raise SystemExit(
+                f"--arms {args.arms}: the module has no arms(). An arm list "
+                "is a function returning dicts with at least id, scenario, "
+                "engine and device"
+            )
+        arms = list(module.arms())
+        arms_source = {
+            "module": args.arms,
+            "file": getattr(module, "__file__", None),
+            "count": len(arms),
+            "runnable": sum(1 for a in arms if not a.get("skip")),
+        }
+        # The plan checks itself before any of it is scheduled, where it has
+        # one, for the reason `comparator_banner` prints before the first
+        # cell: a plan that cannot be read correctly must not be run at all.
+        if hasattr(module, "check"):
+            module.check(arms)
+
+    jobs = build_matrix(args, arms)
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + (
         f"-{args.tag}" if args.tag else ""
     )
@@ -664,6 +1033,10 @@ def main(argv=None):
         "comparator": scenarios.comparator_block(),
         "environment": envinfo.collect(),
         "jobs": jobs,
+        # What produced the arm list, or None for the engine cross product.
+        # A records file that says "97 arms" and cannot say which plan they
+        # came from is a table nobody can reproduce.
+        "arms_source": arms_source,
         "sequential": True,
         "arm_order": "round-interleaved",
         "note": (
@@ -675,7 +1048,10 @@ def main(argv=None):
             "Inside a round, arms keep build order except that catboost runs "
             "before mojotrees_catboost_mode, which cannot be built until "
             "catboost has written its resolved learning rate into "
-            "catboost_readback.json: see run.CELL_ORDER."
+            "catboost_readback.json: see run.CELL_ORDER. A job's `arm` is "
+            "its identity within an engine and defaults to the engine name, "
+            "so a matrix with no --arms carries arm == engine on every row "
+            "and renders exactly the labels it always did."
         ),
     }
 
@@ -736,6 +1112,8 @@ def main(argv=None):
                 "status": "timeout",
                 "scenario": job["scenario"],
                 "engine": job["engine"],
+                "arm": job.get("arm") or job["engine"],
+                "axis": job.get("axis"),
                 "device_requested": job["device"],
                 "threads": job["threads"],
                 "repeat": job["repeat"],
@@ -766,6 +1144,8 @@ def main(argv=None):
             {
                 "schema_version": 1, "status": "skipped",
                 "scenario": job["scenario"], "engine": job["engine"],
+                "arm": job.get("arm") or job["engine"],
+                "axis": job.get("axis"),
                 "device_requested": job["device"], "threads": job["threads"],
                 "repeat": 0, "skip_reason": job["skip"],
             }
