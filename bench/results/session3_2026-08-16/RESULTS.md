@@ -393,9 +393,49 @@ That is the same class of error as the throttled comparator withdrawn above,
 reached from a different direction, and it would be found by the first outside
 reader who ran LightGBM themselves.
 
-**Unresolved. The CPU campaign is measuring `force_row_wise` against
-`force_col_wise` at 1,000,000 x 50, both pinned. Until that lands, every margin
-in this file carries this caveat.**
+### Resolved the same night: the pin is CONSERVATIVE, and the margins stand
+
+The CPU campaign measured it at 1,000,000 x 50, ten threads, both builders
+pinned, interleaved in one process, five repeats:
+
+| LightGBM builder | median | spread |
+|---|---|---|
+| `force_row_wise`, what we pin | **2.856** | 14.0% |
+| `force_col_wise` | 3.052 | 9.3% |
+
+All five pairs favor row-wise, median margin **6.9 percent**; consistent, not
+resolved, since the delta is smaller than the wider arm's own range.
+
+**The builder we pin is LightGBM's faster one at this shape, so pinning it makes
+the comparison harder on us, not easier.** The feared error — a margin won
+against a handicapped comparator — did not occur, and it failed to occur in the
+direction that supports rather than undermines what is published above. Nothing
+in this file is retracted on this account.
+
+**The caveat stays anyway**, in one sentence, because 6.9 percent is consistent
+rather than resolved and an outside reader on defaults could land anywhere in
+that band and would additionally pay the strategy-timing cost the pin removes.
+The correct phrasing wherever a margin appears: *the comparator is pinned to
+`force_row_wise`, which is LightGBM's faster builder at this shape by a
+consistent 6.9 percent, so the pin is conservative with respect to our margin.*
+
+### A statistic discrepancy in the harness, which may affect close verdicts
+
+The CPU campaign found that `bench_train_gpu.mojo` computes its
+`resolved` / `indistinguishable` verdict from the arms' **minima**, while this
+protocol requires the **median** and says why: the minimum is the luckiest
+sample, and contention here is the finding rather than noise.
+
+At 50,000 rows it flips this project's one claimed win over LightGBM: resolved on
+minima, consistent-not-resolved on medians. Every pair still favors us, so the
+direction is not in doubt, but the verdict word is.
+
+**Audited against this file: no verdict here changes.** The unroll is 10.8
+percent against a 2.1 percent floor on either statistic; the collapse null and
+the S1 figures were computed from medians by hand; the withdrawn slow-window
+LightGBM comparison is withdrawn on other grounds. The harness line should still
+be corrected to use the median, and that is queued behind the canary lane, which
+currently owns that file.
 
 ### The three sentences that are now supportable
 
