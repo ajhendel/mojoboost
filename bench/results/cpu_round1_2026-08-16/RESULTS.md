@@ -93,21 +93,53 @@ smaller than the measurement noise on this machine so its size is not
 established.* Doubling the repeats halved the apparent margin, which is what
 should be expected when the first estimate came from a lucky window.
 
-### Binning, re-measured
+### Binning. THE RATIO IS AGAINST A COMPARATOR WE REQUIRED TO DO MORE WORK
 
-| shape | ours | LightGBM | ratio |
+| shape | ours | LightGBM, pinned to bin every row | ratio |
 |---|---|---|---|
 | 1,000,000 | 0.199 | 1.006 | 5.1x faster |
 | 250,000 | 0.048 | 0.239 | 5.0x faster |
 | 50,000 | 0.048 | 0.046 | 4.6% behind |
 
-Phase 0 gave 6.3x / 5.8x / 2% behind. The shape of the finding is stable and
-the multiple is not: **large-data property, absent at small shapes**. The "~3x
-faster" figure this project carries is wrong at both ends.
+**Read the column heading. This is not LightGBM's binning cost; it is
+LightGBM's binning cost under a pin we imposed.**
 
-Note our binning is 0.048s at both 250,000 and 50,000 rows, which looks like a
+`bench/bench_lightgbm.py` sets `params["bin_construct_sample_cnt"] =
+int(n_rows)`. LightGBM's default is a **fixed 200,000-row subsample** whatever
+the dataset size, so its stock binning cost stops growing above 200,000 rows
+while ours grows with the data. The pin exists for a good reason, stated in
+`bench/real_data/scenarios.py`: unpinned, the two engines fit edges from
+different data and that is the largest single source of split divergence above
+200,000 rows. Its own rationale also says, in a clause nobody had carried
+forward, that leaving it alone "makes LightGBM's binning time look better than
+a like-for-like measurement would" — which is true in the direction that
+flatters LightGBM on *edges* and, as it turns out, flatters **us** on *time*.
+
+**Derived bound, and it is enough to withdraw the headline.** At 1,000,000 rows
+the pin makes LightGBM bin five times more data than it would choose to. If its
+binning is roughly linear in rows, stock LightGBM bins 200,000 rows in about
+0.20 s, against our 0.199 s over the full million. **That is parity, not 5.1x**,
+and the 5.1x is substantially a measurement of the extra work we required.
+
+So: **the 5.1x and 6.3x figures are withdrawn as statements about LightGBM.**
+What survives is narrower and still worth having: *given the same edges fitted
+from the same rows, we fit them about five times faster.* That is a real
+property of our binner and it is the right comparison for parity of the model.
+It is not a claim about what a user waits for at LightGBM's defaults.
+
+This must be re-measured against stock LightGBM before any version of it is
+quoted again, and the project is about to move its own defaults to stock, which
+changes which world the number lives in.
+
+The credit for catching this belongs to the GPU campaign, which read the pin's
+rationale rather than the pin. It is the fourth instance this week of a real
+number being quoted for a question it could not answer, and the third of them
+was mine.
+
+Note our binning is 0.048 s at both 250,000 and 50,000 rows, which looks like a
 fixed floor rather than row-proportional work below about a quarter million
-rows. Not investigated.
+rows. Not investigated, and it interacts with the above: a fixed floor is
+exactly what a sampled edge fit produces.
 
 ## What a quiet box does not buy
 
