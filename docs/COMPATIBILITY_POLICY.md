@@ -682,6 +682,68 @@ been, because a retune changes speed and not results (section 8.4).
 which backend runs, and CPU and GPU are not bit-identical to each other,
 so it changes results within the documented tolerance.
 
+#### 9.5.1 Experimental variables, and the rule that puts them here
+
+**The table above is 7 of 76.** `src/mojotrees/` reads **76 distinct
+`MOJOTREES_*` variables**; the seven above are the ones that are public on
+section 2's terms. The rest are experimental, and this subsection exists
+because "the registry lists seven" was itself a claim nobody had checked
+against the tree.
+
+**The rule (Andrew, 2026-08-16).** An experimental or A/B capability is a
+`MOJOTREES_*` environment variable **only**, and never an API door. Its
+same-named function parameter stays as **internal plumbing**: private, not on
+the estimator, not a parameter-string key. When a capability ships as a
+default or as a supported option it becomes a **named parameter** per
+[PARAMETER_NAMING.md](PARAMETER_NAMING.md), **the environment variable is
+removed in the same commit**, and the API snapshot moves.
+
+So a variable here having a same-named parameter that no caller ever passes
+is **the designed shape, not a defect.** Two were audited in detail on
+2026-08-16 and both came back conforming: `row_compaction` (77 call sites, all
+defaulting, producers genuinely consumed, so the plumbing is live and only the
+door is closed) and `const_hessian` (105 call sites, the only caller passing
+`True` is a test fixture).
+
+**The seventeen variables with a same-named parameter.** This is the set the
+rule governs. Status is `experimental` unless stated.
+
+| Variable | Parameter | Status |
+|---|---|---|
+| `MOJOTREES_AUTO_MIN_CELLS` | `auto_min_cells` | **ships**, listed public above |
+| `MOJOTREES_GPU_BLOCK_THREADS` | `block_threads` | **ships**, listed public above |
+| `MOJOTREES_CONST_HESSIAN` | `const_hessian` | experimental |
+| `MOJOTREES_CONST_HESSIAN_VERIFY` | `const_hessian_verify` | experimental; the verify variable stays until the capability ships |
+| `MOJOTREES_GPU_ROW_COMPACTION` | `row_compaction` | experimental; ship-or-remove decided by the GPU campaign after its A/B |
+| `MOJOTREES_CPU_COMPACT_MIN_ROWS` | `compact_min_rows` | experimental |
+| `MOJOTREES_CPU_FEATURE_GROUP` | `feature_group` | experimental |
+| `MOJOTREES_GPU_FEATURE_GROUP` | `feature_group` | experimental |
+| `MOJOTREES_CPU_ROW_BLOCKS` | `row_blocks` | experimental |
+| `MOJOTREES_CPU_ROW_BLOCK_AMORTIZE` | `row_block_amortize` | experimental |
+| `MOJOTREES_GPU_MIN_TILES` | `min_tiles` | experimental |
+| `MOJOTREES_GPU_PACKED_GRADS` | `packed_grads` | experimental |
+| `MOJOTREES_GPU_STAGING_SLOTS` | `staging_slots` | experimental |
+| `MOJOTREES_GPU_VALID_SCORING` | `valid_scoring` | experimental |
+| `MOJOTREES_GPU_BACKEND` | `backend` | experimental |
+| `MOJOTREES_GPU_TRACE` | `trace` | experimental; diagnostic |
+| `MOJOTREES_GPU_OBJECTIVE` | `objective` | experimental; the name match is probably coincidental, since `objective` is a real parameter almost everywhere |
+
+**Two caveats that must travel with this table.**
+
+**"Not in the Python surface" is not "unreachable from Python."** Any caller
+can set `os.environ["MOJOTREES_X"]` before importing. The gap these variables
+have is **discoverability**: no estimator keyword, no parameter-string key, no
+named door, so you have to already know the string. Stating it the stronger
+way would be an overclaim, and it was made and corrected on 2026-08-16.
+
+**The count of seventeen came from a name match that has already been wrong
+once.** An earlier version of the same filter returned **two**, missing
+`row_compaction`, because its variable carries a `GPU_` infix the match did not
+strip. It was caught only because a known instance was **absent** from the
+output, which is not a check anybody can run over a list of things they do not
+already know about. Treat seventeen as an upper bound produced by a heuristic,
+and `MOJOTREES_GPU_OBJECTIVE` as the visible false positive it probably is.
+
 ## 10. Supported platforms
 
 ### 10.0 Which document is authoritative
