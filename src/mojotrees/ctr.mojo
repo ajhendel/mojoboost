@@ -147,12 +147,19 @@ Intentional differences from CatBoost
 
 Not built
 ---------
-Combinations (`max_ctr_complexity > 1`), which is the next lane and for which
-`ctr_combination_hash` and `ctr_projection_hash` are left in place;
-`FloatTargetMeanValue`; the GPU-only `FeatureFreq`; `ctr_leaf_count_limit`'s
-top-K reindexing; `PriorEstimation`; per-feature CTR descriptions;
-`ctr_history_unit = Group`; and the `Dynamic` fold shape, which is ordered
-boosting (catalog A7) and a different mechanism.
+`FloatTargetMeanValue`; the GPU-only `FeatureFreq`; `PriorEstimation`;
+per-feature CTR descriptions; `ctr_history_unit = Group`; and the `Dynamic`
+fold shape, which is ordered boosting (catalog A7) and a different mechanism.
+
+Combinations (`max_ctr_complexity > 1`) are no longer on that list. They live
+in `ctr_combinations.mojo` (catalog A30), which holds the binarized half of
+`calc_hashes`, the candidate enumeration from `greedy_tensor_search.cpp`,
+`ctr_leaf_count_limit`'s top-K reindexing, and the `SimpleCtrs`-versus-
+`TreeCtrs` routing rule. It imports this module and produces exactly the
+`List[Int]` bucket per row that the four ordered loops below already take, so
+a combination reaches them with no signature change -- which is why every entry
+point here was written to take an already-hashed bucket rather than a raw
+column.
 
 Imports
 -------
@@ -206,9 +213,15 @@ comptime DEFAULT_TARGET_BORDER_COUNT = 1
 comptime DEFAULT_PERMUTATION_COUNT = 4
 
 # `cat_feature_options.cpp:231`, `MaxTensorComplexity("max_ctr_complexity", 4)`.
-# Recorded, and NOT reachable here: `check_ctr_complexity` refuses anything
-# above 1 by name, which is the guard the combinations lane deletes.
+# The projection itself lives in `ctr_combinations.mojo` (catalog A30); this
+# module builds the complexity-1 loops that consume its bucket ids.
 comptime DEFAULT_MAX_CTR_COMPLEXITY = 4
+
+# `GetMaxTreeDepth()` (`restrictions.h:14`), the bound
+# `TCatFeatureParams::Validate` checks `max_ctr_complexity` against
+# (`cat_feature_options.cpp:269-271`). `ctr_combinations.mojo` re-exports it
+# rather than redefining it.
+comptime MAX_CTR_COMPLEXITY_LIMIT = 16
 
 # `cat_feature_options.cpp:234`,
 # `CounterCalcMethod("counter_calc_method", ECounterCalc::SkipTest)`.
@@ -931,24 +944,33 @@ def check_ctr_border_type(border_selection_type: String) raises:
 
 
 def check_ctr_complexity(max_ctr_complexity: Int) raises:
-    """Refuses feature combinations, which are the next lane.
+    """CatBoost's own bound on `max_ctr_complexity`.
 
-    `max_ctr_complexity` defaults to 4 in CatBoost and this module builds only
-    the complexity-1 (single categorical column) projection. The guard is by
-    name so the combinations lane deletes a refusal rather than discovering an
-    assumption. `ctr_combination_hash` and `ctr_projection_hash` are already
-    here and already tested; what is missing is the binarized-feature half of
-    `calc_hashes`, the candidate enumeration in `greedy_tensor_search.cpp`, and
-    `ctr_leaf_count_limit`'s top-K reindexing, which a wide combination needs
-    and a single column does not.
+    `TCatFeatureParams::Validate` (`cat_feature_options.cpp:266-271`):
+
+        const ui32 ctrComplexityLimit = GetMaxTreeDepth();      // 16
+        CB_ENSURE(MaxTensorComplexity.Get() < ctrComplexityLimit, ...);
+
+    This used to refuse anything above 1, by name, so that the combinations lane
+    would delete a refusal rather than discover an assumption. That lane has
+    landed (catalog A30) and `ctr_combinations.mojo` now holds the binarized
+    half of `calc_hashes`, the candidate enumeration from
+    `greedy_tensor_search.cpp`, and `ctr_leaf_count_limit`'s top-K reindexing.
+    The refusal that survives is `ctr_combinations.check_ctr_combination_trainer_support`,
+    which refuses an ENABLED complexity above 1 because no grow loop drives the
+    enumeration yet -- the same honest "unreached" statement
+    `check_ctr_trainer_support` makes below.
+
+    The bound is written out here rather than imported from
+    `ctr_combinations.mojo`, because that module imports this one and a call in
+    the other direction would close a cycle.
     """
     if max_ctr_complexity < 1:
         raise Error("max_ctr_complexity must be positive")
-    if max_ctr_complexity > 1:
+    if max_ctr_complexity >= MAX_CTR_COMPLEXITY_LIMIT:
         raise Error(
-            "ctr feature combinations are not built: max_ctr_complexity above 1"
-            " needs projection hashing over several columns plus"
-            " ctr_leaf_count_limit reindexing, neither of which is here"
+            "max_ctr_complexity must be below 16: CatBoost bounds it by"
+            " GetMaxTreeDepth() at cat_feature_options.cpp:269"
         )
 
 

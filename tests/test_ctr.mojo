@@ -787,7 +787,14 @@ def test_an_enabled_bundle_takes_the_default_priors() raises:
     # Counter is not permutation dependent and needs no target classifier.
     assert_false(c.is_permutation_dependent())
     assert_false(c.needs_target_classifier())
-    # It is enabled with the default complexity of 4, which validate refuses.
+    # It is enabled with CatBoost's default complexity of 4, and `validate` now
+    # ACCEPTS that. It used to refuse it, because A19 built only the
+    # complexity-1 projection; `ctr_combinations.mojo` (catalog A22) built the
+    # rest, so the bound `validate` enforces is CatBoost's own `< 16` and the
+    # "not reached by a trainer" refusal moved to
+    # `ctr_combinations.check_ctr_combination_trainer_support`.
+    p.validate()
+    p.max_ctr_complexity = 16
     with assert_raises():
         p.validate()
 
@@ -808,10 +815,18 @@ def test_non_uniform_ctr_binarization_is_refused_by_name() raises:
         check_ctr_border_type("Median")
 
 
-def test_combinations_are_refused_by_name() raises:
+def test_complexity_is_bounded_by_catboosts_own_limit() raises:
+    # This test used to assert that complexity 4 was REFUSED BY NAME, which was
+    # the guard A19 left for the combinations lane to delete. That lane landed
+    # (catalog A22, `ctr_combinations.mojo`) and the guard now enforces
+    # CatBoost's own bound, `MaxTensorComplexity < GetMaxTreeDepth()` = 16
+    # (`cat_feature_options.cpp:269`). The refusal that survives is
+    # `ctr_combinations.check_ctr_combination_trainer_support`, tested there.
     check_ctr_complexity(1)
+    check_ctr_complexity(4)
+    check_ctr_complexity(15)
     with assert_raises():
-        check_ctr_complexity(4)
+        check_ctr_complexity(16)
     with assert_raises():
         check_ctr_complexity(0)
 
