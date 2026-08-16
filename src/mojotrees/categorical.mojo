@@ -150,9 +150,20 @@ def cat_pool_contains(pool: List[UInt64], offset: Int, bin: Int) -> Bool:
     ) != 0
 
 
-@fieldwise_init
+comptime ONE_HOT_MAX_SIZE_OFF = -1
+"""`CategoricalParams.one_hot_max_size` at `-1` is off: the one-hot decision
+is LightGBM's `max_cat_to_onehot`, which is what this file has always used."""
+
+comptime CATBOOST_DEFAULT_ONE_HOT_MAX_SIZE = 2
+"""CatBoost's `one_hot_max_size` default, verified from
+`catboost/private/libs/options/cat_feature_options.cpp:232`
+(`OneHotMaxSize("one_hot_max_size", 2)`). Recorded, and NOT this repo's
+default: the default here is off."""
+
+
 struct CategoricalParams(Copyable, Movable):
-    """LightGBM's categorical hyperparameters, same names and defaults.
+    """LightGBM's categorical hyperparameters, same names and defaults, plus
+    one CatBoost knob that is off unless asked for.
 
     - `max_cat_to_onehot`: use one-vs-rest search at or below this many
       categories.
@@ -164,6 +175,12 @@ struct CategoricalParams(Copyable, Movable):
       split.
     - `min_data_per_group`: minimum rows added per accepted step of the
       sorted search, and a floor on the right child's row count.
+    - `one_hot_max_size`: CatBoost's one-hot threshold, `-1` for off. See
+      `find_best_categorical_split` and `docs/design/CATBOOST_CATALOG.md` A16.
+
+    `one_hot_max_size` is a trailing argument with a default, not a sixth
+    positional field, so every existing five-argument construction still
+    means exactly what it meant.
     """
 
     var max_cat_to_onehot: Int
@@ -171,10 +188,54 @@ struct CategoricalParams(Copyable, Movable):
     var cat_smooth: Float64
     var cat_l2: Float64
     var min_data_per_group: Int
+    var one_hot_max_size: Int
+
+    def __init__(
+        out self,
+        max_cat_to_onehot: Int,
+        max_cat_threshold: Int,
+        cat_smooth: Float64,
+        cat_l2: Float64,
+        min_data_per_group: Int,
+        one_hot_max_size: Int = ONE_HOT_MAX_SIZE_OFF,
+    ):
+        self.max_cat_to_onehot = max_cat_to_onehot
+        self.max_cat_threshold = max_cat_threshold
+        self.cat_smooth = cat_smooth
+        self.cat_l2 = cat_l2
+        self.min_data_per_group = min_data_per_group
+        self.one_hot_max_size = one_hot_max_size
 
     @staticmethod
     def default() -> CategoricalParams:
         return CategoricalParams(4, 32, 10.0, 10.0, 100)
+
+    def uses_catboost_one_hot(self) -> Bool:
+        """Whether the CatBoost threshold is in force rather than
+        LightGBM's."""
+        return self.one_hot_max_size >= 0
+
+    def check_one_hot(self) raises:
+        """Refuse an unusable `one_hot_max_size`.
+
+        CatBoost's own ceiling is `OneHotMaxSizeLimit`, `GetMaxBinCount()` on
+        CPU and 256 on GPU
+        (`cat_feature_options.cpp:233`, enforced with `<=` at :267). Ours is
+        `CAT_MAX_BINS`, because a node's category set is a fixed 256-bit
+        bitset and a threshold above that could never be reached anyway.
+        """
+        if self.one_hot_max_size < ONE_HOT_MAX_SIZE_OFF:
+            raise Error(
+                "one_hot_max_size must be -1 (off) or non-negative, got ",
+                self.one_hot_max_size,
+            )
+        if self.one_hot_max_size > CAT_MAX_BINS:
+            raise Error(
+                "one_hot_max_size must be at most ",
+                CAT_MAX_BINS,
+                ", got ",
+                self.one_hot_max_size,
+            )
 
 
 @fieldwise_init
@@ -536,7 +597,38 @@ def find_best_categorical_split(
     # children use the larger cat_l2, so this score is the same one the
     # numerical scan subtracts.
     var parent_score = leaf_score(total_g, total_h, lambda_l1, lambda_reg)
-    if n_categories <= cat.max_cat_to_onehot:
+    # Which threshold decides one-hot. `one_hot_max_size` at its default of
+    # -1 is off and this is the LightGBM-named test this function has always
+    # run; at >= 0 it is CatBoost's, verified from
+    # `catboost/private/libs/algo/greedy_tensor_search.cpp:182`
+    # (`if ((onLearnOnlyCount > oneHotMaxSize) || (onLearnOnlyCount <= 1)) return;`).
+    # CatBoost's comparison is `<=` on the count of REAL categories seen on
+    # the learn set, with no dummy bin in the count, and its `<= 1` guard is
+    # the `n_categories < 2` return above.
+    #
+    # The two thresholds are NOT the same boundary and must not be collapsed
+    # onto one comparison. LightGBM's test is `num_bin <= max_cat_to_onehot`
+    # (`src/treelearner/feature_histogram.cpp:183`) where `num_bin` is
+    # `kept_categories + 1` because `src/io/bin.cpp:456-459` pushes a dummy
+    # bin at index 0 first, so LightGBM one-hots up to `max_cat_to_onehot - 1`
+    # real categories. The test below on `max_cat_to_onehot` therefore
+    # one-hots one category more than LightGBM does; that is the known
+    # off-by-one, it is the `wide-categorical-bins` lane's to move because
+    # moving it changes every default categorical fit, and giving the CatBoost
+    # boundary its own parameter here is what stops the two from being fixed
+    # as if they were one. See `docs/design/CATBOOST_CATALOG.md` A16.
+    #
+    # DIVERGENCE above the threshold: CatBoost sends a wider feature to CTRs
+    # (`AddSimpleCtrs` returns early on `<= oneHotMaxSize`, :469), which
+    # mojotrees does not have. Here a wider feature falls to the many-vs-many
+    # sorted search, so this parameter selects CatBoost's boundary and not
+    # CatBoost's other side.
+    var one_hot: Bool
+    if cat.uses_catboost_one_hot():
+        one_hot = n_categories <= cat.one_hot_max_size
+    else:
+        one_hot = n_categories <= cat.max_cat_to_onehot
+    if one_hot:
         return _onehot_search(
             grad,
             hess,

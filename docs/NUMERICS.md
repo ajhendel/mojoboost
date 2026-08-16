@@ -234,11 +234,50 @@ aiming at. A number that moves toward the comparator is not a regression even
 when it moves down.
 
 **But a measured trade becomes a switch.** `derivative_precision` takes
-`float32` (the default, everything above) or `float64`, and `float64` keeps
-per-row gradients and hessians at full Float64 through the objective and every
-read site. Reach it with `MOJOTREES_DERIVATIVE_PRECISION=float64`, which is
-read once per fit by `histogram.ConstHessianSettings.resolve()` and once per
-round by `boosting.fill_grad_hess`.
+`float32` (the default, everything above) or `float64`. Reach it with
+`MOJOTREES_DERIVATIVE_PRECISION=float64`, which is read once per fit by
+`histogram.ConstHessianSettings.resolve()` and once per round by
+`boosting.fill_grad_hess`.
+
+> **Corrected and then fixed, 2026-08-16.** This paragraph used to say
+> `float64` keeps derivatives at Float64 "through the objective and every
+> read site". It was true on the dense CPU path and false on three others,
+> silently. An audit of every fit path found three settings accepted and then
+> ignored:
+>
+> - **Sparse.** `tree_sparse.grow_tree_sparse` passed `narrow=True` at all
+>   five of its `histogram_sparse` sites, so the objective widened and the
+>   histogram re-narrowed and GOSS and weighted rounds accumulated
+>   `Float32(w*g)` where the requested arm accumulates `w*g`.
+> - **Distributed.** The same shape at nine `build_histogram` sites. Worse,
+>   the schema digest did not cover the setting and the environment is read
+>   per process, so exporting the variable on one rank only would all-reduce
+>   histograms taken at two precisions with nothing detecting it.
+> - **The accelerator.** `gpu_gradient_stream.stage_gradients` narrows every
+>   row to Float32 on upload, so a GPU fit at `float64` has always produced
+>   the Float32 answer. `ExtraTreeParams.is_active()` was believed to guard
+>   this and does not: it gates the device split search and the resident
+>   tree, not the histogram.
+>
+> **All three are closed.** Sparse and distributed carry the fit's resolved
+> setting; the digest folds it in, appended only when it is not the default
+> so existing checkpoint digests are unchanged bit for bit. The GPU is
+> **refused** rather than forwarded, because forwarding would make the host
+> compute Float64 gradients the device then narrows -- the same
+> third-configuration failure described below. One consequence to know: a
+> `device='auto'` fit at `float64` now raises rather than falling back to
+> the CPU.
+>
+> **And the parameter form is no longer refused.** The snapshot hop landed
+> in `fc223da` and the objective half across thirty call sites after it, so
+> `derivative_precision=float64` now trains the arm it names.
+> `check_derivative_precision` is a range check only. What the refusal
+> protected against was a half-wired parameter storing `Float64(Float32(g))`
+> and reading it un-re-narrowed -- not float32, since accumulation order
+> moves, and not float64, since the low 29 significand bits are already
+> gone. That third configuration is unreachable now, and the claim is
+> asserted rather than argued: the two entries are compared on full ensemble
+> bits, gated on the default arm differing first.
 
 **What `float64` buys and what it costs, for a reader deciding.** It buys back
 the accuracy in the second table on a rare-class ranking metric, and it buys

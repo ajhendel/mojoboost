@@ -187,6 +187,7 @@ class _Config:
             MojoTreesRegressor,
             _BINARY_LOGISTIC,
             _LAMBDARANK,
+            _MULTICLASS,
         )
 
         given = dict(params or {})
@@ -220,7 +221,23 @@ class _Config:
                 self.base = MojoTreesClassifier(
                     n_estimators=self.rounds, **given
                 )
-                self.objective_code = _BINARY_LOGISTIC
+                # BINARY and MULTICLASS share the classifier, not the
+                # objective code. This read `_BINARY_LOGISTIC` for both,
+                # so `train(params={"objective": "multiclass"})` declared
+                # a single-output binary objective to the device policy
+                # while handing it `n_outputs = num_class`, and wrote the
+                # same false code into `params["objective"]`. The trainer
+                # never read it back (`train_dataset_multiclass` takes the
+                # class count and ignores the objective key) and the one
+                # installed crossover rule declines on `n_outputs > 1`, so
+                # no fit has been routed on it yet -- but the declaration
+                # was still false, and the objective gate is the thing it
+                # was false to.
+                self.objective_code = (
+                    _MULTICLASS
+                    if self.task == _eval.MULTICLASS
+                    else _BINARY_LOGISTIC
+                )
         except TypeError as exc:
             # A LightGBM option this repository knows and does not
             # implement gets the native message saying what it would take

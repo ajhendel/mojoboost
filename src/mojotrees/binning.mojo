@@ -294,8 +294,9 @@ dispatch. None of this moves an edge or a bin: it decides only how the same
 work is spread.
 """
 
-from std.math import isnan
+from std.math import isnan, log
 from std.memory import bitcast
+from std.os import getenv
 
 from .categorical import CategoricalSpec, fit_categorical_spec
 from .parallel import (
@@ -545,6 +546,567 @@ def emit_quantile_edges(
         if len(out) > 0 and edge <= out[len(out) - 1]:
             continue
         out.append(edge)
+
+
+# --------------------------------------------------------------------------
+# CatBoost border selection. An ADDITIONAL mode, never a replacement.
+#
+# Everything below is opt-in and unreachable at `border_type=BORDER_QUANTILE`,
+# which is `fit_bins`'s default and is the LightGBM `GreedyFindBin` port this
+# file has always been. Verified against CatBoost `master`, read 2026-08-16;
+# see `docs/design/CATBOOST_CATALOG.md` A15 for the full citation list and for
+# the divergences. Line numbers below are into
+# `library/cpp/grid_creator/binarization.cpp` unless another file is named.
+#
+# The one fact worth carrying in your head. CatBoost's `border_count` counts
+# THRESHOLDS and this repo's `max_bin` counts BINS, so CatBoost's default 254
+# and our 255 are the same 255-bin budget, and `max_borders` below is
+# `n_ordinary - 1`. Given that, `GreedyLogSum` and our quantile fit produce
+# the SAME NUMBER of borders, `min(max_borders, distinct - 1)`, and differ
+# only in where they sit. The catalog shows why there is no third outcome.
+# --------------------------------------------------------------------------
+
+comptime BORDER_QUANTILE = 0
+"""Ours: LightGBM's `GreedyFindBin`, equal-frequency. The default, and the
+only value that leaves `fit_bins` on the instructions it ran before this
+mode existed."""
+
+comptime BORDER_GREEDY_LOG_SUM = 1
+"""CatBoost `GreedyLogSum`, its own default (`MakeBinarizer`, :118)."""
+
+comptime BORDER_GREEDY_MIN_ENTROPY = 2
+"""CatBoost `GreedyMinEntropy` (`MakeBinarizer`, :120)."""
+
+comptime BORDER_UNIFORM = 3
+"""CatBoost `Uniform` (`TUniformBinarizer`, :1262)."""
+
+comptime BORDER_MEDIAN = 4
+"""CatBoost `Median` (`TMedianBinarizer`, :1201)."""
+
+comptime BORDER_UNIFORM_AND_QUANTILES = 5
+"""CatBoost `UniformAndQuantiles` (`TMedianPlusUniformBinarizer`, :1224)."""
+
+comptime BORDER_MIN_ENTROPY = 6
+"""CatBoost `MinEntropy`. Recognized by name and REFUSED; see
+`check_border_type`."""
+
+comptime BORDER_MAX_LOG_SUM = 7
+"""CatBoost `MaxLogSum`. Recognized by name and REFUSED; see
+`check_border_type`."""
+
+comptime CATBOOST_DEFAULT_BORDER_COUNT = 254
+"""CatBoost's CPU `border_count` default, from
+`catboost/private/libs/options/data_processing_options.cpp:14-19`. Thresholds,
+so it is this repo's `max_bin = 255`. Recorded, and read by nothing: our
+default budget stays 255 bins because it already is this budget."""
+
+comptime _CB_PENALTY_EPS = 1e-8
+"""The `1e-8` inside CatBoost's penalties (`Penalty<>`, :174-186), kept
+because it is what stops `log(0)` at a zero-weight bin."""
+
+comptime _CB_NEG_INF = -POSITIVE_INF
+"""What `CalcSplitScore` returns for a cut at either end of a bin
+(:1400-1402), which is also how an unsplittable bin sinks to the bottom of
+the heap."""
+
+
+def parse_border_type(name: String) raises -> Int:
+    """CatBoost's `feature_border_type` spellings, plus `quantile` for ours.
+
+    CatBoost's own names are taken verbatim from `EBorderSelectionType`
+    (`library/cpp/grid_creator/binarization.h:13-21`) so that a scenario file
+    can pass through whatever the user gave CatBoost.
+    """
+    if name == "quantile":
+        return BORDER_QUANTILE
+    if name == "GreedyLogSum":
+        return BORDER_GREEDY_LOG_SUM
+    if name == "GreedyMinEntropy":
+        return BORDER_GREEDY_MIN_ENTROPY
+    if name == "Uniform":
+        return BORDER_UNIFORM
+    if name == "Median":
+        return BORDER_MEDIAN
+    if name == "UniformAndQuantiles":
+        return BORDER_UNIFORM_AND_QUANTILES
+    if name == "MinEntropy":
+        return BORDER_MIN_ENTROPY
+    if name == "MaxLogSum":
+        return BORDER_MAX_LOG_SUM
+    raise Error(
+        "unknown border_type '",
+        name,
+        "'; expected quantile, GreedyLogSum, GreedyMinEntropy, Uniform,"
+        " Median, UniformAndQuantiles, MinEntropy or MaxLogSum",
+    )
+
+
+def border_type_name(border_type: Int) raises -> String:
+    """The name `parse_border_type` accepts, for messages and round-trips."""
+    if border_type == BORDER_QUANTILE:
+        return String("quantile")
+    if border_type == BORDER_GREEDY_LOG_SUM:
+        return String("GreedyLogSum")
+    if border_type == BORDER_GREEDY_MIN_ENTROPY:
+        return String("GreedyMinEntropy")
+    if border_type == BORDER_UNIFORM:
+        return String("Uniform")
+    if border_type == BORDER_MEDIAN:
+        return String("Median")
+    if border_type == BORDER_UNIFORM_AND_QUANTILES:
+        return String("UniformAndQuantiles")
+    if border_type == BORDER_MIN_ENTROPY:
+        return String("MinEntropy")
+    if border_type == BORDER_MAX_LOG_SUM:
+        return String("MaxLogSum")
+    raise Error("unknown border_type ", border_type)
+
+
+def check_border_type(border_type: Int) raises:
+    """Accept a border type, or refuse it by name with the reason.
+
+    `MinEntropy` and `MaxLogSum` are refused rather than approximated. They
+    are `TExactBinarizer` (:1151), whose engine is the banded dynamic program
+    at :192-694: nine solver modes, `O(distinct * bins)` time and
+    `(bins - 2) * distinct` `size_t` of scratch. An approximation of either is
+    already here under CatBoost's own name for it, `GreedyMinEntropy` and
+    `GreedyLogSum`, which are the same two objectives optimized greedily
+    (`BestWeightedSplit`, :1655-1667, pairs each exact type with its greedy
+    twin under one penalty).
+    """
+    if border_type == BORDER_MIN_ENTROPY or border_type == BORDER_MAX_LOG_SUM:
+        raise Error(
+            "border_type '",
+            border_type_name(border_type),
+            "' is CatBoost's exact dynamic program (TExactBinarizer) and is"
+            " not implemented; its greedy twin is '",
+            String("GreedyMinEntropy") if border_type
+            == BORDER_MIN_ENTROPY else String("GreedyLogSum"),
+            "'",
+        )
+    if border_type < BORDER_QUANTILE or border_type > BORDER_MAX_LOG_SUM:
+        raise Error("unknown border_type ", border_type)
+
+
+@fieldwise_init
+struct _CbBin(Copyable, Movable):
+    """One bin of CatBoost's greedy split, `[start, end)` over distinct
+    levels. `IFeatureBin` (:1320-1376) plus `TWeightedFeatureBin`'s cached
+    best cut (:1428-1497).
+
+    `best` is the level index of the better of the two cuts considered, and
+    `score` is that cut's penalty gain, `_CB_NEG_INF` when the bin holds a
+    single level and cannot be cut at all.
+    """
+
+    var start: Int
+    var end: Int
+    var best: Int
+    var score: Float64
+
+
+def _cb_penalty(border_type: Int, w: Float64) -> Float64:
+    """`Penalty<MaxSumLog>(w) = -log(w + 1e-8)` and
+    `Penalty<MinEntropy>(w) = w * log(w + 1e-8)`, :174-186."""
+    if border_type == BORDER_GREEDY_MIN_ENTROPY:
+        return w * log(w + _CB_PENALTY_EPS)
+    return -log(w + _CB_PENALTY_EPS)
+
+
+def _cb_split_score(
+    b_start: Int,
+    b_end: Int,
+    p: Int,
+    cum: List[Float64],
+    border_type: Int,
+) -> Float64:
+    """`TWeightedFeatureBin::CalcSplitScore`, :1454-1471.
+
+    `Penalty(L + R) - Penalty(L) - Penalty(R)` on the two sides' OBSERVATION
+    weights, and `_CB_NEG_INF` for a cut at either end. `cum[i]` is the
+    cumulative observation count through level `i`.
+    """
+    if p <= b_start or p >= b_end:
+        return _CB_NEG_INF
+    var left_bins = 0.0 if b_start == 0 else cum[b_start - 1]
+    var lw = cum[p - 1] - left_bins
+    var rw = cum[b_end - 1] - cum[p - 1]
+    return (
+        _cb_penalty(border_type, lw + rw)
+        - _cb_penalty(border_type, lw)
+        - _cb_penalty(border_type, rw)
+    )
+
+
+def _cb_update_best(mut b: _CbBin, cum: List[Float64], border_type: Int):
+    """`TWeightedFeatureBin::UpdateBestSplitProperties`, :1473-1493.
+
+    Only TWO cuts are ever considered, the two ends of the level holding the
+    bin's median observation, and a tie goes left
+    (`BestSplit = scoreLeft >= scoreRight ? lb : ub`). That is what makes this
+    a recursive median split rather than an exhaustive search, and it is the
+    single most surprising thing about `GreedyLogSum`.
+    """
+    var left_bins = 0.0 if b.start == 0 else cum[b.start - 1]
+    var mid_w = 0.5 * (left_bins + cum[b.end - 1])
+    # lower_bound over cum[start, end) for mid_w.
+    var lo = b.start
+    var hi = b.end
+    while lo < hi:
+        var m = lo + (hi - lo) // 2
+        if cum[m] < mid_w:
+            lo = m + 1
+        else:
+            hi = m
+    # `mid_w <= cum[end - 1]` always, so `lo < end` always; the clamp is here
+    # because this function must never read past a bin and cannot raise.
+    var lb = lo if lo < b.end else b.end - 1
+    var ub = lb + 1
+    var s_left = _cb_split_score(b.start, b.end, lb, cum, border_type)
+    var s_right = _cb_split_score(b.start, b.end, ub, cum, border_type)
+    if s_left >= s_right:
+        b.best = lb
+        b.score = s_left
+    else:
+        b.best = ub
+        b.score = s_right
+
+
+def _cb_can_split(b: _CbBin) -> Bool:
+    """`IFeatureBin::CanSplit`, :1353-1355."""
+    return b.start != b.best and b.end != b.best
+
+
+def _cb_better(a: _CbBin, b: _CbBin) -> Bool:
+    """Strict heap order: higher score first, ties to the leftmost bin.
+
+    DIVERGENCE, deliberate. `std::priority_queue`'s order among equal scores
+    is unspecified in C++, so CatBoost has no behavior here to match. A total
+    order is required because this project's rule is that a fit reproduce
+    across `MOJOTREES_NUM_WORKERS` and across machines, and a tie CAN change
+    the output: it decides which bin gets the last split the budget allows.
+    """
+    if a.score != b.score:
+        return a.score > b.score
+    return a.start < b.start
+
+
+def _cb_heap_push(mut heap: List[_CbBin], var item: _CbBin):
+    heap.append(item^)
+    var i = len(heap) - 1
+    while i > 0:
+        var p = (i - 1) // 2
+        if not _cb_better(heap[i], heap[p]):
+            break
+        var t = heap[i].copy()
+        heap[i] = heap[p].copy()
+        heap[p] = t^
+        i = p
+
+
+def _cb_heap_pop(mut heap: List[_CbBin]) -> _CbBin:
+    var top = heap[0].copy()
+    var last = heap[len(heap) - 1].copy()
+    heap.resize(len(heap) - 1, top.copy())
+    var n = len(heap)
+    if n > 0:
+        heap[0] = last^
+        var i = 0
+        while True:
+            var l = 2 * i + 1
+            var r = l + 1
+            var best = i
+            if l < n and _cb_better(heap[l], heap[best]):
+                best = l
+            if r < n and _cb_better(heap[r], heap[best]):
+                best = r
+            if best == i:
+                break
+            var t = heap[i].copy()
+            heap[i] = heap[best].copy()
+            heap[best] = t^
+            i = best
+    return top^
+
+
+def _cb_greedy_borders(
+    levels: List[Float64],
+    cum: List[Float64],
+    max_borders: Int,
+    border_type: Int,
+    mut heap: List[_CbBin],
+    mut out: List[Float64],
+):
+    """`GreedySplit`, :1500-1520, over grouped levels.
+
+    The loop is `while (splits.size() <= maxBordersCount && splits.top().CanSplit())`,
+    so it stops either at `max_borders + 1` bins or once the best-scoring bin
+    holds a single level. An unsplittable bin scores `_CB_NEG_INF` and sinks,
+    so "the top cannot split" means every bin is a single level: the border
+    count is exactly `min(max_borders, len(levels) - 1)` and never anything
+    between.
+
+    Grouped levels rather than raw sorted observations: CatBoost runs
+    `TFeatureBin` on the raw array for a dense column (:1703-1712) and
+    `TWeightedFeatureBin` on grouped levels for a sparse one (:1686-1702). The
+    two were ported and compared and produce identical border sets; the
+    grouped array is the shorter one. See catalog A11.
+    """
+    heap.clear()
+    var n = len(levels)
+    if n < 2 or max_borders < 1:
+        return
+    var root = _CbBin(0, n, 0, 0.0)
+    _cb_update_best(root, cum, border_type)
+    _cb_heap_push(heap, root^)
+    while len(heap) <= max_borders and _cb_can_split(heap[0]):
+        var top = _cb_heap_pop(heap)
+        var left = _CbBin(top.start, top.best, 0, 0.0)
+        _cb_update_best(left, cum, border_type)
+        top.start = top.best
+        _cb_update_best(top, cum, border_type)
+        _cb_heap_push(heap, left^)
+        _cb_heap_push(heap, top^)
+    # `IFeatureBin::LeftBorder`, :1357-1371: every bin but the first
+    # contributes the midpoint of the two levels its start sits between. The
+    # heap is not in bin order, so the caller sorts.
+    for i in range(len(heap)):
+        var s = heap[i].start
+        if s > 0:
+            out.append(0.5 * levels[s - 1] + 0.5 * levels[s])
+
+
+def _cb_regular_border(levels: List[Float64], v: Float64) -> Float64:
+    """`RegularBorder`, :698-731, without the `initialBorders` snapping.
+
+    "Border before the element with value `v`". Off the low end it returns
+    `min(0.5 * front, 2 * front)` and off the high end
+    `max(2 * back, back + 1)`, which are CatBoost's "always true" and "always
+    false" degenerate borders; in between it is the midpoint of the two levels
+    `v` falls between, with the wrong-side-rounding guard that pulls the
+    midpoint back down to the lower level when rounding put it on the upper
+    one.
+    """
+    var n = len(levels)
+    # lower_bound: first level not less than v.
+    var lo = 0
+    var hi = n
+    while lo < hi:
+        var m = lo + (hi - lo) // 2
+        if levels[m] < v:
+            lo = m + 1
+        else:
+            hi = m
+    if lo >= n:
+        var back = levels[n - 1]
+        var a = 2.0 * back
+        var b = back + 1.0
+        return _avoid_inf(a if a > b else b)
+    if lo == 0:
+        var front = levels[0]
+        var a = 0.5 * front
+        var b = 2.0 * front
+        return _avoid_inf(a if a < b else b)
+    var res = (levels[lo] + levels[lo - 1]) * 0.5
+    if res == levels[lo]:
+        res = levels[lo - 1]
+    return _avoid_inf(res)
+
+
+def _cb_level_at_rank(cum: List[Float64], rank: Int) -> Int:
+    """The level holding observation `rank`: the first level whose cumulative
+    end exceeds it. This is how a rank-addressed rule reaches a grouped
+    array."""
+    var target = Float64(rank)
+    var lo = 0
+    var hi = len(cum)
+    while lo < hi:
+        var m = lo + (hi - lo) // 2
+        if cum[m] <= target:
+            lo = m + 1
+        else:
+            hi = m
+    return lo if lo < len(cum) else len(cum) - 1
+
+
+def _cb_median_borders(
+    levels: List[Float64],
+    cum: List[Float64],
+    n_valid: Int,
+    max_borders: Int,
+    mut out: List[Float64],
+):
+    """`GenerateMedianBorders`, :1046-1063.
+
+    Equal-count ranks `(i + 1) * total / (max_borders + 1)`, clamped to the
+    last observation, each turned into a border by `RegularBorder`, and each
+    dropped when its value is the column minimum (`if (val1 != featureValues[0])`)
+    because a border there would put every row on one side.
+    """
+    if max_borders < 1 or len(levels) < 2 or n_valid < 1:
+        return
+    var first = levels[0]
+    for i in range(max_borders):
+        var i1 = (i + 1) * n_valid // (max_borders + 1)
+        if i1 > n_valid - 1:
+            i1 = n_valid - 1
+        var val1 = levels[_cb_level_at_rank(cum, i1)]
+        if val1 != first:
+            out.append(_cb_regular_border(levels, val1))
+
+
+def _cb_uniform_borders(
+    lo: Float64, hi: Float64, max_borders: Int, mut out: List[Float64]
+):
+    """`TUniformBinarizer::BestSplit`, :1262-1317.
+
+    `minValue + (i + 1) * (maxValue - minValue) / (maxBordersCount + 1)`,
+    inserted RAW. Note that this one does NOT go through `RegularBorder` while
+    the uniform half of `UniformAndQuantiles` does (:1252); that asymmetry is
+    CatBoost's, not a transcription slip.
+    """
+    if max_borders < 1 or not (lo < hi):
+        return
+    for i in range(max_borders):
+        out.append(
+            _avoid_inf(
+                lo + Float64(i + 1) * (hi - lo) / Float64(max_borders + 1)
+            )
+        )
+
+
+def _cb_uniform_and_quantiles_borders(
+    levels: List[Float64],
+    cum: List[Float64],
+    n_valid: Int,
+    max_borders: Int,
+    mut out: List[Float64],
+):
+    """`TMedianPlusUniformBinarizer::BestSplit`, :1224-1260.
+
+    Half the budget goes to uniform borders and the rest to median ones, and
+    the halving is `halfBorders = maxBordersCount / 2` with the MEDIAN half
+    getting `maxBordersCount - halfBorders`, so an odd budget favours the
+    median half. Both halves land in one set, so a uniform border that
+    coincides with a median one costs nothing and the result can be under
+    budget for that reason alone. Unlike plain `Uniform`, the uniform half
+    here is snapped by `RegularBorder`.
+    """
+    if max_borders < 1 or len(levels) < 2:
+        return
+    var half = max_borders // 2
+    _cb_median_borders(levels, cum, n_valid, max_borders - half, out)
+    var lo = levels[0]
+    var hi = levels[len(levels) - 1]
+    for i in range(half):
+        var v = lo + Float64(i + 1) * (hi - lo) / Float64(half + 1)
+        out.append(_cb_regular_border(levels, v))
+
+
+def _cb_group_levels(
+    mut col: List[Float64],
+    n_valid: Int,
+    mut levels: List[Float64],
+    mut cum: List[Float64],
+):
+    """Sort a column in place and reduce it to ascending distinct levels with
+    cumulative observation counts. CatBoost's `GroupAndSortValues`, :1613-1640,
+    with unit weights and no default value.
+
+    `NaN` is already gone: the caller drops it while building the column, and
+    CatBoost drops it too, one layer up (`NSplitSelection::BestSplit` :90-97
+    erases every `NaN` before any binarizer sees the values).
+    """
+    sort(col)
+    levels.clear()
+    cum.clear()
+    var i = 0
+    while i < n_valid:
+        var v = col[i]
+        var j = i + 1
+        while j < n_valid and col[j] == v:
+            j += 1
+        levels.append(v)
+        cum.append(Float64(j))
+        i = j
+
+
+def _cb_finalize(mut out: List[Float64]):
+    """Sort and strictly deduplicate, which is CatBoost's `THashSet` plus
+    `Sort` (`SetQuantization`, :903-904) and this repo's strictly increasing
+    edge invariant in one pass. `_avoid_inf` clamps, as everywhere else here.
+
+    CatBoost also purges `-0.0f` here (:897-902, "BestSplit might add negative
+    zeros"), an artifact of its Float32 `0.5f * a + 0.5f * b`. Not ported:
+    `-0.0` and `0.0` group into one level above, so no midpoint of two
+    distinct Float64 levels can be `-0.0`, and the strict-increase filter
+    would collapse the pair anyway.
+    """
+    var n = len(out)
+    if n < 1:
+        return
+    sort(out)
+    var w = 0
+    for i in range(n):
+        var e = _avoid_inf(out[i])
+        if w > 0 and e <= out[w - 1]:
+            continue
+        out[w] = e
+        w += 1
+    out.resize(w, 0.0)
+
+
+def catboost_borders(
+    mut col: List[Float64],
+    n_valid: Int,
+    max_borders: Int,
+    border_type: Int,
+    mut levels: List[Float64],
+    mut cum: List[Float64],
+    mut heap: List[_CbBin],
+    mut out: List[Float64],
+):
+    """CatBoost's border selection for one column, into `out` as this repo's
+    strictly increasing bin edges.
+
+    `col` holds the column's `n_valid` non-`NaN` values and is SORTED IN PLACE.
+    `max_borders` is CatBoost's `border_count`, which is one less than the
+    number of ordinary bins the caller is budgeting. `levels`, `cum` and
+    `heap` are reusable scratch, so a caller fitting many features allocates
+    once per worker rather than once per feature.
+
+    Non-raising, like `emit_quantile_edges` and for the same reason: the dense
+    fitter calls this from inside a worker closure. `border_type` is validated
+    by `check_border_type` before any dispatch, so a refused or unknown type
+    cannot arrive here; if one did it would leave `out` empty, which is one
+    bin and no split rather than a wrong split.
+
+    The border semantics line up without translation. CatBoost sends
+    `value > border` right, and `BinMapper.bin_value` puts `v` in the first
+    bin with `v <= edge`, so a CatBoost border IS one of our edges.
+    """
+    out.clear()
+    if n_valid < 1 or max_borders < 1:
+        return
+    _cb_group_levels(col, n_valid, levels, cum)
+    if len(levels) < 2:
+        return
+    if (
+        border_type == BORDER_GREEDY_LOG_SUM
+        or border_type == BORDER_GREEDY_MIN_ENTROPY
+    ):
+        _cb_greedy_borders(levels, cum, max_borders, border_type, heap, out)
+    elif border_type == BORDER_UNIFORM:
+        _cb_uniform_borders(
+            levels[0], levels[len(levels) - 1], max_borders, out
+        )
+    elif border_type == BORDER_MEDIAN:
+        _cb_median_borders(levels, cum, n_valid, max_borders, out)
+    elif border_type == BORDER_UNIFORM_AND_QUANTILES:
+        _cb_uniform_and_quantiles_borders(
+            levels, cum, n_valid, max_borders, out
+        )
+    _cb_finalize(out)
 
 
 # --------------------------------------------------------------------------
@@ -1244,18 +1806,113 @@ thrashes. Untuned, and no measurement here justifies a different number.
 """
 
 
-def env_row_major_bins() -> Bool:
-    """`MOJOTREES_CPU_ROW_MAJOR`: build the row-major view at fit time.
+comptime ROW_MAJOR_OFF = 0
+"""`MOJOTREES_CPU_ROW_MAJOR=0`: never build the view, at any size."""
 
-    **Off by default, and that is a decision rather than an oversight.** The
-    view is one extra copy of the binned matrix (see
-    `BinnedMatrix.row_major_bytes`, and the memory paragraph on the struct),
-    and nothing in this round has measured it. A default that doubles a user's
-    bin-matrix footprint on the strength of an unmeasured argument is exactly
-    the kind of thing this campaign refuses; the orchestrator's timed arms
-    decide whether it becomes one.
+comptime ROW_MAJOR_ON = 1
+"""`MOJOTREES_CPU_ROW_MAJOR=1`: always build it, budget or no budget."""
+
+comptime ROW_MAJOR_AUTO = 2
+"""`MOJOTREES_CPU_ROW_MAJOR` unset: build it when it fits the budget."""
+
+comptime ROW_MAJOR_DEFAULT_BUDGET_MB = 1024
+"""The memory budget, in mebibytes, and the paragraph that states the rule.
+
+*The rule.* Under `auto` -- the default -- the row-major view is built when
+`n_rows * row_stride <= budget` and **refused** otherwise, where the budget is
+1 GiB and `row_stride` is the realized record width computed in
+`BinnedMatrix.build_row_major`, not an estimate. A refusal is silent and
+total: no allocation happens, `has_row_major()` stays false, and every
+histogram build degrades to feature-major through
+`apple_cpu_policy.resolve_bin_layout`, which is the layout that shipped. A
+refusal never raises, because a dataset being large is not a user error.
+`MOJOTREES_CPU_ROW_MAJOR_MAX_MB` moves the budget; `0` there means no budget
+at all, and `MOJOTREES_CPU_ROW_MAJOR=1` overrides it outright.
+
+*Why there is a budget when LightGBM has none.* LightGBM's `auto` allocates
+both layouts unconditionally and mentions memory only in a log line
+(`src/io/dataset.cpp`, "And if memory is not enough, you can set
+`force_col_wise=true`"). The view is a **second full copy** of the bin ids, and
+at 255 bins nothing packs into a nibble, so `row_stride == n_features` and the
+bin-matrix footprint exactly doubles. Turning a fit that fit into a fit that
+does not is a hard failure, not a regression; a slower fit is recoverable and
+an OOM is not, so the default has to bound the absolute surprise.
+
+*Why 1 GiB.* It is chosen, not measured, and it is chosen to admit every shape
+this optimization was built for and refuse the ones that are dangerous. 1M x
+50 is 50 MB, 1M x 200 is 200 MB, 10M x 100 is 1000 MB: all admitted. 10M x 200
+is 2 GB and is refused. The bound is absolute rather than a fraction of free
+memory for two reasons. There is no portable free-memory query here, and a
+rule that read one would give different answers on two runs of the same fit on
+the same machine, which makes a report of "it was fast yesterday"
+unreproducible. This rule is a pure function of the data: the same matrix gets
+the same answer on every machine and at every `MOJOTREES_NUM_WORKERS`.
+
+*What it does not bound.* The feature-major matrix, the Float64 input the
+caller may still be holding, the gradient and hessian planes, and the
+histograms. It bounds one array, the one this file adds.
+"""
+
+
+def env_row_major_mode() raises -> Int:
+    """`MOJOTREES_CPU_ROW_MAJOR`: unset (auto), `1` (force), `0` (never).
+
+    Three states, and unset is not the same as `0`. Unset means **auto**: the
+    view is built when it fits `row_major_budget_bytes()`, which is the rule
+    written out on `ROW_MAJOR_DEFAULT_BUDGET_MB`. Explicit `1` builds it even
+    above the budget, which is how a caller who knows their machine buys the
+    layout on a 10M x 200 matrix. Explicit `0` never builds it, which is the
+    off switch a bisection wants and the one thing that guarantees the fit
+    allocates not one byte for this.
+
+    Raises on an unrecognized value rather than quietly meaning auto, on
+    `apple_cpu_policy.env_bin_layout`'s grounds: this campaign has already
+    thrown away results from arms that silently ran the other configuration.
     """
-    return _env_int("MOJOTREES_CPU_ROW_MAJOR", 0) != 0
+    var s = getenv("MOJOTREES_CPU_ROW_MAJOR")
+    if s.byte_length() == 0 or s == "auto":
+        return ROW_MAJOR_AUTO
+    if s == "0" or s == "off" or s == "false":
+        return ROW_MAJOR_OFF
+    if s == "1" or s == "on" or s == "true":
+        return ROW_MAJOR_ON
+    raise Error(
+        'MOJOTREES_CPU_ROW_MAJOR must be "auto" (or unset), "1" or "0". Got "',
+        s,
+        '"',
+    )
+
+
+def row_major_budget_bytes() -> Int:
+    """Bytes the row-major view may occupy under `auto`, 0 meaning no limit.
+
+    `MOJOTREES_CPU_ROW_MAJOR_MAX_MB` in mebibytes, defaulting to
+    `ROW_MAJOR_DEFAULT_BUDGET_MB`, where the rule and the reason for the
+    number are written out. `MOJOTREES_CPU_ROW_MAJOR_MAX_MB=0` lifts the
+    budget without forcing the view on a dataset that would not have got one.
+    """
+    return _env_int(
+        "MOJOTREES_CPU_ROW_MAJOR_MAX_MB", ROW_MAJOR_DEFAULT_BUDGET_MB
+    ) * 1024 * 1024
+
+
+def row_major_fits_budget(n_rows: Int, row_stride: Int, max_bytes: Int) -> Bool:
+    """The budget rule itself, in one place.
+
+    `n_rows * row_stride <= max_bytes`, with `max_bytes <= 0` meaning there is
+    no budget.
+
+    A function rather than an inline compare so the rule has one definition,
+    a test can assert the boundary without allocating the gigabyte that is
+    being refused, and a caller can ask the question before committing to a
+    layout. It takes the *realized* stride, so packing a feature into a nibble
+    earns admission rather than being rounded away.
+    """
+    if max_bytes <= 0:
+        return True
+    if n_rows <= 0 or row_stride <= 0:
+        return True
+    return n_rows * row_stride <= max_bytes
 
 
 def _row_major_widths(
@@ -1387,9 +2044,15 @@ struct BinnedMatrix(Copyable, Movable):
     feature fits in 4 bits** -- so a fit's bin-matrix footprint goes from 50 MB
     to between 75 MB and 100 MB. Packing recovers half a byte per packable
     feature per row and nothing else: it does not shrink `bins`. `row_stride`
-    and `row_major_bytes()` report the realized figure for a given dataset,
-    and `build_row_major` is opt-in (`MOJOTREES_CPU_ROW_MAJOR`) precisely
-    because this is a cost a user must choose.
+    and `row_major_bytes()` report the realized figure for a given dataset.
+
+    **The view is built by default and refused above a budget.** The default
+    is `auto`: build it when `n_rows * row_stride` is at most 1 GiB, skip it
+    silently above that and run feature-major, which is what shipped.
+    `ROW_MAJOR_DEFAULT_BUDGET_MB` states the rule and argues the number,
+    `MOJOTREES_CPU_ROW_MAJOR_MAX_MB` moves it, and `MOJOTREES_CPU_ROW_MAJOR`
+    forces either way (`1` builds above the budget, `0` never builds). At the
+    shapes above: 1M x 50 and 1M x 200 are built, 10M x 200 is not.
     """
 
     var bins: List[UInt8]
@@ -1554,8 +2217,26 @@ struct BinnedMatrix(Copyable, Movable):
             return 0
         return self.bin_offset[self.n_features]
 
-    def build_row_major(mut self) raises:
+    def build_row_major(mut self, max_bytes: Int = 0) raises:
         """Build (or rebuild) the row-major record array from `bins`.
+
+        `max_bytes` is the memory budget, `0` (the default) meaning none, and
+        it is checked against the **realized** `n_rows * row_stride` after the
+        layout is decided and before anything is allocated. Over budget, this
+        is a no-op that leaves the matrix in the state `drop_row_major` leaves
+        it: nothing allocated, `has_row_major()` false, every histogram build
+        degrading to feature-major. It does not raise. The rule and the number
+        are on `ROW_MAJOR_DEFAULT_BUDGET_MB`; the policy that picks the
+        argument is `env_row_major_mode` at the `transform` call site, so this
+        method stays mechanism and the default keeps its old contract, which
+        is "build it".
+
+        A refusal still pays the width scan below -- reads only, no
+        allocation -- because the exact answer needs the realized stride and
+        the conservative one (`n_rows * n_features`, nothing packed) would
+        refuse a low-cardinality matrix at twice its true cost. One scan of a
+        matrix that is about to be trained on many times is the cheaper
+        mistake.
 
         Three passes, none of which touches a Float64 and none of which can
         change a bin id:
@@ -1625,6 +2306,12 @@ struct BinnedMatrix(Copyable, Movable):
                     mask_of[f] = 15
                     packed += 1
             stride = whole + ((packed + 1) >> 1)
+
+            # The budget, checked here and nowhere else: after the stride is
+            # real and before the one allocation that costs the memory.
+            if not row_major_fits_budget(nr, stride, max_bytes):
+                self.drop_row_major()
+                return
 
             offsets.append(0)
             for f in range(nf):
@@ -1826,14 +2513,31 @@ struct BinMapper(Copyable, Movable):
     def transform[
         features_origin: ImmOrigin, //
     ](
-        self, features: Span[Float64, features_origin], n_rows: Int
+        self,
+        features: Span[Float64, features_origin],
+        n_rows: Int,
+        build_view: Bool = True,
     ) raises -> BinnedMatrix:
         """Bin a column-major feature matrix (`features[f * n_rows + r]`).
 
         `features` is a borrowed view, so a caller holding the matrix
         somewhere other than a Mojo `List` -- the Python bindings hold
         NumPy's own buffer -- bins it in place instead of copying it first.
-        A `List` converts implicitly, so passing one still works."""
+        A `List` converts implicitly, so passing one still works.
+
+        `build_view=False` is the opt-out for a matrix that will be **scored
+        and not histogrammed**: a prediction input, a validation set, a
+        `predict_contrib` call. The row-major view is read by exactly one
+        thing, `histogram.build_histogram_subset_row_major*`, so a matrix that
+        never reaches a histogram builder pays a transpose pass and a second
+        copy of its bin ids for nothing -- and the copy is the same doubling
+        that `ROW_MAJOR_DEFAULT_BUDGET_MB` exists to bound, arriving on a code
+        path the user did not think of as a fit. The default is `True`,
+        meaning "apply the environment policy", because a call site that omits
+        it is more likely to be a fit than a predict; the predict-side call
+        sites that should pass `False` are named in the lane report rather
+        than edited here, because they live in files this lane does not own.
+        """
         if len(features) != n_rows * self.n_features:
             raise Error("features length must equal n_rows * n_features")
         var n_features = self.n_features
@@ -1935,14 +2639,25 @@ struct BinMapper(Copyable, Movable):
             self.missing_bin.copy(),
             self.usable.copy(),
         )
-        # The row-major view, at fit time, off unless asked for. Its widths
-        # come from the bins this call just wrote, so it is built here rather
-        # than fused into the tile above: the packing decision needs each
-        # feature's realized bin count, which does not exist until the last
-        # tile has run. See `BinnedMatrix.build_row_major` for the write
-        # traffic that makes the second pass the cheap way round anyway.
-        if env_row_major_bins():
-            out.build_row_major()
+        # The row-major view, at fit time. Its widths come from the bins this
+        # call just wrote, so it is built here rather than fused into the tile
+        # above: the packing decision needs each feature's realized bin count,
+        # which does not exist until the last tile has run. See
+        # `BinnedMatrix.build_row_major` for the write traffic that makes the
+        # second pass the cheap way round anyway.
+        #
+        # This is the policy half of the decision and the only place the
+        # environment is read: `auto` (the default) offers the budget, an
+        # explicit `1` passes no budget at all, and an explicit `0` does not
+        # call the builder. Whether the view, once built, is the one the
+        # histograms actually read is a *separate* decision made once per fit
+        # by `histogram.choose_bin_layout_timed`; building it only makes both
+        # arms runnable.
+        var mode = ROW_MAJOR_OFF if not build_view else env_row_major_mode()
+        if mode == ROW_MAJOR_ON:
+            out.build_row_major(0)
+        elif mode == ROW_MAJOR_AUTO:
+            out.build_row_major(row_major_budget_bytes())
         return out^
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
@@ -1969,6 +2684,7 @@ def fit_bins[
     data_random_seed: Int = DEFAULT_DATA_RANDOM_SEED,
     feature_pre_filter: Bool = False,
     min_data_in_leaf: Int = DEFAULT_MIN_DATA_IN_LEAF,
+    border_type: Int = BORDER_QUANTILE,
 ) raises -> BinMapper:
     """Fit quantile (equal-frequency) bin edges on a column-major feature
     matrix. Edges are midpoints between distinct values at quantile
@@ -2015,9 +2731,31 @@ def fit_bins[
     - LightGBM warns and continues when every feature is trivial. There is
       nowhere to warn to here and a fit with no usable feature has no tree to
       grow, so this raises instead.
+
+    `border_type` selects CatBoost's border selection instead of the quantile
+    fit above. **`BORDER_QUANTILE` is the default and is this function
+    unchanged**: the CatBoost work sits behind one branch per FEATURE inside
+    the column loop, nothing per row, and its scratch buffers stay
+    unallocated on that arm. Any other value is opt-in, bit-moving by
+    construction (a different rule for where a border goes is a different
+    model), and costs a full sort of each column where the default arm
+    resolves a few hundred ranks by bucket selection. See
+    `docs/design/CATBOOST_CATALOG.md` A15, `check_border_type` for the two
+    types refused by name, and `parse_border_type` for the spellings.
     """
     if max_bins < 2 or max_bins > MAX_BINS:
         raise Error("max_bins must be in [2, ", MAX_BINS, "]")
+    check_border_type(border_type)
+    if border_type != BORDER_QUANTILE and min_data_in_bin > 1:
+        # `min_data_in_bin` is LightGBM's and CatBoost has no analogue, so
+        # honoring it on a CatBoost arm would mean inventing an interaction
+        # neither library defines. Refused rather than silently ignored.
+        raise Error(
+            "min_data_in_bin is LightGBM's and has no CatBoost analogue; it"
+            " cannot be combined with border_type '",
+            border_type_name(border_type),
+            "'. Pass min_data_in_bin=1",
+        )
     if n_rows < 1:
         raise Error("n_rows must be positive")
     if len(features) != n_rows * n_features:
@@ -2101,6 +2839,11 @@ def fit_bins[
         var dist_hits = List[Int]()
         var dist_vals = List[Float64]()
         var level_counts = List[Int]()
+        # CatBoost border-selection scratch. Empty and unallocated on the
+        # default arm, which never touches these three.
+        var cb_levels = List[Float64]()
+        var cb_cum = List[Float64]()
+        var cb_heap = List[_CbBin]()
         # Per-bin populations, refilled per feature and only when the prefilter
         # asked for them.
         var cnt_in_bin = List[Int]()
@@ -2168,7 +2911,21 @@ def fit_bins[
 
             below.clear()
             above.clear()
-            if collect_distinct(
+            if border_type != BORDER_QUANTILE:
+                # CatBoost's border selection. `n_ordinary` BINS is
+                # `n_ordinary - 1` BORDERS, and borders are what CatBoost's
+                # `border_count` counts; see the section header above.
+                catboost_borders(
+                    col,
+                    n_valid,
+                    n_ordinary - 1,
+                    border_type,
+                    cb_levels,
+                    cb_cum,
+                    cb_heap,
+                    edge_buf,
+                )
+            elif collect_distinct(
                 col,
                 n_valid,
                 n_ordinary,
@@ -2274,7 +3031,8 @@ def fit_bins[
                         below.append(w)
                         var e = first_above_sorted(col, idx, n_valid, w)
                         above.append(col[e] if e < n_valid else w)
-            emit_quantile_edges(below, above, edge_buf)
+            if border_type == BORDER_QUANTILE:
+                emit_quantile_edges(below, above, edge_buf)
 
             var out = scratch_p.unsafe_offset(f * max_edges)
             var n_out = len(edge_buf)

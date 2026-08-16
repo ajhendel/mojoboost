@@ -726,9 +726,11 @@ class MojoTreesCatBoostModeEngine(MojoTreesEngine):
             "defaults, reported against the CatBoost peer arm "
             f"{scenarios.catboost_arm_id()}. This is NOT the comparator row: "
             f"the comparator is {scenarios.comparator_id()} and the plain "
-            "mojotrees arm is what is read against it. mojotrees has no "
-            "symmetric-tree policy, so this arm is depthwise at depth 6 and "
-            "is not CatBoost's tree; it also does no row sampling, where "
+            "mojotrees arm is what is read against it. This arm is depthwise "
+            "at depth 6 and is not CatBoost's tree -- a symmetric policy now "
+            "exists in the Mojo package but sklearn.py does not expose it, "
+            "and this harness reaches only what that file validates; it also "
+            "does no row sampling, where "
             "CatBoost's default MVS bootstrap takes 80 percent of the rows "
             "per tree. See scenarios.CATBOOST_UNMATCHABLE."
         )
@@ -770,6 +772,27 @@ class CatBoostEngine:
     """
 
     name = "catboost"
+
+    #: Parameters that define a CatBoost VARIANT row, merged into `extra` so
+    #: they pass through `catboost_params`'s refusal list exactly like a
+    #: scenario-supplied value. Empty here: the `catboost` row is CatBoost at
+    #: its own defaults and that is the whole point of it. A subclass setting
+    #: this is declaring a second, differently-shaped CatBoost column, and it
+    #: must say so in `load()` so the note travels with the record.
+    #:
+    #: Merged rather than applied after the call on purpose. A dict written
+    #: over the resolved params would bypass `CATBOOST_REFUSED_PARAMS`, and
+    #: that list is the only thing standing between this harness and the
+    #: `bin_construct_sample_cnt` defect in CatBoost's vocabulary.
+    variant_params = {}
+
+    def _extra_with_variant(self, extra):
+        """`extra` plus this class's variant, or `extra` unchanged."""
+        if not self.variant_params:
+            return extra
+        merged = dict(extra or {})
+        merged.update(self.variant_params)
+        return merged
 
     def __init__(self, threads, device="cpu"):
         self.threads = int(threads)
@@ -823,7 +846,9 @@ class CatBoostEngine:
     def warmup(self, spec):
         x, y, _group, n_classes = _tiny_like(spec)
         extra = {"num_class": n_classes} if n_classes else None
-        params = scenarios.catboost_params(spec, self.threads, extra)
+        params = scenarios.catboost_params(
+            spec, self.threads, self._extra_with_variant(extra)
+        )
         params["iterations"] = 1
 
         def _fit():
@@ -881,7 +906,9 @@ class CatBoostEngine:
                     train.get("n_classes") or (np.max(train["y"]) + 1)
                 )
             }
-        params = scenarios.catboost_params(spec, self.threads, extra)
+        params = scenarios.catboost_params(
+            spec, self.threads, self._extra_with_variant(extra)
+        )
 
         # Ingestion, and only ingestion. See the class docstring and
         # scenarios.PHASE_SHAPE for why there is no binning phase beside it.
@@ -988,6 +1015,81 @@ class CatBoostEngine:
         }
 
 
+class CatBoostLossguideEngine(CatBoostEngine):
+    """CatBoost grown leaf-wise instead of symmetric. The second CatBoost row.
+
+    Everything is inherited; the only difference is `variant_params`, so the
+    two CatBoost rows run through identical code and the difference between
+    two records is exactly that dict.
+
+    **What this row is for.** The `catboost` row is CatBoost at its own
+    defaults, which means SymmetricTree at depth 6 -- a shape neither of the
+    other two engines grows. That makes it a fair reading of CatBoost and a
+    poor reading of the growth policy: any gap between it and the leaf-wise
+    arms mixes CatBoost's engine with CatBoost's tree shape, and nothing in
+    the record separates them. Lossguide at `max_leaves` 31 is CatBoost
+    growing the same shape LightGBM and mojotrees grow by default, so the two
+    CatBoost rows read together isolate the tree shape inside one engine.
+
+    **Why 31.** It is LightGBM's `num_leaves` default and this harness's
+    shared value, so this row's leaf budget matches the comparator's rather
+    than matching the 64 that CatBoost's depth 6 resolves to. The intent is
+    one variable, and the variable is the growth policy.
+
+    **It is a separate engine name** for the reason
+    `MojoTreesCatBoostModeEngine` gives: the harness's unit of comparison is
+    an engine name -- what `verify.py` pairs on, what `report.py` groups on,
+    what a CSV row carries -- so two differently-shaped CatBoost models must
+    not share a column.
+
+    **It is not a clean isolation and the record must not claim it is.**
+    Verified by a 3-iteration fit on 2026-08-16: CatBoost accepts the pair
+    and `get_all_params()` reads back `grow_policy=Lossguide`,
+    `max_leaves=31`, with `score_function=Cosine` and `bootstrap_type=MVS`
+    still stock, which is the intent. But it also reads back **`depth=6`**.
+    CatBoost keeps its depth default as an active cap under Lossguide, where
+    LightGBM's `max_depth` default is -1, unlimited. So this row is leaf-wise
+    up to 31 leaves AND depth-capped at 6, and a leaf-wise tree that wanted a
+    deeper path does not get it. Whether 31 leaves ever reaches past depth 6
+    on these scenarios is not established here. The cap is left in place
+    rather than overridden, because pinning `depth` would make this a row
+    with three changed parameters instead of two.
+
+    **If CatBoost refuses the combination**, that is what the row records.
+    CatBoost resolves `score_function` and several sampling defaults itself
+    and some of those resolutions are policy-dependent, so this arm passes
+    exactly two parameters and lets the library raise if it will not accept
+    them. The failure is reported as a failure. It is NOT to be papered over
+    by pinning a third parameter until the fit succeeds: that would quietly
+    turn this into a row comparing two things at once, which is the defect
+    the row exists to remove.
+    """
+
+    name = "catboost_lossguide"
+    variant_params = {"grow_policy": "Lossguide", "max_leaves": 31}
+
+    def load(self):
+        super().load()
+        self.notes.append(
+            "arm 'CatBoost lossguide': the CatBoost peer arm with "
+            f"{self.variant_params} applied over its defaults, so it grows "
+            "leaf-wise like LightGBM and mojotrees instead of its default "
+            "SymmetricTree at depth 6. Read it against the 'catboost' row to "
+            "separate CatBoost's engine from CatBoost's tree shape; read "
+            "neither instead of the comparator "
+            f"{scenarios.comparator_id()}. Everything else is stock, "
+            "including score_function and the MVS bootstrap, so this row "
+            "still carries every entry in scenarios.CATBOOST_UNMATCHABLE "
+            "except tree_shape. tree_shape is NARROWED here, not closed: "
+            "CatBoost keeps depth=6 as an active cap under Lossguide where "
+            "LightGBM's max_depth default is unlimited, so this arm is "
+            "leaf-wise to 31 leaves AND depth-capped at 6. Read the "
+            "resolved parameters in this record rather than assuming the "
+            "growth policy is the only difference left."
+        )
+        return self
+
+
 ENGINES = {
     "mojotrees": MojoTreesEngine,
     "lightgbm": LightGBMEngine,
@@ -995,6 +1097,7 @@ ENGINES = {
     # makes worker.py able to run them without a change: it builds an engine
     # by name from this table.
     "catboost": CatBoostEngine,
+    "catboost_lossguide": CatBoostLossguideEngine,
     "mojotrees_catboost_mode": MojoTreesCatBoostModeEngine,
 }
 
@@ -1006,6 +1109,7 @@ ENGINE_ARM = {
     "mojotrees": "subject",
     "lightgbm": "comparator",
     "catboost": "peer",
+    "catboost_lossguide": "peer",
     "mojotrees_catboost_mode": "peer_subject",
 }
 

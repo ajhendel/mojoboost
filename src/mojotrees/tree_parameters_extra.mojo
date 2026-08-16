@@ -1527,6 +1527,44 @@ struct ExtraTreeParams(Copyable, Movable):
         `leaf_estimation_active` below is the test for this one, and
         `boosting._check_leaf_estimation_supported` is what keeps a trainer
         that does not implement it from ignoring it.
+
+        **`derivative_precision` is the second exclusion, and it was in this
+        test until the parameter became reachable.** It is excluded on
+        exactly the argument the paragraph above makes for
+        `leaf_estimation_iterations`, and the argument is sharper here.
+
+        This predicate does not mean "would change the tree". It means "the
+        per-candidate gain needs `split._feature_gain`'s adjustment pass, and
+        the device kernel cannot score it". `derivative_precision` needs
+        neither: it changes the *cells* a gain is computed from, never the
+        gain adjustment applied to it, and `split._feature_gain`'s active
+        path would clamp a non-positive gain to exactly 0.0 where the
+        inactive path passes it through -- a difference no candidate
+        selection can currently see, since the fold accepts only a gain
+        strictly greater than a best that starts at 0.0, but a difference
+        with no reason to exist.
+
+        And it was worse than unnecessary, because the setting has two
+        entries and only one of them moved this predicate. A fit configured
+        through the parameter took `split._feature_gain`'s active path; the
+        same fit configured through `MOJOTREES_DERIVATIVE_PRECISION` took the
+        inactive one. **That divergence was measured and is inert**: with
+        `derivative_precision` back in this predicate,
+        `tests/test_derivative_precision_wiring`'s two end-to-end arms are
+        still bit-identical, because the only difference the active path
+        makes at these defaults is clamping a non-positive gain to 0.0 and
+        the fold accepts only a gain strictly greater than a best that starts
+        at 0.0. So this exclusion fixes no bug. What it does is remove the
+        one mechanism by which the two entries of a single switch could ever
+        stop agreeing -- turning "they produce the same model" from a
+        property that happens to hold into one that has no way not to.
+
+        The protective role it used to play is now explicit and better:
+        `histogram.check_device_derivative_precision` refuses `float64` at
+        both accelerator growers by name, because a device carries
+        derivatives as Float32 and has no Float64 to carry them in. That is a
+        refusal with a reason in its message, at the backend that knows the
+        answer, instead of a fit quietly losing the device scan.
         """
         return (
             self.min_gain_to_split > 0.0
@@ -1538,7 +1576,6 @@ struct ExtraTreeParams(Copyable, Movable):
             or not self.forced.is_empty()
             or self.random_strength > 0.0
             or self.use_quantized_grad
-            or self.derivative_precision != DERIV_PRECISION_FLOAT32
         )
 
     def random_score_stdev(self) -> Float64:
@@ -1546,6 +1583,35 @@ struct ExtraTreeParams(Copyable, Movable):
         to one candidate's gain. 0.0 at the default, where no draw is taken.
         """
         return self.random_strength * self.random_score_scale
+
+    def wants_float64_derivatives(self) -> Bool:
+        """Whether this bundle asks for `derivative_precision = "float64"`.
+
+        The one predicate a trainer calls to carry the parameter onto the
+        per-fit histogram snapshot (`histogram.ConstHessianSettings`). It is a
+        `Bool` rather than the `Int` code deliberately: `histogram.mojo` does
+        not import this module -- the import edge runs the other way, through
+        `binning` -- and a `Bool` keeps it that way while still letting the
+        snapshot be widened from the parameter.
+
+        **The precedence it implements, stated once and here.** `float64`
+        wins from either entry. A fit takes Float64 derivatives if the
+        parameter asks for them **or** if `MOJOTREES_DERIVATIVE_PRECISION`
+        does, and neither entry can narrow what the other widened. That is
+        monotone, so the order the two are read in cannot matter, and it needs
+        no third "unset" code: the field defaults to `DERIV_PRECISION_FLOAT32`
+        and therefore cannot distinguish "the caller chose float32" from "the
+        caller said nothing", which is exactly the distinction a
+        parameter-beats-environment rule would have to make. An UNSET sentinel
+        would buy that distinction and charge for it at every existing reader
+        -- `is_active`, `parse_derivative_precision`,
+        `derivative_precision_name`, `check_derivative_precision`, and every
+        equality test against `DERIV_PRECISION_FLOAT32` in the package would
+        each need a third arm, and a reader that forgot one would read UNSET
+        as "not float32" and silently take the slow arm. Not worth it for a
+        rule nobody has asked for.
+        """
+        return self.derivative_precision != DERIV_PRECISION_FLOAT32
 
     def leaf_estimation_active(self) -> Bool:
         """Whether any leaf value is the result of more than one Newton step.
@@ -1794,28 +1860,40 @@ struct ExtraTreeParams(Copyable, Movable):
             )
 
     def check_derivative_precision(self) raises:
-        """Range-check `derivative_precision`, and refuse `float64` by name
-        rather than ignoring it.
+        """Range-check `derivative_precision`.
 
         Runs whether or not it is set, so a nonsense code is reported when it
         is set rather than when it is first used, which is the rule
         `check_quantized_grad` states and this mirrors.
 
-        **`float64` is refused here, and the refusal is about wiring rather
-        than about the setting.** The switch itself is built and live: every
-        read site in `histogram.mojo`, `histogram_sparse.mojo` and the
-        row-major kernels honors it, and so does the objective in
-        `boosting.fill_grad_hess`. What is missing is the one hop from this
-        field to the fit -- `tree.mojo` would have to put
-        `params.extra.derivative_precision` on the `ConstHessianSettings` it
-        resolves, and `tree.mojo` is not this lane's file. Until that lands,
-        a value set here would train a Float32 model that reported success,
-        which is the silent downgrade this package refuses everywhere else.
+        **The `float64` refusal that stood here is gone, because the thing it
+        was about is built.** For two rounds this raised on `float64` set
+        through the parameters, and the message named the missing hop. Both
+        hops now exist:
 
-        The working entry is the environment: `MOJOTREES_DERIVATIVE_PRECISION
-        =float64` is read once per fit by `ConstHessianSettings.resolve()`
-        and once per round by `boosting.fill_grad_hess`, and reaches every
-        site the parameter would.
+        - The **histogram** half. `wants_float64_derivatives` above is folded
+          onto the per-fit snapshot at `tree.grow_tree_leaves_profiled`, at
+          `boosting._boost_rounds`, at `tree_sparse.grow_tree_sparse` and at
+          the three `distributed` growers, so every CPU grower's read side
+          honors it.
+        - The **objective** half. `boosting.fill_grad_hess`,
+          `boosting._fill_grad_hess` and `boosting._fill_softmax_grad_hess`
+          take it as an argument, forwarded from every trainer call site, so
+          the derivatives are stored at the precision that was asked for
+          rather than narrowed and then read wide.
+
+        Both halves take `float64` from **either** the parameter or
+        `MOJOTREES_DERIVATIVE_PRECISION`, on one precedence stated once in
+        `histogram.ConstHessianSettings.widened`.
+
+        **What is still refused, and refused louder, is the accelerator.**
+        A device carries derivatives as Float32 and has no Float64 to carry
+        them in, so `histogram.check_device_derivative_precision` raises for
+        a `float64` fit at both GPU growers. That refusal is at the backend,
+        where the answer is known, rather than here, where it is not: this
+        bundle does not know which grower will receive it, and refusing a
+        setting the CPU honors would be the mirror of the mistake the old
+        refusal existed to prevent.
         """
         if (
             self.derivative_precision != DERIV_PRECISION_FLOAT32
@@ -1825,19 +1903,7 @@ struct ExtraTreeParams(Copyable, Movable):
                 "derivative_precision must be float32 or float64, got code ",
                 self.derivative_precision,
             )
-        if self.derivative_precision != DERIV_PRECISION_FLOAT32:
-            raise Error(
-                "derivative_precision='",
-                derivative_precision_name(self.derivative_precision),
-                "' is recognized and the histogram and objective paths honor"
-                " it, but no trainer carries it from the parameters onto the"
-                " per-fit settings snapshot in this build, so setting it here"
-                " would train a float32 model that silently ignored it. Set"
-                " MOJOTREES_DERIVATIVE_PRECISION=float64 instead, which"
-                " reaches every site; the wiring that lifts this refusal is"
-                " one field on the ConstHessianSettings that tree.mojo"
-                " resolves",
-            )
+
 
     def check(
         self, n_features: Int, num_leaves: Int, max_depth: Int,

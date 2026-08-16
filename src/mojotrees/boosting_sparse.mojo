@@ -396,7 +396,8 @@ def train_sparse(
         else:
             refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
+            raw, target, objective, sample_weight, alpha, grad, hess,
+            float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
         var grown = grow_tree_sparse(
@@ -515,7 +516,8 @@ def train_sparse_with_valid(
         else:
             refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
+            raw, target, objective, sample_weight, alpha, grad, hess,
+            float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
         var grown = grow_tree_sparse(
@@ -640,14 +642,16 @@ def train_multiclass_sparse(
         var selection = GossSelection.all_rows()
         if goss.active(i, params.learning_rate):
             selection = _multiclass_goss_select(
-                prob, labels, n_classes, sample_weight, goss, i
+                prob, labels, n_classes, sample_weight, goss, i,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             bag = selection.rows.copy()
 
         var made_progress = False
         for k in range(n_classes):
             _fill_softmax_grad_hess(
-                prob, labels, k, n_classes, sample_weight, grad, hess
+                prob, labels, k, n_classes, sample_weight, grad, hess,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             apply_goss_scaling(selection, grad, hess)
             var grown = grow_tree_sparse(

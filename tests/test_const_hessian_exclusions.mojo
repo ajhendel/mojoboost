@@ -38,6 +38,12 @@ from mojotrees.sampling import (
     bayesian_bootstrap_varies_hessian,
     check_bayesian_bootstrap_hessian_declaration,
     refresh_bayesian_bootstrap,
+    MvsAudit,
+    MvsBootstrapParams,
+    check_mvs_hessian_declaration,
+    mvs_auto_lambda_from_gradients,
+    mvs_varies_hessian,
+    refresh_mvs_bootstrap,
 )
 from mojotrees.objective_registry import (
     BINARY_LOGISTIC,
@@ -298,6 +304,103 @@ def test_bayesian_bootstrap_is_an_exclusion() raises:
     check_bayesian_bootstrap_hessian_declaration(
         BayesianBootstrapParams.disabled(), True
     )
+
+
+def test_mvs_excludes_the_constant_hessian_the_same_way() raises:
+    """MVS carries the identical exclusion, and for the identical reason.
+
+    `Bootstrap` calls `CalcWeightedData` for MVS on the same line it does for
+    Bayesian, so the derivatives come out multiplied by a per-row weight
+    either way. The two samplers differ in how the weight is drawn and not at
+    all in what it does to the hessian plane, which is the only thing this
+    file is about.
+
+    Asserted in the same two forms as the Bayesian case above, because a
+    caller that reaches neither is the silent-wrong-hessian failure this file
+    exists to prevent.
+
+    One thing here is NOT a mirror and is worth the extra line. MVS is a row
+    *dropper*: a row below the threshold that loses its draw gets weight
+    exactly 0.0 and is removed from the fold outright. So the weight vector
+    it produces contains zeros where the Bayesian one contains small positive
+    numbers, and a reader might reason that a zero weight is the same as an
+    absent row and leaves the surviving rows' hessian constant. It does not,
+    and the first exclusion refuses the vector for the same reason either
+    way -- which is asserted below rather than argued.
+    """
+    var goss = GossParams.disabled()
+    var params = MvsBootstrapParams.enable()
+
+    # Form one: the effective weights reach the predicate as `sample_weight`.
+    # A ramp of gradients, so the draw has both certainly-kept rows (above the
+    # threshold) and rows decided by the coin, which is the vector shape that
+    # makes this exclusion matter.
+    var gradients = List[Float64]()
+    for i in range(48):
+        gradients.append(Float64(i + 1) * 0.25)
+    var auto_lambda = mvs_auto_lambda_from_gradients(gradients, 48)
+    var weights = List[Float64]()
+    var audit = MvsAudit.empty()
+    refresh_mvs_bootstrap(
+        weights, audit, params, gradients, _unweighted(), 48, 0, auto_lambda
+    )
+    assert_equal(len(weights), 48)
+    # The guard branch must NOT have fired here: the lambda is derived and
+    # positive on a nonzero gradient ramp, so a nonzero count would mean this
+    # fixture is exercising the degenerate path instead of the ordinary one
+    # and the assertions below would be about the wrong thing.
+    assert_equal(audit.blocks_guarded, 0)
+    for objective in _all_objectives():
+        assert_false(round_has_constant_hessian(objective, weights, goss))
+
+    # Form two: the configuration-level predicate, fit-scoped like GOSS's, so
+    # a subsample of 1.0 -- which keeps every row and draws nothing -- is
+    # still refused rather than reasoned about. That coarseness is deliberate
+    # and mirrors the Bayesian temperature=0.0 case.
+    assert_true(mvs_varies_hessian(params))
+    assert_true(mvs_varies_hessian(MvsBootstrapParams.enable(1.0)))
+    assert_false(mvs_varies_hessian(MvsBootstrapParams.disabled()))
+
+    # And the guard that makes the exclusion impossible to omit.
+    var raised = False
+    try:
+        check_mvs_hessian_declaration(params, True)
+    except:
+        raised = True
+    assert_true(raised)
+    # Silent when the declaration is False, and when the sampler is off
+    # whatever was declared: a refusal of one combination, not a blanket one.
+    check_mvs_hessian_declaration(params, False)
+    check_mvs_hessian_declaration(MvsBootstrapParams.disabled(), True)
+
+
+def test_a_disabled_mvs_bootstrap_changes_nothing_either() raises:
+    """The MVS twin of the disabled-bundle assertion below.
+
+    `refresh_mvs_bootstrap` with a disabled bundle and no user weights must
+    produce an *empty* vector, not a vector of 1.0s. A vector of ones would
+    be refused by the weights exclusion and would cost an unbootstrapped,
+    unweighted fit its specialization for nothing -- the same trap the
+    Bayesian bundle documents, pinned here for MVS because MVS is the one
+    that ships as CatBoost's actual default and so is the one most likely to
+    be wired up in a hurry.
+    """
+    var goss = GossParams.disabled()
+    var off = MvsBootstrapParams.disabled()
+    var gradients = List[Float64]()
+    for i in range(48):
+        gradients.append(Float64(i + 1) * 0.25)
+    var weights = List[Float64]()
+    var audit = MvsAudit.empty()
+    refresh_mvs_bootstrap(
+        weights, audit, off, gradients, _unweighted(), 48, 0, 1.0
+    )
+    assert_equal(len(weights), 0)
+    for objective in _all_objectives():
+        assert_equal(
+            round_has_constant_hessian(objective, weights, goss),
+            _is_constant(objective),
+        )
 
 
 def test_a_disabled_bootstrap_changes_nothing_the_predicate_answers() raises:

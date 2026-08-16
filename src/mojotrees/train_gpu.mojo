@@ -371,7 +371,11 @@ from .gpu_split_policy import (
     normalized_split_work,
 )
 from .gpu_tiling import DeviceCaps
-from .histogram import Histogram, subtract_histogram
+from .histogram import (
+    Histogram,
+    check_device_derivative_precision,
+    subtract_histogram,
+)
 from .histogram_gpu import GpuHistogramBuilder
 from .phase_profile import (
     PARTITION_LAUNCHES,
@@ -2458,6 +2462,13 @@ def grow_tree_gpu_profiled(
         params.num_leaves,
         params.max_depth,
         params.min_data_in_leaf,
+    )
+    # `derivative_precision = float64` is refused rather than ignored here:
+    # the device carries derivatives as Float32 and has no Float64 to carry
+    # them in, so this grower cannot honor the setting by any amount of
+    # threading. See `histogram.check_device_derivative_precision`.
+    check_device_derivative_precision(
+        params.extra.wants_float64_derivatives()
     )
     var max_delta_step = params.extra.max_delta_step
     var path_smooth = params.extra.path_smooth

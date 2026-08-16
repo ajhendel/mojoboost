@@ -1,4 +1,4 @@
-"""The six scenarios, and the one comparator both benchmarks run against.
+"""The eight scenarios, and the one comparator both benchmarks run against.
 
 A differential benchmark is only worth reading if the two libraries were
 asked for the same model, and if a reader can tell from the result which
@@ -139,7 +139,7 @@ LightGBM dict, and it is the same kind of thing:
   to coming out than it was, but it cannot come out yet: the ranking
   trainer does not apply a bundling plan at all and refuses an active
   switch by name (`efb.check_bundling_honored`), so turning bundling on
-  for both engines would raise on one of the six scenarios rather than
+  for both engines would raise on one of the eight scenarios rather than
   compare it.
 - `verbosity = -1` and a fixed `seed`. Neither changes the model or the
   work. The first keeps LightGBM's log out of the harness's stdout, which
@@ -546,24 +546,37 @@ CATBOOST_LEFT_AT_STOCK = {
 CATBOOST_UNMATCHABLE = {
     "tree_shape": (
         "CatBoost grows symmetric (oblivious) trees of depth 6, where every "
-        "node at a level shares one split. mojotrees grows leaf-wise by "
-        "default and has depthwise as its only other policy "
-        "(src/mojotrees/growth_policy.mojo); it has no symmetric policy at "
-        "all. So the CatBoost-mode mojotrees arm is depthwise at depth 6, "
-        "which is the nearest reachable shape and is NOT the same tree. "
-        "A symmetric tree is strictly more constrained than a depthwise one "
-        "at the same depth, so this difference is expected to cost CatBoost "
-        "accuracy and save it time, and neither side of that is measured "
-        "here"
+        "node at a level shares one split. mojotrees now HAS a symmetric "
+        "policy -- GROW_OBLIVIOUS in src/mojotrees/growth_policy.mojo, "
+        "landed 2026-08-16 -- so the old claim here that it had none is "
+        "withdrawn. But it is not reachable from this harness: "
+        "python/mojotrees/sklearn.py validates grow_policy against "
+        "_GROW_POLICIES, which carries 'leafwise' (alias 'lossguide') and "
+        "'depthwise' and nothing else, and every arm in bench/real_data goes "
+        "through that surface. So the CatBoost-mode mojotrees arm is STILL "
+        "depthwise at depth 6 and still NOT the same tree, and the reason "
+        "has changed from 'we cannot' to 'the Python layer does not expose "
+        "it yet'. A symmetric tree is strictly more constrained than a "
+        "depthwise one at the same depth, so this difference is expected to "
+        "cost CatBoost accuracy and save it time, and neither side of that "
+        "is measured here. This is the one entry in this table that is "
+        "expected to STOP being unmatchable: wiring symmetrictree through "
+        "_GROW_POLICIES closes it, and then this row becomes a matched "
+        "parameter instead of a caveat"
     ),
     "row_sampling": (
         "CatBoost's default bootstrap_type is MVS with subsample 0.8, so it "
         "subsamples rows on every tree. LightGBM and mojotrees do not "
         "subsample at their defaults. MVS is minimum-variance sampling "
         "weighted by gradient magnitude, not uniform bagging, so mojotrees's "
-        "bagging_fraction is not an emulation of it and the CatBoost-mode "
-        "arm does not try. The CatBoost arm therefore sees about 80 percent "
-        "of the rows per tree and the other two see all of them"
+        "bagging_fraction is not an emulation of it. The CatBoost arm "
+        "therefore sees about 80 percent of the rows per tree and the other "
+        "two see all of them. As of 2026-08-16 mojotrees HAS an MVS sampler "
+        "of its own, built from CatBoost's source and off by default, so "
+        "'the CatBoost-mode arm does not try' has gone from a statement "
+        "about what we can do to a statement about what is wired: nothing "
+        "calls the sampler from a round loop yet. When something does, this "
+        "entry becomes matchable and should move out of this table"
     ),
     "split_scoring": (
         "CatBoost's default score_function is Cosine and its "
@@ -588,12 +601,19 @@ CATBOOST_UNMATCHABLE = {
         "CatBoost's border_count is a count of thresholds and LightGBM's "
         "max_bin is a count of bins, so CatBoost's default 254 borders and "
         "this harness's shared max_bin of 255 describe the same granularity "
-        "budget. They do not describe the same binning: CatBoost's "
-        "GreedyLogSum picks well under the budget on ordinary data (125, "
-        "113 and 101 borders on the first three features of a uniform "
-        "20,000 by 20 matrix, read 2026-08-16), while LightGBM and "
-        "mojotrees fill it. Whether either side reserves a bin for missing "
-        "values is not something this harness has established"
+        "budget, and both sides also produce the SAME NUMBER of borders: "
+        "GreedyLogSum yields exactly min(border_count, distinct - 1), which "
+        "is LightGBM's rule too. They differ only in where the borders sit, "
+        "equal-frequency here against a recursive median split there. The "
+        "earlier claim that GreedyLogSum picks under its budget (125, 113 "
+        "and 101 borders on a uniform 20,000 by 20 matrix) is WITHDRAWN: "
+        "those are used-split counts, because a trained model's per-feature "
+        "Borders are cleared and rebuilt from the tree split set "
+        "(model_build_helper.cpp:102-103, model.cpp:191-194). Read the grid "
+        "off a quantized Pool, never off a fitted model. Missing values cost "
+        "one bin on both sides (quantization.cpp:322-345, LightGBM "
+        "bin.cpp:394-397), so that is not a divergence either -- only the "
+        "side is, CatBoost putting NaN at bin 0 and both of the others last"
     ),
     "learning_rate_precision": (
         "CatBoost stores learning_rate as a 32-bit float. A matched rate of "
@@ -612,9 +632,31 @@ CATBOOST_UNMATCHABLE = {
         "CatBoost splits categorical features on ordered target statistics "
         "(CTR), which is a different algorithm from LightGBM's and "
         "mojotrees's category-set split and uses the label to build the "
-        "feature. No scenario in this suite runs CatBoost with categorical "
-        "features, so this is recorded as the reason the comparison was not "
-        "attempted rather than as a caveat on a number"
+        "feature. STILL TRUE, and still the reason: no scenario in this "
+        "suite runs CatBoost with categorical features. What changed on "
+        "2026-08-16 is that the absence is now a BLOCKED comparison rather "
+        "than an unattempted one, and the two halves have to be read apart. "
+        "WHAT IS NOW COMPARED: high_cardinality_categorical puts mojotrees's "
+        "category-set split against LightGBM's at five cardinalities chosen "
+        "to cross both engines' capacity rules -- max_cat_to_onehot at 4, "
+        "max_cat_threshold's 32-category prefix cap, min_data_per_group's "
+        "100-row floor, and the 254-category ceiling that "
+        "src/mojotrees/categorical.mojo has and LightGBM does not -- plus a "
+        "double-centered two-column interaction that no single-column split "
+        "carries. That is a real reading of the category-set algorithm at "
+        "scale and it did not exist before. WHAT IS STILL NOT COMPARED: "
+        "anything CatBoost does. The CTR itself, the ordered permutation it "
+        "is computed over, and CTR feature COMBINATIONS -- which is the "
+        "mechanism the interaction column was built for -- have no CatBoost "
+        "row on that scenario or on any other, and the blocker is not this "
+        "table's subject at all. It is the harness's float64 matrix: see "
+        "CATBOOST_SCENARIO_SUPPORT['high_cardinality_categorical'], which is "
+        "word for word the categorical_missing blocker. So the honest "
+        "statement is that the scenario CatBoost's categorical algorithm "
+        "would be read on now EXISTS and is unreachable, where before there "
+        "was nothing to reach. This entry closes when the loader can hand "
+        "every engine an integer-typed categorical block whose digest all "
+        "three agree on, and not before"
     ),
 }
 
@@ -626,6 +668,32 @@ CATBOOST_SCENARIO_SUPPORT = {
     "imbalanced_binary": None,
     "multiclass": None,
     "sparse_highdim": None,
+    # Runs, and is the one scenario whose row count was chosen FOR this arm.
+    # See ORDERED_BOOSTING_ROWS for what that row count has to be below and
+    # for how little of that is verified, and CATBOOST_TIER_CAP for why the
+    # arm stops at the standard tier.
+    "ordered_boosting_small": None,
+    "high_cardinality_categorical": (
+        "the same blocker as categorical_missing, on the scenario that was "
+        "built for this arm's algorithm. The harness hands every engine one "
+        "float64 matrix with the categorical columns integer-coded into it, "
+        "and CatBoost refuses cat_features on a floating-point array "
+        "outright: \"'data' is numpy array of floating point numerical "
+        "type, it means no categorical features\". Handing CatBoost a "
+        "converted copy would give it different bytes from the other two "
+        "engines, which is the one thing worker.py's data digest exists to "
+        "prevent. Running it WITHOUT cat_features is worse than skipping "
+        "it: CatBoost would then split five integer-coded columns as "
+        "ordinal numbers, which is the exact error native categorical "
+        "handling exists to avoid, and the row would sit in a column headed "
+        "by two engines doing set splits. So this scenario has no CatBoost "
+        "row, and the cost of that is higher here than anywhere else in the "
+        "suite, because ordered target statistics and CTR combinations are "
+        "what this shape was drawn for. It clears the day the loader can "
+        "produce an integer-typed categorical block whose digest all three "
+        "engines agree on -- the same day categorical_missing clears, by "
+        "the same change"
+    ),
     "ranking": (
         "CatBoost has no lambdarank. Its ranking losses are YetiRank, "
         "YetiRankPairwise, QueryRMSE and PairLogit, and none of them is the "
@@ -744,8 +812,11 @@ MOJOTREES_CATBOOST_MODE = {
 #: dict so the arm explains itself where it is read.
 MOJOTREES_CATBOOST_MODE_REASONS = {
     "grow_policy": (
-        "the nearest reachable shape to SymmetricTree, and not the same "
-        "one. See CATBOOST_UNMATCHABLE['tree_shape']"
+        "the nearest shape this harness can REACH, and not the same one. "
+        "Reachable is the operative word since 2026-08-16: a symmetric "
+        "policy now exists in the Mojo package but sklearn.py's "
+        "_GROW_POLICIES does not expose it, so depthwise remains the "
+        "closest this arm can ask for. See CATBOOST_UNMATCHABLE['tree_shape']"
     ),
     "max_depth": "CatBoost's depth default",
     "num_leaves": (
@@ -939,6 +1010,152 @@ RANKING_PARAMS = {
     "lambdarank_norm": True,
     "ndcg_eval_at": 10,
 }
+
+#: The cardinality ladder for `high_cardinality_categorical`, per tier, and
+#: the argument for every rung. This is the longest comment in this file
+#: because the number of levels is the whole design of that scenario, and a
+#: reviewer's first and correct question is why these five.
+#:
+#: **The quantity is rows per level, not levels.** Every rule that governs a
+#: categorical column here is written against a count of rows, not a count
+#: of categories: `min_data_per_group` is 100 rows, `cat_smooth` is a
+#: count-weighted prior on `sum_grad / (sum_hess + cat_smooth)`, LightGBM's
+#: `min_data_in_bin` drop is 3 rows, and a target statistic stops being a
+#: statistic when a level runs out of rows. So the three tiers hold rows per
+#: level FIXED and move the level counts with the row count, which is why
+#: the same five arguments hold at every tier and a smoke run is the same
+#: problem at 1/50 scale rather than a different one.
+#:
+#: The first two rungs are the exception and are fixed across tiers, because
+#: they are defined against a PARAMETER rather than against a row count:
+#:
+#: - **8 levels.** Above `max_cat_to_onehot` (4), so the column is searched
+#:   by the prefix sort and not one-vs-rest, and below everything else. This
+#:   is the CONTROL and is not claimed to stress anything: a CTR over eight
+#:   levels at 100,000 rows each is a well-estimated mean and an ordered
+#:   target statistic should behave here exactly like an unordered one. It
+#:   earns its column by being the row that separates "ordering costs
+#:   accuracy because levels are rare" from "ordering costs accuracy
+#:   always". It is also, with the 64-level column, one half of the
+#:   interaction described below.
+#: - **64 levels.** The smallest power of two past `max_cat_threshold` (32),
+#:   so this is the first cardinality at which the prefix cap BINDS and the
+#:   category-set split becomes a truncated sort rather than a full one. One
+#:   factor of two past it and no more, so the truncation is visible without
+#:   being the only thing happening.
+#:
+#: The last three are pinned at 800, 40 and 4 rows per level:
+#:
+#: - **800 rows per level.** Comfortably above `min_data_per_group`'s 100,
+#:   so every level survives the population filter and a per-level target
+#:   statistic is well estimated. At the standard tier that is 1,000 levels
+#:   against a 32-category prefix: the split sees three percent of the
+#:   levels per side and has to choose which.
+#: - **40 rows per level.** BELOW `min_data_per_group`'s 100, deliberately.
+#:   Under LightGBM's rule the great majority of levels are excluded from
+#:   the sort outright, and 40 samples is where `cat_smooth`'s prior
+#:   actually moves the estimate rather than rounding off it. This is the
+#:   rung where a category-set split and a target statistic should visibly
+#:   disagree, and it is the reason to build the second one.
+#: - **4 rows per level, and drawn from a power law.** The identifier
+#:   column. A UNIFORM column at this ratio is the useless case -- it costs
+#:   memory and exercises nothing, because no level is ever estimable -- so
+#:   this one is drawn by the same inverse transform `sparse_highdim` uses
+#:   on its column index, which puts an estimable head and a singleton tail
+#:   in one column, the way a user id or a URL hash actually behaves.
+#:
+#: What that draw produces at the standard tier is MEASURED, not estimated:
+#: on the 800,000 training rows of the 1,000,000-row split, nominal 200,000
+#: levels, seed 1907, the column realizes 175,686 distinct levels, of which
+#: 42,843 are singletons, 91,137 hold at least LightGBM's `min_data_in_bin`
+#: of 3 rows, and only **306** hold `min_data_per_group`'s 100. The busiest
+#: level holds 13,739 rows and it takes 167,686 levels to cover 99 percent
+#: of the rows. (Read back on 2026-08-16 by drawing that one column with
+#: `generators._stream`; nothing was trained and nothing was downloaded.)
+#:
+#: Those numbers are the scenario's whole point, so they are here rather
+#: than in a lane report. **The split search on that column is effectively
+#: over 306 levels on both engines**, because the population filter removes
+#: the rest -- but LightGBM pays for a bin table of order 100,000 entries to
+#: arrive there, since its `max_bin` is a floor on a categorical column's
+#: bin count and not a ceiling, while mojotrees pays for 254 and loses
+#: everything below the head (`src/mojotrees/categorical.mojo`, "Capacity").
+#: An ordered target statistic pays for one numeric column of 255 bins and
+#: keeps the tail's information. That three-way gap is what this scenario
+#: makes visible and no other scenario in the suite can.
+#:
+#: **The ladder was checked to carry signal at every rung, and this is the
+#: reading.** A ladder whose rare columns are pure noise is decoration, and
+#: the way to find that out is not to train a model. Taken on 2026-08-16 at
+#: 200,000 rows with the cardinalities divided by five -- (8, 64, 200,
+#: 4,000, 40,000), which reproduces the same rows-per-level ladder exactly
+#: at one fifth the rows -- by fitting a `cat_smooth`-smoothed per-level
+#: target mean on the training split and scoring it on the held-out split,
+#: which is a leakage-free target statistic and not a model:
+#:
+#:     column     rows/level   AUC from that column alone
+#:     8 levels      19,956    0.7041
+#:     64 levels      2,494    0.7031
+#:     200 levels       798    0.6607
+#:     4,000 levels      40    0.5753
+#:     40,000 levels      4.5   0.5234
+#:
+#: All five together score 0.8165 on the held-out split; the numeric terms
+#: alone score 0.6338. So the rare columns carry real and diminishing signal
+#: rather than none -- the 4-rows-per-level column is still 0.52 and not
+#: 0.50 -- which is the gradient the ladder was drawn for, and the baseline
+#: floor in thresholds.json is set under these numbers rather than over a
+#: guess. Nothing was trained and nothing was downloaded to get them.
+HIGH_CARDINALITY_LEVELS = {
+    # 16,000 training rows. The third rung is 160 rows per level rather than
+    # 800, because 800 would put it below `max_cat_threshold` and the prefix
+    # cap would stop binding; 100 levels keeps the cap binding and keeps the
+    # column above `min_data_per_group`. Stated because it is the one place
+    # the tiers are not the same problem at different scale.
+    "smoke": (8, 64, 100, 400, 4_000),
+    # 800,000 training rows: 800, 40 and 4 rows per level exactly.
+    "standard": (8, 64, 1_000, 20_000, 200_000),
+    # 1,600,000 training rows: the same three ratios.
+    "large": (8, 64, 2_000, 40_000, 400_000),
+}
+
+#: The row count for `ordered_boosting_small`, and what it has to be below.
+#:
+#: **This number is an assumption and this comment is the whole of its
+#: provenance.** The scenario exists so that mojotrees's ordered boosting is
+#: compared against CatBoost running its OWN `Ordered` default, and CatBoost
+#: resolves `boosting_type` from the data rather than taking a constant --
+#: `CATBOOST_LEFT_AT_STOCK` records it as the one entry there that is a
+#: reading and not a rule. It picks `Ordered` below some size on CPU and
+#: `Plain` above it, so this row count must sit on the Ordered side of that
+#: threshold or the scenario compares ordered boosting against plain
+#: boosting and reports the difference as engine quality.
+#:
+#: 50,000 is what this scenario assumes, from the commonly quoted reading of
+#: CatBoost's documentation that `Ordered` is chosen for small datasets.
+#: **Nobody in this repository has read that out of CatBoost's source.**
+#: `lane/ordered-boosting` is source-verifying it; until that lands this
+#: constant is a placeholder with an argument attached, and it is a constant
+#: rather than five literals so that the verified number is a one-line
+#: change and every tier moves with it.
+#:
+#: There is evidence in this very file that the naive reading is WRONG, and
+#: it belongs next to the assumption rather than in a lane report.
+#: `CATBOOST_LEFT_AT_STOCK` records `boosting_type: "Plain"`, and
+#: `CATBOOST_DEFAULTS_SOURCE` says that was read back from
+#: `get_all_params()` after a two-iteration fit on **20,000 rows** by 20
+#: features. 20,000 is well under 50,000 and CatBoost still resolved Plain.
+#: Two readings of that, and this harness cannot tell them apart:
+#: the threshold may be far below 50,000, or the rule may not be a row count
+#: at all and may take the iteration count or the cell count as an input,
+#: in which case a two-iteration fit says nothing about a 100-iteration one.
+#: Either way, **a row of this scenario is only the row it claims to be if
+#: the resolved `boosting_type` in that record reads `Ordered`.** The
+#: CatBoost adapter already writes `get_all_params()` into every record, so
+#: that is checkable per run and must be checked before the column is
+#: quoted; it is repeated in the scenario's caveats, which travel into every
+#: record.
+ORDERED_BOOSTING_ROWS = 50_000
 
 #: Size tiers. `smoke` exists to prove the wiring end to end in seconds and
 #: is never reported as a benchmark; `standard` is the default; `large` is
@@ -1334,6 +1551,174 @@ SCENARIOS = {
             "strings itself would compare two encodings, not two trainers.",
         ],
     ),
+    "high_cardinality_categorical": _scenario(
+        task="binary",
+        objective="binary",
+        title="High-cardinality categorical",
+        # No real dataset, and that is a gap rather than a preference. The
+        # real reading of this shape is a click log -- Criteo or Avazu --
+        # and registering one means a sources.json entry, a loader, a
+        # licence check and a multi-gigabyte fetch, none of which is this
+        # lane's to do and none of which can be done without downloading.
+        # This is the first scenario in the suite with no dataset at all, and
+        # `worker.build_data` was corrected for it: a null `dataset` now
+        # produces `fallback_reason: null` plus a `no_real_variant` field,
+        # rather than the string "no real dataset for this scenario", which
+        # summarize.py flags as "a scenario that names a real dataset ran on
+        # the generator instead". That sentence would be true-sounding and
+        # false here. A scenario with no real variant is a different record
+        # from one whose real variant was missing.
+        dataset=None,
+        generator="high_cardinality_categorical",
+        generator_sizes={
+            "smoke": {
+                "n_rows": 20_000,
+                "n_numeric": 10,
+                "cardinalities": HIGH_CARDINALITY_LEVELS["smoke"],
+            },
+            "standard": {
+                "n_rows": 1_000_000,
+                "n_numeric": 10,
+                "cardinalities": HIGH_CARDINALITY_LEVELS["standard"],
+            },
+            "large": {
+                "n_rows": 2_000_000,
+                "n_numeric": 10,
+                "cardinalities": HIGH_CARDINALITY_LEVELS["large"],
+            },
+        },
+        params=dict(CATEGORICAL_PARAMS),
+        primary_metric="auc",
+        notes=(
+            "One million rows and five categorical columns whose level "
+            "counts cross four different rules: max_cat_to_onehot at 4, "
+            "max_cat_threshold's 32-category prefix cap, "
+            "min_data_per_group's 100-row floor, and the 254-category "
+            "ceiling mojotrees has and LightGBM does not. "
+            "HIGH_CARDINALITY_LEVELS carries the argument for each. This is "
+            "the shape ordered target statistics and CTR feature "
+            "combinations exist for, and until 2026-08-16 no scenario in "
+            "this suite had it, so none of that machinery could appear in a "
+            "published number however well it worked. The two-column "
+            "interaction is double-centered so neither marginal carries it: "
+            "a tree needs two stacked set splits to reach it and a "
+            "combination feature reaches it in one."
+        ),
+        caveats=[
+            "This scenario is expected to be WORSE for mojotrees than any "
+            "other in the suite, for a reason that is written down rather "
+            "than discovered: src/mojotrees/categorical.mojo keeps at most "
+            "max_bin - 1 = 254 categories per column and lumps the rest "
+            "into bin 0, which never joins a split set, while LightGBM's "
+            "max_bin is a FLOOR on a categorical column's bin count and it "
+            "keeps admitting categories until it has both covered 99 "
+            "percent of the rows and spent max_bin bins. On the standard "
+            "tier's 200,000-level column that is 254 bins against roughly "
+            "100,000. thresholds.json carries a correspondingly wide gate "
+            "with an exit condition, and the gate is wide because it bounds "
+            "a known structural deficit and not a tie-break.",
+            "The 254-versus-100,000 gap cuts the other way on cost, and the "
+            "large tier is where that is expected to hurt. LightGBM builds "
+            "and clears a bin table of that size at every node of every "
+            "tree; mojotrees builds 254. Nobody has timed either, so this "
+            "is a derived expectation and not an observed limit: the "
+            "arithmetic is 31 leaves by 100 iterations by a sort over the "
+            "kept categories. run.py's per-run timeout is 7200 seconds and "
+            "the standard tier is expected to fit inside it; the large "
+            "tier, at twice the rows and twice the levels, is not "
+            "established to. A timed-out cell is an infrastructure failure "
+            "and takes the whole run's exit code, so schedule the large "
+            "tier knowing that.",
+            "No missing values, unlike categorical_missing. The two "
+            "scenarios are meant to differ in exactly one axis, so a "
+            "difference between them is attributable.",
+            "CPU only, for categorical_missing's reason and not a new one: "
+            "there is no accelerator path for categorical splits this "
+            "harness is willing to compare.",
+            "There is no CatBoost row and the cost of that is higher here "
+            "than anywhere else in the suite, because CatBoost's ordered "
+            "target statistic is the algorithm this shape was drawn for. "
+            "See CATBOOST_SCENARIO_SUPPORT and "
+            "CATBOOST_UNMATCHABLE['categorical_encoding'].",
+        ],
+    ),
+    "ordered_boosting_small": _scenario(
+        task="regression",
+        objective="regression",
+        title="Ordered boosting at small scale",
+        dataset=None,
+        # Deliberately the dense_regression recipe rather than a seventh
+        # one. The axis under test is the boosting SCHEME at a chosen row
+        # count; the data should be the one already understood. A distinct
+        # seed keeps the two scenarios from being the same rows at a shared
+        # size.
+        generator="dense_regression",
+        generator_sizes={
+            # Derived from ORDERED_BOOSTING_ROWS rather than written out, so
+            # that the verified threshold is a one-line change.
+            "smoke": {
+                "n_rows": ORDERED_BOOSTING_ROWS // 10,
+                "n_features": 15,
+                "seed": 1908,
+                "noise": 0.60,
+            },
+            "standard": {
+                "n_rows": ORDERED_BOOSTING_ROWS,
+                "n_features": 30,
+                "seed": 1908,
+                "noise": 0.60,
+            },
+            # The ONLY scenario here whose large tier does not add rows. Its
+            # row count is its identity: adding rows would move it across
+            # the threshold it is defined by and produce a Plain-boosting
+            # row under an Ordered heading. It scales in features instead.
+            "large": {
+                "n_rows": ORDERED_BOOSTING_ROWS,
+                "n_features": 100,
+                "seed": 1908,
+                "noise": 0.60,
+            },
+        },
+        primary_metric="rmse",
+        notes=(
+            "50,000 rows of the dense regression recipe at a high noise "
+            "level, so a 100-tree model at 31 leaves genuinely overfits and "
+            "a scheme that corrects prediction shift has something to "
+            "correct. The row count is the point: CatBoost resolves "
+            "boosting_type from the data, and this scenario is the one "
+            "place in the suite where its Ordered default is supposed to be "
+            "what runs. ORDERED_BOOSTING_ROWS carries what that number has "
+            "to be below and how little of it is verified."
+        ),
+        caveats=[
+            "READ THE RESOLVED boosting_type IN THE RECORD BEFORE QUOTING "
+            "THE CATBOOST ROW. This scenario's row count is an assumption, "
+            "not a verified threshold, and this file records evidence "
+            "against the naive reading of it: CATBOOST_LEFT_AT_STOCK has "
+            "boosting_type Plain, read from get_all_params() after a fit on "
+            "20,000 rows, which is well under this scenario's 50,000. If a "
+            "record's resolved boosting_type reads Plain, the CatBoost row "
+            "is a plain-boosting row and comparing ordered boosting against "
+            "it is a mislabelled comparison, not a result. See "
+            "ORDERED_BOOSTING_ROWS.",
+            "The catboost_lossguide row is expected NOT to be an ordered "
+            "row even when the catboost row is. That arm passes "
+            "grow_policy=Lossguide, and ordered boosting is a symmetric-tree "
+            "mechanism in CatBoost, so the library is expected either to "
+            "refuse the pair or to resolve to Plain. Neither has been "
+            "checked here and this is a stated expectation, not an "
+            "observation. Whichever happens is what the record says, and "
+            "the harness has no way to skip one peer engine on one "
+            "scenario, so the row will exist and must not be read as an "
+            "ordered row without checking its resolved parameters.",
+            "CPU only. CatBoost's Ordered/Plain resolution is a CPU-side "
+            "default (task_type CPU, in CATBOOST_LEFT_AT_STOCK), and this "
+            "row count sits below the size at which this library sends work "
+            "to the accelerator at all, so a GPU row here would be a "
+            "mojotrees-internal comparison at a size chosen for somebody "
+            "else's threshold.",
+        ],
+    ),
     "sparse_highdim": _scenario(
         task="binary",
         objective="binary",
@@ -1361,6 +1746,98 @@ SCENARIOS = {
             "cannot be separated from training time for mojotrees here. The "
             "record carries binning_s = null with that reason, rather than "
             "an estimate.",
+        ],
+    ),
+}
+
+
+#: A scenario that is SPECIFIED AND NOT BUILT, held outside `SCENARIOS` on
+#: purpose.
+#:
+#: Text columns are the third shape this campaign's categorical work needs
+#: and the only one whose INPUT CONTRACT does not exist yet. `lane/text-
+#: features` is live and has not landed anything, so the honest state of
+#: this scenario is a written design with the unknowns named, not a
+#: half-registered entry that fails a self-check or, worse, runs and
+#: measures something nobody specified. `selfcheck.check_pending_scenarios`
+#: fails if this is ever merged into `SCENARIOS` without the three blockers
+#: below being closed, which is what makes "specified but not built" a state
+#: the harness enforces rather than a comment somebody has to notice.
+#:
+#: WHAT IT WAITS ON. Three things, and none of them is a scenario decision:
+#:
+#: 1. **How a text column reaches an engine at all.** Every scenario here
+#:    hands all engines ONE float64 matrix, and text is not a float64
+#:    column. That is the same wall `categorical_missing` and
+#:    `high_cardinality_categorical` hit for integer categories -- see
+#:    `CATBOOST_SCENARIO_SUPPORT` -- and text is strictly harder, because
+#:    CatBoost's `text_features` takes raw strings while LightGBM has no
+#:    text feature type at all and would need the tokenization done for it.
+#: 2. **Who tokenizes.** If each library tokenizes, the comparison is of
+#:    three tokenizers and not of three trainers, which is the defect
+#:    `categorical_missing`'s second caveat already names for category
+#:    codes. If the harness tokenizes once and hands over a bag-of-words
+#:    matrix, then this scenario IS `sparse_highdim` with a different
+#:    generator and does not need to exist. The design below assumes the
+#:    harness tokenizes once and hands over token-id sequences, which is a
+#:    third option neither engine takes today, and that assumption is the
+#:    substance of what `lane/text-features` has to decide.
+#: 3. **What `worker.py` digests.** `data_digest` hashes
+#:    `np.ascontiguousarray(piece).tobytes()`. A numpy object array of
+#:    Python strings has no such bytes, so the guarantee that all engines
+#:    saw identical data -- the guarantee every other number in a row rests
+#:    on -- does not currently extend to a text column. A digest rule for
+#:    text has to be decided before a text row can be compared at all.
+#:
+#: Everything below the blockers is a proposal, and it is written down now
+#: so that the lane that lands the contract has a target rather than a blank
+#: page. Nothing here is measured and no number in it is anything but a
+#: design choice.
+TEXT_SCENARIO_PENDING = {
+    "id": "text_features",
+    "status": "specified, not built",
+    "blocked_on": (
+        "lane/text-features: the input contract for a text column does not "
+        "exist. See the three numbered blockers above this dict"
+    ),
+    "spec": _scenario(
+        task="binary",
+        objective="binary",
+        title="Text features",
+        dataset=None,
+        generator="text_features",
+        generator_sizes={
+            # Documents per tier, not rows of a matrix, because a text
+            # column's cost is per token and not per row. The token budget
+            # matters more than the document count and is stated with it.
+            "smoke": {"n_docs": 20_000, "vocab": 5_000, "tokens_per_doc": 20},
+            "standard": {"n_docs": 500_000, "vocab": 200_000, "tokens_per_doc": 40},
+            "large": {"n_docs": 2_000_000, "vocab": 1_000_000, "tokens_per_doc": 40},
+        },
+        primary_metric="auc",
+        notes=(
+            "A binary target driven by a small set of signal tokens inside "
+            "a Zipf vocabulary, so that most of the vocabulary is noise and "
+            "the useful tokens are rare enough that a per-token statistic "
+            "is a real estimate rather than a lookup. The vocabulary sizes "
+            "are chosen the way HIGH_CARDINALITY_LEVELS is: a token is a "
+            "category, and the rule that governs it is rows per level."
+        ),
+        caveats=[
+            "NOT BUILT. There is no generator named 'text_features' in "
+            "generators.py and no loader, and registering this dict in "
+            "SCENARIOS without one fails selfcheck.check_registry.",
+            "The engines are unknown, not defaulted. LightGBM has no text "
+            "feature type; CatBoost has text_features and would be the only "
+            "engine running its own text algorithm, which is the shape of "
+            "problem CATBOOST_UNMATCHABLE exists to record; mojotrees's "
+            "side does not exist yet. A support decision per engine is part "
+            "of what lane/text-features has to produce, and until it does, "
+            "the engines list here is a placeholder and not a decision.",
+            "No threshold. thresholds.json has no entry for this scenario "
+            "and must not get a speculative one: a gate written before "
+            "anybody knows what the two implementations differ by is a "
+            "number chosen to pass.",
         ],
     ),
 }
@@ -1553,10 +2030,48 @@ CATBOOST_TIER_CAP = {
         "nobody has timed CatBoost at the standard tier to find out how far "
         "over it goes",
     ),
+    "ordered_boosting_small": (
+        "standard",
+        "a cap on LABELLING rather than on cost, and the only one of that "
+        "kind in this dict. This scenario's row count is chosen to sit on "
+        "the Ordered side of CatBoost's own Ordered-versus-Plain threshold, "
+        "and ORDERED_BOOSTING_ROWS records how little of that threshold is "
+        "verified: the rule may not be a row count at all, and this file "
+        "already carries a reading of Plain at 20,000 rows. The large tier "
+        "is the one tier that changes an input the rule might take -- it "
+        "holds rows at 50,000 and raises features from 30 to 100 -- so a "
+        "CatBoost row there could resolve to Plain while the standard row "
+        "resolves to Ordered, and the two would sit in one column under one "
+        "heading. Capped at standard until the rule is read out of "
+        "CatBoost's source. This is a declared bound and not an observed "
+        "limit in the strongest sense: nobody has run the large tier to see "
+        "which way it resolves, and the cap exists so that nobody quotes a "
+        "row without having found out",
+    ),
 }
 
 #: Tiers in increasing size, so a cap can be compared rather than matched.
 TIER_ORDER = ("smoke", "standard", "large")
+
+
+#: Every engine name that is a CatBoost-shaped peer arm, in one place.
+#:
+#: This exists because the same tuple was written out by hand in three files
+#: -- the scenario engine lists here, the tier cap in `run.py`, and the
+#: wiring check in `selfcheck.py` -- and a fourth arm added to two of the
+#: three would run at an uncapped tier, or be capped and never checked, with
+#: nothing failing. `CATBOOST_TIER_CAP` bounds a scenario; this bounds who
+#: the bound applies to.
+#:
+#: `mojotrees_catboost_mode` is deliberately NOT here. It is us shaped toward
+#: CatBoost, not CatBoost, so it neither takes CatBoost's tier caps nor
+#: carries CatBoost's parameters. It is a peer arm by `ENGINE_ARM` and that
+#: is the only list it belongs to.
+CATBOOST_ENGINES = ("catboost", "catboost_lossguide")
+
+#: The peer arms as a group, for callers that mean "anything reported beside
+#: the comparator rather than as it".
+PEER_ENGINES = CATBOOST_ENGINES + ("mojotrees_catboost_mode",)
 
 
 def catboost_tier_ok(scenario, tier):
@@ -1665,10 +2180,12 @@ def mojotrees_catboost_mode_params(spec, device, extra=None):
     else.
 
     What this arm is NOT: a claim that mojotrees can be made into CatBoost.
-    It cannot. mojotrees has no symmetric-tree policy, so this is depthwise
-    at depth 6, and it does no row sampling, where CatBoost's default MVS
-    takes 80 percent of the rows per tree. Both are in
-    `CATBOOST_UNMATCHABLE` and both travel with the record.
+    It cannot. This is depthwise at depth 6 -- a symmetric policy now exists
+    in the Mojo package but `python/mojotrees/sklearn.py` does not expose it,
+    and this harness only reaches what that file validates -- and it does no
+    row sampling, where CatBoost's default MVS takes 80 percent of the rows
+    per tree. Both are in `CATBOOST_UNMATCHABLE` and both travel with the
+    record.
 
     The override is applied to the resolved dict rather than to the
     scenario's `params`, and that is a correction rather than a shortcut.
@@ -1696,5 +2213,5 @@ for _scenario_id, _reason in CATBOOST_SCENARIO_SUPPORT.items():
     if _reason is None:
         SCENARIOS[_scenario_id]["engines"] = list(
             SCENARIOS[_scenario_id]["engines"]
-        ) + ["catboost", "mojotrees_catboost_mode"]
+        ) + list(PEER_ENGINES)
 del _scenario_id, _reason

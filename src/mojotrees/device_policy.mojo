@@ -253,6 +253,7 @@ from .initialization import SessionState, warmup_level_name
 # reaches neither `model.mojo` nor the GPU kernel stack and closes no cycle.
 from .objective_registry import (
     LAMBDARANK,
+    MULTICLASS,
     SQUARED_ERROR,
     objective_gradients_on_device,
     objective_is_builtin,
@@ -1772,6 +1773,27 @@ def _collect_blocks(
                 " groups and trains on the CPU only"
             ),
         )
+    elif request.objective == MULTICLASS:
+        # No block. `gpu_trains_objective` answers False for MULTICLASS, and
+        # correctly: it asks whether `train_gpu` *itself* accepts the code,
+        # and it does not. That is not the question this gate asks. The
+        # question here is whether any backend covers the run, and
+        # `objective_backends(MULTICLASS)` is CPU|GPU because
+        # `train_multiclass_gpu` covers it -- reached through the `device`
+        # setting, not around it: `model.fit_multiclass`,
+        # `trainset.train_dataset_multiclass`, and
+        # `external_memory.train_external_multiclass` all take `device` and
+        # branch to it.
+        #
+        # This branch is what makes `-1` safe to declare. Without it, a
+        # request that honestly says "softmax" is refused with "objective
+        # code -1 is not one the built-in trainers implement", which is the
+        # failure recorded in the comments in model.mojo and trainset.mojo
+        # and measured by bench/real_data. Those call sites worked around it
+        # by sending OBJECTIVE_UNSPECIFIED instead; the workaround costs
+        # every multiclass run its objective gate. Fixed here so the honest
+        # declaration is also the working one.
+        pass
     elif not gpu_trains_objective(request.objective):
         blocks.add(
             BLOCK_UNKNOWN_OBJECTIVE,
@@ -1967,8 +1989,17 @@ def _collect_warnings(
             ),
         )
 
-    if request.objective_known() and (
-        not gpu_objective_is_device_resident(request.objective)
+    # MULTICLASS is excluded for the same reason it is excluded from the
+    # block above and for the same reason `objective_gradients_on_device`
+    # answers False for it: that predicate is about the *single-output*
+    # path's `fill_gradients_device`. Softmax derivatives have a device
+    # kernel of their own inside `train_multiclass_gpu`, so warning that a
+    # declared multiclass run fills gradients on the host would be a false
+    # statement in the report, printed on every softmax fit.
+    if (
+        request.objective_known()
+        and request.objective != MULTICLASS
+        and not gpu_objective_is_device_resident(request.objective)
     ):
         warnings.add(
             WARN_HOST_GRADIENT_PATH,
@@ -2669,6 +2700,14 @@ def _normalized_objective(objective: Int) -> Int:
     Below `-1` is undeclared. `-1` is deliberately excluded: it is the
     multiclass marker and a real code, so folding it into the undeclared
     sentinel would silently skip the objective gate for every multiclass run.
+
+    That `-1` branch was dead from Python until 2026-08-16.
+    `decide_device_workload` in bindings/basic_bindings.mojo folded every
+    negative objective to `OBJECTIVE_UNSPECIFIED` one statement before
+    calling `decide_device_report`, so this function never saw a `-1` that
+    came from a Python caller and the two marshallers disagreed on exactly
+    that value. The binding no longer folds; this is the only normalizer,
+    and it is now the only place the `-1`/`-2` distinction is decided.
     """
     if objective < -1:
         return OBJECTIVE_UNSPECIFIED

@@ -612,6 +612,52 @@ def check_derivative_precision() raises:
     )
 
 
+def check_device_derivative_precision(param_float64: Bool) raises:
+    """Refuse Float64 derivatives on a backend that cannot carry them.
+
+    **The device cannot, and the refusal is the point.** Gradients and
+    hessians reach an accelerator as Float32 and nothing else:
+    `histogram_gpu` states it as a hardware fact ("Apple GPUs have no
+    Float64") and `gpu_gradient_stream.stage_gradients` performs the
+    narrowing with a literal `Float32(g)` per row on upload. So a fit that
+    asked for `float64` and was routed to the device would get the Float32
+    answer, computed more slowly, with no error and nothing in the model to
+    say which arm produced it.
+
+    That is the same accepted-then-ignored failure the sparse and distributed
+    growers had, and it is refused here for the same reason rather than
+    worked around: this package says so or does it, and does not do neither.
+    It is not fixable by threading, because the missing thing is a datatype
+    the hardware does not have.
+
+    **Both entries are refused**, the parameter through `param_float64` and
+    the environment through the live read, because both are equally ignored
+    once the derivatives are on the device. An environment variable exported
+    for a CPU A/B and then left set for a GPU run is the likelier of the two
+    and the harder to notice.
+
+    Called from the two accelerator growers, beside the `ExtraTreeParams`
+    validation they already run, so the refusal lands before the first
+    histogram rather than part way through a fit.
+    """
+    check_derivative_precision()
+    if derivative_precision_narrows() and not param_float64:
+        return
+    raise Error(
+        "derivative_precision='",
+        DERIVATIVE_PRECISION_FLOAT64,
+        "' is not available on the accelerator: gradients and hessians are"
+        " carried as Float32 on the device (there is no Float64 there), so"
+        " the fit would silently produce the float32 answer. Train this"
+        " configuration on the CPU path, which honors it end to end, or"
+        " leave derivative_precision at '",
+        DERIVATIVE_PRECISION_FLOAT32,
+        "'. Note that MOJOTREES_DERIVATIVE_PRECISION reaches this too, so an"
+        " environment variable left over from a CPU comparison is refused"
+        " here rather than quietly ignored",
+    )
+
+
 @always_inline
 def cnt_factor(n_data: Int, sum_hessian: Float64) -> Float64:
     """LightGBM's `cnt_factor`: rows per unit of hessian in one node.
@@ -787,6 +833,14 @@ struct ConstHessianSettings(Copyable, Movable):
     removed 42,300 of; paying it back to support an opt-in diagnostic is not
     a trade this lane is willing to make.
 
+    **Two entries write this field, and `widened` states which wins.** The
+    environment writes it at `resolve()`; the `derivative_precision`
+    parameter writes it at `widened()`, which every dense CPU grower applies
+    from `params.extra` at `tree.grow_tree_leaves_profiled`. `float64` from
+    either entry wins, which is why widening a sentinel is meaningful: an
+    unwired grower still honors the parameter even though it honors the
+    environment only through the per-tree `resolve()` fallback.
+
     So the sentinel means `float32`, the documented default, and
     `derivative_precision` is honored wherever a fit resolves a snapshot --
     which is every trainer that threads one, and any caller that hands one
@@ -810,6 +864,59 @@ struct ConstHessianSettings(Copyable, Movable):
             True,
             derivative_precision_narrows(),
         )
+
+    @staticmethod
+    def resolve_with(param_float64: Bool) raises -> ConstHessianSettings:
+        """`resolve()`, then the parameter entry folded in.
+
+        `param_float64` is `ExtraTreeParams.wants_float64_derivatives()`, and
+        the fold is `widened` below: `float64` wins from either entry.
+        """
+        return ConstHessianSettings.resolve().widened(param_float64)
+
+    def widened(self, param_float64: Bool) -> ConstHessianSettings:
+        """This snapshot with the `derivative_precision` **parameter** folded
+        onto it, which is the hop that makes the parameter and the
+        environment the same switch rather than two.
+
+        **The precedence, decided explicitly: `float64` wins from either
+        entry.** If the parameter asks for Float64 derivatives, or the
+        environment does, the fit does not narrow. Neither entry can reduce
+        the precision the other asked for.
+
+        Three reasons it is this way round rather than
+        parameter-beats-environment.
+
+        - It is **monotone**, so it does not matter whether a trainer widens
+          before or after it resolves, and a caller that widens twice gets
+          the same snapshot. A precedence that could narrow would make the
+          order of two reads observable in a fit's numbers.
+        - It needs **no UNSET code**. `ExtraTreeParams.derivative_precision`
+          defaults to `DERIV_PRECISION_FLOAT32` and therefore cannot tell
+          "the caller chose float32" from "the caller said nothing"; a rule
+          where the parameter overrides would have to tell them apart, which
+          means a third code and a third arm at every existing reader of that
+          field. `wants_float64_derivatives` states what that would cost.
+        - It **cannot silently downgrade**. The documented environment entry
+          (`MOJOTREES_DERIVATIVE_PRECISION=float64`, which is the entry
+          `bench/results/cpu_float32_lambda0_2026-08-16` was taken through)
+          keeps working under a parameter set to anything, and the direction
+          it can only ever move is toward more precision. A switch whose two
+          entries can cancel is not a switch anyone can A/B.
+
+        The const-hessian fields are untouched: they are a different
+        question, and `resolved` is not cleared, because widening does not
+        make a resolved snapshot unresolved or an unresolved one resolved.
+        Widening a **sentinel** is still meaningful and is the case that
+        matters most: `narrow` is the one field every reader consults even
+        under the sentinel (see its docstring), so a grower that was handed
+        no snapshot still honors the parameter.
+        """
+        if not param_float64:
+            return self.copy()
+        var out = self.copy()
+        out.narrow = False
+        return out^
 
     @staticmethod
     def unresolved() -> ConstHessianSettings:

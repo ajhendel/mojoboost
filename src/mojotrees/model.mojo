@@ -134,7 +134,15 @@ struct Model(Copyable, Movable, Writable):
         var resolved = resolve_device(
             device, n_rows, self.mapper.n_features, 1
         )
-        var data = self.mapper.transform(features, n_rows)
+        # `build_view=False`: this matrix is SCORED, never
+        # histogrammed, so the row-major view would be a second full
+        # copy of the bin ids that nothing ever reads. The view went
+        # default-on under a memory budget in the same round, and
+        # without this every `predict` would silently double its
+        # footprint on a path no user thinks of as a fit.
+        var data = self.mapper.transform(
+            features, n_rows, build_view=False
+        )
         if self.booster.linear.is_active():
             if resolved == GPU_DEVICE:
                 check_linear_tree_unconnected("GPU prediction")
@@ -276,7 +284,15 @@ struct MulticlassModel(Copyable, Movable, Writable):
         var resolved = resolve_device(
             device, n_rows, self.mapper.n_features, self.booster.n_classes
         )
-        var data = self.mapper.transform(features, n_rows)
+        # `build_view=False`: this matrix is SCORED, never
+        # histogrammed, so the row-major view would be a second full
+        # copy of the bin ids that nothing ever reads. The view went
+        # default-on under a memory budget in the same round, and
+        # without this every `predict` would silently double its
+        # footprint on a path no user thinks of as a fit.
+        var data = self.mapper.transform(
+            features, n_rows, build_view=False
+        )
         var linear = self.booster.linear.is_active()
         if linear and resolved == GPU_DEVICE:
             check_linear_tree_unconnected("GPU prediction")

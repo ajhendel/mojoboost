@@ -187,6 +187,11 @@ extra_includes() {
   case "$1" in
     test_capi) echo "-I capi" ;;
     test_cli)  echo "-I cli" ;;
+    # Reaches into bindings/ because the thing under test IS a binding: the
+    # objective sentinel fold that used to live in `decide_device_workload`.
+    # Calling it needs a real CPython dict, which is what makes the test a
+    # test of the boundary rather than of a model of the boundary.
+    test_objective_marshalling) echo "-I bindings" ;;
     *)         echo "" ;;
   esac
 }

@@ -184,7 +184,23 @@ REQUIRED_SUPPORTED = [
     "max_cat_threshold",
     "cat_l2",
     "cat_smooth",
-    "max_cat_to_onehot",
+    # `max_cat_to_onehot` was here and is DOWNGRADED to partial, 2026-08-16.
+    #
+    # It is not missing and it is not broken; it is off by one against
+    # LightGBM, verified from both sources. LightGBM's test is
+    # `num_bin <= max_cat_to_onehot` (`feature_histogram.cpp:183`) where
+    # `num_bin` counts a dummy bin pushed at index 0 (`bin.cpp:456-459`), so
+    # LightGBM one-hots `max_cat_to_onehot - 1` real categories where we
+    # one-hot `max_cat_to_onehot`. At the shared default of 4 they one-hot 3
+    # and we one-hot 4, which is a different model on any categorical fit
+    # with exactly 4 levels.
+    #
+    # It stays out of this list until the boundary moves, because "supported"
+    # on a parity contract means a user gets LightGBM's behavior from
+    # LightGBM's parameter, and here they do not. Owned by the
+    # `wide-categorical-bins` lane. Do NOT put it back by editing the row in
+    # docs/LIGHTGBM_PARITY.md; put it back by fixing the comparison, in the
+    # same commit that removes these lines.
     "monotone_constraints",
     "interaction_constraints",
     "max_bin",
@@ -1632,6 +1648,27 @@ STOCK_PYTHON_CONSTANTS = {
     "_LAMBDA_L2": "lambda_l2",
 }
 
+#: The THIRD copy of the stock leaf-regularization defaults, in
+#: `Booster.refit`'s local `_leaf(name, alias, default)` helper in
+#: `python/mojotrees/basic.py`.
+#:
+#: It is a third copy because `sklearn.py` imports `basic.py` and not the
+#: other way round, so `basic.py` cannot reach `_LAMBDA_L2` without an import
+#: cycle. Deduplicating means moving the constants down into `basic.py` and
+#: having `sklearn.py` import them, which is the right fix and is not this
+#: gate's job.
+#:
+#: Until then the literal is checked where it sits. This is exactly the
+#: failure mode item 5 below names: `lambda_l2` sat at 1.0 against LightGBM's
+#: 0.0 in three places, was written down somewhere, and was checked nowhere.
+#: Two of the three are now read by this gate and this table is the third.
+#: A default that is correct today and unguarded is one edit from being
+#: wrong again with nothing to catch it.
+STOCK_BASIC_LEAF_DEFAULTS = {
+    "lambda_l1": "lambda_l1",
+    "lambda_l2": "lambda_l2",
+}
+
 STOCK_PYTHON_SIGNATURE = {
     "num_leaves": "num_leaves",
     "max_depth": "max_depth",
@@ -2025,6 +2062,42 @@ def stock_defaults(problems):
                     lgbm,
                     found[field],
                 )
+
+    # 3b. the functional API's own copy, in Booster.refit. Separate from 3
+    # because it is a separate literal in a separate file that no import
+    # binds to the estimator's: a fix applied to sklearn.py alone leaves a
+    # refit fitting a different regularizer than the fit it refits.
+    basic = ROOT / "python" / "mojotrees" / "basic.py"
+    if not basic.is_file():
+        fail(problems, "stock defaults: python/mojotrees/basic.py is missing")
+    else:
+        text = basic.read_text()
+        for field, lgbm in STOCK_BASIC_LEAF_DEFAULTS.items():
+            m = re.search(
+                r"\b"
+                + field
+                + r"\s*=\s*_leaf\(\s*\"[^\"]*\"\s*,\s*\"[^\"]*\"\s*,"
+                r"\s*([^)\n]+?)\s*\)",
+                text,
+            )
+            got = _mojo_literal(m.group(1), {}) if m else None
+            if got is None:
+                fail(
+                    problems,
+                    f"stock defaults: {field} is no longer set from a literal "
+                    "_leaf(...) default in python/mojotrees/basic.py, so "
+                    f"LightGBM's {lgbm} is unchecked on the refit path. This "
+                    "is the third copy of that default and the one with no "
+                    "import binding it to the other two",
+                )
+                continue
+            _check_stock(
+                problems,
+                "Booster.refit in python/mojotrees/basic.py",
+                field,
+                lgbm,
+                got,
+            )
 
     # 4. fit_bins still reaches the constants.
     binning = ROOT / "src" / "mojotrees" / "binning.mojo"

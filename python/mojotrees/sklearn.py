@@ -42,6 +42,16 @@ _MAPE = 10
 _FAIR = 11
 _CROSS_ENTROPY = 12
 
+#: `objective_registry.MULTICLASS`. Softmax is negative on purpose, to stay
+#: out of the single-output code space forever, and it is a *code*, not an
+#: absence: `objective_code_of_name("multiclass")` returns it and
+#: `_normalized_objective` in src/mojotrees/device_policy.mojo preserves it
+#: while folding everything below it into `OBJECTIVE_UNSPECIFIED` (-2). The
+#: two negatives are one apart and mean opposite things, so nothing in this
+#: package may test an objective code for negativity, for truthiness, or
+#: for `None`-ness and expect to have distinguished them.
+_MULTICLASS = -1
+
 # Defaults of the two regularization parameters, named so the constructor
 # signature and the alias resolution in `_params` cannot drift apart.
 _LAMBDA_L1 = 0.0
@@ -79,6 +89,49 @@ from ._fit_args import (
 )
 from ._ranking import _check_relevance, _group_buffer, ndcg_score
 
+#: "no value was folded in yet" for `_Base._resolve_alias`, which cannot use
+#: `None` for that: `None` is exactly what an unset alias is.
+_UNSET = object()
+
+#: `grow_policy` spellings this estimator accepts and the canonical value
+#: each resolves to.
+#:
+#: The canonical values are XGBoost's and CatBoost's words for the three
+#: growths, per the `grow_policy` row of docs/PARAMETER_NAMING.md:
+#: `lossguide` (best gain anywhere, LightGBM's growth and the default),
+#: `depthwise` (a level at a time), and `symmetrictree` (one split per
+#: level, shared by every node at that level). `leafwise`, `oblivious` and
+#: `symmetric` are accepted aliases, and "oblivious" stays the word for the
+#: *shape* in prose.
+#:
+#: **Why this table exists rather than `_fit_args._GROW_POLICIES`.** That
+#: one carries the two frontier orders and nothing else, so
+#: `growth_policy.GROW_OBLIVIOUS` -- which shipped in the Mojo package and
+#: which `src/mojotrees/tree.mojo` grows -- could not be asked for through
+#: the estimator at all. Every `bench/real_data` arm and every
+#: scikit-learn user goes through this validator, so a policy that was
+#: built, tested and merged was absent from the API.
+#:
+#: The value here is what `_params` sends to the native layer.
+#: `growth_policy.parse_grow_policy` accepts all three words and is the one
+#: resolver every fit entry point reaches, through `_parse_params` in
+#: `bindings/_mojotrees.mojo`; `lossguide` reaches `GROW_LEAFWISE`,
+#: `depthwise` reaches `GROW_DEPTHWISE`, and `symmetrictree` reaches
+#: `GROW_OBLIVIOUS`. The dense CPU grower honors the last of those and the
+#: sparse and GPU growers refuse it by name from `GrowthSchedule.__init__`,
+#: so there is no path on which it is accepted and dropped.
+_CANONICAL_GROW_POLICIES = {
+    "lossguide": "lossguide",
+    "leafwise": "lossguide",
+    "leaf_wise": "lossguide",
+    "depthwise": "depthwise",
+    "depth_wise": "depthwise",
+    "symmetrictree": "symmetrictree",
+    "symmetric_tree": "symmetrictree",
+    "symmetric": "symmetrictree",
+    "oblivious": "symmetrictree",
+}
+
 
 class _Base(_ParamsMixin):
     """Shared hyperparameters, mojotrees defaults (LightGBM-matched).
@@ -87,43 +140,83 @@ class _Base(_ParamsMixin):
     LightGBM's default, counts the nodes that split on each feature, and
     "gain" sums the gain those splits earned.
 
-    Native LightGBM parameter names are canonical. The spellings used by
-    LightGBM's scikit-learn estimators are accepted as aliases:
-    `min_child_samples` for `min_data_in_leaf`, `min_child_weight` for
-    `min_child_hess`, `reg_alpha`/`reg_lambda` for `lambda_l1`/`lambda_l2`,
-    `subsample`/`subsample_freq` for `bagging_fraction`/`bagging_freq`, and
-    `device_type` for `device`. Either spelling works; setting both members
-    of a pair to different non-default values raises, where LightGBM warns
-    and keeps one.
+    **One canonical name per parameter, every vendor's name accepted.**
+    The canonical names are the table in docs/PARAMETER_NAMING.md: one name
+    per parameter, always a name that LightGBM, XGBoost, CatBoost or
+    scikit-learn already uses, chosen for being the clearest of the four.
+    Every other vendor's spelling of the same parameter is an accepted
+    alias, so a LightGBM, XGBoost or CatBoost script runs through this
+    estimator unchanged -- which is the point, because retyping a
+    configuration is where two "identical" configurations quietly stop
+    being identical.
 
-    `max_depth` bounds the depth of any leaf, counted in edges from the root,
-    so `max_depth=1` gives stumps; `max_depth<=0` (the default, -1) means
-    unlimited. Under the default growth a depth-bounded tree is still
-    unbalanced and usually has fewer than `2**max_depth` leaves.
+    The canonical name is what this docstring and every error message use.
+    It is not always the member that holds the default: LightGBM's spelling
+    is kept on the wire (the native layer, the model files, and
+    `tools/check_parity.py`), so `max_leaves` resolves onto `num_leaves`,
+    `min_child_weight` onto `min_child_hess`, and `subsample` onto
+    `bagging_fraction`. Either spelling works, and setting two spellings of
+    one parameter to different non-default values raises, where LightGBM
+    warns and keeps one.
 
-    `grow_policy` is XGBoost's parameter of that name (LightGBM has no
-    equivalent). "leafwise", the default and LightGBM's growth, splits the
-    leaf with the largest gain anywhere in the tree next; "depthwise" splits
-    every leaf at one depth before any deeper one, so a tree fills level by
-    level and is balanced. `num_leaves` stays a hard bound in both: a
-    depth-wise level that would overrun it is admitted as its highest-gain
-    prefix, so at the default `num_leaves=31` and unlimited `max_depth` a
-    depth-wise tree fills four levels (16 leaves) and half of a fifth. Set
-    `max_depth` deliberately for depth-wise runs; a leaf-wise configuration
-    is not a sensible one to inherit. "lossguide" is accepted as XGBoost's
-    alias for "leafwise". Depth-wise growth is honored on the CPU and GPU
-    trainers alike (dense and sparse); the distributed prototype rejects it.
+    Value strings are case insensitive throughout, so CatBoost's
+    `SymmetricTree`, `RMSE` and `Plain` arrive as written.
 
-    `bagging_fraction` and `bagging_freq` are LightGBM's row bagging: every
-    `bagging_freq` rounds, each row is kept independently with probability
-    `bagging_fraction` and the trees of the following rounds are grown on
-    that sample. `bagging_freq=0` (the default) or `bagging_fraction=1`
-    disables it. `bagging_seed` makes a run reproducible; the same seed and
-    data give the same model on CPU and GPU alike.
+    `max_leaves` (LightGBM's `num_leaves`) bounds the leaves of a tree.
+    `max_depth` (CatBoost's `depth`) bounds the depth of any leaf, counted
+    in edges from the root, so `max_depth=1` gives stumps; `max_depth<=0`
+    (the default, -1) means unlimited. Under the default growth a
+    depth-bounded tree is still unbalanced and usually has fewer than
+    `2**max_depth` leaves.
 
-    `boosting` (LightGBM's parameter of that name, aliased `boosting_type`)
-    selects the training strategy: "gbdt", the default, trains every tree on
-    every row, and "goss" is Gradient-based One-Side Sampling. Under GOSS
+    `grow_policy` is XGBoost's and CatBoost's parameter of that name
+    (LightGBM has no equivalent) and takes three values, case insensitively:
+
+    - `"lossguide"`, the default, splits the leaf with the largest gain
+      anywhere in the tree next. This is LightGBM's growth, and `leafwise`
+      is accepted as an alias.
+    - `"depthwise"` splits every leaf at one depth before any deeper one, so
+      a tree fills level by level and is balanced. `num_leaves` stays a hard
+      bound: a level that would overrun it is admitted as its highest-gain
+      prefix, so at the default `num_leaves=31` and unlimited `max_depth` a
+      depth-wise tree fills four levels (16 leaves) and half of a fifth. Set
+      `max_depth` deliberately for depth-wise runs; a leaf-wise
+      configuration is not a sensible one to inherit.
+    - `"symmetrictree"` grows oblivious trees, CatBoost's default and its
+      word for them: one split is chosen per level and every node at that
+      level uses it, so the tree is symmetric by construction. `max_depth`
+      is REQUIRED there and is the only bound on the tree's size --
+      `num_leaves` does not bind, because a level splits entirely or not at
+      all. `oblivious` and `symmetric` are accepted as aliases, and
+      "oblivious" stays the word for the shape in prose.
+
+    Depth-wise growth is honored on the CPU and GPU trainers alike (dense
+    and sparse); the distributed prototype rejects it. Symmetric growth is
+    honored by the dense CPU grower; the sparse and GPU growers refuse it by
+    name rather than growing a tree that is not symmetric.
+
+    `subsample` and `subsample_freq` (LightGBM's `bagging_fraction` and
+    `bagging_freq`) are row bagging: every `subsample_freq` rounds, each row
+    is kept independently with probability `subsample` and the trees of the
+    following rounds are grown on that sample. `subsample=1` disables it.
+
+    **`subsample < 1` implies `subsample_freq = 1`** unless `subsample_freq`
+    was set explicitly. LightGBM leaves the frequency at 0 there, which
+    makes `subsample=0.8` alone a silent no-op: no bagging happens and
+    nothing says so. That is a defect and it is not copied. An explicit
+    `subsample_freq=0` still disables bagging, because that is a statement
+    rather than an omission.
+
+    `bagging_seed` makes a run reproducible; the same seed and data give the
+    same model on CPU and GPU alike. `random_state` (LightGBM's `seed`,
+    CatBoost's `random_seed`) sets every per-component seed at once, leaving
+    any seed you named yourself alone.
+
+    `boosting_type` (LightGBM's `boosting`, XGBoost's `booster`) selects the
+    training strategy: "gbdt", the default, trains every tree on
+    every row, and "goss" is Gradient-based One-Side Sampling. CatBoost's
+    "plain" is an alias of "gbdt"; its "ordered" is not implemented and
+    raises by name rather than being rejected as an unknown value. Under GOSS
     each round keeps the `top_rate` share of rows with the largest gradient
     magnitude, samples `other_rate` of the rest, and scales the sampled rows
     up to compensate. `goss_seed` makes the sample reproducible and
@@ -148,13 +241,41 @@ class _Base(_ParamsMixin):
     the fitted model is an ordinary one for prediction, saving, and
     inspection.
 
-    `feature_fraction` samples that share of the features once per tree and
-    `feature_fraction_bynode` samples again at every node from the tree's own
-    set, both without replacement and both reproducible from
+    `colsample_bytree` (LightGBM's `feature_fraction`, CatBoost's `rsm`)
+    samples that share of the features once per tree and `colsample_bynode`
+    (LightGBM's `feature_fraction_bynode`) samples again at every node from
+    the tree's own set, both without replacement and both reproducible from
     `feature_fraction_seed`. Fractions must be in (0, 1]; 1.0 (the default)
     means no subsampling. As in LightGBM, at least 2 features are selected
-    whenever the data has that many. XGBoost's `colsample_bytree` and
-    `colsample_bynode` are accepted as aliases of the two fractions.
+    whenever the data has that many.
+
+    `n_jobs` (LightGBM's `num_threads`, CatBoost's `thread_count`) has no
+    estimator-level answer here: the worker count comes from
+    `MOJOTREES_NUM_WORKERS` and from the machine, and a fit is
+    bit-identical at every worker count. `None`, `-1` and `0`, which all
+    mean "use the machine", are what this already does and are accepted; a
+    specific count raises and names the environment variable, rather than
+    being accepted and dropped.
+
+    `verbose` (LightGBM's and XGBoost's `verbosity`) is the log level.
+    Nothing here writes a training log on its own, so `None`, `False` and
+    any value at or below 0 are the silence this already is, and a positive
+    value installs `callback.log_evaluation` with that period, which
+    reports only where there is a validation set to report on.
+
+    `early_stopping_rounds` (LightGBM's `early_stopping_round`, CatBoost's
+    `od_wait`, scikit-learn's `n_iter_no_change`) sets the default for
+    `fit`'s argument of the same name, which is where XGBoost and CatBoost
+    take it too. A value given to `fit` wins, being the more specific
+    statement.
+
+    The CatBoost-only parameters -- `random_strength`, `bootstrap_type`,
+    `bagging_temperature`, `leaf_estimation_iterations`, `score_function`,
+    `max_ctr_complexity` -- keep CatBoost's names. Each is accepted at the
+    value that names what mojotrees already does (`random_strength=0`,
+    `leaf_estimation_iterations=1`, `score_function="L2"`,
+    `bootstrap_type="No"`) and refused by name with what it would take
+    otherwise, rather than accepted and ignored.
 
     `use_missing` is LightGBM's parameter of the same name. With it (the
     default), `NaN` is a missing value: a feature that has any in training
@@ -287,23 +408,61 @@ class _Base(_ParamsMixin):
     def __init__(
         self,
         num_leaves=31,
+        max_leaves=None,
+        max_leaf_nodes=None,
         max_depth=-1,
-        grow_policy="leafwise",
+        depth=None,
+        grow_policy="lossguide",
         learning_rate=0.1,
+        eta=None,
+        shrinkage_rate=None,
         n_estimators=100,
+        num_iterations=None,
+        num_boost_round=None,
+        iterations=None,
+        max_iter=None,
         min_data_in_leaf=20,
         min_child_samples=None,
+        min_samples_leaf=None,
         lambda_l2=_LAMBDA_L2,
         lambda_l1=_LAMBDA_L1,
         reg_lambda=None,
         reg_alpha=None,
+        l2_leaf_reg=None,
+        l2_regularization=None,
         min_child_hess=1e-3,
         min_child_weight=None,
+        min_sum_hessian_in_leaf=None,
         max_bin=255,
+        max_bins=None,
+        border_count=None,
+        random_state=None,
+        seed=None,
+        random_seed=None,
+        n_jobs=None,
+        num_threads=None,
+        nthread=None,
+        thread_count=None,
+        verbose=None,
+        verbosity=None,
+        early_stopping_rounds=None,
+        early_stopping_round=None,
+        od_wait=None,
+        n_iter_no_change=None,
+        random_strength=None,
+        bootstrap_type=None,
+        bagging_temperature=None,
+        leaf_estimation_iterations=None,
+        score_function=None,
+        max_ctr_complexity=None,
         device="cpu",
         device_type=None,
+        task_type=None,
+        tree_method=None,
         interaction_constraints=None,
+        interaction_cst=None,
         monotone_constraints=None,
+        monotonic_cst=None,
         bagging_fraction=1.0,
         subsample=None,
         bagging_freq=0,
@@ -311,11 +470,13 @@ class _Base(_ParamsMixin):
         bagging_seed=3,
         boosting="gbdt",
         boosting_type=None,
+        booster=None,
         top_rate=0.2,
         other_rate=0.1,
         goss_seed=3,
         goss_warmup_rounds=-1,
         drop_rate=0.1,
+        rate_drop=None,
         max_drop=50,
         skip_drop=0.5,
         xgboost_dart_mode=False,
@@ -323,19 +484,24 @@ class _Base(_ParamsMixin):
         drop_seed=4,
         feature_fraction=1.0,
         colsample_bytree=None,
+        rsm=None,
         feature_fraction_bynode=1.0,
         colsample_bynode=None,
+        max_features=None,
         feature_fraction_seed=2,
         use_missing=True,
         categorical_feature="auto",
         categorical_features=None,
+        cat_features=None,
         max_cat_to_onehot=4,
+        one_hot_max_size=None,
         max_cat_threshold=32,
         cat_smooth=10.0,
         cat_l2=10.0,
         min_data_per_group=100,
         min_gain_to_split=0.0,
         min_split_gain=None,
+        gamma=None,
         max_delta_step=0.0,
         path_smooth=0.0,
         extra_trees=False,
@@ -362,23 +528,61 @@ class _Base(_ParamsMixin):
         top_k=20,
     ):
         self.num_leaves = num_leaves
+        self.max_leaves = max_leaves
+        self.max_leaf_nodes = max_leaf_nodes
         self.max_depth = max_depth
+        self.depth = depth
         self.grow_policy = grow_policy
         self.learning_rate = learning_rate
+        self.eta = eta
+        self.shrinkage_rate = shrinkage_rate
         self.n_estimators = n_estimators
+        self.num_iterations = num_iterations
+        self.num_boost_round = num_boost_round
+        self.iterations = iterations
+        self.max_iter = max_iter
         self.min_data_in_leaf = min_data_in_leaf
         self.min_child_samples = min_child_samples
+        self.min_samples_leaf = min_samples_leaf
         self.lambda_l2 = lambda_l2
         self.lambda_l1 = lambda_l1
         self.reg_lambda = reg_lambda
         self.reg_alpha = reg_alpha
+        self.l2_leaf_reg = l2_leaf_reg
+        self.l2_regularization = l2_regularization
         self.min_child_hess = min_child_hess
         self.min_child_weight = min_child_weight
+        self.min_sum_hessian_in_leaf = min_sum_hessian_in_leaf
         self.max_bin = max_bin
+        self.max_bins = max_bins
+        self.border_count = border_count
+        self.random_state = random_state
+        self.seed = seed
+        self.random_seed = random_seed
+        self.n_jobs = n_jobs
+        self.num_threads = num_threads
+        self.nthread = nthread
+        self.thread_count = thread_count
+        self.verbose = verbose
+        self.verbosity = verbosity
+        self.early_stopping_rounds = early_stopping_rounds
+        self.early_stopping_round = early_stopping_round
+        self.od_wait = od_wait
+        self.n_iter_no_change = n_iter_no_change
+        self.random_strength = random_strength
+        self.bootstrap_type = bootstrap_type
+        self.bagging_temperature = bagging_temperature
+        self.leaf_estimation_iterations = leaf_estimation_iterations
+        self.score_function = score_function
+        self.max_ctr_complexity = max_ctr_complexity
         self.device = device
         self.device_type = device_type
+        self.task_type = task_type
+        self.tree_method = tree_method
         self.interaction_constraints = interaction_constraints
+        self.interaction_cst = interaction_cst
         self.monotone_constraints = monotone_constraints
+        self.monotonic_cst = monotonic_cst
         self.bagging_fraction = bagging_fraction
         self.subsample = subsample
         self.bagging_freq = bagging_freq
@@ -386,11 +590,13 @@ class _Base(_ParamsMixin):
         self.bagging_seed = bagging_seed
         self.boosting = boosting
         self.boosting_type = boosting_type
+        self.booster = booster
         self.top_rate = top_rate
         self.other_rate = other_rate
         self.goss_seed = goss_seed
         self.goss_warmup_rounds = goss_warmup_rounds
         self.drop_rate = drop_rate
+        self.rate_drop = rate_drop
         self.max_drop = max_drop
         self.skip_drop = skip_drop
         self.xgboost_dart_mode = xgboost_dart_mode
@@ -398,19 +604,24 @@ class _Base(_ParamsMixin):
         self.drop_seed = drop_seed
         self.feature_fraction = feature_fraction
         self.colsample_bytree = colsample_bytree
+        self.rsm = rsm
         self.feature_fraction_bynode = feature_fraction_bynode
         self.colsample_bynode = colsample_bynode
+        self.max_features = max_features
         self.feature_fraction_seed = feature_fraction_seed
         self.use_missing = use_missing
         self.categorical_feature = categorical_feature
         self.categorical_features = categorical_features
+        self.cat_features = cat_features
         self.max_cat_to_onehot = max_cat_to_onehot
+        self.one_hot_max_size = one_hot_max_size
         self.max_cat_threshold = max_cat_threshold
         self.cat_smooth = cat_smooth
         self.cat_l2 = cat_l2
         self.min_data_per_group = min_data_per_group
         self.min_gain_to_split = min_gain_to_split
         self.min_split_gain = min_split_gain
+        self.gamma = gamma
         self.max_delta_step = max_delta_step
         self.path_smooth = path_smooth
         self.extra_trees = extra_trees
@@ -442,7 +653,10 @@ class _Base(_ParamsMixin):
         flattened group features and one more offset than there are groups.
         Both must stay referenced while their addresses are in use.
         `(None, None)` when unconstrained."""
-        groups = self.interaction_constraints
+        # scikit-learn spells this `interaction_cst`.
+        groups = self._resolve_alias(
+            "interaction_constraints", "interaction_cst", None
+        )
         if groups is None:
             return None, None
         if isinstance(groups, (str, bytes)):
@@ -492,7 +706,11 @@ class _Base(_ParamsMixin):
         One entry per feature, each exactly -1, 0, or 1. Fractional values are
         rejected here rather than truncated at the boundary, where the buffer
         is read as integers."""
-        signs = self.monotone_constraints
+        # `monotone_constraints` is unanimous across LightGBM, XGBoost and
+        # CatBoost; scikit-learn spells it `monotonic_cst`.
+        signs = self._resolve_alias(
+            "monotone_constraints", "monotonic_cst", None
+        )
         if signs is None:
             return None, 0
         if isinstance(signs, (str, bytes)):
@@ -660,6 +878,9 @@ class _Base(_ParamsMixin):
         """
         spec = self._resolve_alias(
             "categorical_feature", "categorical_features", "auto"
+        )
+        spec = self._resolve_alias(
+            "categorical_feature", "cat_features", "auto", spec
         )
         if isinstance(spec, str):
             if spec != "auto":
@@ -840,32 +1061,70 @@ class _Base(_ParamsMixin):
                 "a callable objective"
             )
 
+    #: `boosting_type` spellings and the strategy each names. One key
+    #: carries all six values of docs/PARAMETER_NAMING.md: LightGBM's four,
+    #: plus CatBoost's `Plain` (which is `gbdt` under another name) and
+    #: `Ordered` (which is not implemented and is refused by name below, not
+    #: rejected as unknown). XGBoost's `booster` is the same parameter and
+    #: its `gbtree` is the same strategy.
+    _BOOSTING_ALIASES = {
+        "gbdt": "gbdt",
+        "gbrt": "gbdt",
+        "gbtree": "gbdt",
+        "traditional": "gbdt",
+        "plain": "gbdt",
+        "dart": "dart",
+        "goss": "goss",
+        "rf": "rf",
+        "random_forest": "rf",
+        "ordered": "ordered",
+    }
+
     def _resolve_boosting(self):
-        """The effective boosting strategy, "gbdt" or "goss".
+        """The effective boosting strategy: "gbdt", "goss", "dart" or "rf".
 
         `_resolve_alias` compares numerically, so the string-valued
-        `boosting` / `boosting_type` pair resolves here instead, with the
-        same rule: an unset alias leaves the primary alone, and two
-        different non-default values raise.
+        `boosting_type` / `boosting` / `booster` group resolves here
+        instead, with the same rule: an unset alias leaves the primary
+        alone, and two different non-default values raise. Values are case
+        insensitive, as every value string is.
+
+        `boosting_type` is the canonical name and `boosting` is the member
+        that holds the default, which is why the primary is spelled the
+        LightGBM way here and the message is not.
         """
         boosting = self.boosting
-        if self.boosting_type is not None:
-            if boosting != "gbdt" and boosting != self.boosting_type:
+        for alias in ("boosting_type", "booster"):
+            value = getattr(self, alias)
+            if value is None:
+                continue
+            if boosting != "gbdt" and boosting != value:
                 raise ValueError(
-                    f"boosting={boosting!r} and "
-                    f"boosting_type={self.boosting_type!r} are aliases with "
-                    "different values; set only one"
+                    f"boosting_type={boosting!r} and {alias}={value!r} are "
+                    "aliases with different values; set only one"
                 )
-            boosting = self.boosting_type
-        if boosting not in _BOOSTING_TYPES:
+            boosting = value
+        resolved = None
+        if isinstance(boosting, str):
+            resolved = self._BOOSTING_ALIASES.get(boosting.strip().lower())
+        if resolved == "ordered":
             raise ValueError(
-                f"unknown boosting {boosting!r}; expected one of "
-                + ", ".join(sorted(_BOOSTING_TYPES))
+                "boosting_type='ordered' is not implemented: CatBoost's "
+                "ordered boosting takes each row's derivatives from a model "
+                "fitted without that row, which needs a per-permutation "
+                "model set mojotrees does not build. 'plain' (an alias of "
+                "'gbdt') is the scheme mojotrees trains."
             )
-        return boosting
+        if resolved is None or resolved not in _BOOSTING_TYPES:
+            raise ValueError(
+                f"unknown boosting_type {boosting!r}; expected one of "
+                + ", ".join(sorted(_BOOSTING_TYPES))
+                + ", plain (= gbdt), or ordered (not implemented)"
+            )
+        return resolved
 
-    def _resolve_alias(self, primary, alias, default):
-        """The effective value of a parameter that has a LightGBM alias.
+    def _resolve_alias(self, primary, alias, default, folded=_UNSET):
+        """The effective value of a parameter that has vendor aliases.
 
         scikit-learn requires `__init__` to store every argument unmodified,
         so aliases are resolved here, at fit time, rather than in the
@@ -873,17 +1132,241 @@ class _Base(_ParamsMixin):
         LightGBM warns and keeps one value when a parameter and its alias
         disagree; mojotrees raises instead, so a typo cannot silently train
         a different model.
+
+        `primary` is the name that holds the stock default and the value the
+        native layer is sent -- LightGBM's spelling, because that is the wire
+        (see the class docstring). It is not necessarily the canonical
+        user-facing name: `num_leaves` is the primary and `max_leaves` is
+        the canonical name resolved onto it.
+
+        `folded` is what makes one parameter take more than one alias. A
+        parameter with several vendor spellings resolves in a chain, each
+        call passing the previous result:
+
+            n = self._resolve_alias("n_estimators", "num_iterations", 100)
+            n = self._resolve_alias("n_estimators", "iterations", 100, n)
+
+        Each link keeps three literal leading arguments, which is what
+        `tools/api_snapshot.py:alias_pairs` reads to derive the alias table
+        from the call sites; a chain therefore stays derivable where a loop
+        over a tuple of names would not. Conflicts are detected against the
+        value resolved so far, so `num_iterations=200 iterations=300` raises
+        rather than letting the last spelling win.
         """
         alias_value = getattr(self, alias)
+        primary_value = (
+            getattr(self, primary) if folded is _UNSET else folded
+        )
         if alias_value is None:
-            return getattr(self, primary)
-        primary_value = getattr(self, primary)
+            return primary_value
         if primary_value != default and primary_value != alias_value:
             raise ValueError(
                 f"{primary}={primary_value} and {alias}={alias_value} are "
                 "aliases with different values; set only one"
             )
         return alias_value
+
+    #: The per-component seeds a global `random_state` fills, each with the
+    #: stock default it keeps when neither it nor `random_state` is set.
+    #: LightGBM's own defaults, and the same numbers `__init__` carries.
+    _SEEDS = {
+        "bagging_seed": 3,
+        "feature_fraction_seed": 2,
+        "extra_seed": 6,
+        "goss_seed": 3,
+        "drop_seed": 4,
+    }
+
+    def _resolve_seeds(self):
+        """Every per-component seed a fit runs with, after `random_state`.
+
+        `random_state` is scikit-learn's word and the canonical one;
+        LightGBM spells it `seed`, XGBoost `random_state`/`seed`, CatBoost
+        `random_seed`. It seeds every draw at once, which is what a script
+        that sets it is asking for, and a seed named outright wins over it
+        whichever order the two appear in.
+
+        **It sets each seed to `random_state` rather than deriving one per
+        component the way LightGBM's `seed` does.** That is a divergence and
+        it is stated rather than hidden. LightGBM derives its per-component
+        seeds by running its own LCG over the global one; reproducing that
+        would mean reimplementing that generator bit for bit, and it would
+        still not reproduce LightGBM's row and feature subsets, because
+        mojotrees draws with splitmix64 (src/mojotrees/rng.mojo) and a
+        matching seed gives a different sample. What `random_state` buys
+        here is that a mojotrees fit repeats, not that it matches LightGBM's.
+
+        Returns the full mapping so the caller reads one dict rather than
+        five aliases.
+        """
+        global_seed = self._resolve_alias("random_state", "seed", None)
+        global_seed = self._resolve_alias(
+            "random_state", "random_seed", None, global_seed
+        )
+        out = {}
+        for name, default in self._SEEDS.items():
+            value = getattr(self, name)
+            if global_seed is not None and value == default:
+                value = global_seed
+            if int(value) < 0:
+                raise ValueError(f"{name} must be nonnegative")
+            out[name] = int(value)
+        return out
+
+    def _check_n_jobs(self):
+        """Refuse a worker count this estimator cannot honor, accept the
+        values that mean "use the machine".
+
+        `n_jobs` is scikit-learn's word and the canonical one; LightGBM
+        spells it `num_threads`, XGBoost `n_jobs`/`nthread`, CatBoost
+        `thread_count`. There is no worker count on the estimator: the
+        native layer takes one from `MOJOTREES_NUM_WORKERS` and from the
+        machine (src/mojotrees/parallel.mojo), and a fit is bit-identical at
+        every worker count by contract, so the count is a speed knob and
+        nothing else.
+
+        `None`, `-1` and `0` all mean "use the machine", which is exactly
+        what happens, so they are honored by doing nothing. A specific count
+        is refused by name and pointed at the variable that does reach the
+        scheduler, rather than accepted and dropped: a user who asked for
+        four threads and silently got sixteen has been misled about the
+        thing they asked about.
+        """
+        jobs = self._resolve_alias("n_jobs", "num_threads", None)
+        jobs = self._resolve_alias("n_jobs", "nthread", None, jobs)
+        jobs = self._resolve_alias("n_jobs", "thread_count", None, jobs)
+        if jobs is None or int(jobs) <= 0:
+            return
+        raise ValueError(
+            f"n_jobs={int(jobs)} cannot be set on the estimator: the worker "
+            "count comes from MOJOTREES_NUM_WORKERS and from the machine "
+            "(src/mojotrees/parallel.mojo), and a fit is bit-identical at "
+            f"every worker count. Set MOJOTREES_NUM_WORKERS={int(jobs)} in "
+            "the environment instead. n_jobs of -1, 0 or None, which means "
+            "'use the machine', is what this estimator already does and is "
+            "accepted."
+        )
+
+    def _check_catboost_only(self):
+        """The CatBoost-only parameters, each accepted at the value that
+        names what mojotrees already does and refused by name otherwise.
+
+        None of these reaches a trainer from Python today: the binding's
+        `extra_params_from_mapping` does not read `random_strength` or
+        `leaf_estimation_iterations`, and `bootstrap_type` needs a
+        `BayesianBootstrapParams` handed to a trainer, which no Python entry
+        point builds. So each is either a statement of the current behavior,
+        which costs nothing to honor, or a request for something that would
+        not happen, which is refused with what it would take -- the same
+        refuse-rather-than-ignore rule src/mojotrees/params.mojo applies to
+        the same names on the parameter-string surface.
+
+        `None` everywhere is "not named", and nothing is checked for it.
+        """
+        if self.random_strength is not None:
+            if float(self.random_strength) != 0.0:
+                raise ValueError(
+                    "random_strength must be 0.0 here: the per-split score "
+                    "noise needs a per-tree scale taken from the ensemble's "
+                    "gradients, which no trainer in this build computes and "
+                    "a histogram scan cannot reconstruct. 0.0 is LightGBM's "
+                    "behavior and mojotrees's, and is accepted."
+                )
+        if self.leaf_estimation_iterations is not None:
+            if int(self.leaf_estimation_iterations) != 1:
+                raise ValueError(
+                    "leaf_estimation_iterations must be 1 here: extra Newton "
+                    "steps per leaf are implemented by boosting.train, "
+                    "train_more and train_with_valid in the Mojo API only, "
+                    "and this estimator also reaches the sparse, "
+                    "custom-objective, multiclass, ranking and GPU trainers, "
+                    "which do not, so a value above 1 would be honored by "
+                    "some fits and dropped by others. 1 is LightGBM's "
+                    "behavior and mojotrees's, and is accepted."
+                )
+        if self.score_function is not None:
+            # `Cosine`, CatBoost's default, is refused rather than accepted
+            # as an equivalent even though at stock settings it would pick
+            # the same split: its numerator is the L2 sum and at
+            # `lambda_l2 = 0` its denominator collapses onto the same
+            # expression, so it degenerates to `sqrt(L2)` and the argmax
+            # cannot move (docs/design/CATBOOST_CATALOG.md, A10 section 3).
+            # That equivalence is conditional on a value the user may
+            # change, and it bites under leaf-wise growth, which is the
+            # default.
+            if str(self.score_function).lower() != "l2":
+                raise ValueError(
+                    f"score_function={self.score_function!r} is not "
+                    "implemented; mojotrees scores a split as "
+                    "G^2/(H+lambda), which is CatBoost's 'L2', and that is "
+                    "the only value accepted. 'Cosine' picks the same split "
+                    "at reg_lambda=0, where it degenerates to sqrt(L2), but "
+                    "not above it, so it is not accepted as an alias."
+                )
+        if self.max_ctr_complexity is not None:
+            raise ValueError(
+                "max_ctr_complexity is not implemented: it bounds the arity "
+                "of CatBoost's target-statistic (CTR) feature combinations, "
+                "and mojotrees builds none. Its categorical handling is "
+                "LightGBM's category-set split, under max_cat_to_onehot, "
+                "max_cat_threshold, cat_smooth and cat_l2."
+            )
+        if self.bagging_temperature is not None:
+            raise ValueError(
+                "bagging_temperature is reachable from the Mojo API only, "
+                "through BayesianBootstrapParams "
+                "(src/mojotrees/sampling.mojo); no Python entry point builds "
+                "one. CatBoost's Bernoulli bootstrap is row bagging under "
+                "another name and is reachable here as subsample with "
+                "subsample_freq."
+            )
+        if self.bootstrap_type is not None:
+            kind = str(self.bootstrap_type).lower()
+            if kind in ("no", "none"):
+                # Exactly what an unbagged fit already is.
+                return
+            if kind == "bernoulli":
+                raise ValueError(
+                    "bootstrap_type='Bernoulli' is row bagging under another "
+                    "name; use subsample with subsample_freq."
+                )
+            if kind in ("bayesian", "mvs"):
+                raise ValueError(
+                    f"bootstrap_type={self.bootstrap_type!r} is reachable "
+                    "from the Mojo API only: it needs a parameter bundle "
+                    "handed to a trainer (BayesianBootstrapParams, "
+                    "MvsBootstrapParams in src/mojotrees/sampling.mojo) and "
+                    "no Python entry point builds one."
+                )
+            if kind == "poisson":
+                raise ValueError(
+                    "bootstrap_type='Poisson' is not implemented; CatBoost "
+                    "itself refuses it on the CPU."
+                )
+            raise ValueError(
+                f"unknown bootstrap_type {self.bootstrap_type!r}; expected "
+                "No, Bayesian, Bernoulli, MVS, or Poisson"
+            )
+
+    def _resolve_grow_policy(self):
+        """The canonical `grow_policy` value a fit runs under.
+
+        One of `lossguide`, `depthwise`, `symmetrictree`
+        (docs/PARAMETER_NAMING.md), resolved case insensitively from any of
+        the spellings in `_CANONICAL_GROW_POLICIES`. That is the string
+        `_params` sends, and `growth_policy.parse_grow_policy` on the other
+        side accepts all three.
+        """
+        value = self.grow_policy
+        if isinstance(value, str):
+            resolved = _CANONICAL_GROW_POLICIES.get(value.strip().lower())
+            if resolved is not None:
+                return resolved
+        raise ValueError(
+            "grow_policy must be 'lossguide' (alias 'leafwise'), "
+            "'depthwise', or 'symmetrictree' (aliases 'oblivious', "
+            f"'symmetric'), got {self.grow_policy!r}"
+        )
 
     def _params(
         self,
@@ -895,14 +1378,53 @@ class _Base(_ParamsMixin):
         categorical=None,
         contri_addr=0,
     ):
+        # Every canonical name of docs/PARAMETER_NAMING.md and every other
+        # vendor's spelling of it, resolved onto the LightGBM-spelled member
+        # that holds the stock default and is what the native layer is sent.
+        # Chained: see `_resolve_alias`.
+        n_estimators = self._resolve_alias(
+            "n_estimators", "num_iterations", 100
+        )
+        n_estimators = self._resolve_alias(
+            "n_estimators", "num_boost_round", 100, n_estimators
+        )
+        n_estimators = self._resolve_alias(
+            "n_estimators", "iterations", 100, n_estimators
+        )
+        n_estimators = self._resolve_alias(
+            "n_estimators", "max_iter", 100, n_estimators
+        )
+        learning_rate_set = self._resolve_alias("learning_rate", "eta", 0.1)
+        learning_rate_set = self._resolve_alias(
+            "learning_rate", "shrinkage_rate", 0.1, learning_rate_set
+        )
+        num_leaves = self._resolve_alias("num_leaves", "max_leaves", 31)
+        num_leaves = self._resolve_alias(
+            "num_leaves", "max_leaf_nodes", 31, num_leaves
+        )
+        max_depth = self._resolve_alias("max_depth", "depth", -1)
         min_data_in_leaf = self._resolve_alias(
             "min_data_in_leaf", "min_child_samples", 20
+        )
+        min_data_in_leaf = self._resolve_alias(
+            "min_data_in_leaf", "min_samples_leaf", 20, min_data_in_leaf
         )
         min_child_hess = self._resolve_alias(
             "min_child_hess", "min_child_weight", 1e-3
         )
+        min_child_hess = self._resolve_alias(
+            "min_child_hess", "min_sum_hessian_in_leaf", 1e-3, min_child_hess
+        )
         lambda_l1 = self._resolve_alias("lambda_l1", "reg_alpha", _LAMBDA_L1)
         lambda_l2 = self._resolve_alias("lambda_l2", "reg_lambda", _LAMBDA_L2)
+        lambda_l2 = self._resolve_alias(
+            "lambda_l2", "l2_leaf_reg", _LAMBDA_L2, lambda_l2
+        )
+        lambda_l2 = self._resolve_alias(
+            "lambda_l2", "l2_regularization", _LAMBDA_L2, lambda_l2
+        )
+        max_bin = self._resolve_alias("max_bin", "max_bins", 255)
+        max_bin = self._resolve_alias("max_bin", "border_count", 255, max_bin)
         bagging_fraction = self._resolve_alias(
             "bagging_fraction", "subsample", 1.0
         )
@@ -912,35 +1434,80 @@ class _Base(_ParamsMixin):
         min_gain_to_split = self._resolve_alias(
             "min_gain_to_split", "min_split_gain", 0.0
         )
+        min_gain_to_split = self._resolve_alias(
+            "min_gain_to_split", "gamma", 0.0, min_gain_to_split
+        )
         monotone_penalty = self._resolve_alias(
             "monotone_penalty", "monotone_constraints_penalty", 0.0
         )
-        # XGBoost's spellings of the two feature-sampling fractions.
-        # LightGBM accepts both as aliases of `feature_fraction` and
-        # `feature_fraction_bynode`, and so does this estimator.
+        drop_rate = self._resolve_alias("drop_rate", "rate_drop", 0.1)
+        max_cat_to_onehot = self._resolve_alias(
+            "max_cat_to_onehot", "one_hot_max_size", 4
+        )
+        # XGBoost's and CatBoost's spellings of the two feature-sampling
+        # fractions. LightGBM accepts the XGBoost pair as aliases of
+        # `feature_fraction` and `feature_fraction_bynode`, and so does this
+        # estimator; `rsm` is CatBoost's per-tree share and `max_features`
+        # is scikit-learn's per-split one.
         feature_fraction = self._resolve_alias(
             "feature_fraction", "colsample_bytree", 1.0
+        )
+        feature_fraction = self._resolve_alias(
+            "feature_fraction", "rsm", 1.0, feature_fraction
         )
         feature_fraction_bynode = self._resolve_alias(
             "feature_fraction_bynode", "colsample_bynode", 1.0
         )
+        feature_fraction_bynode = self._resolve_alias(
+            "feature_fraction_bynode", "max_features", 1.0,
+            feature_fraction_bynode,
+        )
+        # The seeds, the worker count, the log level, and the CatBoost-only
+        # names. Each of these either sets something real or refuses by name;
+        # none of them is accepted and dropped.
+        seeds = self._resolve_seeds()
+        self._check_n_jobs()
+        self._check_catboost_only()
+        # THE BEHAVIOR FIX. `subsample < 1` with `subsample_freq` unset is a
+        # silent no-op in LightGBM: bagging never runs, and the user who
+        # asked for it is told nothing. Here an unset frequency becomes 1
+        # (bag every round), which is the only reading of "subsample=0.8"
+        # that does what it says. An explicit `subsample_freq=0` still
+        # disables bagging, because that is a statement and not an omission.
+        #
+        # It fires only when a fraction below 1 was actually asked for, so
+        # no default configuration changes and no bits move on any fit that
+        # does not name `subsample`/`bagging_fraction`.
+        # `subsample_freq` is distinguishable from unset (it defaults to
+        # None) and an explicit 0 there is honored. `bagging_freq` is not
+        # (0 is its stock default), and an explicit `bagging_freq=0`
+        # alongside a fraction below 1 is exactly the LightGBM no-op this
+        # fixes, so it takes the implied 1 too.
+        if (
+            float(bagging_fraction) < 1.0
+            and int(bagging_freq) == 0
+            and self.subsample_freq is None
+        ):
+            bagging_freq = 1
         # Same ranges src/mojotrees/params.mojo and callback.mojo enforce,
         # so an estimator cannot construct a configuration the trainer
         # rejects (or, worse, quietly degenerates on).
-        if int(self.num_leaves) < 2:
-            raise ValueError("num_leaves must be at least 2")
-        if float(self.learning_rate) <= 0.0:
+        # Messages name the canonical parameter
+        # (docs/PARAMETER_NAMING.md), never the member they resolved onto.
+        if int(num_leaves) < 2:
+            raise ValueError("max_leaves must be at least 2")
+        if float(learning_rate_set) <= 0.0:
             raise ValueError("learning_rate must be positive")
-        if int(self.max_bin) < 2:
+        if int(max_bin) < 2:
             raise ValueError("max_bin must be at least 2")
         if float(lambda_l1) < 0.0:
-            raise ValueError("lambda_l1 must be nonnegative")
+            raise ValueError("reg_alpha must be nonnegative")
         if float(lambda_l2) < 0.0:
-            raise ValueError("lambda_l2 must be nonnegative")
+            raise ValueError("reg_lambda must be nonnegative")
         if not 0.0 < float(bagging_fraction) <= 1.0:
-            raise ValueError("bagging_fraction must be in (0, 1]")
+            raise ValueError("subsample must be in (0, 1]")
         if int(bagging_freq) < 0:
-            raise ValueError("bagging_freq must be nonnegative")
+            raise ValueError("subsample_freq must be nonnegative")
         boosting = self._resolve_boosting()
         goss = boosting == "goss"
         if goss:
@@ -964,11 +1531,11 @@ class _Base(_ParamsMixin):
             # disables bagging under GOSS; mojotrees rejects the pair.
             if int(bagging_freq) > 0 and float(bagging_fraction) < 1.0:
                 raise ValueError(
-                    "boosting='goss' cannot be combined with row bagging; "
-                    "leave bagging_freq at 0 or bagging_fraction at 1.0"
+                    "boosting_type='goss' cannot be combined with row "
+                    "bagging; leave subsample_freq at 0 or subsample at 1.0"
                 )
         if boosting == "dart":
-            if not 0.0 <= float(self.drop_rate) <= 1.0:
+            if not 0.0 <= float(drop_rate) <= 1.0:
                 raise ValueError("drop_rate must be in [0, 1]")
             if not 0.0 <= float(self.skip_drop) <= 1.0:
                 raise ValueError("skip_drop must be in [0, 1]")
@@ -977,18 +1544,13 @@ class _Base(_ParamsMixin):
         # A forest averages its trees, so LightGBM's RF ignores
         # learning_rate and trains at 1.0; the same here, whatever the
         # estimator was given, because boosting_rf refuses any other rate.
-        learning_rate = 1.0 if boosting == "rf" else float(self.learning_rate)
+        learning_rate = 1.0 if boosting == "rf" else float(learning_rate_set)
         if not 0.0 < float(feature_fraction) <= 1.0:
-            raise ValueError("feature_fraction must be in (0, 1]")
+            raise ValueError("colsample_bytree must be in (0, 1]")
         if not 0.0 < float(feature_fraction_bynode) <= 1.0:
-            raise ValueError("feature_fraction_bynode must be in (0, 1]")
-        grow_policy = str(self.grow_policy)
-        if grow_policy not in _GROW_POLICIES:
-            raise ValueError(
-                "grow_policy must be 'leafwise' (alias 'lossguide') or "
-                f"'depthwise', got {self.grow_policy!r}"
-            )
-        if int(self.max_cat_to_onehot) < 0:
+            raise ValueError("colsample_bynode must be in (0, 1]")
+        grow_policy = self._resolve_grow_policy()
+        if int(max_cat_to_onehot) < 0:
             raise ValueError("max_cat_to_onehot must be nonnegative")
         if int(self.max_cat_threshold) < 1:
             raise ValueError("max_cat_threshold must be positive")
@@ -1001,18 +1563,24 @@ class _Base(_ParamsMixin):
         if not float(self.linear_lambda) >= 0.0:
             raise ValueError("linear_lambda must be nonnegative")
         return {
-            "num_leaves": int(self.num_leaves),
-            "max_depth": int(self.max_depth),
-            # Sent as its canonical name; the binding parses it with the same
-            # function the parameter string goes through.
-            "grow_policy": _GROW_POLICIES[grow_policy],
+            # LightGBM's spelling on the wire, whatever the user typed: the
+            # native side, the model files and `tools/check_parity.py` all
+            # name these as LightGBM does, and only the user-facing layer is
+            # renamed (docs/PARAMETER_NAMING.md).
+            "num_leaves": int(num_leaves),
+            "max_depth": int(max_depth),
+            # Sent as its canonical value; the binding parses it with the
+            # same `growth_policy.parse_grow_policy` the parameter string
+            # goes through, which is the one resolver every fit entry point
+            # reaches.
+            "grow_policy": grow_policy,
             "learning_rate": learning_rate,
-            "n_estimators": int(self.n_estimators),
+            "n_estimators": int(n_estimators),
             "min_data_in_leaf": int(min_data_in_leaf),
             "lambda_l2": float(lambda_l2),
             "lambda_l1": float(lambda_l1),
             "min_child_hess": float(min_child_hess),
-            "max_bin": int(self.max_bin),
+            "max_bin": int(max_bin),
             # int, not bool: the binding reads it as an integer.
             "use_missing": int(bool(self.use_missing)),
             "sample_weight_addr": int(sample_weight_addr),
@@ -1022,27 +1590,27 @@ class _Base(_ParamsMixin):
             "device": device,
             "bagging_fraction": float(bagging_fraction),
             "bagging_freq": int(bagging_freq),
-            "bagging_seed": int(self.bagging_seed),
+            "bagging_seed": int(seeds["bagging_seed"]),
             # int, not bool: the binding reads it as an integer.
             "goss": int(goss),
             "top_rate": float(self.top_rate),
             "other_rate": float(self.other_rate),
-            "goss_seed": int(self.goss_seed),
+            "goss_seed": int(seeds["goss_seed"]),
             "goss_warmup_rounds": int(self.goss_warmup_rounds),
             # LightGBM's `boosting` by name; the binding routes dart and rf
             # to alternate_boosting.fit_boosting and leaves gbdt and goss on
             # the trainer they always used. The dart bundle is read only
             # when the mode is dart; ints, not bools, as everywhere here.
             "boosting": boosting,
-            "drop_rate": float(self.drop_rate),
+            "drop_rate": float(drop_rate),
             "max_drop": int(self.max_drop),
             "skip_drop": float(self.skip_drop),
             "xgboost_dart_mode": int(bool(self.xgboost_dart_mode)),
             "uniform_drop": int(bool(self.uniform_drop)),
-            "drop_seed": int(self.drop_seed),
+            "drop_seed": int(seeds["drop_seed"]),
             "feature_fraction": float(feature_fraction),
             "feature_fraction_bynode": float(feature_fraction_bynode),
-            "feature_fraction_seed": int(self.feature_fraction_seed),
+            "feature_fraction_seed": int(seeds["feature_fraction_seed"]),
             "interaction_flat_addr": 0 if ic_flat is None else _addr(ic_flat),
             "interaction_flat_len": 0 if ic_flat is None else len(ic_flat),
             "interaction_offsets_addr": (
@@ -1056,7 +1624,7 @@ class _Base(_ParamsMixin):
                 0 if categorical is None else _addr(categorical)
             ),
             "categorical_len": 0 if categorical is None else len(categorical),
-            "max_cat_to_onehot": int(self.max_cat_to_onehot),
+            "max_cat_to_onehot": int(max_cat_to_onehot),
             "max_cat_threshold": int(self.max_cat_threshold),
             "cat_smooth": float(self.cat_smooth),
             "cat_l2": float(self.cat_l2),
@@ -1079,7 +1647,7 @@ class _Base(_ParamsMixin):
             "path_smooth": float(self.path_smooth),
             # int, not bool: the binding reads it as an integer.
             "extra_trees": int(bool(self.extra_trees)),
-            "extra_seed": int(self.extra_seed),
+            "extra_seed": int(seeds["extra_seed"]),
             "monotone_penalty": float(monotone_penalty),
             "monotone_constraints_method": str(
                 self.monotone_constraints_method
@@ -1174,6 +1742,36 @@ class _Base(_ParamsMixin):
         the callers keep their own guards (see `_gpu_unsupported`).
         """
         device = self._resolve_alias("device", "device_type", "cpu")
+        device = self._resolve_alias("device", "task_type", "cpu", device)
+        # XGBoost's older switch names an algorithm and a device at once.
+        # Only the two values that name the histogram algorithm mojotrees
+        # implements resolve; `exact` and `approx` are different split
+        # searches, not spellings of `device`, and are refused by name.
+        if self.tree_method is not None:
+            method = str(self.tree_method).strip().lower()
+            if method in ("exact", "approx"):
+                raise ValueError(
+                    f"tree_method={self.tree_method!r} is a different split "
+                    "search, not a spelling of device: mojotrees searches a "
+                    "histogram, which is XGBoost's 'hist'. Use device='cpu' "
+                    "or device='gpu'."
+                )
+            mapped = {"hist": "cpu", "auto": "auto", "gpu_hist": "gpu"}.get(
+                method
+            )
+            if mapped is None:
+                raise ValueError(
+                    f"unknown tree_method {self.tree_method!r}; expected "
+                    "'hist', 'gpu_hist', or 'auto'. device='cpu' and "
+                    "device='gpu' are the canonical spellings."
+                )
+            if device != "cpu" and device != mapped:
+                raise ValueError(
+                    f"device={device!r} and tree_method="
+                    f"{self.tree_method!r} are aliases with different "
+                    "values; set only one"
+                )
+            device = mapped
         if not isinstance(device, str) or device.lower() not in _DEVICES:
             raise ValueError(
                 f"unknown device {device!r}; expected one of "
@@ -1190,7 +1788,9 @@ class _Base(_ParamsMixin):
                 n_features,
                 objective_code=objective_code,
                 n_classes=n_outputs,
-                max_bin=int(self.max_bin),
+                max_bin=int(
+                    self._resolve_alias("max_bin", "max_bins", 255)
+                ),
                 sparse=bool(sparse),
                 categorical=bool(categorical),
                 has_missing=bool(self.use_missing),
@@ -1242,6 +1842,41 @@ class _Base(_ParamsMixin):
             return None, 0
         wb = _arrays.check_sample_weight(sample_weight, n_rows)
         return wb, _addr(wb)
+
+    def _registry_objective_name(self):
+        """The objective spelling `_eval.default_metric` can look up.
+
+        The default `eval_metric` comes from a registry table keyed by
+        LightGBM's objective aliases, so a vendor spelling
+        (`reg:squarederror`, `RMSE`) would find nothing there and a fit with
+        an `eval_set` and no `eval_metric` would fail on the spelling rather
+        than on anything real. This resolves such a spelling back to a
+        LightGBM alias of the same objective, derived from the estimator's
+        own table rather than from a second list: the code is looked up in
+        `_OBJECTIVES`, then the first spelling in `_OBJECTIVES` that the
+        registry itself resolves to that code is returned.
+
+        Estimators with no `_OBJECTIVES` (the classifier and the ranker)
+        pass their spelling through; their tasks carry a task-level default
+        metric, so the objective is not consulted.
+        """
+        resolve = getattr(self, "_resolve_objective", None)
+        objective = resolve() if resolve is not None else None
+        if objective is None or callable(objective):
+            return objective
+        key = str(objective).strip().lower()
+        table = getattr(self, "_OBJECTIVES", None)
+        if not table:
+            return key
+        if _objective_status(key) == "supported":
+            return key
+        code = table.get(key)
+        if code is None:
+            return key
+        for name in sorted(table):
+            if _objective_code_of_name(name) == code:
+                return name
+        return key
 
     def _alpha_slot(self):
         """The number the trainer's one objective-parameter slot carries.
@@ -1368,36 +2003,63 @@ class _Base(_ParamsMixin):
         else would invite a reset that cannot be honored. Aliases are
         resolved here, once, the way `_params` resolves them.
         """
+        # `callback.RESETTABLE` is a native vocabulary and keeps LightGBM's
+        # names, as every wire does; the values are resolved from the
+        # canonical user-facing names the same way `_params` resolves them.
+        learning_rate = self._resolve_alias("learning_rate", "eta", 0.1)
+        learning_rate = self._resolve_alias(
+            "learning_rate", "shrinkage_rate", 0.1, learning_rate
+        )
+        num_leaves = self._resolve_alias("num_leaves", "max_leaves", 31)
+        num_leaves = self._resolve_alias(
+            "num_leaves", "max_leaf_nodes", 31, num_leaves
+        )
+        min_data_in_leaf = self._resolve_alias(
+            "min_data_in_leaf", "min_child_samples", 20
+        )
+        min_data_in_leaf = self._resolve_alias(
+            "min_data_in_leaf", "min_samples_leaf", 20, min_data_in_leaf
+        )
+        min_child_hess = self._resolve_alias(
+            "min_child_hess", "min_child_weight", 1e-3
+        )
+        min_child_hess = self._resolve_alias(
+            "min_child_hess", "min_sum_hessian_in_leaf", 1e-3, min_child_hess
+        )
+        lambda_l2 = self._resolve_alias("lambda_l2", "reg_lambda", _LAMBDA_L2)
+        lambda_l2 = self._resolve_alias(
+            "lambda_l2", "l2_leaf_reg", _LAMBDA_L2, lambda_l2
+        )
+        lambda_l2 = self._resolve_alias(
+            "lambda_l2", "l2_regularization", _LAMBDA_L2, lambda_l2
+        )
+        feature_fraction = self._resolve_alias(
+            "feature_fraction", "colsample_bytree", 1.0
+        )
+        feature_fraction = self._resolve_alias(
+            "feature_fraction", "rsm", 1.0, feature_fraction
+        )
+        feature_fraction_bynode = self._resolve_alias(
+            "feature_fraction_bynode", "colsample_bynode", 1.0
+        )
+        feature_fraction_bynode = self._resolve_alias(
+            "feature_fraction_bynode", "max_features", 1.0,
+            feature_fraction_bynode,
+        )
         return {
-            "learning_rate": float(self.learning_rate),
-            "num_leaves": int(self.num_leaves),
-            "max_depth": int(self.max_depth),
-            "min_data_in_leaf": int(
-                self._resolve_alias(
-                    "min_data_in_leaf", "min_child_samples", 20
-                )
-            ),
+            "learning_rate": float(learning_rate),
+            "num_leaves": int(num_leaves),
+            "max_depth": int(self._resolve_alias("max_depth", "depth", -1)),
+            "min_data_in_leaf": int(min_data_in_leaf),
             # The environment uses LightGBM's name for this one; the
-            # estimator's own spelling of it is `min_child_hess`.
-            "min_sum_hessian_in_leaf": float(
-                self._resolve_alias("min_child_hess", "min_child_weight", 1e-3)
-            ),
+            # canonical spelling of it is `min_child_weight`.
+            "min_sum_hessian_in_leaf": float(min_child_hess),
             "lambda_l1": float(
                 self._resolve_alias("lambda_l1", "reg_alpha", _LAMBDA_L1)
             ),
-            "lambda_l2": float(
-                self._resolve_alias("lambda_l2", "reg_lambda", _LAMBDA_L2)
-            ),
-            "feature_fraction": float(
-                self._resolve_alias(
-                    "feature_fraction", "colsample_bytree", 1.0
-                )
-            ),
-            "feature_fraction_bynode": float(
-                self._resolve_alias(
-                    "feature_fraction_bynode", "colsample_bynode", 1.0
-                )
-            ),
+            "lambda_l2": float(lambda_l2),
+            "feature_fraction": float(feature_fraction),
+            "feature_fraction_bynode": float(feature_fraction_bynode),
         }
 
     def _fit_with_metrics(
@@ -1455,7 +2117,7 @@ class _Base(_ParamsMixin):
             device, "validation metrics are scored on the CPU"
         )
         specs = _metric_specs(
-            eval_metric, task, getattr(self, "objective", None)
+            eval_metric, task, self._registry_objective_name()
         )
         keep, valid_specs, targets, rows, weights, groups = self._eval_sets(
             eval_set,
@@ -1467,6 +2129,40 @@ class _Base(_ParamsMixin):
         )
         primary = _primary_index(primary_metric, specs)
         callbacks = list(callbacks or ())
+        # `verbose` is the canonical name for the log level (scikit-learn's
+        # and CatBoost's word; LightGBM and XGBoost spell it `verbosity`).
+        # Nothing in mojotrees writes a training log on its own, so a
+        # positive value is honored the only way it can be: by installing
+        # the callback that does. A value of 0 or below asks for the silence
+        # this already is. This is the only place `verbose` acts, which is
+        # also the only place there is anything to report.
+        period = self._resolve_alias("verbose", "verbosity", None)
+        if period is not None and not isinstance(period, bool):
+            period = int(period)
+        if period is True:
+            period = 1
+        if period and int(period) > 0:
+            callbacks = callbacks + [_callback.log_evaluation(int(period))]
+        # `early_stopping_rounds` given on the estimator is the default for
+        # the fit-time argument of the same name, which is XGBoost's and
+        # CatBoost's shape (both take it in the constructor) as well as
+        # LightGBM's `early_stopping_round` parameter. An explicit fit-time
+        # value wins, because it is the more specific statement.
+        if not early_stopping_rounds:
+            estimator_rounds = self._resolve_alias(
+                "early_stopping_rounds", "early_stopping_round", None
+            )
+            estimator_rounds = self._resolve_alias(
+                "early_stopping_rounds", "od_wait", None, estimator_rounds
+            )
+            estimator_rounds = self._resolve_alias(
+                "early_stopping_rounds",
+                "n_iter_no_change",
+                None,
+                estimator_rounds,
+            )
+            if estimator_rounds is not None:
+                early_stopping_rounds = estimator_rounds
         (
             early_stopping_rounds,
             min_delta,
@@ -1587,7 +2283,9 @@ class _Base(_ParamsMixin):
                 reset_buf,
                 evals_buf,
             )
-            runner.end_iteration = int(self.n_estimators)
+            runner.end_iteration = int(
+                self._resolve_alias("n_estimators", "num_iterations", 100)
+            )
         params["callback"] = runner
         params["has_callback"] = int(runner is not None)
         params["reset_addr"] = _addr(reset_buf)
@@ -2389,26 +3087,52 @@ class MojoTreesRegressor(_Base):
     # resolves every one of them to the same code
     # (python/tests/test_registry_readers.py). A spelling the registry
     # gains does not become a regressor objective until it is added here.
+    #: Every spelling of every regression objective, from all four
+    #: vendors: LightGBM's `objective`, XGBoost's `objective`, CatBoost's
+    #: `loss_function`, and scikit-learn's `HistGradientBoostingRegressor`
+    #: `loss`. Names are matched after a `.lower()`, so CatBoost's `RMSE`
+    #: and `MAE` arrive as written.
+    #:
+    #: The same table exists in `src/mojotrees/params.mojo`
+    #: (`_objective_from_lower`) for the parameter-string surface. Two
+    #: tables, because the two surfaces resolve through different code and
+    #: neither can import the other; they are checked against each other by
+    #: the vendor-dialect tests.
     _OBJECTIVES = {
+        # LightGBM.
         "regression": _SQUARED_ERROR,
         "regression_l2": _SQUARED_ERROR,
         "l2": _SQUARED_ERROR,
         "mean_squared_error": _SQUARED_ERROR,
         "mse": _SQUARED_ERROR,
+        # XGBoost, its pre-1.0 spelling, CatBoost, scikit-learn.
+        "reg:squarederror": _SQUARED_ERROR,
+        "reg:linear": _SQUARED_ERROR,
+        "rmse": _SQUARED_ERROR,
+        "squared_error": _SQUARED_ERROR,
         "huber": _HUBER,
         "quantile": _QUANTILE,
+        "reg:quantileerror": _QUANTILE,
+        "quantile_loss": _QUANTILE,
         "mae": _L1,
         "regression_l1": _L1,
         "l1": _L1,
         "mean_absolute_error": _L1,
+        "reg:absoluteerror": _L1,
+        "absolute_error": _L1,
         "poisson": _POISSON,
+        "count:poisson": _POISSON,
         "gamma": _GAMMA,
+        "reg:gamma": _GAMMA,
         "tweedie": _TWEEDIE,
+        "reg:tweedie": _TWEEDIE,
         "mape": _MAPE,
         "mean_absolute_percentage_error": _MAPE,
+        "reg:absolutepercentageerror": _MAPE,
         "fair": _FAIR,
         "cross_entropy": _CROSS_ENTROPY,
         "xentropy": _CROSS_ENTROPY,
+        "crossentropy": _CROSS_ENTROPY,
     }
 
     #: objective code -> (parameter name, default). The trainer takes one
@@ -2424,6 +3148,8 @@ class MojoTreesRegressor(_Base):
     def __init__(
         self,
         objective="regression",
+        loss_function=None,
+        loss=None,
         alpha=0.9,
         fair_c=1.0,
         tweedie_variance_power=1.5,
@@ -2432,26 +3158,55 @@ class MojoTreesRegressor(_Base):
     ):
         super().__init__(**kwargs)
         self.objective = objective
+        self.loss_function = loss_function
+        self.loss = loss
         self.alpha = alpha
         self.fair_c = fair_c
         self.tweedie_variance_power = tweedie_variance_power
         self.base_score = base_score
 
+    def _resolve_objective(self):
+        """The objective as spelled, from `objective` or from either vendor
+        alias. CatBoost calls the parameter `loss_function` and
+        scikit-learn calls it `loss`; `objective` is the canonical name and
+        the one three of the four vendors use.
+
+        The third argument is `"regression"` and not `None` because that is
+        this estimator's default for `objective`, and an alias only wins
+        over a primary still sitting at its default.
+        """
+        objective = self._resolve_alias(
+            "objective", "loss_function", "regression"
+        )
+        return self._resolve_alias(
+            "objective", "loss", "regression", objective
+        )
+
     def _objective_code(self):
-        if callable(self.objective):
+        objective = self._resolve_objective()
+        if callable(objective):
             return _CUSTOM
         code = None
-        if self.objective in self._OBJECTIVES:
-            # The registry is the resolver; the literal says which of its
-            # spellings are regression objectives.
-            code = _objective_code_of_name(self.objective)
+        key = objective.lower() if isinstance(objective, str) else objective
+        if key in self._OBJECTIVES:
+            # The registry is the resolver for the spellings it knows; the
+            # literal says which of its spellings are regression objectives
+            # and carries the vendor names the registry has never held.
+            code = _objective_code_of_name(key)
             if code is None:
-                code = self._OBJECTIVES[self.objective]
+                code = self._OBJECTIVES[key]
         if code is None:
+            if key == "reg:pseudohubererror":
+                raise ValueError(
+                    "objective='reg:pseudohubererror' is XGBoost's smooth "
+                    "pseudo-Huber, which is a different curve from "
+                    "'huber' (a quadratic spliced to a line at alpha), not "
+                    "a spelling of it; mojotrees implements 'huber'"
+                )
             raise ValueError(
-                f"unknown objective {self.objective!r}; expected one of "
+                f"unknown objective {objective!r}; expected one of "
                 + ", ".join(sorted(self._OBJECTIVES))
-                + _unimplemented_objective_note(self.objective)
+                + _unimplemented_objective_note(objective)
             )
         self._objective_param(code)
         return code
@@ -2480,7 +3235,7 @@ class MojoTreesRegressor(_Base):
             if value != other_default:
                 raise ValueError(
                     f"{other_name}={value!r} does not apply to objective "
-                    f"{self.objective!r}"
+                    f"{self._resolve_objective()!r}"
                     + (
                         f"; it takes {name}"
                         if name is not None
@@ -2700,7 +3455,7 @@ class MojoTreesRegressor(_Base):
         # Backstop; BLOCK_CUSTOM_OBJECTIVE is what refuses this on a build
         # whose native policy can be asked. See `_gpu_unsupported`.
         self._gpu_unsupported(device, "custom objectives train on the CPU")
-        fobj = self.objective
+        fobj = self._resolve_objective()
         raw = _out_buffer(n_rows)
         grad = _out_buffer(n_rows)
         hess = _out_buffer(n_rows)
@@ -2907,22 +3662,111 @@ class MojoTreesClassifier(_Base):
     # See the note on MojoTreesRegressor._estimator_type.
     _estimator_type = "classifier"
 
-    def __init__(self, objective=None, class_weight=None, **kwargs):
+    #: Objective spellings that name what this classifier already trains,
+    #: and the class count each one asserts (`None` for a spelling that says
+    #: nothing about the count). All four vendors' words: LightGBM's
+    #: `objective`, XGBoost's, CatBoost's `loss_function`, scikit-learn's
+    #: `loss`. Naming one of these is a statement of what the classifier
+    #: does, so it is honored; naming anything else is a request for a
+    #: different model, and that is what the refusal below is for.
+    _CLASSIFIER_OBJECTIVES = {
+        "binary": 2,
+        "binary:logistic": 2,
+        "binary:logitraw": 2,
+        "logloss": 2,
+        "log_loss": 2,
+        "cross_entropy": 2,
+        "crossentropy": 2,
+        "xentropy": 2,
+        "multiclass": None,
+        "softmax": None,
+        "multi:softmax": None,
+        "multi:softprob": None,
+        "multiclass_loss": None,
+        "auto": None,
+    }
+
+    def __init__(
+        self,
+        objective=None,
+        loss_function=None,
+        loss=None,
+        class_weight=None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.objective = objective
+        self.loss_function = loss_function
+        self.loss = loss
         self.class_weight = class_weight
 
+    def _resolve_objective(self):
+        """The objective as spelled, from `objective` or from either vendor
+        alias (CatBoost's `loss_function`, scikit-learn's `loss`)."""
+        objective = self._resolve_alias("objective", "loss_function", None)
+        return self._resolve_alias("objective", "loss", None, objective)
+
+    def _check_objective(self, n_classes):
+        """Accept an objective that names what this classifier trains for
+        `n_classes` classes; refuse anything else.
+
+        The classifier derives its task from `y`, so it needs no objective
+        and had none: any value at all raised. That made a LightGBM,
+        XGBoost or CatBoost classification script fail on a line that was
+        telling the truth -- `objective='binary'` and
+        `loss_function='Logloss'` are exactly what a two-class fit here is.
+        Such a spelling is now honored, and a spelling that disagrees with
+        the encoded class count is refused as the mismatch it is rather
+        than as an unsupported parameter.
+        """
+        objective = self._resolve_objective()
+        if objective is None:
+            return
+        if callable(objective):
+            raise ValueError(
+                "MojoTreesClassifier takes no callable objective; custom "
+                "objectives are single-output only. Use MojoTreesRegressor "
+                "with your objective and apply your own link (a sigmoid, "
+                "say) to the raw predictions."
+            )
+        key = str(objective).strip().lower()
+        if key not in self._CLASSIFIER_OBJECTIVES:
+            raise ValueError(
+                f"objective={objective!r} is not what MojoTreesClassifier "
+                "trains; it derives the task from y, fitting binary "
+                "logistic for two classes and softmax beyond that. Accepted "
+                "spellings of those two: "
+                + ", ".join(sorted(self._CLASSIFIER_OBJECTIVES))
+                + _unimplemented_objective_note(objective)
+            )
+        wants = self._CLASSIFIER_OBJECTIVES[key]
+        if wants is None or int(n_classes) == wants:
+            return
+        raise ValueError(
+            f"objective={objective!r} is a two-class objective but y has "
+            f"{int(n_classes)} classes, which this classifier fits with "
+            "softmax; leave objective unset, or name a multiclass spelling."
+        )
+
     def _objective_code(self, n_classes=None):
-        """The native objective code this classifier trains, or None when
-        the class count is the answer instead of a code.
+        """The native objective code this classifier trains, or None before
+        there is a class count to decide it.
 
         Two classes is `binary_logistic`, a built-in single-output
-        objective the device vocabulary routes. Softmax is not one: it is
-        its own trainer growing one tree per class per round, and what the
-        native policy gates on there is `n_outputs`, which the caller
-        passes. Naming a code for it would assert something the request is
-        not, so it stays undeclared, which the native decision reports as
-        an incomplete request rather than assuming either way.
+        objective the device vocabulary routes. More than two is
+        `_MULTICLASS`, which is a code and not an absence: the registry
+        resolves the name `"multiclass"` to it, `_normalized_objective` in
+        device_policy.mojo preserves it, and the objective gate now
+        recognizes it as an objective both backends train (softmax reaches
+        the device through `train_multiclass_gpu`).
+
+        It returned None here, meaning "undeclared", which is a different
+        claim and a weaker one: an undeclared request skips the objective
+        gate entirely, carries `WARN_INCOMPLETE_REQUEST`, and can never
+        match a crossover rule, so a multiclass fit could not be routed on
+        evidence even once evidence exists. None now means only "this
+        estimator has not been fitted and was not told the class count",
+        which is the one case where there genuinely is no answer.
 
         `n_classes` is the count the current fit has just encoded, for the
         callers that ask before `n_classes_` exists; without it the fitted
@@ -2933,7 +3777,7 @@ class MojoTreesClassifier(_Base):
             n_classes = getattr(self, "n_classes_", None)
         if n_classes is None:
             return None
-        return _BINARY_LOGISTIC if int(n_classes) == 2 else None
+        return _BINARY_LOGISTIC if int(n_classes) == 2 else _MULTICLASS
 
     def _class_weight_rows(self, codes, n_rows, classes, sample_weight):
         """`sample_weight` with `class_weight` folded in, or it unchanged
@@ -3027,13 +3871,6 @@ class MojoTreesClassifier(_Base):
 
         Returns self.
         """
-        if self.objective is not None:
-            raise ValueError(
-                "MojoTreesClassifier takes no objective; custom objectives "
-                "are single-output only. Use MojoTreesRegressor with your "
-                "objective and apply your own link (a sigmoid, say) to the "
-                "raw predictions."
-            )
         eval_set = _eval_pairs(eval_set, eval_X, eval_y)
         _check_eval_arguments(
             eval_set,
@@ -3050,6 +3887,10 @@ class MojoTreesClassifier(_Base):
         self._check_fit_structure(X, y, n_rows, n_features, sample_weight)
         yb, classes = _arrays.encode_labels(y, n_rows)
         n_classes = len(classes)
+        # An objective spelling is checked here rather than at the top of
+        # `fit`, because whether it names this fit depends on the class
+        # count and the class count comes from y.
+        self._check_objective(n_classes)
         # class_weight becomes ordinary row weights before anything else
         # sees it, so the trainer has one weighting mechanism, not two.
         sample_weight = self._class_weight_rows(
@@ -3156,6 +3997,7 @@ class MojoTreesClassifier(_Base):
         # class_weight has to reach the weight buffer the params carry.
         yb, classes = _arrays.encode_labels(y, X.shape[0])
         n_classes = len(classes)
+        self._check_objective(n_classes)
         sample_weight = self._class_weight_rows(
             yb, X.shape[0], classes, sample_weight
         )
@@ -3463,9 +4305,13 @@ class MojoTreesRanker(_Base):
         pair_sampling_rate=1.0,
         pair_sampling_seed=5,
         max_dcg_cutoff=0,
+        objective=None,
+        loss_function=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.objective = objective
+        self.loss_function = loss_function
         self.lambdarank_truncation_level = lambdarank_truncation_level
         self.sigmoid = sigmoid
         self.lambdarank_norm = lambdarank_norm
@@ -3477,6 +4323,34 @@ class MojoTreesRanker(_Base):
         self.pair_sampling_rate = pair_sampling_rate
         self.pair_sampling_seed = pair_sampling_seed
         self.max_dcg_cutoff = max_dcg_cutoff
+
+    #: Objective spellings that name what this ranker already trains:
+    #: LightGBM's `lambdarank` and XGBoost's `rank:ndcg`, which are the same
+    #: LambdaRank-with-NDCG family. CatBoost's `YetiRank` is a different
+    #: pairwise loss and is deliberately absent.
+    _RANKER_OBJECTIVES = ("lambdarank", "rank:ndcg", "rank:pairwise")
+
+    def _check_objective(self):
+        """Accept an objective spelling that names LambdaRank; refuse
+        anything else.
+
+        The ranker trains one objective and took no `objective` parameter
+        at all, so `MojoTreesRanker(objective="lambdarank")` -- which is
+        what an LGBMRanker script says, and it is true -- raised a
+        TypeError. Naming the objective this estimator does train is now
+        honored and nothing else is."""
+        objective = self._resolve_alias("objective", "loss_function", None)
+        if objective is None:
+            return
+        key = str(objective).strip().lower()
+        if key in self._RANKER_OBJECTIVES:
+            return
+        raise ValueError(
+            f"objective={objective!r} is not what MojoTreesRanker trains; "
+            "it fits LambdaRank, spelled "
+            + ", ".join(self._RANKER_OBJECTIVES)
+            + _unimplemented_objective_note(objective)
+        )
 
     @staticmethod
     def _objective_code():
@@ -3595,6 +4469,7 @@ class MojoTreesRanker(_Base):
                 )
         elif eval_group is not None:
             raise ValueError("eval_group needs an eval_set to describe")
+        self._check_objective()
         self._refuse_alternate_boosting("for a ranker")
         self._reset_fitted()
         Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)

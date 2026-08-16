@@ -464,6 +464,7 @@ from .sklearn import (  # noqa: E402,F401
     _MAPE,
     _FAIR,
     _CROSS_ENTROPY,
+    _MULTICLASS,
     _LAMBDA_L1,
     _LAMBDA_L2,
     _Base,
