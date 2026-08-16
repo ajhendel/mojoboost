@@ -37,17 +37,24 @@ both directions, so the honest per-tree figure was sixteen host waits and not
 one: nine uploads before the first split, six downloads and the `synchronize`
 at the end.
 
-That figure is now **six**, on the default arms, because ten of those copies
-were not carrying anything a copy had to carry. The tables reset is a kernel
-that takes three scalars rather than five staged uploads
-(`gpu_tree_tables.DeviceTreeTables.set_reset_on_device`), and the download is
-one copy of one device-side concatenation rather than six
-(`set_packed_download`). What is left is four uploads inside
-`searcher.enqueue_frontier`, the one download, and the `synchronize`, which
-is free on Metal since the copy before it already drained.
-`grow_tree_device_resident` itemizes all of them. Both replacements have a
-second arm reachable at run time, because this machine's timings drift
-several-fold across time windows and only interleaved arms compare.
+That figure is now **three**, on the default arms, because thirteen of those
+copies were not carrying anything a copy had to carry. The tables reset is a
+kernel that takes three scalars rather than five staged uploads
+(`gpu_tree_tables.DeviceTreeTables.set_reset_on_device`); the download is one
+copy of one device-side concatenation rather than six (`set_packed_download`);
+and the searcher's four staged tables are now `create_sub_buffer` windows onto
+one parent allocation, so one copy writes all four
+(`gpu_split_search.GpuSplitSearcher.set_table_upload_hoisting`). What is left
+is that one upload, the one download, and the `synchronize`, which is free on
+Metal since the copy before it already drained.
+`grow_tree_device_resident` itemizes all three. Every replacement has a second
+arm reachable at run time, because this machine's timings drift several-fold
+across time windows and only interleaved arms compare.
+
+Two lanes produced that thirteen and neither could see the other, so each
+reported a correct intermediate figure against its own baseline: sixteen to
+six, and separately four to one giving thirteen. Composed it is three. Written
+out because that is the arithmetic a multi-lane round gets wrong.
 
 What survives all of this intact is the count of *round trips*, meaning
 points where host code reads a device answer before it can decide what to
