@@ -1182,14 +1182,14 @@ def _check_gpu_const_hessian_verify(trainer: String) raises:
 def _check_gpu_booster_params(
     params: BoosterParams, trainer: String
 ) raises:
-    """Refuse what this trainer cannot honor: two parameters and one knob.
+    """Refuse what this trainer cannot honor: three parameters and one knob.
 
     The parameters first.
 
-    Both were accepted and silently dropped until 2026-08-16, and both are
-    ensemble-level rather than per-tree, which is why they are refused at the
-    trainer rather than at the grower: a grower is handed a `TreeParams` and
-    never sees either one.
+    All three were accepted and silently dropped until 2026-08-16, and all
+    three are ensemble-level rather than per-tree, which is why they are
+    refused at the trainer rather than at the grower: a grower is handed a
+    `TreeParams` and never sees any of them.
 
     `enable_bundle` is built by the dense CPU trainers in boosting.mojo, which
     fit a bundling plan once per training call and grow every tree on the
@@ -1217,6 +1217,35 @@ def _check_gpu_booster_params(
     if params.linear.is_active():
         check_linear_tree_unconnected(trainer)
     _check_gpu_const_hessian_verify(trainer)
+    # A third parameter, added 2026-08-16 evening on the day it became
+    # reachable. `boosting_type='ordered'` is ensemble-level like the two
+    # above -- the rung planes are advanced once per round, and a grower
+    # handed a `TreeParams` never sees them -- so it is refused in the same
+    # place and for the same reason.
+    #
+    # This is the trainer half of `device_policy.BLOCK_ORDERED_BOOSTING`, and
+    # the two are not a duplicated policy: the policy decides where a run
+    # goes, and this refuses a run that arrived anyway, which is the only
+    # protection a caller reaching `train_gpu` directly has. That caller is
+    # not hypothetical here -- `model.fit_multiclass`,
+    # `external_memory.train_external*` and every direct call in this file go
+    # past `model.fit`, which is exactly how the `linear_tree` gap above was
+    # found.
+    #
+    # Read as `params.ordered.enabled` rather than through an `is_active()`
+    # helper because `OrderedBoostingParams` has no such method; inventing one
+    # here that answered a slightly different question is the shape of defect
+    # this campaign has now hit twice under the name "a guard that looks like
+    # coverage".
+    if params.ordered.enabled:
+        raise Error(
+            trainer,
+            " cannot honor boosting_type='ordered': the per-permutation rung"
+            " planes that fit each row from a model which never saw it are"
+            " built in ordered_boosting.mojo and advanced by boosting.train,"
+            " and no device trainer builds them, so this fit would silently"
+            " be ordinary plain boosting",
+        )
 
 
 def resident_frontier_disabled() -> Bool:

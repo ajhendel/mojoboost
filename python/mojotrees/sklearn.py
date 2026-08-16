@@ -133,6 +133,32 @@ _CANONICAL_GROW_POLICIES = {
 }
 
 
+def _score_function_code(value):
+    """`score_function` as the integer the device policy gates on.
+
+    Only the device decision reads this. The grower takes the name through
+    its own path, and `check_score_function` in split.mojo is what refuses an
+    unknown one; this function's whole job is to answer, before a backend has
+    been chosen, "is this the one functional the accelerator implements".
+
+    **It fails closed, and that is the design.** Anything that is not
+    recognizably `L2` maps to `SCORE_COSINE`, which the policy blocks, rather
+    than to `SCORE_L2`, which it allows. A selector this function has not been
+    taught therefore keeps the fit on the CPU, where every selector is
+    implemented, instead of reaching a device that computes `G^2/(H+lambda)`
+    whatever it was asked for. Mapping the unknown case to L2 would be the
+    silent-wrong-answer defect the block exists to close, reintroduced one
+    layer up.
+    """
+    from .device_selection import SCORE_COSINE, SCORE_L2
+
+    if value is None:
+        return SCORE_L2
+    if str(value).strip().lower() == "l2":
+        return SCORE_L2
+    return SCORE_COSINE
+
+
 class _Base(_ParamsMixin):
     """Shared hyperparameters, mojotrees defaults (LightGBM-matched).
 
@@ -2036,11 +2062,40 @@ class _Base(_ParamsMixin):
                 categorical=bool(categorical),
                 has_missing=bool(self.use_missing),
                 has_eval_set=bool(has_eval_set),
+                # Read through `_resolve_boosting()` rather than off
+                # `self.boosting_type`, because `boosting` and `booster` are
+                # aliases for the same parameter: a user who wrote
+                # `booster='ordered'` would leave `self.boosting_type` None,
+                # and this gate would have seen plain boosting for an ordered
+                # fit. `_resolve_boosting` is where the three spellings
+                # already become one word.
+                ordered_boosting=(self._resolve_boosting() == "ordered"),
+                # `getattr` with a default, and deliberately, because the
+                # CPU campaign is landing the field that carries a non-L2
+                # choice; until it does, `self.score_function` exists but no
+                # value other than L2 gets past the refusal below it. Written
+                # this way the gate is correct before and after that lands,
+                # and it fails closed: an unrecognized spelling maps to
+                # SCORE_COSINE, which the device policy blocks, rather than
+                # to SCORE_L2, which it waves through.
+                score_function=_score_function_code(
+                    getattr(self, "score_function", None)
+                ),
             )
             # DeviceUnavailableError is a RuntimeError subclass carrying the
             # native refusal text, so it propagates as what this method has
             # always raised, with the report attached.
             return _policy.select_device(device, workload).resolved
+        # The narrow contract answers on shape alone, so it cannot see
+        # `boosting_type` or `score_function` any more than it sees
+        # `enable_bundle` or `linear_tree`. That is not a hole this branch can
+        # close: a build old enough to expose `resolve_device` and not
+        # `decide_device` predates `BLOCK_ORDERED_BOOSTING` and
+        # `BLOCK_SCORE_FUNCTION` entirely, so there is no native gate here to
+        # reach. The trainer-side refusals are what protect this path --
+        # `_check_gpu_booster_params` in train_gpu.mojo and `_refuse_unhonored`
+        # in train_gpu_sparse.mojo both raise on `params.ordered.enabled`
+        # whatever resolved the device.
         try:
             return _mojotrees.resolve_device(
                 device, int(n_rows), int(n_features), int(n_outputs)

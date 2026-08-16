@@ -99,6 +99,19 @@ __all__ = [
 #: `parse_device` in src/mojotrees/device_policy.mojo accepts it.
 DEVICES = ("cpu", "gpu", "auto")
 
+#: `split.SCORE_L2` and `split.SCORE_COSINE`, which select which functional
+#: of the children's sums a split maximizes. Defined here rather than beside
+#: `_BINS_UNSPECIFIED` below because `Workload.__init__` takes `SCORE_L2` as a
+#: default argument, and a default is evaluated when the class body runs.
+#:
+#: These are transport, exactly like the sentinels below: no rule in this
+#: module reads them, and the native layer decides what a selector means. The
+#: device policy blocks anything that is not `SCORE_L2`, so a value added to
+#: `split.mojo` and not to this pair refuses the accelerator rather than
+#: reaching it with the wrong functional.
+SCORE_L2 = 0
+SCORE_COSINE = 1
+
 
 class DeviceUnavailableError(RuntimeError):
     """An explicit `device="gpu"` cannot run this workload.
@@ -280,6 +293,8 @@ class Workload:
         categorical=False,
         has_missing=False,
         has_eval_set=False,
+        ordered_boosting=False,
+        score_function=SCORE_L2,
     ):
         self.n_rows = int(n_rows)
         self.n_features = int(n_features)
@@ -299,6 +314,8 @@ class Workload:
         self.categorical = bool(categorical)
         self.has_missing = bool(has_missing)
         self.has_eval_set = bool(has_eval_set)
+        self.ordered_boosting = bool(ordered_boosting)
+        self.score_function = int(score_function)
         if self.n_rows < 1 or self.n_features < 1:
             raise ValueError(
                 "a workload needs at least one row and one feature; got "
@@ -676,6 +693,8 @@ class _FullNativePolicy:
                 "categorical": 1 if workload.categorical else 0,
                 "has_missing": 1 if workload.has_missing else 0,
                 "uses_validation": 1 if workload.has_eval_set else 0,
+                "ordered_boosting": 1 if workload.ordered_boosting else 0,
+                "score_function": int(workload.score_function),
             },
         )
         return _parse_decision(str(text))

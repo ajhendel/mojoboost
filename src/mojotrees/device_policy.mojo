@@ -299,6 +299,19 @@ from .boosting import CUSTOM
 # binning, objective_registry, apple_cpu_policy and parallel, none of which
 # come back here, and `boosting` (already imported above) reaches it anyway.
 from .histogram import const_hessian_verify, derivative_precision_narrows
+# `SCORE_L2` is imported rather than mirrored here. A mirrored constant is a
+# default expressed in two places, which has already produced two silent wrong
+# answers in this campaign; if `split.mojo` ever renumbers, this must fail to
+# compile rather than start refusing the wrong selector. The edge is
+# cycle-free: nothing in `split.mojo`'s import closure reaches `device.mojo`,
+# `gpu_predict.mojo` or this module, which are the only three importers of the
+# policy.
+#
+# `SCORE_L2` alone, and not `SCORE_COSINE` beside it: the block below tests
+# `!= SCORE_L2` so that a selector added later refuses the device instead of
+# reaching it, which means the Cosine constant is never named here. Importing
+# it for symmetry would be an unused import that reads like a coupling.
+from .split import SCORE_L2
 from .initialization import SessionState, warmup_level_name
 
 # The one table of objective facts. Imported rather than restated: this
@@ -434,7 +447,22 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # rule (it requires two or more trees per round). A version-4 report saying
 # "no rule covered this" for a multiclass workload and a version-6 report
 # saying it therefore mean different things.
-comptime POLICY_VERSION = 6
+# 7: two gates were added and no rule moved, for the same reason version 5
+# existed -- a CatBoost parameter that the GPU trainers accepted and silently
+# did not apply. `boosting_type='ordered'` (`BLOCK_ORDERED_BOOSTING`) and
+# `score_function=Cosine` (`BLOCK_SCORE_FUNCTION`). Both were harmless while
+# the Python surface refused them outright; the CatBoost reachability work of
+# 2026-08-16 made both reachable, and neither has a device implementation. A
+# version-6 report saying a GPU selection was unblocked and a version-7 report
+# saying the same thing mean different things for a request that set either.
+#
+# Worth recording as a mechanism rather than as two entries: a lane that wires
+# a feature can open a hole in a refusal that a different lane owns, and no
+# reachability walk finds it, because the gate is imported, is called on every
+# fit, and is merely BLIND to the parameter it would refuse on. Both halves of
+# this version were found that way and neither was found by the lane that
+# built the feature.
+comptime POLICY_VERSION = 7
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -544,6 +572,8 @@ comptime BLOCK_FEATURE_BUNDLING = 13
 comptime BLOCK_LINEAR_TREE = 14
 comptime BLOCK_FORCED_SPLITS = 15
 comptime BLOCK_CONST_HESSIAN_VERIFY = 16
+comptime BLOCK_ORDERED_BOOSTING = 17
+comptime BLOCK_SCORE_FUNCTION = 18
 
 
 def block_reason_name(code: Int) -> String:
@@ -579,6 +609,10 @@ def block_reason_name(code: Int) -> String:
         return String("forced-splits")
     if code == BLOCK_CONST_HESSIAN_VERIFY:
         return String("const-hessian-verify")
+    if code == BLOCK_ORDERED_BOOSTING:
+        return String("ordered-boosting")
+    if code == BLOCK_SCORE_FUNCTION:
+        return String("score-function")
     return String("unknown-block")
 
 
@@ -1089,6 +1123,8 @@ struct DeviceRequest(Copyable, Movable):
     var bundling: Bool
     var linear_tree: Bool
     var forced_splits: Bool
+    var ordered_boosting: Bool
+    var score_function: Int
 
     def __init__(
         out self,
@@ -1105,6 +1141,8 @@ struct DeviceRequest(Copyable, Movable):
         bundling: Bool = False,
         linear_tree: Bool = False,
         forced_splits: Bool = False,
+        ordered_boosting: Bool = False,
+        score_function: Int = SCORE_L2,
     ):
         self.requested_device = requested_device
         self.n_rows = n_rows
@@ -1119,6 +1157,8 @@ struct DeviceRequest(Copyable, Movable):
         self.bundling = bundling
         self.linear_tree = linear_tree
         self.forced_splits = forced_splits
+        self.ordered_boosting = ordered_boosting
+        self.score_function = score_function
 
     def cells(self) -> Int:
         """`n_rows * n_features`, the size measure the crossover rules and
@@ -2257,6 +2297,72 @@ def _collect_blocks(
             ),
         )
 
+    # --- The second refusal sweep, 2026-08-16 evening ---
+    #
+    # Two CatBoost parameters, added the day they became reachable rather than
+    # the day they were built. Both were harmless until then: `params.mojo`
+    # refused `score_function` other than L2 by name, and `boosting_type`
+    # never reached a fit. The CatBoost reachability work removed both
+    # refusals at the Python surface, and neither has a device implementation,
+    # so without these two blocks a `device='auto'` fit above the crossover
+    # would have returned plain-boosting L2 answers under CatBoost labels.
+    #
+    # They are blocks and not rule scopes, for the reason spelled at
+    # `BLOCK_DERIVATIVE_PRECISION`: an explicit `device='gpu'` raises, because
+    # a backend the user named cannot honor what they asked for; `device=
+    # 'auto'` takes the CPU with `DECISION_AUTO_CPU_BLOCKED`, because a user
+    # who asked us to pick asked for the backend that *can* honor it.
+    if request.ordered_boosting:
+        # `ordered_boosting.mojo` holds the rung planes and the per-permutation
+        # score ladder, and it is reached from `boosting.mojo` only. Neither
+        # `train_gpu.mojo` nor `gpu_split_search.mojo` mentions `boosting_type`
+        # at all, so a device fit does not partially implement this -- it does
+        # plain boosting and reports success, which is precisely the leakage
+        # ordered boosting exists to remove.
+        #
+        # Ordered boosting's own five refusals (bagging, GOSS, balanced
+        # bagging, renewing objectives, continued training) are all about the
+        # sampler and the objective. None of them is about the device, which
+        # is why this one has to live here.
+        blocks.add(
+            BLOCK_ORDERED_BOOSTING,
+            String(
+                "boosting_type='ordered' fits each row from a model that never"
+                " saw it, through the per-permutation rung planes in"
+                " ordered_boosting.mojo, and no accelerator path builds those"
+                " planes; a GPU fit would return ordinary plain boosting"
+            ),
+        )
+
+    if request.score_function != SCORE_L2:
+        # Deliberately `!= SCORE_L2` rather than `== SCORE_COSINE`. An unknown
+        # selector must refuse the device too: `check_score_function` raises
+        # on it, but only once a grower reads it, and the whole point of this
+        # gate is to answer before a backend has been chosen. Written the
+        # narrow way, a third score function added later would silently reach
+        # the device and get an L2 answer -- the exact defect this block was
+        # written to close, reintroduced by the shape of the test.
+        #
+        # WHY THIS IS NOT WAIVED WHEN THE TWO AGREE. Cosine and L2 have the
+        # same argmax at `lambda_l2 = 0`, provably (split.mojo: substituting
+        # the free Newton step makes numerator and denominator the same
+        # expression, so Cosine collapses to sqrt of the L2 score and sqrt is
+        # strictly increasing). It is tempting to let the device through on
+        # that identity. It must not: the identity holds for one node's argmax
+        # and the CatBoost-mode arm sets `lambda_l2 = 3`, a leaf-wise queue
+        # compares gains across parents, and `random_strength` adds noise in
+        # units Cosine has changed. Any one of those breaks it, and this gate
+        # cannot see `lambda_l2` or the growth policy.
+        blocks.add(
+            BLOCK_SCORE_FUNCTION,
+            String(
+                "score_function selects which functional of the children's"
+                " sums is maximized, and the device split search computes"
+                " G^2/(H+lambda) only, which is score_function=L2; no"
+                " accelerator path evaluates the Cosine ratio"
+            ),
+        )
+
     if not gpu_supports_outputs(request.n_outputs):
         blocks.add(
             BLOCK_OUTPUT_LIMIT,
@@ -2643,6 +2749,18 @@ struct DeviceDecision(Copyable, Movable):
         )
         out += String(
             "forced_splits=", _bool_text(self.request.forced_splits), "\n"
+        )
+        # Serialized beside the other three request flags, not left out of the
+        # record. A refusal a reader cannot see the input for is a refusal
+        # they have to reproduce to understand, and this report exists so that
+        # `device='gpu'` can be asked "what would you do here" without one.
+        out += String(
+            "ordered_boosting=",
+            _bool_text(self.request.ordered_boosting),
+            "\n",
+        )
+        out += String(
+            "score_function=", self.request.score_function, "\n"
         )
 
         out += String(
@@ -3054,6 +3172,8 @@ def resolve_device(
     n_features: Int,
     n_outputs: Int = 1,
     objective: Int = OBJECTIVE_UNSPECIFIED,
+    ordered_boosting: Bool = False,
+    score_function: Int = SCORE_L2,
 ) raises -> Int:
     """Resolve a requested device to the backend that will actually run:
     `CPU_DEVICE` or `GPU_DEVICE`, never `AUTO_DEVICE`.
@@ -3113,6 +3233,13 @@ def resolve_device(
         n_outputs,
         BINS_UNSPECIFIED,
         objective,
+        # Keyword-passed, and the reason is on the record. `gain_form` was
+        # dropped from `GpuSplitSearcher.search` for months because it sat in
+        # a positional list that something was later inserted above. These two
+        # are the last parameters of a thirteen-argument constructor, which is
+        # the position that mistake happens in.
+        ordered_boosting=ordered_boosting,
+        score_function=score_function,
     )
     var caps = DeviceCapabilities.detect()
     var decision = decide_device(request, caps)
@@ -3223,6 +3350,8 @@ def decide_device_report(
     bundling: Bool = False,
     linear_tree: Bool = False,
     forced_splits: Bool = False,
+    ordered_boosting: Bool = False,
+    score_function: Int = SCORE_L2,
 ) raises -> String:
     """The whole contract across a flat boundary: workload in, serialized
     decision out.
@@ -3259,6 +3388,8 @@ def decide_device_report(
         bundling,
         linear_tree,
         forced_splits,
+        ordered_boosting=ordered_boosting,
+        score_function=score_function,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     return decide_device(request, caps).serialize()
@@ -3287,6 +3418,8 @@ def decide_device_report_reported(
     bundling: Bool = False,
     linear_tree: Bool = False,
     forced_splits: Bool = False,
+    ordered_boosting: Bool = False,
+    score_function: Int = SCORE_L2,
 ) raises -> String:
     """`decide_device_report` for a caller that has read the device.
 
@@ -3310,6 +3443,8 @@ def decide_device_report_reported(
         bundling,
         linear_tree,
         forced_splits,
+        ordered_boosting=ordered_boosting,
+        score_function=score_function,
     )
     var caps = capabilities_from_reported(
         reported_api,
@@ -3339,6 +3474,8 @@ def resolve_device_full(
     bundling: Bool = False,
     linear_tree: Bool = False,
     forced_splits: Bool = False,
+    ordered_boosting: Bool = False,
+    score_function: Int = SCORE_L2,
 ) raises -> Int:
     """Resolve a fully described workload to `CPU_DEVICE` or `GPU_DEVICE`,
     raising the refusal when it cannot run.
@@ -3371,6 +3508,8 @@ def resolve_device_full(
         bundling,
         linear_tree,
         forced_splits,
+        ordered_boosting=ordered_boosting,
+        score_function=score_function,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     var decision = decide_device(request, caps)

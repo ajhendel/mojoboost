@@ -200,6 +200,15 @@ def _refuse_unhonored(params: BoosterParams, trainer: String) raises:
     `boosting.train` never sees one, and `boosting.train` refuses it for that
     reason. No GPU trainer, dense or sparse, did.
 
+    `boosting_type='ordered'` was added to this list on 2026-08-16 evening,
+    the day the CatBoost reachability work made it reachable rather than the
+    day it was built. The rung planes live in `ordered_boosting.mojo` and are
+    advanced once per round by `boosting.train`; no device trainer, dense or
+    sparse, builds them, so a fit here would have been plain boosting reported
+    as ordered -- which is the leakage the option exists to remove. The dense
+    half is in `train_gpu._check_gpu_booster_params` and the routing half is
+    `device_policy.BLOCK_ORDERED_BOOSTING`.
+
     `leaf_estimation_iterations > 1` re-evaluates each leaf's rows at the
     value the leaf currently holds and takes another Newton step. `train_gpu`
     implements it (`_check_leaf_estimation_config` plus `GpuLeafEstimator`)
@@ -221,6 +230,15 @@ def _refuse_unhonored(params: BoosterParams, trainer: String) raises:
     """
     if params.linear.is_active():
         check_linear_tree_unconnected(trainer)
+    if params.ordered.enabled:
+        raise Error(
+            trainer,
+            " cannot honor boosting_type='ordered': the per-permutation rung"
+            " planes that fit each row from a model which never saw it are"
+            " built in ordered_boosting.mojo and advanced by boosting.train,"
+            " and no device trainer builds them, so this fit would silently"
+            " be ordinary plain boosting",
+        )
     _refuse_leaf_estimation(params.tree.extra, trainer)
     if const_hessian_verify():
         raise Error(
