@@ -292,6 +292,39 @@ and the whole CatBoost knob set refused at the Python layer. Plus CatBoost's
 own instance of it, `mvs_reg = 0`, which drives every row weight to zero
 through a NaN its comparison eats.
 
+### The second category, which no walk counts: a gate that is reachable and blind
+
+Found by f9 reading rather than running, and **confirmed here by grep before
+being written down**: `boosting_type` appears **zero times** across
+`device_policy.mojo`, `train_gpu.mojo` and `gpu_split_search.mojo`.
+`resolve_device_full` takes thirteen parameters and none of them is the
+boosting type.
+
+So now that `boosting_type='ordered'` reaches a fit -- which this round's
+reachability lane is what made true -- **`device='auto'` at or above the
+250,000-row crossover resolves to GPU, and the GPU trainer has no ordered
+code.** Plain boosting under an ordered label, or a failure deeper in. The
+five refusals ordered boosting carries are about samplers, objectives and
+continuation; none is about the device.
+
+**This is the same defect wearing a different hat, and the count above does
+not catch it.** The 13-of-107 walk finds modules nothing imports. This is a
+gate that IS imported, IS called on every fit, and is blind to a parameter
+that has just started mattering. Both were invisible to every lane that owned
+the feature -- because a lane tests the thing it built, and neither failure is
+in the thing it built.
+
+So rule 3 needs a second half: audit not only "is there code that reads this
+setting" but **"is there a gate that should refuse this combination, and can
+it see the parameter it would refuse on"**. A wired feature can create the
+exposure for a gate somebody else owns, which is exactly what happened here.
+
+It is f9's to fix and it is queued rather than urgent: the comparison run does
+not trigger it, because `MOJOTREES_CATBOOST_MODE` sets seven tree-shape and
+regularization keys and `boosting_type` is not among them. **Deliberately not
+patched here** -- the comparison head must not take unverified code under a
+no-test order to close a hole nothing in the run reaches.
+
 **The rule, for every lane from here:**
 
 1. A lane is not done when its tests pass. It is done when something outside

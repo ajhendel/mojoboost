@@ -570,44 +570,42 @@ CATBOOST_LEFT_AT_STOCK = {
 #: and none of them is fixed by passing something.
 CATBOOST_UNMATCHABLE = {
     "tree_shape": (
-        "CatBoost grows symmetric (oblivious) trees of depth 6, where every "
-        "node at a level shares one split. mojotrees now HAS a symmetric "
-        "policy -- GROW_OBLIVIOUS in src/mojotrees/growth_policy.mojo, "
-        "landed 2026-08-16 -- so the old claim here that it had none is "
-        "withdrawn. But it is not reachable from this harness: "
-        "python/mojotrees/sklearn.py validates grow_policy against "
-        "_GROW_POLICIES, which carries 'leafwise' (alias 'lossguide') and "
-        "'depthwise' and nothing else, and every arm in bench/real_data goes "
-        "through that surface. So the CatBoost-mode mojotrees arm is STILL "
-        "depthwise at depth 6 and still NOT the same tree, and the reason "
-        "has changed from 'we cannot' to 'the Python layer does not expose "
-        "it yet'. A symmetric tree is strictly more constrained than a "
-        "depthwise one at the same depth, so this difference is expected to "
-        "cost CatBoost accuracy and save it time, and neither side of that "
-        "is measured here. This is the one entry in this table that is "
-        "expected to STOP being unmatchable: wiring symmetrictree through "
-        "_GROW_POLICIES closes it, and then this row becomes a matched "
-        "parameter instead of a caveat"
+        "CLOSED 2026-08-16, and recorded rather than deleted because it was "
+        "the largest caveat on this comparison for the whole campaign. "
+        "CatBoost grows symmetric trees of depth 6 where every node at a "
+        "level shares one split; mojotrees now does too, and the "
+        "CatBoost-mode arm asks for it by name. The policy landed in wave 4 "
+        "and spent the intervening time unreachable -- built, tested, merged, "
+        "and refused by the estimator's grow_policy validator, which listed "
+        "two of the three values. A symmetric tree is strictly more "
+        "constrained than a depthwise one at the same depth, so the "
+        "difference this entry used to describe was expected to cost CatBoost "
+        "accuracy and save it time; neither side of that was ever measured "
+        "and now neither needs to be"
     ),
     "row_sampling": (
+        "STILL UNMATCHED, and now for a narrower reason than before. "
         "CatBoost's default bootstrap_type is MVS with subsample 0.8, so it "
-        "subsamples rows on every tree. LightGBM and mojotrees do not "
-        "subsample at their defaults. MVS is minimum-variance sampling "
-        "weighted by gradient magnitude, not uniform bagging, so mojotrees's "
-        "bagging_fraction is not an emulation of it. The CatBoost arm "
-        "therefore sees about 80 percent of the rows per tree and the other "
-        "two see all of them. As of 2026-08-16 mojotrees HAS an MVS sampler "
-        "of its own, built from CatBoost's source and off by default, so "
-        "'the CatBoost-mode arm does not try' has gone from a statement "
-        "about what we can do to a statement about what is wired: nothing "
-        "calls the sampler from a round loop yet. When something does, this "
-        "entry becomes matchable and should move out of this table"
+        "subsamples rows on every tree, weighted by gradient magnitude "
+        "rather than uniformly. mojotrees HAS an MVS sampler now, built from "
+        "CatBoost's source and wired into the round loop -- but the bundle "
+        "cannot travel from Python: bindings/_mojotrees.mojo does not parse "
+        "bootstrap_type and model.fit does not forward it, so the estimator "
+        "still refuses the key. This arm therefore sees every row where "
+        "CatBoost sees about 80 percent. The missing edge is two files and "
+        "is named in the sampler-wire lane report; until it lands this is a "
+        "wiring gap, not a capability gap"
     ),
     "split_scoring": (
-        "CatBoost's default score_function is Cosine and its "
-        "random_strength is 1, which adds seeded random noise to every "
-        "split score. LightGBM and mojotrees score splits by gain with no "
-        "perturbation. No parameter makes these the same rule"
+        "HALF CLOSED. CatBoost's default score_function is Cosine and this "
+        "arm now asks for it, so the scoring RULE matches. What does not is "
+        "random_strength's seeded noise: both engines now add it and the "
+        "streams are different by construction -- CatBoost's per-document "
+        "draws depend on how many queries precede a row in its thread block, "
+        "reproducible only because CB_THREAD_LIMIT is a compile-time "
+        "constant, and ours are keyed on (seed, tree, row). Same "
+        "distribution, different numbers, and no parameter makes them the "
+        "same draw"
     ),
     "leaf_population": (
         "CatBoost's min_data_in_leaf default is 1 and this harness's shared "
@@ -1011,24 +1009,60 @@ CATBOOST_DETERMINISM = {
 #: row sampling and a bagging_fraction of 0.8 would be an imitation of the
 #: number rather than of the method.
 MOJOTREES_CATBOOST_MODE = {
-    "grow_policy": "depthwise",
+    # CatBoost's actual CPU defaults, to the extent this surface can now
+    # reach them. Four knobs became reachable on 2026-08-16 and are set here
+    # for the first time: grow_policy, score_function, random_strength and
+    # leaf_estimation_iterations. Two are still refused and are listed under
+    # "what is still unmatched" below.
+    "grow_policy": "symmetrictree",
     "max_depth": 6,
     "num_leaves": 64,
     "min_data_in_leaf": 1,
     "min_child_hess": 0.0,
     "lambda_l1": 0.0,
     "lambda_l2": 3.0,
+    "score_function": "cosine",
+    "random_strength": 1.0,
+    "leaf_estimation_iterations": 1,
+    "max_bin": 255,
 }
 
 #: Why each entry above is what it is, carried into the record beside the
 #: dict so the arm explains itself where it is read.
 MOJOTREES_CATBOOST_MODE_REASONS = {
     "grow_policy": (
-        "the nearest shape this harness can REACH, and not the same one. "
-        "Reachable is the operative word since 2026-08-16: a symmetric "
-        "policy now exists in the Mojo package but sklearn.py's "
-        "_GROW_POLICIES does not expose it, so depthwise remains the "
-        "closest this arm can ask for. See CATBOOST_UNMATCHABLE['tree_shape']"
+        "CatBoost's own SymmetricTree, and no longer an approximation of it. "
+        "This entry read 'depthwise, the nearest shape this harness can "
+        "REACH' until 2026-08-16, when the estimator's validator was widened "
+        "to carry symmetrictree through to the GROW_OBLIVIOUS the package had "
+        "held unreachable since wave 4. tree_shape leaves "
+        "CATBOOST_UNMATCHABLE as a result"
+    ),
+    "score_function": (
+        "CatBoost's CPU default for EVERY grow policy -- the widely repeated "
+        "Lossguide-to-NewtonL2 override is inside a TaskType == GPU branch "
+        "and is unreachable on CPU. It matters HERE and would not at our "
+        "stock settings: Cosine's numerator is the L2 sum and at lambda_l2 = "
+        "0 its denominator collapses onto the same expression, so it "
+        "degenerates to sqrt(L2). This arm runs lambda_l2 = 3"
+    ),
+    "random_strength": (
+        "CatBoost's default. The per-split score noise was implemented on "
+        "host and device for months while the function computing its "
+        "per-tree scale had zero callers, so a positive value was refused; "
+        "the dense CPU round loop now computes it before each tree"
+    ),
+    "leaf_estimation_iterations": (
+        "CatBoost's resolved value for the objectives this suite runs. It is "
+        "1 for RMSE and Logloss and this arm does not run the losses where "
+        "CatBoost resolves it higher"
+    ),
+    "max_bin": (
+        "CatBoost's border_count of 254 counts THRESHOLDS where max_bin "
+        "counts BINS, so 255 here and 254 there are the same granularity "
+        "budget. Both sides also produce the same NUMBER of borders: "
+        "GreedyLogSum yields exactly min(border_count, distinct - 1), which "
+        "is LightGBM's rule too. Only the placement differs"
     ),
     "max_depth": "CatBoost's depth default",
     "num_leaves": (
@@ -2531,12 +2565,21 @@ def mojotrees_catboost_mode_params(spec, device, extra=None):
     else.
 
     What this arm is NOT: a claim that mojotrees can be made into CatBoost.
-    It cannot. This is depthwise at depth 6 -- a symmetric policy now exists
-    in the Mojo package but `python/mojotrees/sklearn.py` does not expose it,
-    and this harness only reaches what that file validates -- and it does no
-    row sampling, where CatBoost's default MVS takes 80 percent of the rows
-    per tree. Both are in `CATBOOST_UNMATCHABLE` and both travel with the
-    record.
+    It cannot, but the list of reasons is shorter than it was. As of
+    2026-08-16 this arm grows **symmetric** trees at depth 6, scores splits
+    with **Cosine**, and adds CatBoost's **random_strength** noise -- three
+    things it could not ask for a day earlier, not because the package
+    lacked them but because `python/mojotrees/sklearn.py` refused the keys
+    and this harness reaches only what that file validates.
+
+    What it still does not do is **sample rows**. CatBoost's default MVS
+    takes about 80 percent of them per tree, weighted by gradient magnitude;
+    this arm sees all of them. The sampler exists and is wired into the round
+    loop -- the gap is that `bindings/_mojotrees.mojo` does not parse
+    `bootstrap_type` and `model.fit` does not forward it, so the bundle
+    cannot travel from Python. That is a wiring gap rather than a capability
+    gap and it is the one entry in `CATBOOST_UNMATCHABLE` expected to close
+    next. It travels with the record either way.
 
     The override is applied to the resolved dict rather than to the
     scenario's `params`, and that is a correction rather than a shortcut.

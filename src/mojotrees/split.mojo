@@ -135,6 +135,13 @@ Nothing on the default path is conditional on it. The selector is read once
 per node into a `Bool`, the branch that reads it is loop-invariant for the
 whole scan, and `_split_gain` is not touched. The two extra accumulator
 planes the shared search needs are allocated with length 0 when it is off.
+
+The selector is carried by `ExtraTreeParams.score_function`, which
+`tree._search` and `tree._grow_oblivious_levels` pass into the two entry
+points below. It is named by `ExtraTreeParams.is_active()`, which is what
+puts a Cosine fit out of reach of every path that does not read it -- the
+device split kernel scores `G^2/(H+lambda)` and nothing else, so it raises
+or declines rather than returning an L2 tree under a Cosine label.
 """
 
 from std.math import sqrt
@@ -170,9 +177,20 @@ from .cegb import (
     check_cegb_grower_support,
     prepare_cegb_node,
 )
+
+# Re-exported, for the reason `soft_threshold_l1` above is: the two
+# `score_function` codes and their range check live beside the
+# `ExtraTreeParams.score_function` field that carries the choice, because
+# this module imports that one and the edge cannot go both ways. Their
+# public names are still `split.SCORE_L2`, `split.SCORE_COSINE` and
+# `split.check_score_function`, which is what `find_best_split`'s argument
+# and every test of it read.
 from .tree_parameters_extra import (
+    SCORE_COSINE,
+    SCORE_L2,
     ExtraTreeParams,
     apply_monotone_penalty,
+    check_score_function,
     extra_threshold_index,
     finish_leaf_output,
     passes_min_gain,
@@ -202,18 +220,13 @@ comptime _FLAG_CATEGORICAL = 2
 # `docs/design/CATBOOST_CATALOG.md` A10 for the full source reading; the
 # short form is in `_cosine_pair` below.
 #
-# Nothing here is reachable from `TreeParams` or `ExtraTreeParams` yet: this
-# lane owns `split.mojo` only, and the parameter surface lives in files it
-# does not own. The two search entry points take the selector directly and
-# default it to `SCORE_L2`.
-
-comptime SCORE_L2 = 0
-"""LightGBM's second-order gain, `_split_gain`. The default. Unchanged."""
-
-comptime SCORE_COSINE = 1
-"""CatBoost `score_function=Cosine`: `sum(-out * G) / sqrt(sum(out^2 * H))`
-over the children, minus the same functional of the unsplit node."""
-
+# The two codes and `check_score_function` are imported from
+# `tree_parameters_extra` and re-exported at the top of this file; the
+# comment there says why they live on that side of the import edge. The
+# selector reaches this module two ways and they agree by construction: a
+# caller may pass `score_function=` to either search entry point directly,
+# and `tree._search` / `tree._grow_oblivious_levels` pass
+# `params.extra.score_function`, which is the same integer.
 
 # CatBoost seeds the denominator accumulator at 1e-100 rather than 0
 # (`score_calcers.h`, `Scores.resize(splitsCount, {0, 1e-100})`). It is a
@@ -221,18 +234,6 @@ over the children, minus the same functional of the unsplit node."""
 # through the same zero-weight guard in `_cosine_out`, so the ratio is 0/0
 # without it. `min_child_hess` is what actually keeps H off the floor.
 comptime _COSINE_DEN_FLOOR = 1e-100
-
-
-def check_score_function(score_function: Int) raises:
-    """Refuse an unknown selector by name rather than falling through to the
-    default, which would silently give an L2 answer to a caller who asked for
-    something else."""
-    if score_function != SCORE_L2 and score_function != SCORE_COSINE:
-        raise Error(
-            "score_function must be split.SCORE_L2 (0) or split.SCORE_COSINE"
-            " (1); got ",
-            score_function,
-        )
 
 
 @fieldwise_init

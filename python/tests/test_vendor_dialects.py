@@ -354,7 +354,10 @@ def test_ranker_accepts_the_objective_it_trains(objective):
         {"thread_count": 4},
         {"max_ctr_complexity": 4},
         {"random_strength": 1.0},
-        {"score_function": "Cosine"},
+        # `score_function="Cosine"` is NOT in this list any more: it is
+        # honored, and its tests are in test_catboost_reachability.py. An
+        # unknown value still refuses by name, which is what belongs here.
+        {"score_function": "NewtonCosine"},
         {"bootstrap_type": "Bayesian"},
         {"bagging_temperature": 1.0},
         {"tree_method": "exact"},

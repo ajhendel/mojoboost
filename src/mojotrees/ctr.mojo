@@ -772,6 +772,40 @@ def ctr_predict_border(bin_border: Int) -> Float64:
     return Float64(Float32(bin_border) + Float32(_UI8_ROUNDING_EPS))
 
 
+def ctr_predict_bucket(value: Float64, ctr_border_count: Int) raises -> Int:
+    """`ctr_predict_border`'s rule solved for the bucket index instead.
+
+    CatBoost carries a float threshold in the model and tests
+    `x > border + 0.999999f`. mojotrees carries an **integer bin id** in the
+    tree and tests `bin > border`, so the epsilon that CatBoost puts on the
+    threshold has to be put back on the value. Solving for the bucket that makes
+    the two tests agree for every integer `border`:
+
+        x > border + 0.999999          (CatBoost)
+        <=>  (x - 0.999999) > border
+        <=>  floor(x - 0.999999) + 1 > border
+
+    so `bucket = floor(x - 0.999999) + 1`, clamped to `[0, ctr_border_count]`.
+    They differ only at the single point `x == border + 0.999999f` exactly,
+    where CatBoost's strict `>` sends the row left and this sends it right; the
+    band between `floor(x)` and this answer is `1e-6` wide in units of a bucket,
+    which is the whole of the divergence and it is stated rather than hidden.
+
+    The arithmetic is `Float32` for the reason `ctr_train_bin`'s is: CatBoost's
+    `float` is what decides the bucket, and reproducing the bucket means
+    reproducing the width.
+    """
+    if ctr_border_count < 1:
+        raise Error("ctr_border_count must be positive")
+    var shifted = Float32(value) - Float32(_UI8_ROUNDING_EPS)
+    var b = Int(floor(Float64(shifted))) + 1
+    if b < 0:
+        b = 0
+    if b > ctr_border_count:
+        b = ctr_border_count
+    return b
+
+
 # ---------------------------------------------------------------------------
 # Parameters
 # ---------------------------------------------------------------------------
@@ -975,19 +1009,60 @@ def check_ctr_complexity(max_ctr_complexity: Int) raises:
 
 
 def check_ctr_trainer_support(params: CtrParams) raises:
-    """Refuses an enabled bundle at a trainer boundary, because no trainer
-    consumes CTR features yet.
+    """Refuses an enabled bundle at a trainer boundary. See
+    `check_ctr_model_support`, which is the refusal that now actually holds.
 
-    This module manufactures numeric columns; nothing in `boosting.mojo`,
-    `tree.mojo` or `binning.mojo` appends them to a design matrix. Rather than
-    let an enabled bundle be silently dropped, a trainer that grows a CTR
-    parameter calls this and it raises. Deleting this guard is the first step of
-    the wiring lane, not a side effect of it.
+    The original reason -- "nothing appends CTR columns to a design matrix" --
+    stopped being true on 2026-08-16. `ctr_columns.mojo` builds them,
+    `binning.append_ctr_train_columns` appends them to a `BinnedMatrix`, and
+    `BinMapper.transform` and `BinMapper.bin_row` append the inference half, so
+    the mechanism reaches the histogram and reaches a score. What has NOT
+    landed is the model file: `serialize._write_mapper` has no ctr section, so a
+    fitted model would save without its tables and load scoring wrong.
+
+    This overload is kept because it takes a `CtrParams`, which is A19's own
+    bundle and is still what a caller holding one has. `check_ctr_model_support`
+    is the one the dataset path calls, and it names the real blocker.
     """
     if params.enabled:
         raise Error(
-            "ordered target statistics are built but unreached: no trainer"
-            " appends ctr columns to the design matrix yet (catalog A19)"
+            "ordered target statistics cannot be trained into a model yet:"
+            " the columns build and score, but their fitted tables have no"
+            " place in the model file, so a saved model would load without"
+            " them (catalog A19, and A29 owns serialize.mojo)"
+        )
+
+
+def check_ctr_model_support(active: Bool) raises:
+    """Refuses to turn CTR columns into a `Model`, and says why by name.
+
+    The four fitted tables (`final_ctr_class_table`, `final_ctr_mean_table`,
+    `final_ctr_counter_table`, and the counter denominator) are **model state**:
+    they are read off the target, and a model that lost them keeps every tree
+    that references a CTR column and then bins those columns as if the columns
+    were absent. That is a wrong answer that looks like a right one, which is
+    the one failure mode worth refusing loudly for.
+
+    `serialize._write_mapper` writes `n_features`, `n_bins`, the edges, the edge
+    offsets and the missing-bin table; `_write_categorical` writes the category
+    tables. Neither writes a CTR section and neither reader reads one. Adding
+    that section, bumping the format version, and calling
+    `ctr_columns.check_ctr_serializable` from `save_model`,
+    `save_multiclass_model` and `save_dataset` is catalog A29's work in
+    `serialize.mojo`, which the CTR wiring lane does not own.
+
+    Until then this raises at every `trainset.train_dataset*` entry point, so a
+    CTR-carrying model is never produced and therefore never saved wrong.
+    Deleting this guard is the export lane's first step, not a side effect of
+    anything here.
+    """
+    if active:
+        raise Error(
+            "a dataset carrying ctr columns cannot be trained into a model:"
+            " the fitted ctr tables are model state (catalog A19) and the"
+            " mojotrees model format has no ctr section, so the model would"
+            " save without them and load scoring wrong. serialize.mojo and the"
+            " format version belong to the model-export lane (catalog A29)"
         )
 
 

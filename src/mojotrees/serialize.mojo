@@ -91,6 +91,13 @@ nothing downstream can rederive.
 from std.memory import bitcast
 
 from .binning import MAX_BINS, BinMapper, BinnedMatrix, no_missing_bins
+# The CTR serialization guard. A fitted CTR table is MODEL STATE -- it is
+# built from the target -- and this format has no section for it, so a
+# CTR-carrying model written today would load with empty tables, keep
+# every tree referencing its CTR columns, and bin those columns as if the
+# feature were absent. That is a wrong answer that looks right. Refusing
+# to write beats writing something that loads.
+from .ctr_columns import check_ctr_serializable
 from .categorical import CAT_BITSET_WORDS, CategoricalSpec
 from .boosting import Booster, MulticlassBooster
 from .linear_tree import (
@@ -531,6 +538,7 @@ def save_model(
     passing a list of the wrong length is refused rather than silently
     dropped, since a wrong name is worse than no name.
     """
+    check_ctr_serializable(model.mapper.ctr)
     _check_feature_names(feature_names, model.mapper.n_features)
     var out = String("")
     out += _MAGIC
@@ -570,6 +578,7 @@ def save_multiclass_model(
     text format. Trees keep their round-major order, one per class per
     round, which is what recovers the iteration a tree belongs to.
     `feature_names` behaves exactly as it does in `save_model`."""
+    check_ctr_serializable(model.mapper.ctr)
     _check_feature_names(feature_names, model.mapper.n_features)
     var out = String("")
     out += _MAGIC
@@ -1109,6 +1118,7 @@ def save_dataset(dataset: Dataset, path: String) raises:
     values it was fitted from, so `Dataset.has_raw()` is false on it and
     `subset` raises. Use `Dataset.subset` before saving, not after loading.
     """
+    check_ctr_serializable(dataset.mapper.ctr)
     var out = String("")
     out += _DATASET_MAGIC + " " + _DATASET_VERSION + " "
     out += String(CURRENT_FORMAT_VERSION) + "\n"

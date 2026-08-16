@@ -87,6 +87,7 @@ from .tree_parameters_extra import (
     check_feature_pre_filter,
     parse_derivative_precision,
     parse_monotone_method,
+    parse_score_function,
 )
 
 # `TrainConfig.objective` when the parameter string selects softmax
@@ -656,8 +657,19 @@ def _validate(
     # The data-independent half of the remaining tree controls. The per-
     # feature vectors are checked against the dataset later, in
     # `tree.grow_tree`, because a parameter string cannot carry one.
+    # `scale_computed_per_tree` on the CPU arm only: the dense CPU round
+    # loops compute `random_score_scale` per tree onto their own copy of
+    # the bundle, so a positive `random_strength` beside a zero scale is
+    # legitimate HERE and a defect anywhere else. The device and
+    # distributed loops do not compute it, so they keep the refusal.
+    #
+    # Known narrow gap, and it is a refusal rather than a silent drop: a
+    # CPU MULTICLASS fit passes this and then raises at `split.mojo`'s
+    # noise read mid-fit, because `_boost_rounds_multiclass` is not
+    # wired. A dedicated refusal here would give a better message.
     config.booster.tree.extra.check_scalars(
-        config.booster.tree.min_data_in_leaf
+        config.booster.tree.min_data_in_leaf,
+        scale_computed_per_tree=(config.device == CPU_DEVICE),
     )
     # Exclusive feature bundling: the knobs are range-checked whether or not
     # the switch is on, so a bad value is named here rather than at the first
@@ -1014,32 +1026,34 @@ def parse_params(spec: String) raises -> TrainConfig:
                     " log. 'Silent' is what this surface already does and is"
                     " accepted",
                 )
-        # CatBoost's `score_function`, the split-gain shape. mojotrees
-        # scores every split as `G^2 / (H + lambda)`, which is CatBoost's
-        # `L2` (see the note in tree_parameters_extra.mojo), so naming `L2`
-        # states what already happens and is accepted.
+        # CatBoost's `score_function`, the functional a split candidate is
+        # scored by. `L2` is `G^2 / (H + lambda)`, which is what mojotrees
+        # has always maximized and is the default; `Cosine` is CatBoost's own
+        # default, a ratio rather than a sum
+        # (`tree_parameters_extra.SCORE_COSINE`, and
+        # docs/design/CATBOOST_CATALOG.md A10 for the derivation).
         #
-        # `Cosine`, CatBoost's own default, is refused rather than accepted
-        # as an equivalent, even though at THIS library's stock settings it
-        # would pick the same split: Cosine's numerator is the L2 sum and at
-        # `lambda_l2 = 0` its denominator collapses onto the same
-        # expression, so it degenerates to `sqrt(L2)` and the argmax cannot
-        # move (docs/design/CATBOOST_CATALOG.md, A10 section 3). That
-        # equivalence is conditional on `lambda_l2 = 0`, which is stock but
-        # is a value a user may change, and it bites under leaf-wise growth,
-        # which is the default. Accepting the name on a condition the user
-        # can silently break is the shape this package refuses.
+        # Both are now honored rather than one of them refused. The field
+        # this writes, `ExtraTreeParams.score_function`, is read by
+        # `tree._search` and `tree._grow_oblivious_levels`, which pass it
+        # into `split.find_best_split` and `split.find_best_split_shared`;
+        # `ExtraTreeParams.is_active()` names it, so the device split search
+        # -- which scores `G^2/(H+lambda)` and nothing else -- refuses or
+        # declines instead of returning an L2 tree under a Cosine label.
+        #
+        # Worth stating because it is the reason the two are NOT aliases:
+        # Cosine's numerator is the L2 sum and at `lambda_l2 = 0` its
+        # denominator collapses onto the same expression, so it degenerates
+        # to `sqrt(L2)` and the argmax *within one node* cannot move.
+        # `lambda_l2 = 0` is this package's stock value. It is still not an
+        # alias there: leaf-wise growth, the default, compares gains from
+        # different parents, and `sqrt` does not preserve that ordering
+        # (CATBOOST_CATALOG A10 section 5). The CatBoost-mode arm sets
+        # `lambda_l2 = 3`, which is off the degenerate point outright.
         elif key == "score_function":
-            if lowered != "l2":
-                raise Error(
-                    "score_function '",
-                    value,
-                    "' is not implemented; mojotrees scores a split as"
-                    " G^2/(H+lambda), which is CatBoost's 'L2', and that is"
-                    " the only value accepted. 'Cosine' picks the same split"
-                    " at lambda_l2=0, where it degenerates to sqrt(L2), but"
-                    " not above it, so it is not accepted as an alias",
-                )
+            config.booster.tree.extra.score_function = parse_score_function(
+                lowered
+            )
         # CatBoost's `max_ctr_complexity`. Refused for any value, its own
         # default included: CTRs -- ordered target statistics over
         # categorical combinations -- are the feature construction the name
@@ -1047,13 +1061,28 @@ def parse_params(spec: String) raises -> TrainConfig:
         # is LightGBM's category-set split). A number here would ask for
         # combinations that are never built.
         elif key == "max_ctr_complexity":
-            raise Error(
-                "max_ctr_complexity is not implemented: it bounds the arity"
-                " of CatBoost's target-statistic (CTR) feature combinations,"
-                " and mojotrees builds none. Its categorical handling is"
-                " LightGBM's category-set split, under max_cat_to_onehot,"
-                " max_cat_threshold, cat_smooth and cat_l2"
-            )
+            # Complexity 1 is BUILT now (ctr_columns.mojo, catalog A19) and a
+            # simple projection reaches a design matrix. Above 1 needs the
+            # candidate enumeration driven by a grow loop, and nothing drives
+            # it, so it is refused by name.
+            #
+            # This key only bounds the arity. It does NOT turn CTRs on, and
+            # there is deliberately no parameter-string name that does,
+            # because a fit that built CTR columns cannot be SAVED yet -- the
+            # tables are model state and the format has no section for them.
+            # `ctr.check_ctr_model_support` refuses at every model-producing
+            # entry point and `serialize.check_ctr_serializable` refuses at
+            # every writer.
+            var complexity = _parse_int(key, value)
+            if complexity != 1:
+                raise Error(
+                    "max_ctr_complexity above 1 is not implemented: the"
+                    " projection enumeration exists"
+                    " (ctr_combinations.grow_tree_ctr_projections) but no"
+                    " grow loop drives it, so a combination would never be"
+                    " built. 1, the value CatBoost itself resolves to for any"
+                    " fit under 200 iterations, is accepted"
+                )
         # CatBoost's `random_strength`, the only name on this surface that is
         # not LightGBM's. 0.0, the default, is LightGBM's behavior exactly. A
         # positive value parses and then fails validation with a sentence

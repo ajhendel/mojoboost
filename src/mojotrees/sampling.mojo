@@ -133,6 +133,15 @@ A11 for the source citations.
 bootstrap's are, and more strongly: see `mvs_varies_hessian` and
 `check_mvs_hessian_declaration`.
 
+**The wire is `BootstrapParams` and `bootstrap_round`.** The two bundles are
+paired into one `bootstrap_type` argument and one per-round entry point, in
+`goss.goss_round`'s shape and in `goss_round`'s place in a round loop:
+`boosting._boost_rounds` and `boosting.train_with_valid` call it immediately
+after the gradient fill. `BootstrapParams.check_hessian_declaration` is how a
+trainer proves it withdrew the constant-hessian declaration, and
+`check_bootstrap_honored` is what a trainer without the call in its loop uses
+instead of ignoring the bundle.
+
 **Read `check_mvs_reg` before touching the regularizer.** MVS's lambda is
 `mvs_reg` and has nothing to do with `lambda_l2`; it is the only floor under a
 bare denominator, its default is derived from the data rather than being a
@@ -1698,6 +1707,316 @@ def mvs_kept_rows(weights: List[Float64]) raises -> List[Int]:
         if weights[r] != 0.0:
             rows.append(r)
     return rows^
+
+
+@fieldwise_init
+struct BootstrapParams(Copyable, Movable):
+    """`bootstrap_type` as one bundle, so a trainer takes one argument.
+
+    CatBoost's `bootstrap_type` is a single enum and cannot name two samplers
+    at once; ours is two independent bundles and could, so this pairs them and
+    `validate` runs `check_bootstrap_type_exclusive` over the pair. Every
+    trainer that samples rows takes this rather than the two bundles, which is
+    what makes the exclusivity impossible to forget at a call site.
+
+    The mapping from CatBoost's option surface:
+
+    - `bootstrap_type=No` (and mojotrees's default) is `disabled()`: both
+      bundles off, no draw taken, no weight vector materialized, and every fit
+      byte for byte the fit it is today.
+    - `bootstrap_type=MVS` is `mvs_at`, and `subsample` is its rate. CatBoost's
+      CPU default for both objectives this project benchmarks, at
+      `subsample=0.8` (`DEFAULT_MVS_SUBSAMPLE`).
+    - `bootstrap_type=Bayesian` is `bayesian_at`, and `bagging_temperature` is
+      its knob.
+    - `bootstrap_type=Bernoulli` is `bagging.BaggingParams` under mojotrees's
+      own name and is not here at all; `canonical_bootstrap_type` refuses the
+      spelling by name rather than as an unknown value.
+
+    **Both samplers put a per-row weight on the round's derivatives**, so a fit
+    with either on has a per-row hessian. `varies_hessian` states that and
+    `check_hessian_declaration` refuses a constant-hessian declaration beside
+    it; a round loop must call the second one after it has decided, which is
+    the whole point of the pair existing (see `mvs_varies_hessian` and
+    `bayesian_bootstrap_varies_hessian` for the argument, and
+    `boosting.round_has_constant_hessian` for why the guard cannot live there).
+    """
+
+    var mvs: MvsBootstrapParams
+    var bayesian: BayesianBootstrapParams
+
+    @staticmethod
+    def disabled() -> BootstrapParams:
+        """`bootstrap_type=No`: neither sampler, which is the library
+        default and the arm every existing fit is on."""
+        return BootstrapParams(
+            MvsBootstrapParams.disabled(), BayesianBootstrapParams.disabled()
+        )
+
+    @staticmethod
+    def mvs_at(
+        subsample: Float64 = DEFAULT_MVS_SUBSAMPLE,
+        seed: Int = DEFAULT_BOOTSTRAP_SEED,
+    ) -> BootstrapParams:
+        """`bootstrap_type=MVS` with `mvs_reg` left unset, so the lambda is
+        derived from the data every tree exactly as CatBoost's is. This is
+        CatBoost's own CPU default configuration."""
+        return BootstrapParams(
+            MvsBootstrapParams.enable(subsample, seed),
+            BayesianBootstrapParams.disabled(),
+        )
+
+    @staticmethod
+    def mvs_with_reg(
+        reg: Float64,
+        subsample: Float64 = DEFAULT_MVS_SUBSAMPLE,
+        seed: Int = DEFAULT_BOOTSTRAP_SEED,
+    ) -> BootstrapParams:
+        """`bootstrap_type=MVS` with an explicit `mvs_reg`. `validate` refuses
+        exactly 0; `check_mvs_reg` says why at length."""
+        return BootstrapParams(
+            MvsBootstrapParams.enable_with_reg(reg, subsample, seed),
+            BayesianBootstrapParams.disabled(),
+        )
+
+    @staticmethod
+    def bayesian_at(
+        temperature: Float64 = DEFAULT_BAGGING_TEMPERATURE,
+        seed: Int = DEFAULT_BOOTSTRAP_SEED,
+    ) -> BootstrapParams:
+        """`bootstrap_type=Bayesian` at `bagging_temperature`."""
+        return BootstrapParams(
+            MvsBootstrapParams.disabled(),
+            BayesianBootstrapParams.enable(temperature, seed),
+        )
+
+    def enabled(self) -> Bool:
+        """Whether any bootstrap is configured. Deliberately coarser than
+        `MvsBootstrapParams.samples_rows` and
+        `BayesianBootstrapParams.draws_weights`: those two answer "will this
+        draw move a number", and this one answers "is a sampler configured",
+        which is the question every fit-lifetime decision has to ask."""
+        return self.mvs.enabled or self.bayesian.enabled
+
+    def validate(self) raises:
+        """One `bootstrap_type` at a time, and each bundle's own ranges."""
+        check_bootstrap_type_exclusive(self.mvs, self.bayesian)
+        self.mvs.validate()
+        self.bayesian.validate()
+
+    def varies_hessian(self) -> Bool:
+        """Whether a fit configured this way has a per-row hessian, so that
+        `histogram.CONSTANT_HESSIAN` must not be declared for it. The union of
+        `mvs_varies_hessian` and `bayesian_bootstrap_varies_hessian`, both of
+        which test `enabled` alone and for the reason they each give."""
+        return mvs_varies_hessian(self.mvs) or (
+            bayesian_bootstrap_varies_hessian(self.bayesian)
+        )
+
+    def check_hessian_declaration(self, const_hessian: Bool) raises:
+        """Refuse a constant-hessian declaration beside an active bootstrap.
+
+        Both twins, in one call. A round loop calls this once per fit **after**
+        it has computed its declaration, so the failure mode of forgetting the
+        exclusion is an exception at fit setup rather than a hessian plane
+        rebuilt from the row count while the true hessian is the draw.
+        """
+        check_mvs_hessian_declaration(self.mvs, const_hessian)
+        check_bayesian_bootstrap_hessian_declaration(
+            self.bayesian, const_hessian
+        )
+
+
+def check_bootstrap_honored(params: BootstrapParams, where: String) raises:
+    """Refuse an active bootstrap on an entry point that does not run one.
+
+    The shape `efb.check_bundling_honored` and
+    `ordered_boosting.check_ordered_honored` already take, and it is here for
+    the same reason: a trainer that accepts a sampler bundle and never draws
+    from it trains an unsampled model and reports a sampled one. Every trainer
+    that does not thread `bootstrap_round` into its round loop calls this
+    instead of ignoring the bundle.
+    """
+    if params.enabled():
+        raise Error(
+            "bootstrap_type is not implemented by ",
+            where,
+            ": the MVS and Bayesian draws are per-round work and this entry"
+            " point's loop does not call sampling.bootstrap_round, so the fit"
+            " would be unsampled. Use boosting.train, boosting.train_more or"
+            " boosting.train_with_valid, or drop bootstrap_type",
+        )
+
+
+def apply_bootstrap_weights(
+    mut grad: List[Float64],
+    mut hess: List[Float64],
+    weights: List[Float64],
+    n_rows: Int,
+    n_outputs: Int = 1,
+) raises:
+    """Multiply one round's derivatives by the drawn per-row weight, in place.
+
+    This is CatBoost's `CalcWeightedData`, first line:
+
+        sampleWeightedDerivativesData[z] =
+            weightedDerivativesData[z] * sampleWeightsData[z]
+
+    with two things worth being exact about, because getting either wrong is a
+    silently wrong model rather than an error.
+
+    **`weights` is the DRAW alone, not the draw times the user's
+    `sample_weight`.** CatBoost multiplies its *already user-weighted*
+    derivatives by the raw draw and only afterwards folds the user's weights
+    into `SampleWeights` (`SampleWeights[i] *= learnWeights[i]`). A caller here
+    has already filled `grad` and `hess` through
+    `boosting._fill_grad_hess(..., sample_weight, ...)`, so the user's weight
+    is in the derivatives; passing the product would square it.
+
+    **The product CatBoost keeps in `SampleWeights` is `hess`.** Under an
+    objective whose unweighted hessian is the literal 1.0, this leaves
+    `hess[r] = draw[r] * sample_weight[r]`, which is exactly the vector
+    CatBoost's leaf denominators sum -- so no second weight vector has to be
+    carried, and the fit's leaf values and `min_child_hess` counts are the
+    weighted ones by construction. It is also precisely why a bootstrapped fit
+    must not declare a constant hessian.
+
+    Every row is scaled by its own weight and reads nothing else, so any
+    partition of the row range across workers produces the identical buffers.
+    """
+    if n_rows < 0:
+        raise Error("n_rows must be nonnegative")
+    if n_outputs < 1:
+        raise Error("n_outputs must be positive")
+    if len(weights) != n_rows:
+        raise Error("bootstrap weight length must match the row count")
+    var need = n_rows * n_outputs
+    if len(grad) != need or len(hess) != need:
+        raise Error(
+            "gradient and hessian buffers must hold n_rows * n_outputs entries"
+        )
+    for r in range(n_rows):
+        var w = weights[r]
+        var base = r * n_outputs
+        for k in range(n_outputs):
+            grad[base + k] = grad[base + k] * w
+            hess[base + k] = hess[base + k] * w
+
+
+def bootstrap_round(
+    mut rows: List[Int],
+    mut grad: List[Float64],
+    mut hess: List[Float64],
+    mut weights: List[Float64],
+    mut audit: MvsAudit,
+    params: BootstrapParams,
+    n_rows: Int,
+    tree_index: Int,
+    auto_lambda: Float64,
+    n_outputs: Int = 1,
+) raises:
+    """Run one round's bootstrap: draw the per-row weights, scale the round's
+    derivatives by them, and hand back the row set the split search should see.
+
+    Deliberately the same shape as `goss.goss_round`, and it sits in the same
+    place in a round loop, immediately after the gradient fill: both are row
+    samplers that read this round's derivatives, rewrite them, and may replace
+    the row list. A disabled bundle validates and returns having touched
+    nothing at all -- not `rows`, not `grad`, not `hess`, and it leaves
+    `weights` **empty** rather than filled with 1.0s, which is the convention
+    `refresh_bayesian_bootstrap` and `refresh_mvs_bootstrap` already state and
+    matters because a vector of ones handed on as a `sample_weight` would cost
+    an unbootstrapped fit its constant-hessian specialization for nothing.
+
+    Ordering inside a round, which is not free to move:
+
+    1. The caller fills `grad`/`hess` from the raw scores and the user's
+       `sample_weight`. Those are CatBoost's `WeightedDerivatives`.
+    2. The caller computes `random_strength`'s per-tree scale from `grad` if it
+       wants one. CatBoost's `CalcScoreStDev` reads `WeightedDerivatives`, and
+       `Bootstrap` writes `SampleWeightedDerivatives`, so the scale is taken
+       **before** this call and is not affected by the draw.
+    3. This call. MVS's row magnitudes are read from `grad` as it arrives, for
+       the same reason: `Bootstrap` is handed the pre-bootstrap derivatives.
+    4. Growth, on the rewritten `grad`/`hess` and the returned `rows`.
+
+    `auto_lambda` is what `MvsBootstrapParams.resolve_reg` uses when the user
+    left `mvs_reg` unset, and it is a parameter because the branch
+    `TMvsSampler::GetLambda` takes needs the previous tree: the caller passes
+    `mvs_auto_lambda_from_gradients(grad, n_rows, n_outputs)` on the first tree
+    of the ensemble and `mvs_auto_lambda_from_leaf_values(...)` on every tree
+    after it. It is ignored entirely when the bundle is Bayesian or when
+    `mvs_reg` was set explicitly.
+
+    **Rows.** MVS is a row *dropper* (`SetControlNoZeroWeighted`), so its
+    zero-weight rows are compacted out into an ascending row list, which is
+    what makes `min_data_in_leaf` count the rows the tree was actually fitted
+    on. The Bayesian bootstrap keeps every row and never touches `rows`. Two
+    refusals guard the compaction rather than letting it go quietly wrong:
+    `rows` must arrive empty under MVS, because an empty list means "every row"
+    everywhere in mojotrees and silently intersecting a bag with a draw would
+    be a third sampler nobody asked for; and a draw that kept no row at all is
+    refused rather than written back as an empty list, which would invert into
+    "every row" and train a full-data tree while reporting a sampled one.
+
+    **Determinism.** Nothing here reads a worker count, a block layout, or a
+    running counter: every weight is a function of `(seed, tree_index, row)`
+    alone (`_mvs_stream`, `_bootstrap_stream`), the MVS threshold is solved per
+    fixed-size block over candidates in row order, and the scaling is
+    elementwise. The buffers are identical at any `MOJOTREES_NUM_WORKERS` and
+    on any machine.
+    """
+    params.validate()
+    if not params.enabled():
+        weights.clear()
+        audit = MvsAudit.empty()
+        return
+    if n_rows < 0:
+        raise Error("n_rows must be nonnegative")
+    if n_outputs < 1:
+        raise Error("n_outputs must be positive")
+
+    # The draw alone: an empty `base_weight` is the "unweighted" convention,
+    # and it is the right one here because the caller's `sample_weight` is
+    # already inside `grad` and `hess`. See `apply_bootstrap_weights`.
+    var no_base = List[Float64]()
+    if params.bayesian.enabled:
+        audit = MvsAudit.empty()
+        refresh_bayesian_bootstrap(
+            weights, params.bayesian, no_base, n_rows, tree_index
+        )
+    else:
+        if len(rows) != 0:
+            raise Error(
+                "mvs bootstrap owns the round's row set and cannot compose"
+                " with another row sampler: it drops its own zero-weight rows,"
+                " so a bag arriving here would be silently intersected with a"
+                " draw that never saw it"
+            )
+        refresh_mvs_bootstrap(
+            weights,
+            audit,
+            params.mvs,
+            grad,
+            no_base,
+            n_rows,
+            tree_index,
+            auto_lambda,
+            n_outputs,
+        )
+    apply_bootstrap_weights(grad, hess, weights, n_rows, n_outputs)
+    if not params.mvs.enabled:
+        return
+    var kept = mvs_kept_rows(weights)
+    if len(kept) == 0 and n_rows > 0:
+        raise Error(
+            "the mvs draw kept no rows at all. An empty row list means 'every"
+            " row' everywhere in mojotrees, so this cannot be handed on;"
+            " leave mvs_reg unset so the lambda is derived from the data, or"
+            " raise subsample"
+        )
+    if len(kept) != n_rows:
+        rows = kept^
 
 
 def canonical_bootstrap_type(value: String) raises -> String:

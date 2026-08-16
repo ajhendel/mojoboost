@@ -270,6 +270,16 @@ from mojotrees.serialize import (
 from mojotrees.growth_policy import parse_grow_policy
 from mojotrees.tree import Tree, TreeParams
 
+# CatBoost's `score_function`. Parsed here rather than in
+# `extra_params_from_mapping` for the reason `leaf_estimation_iterations` is:
+# that parser is also `extra_params_check`'s, and this refusal needs the
+# entry point, which only `_parse_params` knows.
+from mojotrees.tree_parameters_extra import (
+    SCORE_L2,
+    parse_score_function,
+    score_function_name,
+)
+
 
 @export
 def PyInit__mojotrees() abi("C") -> PythonObject:
@@ -636,6 +646,8 @@ def _parse_params(
     entry: String = "",
     ordered_ok: Bool = False,
     leaf_estimation_ok: Bool = False,
+    score_function_ok: Bool = False,
+    random_strength_ok: Bool = False,
 ) raises -> BoosterParams:
     """The `BoosterParams` a fit runs under, from the params mapping.
 
@@ -652,8 +664,9 @@ def _parse_params(
     both alone (the sparse fits and continued training) is CPU-only by
     construction.
 
-    **`ordered_ok` and `leaf_estimation_ok` are the same declaration for the
-    two CatBoost mechanisms, and they default to `False` on purpose.** The
+    **`ordered_ok`, `leaf_estimation_ok` and `score_function_ok` are the same
+    declaration for three CatBoost mechanisms, and they default to `False` on
+    purpose.** The
     default of a reachability flag is the direction a forgotten call site
     fails in, and this repository has now shipped five mechanisms that were
     built and never reached because the default was "accept". A new entry
@@ -674,6 +687,19 @@ def _parse_params(
       not, and the near miss is worth recording: it routes to
       `custom_metric.fit_with_metrics`, which is a different round loop from
       `boosting.train_with_valid` and reads the field nowhere.
+    - `score_function_ok`: CatBoost's `score_function`
+      (src/mojotrees/split.mojo, `SCORE_COSINE`). Honored by every trainer
+      that elects a split through `tree._search` or
+      `tree._grow_oblivious_levels`, which is every grower in this package
+      except the distributed prototype: `tree.grow_tree`,
+      `tree_sparse.grow_tree_sparse`, `train_gpu` and
+      `train_gpu_sparse.grow_tree_gpu_sparse` all route through those two,
+      and the device split searches decline or refuse on
+      `ExtraTreeParams.is_active()`, which names the field. The one entry
+      point that must pass False is `distributed_train_local`:
+      `distributed_strategies` calls `split.find_best_split` itself, at its
+      `SCORE_L2` default, so a Cosine fit there would be an L2 tree under a
+      Cosine label.
     """
     var who = entry.copy()
     if who.byte_length() == 0:
@@ -702,6 +728,47 @@ def _parse_params(
             " train_gpu.train_gpu_with_valid, which this estimator reaches"
             " through a dense, single-output fit without a custom objective."
             " 1 is LightGBM's behavior and mojotrees's, and is the default",
+        )
+    # CatBoost's `random_strength`. The noise and its per-tree scale are both
+    # implemented; the dense CPU round loops compute the scale onto their own
+    # copy of the bundle before growth, which is why the strength can arrive
+    # here beside a zero `random_score_scale` and still be honest. A loop that
+    # does NOT compute a scale must refuse rather than train a model that
+    # ignored the setting, which is what `random_strength_ok` selects.
+    extra.random_strength = Float64(py=params["random_strength"])
+    if extra.random_strength > 0.0 and not random_strength_ok:
+        raise Error(
+            "random_strength is not honored by ",
+            who,
+            ": the per-split noise is added by split.find_best_split and"
+            " staged on the device by GpuSplitSearcher, but its per-tree"
+            " scale is computed only by the dense CPU round loops"
+            " (boosting._round_random_score_scale). Multiclass, distributed"
+            " and the device loops do not compute one, so accepting it here"
+            " would train a model that silently ignored it. 0.0 is"
+            " LightGBM's behavior and mojotrees's, and is accepted.",
+        )
+
+    # CatBoost's `score_function`, folded onto the same bundle for the same
+    # reason. The wrapper sends the name lowercased, which is the contract
+    # `parse_score_function` states and `device_policy.parse_device` and
+    # `sampling.canonical_bootstrap_type` already keep, so the parameter
+    # string and the estimator resolve one spelling to one code.
+    extra.score_function = parse_score_function(
+        String(py=params["score_function"])
+    )
+    if extra.score_function != SCORE_L2 and not score_function_ok:
+        raise Error(
+            "score_function=",
+            score_function_name(extra.score_function),
+            " is not implemented by ",
+            who,
+            "; the split search that reads it is tree._search and"
+            " tree._grow_oblivious_levels, which every grower in this"
+            " package reaches except the distributed prototype"
+            " (distributed_strategies calls split.find_best_split at its"
+            " SCORE_L2 default). 'L2' is what mojotrees has always scored"
+            " with -- G^2/(H+lambda) -- and is the default",
         )
     var tree = TreeParams(
         Int(py=params["num_leaves"]),
@@ -916,7 +983,14 @@ def fit(
         cpu=device == CPU_DEVICE,
         entry=String("fit"),
         ordered_ok=device == CPU_DEVICE,
+        # Same condition and the same reason: `model.fit` routes a CPU
+        # run to `boosting.train`, whose round loop is the one that
+        # computes `random_score_scale` per tree. Every other entry
+        # point in this file leaves the flag False and refuses a
+        # positive strength by name rather than dropping it.
+        random_strength_ok=device == CPU_DEVICE,
         leaf_estimation_ok=True,
+        score_function_ok=True,
     )
     var weights = _parse_weights(params, nr)
     var boosting = _parse_boosting(params)
@@ -1047,6 +1121,13 @@ def distributed_train_local(
     var nf = Int(py=n_features)
     var features = f64_view(Int(py=x_addr), nr * nf)
     var target = f64_buffer(Int(py=y_addr), nr)
+    # `score_function_ok` is left at its default of False here and passed
+    # True at every other entry point below, and this is the one place the
+    # difference is real rather than cautious: the distributed prototype
+    # elects a split through `distributed_strategies`, which calls
+    # `split.find_best_split` itself and leaves `score_function` at its
+    # `SCORE_L2` default, so a Cosine fit routed here would be an L2 tree
+    # reported as a Cosine one. Refused by name instead.
     var bp = _parse_params(
         params, nf, cpu=True, entry=String("distributed_train_local")
     )
@@ -1093,7 +1174,11 @@ def fit_custom(
     var features = f64_view(Int(py=x_addr), nr * nf)
     var target = f64_buffer(Int(py=y_addr), nr)
     var bp = _parse_params(
-        params, nf, unbundled="fit_custom", entry=String("fit_custom")
+        params,
+        nf,
+        unbundled="fit_custom",
+        entry=String("fit_custom"),
+        score_function_ok=True,
     )
     var weights = _parse_weights(params, nr)
 
@@ -1191,7 +1276,10 @@ def fit_with_metrics(
     # bit-identical arms until `test_catboost_reachability` demanded they
     # differ.
     var bp = _parse_params(
-        params, nf, unbundled="fit_with_metrics"
+        params,
+        nf,
+        unbundled="fit_with_metrics",
+        score_function_ok=True,
     )
     var weights = _parse_weights(params, nr)
 
@@ -1427,7 +1515,12 @@ def fit_multiclass_with_metrics(
     var nc = Int(py=n_classes)
     var features = f64_view(Int(py=x_addr), nr * nf)
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf, unbundled="fit_multiclass_with_metrics")
+    var bp = _parse_params(
+        params,
+        nf,
+        unbundled="fit_multiclass_with_metrics",
+        score_function_ok=True,
+    )
     var weights = _parse_weights(params, nr)
     var pred_p = _pred_pointer(params)
     var valid_sets = _parse_valid_sets(params, nf)
@@ -1491,7 +1584,12 @@ def fit_ranker_with_metrics(
     var nf = Int(py=n_features)
     var features = f64_view(Int(py=x_addr), nr * nf)
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf, unbundled="fit_ranker_with_metrics")
+    var bp = _parse_params(
+        params,
+        nf,
+        unbundled="fit_ranker_with_metrics",
+        score_function_ok=True,
+    )
     var advanced = _parse_advanced_rank_params(params)
     var positions = _parse_positions(params, nr)
     var weights = _parse_weights(params, nr)
@@ -1682,6 +1780,7 @@ def fit_multiclass(
         nf,
         cpu=device == CPU_DEVICE,
         entry=String("the multiclass trainers"),
+        score_function_ok=True,
     )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass(
@@ -1716,7 +1815,10 @@ def fit_csc(
     var nr = csc.n_rows
     var target = f64_buffer(Int(py=y_addr), nr)
     var bp = _parse_params(
-        params, csc.n_features, entry=String("a sparse (CSC) fit")
+        params,
+        csc.n_features,
+        entry=String("a sparse (CSC) fit"),
+        score_function_ok=True,
     )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_csc(
@@ -1747,7 +1849,10 @@ def fit_multiclass_csc(
     var nr = csc.n_rows
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(
-        params, csc.n_features, entry=String("a sparse (CSC) fit")
+        params,
+        csc.n_features,
+        entry=String("a sparse (CSC) fit"),
+        score_function_ok=True,
     )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass_csc(
@@ -1906,7 +2011,11 @@ def fit_ranker(
     var features = f64_view(Int(py=x_addr), nr * nf)
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(
-        params, nf, unbundled="fit_ranker", entry=String("fit_ranker")
+        params,
+        nf,
+        unbundled="fit_ranker",
+        entry=String("fit_ranker"),
+        score_function_ok=True,
     )
     var weights = _parse_weights(params, nr)
     var advanced = _parse_advanced_rank_params(params)
@@ -3213,6 +3322,7 @@ def train_dataset(
             d[].num_feature(),
             cpu=device == CPU_DEVICE,
             entry=String("a Dataset fit"),
+            score_function_ok=True,
         ),
         Float64(py=params["alpha"]),
         device,
@@ -3238,6 +3348,7 @@ def train_dataset_multiclass(
             d[].num_feature(),
             cpu=device == CPU_DEVICE,
             entry=String("a Dataset fit"),
+            score_function_ok=True,
         ),
         device,
         _parse_bagging(params),
@@ -3258,6 +3369,7 @@ def train_dataset_ranker(
             params,
             d[].num_feature(),
             unbundled="train_dataset_ranker",
+            score_function_ok=True,
         ),
         _parse_advanced_rank_params(params),
         _parse_positions(params, d[].num_data()),
@@ -3279,7 +3391,10 @@ def booster_update(
         m[],
         d[],
         _parse_params(
-            params, d[].num_feature(), entry=String("a Dataset fit")
+            params,
+            d[].num_feature(),
+            entry=String("a Dataset fit"),
+            score_function_ok=True,
         ),
         Float64(py=params["alpha"]),
         _parse_bagging(params),
@@ -3300,7 +3415,10 @@ def booster_update_multiclass(
         m[],
         d[],
         _parse_params(
-            params, d[].num_feature(), entry=String("a Dataset fit")
+            params,
+            d[].num_feature(),
+            entry=String("a Dataset fit"),
+            score_function_ok=True,
         ),
         _parse_bagging(params),
         _parse_goss(params),
