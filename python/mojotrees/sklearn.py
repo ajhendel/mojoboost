@@ -1369,34 +1369,20 @@ class _Base(_ParamsMixin):
         `None` everywhere is "not named", and nothing is checked for it.
         """
         if self.random_strength is not None:
-            if float(self.random_strength) != 0.0:
-                # Not a missing implementation: `split.find_best_split` adds
-                # the seeded normal, `GpuSplitSearcher.stage_random_score`
-                # stages it on the device, and
-                # `ExtraTreeParams.random_score_stdev` is the standard
-                # deviation both read. The missing piece is one factor of
-                # that product. CatBoost's scoreStDev is `random_strength *
-                # derivativesStDevFromZero * modelSizeDecrease`, and the last
-                # two are properties of the ensemble at the current
-                # iteration; `random_score_scale_from_gradients` computes
-                # them and **has no callers**, so no trainer puts a scale on
-                # the bundle and `check_random_strength` refuses a positive
-                # strength beside a zero scale. Setting it from here would
-                # therefore raise in the native layer anyway; this message is
-                # the one that says which line is missing.
-                raise ValueError(
-                    "random_strength must be 0.0 here: the per-split score "
-                    "noise is implemented (split.find_best_split and "
-                    "gpu_split_search both add it), but its per-tree scale "
-                    "is not supplied by any trainer -- "
-                    "tree_parameters_extra.random_score_scale_from_gradients "
-                    "computes CatBoost's derivativesStDevFromZero * "
-                    "modelSizeDecrease and has no caller, so "
-                    "ExtraTreeParams.random_score_scale stays 0.0 and "
-                    "ExtraTreeParams.check_random_strength refuses the pair. "
-                    "0.0 is LightGBM's behavior and mojotrees's, and is "
-                    "accepted."
-                )
+            if float(self.random_strength) < 0.0:
+                raise ValueError("random_strength must be nonnegative")
+            # No longer refused. `random_score_scale_from_gradients` had no
+            # caller when the old block was written; the dense CPU round
+            # loops now compute the scale per tree onto their own copy of the
+            # bundle (`boosting._round_random_score_scale`) before growth, so
+            # the pair `random_strength > 0` with a zero scale is legitimate
+            # at parameter time and `params.mojo` declares that by passing
+            # `scale_computed_per_tree` on the CPU arm.
+            #
+            # Still refused deeper, by design rather than by omission:
+            # multiclass, distributed and the device round loops do not
+            # compute a scale, so a fit on any of those raises rather than
+            # training a model that ignored the setting.
         if self.max_ctr_complexity is not None:
             raise ValueError(
                 "max_ctr_complexity is not reachable: CatBoost's "
@@ -1918,6 +1904,14 @@ class _Base(_ParamsMixin):
                 if self.score_function is None
                 else str(self.score_function).lower()
             ),
+            # CatBoost's per-split score noise. Emitted here rather than
+            # left out: the noise and its per-tree scale are both implemented
+            # and the dense CPU round loops now compute the scale, so a value
+            # that did not reach the binding would be accepted and silently
+            # dropped -- the defect this whole sequence exists to remove. The
+            # binding refuses it by entry point for the loops that do not
+            # compute a scale.
+            "random_strength": float(self.random_strength or 0.0),
             "max_delta_step": float(self.max_delta_step),
             "path_smooth": float(self.path_smooth),
             # int, not bool: the binding reads it as an integer.

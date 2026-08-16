@@ -657,8 +657,19 @@ def _validate(
     # The data-independent half of the remaining tree controls. The per-
     # feature vectors are checked against the dataset later, in
     # `tree.grow_tree`, because a parameter string cannot carry one.
+    # `scale_computed_per_tree` on the CPU arm only: the dense CPU round
+    # loops compute `random_score_scale` per tree onto their own copy of
+    # the bundle, so a positive `random_strength` beside a zero scale is
+    # legitimate HERE and a defect anywhere else. The device and
+    # distributed loops do not compute it, so they keep the refusal.
+    #
+    # Known narrow gap, and it is a refusal rather than a silent drop: a
+    # CPU MULTICLASS fit passes this and then raises at `split.mojo`'s
+    # noise read mid-fit, because `_boost_rounds_multiclass` is not
+    # wired. A dedicated refusal here would give a better message.
     config.booster.tree.extra.check_scalars(
-        config.booster.tree.min_data_in_leaf
+        config.booster.tree.min_data_in_leaf,
+        scale_computed_per_tree=(config.device == CPU_DEVICE),
     )
     # Exclusive feature bundling: the knobs are range-checked whether or not
     # the switch is on, so a bad value is named here rather than at the first

@@ -647,6 +647,7 @@ def _parse_params(
     ordered_ok: Bool = False,
     leaf_estimation_ok: Bool = False,
     score_function_ok: Bool = False,
+    random_strength_ok: Bool = False,
 ) raises -> BoosterParams:
     """The `BoosterParams` a fit runs under, from the params mapping.
 
@@ -728,6 +729,26 @@ def _parse_params(
             " through a dense, single-output fit without a custom objective."
             " 1 is LightGBM's behavior and mojotrees's, and is the default",
         )
+    # CatBoost's `random_strength`. The noise and its per-tree scale are both
+    # implemented; the dense CPU round loops compute the scale onto their own
+    # copy of the bundle before growth, which is why the strength can arrive
+    # here beside a zero `random_score_scale` and still be honest. A loop that
+    # does NOT compute a scale must refuse rather than train a model that
+    # ignored the setting, which is what `random_strength_ok` selects.
+    extra.random_strength = Float64(py=params["random_strength"])
+    if extra.random_strength > 0.0 and not random_strength_ok:
+        raise Error(
+            "random_strength is not honored by ",
+            who,
+            ": the per-split noise is added by split.find_best_split and"
+            " staged on the device by GpuSplitSearcher, but its per-tree"
+            " scale is computed only by the dense CPU round loops"
+            " (boosting._round_random_score_scale). Multiclass, distributed"
+            " and the device loops do not compute one, so accepting it here"
+            " would train a model that silently ignored it. 0.0 is"
+            " LightGBM's behavior and mojotrees's, and is accepted.",
+        )
+
     # CatBoost's `score_function`, folded onto the same bundle for the same
     # reason. The wrapper sends the name lowercased, which is the contract
     # `parse_score_function` states and `device_policy.parse_device` and
@@ -962,6 +983,12 @@ def fit(
         cpu=device == CPU_DEVICE,
         entry=String("fit"),
         ordered_ok=device == CPU_DEVICE,
+        # Same condition and the same reason: `model.fit` routes a CPU
+        # run to `boosting.train`, whose round loop is the one that
+        # computes `random_score_scale` per tree. Every other entry
+        # point in this file leaves the flag False and refuses a
+        # positive strength by name rather than dropping it.
+        random_strength_ok=device == CPU_DEVICE,
         leaf_estimation_ok=True,
         score_function_ok=True,
     )

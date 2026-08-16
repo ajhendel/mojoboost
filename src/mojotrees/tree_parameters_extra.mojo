@@ -1792,7 +1792,9 @@ struct ExtraTreeParams(Copyable, Movable):
         """
         return self.needs_leaf_finish() or self.needs_node_identity()
 
-    def check_scalars(self, min_data_in_leaf: Int) raises:
+    def check_scalars(
+        self, min_data_in_leaf: Int, scale_computed_per_tree: Bool = False
+    ) raises:
         """The half of `check` that needs neither the feature count nor the
         growth budget, so a parameter string can be rejected before any data
         is read (see `params._validate`).
@@ -1821,7 +1823,7 @@ struct ExtraTreeParams(Copyable, Movable):
             self.monotone_penalty < 0.0
         ):
             raise Error("monotone_penalty must be a finite nonnegative number")
-        self.check_random_strength()
+        self.check_random_strength(scale_computed_per_tree)
         self.check_quantized_grad()
         self.check_leaf_estimation()
         self.check_derivative_precision()
@@ -1858,7 +1860,9 @@ struct ExtraTreeParams(Copyable, Movable):
                 " the result on ExtraTreeParams.forced"
             )
 
-    def check_random_strength(self) raises:
+    def check_random_strength(
+        self, scale_computed_per_tree: Bool = False
+    ) raises:
         """Range-check `random_strength`, and refuse a positive value whose
         per-tree scale nobody supplied.
 
@@ -1894,11 +1898,27 @@ struct ExtraTreeParams(Copyable, Movable):
             raise Error(
                 "random_score_scale must be a finite nonnegative number"
             )
-        if self.random_strength > 0.0 and self.random_score_scale <= 0.0:
+        # `boosting._boost_rounds` and `boosting.train_with_valid` compute
+        # the scale once per tree and write it onto their OWN copy of the
+        # bundle before growth (`_round_random_score_scale`), so the user's
+        # bundle legitimately still carries 0.0 at parameter-validation
+        # time. A wire that will dispatch to one of those passes True; the
+        # grower's own call keeps the default and still refuses a bundle
+        # that reached a split search with no scale on it.
+        if (
+            self.random_strength > 0.0
+            and self.random_score_scale <= 0.0
+            and not scale_computed_per_tree
+        ):
             raise Error(
-                "random_strength is recognized but no trainer computes its"
-                " per-tree scale in this build, so setting it alone would"
-                " train an unregularized model that ignored it. The scale is"
+                "random_strength is set on a bundle whose per-tree scale is"
+                " still zero, and this caller did not declare that a"
+                " trainer will compute one. The CPU dense round loops DO"
+                " compute it (boosting._round_random_score_scale); a wire"
+                " that dispatches to one of them passes"
+                " scale_computed_per_tree=True. Multiclass, distributed and"
+                " the device loops do not compute it and this refusal is"
+                " correct for them. The scale is"
                 " CatBoost's derivativesStDevFromZero * modelSizeDecrease;"
                 " compute it with"
                 " tree_parameters_extra.random_score_scale_from_gradients("
