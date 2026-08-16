@@ -2382,7 +2382,14 @@ def _bin_valid_sets(
         binned.append(
             ValidSet(
                 valid_sets[v].name,
-                mapper.transform(valid_sets[v].features, valid_sets[v].n_rows),
+                # Scored, never histogrammed -- see the note in
+                # `model.predict_batch`. A validation set that built the
+                # row-major view would double its own memory for nothing.
+                mapper.transform(
+                    valid_sets[v].features,
+                    valid_sets[v].n_rows,
+                    build_view=False,
+                ),
                 valid_sets[v].target.copy(),
                 raw^,
             )
