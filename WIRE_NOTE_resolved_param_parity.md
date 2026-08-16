@@ -1,20 +1,31 @@
-# Wire note: the CatBoost read-back edges this lane did not own
+# LANDED: the CatBoost read-back edges
 
-Lane `lane/resolved-param-parity`. `bench/real_data/engines.py`, `run.py` and
-`worker.py` were being run from by another session while this was written, so
-none of them was touched. Everything below is exact and unrun.
+**Status: all six parts are applied on `lane/resolved-param-parity`.** This
+started as a wire note, written when `engines.py`, `worker.py` and `run.py`
+belonged to a session that was running from them. That session stood down and
+the edits were made by this lane.
 
-Applying all four parts unparks the `mojotrees_catboost_mode` arm. Until then
-it is parked by name in `MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT` with
-`MOJOTREES_CATBOOST_MODE_PARKED` as the reason, and the parity gate keeps
-checking its parameters anyway.
+It is kept rather than deleted because it is the only document that states each
+edit as a standalone change with its reasoning, which is what a reviewer wants
+when reading the diff, and because two of the parts have a hazard in them that
+is easy to reintroduce:
 
-Nothing here changes what any engine computes. The one change that does is the
-CatBoost arm's learning rate, and that is in `scenarios.py` on this branch,
-committed beside this note.
+- **Part 4's sort key must stay composed under the repeat sort.** `(repeat,
+  rank)`, never `(rank, repeat)`. The landed version is `run.CELL_ORDER`.
+- **Part 1's `catboost_lossguide` suppression is load-bearing.** Both CatBoost
+  rows share a cell key, and the variant row's resolved dict is not the shape
+  the CatBoost-mode arm is built from.
 
-**None of this has been run.** No `mojo`, no `pixi`, no `selfcheck.py`, no
-benchmark, no lock. Read every snippet before pasting it.
+What landed differs from the note in three small ways, all of them additions:
+`build` dispatches on `issubclass(engine, MojoTreesEngine)` rather than on the
+name; `_params` takes a `device` override so the sparse path keeps its
+hard-coded `"cpu"`; and `run.build_matrix` gained a skip so that scheduling the
+CatBoost-mode arm without `catboost` is a reported skip rather than a raising
+cell.
+
+Part 6 is applied too: `schema.json` no longer says the harness pins the
+learning rate, and it has an `engine_resolved_params_drift` entry.
+`RESULTS_TEMPLATE.md` carries the misreading warning as a block quote.
 
 ---
 
