@@ -238,6 +238,34 @@ def _producers(param):
     Matched conservatively, on name only: `def <param>`, `def <param>_*`,
     `def *_<param>`, and `var <param>` on a struct. A match is a reason to
     read, never a verdict.
+
+    **This group's name promises more than the check delivers, and the
+    difference is load-bearing.** "A producer exists and nothing consumes it"
+    is what the heading says; what the code tests is only that a producer
+    exists and that no CALL SITE passes the parameter. It does not trace
+    consumption. `train_gpu(row_compaction=...)` is the proof: its producers
+    ARE consumed, at `train_gpu.mojo:3594` and `:3703`, so the plumbing is
+    live and the row is not dead code at all. **It still paid**, because what
+    it actually found was a live mechanism with a dead door: 77 call sites all
+    defaulting, one environment variable as the only producer of a `True`, and
+    no named way in from Python.
+
+    So read this group as **where reading is cheap and likely to pay**, not as
+    a list of dead code. A ranking that surfaces live plumbing behind a dead
+    door is more useful than one that only finds orphans, and the docstring
+    should promise the weaker thing it does rather than the stronger thing the
+    heading implies.
+
+    **A second warning, from a sibling filter that reported its own blind spot
+    as a result.** A name-matching pass over environment variables first
+    returned 2 candidates and missed `row_compaction`, because its variable is
+    `MOJOTREES_GPU_ROW_COMPACTION` and the parameter is `row_compaction`: the
+    infix broke the match. Handling it took the count from 2 to 11. **That was
+    caught only because a known instance was absent from the output**, which
+    is not a check anyone can run on a list of things they do not already
+    know. This file's own first version had the same failure in a different
+    shape, counting only keyword arguments and reporting `tree._search` with
+    136 positional call sites as its loudest row.
     """
     if len(param) < 4:
         return []
