@@ -1764,6 +1764,7 @@ def refit(
                 alpha,
                 grad,
                 hess,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             _refit_tree_newton(
                 booster.trees[t], data, grad, hess, params, signs, report
@@ -1849,7 +1850,8 @@ def refit_multiclass(
             _softmax_inplace(prob, r * k_n, k_n)
         for k in range(k_n):
             _fill_softmax_grad_hess(
-                prob, labels, k, k_n, sample_weight, grad, hess
+                prob, labels, k, k_n, sample_weight, grad, hess,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             var t = i * k_n + k
             _refit_tree_newton(

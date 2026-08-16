@@ -612,6 +612,52 @@ def check_derivative_precision() raises:
     )
 
 
+def check_device_derivative_precision(param_float64: Bool) raises:
+    """Refuse Float64 derivatives on a backend that cannot carry them.
+
+    **The device cannot, and the refusal is the point.** Gradients and
+    hessians reach an accelerator as Float32 and nothing else:
+    `histogram_gpu` states it as a hardware fact ("Apple GPUs have no
+    Float64") and `gpu_gradient_stream.stage_gradients` performs the
+    narrowing with a literal `Float32(g)` per row on upload. So a fit that
+    asked for `float64` and was routed to the device would get the Float32
+    answer, computed more slowly, with no error and nothing in the model to
+    say which arm produced it.
+
+    That is the same accepted-then-ignored failure the sparse and distributed
+    growers had, and it is refused here for the same reason rather than
+    worked around: this package says so or does it, and does not do neither.
+    It is not fixable by threading, because the missing thing is a datatype
+    the hardware does not have.
+
+    **Both entries are refused**, the parameter through `param_float64` and
+    the environment through the live read, because both are equally ignored
+    once the derivatives are on the device. An environment variable exported
+    for a CPU A/B and then left set for a GPU run is the likelier of the two
+    and the harder to notice.
+
+    Called from the two accelerator growers, beside the `ExtraTreeParams`
+    validation they already run, so the refusal lands before the first
+    histogram rather than part way through a fit.
+    """
+    check_derivative_precision()
+    if derivative_precision_narrows() and not param_float64:
+        return
+    raise Error(
+        "derivative_precision='",
+        DERIVATIVE_PRECISION_FLOAT64,
+        "' is not available on the accelerator: gradients and hessians are"
+        " carried as Float32 on the device (there is no Float64 there), so"
+        " the fit would silently produce the float32 answer. Train this"
+        " configuration on the CPU path, which honors it end to end, or"
+        " leave derivative_precision at '",
+        DERIVATIVE_PRECISION_FLOAT32,
+        "'. Note that MOJOTREES_DERIVATIVE_PRECISION reaches this too, so an"
+        " environment variable left over from a CPU comparison is refused"
+        " here rather than quietly ignored",
+    )
+
+
 @always_inline
 def cnt_factor(n_data: Int, sum_hessian: Float64) -> Float64:
     """LightGBM's `cnt_factor`: rows per unit of hessian in one node.

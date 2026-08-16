@@ -1184,8 +1184,13 @@ def train_with_callbacks[
             baked = True
 
         refresh_bag(bag, bagging, n, i)
+        # `current`, not `params`: a callback may have changed the parameters
+        # for this round, and the grower two lines below reads `current.tree`.
+        # The objective and the histogram have to be at the same precision or
+        # the round's derivatives and the cells they land in disagree.
         _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
+            raw, target, objective, sample_weight, alpha, grad, hess,
+            float64_derivatives=current.tree.extra.wants_float64_derivatives(),
         )
         goss_round(bag, grad, hess, goss, i, lr)
         var tree = grow_tree(data, grad, hess, current.tree, bag, i)
@@ -2087,7 +2092,8 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
         var selection = GossSelection.all_rows()
         if goss.active(i, params.learning_rate):
             selection = _multiclass_goss_select(
-                prob, labels, n_classes, sample_weight, goss, i
+                prob, labels, n_classes, sample_weight, goss, i,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             bag = selection.rows.copy()
 
@@ -2096,7 +2102,8 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
         var round_linear = List[LinearTree]()
         for k in range(n_classes):
             _fill_softmax_grad_hess(
-                prob, labels, k, n_classes, sample_weight, grad, hess
+                prob, labels, k, n_classes, sample_weight, grad, hess,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             apply_goss_scaling(selection, grad, hess)
             var tree = grow_tree(
