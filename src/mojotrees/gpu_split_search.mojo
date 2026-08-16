@@ -485,6 +485,24 @@ def split_primitives_requested() -> Bool:
     return getenv("MOJOTREES_GPU_SPLIT_PRIMITIVES") != "0"
 
 
+def table_upload_hoisting_requested() -> Bool:
+    """`MOJOTREES_GPU_SPLIT_TABLE_PACK=0`, the switch back to four separate
+    per-table uploads.
+
+    On unless refused, because the packed arm writes the device exactly the
+    bytes the four-copy arm writes (`GpuSplitSearcher._copy_tables` argues
+    that byte for byte) and differs only in how many times the host blocks
+    to do it. Read once at construction and overridable per searcher through
+    `GpuSplitSearcher.set_table_upload_hoisting`, the same one-variable /
+    one-handle shape `MOJOTREES_GPU_SPLIT_PRIMITIVES` already has: an
+    interleaved benchmark has to hold both arms inside one process and one
+    thermal state, and re-execing with a different environment cannot do
+    that on a machine whose device timings drift several-fold between time
+    windows.
+    """
+    return getenv("MOJOTREES_GPU_SPLIT_TABLE_PACK") != "0"
+
+
 # --- Kernels --------------------------------------------------------------
 
 
@@ -2544,13 +2562,24 @@ struct GpuSplitSearcher(Movable):
 
     The staging contract, which is what a caller has to respect:
 
-    - `enqueue_frontier` writes every record's slot first and issues one
-      copy per table, so nothing is overwritten while a copy of it is in
+    - `enqueue_frontier` writes every record's slot first and then the
+      tables cross, so nothing is overwritten while a copy of it is in
       flight. `download_frontier` is the batch's single wait, and no new
       staging may begin before it (or an explicit `synchronize`).
     - `enqueue` and `search` stage one record and copy, which is the
       node-at-a-time loop's existing contract: a node's `enqueue` is
       followed by its `download` before the next node stages.
+
+    One copy, not four
+    ------------------
+    The four per-node tables live at fixed offsets inside one pinned
+    staging allocation and one device allocation, and `_copy_tables` moves
+    the whole thing in a single `enqueue_copy`. On Metal that is the
+    difference between four host waits and one, because a copy there costs a
+    full-queue drain regardless of its size. `set_table_upload_hoisting`
+    puts the four-copy arm back at run time for an interleaved measurement,
+    and `_copy_tables` argues why the two arms leave the device holding
+    identical bytes.
     """
 
     var ctx: DeviceContext
@@ -2574,10 +2603,26 @@ struct GpuSplitSearcher(Movable):
     """Whether `hist_dev` has been sized for a `3 * n_features * n_bins`
     histogram yet. False on a searcher that has only ever been driven by the
     trainer."""
+    # The one device allocation the four per-node tables live in, and the
+    # four windows onto it that the kernels are handed. See `_copy_tables`
+    # for why they share an allocation and `_feat_off` for the layout.
+    #
+    # `tables_dev` is never passed to a kernel and never read except by the
+    # packed copy. It is a field rather than a local so that it outlives the
+    # four sub-buffer views below, which alias its storage.
+    var tables_dev: DeviceBuffer[DType.int32]
     # Per-record tables. `feat_dev` and `allow_dev` are strided by
     # `n_features` rather than by a batch's slot count, so narrowing one
     # node's feature set never moves another node's row, which is the same
     # choice `GpuLeafBatcher` makes for its item tables.
+    #
+    # Each is a `create_sub_buffer` window onto `tables_dev` rather than its
+    # own allocation. Nothing outside this struct can tell: a sub-buffer is
+    # a `DeviceBuffer` of the same element type and length, its
+    # `unsafe_ptr()` is the window's base, and `enqueue_copy` into it lands
+    # at the window. `gpu_resident_round` reads all four of these fields
+    # directly and `_launch_search` hands all four to the kernels; both see
+    # what they saw before.
     var node_dev: DeviceBuffer[DType.int32]
     var feat_dev: DeviceBuffer[DType.int32]
     var allow_dev: DeviceBuffer[DType.int32]
@@ -2597,12 +2642,16 @@ struct GpuSplitSearcher(Movable):
     # One-way, not asynchronous. On Metal `enqueue_copy` is a synchronous
     # full-queue drain in both directions (measured by disassembly,
     # `docs/GPU_PORTABILITY.md` section 6.1), so an upload here is a host
-    # synchronization and the copies below have to be counted as waits, not
-    # as enqueues.
-    var stage_node: HostBuffer[DType.int32]
-    var stage_feat: HostBuffer[DType.int32]
-    var stage_allow: HostBuffer[DType.int32]
-    var stage_param: HostBuffer[DType.float32]
+    # synchronization and the copy below has to be counted as a wait, not
+    # as an enqueue. That is why there is one buffer and not four.
+    #
+    # One pinned buffer holding all four staged tables end to end, in the
+    # same order and at the same offsets as `tables_dev`, so the packed
+    # upload is one `enqueue_copy` from its base. The float parameter block
+    # occupies the last region and is written through a Float32 view of it:
+    # both element types are four bytes wide, so the region boundaries fall
+    # on both alignments and an Int32 word count addresses either.
+    var stage_tables: HostBuffer[DType.int32]
     var host_i: HostBuffer[DType.int32]
     var host_f: HostBuffer[DType.float32]
     var active: List[Int]
@@ -2613,6 +2662,17 @@ struct GpuSplitSearcher(Movable):
     """Feature slots per record, one entry per record slot."""
     var missing_bin: List[Int]
     var cat_n: List[Int]
+    var mono_host: List[Int32]
+    """The monotone vector this searcher last wrote into `mono_dev`, one
+    entry per feature. The host's mirror of a device buffer nothing on the
+    device writes, which is what lets `set_monotone` skip a repeat; see
+    there for the enumeration that makes the mirror trustworthy."""
+    var mono_uploaded: Bool
+    """Whether `mono_host` is known to describe `mono_dev`. Set by the
+    constructor, which writes the all-free vector itself, and by every
+    `set_monotone` that maps. It exists so that the skip is a claim about a
+    write this searcher performed rather than about a buffer's initial
+    contents, which no backend promises."""
     var constrained: Bool
     var wide_scan: Bool
     """Whether the per-feature scan runs on a threadgroup rather than on one
@@ -2629,6 +2689,12 @@ struct GpuSplitSearcher(Movable):
     reductions it replaces are exact under reassociation on every dataset:
     the collectives choose the same split as the loops, whatever the
     histogram."""
+    var hoist_tables: Bool
+    """Whether the four per-node tables cross in one packed copy rather than
+    in four, and whether an unchanged monotone vector is re-mapped. Read once
+    at construction from `MOJOTREES_GPU_SPLIT_TABLE_PACK` and settable
+    afterwards, so one process can hold both arms; see
+    `set_table_upload_hoisting`."""
 
     def __init__(
         out self,
@@ -2703,6 +2769,11 @@ struct GpuSplitSearcher(Movable):
         # features, never introduce a categorical one.
         self.wide_scan = wide_scan_for(any_cat)
         self.use_primitives = split_primitives_requested()
+        self.hoist_tables = table_upload_hoisting_requested()
+        self.mono_host = List[Int32](capacity=n_features)
+        for _ in range(n_features):
+            self.mono_host.append(Int32(MONOTONE_FREE))
+        self.mono_uploaded = False
         for _ in range(max_records):
             self.active_len.append(n_features)
 
@@ -2711,23 +2782,37 @@ struct GpuSplitSearcher(Movable):
         # zero-length device buffer is not portable. See the field.
         self.hist_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
         self.hist_owned = False
-        self.node_dev = self.ctx.enqueue_create_buffer[DType.int32](
-            max_records * NODE_WORDS
+        # The four per-node tables in one allocation, in the order
+        # `_feat_off` fixes: node, features, allow mask, float parameters.
+        # The float region is counted in Int32 words because a Float32 is
+        # the same four bytes; `create_sub_buffer` takes its offset and
+        # length in elements, and at four bytes either element type
+        # addresses the same boundary.
+        var node_words = max_records * NODE_WORDS
+        var param_words = max_records * PF_WORDS
+        var feat_off = node_words
+        var allow_off = feat_off + table_cells
+        var param_off = allow_off + table_cells
+        self.tables_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            param_off + param_words
         )
-        self.feat_dev = self.ctx.enqueue_create_buffer[DType.int32](
-            table_cells
+        self.node_dev = self.tables_dev.create_sub_buffer[DType.int32](
+            0, node_words
         )
-        self.allow_dev = self.ctx.enqueue_create_buffer[DType.int32](
-            table_cells
+        self.feat_dev = self.tables_dev.create_sub_buffer[DType.int32](
+            feat_off, table_cells
+        )
+        self.allow_dev = self.tables_dev.create_sub_buffer[DType.int32](
+            allow_off, table_cells
+        )
+        self.fparam_dev = self.tables_dev.create_sub_buffer[DType.float32](
+            param_off, param_words
         )
         self.missing_dev = self.ctx.enqueue_create_buffer[DType.int32](
             n_features
         )
         self.catn_dev = self.ctx.enqueue_create_buffer[DType.int32](n_features)
         self.mono_dev = self.ctx.enqueue_create_buffer[DType.int32](n_features)
-        self.fparam_dev = self.ctx.enqueue_create_buffer[DType.float32](
-            max_records * PF_WORDS
-        )
         self.slot_i_dev = self.ctx.enqueue_create_buffer[DType.int32](
             table_cells * SPLIT_IWORDS
         )
@@ -2740,17 +2825,8 @@ struct GpuSplitSearcher(Movable):
         self.rec_f_dev = self.ctx.enqueue_create_buffer[DType.float32](
             max_records * SPLIT_FWORDS
         )
-        self.stage_node = self.ctx.enqueue_create_host_buffer[DType.int32](
-            max_records * NODE_WORDS
-        )
-        self.stage_feat = self.ctx.enqueue_create_host_buffer[DType.int32](
-            table_cells
-        )
-        self.stage_allow = self.ctx.enqueue_create_host_buffer[DType.int32](
-            table_cells
-        )
-        self.stage_param = self.ctx.enqueue_create_host_buffer[DType.float32](
-            max_records * PF_WORDS
+        self.stage_tables = self.ctx.enqueue_create_host_buffer[DType.int32](
+            param_off + param_words
         )
         self.host_i = self.ctx.enqueue_create_host_buffer[DType.int32](
             max_records * SPLIT_IWORDS
@@ -2763,10 +2839,12 @@ struct GpuSplitSearcher(Movable):
         # at offset zero", so a caller that never narrows a set and never
         # batches (the node-at-a-time loop, and every existing caller) sees
         # exactly the behavior it saw when these tables held one slot.
-        var dst_node = self.stage_node.unsafe_ptr()
-        var dst_feat = self.stage_feat.unsafe_ptr()
-        var dst_allow = self.stage_allow.unsafe_ptr()
-        var dst_param = self.stage_param.unsafe_ptr()
+        var dst_node = self.stage_tables.unsafe_ptr()
+        var dst_feat = dst_node.unsafe_offset(feat_off)
+        var dst_allow = dst_node.unsafe_offset(allow_off)
+        var dst_param = dst_node.unsafe_offset(param_off).unsafe_bitcast[
+            Scalar[DType.float32]
+        ]()
         for r in range(max_records):
             var nt = r * NODE_WORDS
             dst_node.unsafe_store(nt + NODE_SLOTS, Int32(n_features))
@@ -2776,9 +2854,13 @@ struct GpuSplitSearcher(Movable):
                 dst_allow.unsafe_store(r * n_features + f, Int32(1))
             for w in range(PF_WORDS):
                 dst_param.unsafe_store(r * PF_WORDS + w, Float32(0.0))
-        self.ctx.enqueue_copy(dst_buf=self.node_dev, src_ptr=dst_node)
-        self.ctx.enqueue_copy(dst_buf=self.feat_dev, src_ptr=dst_feat)
-        self.ctx.enqueue_copy(dst_buf=self.allow_dev, src_ptr=dst_allow)
+        # One copy where there were three, and it carries the float
+        # parameter region as well, which the three did not. That region was
+        # previously left unwritten on the device until the first
+        # `_copy_tables`, and no kernel could read it before then, so
+        # uploading the zeros staged above changes no kernel's input and
+        # only replaces an unspecified allocation with a defined one.
+        self.ctx.enqueue_copy(dst_buf=self.tables_dev, src_ptr=dst_node)
 
         with self.missing_dev.map_to_host() as host:
             var dst = host.unsafe_ptr()
@@ -2793,9 +2875,13 @@ struct GpuSplitSearcher(Movable):
             var dst = host.unsafe_ptr()
             for f in range(n_features):
                 dst.unsafe_store(f, Int32(MONOTONE_FREE))
-        # The three table copies above read pinned buffers those tables
-        # reuse every node, so the session starts with them retired rather
-        # than in flight. On Metal each copy already drained the queue
+        # `mono_host` was filled with the same all-free vector above. The
+        # mirror is true of the device from here, which is what lets
+        # `set_monotone` decline to repeat it.
+        self.mono_uploaded = True
+        # The table copy above reads a pinned buffer the tables reuse every
+        # node, so the session starts with it retired rather than in
+        # flight. On Metal the copy already drained the queue
         # (`docs/GPU_PORTABILITY.md` section 6.1) and this call is therefore
         # redundant there; it is kept because it is what makes the sequence
         # correct on a backend where the copy is asynchronous, and because
@@ -2822,6 +2908,63 @@ struct GpuSplitSearcher(Movable):
         either arm returns are the same records."""
         self.use_primitives = enabled
 
+    def set_table_upload_hoisting(mut self, on: Bool):
+        """Force the packed table upload on or off for this searcher,
+        overriding `MOJOTREES_GPU_SPLIT_TABLE_PACK`.
+
+        Off is what this module shipped before this lane: four
+        `enqueue_copy` calls in `_copy_tables`, and a `map_to_host` in
+        `set_monotone` on every call whether or not the vector moved. On is
+        one `enqueue_copy` covering all four tables, and a `set_monotone`
+        that maps only when the vector it is handed differs from the one it
+        last wrote.
+
+        Reachable at run time rather than through the environment, and for
+        the same reason `set_primitives` and `GpuActiveRows.set_row_unroll`
+        are: this machine's device timings drift several-fold between time
+        windows, so only arms interleaved inside one process and one thermal
+        state compare at all, and an environment-only knob would have forced
+        a two-build comparison.
+
+        It cannot change a record. Both arms leave the device holding the
+        same bytes in the same four tables before either kernel is enqueued
+        (`_copy_tables` argues that region by region) and the same monotone
+        vector (`set_monotone` argues that one). What differs is only how
+        many times the host blocks on a queue drain to put them there.
+
+        Takes effect on the next `_copy_tables`, which is the next
+        `enqueue`, `search` or `enqueue_frontier`, and on the next
+        `set_monotone`.
+        """
+        self.hoist_tables = on
+
+    def _feat_off(self) -> Int:
+        """First Int32 word of the feature table inside the packed tables.
+
+        The layout, in Int32 words, of both `tables_dev` and
+        `stage_tables`, which hold the same four regions at the same
+        offsets:
+
+        - `[0, max_records * NODE_WORDS)` the node table
+        - `[_feat_off, + max_records * n_features)` the feature table
+        - `[_allow_off, + max_records * n_features)` the allow mask
+        - `[_param_off, + max_records * PF_WORDS)` the float parameters
+
+        Recomputed from two fields rather than stored, because both are
+        construction-time constants and three more fields to keep in step
+        with them is three more ways for the layout to disagree with
+        itself."""
+        return self.max_records * NODE_WORDS
+
+    def _allow_off(self) -> Int:
+        """First Int32 word of the allow mask. See `_feat_off`."""
+        return self._feat_off() + self.max_records * self.n_features
+
+    def _param_off(self) -> Int:
+        """First word of the float parameter block, counted in Int32 words
+        because a Float32 is the same four bytes wide. See `_feat_off`."""
+        return self._allow_off() + self.max_records * self.n_features
+
     def describe_scan(self) -> String:
         """One line for benchmark output and bug reports: which scan kernel
         this searcher launches, how wide its threadgroup is, and whether its
@@ -2830,9 +2973,18 @@ struct GpuSplitSearcher(Movable):
             " reduce=block-primitives threads=",
             REDUCE_SLOT_THREADS,
         ) if self.use_primitives else String(" reduce=serial threads=1")
+        # Which upload arm is live belongs on this line for the same reason
+        # the reduction does: an interleaved benchmark prints it next to the
+        # timing, and a run whose arm cannot be read off its own output is a
+        # run that proves nothing.
+        var tables = String(
+            " tables=packed copies=1"
+        ) if self.hoist_tables else String(" tables=split copies=4")
         if self.wide_scan:
-            return String("scan=wide threads=", WIDE_SCAN_THREADS, reduction)
-        return String("scan=serial threads=1", reduction)
+            return String(
+                "scan=wide threads=", WIDE_SCAN_THREADS, reduction, tables
+            )
+        return String("scan=serial threads=1", reduction, tables)
 
     def _check_record(self, record: Int) raises:
         if record < 0 or record >= self.max_records:
@@ -2844,12 +2996,12 @@ struct GpuSplitSearcher(Movable):
         """Write one record's feature slots and slot count into the pinned
         tables. Copies nothing: the caller decides when the tables go
         across, which is what lets a frontier stage every node first."""
-        var dst = self.stage_feat.unsafe_ptr()
+        var node = self.stage_tables.unsafe_ptr()
+        var dst = node.unsafe_offset(self._feat_off())
         var base = record * self.n_features
         for i in range(len(features)):
             dst.unsafe_store(base + i, Int32(features[i]))
         self.active_len[record] = len(features)
-        var node = self.stage_node.unsafe_ptr()
         node.unsafe_store(
             record * NODE_WORDS + NODE_SLOTS, Int32(len(features))
         )
@@ -2859,10 +3011,11 @@ struct GpuSplitSearcher(Movable):
     ) raises:
         """Write one record's allow mask, translated from global feature
         ids into this record's slot order."""
-        var dst = self.stage_allow.unsafe_ptr()
+        var pack = self.stage_tables.unsafe_ptr()
+        var dst = pack.unsafe_offset(self._allow_off())
         var base = record * self.n_features
         var n_slots = self.active_len[record]
-        var feat = self.stage_feat.unsafe_ptr()
+        var feat = pack.unsafe_offset(self._feat_off())
         for i in range(n_slots):
             var f = Int(feat.unsafe_load(base + i))
             var ok = True
@@ -2872,19 +3025,196 @@ struct GpuSplitSearcher(Movable):
         for i in range(n_slots, self.n_features):
             dst.unsafe_store(base + i, Int32(0))
 
+    def _stage_hist_base(mut self, record: Int, hist_base: Int32):
+        """Write one record's histogram offset into the staged node table.
+
+        The node table is the first region of `stage_tables`, so its record
+        rows are at `record * NODE_WORDS` from the base with no further
+        offset; `_feat_off` has the whole layout.
+
+        A method rather than three open-coded stores, so that the writers of
+        `NODE_HIST_BASE` can be enumerated by grepping for one name. The
+        three are `enqueue`, `search` and `enqueue_frontier`, and the
+        distinction matters because this word is the one thing in the four
+        staged tables that a shipping loop changes between one split and the
+        next, while the feature set, the allow mask and the parameter block
+        usually do not."""
+        self.stage_tables.unsafe_ptr().unsafe_store(
+            record * NODE_WORDS + NODE_HIST_BASE, hist_base
+        )
+
     def _copy_tables(mut self) raises:
-        """One copy per per-node table, covering every record slot."""
+        """Put the four staged per-node tables on the device: one copy when
+        `hoist_tables` is on, four when it is off.
+
+        Why this is where the waits were
+        --------------------------------
+        On Metal `enqueue_copy` is a synchronous full-queue drain in both
+        directions, measured by disassembly and recorded in
+        `docs/GPU_PORTABILITY.md` section 6.1 at roughly 458 microseconds
+        against under 4 microseconds of actual byte movement for these
+        table sizes. The cost is therefore per *call*, not per byte, by two
+        orders of magnitude. Four calls that together move a few tens of
+        kilobytes cost four drains; one call that moves the same bytes
+        costs one. That ratio is what this method is built around, and it is
+        why the packed arm does not bother to skip regions that did not
+        change: not copying a clean region saves bytes, and bytes are not
+        the price.
+
+        `grow_tree_device_resident` counts sixteen host waits per tree on
+        the device-resident plane and attributes four of them to this
+        method. The packed arm makes it one, so that count is thirteen. The
+        shipping node-at-a-time and frontier loops call this once per split
+        rather than once per tree, so there the same change is four waits
+        per split down to one.
+
+        Why one allocation and not four plus a scatter
+        ----------------------------------------------
+        The four tables keep their own `DeviceBuffer` handles, because
+        `_launch_search` passes each to the kernels separately and
+        `gpu_resident_round` reads all four fields by name. What changed is
+        that the handles are `create_sub_buffer` windows onto one parent
+        allocation instead of four independent ones, so a single copy of the
+        parent writes all four regions.
+
+        Three properties of that facility are **measured**, by running a
+        program that asserts each one on this backend, rather than assumed
+        from its signature, because all three are silent when wrong:
+
+        1. a sub-buffer used as an `enqueue_copy` destination lands at its
+           window and writes only its own length, leaving the words on
+           either side alone (this is what makes the four-copy arm a valid
+           reference arm rather than a second implementation);
+        2. a window whose element type differs from its parent's (the
+           Float32 parameter region inside an Int32 parent) aliases the same
+           bytes, with offset and length counted in elements, which is
+           unambiguous here only because both types are four bytes wide;
+        3. the windows keep addressing the parent's storage after the struct
+           holding all five handles is moved, which `GpuSplitSearcher` is:
+           the trainer moves one out of its constructor and into a `List`.
+
+        `GpuHistogramBuilder.readback_range` already depends on the source
+        direction of the same facility.
+
+        The bytes are the same bytes
+        ----------------------------
+        This is the claim that outranks the saving. Region by region, the
+        packed copy writes exactly what the four copies wrote:
+
+        - the node table, `[0, max_records * NODE_WORDS)`, from the same
+          staged words `_stage_features` and the three `NODE_HIST_BASE`
+          writers produce;
+        - the feature table and the allow mask, each `max_records *
+          n_features` words at `_feat_off` and `_allow_off`, from the same
+          staged words `_stage_features` and `_stage_allowed` produce;
+        - the float parameter block, `max_records * PF_WORDS` words at
+          `_param_off`, from the same staged words `_stage_params`
+          produces.
+
+        The staging buffer is one pinned allocation laid out in that order
+        and the device buffer is one allocation laid out in that order, so
+        "copy the parent" is "copy all four regions", and no region can be
+        left holding a previous call's contents while another is fresh.
+        That last clause is the whole safety argument, and it is why there
+        is no per-table dirty flag here.
+
+        The skip that is not here, and why
+        ----------------------------------
+        This lane was asked to upload each table at its true scope of
+        change: once per fit for the tables that are fit-constant, once per
+        tree for the ones that are not. The mechanism that needs is a dirty
+        flag per table, and the flag needs every mutator enumerated, because
+        a table that changed without setting its flag is a stale table on
+        the device, which does not crash, does not raise, and quietly grows
+        a worse tree. Here is the enumeration, and here is what it decided.
+
+        **Node table.** Host writers: `_stage_features` (the `NODE_SLOTS`
+        word) and `_stage_hist_base`, whose three callers are `enqueue`,
+        `search` and `enqueue_frontier`. Device writers: **one**, and this
+        is the finding that settles the question.
+        `GpuTreeTables.enqueue_stage_child_search` launches
+        `_stage_child_search_kernel` over `GpuSplitSearcher.node_dev` and
+        rewrites the two scratch records' histogram bases once per split on
+        the device-resident plane; `gpu_resident_round` reaches it through
+        the public field, which this module cannot intercept. So the pinned
+        staging buffer is not a mirror of the node table's device contents
+        at all, and no host-side flag can be evidence about them. The node
+        table therefore uploads on every call, exactly as it did before.
+
+        **Feature table.** Writers: `_stage_features`, from `set_features`.
+        Called once per tree by the trainer with the tree's feature set,
+        which is the fit's whole feature set unless `feature_fraction` is
+        active, and per record by `enqueue_frontier` for a caller drawing a
+        subset per node. Fit-constant in the common case, genuinely per tree
+        under column subsampling.
+
+        **Allow mask.** Writers: `_stage_allowed`, from `set_allowed` and
+        from `set_features` (which resets it, because the mask is indexed by
+        slot and a new slot order invalidates it). Fit-constant unless
+        interaction constraints are in play.
+
+        **Float parameter block.** Writers: `_stage_params`, called by
+        `enqueue`, `search`, `enqueue_frontier`, and directly by
+        `gpu_resident_round` for every record before each tree. This one is
+        **not** fit-constant, contrary to what it looks like from its field
+        list: `PF_G_INV` and `PF_H_INV` are the reciprocals of
+        `GpuHistogramBuilder.g_scale` and `h_scale`, which
+        `upload_gradients` recomputes every boosting round from the actual
+        gradient magnitudes (`histogram_gpu._fixed_scale` ->
+        `quantized_gradient.fixed_point_scale`). Only the regularization and
+        categorical words in it are fit-constant. So this table changes once
+        per round on every fit that is not constant-gradient, which is every
+        real fit.
+
+        What that enumeration buys, counted rather than estimated: a
+        per-table skip could remove the feature and allow copies on a fit
+        without column subsampling or interaction constraints, and neither
+        parameter nor node copy on any fit. Two of four, in the good case,
+        and one of four in the bad one. Packing removes three of four in
+        every case, needs no flag to be right, and cannot go stale, so the
+        two mechanisms are not additive: with one copy left there is nothing
+        for a flag to remove, since the one copy is the node table's and the
+        node table is the one no flag may skip.
+
+        Rejected, and worth saying why. A content hash over each table would
+        have removed the need to enumerate mutators; it was rejected because
+        a hash collision produces exactly the silent staleness above, and
+        because it does not help with the node table either, whose device
+        contents no host-side hash can see. An explicit `mark_*_dirty` on
+        each mutator is the auditable form and is what the enumeration above
+        would have driven; it was rejected only because packing dominates it
+        on this call graph, not because it was wrong. The one place a skip
+        is both provable and worth a wait is the monotone vector, which has
+        no device writer at all, and `set_monotone` takes it.
+
+        Ordering is unchanged. The copy is issued from `_launch` before
+        either kernel is enqueued, into the same in-order queue, so the
+        tables are on the device before the scan reads them exactly as
+        before.
+        """
+        var base = self.stage_tables.unsafe_ptr()
+        if self.hoist_tables:
+            self.ctx.enqueue_copy(dst_buf=self.tables_dev, src_ptr=base)
+            return
+        # The arm this module shipped before the packing lane, kept
+        # reachable at run time so a benchmark can interleave the two. Four
+        # copies of four windows of the same staging buffer write the same
+        # bytes into the same device words the one copy above writes; only
+        # the number of queue drains differs.
+        self.ctx.enqueue_copy(dst_buf=self.node_dev, src_ptr=base)
         self.ctx.enqueue_copy(
-            dst_buf=self.node_dev, src_ptr=self.stage_node.unsafe_ptr()
+            dst_buf=self.feat_dev,
+            src_ptr=base.unsafe_offset(self._feat_off()),
         )
         self.ctx.enqueue_copy(
-            dst_buf=self.feat_dev, src_ptr=self.stage_feat.unsafe_ptr()
+            dst_buf=self.allow_dev,
+            src_ptr=base.unsafe_offset(self._allow_off()),
         )
         self.ctx.enqueue_copy(
-            dst_buf=self.allow_dev, src_ptr=self.stage_allow.unsafe_ptr()
-        )
-        self.ctx.enqueue_copy(
-            dst_buf=self.fparam_dev, src_ptr=self.stage_param.unsafe_ptr()
+            dst_buf=self.fparam_dev,
+            src_ptr=base.unsafe_offset(self._param_off()).unsafe_bitcast[
+                Scalar[DType.float32]
+            ](),
         )
 
     def set_features(
@@ -2950,7 +3280,42 @@ struct GpuSplitSearcher(Movable):
 
     def set_monotone(mut self, signs: List[Int] = []) raises:
         """This tree's active monotone constraint vector. Empty (the default)
-        keeps the unconstrained scoring path, exactly as on the host."""
+        keeps the unconstrained scoring path, exactly as on the host.
+
+        Called once per tree by the trainer (`train_gpu.mojo` line 1034) and
+        handed the fit's constraint vector, which does not vary by tree.
+        `map_to_host` moves the buffer in both directions on every use, so
+        an unconditional map is one or two host waits per tree spent writing
+        the same words that are already there. With `hoist_tables` on, this
+        maps only when the vector it is handed differs from the one this
+        searcher last wrote, which makes it once per fit for every
+        configuration mojotrees supports.
+
+        Why a mirror here is trustworthy, where it is not for the four
+        tables `_copy_tables` carries. The skip is sound exactly when the
+        host's `mono_host` is what `mono_dev` holds, and that needs every
+        writer of `mono_dev` enumerated. There are two, and both are in this
+        file and both update the mirror:
+
+        1. the constructor, which writes `MONOTONE_FREE` to every entry and
+           fills `mono_host` with the same;
+        2. this method.
+
+        Nothing else can write it. `mono_dev` leaves this struct in exactly
+        two places, `_launch_search`'s `mono` argument and
+        `gpu_resident_round`'s direct read of the field, and both hand it to
+        the scan kernels, which take it as `mono` and only ever load from
+        it: `_scan_slot_kernel`, `_scan_slot_wide_kernel` and
+        `_scan_slot_wide_primitive_kernel` contain no store through that
+        pointer, and the two reduction kernels are not given it at all.
+        Contrast `node_dev`, which `GpuTreeTables.enqueue_stage_child_search`
+        writes on the device inside every tree of the resident plane, and
+        whose host staging is therefore not a mirror of anything.
+
+        `constrained` is set on every call whether or not the map is
+        skipped, because it is a kernel argument rather than device state
+        and the skip says nothing about it.
+        """
         if len(signs) > 0 and len(signs) != self.n_features:
             raise Error("monotone length must equal n_features")
         for f in range(self.n_features):
@@ -2964,11 +3329,25 @@ struct GpuSplitSearcher(Movable):
                     " features"
                 )
         self.constrained = len(signs) > 0
+        # Compared against the mirror rather than against a hash of it: the
+        # words are `n_features` Int32s already in cache, the comparison is
+        # the loop that would have written them, and an exact comparison
+        # cannot collide. A hash could, and a collision here is the failure
+        # this whole lane is written to avoid: a stale table that does not
+        # crash, does not raise, and quietly produces a worse model.
+        var moved = not self.mono_uploaded
+        for f in range(self.n_features):
+            var s = Int32(signs[f] if len(signs) > 0 else MONOTONE_FREE)
+            if s != self.mono_host[f]:
+                moved = True
+                self.mono_host[f] = s
+        if not moved and self.hoist_tables:
+            return
         with self.mono_dev.map_to_host() as host:
             var dst = host.unsafe_ptr()
             for f in range(self.n_features):
-                var s = signs[f] if len(signs) > 0 else MONOTONE_FREE
-                dst.unsafe_store(f, Int32(s))
+                dst.unsafe_store(f, self.mono_host[f])
+        self.mono_uploaded = True
 
     def _ensure_hist(mut self) raises:
         """Size the searcher's own histogram buffer, once, on first use.
@@ -3013,7 +3392,9 @@ struct GpuSplitSearcher(Movable):
         nothing; `_copy_tables` does."""
         if g_scale <= 0.0 or h_scale <= 0.0:
             raise Error("fixed-point scales must be positive")
-        var dst = self.stage_param.unsafe_ptr()
+        var dst = self.stage_tables.unsafe_ptr().unsafe_offset(
+            self._param_off()
+        ).unsafe_bitcast[Scalar[DType.float32]]()
         var base = record * PF_WORDS
         dst.unsafe_store(base + PF_G_INV, Float32(1.0 / g_scale))
         dst.unsafe_store(base + PF_H_INV, Float32(1.0 / h_scale))
@@ -3084,12 +3465,16 @@ struct GpuSplitSearcher(Movable):
         `record`.
 
         It does transfer, and on Metal it therefore waits. `_launch` copies
-        the four staged per-node tables across before either kernel is
-        enqueued, and `enqueue_copy` on Metal is a synchronous full-queue
-        drain (measured by disassembly, `docs/GPU_PORTABILITY.md` section
-        6.1). An earlier version of this line said "does not transfer or
+        the staged per-node tables across before either kernel is enqueued,
+        and `enqueue_copy` on Metal is a synchronous full-queue drain
+        (measured by disassembly, `docs/GPU_PORTABILITY.md` section 6.1). An
+        earlier version of this line said "does not transfer or
         synchronize" and was wrong on both halves. Nothing about the launch
         changed; what changed is what a wait count may claim.
+
+        That wait is **one** with `hoist_tables` on, where it was four: the
+        four tables share an allocation and cross in one copy. See
+        `_copy_tables`.
 
         `hist` is a device buffer of `3 * n_features * n_bins` Int32 words in
         `GpuHistogramBuilder`'s `[grad | hess | count]` layout, and `g_scale`
@@ -3110,9 +3495,8 @@ struct GpuSplitSearcher(Movable):
         if hist_slot < 0:
             raise Error("histogram slot must be nonnegative")
         self._stage_params(params, g_scale, h_scale, bounds, record)
-        self.stage_node.unsafe_ptr().unsafe_store(
-            record * NODE_WORDS + NODE_HIST_BASE,
-            Int32(hist_slot * 3 * self.n_features * self.n_bins),
+        self._stage_hist_base(
+            record, Int32(hist_slot * 3 * self.n_features * self.n_bins)
         )
         self._launch(hist, params, record, 1, self.active_len[record])
 
@@ -3188,9 +3572,7 @@ struct GpuSplitSearcher(Movable):
         # placeholder, whatever order a caller uses.
         self._ensure_hist()
         self._stage_params(params, g_scale, h_scale, bounds, record)
-        self.stage_node.unsafe_ptr().unsafe_store(
-            record * NODE_WORDS + NODE_HIST_BASE, Int32(0)
-        )
+        self._stage_hist_base(record, Int32(0))
         # Do not call `_launch(self.hist_dev, ...)`: that borrows all of
         # `self` mutably for the method receiver while also borrowing one of
         # its fields mutably as an argument, which Mojo correctly rejects as
@@ -3250,14 +3632,14 @@ struct GpuSplitSearcher(Movable):
 
         This is the entry point that removes the *download* per node. Every
         node's feature set, allow mask, monotone bounds, and histogram slot
-        are written into their own record's staging slot first, then each
-        table crosses once, then one scan covers the whole batch and one
+        are written into their own record's staging slot first, then the
+        tables cross, then one scan covers the whole batch and one
         reduction writes every record. The host's next download is
         `download_frontier`, which is one for the level rather than one per
         leaf.
 
-        It does transfer, and on Metal it therefore waits. Four table
-        copies cross in `_copy_tables` before the launches, and on Metal an
+        It does transfer, and on Metal it therefore waits. The tables cross
+        in `_copy_tables` before the launches, and on Metal an
         `enqueue_copy` is a synchronous full-queue drain in both directions,
         measured by disassembly and recorded in `docs/GPU_PORTABILITY.md`
         section 6.1. An earlier version of this line said "does not transfer
@@ -3265,6 +3647,12 @@ struct GpuSplitSearcher(Movable):
         entry point buys is one table crossing for a whole level instead of
         one per node, which is still the point of it; what it does not buy
         is a level with no host wait in it at all.
+
+        That crossing is **one** copy with `hoist_tables` on and four with
+        it off. It was four unconditionally before the table-packing lane,
+        and `grow_tree_device_resident`'s per-tree wait count, which
+        attributed four of its sixteen to this call, is therefore thirteen
+        on the packed arm.
 
         `hist` holds every node's histogram: the builder's single-node
         buffer when the batch has one node, and a multi-slot buffer
@@ -3299,10 +3687,7 @@ struct GpuSplitSearcher(Movable):
             self._stage_params(
                 params, g_scale, h_scale, nodes[i].bounds, i
             )
-            self.stage_node.unsafe_ptr().unsafe_store(
-                i * NODE_WORDS + NODE_HIST_BASE,
-                Int32(nodes[i].hist_slot * slot_cells),
-            )
+            self._stage_hist_base(i, Int32(nodes[i].hist_slot * slot_cells))
             if self.active_len[i] > widest:
                 widest = self.active_len[i]
         self._launch(hist, params, 0, len(nodes), widest)
