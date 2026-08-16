@@ -134,17 +134,35 @@ MOJOTREES_GPU_TREE_RESIDENT=0 pixi run -e bench bench-train-gpu 1000000 50 reg 5
 
 ### M2.3 The histogram row unroll
 
-**Blocked on `lane/bench-arms` wiring `set_row_unroll` into the harness.**
+**Unblocked.** The arms are wired and compile; nothing has been run.
 
 Must run interleaved in ONE process. That is the entire reason `set_row_unroll`
 is a runtime argument rather than a comptime knob, and a two-build comparison on
 this machine would be worthless. It cannot change a histogram: both arms visit
 the same rows and add the same fixed-point integers, and integer addition is
-associative, so this is a speed question only.
+associative, so this is a speed question only. A smoke run at 2,000 x 8 had the
+two arms agree on the training loss to the last digit and on the tree count,
+which is that claim holding rather than a timing.
+
+Two benchmarks, and **run both**:
 
 ```
-pixi run -e bench bench-train-gpu 1000000 50 reg 5 gpu-unroll,gpu-nounroll   # names pending
+pixi run bench-train-gpu 1000000 50 reg 5 row-unroll-on,row-unroll-off
+pixi run bench-hist 1000000 50 20
 ```
+
+The first is end to end through `train_gpu`; the second is the isolated
+histogram A/B in `bench_histogram.mojo` and prints `row_unroll_on_*` /
+`row_unroll_off_*` in milliseconds. They answer different questions and the
+end-to-end one is the one that decides anything: **an isolated histogram win is
+a hypothesis about a fit, not a result about one.** The row-tile floor measured
+well in isolation and was a 22 to 36 percent regression across a whole fit,
+because the isolated shape did not carry the partial traffic a real round does.
+If the two disagree here, that disagreement is the finding and neither number
+supersedes the other.
+
+`gpu-unroll,gpu-nounroll`, the spelling this file carried while the arms did not
+exist, still parses and resolves to the same pair under the same two labels.
 
 The only prior attempt ran at 18.6 percent spread with lanes compiling and is
 discarded, not superseded.
