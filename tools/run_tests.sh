@@ -84,6 +84,24 @@ ROOT="$PWD"
 # `mojo` is on PATH inside a pixi environment and nowhere else, so a pixi
 # task reaches it and a bare shell does not.  Re-enter the environment
 # rather than fail on `mojo: command not found`.
+#
+# In a LANE WORKTREE, borrow the main checkout's environment before reaching
+# for `pixi run`.  `pixi run` here would treat the worktree as its own
+# project and install a second complete copy of the environment into
+# `<worktree>/.pixi`, roughly 1.1 GB, before compiling anything -- and with
+# it a second, empty Mojo compile cache, because `MODULAR_HOME` follows the
+# environment.  Measured 2026-08-16: 46 lane worktrees had done that, 49 GB
+# of duplicated environments, their caches running 1.1 MB to 243 MB against
+# the main checkout's 8.7 GB.  `tools/lane_env.sh` points at the main one
+# instead, declines when the manifests differ, and is a no-op in the main
+# checkout, so the `pixi run` fallback below still covers every case it
+# cannot serve.
+if ! command -v mojo >/dev/null 2>&1; then
+  if [ -r "$ROOT/tools/lane_env.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$ROOT/tools/lane_env.sh" || true
+  fi
+fi
 if ! command -v mojo >/dev/null 2>&1; then
   if command -v pixi >/dev/null 2>&1 && [ -z "${MOJOTREES_TEST_REEXEC:-}" ]; then
     export MOJOTREES_TEST_REEXEC=1
