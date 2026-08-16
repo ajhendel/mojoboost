@@ -182,6 +182,10 @@ chosen. Building it would be building a gate that cannot open.
 | A19 | Ordered target statistics, the simple (single-cat-feature) projection (`catboost/private/libs/algo/online_ctr.{h,cpp}`, `.../ctr_helper.{h,cpp}`, `.../fold.cpp`, `.../split.cpp`, `catboost/libs/model/online_ctr.h`) -- **verified from source**, see the A19 note | The mechanism A5 named. A categorical value becomes a *numeric* feature whose value at row `i` is a target statistic over the rows that precede `i` in a random permutation, quantized to 16 buckets. Four CTR types, three priors, an unshuffled fold 0, and a separate non-online table for inference | Yes -- it adds features that did not exist | Yes. This is the one mechanism that makes a categorical CatBoost comparison possible at all, and `bench/real_data` runs no such scenario today because we had no counterpart | CPU (`ctr.mojo`, new file; `categorical.mojo` untouched) | A19 note. **BUILT, off by default, unreached.** (3) when on. Deterministic under the seed, across `MOJOTREES_NUM_WORKERS`, and across machines, by a keyed sort rather than a shuffle |
 | A20 | `embedding_features`: the `LDA` and `KNN` embedding estimators (`catboost/private/libs/embedding_features/lda.{h,cpp}`, `knn.{h,cpp}`, `catboost/private/libs/feature_estimator/{base_,}embedding_feature_estimators.{h,cpp}`, `catboost/private/libs/options/embedding_processing_options.{h,cpp}`, `catboost/private/libs/algo/{fold,estimated_features}.cpp`) -- **verified from source**, see the A20 note | Host-side generation of numeric columns from a raw embedding column, which are then quantized by the ordinary float binning path. LDA projects the embedding onto the leading generalized eigenvectors of (between-class scatter, within-class scatter); KNN emits per-class neighbour counts (classification) or the neighbour target mean (regression). **Both read the target**, and both are computed **online against the fold's permutation** -- the same `TFold::GetLearnPermutationArray()` the ordered CTRs use | Yes: new columns, so every downstream bit moves | Yes, and it is bucket C before it is bucket B: CatBoost takes a raw embedding column and mojotrees cannot, so an embedding benchmark today is not a comparison at all | CPU (`embedding.mojo`, new file). **Consumes** `ordered-ts-2`'s permutation; does not own one | A20 note. **BUILT, off by default**, no existing default changed, nothing in the package imports it |
 | A21 | The learn-permutation layer: `permutation_count`, `fold_permutation_block`, `has_time` (`learn_context.cpp::IsPermutationNeeded` / `CountLearningFolds` / `TFoldsCreationParams`, `objects_grouping.cpp::NCB::Shuffle`, `defaults_helper.h::DefaultFoldPermutationBlockSize`) -- **verified from source**, see the A17 note | The permutations themselves, separately from what consumes them. CatBoost builds `max(1, permutation_count - 1)` **learning** permutations plus one **averaging** fold, each a permutation of *blocks* of `min(256, n/1000 + 1)` consecutive rows. **Both A5 (CTRs) and A7 (ordered boosting) read this same layer**, and `IsPermutationNeeded` is what decides whether either gets a shuffle at all | Yes when either consumer is on | Built as part of A7 (`ordered_boosting.ordered_permutation`, `default_permutation_block_size`, `permutation_choice`). **A5's lane should consume it rather than draw its own**: two independent permutation layers keyed by two seeds is two answers to one question | CPU (`ordered_boosting.mojo`); A5's lane is the second consumer | A17 note. Deterministic under the seed and worker-independent, which CatBoost's own `CreateShuffledIndices` is not |
+| A22 | `QueryRMSE` (`catboost/private/libs/algo_helpers/error_functions.h::TQueryRmseError::CalcDersForQueries` and its private `CalcQueryAvrg`) -- **verified from source**, see the A22/A23/A24 note | Squared error with the query's weighted mean residual removed, so only *within-query* level is learned. `Der1 = w_i (t_i - a_i - avg)`, `Der2 = -w_i`, `avg = sum_j w_j (t_j - a_j) / sum_j w_j`. `IsStoreExpApprox` false | Yes -- it is a new objective | Yes. It is the cheapest of the three CatBoost ranking losses and the only one whose hessian stays constant under unit weights | CPU (`catboost_ranking.mojo`, new file) | A22/A23/A24 note. **BUILT, off by default, unreached.** (3) when on. Deterministic: no RNG at all |
+| A23 | `PairLogit` + its automatic pair generation (`error_functions.h::TPairLogitError::CalcDersForQueries`; `catboost/private/libs/pairs/util.cpp::GeneratePairLogitPairs` / `GenerateBruteForce`; `catboost/private/libs/target/data_providers.cpp::GeneratePairs`) -- **verified from source** | Pairwise logistic loss over (winner, loser) pairs inside a group. `p = e^{a_lose} / (e^{a_lose} + e^{a_win})`, `Der1[win] += c p`, `Der1[lose] -= c p`, `Der2[both] += c p (p-1)`. With `max_pairs` unset, pairs are *every* label-distinct pair in the group, weight = group weight, no RNG | Yes -- a new objective, and it is the first mojotrees objective whose hessian is pairwise by construction | Yes. It is also the gradient kernel `YetiRank` reuses | CPU (`catboost_ranking.mojo`) | A22/A23/A24 note. **BUILT, off by default, unreached.** (3) when on. **Carries a constant-hessian exclusion.** Deterministic: default pair generation draws nothing |
+| A24 | `YetiRank` (`catboost/private/libs/algo/yetirank_helpers.cpp`: `UpdatePairsForYetiRank`, `GenerateYetiRankPairsForQuery`, `TYetiRankPairWeightsCalcer::{AddNoise,CalcWeightsClassic}`; defaults in `catboost/private/libs/options/loss_description.cpp::GetYetiRankPermutations` / `GetYetiRankDecay`) -- **verified from source** | A *sampled* pairwise scheme, not a closed form: each round, per group, draw `permutations`=10 noisy rankings of the current scores, and in each ranking charge each adjacent pair `0.15 * decay^k * |rel_i - rel_j|`. Average the pair weights over the 10 draws and feed them to the `PairLogit` gradient | Yes, and it is the only objective in the catalog whose gradients depend on an RNG stream | Yes. It is CatBoost's flagship ranking loss and the one a CatBoost ranking comparison will be run under | CPU (`catboost_ranking.mojo`) | A22/A23/A24 note. **BUILT, off by default, unreached.** (3) when on. **Carries a constant-hessian exclusion.** Deterministic under `(seed, iteration, query, permutation, doc)` keying, across `MOJOTREES_NUM_WORKERS` and machines. CatBoost's own stream is NOT nameable |
+| A25 | `group_id` and the two ranking eval metrics `NDCG`, `PFound` (`catboost/libs/data/objects.cpp::CheckGroupIds`; `catboost/libs/data/target.cpp::CheckGroupWeights`; `catboost/libs/metrics/dcg.cpp` + `catboost/libs/metrics/metric.cpp::TDcgMetric`; `catboost/libs/metrics/pfound.h::TPFoundCalcer` + `metric.cpp::TPFoundMetric`; tie rule in `catboost/libs/metrics/doc_comparator.h`) -- **verified from source**, see the A25 note | The grouping contract (contiguous, *not* sorted; loud failure when violated; weights constant inside a group) and the two metrics a CatBoost ranking run is actually judged by. CatBoost's default `NDCG` is **not** LightGBM's: `type=Base` (raw relevance, not `2^l - 1`), no truncation, and an adversarial tie rule | No (metrics move no bits) | Yes. Without them we cannot score a CatBoost ranking run at all, which is bucket C | CPU (`catboost_ranking.mojo`); `ranking.RankGroups` reused unchanged | A25 note. **BUILT, off by default, unreached.** (3) as a metric selection. Deterministic: no RNG |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -3468,3 +3472,358 @@ alone, where CatBoost's is `Folds[Rand.GenRand() % foldCount]`
 makes a continued run draw what an uninterrupted run would have drawn, the
 same reason every other seeded decision in `_boost_rounds` reads the absolute
 round index.
+
+### A22/A23/A24 note: the three CatBoost ranking objectives, verified from source
+
+Files read, CatBoost `master`, 2026-08-16:
+
+- `catboost/private/libs/algo_helpers/error_functions.h`
+  (`TQueryRmseError::CalcDersForQueries`, `TQueryRmseError::CalcQueryAvrg`,
+  `TPairLogitError::CalcDersForQueries`)
+- `catboost/private/libs/algo_helpers/approx_updater_helpers.h`
+  (`IsStoreExpApprox`, `CalcPairwiseWeights`)
+- `catboost/private/libs/algo/yetirank_helpers.{h,cpp}`
+  (`UpdatePairsForYetiRank`, `YetiRankRecalculation`,
+  `GenerateYetiRankPairsForQuery`, `TYetiRankPairWeightsCalcer`)
+- `catboost/private/libs/pairs/util.cpp` (`GeneratePairLogitPairs`,
+  `GenerateBruteForce`, `GenerateRandomly`, `TryGeneratePair`)
+- `catboost/private/libs/target/data_providers.cpp` (`GeneratePairs`)
+- `catboost/private/libs/options/loss_description.cpp`
+  (`GetYetiRankPermutations`, `GetYetiRankDecay`, `GetMaxPairCount`)
+
+#### Sign convention, which everything below depends on
+
+CatBoost's `TDers` carries `Der1` and `Der2` as derivatives of the
+*log-likelihood*, so `Der1` is the NEGATIVE gradient and `Der2` is the
+NEGATIVE hessian. mojotrees carries LightGBM's convention: `grad = dL/df`,
+`hess = d2L/df2`. Every formula below is transcribed and then negated once,
+and the negation is stated at each site rather than assumed. A lane that
+copies `Der1` into `grad` gets a model that boosts away from the loss.
+
+#### A22. QueryRMSE
+
+`TQueryRmseError::CalcDersForQueries`, per document `i` of query `q`:
+
+    avg      = sum_j w_j (t_j - a_j) / sum_j w_j          (0 if sum_j w_j <= 0)
+    Der1[i]  = w_i (t_i - a_i - avg)
+    Der2[i]  = -w_i
+
+so in mojotrees terms
+
+    grad[i]  = w_i (a_i - t_i + avg)
+    hess[i]  = w_i
+
+`CalcQueryAvrg` takes `w = 1` when the weight vector is empty, and computes
+`querySum` and `queryCount` in document order over the query; the division
+guard is `queryCount > 0`.
+
+Three consequences worth naming:
+
+1. **The hessian is the weight.** Under unit weights it is the literal 1.0,
+   exactly as for squared error, so `QueryRMSE` is *admissible* on the
+   two-plane constant-hessian path. It is the only one of the three that is.
+   `catboost_ranking.query_rmse_varies_hessian` returns True exactly when a
+   non-empty `sample_weight` was supplied, which is the same rule squared
+   error already lives under.
+2. **The gradients of a query sum to zero** when the weights are uniform, so
+   the objective learns only within-query level and boosts from 0.
+   `objective_init_kind` is `INIT_ZERO`, the same answer `LAMBDARANK` gets.
+3. `IsStoreExpApprox` does **not** list `QueryRMSE`, so its approxes are raw.
+
+#### A23. PairLogit, and where its pairs come from
+
+`TPairLogitError::CalcDersForQueries`, for winner `i` and each competitor
+`(j, c)` in `queriesInfo[q].Competitors[i - begin]`:
+
+    p            = expApprox[j] / (expApprox[j] + expApprox[i])
+    Der1[i]     += c p
+    Der1[j]     -= c p
+    Der2[i]     += c p (p - 1)
+    Der2[j]     += c p (p - 1)
+
+`IsStoreExpApprox` DOES list `PairLogit`, so `expApprox` is `exp(a)` and
+therefore
+
+    p        = sigmoid(a_j - a_i)
+    grad[i] -= c p        grad[j] += c p
+    hess[i] += c p (1-p)  hess[j] += c p (1-p)
+
+**The hessian is per row and per round by construction.** `c p (1-p)` depends
+on the current scores of both members of every pair the row appears in. There
+is no configuration of `PairLogit` under which it is constant, which is why
+`catboost_ranking.pairwise_varies_hessian` is unconditional rather than a
+predicate over parameters, and why
+`check_catboost_ranking_hessian_declaration` refuses a constant-hessian
+declaration beside it with no escape hatch. This is the same guard shape as
+`sampling.check_mvs_hessian_declaration`; the difference is that MVS's is a
+consequence of a *knob* and this one is a consequence of the loss.
+
+**Where the pairs come from when the user supplies none.**
+`data_providers.cpp::GeneratePairs` calls `GeneratePairLogitPairs`, which for
+each group counts the pairs of distinct target values and then takes one of
+two branches. With `max_pairs` unset, `GetMaxPairCount` returns the sentinel
+`MAX_AUTOGENERATED_PAIRS_COUNT` and the branch is `GenerateBruteForce` with
+the truncation disabled: **every** ordered pair `(first, second)` with
+`first < second` inside the group and `target[first] != target[second]`, the
+higher target as winner, weight = the group weight, emitted in nested-loop
+order. **No RNG is consulted on this path.** That is the path mojotrees
+implements, and it is the path a default `loss_function=PairLogit` run takes.
+
+`max_pairs` set is NOT implemented here and is refused rather than
+approximated, for two reasons. It shuffles with `TRestorableFastRng64`, whose
+stream is drawn from the unnamed global learn-progress generator; and its
+branch condition is `pairCount / 2 < maxPairCount` *after* `pairCount` has
+already been halved on the line above, so the brute-force branch is taken
+whenever the true pair count is under `4 * max_pairs` and the truncation
+inside `GenerateBruteForce` then fires anyway. Reproducing a bug we cannot
+seed is worth nothing.
+
+**Numerics, a deliberate divergence.** CatBoost forms
+`e^{a_j} / (e^{a_j} + e^{a_i})` from stored exponentials, which overflows to
+`inf/inf = NaN` once an approx passes about 709. mojotrees computes
+`p = sigmoid(a_j - a_i)` through a branch on the sign of the difference, which
+is finite for every finite pair of scores. Same value wherever CatBoost's is
+finite, defined where CatBoost's is not. Classification: **(1) strictly less
+work and exact** (one `exp` instead of two plus a division).
+
+#### A24. YetiRank: what it samples, how many times, and what seeds it
+
+This is the question that decides whether the objective is reproducible, so
+it is answered in CatBoost's own terms first.
+
+**What it samples.** `GenerateYetiRankPairsForQuery` does, per query, for
+`permutationIndex` in `[0, permutationCount)`:
+
+1. Copy the query's `expApproxes`.
+2. `AddNoise`. In the default `Gumbel` arm this is
+   `expApproxes[d] *= u / (1.000001f - u)` with `u = rand.GenRandReal1()`.
+   Since `IsStoreExpApprox` lists `YetiRank`, the values are `exp(a)`, so the
+   multiplication is `a_d + log(u) - log(1.000001 - u)` on the score scale:
+   **logistic** noise, not Gumbel. The name in CatBoost's enum is wrong; the
+   arithmetic is what it is. `u` is stored into a `float`, and `1.000001f` is
+   a `float` literal, so CatBoost's noise is computed in single precision.
+3. `StableSort` the query's indices by noisy value descending.
+4. `CalcWeightsClassic` walks the sorted list once and charges each ADJACENT
+   pair `0.15 * decayCoefficient * |rel[first] - rel[second]|`, with
+   `decayCoefficient` starting at 1 and multiplied by `decay` after each
+   position. The charge is added to `competitorsWeights[winner][loser]` where
+   the winner is the member with the larger relevance; an equal-relevance pair
+   is charged nothing (`AddWeight` has no `==` branch).
+
+After all permutations, every nonzero cell becomes a competitor with weight
+`queryWeight * cell / permutationCount`, scanned winner-major then
+loser-major.
+
+**How many times.** `GetYetiRankPermutations` defaults to **10**.
+
+**Decay.** `GetYetiRankDecay` defaults to **0.85**. The `Decay = 0.99` field
+initializer inside `TYetiRankPairWeightsCalcer::TConfig` is DEAD: the
+constructor overwrites it unconditionally on the next line. Reading 0.99 off
+the header and calling it CatBoost's default is wrong by a factor that
+compounds over the whole ranking.
+
+**The 0.15.** A literal in the source, commented `// Like in GPU`. It scales
+every pair weight uniformly inside a query, so it is absorbed by the learning
+rate up to the interaction with `reg_lambda`; it is carried across anyway
+because that interaction is real.
+
+**What seeds it, and why we cannot copy it.** `UpdatePairsForYetiRank` splits
+the query range into `CB_THREAD_LIMIT` blocks, draws one `ui64` per block from
+`GenRandUI64Vector(blockCount, randomSeed)`, and inside a block runs a single
+`TFastRng64` from which each query in turn takes `rand.GenRand()` as its own
+seed. Query `q`'s stream therefore depends on how many queries precede it
+*inside its block*, and the per-document uniforms inside a query are one
+sequential run shared by all 10 permutations. This is deterministic in
+CatBoost only because `CB_THREAD_LIMIT` is a compile-time constant rather than
+the thread count -- the same accident that makes MVS reproducible there (A11).
+It is not a stream that can be named from outside, and it is exactly the
+shape this repository forbids.
+
+mojotrees keys instead on `(seed, iteration, query, permutation)` through
+`_yetirank_stream`, with document `d` reading `stream + d`. Nothing advances,
+nothing is shared between permutations, and no draw depends on how many
+queries or documents were processed first. The draws differ from CatBoost's;
+the distribution does not. Bit-identity was never on offer, because their
+stream has no name.
+
+**Storage, and a real saving.** CatBoost allocates a dense `querySize x
+querySize` float matrix per query and then scans all of it, which is O(n^2)
+time and memory in the group size for a mode that can only ever touch
+`permutations * (querySize - 1)` cells. mojotrees collects the charged pairs
+into a flat list, sorts it by `(winner, loser)` and merge-sums runs. The sort
+key reproduces CatBoost's winner-major/loser-major emission order exactly, so
+the pair sequence handed to the gradient is the same sequence, and the
+summation order inside a cell is fixed by permutation index. Classification:
+**(1) strictly less work and exact** in the pair set and its order;
+the per-cell sum is a reassociation of the same 10-or-fewer addends and is
+therefore **(3) bit-moving** at the last ulp.
+
+**Modes not implemented.** `mode` in {`DCG`, `NDCG`, `MRR`, `ERR`, `MAP`},
+`noise=Gauss`, `num_neighbors != 1`, and `top`. `Classic` with
+`noise=Gumbel` and `num_neighbors=1` is the constructed default and is the
+whole of what a default `loss_function=YetiRank` run does; `top` is not read
+by `CalcWeightsClassic` at all. The others are refused by name rather than
+silently ignored.
+
+**`YetiRankPairwise` is a different loss** and is not implemented. It shares
+the pair generator but is trained through CatBoost's pairwise scoring path
+(`pairwise_scoring.cpp`), not through leafwise `PairLogit` derivatives.
+
+#### Three further YetiRank facts from `catboost_options.cpp`, verified
+
+`SetNotSpecifiedOptionsToDefaults` and `GetEstimationMethodDefaults` say
+things about a `YetiRank` fit that a comparison harness has to honor or the
+comparison is against a differently-configured CatBoost:
+
+1. **The default eval metric is `PFound`**, not NDCG:
+   `lossDescription.Load(LossDescriptionToJson("PFound")); MetricOptions->
+   ObjectiveMetric.Set(lossDescription);` in the `YetiRank` /
+   `YetiRankPairwise` case. `PairLogit`'s objective metric is `PairLogit`
+   itself; mojotrees implements neither `QueryRMSE` nor `PairLogit` as a
+   *metric*, so the registry diff points those two at `ndcg_catboost` and
+   records the divergence rather than inventing a metric.
+2. **`l2_leaf_reg` defaults to 0 under `YetiRank`**, not to CatBoost's usual
+   3 (`defaultL2Reg = 0`). A harness that leaves `l2_leaf_reg` at 3 while
+   CatBoost silently used 0 is comparing two different regularizations.
+3. **Leaf estimation is Newton with exactly one iteration**
+   (`defaultEstimationMethod = ELeavesEstimation::Newton`,
+   `defaultNewtonIterations = 1`), and CatBoost *refuses* to let you change
+   it: "At the moment, in the YetiRank mode, changing the
+   leaf_estimation_method parameter is prohibited." Backtracking is likewise
+   forced off. So catalog A6 (`leaf_estimation_iterations`) has no bearing on
+   a YetiRank comparison.
+
+CatBoost also records that `YetiRank` "cannot be used as a metric"
+(`IsSkipInMetricsParamsExport`), which is why there is no YetiRank eval
+metric to implement.
+
+#### Why `YetiRank` is not aliased to `lambdarank`
+
+Recorded by the naming lane and restated here because it is the mistake a
+reader of this file is most likely to make. LambdaRank weights a pair by the
+NDCG change that swapping it would cause, computed on the *deterministic*
+current ranking. YetiRank weights a pair by how often it lands adjacent in a
+*noisy* ranking, with a positional decay and a relevance-difference factor,
+and never computes an NDCG at all. They agree only in being pairwise. An alias
+would make a comparison table say two libraries were run on the same loss when
+they were not.
+
+### A25 note: `group_id` and the two eval metrics, verified from source
+
+#### The `group_id` contract
+
+`catboost/libs/data/objects.cpp::CheckGroupIds` is the whole of it:
+
+- Rows of one group must be **CONTIGUOUS**. The function walks the column once
+  collecting the id of each maximal run, then sorts the run ids and calls
+  `std::adjacent_find`; a repeat means some group's rows were interleaved with
+  another's, and it raises **`"group Ids are not consecutive"`**.
+- Groups need **NOT be sorted** by id, and the ids need not be dense, ordered,
+  or numeric (CatBoost hashes string ids through `CalcGroupIdFor`). Only the
+  runs matter.
+- The failure is **loud**. CatBoost does not regroup, does not sort, and does
+  not drop. This is the one thing that has to be true, because a ranking
+  objective reading a mis-grouped column produces a plausible model and a
+  meaningless one, and nothing downstream can detect it.
+- `catboost/libs/data/target.cpp::CheckGroupWeights` additionally requires the
+  weight to be `FuzzyEquals`-constant inside a group: a group weight is a
+  property of the group, and a per-row weight that varies inside one is
+  refused rather than averaged.
+
+mojotrees already had exactly the first three: `ranking.groups_from_query_ids`
+walks the runs, sorts the run ids, and raises
+`"query ids must be contiguous: rows of query N are not consecutive"`. It was
+built against LightGBM and it happens to match CatBoost's rule line for line.
+It is reused unchanged and re-exported under CatBoost's name. The fourth,
+constant weight inside a group, did not exist and is added
+(`check_group_weights_constant`).
+
+#### `NDCG`, and how it differs from the `ndcg` mojotrees already has
+
+`metric.cpp::TDcgMetric` + `dcg.cpp::{CalcNdcg,CalcDcg,CalcIDcg,CalcDcgSorted,
+FillDcgDecay,GetTopSortedTargets}` + `doc_comparator.h::CompareDocs`.
+
+Defaults, from `TDcgMetric`: `DefaultTopSize = -1` (passed as `ui32`, so it
+becomes `Max<ui32>`, i.e. no truncation), `DefaultMetricType =
+ENdcgMetricType::Base`, `DefaultDenominatorType =
+ENdcgDenominatorType::LogPosition`, `UseWeights` default true.
+
+    numerator(rel)  = rel                    (Base, the DEFAULT)
+                    = 2^rel - 1              (Exp)
+    decay[0]        = 1
+    decay[i]        = 1 / log2(i + 2)        (LogPosition, the DEFAULT)
+                    = 1 / (i + 1)            (Position)
+    DCG             = sum_{i < top} numerator(target[order[i]]) * decay[i]
+    IDCG            = same, over targets sorted DESCENDING by target alone
+    NDCG            = IDCG > 0 ? DCG / IDCG : 1
+    reported        = sum_q qw_q NDCG_q / sum_q qw_q      (0 if the sum is 0)
+
+Three differences from `ranking.ndcg`, which is LightGBM's, and every one of
+them changes the number:
+
+1. **The gain.** CatBoost's default is `Base`: the numerator is the raw
+   relevance. LightGBM's is `2^l - 1`, which is CatBoost's `Exp`. A graded
+   relevance set scored under the wrong one is not a rescaling; it reorders
+   which of two models is better.
+2. **The truncation.** CatBoost's default is none. LightGBM's `eval_at`
+   defaults to 5 and mojotrees follows it (`DEFAULT_NDCG_EVAL_AT`).
+3. **The tie rule.** `CompareDocs` is
+   `approxLeft != approxRight ? approxLeft > approxRight : targetLeft <
+   targetRight`: on an exact score tie the LOWER relevance is ranked FIRST.
+   That is adversarial on purpose and is what makes an untrained model score
+   near its floor instead of at whatever the input order happened to give.
+   LightGBM stable-sorts and keeps input order, which flatters the model on
+   any dataset that arrives sorted by relevance -- and ranking datasets
+   frequently do.
+
+`GetTopSortedTargets` uses `PartialSort` with an index tiebreak when
+`top < size` and `StableSort` otherwise. Both are the same total order
+(`CompareDocs`, then input index), so mojotrees does one stable sort and
+truncates. Classification: **(1) strictly less work and exact** -- one sort
+instead of a branch over two.
+
+`CalcIDcg` sorts by `left.Target > right.Target` alone, stably, so the ideal
+ordering keeps input order among equal relevances. That matters only for
+`top < size`.
+
+#### `PFound`
+
+`pfound.h::TPFoundCalcer::AddQuery` + `metric.cpp::TPFoundMetric`. Defaults
+`DefaultTopSize = -1` (`ui32`, so no truncation), `DefaultDecay = 0.85`,
+`UseWeights` default true.
+
+    order    = StableSort by CompareDocs           (the SAME tie rule)
+    pLook    = 1, pFound = 0
+    for position in [0, min(size, top)):
+        pRel   = relevance[order[position]]
+        pFound += pRel * pLook
+        pLook  *= (1 - pRel) * decay
+    reported = sum_q qw_q pFound_q / sum_q qw_q    (0 if the sum is 0)
+
+`GetBestValue` is `Max` with `bestValue = 0`, which is a CatBoost quirk (the
+attainable maximum is 1, not 0) and is not carried across; mojotrees records
+only "higher is better".
+
+**Relevances are probabilities here**, not grades: the recursion is only a
+probability if `pRel` is in `[0, 1]`. CatBoost does not check. mojotrees does
+not check either, because refusing would break the CatBoost-compatible reading
+of a graded column, but `pfound` documents the range and the value is
+meaningless outside it.
+
+**`subgroup_id` is not implemented.** CatBoost skips a document whose
+`subgroupId` was already seen at a higher position, which deduplicates
+near-identical results. There is no subgroup column in mojotrees and inventing
+one is a data-model change this lane does not own. A `PFound` computed here on
+data that HAS subgroups in CatBoost will read high. Named, not hidden.
+
+#### The metric-name collision, which needs a ruling
+
+`NDCG` is not a CatBoost-only concept, so `docs/PARAMETER_NAMING.md`'s rule
+does not settle it, and the two vendors' `NDCG` are different functions (see
+above). mojotrees already spells LightGBM's as `ndcg`. This lane registers the
+CatBoost one as `ndcg_catboost` (alias `catboost_ndcg`), which is a mojotrees
+coinage and not anybody's existing name; it is the only truthful option short
+of carrying CatBoost's `NDCG:type=Base;denominator=LogPosition` parameter
+syntax through a registry that has one scalar slot per metric. `PFound` has no
+collision and is registered under CatBoost's own name, `pfound`. The naming
+lane owns the final spelling of the first.
