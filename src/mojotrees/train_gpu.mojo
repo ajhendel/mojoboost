@@ -148,10 +148,11 @@ from .gpu_resident_round import (
     RESIDENT_OK,
     RESIDENT_TABLES,
     grow_tree_device_resident,
-    resident_round_record_slots,
+    resident_round_enabled,
     resident_round_reason_name,
+    resident_round_record_slots,
     resident_round_refusal_detail,
-    resident_round_requested,
+    resident_round_report_refusal,
     resident_round_supported,
 )
 from .gpu_runtime import GpuSession, NoLifecycle, RoundLifecycle
@@ -686,10 +687,20 @@ def _search_record_slots(params: TreeParams, n_features: Int) -> Int:
         # The device-owned growth plane (gpu_resident_round.mojo) reduces
         # over the whole frontier on the device, so every live leaf needs a
         # record of its own, plus two scratch records the child searches
-        # write into. Off unless `MOJOTREES_GPU_TREE_RESIDENT=1`, and a
-        # searcher this size is harmless to the shipping loops, which use
-        # the first two slots and leave the rest staged and unread.
-        if resident_round_requested():
+        # write into. That plane is the default, so this is the ordinary
+        # size; `MOJOTREES_GPU_TREE_RESIDENT=0` takes the two-slot branch.
+        # A searcher this size is harmless to the shipping loops either way,
+        # since they use the first two slots and leave the rest staged and
+        # unread.
+        #
+        # This asks the same question `_grow_tree_gpu_device_search` asks
+        # before it routes, and it has to: `resident_round_supported`
+        # refuses with `RESIDENT_RECORDS` when the searcher holds fewer
+        # records than one per live leaf plus scratch, so a capacity
+        # decision made from a different predicate than the routing decision
+        # would refuse the plane on the grounds that it had not been given
+        # room for it.
+        if resident_round_enabled():
             return resident_round_record_slots(params.num_leaves, n_features)
         return 2
     var slots = 2 * params.num_leaves
@@ -1122,11 +1133,27 @@ def _grow_tree_gpu_device_search(
         # The device-owned growth plane, which is a second control plane
         # beside this one rather than a change to it: it grows the same tree
         # with the frontier, the tree and the slot pool all resident, and it
-        # waits once per tree where the loop below waits once per split. It
-        # is off unless `MOJOTREES_GPU_TREE_RESIDENT=1`, it refuses by name
-        # every configuration it cannot express, and it falls back here
-        # rather than approximating any of them. See gpu_resident_round.mojo.
-        if resident_round_requested():
+        # waits once per tree where the loop below waits once per split.
+        #
+        # **It is the default.** `MOJOTREES_GPU_TREE_RESIDENT=0` forces the
+        # loop below instead, which is the A/B handle and stays because on
+        # this hardware only interleaved arms compare. It refuses by name
+        # every configuration it cannot express, and every one of those
+        # falls through to the loop below rather than being approximated.
+        # See gpu_resident_round.mojo.
+        #
+        # **It is not instrumented, and the default flip is what makes that
+        # matter.** `profile` is not threaded into it: it has no per-node
+        # host phases to time, because the whole point of it is that the
+        # host does not see the nodes. So a `PhaseProfile` of a
+        # device-search fit now comes back empty by default where it used to
+        # come back full, which is the honest failure rather than a wrong
+        # one, but it is a change in what the instrument covers and not only
+        # in what the trainer does. `MOJOTREES_GPU_TREE_RESIDENT=0` gets the
+        # instrumented loop back; the plane's own trace
+        # (`MOJOTREES_GPU_TREE_RESIDENT_TRACE`) is what replaces it, and a
+        # Metal timeline from outside the process is what sees the rest.
+        if resident_round_enabled():
             var why = resident_round_supported(
                 params, builder, cache.searchers[0].max_records
             )
@@ -1144,17 +1171,24 @@ def _grow_tree_gpu_device_search(
                     n_root,
                 )
             if tree_index == 0:
-                # Once per fit rather than once per tree: a caller who asked
-                # for the plane and did not get it should be told exactly
-                # once, and told which layer refused.
+                # Once per fit rather than once per tree, and named down to
+                # the layer that refused.
+                #
+                # Where it goes changed with the default. While the plane
+                # was opt-in this printed unconditionally, which was right:
+                # the only way to reach it was to have asked. Now that the
+                # plane is the default, an unconditional print would put a
+                # line on standard output for every GPU fit with monotone
+                # constraints, depth-wise growth or a categorical column,
+                # all of which are refusing correctly and none of which
+                # asked. `resident_round_report_refusal` keeps the print for
+                # the caller who still sets `=1` by hand and otherwise
+                # routes the reason to the trace sink, so a default-path
+                # refusal is inspectable without being noisy.
                 var detail = resident_round_reason_name(why)
                 if why == RESIDENT_TABLES:
                     detail = resident_round_refusal_detail(params)
-                print(
-                    "resident_round unavailable, using the device-search"
-                    " resident loop:",
-                    detail,
-                )
+                resident_round_report_refusal(detail)
         return _device_search_resident(
             profile,
             builder,

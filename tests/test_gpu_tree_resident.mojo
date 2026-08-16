@@ -21,8 +21,13 @@ one of them:
    sets it for **both** arms, so what is being compared is
    `grow_tree_device_resident` against `_device_search_resident`, which is the
    identity the module actually claims.
-2. `MOJOTREES_GPU_TREE_RESIDENT=1` has to be set, and the configuration has to
-   be one the plane accepts.
+2. The plane's own gate has to be on, and the configuration has to be one the
+   plane accepts. Since 2026-08-16 that gate is on **by default**
+   (`resident_round_enabled`, `MOJOTREES_GPU_TREE_RESIDENT != "0"`), so what
+   the comparisons below set by hand is the **off** arm, `=0`. Both arms are
+   named explicitly rather than one of them relying on a default, because
+   that default has already moved once and the whole value of this file
+   depends on the two arms differing.
 
 Forcing the first is necessary and is not sufficient, because a future refusal
 in the second, or a change to either gate, would route around the plane again
@@ -151,6 +156,17 @@ def _both_planes(
     Both fits happen in one process against one dataset, so nothing about the
     environment differs between them beyond the gate itself.
 
+    **Both arms set the variable explicitly, and the off arm sets `0`.** It
+    used to set the empty string, on the reasoning that unset meant off. That
+    stopped being true on 2026-08-16, when the plane became the default: the
+    gate is now `!= "0"`, so an empty value selects the plane rather than the
+    fallback and this helper would have run the same plane twice and compared
+    it with itself. `_assert_plane_ran` would have caught it, because it
+    requires the off arm to trace **zero** trees, which is exactly the
+    two-sidedness that assertion was written for and exactly the failure it
+    was written against. The fix is to name the arm rather than to rely on a
+    default that has now moved once.
+
     `MOJOTREES_GPU_SPLIT_STRATEGY=device` is set for both arms and is not
     optional. Without it the automatic policy sends a fixture this size to the
     host histogram scan, which reaches neither the plane nor the loop the
@@ -166,7 +182,7 @@ def _both_planes(
     _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", _TRACE_PATH)
 
     _truncate_trace()
-    _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "")
+    _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "0")
     var host_plane = train_gpu(
         data, target, SQUARED_ERROR, params, bagging=bagging
     )
@@ -494,6 +510,77 @@ def test_a_refused_configuration_falls_back_rather_than_diverging() raises:
         var run = _both_planes(data, target, params)
         _assert_plane_refused(run, "monotone falls back")
         _assert_same_forest(run.host, run.device, "monotone falls back")
+
+
+def test_the_default_path_refuses_by_name_and_says_so_only_in_the_trace() raises:
+    """The refusal path with **nobody having set the variable at all**.
+
+    This is the case the default flip created and the case the other
+    refusal test does not cover. `_both_planes` names both arms, so it only
+    ever exercises a refusal that was explicitly asked for; a monotone fit on
+    a machine where nobody has heard of `MOJOTREES_GPU_TREE_RESIDENT` now
+    reaches the gate too, and has to refuse just as correctly.
+
+    Three claims, and the third is the one that is easy to get wrong when a
+    default moves:
+
+    - the plane did not run, so a refused configuration is not being
+      approximated by it;
+    - the refusal named its own reason, so a fallback is diagnosable rather
+      than merely quiet; the reason is written to the trace sink, which is
+      how a default-path refusal is inspected;
+    - the reason is `monotone constraints` and not some other refusal that
+      happened to fire first, which is what makes this a test of the refusal
+      rather than a test that something refused.
+
+    What is asserted about standard output is nothing, because a test cannot
+    read it. The design that keeps it quiet is
+    `resident_round_explicitly_requested`, asserted directly in
+    `tests/test_gpu_resident_gate.mojo`; here the trace record standing in
+    for it is the observable half.
+    """
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 3_000
+        var n_features = 4
+        var features = _make_features(n_rows, n_features)
+        var target = _regression_target(features, n_rows)
+        var data = bin_equal_width(features, n_rows, n_features, 32)
+        var params = BoosterParams(4, 0.1, TreeParams(16, 20, 1.0, 1e-3))
+        params.tree.monotone = MonotoneConstraints.from_signs(
+            [1, 0, 0, 0], n_features
+        )
+
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "device")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", _TRACE_PATH)
+        # Deliberately NOT set: that is the whole point of this test.
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "")
+        _truncate_trace()
+        var booster = train_gpu(data, target, SQUARED_ERROR, params)
+        var text = _read_trace()
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", "")
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "")
+
+        assert_true(
+            len(booster.trees) > 0, "default refusal: the fit grew no trees"
+        )
+        assert_equal(
+            text.count(_PLANE_MARK),
+            0,
+            "default refusal: a refused configuration reached the plane",
+        )
+        assert_equal(
+            text.count("mojotrees.resident refused:"),
+            1,
+            "default refusal: the refusal should be reported once per fit,"
+            " not once per tree and not never",
+        )
+        assert_true(
+            text.find("mojotrees.resident refused: monotone constraints") >= 0,
+            "default refusal: the reason should name the constraint that"
+            " caused it, down to the layer that refused",
+        )
 
 
 def test_the_step_trace_shows_every_step_of_every_tree() raises:

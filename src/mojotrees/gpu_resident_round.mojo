@@ -4,11 +4,20 @@ What this module is
 -------------------
 A second control plane for growing one tree on the GPU, built beside the one
 in `train_gpu.mojo` rather than inside it. `train_gpu` gains a single call
-site that routes here when the gate is on and the configuration is one this
-plane can express; everything else about that file is untouched. The plan is
-new plane beside old plane, measure one against the other, and only then
-retire the old one. Nothing here deletes or restructures any part of the
-shipping path.
+site that routes here whenever the configuration is one this plane can
+express; everything else about that file is untouched. The plan was new
+plane beside old plane, measure one against the other, and only then retire
+the old one.
+
+**The measurement has been taken and this is now the default.** It ran
+opt-in behind `MOJOTREES_GPU_TREE_RESIDENT=1` until 2026-08-16; it now runs
+unless `MOJOTREES_GPU_TREE_RESIDENT=0` says otherwise, on the three
+*measured* results recorded in `bench/results/session3_2026-08-16/RESULTS.md`
+and argued at `resident_round_enabled` below. What has **not** happened is
+the third step: nothing here deletes or restructures any part of the
+shipping path, and `_device_search_resident` is still what every refusal and
+every `=0` run falls back to. Retiring it is a separate and larger change
+that has to land on a green default rather than tangled with the flip.
 
 The measurement that justifies it
 ---------------------------------
@@ -315,18 +324,89 @@ from .tree import Tree, TreeParams
 # --- The gate -------------------------------------------------------------
 
 
-def resident_round_requested() -> Bool:
-    """`MOJOTREES_GPU_TREE_RESIDENT=1`, and off for every other value.
+def resident_round_enabled() -> Bool:
+    """On, unless `MOJOTREES_GPU_TREE_RESIDENT=0`.
+
+    **This is the default GPU growth plane.** It was not: it landed opt-in
+    behind `=1`, to be measured before it was believed. It has now been
+    measured, and the polarity of this predicate is the whole content of
+    that decision.
+
+    Why the default moved
+    ---------------------
+    Rule S1 in `bench/results/PROFILE_PROTOCOL.md` put three conditions on
+    this plane and all three are answered in
+    `bench/results/session3_2026-08-16/RESULTS.md`:
+
+    - **Trees node-identical to the host plane.** Satisfied, and by an
+      assertion rather than by an argument:
+      `tests/test_gpu_tree_resident.mojo` compares this plane against
+      `_device_search_resident` node for node with no tolerance anywhere,
+      `value` as bit patterns, over six configurations, and asserts from the
+      plane's own trace that the gate opened rather than trusting that it
+      did.
+    - **Faster at 250,000 and at 1,000,000 rows.** *Measured*: 44 percent
+      and 24 percent, five alternating pairs per shape, both resolved under
+      M0 with every pair agreeing in sign.
+    - **No regression at 50,000 rows.** *Measured*: 2.2x faster (median
+      0.789 s against 1.724 s, arm spreads under 0.02 s). The condition
+      asked only for no regression and got the largest relative win of the
+      three shapes.
+
+    Those three figures are measurements, not fits, bounds, or estimates,
+    and they are the only reason this predicate reads the way it does. They
+    were taken on one machine in one thermal window with the arms
+    interleaved, which is the only comparison this machine supports: it
+    drifts several-fold between windows, so an absolute second from that
+    file means nothing and a within-window ratio means everything.
+
+    Why the opt-out stays
+    ---------------------
+    `=0` forces the shipping loop (`_device_search_resident`) in the same
+    binary. That is a standing requirement on this repository rather than a
+    courtesy: since only interleaved arms compare here, an A/B has to be
+    reachable without a rebuild, and a rebuild between arms would put a
+    different compile and a different thermal state on either side of the
+    comparison. It is also where a run goes that hits a fault in this plane,
+    and the answer to that must not be "use the host scan".
+
+    Spelling
+    --------
+    An inequality against "0", which is how `MOJOTREES_GPU_SPLIT_RESIDENT`
+    is spelled for the same polarity, so that an unset variable and a
+    variable set to something unrecognized both land on the **default**
+    rather than on whatever a permissive parser makes of them. The name
+    changed with the polarity: this used to be `resident_round_requested`,
+    and a predicate that means "was not opted out of" must not keep a name
+    that means "was asked for".
 
     One gate for the tables and for the loop that drives them, because a
     caller has no reason to want one without the other and two variables
-    would only make it possible to set them inconsistently. Spelled as an
-    equality against "1" so that an unset variable and a variable set to
-    something unrecognized both land on the default, which is off.
+    would only make it possible to set them inconsistently.
 
-    This lands as an opt-in path to be measured, not as a new default.
+    The stale duplicate, which is a live hazard
+    -------------------------------------------
+    `gpu_tree_tables.tree_resident_requested` reads the same variable and
+    still spells it `== "1"`. It is **not** consulted by anything: nothing in
+    `train_gpu.mojo` calls it and only `tests/test_gpu_tree_tables.mojo`
+    imports it, which is why the default could move here without moving
+    there and without a test failing anywhere. That is exactly what makes it
+    dangerous. Two predicates over one variable now disagree about that
+    variable's default, and the next caller to reach for the one in
+    `gpu_tree_tables` gets the pre-flip answer with no warning.
+
+    It should be deleted and its callers pointed here. It was left standing
+    only because the lane that flipped this default did not own that file at
+    the time. Anyone who does own it: delete it, do not "fix" it, because a
+    second predicate that agrees is still a second predicate that can drift.
+
+    Enabled is not the same as taken. `resident_round_supported` still
+    refuses by name every configuration this plane cannot express, and
+    `train_gpu` still falls back to the shipping loop for those; the default
+    flip changes which plane runs where the plane is *admissible*, and
+    changes nothing about what is admissible.
     """
-    return getenv("MOJOTREES_GPU_TREE_RESIDENT") == "1"
+    return getenv("MOJOTREES_GPU_TREE_RESIDENT") != "0"
 
 
 # --- The trace ------------------------------------------------------------
@@ -542,6 +622,55 @@ def resident_round_refusal_detail(params: TreeParams) raises -> String:
     `RESIDENT_TABLES`. Split out so the caller can print one line that names
     both the layer that refused and what it refused."""
     return tree_resident_reason_name(tree_resident_supported(params))
+
+
+def resident_round_explicitly_requested() -> Bool:
+    """`MOJOTREES_GPU_TREE_RESIDENT=1` was set by hand.
+
+    Not the gate. `resident_round_enabled` is the gate and it is on by
+    default; this distinguishes the caller who *asked* from the caller who
+    simply did not opt out, and the only thing that distinction is used for
+    is whether a refusal says so on standard output.
+
+    It exists because the default flip would otherwise have turned a
+    diagnostic into noise. While the plane was opt-in, "you asked for the
+    resident plane and did not get it" was worth one line per fit, because
+    the only way to see it was to have asked. On by default, the same line
+    would print on every GPU fit with monotone constraints, depth-wise
+    growth, a categorical column, or any other refused shape, none of which
+    asked for anything and all of which are behaving correctly. A fallback
+    that is correct and expected must be silent.
+    """
+    return getenv("MOJOTREES_GPU_TREE_RESIDENT") == "1"
+
+
+def resident_round_report_refusal(detail: String) raises:
+    """Say once per fit that the plane refused, where saying it is wanted.
+
+    Two sinks and neither is on by default:
+
+    - standard output, only when the caller set `=1` by hand, which is the
+      pre-default-flip behavior preserved exactly for the caller who still
+      asks by hand;
+    - the trace sink, whenever `MOJOTREES_GPU_TREE_RESIDENT_TRACE` names
+      one, which is how a default-path refusal is made visible without
+      printing at anybody.
+
+    The trace record deliberately does **not** carry the
+    `plane=device-resident` token that `grow_tree_device_resident` writes
+    once per tree it grows. That token is what
+    `tests/test_gpu_tree_resident.mojo` counts to prove the plane ran, and a
+    refusal writing it would turn the negative control into a false
+    positive: a refused configuration would look like a plane that executed.
+    """
+    var line = String("mojotrees.resident refused: ") + detail + "\n"
+    if resident_round_explicitly_requested():
+        print(
+            "resident_round unavailable, using the device-search resident"
+            " loop:",
+            detail,
+        )
+    _resident_trace_emit(resident_trace_sink(), line)
 
 
 # --- The loop -------------------------------------------------------------

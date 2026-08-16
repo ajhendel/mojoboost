@@ -99,9 +99,15 @@ The device mirror of this frontier
 words per live leaf, alongside the tree under construction and a device copy
 of the histogram slot pool, and its `_pick_and_commit_kernel` performs
 `select_best` and `plan_commit`/`apply_commit` in one launch with no host
-round trip. That module is gated off (`MOJOTREES_GPU_TREE_RESIDENT`) and
-wired to nothing; it exists so a later lane can move the per-split host wait
-that a stage profile measured at 31 synchronizations per tree.
+round trip. That module was gated off and wired to nothing when this was
+written; `gpu_resident_round.mojo` has since wired it, and since 2026-08-16
+it is the **default** GPU growth plane, with `MOJOTREES_GPU_TREE_RESIDENT=0`
+as the opt-out back to the host-driven loop. It moved the per-split host
+wait that a stage profile measured at 31 synchronizations per tree.
+
+So this host frontier is no longer the only one that runs. It is what a fit
+falls back to: every configuration the device plane refuses by name, and
+every `=0` run. The three rules below still have to hold in both places.
 
 Three rules stated here are the ones it had to reproduce exactly, and they
 are the reason they are stated here at all rather than left implicit in a
