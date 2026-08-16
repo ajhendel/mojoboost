@@ -498,19 +498,202 @@ the block occurs, not observed.
 
 ### 6.3 What each backend provides, on these two points
 
+**Two Metal rows were corrected on 2026-08-16 by execution. See 6.5.** The
+copy rows used to read "**no**, measured by disassembly", from the same
+reading that produced 6.1, and both are wrong for the destination this
+library actually uses.
+
 | Requirement | Metal | CUDA | HIP |
 |---|---|---|---|
-| `asynchronous-host-to-device-copy` | **no**, measured by disassembly | unestablished; the API specifies one, MAX's use of it has not been read | unestablished, same reason |
-| `asynchronous-device-to-host-copy` | **no**, measured by disassembly | unestablished | unestablished |
-| `queue-depth` | 64 command buffers, one per launch, measured by disassembly; not raisable | unestablished | unestablished |
-| `second-queue-or-stream` | none, `"Metal stream not implemented"` in the runtime | unestablished | unestablished |
+| `asynchronous-host-to-device-copy` | **yes** into a pinned `HostBuffer`, **no** into an arbitrary host pointer; measured by execution, 6.5 | unestablished; the API specifies one, MAX's use of it has not been read | unestablished, same reason |
+| `asynchronous-device-to-host-copy` | **yes** into a pinned `HostBuffer`, **no** into an arbitrary host pointer; measured by execution, 6.5 | unestablished | unestablished |
+| `queue-depth` | 64 command buffers, one per launch, measured by disassembly; not raisable, and 6.5 verifies the "not raisable" two further ways | unestablished | unestablished |
+| `second-queue-or-stream` | none; `"Metal stream not implemented"` in the runtime, and `create_stream()` raises `createStream is not supported on this device` | unestablished | unestablished |
 | `capture-and-replay` | none, no `MetalDeviceGraphBuilder` | `CUDADeviceGraphBuilder` ships; never exercised here | `HIPDeviceGraphBuilder` ships; never exercised here |
+| `event-or-fence` | **none**; `create_event()` raises, and every `MTLSharedEvent` and `MTLFence` selector has zero load sites. 6.5 | unestablished | unestablished |
+| `host-visible-device-allocation` | **none reachable**; every buffer is shared storage, but the Mojo API hands out `gpuAddress` for a `DeviceBuffer` and `contents` for a `HostBuffer`, never both names for one allocation. 6.5 | unestablished | unestablished |
+| `runtime-handle-out` | **none**; `DeviceContext` exposes no queue, command-buffer, or native handle, so no vendor shim can hook it. 6.5 | unestablished | unestablished |
 
 "unestablished" is deliberately not "specified" here. Section 1's table can
 say "specified" because it is quoting what an API documents about a kernel
 primitive. These rows are about what the runtime *does* between the API and
 the device, which is exactly the layer where Metal turned out to differ, so
 quoting the API would be the wrong kind of answer.
+
+### 6.5 What the readback path can and cannot reach, and the correction to 6.1
+
+Added 2026-08-16 by the `cheap-sync` lane, whose question was whether one host
+readback of a 136-byte split record can be made to cost what it costs on CUDA
+rather than what a queue drain costs. Everything below is **measured**, by
+execution on an Apple M4 unless it says disassembly. The reproductions are
+`probes/readback_cost.mojo`, which runs every claim as a gated arm.
+
+#### 6.5.1 `enqueue_copy` has two implementations and the destination picks one
+
+**This is a correction to 6.1, and it is the load-bearing one.** 6.1 says
+`enqueue_copy` on Metal blocks until the whole queue has drained and then
+copies, in both directions, and it established that by disassembling
+`enqueueCopyToDevice` / `enqueueCopyFromDevice`. The disassembly is not
+retracted. What it missed is that it is not the only path.
+
+| destination | behavior | how established |
+|---|---|---|
+| pinned `HostBuffer` (`enqueue_create_host_buffer`) | **asynchronous.** Enqueues a blit and returns | execution |
+| arbitrary host pointer (a `List`'s `unsafe_ptr()`) | **synchronous.** Commits, waits, memcpys, exactly as 6.1 disassembled | execution |
+| `map_to_host()` | **synchronous**, and it is a fresh host allocation with a copy in on entry and a copy out on exit, not an address remap | execution |
+
+Download, **measured**: a kernel slow enough to be unambiguous, then a copy
+into a pinned `HostBuffer`, read with no intervening `synchronize()`. All 64
+of 64 words stale, four attempts out of four, and all 64 correct after the
+`synchronize()`. The same kernel and the same read into a plain heap pointer:
+0 of 64 stale, with no `synchronize()` anywhere.
+
+Upload, **measured**: a pinned buffer filled with ones, uploaded, and then
+overwritten with sevens with no drain in between; a kernel summed what the
+device received. Across four repetitions the device saw the sevens once and
+the ones three times. **Non-deterministic**, which is the signature of a live
+race and not of either fixed ordering.
+
+**What this changes, in the unsafe direction.**
+
+- 6.1's bullet "every `ctx.synchronize()` that immediately follows an
+  `enqueue_copy` with no enqueue in between is redundant on Metal" is
+  **wrong** for the pinned destination, which is the one every transfer in
+  this library uses. That `synchronize` is the only thing making the readback
+  correct. `probes/readback_cost.mojo` carries `pinned_pair_nosync` and
+  `pinned_one_nosync` as arms for exactly this reason: they execute the edit
+  the bullet licensed and report 34 of 34 words wrong.
+- 6.1's bullet that `StagingRing` can never save a wait on Metal, and that
+  `HazardTracker`'s host-write hazard class is vacuous there, is **wrong**.
+  The hazard is real and was reproduced. Both docstrings in
+  `gpu_runtime.mojo` are corrected in place.
+- **The race is latency-dependent, which is what makes it dangerous.** Under
+  a fast kernel the unsafe shapes pass every time, because the blit wins;
+  under a slow one they fail every time. A change validated on a small
+  fixture will look correct and break on a large one. This is the same shape
+  as the host-side table that once made tree 0 bit-identical and every tree
+  after it diverge.
+- It does **not** disturb 6.1.1. Removing thirteen pinned copies per tree
+  measured 0.016 seconds, and this section supplies the mechanism that null
+  was missing: a pinned copy is nearly free because it never waited, not
+  because the drain it performed was cheap. Count round trips to predict time
+  still holds, and is now better founded.
+
+**What it does not change.** The synchronous path is real and 6.1 described
+it correctly. A copy into an arbitrary host pointer still drains.
+
+#### 6.5.2 There is no event, fence, stream, callback, or completion query
+
+Every one of these compiles and then fails at run time, which is why the
+compiler is not sufficient here and the probe executes them:
+
+| API | result |
+|---|---|
+| `DeviceContext.create_event()` | raises `eventCreate is not supported on this device` |
+| `DeviceContext.create_stream()` | raises `createStream is not supported on this device`; `num_streams()` answers 1 |
+| `DeviceContext.enqueue_cpu_function(f)` | raises `enqueue_cpu_function is only supported on CPU DeviceContexts` |
+| `DeviceContext.handle/unsafe_ptr/native_handle/stream_handle` | do not exist; the compiler rejects each |
+| `DeviceContext.query/is_idle/poll/is_complete` | do not exist; the compiler rejects each |
+
+Independently, **measured by disassembly** of `libMGPRT.dylib`:
+`newSharedEvent`, `newSharedEventHandle`, `newSharedEventWithHandle:`,
+`newEvent`, `newFence`, `encodeSignalEvent:value:`,
+`encodeWaitForEvent:value:`, `notifyListener:atValue:block:` and
+`addCompletedHandler:` are each registered in the runtime's metal-cpp
+selector table and each has **zero** load sites. The only synchronization
+selectors with load sites are `commit` (8) and `waitUntilCompleted` (6). So
+the runtime does not use a single Metal synchronization primitive beyond
+committing a command buffer and blocking on it.
+
+**A vendor `MTLSharedEvent` shim is therefore not constructible, and the
+reason is not effort.** To make a wait cheaper than `waitUntilCompleted`, a
+shim must either encode `encodeSignalEvent:value:` into the command buffer
+MAX committed, or poll memory MAX's kernel wrote. The first needs MAX's queue
+or command buffer, and the table above shows no handle comes out. The second
+needs a host address for a device allocation, and 6.5.3 shows none is
+reachable. Allocating the `MTLBuffer` outside MAX and handing its
+`gpuAddress` to `enqueue_function` fails on residency: MAX calls
+`useResource:usage:` for its own allocations only, and a bindless argument to
+a non-resident buffer is undefined. The gap is upstream, and
+`handoffs/upstream_max_metal_gaps.md` is the report.
+
+#### 6.5.3 Every buffer is shared storage, and no allocation exposes both names
+
+**Measured by disassembly.** Every Metal allocation MAX makes goes through
+one `newBufferWithLength:options:` call site, and the one caller reached from
+the device-context allocator passes `options == 0`, which is
+`MTLStorageModeShared`. So the hardware premise of a zero-copy readback holds:
+the memory really is host-addressable.
+
+**Measured by execution**, and this is where it stops:
+
+- `DeviceBuffer.unsafe_ptr()` and `DeviceBuffer.device_ptr()` return the same
+  value, and it is the buffer's `gpuAddress`. An M4 returned 0x10000080000
+  for a fresh device buffer and **faulted** on the first host load;
+  consecutive allocations were 256 bytes apart in that space. Host
+  allocations in the same process sat near 0x100b4c000. (`gpuAddress` has one
+  load site, `setBuffer:offset:atIndex:` has none, and `useResource:usage:`
+  has one, so kernel arguments are bound bindlessly by GPU address.)
+- `HostBuffer.unsafe_ptr()` returns the buffer's `contents`, a real host
+  address. A kernel handed it wrote nothing: the destination still held its
+  pre-fill sentinel in all 34 words after a full drain. A kernel handed it as
+  a source read zeros. Both directions, and both before and after the buffer
+  had been used as an `enqueue_copy` destination, which rules out "the
+  runtime had never seen it".
+
+**So the 2026-08-15 `host_direct WRONG` result in
+`bench/results/apple_m4_unified_memory_2026-08-15/` was never an ordering
+bug.** It is an addressing mismatch: `enqueue_function` binds by GPU address
+and the Mojo API hands out a CPU address for that allocation kind. The
+ordering requirement for a direct read is satisfiable and already paid, since
+one command buffer completion is Metal's visibility point for shared storage
+and every readback pays one. What is missing is an address, and no amount of
+fencing supplies it.
+
+#### 6.5.4 The queue depth has no knob, verified three ways
+
+6.2 established by disassembly that the queue is created with a bare
+`[device newCommandQueue]`. Re-verified here from the same binary by counting
+load sites rather than by reading the call site: `newCommandQueue` has one
+store (the metal-cpp selector registration) and **one load**, at 0xe2b7c,
+inside the Metal device context's initialization and immediately before its
+`MODULAR_DISABLE_METAL_GPU_PRINT` lookup. `newCommandQueueWithDescriptor:`,
+`newCommandQueueWithMaxCommandBufferCount:` and `setMaxCommandBufferCount:`
+each have their registration store and **zero** loads.
+
+Two further checks 6.2 did not make. MAX reads no environment variable
+resembling a queue depth; the complete set of `MODULAR_*` and `METAL_*` names
+in the runtime is context, telemetry, logging, affinity, cache, compiler-path
+and health-check settings, and none of them is a queue parameter. And
+`DeviceContext.__init__` has exactly four overloads, none of which takes one;
+the compiler lists all four when handed a bad keyword.
+
+**So the depth cannot be raised, and the derived one-in-one-out claim in
+`gpu_resident_round.mojo` cannot be tested by raising it.**
+`probes/readback_cost.mojo` tests the consequence instead, with a ladder of
+launch-stream lengths on both sides of 64 that times only the enqueue loop.
+A depth that blocks shows up as a knee in per-launch enqueue cost. That
+measurement is the orchestrator's; this section only records that the ladder
+is the available instrument and why.
+
+#### 6.5.5 A toolchain trap that can invalidate a worktree's compile check
+
+Not about the device, and recorded here because it can silently invalidate
+everything above. On this machine, `mojo run -I <path>` does **not** resolve
+the `mojotrees` package to `<path>` when another checkout of the same package
+name exists. **Measured**: a fresh copy of `src/` at an unrelated path, with a
+new module-level constant added, compiled without the constant being visible;
+appending deliberately invalid syntax to that copy produced no error at all,
+so the file was never read. The same tree copied to a package named
+`mtprobe` compiled and exposed everything. Clearing the cache directory, a
+private `MODULAR_HOME`, and a private `cache_dir` each changed nothing.
+
+**Consequence for anyone working in a git worktree: `mojo precompile -I
+src src/mojotrees` may be elaborating the shared checkout's source, not
+yours, and it will report success.** The workaround that is known to work is
+to copy the package under a different name and compile that. Whatever the
+resolution mechanism is, it has not been identified, and identifying it is
+worth someone's hour.
 
 ## 7. Gates and environment variables
 

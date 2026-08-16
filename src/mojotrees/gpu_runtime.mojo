@@ -58,18 +58,30 @@ a place where today's code synchronizes unconditionally and the model says
 it did not have to.
 
 One backend fact the model does not encode, and must not be read as denying.
-On Metal `enqueue_copy` is itself a synchronous full-queue drain in both
-directions, **measured** by disassembly of the shipped runtime and recorded
-in `docs/GPU_PORTABILITY.md` section 6.1. Two things follow for anyone
-reading this model's output on that backend. A copy is a synchronization
-whether or not the model was told to record one, so a per-round upload is a
-per-round ordering point and belongs in any *hazard* count of them. And the
-second hazard class above, the host about to overwrite a staging buffer a
-copy may still be reading, is vacuous there, so an elided check the tracker
-reports against `RES_STAGE` is not a synchronization anyone could have
-removed. The model stays written against queue ordering rather than against
-Metal, which is what makes it portable and what makes it conservative in the
-safe direction.
+`docs/GPU_PORTABILITY.md` section 6.1 records that on Metal `enqueue_copy` is
+a synchronous full-queue drain in both directions, **measured** by
+disassembling the shipped runtime. **Section 6.5 corrects that on
+2026-08-16: it is true of one of `enqueue_copy`'s two implementations and
+false of the other, and the destination chooses which one runs.** A copy into
+an arbitrary host pointer is the synchronous drain the disassembly found. A
+copy into a pinned `HostBuffer` -- which is what every transfer in this
+library actually uses -- is **asynchronous**, and section 6.5 carries the
+measurement.
+
+Two things follow for anyone reading this model's output on that backend, and
+they are the opposite of what stood here before. A pinned copy is *not* a
+synchronization, so it does not belong in a hazard count merely for being a
+copy; the queue ordering the model is written against is the whole story for
+it. And the second hazard class above -- the host about to overwrite a staging
+buffer a copy may still be reading -- **is real on Metal, not vacuous**, and
+an elided check the tracker reports against `RES_STAGE` is a check that was
+genuinely needed. That class was documented here as vacuous from 2026-08-15
+until 2026-08-16, and code written against that claim has a data race in it.
+
+The model stays written against queue ordering rather than against any
+backend, which is what makes it portable and what makes it conservative in
+the safe direction. That conservatism is now load-bearing rather than
+decorative.
 
 A third thing follows, and it is the one this file is most likely to be
 misread on. **What this tracker counts is hazards, not time.** Section 6.1.1,
@@ -81,11 +93,13 @@ device-resident plane **measured** 0.016 seconds at 1,000,000 x 50 against a
 registered prediction of 0.64, a null under M0
 (`bench/results/session3_2026-08-16/RESULTS.md`). So a required check this
 model reports is a real ordering constraint and an elided one is a real
-redundancy, and neither number converts to a saving. `StagingRing` inherits
-the same correction: on Metal no copy is ever still in flight, so a second
-slot cannot be what avoids a wait, and `MOJOTREES_GPU_STAGING_SLOTS` above 1
-buys nothing on this backend. The ring is correct, cheap and portable and
-should stay; what is wrong is the expected value of turning it up.
+redundancy, and neither number converts to a saving.
+
+Section 6.5, later the same day, supplies the *mechanism* that null was
+missing: a pinned copy is nearly free because it never waited in the first
+place, not because the drain it performed was cheap. `StagingRing` therefore
+does **not** inherit the correction that once stood here. It was written as
+though a second slot could never avoid a wait on Metal, and that was wrong.
 
 Nothing in this file removes a synchronization from histogram_gpu.mojo or
 train_gpu.mojo, and nothing here has been measured. It is the model and the
@@ -108,6 +122,11 @@ Environment contract, matching the `MOJOTREES_` convention in parallel.mojo:
   a session actually performs: context creation, device discovery, kernel
   creation, and first versus warm fit. Off by default, and the phase *counts*
   are kept either way, which is what `session_state()` answers from.
+- `MOJOTREES_GPU_READBACK` names the transport a small device answer comes
+  home on, from `readback_transport_name`. Default `pinned_pair_sync`, which
+  is what the code does today; `require_readback_correct` refuses the two
+  spellings this backend is measured to get wrong. See the readback section
+  below and `probes/readback_cost.mojo`.
 - `MOJOTREES_GPU_WARMUP` (`off`, `train`, `all`) names which kernels a
   session intends to front-load. Nothing is created up front yet; what the
   plan buys today is that the first launch of a named kernel is attributed to
@@ -342,9 +361,25 @@ struct HazardTracker(Copyable, Movable):
     order, which is precisely the reason so many synchronizations can go.
 
     `sync` clears every resource, because `DeviceContext.synchronize()` is a
-    whole-queue drain and there is no finer-grained wait in use. A model
-    with per-event waits would clear less and elide more; this one is
-    deliberately the conservative version of the argument.
+    whole-queue drain and there is no finer-grained wait in use. A model with
+    per-event waits would clear less and elide more; this one is deliberately
+    the conservative version of the argument.
+
+    **There is no finer-grained wait to be had on Metal, and that is now
+    established rather than assumed.** `DeviceContext.create_event()` compiles
+    and raises `eventCreate is not supported on this device`;
+    `create_stream()` raises `createStream is not supported on this device`
+    and `num_streams()` answers 1; `enqueue_cpu_function` raises `only
+    supported on CPU DeviceContexts`, so a completion callback cannot be
+    turned into a flag either. Independently, in the shipped runtime,
+    `newSharedEvent`, `newEvent`, `newFence`, `encodeSignalEvent:value:`,
+    `encodeWaitForEvent:value:`, `notifyListener:atValue:block:` and
+    `addCompletedHandler:` are each registered in the metal-cpp selector table
+    and each has **zero** load sites; the only synchronization selectors with
+    load sites are `commit` and `waitUntilCompleted`. So on this backend the
+    conservative model is not merely a safe choice, it is the only expressible
+    one, and an elided check is the only kind of saving available.
+    `docs/GPU_PORTABILITY.md` section 6.5 carries all of it.
     """
 
     var n_resources: Int
@@ -489,17 +524,38 @@ struct StagingRing(Copyable, Movable):
     the device has finished, which a second set of flags would eventually
     manage to do.
 
-    **On Metal this ring can never save a wait, and the count above is the
-    reason.** `enqueue_copy` there is a synchronous full-queue drain in both
-    directions, measured by disassembly of the shipped runtime and recorded
-    in `docs/GPU_PORTABILITY.md` section 6.1. A copy that has already
-    drained the queue is retired the instant it returns, so `pending()` is
-    False for every slot on every call and `MOJOTREES_GPU_STAGING_SLOTS`
-    above 1 changes nothing observable. The ring is kept because it is
-    correct, cheap, and the right model for a backend where the copy is
-    asynchronous, and because it is the bookkeeping a removal would have to
-    be argued from. What must not be claimed is a Metal speedup from turning
-    it up.
+    **The hazard this ring exists for is real on Metal. Corrected
+    2026-08-16.** From 2026-08-15 until then this docstring said the
+    opposite: that `enqueue_copy` there is a synchronous drain in both
+    directions, so a copy is retired the instant it returns, `pending()` is
+    False for every slot on every call, and `MOJOTREES_GPU_STAGING_SLOTS`
+    above 1 changes nothing observable. Every clause of that is wrong for the
+    copy this library actually issues.
+
+    `docs/GPU_PORTABILITY.md` section 6.5 has the measurement.
+    `enqueue_copy(dst_buf=..., src_ptr=<pinned HostBuffer>)` on Metal is
+    **asynchronous**: it enqueues a blit and returns. The hazard was
+    reproduced directly. A host buffer was filled with ones, uploaded, and
+    then overwritten with sevens with no drain in between; the device summed
+    what it received. Across four repetitions the device saw the sevens once
+    and the ones three times -- **non-deterministically**, which is the
+    signature of a live race rather than of either fixed ordering.
+
+    Three consequences, all of which the old text denied:
+
+    - `pending()` is a real question and its answer is sometimes True.
+    - A second slot really can avoid a wait, so
+      `MOJOTREES_GPU_STAGING_SLOTS` above 1 has a mechanism behind it. What
+      it is worth is still unmeasured, and a number would need the
+      interleaved harness.
+    - Any code that refills a staging arena without first draining or
+      rotating has a data race that will be silent at small sizes and appear
+      under load, because whether the blit or the host store wins depends on
+      how long the queue ahead of it is. `histogram_gpu.stage_gradients`
+      drains, so the shipping path is safe; its docstring's *reason* for
+      keeping the drain ("this synchronize has nothing of its own to wait
+      for") is the claim that is wrong, and the drain must not be removed on
+      the strength of it.
     """
 
     var n_slots: Int
@@ -557,6 +613,235 @@ struct StagingRing(Copyable, Movable):
             if at >= 0 and drains <= at:
                 n += 1
         return n
+
+
+# ---------------------------------------------------------------------------
+# Readback transports
+# ---------------------------------------------------------------------------
+#
+# How a small device answer gets to the host, as run-time-selectable arms with
+# their costs and their correctness stated per backend. The 136-byte split
+# record is the case this exists for: `_device_search_resident` reads one per
+# split, and that read is the round trip that predicts the plane's time.
+#
+# This is policy, not mechanism. It holds no context and issues no copy, in
+# the same way `PoolLedger` holds sizes and not buffers, so it is testable on
+# a machine with no accelerator and so the module that owns the buffers stays
+# the module that touches them. `GpuSplitSearcher.download_words` in
+# gpu_split_search.mojo is the adoption site; the transports below are named
+# from its point of view.
+#
+# Why this is a table and not a constant
+# --------------------------------------
+#
+# Two of the five transports were believed correct and are not, and the
+# believing was done from a docstring. `probes/readback_cost.mojo` executes
+# every one of them against a per-arm tag under a kernel slow enough to make
+# the answer deterministic, and reports which delivered the record. The
+# `correct_on_metal` column below is that result and nothing else. Anything
+# that reads this table gets the measured answer rather than the argued one.
+
+comptime READBACK_PINNED_PAIR_SYNC = 0
+comptime READBACK_PINNED_ONE_SYNC = 1
+comptime READBACK_PLAIN_PAIR = 2
+comptime READBACK_PLAIN_ONE = 3
+comptime READBACK_MAP = 4
+comptime READBACK_PINNED_PAIR_NOSYNC = 5
+comptime READBACK_PINNED_ONE_NOSYNC = 6
+comptime N_READBACK_TRANSPORTS = 7
+
+comptime READBACK_DEFAULT = READBACK_PINNED_PAIR_SYNC
+"""What ships until a measurement says otherwise.
+
+It is what `download_words` does today, and the default is deliberately the
+current behavior rather than the arm with the fewest command buffers: this
+lane produced no timings, and `docs/GPU_PORTABILITY.md` section 6.4 records
+what happens here when a count is turned into a prediction without one. Two
+arms below carry strictly fewer command buffers for the same bytes and are
+correct; choosing between them is a measurement, and `pixi run
+probe-readback` is the measurement."""
+
+
+def readback_transport_name(transport: Int) -> String:
+    if transport == READBACK_PINNED_PAIR_SYNC:
+        return String("pinned_pair_sync")
+    if transport == READBACK_PINNED_ONE_SYNC:
+        return String("pinned_one_sync")
+    if transport == READBACK_PLAIN_PAIR:
+        return String("plain_pair")
+    if transport == READBACK_PLAIN_ONE:
+        return String("plain_one")
+    if transport == READBACK_MAP:
+        return String("map")
+    if transport == READBACK_PINNED_PAIR_NOSYNC:
+        return String("pinned_pair_nosync")
+    if transport == READBACK_PINNED_ONE_NOSYNC:
+        return String("pinned_one_nosync")
+    return String("unknown")
+
+
+@fieldwise_init
+struct ReadbackTransport(Copyable, Movable):
+    """One way of moving a small record from device to host, priced and
+    graded.
+
+    `command_buffers` counts what the transport commits, including the kernel
+    that produced the record, because that is the count a Metal System Trace
+    reports and comparing against a different denominator is how the five-fold
+    error in section 6.4 happened. `host_waits` counts the ones the host
+    blocks on, which is the count that predicts time.
+
+    `correct_on_metal` is a **measured** result from
+    `probes/readback_cost.mojo`, not a judgement. `correct_elsewhere` is
+    deliberately True for the two arms Metal rejects, because what makes them
+    wrong here is Metal's asynchronous pinned copy, and a backend whose copy
+    is synchronous would accept them. Neither CUDA nor HIP has been checked;
+    see the note on the field.
+    """
+
+    var transport: Int
+    var command_buffers: Int
+    var host_waits: Int
+    var pinned_destination: Bool
+    var correct_on_metal: Bool
+    var correct_elsewhere: Bool
+    """True where the transport's correctness depends only on queue ordering,
+    which every backend provides. **Unestablished** on CUDA and HIP as a
+    statement about MAX: nothing in this repository has run either. It is the
+    weaker claim that the transport does not additionally depend on the copy
+    being synchronous."""
+
+    var note: String
+
+
+def readback_transport(transport: Int) raises -> ReadbackTransport:
+    """The row for one transport.
+
+    Command buffer counts include the record-producing kernel, so every row
+    is on the same denominator and a reader can subtract it once rather than
+    per row.
+    """
+    if transport == READBACK_PINNED_PAIR_SYNC:
+        return ReadbackTransport(
+            transport, 4, 1, True, True, True,
+            String(
+                "today's shape: one enqueue_copy per record plane into pinned"
+                " host memory, then synchronize(). The two copies are"
+                " asynchronous blits, so the round trip is the synchronize"
+                " alone"
+            ),
+        )
+    if transport == READBACK_PINNED_ONE_SYNC:
+        return ReadbackTransport(
+            transport, 3, 1, True, True, True,
+            String(
+                "the same with both planes in one device buffer: one blit"
+                " instead of two, same single wait. Needs the record laid out"
+                " in one buffer, which is a gpu_split_search change"
+            ),
+        )
+    if transport == READBACK_PLAIN_PAIR:
+        return ReadbackTransport(
+            transport, 3, 2, False, True, True,
+            String(
+                "two enqueue_copy calls into ordinary heap memory and no"
+                " synchronize at all. That destination kind takes MAX's"
+                " synchronous path, so each copy drains inside itself: fewer"
+                " command buffers than today and one more wait"
+            ),
+        )
+    if transport == READBACK_PLAIN_ONE:
+        return ReadbackTransport(
+            transport, 2, 1, False, True, True,
+            String(
+                "one enqueue_copy into ordinary heap memory. The whole"
+                " readback is the kernel's command buffer and the copy's:"
+                " the fewest of any correct arm, and no pinned staging buffer"
+                " to keep alive"
+            ),
+        )
+    if transport == READBACK_MAP:
+        return ReadbackTransport(
+            transport, 3, 2, False, True, True,
+            String(
+                "map_to_host(). Documented as a host-accessible view; on"
+                " Metal it is a fresh host allocation with a copy in on entry"
+                " and a copy out on exit, so it is the most expensive"
+                " transport here and not the cheapest"
+            ),
+        )
+    if transport == READBACK_PINNED_PAIR_NOSYNC:
+        return ReadbackTransport(
+            transport, 3, 0, True, False, True,
+            String(
+                "today's shape with the trailing synchronize removed, which"
+                " docs/GPU_PORTABILITY.md 6.1 licensed. WRONG on Metal: the"
+                " pinned copy is asynchronous, so the host reads the previous"
+                " record. Measured 34 of 34 words wrong"
+            ),
+        )
+    if transport == READBACK_PINNED_ONE_NOSYNC:
+        return ReadbackTransport(
+            transport, 2, 0, True, False, True,
+            String(
+                "the packed shape with the same edit, and wrong for the same"
+                " reason: 34 of 34 words"
+            ),
+        )
+    raise Error("unknown readback transport ", transport)
+
+
+def env_readback_transport() raises -> Int:
+    """`MOJOTREES_GPU_READBACK`, or `READBACK_DEFAULT`.
+
+    Named transports only. A numeric spelling is refused rather than accepted,
+    because the identifiers above are an implementation detail and a benchmark
+    row reading `MOJOTREES_GPU_READBACK=3` says nothing to the person reading
+    it a month later.
+    """
+    var raw = getenv("MOJOTREES_GPU_READBACK")
+    if raw == "":
+        return READBACK_DEFAULT
+    for t in range(N_READBACK_TRANSPORTS):
+        if raw == readback_transport_name(t):
+            return t
+    raise Error(
+        "MOJOTREES_GPU_READBACK must name a transport, not ",
+        raw,
+        "; see gpu_runtime.readback_transport_name",
+    )
+
+
+def require_readback_correct(transport: Int, api_is_metal: Bool) raises:
+    """Refuse a transport this backend is known to get wrong.
+
+    The two unsafe arms exist in the table so that a probe can execute them
+    and so that the refutation is checkable rather than asserted. They must
+    not be reachable from a fit, and this is the gate that keeps them out. It
+    fires on the measured column, so it cannot drift away from what the probe
+    reports without someone editing the row the probe wrote.
+    """
+    var row = readback_transport(transport)
+    if api_is_metal and not row.correct_on_metal:
+        raise Error(
+            "readback transport ",
+            readback_transport_name(transport),
+            " does not deliver the record on Metal: ",
+            row.note,
+        )
+
+
+def readback_report() raises -> String:
+    """Every transport as `name buffers waits metal_ok` lines, for a probe or
+    a debug print. Not for parsing by anything shipped."""
+    var out = String("")
+    for t in range(N_READBACK_TRANSPORTS):
+        var row = readback_transport(t)
+        out += "readback." + readback_transport_name(t)
+        out += " " + String(row.command_buffers)
+        out += " " + String(row.host_waits)
+        out += " " + ("ok" if row.correct_on_metal else "wrong") + "\n"
+    return out
 
 
 # ---------------------------------------------------------------------------
