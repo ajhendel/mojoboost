@@ -1273,6 +1273,16 @@ can never coincide with `tree_parameters_extra.extra_split_stream`'s even
 when both seeds are equal. Must equal
 `tree_parameters_extra._RANDOM_SCORE_DOMAIN`."""
 
+comptime OBLIVIOUS_SCORE_DOMAIN = UInt64(0x4F424C5653434F52)
+"""The second domain separator, ASCII "OBLVSCOR", for a draw keyed to an
+oblivious LEVEL rather than to a node. Must equal
+`tree_parameters_extra._OBLIVIOUS_SCORE_DOMAIN`.
+
+A depth and a node id are both small nonnegative integers, so one domain
+would make an oblivious level at depth 0 and a leaf-wise node 0 draw the
+identical value for the same (seed, tree, feature, bin). The second constant
+makes the two streams disjoint as a property rather than as a convention."""
+
 comptime RANDOM_SCORE_POLAR_MAX_TRIES = 64
 """Marsaglia's polar method rejects a pair outside the unit disc, which is
 `1 - pi/4` of the plane. Sixty-four rejections in a row has probability about
@@ -1304,13 +1314,70 @@ def gpu_random_score_stream(
     directly to the host's copy is written out there and becomes live the
     moment the two branches meet.
     """
-    var h = splitmix64(
-        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ RANDOM_SCORE_DOMAIN
+    return gpu_score_stream_in(
+        RANDOM_SCORE_DOMAIN, seed, tree_index, node, feature, bin
     )
+
+
+@always_inline
+def gpu_score_stream_in(
+    domain: UInt64,
+    seed: Int,
+    tree_index: Int,
+    site: Int,
+    feature: Int,
+    bin: Int,
+) -> UInt64:
+    """Stage A itself, in `domain`. The device's copy of
+    `tree_parameters_extra.score_stream_in`, and the ONE definition of the
+    arithmetic on this side: both wrappers call it and differ only in the
+    constant they pass.
+
+    `site` is the term naming where in the tree the draw was taken -- a node
+    id in `RANDOM_SCORE_DOMAIN`, a level depth in
+    `OBLIVIOUS_SCORE_DOMAIN`. One parameter because it is one position in the
+    key; the domain is what keeps the two readings of it disjoint.
+
+    THE IRREGULARITY IS LOAD-BEARING: `tree_index` carries no `+1`, while
+    `site`, `feature` and `bin` all do. A reimplementation that tidies that up
+    desynchronizes the two backends silently."""
+    var h = splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ domain)
     h = splitmix64(h ^ UInt64(tree_index & 0x7FFFFFFFFFFFFFFF))
-    h = splitmix64(h ^ UInt64((node + 1) & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64((site + 1) & 0x7FFFFFFFFFFFFFFF))
     h = splitmix64(h ^ UInt64((feature + 1) & 0x7FFFFFFFFFFFFFFF))
     return splitmix64(h ^ UInt64((bin + 1) & 0x7FFFFFFFFFFFFFFF))
+
+
+@always_inline
+def gpu_oblivious_score_stream(
+    seed: Int, tree_index: Int, depth: Int, feature: Int, bin: Int
+) -> UInt64:
+    """The counter key for one `grow_policy=oblivious` LEVEL candidate's
+    noise draw, keyed by (seed, tree, **depth**, feature, bin).
+
+    Byte for byte `tree_parameters_extra.oblivious_score_stream`, and it must
+    stay that way for the reason `gpu_random_score_stream` gives about its own
+    twin: the cross-backend equality assertion is over these words.
+
+    THE DEPTH TERM IS WHY THIS IS NOT CATBOOST'S MECHANISM, AND THAT IS
+    DELIBERATE
+    -------------------------------------------------------------------
+    CatBoost redraws per level by ADVANCING a generator --
+    `greedy_tensor_search.cpp:884` takes a fresh `GenRand()` inside
+    `CalcScores`, which `:1199` calls inside the `curDepth` loop, while the
+    standard deviation at `:1186` is drawn once per tree immediately before
+    it. We reproduce the property (a candidate draws different noise at each
+    depth) counter-based instead. An advancing generator is a function of
+    iteration order and generator state and would diverge between the two
+    backends the moment either changed the order or the worker count it
+    visited depths with, silently, with both models still training. Keying on
+    the depth makes the draw worker-independent by construction, which is the
+    only form in which the CPU and the GPU can be asserted equal.
+
+    **Do not "fix" this back into a running generator.**"""
+    return gpu_score_stream_in(
+        OBLIVIOUS_SCORE_DOMAIN, seed, tree_index, depth, feature, bin
+    )
 
 
 def host_standard_normal(stream: UInt64) -> Float64:
@@ -1354,6 +1421,7 @@ def host_random_score_noise(
     node: Int,
     feature: Int,
     bin: Int,
+    domain: UInt64 = RANDOM_SCORE_DOMAIN,
 ) -> Float32:
     """The number a candidate's gain is shifted by, as the device consumes
     it: `Float32(stdev * normal)`.
@@ -1368,13 +1436,22 @@ def host_random_score_noise(
 
     At or below zero -- the default, and every LightGBM-mode fit -- this is
     exactly 0.0 and no stream is touched.
+
+    `domain` selects which stream the key is taken in and `node` is read
+    accordingly: `RANDOM_SCORE_DOMAIN` (the default, and the only value any
+    caller passed before oblivious levels existed) reads it as a node id;
+    `OBLIVIOUS_SCORE_DOMAIN` reads it as a level depth. A defaulted argument
+    rather than a second function, so there is one place where stage A meets
+    stage B and one rounding to Float32 for both readings.
     """
     if not (stdev > 0.0) or stdev > Float64.MAX_FINITE:
         return Float32(0.0)
     return Float32(
         stdev
         * host_standard_normal(
-            gpu_random_score_stream(seed, tree_index, node, feature, bin)
+            gpu_score_stream_in(
+                domain, seed, tree_index, node, feature, bin
+            )
         )
     )
 
@@ -1386,6 +1463,7 @@ def random_score_plane(
     node: Int,
     features: List[Int],
     n_bins: Int,
+    domain: UInt64 = RANDOM_SCORE_DOMAIN,
 ) raises -> List[Float32]:
     """One node's noise plane, `len(features) * n_bins` Float32 in
     (slot-major, bin-minor) order, which is the layout the scan kernels
@@ -1421,9 +1499,45 @@ def random_score_plane(
         var f = features[slot]
         for b in range(n_bins):
             out.append(
-                host_random_score_noise(stdev, seed, tree_index, node, f, b)
+                host_random_score_noise(
+                    stdev, seed, tree_index, node, f, b, domain
+                )
             )
     return out^
+
+
+def oblivious_score_plane(
+    stdev: Float64,
+    seed: Int,
+    tree_index: Int,
+    depth: Int,
+    features: List[Int],
+    n_bins: Int,
+) raises -> List[Float32]:
+    """One oblivious LEVEL's noise plane: `random_score_plane` in
+    `OBLIVIOUS_SCORE_DOMAIN`, with the level depth in the site position.
+
+    The layout is the same (slot-major, bin-minor) plane the scan kernels
+    index, and it is keyed by the *global* feature id for the same reason:
+    reordering or narrowing the level's feature set permutes the plane and
+    changes no value in it.
+
+    One plane per level and not per leaf, because the noise is drawn on the
+    level's aggregate score and the level takes one split.
+    """
+    if depth < 0:
+        raise Error(
+            "an oblivious level sits at a nonnegative depth, got ", depth
+        )
+    return random_score_plane(
+        stdev,
+        seed,
+        tree_index,
+        depth,
+        features,
+        n_bins,
+        OBLIVIOUS_SCORE_DOMAIN,
+    )
 
 
 def _random_score_key_kernel(
@@ -1507,6 +1621,89 @@ def random_score_key_probe(queries: List[Int]) raises -> List[UInt64]:
             for i in range(n):
                 var lo = UInt64(Int(src[unsafe_offset = 2 * i][0]) & 0xFFFFFFFF)
                 var hi = UInt64(Int(src[unsafe_offset = 2 * i + 1][0]) & 0xFFFFFFFF)
+                words.append(lo | (hi << UInt64(32)))
+        return words^
+
+
+def _oblivious_score_key_kernel(
+    args: MutPointer[Int32, MutAnyOrigin],
+    keys: MutPointer[Int32, MutAnyOrigin],
+    n: Int32,
+):
+    """`_random_score_key_kernel` in `OBLIVIOUS_SCORE_DOMAIN`: run
+    `gpu_oblivious_score_stream` on the device and hand the words back.
+
+    A second kernel rather than a domain word threaded through the first,
+    because the first's five-int query tuple is a contract
+    `tests/test_gpu_random_score_noise.mojo` already writes against, and
+    widening it would edit a passing test to make a new one compile."""
+    var i = Int(block_idx.x)
+    if i >= Int(n):
+        return
+    var b = i * 5
+    var key = gpu_oblivious_score_stream(
+        Int(args[unsafe_offset=b][0]),
+        Int(args[unsafe_offset = b + 1][0]),
+        Int(args[unsafe_offset = b + 2][0]),
+        Int(args[unsafe_offset = b + 3][0]),
+        Int(args[unsafe_offset = b + 4][0]),
+    )
+    keys[unsafe_offset = 2 * i] = (key & UInt64(0xFFFFFFFF)).cast[
+        DType.int32
+    ]()
+    keys[unsafe_offset = 2 * i + 1] = (
+        (key >> UInt64(32)) & UInt64(0xFFFFFFFF)
+    ).cast[DType.int32]()
+
+
+def oblivious_score_key_probe(queries: List[Int]) raises -> List[UInt64]:
+    """Evaluate stage A on the accelerator for a list of
+    (seed, tree, **depth**, feature, bin) tuples, flattened five ints to a
+    tuple.
+
+    `random_score_key_probe`'s twin in the level domain, and it exists for
+    the same one assertion: the device's key and the host's key are the same
+    64-bit word for every tuple. With that and the plane comparison, a level's
+    noise is pinned end to end across the two backends.
+    """
+    if len(queries) % 5 != 0:
+        raise Error(
+            "oblivious_score_key_probe takes five ints per query"
+            " (seed, tree, depth, feature, bin), got ",
+            len(queries),
+        )
+    var n = len(queries) // 5
+    if n == 0:
+        return List[UInt64]()
+    comptime if not has_accelerator():
+        raise Error(
+            "oblivious_score_key_probe needs an accelerator; this binary was"
+            " built without one"
+        )
+    else:
+        var ctx = DeviceContext()
+        var args = ctx.enqueue_create_buffer[DType.int32](len(queries))
+        var out = ctx.enqueue_create_buffer[DType.int32](2 * n)
+        with args.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            for i in range(len(queries)):
+                dst.unsafe_store(i, Int32(queries[i]))
+        ctx.enqueue_function[_oblivious_score_key_kernel](
+            args.unsafe_ptr(),
+            out.unsafe_ptr(),
+            Int32(n),
+            grid_dim=n,
+            block_dim=1,
+        )
+        ctx.synchronize()
+        var words = List[UInt64](capacity=n)
+        with out.map_to_host() as host:
+            var src = host.unsafe_ptr()
+            for i in range(n):
+                var lo = UInt64(Int(src[unsafe_offset = 2 * i][0]) & 0xFFFFFFFF)
+                var hi = UInt64(
+                    Int(src[unsafe_offset = 2 * i + 1][0]) & 0xFFFFFFFF
+                )
                 words.append(lo | (hi << UInt64(32)))
         return words^
 
@@ -3159,6 +3356,7 @@ def _scan_slot_oblivious_kernel(
     cat_n: MutPointer[Int32, MutAnyOrigin],
     mono: MutPointer[Int32, MutAnyOrigin],
     fparams: MutPointer[Float32, MutAnyOrigin],
+    noise: MutPointer[Float32, MutAnyOrigin],
     out_i: MutPointer[Int32, MutAnyOrigin],
     out_f: MutPointer[Float32, MutAnyOrigin],
     n_bins: Int32,
@@ -3171,6 +3369,7 @@ def _scan_slot_oblivious_kernel(
     constrained: Int32,
     gain_form: Int32,
     score_function: Int32,
+    noisy: Int32,
 ):
     """One threadgroup per active feature slot: scan that feature's candidates
     for a whole oblivious *level* and write the level's best one as a per-slot
@@ -3313,7 +3512,58 @@ def _scan_slot_oblivious_kernel(
     agree, so there is no single prefix to walk. A feature with two or more
     categories is skipped here and `_launch_oblivious_search` refuses a dataset
     that has one, so the refusal is visible at the call rather than as a
-    silently narrower search."""
+    silently narrower search.
+
+    `random_strength`: ONE DRAW PER (FEATURE, BIN), ON THE LEVEL'S AGGREGATE
+    -----------------------------------------------------------------------
+    Read from `catboost/private/libs/algo/tensor_search_helpers.cpp`'s
+    `SetBestScore` (v1.2.10, lines 716-757), which is where CatBoost's
+    `random_strength` actually lands: `scoreWoNoise = scores[binFeatureIdx]`
+    is **already the level-summed score across every leaf**, returned by
+    `CalculateNonPairwiseScore`, and the noise is added to that one number
+    before the argmax runs over the noised instances. It is NOT a draw per
+    (leaf, candidate) folded into the sum. Those are two different
+    regularizers wearing one parameter name, and this kernel implements the
+    first because that is the one CatBoost implements.
+
+    So the addend enters at exactly one place: after the leaf loop has closed,
+    after the Cosine ratio has been taken and `level_parent` subtracted, and
+    immediately before the `> best_gain` test. **Never into `cos_num` or
+    `cos_den`.** Adding it inside the accumulation would noise the numerator
+    and the denominator of a ratio -- a different functional, scaled by the
+    level's width, and it would look entirely correct in a diff. The Cosine
+    arm exists precisely so that the level's score is expressible as one
+    number at one point; that is the point at which the noise is added.
+
+    One draw per (feature, bin), shared by the missing-left and missing-right
+    candidates and by every leaf of the level, for the two reasons the
+    per-node scan gives and one more: the noise belongs to the threshold and
+    not to the routing (so an exact tie between the two directions still keeps
+    `default_left`, since equal numbers stay equal after the same addend), and
+    the level takes ONE split, so it draws once.
+    `split.find_best_split_shared` takes its draw at the same granularity and
+    at the same point in its own scan.
+
+    **The key's third component is the level's DEPTH, in its own domain**,
+    staged by `GpuSplitSearcher.stage_random_score_level`. A level has no
+    node, which is what kept `random_strength` off this path; it has a depth,
+    and the depth is exactly the term CatBoost's fresh-per-level seed is
+    standing in for. `gpu_oblivious_score_stream` says why it is a counter
+    term rather than an advancing generator, and `OBLIVIOUS_SCORE_DOMAIN` why
+    it is a second domain rather than the node slot reused.
+
+    **What the noise costs the top-threshold argument.** Two paragraphs above,
+    this docstring states that a candidate every leaf refuses scores an exact
+    `0.0` and therefore never beats a `best_gain` that starts at `0.0` under a
+    strict `>`. That holds with the noise **off**, which is the default and
+    every LightGBM-mode fit. With it on, `0.0 + noise` beats `0.0` whenever
+    the draw is positive, so such a candidate can win a level in which nothing
+    admissible was found. That is not a defect introduced here: it is what
+    `_scan_slot_kernel` does at the same initial `best_gain`, and it is what
+    `find_best_split_shared` does at its own `f_gain = 0.0`, so all three
+    agree. It is also CatBoost's own shape -- `bestScoreInstance` starts at
+    `MINIMAL_SCORE` and every candidate it compares is already noised. The
+    property the two backends must share is that they share it, and they do."""
     var slot = Int(block_idx.x)
     var record = Int(level_record)
     var nt = record * NODE_WORDS
@@ -3327,6 +3577,13 @@ def _scan_slot_oblivious_kernel(
     var io = (table + slot) * SPLIT_IWORDS
     var fo = (table + slot) * SPLIT_FWORDS
     var pf = record * PF_WORDS
+    # This slot's row of the level's noise plane, one Float32 per bin, in the
+    # same (record, slot) cell order every other per-slot table uses -- the
+    # identical indexing `_scan_slot_kernel` uses, because a level's plane is
+    # the level record's plane and the level record is an ordinary record.
+    # Read only when `noisy`; at the default the pointer is a one-element
+    # placeholder and no lane touches it.
+    var noise_base = (table + slot) * nb
     var nl = Int(n_leaves)
     if nl > OBLIVIOUS_MAX_LEAVES:
         nl = OBLIVIOUS_MAX_LEAVES
@@ -3564,6 +3821,17 @@ def _scan_slot_oblivious_kernel(
                 + hist[unsafe_offset = 2 * hs + lb + b][0]
             )
 
+        # This threshold's `random_strength` shift for the whole level: read
+        # once per bin, outside the direction loop and outside the leaf loop,
+        # because the level takes one split and CatBoost noises the level's
+        # aggregate score once. Shared by the two routing directions for the
+        # reason `_scan_slot_kernel` gives -- the noise belongs to the
+        # threshold, not to the direction, so an exact tie still keeps
+        # `default_left`.
+        var bin_noise = Float32(0.0)
+        if noisy != Int32(0):
+            bin_noise = noise[unsafe_offset = noise_base + b][0]
+
         # Missing to the left first, so an exact tie keeps `default_left`.
         for d in range(2):
             var want_default_left = d == 0
@@ -3667,6 +3935,15 @@ def _scan_slot_oblivious_kernel(
             # Cosine gains.
             if cosine:
                 total = gpu_cosine_score(cos_num, cos_den) - level_parent
+            # `random_strength`, HERE and nowhere earlier: on the level's one
+            # aggregate score, after the cross-leaf sum, after the single
+            # Cosine ratio, and immediately before the argmax -- which is
+            # `SetBestScore`'s `scoreWoNoise + Normal(0, scoreStDev)` on a
+            # `scores[binFeatureIdx]` that is already level-summed. Adding it
+            # to `cos_num` or `cos_den` above would be a different
+            # regularizer and would read as correct; see the docstring.
+            if noisy != Int32(0):
+                total += bin_noise
             if total > best_gain:
                 runner_gain = best_gain
                 best_gain = total
@@ -4776,9 +5053,99 @@ def _launch_oblivious_search(
     gain_form: Int = DEFAULT_GAIN_FORM,
     score_function: Int = SCORE_L2,
 ) raises:
+    """The level launch without a noise plane, which is every caller that does
+    not stage one -- `gpu_resident_round`'s device-owned oblivious plane
+    included.
+
+    An overload rather than a defaulted argument for the reason
+    `_launch_search`'s own no-noise overload gives: the plane is a
+    `DeviceBuffer` and there is no null one to default to. A one-element
+    window onto `fparam` stands in and is never dereferenced, since `noisy` is
+    zero and every read of that pointer is behind it; a window rather than a
+    fresh buffer because this is a per-launch path and it must not allocate.
+
+    **`gpu_resident_round.grow_tree_device_oblivious` lands here, so
+    `random_strength` does not reach the device-owned oblivious plane.** That
+    is a wiring gap and not a semantic one -- the plane holds the searcher and
+    would stage a plane per level exactly as `enqueue_oblivious_level` does --
+    and it is currently unreachable anyway: `_check_device_search_supported`
+    refuses `ExtraTreeParams.is_active()`, which still names `random_strength`,
+    before any oblivious growth begins. Making that term's removal *earnable*
+    is what this lane built; performing the removal is not this lane's.
+    """
+    var unread = fparam.create_sub_buffer[DType.float32](0, 1)
+    _launch_oblivious_search(
+        ctx,
+        hist,
+        node,
+        feat,
+        allow,
+        missing,
+        catn,
+        mono,
+        fparam,
+        unread,
+        slot_i,
+        slot_f,
+        rec_i,
+        rec_f,
+        n_bins,
+        hist_size,
+        feat_stride,
+        widest_slots,
+        level_record,
+        leaf_base,
+        n_leaves,
+        min_data_in_leaf,
+        constrained,
+        has_categorical,
+        primitives,
+        gain_form,
+        score_function,
+        False,
+    )
+
+
+def _launch_oblivious_search(
+    mut ctx: DeviceContext,
+    mut hist: DeviceBuffer[DType.int32],
+    mut node: DeviceBuffer[DType.int32],
+    mut feat: DeviceBuffer[DType.int32],
+    mut allow: DeviceBuffer[DType.int32],
+    mut missing: DeviceBuffer[DType.int32],
+    mut catn: DeviceBuffer[DType.int32],
+    mut mono: DeviceBuffer[DType.int32],
+    mut fparam: DeviceBuffer[DType.float32],
+    mut noise: DeviceBuffer[DType.float32],
+    mut slot_i: DeviceBuffer[DType.int32],
+    mut slot_f: DeviceBuffer[DType.float32],
+    mut rec_i: DeviceBuffer[DType.int32],
+    mut rec_f: DeviceBuffer[DType.float32],
+    n_bins: Int,
+    hist_size: Int,
+    feat_stride: Int,
+    widest_slots: Int,
+    level_record: Int,
+    leaf_base: Int,
+    n_leaves: Int,
+    min_data_in_leaf: Int,
+    constrained: Bool,
+    has_categorical: Bool,
+    primitives: Bool = True,
+    gain_form: Int = DEFAULT_GAIN_FORM,
+    score_function: Int = SCORE_L2,
+    noisy: Bool = False,
+) raises:
     """Enqueue the two kernels of one oblivious *level* search: the cross-leaf
     scan and the ordinary cross-feature reduction over the single record the
     scan wrote into.
+
+    `noise` is the level record's `(slot, bin)` plane, filled by
+    `GpuSplitSearcher.stage_random_score_level` from
+    `oblivious_score_plane`; when `noisy` is False it is a one-element window
+    the kernel never reads. **The level's plane is a single record's plane**,
+    because the level is scored as one candidate set and elects one split, so
+    it costs one `n_features * n_bins` row rather than one per leaf.
 
     **Two launches, which is the whole point.** A level search costs exactly
     what a node search costs, because the sum over the level's leaves is the
@@ -4873,6 +5240,7 @@ def _launch_oblivious_search(
             catn.unsafe_ptr(),
             mono.unsafe_ptr(),
             fparam.unsafe_ptr(),
+            noise.unsafe_ptr(),
             slot_i.unsafe_ptr(),
             slot_f.unsafe_ptr(),
             Int32(n_bins),
@@ -4885,6 +5253,7 @@ def _launch_oblivious_search(
             Int32(1) if constrained else Int32(0),
             Int32(gain_form),
             Int32(score_function),
+            Int32(1) if noisy else Int32(0),
             grid_dim=widest_slots,
             block_dim=1,
         )
@@ -5163,7 +5532,11 @@ struct GpuSplitSearcher(Movable):
     components, and the reason two trees of one fit do not reuse a draw."""
     var noise_node: List[Int]
     """The node id each record's staged plane was drawn for, or -1 for "no
-    plane staged". A launch with `noise_stdev > 0` and a -1 here is refused
+    plane staged", and under `grow_policy=oblivious` it holds the level's
+    DEPTH instead, written by `stage_random_score_level`; the two readings
+    never mix, because a searcher grows one policy's trees and the two draws
+    live in different domains. A launch with `noise_stdev > 0` and a -1 here
+    is refused
     rather than run: a default 0 standing in for a node id would draw every
     node of the tree from the same stream, which is exactly what
     `ExtraTreeParams.needs_node_identity` refuses on the host."""
@@ -5731,6 +6104,55 @@ struct GpuSplitSearcher(Movable):
             self.noise_stage[base + i] = plane[i]
         self.noise_node[record] = node
 
+    def stage_random_score_level(
+        mut self, record: Int, depth: Int
+    ) raises:
+        """Draw an oblivious LEVEL's noise plane for the level at `depth` and
+        stage it into `record`, which is the level record the level search
+        writes into.
+
+        `stage_random_score`'s twin, and the difference between them is the
+        whole of what this lane resolved. That one keys its draw by a node id
+        in `RANDOM_SCORE_DOMAIN`; a level has no node, which is the reason
+        `random_strength` was refused here. It has a DEPTH, and CatBoost's own
+        per-level redraw is keyed to nothing else -- `CalcScores` takes a
+        fresh seed inside the `curDepth` loop -- so this keys by the depth in
+        `OBLIVIOUS_SCORE_DOMAIN` and the objection dissolves.
+
+        One plane per level, not per leaf. The level is one candidate set and
+        elects one split, so the draw is per (feature, bin) and the leaf loop
+        never sees it: the kernel adds it to the level's aggregate score after
+        the cross-leaf sum and, under Cosine, after the single ratio.
+
+        Called once per level, after `set_features` has fixed the level
+        record's active set and before the `enqueue_oblivious_level` or
+        `search_oblivious_level` that searches it. Restaging the same depth
+        reproduces the same plane bit for bit.
+        """
+        self._check_record(record)
+        if not (self.noise_stdev > 0.0):
+            raise Error(
+                "stage_random_score_level needs a positive noise standard"
+                " deviation; call set_random_score first"
+            )
+        if depth < 0:
+            raise Error(
+                "an oblivious level sits at a nonnegative depth, got ", depth
+            )
+        var slots = self.active_len[record]
+        var plane = oblivious_score_plane(
+            self.noise_stdev,
+            self.noise_seed,
+            self.noise_tree,
+            depth,
+            self._record_features(record),
+            self.n_bins,
+        )
+        var base = record * self.n_features * self.n_bins
+        for i in range(slots * self.n_bins):
+            self.noise_stage[base + i] = plane[i]
+        self.noise_node[record] = depth
+
     def _record_features(self, record: Int) -> List[Int]:
         """Record `record`'s active feature ids, read back out of the staged
         feature table so the plane is keyed by exactly the features the scan
@@ -5756,8 +6178,10 @@ struct GpuSplitSearcher(Movable):
                     "random_strength is on but record ",
                     r,
                     " has no noise plane staged for it; call"
-                    " stage_random_score(record, node) after set_features"
-                    " and before the search",
+                    " stage_random_score(record, node) -- or, for an"
+                    " oblivious level record,"
+                    " stage_random_score_level(record, depth) -- after"
+                    " set_features and before the search",
                 )
 
     def _feat_off(self) -> Int:
@@ -6342,6 +6766,11 @@ struct GpuSplitSearcher(Movable):
                 leaf_base + i, Int32(leaf_slots[i] * slot_cells)
             )
         self._copy_tables()
+        # The level record's own plane, and only it: the level is one
+        # candidate set electing one split, so the leaf records carry no
+        # noise and are never asked for one.
+        self._check_noise_staged(level_record, 1)
+        self._copy_noise(level_record, 1)
         _launch_oblivious_search(
             self.ctx,
             self.hist_dev,
@@ -6352,6 +6781,7 @@ struct GpuSplitSearcher(Movable):
             self.catn_dev,
             self.mono_dev,
             self.fparam_dev,
+            self.noise_dev,
             self.slot_i_dev,
             self.slot_f_dev,
             self.rec_i_dev,
@@ -6369,6 +6799,7 @@ struct GpuSplitSearcher(Movable):
             self.use_primitives,
             self.gain_form_code,
             score_function,
+            self.noise_stdev > 0.0,
         )
         return self.download(level_record)
 
@@ -6609,6 +7040,8 @@ struct GpuSplitSearcher(Movable):
                 leaf_base + i, Int32(leaf_slots[i] * slot_cells)
             )
         self._copy_tables()
+        self._check_noise_staged(level_record, 1)
+        self._copy_noise(level_record, 1)
         _launch_oblivious_search(
             self.ctx,
             hist,
@@ -6619,6 +7052,7 @@ struct GpuSplitSearcher(Movable):
             self.catn_dev,
             self.mono_dev,
             self.fparam_dev,
+            self.noise_dev,
             self.slot_i_dev,
             self.slot_f_dev,
             self.rec_i_dev,
@@ -6636,6 +7070,7 @@ struct GpuSplitSearcher(Movable):
             self.use_primitives,
             self.gain_form_code,
             score_function,
+            self.noise_stdev > 0.0,
         )
 
     def enqueue_pick_best(

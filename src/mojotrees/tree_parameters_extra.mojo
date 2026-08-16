@@ -668,6 +668,22 @@ comptime CATBOOST_L2_LEAF_REG = 3.0
 # "RANDSCOR".
 comptime _RANDOM_SCORE_DOMAIN = UInt64(0x52414E4453434F52)
 
+# The same separator for the OTHER thing `random_strength` can be keyed to.
+# ASCII "OBLVSCOR".
+#
+# Under `grow_policy=oblivious` the noise is drawn per LEVEL, not per node
+# (CatBoost `greedy_tensor_search.cpp:1199` calls `CalcScores` inside the
+# `curDepth` loop and `:884` draws a fresh seed there, so the same candidate
+# gets different noise at each depth), and the level's identity in the key is
+# its DEPTH. A depth and a node id are both small nonnegative integers, so
+# with one domain an oblivious level at depth 0 and a leaf-wise node 0 would
+# draw the identical value for the same (seed, tree, feature, bin). That is
+# harmless while a fit is one growth policy or the other, and it stops being
+# harmless the moment anything compares the two policies at a fixed seed. A
+# second constant makes the two streams disjoint as a PROPERTY rather than as
+# a docstring sentence somebody has to still be reading in six months.
+comptime _OBLIVIOUS_SCORE_DOMAIN = UInt64(0x4F424C5653434F52)
+
 # Marsaglia's polar method rejects a draw outside the unit disc, which is
 # 1 - pi/4 of the plane. Sixty-four rejections in a row has probability about
 # 3e-43; the bound exists so the loop is provably finite, not because it is
@@ -754,28 +770,99 @@ def random_score_scale_from_gradients(
     )
 
 
-def random_score_stream(
-    seed: Int, tree_index: Int, node: Int, feature: Int, bin: Int
+@always_inline
+def score_stream_in(
+    domain: UInt64,
+    seed: Int,
+    tree_index: Int,
+    site: Int,
+    feature: Int,
+    bin: Int,
 ) -> UInt64:
-    """The counter key for one candidate's noise draw.
+    """The counter key for one candidate's noise draw, in `domain`.
 
-    Keyed by (seed, tree, node, feature, bin) and by nothing else. It reads
-    no counter that advances with evaluation order, so the draw for a
+    ONE hash, and the two named wrappers below differ only in the constant
+    they pass. `site` is the term that identifies *where in the tree* the
+    draw was taken: a node id under leaf-wise and depth-wise growth, a level
+    depth under `grow_policy=oblivious`. It is one parameter because it is
+    one position in the key, and the domain is what keeps the two readings of
+    it from colliding.
+
+    Keyed by (domain, seed, tree, site, feature, bin) and by nothing else. It
+    reads no counter that advances with evaluation order, so the draw for a
     candidate is the same value whether that candidate was the first scored
     in the node or the last, whether its feature ran on its own task or
     shared one, and at any `MOJOTREES_NUM_WORKERS`. Sign bits are masked off
     so negative seeds are accepted, as in `extra_split_stream`.
 
-    The bin is mixed in last, and `bin + 1` rather than `bin` so that the
-    lowest bin is not the identity element of the xor.
+    THE MIXING CONVENTION IS FIXED AND ITS IRREGULARITY IS LOAD-BEARING.
+    `tree_index` carries NO `+1`; `site`, `feature` and `bin` all do. That is
+    exactly the kind of asymmetry a reimplementation tidies up by accident,
+    and tidying it would desynchronize the two backends silently -- the
+    models would still train and the failure would surface as a parity gap
+    nobody could localize. The bin is mixed in last, and `bin + 1` rather
+    than `bin` so that the lowest bin is not the identity element of the xor;
+    the same argument gives `site + 1` and `feature + 1`.
     """
-    var h = splitmix64(
-        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _RANDOM_SCORE_DOMAIN
-    )
+    var h = splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ domain)
     h = splitmix64(h ^ UInt64(tree_index & 0x7FFFFFFFFFFFFFFF))
-    h = splitmix64(h ^ UInt64((node + 1) & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64((site + 1) & 0x7FFFFFFFFFFFFFFF))
     h = splitmix64(h ^ UInt64((feature + 1) & 0x7FFFFFFFFFFFFFFF))
     return splitmix64(h ^ UInt64((bin + 1) & 0x7FFFFFFFFFFFFFFF))
+
+
+@always_inline
+def random_score_stream(
+    seed: Int, tree_index: Int, node: Int, feature: Int, bin: Int
+) -> UInt64:
+    """The counter key for one NODE candidate's noise draw: leaf-wise and
+    depth-wise growth, where a candidate belongs to a node.
+
+    `score_stream_in` in the `_RANDOM_SCORE_DOMAIN` domain, and byte for byte
+    the function this was before the domain became a parameter."""
+    return score_stream_in(
+        _RANDOM_SCORE_DOMAIN, seed, tree_index, node, feature, bin
+    )
+
+
+@always_inline
+def oblivious_score_stream(
+    seed: Int, tree_index: Int, depth: Int, feature: Int, bin: Int
+) -> UInt64:
+    """The counter key for one LEVEL candidate's noise draw:
+    `grow_policy=oblivious`, where a candidate belongs to a level and a level
+    has no node.
+
+    `score_stream_in` in the `_OBLIVIOUS_SCORE_DOMAIN` domain, with the level
+    DEPTH in the site position.
+
+    WHY DEPTH, AND WHY NOT AN ADVANCING GENERATOR
+    ---------------------------------------------
+    CatBoost draws `random_strength`'s noise once per candidate per level, on
+    the level's already-summed score, and it gets per-level independence by
+    ADVANCING a generator: `greedy_tensor_search.cpp:884` takes a fresh
+    `ctx->LearnProgress->Rand.GenRand()` inside `CalcScores`, and `:1199`
+    calls `CalcScores` inside the `curDepth` loop, so each depth is seeded off
+    a stream that has moved. (The standard deviation is the other way round:
+    `:1186`, immediately before the loop, once per tree.)
+
+    We reproduce the property -- the same (feature, bin) draws different noise
+    at depth 0 and at depth 5 -- and deliberately not the mechanism. An
+    advancing generator makes a draw a function of iteration order and of
+    generator state, so it diverges between two backends the moment either
+    changes the order it visits depths in or the worker count it visits them
+    with, and it diverges silently with both models still training. The depth
+    term makes the draw a pure function of its key and worker-independent by
+    construction, which is the only form in which the CPU and the GPU can be
+    asserted equal.
+
+    **Do not "fix" this back into a running generator.** It is not an
+    approximation of CatBoost's stream; it is the same property obtained
+    counter-based.
+    """
+    return score_stream_in(
+        _OBLIVIOUS_SCORE_DOMAIN, seed, tree_index, depth, feature, bin
+    )
 
 
 def standard_normal(stream: UInt64) -> Float64:
@@ -824,6 +911,34 @@ def random_score_noise(
         return 0.0
     return stdev * standard_normal(
         random_score_stream(seed, tree_index, node, feature, bin)
+    )
+
+
+@always_inline
+def oblivious_score_noise(
+    stdev: Float64,
+    seed: Int,
+    tree_index: Int,
+    depth: Int,
+    feature: Int,
+    bin: Int,
+) -> Float64:
+    """`random_score_noise` for a `grow_policy=oblivious` LEVEL: the noise
+    added to one (feature, bin) candidate's **level-aggregate** score, keyed
+    as `oblivious_score_stream` describes.
+
+    One draw per (feature, bin) per level, shared by the two routing
+    directions and by every leaf of the level, because the level takes one
+    split. It is added to the summed score after the cross-leaf reduction --
+    and, under `score_function=Cosine`, after the single ratio -- and never
+    inside the accumulation; see `split.find_best_split_shared` and
+    `gpu_split_search._scan_slot_oblivious_kernel`, which are the two places
+    that add it.
+    """
+    if not (stdev > 0.0) or not _is_finite(stdev):
+        return 0.0
+    return stdev * standard_normal(
+        oblivious_score_stream(seed, tree_index, depth, feature, bin)
     )
 
 
