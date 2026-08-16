@@ -2897,7 +2897,7 @@ def _hist_accumulate_rows[
     rstride: Int,
     probe_mode: Int,
     ptab: MutPointer[Int32, MutAnyOrigin],
-    packed: Bool,
+    packed_bins: Bool,
 ):
     """One thread's whole walk over its share of one tile.
 
@@ -3027,7 +3027,7 @@ def _hist_accumulate_rows[
         bw[unsafe_offset=k] = PACKED_WIDTH_OFF
         if k < owned:
             var fid_k = Int(feat_ids[unsafe_offset = slot0 + k][0])
-            if packed:
+            if packed_bins:
                 col[unsafe_offset=k] = Int(
                     ptab[unsafe_offset = PACKED_TABLE_STRIDE * fid_k][0]
                 )
@@ -3195,7 +3195,7 @@ def _hist_accumulate_dispatch[
     rstride: Int,
     probe_mode: Int,
     ptab: MutPointer[Int32, MutAnyOrigin],
-    packed: Bool,
+    packed_bins: Bool,
 ):
     """Resolve the two comptime-worthy runtime flags into one of four arms,
     once, above the row loop.
@@ -3249,7 +3249,7 @@ def _hist_accumulate_dispatch[
                 rstride,
                 probe_mode,
                 ptab,
-                packed,
+                packed_bins,
             )
         else:
             _hist_accumulate_rows[GROUP, UNROLL, True, False](
@@ -3278,7 +3278,7 @@ def _hist_accumulate_dispatch[
                 rstride,
                 probe_mode,
                 ptab,
-                packed,
+                packed_bins,
             )
     elif quant:
         _hist_accumulate_rows[GROUP, UNROLL, False, True](
@@ -3307,7 +3307,7 @@ def _hist_accumulate_dispatch[
             rstride,
             probe_mode,
             ptab,
-            packed,
+            packed_bins,
         )
     else:
         _hist_accumulate_rows[GROUP, UNROLL, False, False](
@@ -3336,7 +3336,7 @@ def _hist_accumulate_dispatch[
             rstride,
             probe_mode,
             ptab,
-            packed,
+            packed_bins,
         )
 
 
