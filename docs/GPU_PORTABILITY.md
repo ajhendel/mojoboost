@@ -585,6 +585,30 @@ race and not of either fixed ordering.
 **What it does not change.** The synchronous path is real and 6.1 described
 it correctly. A copy into an arbitrary host pointer still drains.
 
+**What shipped on it, 2026-08-16.** `GpuSplitSearcher.download_words` takes
+the synchronous path now, as `READBACK_PLAIN_ONE`: one `enqueue_copy` out of
+one device allocation into a `List[Int32]`, and no trailing `synchronize()`,
+because there is nothing left to wait for. It replaced two copies into two
+pinned `HostBuffer`s followed by a `synchronize()`, four command buffers a
+trip against two, and the probe measured 202.14 us against 124.85 with the
+arms interleaved in one process. The record's two planes became one
+allocation with two `create_sub_buffer` windows to make the single copy
+possible; `gpu_split_search.SPLIT_RECORD_WORDS` states that layout and
+`tests/test_gpu_readback_transport.mojo` checks the windows land where it
+says, against a fixture whose every word differs from every other.
+
+The gate on that edit is this section, and it is worth stating as a rule
+because the next lane will want to drop a `synchronize()` somewhere else.
+**A wait may be removed only where the destination is provably not pinned,
+and the proof has to be about the type of the destination and not about what
+the call site appears to pass.** `download_words` branches on
+`ReadbackTransport.pinned_destination` rather than on an arm code for exactly
+that reason: the branch that omits the wait is unreachable with a pinned
+destination, so pointing a plain arm at a `HostBuffer` to save an allocation
+cannot compile into a silent corruption. Every remaining `synchronize()` in
+that file now says at its call site which of the two paths makes it
+load-bearing.
+
 #### 6.5.2 There is no event, fence, stream, callback, or completion query
 
 Every one of these compiles and then fails at run time, which is why the
@@ -740,6 +764,7 @@ that turns this gate from a declaration into an enforcement.
 |---|---|
 | `MOJOTREES_GPU_BACKEND` | Names the API for reporting. Read by `device_policy.env_declared_api`, never a capability number. A declaration, not a detection |
 | `MOJOTREES_GPU_BACKEND_UNVALIDATED=1` | Acknowledges selecting a specialization on a backend with no validation record, and runs it anyway. Any number measured under it must be reported with it |
+| `MOJOTREES_GPU_READBACK` | Names the split-record readback transport (`plain_one` by default; also `plain_pair`, `pinned_one_sync`, `pinned_pair_sync`). Named transports only, never a number. Refuses `map` and the two `nosync` arms, which 6.5.1 measured wrong. `GpuSplitSearcher.set_readback_transport` is the in-process handle a window uses, since two arms have to be interleaved in one process to be comparable at all |
 
 The second follows `MOJOTREES_GPU_TRANSFER_UNPROVEN` in
 `unified_memory_policy.mojo` deliberately: the evidence that would lift the

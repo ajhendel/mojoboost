@@ -255,12 +255,24 @@ from max.gpu.memory import AddressSpace
 from max.gpu.primitives import block
 from max.gpu.sync import barrier
 
+from .apple_gpu_policy import API_METAL, parse_api
 from .categorical import (
     CatBitset,
     CategoricalParams,
     CategoricalSpec,
     cat_add,
     cat_empty,
+)
+from .gpu_runtime import (
+    READBACK_MAP,
+    READBACK_PINNED_ONE_SYNC,
+    READBACK_PINNED_PAIR_SYNC,
+    READBACK_PLAIN_ONE,
+    READBACK_PLAIN_PAIR,
+    env_readback_transport,
+    readback_transport,
+    readback_transport_name,
+    require_readback_correct,
 )
 from .monotone import (
     MONOTONE_DECREASING,
@@ -279,6 +291,14 @@ comptime MAX_SPLIT_BINS = 256
 # rather than one packed struct, so no value is ever bit-cast between an
 # integer and a float on the device. Counts, bin ids, and the category set
 # are exact integers; gains, sums, and leaf values are Float32.
+#
+# Two slices, one allocation. `records_dev` holds both planes end to end and
+# `rec_i_dev` / `rec_f_dev` are windows onto it, so one `enqueue_copy` moves a
+# whole record set. The bit-cast sentence above still holds: nothing on the
+# device reads an integer word as a float or the reverse, and the only place
+# the two planes are ever addressed through one pointer is the host-side
+# unpack in `download_words`, where the reinterpretation is explicit and
+# region-aligned. See `SPLIT_RECORD_WORDS`.
 
 comptime IREC_FEATURE = 0
 comptime IREC_BIN = 1
@@ -315,6 +335,34 @@ what a caller measures a Float32 near-tie against; see
 docstring."""
 
 comptime SPLIT_FWORDS = 11
+
+comptime SPLIT_RECORD_WORDS = SPLIT_IWORDS + SPLIT_FWORDS
+"""One record's whole width in four-byte words: 23 integer, then 11 float,
+then 136 bytes.
+
+**The packed record layout, and it is a layout and not a sum.** `records_dev`
+is one device allocation of `max_records * SPLIT_RECORD_WORDS` Int32 words in
+which slot `r`'s integer words live at `r * SPLIT_IWORDS` and slot `r`'s float
+words live at `max_records * SPLIT_IWORDS + r * SPLIT_FWORDS`. `rec_i_dev` and
+`rec_f_dev` are `create_sub_buffer` windows onto those two regions, so every
+kernel and every reader outside this struct sees exactly the buffers it saw
+when they were two allocations: same element type, same length, and
+`unsafe_ptr()` is the window's base.
+
+Plane-major and not record-major, deliberately. Interleaving each record's
+integer and float words would put the whole 136-byte record contiguous, which
+is the layout a reader expects from the phrase "packed record"; it is the
+wrong one here. `_pick_best_record_kernel` and the frontier reduction index
+`rec_i` by `r * SPLIT_IWORDS` and `rec_f` by `r * SPLIT_FWORDS`, both from
+their own base, and the whole point of the sub-buffer windows is that those
+kernels do not change. Record-major would have changed every one of them, and
+`gpu_resident_round.mojo` reads both fields directly and belongs to another
+lane. Plane-major buys the single copy for nothing.
+
+The two regions are counted in Int32 words because a Float32 is the same four
+bytes, which is the same argument `tables_dev` makes for its float parameter
+region: `create_sub_buffer` takes its offset and length in elements, and at
+four bytes either element type addresses the same boundary."""
 
 comptime FLAG_FOUND = 1
 comptime FLAG_DEFAULT_LEFT = 2
@@ -971,6 +1019,49 @@ def table_upload_hoisting_requested() -> Bool:
     windows.
     """
     return getenv("MOJOTREES_GPU_SPLIT_TABLE_PACK") != "0"
+
+
+def _require_readback_implemented(transport: Int) raises:
+    """Refuse a transport `download_words` does not execute.
+
+    Four of the seven rows in `gpu_runtime`'s table are reachable here: both
+    pinned arms and both plain ones, which is every arm that is correct on
+    Metal and cheap to reach once the record is one allocation. The other
+    three are refused, and for two different reasons that are worth keeping
+    apart.
+
+    `READBACK_MAP` is refused because it is the slowest transport measured,
+    at 349.47 us a trip against `plain_one`'s 124.85, so implementing it
+    would add a `map_to_host` round trip per plane to a fit in exchange for
+    nothing. The probe already executes it; that is where it belongs.
+
+    The two `nosync` rows are refused because they are **wrong**, and they
+    are refused twice over: `require_readback_correct` rejects them on Metal
+    off the measured column, and this rejects them everywhere, because what
+    makes them wrong elsewhere is unestablished rather than known to be
+    false. A fit must not be the place that finds out.
+    """
+    if (
+        transport == READBACK_PINNED_PAIR_SYNC
+        or transport == READBACK_PINNED_ONE_SYNC
+        or transport == READBACK_PLAIN_PAIR
+        or transport == READBACK_PLAIN_ONE
+    ):
+        return
+    if transport == READBACK_MAP:
+        raise Error(
+            "readback transport map is not implemented by the split searcher:",
+            " it measured 349.47 us a trip against plain_one's 124.85, so it",
+            " lives in probes/readback_cost.mojo and not on the split path",
+        )
+    raise Error(
+        "readback transport ",
+        readback_transport_name(transport),
+        " is not implemented by the split searcher; it does not deliver the",
+        " record on Metal and no backend has established that it delivers it",
+        " anywhere. Reachable arms: pinned_pair_sync, pinned_one_sync,",
+        " plain_pair, plain_one",
+    )
 
 
 # --- Kernels --------------------------------------------------------------
@@ -3301,6 +3392,14 @@ struct GpuSplitSearcher(Movable):
     var fparam_dev: DeviceBuffer[DType.float32]
     var slot_i_dev: DeviceBuffer[DType.int32]
     var slot_f_dev: DeviceBuffer[DType.float32]
+    # Both record planes in one allocation, so that one `enqueue_copy` moves
+    # the whole record set instead of one per plane. The layout, and why it is
+    # plane-major rather than record-major, is at `SPLIT_RECORD_WORDS`.
+    #
+    # A field rather than a local for the same reason `tables_dev` is one: the
+    # two sub-buffer views below alias its storage and must not outlive it. It
+    # is declared before them for the same reason.
+    var records_dev: DeviceBuffer[DType.int32]
     var rec_i_dev: DeviceBuffer[DType.int32]
     var rec_f_dev: DeviceBuffer[DType.float32]
     # Pinned staging for the per-node tables, so a node's parameters upload
@@ -3329,7 +3428,38 @@ struct GpuSplitSearcher(Movable):
     # on both alignments and an Int32 word count addresses either.
     var stage_tables: HostBuffer[DType.int32]
     var host_i: HostBuffer[DType.int32]
+    """Pinned download staging, sized for the **whole** packed record set and
+    not just for the integer plane, so that the packed pinned arm needs no
+    allocation of its own. The pair arms use its first `max_records *
+    SPLIT_IWORDS` words and leave the rest untouched.
+
+    Read only by the two pinned arms of `download_words`. Every other arm
+    lands in `plain_words` and never touches this."""
     var host_f: HostBuffer[DType.float32]
+    """The float plane's pinned staging, for the pair arms only."""
+    var plain_words: List[Int32]
+    """The unpinned download destination, `max_records * SPLIT_RECORD_WORDS`
+    words in the layout `SPLIT_RECORD_WORDS` describes.
+
+    **This field's type is the correctness argument for the arm that ships**,
+    so it is a `List` on purpose and must stay one. `docs/GPU_PORTABILITY.md`
+    section 6.5.1 establishes by execution that `enqueue_copy` on Metal has
+    two implementations and that the destination picks which: into memory from
+    `DeviceContext.enqueue_create_host_buffer` it enqueues an asynchronous blit
+    and returns, and into an arbitrary host pointer it commits, waits, and
+    memcpys. A `List`'s storage comes from Mojo's heap allocator and there is
+    no path by which `enqueue_create_host_buffer` could have produced it, so
+    the copy into it takes the synchronous path and the drain is inside the
+    copy. That is what lets the unpinned arms carry no `synchronize()`.
+
+    Swapping this for a `HostBuffer` to save an allocation would silently make
+    the shipped readback wrong, and wrong in the worst available way: the blit
+    usually wins the race under a small fixture and loses it under a real
+    histogram, so a test would pass and a fit would read the previous split
+    record for every node. `download_words` branches on
+    `ReadbackTransport.pinned_destination` rather than on an arm code, so the
+    branch that omits the wait cannot be reached with a pinned destination;
+    this docstring is why that indirection is there."""
     var active: List[Int]
     """The most recently broadcast feature set, and what `n_active`
     reports. A record whose own set was narrowed by `set_features(...,
@@ -3371,6 +3501,23 @@ struct GpuSplitSearcher(Movable):
     at construction from `MOJOTREES_GPU_SPLIT_TABLE_PACK` and settable
     afterwards, so one process can hold both arms; see
     `set_table_upload_hoisting`."""
+    var readback: Int
+    """Which `ReadbackTransport` `download_words` executes.
+
+    `READBACK_PLAIN_ONE` by default, read once at construction from
+    `MOJOTREES_GPU_READBACK` and settable afterwards, so one process can hold
+    both arms; see `set_readback_transport`. Like `set_primitives` and
+    `set_table_upload_hoisting` and unlike `set_gain_form`, this returns the
+    same records whichever arm is live: it moves the same words out of the
+    same device buffer and only the number of copies and the kind of
+    destination differ."""
+    var api_is_metal: Bool
+    """Whether this searcher's context reports the Metal API.
+
+    Read once at construction, because `ctx.api()` returns a `String` and
+    `download_words` is on the per-split path. It feeds
+    `require_readback_correct`, which is what keeps the two measured-wrong
+    transports out of a fit; see `set_readback_transport`."""
     var gain_form_code: Int
     """Which gain form and right-hand subtraction rule the scans use.
     `GAIN_FORM_CROSS` or `GAIN_FORM_SUBTRACTIVE`, read once at construction
@@ -3452,6 +3599,13 @@ struct GpuSplitSearcher(Movable):
         self.use_primitives = split_primitives_requested()
         self.hoist_tables = table_upload_hoisting_requested()
         self.gain_form_code = gain_form_requested()
+        # Resolved here rather than per download: `ctx.api()` builds a String
+        # and the readback is on the per-split path, where a device context's
+        # API cannot change under it.
+        self.api_is_metal = parse_api(ctx.api()) == API_METAL
+        self.readback = env_readback_transport()
+        require_readback_correct(self.readback, self.api_is_metal)
+        _require_readback_implemented(self.readback)
         self.mono_host = List[Int32](capacity=n_features)
         for _ in range(n_features):
             self.mono_host.append(Int32(MONOTONE_FREE))
@@ -3501,21 +3655,41 @@ struct GpuSplitSearcher(Movable):
         self.slot_f_dev = self.ctx.enqueue_create_buffer[DType.float32](
             table_cells * SPLIT_FWORDS
         )
-        self.rec_i_dev = self.ctx.enqueue_create_buffer[DType.int32](
-            max_records * SPLIT_IWORDS
+        # Both record planes end to end in one allocation, with the two
+        # windows the kernels and `gpu_resident_round.mojo` already take. The
+        # float window's offset and length are given in Int32 elements, which
+        # is what `create_sub_buffer` wants and what four-byte elements make
+        # unambiguous; the same argument `tables_dev` makes above.
+        var rec_i_words = max_records * SPLIT_IWORDS
+        var rec_f_words = max_records * SPLIT_FWORDS
+        self.records_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            max_records * SPLIT_RECORD_WORDS
         )
-        self.rec_f_dev = self.ctx.enqueue_create_buffer[DType.float32](
-            max_records * SPLIT_FWORDS
+        self.rec_i_dev = self.records_dev.create_sub_buffer[DType.int32](
+            0, rec_i_words
+        )
+        self.rec_f_dev = self.records_dev.create_sub_buffer[DType.float32](
+            rec_i_words, rec_f_words
         )
         self.stage_tables = self.ctx.enqueue_create_host_buffer[DType.int32](
             param_off + param_words
         )
+        # Sized for the packed record set, not for the integer plane: the pair
+        # arms use the first `rec_i_words` words and the packed pinned arm
+        # uses all of it, so neither needs a second pinned allocation.
         self.host_i = self.ctx.enqueue_create_host_buffer[DType.int32](
-            max_records * SPLIT_IWORDS
+            max_records * SPLIT_RECORD_WORDS
         )
         self.host_f = self.ctx.enqueue_create_host_buffer[DType.float32](
-            max_records * SPLIT_FWORDS
+            rec_f_words
         )
+        # Ordinary heap memory, which is the whole correctness argument for
+        # the arm that ships; see the field.
+        self.plain_words = List[Int32](
+            capacity=max_records * SPLIT_RECORD_WORDS
+        )
+        for _ in range(max_records * SPLIT_RECORD_WORDS):
+            self.plain_words.append(Int32(0))
 
         # Every record starts as "every feature, all allowed, one histogram
         # at offset zero", so a caller that never narrows a set and never
@@ -3561,16 +3735,19 @@ struct GpuSplitSearcher(Movable):
         # mirror is true of the device from here, which is what lets
         # `set_monotone` decline to repeat it.
         self.mono_uploaded = True
-        # The table copy above reads a pinned buffer the tables reuse every
-        # node, so the session starts with it retired rather than in
-        # flight. CORRECTED 2026-08-16: on Metal a copy into a pinned
-        # HostBuffer does NOT drain the queue -- only one into an arbitrary
-        # host pointer does. See docs/GPU_PORTABILITY.md 6.5. The wait below
-        # is load-bearing if this destination is pinned
-        # (`docs/GPU_PORTABILITY.md` section 6.1) and this call is therefore
-        # redundant there; it is kept because it is what makes the sequence
-        # correct on a backend where the copy is asynchronous, and because
-        # it costs nothing once the queue is empty.
+        # RETAINED, and load-bearing. The table copy above uploads *out of*
+        # `stage_tables`, a pinned buffer every subsequent node rewrites in
+        # place through `_stage_params`. Section 6.5.1 of
+        # docs/GPU_PORTABILITY.md measured that direction too: a pinned buffer
+        # uploaded and then overwritten with no drain in between delivered the
+        # overwritten bytes once in four repetitions and the original three
+        # times, which is a live race and not a fixed ordering. Without this
+        # wait the first node's staging could reach the device instead of the
+        # constructor's zeros.
+        #
+        # This comment previously said the copy drained by itself and that the
+        # wait was redundant on Metal, on the strength of section 6.1. 6.5.1
+        # withdrew that for pinned memory, which is what this is.
         self.ctx.synchronize()
 
     def synchronize(self) raises:
@@ -3631,6 +3808,53 @@ struct GpuSplitSearcher(Movable):
         `set_monotone`.
         """
         self.hoist_tables = on
+
+    def set_readback_transport(mut self, transport: Int) raises:
+        """Which `ReadbackTransport` `download_words` executes, overriding
+        `MOJOTREES_GPU_READBACK`.
+
+        `READBACK_PLAIN_ONE` is the default and what ships:
+        `pixi run probe-readback` measured it at 124.85 us a trip against
+        `READBACK_PINNED_PAIR_SYNC`'s 202.14, arms interleaved in one process,
+        with a bare `synchronize()` floor of 10.59. `READBACK_PINNED_PAIR_SYNC`
+        is what this module did until 2026-08-16 and is the arm a window holds
+        this one against; `READBACK_PLAIN_PAIR` and `READBACK_PINNED_ONE_SYNC`
+        separate the two changes (the destination kind and the packing) so a
+        window can attribute the difference to one of them rather than to
+        both. `READBACK_MAP` and the two `nosync` rows raise here; see
+        `_require_readback_implemented`.
+
+        Reachable at run time rather than through the environment alone, and
+        for the same reason `set_primitives`, `set_table_upload_hoisting` and
+        `GpuActiveRows.set_row_unroll` are: this machine's device timings
+        drift several-fold between time windows, so only arms interleaved
+        inside one process and one thermal state compare at all.
+
+        **It cannot change a record.** Every arm moves the same
+        `max_records * 136` bytes out of the same `records_dev` and unpacks
+        them into the same two lists. What differs is how many command buffers
+        carry them and whether the wait is a `synchronize()` or the copy's own
+        drain. This is a transfer shape in the sense `set_table_upload_
+        hoisting` is, not a numeric arm in the sense `set_gain_form` is.
+
+        Refuses an arm this backend is measured to get wrong before it can be
+        stored, so a wrong transport cannot be reached by a fit even through
+        this handle. Takes effect on the next `download_words`.
+        """
+        require_readback_correct(transport, self.api_is_metal)
+        _require_readback_implemented(transport)
+        self.readback = transport
+
+    def describe_readback(self) raises -> String:
+        """The live transport as `name buffers/trip`, for `describe_scan` and
+        for a test that wants to assert which arm is live without restating
+        the constant."""
+        var row = readback_transport(self.readback)
+        return String(
+            readback_transport_name(self.readback),
+            " buffers=",
+            row.command_buffers,
+        )
 
     def set_gain_form(mut self, form: Int) raises:
         """Which gain expression and right-hand subtraction rule this
@@ -3733,10 +3957,11 @@ struct GpuSplitSearcher(Movable):
         because a Float32 is the same four bytes wide. See `_feat_off`."""
         return self._allow_off() + self.max_records * self.n_features
 
-    def describe_scan(self) -> String:
+    def describe_scan(self) raises -> String:
         """One line for benchmark output and bug reports: which scan kernel
-        this searcher launches, how wide its threadgroup is, and whether its
-        reductions are collectives or hand-rolled loops."""
+        this searcher launches, how wide its threadgroup is, whether its
+        reductions are collectives or hand-rolled loops, and which readback
+        transport brings the records home."""
         var reduction = String(
             " reduce=block-primitives threads=",
             REDUCE_SLOT_THREADS,
@@ -3754,6 +3979,11 @@ struct GpuSplitSearcher(Movable):
         var gain = String(
             " gain=", describe_gain_form(self.gain_form_code)
         )
+        # And the readback arm, for the same reason the upload arm is here:
+        # it is the round trip that predicts this plane's time, a window
+        # interleaves two settings of it, and a run whose arm cannot be read
+        # off its own output proves nothing about either.
+        var back = String(" readback=", self.describe_readback())
         if self.wide_scan:
             return String(
                 "scan=wide threads=",
@@ -3761,8 +3991,9 @@ struct GpuSplitSearcher(Movable):
                 reduction,
                 tables,
                 gain,
+                back,
             )
-        return String("scan=serial threads=1", reduction, tables, gain)
+        return String("scan=serial threads=1", reduction, tables, gain, back)
 
     def _check_record(self, record: Int) raises:
         if record < 0 or record >= self.max_records:
@@ -4332,24 +4563,112 @@ struct GpuSplitSearcher(Movable):
     def download_words(
         mut self, mut words_i: List[Int32], mut words_f: List[Float32]
     ) raises:
-        """Copy every record slot into two host lists. One host
-        synchronization and `max_records * 136` bytes, whatever the histogram
-        shape; a 100-feature, 256-bin node's histogram is 300 KB."""
+        """Copy every record slot into two host lists. `max_records * 136`
+        bytes, whatever the histogram shape; a 100-feature, 256-bin node's
+        histogram is 300 KB.
+
+        **The round trip this plane's time is made of.** `_device_search_
+        resident` reads one record per split and this is that read, about a
+        hundred times in a fit. `gpu_runtime`'s transport table prices every
+        way of doing it and `self.readback` picks one; the default is
+        `READBACK_PLAIN_ONE`, measured at 124.85 us a trip against the
+        `READBACK_PINNED_PAIR_SYNC` shape this shipped until 2026-08-16 at
+        202.14. Same words, same values, two command buffers instead of four.
+
+        WHERE THE WAIT IS, AND WHY THE BRANCH IS ON THE DESTINATION
+        -----------------------------------------------------------
+        `docs/GPU_PORTABILITY.md` section 6.5.1: on Metal `enqueue_copy` has
+        two implementations and **the destination picks one**. Into pinned
+        memory from `enqueue_create_host_buffer` it enqueues a blit and
+        returns, so the words are not there until something waits. Into an
+        arbitrary host pointer it commits, waits, and memcpys, so the words
+        are there when the call returns and a following `synchronize()` would
+        be waiting on an empty queue.
+
+        So the pinned arms below end in `self.ctx.synchronize()` and the plain
+        arms do not, and that trailing call is **load-bearing** wherever it
+        appears: 6.1's bullet licensing its removal is exactly what 6.5.1
+        withdrew, after measuring 64 of 64 stale words behind a slow kernel
+        and 0 of 64 behind a fast one. Latency-dependent, which is why it
+        cannot be validated by running something small.
+
+        The branch is therefore on `row.pinned_destination` and not on the
+        arm code. Written as `if self.readback == READBACK_PLAIN_ONE`, a later
+        edit that pointed a plain arm at `host_i` to save an allocation would
+        compile, pass, and corrupt every split after the first. Written this
+        way it cannot: the only branch that omits the wait is the one whose
+        destination the table says is unpinned, and `plain_words` is a `List`
+        whose storage no `enqueue_create_host_buffer` ever produced.
+
+        The unpack is `[integer plane | float plane]`, the layout
+        `SPLIT_RECORD_WORDS` fixes, and the float half is read through a
+        four-byte-aligned `Float32` view of the same words.
+
+        **Every arm leaves the queue drained**, which is the postcondition
+        callers rely on and the reason dropping the `synchronize()` on the
+        plain arms is a saving rather than a semantic change. Section 6.1's
+        disassembly of the synchronous path is not retracted by 6.5.1: a copy
+        into an arbitrary host pointer commits the queue and waits for it, so
+        it drains everything enqueued before it and not merely itself. What
+        6.5.1 corrected is which destinations take that path.
+        """
         var n_i = self.max_records * SPLIT_IWORDS
         var n_f = self.max_records * SPLIT_FWORDS
         words_i.resize(n_i, Int32(0))
         words_f.resize(n_f, Float32(0.0))
-        self.ctx.enqueue_copy(
-            dst_ptr=self.host_i.unsafe_ptr(), src_buf=self.rec_i_dev
-        )
-        self.ctx.enqueue_copy(
-            dst_ptr=self.host_f.unsafe_ptr(), src_buf=self.rec_f_dev
-        )
-        self.ctx.synchronize()
-        var src_i = self.host_i.unsafe_ptr()
-        var src_f = self.host_f.unsafe_ptr()
+        var row = readback_transport(self.readback)
+        if row.pinned_destination:
+            if row.packed_source:
+                self.ctx.enqueue_copy(
+                    dst_ptr=self.host_i.unsafe_ptr(), src_buf=self.records_dev
+                )
+            else:
+                self.ctx.enqueue_copy(
+                    dst_ptr=self.host_i.unsafe_ptr(), src_buf=self.rec_i_dev
+                )
+                self.ctx.enqueue_copy(
+                    dst_ptr=self.host_f.unsafe_ptr(), src_buf=self.rec_f_dev
+                )
+            # Load-bearing. The copies above are asynchronous blits into
+            # pinned memory; without this the reads below see the previous
+            # record. Section 6.5.1, measured.
+            self.ctx.synchronize()
+            var src_i = self.host_i.unsafe_ptr()
+            for i in range(n_i):
+                words_i[i] = src_i.unsafe_load(i)
+            if row.packed_source:
+                # The packed pinned arm lands both planes in `host_i`, so the
+                # float words are the tail of that buffer read as Float32.
+                var src_p = self.host_i.unsafe_ptr().unsafe_offset(
+                    n_i
+                ).unsafe_bitcast[Scalar[DType.float32]]()
+                for i in range(n_f):
+                    words_f[i] = src_p.unsafe_load(i)
+            else:
+                var src_f = self.host_f.unsafe_ptr()
+                for i in range(n_f):
+                    words_f[i] = src_f.unsafe_load(i)
+            return
+        # Unpinned. Every copy below drains inside itself, so no
+        # `synchronize()` follows and none may be added back as a precaution:
+        # it would be a wait on an empty queue, which is what the pinned arm's
+        # measured 202.14 us is mostly made of.
+        var dst = self.plain_words.unsafe_ptr()
+        if row.packed_source:
+            self.ctx.enqueue_copy(dst_ptr=dst, src_buf=self.records_dev)
+        else:
+            self.ctx.enqueue_copy(dst_ptr=dst, src_buf=self.rec_i_dev)
+            self.ctx.enqueue_copy(
+                dst_ptr=dst.unsafe_offset(n_i).unsafe_bitcast[
+                    Scalar[DType.float32]
+                ](),
+                src_buf=self.rec_f_dev,
+            )
         for i in range(n_i):
-            words_i[i] = src_i.unsafe_load(i)
+            words_i[i] = dst.unsafe_load(i)
+        var src_f = dst.unsafe_offset(n_i).unsafe_bitcast[
+            Scalar[DType.float32]
+        ]()
         for i in range(n_f):
             words_f[i] = src_f.unsafe_load(i)
 
@@ -4513,10 +4832,13 @@ struct GpuSplitSearcher(Movable):
         """The batch's one wait: copy every record back and decode slots
         `[0, n_records)`.
 
-        `max_records * 136` bytes and one synchronization, against one
-        histogram download and one synchronization per node, which is what
-        the node-at-a-time loop pays and what the whole record layout
-        exists to avoid.
+        `max_records * 136` bytes and one wait, against one histogram download
+        and one wait per node, which is what the node-at-a-time loop pays and
+        what the whole record layout exists to avoid.
+
+        One wait, not necessarily one `synchronize()`: under the default
+        `READBACK_PLAIN_ONE` the wait is the copy's own drain. See
+        `download_words`.
         """
         if n_records < 1 or n_records > self.max_records:
             raise Error("n_records out of range")
