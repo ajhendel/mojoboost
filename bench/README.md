@@ -158,7 +158,8 @@ single-core work moves.
 | `split_scan` | best-split search over a built histogram |
 | `partition` | routing a node's rows to its two children |
 | `grow_tree` | one whole tree, as an integration check on the above |
-| `predict` | scoring every row through a grown tree |
+| `predict_batch` | the shipped batch scorer, `Booster.predict_batch_range` |
+| `predict_row_serial` | this benchmark's own serial loop over `Tree.predict_row` for one tree |
 
 It prints a machine header first (ISA, core counts, SIMD width, and the
 scheduler's resolved task counts), which must accompany any number taken from
@@ -167,7 +168,93 @@ it.
 ```sh
 pixi run bench-profile                  # 100000 rows x 100 features, 3 reps
 pixi run bench-profile 200000 50 5      # rows, features, reps
+pixi run bench-profile 200000 50 5 8    # ... and the predict ensemble size
 ```
+
+#### The stage formerly called `predict`
+
+There is no stage named `predict` any more, and **a number recorded under
+that name is a `predict_row_serial` number**. It was this benchmark's own
+serial loop calling `Tree.predict_row` once per row over a single tree,
+which is serial in both columns by construction, so the roughly 1.0x
+speedup it reported was a property of that loop and told you nothing about
+the library. In particular it was never evidence that batch prediction fails
+to parallelize.
+
+`predict_batch` is the stage that measures the shipped path.
+`Booster.predict_batch_range` fans out over row blocks with
+`parallel.dispatch_rows`, and until this stage existed nothing in the
+repository had measured what that fan-out is worth. Its ensemble is
+`pred_trees` (default 8) copies of the one grown tree, which costs a row
+what an ensemble of distinct trees of that shape costs it.
+
+#### Stages that are not the shipped call
+
+A stage name is not a claim that the library calls that code. Three stages
+allocate per call where the grower recycles, and at small node sizes the
+allocation is the larger term:
+
+- `hist_full`, `hist_subset50`, `hist_subset10` allocate a fresh `Histogram`
+  per call (25,600 cells at 24 bytes = 614,400 bytes at 100 features and 256
+  bins) and the subset pair buffer per call. The grower takes a pooled buffer
+  and one shared `pairs` list.
+- `hist_subtract` allocates its result; the grower calls
+  `subtract_histogram_into`. Since the subtraction is one SIMD sweep over the
+  same 614,400 bytes, this stage may be allocation-dominated, and no run has
+  established what share is which.
+- `partition` allocates two `List[Int]`; the grower reuses its buffers.
+
+They are left that way so numbers already recorded under those names stay
+comparable. Use the ladder below when the question is what a node costs the
+grower.
+
+#### The node-size ladder
+
+`hist_full` / `hist_subset50` / `hist_subset10` are all the node sizes the
+old table had: at 1,000,000 rows that is 1,000,000, 500,000 and 100,000. A
+default 31-leaf tree spends most of its nodes far below the smallest of
+those, so the table was silent about them, which left two explanations of the
+gap between well-scaling kernels and a poorly-scaling `grow_tree` -- per-node
+fixed cost, and nodes falling below the grain floor and running serial --
+that nothing could tell apart.
+
+The second table times the node histogram at 100,000 / 30,000 / 10,000 /
+3,000 / 1,000 / 300 rows through
+`histogram.build_histogram_subset_into_scratch` with a recycled output
+buffer and a recycled pair buffer, which is the call the grower makes. Its
+columns:
+
+| Column | Meaning |
+|---|---|
+| `serial_s`, `auto_s`, `speedup` | as in the main table |
+| `serial_tasks`, `auto_tasks` | the **resolved** task count of the accumulation dispatch in each arm, from `plan_tasks` on the same two arguments `dispatch_feature_ranges` passes |
+| `gather_blocks` | resolved row blocks of the gradient/hessian gather, or 0 when the plan declined to compact |
+| `group_width`, `group_count`, `active_ops`, `compact` | the `AccumulationPlan` the kernel derived |
+
+`auto_tasks` is the column that earns the table. A 1.0x speedup is ambiguous
+between "fanned out and gained nothing" and "never fanned out"; a resolved
+count of 1 settles it. `serial_tasks` is there so the serial arm is proven
+serial rather than assumed.
+
+Two structural facts the columns will expose, both arithmetic rather than
+measurement. The accumulation's work estimate is
+`n_active * (n_bins + n_rows)` and the grain floor is 65,536, so with 256
+bins a node stays serial below about 1,055 rows at 50 features and below
+about 400 at 100. And the task count is clamped to `group_count`, which is
+`ceil(n_active / group_width)`, so at 50 features and `group_width` 2 no
+histogram build can use more than 25 tasks however large the node is.
+
+Row lists are strided rather than contiguous, following `hist_subset50` and
+`hist_subset10`. A real node's rows are ascending but clustered by the split
+feature's bin, so the ladder bounds a real node's time from above rather than
+estimating it.
+
+This is still a microbenchmark. The in-run complement -- real trees, every
+node, a size breakdown, and the share of a whole fit -- is
+`src/mojotrees/phase_profile.mojo`, reached with `MOJOTREES_PHASE_PROFILE=async`
+on any run that trains. It cannot answer the resolved-task-count question:
+its host `dispatches` column is a structural constant charged per call site,
+not the count the scheduler chose.
 
 Sweeping `TASKS_PER_CORE` in `src/mojotrees/parallel.mojo` and rerunning this
 is how that constant should be settled; it is currently an unmeasured starting
