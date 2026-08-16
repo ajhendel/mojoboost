@@ -5,14 +5,23 @@ node for node and bit for bit, the tree grown on a dataset physically
 holding only those rows. Everything else here (fraction = 1, reproducibility,
 seed sensitivity, zero-weight rows, tiny datasets) rests on that.
 
-One qualification, and it is about the histogram builders rather than about
-bagging. "Bit for bit" holds against the *subset* builder, which is the one a
-bag goes through, and it is asserted at full strength. Against the
-whole-dataset builder only the structure is bit-equal, because the subset
-builder now folds contiguous row blocks and the whole-dataset builder still
-sums flat, so the two reassociate a node's rows differently and its leaf
-value can move in its last bits. See `test_bagged_tree_equals_tree_on_subset_dataset`
-and the "row blocks" section of `src/mojotrees/histogram.mojo`.
+One qualification that WAS here and is no longer true, kept as history
+because it is the shape of a defect worth recognizing again. For a while
+"bit for bit" held against the *subset* builder but only structurally
+against the whole-dataset builder, because the subset builder folded
+contiguous row blocks while the whole-dataset builder still summed flat. The
+two reassociated a node's rows differently and a leaf value moved by four
+ulp. That is fixed at the cause: both builders now block on one plan, and
+`test_bagged_tree_equals_tree_on_subset_dataset` asserts bit identity against
+both. The assertion was restored rather than the tolerance widened.
+
+It is worth naming what that defect was, since nothing in the determinism
+contract caught it. Results stayed invariant across `MOJOTREES_NUM_WORKERS`
+and across task counts the whole time, because the block count came from the
+node's row count and never from the machine. What broke was an unwritten
+property -- that growing on a bag is growing on the dataset of those rows --
+and no test asserted it until this one went red. See the "row blocks" section
+of `src/mojotrees/histogram.mojo`.
 
 CPU/GPU equivalence lives in tests/test_gpu_training.mojo, which needs an
 accelerator.
