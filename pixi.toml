@@ -88,6 +88,14 @@ test-capi = "bash tools/run_tests.sh cpu test_capi"
 test-cli = "bash tools/run_tests.sh cpu test_cli"
 test-c = "capi/run_c_tests.sh"
 
+# Device probes. Not benchmarks: a probe asks what one runtime operation costs
+# or whether one runtime capability exists, and it gates every answer it gives
+# on delivering the right bytes. `probes/readback_cost.mojo` prices one host
+# readback of a 136-byte split record against a bare command-buffer completion,
+# and reports which transports this MAX version and this backend can reach at
+# all. Takes optional `trips trials`.
+probe-readback = "mojo run -I src probes/readback_cost.mojo"
+
 [dependencies]
 mojo = ">=1.0.0,<2"
 max = ">=26.5.0,<27"
