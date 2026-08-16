@@ -84,6 +84,7 @@ from .boosting import (
     _fill_softmax_grad_hess,
     _mean_loss,
     _multiclass_goss_select,
+    _refuse_leaf_estimation,
     _softmax_inplace,
     objective_renews_leaves,
     renewal_alpha,
@@ -99,9 +100,11 @@ from .growth_policy import GrowthSchedule, LeafCandidate, check_grow_policy
 from .histogram import (
     Histogram,
     check_device_derivative_precision,
+    const_hessian_verify,
     subtract_histogram,
 )
 from .interaction import extend_branch
+from .linear_tree import check_linear_tree_unconnected
 from .monotone import (
     MONOTONE_FREE,
     OutputBounds,
@@ -181,6 +184,81 @@ def _refuse_bundling(
     check_bundling_honored(params.bundling, trainer)
 
 
+def _refuse_unhonored(params: BoosterParams, trainer: String) raises:
+    """Refuse everything else this trainer takes and does not apply.
+
+    Found by the 2026-08-16 refusal sweep, which enumerated the parameter and
+    environment surface against the code that would have to read it rather
+    than against any aggregate predicate. `_refuse_bundling` above was
+    already right, and being right is what made the three below visible: the
+    sparse trainer refused `enable_bundle` while the dense one silently
+    dropped it, so the two were compared and the rest of the surface with
+    them.
+
+    `linear_tree` fits an affine model per leaf from the raw feature matrix.
+    This trainer takes a `SparseBinnedMatrix` and never sees one, exactly as
+    `boosting.train` never sees one, and `boosting.train` refuses it for that
+    reason. No GPU trainer, dense or sparse, did.
+
+    `leaf_estimation_iterations > 1` re-evaluates each leaf's rows at the
+    value the leaf currently holds and takes another Newton step. `train_gpu`
+    implements it (`_check_leaf_estimation_config` plus `GpuLeafEstimator`)
+    and `train_custom_gpu` and `train_multiclass_gpu` refuse it by entry
+    point; this trainer did neither, so an above-1 setting produced
+    single-step leaves reported as multi-step ones. `_refuse_leaf_estimation`
+    is the refusal keyed on the entry point and is what those two use.
+
+    `MOJOTREES_CONST_HESSIAN_VERIFY=1` audits a declared constant hessian by
+    walking the host hessian array, which only the CPU histogram builders do.
+    See `train_gpu._check_gpu_const_hessian_verify`, which is the same
+    refusal on the dense path; the reason it is duplicated rather than shared
+    is that a shared one would have to live in a module both trainers import,
+    and the sentence is three lines.
+
+    A forced-split document is refused by `_check_gpu_forced_splits_sparse`
+    at the grower instead, because the grower is what a direct caller of
+    `grow_tree_gpu_sparse` reaches.
+    """
+    if params.linear.is_active():
+        check_linear_tree_unconnected(trainer)
+    _refuse_leaf_estimation(params.tree.extra, trainer)
+    if const_hessian_verify():
+        raise Error(
+            "MOJOTREES_CONST_HESSIAN_VERIFY=1 audits a declared constant"
+            " hessian by walking the host hessian array, which only the CPU"
+            " histogram builders do; ",
+            trainer,
+            " accumulates on the device and would take the shortcut"
+            " unaudited. Train on the CPU, or unset"
+            " MOJOTREES_CONST_HESSIAN_VERIFY",
+        )
+
+
+def _check_gpu_forced_splits_sparse(
+    params: TreeParams, grower: String
+) raises:
+    """Refuse a forced-split document on a grower that does not apply one.
+
+    `tree.grow_tree` is the only grower in this package that reads
+    `params.extra.forced`. This one passes `grower_applies_extra=True` to
+    `tree._search`, which is true of everything that flag covers --
+    `max_delta_step`, `path_smooth`, `extra_trees`, `random_strength` -- and
+    is not true of forced splits, which that flag says nothing about. So the
+    document went unread here for the same reason it went unread on the dense
+    device path, and `train_gpu._check_gpu_forced_splits` has the long form
+    of why no aggregate guard caught it.
+    """
+    if params.extra.forced.is_empty():
+        return
+    raise Error(
+        "forced splits are applied by tree.grow_tree, the dense CPU grower,"
+        " and by no other grower in this package; ",
+        grower,
+        " never reads the document and would return an unforced tree. Train"
+        " on the CPU, or leave forced_splits unset",
+    )
+
+
 def _open_builder(
     data: SparseBinnedMatrix, num_leaves: Int
 ) raises -> GpuSparseHistogramBuilder:
@@ -248,6 +326,7 @@ def grow_tree_gpu_sparse(
     check_device_derivative_precision(
         params.extra.wants_float64_derivatives()
     )
+    _check_gpu_forced_splits_sparse(params, String("grow_tree_gpu_sparse"))
     var max_delta_step = params.extra.max_delta_step
     var path_smooth = params.extra.path_smooth
     var signs = params.monotone.active_signs()
@@ -547,6 +626,7 @@ def train_gpu_sparse(
             raise Error("target length must equal n_rows")
         data.validate()
         _refuse_bundling(bundling, params, "train_gpu_sparse")
+        _refuse_unhonored(params, String("train_gpu_sparse"))
         var n_features = data.n_features
         _check_objective(objective, target, alpha)
         _check_sample_weight(sample_weight, data.n_rows)
@@ -653,6 +733,7 @@ def train_gpu_sparse_with_valid(
         data.validate()
         valid_data.validate()
         _refuse_bundling(bundling, params, "train_gpu_sparse_with_valid")
+        _refuse_unhonored(params, String("train_gpu_sparse_with_valid"))
         var n_features = data.n_features
         if valid_data.n_features != n_features:
             raise Error("valid_data must have the same features")
@@ -770,6 +851,7 @@ def train_multiclass_gpu_sparse(
             raise Error("n_classes must be at least 2")
         data.validate()
         _refuse_bundling(bundling, params, "train_multiclass_gpu_sparse")
+        _refuse_unhonored(params, String("train_multiclass_gpu_sparse"))
         _check_sample_weight(sample_weight, data.n_rows)
         check_bagging(bagging)
         _check_goss(goss, bagging)

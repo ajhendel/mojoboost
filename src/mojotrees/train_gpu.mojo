@@ -317,6 +317,7 @@ from .boosting import (
     renewal_weights,
     round_has_constant_hessian,
 )
+from .efb import check_bundling_honored
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .gpu_frontier import subtraction_builds_left
 from .gpu_fused_round import (
@@ -374,9 +375,11 @@ from .gpu_tiling import DeviceCaps
 from .histogram import (
     Histogram,
     check_device_derivative_precision,
+    const_hessian_verify,
     subtract_histogram,
 )
 from .histogram_gpu import GpuHistogramBuilder
+from .linear_tree import check_linear_tree_unconnected
 from .phase_profile import (
     PARTITION_LAUNCHES,
     PROF_CONVERT,
@@ -1048,6 +1051,174 @@ def _check_device_search_supported(params: TreeParams) raises:
         )
 
 
+def verify_rows_requested() -> Bool:
+    """`MOJOTREES_GPU_VERIFY_ROWS=1`, the per-split row-count cross-check.
+
+    A second read of a variable `gpu_active_rows.GpuActiveRows.__init__`
+    already reads, and it is deliberate rather than an oversight: that read
+    lands on a field of a device object this module cannot reach from the
+    routing decision below, and the routing decision is the only place the
+    request can be honored or refused. The two agree by construction because
+    both are the same one-line `== "1"` test on the same name, and neither
+    interprets it.
+    """
+    return getenv("MOJOTREES_GPU_VERIFY_ROWS") == "1"
+
+
+def _check_verify_rows_reachable() raises:
+    """Refuse the row-count cross-check on the plane that cannot perform it.
+
+    `MOJOTREES_GPU_VERIFY_ROWS=1` asks for one thing: after each split, the
+    device's left-count is downloaded and compared against the histogram's,
+    and a disagreement raises. `GpuActiveRows.partition` does exactly that
+    (gpu_active_rows.mojo, `verify_counts`), and it is the arm the
+    `apply_split` / `finish_split` loops take.
+
+    The device-owned growth plane has no such comparison and cannot grow one
+    cheaply: `enqueue_partition_desc` still *writes* the count, and its own
+    docstring says the value "stays written so that
+    `MOJOTREES_GPU_VERIFY_ROWS` remains meaningful for anyone who wants to
+    check" -- but nothing on that plane ever reads it back, because reading it
+    per step is precisely the host wait the plane exists to remove. So the
+    flag was accepted and did nothing, on what is now the default path.
+
+    That is the worst shape a silent ignore can take. A knob that quietly
+    fails to change a fit costs the user a wrong number; a *verification*
+    knob that quietly fails to verify costs them a wrong number they have
+    been told is checked. It is refused here rather than warned about for the
+    same reason.
+
+    `MOJOTREES_GPU_TREE_RESIDENT=0` is the answer and is named in the
+    message: it takes the incremental loop, where the cross-check is real.
+    """
+    if not verify_rows_requested():
+        return
+    raise Error(
+        "MOJOTREES_GPU_VERIFY_ROWS=1 asks for the per-split row-count"
+        " cross-check, and the device-owned growth plane never downloads the"
+        " count to compare, so the check would silently not run. Set"
+        " MOJOTREES_GPU_TREE_RESIDENT=0 to take the incremental loop, which"
+        " performs it, or unset MOJOTREES_GPU_VERIFY_ROWS"
+    )
+
+
+def _check_gpu_forced_splits(params: TreeParams, grower: String) raises:
+    """Refuse a forced-split document on a grower that does not apply one.
+
+    `tree.grow_tree` is the only grower in this package that reads
+    `params.extra.forced`: it seeds the growth loop from the document
+    (tree.mojo, `forced=` on the root candidate) and follows it down. No GPU
+    grower does, dense or sparse, and none ever has.
+
+    WHY THE GUARD EVERYONE READS DID NOT CATCH THIS, because it is the whole
+    lesson of the 2026-08-16 refusal sweep and it will be read as redundant
+    otherwise. `ExtraTreeParams.is_active()` *does* name `forced`, so the
+    parameter looks covered. It is covered on exactly one path:
+    `_check_device_search_supported` refuses the entire bundle, and that path
+    is `MOJOTREES_GPU_SPLIT_STRATEGY=device`, which is not the default. The
+    shipping host split scan routes through `tree._search`, and `tree._search`
+    refuses `ExtraTreeParams.needs_grower_support()`, which is
+    `max_delta_step`, `path_smooth`, `extra_trees`, and `random_strength` and
+    is strictly smaller than `is_active()`. `forced` fell in the gap between
+    the two.
+
+    It is worse than a gap, because AUTO steers into it. `is_active()` being
+    True is exactly what makes `split_search_decision_for` decline the device
+    arm (`_device_search_semantics_supported`), so a fit that set forced
+    splits was routed *onto* the host arm, which is the arm that drops them,
+    by the same predicate that would have refused it on the other one.
+
+    Called before the two arms split rather than inside either, so both raise
+    the same sentence and a caller cannot be told a different story by a
+    strategy switch. `binning.map_forced_splits` has already turned thresholds
+    into bins by the time a document gets this far, which is why
+    `check_scalars`' unmapped-document refusal does not fire: a correctly
+    mapped document is precisely the case that used to be dropped.
+    """
+    if params.extra.forced.is_empty():
+        return
+    raise Error(
+        "forced splits are applied by tree.grow_tree, the dense CPU grower,"
+        " and by no other grower in this package; ",
+        grower,
+        " never reads the document and would return an unforced tree. Train"
+        " on the CPU (device='cpu', or device='auto', which routes around"
+        " this), or leave forced_splits unset",
+    )
+
+
+def _check_gpu_const_hessian_verify(trainer: String) raises:
+    """Refuse the constant-hessian audit on a backend that does not run it.
+
+    `MOJOTREES_CONST_HESSIAN_VERIFY=1` makes a builder that was told the
+    hessians are constant walk the hessian array and raise if any entry is
+    not exactly `CONSTANT_HESSIAN` (`histogram._check_constant_hessian`).
+    Every CPU builder honors it. No GPU builder does: the device path reads
+    its sibling `MOJOTREES_CONST_HESSIAN` through
+    `GpuActiveRows.const_hessian_allowed` and takes or declines the shortcut
+    on it, and then verifies nothing, because the audit is a host walk over a
+    host array and the plane the hessians are on is the device's.
+
+    So the two halves of one diagnostic pair came apart: the half that
+    *enables* an optimization is live on both backends and the half that
+    *checks* it is live on one. A GPU fit under this flag took the shortcut
+    and reported that it had been audited. Refused rather than warned for the
+    reason `_check_verify_rows_reachable` gives at length: an unperformed
+    check is worse than an unset one, because the user has stopped looking.
+    """
+    if not const_hessian_verify():
+        return
+    raise Error(
+        "MOJOTREES_CONST_HESSIAN_VERIFY=1 audits a declared constant hessian"
+        " by walking the host hessian array, which only the CPU histogram"
+        " builders do; ",
+        trainer,
+        " accumulates on the device and would take the shortcut unaudited."
+        " Train on the CPU (device='cpu', or device='auto', which routes"
+        " around this), or unset MOJOTREES_CONST_HESSIAN_VERIFY",
+    )
+
+
+def _check_gpu_booster_params(
+    params: BoosterParams, trainer: String
+) raises:
+    """Refuse what this trainer cannot honor: two parameters and one knob.
+
+    The parameters first.
+
+    Both were accepted and silently dropped until 2026-08-16, and both are
+    ensemble-level rather than per-tree, which is why they are refused at the
+    trainer rather than at the grower: a grower is handed a `TreeParams` and
+    never sees either one.
+
+    `enable_bundle` is built by the dense CPU trainers in boosting.mojo, which
+    fit a bundling plan once per training call and grow every tree on the
+    bundled matrix. A GPU trainer accumulates its histograms from the
+    unbundled binned matrix through histogram_gpu.mojo and has nowhere to
+    apply a plan. `efb.check_bundling_honored` is the refusal boosting.mojo's
+    own docstring asks every other trainer to make;
+    `train_gpu_sparse._refuse_bundling` has made it since it shipped, and the
+    dense trainers here did not, which is how the gap was found.
+
+    `linear_tree` fits an affine model per leaf from the *raw* feature matrix.
+    Every GPU trainer here takes a `BinnedMatrix`, exactly as `boosting.train`
+    does, and `boosting.train` refuses it for that reason. `model.fit` also
+    refuses it before it dispatches, which is why this was invisible from the
+    Python surface; `model.fit_multiclass`, `external_memory.train_external*`,
+    and any direct call to a trainer in this file went straight past it.
+
+    And then the knob, which is here rather than in a separate call at every
+    entry point because a caller of this function is asking one question --
+    "is there anything I asked for that you will not do" -- and the answer
+    must not depend on whether the thing they asked for arrived as a field or
+    as an environment variable.
+    """
+    check_bundling_honored(params.bundling, trainer)
+    if params.linear.is_active():
+        check_linear_tree_unconnected(trainer)
+    _check_gpu_const_hessian_verify(trainer)
+
+
 def resident_frontier_disabled() -> Bool:
     """`MOJOTREES_GPU_SPLIT_RESIDENT=0`, which forces the device split search
     back onto its incremental loop even where the slot pool would open.
@@ -1384,6 +1555,11 @@ def _grow_tree_gpu_device_search(
                     " constraint, and no extra tree parameters",
                 )
             )
+        # The symmetric plane is the same descriptor plane as the leaf-wise
+        # one and downloads the split count no more often, so the row-count
+        # cross-check is equally unavailable here. See
+        # `_check_verify_rows_reachable`.
+        _check_verify_rows_reachable()
         profile.begin_tree(n_root, builder.n_rows)
         var oblivious_started = profile.clock()
         var symmetric = grow_tree_device_oblivious(
@@ -1444,6 +1620,10 @@ def _grow_tree_gpu_device_search(
             ):
                 why = RESIDENT_NO_POOL
             if why == RESIDENT_OK:
+                # The plane is elected here and nowhere else, so this is the
+                # one place a request the plane cannot honor can be refused
+                # rather than dropped. See `_check_verify_rows_reachable`.
+                _check_verify_rows_reachable()
                 # Counted, not timed, and the distinction is the whole of
                 # what this bracket claims. The plane takes no `profile` and
                 # will not: its phases are device phases and separating them
@@ -2424,6 +2604,10 @@ def grow_tree_gpu_profiled(
     # on the crossover are the only record of why this fit is taking the
     # path it is taking, and they used to be discarded on the line that
     # computed them.
+    # Before the arms split, so a strategy switch cannot change the answer.
+    # See `_check_gpu_forced_splits` for why AUTO steers a forced-split fit
+    # onto the one arm that drops them.
+    _check_gpu_forced_splits(params, String("the GPU grower"))
     var decision = split_search_decision_for(builder, params, split_search)
     if split_trace_enabled():
         print("split_trace tree", tree_index, decision.describe())
@@ -2884,6 +3068,7 @@ def _check_train_gpu(
     check_bagging(bagging)
     _check_goss(goss, bagging)
     params.tree.monotone.check_features(data.n_features)
+    _check_gpu_booster_params(params, String("train_gpu"))
 
 
 def _train_gpu_rounds[
@@ -3615,6 +3800,7 @@ def train_custom_gpu[F: GradHessFn](
         if len(target) != data.n_rows:
             raise Error("target length must equal n_rows")
         _check_sample_weight(sample_weight, data.n_rows)
+        _check_gpu_booster_params(params, String("train_custom_gpu"))
 
         var builder = GpuHistogramBuilder(data)
         # No constant-hessian declaration on a custom objective, and the
@@ -3658,6 +3844,7 @@ def train_custom_gpu[F: GradHessFn](
         if len(target) != data.n_rows:
             raise Error("target length must equal n_rows")
         _check_sample_weight(sample_weight, data.n_rows)
+        _check_gpu_booster_params(params, String("train_custom_gpu"))
 
         var fit = session.begin_fit()
         var builder = GpuHistogramBuilder(session, data)
@@ -4092,6 +4279,7 @@ def train_multiclass_gpu(
         _check_sample_weight(sample_weight, data.n_rows)
         check_bagging(bagging)
         _check_goss(goss, bagging)
+        _check_gpu_booster_params(params, String("train_multiclass_gpu"))
         var base_scores = _multiclass_base_scores(
             labels, n_classes, sample_weight
         )
@@ -4150,6 +4338,7 @@ def train_multiclass_gpu(
         _check_sample_weight(sample_weight, data.n_rows)
         check_bagging(bagging)
         _check_goss(goss, bagging)
+        _check_gpu_booster_params(params, String("train_multiclass_gpu"))
         var base_scores = _multiclass_base_scores(
             labels, n_classes, sample_weight
         )
@@ -4587,6 +4776,7 @@ def train_gpu_with_valid(
         check_bagging(bagging)
         _check_goss(goss, bagging)
         params.tree.monotone.check_features(data.n_features)
+        _check_gpu_booster_params(params, String("train_gpu_with_valid"))
 
         var builder = GpuHistogramBuilder(data)
         # The same declaration `train_gpu` makes, over the same three inputs.
