@@ -404,3 +404,91 @@ parallel range reduction, that is a candidate mechanism for the loss rather than
 evidence that tiling is wrong -- and it would mean the untested downward
 direction and the reduction shape are two separate questions that the earlier
 experiment confounded.
+
+
+---
+
+## K3 refuted itself before measurement, and found the real blocker on packing
+
+### The layout is a provable no-op at the shipping configuration
+
+`G` must equal `feature_group` or the threadgroup does not consume the `G` bytes
+it pulls. `free_feature_group` returns **1** at `bin_cap = 256`, which is every
+headline shape here. **`G = 1` is feature-major.** Not "probably small" --
+identical, structurally, by construction.
+
+Reaching any win requires widening `feature_group` first, which is an unmeasured
+residency trade in modules that lane did not own. So the measurement is three
+arms, and the middle one is not optional:
+
+| arm | `feature_group` | `blocked_layout` |
+|---|---|---|
+| A shipping | 1 | off |
+| B group only | 4 | off |
+| C group + layout | 4 | 4 |
+
+**C against B is the layout.** C against A would attribute a **measured** group
+effect (1.17x for group 2 over 1, atomic, on this M4) to an unmeasured layout.
+
+### Estimate revised 1.5-2.5x down to 1.10-1.20x, at or under its own threshold
+
+Registered refutation was "below 1.2x by size class". The lane's own revised
+estimate is 1.10-1.20x, and the win is confined to `small` and `tiny`: at the
+root the feature-major column is already read contiguously, so root and large are
+**neutral, not slightly better**. A stated consequence worth keeping: **if a
+measurement shows the win in `large`, this mechanism did not produce it.**
+
+The reason the registration was too high: **the three shared atomics are
+untouched and bound the win from above, and nobody has measured their share.**
+
+### The packed-pair objection I retracted was wrong, and a different one is fatal
+
+My retraction stands on its own terms -- the row bound is per node and I applied
+it to the fit. But K3 found the dispositive objection, and it is not the row
+count at all: **`SCALE_MAGNITUDE_SUM` is per-TREE** (`2^30 / sum_dataset|g|`), so
+a bin overflows int16 at **3.05e-5 of total gradient mass**.
+
+`ACCURACY_BUDGET.md` Experiment D **already measured 228 of 255 bins overflowing
+at 100,000 rows** -- three times *below* the 32,766-row ceiling, and worse than at
+1M, because boosting concentrates residual mass into exactly the nodes a tree
+keeps splitting.
+
+So packing is blocked by the **scale**, not by the row count. Fixing it needs
+either per-node requantization -- a pass over the node's rows, and an accuracy
+change -- or LightGBM's per-row clamp, which points against the numerics
+settlement made the same day. **Not built, design recorded.** Its reach would be
+`small`/`tiny`, the *same* classes as the layout, so the two **compete rather
+than compose**.
+
+### The serial-reduction hypothesis is refuted
+
+`_range_reduce_kernel` is already one thread per output cell summing over tiles,
+which is LightGBM's shape exactly, and all four flush and zero loops stride by
+`block_dim.x`. No thread owns a whole histogram.
+
+**So the tile arms test what they are thought to test**, and the row-tile floor's
+loss keeps its partial-traffic explanation: 80 tiles x 50 features x 256 bins x 3
+planes is 12.3 MB of partials per node histogram, linear in tile count.
+
+One adjacent lead, unmeasured and belonging to a tiling lane: each reduce
+thread's `n_tiles` reads stride by tens of kilobytes, and a bin-major partial
+layout would make them contiguous.
+
+### The row-major question, answered for both paths
+
+The GPU histogram **cannot** use a row-major `BinnedMatrix` view, and the reason
+is threadgroup memory rather than taste: a threadgroup needs `3*k*bin_cap*4`
+bytes for `k` features, which is 3 KiB per feature at 256 bins, so an M4's 32 KiB
+holds at most 8 slots. A 50-wide row-major record is **84 percent waste**,
+re-read `ceil(50/8)` times.
+
+**The GPU predictor does want row-major and always did.** So: histogram
+feature-blocked at `G = feature_group`; prediction row-major.
+
+### What the lane recommends instead, and it is the right next question
+
+**Measure the shared-atomic fraction of the histogram phase first**, as a small
+non-shipping arm. It decides both this lane's ceiling and whether the next lane
+should attack atomics rather than addresses. Nobody has measured it, and every
+estimate in this batch has been bounded above by it without anyone knowing by how
+much.
