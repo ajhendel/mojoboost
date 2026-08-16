@@ -446,6 +446,7 @@ honors it, so the Mojo API and a future estimator parameter both reach it, but
 from Python it is always "unset", which is CatBoost's own default and the
 configuration `sampling.check_mvs_reg` argues is the only sensible one.
 | A35 | Persisting the fitted CTR tables in the model file (`catboost/libs/model/model_export/model_exporter.cpp`, `catboost/libs/model/ctr_data.h`, `catboost/libs/model/online_ctr.h::TModelCtr`; `CalcFinalCtrsAndSaveToModel` in `catboost/private/libs/algo/full_model_saver.cpp`) -- **CatBoost's behavior verified from source only to the extent A19 already verified it**: that `.cbm` carries `TCtrValueTable` per `TModelCtrBase` and that inference reads it through `TModelCtr::Calc`. The `.cbm` binary layout itself was NOT read, and nothing here imitates it | The model format's section for A19's model state. A fitted `CtrTables` is read off the target, so it is model state and not configuration; a file without it loads a model that keeps every tree referencing a CTR column and bins that column from different numbers | No. A reloaded model must score **bit-identically**, which is the whole test | Yes, and it is the gate on A19 being reachable at all: an arm that cannot be saved is an arm nobody can ship, and A19's own trainer refusal named this as the blocker | `serialize.mojo` (v5 `ctr` section), `ctr_columns.mojo` (the guards), `model_dump.mojo` (the remaining refusal) | A35 note. **BUILT and REACHED.** Format **v5**, conditional: a model with no ctr tables and no linear leaves still writes v4. Floats round-trip exactly because the whole format stores IEEE-754 bit patterns. Prepared tables, the model dump and every Python entry point still REFUSE, each by its own reason |
+| A36 | **CTR REPLACEMENT of a raw categorical column, and `random_strength` at the trainer the benchmark uses.** Two reachability edges, not two new mechanisms: A19/A30 own the CTR arithmetic and A3 owns the noise. CatBoost's own fork is `one_hot_max_size` (A16): a column at or under the cutoff becomes one-hot and every wider column is REPLACED by its CTR columns, so its split search never meets a category. **CatBoost's behavior here is RELAYED from the A16, A19 and A30 notes, not independently re-verified: there is no CatBoost checkout in this worktree** | Replacement is what the word says. A CTR that is *added* beside the raw column leaves the categorical in the matrix, so `tree._check_oblivious` still refuses the level and nothing has been built. The noise edge is narrower: the per-split draw exists on both backends, and what is scarce is the per-tree scale, which exactly two round loops compute | Yes for the CTR half (new columns, and one column removed). No for the noise half beyond what A3 already moves | The noise half YES and **BUILT**. The CTR half **BLOCKED**, four traced reasons, see the A36 note | `bindings/_mojotrees.mojo` (both), `bench/real_data/scenarios.py`; the CTR half would need `ctr_columns.mojo`, `binning.mojo`, `trainset.mojo` plus two files this lane does not own | A36 note. (3) when set. `random_strength` is deterministic across `MOJOTREES_NUM_WORKERS` and across machines, established by reading the code and written out in the note |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -5322,3 +5323,208 @@ made, and the `.cbm` binary layout was not read -- this is mojotrees' own
 text format gaining a section, not an interchange format. Whether a CTR model
 is *better* on any dataset is untested; A19's own row says `bench/real_data`
 runs no categorical CatBoost scenario, and that is still true.
+
+### A36 note: replacement is the mechanism, and a flag is not a wire
+
+Lane `lane/catboost-cat-and-noise`, 2026-08-16. Two failures of the
+`mojotrees_catboost_mode` benchmark arm, taken together because they are the
+same defect class seen from two sides: a mechanism that is built, and an edge
+to it that was declared at the one call site somebody looked at.
+
+**Nothing in this lane was compiled and nothing was run.** A long benchmark
+owned the machine. Every claim below about CatBoost is RELAYED from the A16,
+A19, A30 and A31 notes, which did read source; there is no CatBoost checkout in
+this worktree and none of it was re-read here. Every claim about mojotrees is
+from reading mojotrees source and is cited by file and line.
+
+#### 1. The categorical half, and why it is BLOCKED rather than built
+
+The failure. `grow_policy=symmetrictree` on `high_cardinality_categorical`
+raises at `tree._check_oblivious` (`src/mojotrees/tree.mojo:1873`), on
+`data.cats.any_categorical()`. The refusal is correct: a level of an oblivious
+tree shares one split, and a categorical feature is searched as category
+partitions ordered by one node's own gradient/hessian ratios, so there is no
+one partition a level could share.
+
+CatBoost does not meet this because it forks on `one_hot_max_size` before any
+split search: a column at or under the cutoff becomes one-hot, and every wider
+column is replaced by its CTR columns. The word that carries the whole design
+is REPLACED. A CTR *added* beside the raw column changes nothing here: the
+categorical is still in `BinnedMatrix.cats`, `any_categorical()` is still true,
+and the grower still refuses.
+
+**Which constant governs the cutoff, and how it reconciles with
+`max_cat_to_onehot`.** They are two different knobs and both are correct where
+they stand.
+
+- `ctr_columns.CTR_ONE_HOT_MAX_SIZE = 2` (`src/mojotrees/ctr_columns.mojo:192`)
+  is CatBoost's `OneHotMaxSize`, and it is the constant that would govern
+  replacement. It is read at `SimpleCtrConfig.__init__`
+  (`ctr_columns.mojo:317`) into `SimpleCtrConfig.one_hot_max_size`, and the
+  only place that value is consumed is `ctr_source_features`
+  (`ctr_columns.mojo:935`): `n_categories[f] > config.one_hot_max_size` decides
+  which columns earn CTRs. It answers "is this column narrow enough to one-hot
+  INSTEAD of a CTR".
+- `CategoricalParams.max_cat_to_onehot` is LightGBM's, default 4, and it
+  answers a different question inside a search that has already decided to
+  treat the column as a category: below it, LightGBM enumerates one-versus-rest
+  splits; at or above it, it sorts categories by gradient ratio and takes a
+  prefix. A16 settled that boundary already.
+
+They must NOT be unified. Setting `max_cat_to_onehot` to 2 would not stop a
+column from being searched as a category, and raising `CTR_ONE_HOT_MAX_SIZE`
+to 4 would silently change which columns CatBoost mode gives a CTR, which is a
+parity claim and not a tuning one. The reconciliation is that
+`CTR_ONE_HOT_MAX_SIZE` governs *whether the column survives as a category at
+all* and `max_cat_to_onehot` governs *how a surviving category is searched*.
+
+**The four blockers, traced.** Replacement was not built, and each of these is
+a thing that does not exist rather than a thing that was hard.
+
+1. **A CTR bundle is dataset state, and the harness cannot vary it per arm.**
+   `bench/real_data/engines.py`'s `MojoTreesEngine._run_dense` builds the
+   dataset from `scenarios.dataset_params(spec)`, which takes the scenario and
+   not the engine and returns `{max_bin, use_missing}`.
+   `MojoTreesCatBoostModeEngine` overrides `params_fn` alone. So the
+   CatBoost-mode arm and the plain arm receive the *same* dataset, and there is
+   no key `MOJOTREES_CATBOOST_MODE` could carry that would change one and not
+   the other -- that dict is applied over the TRAINING parameters, which is
+   exactly what killed `max_bin` in the same smoke pass. Closing this means
+   editing `engines.py`, which this lane was told not to touch and which
+   another session is running from.
+2. **No Python entry point can turn CTRs on.** `grep -n ctr` over
+   `bindings/_mojotrees.mojo` and `python/mojotrees/basic.py` returns nothing.
+   `trainset.Dataset.__init__` takes `ctr: SimpleCtrConfig` and defaults it to
+   `SimpleCtrConfig.disabled()`, and no caller outside `tests/` ever passes
+   anything else. The bundle is a Mojo-API capability only, which is what
+   `ctr_columns.mojo`'s own docstring says.
+3. **Nothing can remove a column from the split search.** This is the one that
+   makes replacement unbuildable rather than merely unreachable.
+   `BinnedMatrix.usable` exists for exactly this and is documented as the pool
+   `sampling.select_tree_features` samples ("because a grower is handed the
+   matrix and nothing else", `binning.mojo:179`). It is not: `tree.grow_tree`
+   calls `select_tree_features(data.n_features, params.feature_fraction,
+   params.feature_fraction_seed, tree_index)` at `tree.mojo:2819` and never
+   passes the pool, so `usable` reaches no grower and `select_tree_features`'s
+   `usable` argument is exercised by tests alone. **`feature_pre_filter` is
+   half-wired for the same reason and this lane did not fix it, because
+   `tree.mojo` is another lane's file.** Without that edge, the only remaining
+   levers are inside `tree.mojo`/`split.mojo`: demoting the column in
+   `BinnedMatrix.cats` clears `any_categorical()` but leaves a numeric column
+   whose bins are category codes, and an ordinal split on an arbitrary category
+   encoding is a worse answer than a refusal. Two hacks were considered and
+   rejected in writing: blanking the column to a single bin (breaks
+   `Dataset.subset`, which refits the CTR columns over the selected rows from
+   those same bins, `trainset.mojo:1336`; and a constant column can still win a
+   candidate when `min_data_in_leaf == 0` and `random_strength` is on, because
+   the noise is added to a zero gain), and setting the column's `missing_bin`
+   to 0 so `find_best_split`'s `n_scan` is 0 and the scan loop has no
+   iterations (works, and is an abuse of a field that means something else).
+4. **A second refusal sits behind the first.** `split.find_best_split`
+   (`src/mojotrees/split.mojo:769`) refuses `random_strength > 0` beside any
+   categorical feature, because a category set is scored inside
+   `find_best_categorical_split` and only its winner reaches the numerical
+   scan, so one candidate per categorical feature would be noised while every
+   numerical feature had every candidate noised. This arm carries
+   `random_strength` again as of this lane, so `high_cardinality_categorical`
+   would have raised on that even if the grower had accepted it.
+
+`MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT["high_cardinality_categorical"]`
+therefore stays a skip, and its reason text now carries all four blockers. That
+is the deliberate choice: this harness withholds the quality verdict for the
+whole matrix on one infrastructure failure, so a wrong re-enable would cost the
+verdict on every cell that did run.
+
+#### 2. The noise half: every `_parse_params` call site, with its routing
+
+The failure. `random_strength`'s per-split draw is implemented on both
+backends; its **per-tree scale** is not. Exactly two round loops in the package
+compute one, both through `boosting._round_random_score_scale`
+(`boosting.mojo:2192`), which calls
+`tree_parameters_extra.random_score_scale_from_gradients`
+(`tree_parameters_extra.mojo:665`) = `derivatives_stdev_from_zero(grad, n) *
+model_size_decrease(n, round * learning_rate)`:
+
+- `boosting._boost_rounds`, at `boosting.mojo:2593`. Reached by
+  `boosting.train` (`:2915`) and `boosting.train_more` (`:3035`).
+- `boosting.train_with_valid`'s own loop, at `boosting.mojo:3196`. Reached from
+  `alternate_boosting.mojo:1533` and from no binding entry point.
+
+`bindings/_mojotrees.mojo::_parse_params` gates the parameter on
+`random_strength_ok`, which was True at ONE call site. The complete
+enumeration, after this lane, with the routing that decides each:
+
+| line | entry point | routes to | verdict |
+|---|---|---|---|
+| ~1116 | `fit` | `model.fit` -> `boosting.train` on the CPU, `train_gpu` on the GPU | `device == CPU_DEVICE`, **unchanged**, plus two new named refusals for the forks below |
+| ~1285 | `distributed_train_local` | `distributed.train_local_world`; `distributed_strategies` calls `split.find_best_split` itself | False. Computes no scale |
+| ~1334 | `fit_custom` | `model.fit_custom` -> `objective.train_custom`'s own loop | False. Computes no scale |
+| ~1443 | `fit_with_metrics` | `custom_metric.fit_with_metrics`, a different loop from `boosting.train_with_valid` | False. Computes no scale |
+| ~1690 | `fit_multiclass_with_metrics` | `custom_metric.fit_multiclass_with_metrics` | False. Multiclass, computes no scale |
+| ~1763 | `fit_ranker_with_metrics` | `custom_metric.fit_ranker_with_metrics` | False. Computes no scale |
+| ~1958 | `fit_multiclass` | `model.fit_multiclass` -> `boosting._boost_rounds_multiclass` | False. That loop has no `random_score_scale` line at all |
+| ~2005 | `fit_csc` | `model_sparse.fit_csc` -> `boosting_sparse.train_sparse` | False. No sparse loop computes a scale |
+| ~2043 | `fit_multiclass_csc` | `model_sparse.fit_multiclass_csc` | False. Sparse and multiclass |
+| ~2209 | `fit_ranker` | `ranking` / `ranking_advanced` loops | False. Computes no scale |
+| ~3520 | `train_dataset` | `trainset.train_dataset`: sparse -> `train_sparse`; dense+GPU -> `train_gpu`; **dense+CPU -> `boosting.train`** | **CHANGED to `device == CPU_DEVICE and not d[].is_sparse`.** This is the entry `bench/real_data` trains through |
+| ~3555 | `train_dataset_multiclass` | `trainset.train_dataset_multiclass` | False. Multiclass |
+| ~3581 | `train_dataset_ranker` | `trainset.train_dataset_ranker_advanced` | False. Ranking |
+| ~3610 | `booster_update` | `trainset.update_dataset` -> `boosting.train_more` -> `_boost_rounds` | **CHANGED to True.** Refuses sparse itself, takes no device |
+| ~3641 | `booster_update_multiclass` | `trainset.update_dataset_multiclass` | False. Multiclass |
+
+Two things in that table are worth more than the flags.
+
+**`train_dataset` needed a conjunction, not a device test.** A sparse dataset
+resolves its device to the CPU like any other, so `device == CPU_DEVICE` alone
+would have declared `boosting_sparse.train_sparse` honored. The fork is settled
+by `d[].is_sparse` as well.
+
+**`fit` was already too wide, and this lane narrowed it by refusal rather than
+by flag.** `fit` forks three ways on the CPU: `boosting='dart'`/`'rf'` go to
+`alternate_boosting.fit_boosting`, `linear_tree=True` goes to
+`custom_metric.fit_with_metrics`, and only the plain fork reaches
+`boosting.train`. Neither of the first two computes a scale. They were not
+silently unnoised -- `split.find_best_split:754` refuses a positive strength
+beside a zero scale -- but the message it raises tells a Mojo-API caller to
+compute the scale themselves, which a Python caller cannot act on. Both
+combinations are now refused by name beside the two `boosting_type='ordered'`
+refusals that already stood there, which is the same shape for the same reason.
+
+#### 3. Determinism of the noise, established by reading
+
+The requirement is worker-count and machine independence, not bit-identity with
+past output. Both halves of the draw meet it.
+
+- **The per-candidate draw.** `tree_parameters_extra.random_score_stream(seed,
+  tree_index, node, feature, bin)` (`:681`) is counter-based: five
+  `splitmix64` mixes off a domain constant, reading no counter that advances
+  with evaluation order. `standard_normal` (`:705`) is Marsaglia polar on that
+  one key. `split.find_best_split` calls it inside `scan_feature` with exactly
+  those five arguments, so a candidate's noise is the same number whether its
+  feature ran on its own task or shared one. `find_best_split_shared`, the
+  oblivious level search, uses the same key with the level's `level_node`.
+- **The per-tree scale.** `derivatives_stdev_from_zero`
+  (`tree_parameters_extra.mojo:602`) is a **serial** `for i in
+  range(len(gradients))` accumulation into one Float64, so the sum order is
+  fixed and does not move with `MOJOTREES_NUM_WORKERS`. Its input `grad` is
+  written by `_fill_grad_hess`, where each row writes its own slot.
+  `model_size_decrease` is closed-form on `(n_rows, round * learning_rate)`.
+
+So the answer is yes, and it does not depend on the reduction being lucky: it
+depends on that reduction being serial. **A future lane that parallelizes
+`derivatives_stdev_from_zero` breaks this**, because a tree-shaped Float64 sum
+is worker-count dependent, and it would break it silently, since the noise
+would still look like noise. That is the line to watch.
+
+#### 4. What was restored, and the blast radius
+
+`MOJOTREES_CATBOOST_MODE["random_strength"] = 1.0` is back. The arm runs on
+three scenarios and no others (`dense_regression`, `imbalanced_binary`,
+`ordered_boosting_small`); every categorical, multiclass, sparse and ranking
+cell is already skipped by
+`MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT`. All three are dense CPU fits with
+no categorical column, so all three reach `boosting.train` and none can meet
+`find_best_split`'s categorical refusal. That is the whole reason restoring the
+key is safe rather than hopeful, and it is a property of the support table: if
+a categorical scenario is ever re-enabled for this arm, this key has to be
+re-examined at the same time.
