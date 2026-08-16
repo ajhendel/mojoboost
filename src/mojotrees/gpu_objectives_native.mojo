@@ -92,6 +92,7 @@ from .boosting import (
 )
 from .gpu_active_rows import GpuActiveRows
 from .gpu_tiling import derive_block_threads, query_device_caps
+from .monotone import NO_BOUND, OutputBounds
 from .objective_registry import objective_gradients_on_device
 from .quantized_gradient import fixed_point_scale
 
@@ -1581,3 +1582,566 @@ struct GpuObjectiveState(Movable):
         for r in range(self.n_rows):
             g.append(Float64(src.unsafe_load(r)))
         return g^
+
+
+# ---------------------------------------------------------------------------
+# CatBoost's `leaf_estimation_iterations` on the device-resident plane.
+# ---------------------------------------------------------------------------
+#
+# One device-side leaf record, in Int32 words. `EST_START` is where this leaf's
+# rows begin in the flattened thread index space (the running sum of the
+# preceding leaves' counts), `EST_BEGIN` is where they begin in the active-row
+# permutation, and `EST_COUNT` is how many there are. The fourth word is unused
+# and keeps the stride a power of two, exactly as `SEG_WORDS` does.
+#
+# The count is carried here and is not carried in `SEG_WORDS`, because the two
+# tables answer different questions. `_range_table_add_raw_kernel` maps a
+# *thread* to a leaf, so it needs only the running start and finds its row from
+# the difference; `_leaf_newton_kernel` maps a *block* to a leaf and then
+# sweeps that leaf's rows, so it needs the leaf's own extent. Reusing `seg_dev`
+# would mean either recovering the count by differencing the next descriptor
+# (which has no next at the last leaf) or making the two kernels' layouts
+# co-vary for no gain.
+comptime EST_WORDS = 4
+comptime EST_START = 0
+comptime EST_BEGIN = 1
+comptime EST_COUNT = 2
+
+# The Float32 plane parallel to it: the leaf's current value, and the closed
+# monotone interval that value must stay inside. `EST_V` is the only word the
+# device writes; the bounds are read-only for the whole tree. Fourth word
+# padding again, for the same alignment reason.
+comptime EST_VALS = 4
+comptime EST_V = 0
+comptime EST_LO = 1
+comptime EST_HI = 2
+
+
+def _leaf_shift_raw_kernel(
+    rows: MutPointer[Int32, MutAnyOrigin],
+    raw: MutPointer[Float32, MutAnyOrigin],
+    shifted: MutPointer[Float32, MutAnyOrigin],
+    segs: MutPointer[Int32, MutAnyOrigin],
+    vals: MutPointer[Float32, MutAnyOrigin],
+    n_segments: Int32,
+    total: Int32,
+):
+    """`shifted[r] = raw[r] + v[leaf(r)]` for every row of every live leaf.
+
+    The score an extra Newton step differentiates at is the score the row
+    would sit at if the tree stopped here, which is its current raw score plus
+    the value its leaf currently holds. This kernel materializes that point so
+    that `_grad_hess_kernel` -- the *same* kernel the round's own derivatives
+    come from, argument for argument -- can be run over it unchanged. That
+    reuse is the whole reason this arm is three launches per iteration rather
+    than one: a fused kernel would have to restate every objective's
+    derivative and its weight multiplier, and a second definition of the
+    objectives is precisely what `supports_device_objective`'s docstring says
+    this module has already paid for once.
+
+    **The shift is `v`, not `learning_rate * v`.** The ensemble adds
+    `learning_rate * v` to each row, so evaluating here at `raw[r] + v` asks
+    what the best *full* step for this leaf is and lets the raw-score update
+    shrink that answer once, at the end. It is the same division of labour the
+    host implementation makes and states at length
+    (`boosting._estimate_leaf_values`), and it is CatBoost's: its walker
+    carries no rate and `NormalizeLeafValues` multiplies the accumulated leaf
+    value by the rate once, after the last iteration.
+
+    Thread `t` finds its leaf by the same binary search
+    `_range_table_add_raw_kernel` uses, over the same strictly ascending
+    `EST_START` column. Ranges are pairwise disjoint, so each row is written
+    by exactly one thread. Rows in no range -- out of bag -- are never written
+    and keep the zero `GpuLeafEstimator` put there once at construction;
+    nothing reads them, and the zero is there so that `_grad_hess_kernel`'s
+    full-grid sweep never differentiates uninitialized memory.
+    """
+    var t = Int(global_idx.x)
+    if t >= Int(total):
+        return
+    var lo = 0
+    var hi = Int(n_segments) - 1
+    while lo < hi:
+        var mid = (lo + hi + 1) // 2
+        if Int(segs[unsafe_offset = mid * EST_WORDS + EST_START][0]) <= t:
+            lo = mid
+        else:
+            hi = mid - 1
+    var base = lo * EST_WORDS
+    var j = t - Int(segs[unsafe_offset = base + EST_START][0])
+    var slot = Int(segs[unsafe_offset = base + EST_BEGIN][0]) + j
+    var r = Int(rows[unsafe_offset=slot][0])
+    shifted[unsafe_offset=r] = (
+        raw[unsafe_offset=r][0]
+        + vals[unsafe_offset = lo * EST_VALS + EST_V][0]
+    )
+
+
+def _leaf_newton_kernel(
+    rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    segs: MutPointer[Int32, MutAnyOrigin],
+    vals: MutPointer[Float32, MutAnyOrigin],
+    lambda_l1: Float32,
+    lambda_l2: Float32,
+    max_delta_step: Float32,
+):
+    """One threadgroup per live leaf: sum that leaf's gradients and hessians
+    and take one more Newton step, in place, without the host seeing either
+    number.
+
+    This is the launch that makes the iteration a *device* iteration. The
+    dependency an extra Newton step introduces is genuine -- iteration `k`'s
+    sums are taken at the scores iteration `k - 1` wrote -- and it is resolved
+    here, inside the device queue, rather than by handing the sums to the host
+    and taking the value back. A block owns one leaf and no other block reads
+    or writes that leaf's record, so the step needs no cross-block
+    communication and no second launch: thread 0 of the block writes the new
+    value straight back into `EST_V`, where the next iteration's shift kernel
+    reads it.
+
+    What is recomputed and what is not
+    ----------------------------------
+    **The histogram is not rebuilt and the tree's structure does not move.**
+    Nothing here reads a bin, a threshold, or a feature. What moves between
+    iterations is exactly two numbers per leaf, `G` and `H`, and they move
+    only because the point they are evaluated at moved. The row membership is
+    the one the grower left in the active-row permutation and is fixed for the
+    whole call.
+
+    The fold order
+    --------------
+    Thread `t` accumulates rows `t, t + SUM_THREADS, t + 2 * SUM_THREADS, ...`
+    of its leaf's slice, then the threadgroup folds those 256 partials in a
+    fixed binary tree. Both the stride and the tree are compile-time constants
+    and the slice is the grower's, so the sum is the same Float32 for a given
+    leaf whatever the device schedules -- deterministic run to run, in the
+    sense the module docstring already claims for `_abs_sum_kernel`.
+
+    It is **not** the host's fold. `boosting._estimate_leaf_values` sums the
+    same rows sequentially in ascending row order in Float64. This is a
+    strided Float32 tree reduction, so the two agree to Float32 and not to the
+    bit, which is the same trade every other number on this plane already
+    makes and is stated in the module docstring. Agreement with the host
+    implementation is asserted in `tests/test_gpu_leaf_estimation.mojo` rather
+    than argued here.
+
+    The guard, the cap and the clamp
+    --------------------------------
+    A non-positive `H + lambda_l2` leaves the value alone. On the host that is
+    a `break` out of the iteration loop; here it is a skip, and the two end at
+    the same value because a skipped iteration changes nothing the next
+    iteration reads, so every later iteration skips too.
+
+    `max_delta_step` and the monotone interval are re-applied after every
+    step, not only after the last, because both are projections onto a fixed
+    set: applying one to an already-projected value is the identity, so this
+    costs nothing and keeps the value the *next* iteration differentiates at
+    inside the cap and inside the constraint the tree was grown under.
+    `path_smooth` is not a projection and is refused beside this parameter in
+    `ExtraTreeParams.check_leaf_estimation`, which is why no smoothing appears
+    here.
+
+    No fused multiply-add is at stake in the step. `-T(G) / (H + lambda_l2)`
+    is a divide and the accumulation `v + step` adds its quotient, so there is
+    no multiply for the device compiler to contract into the following add --
+    unlike `learning_rate * value[node]` in `_range_table_add_raw_kernel`,
+    whose contraction cost that lane a bit and is documented there. The
+    reduction loop is a chain of plain adds for the same reason.
+    """
+    var tid = thread_idx.x
+    var seg = Int(block_idx.x)
+    var sg = stack_allocation[
+        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var sh = stack_allocation[
+        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+
+    var base = seg * EST_WORDS
+    var begin = Int(segs[unsafe_offset = base + EST_BEGIN][0])
+    var count = Int(segs[unsafe_offset = base + EST_COUNT][0])
+
+    var acc_g = Float32(0.0)
+    var acc_h = Float32(0.0)
+    var j = tid
+    while j < count:
+        var r = Int(rows[unsafe_offset = begin + j][0])
+        acc_g += grad[unsafe_offset=r][0]
+        acc_h += hess[unsafe_offset=r][0]
+        j += SUM_THREADS
+    sg[unsafe_offset=tid] = acc_g
+    sh[unsafe_offset=tid] = acc_h
+    barrier()
+
+    # Uniform trip count across the threadgroup, so every thread reaches every
+    # barrier, exactly as in `_abs_sum_kernel`.
+    var active = SUM_THREADS // 2
+    while active > 0:
+        if tid < active:
+            sg[unsafe_offset=tid] = (
+                sg[unsafe_offset=tid][0] + sg[unsafe_offset = tid + active][0]
+            )
+            sh[unsafe_offset=tid] = (
+                sh[unsafe_offset=tid][0] + sh[unsafe_offset = tid + active][0]
+            )
+        barrier()
+        active //= 2
+
+    if tid == 0:
+        var vbase = seg * EST_VALS
+        var g_sum = sg[unsafe_offset=0][0]
+        var h_sum = sh[unsafe_offset=0][0]
+        var denom = h_sum + lambda_l2
+        if denom > 0.0:
+            # `gain.soft_threshold_l1`, arm for arm. `g_sum == 0` reaches the
+            # `mag <= 0` arm whenever `lambda_l1 > 0`, so the sign test below
+            # is never asked about a zero.
+            var s = g_sum
+            if lambda_l1 > 0.0:
+                var mag = abs(g_sum) - lambda_l1
+                if mag <= 0.0:
+                    s = 0.0
+                elif g_sum > 0.0:
+                    s = mag
+                else:
+                    s = -mag
+            var v = vals[unsafe_offset = vbase + EST_V][0] + (-s / denom)
+            # `tree_parameters_extra.cap_leaf_output`.
+            if max_delta_step > 0.0:
+                if v > max_delta_step:
+                    v = max_delta_step
+                elif v < -max_delta_step:
+                    v = -max_delta_step
+            # `monotone.OutputBounds.clamp`.
+            var b_lo = vals[unsafe_offset = vbase + EST_LO][0]
+            var b_hi = vals[unsafe_offset = vbase + EST_HI][0]
+            if v < b_lo:
+                v = b_lo
+            elif v > b_hi:
+                v = b_hi
+            vals[unsafe_offset = vbase + EST_V] = v
+
+
+struct GpuLeafEstimator(Movable):
+    """CatBoost's `leaf_estimation_iterations` for the device-resident round.
+
+    After a tree's structure is fixed, re-estimate each leaf's value `k` times
+    instead of once, each iteration recomputing that leaf's gradient and
+    hessian sums against the raw scores the previous iteration produced. The
+    host implementation is `boosting._estimate_leaf_values` and is the
+    definition; this is the same iteration on the plane where the raw scores
+    live on the device, node-identical to that implementation to Float32.
+
+    Which shape this is, and why
+    ----------------------------
+    Two shapes were available. This is the **per-iteration device reduction
+    inside the tree**: the launches go into the schedule and the host stays
+    out of the loop. The alternative -- lifting leaf estimation out of the
+    device round, downloading the raw scores, iterating on the host and
+    uploading the values -- was rejected because it converts a fixed launch
+    cost into `k - 1` *round trips* per tree, and section 6.1.1 of
+    `docs/GPU_PORTABILITY.md` is explicit that a round-trip count predicts
+    seconds while a launch or copy count predicts ordering hazard. A hundred
+    rounds at `k = 10` would be nine hundred waits on a plane whose entire
+    design is one wait per tree.
+
+    What it costs, counted in source
+    --------------------------------
+    Three launches per extra iteration, independent of the leaf count, plus
+    one device-to-host copy and one synchronization per tree:
+
+      shift    `_leaf_shift_raw_kernel`, one thread per live row
+      grads    `_grad_hess_kernel`, the round's own derivative kernel,
+               unmodified, over the shifted scores
+      step     `_leaf_newton_kernel`, one threadgroup per live leaf
+
+    So `k` iterations add `3 * (k - 1)` launches to a tree's schedule. The
+    campaign's measured enqueue cost is flat at 6-7 microseconds through 64
+    command buffers and 14-17 beyond, and the two schedules sit on opposite
+    sides of that knee, so the same six launches are not the same cost:
+
+    - **Leaf-wise**, a tree already issues 278 launches, well past the knee.
+      `k = 3` takes it to 284, a 2.2% increase entirely inside the expensive
+      regime: about 84-102 microseconds of enqueue per tree.
+    - **Oblivious**, a depth-6 tree issues 62, inside the flat regime. `k = 3`
+      takes it to 68, a 9.7% increase, and it **crosses the knee**: six
+      launches that would each have cost 6-7 microseconds instead push the
+      schedule past 64 buffers. Proportionally the added launches cost more on
+      the oblivious schedule, and the crossing is the reason, not the count.
+
+    The one round trip per tree is unavoidable in either shape: `Tree.value`
+    is a host list and the ensemble is scored from it, so the finished values
+    have to come home. What this shape buys is that it is **one** and not
+    `k - 1`.
+
+    Memory
+    ------
+    Three `n_rows` Float32 planes -- the shifted scores and the derivative
+    pair -- so 12 MB at a million rows, allocated only when a fit actually
+    sets the parameter above 1. The derivative planes are the estimator's own
+    rather than the histogram builder's: the builder's hold the round's
+    gradients, and although nothing reads them after the tree is grown,
+    borrowing them would make this feature's correctness depend on that
+    remaining true.
+
+    Construct once per fit, alongside `GpuObjectiveState`, and call `estimate`
+    once per tree between growth and the raw-score update.
+    """
+
+    var shift_dev: DeviceBuffer[DType.float32]
+    """`raw[r] + v[leaf(r)]`, the point this iteration differentiates at."""
+    var grad_dev: DeviceBuffer[DType.float32]
+    var hess_dev: DeviceBuffer[DType.float32]
+    var seg_dev: DeviceBuffer[DType.int32]
+    """`EST_WORDS` Int32 per live leaf, staged once per tree."""
+    var val_dev: DeviceBuffer[DType.float32]
+    """`EST_VALS` Float32 per live leaf: the value the iteration carries, and
+    the monotone interval it stays inside."""
+    var stage_seg: HostBuffer[DType.int32]
+    var stage_val: HostBuffer[DType.float32]
+    """Pinned staging for `val_dev`, **and** the destination of the one
+    readback. Both directions can share it because the queue is in order: the
+    upload copy has retired before the last iteration's kernels run, and the
+    readback is enqueued behind all of them."""
+
+    var n_rows: Int
+    var max_nodes: Int
+    var block_threads: Int
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        n_rows: Int,
+        max_nodes: Int = DEFAULT_MAX_NODES,
+    ) raises:
+        if n_rows < 1:
+            raise Error("leaf estimation requires at least one row")
+        if max_nodes < 1:
+            raise Error("max_nodes must be positive")
+        self.n_rows = n_rows
+        self.max_nodes = max_nodes
+        self.block_threads = derive_block_threads(query_device_caps(ctx))
+        self.shift_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        self.grad_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        self.hess_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        self.seg_dev = ctx.enqueue_create_buffer[DType.int32](
+            max_nodes * EST_WORDS
+        )
+        self.val_dev = ctx.enqueue_create_buffer[DType.float32](
+            max_nodes * EST_VALS
+        )
+        self.stage_seg = ctx.enqueue_create_host_buffer[DType.int32](
+            max_nodes * EST_WORDS
+        )
+        self.stage_val = ctx.enqueue_create_host_buffer[DType.float32](
+            max_nodes * EST_VALS
+        )
+        # Once per fit, not once per tree. `_grad_hess_kernel` sweeps the whole
+        # grid, so it differentiates rows the shift kernel never wrote --
+        # out-of-bag rows, under a sampler. Their derivatives are read by
+        # nothing, since no leaf owns them, but an allocation's contents are
+        # not defined and a NaN sitting in a buffer is the kind of thing that
+        # is harmless until it is not. Zero is a point every device objective
+        # is finite at.
+        with self.shift_dev.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            for r in range(n_rows):
+                dst.unsafe_store(r, Float32(0.0))
+
+    def estimate(
+        mut self,
+        ctx: DeviceContext,
+        mut state: GpuObjectiveState,
+        mut rows: GpuActiveRows,
+        mut values: List[Float64],
+        is_leaf: List[Bool],
+        bounds: List[OutputBounds],
+        objective: Int,
+        alpha: Float64,
+        iterations: Int,
+        lambda_l1: Float64,
+        lambda_l2: Float64,
+        max_delta_step: Float64,
+    ) raises:
+        """Take `iterations - 1` extra Newton steps on every live leaf of the
+        tree `values` belongs to, and write the results back into `values`.
+
+        Call after growth and before the next `begin_tree`, which is what
+        resets the ranges this reads, and before the raw-score update, which
+        is what consumes the values this writes.
+
+        `values` is the tree's node-value array, **finished**: capped and
+        clamped, exactly as the grower left it and exactly as
+        `update_raw_ranges` will consume it. That is the value whose
+        derivatives the first extra iteration evaluates, because it is the
+        value the leaf actually holds. `is_leaf` and `bounds` are parallel to
+        it: `is_leaf[node]` is `tree.feature[node] < 0`, and `bounds` is
+        `tree.node_bounds`'s output, or empty when no monotone constraint is
+        active.
+
+        **`iterations <= 1` returns before it stages a word, and that early
+        return is the bit-identity guarantee.** It mirrors, statement for
+        statement, the early return `boosting._estimate_leaf_values` opens
+        with: iteration 1 is never recomputed here either, so the value the
+        grower wrote from the histogram's own sums is the value the tree
+        keeps, and the default path enqueues nothing, copies nothing and waits
+        on nothing.
+
+        Order of operations, per tree
+        -----------------------------
+        1. Flatten the live leaf ranges into ascending-node-order records on
+           the host, one per leaf with a live range, each carrying the leaf's
+           current value and its monotone interval. Internal nodes are skipped
+           twice over: their ranges are empty once their children own their
+           rows, and `is_leaf` is checked as well, so a range a grower failed
+           to clear cannot be mistaken for a leaf.
+        2. Upload both planes. Two copies, once, not once per iteration.
+        3. For each of the `iterations - 1` extra steps: shift, differentiate,
+           reduce-and-step. Nothing crosses to the host inside this loop.
+        4. Read the value plane back, once, and write it into `values`.
+
+        The membership does not move between steps and neither does the
+        structure. Only `G` and `H` move, and only because the point they are
+        taken at moved.
+        """
+        if iterations <= 1:
+            return
+        if state.n_classes != 1:
+            raise Error(
+                "leaf estimation iterations are single-output only; the"
+                " multiclass trainers refuse the setting by name"
+            )
+        if state.n_rows != self.n_rows:
+            raise Error(
+                "objective state and leaf estimator disagree on n_rows"
+            )
+        if not state.has_raw:
+            raise Error("call init_raw before estimating leaf values")
+        if objective == CUSTOM or not supports_device_objective(objective):
+            raise Error(
+                "leaf estimation iterations need a device objective kernel;"
+                " custom objectives stay on the host path"
+            )
+        if not isfinite(alpha):
+            raise Error("alpha must be finite")
+        if not isfinite(lambda_l1) or not isfinite(lambda_l2):
+            raise Error("regularization must be finite")
+        if not isfinite(max_delta_step):
+            raise Error("max_delta_step must be finite")
+        if len(values) > self.max_nodes:
+            raise Error(
+                "tree has more nodes than the leaf-estimation table holds;"
+                " construct with a larger max_nodes"
+            )
+        for i in range(len(values)):
+            if not isfinite(values[i]):
+                raise Error("node values must be finite")
+
+        var dseg = self.stage_seg.unsafe_ptr()
+        var dval = self.stage_val.unsafe_ptr()
+        var nodes = List[Int]()
+        var n_segments = 0
+        var total = 0
+        for node in range(rows.ranges.n_nodes()):
+            if node >= len(values):
+                break
+            if node < len(is_leaf) and not is_leaf[node]:
+                continue
+            var window = rows.ranges.get(node)
+            var n = window.count()
+            if n <= 0:
+                continue
+            var base = n_segments * EST_WORDS
+            dseg.unsafe_store(base + EST_START, Int32(total))
+            dseg.unsafe_store(base + EST_BEGIN, Int32(window.begin))
+            dseg.unsafe_store(base + EST_COUNT, Int32(n))
+            dseg.unsafe_store(base + EST_WORDS - 1, Int32(0))
+            var vbase = n_segments * EST_VALS
+            dval.unsafe_store(vbase + EST_V, Float32(values[node]))
+            # An inactive bound is `Float64.MAX_FINITE`, which is not a finite
+            # Float32; it is staged as the Float32 maximum instead, so the
+            # comparison in the kernel is against a real number and the clamp
+            # is the identity either way.
+            var b_lo = -Float32.MAX_FINITE
+            var b_hi = Float32.MAX_FINITE
+            if node < len(bounds):
+                if bounds[node].lo > -NO_BOUND:
+                    b_lo = Float32(bounds[node].lo)
+                if bounds[node].hi < NO_BOUND:
+                    b_hi = Float32(bounds[node].hi)
+            dval.unsafe_store(vbase + EST_LO, b_lo)
+            dval.unsafe_store(vbase + EST_HI, b_hi)
+            dval.unsafe_store(vbase + EST_VALS - 1, Float32(0.0))
+            nodes.append(node)
+            n_segments += 1
+            total += n
+        if n_segments == 0:
+            return
+
+        ctx.enqueue_copy(dst_buf=self.seg_dev, src_ptr=dseg)
+        ctx.enqueue_copy(dst_buf=self.val_dev, src_ptr=dval)
+
+        var l1 = Float32(lambda_l1)
+        var l2 = Float32(lambda_l2)
+        var cap = Float32(max_delta_step)
+        var shift_blocks = (
+            total + self.block_threads - 1
+        ) // self.block_threads
+        var row_blocks = (
+            self.n_rows + self.block_threads - 1
+        ) // self.block_threads
+        for _ in range(iterations - 1):
+            ctx.enqueue_function[_leaf_shift_raw_kernel](
+                rows.rows_dev.unsafe_ptr(),
+                state.raw_dev.unsafe_ptr(),
+                self.shift_dev.unsafe_ptr(),
+                self.seg_dev.unsafe_ptr(),
+                self.val_dev.unsafe_ptr(),
+                Int32(n_segments),
+                Int32(total),
+                grid_dim=shift_blocks,
+                block_dim=self.block_threads,
+            )
+            # The round's own derivative kernel, over the shifted scores and
+            # the state's own labels and weights. Not a copy of it and not a
+            # variant of it: the same function, so the weight multiplier and
+            # every objective arm keep one definition on this backend.
+            ctx.enqueue_function[_grad_hess_kernel](
+                self.shift_dev.unsafe_ptr(),
+                state.target_dev.unsafe_ptr(),
+                state.weight_dev.unsafe_ptr(),
+                self.grad_dev.unsafe_ptr(),
+                self.hess_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                Int32(objective),
+                Float32(alpha),
+                Int32(1) if state.weighted else Int32(0),
+                grid_dim=row_blocks,
+                block_dim=self.block_threads,
+            )
+            ctx.enqueue_function[_leaf_newton_kernel](
+                rows.rows_dev.unsafe_ptr(),
+                self.grad_dev.unsafe_ptr(),
+                self.hess_dev.unsafe_ptr(),
+                self.seg_dev.unsafe_ptr(),
+                self.val_dev.unsafe_ptr(),
+                l1,
+                l2,
+                cap,
+                grid_dim=n_segments,
+                block_dim=SUM_THREADS,
+            )
+
+        # The tree's one round trip. `Tree.value` is a host list and the
+        # ensemble is scored from it, so the finished values have to come
+        # home; what this shape buys is that they come home once and not once
+        # per iteration.
+        ctx.enqueue_copy(
+            dst_ptr=self.stage_val.unsafe_ptr(), src_buf=self.val_dev
+        )
+        ctx.synchronize()
+        var src = self.stage_val.unsafe_ptr()
+        for s in range(n_segments):
+            values[nodes[s]] = Float64(src.unsafe_load(s * EST_VALS + EST_V))

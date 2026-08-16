@@ -576,26 +576,36 @@ def parse_params(spec: String) raises -> TrainConfig:
         # `use_quantized_grad` take, for a reason particular to this surface:
         # a parameter string is the entry point for `cli/`, for every
         # `bindings/_mojotrees.mojo` fit including the sparse, custom,
-        # multiclass, ranking and GPU ones, and for the sklearn wrapper, while
-        # `boosting._estimate_leaf_values` is reached only from the dense
-        # single-output CPU trainers. A string accepted here would therefore
-        # be honored by some fits and silently dropped by most, which is worse
-        # than either. The Mojo API route named in the message is exact and is
-        # not refused.
+        # multiclass and ranking ones, and for the sklearn wrapper, while the
+        # mechanism is reached only from the dense single-output trainers. A
+        # string accepted here would therefore be honored by some fits and
+        # silently dropped by most, which is worse than either. The Mojo API
+        # route named in the message is exact and is not refused.
+        #
+        # The dense single-output **GPU** trainers left that list on
+        # 2026-08-16: `train_gpu` and `train_gpu_with_valid` honor the setting
+        # now, through `gpu_objectives_native.GpuLeafEstimator` on the
+        # device-objective arm and `boosting._estimate_leaf_values` on the
+        # host-objective one. That does not reopen this key, because the
+        # refusal is about the *set* a string reaches and not about any one
+        # member of it: the sparse, custom-objective, multiclass and ranking
+        # trainers still refuse, so a string is still honored by some fits and
+        # dropped by others.
         elif key == "leaf_estimation_iterations":
             var iters = _parse_int(key, value)
             if iters > 1:
                 raise Error(
                     "leaf_estimation_iterations > 1 cannot be set from a"
                     " parameter string: this string reaches the sparse,"
-                    " custom-objective, multiclass, ranking and GPU trainers,"
-                    " none of which implement extra Newton steps, so it would"
-                    " be honored by some fits and dropped by others. Set it"
-                    " from the Mojo API instead, on"
+                    " custom-objective, multiclass and ranking trainers, none"
+                    " of which implement extra Newton steps, so it would be"
+                    " honored by some fits and dropped by others. Set it from"
+                    " the Mojo API instead, on"
                     " TreeParams.extra.leaf_estimation_iterations, which"
-                    " boosting.train, boosting.train_more and"
-                    " boosting.train_with_valid honor and every other trainer"
-                    " refuses by name"
+                    " boosting.train, boosting.train_more,"
+                    " boosting.train_with_valid, train_gpu.train_gpu and"
+                    " train_gpu.train_gpu_with_valid honor and every other"
+                    " trainer refuses by name"
                 )
             config.booster.tree.extra.leaf_estimation_iterations = iters
         # LightGBM's quantized-training family. The four names and no others:
