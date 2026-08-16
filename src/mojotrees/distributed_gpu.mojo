@@ -101,7 +101,7 @@ from .distributed_strategies import (
     tree_learner_name,
 )
 from .distributed_transport import transport_available
-from .quantized_gradient import FIXED_ONE, magnitude_sum
+from .quantized_gradient import FIXED_ONE, fixed_point_scale, magnitude_sum
 
 # ---------------------------------------------------------------------------
 # Build-level facts
@@ -419,27 +419,34 @@ def fixed_scale_from_total(total: Float64) raises -> Float64:
     """The scale for a magnitude sum, matching `_fixed_scale` in
     histogram_gpu.mojo exactly.
 
-    Same floor, same `Float32` narrowing, same rejection of a non-finite
-    input. It is written out rather than imported because that function is
-    private to its module; the handoff asks for it to be exported so this can
-    forward instead of mirror. Any divergence between the two is a
-    correctness bug, not a style difference, which is what
-    `check_fixed_point_contract` and the mirror test in the handoff are for.
+    It now *is* that function's rule rather than a copy of it. The body used
+    to restate the floor, the `Float32` narrowing, and the non-finite
+    rejection, with a docstring saying the duplication was waiting on the
+    definition being exported and that "any divergence between the two is a
+    correctness bug, not a style difference".
+    `quantized_gradient.fixed_point_scale` is that exported definition, this
+    module already imports from that file, and the arrival of the
+    power-of-two scale rule is exactly the change that would have made the
+    two diverge: a mirror that kept dividing would have put every rank on a
+    lattice the histogram builder was not using. So the mirror is deleted
+    here rather than updated in parallel.
+
+    The negative check stays and is not in the shared rule, because it is a
+    fact about this caller and not about the arithmetic: a magnitude sum
+    arriving negative from an all-reduce means a rank contributed something
+    that was not a sum of absolute values, and that is a transport bug worth
+    a distinct error rather than a silent floor to `MAGNITUDE_FLOOR`.
+
+    Returned as Float64 because that is what `GpuFixedScales` holds and what
+    every caller here consumes; the shared rule's Float32 is widened without
+    loss, and under the default power-of-two shape without any narrowing to
+    undo in the first place.
     """
-    var magnitude = total
-    if not isfinite(magnitude):
+    if not isfinite(total):
         raise Error("gradients and hessians must be finite")
-    if magnitude < 0.0:
+    if total < 0.0:
         raise Error("a magnitude sum cannot be negative")
-    if magnitude < 1e-12:
-        magnitude = 1e-12
-    var scale = Float32(FIXED_ONE / magnitude)
-    if not isfinite(Float64(scale)) or Float64(scale) <= 0.0:
-        raise Error(
-            "gradient/hessian magnitudes are out of range for the GPU"
-            " fixed-point histogram"
-        )
-    return Float64(scale)
+    return Float64(fixed_point_scale(total))
 
 
 def agree_fixed_scales[
@@ -492,6 +499,15 @@ def check_fixed_point_headroom(total_rows: Int, world_size: Int) raises:
     The bound is global, not per rank, which is exactly why it survives
     sharding: splitting the same rows across more ranks does not increase
     either term.
+
+    The power-of-two scale rule leaves this argument standing with slack it
+    did not have. `fixed_point_scale_pow2` floors the factor, so the exact
+    scaled total is at most `FIXED_ONE` and at least half of it, where the
+    old arbitrary factor could sit up to a relative 2^-24 *above* `FIXED_ONE`
+    after its narrowing to Float32 -- 64 units of the headroom this function
+    is checking. Nothing here needed changing, and that is the point: the
+    only direction the first term moved is down. **Derived bound**; no
+    measurement is involved on either side of it.
     """
     if world_size < 1:
         raise Error("world_size must be positive")

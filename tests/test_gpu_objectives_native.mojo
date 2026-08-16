@@ -603,11 +603,24 @@ def test_magnitude_sums_match_host() raises:
         assert_equal(again.grad, sums.grad)
         assert_equal(again.hess, sums.hess)
 
-        # The scale puts the whole magnitude sum at half the Int32 range, so
-        # no partial sum over any subset of rows can overflow.
+        # The scale puts the whole magnitude sum at or below half the Int32
+        # range, so no partial sum over any subset of rows can overflow.
+        #
+        # At or below, not at. The scale is the power of two at or below
+        # `2^30 / sum|g|` (`quantized_gradient.fixed_point_scale_pow2`), so
+        # the scaled total lands in `(2^29, 2^30]` rather than exactly on
+        # 2^30. Both halves are asserted, because both are load-bearing: the
+        # upper one is the overflow bound, and the lower one is what says the
+        # flooring gave up at most one bit rather than an unbounded amount.
         var scale = Float64(device_fixed_scale(sums.grad))
-        _assert_close(
-            scale * sums.grad, Float64(1 << 30), 1e-6, 1e-6, "fixed scale"
+        var scaled = scale * sums.grad
+        assert_true(
+            scaled <= Float64(1 << 30) * (1.0 + 1e-9),
+            "the scaled magnitude sum must not exceed half the Int32 range",
+        )
+        assert_true(
+            scaled > Float64(1 << 29) * (1.0 - 1e-9),
+            "flooring the scale to a power of two may cost at most one bit",
         )
 
 

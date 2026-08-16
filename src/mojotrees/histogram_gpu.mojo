@@ -218,10 +218,16 @@ from .gpu_portability import (
 from .gpu_objectives_native import (
     DEFAULT_MAX_NODES,
     GpuObjectiveState,
-    device_fixed_scale,
 )
 from .parallel import _env_int, dispatch_rows
-from .quantized_gradient import fixed_point_scale, magnitude_sum
+from .quantized_gradient import (
+    DEFAULT_SCALE_SHAPE,
+    SCALE_SHAPE_ARBITRARY,
+    SCALE_SHAPE_POW2,
+    describe_scale_shape,
+    fixed_point_scale_shaped,
+    magnitude_sum,
+)
 from .unified_memory_policy import (
     ROLE_BINS,
     ROUTE_COPY_STAGED,
@@ -328,9 +334,20 @@ def build_kernel_features() -> KernelFeatures:
     return KernelFeatures(False, False, True)
 
 
-def _fixed_scale(values: List[Float64]) raises -> Float32:
-    """Fixed-point scale derived from a host-side value list."""
-    return fixed_point_scale(magnitude_sum(values))
+def _fixed_scale(
+    values: List[Float64], shape: Int = DEFAULT_SCALE_SHAPE
+) raises -> Float32:
+    """Fixed-point scale derived from a host-side value list.
+
+    `shape` selects the scale arm and defaults to the package default, which
+    is `SCALE_SHAPE_POW2`: `2^30 / sum|v|` rounded *down* to a power of two.
+    `quantized_gradient.fixed_point_scale_pow2` is the rule and carries the
+    whole argument for it -- the exactness it buys, the overflow bound it
+    tightens rather than loosens, and the up-to-one-bit of lattice resolution
+    it costs. Nothing about the rule lives here; this function is a magnitude
+    sum and a forward.
+    """
+    return fixed_point_scale_shaped(magnitude_sum(values), shape)
 
 
 struct GpuHistogramBuilder(Movable):
@@ -422,6 +439,12 @@ struct GpuHistogramBuilder(Movable):
     var tiling: HistogramTiling
     var g_scale: Float64
     var h_scale: Float64
+    # Which shape this builder's fixed-point scales take:
+    # `SCALE_SHAPE_POW2` (the default and the accurate arm) or
+    # `SCALE_SHAPE_ARBITRARY` (what shipped). A *numeric* option, unlike
+    # every other arm on this builder, so it is the one that changes
+    # histogram bits; `set_scale_shape` says what that means for a fixture.
+    var fixed_scale_shape: Int
     var has_gradients: Bool
     # Whether the Float32 gradients the kernels read this round are also
     # sitting in the `stage_gh` arena on the host: True after
@@ -653,6 +676,7 @@ struct GpuHistogramBuilder(Movable):
             )
         self.g_scale = 1.0
         self.h_scale = 1.0
+        self.fixed_scale_shape = DEFAULT_SCALE_SHAPE
         self.has_gradients = False
         self.gradients_host = False
         self.round_epoch = 0
@@ -766,6 +790,69 @@ struct GpuHistogramBuilder(Movable):
     def row_unroll(self) -> Bool:
         """The row-walk arm `set_row_unroll` last chose."""
         return self.rows.row_unroll
+
+    def set_scale_shape(mut self, shape: Int) raises:
+        """Which shape this builder's fixed-point scales take from the next
+        `upload_gradients` or device fill on.
+
+        `SCALE_SHAPE_POW2` is the default: `2^30 / sum|g|` rounded *down* to
+        a power of two. `SCALE_SHAPE_ARBITRARY` is what shipped before it.
+        The rule, the exactness argument, the overflow proof, and the
+        one-bit resolution cost are all at
+        `quantized_gradient.fixed_point_scale_pow2`, which is the single
+        statement of the rule for the CPU and the GPU alike; nothing about it
+        is restated here.
+
+        **This is the one arm on this builder that changes histogram bits.**
+        `set_row_unroll`, `set_feature_group`, `set_narrow_index`,
+        `set_pair_alignment`, `set_row_tiling`, and
+        `set_fused_gradient_upload` are launch shapes and transfer shapes:
+        every one of them accumulates the same fixed-point integers into the
+        same bins, and their docstrings say so. This one changes the unit
+        those integers count in, so it changes every cell, therefore possibly
+        a split, therefore possibly a tree. A fixture taken under one shape
+        does not describe the other and must not be diffed against it.
+
+        It exists as a runtime arm for the same two reasons the others do.
+        First, `train_gpu` constructs its own builder, so an end-to-end
+        comparison has no other way to reach the setting -- though reaching
+        it end to end still needs a `train_gpu` parameter, exactly as
+        `set_fused_gradient_upload` records for itself. Second, an
+        environment variable would compare two arms across two processes, and
+        this machine's device timings drift several-fold between time
+        windows, so only interleaved arms inside one process resolve
+        anything.
+
+        The accuracy case for the default is the argument for the change, and
+        it is an argument rather than a measurement: three roundings deleted
+        against up to one bit of lattice step, worked through per bin at
+        `fixed_point_scale_pow2`. **The speed effect is unmeasured**, in
+        either direction, and this arm is what makes it measurable: a
+        power-of-two multiply is an exponent add where an arbitrary one is a
+        full multiply, and the reciprocal on the download path becomes exact,
+        but nothing here predicts a time from that and nothing may.
+
+        Refuses an unknown code rather than defaulting to one, because
+        silently quantizing on a lattice the caller did not ask for is the
+        failure this whole file is arranged to prevent.
+        """
+        if shape != SCALE_SHAPE_POW2 and shape != SCALE_SHAPE_ARBITRARY:
+            raise Error(
+                String(
+                    "unknown fixed-point scale shape: ",
+                    String(shape),
+                    "; expected SCALE_SHAPE_POW2 or SCALE_SHAPE_ARBITRARY",
+                )
+            )
+        self.fixed_scale_shape = shape
+
+    def scale_shape(self) -> Int:
+        """The scale arm `set_scale_shape` last chose."""
+        return self.fixed_scale_shape
+
+    def describe_scale(self) -> String:
+        """One phrase naming the scale arm, for a trace line."""
+        return describe_scale_shape(self.fixed_scale_shape)
 
     def set_narrow_index(mut self, on: Bool) raises:
         """Whether the histogram row loop forms its two data-dependent
@@ -1034,8 +1121,8 @@ struct GpuHistogramBuilder(Movable):
             raise Error("gradient/hessian length must equal n_rows")
         self.has_gradients = False
 
-        var g_scale = _fixed_scale(grad)
-        var h_scale = _fixed_scale(hess)
+        var g_scale = _fixed_scale(grad, self.fixed_scale_shape)
+        var h_scale = _fixed_scale(hess, self.fixed_scale_shape)
         self.g_scale = Float64(g_scale)
         self.h_scale = Float64(h_scale)
         self.round_epoch += 1
@@ -1160,15 +1247,28 @@ struct GpuHistogramBuilder(Movable):
         """This round's gradients, computed on the device straight into the
         histogram buffers. Replaces `upload_gradients` for the built-in
         objectives; the fixed-point scales come from a device reduction
-        instead of a host pass, and nothing per-row crosses to the device."""
+        instead of a host pass, and nothing per-row crosses to the device.
+
+        The scale is derived by `quantized_gradient.fixed_point_scale_shaped`
+        rather than by `gpu_objectives_native.device_fixed_scale`, which is
+        the same rule reached one forward earlier: `device_fixed_scale` takes
+        no shape argument and this builder's arm has to reach the derivation.
+        Only where the magnitude sum comes from differs between this path and
+        the host one, and that difference is the point of the device
+        reduction, not of the scale.
+        """
         state.fill_grad_hess(
             self.ctx, objective, alpha, self.grad_dev, self.hess_dev
         )
         var sums = state.magnitude_sums(
             self.ctx, self.grad_dev, self.hess_dev
         )
-        self.g_scale = Float64(device_fixed_scale(sums.grad))
-        self.h_scale = Float64(device_fixed_scale(sums.hess))
+        self.g_scale = Float64(
+            fixed_point_scale_shaped(sums.grad, self.fixed_scale_shape)
+        )
+        self.h_scale = Float64(
+            fixed_point_scale_shaped(sums.hess, self.fixed_scale_shape)
+        )
         self.has_gradients = True
         self.gradients_host = False
         self.round_epoch += 1
@@ -1184,8 +1284,12 @@ struct GpuHistogramBuilder(Movable):
         var sums = state.magnitude_sums(
             self.ctx, self.grad_dev, self.hess_dev
         )
-        self.g_scale = Float64(device_fixed_scale(sums.grad))
-        self.h_scale = Float64(device_fixed_scale(sums.hess))
+        self.g_scale = Float64(
+            fixed_point_scale_shaped(sums.grad, self.fixed_scale_shape)
+        )
+        self.h_scale = Float64(
+            fixed_point_scale_shaped(sums.hess, self.fixed_scale_shape)
+        )
         self.has_gradients = True
         self.gradients_host = False
         self.round_epoch += 1
@@ -1258,6 +1362,17 @@ struct GpuHistogramBuilder(Movable):
         node -- and it buys the removal of one host synchronization per
         class, which is the cost the batch exists to remove. That trade has
         not been measured on any device.
+
+        `set_scale_shape` does not reach this path, and the boundary is real
+        rather than an oversight. The scales come from `GpuClassBatch`, which
+        derives its own through `gpu_objectives_native.device_fixed_scale`
+        and so gets `DEFAULT_SCALE_SHAPE` -- the same shape this builder
+        defaults to, so the shipping behavior of the two agrees. Asking this
+        builder for `SCALE_SHAPE_ARBITRARY` and then adopting a batched
+        class's scale would silently get the power-of-two arm anyway. The A/B
+        this arm exists for is a single-output one; a multiclass A/B needs
+        the shape threaded through `gpu_multiclass_batch.refresh_scales`,
+        which is a file this lane does not own.
         """
         if batch.n_rows != self.n_rows:
             raise Error("class batch and histogram builder disagree on n_rows")
@@ -1542,6 +1657,15 @@ struct GpuHistogramBuilder(Movable):
         var g = _zeroed_f64(hist_size)
         var h = _zeroed_f64(hist_size)
         var c = _zeroed_int(hist_size)
+        # Reciprocal once, multiply per cell -- and under
+        # `SCALE_SHAPE_POW2`, the default, this whole conversion is *exact*.
+        # `g_scale` is a power of two, so `1.0 / g_scale` is representable in
+        # Float64 with no rounding, an Int32 cell is representable exactly,
+        # and a Float64 times a power of two is exact. Under
+        # `SCALE_SHAPE_ARBITRARY` neither the reciprocal nor the product is,
+        # and every cell carried both roundings. Trading a division per cell
+        # for a multiply is why the reciprocal is hoisted; that it now costs
+        # nothing in accuracy to hoist it is new.
         var g_inv = 1.0 / self.g_scale
         var h_inv = 1.0 / self.h_scale
         var gp = g.unsafe_ptr()
@@ -2274,6 +2398,8 @@ struct GpuHistogramBuilder(Movable):
         var g = _zeroed_f64(hist_size)
         var h = _zeroed_f64(hist_size)
         var c = _zeroed_int(hist_size)
+        # Exact under `SCALE_SHAPE_POW2`, for the reason spelled out at the
+        # same two lines in `histogram_from_host`.
         var g_inv = 1.0 / self.g_scale
         var h_inv = 1.0 / self.h_scale
         var gp = g.unsafe_ptr()
