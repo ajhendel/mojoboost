@@ -50,10 +50,11 @@ each other and are not intended to be.** The GPU histogram path carries
 gradients in Float32 and accumulates in Int32 fixed point; the CPU path carries
 Float64. `histogram_gpu.mojo` states the resulting contract directly, that
 agreement with the CPU builder is to Float32 precision and not bit-exact, while
-integer counts agree exactly. `hybrid_leaf_scheduler.mojo` builds its whole
-`MODE_MIRROR` gate on the same point, that a host histogram is interchangeable
-with a device one only once the two have been shown to agree bit for bit on the
-target hardware, which is a hardware claim and never an assumption.
+integer counts agree exactly. `tests/test_host_replica.mojo` rests on the same
+point, that a host histogram is interchangeable with a device one only once the
+two have been shown to agree bit for bit on the target hardware, which is a
+hardware claim and never an assumption. (The hybrid leaf scheduler built its
+`MODE_MIRROR` gate on it too, until that module was deleted on 2026-08-16.)
 
 So the promise is **per backend**. Within a backend it is bitwise. Across
 backends it is to Float32 precision on the float planes and exact on the
@@ -404,8 +405,9 @@ measurements unless the site is separately pinned by a test.
 
 Two exemptions apply throughout and remove most of the code from consideration.
 **Integer arithmetic cannot contract.** Every index computation, every Int32
-histogram accumulation, every Int32 sibling subtraction, and the whole integer
-cost model in `hybrid_leaf_scheduler.mojo` are exempt by type. **A multiply that
+histogram accumulation, and every Int32 sibling subtraction are exempt by type
+(so was the integer cost model in `hybrid_leaf_scheduler.mojo`, deleted
+2026-08-16). **A multiply that
 feeds anything other than an add or a subtract cannot contract.** A product
 consumed by `round()`, by `abs()`, by a comparison, by a divide, or by a store is
 not a contraction site, which is why the entire fixed-point quantization pipeline
@@ -551,9 +553,10 @@ integer times a power of two and the sum needs at most 32 mantissa bits of the
 Float64's 53, so fused and unfused agree bit for bit. **Nothing.** It is listed
 for completeness only.
 
-`hybrid_leaf_scheduler.mojo` contains no floating point arithmetic at all. Its
-cost model is integer nanoseconds throughout, which its own docstring gives as
-the reason.
+`hybrid_leaf_scheduler.mojo` contained no floating point arithmetic at all: its
+cost model was integer nanoseconds throughout, which its own docstring gave as
+the reason. The module was deleted on 2026-08-16 and this paragraph is kept as
+the record of what was audited.
 
 ### 5.7 Prediction
 

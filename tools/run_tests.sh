@@ -126,7 +126,7 @@ test_gpu_strategies
 test_gpu_tiling
 test_gpu_training
 test_gpu_vendor_policy
-test_hybrid_replica
+test_host_replica
 "
 
 # `test_gpu_tile_floor` is deliberately NOT above. It asserts the tiling

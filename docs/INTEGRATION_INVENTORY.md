@@ -54,6 +54,7 @@ it, not a second opinion.
 |---|---|---|---|
 | `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference the CPU/GPU equivalence test compares against. Test-only by design |
 | `gpu_vendor_policy` | EXPERIMENTAL | consolidation_K2 | CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / gpu_amd_policy twins (f23bd1b). Reached only from its test until a discrete-GPU trainer consults it; that is the same status the twins had. handoffs/migration_20_device_policy.md |
+| `histogram_cache_policy` | PENDING | connect_04 | Was reached only from hybrid_leaf_scheduler, which was deleted 2026-08-16; now has no importer at all. Delete candidate |
 
 Three shapes recur and are worth naming, because they change what a fix
 costs:
@@ -100,6 +101,11 @@ overflow guard and no packed plan, `gpu_bin_packing` nothing at all,
 `hybrid_leaf_scheduler` a report that moves no histogram, and
 `histogram_cache_policy` only what that report reads. Their rows stay at
 `deferred` with the reach written into the evidence.
+*Dated note, 2026-08-16.* One of those seven, `hybrid_leaf_scheduler`, has
+since been deleted rather than connected, and `histogram_cache_policy` —
+which only that module imported — is now an orphan with no importer at all.
+The paragraph above stands as the record of what was true at that snapshot.
+
 `CLASSIFICATION` in `tools/connectivity_audit.py` still carries
 entries for all seven; they are now judgments about modules that are no
 longer findings, and removing them is a patch for that file's owner.
@@ -204,7 +210,7 @@ to describe them as behavior a user gets.
 | `unified_memory_policy` | `device_policy`, `histogram_gpu` | one live route; the others it scores are not implemented in any trainer | `MOJOTREES_GPU_TRANSFER` |
 | `device_policy` crossover table | `device`, and through it every `fit` | one rule, scoped to Metal on an M4 for squared error at 1,000,000 x 50 and above, which cannot fire through `resolve_device` because `DeviceCapabilities.detect()` opens no device and a hardware-scoped rule cannot match an unidentified profile. `auto` therefore still resolves to the CPU everywhere, with a warning that says which half of "does not cover" applied | `MOJOTREES_AUTO_MIN_CELLS`, or a caller passing a profile read from an open `DeviceContext` to `decide_device_report_reported` |
 | `gpu_multiclass_batch` | `train_gpu`, `histogram_gpu` | a sequential schedule, so multiclass GPU training stays one tree per class per round and `_train_multiclass_gpu_batched` is not entered. Now measured rather than merely unmeasured: batching seven classes gives 15.45s against the sequential schedule's 15.30s at 465,000 x 54, which is inside the spread and therefore indistinguishable, so the default is right and there is nothing here to turn on | `MOJOTREES_GPU_CLASS_BATCH` above one, or a caller passing its own batch |
-| `hybrid_leaf_scheduler` | `gpu_runtime` | a report and nothing else. `GpuSession.note_hybrid` records what was asked for and why it was declined; no histogram changes device | nothing. `MOJOTREES_HYBRID_LEAVES` and `MOJOTREES_HYBRID_TRACE` change what is reported, not where a histogram is built |
+| `hybrid_leaf_scheduler` | *deleted 2026-08-16* | the module, its `gpu_runtime` report (`GpuSession.note_hybrid`), its `train_gpu` wiring, `MOJOTREES_HYBRID_LEAVES`, `MOJOTREES_HYBRID_COSTS`, `MOJOTREES_HYBRID_TRACE`, `MOJOTREES_HYBRID_GUARD_TRANSFER` and its cost-calibration bench are gone. Its premise was that the host could usefully take the leaves the device was slow at; the device-resident tree plane now beats the host path at every measured shape (`bench/results/session3_2026-08-16/RESULTS.md`), so there is no such leaf. The host replica builder it called is not gone and was never its own: see `histogram.build_histogram_subset_replica_into` and `tests/test_host_replica.mojo` | nothing; there is nothing left to turn on |
 
 Two of those rows are held off by default because they were measured and did
 not pay, not because the connecting work is outstanding, and the difference

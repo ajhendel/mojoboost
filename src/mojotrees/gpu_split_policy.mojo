@@ -106,8 +106,9 @@ comptime SPLIT_POLICY_VERSION = 2
 # What the edge decides is not only which scan runs. The host scan pays, per
 # node, a full `3 * n_features * n_bins` histogram download and a host
 # synchronization, and then dequantizes those cells into a Float64
-# `Histogram` (`GpuHistogramBuilder.histogram_from_host`), which the hybrid
-# scheduler's calibrated model prices at about 10 ns per cell. The
+# `Histogram` (`GpuHistogramBuilder.histogram_from_host`), which the M4
+# calibration in bench/results/apple_m4_hybrid_costs_2026-08-15.md prices at
+# about 10 ns per cell. The
 # device-resident scan pays none of that: the histogram is scanned where it
 # lives and a 136-byte record crosses instead. So a single row, a single
 # feature, or a `feature_fraction` of 0.99 is the difference between paying

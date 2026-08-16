@@ -153,8 +153,23 @@ plane, small data, and verification.**
 |---|---|---|
 | GPU | binned matrix, gradients and hessians, active-row permutation and leaf ranges, histogram accumulation, stable row partitioning, native objective evaluation and score advancement, device split search when selected | every one of these scales with `n_rows`, and none of it crosses the boundary during a fit (`train_gpu.mojo`, `gpu_active_rows.mojo`, `gpu_objectives_native.mojo`, `gpu_frontier.mojo`) |
 | CPU | boosting coordination, split selection over histograms of `n_features x n_bins` cells, the tree model, leaf-value renewal, prediction, host row sampling for bagging and GOSS | latency-bound scalar work over data that does not scale with `n_rows`; the host scan of a 50 x 255 histogram costs microseconds and a device scan of it costs a launch and a synchronization |
-| CPU | the entire fit below the launch-cost crossover, and individual small leaves above it (`hybrid_leaf_scheduler.mojo`) | a kernel launch plus a synchronization is a fixed cost per node; a node that owns a few hundred rows is cheaper to build where no launch is paid |
-| CPU | the reference implementation the GPU path is verified against | the host fixed-point replica has been shown bit-identical to the device build in-run, and the CPU trainer is the oracle every GPU test compares to |
+| CPU | the entire fit below the launch-cost crossover (`device_policy.mojo`) | a kernel launch plus a synchronization is a fixed cost per node, and below the crossover the whole fit is cheaper where no launch is paid. Per-leaf hybrid placement above the crossover was tried and deleted on 2026-08-16; see the note below |
+| CPU | the reference implementation the GPU path is verified against | the host fixed-point replica (`histogram.build_histogram_subset_replica_into`) has been shown bit-identical to the device build, and the CPU trainer is the oracle every GPU test compares to |
+
+**Per-leaf hybrid placement, and why it is gone.** Until 2026-08-16 a hybrid
+CPU/GPU leaf scheduler (`hybrid_leaf_scheduler.mojo`, double opt-in behind
+`MOJOTREES_HYBRID_LEAVES` and `MOJOTREES_HYBRID_COSTS=apple-m4`) elected
+individual small leaves onto the host, on the premise that the host could
+usefully take the leaves the device was slow at. It measured 1.20x on a
+bagged 20,000-row fit, and it only ever reached host-gradient runs. The
+premise is gone: the device-resident tree plane now beats the host path at
+every shape measured, all resolved under rule M0 — 2.2x at 50,000 rows, 44
+percent at 250,000, 24 percent at 1,000,000
+(`bench/results/session3_2026-08-16/RESULTS.md`). What survives the deletion
+is the host replica builder itself, which was never the scheduler's: it is
+the oracle in the row above. The design record is
+`docs/design/HYBRID_TRAINING.md` and the calibration is
+`bench/results/apple_m4_hybrid_costs_2026-08-15.md`.
 
 Two things follow. First, the CPU trainer is a permanent part of the design,
 not a compatibility layer to be retired once the GPU path is complete; it is

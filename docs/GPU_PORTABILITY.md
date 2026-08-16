@@ -469,7 +469,9 @@ the block occurs, not observed.
   At the default 32-leaf budget that is on the order of 315 launches between
   waits, which is nearly five times the depth. **Derived bound**, from the 64
   and from a launch count read off the source; not measured.
-- `hybrid_leaf_scheduler.HybridCosts.launch_nanos` is documented as the
+- `HybridCosts.launch_nanos`, in the hybrid leaf scheduler deleted on
+  2026-08-16 and preserved in
+  `bench/results/apple_m4_hybrid_costs_2026-08-15.md`, was documented as the
   fixed cost of enqueuing and running one histogram kernel. Under
   backpressure the enqueue half is not fixed: it is zero while the queue has
   room and the completion time of an older buffer once it does not. A cost

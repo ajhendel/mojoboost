@@ -928,6 +928,14 @@ comparison instead, and somebody has to decide what tolerance means for a chosen
 bin index, which is a discrete quantity where "close" has no meaning. Two splits
 that differ by one bin are not approximately equal, they are different trees.
 
+*Dated note, 2026-08-16.* The hybrid scheduler discussed in the next
+paragraph has been deleted. The argument above is unaffected and was in fact
+acted on: `histogram.build_histogram_subset_replica_into` was kept precisely
+because this section names it as the project's oracle, and
+`tests/test_host_replica.mojo` is where it is now asserted. The observation
+point this section says a device-resident tree removes is therefore still
+standing on the host side.
+
 There is one piece of good news here worth recording. The hybrid scheduler
 already fails safe rather than fails wrong. `MODE_MIRROR` compares and discards,
 so a mismatch is a diagnostic; `MODE_REPLICA` is downgraded to mirror for its

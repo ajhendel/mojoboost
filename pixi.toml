@@ -74,10 +74,6 @@ bench-goss = "mojo run -I src bench/bench_goss.mojo"
 # proposing any GPU change whose whole benefit is fewer launches or fewer
 # synchronizations; see train_gpu.mojo's `_device_search_resident`.
 bench-launch-cost = "mojo run -I src bench/bench_launch_cost.mojo"
-# Calibrates the eight HybridCosts coefficients the hybrid CPU/GPU leaf
-# scheduler compares (E1 in docs/design/HYBRID_TRAINING.md). Its output is
-# what a `HybridCosts` constructor for this machine must cite.
-bench-hybrid-costs = "mojo run -I src bench/bench_hybrid_costs.mojo"
 bench-unified-memory = "mojo run -I src bench/apple/unified_memory.mojo"
 build-python = "bindings/build.sh"
 test-python = { cmd = "python python/test_python_api.py", depends-on = [

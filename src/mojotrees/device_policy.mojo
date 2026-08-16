@@ -1186,7 +1186,8 @@ struct CrossoverEvidence(Copyable, Movable):
     def cite(self) -> String:
         """Where the numbers came from and what they were taken on.
 
-        The form `HybridCosts.cite` uses, for the same reason: a decision
+        The form the deleted `HybridCosts.cite` used, for the same reason:
+        a decision
         that says "the GPU, on evidence" is worth what the reader can go
         and check, so the identifier and the device travel together.
         """
@@ -1220,7 +1221,7 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
     measured CPU against GPU end to end. Extrapolating down would be the
     thing this module exists to refuse: below a million rows the GPU's
     fixed per-round and per-node costs are a growing fraction of a tree
-    (see `hybrid_leaf_scheduler.mojo`, whose whole domain is that regime),
+    (the regime the deleted hybrid leaf scheduler addressed, and lost),
     so the crossover is somewhere below here and its location is a
     measurement nobody has taken.
 
