@@ -1,3 +1,50 @@
+# HOW TO TAKE A NUMBER
+
+This checklist is the protocol. Everything below it is the reasoning, the
+history, and the decision rules, and it is worth reading once. This part is worth
+reading every time, which is why it is ten lines and sits at the top: a protocol
+that must be read in full before each use is one that gets skimmed.
+
+1. **Take the lock** if you are timing: `/tmp/mojotrees-bench.lock`, `mode:
+   timing` only, your addressable session name, what and an ETA. Compiles proceed
+   freely; timing does not. See `MACHINE_LOCK.md`.
+2. **Record the box** before the first arm and after the last: `uptime`, and
+   `ps -Ao pcpu,comm | sort -rn | head`. Record it even when it looks fine, and
+   record the **canary ratio** at both ends. A quiet box can still be a slow one.
+3. **Interleave arms in one process** where the harness allows. Alternating
+   processes turns a neighbour's build into your result.
+4. **Five pairs minimum**, and read the verdict off **M0** as amended by **A2**:
+   resolved by spread, or resolved by the sign of the per-pair difference.
+5. **Label every number** `measured` / `fitted` / `derived bound` / `estimated`,
+   every time it appears.
+6. **Label the regime.** Effect sizes move with machine state, not just levels.
+   Where they differ, report both and refuse to pick one.
+7. **A null in a dirty or slow window closes nothing.** It defers. Retake before
+   using it to cancel a lane. (A3)
+8. **Compare against the comparator at its best**, not at a configuration we
+   pinned for our own convenience. See the comparator rule below.
+9. **Register the prediction and its falsification before the data**, in this
+   file, and do not edit either afterwards. A refuted registered prediction is
+   the process working.
+10. **Write the results file before interpreting any of it.**
+
+## The comparator rule
+
+`scenarios.LIGHTGBM_ALIGNMENT` pins `force_row_wise = True`, and that pin stays:
+on auto, LightGBM spends its first iterations timing both builders and that
+one-off lands inside the measured region, which would flatter us.
+
+But a pin we chose is not a fair comparator. **The rule is LightGBM's better
+pinned builder at each shape**, measured once per shape and recorded beside the
+result. Then "ahead by X" means ahead of LightGBM at its best, which is the only
+form of the claim that survives an outside reader running LightGBM themselves.
+
+Every LightGBM figure this repository has recorded to date was taken row-wise,
+including the 2.767 that framed a week of work. Until each shape has its builder
+measured, every margin carries that caveat explicitly.
+
+---
+
 # Profile session protocol, and the decisions it settles
 
 Written **before** the session ran, deliberately. The point of committing this
