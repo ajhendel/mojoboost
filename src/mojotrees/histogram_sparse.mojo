@@ -25,7 +25,7 @@ two agree to floating-point rounding (counts agree exactly), the same
 trade-off the dense path already makes for sibling subtraction.
 """
 
-from .histogram import Histogram, _check_features
+from .histogram import Histogram, _check_features, score_t
 from .parallel import dispatch_features
 from .sparse import SparseBinnedMatrix
 
@@ -45,8 +45,8 @@ def sum_rows(
     var g = 0.0
     var h = 0.0
     for i in range(len(rows)):
-        g += grad[rows[i]]
-        h += hess[rows[i]]
+        g += score_t(grad[rows[i]])
+        h += score_t(hess[rows[i]])
     return NodeTotals(g, h, len(rows))
 
 
@@ -54,8 +54,8 @@ def sum_all(grad: List[Float64], hess: List[Float64]) -> NodeTotals:
     var g = 0.0
     var h = 0.0
     for r in range(len(grad)):
-        g += grad[r]
-        h += hess[r]
+        g += score_t(grad[r])
+        h += score_t(hess[r])
     return NodeTotals(g, h, len(grad))
 
 
@@ -256,8 +256,8 @@ def build_histogram_sparse_node(
             var e = order_p.unsafe_load(i)
             var r = entry_row_p.unsafe_load(e)
             var b = base + Int(entry_bin_p.unsafe_load(e))
-            var gr = grad_p.unsafe_load(r)
-            var he = hess_p.unsafe_load(r)
+            var gr = score_t(grad_p.unsafe_load(r))
+            var he = score_t(hess_p.unsafe_load(r))
             gp.unsafe_store(b, gp.unsafe_load(b) + gr)
             hp.unsafe_store(b, hp.unsafe_load(b) + he)
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
@@ -369,8 +369,8 @@ def build_histogram_sparse_subset(
             if member_p.unsafe_load(r) == 0:
                 continue
             var b = base + Int(entry_bin_p.unsafe_load(e))
-            var gr = grad_p.unsafe_load(r)
-            var he = hess_p.unsafe_load(r)
+            var gr = score_t(grad_p.unsafe_load(r))
+            var he = score_t(hess_p.unsafe_load(r))
             gp.unsafe_store(b, gp.unsafe_load(b) + gr)
             hp.unsafe_store(b, hp.unsafe_load(b) + he)
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
