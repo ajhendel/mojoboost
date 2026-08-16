@@ -1642,18 +1642,18 @@ def _expand_bundled(
     """Turn a per-bundle histogram in `scratch` into the per-feature histogram
     every consumer downstream expects, in `hist`.
 
-    The three buffers are passed as separate lists rather than reached through
+    The buffers are passed as separate lists rather than reached through
     `hist` for the reason `histogram.build_histogram_into` gives: a pointer
-    taken from a struct field carries that field's origin.
+    taken from a struct field carries that field's origin. There are two of
+    them per histogram now, not three: `_gh` is the interleaved
+    `(gradient, hessian)` plane and `_count` is the count.
     """
     expand_bundled_histogram(
-        hist._grad,
-        hist._hess,
+        hist._gh,
         hist._count,
         hist.n_bins,
         bundled.plan,
-        scratch._grad,
-        scratch._hess,
+        scratch._gh,
         scratch._count,
         scratch.n_bins,
         features,

@@ -1648,21 +1648,25 @@ def bundle_csc(
 
 
 def _recover_member_into(
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     out_base: Int,
     out_bins: Int,
     plan: FeatureBundling,
     bundle: Int,
     slot_rank: Int,
-    grad: List[Float64],
-    hess: List[Float64],
+    gh: List[Float64],
     count: List[Int],
     base: Int,
 ) raises:
     """One member's local histogram, written into
     `out_*[out_base : out_base + out_bins)`.
+
+    `gh` and `out_gh` are `Histogram`'s interleaved `(gradient, hessian)`
+    storage: cell `i` at `[2 * i]` and `[2 * i + 1]`. `out_base` and `base`
+    are still CELL indices, shifted here. The arithmetic is unchanged --
+    every addend and every subtraction is the same value in the same order --
+    so no bit moves; only the addressing does.
 
     The single copy of the recovery arithmetic. Both public forms below go
     through it, so a caller reading one member and a caller expanding a whole
@@ -1678,10 +1682,10 @@ def _recover_member_into(
     if slot_rank < 0 or slot_rank >= hi - lo:
         raise Error("slot rank out of range for this bundle")
     var width = plan.bundle_bins[bundle]
-    if base < 0 or base + width > len(grad):
+    if base < 0 or 2 * (base + width) > len(gh):
         raise Error("histogram block is outside the supplied arrays")
-    if len(hess) != len(grad) or len(count) != len(grad):
-        raise Error("grad, hess, and count must have equal length")
+    if len(gh) != 2 * len(count):
+        raise Error("the pair plane must hold two floats per counted cell")
 
     var k = lo + slot_rank
     var n_local = plan.slot_bins[k]
@@ -1689,21 +1693,21 @@ def _recover_member_into(
         raise Error(
             "member needs more bins than the output histogram has per feature"
         )
-    if out_base < 0 or out_base + out_bins > len(out_grad):
+    if out_base < 0 or 2 * (out_base + out_bins) > len(out_gh):
         raise Error("output block is outside the supplied arrays")
-    if len(out_hess) != len(out_grad) or len(out_count) != len(out_grad):
-        raise Error("output grad, hess, and count must have equal length")
+    if len(out_gh) != 2 * len(out_count):
+        raise Error("the pair plane must hold two floats per counted cell")
 
     for b in range(n_local, out_bins):
-        out_grad[out_base + b] = 0.0
-        out_hess[out_base + b] = 0.0
+        out_gh[2 * (out_base + b)] = 0.0
+        out_gh[2 * (out_base + b) + 1] = 0.0
         out_count[out_base + b] = 0
 
     if hi - lo == 1:
         # Identity encoded: the block is already the member's histogram.
         for b in range(n_local):
-            out_grad[out_base + b] = grad[base + b]
-            out_hess[out_base + b] = hess[base + b]
+            out_gh[2 * (out_base + b)] = gh[2 * (base + b)]
+            out_gh[2 * (out_base + b) + 1] = gh[2 * (base + b) + 1]
             out_count[out_base + b] = count[base + b]
         return
 
@@ -1711,22 +1715,23 @@ def _recover_member_into(
     var total_hess = 0.0
     var total_count = 0
     for b in range(width):
-        total_grad += grad[base + b]
-        total_hess += hess[base + b]
+        total_grad += gh[2 * (base + b)]
+        total_hess += gh[2 * (base + b) + 1]
         total_count += count[base + b]
 
     var d = plan.slot_default[k]
     var start = plan.slot_offset[k]
     for i in range(n_local - 1):
         var local = i if i < d else i + 1
-        out_grad[out_base + local] = grad[base + start + i]
-        out_hess[out_base + local] = hess[base + start + i]
-        out_count[out_base + local] = count[base + start + i]
-        total_grad -= grad[base + start + i]
-        total_hess -= hess[base + start + i]
-        total_count -= count[base + start + i]
-    out_grad[out_base + d] = total_grad
-    out_hess[out_base + d] = total_hess
+        var src = base + start + i
+        out_gh[2 * (out_base + local)] = gh[2 * src]
+        out_gh[2 * (out_base + local) + 1] = gh[2 * src + 1]
+        out_count[out_base + local] = count[src]
+        total_grad -= gh[2 * src]
+        total_hess -= gh[2 * src + 1]
+        total_count -= count[src]
+    out_gh[2 * (out_base + d)] = total_grad
+    out_gh[2 * (out_base + d) + 1] = total_hess
     out_count[out_base + d] = total_count
 
 
@@ -1759,37 +1764,49 @@ def unbundle_histogram_into(
     out_grad.resize(n_local, 0.0)
     out_hess.resize(n_local, 0.0)
     out_count.resize(n_local, 0)
+    # The recovery arithmetic lives on `Histogram`'s interleaved storage. This
+    # form takes and returns separate planes because its only callers are the
+    # inspection API and the tests, neither of which is on a node's critical
+    # path; it pays two O(bins) repacks rather than duplicating the rule.
+    if len(hess) != len(grad) or len(count) != len(grad):
+        raise Error("grad, hess, and count must have equal length")
+    var src_gh = List[Float64](capacity=2 * len(grad))
+    src_gh.resize(2 * len(grad), 0.0)
+    for i in range(len(grad)):
+        src_gh[2 * i] = grad[i]
+        src_gh[2 * i + 1] = hess[i]
+    var dst_gh = List[Float64](capacity=2 * n_local)
+    dst_gh.resize(2 * n_local, 0.0)
     _recover_member_into(
-        out_grad,
-        out_hess,
+        dst_gh,
         out_count,
         0,
         n_local,
         plan,
         bundle,
         slot_rank,
-        grad,
-        hess,
+        src_gh,
         count,
         base,
     )
+    for i in range(n_local):
+        out_grad[i] = dst_gh[2 * i]
+        out_hess[i] = dst_gh[2 * i + 1]
 
 
 def expand_bundled_histogram(
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     out_n_bins: Int,
     plan: FeatureBundling,
-    grad: List[Float64],
-    hess: List[Float64],
+    gh: List[Float64],
     count: List[Int],
     src_n_bins: Int,
     features: List[Int],
 ) raises:
     """Turn a per-bundle histogram back into a per-feature one.
 
-    This is where a bundle stops existing. `grad`/`hess`/`count` are a
+    This is where a bundle stops existing. `gh`/`count` are a
     histogram over the bundled matrix, laid out `[bundle * src_n_bins + b]`;
     the output is laid out `[feature * out_n_bins + b]` in the plan's original
     feature space, which is exactly the shape `split.find_best_split` and
@@ -1816,7 +1833,7 @@ def expand_bundled_histogram(
     """
     if out_n_bins < 1 or src_n_bins < 1:
         raise Error("histogram bin counts must be positive")
-    if len(out_grad) != plan.n_features * out_n_bins:
+    if len(out_gh) != 2 * plan.n_features * out_n_bins:
         raise Error("expanded histogram must be n_features x out_n_bins")
     var use_all = len(features) == 0
     var n_active = plan.n_features if use_all else len(features)
@@ -1826,16 +1843,14 @@ def expand_bundled_histogram(
             raise Error("feature index out of range for this bundling plan")
         var bundle = plan.bundle_of[f]
         _recover_member_into(
-            out_grad,
-            out_hess,
+            out_gh,
             out_count,
             f * out_n_bins,
             out_n_bins,
             plan,
             bundle,
             plan.slot_of[f] - plan.bundle_start[bundle],
-            grad,
-            hess,
+            gh,
             count,
             bundle * src_n_bins,
         )
