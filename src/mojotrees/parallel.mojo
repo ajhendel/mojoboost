@@ -277,6 +277,37 @@ def env_parallel_min_task_ops() -> Int:
     return n if n > 0 else DEFAULT_MIN_TASK_OPS
 
 
+def env_core_floor() -> Bool:
+    """Whether the core floor in `_cap_tasks` is applied. On by default.
+
+    `MOJOTREES_CPU_TASK_FLOOR=0` reverts the fan-out rule to the one that
+    shipped before the floor existed, where the task count came from the
+    grain alone and bottomed out at `MIN_TASKS_ABOVE_GRAIN`.
+
+    **This exists because the floor is unmeasured.** It was derived from the
+    observation that a `sync_parallelize` pays its wake and its barrier in
+    full the moment the loop is declared parallel, so a task count below the
+    core count leaves cores idle behind a cost already bought. That argument
+    is sound and it is still an argument. It changes the task count for every
+    caller whose work sits between one grain and the machine ceiling --
+    the split scan 3 to 10, the gradient fill 3 to 10 at a million rows, the
+    row partition at medium nodes 2 to 10, the histogram at small nodes 4 to
+    10 -- and none of those has been timed.
+
+    The histogram at small nodes is the one to watch: it was measured at
+    1.20x with four tasks, which is poor enough that the cause could be
+    imbalance, which more tasks fix, or barrier cost, which more tasks make
+    worse. Arithmetic cannot separate those and this flag is what lets a
+    measurement do it.
+
+    It is deliberately NOT a `DispatchSettings` field on the unresolved path
+    only: both paths honor it, so an A/B does not accidentally compare a
+    snapshot arm against a live arm.
+    """
+    var s = getenv("MOJOTREES_CPU_TASK_FLOOR")
+    return s != "0"
+
+
 def elementwise_row_ops(n_rows: Int) -> Int:
     """Work estimate, in histogram-op equivalents, for a pass that touches
     `n_rows` rows and does a handful of arithmetic on sequential arrays.
@@ -347,6 +378,12 @@ struct DispatchSettings(Copyable, Movable):
     var min_ops: Int
     var min_task_ops: Int
 
+    var core_floor: Bool
+    """Whether the core floor in `_cap_tasks` applies, from
+    `MOJOTREES_CPU_TASK_FLOOR`. Carried in the snapshot rather than read at
+    the dispatch so that the resolved and live paths answer the same question
+    the same way; see `env_core_floor` for why the flag exists at all."""
+
     var resolved: Bool
     """Whether this value is a snapshot or the sentinel.
 
@@ -374,6 +411,7 @@ struct DispatchSettings(Copyable, Movable):
             env_num_workers(),
             env_parallel_min_ops(),
             env_parallel_min_task_ops(),
+            env_core_floor(),
             True,
         )
 
@@ -383,7 +421,9 @@ struct DispatchSettings(Copyable, Movable):
         costs a few integer stores; it is what every defaulted `settings`
         parameter in this package constructs, once per call, on a path that
         then goes on to read the environment live exactly as it always did."""
-        return DispatchSettings(ResolvedCpuPolicy.unresolved(), 0, 0, 0, False)
+        return DispatchSettings(
+            ResolvedCpuPolicy.unresolved(), 0, 0, 0, True, False
+        )
 
     def describe(self) -> String:
         if not self.resolved:
@@ -396,6 +436,8 @@ struct DispatchSettings(Copyable, Movable):
             self.min_ops,
             " min_task_ops=",
             self.min_task_ops,
+            " core_floor=",
+            self.core_floor,
         )
 
 
@@ -428,12 +470,23 @@ def _cap_tasks(
     var by_grain = max_auto
     if min_task_ops > 0:
         by_grain = total_ops // min_task_ops
+    # `dispatch_cores` arrives already reduced to MIN_TASKS_ABOVE_GRAIN when
+    # the caller resolved `MOJOTREES_CPU_TASK_FLOOR=0`, so the floor is off
+    # without this function reading anything. `_cap_tasks` stays pure, which
+    # is what lets the snapshot path call it without touching the
+    # environment.
     var floor = dispatch_cores
     if floor < MIN_TASKS_ABOVE_GRAIN:
         floor = MIN_TASKS_ABOVE_GRAIN
     if by_grain < floor:
         by_grain = floor
     return by_grain if by_grain < max_auto else max_auto
+
+
+def _effective_cores(dispatch_cores: Int, floor_on: Bool) -> Int:
+    """`dispatch_cores` when the core floor is on, and the pre-floor value
+    when it is off. One place, so the live and snapshot paths cannot drift."""
+    return dispatch_cores if floor_on else MIN_TASKS_ABOVE_GRAIN
 
 
 def plan_tasks_with(
@@ -464,7 +517,9 @@ def plan_tasks_with(
         n_tasks = _cap_tasks(
             total_ops,
             settings.min_task_ops,
-            settings.policy.dispatch_cores(),
+            _effective_cores(
+                settings.policy.dispatch_cores(), settings.core_floor
+            ),
             settings.policy.max_auto_tasks(),
         )
     if n_tasks < 1:
@@ -532,7 +587,7 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
         n_tasks = _cap_tasks(
             total_ops,
             env_parallel_min_task_ops(),
-            profile.dispatch_cores(),
+            _effective_cores(profile.dispatch_cores(), env_core_floor()),
             profile.max_auto_tasks(),
         )
     if n_tasks < 1:
