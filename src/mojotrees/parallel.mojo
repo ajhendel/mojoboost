@@ -43,7 +43,7 @@ grower's histogram count, one host synchronization per split, off by
 default), `MOJOTREES_GPU_TRACE` and `MOJOTREES_GPU_STAGING_SLOTS`
 (gpu_runtime.mojo).
 
-Four dispatch shapes are provided. All of them keep every floating-point
+Five dispatch shapes are provided. All of them keep every floating-point
 summation order independent of the task count, so every result is
 bit-identical to the serial path on every machine and at every worker
 setting:
@@ -73,6 +73,12 @@ setting:
   in-order blocks reproduce the serial result exactly. It is deliberately
   not used for histogram accumulation, which would need a cross-block
   reduction.
+- `dispatch_regions` runs several *independent* unit spaces under one
+  fan-out. It is `dispatch_feature_ranges` over the concatenation of the
+  regions, with the callback told which region each range came from, so a
+  caller that would otherwise make three `sync_parallelize` calls in a row
+  makes one. See "One fan-out, several regions" below; the independence
+  requirement there is a correctness precondition, not advice.
 
 Task count comes from the workload shape rather than from the item count.
 One task per item balances perfectly but pays a scheduling event per item,
@@ -115,7 +121,11 @@ the fan-out: the per-task floor is the right one, and it is now separately
 named and separately overridable. State the honest work; let the two grains
 decide.
 
-Neither grain has been measured against the other. `DEFAULT_MIN_TASK_OPS`
+Neither grain has been measured against the other, and neither has been
+measured against a kernel. What *has* been measured, once, is the thing both
+of them are trading against: see "What a fan-out costs, measured" below, and
+note that it makes the per-task floor the more suspect of the two, since the
+cost of a fan-out rises with its width. `DEFAULT_MIN_TASK_OPS`
 equals `PARALLEL_MIN_OPS`, which reproduces the fan-out this module has
 always chosen everywhere except the degenerate one-task window above, and
 `MOJOTREES_PARALLEL_MIN_TASK_OPS` is there so a sweep can lower it without a
@@ -151,9 +161,14 @@ grain of work. `MIN_TASKS_ABOVE_GRAIN` survives as the floor under the floor,
 for a machine that reports one core.
 
 What bounds this from above -- the reason it is one task per core and not
-`max_auto_tasks` -- is that nothing has measured the marginal cost of a task,
-so the smallest defensible step past "not enough tasks to fill the machine"
-is "exactly enough". What bounds it from below is the one measurement this
+`max_auto_tasks` -- was that nothing had measured the marginal cost of a
+task, so the smallest defensible step past "not enough tasks to fill the
+machine" was "exactly enough". Something has now: the sweep in "What a
+fan-out costs, measured" prices an empty fan-out at every width this module
+can choose, and it rises monotonically with the width. That does not repeal
+the floor, which is an argument about idle cores rather than about task cost,
+but it does mean the floor is now the first thing to A/B rather than the
+last. What bounds it from below is the one measurement this
 module does hold, and it is worth writing down because it is easy to lose:
 bench/bench_threshold.mojo forces its parallel arm with
 `MOJOTREES_PARALLEL_MIN_OPS=1` alone. Under the single-grain rule that read
@@ -174,6 +189,94 @@ This floor cannot make any loop parallel that was serial before it: the
 crossover is untouched and is tested first. It cannot lower any task count
 either, since it only ever raises `by_grain`. What it can do is over-fan a
 loop that has just cleared the crossover, and that is the risk it carries.
+
+What a fan-out costs, measured
+------------------------------
+Every paragraph above this one was written against an unknown constant, and
+several of them say so. `bench/bench_dispatch_cost.mojo` measures it: R
+`sync_parallelize` calls whose body is one padded store, divided by R, at a
+sweep of task counts, with a no-fan-out control that prices the body. It is
+the CPU counterpart of `bench_launch_cost.mojo` and it exists for the same
+reason -- a per-event cost nobody has measured turns every argument about
+scheduling into arithmetic over a variable.
+
+**One run, 2026-08-16, Apple M4 (10 physical / 4 performance), load average
+5.05 on a shared box, minimum of five trials of 2000 dispatches each:**
+
+    tasks   1      2      4      8     10     16     25     32     40
+    us   0.06   4.84  39.44  51.94 130.50 244.06 276.89 396.23 293.04
+
+with the control (the same body, called 40 times, no `sync_parallelize`) at
+0.02 us. Read it for its two orders of magnitude and its shape, not for its
+digits: the box was loaded, a barrier-synchronized fan-out finishes when its
+slowest task is scheduled, and an idle machine would give smaller numbers.
+The 40-task row coming in under the 32-task row is that noise showing.
+
+Three things survive the noise, and all three are mechanism rather than
+tuning:
+
+- **The pool is already persistent.** A one-task `sync_parallelize` costs 60
+  nanoseconds. Creating a thread costs tens of microseconds on any operating
+  system, so no thread is being created here; the runtime holds its workers
+  across calls and the one-task case never leaves the calling thread. A
+  hand-rolled persistent pool in this module would therefore replace a
+  persistent pool with a persistent pool. That is the whole of the argument
+  against building one, and it is why this module still has exactly one
+  primitive under it.
+- **What is paid per dispatch is the wake, and it scales with the width.**
+  From 60 nanoseconds at one task to ~5 microseconds at two and ~130 at ten,
+  with an empty body and therefore no work to imbalance. Every microsecond in
+  that row is fan-out. A wider fan-out is a dearer fan-out, monotonically
+  across the measured range, which is the opposite of what a cost model that
+  treats the fan-out as a fixed price would predict.
+- **Therefore the number of dispatches is a first-class quantity**, not an
+  accounting detail. `phase_profile`'s `HOST_*_DISPATCHES` constants are the
+  count, and `dispatch_regions` below is the instrument for lowering it.
+
+What this measurement does **not** settle, and must not be used to claim: it
+does not price any real kernel, it does not say whether the core floor above
+is a win or a loss, and it cannot be turned into a speedup for anything. It
+prices one event. `MOJOTREES_CPU_TASK_FLOOR=0` against the default is still
+the A/B that answers the floor, and this number is the reason that A/B is
+now worth running first rather than last: the floor raised the *width* of
+exactly the dispatches whose work is smallest (the split scan 3 to 10, the
+small-node histogram 4 to 10, the medium-node partition 2 to 10), and the
+column above is monotone increasing in width.
+
+One fan-out, several regions
+----------------------------
+`dispatch_regions` exists because of the row above. Two consecutive
+dispatches of ten tasks pay the ten-task wake twice; one dispatch over the
+union of their units pays it once and hands each task a longer run. The
+saving is exactly one fan-out at the merged width, which is a count a caller
+can state and a reader can check, and it is the only thing this shape claims.
+
+The precondition is **independence**, and it is a correctness precondition
+rather than a performance one. Two regions may be fused only when no unit of
+either reads storage any unit of the other writes. A pipeline must not be
+fused: the row-blocked histogram accumulates per `(block, group)` unit and
+then folds the per-block partials per output slot, and the fold reads every
+block, so those two dispatches are a dependency and the barrier between them
+is load-bearing. Fusing them would not be slower, it would be wrong.
+
+What is safely fusible is a set of *siblings*: the two children of a split
+searched for their best feature, the several leaves of a depth-wise level
+accumulated at once, a zeroing pass over features nobody accumulates beside
+an accumulation over the features somebody does. Each of those is one output
+range per unit and no cross-unit read, which is the same contract
+`dispatch_feature_ranges` already states for one region.
+
+Exactness is unchanged and for the same reason. A unit is never split across
+tasks, a task walks its regions in ascending region order, and every unit
+runs exactly once. So a fused dispatch executes each region's units in the
+same grouping discipline the region's own `dispatch_feature_ranges` would
+have, and any caller that was bit-identical across task counts before is
+bit-identical across fusions. What *does* change is the work estimate: a
+fused call passes the sum of the regions' estimates, so a pair that sat below
+the crossover separately can clear it together. That is the correct decision
+-- the crossover is a statement about the total work behind one scheduling
+event, and after fusion there is one event -- but it is a change in the
+answer and is called out here rather than discovered.
 
 Who carries the snapshot
 ------------------------
@@ -299,6 +402,15 @@ def env_core_floor() -> Bool:
     imbalance, which more tasks fix, or barrier cost, which more tasks make
     worse. Arithmetic cannot separate those and this flag is what lets a
     measurement do it.
+
+    A second measurement now leans on the answer without settling it.
+    `bench/bench_dispatch_cost.mojo` prices an *empty* fan-out at every width
+    (see "What a fan-out costs, measured" in the module docstring) and finds
+    it rising monotonically with the width -- with no body, and therefore no
+    imbalance to explain any of it. That says the cost this flag turns off is
+    real and grows with exactly the quantity the flag raises. It does not say
+    the floor is a net loss, because it prices none of the work the extra
+    cores go on to do. It says: run the A/B, and run it early.
 
     It is deliberately NOT a `DispatchSettings` field on the unresolved path
     only: both paths honor it, so an A/B does not accidentally compare a
@@ -684,6 +796,123 @@ def dispatch_features_with[FuncType: def (Int) -> None](
             func(f)
 
     dispatch_feature_ranges_with(settings, do_range, n_features, total_ops)
+
+
+def region_units(sizes: List[Int]) -> Int:
+    """Units a `dispatch_regions` call covers: the sum of the region sizes,
+    with a non-positive size counted as zero.
+
+    Public because a caller has to hand `dispatch_regions` a work estimate for
+    the same union, and computing the two from different arithmetic is how a
+    fan-out ends up sized against a unit space it does not have.
+    """
+    var total = 0
+    for i in range(len(sizes)):
+        if sizes[i] > 0:
+            total += sizes[i]
+    return total
+
+
+def dispatch_regions[FuncType: def (Int, Int, Int) -> None](
+    func: FuncType, sizes: List[Int], total_ops: Int
+) raises:
+    """Run `func(region, start, end)` over contiguous ranges covering every
+    region's units, under one fan-out.
+
+    `sizes[r]` is how many units region `r` holds; a region of zero or fewer
+    units is skipped and still occupies its index, so a caller may pass a
+    fixed-length vector with an inactive region zeroed rather than renumbering
+    its regions. `total_ops` is the work estimate for the **union**, in the
+    usual histogram-op equivalents, and `region_units` is the matching unit
+    count.
+
+    **The regions must be independent.** No unit of any region may read
+    storage that a unit of another region writes. This is the same contract
+    `dispatch_feature_ranges` states within one region, extended across
+    regions, and it is what makes fusing two dispatches into one legal rather
+    than merely cheaper. A producer and its consumer -- the row-blocked
+    histogram's accumulate and its fold, a count pass and the scatter that
+    reads its prefix sums -- are a dependency, the barrier between them is
+    load-bearing, and fusing them is a correctness bug and not a tuning
+    regression. See "One fan-out, several regions" in the module docstring.
+
+    What it is worth is one fan-out at the merged width, which the caller can
+    count. What it cannot do is change a result: a unit is never split across
+    tasks, every unit runs exactly once, and a task walks its regions in
+    ascending region order, so each region's units are grouped exactly as its
+    own `dispatch_feature_ranges` would have grouped them. What it does
+    change is the go/no-go decision, since the estimate is now the union's;
+    that is deliberate and is documented in the module docstring.
+
+    The serial path calls `func(r, 0, sizes[r])` for each non-empty region in
+    ascending order, which is the same shape a task gets, so there is one body
+    to test rather than two.
+    """
+    _run_regions(func, sizes, plan_tasks(region_units(sizes), total_ops))
+
+
+def dispatch_regions_with[FuncType: def (Int, Int, Int) -> None](
+    settings: DispatchSettings,
+    func: FuncType,
+    sizes: List[Int],
+    total_ops: Int,
+) raises:
+    """`dispatch_regions` against an already-resolved snapshot."""
+    _run_regions(
+        func, sizes, plan_tasks_with(settings, region_units(sizes), total_ops)
+    )
+
+
+def _run_regions[FuncType: def (Int, Int, Int) -> None](
+    func: FuncType, sizes: List[Int], n_tasks: Int
+) raises:
+    """The split itself, with the task count already chosen. One copy, so the
+    resolved and unresolved entry points hand out identical ranges."""
+    var n_regions = len(sizes)
+    # Prefix offsets over the concatenated unit space: `offsets[r]` is the
+    # flat id of region r's first unit and `offsets[n_regions]` is the total.
+    # Built once here rather than rescanned inside every task, and held in a
+    # local whose lifetime spans the whole `sync_parallelize`, which is
+    # synchronous.
+    var offsets = List[Int](capacity=n_regions + 1)
+    offsets.append(0)
+    var running = 0
+    for r in range(n_regions):
+        if sizes[r] > 0:
+            running += sizes[r]
+        offsets.append(running)
+    var n_units = running
+    if n_units <= 0:
+        return
+    if n_tasks <= 1:
+        for r in range(n_regions):
+            if sizes[r] > 0:
+                func(r, 0, sizes[r])
+        return
+
+    var off_p = offsets.unsafe_ptr()
+
+    # The same even split `_run_feature_ranges` uses, over the union: task w
+    # takes flat [w * n // tasks, (w + 1) * n // tasks) and cuts it at every
+    # region boundary it crosses. `plan_tasks` has clamped n_tasks to n_units,
+    # so no task comes out with an empty flat range; a task *can* still emit
+    # no call for a given region, which is the point.
+    def do_range(w: Int) {imm}:
+        var lo = (w * n_units) // n_tasks
+        var hi = ((w + 1) * n_units) // n_tasks
+        for r in range(n_regions):
+            var r0 = off_p.unsafe_load(r)
+            var r1 = off_p.unsafe_load(r + 1)
+            if r1 <= lo:
+                continue
+            if r0 >= hi:
+                break
+            var s = (lo - r0) if lo > r0 else 0
+            var e = (hi - r0) if hi < r1 else (r1 - r0)
+            if s < e:
+                func(r, s, e)
+
+    sync_parallelize(do_range, n_tasks)
 
 
 def dispatch_feature_rows[FuncType: def (Int, Int, Int) -> None](
