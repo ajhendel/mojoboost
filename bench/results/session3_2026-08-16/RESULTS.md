@@ -914,3 +914,136 @@ instance -- after `HostGradientStage`, `DispatchSettings`, the stale
 **No bits move.** Nothing touches a scan, a reduction, or a gain expression; the
 only behavioural change is which nodes a fallback that nothing calls would flag,
 and it can only flag more.
+
+
+---
+
+## The speculation is built, and the instrument it shipped refuted my registered figure
+
+### 27 wasted builds predicted, 0 issued
+
+The registered economics said a speculative build adds a partition, a histogram
+and a search pair to **every** step including dead ones. **That is not what
+shipped and not what happens.** `_pick_runner_up_kernel` returns on `STEP_LIVE`
+before it reads the frontier, so a dead step publishes nothing and costs three
+near-empty launches. The speculation also runs **no search**, so there is no
+speculative search pair at all.
+
+Measured on the early-stopping fixture: the commit-log census says
+`builds=29 wasted=27`; the device says `device_builds=2 device_consumed=2`.
+**Twenty-seven wasted builds predicted, zero issued.**
+
+**The census is an upper bound, not a count**, and it overcounts in four ways a
+commit log structurally cannot see: a dead step, a budget spent after this
+commit, no admissible pre-existing leaf, and no free slot. `SpeculationCensus.
+builds` and `.wasted` are now documented as bounds and the census line carries
+`device_builds` / `device_consumed` beside them.
+
+**The concrete correction to my registered figure:** the budget check alone costs
+the last growth step of every full-budget tree, so at 1M x 50 the honest issued
+count is at most **2,800 not 2,900** and the waste at most **864 not 964**, about
+10 percent less than registered. The instrument to measure it exactly now exists.
+
+The 66.8 percent hit rate is unchanged and nothing in this lane bears on it; the
+lane's own fixtures are a different shape and report 100 percent, which says the
+rate is shape-dependent rather than that 66.8 is wrong.
+
+### Two design corrections, both better than what I specified
+
+**No extra pool slot and no extra scratch records.** I specified
+`open_resident(num_leaves + 1)` and two more scratch records. The lane instead
+builds into **the slot the next commit will acquire** -- lowest free by the commit
+kernel's own upward scan, with nothing acquiring or releasing in between, so it
+is a prediction with a proof. That matters practically: `open_resident`'s argument
+lives in `train_gpu.mojo`, which the lane could not edit.
+
+The parent's histogram survives a miss because the prebuild runs with `do_sub`
+off -- my correction honored by a different and cheaper mechanism.
+
+**A hit is decided by identity of the work, not of the leaf.** `_spec_consume_
+kernel` compares ten descriptor fields -- window, routing rule, built-child
+window, built slot, category set -- so it **does not rely on the K=1 theorem at
+all**. It verifies directly that the launches already issued were handed this
+step's arguments. Too strict costs a hit; too loose would be a wrong tree.
+
+### The consumption counter proves consumption because it is the same branch
+
+`SPEC_STAT_CONSUMED` increments in exactly one place: the branch that writes
+`build_dev[STEP_LIVE] = 0`, which is the word that makes the real partition and
+the real accumulation return at their first read. **The increment and the
+suppression are the same branch**, so a speculation that launched everything and
+hit nothing cannot move it. The test also asserts it **equal** to the census's
+`consumed` per tree, and a two-leaf budget is a guaranteed zero pole asserting
+zeros on both counters.
+
+Bits do not move: forests compared node for node, `value` and `split_gain` as bit
+patterns, over **eight** rounds -- one round would hide a scores-only divergence,
+which is the bug that once cost this plane every tree after the first.
+
+---
+
+## The bin layout question is closed: feature-major stays
+
+Two lanes reached the same verdict independently, by different routes, and the
+second one found the argument that settles it.
+
+**The row-side amortization the blocked layout was supposed to buy is already
+bought by the shipping launch shape.** `_range_hist_atomic_kernel[GROUP, BIN_CAP]`
+owns `GROUP` feature slots per threadgroup and reads the row side once for all of
+them, on the feature-major buffer. What is left for a blocked layout is the bin
+gather alone -- and **the gather is not broken**: consecutive threads take
+consecutive `j`, node rows stay ascending, so at a fixed feature the warp's reads
+are ascending and at the root exactly contiguous.
+
+**A GPU coalesces across threads, not across one thread's own accesses.** So K1's
+"no coalescing across the features a thread needs" is a CPU-shaped framing of a
+pattern the device already handles. That sentence set this lane's registered
+estimate at 1.5-2.5x, and it was the wrong mental model.
+
+Three further findings, all **derived bounds**, nothing measured:
+
+- **`GROUP = 1` is a regression, not a tie.** A launch owning one slot fetches a
+  `G`-wide row, spends one byte, and the block is walked again per lane: `G`-fold
+  streaming amplification. Pinned by test.
+- **Feature subsampling inverts the sign.** Random `feature_fraction` leaves every
+  storage block live while narrowing feature-major's active columns: 0.5 loses
+  1.12x, 0.25 loses 1.77x.
+- **The upload transform is NOT what makes it a bad trade** and should not be
+  cited as though it were. It is tens of milliseconds against a seconds-long run.
+  What makes it bad is that the win is 1.00x at the default bin count and that
+  three kernel families index this buffer.
+
+### The two lanes disagreed on a fact, and the fact is settled against K3
+
+K3 stated that `free_feature_group` returns **1** at 256 bins, which is the basis
+of its "provable no-op at the shipping configuration" argument. The layout lane
+says **2 on Metal**.
+
+**The layout lane is right.** `histogram_gpu.__init__`'s own docstring says
+Metal's baseline is the pairing, measured at 1.39x end to end on an Apple M4 with
+byte-identical predictions, and that "a 256-bin one gets the baseline back
+unchanged". So shipping on this M4 is `feature_group = 2`, not 1.
+
+**This does not change the verdict** -- G=2 is 1.00x to 1.12x, still inside the
+refutation threshold -- but it invalidates K3's arm design, which was built on
+`feature_group = 1` being the shipping baseline. Arm A is not the shipping
+configuration on the device this round measures on.
+
+### And a contract disagreement worth keeping
+
+K3 states the contract as "histogram feature-blocked at `G = feature_group`"; the
+layout lane states it as "**feature-major, full stop**". The difference is real:
+K3 treats `G=1` blocked as identical to feature-major, which holds only if the
+buffer is *built* at `G=1`, and a `G=8` buffer under a group of 1 is an 8x
+regression. A blocked buffer would have to be rebuilt whenever `set_feature_group`
+moves -- which is exactly what that setter exists to allow at run time.
+Feature-major has no such coupling. **The layout lane's statement is the one to
+keep.**
+
+### Both lanes independently recommend the same next measurement
+
+**The shared-atomic fraction of the histogram phase.** Three shared atomics per
+(row, feature) are identical under both layouts, so they cancel in a comparison
+but not in a speedup, and **their share is unmeasured**, which makes every
+memory-side estimate in this batch an upper bound on wall-clock effect. Two lanes
+that disagreed about the layout agree about this.
