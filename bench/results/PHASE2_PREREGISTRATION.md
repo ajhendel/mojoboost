@@ -36,9 +36,21 @@ partial traffic is known to be the confound** that made the earlier tile
 experiment a 22-36 percent regression.
 
 - **Estimate:** 10-25 percent on the histogram phase.
-- **Refutation threshold:** if the whole fit does not move by at least **0.1
-  seconds at 1,000,000 x 50**, the lane is refuted and does not get a second
-  round. Registered because the unroll moved 0.284 seconds and set the scale.
+- **Refutation threshold, with a regime condition that is part of the rule:**
+  refuted if the whole fit does not move by at least **0.1 seconds at 1,000,000
+  x 50**, measured with **interleaved arms in one process, resolved under M0,
+  and the canary reporting an unshifted fast window**.
+
+  **If the window is not fast, the lane is neither confirmed nor refuted and the
+  measurement is re-taken, not filed.** 0.1 seconds is 4 percent of a 2.58
+  second fit, against an arm spread of 2.7 percent in a fast window and 11 to 14
+  percent in a slow one. Without the regime condition a real 4 percent win is
+  filed as a null in any bad window -- which is exactly what happened to the row
+  unroll, called indistinguishable at 8.1 percent against a 14.1 percent floor
+  and resolved at 10.8 against 2.1 four hours later. Same code, opposite verdict.
+- **End-to-end condition:** an isolated-kernel improvement that does not move the
+  fit is not a win. Both numbers are reported and the fit is the one that
+  decides. See K3, where the same rule is argued at length.
 - The tile re-test is the part most likely to fail again. It failed once with a
   well-argued mechanism and a satisfied amortization bound. If it regresses a
   second time, the standing bound `MIN_ROWS_PER_TILE_BIN_FACTOR = 8` is itself
@@ -57,6 +69,14 @@ exactly one speculative candidate suffices.
   launched.** This project shipped a test whose six fixtures ran below the gate
   they were testing and verified nothing; a speculative path that always
   launches and never hits would pass any test that only asserts it ran.
+- **Report a consumed fraction and a wasted-build fraction as numbers in the
+  results, per shape.** The census that justifies K=1 -- the greedy pick being
+  the top runner-up in 100 percent of 4,030 decisions -- was taken under
+  conditions close enough to synthetic that it should not be trusted as the real
+  hit rate. **The measured hit rate is what makes K=1 sufficient or not**, and if
+  it comes in materially below 100 percent then K=1 is the wrong K and the lane
+  reports that rather than shipping a speculation that misses. A wasted build is
+  real device work spent on a child that is discarded.
 
 ### K3, feature-blocked layout. Owns `gpu_binned_layout.mojo`, `gpu_bin_packing.mojo`, and a NEW kernel variant file.
 
@@ -88,6 +108,13 @@ the total.
   2.14x isolated and 10.8 percent of the whole fit, both resolved -- and that
   agreement is why the unroll result stands. Agreement is the thing to check
   for, not to assume.
+- **Refuted if EITHER the isolated figure is below 1.2x by size class OR the fit
+  moves less than 0.15 seconds at 1,000,000 x 50.** Both, not either alone.
+  The row-tile floor is the case in point: it raised occupancy exactly as
+  designed, was the change its author was most confident in, and measured **22
+  percent slower at 50 features and 36 percent slower at 100** in a real fit. An
+  isolated win that vanishes end to end is not a win, and this repository has
+  already paid for that lesson once.
 - It gets a **new** kernel variant file rather than editing K1's body, so the two
   can be held as arms in one binary.
 
@@ -124,3 +151,21 @@ If K1 and K3 both land at the low end of their estimates the fit goes near 2.0,
 which would be a margin wide enough to resolve against a comparator that drifts.
 **That sentence is an estimate over two unmeasured lanes and must not be quoted
 as a projection.** It is written down so that failing to reach it is visible.
+
+
+## Phase 1 sequencing, registered with the rest
+
+- **The retake does not start when the lock clears. It starts when the 5-minute
+  load average is under about 4.** The 1-minute figure recovers long before the
+  machine does: at the moment the box was handed over it read 2.56 over one
+  minute against 7.65 over five and 12.76 over fifteen. Starting on the 1-minute
+  number would measure the tail of a six-lane batch and call it a fast window.
+- **Push before promoting**, so the CPU-only CI matrix runs on the exact SHA that
+  gets promoted rather than on an ancestor. The CPU-only build is the one an M4
+  structurally cannot catch locally -- a GPU entry point missing its `comptime if
+  not has_accelerator()` guard dies with "Unknown GPU architecture" only on the
+  x86-64 half.
+- **The deletion commit touches `train_gpu.mojo` only**, and the API snapshot is
+  regenerated **once, after it**, since exports move. Not per lane: four lanes
+  each regenerating one generated file is four conflicts on it, which is what
+  happened last round and why it is written down here.
