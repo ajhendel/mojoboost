@@ -1384,17 +1384,30 @@ class _Base(_ParamsMixin):
             # compute a scale, so a fit on any of those raises rather than
             # training a model that ignored the setting.
         if self.max_ctr_complexity is not None:
+            if self.max_ctr_complexity != 1:
+                raise ValueError(
+                    "max_ctr_complexity above 1 is not reachable: the "
+                    "projection enumeration exists "
+                    "(src/mojotrees/ctr_combinations.mojo) but no grow loop "
+                    "drives it, so a combination would never be built. 1 is "
+                    "what CatBoost itself resolves to for any fit under 200 "
+                    "iterations."
+                )
+            # 1 is built and reaches a design matrix, and this still refuses,
+            # because the blocker moved rather than cleared. The fitted CTR
+            # tables are MODEL STATE -- built from the target -- and the model
+            # format has no section for them, so a CTR fit that produced a
+            # model would write a file that loads with empty tables, keeps
+            # every tree referencing its CTR columns, and bins them as if the
+            # feature were absent. Refusing here beats producing a model that
+            # loads and scores wrong.
             raise ValueError(
-                "max_ctr_complexity is not reachable: CatBoost's "
-                "target-statistic (CTR) features are implemented "
-                "(src/mojotrees/ctr.mojo builds the ordered statistics and "
-                "src/mojotrees/ctr_combinations.mojo the projections this "
-                "parameter bounds the arity of), but neither module is "
-                "imported by any trainer, binner or dataset path, so no fit "
-                "constructs a CTR column and there is nothing for an arity "
-                "bound to bound. The categorical handling every fit actually "
-                "gets is LightGBM's category-set split, under "
-                "max_cat_to_onehot, max_cat_threshold, cat_smooth and cat_l2."
+                "max_ctr_complexity=1 is built but no Python fit enables it: "
+                "an enabled CTR bundle is refused at the trainer boundary "
+                "(ctr.check_ctr_model_support) and at every model writer "
+                "(serialize.check_ctr_serializable), because the fitted CTR "
+                "tables are model state and the model format carries no "
+                "section for them. Follow catalog A29."
             )
         if self.bagging_temperature is not None:
             raise ValueError(

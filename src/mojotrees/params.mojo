@@ -1061,13 +1061,28 @@ def parse_params(spec: String) raises -> TrainConfig:
         # is LightGBM's category-set split). A number here would ask for
         # combinations that are never built.
         elif key == "max_ctr_complexity":
-            raise Error(
-                "max_ctr_complexity is not implemented: it bounds the arity"
-                " of CatBoost's target-statistic (CTR) feature combinations,"
-                " and mojotrees builds none. Its categorical handling is"
-                " LightGBM's category-set split, under max_cat_to_onehot,"
-                " max_cat_threshold, cat_smooth and cat_l2"
-            )
+            # Complexity 1 is BUILT now (ctr_columns.mojo, catalog A19) and a
+            # simple projection reaches a design matrix. Above 1 needs the
+            # candidate enumeration driven by a grow loop, and nothing drives
+            # it, so it is refused by name.
+            #
+            # This key only bounds the arity. It does NOT turn CTRs on, and
+            # there is deliberately no parameter-string name that does,
+            # because a fit that built CTR columns cannot be SAVED yet -- the
+            # tables are model state and the format has no section for them.
+            # `ctr.check_ctr_model_support` refuses at every model-producing
+            # entry point and `serialize.check_ctr_serializable` refuses at
+            # every writer.
+            var complexity = _parse_int(key, value)
+            if complexity != 1:
+                raise Error(
+                    "max_ctr_complexity above 1 is not implemented: the"
+                    " projection enumeration exists"
+                    " (ctr_combinations.grow_tree_ctr_projections) but no"
+                    " grow loop drives it, so a combination would never be"
+                    " built. 1, the value CatBoost itself resolves to for any"
+                    " fit under 200 iterations, is accepted"
+                )
         # CatBoost's `random_strength`, the only name on this surface that is
         # not LightGBM's. 0.0, the default, is LightGBM's behavior exactly. A
         # positive value parses and then fails validation with a sentence

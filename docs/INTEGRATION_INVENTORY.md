@@ -54,8 +54,6 @@ it, not a second opinion.
 |---|---|---|---|
 | `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference the CPU/GPU equivalence test compares against. Test-only by design |
 | `catboost_ranking` | PENDING | cpu_round_2 | CatBoost ranking objectives and eval metrics (QueryRMSE, PairLogit, YetiRank, NDCG, PFound). No trainer selects them |
-| `ctr` | PENDING | cpu_round_2 | Ordered target statistics, the simple CTR projection. Catalog A19. Parked until binning or the trainer asks for a CTR column |
-| `ctr_combinations` | PENDING | cpu_round_2 | CTR feature combinations, CatBoost's TProjection above complexity 1. Catalog A30, extending A19. Its parameter max_ctr_complexity is refused rather than ignored while this is unreached |
 | `embedding` | PENDING | cpu_round_2 | CatBoost's LDA and KNN embedding feature estimators. Catalog A20. Needs a raw embedding column the ingestion path does not accept |
 | `gpu_vendor_policy` | EXPERIMENTAL | consolidation_K2 | CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / gpu_amd_policy twins (f23bd1b). Reached only from its test until a discrete-GPU trainer consults it; that is the same status the twins had. handoffs/migration_20_device_policy.md |
 | `langevin` | PENDING | cpu_round_2 | Stochastic Gradient Langevin Boosting and model shrinkage (langevin, diffusion_temperature, model_shrink_rate). The boosting loop does not draw the noise or apply the shrinkage |
