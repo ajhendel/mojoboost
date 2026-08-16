@@ -2190,10 +2190,11 @@ def _collect_blocks(
         blocks.add(
             BLOCK_DERIVATIVE_PRECISION,
             String(
-                "MOJOTREES_DERIVATIVE_PRECISION=float64 asks for Float64"
-                " per-row derivatives, and the GPU gradient upload narrows"
-                " every derivative to Float32, so no accelerator path can"
-                " produce that answer"
+                "derivative_precision=float64 asks for Float64 per-row"
+                " derivatives -- set as a parameter, or through"
+                " MOJOTREES_DERIVATIVE_PRECISION -- and the GPU gradient"
+                " upload narrows every derivative to Float32, so no"
+                " accelerator path can produce that answer"
             ),
         )
 
