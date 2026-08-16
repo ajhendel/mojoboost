@@ -41,6 +41,18 @@ integer prefix sums, so no atomic decides where a row lands and no run-to-run
 scheduling difference can reorder the output. The prefix sums are exact
 Int32 sums over 0/1 flags, so they cannot round.
 
+Say it once more precisely, because a later reader will want to change the
+launch shape again and this is the invariant that constrains what may be
+changed. Write `flag(i)` for whether element `i` of the range goes left,
+`P(j)` for the number of `i < j` with `flag(i)`, and `T` for `P(count)`. The
+partition writes element `j` to `P(j)` when it goes left and to `T + (j -
+P(j))` when it goes right. `P` and `T` are properties of the flags and of the
+positions and of nothing else, so *no* choice of how the range is cut into
+threadgroups, how many threadgroups there are, how many tiles each one walks,
+or which kernel arm computes the prefix can move a single row. That is why
+this module treats the block cap, the tile count, and the scan arm as
+launch-shape knobs and says so at every one of them.
+
 Collective primitives, and a rule this module repeals
 -----------------------------------------------------
 The scan inside a threadgroup is `max.gpu.primitives.block.prefix_sum`, warp
@@ -75,6 +87,31 @@ under one threadgroup (flag, scan, scatter in one launch, no scratch, no
 copy back) measured 1.00x on 256 partitions of 600 rows, 78 us each either
 way: the per-partition cost there is enqueue overhead, not launch count, so
 it was not kept. Do not retry either without a new reason.
+
+The launch count, and an open tension
+-------------------------------------
+A partition is three launches: flag and scan, scatter, copy back. It was four
+until the block-sums scan was folded into the head of the scatter; see
+`_scatter_kernel` for how, `_partition_grid` for the block cap that keeps the
+folded scan's redundant reads bounded, and `_copy_back_kernel` for the design
+that would remove the third launch and for the readers that stopped it being
+built here.
+
+The reason to want fewer launches is a stage-level profile of a 1M by 50
+round of 100 trees on an M4, which charged partition 17.7 percent against
+histogram's 49.3 and transfer's 28.2, and a follow-up audit of it which
+believed roughly half of that 17.7 was fence attribution and put partition's
+real floor at a four-launch minimum near 237 microseconds on a machine where
+an enqueue costs about 20 microseconds and a host wait about 126. On that
+reading a launch is worth removing on its own.
+
+That reading is in tension with the paragraph above, which records that
+collapsing a small range's four launches into one measured 1.00x. Both cannot
+be the whole story, and this module does not know which is right: neither
+number was re-measured by the change that removed the launch, and nothing
+here claims the removal made anything faster. What it claims is that three
+launches compute what four computed, element for element, which is a
+statement about the permutation and not about time.
 
 Bagging
 -------
@@ -235,6 +272,65 @@ def _scan_primitive_width_supported(threads: Int) -> Bool:
     )
 
 
+def _partition_grid(n: Int, threads: Int, cap: Int) raises -> Tuple[Int, Int]:
+    """The partition's launch geometry: how many threadgroups, and how many
+    `threads`-wide tiles each of them walks.
+
+    Before this lane the answer was always "one tile per threadgroup, as many
+    threadgroups as it takes", and the per-block left counts that shape
+    produced were turned into global offsets by a *separate* launch. The
+    scatter now does that scan itself, at its own head, which is what removes
+    the launch; the price is that every threadgroup of the scatter re-reads
+    the whole block-sums array, so the block count has to be bounded or the
+    re-read grows quadratically in the range length. Bounding it is what this
+    function is for.
+
+    The rule, given a range of `n` elements:
+
+        tiles_total = ceil(n / threads)      tiles the range needs at all
+        blocks      = min(tiles_total, cap)  bounded threadgroup count
+        tiles       = ceil(tiles_total / blocks)   tiles each one walks
+        blocks      = ceil(tiles_total / tiles)    trim the empty tail
+
+    The second assignment to `blocks` only ever lowers it, and it exists so
+    that a range like `cap + 1` tiles does not launch `cap` threadgroups of
+    which half own nothing: with two tiles each, `ceil((cap + 1) / 2)` of them
+    is enough to cover the range. It cannot raise `blocks` above `cap`,
+    because `tiles >= tiles_total / cap` gives `blocks <= cap`.
+
+    Two properties the kernels depend on, both of which hold by construction.
+    First, `blocks * tiles * threads >= n`, so every element of the range is
+    covered by exactly one (block, tile, lane) triple. Second, the blocks
+    partition the range into *contiguous* chunks in ascending order, block `b`
+    owning `[b * tiles * threads, (b + 1) * tiles * threads)` clipped to the
+    range, which is what keeps the scatter's destination arithmetic a stable
+    partition.
+
+    Note what this does *not* change: while `tiles_total <= cap` the geometry
+    is identical to what the module launched before this lane, one tile per
+    threadgroup. With the default cap (`block_threads`, see
+    `GpuActiveRows.partition_block_cap`) that covers every range shorter than
+    `threads * threads` elements, which at the usual 256-wide threadgroup is
+    every range under 65,536 rows. Only ranges larger than that see the
+    multi-tile loop at all, so on a small dataset, and on every node below the
+    first level or two of a large one, the flag pass runs exactly the code
+    path it ran before.
+    """
+    if n < 1:
+        raise Error("partition grid needs at least one element")
+    if threads < 1:
+        raise Error("partition grid needs a positive threadgroup width")
+    if cap < 1:
+        raise Error("partition grid needs a positive block cap")
+    var tiles_total = (n + threads - 1) // threads
+    var blocks = tiles_total
+    if blocks > cap:
+        blocks = cap
+    var tiles = (tiles_total + blocks - 1) // blocks
+    blocks = (tiles_total + tiles - 1) // tiles
+    return (blocks, tiles)
+
+
 # Features one histogram threadgroup may accumulate at once, and the top of
 # the ladder the kernel family is instantiated over. One threadgroup's shared
 # histogram is three Int32 planes of `GROUP * BIN_CAP` cells, where `BIN_CAP`
@@ -323,105 +419,62 @@ def _flag_scan_kernel(
     cat1: UInt64,
     cat2: UInt64,
     cat3: UInt64,
+    tiles: Int32,
 ):
     """Stage one of the stable partition: flag each row of the range and scan
     the flags within each threadgroup.
 
-    `offsets[j]` becomes the number of left-going rows before `j` *inside
-    j's own block*, shifted left one bit, with j's own flag in the low bit;
-    `block_sums[b]` is the number of left-going rows in block b. Carrying the
-    flag in the offset word is what lets the scatter route the row without
-    gathering its bin a second time: the bin loads are the one random-access
-    read of the partition (`bins[feature * n_rows + row]`, one byte from a
-    fresh cache line per row once the leaf's rows are sparse in the
-    dataset), so reading each once instead of twice halves the partition's
-    gathered traffic, and the packed word costs nothing the plain prefix did
-    not. The prefix is bounded by the block size, so the shift cannot
-    overflow. Threads past the end of the range contribute a zero flag, so a
-    partial tail block still sums correctly. The scan is the plain
-    Hillis-Steele shared-memory scan: two barriers per doubling step, with
-    the read separated from the write so no thread reads a slot another has
-    already advanced.
+    Block `b` owns the contiguous chunk of `tiles * block_dim.x` elements
+    starting at `b * tiles * block_dim.x`, clipped to the range, and walks it
+    one `block_dim.x`-wide tile at a time. `offsets[j]` becomes the number of
+    left-going rows before `j` *inside j's own chunk*, shifted left one bit,
+    with j's own flag in the low bit; `block_sums[b]` is the number of
+    left-going rows in the whole chunk. The running count across the chunk's
+    tiles is carried in a register that every thread of the block computes
+    identically, exactly the way the block-sums scan this lane deleted carried
+    its own running total.
 
-    This is the *fallback* arm. `_flag_scan_prim_kernel` is the default and
-    scans with `block.prefix_sum` instead; see the module docstring for which
-    rule that repeals and why. This kernel is kept rather than deleted
-    because it reads its width from `block_dim.x` and so serves any
-    threadgroup width, including the ones no primitive instantiation exists
-    for, and because a benchmark wanting both arms in one process needs both
-    to be present. It produces the identical offsets and block sums.
+    Before this lane `tiles` was always 1 and the chunk was always one tile,
+    so this loop had no iterations to run and the code below reduces to what
+    was here before whenever `_partition_grid` returns `tiles == 1`, which it
+    does for every range shorter than `block_threads * block_threads`
+    elements. What changed is only that a longer range is now covered by a
+    bounded number of threadgroups walking several tiles each rather than by
+    an unbounded number walking one, which is what lets the scatter scan the
+    block sums itself instead of a separate launch doing it. The permutation
+    cannot notice: a row's destination is a function of the routing flags and
+    the row's position in the range, and neither depends on how the range was
+    cut into blocks. See `_scatter_kernel` for that argument written out.
+
+    Carrying the flag in the offset word is what lets the scatter route the
+    row without gathering its bin a second time: the bin loads are the one
+    random-access read of the partition (`bins[feature * n_rows + row]`, one
+    byte from a fresh cache line per row once the leaf's rows are sparse in
+    the dataset), so reading each once instead of twice halves the
+    partition's gathered traffic, and the packed word costs nothing the plain
+    prefix did not. The prefix is bounded by the chunk length, which is
+    bounded by the range length, which is bounded by `n_rows` and therefore
+    by `Int32.MAX / 2` for any dataset this module accepts, so the shift
+    cannot overflow. Threads past the end of the range contribute a zero
+    flag, so a partial tail tile still sums correctly.
+
+    The scan is the plain Hillis-Steele shared-memory scan: two barriers per
+    doubling step, with the read separated from the write so no thread reads a
+    slot another has already advanced. This is the *fallback* arm.
+    `_flag_scan_prim_kernel` is the default and scans with `block.prefix_sum`
+    instead; see the module docstring for which rule that repeals and why.
+    This kernel is kept rather than deleted because it reads its width from
+    `block_dim.x` and so serves any threadgroup width, including the ones no
+    primitive instantiation exists for, and because a benchmark wanting both
+    arms in one process needs both to be present. It produces the identical
+    offsets and block sums.
     """
     var tid = thread_idx.x
     var nthreads = block_dim.x
-    var j = block_idx.x * nthreads + tid
     var n = Int(count)
     var col = Int(feature) * Int(n_rows)
-
-    var s = stack_allocation[
-        SCAN_MAX_THREADS,
-        Scalar[DType.int32],
-        address_space = AddressSpace.SHARED,
-    ]()
-
-    var flag = Int32(0)
-    if j < n:
-        var row = rows[unsafe_offset = Int(begin) + j][0]
-        var bin = Int32(bins[unsafe_offset = col + Int(row)])
-        if _row_goes_left(
-            bin,
-            threshold_bin,
-            missing_bin,
-            default_left,
-            is_categorical,
-            cat0,
-            cat1,
-            cat2,
-            cat3,
-        ):
-            flag = Int32(1)
-    s[unsafe_offset=tid] = flag
-    barrier()
-
-    # Every thread runs the same number of steps (the bound is the uniform
-    # block size), so the barriers are reached by the whole threadgroup.
-    var offset = 1
-    while offset < nthreads:
-        var carried = Int32(0)
-        if tid >= offset:
-            carried = s[unsafe_offset = tid - offset][0]
-        barrier()
-        if tid >= offset:
-            s[unsafe_offset=tid] = s[unsafe_offset=tid][0] + carried
-        barrier()
-        offset += offset
-
-    if j < n:
-        # Inclusive minus own flag is the exclusive prefix; the flag rides
-        # in the low bit for the scatter.
-        offsets[unsafe_offset=j] = (
-            (s[unsafe_offset=tid][0] - flag) * Int32(2)
-        ) + flag
-    if tid == nthreads - 1:
-        block_sums[unsafe_offset = block_idx.x] = s[unsafe_offset=tid][0]
-
-
-def _scan_block_sums_kernel(
-    block_sums: MutPointer[Int32, MutAnyOrigin],
-    total: MutPointer[Int32, MutAnyOrigin],
-    n_blocks: Int32,
-):
-    """Stage two: turn the per-block left counts into per-block starting
-    offsets, and write the range's total left count.
-
-    One threadgroup walks the block sums in chunks of its own size, scanning
-    each chunk in shared memory and carrying the running total across chunks
-    in a register every thread computes identically. Sequential over exact
-    integers in a fixed order, so the result cannot depend on scheduling, and
-    it needs no second level of launches however many blocks stage one used.
-    """
-    var tid = thread_idx.x
-    var nthreads = block_dim.x
-    var nb = Int(n_blocks)
+    var chunk = Int(tiles) * nthreads
+    var base = Int(block_idx.x) * chunk
 
     var s = stack_allocation[
         SCAN_MAX_THREADS,
@@ -430,15 +483,32 @@ def _scan_block_sums_kernel(
     ]()
 
     var carry = Int32(0)
-    var base = 0
-    while base < nb:
-        var idx = base + tid
-        var own = Int32(0)
-        if idx < nb:
-            own = block_sums[unsafe_offset=idx][0]
-        s[unsafe_offset=tid] = own
+    for t in range(Int(tiles)):
+        var j = base + t * nthreads + tid
+
+        var flag = Int32(0)
+        if j < n:
+            var row = rows[unsafe_offset = Int(begin) + j][0]
+            var bin = Int32(bins[unsafe_offset = col + Int(row)])
+            if _row_goes_left(
+                bin,
+                threshold_bin,
+                missing_bin,
+                default_left,
+                is_categorical,
+                cat0,
+                cat1,
+                cat2,
+                cat3,
+            ):
+                flag = Int32(1)
+        s[unsafe_offset=tid] = flag
         barrier()
 
+        # Every thread runs the same number of steps (the bound is the
+        # uniform block size), so the barriers are reached by the whole
+        # threadgroup. `tiles` is uniform too, so the tile loop itself
+        # cannot leave a thread behind at a barrier.
         var offset = 1
         while offset < nthreads:
             var carried = Int32(0)
@@ -450,18 +520,21 @@ def _scan_block_sums_kernel(
             barrier()
             offset += offset
 
-        if idx < nb:
-            block_sums[unsafe_offset=idx] = (
-                carry + s[unsafe_offset=tid][0] - own
-            )
+        if j < n:
+            # Inclusive minus own flag is the exclusive prefix within the
+            # tile; plus the chunk's running count it is the exclusive
+            # prefix within the chunk. The flag rides in the low bit for
+            # the scatter.
+            offsets[unsafe_offset=j] = (
+                (carry + s[unsafe_offset=tid][0] - flag) * Int32(2)
+            ) + flag
         carry += s[unsafe_offset = nthreads - 1][0]
-        # The chunk total has been read by every thread; the next iteration
+        # The tile total has been read by every thread; the next iteration
         # may now overwrite the shared buffer.
         barrier()
-        base += nthreads
 
     if tid == 0:
-        total[unsafe_offset=0] = carry
+        block_sums[unsafe_offset = Int(block_idx.x)] = carry
 
 
 def _flag_scan_prim_kernel[block_size: Int](
@@ -481,14 +554,15 @@ def _flag_scan_prim_kernel[block_size: Int](
     cat1: UInt64,
     cat2: UInt64,
     cat3: UInt64,
+    tiles: Int32,
 ):
     """Stage one, scanned with `block.prefix_sum` instead of by hand.
 
     Everything a later stage reads is byte for byte what `_flag_scan_kernel`
-    writes: `offsets[j]` is still `(exclusive_prefix_within_j's_block << 1) |
-    flag`, and `block_sums[b]` is still block b's left count, so
-    `_scatter_kernel` is shared between the two arms unchanged. The
-    difference is only how the intra-block scan is computed.
+    writes: `offsets[j]` is still `(exclusive_prefix_within_j's_chunk << 1) |
+    flag`, and `block_sums[b]` is still block b's left count over the same
+    contiguous chunk, so the two arms remain interchangeable stage by stage.
+    The difference is only how the intra-tile scan is computed.
     `block.prefix_sum` is warp shuffles plus one shared round rather than a
     doubling loop with two barriers per step, and it sums exact Int32 flags,
     so the permutation cannot differ; the test file asserts that against the
@@ -510,74 +584,248 @@ def _flag_scan_prim_kernel[block_size: Int](
     outside it falls back rather than being rounded. The primitive is a
     collective, so every thread of the threadgroup reaches it: the flag is
     computed as zero for threads past the end of the range and the call sits
-    outside the `j < n` guard, which is also what keeps a partial tail block
+    outside the `j < n` guard, which is also what keeps a partial tail tile
     summing correctly.
-    """
-    var tid = thread_idx.x
-    var j = block_idx.x * block_size + tid
-    var n = Int(count)
-    var col = Int(feature) * Int(n_rows)
 
-    var flag = Int32(0)
-    if j < n:
-        var row = rows[unsafe_offset = Int(begin) + j][0]
-        var bin = Int32(bins[unsafe_offset = col + Int(row)])
-        if _row_goes_left(
-            bin,
-            threshold_bin,
-            missing_bin,
-            default_left,
-            is_categorical,
-            cat0,
-            cat1,
-            cat2,
-            cat3,
-        ):
-            flag = Int32(1)
-
-    var inclusive = block_prefix_sum[block_size=block_size, exclusive=False](
-        flag
-    )
-
-    if j < n:
-        offsets[unsafe_offset=j] = ((inclusive - flag) * Int32(2)) + flag
-    if tid == block_size - 1:
-        block_sums[unsafe_offset = block_idx.x] = inclusive
-
-
-def _scan_block_sums_prim_kernel[block_size: Int](
-    block_sums: MutPointer[Int32, MutAnyOrigin],
-    total: MutPointer[Int32, MutAnyOrigin],
-    n_blocks: Int32,
-):
-    """Stage two on the primitive arm. Same output as
-    `_scan_block_sums_kernel`: the block sums become block starting offsets
-    in place and the range's total left count lands in `total`.
-
-    One threadgroup still walks the block sums in chunks of its own width and
-    still carries the running total across chunks in a register, but the
-    per-chunk scan is `block.prefix_sum` and the chunk total reaches every
-    thread through `block.broadcast[block_size=block_size](inclusive,
-    src_thread=block_size - 1)` rather than through a shared slot every
-    thread re-reads. Signature, again checked against the toolchain:
+    The tile loop and the register-carried running count are the same
+    construction `_flag_scan_kernel` uses and the same one the deleted
+    block-sums kernel used to carry its total across chunks: the chunk total
+    reaches every thread through `block.broadcast[block_size=block_size](
+    inclusive, src_thread=block_size - 1)` rather than through a shared slot
+    every thread re-reads. Signature, checked against the toolchain:
     `block.broadcast[dtype: DType, width: SIMDLength, //, *, block_size:
     Int](val: SIMD[dtype, width], src_thread: Int = 0) -> SIMD[dtype,
     width]`. Broadcasting from the last thread is what keeps `carry`
-    bit-identical on every thread, which is what makes the chunk-to-chunk
-    carry deterministic; summing over exact Int32 in a fixed chunk order, it
-    cannot depend on scheduling.
+    bit-identical on every thread of the block, which is what makes the
+    tile-to-tile carry deterministic; summing exact Int32 in a fixed tile
+    order, it cannot depend on scheduling.
 
     The trailing `barrier()` is deliberate and is not the primitive's job to
     supply: the next iteration calls the same collectives again, and this
     kernel does not get to assume anything about whether a primitive fences
-    its own scratch on exit. One barrier per chunk is what the hand-rolled
-    arm already paid, and a chunk is a whole threadgroup's worth of block
-    sums, so the count of them is tiny.
+    its own scratch on exit. `tiles` is a uniform argument, so every thread
+    of the block runs the same number of iterations and reaches every
+    collective.
+    """
+    var tid = thread_idx.x
+    var n = Int(count)
+    var col = Int(feature) * Int(n_rows)
+    var chunk = Int(tiles) * block_size
+    var base = Int(block_idx.x) * chunk
+
+    var carry = Int32(0)
+    for t in range(Int(tiles)):
+        var j = base + t * block_size + tid
+
+        var flag = Int32(0)
+        if j < n:
+            var row = rows[unsafe_offset = Int(begin) + j][0]
+            var bin = Int32(bins[unsafe_offset = col + Int(row)])
+            if _row_goes_left(
+                bin,
+                threshold_bin,
+                missing_bin,
+                default_left,
+                is_categorical,
+                cat0,
+                cat1,
+                cat2,
+                cat3,
+            ):
+                flag = Int32(1)
+
+        var inclusive = block_prefix_sum[
+            block_size=block_size, exclusive=False
+        ](flag)
+        var tile_total = block_broadcast[block_size=block_size](
+            inclusive, src_thread = block_size - 1
+        )
+
+        if j < n:
+            offsets[unsafe_offset=j] = (
+                (carry + inclusive - flag) * Int32(2)
+            ) + flag
+        carry += tile_total
+        barrier()
+
+    if tid == 0:
+        block_sums[unsafe_offset = Int(block_idx.x)] = carry
+
+
+def _scatter_kernel(
+    rows: MutPointer[Int32, MutAnyOrigin],
+    scratch: MutPointer[Int32, MutAnyOrigin],
+    offsets: MutPointer[Int32, MutAnyOrigin],
+    block_sums: MutPointer[Int32, MutAnyOrigin],
+    total: MutPointer[Int32, MutAnyOrigin],
+    begin: Int32,
+    count: Int32,
+    tiles: Int32,
+    n_blocks: Int32,
+):
+    """Stage two: scan the block sums at the head of the block, then write
+    each row of this block's chunk to its compacted slot.
+
+    Before this lane the block-sums scan was a launch of its own, one
+    threadgroup that turned the per-block left counts into per-block starting
+    offsets in place and wrote the range's total. It is now the first thing
+    every scatter block does, over the same block sums, with the same chunked
+    single-threadgroup scan the deleted kernel used; the block sums are read
+    and not modified, so every block computing the scan redundantly is safe
+    as well as necessary. That is the launch this lane removes: four launches
+    per partition become three.
+
+    What the scan has to yield here is two numbers, and only two. `mine` is
+    the number of left-going rows in every chunk before this block's, which is
+    the exclusive prefix of `block_sums` at `block_idx.x`; `grand` is the
+    range's total left count. Both are block-uniform, so the loop that
+    produces them broadcasts rather than leaving them in one lane. The
+    exclusive prefix at the block's own index is recovered as the inclusive
+    prefix there minus that index's own block sum, which any thread can read
+    straight out of `block_sums` because nothing writes it.
+
+    The cost of doing it here rather than in a launch of its own is that each
+    of the `n_blocks` blocks re-reads all `n_blocks` block sums, so the extra
+    traffic is quadratic in the block count. That is why the block count is
+    capped (`_partition_grid`, `GpuActiveRows.partition_block_cap`): with the
+    default cap of one threadgroup width, `n_blocks <= threads` and the worst
+    case, a range of exactly `threads * threads` elements, re-reads
+    `threads * threads` Int32 against `3 * threads * threads` Int32 of useful
+    streamed traffic, so it is bounded by a third of the row work and is far
+    below that for any longer range. The block sums are a few kilobytes and
+    are read by every block at once, so they are cache-resident; none of this
+    has been measured, and the bound is an argument about counts, not a
+    timing.
+
+    The scatter itself. A left-going row at local index `j` lands at its
+    global left rank `p`; a right-going one lands after every left-going row,
+    at `grand + (j - p)`, where `j - p` is its rank among the right-going
+    rows. Both ranks are monotone in `j`, so both sides keep their relative
+    order and the partition is stable. `p` is `mine` plus the exclusive prefix
+    within the chunk that stage one packed into `offsets[j]`, which is exactly
+    the number of left-going rows at positions before `j` in the range. Note
+    that `p` is therefore a function of the routing flags and of `j` alone: it
+    does not depend on how the range was cut into chunks, on how many chunks
+    there were, or on how many tiles each walked. That is the whole argument
+    that this lane leaves the permutation element for element unchanged.
+
+    The direction comes out of the low bit of the packed offset stage one
+    wrote, so this stage touches no bin and needs no routing rule: it is a
+    pure permutation of the range from three streamed Int32 reads per row.
+
+    Launched with the same width and the same `tiles` stage one used, because
+    `block_idx.x` and `tiles` are what select this element's chunk, and the
+    packed offsets are chunk-relative.
+
+    This is the fallback arm; `_scatter_prim_kernel` is the default and
+    differs only in scanning with `block.prefix_sum` and `block.broadcast`
+    instead of in shared memory by hand.
+    """
+    var tid = thread_idx.x
+    var nthreads = block_dim.x
+    var nb = Int(n_blocks)
+    var me = Int(block_idx.x)
+
+    var s = stack_allocation[
+        SCAN_MAX_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var carry = Int32(0)
+    var mine = Int32(0)
+    var base = 0
+    while base < nb:
+        var idx = base + tid
+        var own = Int32(0)
+        if idx < nb:
+            own = block_sums[unsafe_offset=idx][0]
+        s[unsafe_offset=tid] = own
+        barrier()
+
+        var offset = 1
+        while offset < nthreads:
+            var carried = Int32(0)
+            if tid >= offset:
+                carried = s[unsafe_offset = tid - offset][0]
+            barrier()
+            if tid >= offset:
+                s[unsafe_offset=tid] = s[unsafe_offset=tid][0] + carried
+            barrier()
+            offset += offset
+
+        # `me` is block-uniform, so this branch is taken by the whole
+        # threadgroup or by none of it and no barrier is skipped.
+        if me >= base and me < base + nthreads:
+            mine = (
+                carry
+                + s[unsafe_offset = me - base][0]
+                - block_sums[unsafe_offset=me][0]
+            )
+        carry += s[unsafe_offset = nthreads - 1][0]
+        # The chunk total has been read by every thread; the next iteration
+        # may now overwrite the shared buffer.
+        barrier()
+        base += nthreads
+
+    if me == 0 and tid == 0:
+        total[unsafe_offset=0] = carry
+
+    var n = Int(count)
+    var b = Int(begin)
+    var chunk = Int(tiles) * nthreads
+    var first = me * chunk
+    for t in range(Int(tiles)):
+        var j = first + t * nthreads + tid
+        if j < n:
+            var row = rows[unsafe_offset = b + j][0]
+            var packed = offsets[unsafe_offset=j][0]
+            var p = Int(mine) + (Int(packed) >> 1)
+            var dst: Int
+            if (packed & Int32(1)) != 0:
+                dst = p
+            else:
+                dst = Int(carry) + (j - p)
+            scratch[unsafe_offset = b + dst] = row
+
+
+def _scatter_prim_kernel[block_size: Int](
+    rows: MutPointer[Int32, MutAnyOrigin],
+    scratch: MutPointer[Int32, MutAnyOrigin],
+    offsets: MutPointer[Int32, MutAnyOrigin],
+    block_sums: MutPointer[Int32, MutAnyOrigin],
+    total: MutPointer[Int32, MutAnyOrigin],
+    begin: Int32,
+    count: Int32,
+    tiles: Int32,
+    n_blocks: Int32,
+):
+    """Stage two on the primitive arm: the same head scan and the same
+    scatter, with `block.prefix_sum` and `block.broadcast` in place of the
+    hand-rolled shared-memory scan.
+
+    Byte for byte the same writes as `_scatter_kernel` makes, for the same
+    reason the two stage-one arms agree: the scan sums exact Int32 over a
+    fixed order, so the prefix it produces is a value and not an
+    approximation, and every destination index is computed from that prefix
+    by the same integer arithmetic. `tests/test_gpu_partition_launches.mojo`
+    asserts that against the hand-rolled arm element for element rather than
+    leaving it as a comment here.
+
+    Two broadcasts per chunk rather than one. `block_size - 1` gives the
+    chunk total, as on stage one; `me - base` gives the inclusive prefix at
+    this block's own index, from which its own block sum is subtracted to
+    make the exclusive prefix. `src_thread` is a runtime argument of
+    `block.broadcast`, and `me - base` is block-uniform inside the guarded
+    branch, so the collective is reached by the whole threadgroup with the
+    same source lane.
     """
     var tid = thread_idx.x
     var nb = Int(n_blocks)
+    var me = Int(block_idx.x)
 
     var carry = Int32(0)
+    var mine = Int32(0)
     var base = 0
     while base < nb:
         var idx = base + tid
@@ -591,57 +839,34 @@ def _scan_block_sums_prim_kernel[block_size: Int](
         var chunk_total = block_broadcast[block_size=block_size](
             inclusive, src_thread = block_size - 1
         )
-
-        if idx < nb:
-            block_sums[unsafe_offset=idx] = carry + inclusive - own
+        if me >= base and me < base + block_size:
+            var at_me = block_broadcast[block_size=block_size](
+                inclusive - own, src_thread = me - base
+            )
+            mine = carry + at_me
         carry += chunk_total
         barrier()
         base += block_size
 
-    if tid == 0:
+    if me == 0 and tid == 0:
         total[unsafe_offset=0] = carry
 
-
-def _scatter_kernel(
-    rows: MutPointer[Int32, MutAnyOrigin],
-    scratch: MutPointer[Int32, MutAnyOrigin],
-    offsets: MutPointer[Int32, MutAnyOrigin],
-    block_sums: MutPointer[Int32, MutAnyOrigin],
-    total: MutPointer[Int32, MutAnyOrigin],
-    begin: Int32,
-    count: Int32,
-):
-    """Stage three: write each row to its compacted slot.
-
-    A left-going row at local index `j` lands at its global left rank `p`; a
-    right-going one lands after every left-going row, at `n_left + (j - p)`,
-    where `j - p` is its rank among the right-going rows. Both ranks are
-    monotone in `j`, so both sides keep their relative order and the
-    partition is stable. `n_left` is read from the device, so no host round
-    trip sits between the scan and the scatter.
-
-    The direction comes out of the low bit of the packed offset stage one
-    wrote, so this stage touches no bin and needs no routing rule: it is a
-    pure permutation of the range from three streamed Int32 reads per row.
-
-    Launched with the block size stage one used, because `block_idx.x` is
-    what selects this element's block offset.
-    """
-    var j = block_idx.x * block_dim.x + thread_idx.x
     var n = Int(count)
-    if j < n:
-        var b = Int(begin)
-        var row = rows[unsafe_offset = b + j][0]
-        var packed = offsets[unsafe_offset=j][0]
-        var p = Int(block_sums[unsafe_offset = block_idx.x][0]) + (
-            Int(packed) >> 1
-        )
-        var dst: Int
-        if (packed & Int32(1)) != 0:
-            dst = p
-        else:
-            dst = Int(total[unsafe_offset=0][0]) + (j - p)
-        scratch[unsafe_offset = b + dst] = row
+    var b = Int(begin)
+    var chunk = Int(tiles) * block_size
+    var first = me * chunk
+    for t in range(Int(tiles)):
+        var j = first + t * block_size + tid
+        if j < n:
+            var row = rows[unsafe_offset = b + j][0]
+            var packed = offsets[unsafe_offset=j][0]
+            var p = Int(mine) + (Int(packed) >> 1)
+            var dst: Int
+            if (packed & Int32(1)) != 0:
+                dst = p
+            else:
+                dst = Int(carry) + (j - p)
+            scratch[unsafe_offset = b + dst] = row
 
 
 def _copy_back_kernel(
@@ -650,9 +875,66 @@ def _copy_back_kernel(
     begin: Int32,
     count: Int32,
 ):
-    """Fold the compacted range back over the parent's slots. Only the
+    """Stage three: fold the compacted range back over the parent's slots.
+
+    Only the
     parent's own range is touched, so every other leaf's range survives the
-    split untouched; that is why this is a copy and not a buffer swap."""
+    split untouched; that is why this is a copy and not a buffer swap.
+
+    Launched over its own grid, `ceil(count / threads)` blocks of one tile
+    each, and not over the capped grid the flag pass and the scatter share.
+    It has no cross-block dependency of any kind, so there is nothing for a
+    bounded block count to buy it, and giving it the uncapped grid keeps its
+    shape exactly what it was before this lane.
+
+    Why this launch is still here
+    -----------------------------
+    Removing it is a real saving and was scoped for this lane: it is one of
+    three launches, and it moves 8 bytes per row of the range (a 4-byte read
+    from `scratch` and a 4-byte write to `rows`) that exist only to undo the
+    fact that the scatter cannot write in place. The design that removes it
+    is per-range ping-pong: `scratch` becomes a co-equal second row buffer,
+    each `LeafRange` carries a bit saying which of the two currently holds
+    its rows, the scatter reads from the parent's live buffer and writes to
+    the other one, and the two children are recorded as living in the buffer
+    the scatter just wrote. No copy, and the ranges other leaves hold stay
+    valid because nothing outside the parent's window is touched either way.
+
+    It is not done here because the bit has to be consulted by *every* reader
+    of the permutation, and the readers are not all in this file. The audit,
+    at the commit that added this note:
+
+    - `enqueue_range_histogram` in this module, which hands the row pointer
+      to `_range_hist_atomic_kernel` and `_range_hist_partial_kernel`. It
+      knows the node, so it could pick the pointer on the host with no kernel
+      change at all, which is the easy half.
+    - `GpuHistogramBuilder.readback_range` (histogram_gpu.mojo), which builds
+      a sub-buffer view of `rows_dev[begin : begin + count]` and hands it to a
+      host histogram build. Same fix, different file.
+    - `GpuHistogramBuilder.snapshot_rows` (histogram_gpu.mojo), which copies
+      the *whole* permutation in one transfer. This one is not a pointer
+      swap: under per-range ping-pong there is no single buffer that holds
+      the whole permutation, so a snapshot becomes a gather across both
+      buffers driven by the range table, or a merge pass, and the hybrid
+      replica path that consumes it is exactly the path whose bit-for-bit
+      agreement with the device is load-bearing.
+    - `download_rows` and `download_range` in this module, which have the
+      same problem as `snapshot_rows` for the same reason.
+    - the two launches in `gpu_objectives_native.mojo` that take
+      `rows.rows_dev.unsafe_ptr()` over the whole active prefix, which have
+      it again.
+    - `_quantize_grad_hess_kernel` here, which reads no permutation at all
+      (it is indexed by row id) and is therefore *not* affected; recorded so
+      that a later reader does not have to re-derive that.
+
+    Three of those live in files this lane may not edit and one of them,
+    `snapshot_rows`, is not a one-line change anywhere. A half-applied
+    ping-pong leaves one reader looking at the stale buffer for one range,
+    which produces a wrong histogram for one node on some tree shapes and
+    not others, which is precisely the kind of fault no fixture catches. So
+    the copy stays, and the design is written down here rather than
+    half-built.
+    """
     var j = global_idx.x
     if j < Int(count):
         var i = Int(begin) + j
@@ -1380,11 +1662,16 @@ struct GpuActiveRows(Movable):
     # Scatter destination. Only the partitioned range is ever read back out
     # of it, so the two buffers never have to agree outside that window.
     var scratch_dev: DeviceBuffer[DType.int32]
-    # Block-local exclusive left-prefix, one per element of the range.
+    # Chunk-local exclusive left-prefix, one per element of the range, with
+    # the element's own routing flag packed into the low bit. A chunk is one
+    # threadgroup's share of the range (`_partition_grid`).
     var offsets_dev: DeviceBuffer[DType.int32]
-    # Per-scan-block left counts, turned into block offsets in place.
+    # Per-chunk left counts. Written by the flag pass and read, never
+    # rewritten, by every block of the scatter, which scans them at its own
+    # head; they were turned into block offsets in place by a launch of their
+    # own until that fold removed it.
     var block_sums_dev: DeviceBuffer[DType.int32]
-    # One Int32: the range's total left count.
+    # One Int32: the range's total left count, written by the scatter.
     var total_dev: DeviceBuffer[DType.int32]
     var host_total: HostBuffer[DType.int32]
     var host_rows: HostBuffer[DType.int32]
@@ -1417,6 +1704,17 @@ struct GpuActiveRows(Movable):
     # kernels. A launch-shape knob and nothing else, because the two arms
     # produce the identical permutation and the identical left count.
     var scan_primitives: Bool
+    # The most threadgroups one partition launches, whatever the range
+    # length; a longer range is covered by giving each of them more tiles to
+    # walk rather than by launching more of them (`_partition_grid`). It is a
+    # cap and not a count: a range short enough to fit in fewer blocks
+    # launches fewer. Bounded because the scatter scans the block sums at its
+    # own head, once per block, so the redundant reads grow as the square of
+    # the block count; see `_scatter_kernel` for the bound the default
+    # (`block_threads`) buys. A launch-shape knob and nothing else, because
+    # the permutation is a function of the routing flags and each row's
+    # position in the range and so cannot see the tiling at all.
+    var partition_block_cap: Int
     # --- hist-kernel-family lane ---
     # The shared-plane width every histogram launch from here instantiates its
     # kernel at: `histogram_bin_capacity(n_bins)`, one of 32, 64, 128, 256.
@@ -1538,6 +1836,19 @@ struct GpuActiveRows(Movable):
         self.scan_primitives = _env_int(
             "MOJOTREES_GPU_SCAN_PRIMITIVES", 1
         ) != 0 and _scan_primitive_width_supported(threads)
+        # One threadgroup width's worth of scan blocks. Chosen by the
+        # counting argument in `_scatter_kernel` and not by a measurement:
+        # at this cap the scatter's redundant re-read of the block sums is
+        # bounded by a third of the range's own streamed traffic in the worst
+        # case, and every range shorter than `threads * threads` gets exactly
+        # the one-tile-per-block geometry the module launched before the head
+        # scan was folded in. `set_partition_block_cap` moves it, which is
+        # how a benchmark holds two caps in one process and how the test file
+        # forces the multi-tile path on a range small enough to check by
+        # hand. No environment variable: the arm belongs in the call, because
+        # an A/B that reads its arm from the environment has already once in
+        # this repository run one arm under the other's label.
+        self.partition_block_cap = threads
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -1640,6 +1951,37 @@ struct GpuActiveRows(Movable):
             )
         self.scan_primitives = on
 
+    def set_partition_block_cap(mut self, cap: Int) raises:
+        """The most threadgroups one partition may launch.
+
+        A launch-shape knob in exactly the sense `set_feature_group` and
+        `set_scan_primitives` are: it changes how the range is cut into
+        chunks and therefore how much redundant block-sums scanning the
+        scatter does, and it cannot change one element of the permutation or
+        one unit of the left count, because a row's destination is a function
+        of the routing flags and of the row's position in the range and of
+        nothing else. `tests/test_gpu_partition_launches.mojo` asserts that
+        across caps rather than leaving it as a claim here.
+
+        Two reasons it is settable. A test needs to reach the multi-tile path
+        without allocating a range of `block_threads * block_threads` rows, so
+        it lowers the cap instead and gets the same code path on a range small
+        enough to check against the serial reference model. And a benchmark
+        that wants to know whether the default (`block_threads`, chosen by a
+        counting argument in `_scatter_kernel` and by no measurement at all)
+        is the right cap on a given device has to be able to hold two caps in
+        one process.
+
+        Takes effect on the next `enqueue_partition`. There is no upper bound
+        beyond the one the block-sums buffer already implies: the scatter's
+        head scan walks the sums in chunks of a threadgroup width, so it
+        serves any block count, and `_partition_grid` never returns more
+        blocks than the range has tiles.
+        """
+        if cap < 1:
+            raise Error("partition block cap must be at least one block")
+        self.partition_block_cap = cap
+
     def begin_tree(mut self, bag: List[Int] = []) raises:
         """Seed the root's rows and make node 0 own all of them.
 
@@ -1689,7 +2031,29 @@ struct GpuActiveRows(Movable):
         routing: RowRouting,
     ) raises:
         """Enqueue the stable partition of `window`. Does not transfer or
-        synchronize; the left count lands in `total_dev`."""
+        synchronize; the left count lands in `total_dev`.
+
+        Three launches, whatever the range length: the flag-and-scan pass,
+        the scatter (which scans the block sums at its own head), and the
+        copy back. It was four until this lane folded the block-sums scan
+        into the scatter. The saving is a launch, not bytes: nothing about
+        what is read or written per row changed, and the copy back still
+        moves 8 bytes per row of the range that per-range ping-pong would
+        remove, which `_copy_back_kernel` writes up as a design and explains
+        why this lane did not build.
+
+        No timing is claimed. The stage profile that motivated the lane
+        attributes 17.7 percent of a 1M by 50 GPU round to partition on an
+        M4, of which an audit believes about half is fence attribution, and
+        puts partition's floor at a four-launch minimum of roughly 237
+        microseconds against a per-enqueue cost of roughly 20; that arithmetic
+        says a launch is worth removing, and it is also in tension with the
+        earlier finding recorded in the module docstring, that collapsing a
+        small range's four launches into one measured 1.00x. Both of those
+        are measurements this lane could not repeat and did not repeat. What
+        is asserted here is only that three launches now do what four did,
+        element for element.
+        """
         routing.check(self.n_features, self.n_bins)
         if window.begin < 0 or window.end > self.n_rows:
             raise Error("range escapes the row buffer")
@@ -1698,17 +2062,23 @@ struct GpuActiveRows(Movable):
             return
 
         var threads = self.block_threads
-        var blocks = (n + threads - 1) // threads
+        var grid = _partition_grid(n, threads, self.partition_block_cap)
+        var blocks = grid[0]
+        var tiles = grid[1]
+        # The copy back has no cross-block dependency, so it keeps the plain
+        # one-tile-per-block grid rather than the capped one the scan and the
+        # scatter share.
+        var copy_blocks = (n + threads - 1) // threads
         var cat = routing.cat_bitset
         var default_left = Int32(1) if routing.default_left else Int32(0)
         var is_cat = Int32(1) if routing.is_categorical else Int32(0)
 
-        # The two scan stages, on whichever arm is selected. The primitive
-        # kernels are instantiated per width, so the dispatch is an if-chain
-        # over the menu rather than a runtime block size; the whole chain
-        # sits inside a `comptime if has_accelerator()` because a build with
-        # no accelerator target has no warp size for `block.prefix_sum` to
-        # constrain against, and pruning the branch is what keeps those
+        # The flag pass and the scatter, on whichever arm is selected. The
+        # primitive kernels are instantiated per width, so the dispatch is an
+        # if-chain over the menu rather than a runtime block size; the whole
+        # chain sits inside a `comptime if has_accelerator()` because a build
+        # with no accelerator target has no warp size for `block.prefix_sum`
+        # to constrain against, and pruning the branch is what keeps those
         # instantiations out of a CPU-only extension build entirely.
         var scanned = False
         comptime if has_accelerator():
@@ -1716,19 +2086,19 @@ struct GpuActiveRows(Movable):
                 scanned = True
                 if threads == 128:
                     self._enqueue_scan_primitives[128](
-                        bins, window, routing, n, blocks
+                        bins, window, routing, n, blocks, tiles
                     )
                 elif threads == 256:
                     self._enqueue_scan_primitives[256](
-                        bins, window, routing, n, blocks
+                        bins, window, routing, n, blocks, tiles
                     )
                 elif threads == 512:
                     self._enqueue_scan_primitives[512](
-                        bins, window, routing, n, blocks
+                        bins, window, routing, n, blocks, tiles
                     )
                 elif threads == 1024:
                     self._enqueue_scan_primitives[1024](
-                        bins, window, routing, n, blocks
+                        bins, window, routing, n, blocks, tiles
                     )
                 else:
                     # `__init__` and `set_scan_primitives` both refuse to
@@ -1755,35 +2125,32 @@ struct GpuActiveRows(Movable):
                 cat[1],
                 cat[2],
                 cat[3],
+                Int32(tiles),
                 grid_dim=blocks,
                 block_dim=threads,
             )
-            self.ctx.enqueue_function[_scan_block_sums_kernel](
+            # Same width and the same tiling as the flag pass: the scatter
+            # looks its chunk up by `block_idx.x` and `tiles`, and the packed
+            # offsets it reads are chunk-relative.
+            self.ctx.enqueue_function[_scatter_kernel](
+                self.rows_dev.unsafe_ptr(),
+                self.scratch_dev.unsafe_ptr(),
+                self.offsets_dev.unsafe_ptr(),
                 self.block_sums_dev.unsafe_ptr(),
                 self.total_dev.unsafe_ptr(),
+                Int32(window.begin),
+                Int32(n),
+                Int32(tiles),
                 Int32(blocks),
-                grid_dim=1,
+                grid_dim=blocks,
                 block_dim=threads,
             )
-        # Same block size as the flag pass: the scatter looks its block
-        # offset up by `block_idx.x`.
-        self.ctx.enqueue_function[_scatter_kernel](
-            self.rows_dev.unsafe_ptr(),
-            self.scratch_dev.unsafe_ptr(),
-            self.offsets_dev.unsafe_ptr(),
-            self.block_sums_dev.unsafe_ptr(),
-            self.total_dev.unsafe_ptr(),
-            Int32(window.begin),
-            Int32(n),
-            grid_dim=blocks,
-            block_dim=threads,
-        )
         self.ctx.enqueue_function[_copy_back_kernel](
             self.rows_dev.unsafe_ptr(),
             self.scratch_dev.unsafe_ptr(),
             Int32(window.begin),
             Int32(n),
-            grid_dim=blocks,
+            grid_dim=copy_blocks,
             block_dim=threads,
         )
 
@@ -1796,18 +2163,23 @@ struct GpuActiveRows(Movable):
         routing: RowRouting,
         n: Int,
         blocks: Int,
+        tiles: Int,
     ) raises:
-        """The flag pass and the block-sum scan, on the primitive arm, at one
+        """The flag pass and the scatter, on the primitive arm, at one
         compile-time threadgroup width.
 
         Split out only so `enqueue_partition` can name the width once per
-        menu entry instead of repeating sixteen kernel arguments per entry.
+        menu entry instead of repeating seventeen kernel arguments per entry.
         `block_dim` is `width` and not `self.block_threads`: the two are equal
         wherever this is reached, and writing the compile-time one is what
         makes a mismatch between the parameter and the launch impossible to
-        introduce later. `grid_dim` is the caller's block count, computed
-        from `self.block_threads`, so the block count and therefore the
-        `block_sums_dev` footprint are exactly what the fallback arm uses.
+        introduce later. `grid_dim` and `tiles` are the caller's, computed
+        once by `_partition_grid` from `self.block_threads`, so the geometry
+        and therefore the `block_sums_dev` footprint are exactly what the
+        fallback arm uses. Passing the same pair to both kernels rather than
+        recomputing it in each is deliberate: the scatter's chunk arithmetic
+        has to be the flag pass's chunk arithmetic exactly, or a packed offset
+        would be read against the wrong chunk's block sum.
         """
         var cat = routing.cat_bitset
         var default_left = Int32(1) if routing.default_left else Int32(0)
@@ -1829,14 +2201,21 @@ struct GpuActiveRows(Movable):
             cat[1],
             cat[2],
             cat[3],
+            Int32(tiles),
             grid_dim=blocks,
             block_dim=width,
         )
-        self.ctx.enqueue_function[_scan_block_sums_prim_kernel[width]](
+        self.ctx.enqueue_function[_scatter_prim_kernel[width]](
+            self.rows_dev.unsafe_ptr(),
+            self.scratch_dev.unsafe_ptr(),
+            self.offsets_dev.unsafe_ptr(),
             self.block_sums_dev.unsafe_ptr(),
             self.total_dev.unsafe_ptr(),
+            Int32(window.begin),
+            Int32(n),
+            Int32(tiles),
             Int32(blocks),
-            grid_dim=1,
+            grid_dim=blocks,
             block_dim=width,
         )
 
