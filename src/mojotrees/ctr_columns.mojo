@@ -216,7 +216,7 @@ struct CtrDescription(Copyable, Movable):
         ctr_type: Int,
         var priors: List[Float64] = [],
         ctr_border_count: Int = DEFAULT_CTR_BORDER_COUNT,
-    ):
+    ) raises:
         """An empty `priors` takes `ctr.default_priors`, which is what
         `SetDefaultPriorsIfNeeded` (`catboost_options.cpp:1209`) does."""
         self.ctr_type = ctr_type

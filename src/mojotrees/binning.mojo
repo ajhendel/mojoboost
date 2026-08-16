@@ -2686,7 +2686,12 @@ struct BinMapper(Copyable, Movable):
                 return True
         return False
 
-    def matches(self, other: BinMapper) -> Bool:
+    # `raises` because the CTR comparison below walks two fitted table
+    # sets and indexes them, and `CtrTables.matches` is declared
+    # accordingly. All three callers -- model_editing._check_refit_dataset
+    # and external_memory.update_external{,_multiclass} -- are already
+    # raising, so this widens no contract.
+    def matches(self, other: BinMapper) raises -> Bool:
         """Whether two mappers bin every value the same way.
 
         Equality of the fitted binning, not of the objects: same features,
