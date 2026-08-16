@@ -219,3 +219,46 @@ One consequence for the shipping configuration specifically: the gradient-pair
 load is amortized over `GROUP` features, and the default `feature_group` is 1 at
 256 bins, so **item 2's share is largest exactly at the default and shrinks if
 anyone widens the group**.
+
+---
+
+## Registered re-test: when the hybrid scheduler may return
+
+The hybrid CPU/GPU leaf scheduler was deleted this round. Its premise was that
+the host could usefully take leaves the device was slow at, and the premise died
+when the device-resident plane beat the host path at every shape measured. That
+was the right call on the evidence, and it is registered here rather than closed,
+because the evidence can change and a deletion should not become an unexamined
+assumption.
+
+**The conditions under which it is re-tested, both required:**
+
+1. the device-owned tree plane is the default GPU plane, and
+2. the CPU backend's **serial** performance is within 1.2x of LightGBM's
+
+The second is the one that matters. The scheduler was built when our CPU was far
+enough behind that a CPU-assisted leaf was nearly always a bad trade. If the
+concurrent CPU campaign closes that gap, the arithmetic changes and the trade may
+become a good one at shapes where the GPU is underfilled.
+
+**The measurement, when those hold:** GPU alone against GPU with CPU-assisted
+leaves, at 250,000 and 1,000,000, interleaved, under M0. If the assisted arm wins
+outside the spread, the hybrid returns **as the default GPU mode** rather than as
+a double-opt-in path, which is what it was and part of why nobody measured it.
+
+`docs/design/HYBRID_TRAINING.md` keeps the full design and
+`bench/results/apple_m4_hybrid_costs_2026-08-14.md` and `-15.md` keep their
+measured coefficients, annotated as describing a removed path. Nothing has to be
+re-derived to run this; `phase_profile.mojo` still reports in the units those
+coefficients are stated in.
+
+## A note that binds K2, added when the accuracy policy was settled
+
+At 1,000,000 rows compute is roughly **60 percent of the run**, not the 22.9
+percent this project quoted for months from a 200,000-row capture. So K2's 964
+wasted builds per fit are a real fraction of a real cost, not a rounding error
+against a control-plane-dominated round.
+
+**K2's end-to-end condition therefore binds hard: the launch-shape gain must beat
+the wasted work in a whole fit, not in a phase.** A phase-level win that the fit
+does not show is the row-tile floor again.
