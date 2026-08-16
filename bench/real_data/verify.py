@@ -17,14 +17,22 @@ after it:
 4. Determinism. mojotrees trains bit-identically on a repeat, on the CPU
    and on the accelerator alike. Two repeats with different prediction
    digests fail even when every metric matches.
-5. The differential. mojotrees against LightGBM on the primary metric,
+5. Backend proof. A record that claims an accelerator has to carry
+   evidence from the trainer that one ran. This sits before the checks
+   below it because a mislabelled backend makes every one of them
+   meaningless while leaving all of them green: that is exactly what
+   happened to multiclass, where `trainset.train_dataset_multiclass`
+   resolved the device, discarded the answer, and trained on the CPU under
+   a `device_used="gpu"` label. Nothing here noticed. A human did, by
+   seeing that covertype's CPU and GPU records shared a prediction digest.
+6. The differential. mojotrees against LightGBM on the primary metric,
    in the direction and by the tolerance thresholds.json gives, plus a
    check that mojotrees is not implausibly better, which is what a
    mismatched problem looks like from the outside.
-6. The baseline floor. Each engine separately has to beat the trivial
+7. The baseline floor. Each engine separately has to beat the trivial
    model. Two engines that agree because both produced rubbish pass the
    differential check and fail here.
-7. Device agreement. mojotrees on the accelerator against mojotrees on the
+8. Device agreement. mojotrees on the accelerator against mojotrees on the
    CPU, compared row by row on the predictions themselves rather than on a
    summary of them.
 
@@ -42,6 +50,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import backend_proof  # noqa: E402
 import quality  # noqa: E402
 
 PASS, FAIL, WARN, SKIP = "pass", "fail", "warn", "skip"
@@ -199,6 +208,115 @@ def check_determinism(ok, config, verdict):
                 f"{len(digests)} distinct prediction digests across "
                 f"{len(group)} repeats: " + ", ".join(sorted(d[:12] for d in digests)),
             )
+
+
+def _device_of(record):
+    """The backend a record is being read as running on.
+
+    `device_used` when the engine reported one and the request otherwise,
+    which is the same rule every other check in this file uses. Both are
+    labels; the point of `check_backend_proof` is that neither is evidence.
+    """
+    return record.get("device_used") or record.get("device_requested")
+
+
+def check_backend_proof(ok, config, verdict):
+    """Refuse a device claim that nothing corroborates and that produced
+    the CPU arm's model byte for byte.
+
+    Three conditions, evaluated separately and named separately in every
+    message, because they mean three different things:
+
+    A. the record claims an accelerator. On its own this is a label the
+       Python side wrote, and the whole reason for this check.
+    B. no independent proof. Nothing the trainer emitted says a device
+       backend ran. See backend_proof.py for what counts and why.
+    C. the prediction digest equals a CPU arm's for the same scenario and
+       thread count. On its own this is suspicious, not wrong: two
+       backends can in principle produce one model, and mojotrees's device
+       histogram reduction is deliberately fixed point so that bit-exact
+       agreement is a reachable outcome rather than an impossible one.
+
+    Only the conjunction fails. Failing on C alone would gate out a real
+    integer-exact agreement, and failing on B alone would gate out every
+    run somebody chose not to instrument. Together they are the signature
+    of a CPU fit wearing a GPU label, which is the one shape none of the
+    other checks in this file can see.
+
+    C also warns on its own, every time, whether or not the other two
+    fire. Two backends landing on one digest is rare enough that the next
+    person should be told rather than left to compare two SHA-256s by eye,
+    which is how this was caught the first time and is not a method.
+    """
+    rule = config["defaults"].get("backend_proof") or {}
+    if not rule.get("require_for_device_claims", True):
+        return
+
+    cpu_digests = {}
+    for record in ok:
+        if record.get("engine") != "mojotrees":
+            continue
+        if _device_of(record) != "cpu":
+            continue
+        key = (record["scenario"], record["threads"])
+        cpu_digests.setdefault(key, set()).add(record.get("predictions_sha256"))
+
+    for record in ok:
+        if record.get("engine") != "mojotrees":
+            continue
+        device = _device_of(record)
+        if device == "cpu":
+            # A CPU row makes no device claim, so condition A never holds
+            # and there is nothing here to refuse.
+            continue
+
+        scope = f"{record['scenario']}/{device}/t{record['threads']}"
+        proved, reason = backend_proof.device_evidence(
+            record.get("backend_proof")
+        )
+        digest = record.get("predictions_sha256")
+        twin = cpu_digests.get((record["scenario"], record["threads"]), set())
+        hash_matches = bool(digest) and digest in twin
+
+        conditions = [f"A claims {device}"]
+        conditions.append(
+            f"B no independent proof ({reason})" if not proved
+            else f"B proof present ({reason})"
+        )
+        if hash_matches:
+            conditions.append(
+                f"C prediction digest {digest[:12]} equals the cpu arm's"
+            )
+        elif twin:
+            conditions.append("C digest differs from the cpu arm's")
+        else:
+            conditions.append("C no cpu arm to compare against")
+        detail = "; ".join(conditions)
+
+        if not proved and hash_matches:
+            verdict.add(
+                FAIL, "backend_proof", scope,
+                detail + ". A and B and C together are what a CPU fit "
+                "labelled as a device fit looks like from the outside, and "
+                "no other check in this file can tell the difference.",
+            )
+        elif not proved:
+            verdict.add(
+                WARN, "backend_proof", scope,
+                detail + ". The claim is uncorroborated. It is not refused "
+                "because the digest does not match the CPU arm's, which a "
+                "silent CPU fallback could not manage.",
+            )
+        elif hash_matches:
+            verdict.add(
+                WARN, "backend_proof", scope,
+                detail + ". Allowed: the trainer's own evidence says a "
+                "device backend ran, so this is two backends agreeing bit "
+                "for bit rather than one backend counted twice. Rare enough "
+                "to say out loud every time.",
+            )
+        else:
+            verdict.add(PASS, "backend_proof", scope, detail)
 
 
 def _representative(records):
@@ -394,6 +512,7 @@ def main(argv=None):
     broken |= check_data_agreement(ok, config, verdict)
     check_pinning(ok, config, verdict)
     check_determinism(ok, config, verdict)
+    check_backend_proof(ok, config, verdict)
     check_differential(ok, config, verdict, broken)
     check_baseline(ok, config, verdict)
     check_device_agreement(ok, config, verdict, run_dir)

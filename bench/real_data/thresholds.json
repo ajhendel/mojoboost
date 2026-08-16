@@ -45,6 +45,10 @@
       "primary_metric_relative": 0.005,
       "rationale": "The row bound is the tolerance the repository's own CPU-and-accelerator equivalence tests use for predictions, and it holds when both devices grow the same trees (the host split search guarantees that). The workload-aware AUTO strategy sends large shapes to the device split search, which trades exactly that guarantee: Float32 gain comparisons flip near-tie splits, so equally good trees can disagree on individual rows. verify.py therefore fails a row-bound breach only when the primary metric also leaves its band, and records it as a warning otherwise; the metric band is the gate that must hold in every configuration."
     },
+    "backend_proof": {
+      "require_for_device_claims": true,
+      "rationale": "A record that says it ran on an accelerator has to carry something the trainer emitted that only a device run can produce, because every other check in this file passes on a CPU fit wearing a GPU label. One did: trainset.train_dataset_multiclass resolved the device, discarded the answer, and trained on the CPU, and the covertype rows of 20260815T023123Z were quoted in three reviews as the project's worst GPU result while being CPU timings. The refusal is deliberately the conjunction of three conditions rather than any one of them. A missing proof alone is a run nobody instrumented, not a lie. A prediction digest matching the CPU arm's alone is not a lie either: the device histogram reduction is fixed point precisely so that bit-exact agreement between backends is reachable, and gating on the digest would forbid the property the trainer is built to have. Together they are the signature. Turning this off means accepting device timings on the strength of a label."
+    },
     "pinning": {
       "require_pinned_for_real_data": true,
       "rationale": "A real-data result from unverified bytes is a result about an unknown dataset. Synthetic runs are exempt because their recipe is the pin."

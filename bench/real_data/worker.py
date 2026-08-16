@@ -21,6 +21,12 @@ recipe, and each records a digest of what it built. The runner refuses to
 compare two records whose data digests differ, so "the two engines were
 given the same data" is checked rather than assumed.
 
+The same applies to the backend. `device_used` is a label the Python side
+resolved, so this module turns the trainer's own instrument on for exactly
+the measured fit and leaves the evidence on the process's stdout for
+run.py to read back into `backend_proof`. What that establishes, and what
+it does not, is backend_proof.py's docstring.
+
     python bench/real_data/worker.py --job job.json --out record.json
 """
 
@@ -46,6 +52,7 @@ _REPO_PYTHON = os.path.join(
 if os.path.isdir(_REPO_PYTHON) and _REPO_PYTHON not in sys.path:
     sys.path.insert(1, _REPO_PYTHON)
 
+import backend_proof  # noqa: E402
 import engines  # noqa: E402
 import envinfo  # noqa: E402
 import generators  # noqa: E402
@@ -169,7 +176,22 @@ def run_job(job):
     engine = engines.build(job["engine"], job["threads"], job["device"])
     engine.load()
     warmup = engine.warmup(spec)
-    result = engine.run(spec, train, test, repeats=job.get("predict_repeats", 3))
+    # The trainer's own instrument, on for the measured fit and off for
+    # everything around it. Off for the warm-up above deliberately: the
+    # warm-up fits one round on a tiny matrix through the same entry point,
+    # so a block from it would be evidence about a shape nobody measured,
+    # and evidence about the wrong shape is how a proof stops proving
+    # anything. See backend_proof.py for what the blocks establish, what
+    # they do not, and what the instrument costs.
+    want_proof = job.get("backend_proof", True)
+    previous_profile = backend_proof.enable() if want_proof else None
+    try:
+        result = engine.run(
+            spec, train, test, repeats=job.get("predict_repeats", 3)
+        )
+    finally:
+        if want_proof:
+            backend_proof.restore(previous_profile)
     predictions = result.pop("predictions")
     # The engine's own dicts, not a second call to the translators. Each
     # adapter adds to the translated dict after it gets it, and rebuilding
@@ -214,6 +236,11 @@ def run_job(job):
         "baseline_quality": baseline,
         "predictions_sha256": measure.digest(predictions),
         "predictions_shape": list(np.asarray(predictions).shape),
+        # Placeholder until run.py, which owns the worker's stdout, fills
+        # in what the trainer printed. Never omitted, so a record that was
+        # not run under run.py says why it has no proof instead of looking
+        # like a run whose proof came back empty.
+        "backend_proof": backend_proof.pending(want_proof),
         "warmup": warmup.as_dict(),
         **{k: v for k, v in result.items() if k != "notes"},
     }
