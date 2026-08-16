@@ -558,9 +558,26 @@ def _assert_matches(snap: TreeTablesSnapshot, host_ref: _RefTree) raises:
 
 
 def test_the_gate_is_off_unless_it_is_set_to_one() raises:
-    """Default off, and off for anything but the exact string "1". Nothing
-    in the package consults this yet, which is the point: the switch is
-    agreed before the wiring rather than after it."""
+    """`tree_resident_requested` is off for anything but the exact string
+    "1" -- and it is **no longer the gate**.
+
+    Read this before trusting it. When it was written, "nothing in the
+    package consults this yet" was the point: the switch was agreed before
+    the wiring. The wiring arrived in `gpu_resident_round.mojo`, and it
+    declared its own predicate rather than importing this one. On 2026-08-16
+    that predicate's default flipped: `resident_round_enabled` is now
+    `MOJOTREES_GPU_TREE_RESIDENT != "0"`, on by default, on the S1 evidence
+    in `bench/results/session3_2026-08-16/RESULTS.md`.
+
+    This one did not flip, because nothing calls it and so nothing broke.
+    That is the hazard, not the reassurance: two predicates now read one
+    variable and disagree about its default, and this assertion passes
+    either way. It is left standing, and this docstring rewritten, so the
+    next reader finds the divergence here rather than in a fit that took the
+    wrong plane. `tests/test_gpu_resident_gate.mojo` asserts the live
+    polarity; the fix here is deletion, and it belongs to whoever next owns
+    `gpu_tree_tables.mojo`.
+    """
     assert_false(tree_resident_requested())
 
 
