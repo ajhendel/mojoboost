@@ -1377,6 +1377,31 @@ since integer accumulation cannot absorb an addend.
 > No CPU lane has implemented this and none should without reading the four
 > corrections immediately below.
 
+### Both worked examples below were computed at `lambda_l2 = 1`, and the default is becoming 0
+
+This section's algebra was written when mojotrees defaulted `lambda_l2` to
+1.0. That default is being changed to **0.0** to match LightGBM stock, so the
+two worked expressions have degenerate forms that a reader will otherwise
+have to derive:
+
+- **The split-tie correction term**, `lambda_l2 * G^2 / ((H + 2*lambda_l2) *
+  (H + lambda_l2))`, carries `lambda_l2` as a factor of its numerator, so at
+  `lambda_l2 = 0` it is **identically zero**. The cross form and the shipped
+  form then agree exactly on that term rather than differing by it.
+- **The many-versus-many categorical offset**, `G^2 (2a - lambda_l2) / (S (H
+  + lambda_l2))` with `a = cat_l2`, collapses to `2 * cat_l2 * G^2 / (S * H)`.
+  Note the `G^2` survives; a shorthand of this that drops it is wrong.
+
+**The conclusions of this section are unchanged.** Both terms get smaller or
+vanish at `lambda_l2 = 0`, which does not reverse any comparison the section
+makes. What changes is that the numbers quoted alongside them describe a
+configuration this project is about to stop shipping, and a stale number that
+still reads as current is the failure mode this document exists to prevent.
+
+**`GAIN_FORM_CROSS` is unaffected.** Its refusal is keyed on `lambda_l1`, not
+`lambda_l2`, so nothing about the L1 warning at the top of this section needs
+re-checking against the new default.
+
 ### Four corrections to this section, from the campaign that implemented it
 
 Reported by the GPU campaign after building the arm. **Recorded here rather
