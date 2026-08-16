@@ -1172,3 +1172,117 @@ is in the tree to make that a one-line change.
 Taken at load 8.63 -- a busy box -- which the ratio design tolerates and the
 absolute milliseconds do not. The three medians are not quotable as kernel
 timings; only the ratios between them are.
+
+---
+
+## The histogram decomposition: GATHER-BOUND, and it redirects the next lane
+
+Four arms, one kernel instantiation, identical grid and threadgroup footprint,
+interleaved in one process. 1,000,000 x 50, 256 bins, 15 repeats.
+
+| arm | median | band |
+|---|---|---|
+| full | 6.352 ms | 8.2% |
+| no_atomics | 5.344 ms | 10.2% |
+| no_gather | 2.752 ms | 8.9% |
+| empty | 0.984 ms | **115.8%** |
+
+| component | fraction |
+|---|---|
+| **gather** | **56.7%** |
+| atomics | 15.9% |
+| launch | 15.5% |
+| unattributed residual | 12.0% |
+
+**The gather is the histogram phase.** Every kernel lane this wave aimed at
+something else: K1 at index width and load width, K3 and the bin-layout lane at
+addressing, atomic-halving at the atomics. The two that measured their own
+estimates down did so because they were bounded by a quantity nobody had
+measured -- and it turns out the binding quantity was neither of the two they
+suspected.
+
+**So the next kernel lane is `ellpack-bins`** -- device bit-packed bins at
+`ceil(log2(n_bins))` per feature -- **and packed or Float16 gradient staging.**
+Both attack bytes fetched per visit, which is what 56.7 percent says the kernel
+is spending its time on.
+
+### Three caveats, and the third is a warning
+
+**The empty arm is unusable at this reading.** A 115.8 percent band against a
+15.5 percent fraction: the launch figure is not a number, and its "resolved"
+verdict is an artifact of comparing against the *other* arm's band. Do not quote
+launch-bound or launch-not-bound from this run.
+
+**The atomic fraction moved between windows**: 9.8 percent measured earlier at
+load 2.14, 15.9 percent here at load 16.5, from the same arm unchanged. Both are
+lower bounds and neither is wrong, but a ratio inside one process was expected to
+be more robust than that. Worth re-taking both on a quiet box before either is
+built against.
+
+**250,000 and 50,000 produced no output at all**, at load 21. Not a null -- a
+failed run. The shape-dependence question ("if the fraction rises as rows fall,
+the atomics are contention-bound") is still open and needs a quiet box.
+
+## trip-count: the ~10 target is NOT reachable, and the lane proved why
+
+The premise was that the scale could be computed on device so the host never
+reads it. **It cannot**, and the reason is not plumbing.
+
+The host needs the scale's *value* in three places. Two are mechanical -- a
+launch argument to nine kernels, a staged table for two more. The third is
+`Float32(1.0 / g_scale)` packed into the split searcher's parameter block, and
+**the gain `G^2/(H+lambda)` and the leaf value `-G/(H+lambda)` are not homogeneous
+in the scale, because `lambda` is not scaled.** A searcher told the scale is 1.0
+computes a different gain and picks a different split.
+
+The obvious dodge -- pre-scale the gradients on device, which is exact for a
+power-of-two scale, and hand every kernel 1.0 -- **fails on exactly that third
+site.** So the host has to know the number, and the only lever left is *how
+often* it asks.
+
+What shipped instead is `set_scale_refresh(N, H)`: the magnitudes are still
+reduced every round into their own slot of a pinned window, and only the readback
+is deferred. **200 trips becomes 114 at N=8 and 103 at N=64**, not 10. And the
+amortization is *verifiable* rather than assumed -- every round under an outgoing
+scale is checked against `sum|v| * s <= 2^30` and a violation **raises**. A stale
+scale can end a fit loudly; it cannot corrupt one silently.
+
+Honest value, from the lane: this halves at most one of the two trips, ~0.046
+seconds of a 2.58 second fit, which M0 does not resolve. **The default stays 1.**
+
+### And the second half was blocked by a fact, not by ownership
+
+Downloading trees every N rounds needs `update_raw_device`, which is **not**
+device-sourced: it reads a segment table the host builds from `tree.value` and
+from the host leaf-range mirror, correct only because `_publish_row_ranges`
+replays the downloaded commit order onto it. The rule for N is recorded anyway so
+the owning lane need not re-derive it: `N = min(requested_N, early_stopping_
+rounds)`, because at `N <= patience` the stop is up to N-1 rounds late but the
+model is identical, and at `N > patience` the loop can pass the stopping point --
+a silently defeated stop, worse than no change.
+
+## launch-fusion: 308 command buffers per tree, now 278
+
+The docstring's "on the order of 306" was an estimate. **The number is 308**, and
+its "eleven launches a step when armed" was counting itemized lines rather than
+launches -- the armed step is 18.
+
+One fusion shipped: the partition's copy-back and the child build's slot-zeroing,
+which are **disjoint in memory** -- one writes `rows_dev` reading `scratch_dev`,
+the other writes a histogram pool slot -- so there was no ordering between them
+for a launch boundary to be providing. 30 fewer command buffers per tree, ~3,000
+per fit, **all taken from the stretch past the 64-deep queue's knee** where
+enqueue costs roughly double.
+
+The pairing is **enforced rather than documented**: a deferred copy-back is a
+debt, and four entry points raise while one is outstanding.
+
+Six adjacencies were found and left, each with its reason. The load-bearing ones
+need a device-wide barrier a fused kernel cannot provide. Three are only
+sequenced and were left on ownership -- the largest is `_copy_records_kernel` at
+step k into `_pick_and_commit_kernel` at step k+1, both `grid_dim=1`.
+
+**And ping-pong instead of copy-back is not available**, for a reason that is
+new: the descriptor decides *at run time* whether the partition happened, so a
+host-side buffer swap cannot be conditioned on it and a dead step would swap in
+stale scratch.
