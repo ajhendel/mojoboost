@@ -55,6 +55,16 @@ section is the authority and this line is the bug.
       `PATH`, and its output is saved.
 - [ ] **G6.** `SHA256SUMS` written, and verified in a second command rather
       than trusted from the first. Section 8.1.
+- [ ] **G7.** The wheel is compiled for the baseline CPU, not for the build
+      machine's. `python3 packaging/isa_baseline.py python/dist/*.whl` green,
+      and the build log shows `target: baseline (--target-cpu apple-m1)` rather
+      than `target: native`. This is not covered by G3: `mojo build` defaults
+      `--target-cpu` to the host, the release runner is a self-hosted M4 whose
+      feature set includes `+bf16`, `+i8mm` and `+sme2`, and no Mach-O header
+      records any of it, so `validate_artifact.py` and `inspect_wheel.py`'s C1
+      and C2 all pass a wheel that will SIGILL on an M1. `packaging/build_target.sh`
+      is the fix and this is the check. Exit status 2 means the check could not
+      run, which is not a pass.
 
 ## H. Publish
 

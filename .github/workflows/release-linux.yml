@@ -190,6 +190,13 @@ jobs:
 
       - name: Build the wheel
         env:
+          # Stated rather than relied on; packaging/build_target.sh already
+          # defaults to `baseline`. It resolves to --target-cpu x86-64-v2 on
+          # x86_64 and to --target-cpu generic --target-features +lse on
+          # aarch64. Without it, this job's product depends on which of
+          # GitHub's mixed Intel/AMD (and Neoverse) runners it landed on, and
+          # nothing in the wheel records which that was.
+          MOJOTREES_BUILD_TARGET: baseline
           MOJOTREES_TAG_POLICY: ${{ inputs.tag_policy }}
           MOJOTREES_MANYLINUX: ${{ inputs.manylinux_floor }}
         run: pixi run -e pkg packaging/linux/build_wheel_linux.sh

@@ -27,6 +27,8 @@ Related, and owned elsewhere:
 | [`packaging/matrix/smoke/clean_install_linux.sh`](../matrix/smoke/clean_install_linux.sh) | The clean-install acceptance fixture. This directory produces the wheel it is waiting for |
 | [`packaging/matrix/validate_artifact.py`](../matrix/validate_artifact.py) | Matrix conformance for a built wheel. Its ELF branch is a byte scan and says so; `inspect_wheel.py` here is the dynamic-section parse it defers to |
 | [`packaging/build_wheel.sh`](../build_wheel.sh) | The macOS builder. Not portable, see below |
+| [`packaging/build_target.sh`](../build_target.sh) | Which CPU the extension is compiled for. `mojo build` defaults `--target-cpu` to the **host**, so without this the product of a Linux release job depends on which of GitHub's mixed Intel/AMD (and Neoverse) runners it landed on. Resolves to `--target-cpu x86-64-v2` on x86_64 and `--target-cpu generic --target-features +lse` on aarch64. That file justifies both, and states what a baseline costs |
+| [`packaging/isa_baseline.py`](../isa_baseline.py) | The check that the pin held: disassembles and refuses an object containing post-baseline instructions. `build_wheel_linux.sh` runs it on the freshly built extension rather than `inspect_wheel.py` running it on the wheel, because it needs `objdump` and `inspect_wheel.py` is deliberately stdlib-only so a Linux wheel can be examined from a macOS laptop |
 | [`.github/workflows/release-linux.yml`](../../.github/workflows/release-linux.yml) | The manual release workflow that drives everything here |
 
 ## Two different things, one of which exists

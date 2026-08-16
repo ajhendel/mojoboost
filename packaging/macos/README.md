@@ -67,7 +67,7 @@ declared, is the architecture right, is the deployment target no newer than the
 tag claims, is everything signed, is every `@rpath` dependency bundled. Those
 rules stand and are not re-implemented.
 
-The release adds four questions that a matrix check does not ask.
+The release adds five questions that a matrix check does not ask.
 
 1. **Is the platform tag exactly right, rather than merely not-a-lie?**
    `validate_artifact.py` rule R5b passes when the extension's `minos` is *at or
@@ -85,6 +85,18 @@ The release adds four questions that a matrix check does not ask.
 4. **Is anything from the source tree in the artifact?** Caches, test data,
    scratch files, and secret-shaped strings, across every member of the zip
    rather than only the Mach-O objects.
+5. **Was this compiled for a CPU the tag does not promise?** (C14, added
+   2026-08-16.) `mojo build` defaults `--target-cpu` to the **host**, and both
+   release workflows build on a self-hosted M4, whose feature set includes
+   `+bf16`, `+i8mm` and `+sme2`. An M1 has none of the three; an M2 or M3 has no
+   `+sme2`. Nothing in Mach-O records this: arm64 `cpusubtype` stays
+   `ARM64_ALL` whatever `-mcpu` was passed, and there is no load command for the
+   feature set, so **the header of a native wheel and the header of a portable
+   one are identical** and every other rule above passes both. The check
+   disassembles, in [`packaging/isa_baseline.py`](../isa_baseline.py), and the
+   fix when it fires is [`packaging/build_target.sh`](../build_target.sh)
+   rather than anything in this directory. Read that file for the baselines and
+   for the honest statement of what pinning one costs.
 
 ## Code signing and notarization
 
