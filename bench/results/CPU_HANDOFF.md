@@ -1,10 +1,34 @@
 # CPU orchestrator handoff
 
-Written 2026-08-16, updated after the window. Branch `cpu-round-2`, based on
-`perf-round-2` at `901e31d` where wave 4 is merged. Suite was green at 72/72
-on the wave-4 base; it has NOT been re-run since the merge into
-`perf-round-2`, which brought in the GPU campaign's work. Read `LANE_RULES.md` and `PROFILE_PROTOCOL.md` (sections C0 through
-C9) first; this file is only state, not policy.
+Written 2026-08-16, updated after the window and again after the directive
+below. Branch `cpu-round-2`, based on `perf-round-2` at `901e31d`. Read
+`LANE_RULES.md` and `PROFILE_PROTOCOL.md` (C0 through C9) first; this file is
+only state, not policy.
+
+## THE DIRECTIVE THAT SUPERSEDES THE MEASUREMENT SECTIONS BELOW
+
+Andrew, 2026-08-16, after the window: **no more speed tests until the feature
+work is done.** Head against `e8c0877` and the phase profile are **cancelled**
+(the `MOJOTREES_BENCH_LAMBDA_L2` glue written for the first was reverted
+unbuilt rather than shipped unverified). **No full suite runs**: local tests
+on touched files, merge as they pass, this is alpha. Report merged/blocked
+only. **One comparison run happens at the end**, both backends, LightGBM
+stock+det and CatBoost side by side.
+
+The box is released and the lock is deleted. Everything in this file about
+canaries, plateaus and anchor normalization is still true and is still how the
+final run must be taken; it is simply not what anyone should be doing now.
+
+## Suite state, and it is the last suite run
+
+`perf-round-2` at `c8ed5b2`, **119 test files, 118 pass**. The merge brought
+the GPU campaign's tests in, which is why it is 119 and not 72.
+
+**`test_gpu_objectives` FAILS.** Relayed to f9 with the list of what I merged;
+`test_gpu_objectives_native` passes beside it, as do every other GPU file
+including `test_gpu_training`, `test_gpu_tree_resident` and `test_host_replica`,
+so it is one file rather than the device path. Log at
+`scratchpad/suite-c8ed5b2.log`. Not mine and not touched.
 
 ## Merged into cpu-round-1
 
@@ -134,10 +158,64 @@ whole path when it reports: accepted-and-dropped is worse than rejected, and
    boosting stays a design note, since CatBoost itself defaults to Plain
    above about 50k rows.
 
-## Out with lanes right now
+## The CatBoost set, against Andrew's list
 
-`canonical-naming`, `score-function`, `derivative-precision-wiring`,
-`mvs-bootstrap`. All four branched off `perf-round-2` at `901e31d`.
+DONE and merged: oblivious CPU (**but unreachable, see above**), Bayesian
+bootstrap, `leaf_estimation_iterations`, Cosine score (`9b1f4da`, and it is a
+**provable no-op at stock** -- see below), MVS (`9e2d73e`), and the harness
+(defaults row, matched-trees-and-lr row, Lossguide row `ca33ebc`, iterations
+and lr structural on every row through `CATBOOST_MATCHED`).
+
+OUT WITH LANES: `canonical-naming` (wiring `docs/PARAMETER_NAMING.md`,
+aliases included, `subsample < 1` implies `subsample_freq = 1`),
+`derivative-precision-wiring` (now on the sparse/distributed no-op, then the
+objective half), `auto-learning-rate`, `langevin-model-shrink`,
+`catboost-quantization` (border quantization plus `one_hot_max_size`).
+
+NOT REPORTED: `lane/ordered-ts`. CTR feature combinations under
+`max_ctr_complexity` follow it to the same owner.
+
+### Cosine is zero at our settings, by derivation
+
+Worth stating plainly so nobody spends a run on it. Cosine's numerator IS the
+L2 sum, `sum G^2/(H+lambda)`; its denominator is
+`sum G^2*H/(H+lambda)^2`. At `lambda = 0` those are the **same expression**,
+so Cosine is `sqrt(L2)`, `sqrt` is strictly increasing, and the argmax cannot
+move. `lambda_l2` is 0 stock as of this round. The admission test is
+unaffected too, since `num > parent` iff `sqrt(num) > sqrt(parent)`.
+
+The one arm where it bites at stock is **leaf-wise** growth, where the queue
+compares gains from different parents and `sqrt(a)-sqrt(p)` genuinely reorders
+against `a-p`. That arm needs the cross-lane wiring in
+`tree_parameters_extra.mojo` and `tree.mojo` and is untested. If anyone ever
+gates Cosine on real data, that is the arm to run, not depth-wise.
+
+Also settled: the widely-repeated "Lossguide defaults to NewtonL2" sits inside
+`if (TaskType == GPU)`. On CPU it is unreachable and NewtonL2 would be refused
+by `CB_ENSURE` anyway. Cosine is the CPU default for **every** grow policy.
+
+## Glue held, waiting on `canonical-naming`
+
+Three items, all blocked on the same lane because it owns the parameter-name
+surface. Ready to apply the moment it lands:
+
+1. **MVS reachability.** Two hunks in `canonical_bootstrap_type` (split `mvs`
+   out of the not-implemented raise) and one key, `mvs_reg`, in
+   `sampling_param_names` and `canonical_sampling_param`. No `mvs_seed`: it
+   reuses `bootstrap_seed`.
+2. **`symmetrictree` in `_GROW_POLICIES`**, which is what makes the merged
+   oblivious policy reachable at all.
+3. **`subsample` is ONE key, not two.** The spec renames `bagging_fraction`
+   to `subsample` and MVS reads the same key. CatBoost has exactly one
+   `subsample` and which sampler consumes it depends on `bootstrap_type`, so
+   the collision is correct behavior -- but only if both wire to the one
+   shared key. The MVS lane deliberately added no `subsample` entry so
+   nothing pre-empts the decision.
+
+Also owed from the score-function lane, and NOT blocked on naming: a
+`score_function` field on `ExtraTreeParams` and a pass-through in `tree.mojo`
+to both `find_best_split` and `find_best_split_shared`. Without it Cosine is
+reachable only from its own test.
 
 **`src/mojotrees/sampling.mojo` has two lanes in it and the split is a
 ruling, not a convention.** `canonical-naming` holds
