@@ -315,5 +315,30 @@ def test_forced_on_ignores_the_budget() raises:
     _clear_env()
 
 
+def test_scoring_opt_out_beats_the_policy() raises:
+    """`build_view=False` refuses the view whatever the environment says.
+
+    This is the escape hatch for a matrix that will be scored and never
+    histogrammed, and it has to beat an explicit `MOJOTREES_CPU_ROW_MAJOR=1`,
+    not merely the default: a user who forced the layout on for training did
+    not thereby ask a `predict` call to allocate a second copy of its input.
+    """
+    var n_rows = 256
+    var n_features = 4
+    var features = _features(n_rows, n_features)
+    var mapper = fit_bins(features, n_rows, n_features, 255)
+    _clear_env()
+    _ = setenv("MOJOTREES_CPU_ROW_MAJOR", "1")
+    var scoring = mapper.transform(features, n_rows, False)
+    assert_true(
+        not scoring.has_row_major(), "the scoring opt-out built a view anyway"
+    )
+    assert_equal(scoring.row_major_bytes(), 0, "the opt-out allocated bytes")
+    # Same mapper, same matrix, same environment, without the opt-out.
+    var training = mapper.transform(features, n_rows)
+    assert_true(training.has_row_major(), "the default stopped building")
+    _clear_env()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

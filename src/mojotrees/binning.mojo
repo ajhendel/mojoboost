@@ -2513,14 +2513,31 @@ struct BinMapper(Copyable, Movable):
     def transform[
         features_origin: ImmOrigin, //
     ](
-        self, features: Span[Float64, features_origin], n_rows: Int
+        self,
+        features: Span[Float64, features_origin],
+        n_rows: Int,
+        build_view: Bool = True,
     ) raises -> BinnedMatrix:
         """Bin a column-major feature matrix (`features[f * n_rows + r]`).
 
         `features` is a borrowed view, so a caller holding the matrix
         somewhere other than a Mojo `List` -- the Python bindings hold
         NumPy's own buffer -- bins it in place instead of copying it first.
-        A `List` converts implicitly, so passing one still works."""
+        A `List` converts implicitly, so passing one still works.
+
+        `build_view=False` is the opt-out for a matrix that will be **scored
+        and not histogrammed**: a prediction input, a validation set, a
+        `predict_contrib` call. The row-major view is read by exactly one
+        thing, `histogram.build_histogram_subset_row_major*`, so a matrix that
+        never reaches a histogram builder pays a transpose pass and a second
+        copy of its bin ids for nothing -- and the copy is the same doubling
+        that `ROW_MAJOR_DEFAULT_BUDGET_MB` exists to bound, arriving on a code
+        path the user did not think of as a fit. The default is `True`,
+        meaning "apply the environment policy", because a call site that omits
+        it is more likely to be a fit than a predict; the predict-side call
+        sites that should pass `False` are named in the lane report rather
+        than edited here, because they live in files this lane does not own.
+        """
         if len(features) != n_rows * self.n_features:
             raise Error("features length must equal n_rows * n_features")
         var n_features = self.n_features
@@ -2636,7 +2653,7 @@ struct BinMapper(Copyable, Movable):
         # histograms actually read is a *separate* decision made once per fit
         # by `histogram.choose_bin_layout_timed`; building it only makes both
         # arms runnable.
-        var mode = env_row_major_mode()
+        var mode = ROW_MAJOR_OFF if not build_view else env_row_major_mode()
         if mode == ROW_MAJOR_ON:
             out.build_row_major(0)
         elif mode == ROW_MAJOR_AUTO:
