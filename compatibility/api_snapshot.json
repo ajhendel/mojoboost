@@ -1031,6 +1031,7 @@
       "path_smooth",
       "extra_trees",
       "extra_seed",
+      "random_strength",
       "monotone_penalty",
       "monotone_constraints_method",
       "cegb_tradeoff",
