@@ -223,6 +223,117 @@ else. They remain useful for a factor-of-two question and are useless for a
 few-percent one. Use the interleaved arm below for anything narrower than the
 machine's drift.
 
+## The regime canary
+
+Every figure in this file is a time, and this machine's times drift by
+factors of two and three between windows. Worse, **effect sizes move with
+the window and not only levels**: the device-resident tree plane measured 24
+percent in a fast window and 8 percent in a slow one, both resolved and both
+correct, and the histogram row unroll came out *indistinguishable* in one
+window and *resolved* in another from the same command and the same code
+(`results/session3_2026-08-16/RESULTS.md`).
+
+Until now nothing measured the window. `apple/thermal_capture.sh` prints a
+plan and refuses `--execute` with exit code 3, so the protocol step that told
+every session to capture thermal state with it was never followable;
+`pmset -g therm` returns nothing useful on Apple silicon; and the A1
+replacement (`uptime` plus the top processes) has a hole Session III walked
+into, which is that the slow window showed a **quiet box and slow results at
+the same time**. Every regime label in this repository was therefore inferred
+by hand from effect sizes, and one such attribution was made and retracted the
+same night.
+
+`canary.mojo` is the instrument that was missing. Two fixed probes:
+
+- **CPU probe.** A serial splitmix64 mixing chain, `2^26` rounds, one thread.
+  Serial so it cannot vectorize or overlap, which makes its wall time a
+  function of core clock and essentially nothing else; one thread so core
+  availability and other processes cannot move it. It measures clock in
+  isolation, deliberately, and its blind spot -- a window where the memory
+  system throttles but the core clock holds -- is stated in the source rather
+  than argued away.
+- **GPU probe.** A quarter of a million threads each running a serial 32-bit
+  mixing chain, four launches, one synchronization, **no copy back** (on Metal
+  every `enqueue_copy` is a synchronous full-queue drain, so a probe that read
+  its results back would be timing a transfer). The grid saturates, unlike the
+  CPU probe which isolates, because Apple GPU throttling presents as a
+  device-wide clock reduction and the GPU is not shared with the OS during a
+  session the way cores are. **Device open is excluded** and reported beside
+  it as `gpu_open_ms_excluded`; including it would make the start-of-session
+  reading structurally higher than the end-of-session one and would fire the
+  drift alarm on every single run.
+
+Neither probe calls into `src/mojotrees/`, touches a dataset, or reads any
+knob a session varies. That is the requirement, not an accident: a probe that
+went through the training code would move when another lane landed a kernel
+optimization, and a code change would become indistinguishable from a regime
+change -- the exact confusion the canary exists to end.
+
+The two are **reported separately and never averaged**. Session III measured
+ten CPU cores degrading by a factor of 2.2 in a window where the GPU arm
+degraded by 1.5; a single-engine canary would have mislabelled that window and
+an average would have reported 1.85, describing neither engine.
+
+`bench_train_gpu.mojo` runs the canary **first and last** in every run and
+prints `canary_cpu_ratio` and `canary_gpu_ratio` (reading over baseline; 1.0
+is the baseline window, larger is slower) alongside the raw milliseconds, and
+adds a `canary` object to the `json_summary` record. Running it first and last
+is the part that would have caught the six-pair sequence that straddled a
+regime change: when the two readings differ by more than 5 percent the output
+says in capitals that **the arms in between were not all taken on the same
+machine**, which is a stronger statement than "the box was slow", because a
+slow but stable session still yields valid A/Bs and a session that moved
+underneath its own arms does not. The 5 percent is **chosen, not measured** --
+the smallest effect this repository has ever resolved was 10.8 percent.
+
+### The baselines are not recorded yet, on purpose
+
+`canary_baseline.json` ships with `cpu_ms` and `gpu_ms` null. The mechanism
+handles that by printing raw milliseconds and `canary_cpu_ratio: unavailable`,
+which is the designed behavior and not a degraded one. Do not fill them in
+with an estimate or a figure that looks about right: a fabricated baseline in
+a regime detector does not fail loudly, it silently mislabels every session
+afterwards, in a form that reads as data. Having no detector is better.
+
+Establish them on a box that is verifiably quiet -- no lane, build, agent, or
+compile running, per `results/SESSION_QUEUE.md` -- with
+
+```sh
+pixi run mojo run -I src bench/bench_canary.mojo 7
+```
+
+The long form is deliberate for now: the lane that wrote this was scoped to
+`bench/` and could not add a `bench-canary` task to `pixi.toml`, so
+`check-pixi` reports it as an unwired benchmark. Registering
+`bench-canary = "mojo run -I src bench/bench_canary.mojo"` is a one-line change
+whenever somebody owns that file.
+
+That prints per-repeat samples, the minimum and the spread for each probe, and
+a ready-to-paste file body with `FILL-IN` markers for the date, the toolchain,
+the machine, and the evidence that the box was quiet. It refuses to write the
+file itself, because those four fields are the difference between a measured
+baseline and a number and the program cannot attest to any of them. If the
+repeats disagree by more than 3 percent it says so: the window was not quiet
+and the baseline must not come from it.
+
+The same command with no baseline recorded is also how you ask what regime the
+machine is in right now, in under a second, without a training run.
+
+Two caveats on the constants. `CPU_PROBE_ROUNDS` and the GPU grid were sized
+from an **estimate** -- a nominal 4.4 GHz and published instruction latencies
+-- and **have never been timed**, so whoever calibrates first is also the
+first to learn whether the estimate was any good; `bench_canary.mojo` checks
+the reading against that estimate and says what to do if it is far off. And
+any change to a probe constant must bump `CANARY_PROBE_VERSION` in the same
+commit, which invalidates the baseline loudly instead of leaving a stale
+denominator quietly dividing two different amounts of work.
+
+`MOJOTREES_CANARY=0` turns the canary off, for the one case that needs it:
+reproducing a run recorded before the canary existed, since opening a device
+for the canary shifts some one-time GPU setup out of the first GPU repeat. The
+off state is printed and lands in the JSON record, so it is a declared
+condition rather than a silent one.
+
 ## Interleaved LightGBM arm
 
 `lightgbm` is an arm of `bench_train_gpu.mojo` like `cpu` and `gpu-device`

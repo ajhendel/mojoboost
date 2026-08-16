@@ -56,6 +56,7 @@ check-gates = "bash tools/check_gates.sh"
 install-hooks = "bash tools/install_hooks.sh"
 
 bench = "mojo run -I src bench/bench_train.mojo"
+bench-canary = "mojo run -I src bench/bench_canary.mojo"
 bench-hist = "mojo run -I src bench/bench_histogram.mojo"
 bench-hist-scaling = "mojo run -I src bench/bench_histogram_scaling.mojo"
 bench-train-gpu = "mojo run -I src bench/bench_train_gpu.mojo"

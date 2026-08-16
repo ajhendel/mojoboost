@@ -823,3 +823,55 @@ within an hour of the data arriving.
 The failure mode to watch is not strictness, it is **inherited instructions that
 nobody executes**. A1 was one. Anything in this file that has never actually been
 run should be treated as suspect until someone runs it.
+
+## A5. The regime now has an instrument, and it is not calibrated yet
+
+A1 replaced an unfollowable instruction with a followable one and was honest
+that the replacement is weak: `uptime` and the top processes did not, and could
+not, catch the Session III slow window, which showed a **quiet box and slow
+results at the same time**. A3 then made regime part of every result. Between
+them the protocol requires a label it has no way to read, so every regime label
+in this repository is inferred by hand from effect sizes -- an inference that
+was made and retracted the same night.
+
+`bench/canary.mojo` is the instrument. Two fixed probes, a single-threaded CPU
+mixing chain and a saturating GPU kernel, neither of which touches
+`src/mojotrees/`, a dataset, a thread count, or anything else a session varies.
+`bench/bench_train_gpu.mojo` runs both **first and last** in every run and
+reports `canary_cpu_ratio` and `canary_gpu_ratio` against a recorded baseline,
+plus the raw milliseconds, plus a `canary` object on the `json_summary` record.
+The two engines are reported separately and never averaged, because Session III
+measured the CPU degrading by 2.2 in a window where the GPU degraded by 1.5.
+
+**Three rules follow, and they take effect the moment a baseline exists.**
+
+- **A results header states `canary_cpu_ratio` and `canary_gpu_ratio`, or
+  states that no baseline was recorded.** A regime named without one is an
+  inference from effect and is labelled as such, exactly as A1 requires today.
+- **A run whose canary reports `SHIFTED-DURING-SESSION` is discarded, not
+  corrected.** This is C8's existing rule with the straddle now detectable
+  instead of noticed afterwards. The threshold is 5 percent of the smaller
+  reading, which is **chosen and not measured**: the smallest effect this
+  repository has ever resolved was 10.8 percent, so a machine that moved five
+  percent between the first arm and the last was already moving by half the
+  size of what is being hunted.
+- **The canary does not replace the A1 capture.** `uptime` and the top
+  processes say *what* was running; the canary says *whether it mattered*. Both
+  go in the header. The canary's blind spot is the mirror of A1's: it reads the
+  machine's delivery and cannot name the cause.
+
+**The baselines have not been measured and the file ships with them null.**
+Establish them on a verifiably quiet box with
+
+    pixi run mojo run -I src bench/bench_canary.mojo 7
+
+and paste the block it prints into `bench/canary_baseline.json`, filling in the
+date, the toolchain, the machine, and the evidence the box was quiet. Until
+then the mechanism reports raw milliseconds and says the ratio is unavailable,
+which is correct behavior and not a gap to be closed by filling in a plausible
+number. A fabricated baseline in a regime detector does not fail loudly; it
+mislabels every session afterwards in a form that reads as data.
+
+And per A4: **this has never been run in anger.** The probe constants were
+sized from an estimate, no baseline exists, and no session has yet carried a
+canary line. Treat it as suspect until someone does.

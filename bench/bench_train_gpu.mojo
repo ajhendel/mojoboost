@@ -105,6 +105,31 @@ arm's; and the reported loss is multiclass log loss, not squared error or
 binary log loss, so it is comparable across arms of the same run and across
 nothing else.
 
+Every run is also bracketed by the **regime canary** (`bench/canary.mojo`): a
+fixed CPU probe and a fixed GPU probe, run once before the first arm and once
+after the last, reported as `canary_cpu_ratio` and `canary_gpu_ratio` against
+the baselines in `bench/canary_baseline.json` and never averaged together.
+The probes touch nothing this file varies -- no dataset, no thread count, no
+trainer -- so they move only when the machine does. That is the point: this
+file's whole design rests on adjacent samples being comparable, and until now
+nothing in it could tell you whether that assumption held. When the start and
+end readings disagree by more than the canary's threshold, the output says so
+in capitals, because it means the arms in between were not all taken on the
+same machine and the verdict lines below are not usable. Sessions before this
+existed inferred their regime by hand from effect sizes, and one such
+attribution was made and retracted the same night.
+
+Two consequences worth stating rather than discovering. **With no baseline
+recorded the canary prints raw milliseconds and says the ratio is
+unavailable**, which is the designed behavior; `bench/bench_canary.mojo`
+establishes the baselines and must be run in a certified quiet window.
+**Opening a device for the canary before the first arm shifts some one-time
+GPU setup out of the first GPU repeat**, which the summary already leads with
+the minimum to defend against, but it does mean an arm timing from a
+canary-bearing run is not interchangeable with one recorded before the canary
+existed. `MOJOTREES_CANARY=0` turns it off for exactly that comparison, and
+the off state is printed and recorded rather than left silent.
+
 `MOJOTREES_PHASE_PROFILE=async` on any run prints one `phase_profile` block
 per arm per repeat: wall time, call counts, kernel or dispatch counts, host
 synchronizations, rows, row slots, and histogram cells, per phase and per
@@ -176,6 +201,18 @@ from std.os import getenv
 from std.python import Python, PythonObject
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
+
+from canary import (
+    CanaryReading,
+    canary_disabled_json,
+    canary_json,
+    enabled as canary_enabled,
+    load_baseline,
+    print_baseline,
+    print_reading,
+    print_session_verdict,
+    take_reading,
+)
 
 from mojotrees.binning import fit_bins
 from mojotrees.boosting import (
@@ -1004,6 +1041,28 @@ def main() raises:
             print("lightgbm_params:", lgbm_params)
             lgbm = Optional[PythonObject](state)
 
+        # The regime canary's first reading. Taken here rather than at the top
+        # of `main` on purpose: everything above -- data generation, binning,
+        # the LightGBM import and its Dataset construction -- has already run,
+        # so the process the canary reads is the process the arms will run in,
+        # with the same memory resident and the same thread pools parked. A
+        # reading taken before all that would describe a different machine
+        # state than any arm experiences.
+        var canary_on = canary_enabled()
+        var baseline = load_baseline()
+        var canary_start = CanaryReading(-1.0, 0, -1.0, -1.0, String("off"))
+        var canary_end = CanaryReading(-1.0, 0, -1.0, -1.0, String("off"))
+        if canary_on:
+            print_baseline(baseline)
+            canary_start = take_reading()
+            print_reading(String("start"), canary_start, baseline)
+        else:
+            print(
+                "canary: disabled by MOJOTREES_CANARY; this run carries no"
+                " regime label and its arm timings cannot be placed in a"
+                " window"
+            )
+
         # Interleaved, not blocked: one repeat runs every arm before the next
         # repeat starts, so the samples being compared sit next to each other
         # in time. Running all of one arm and then all of the other puts the
@@ -1034,6 +1093,18 @@ def main() raises:
                 print(
                     "run", rep + 1, _arm_name(arms[a]), "train_s:", run.seconds
                 )
+
+        # The canary's second reading, immediately after the last arm and
+        # before any reduction, so that nothing between the two readings but
+        # the arms themselves. The verdict is printed before the per-arm
+        # summaries rather than after, because if the machine moved during the
+        # run then every line below it is a comparison between arms in
+        # different regimes and the reader should know that first.
+        var regime = String("unmeasured")
+        if canary_on:
+            canary_end = take_reading()
+            print_reading(String("end"), canary_end, baseline)
+            regime = print_session_verdict(canary_start, canary_end, baseline)
 
         # The minimum leads because it is the sample least contaminated by
         # thermal drift and by the one-time device setup the first GPU run
@@ -1211,6 +1282,16 @@ def main() raises:
                 _json_string(lgbm_params),
                 "}",
             )
+        # One new key, added rather than replacing anything: every key above
+        # is read by committed results under `bench/results/` and by other
+        # sessions. Absent baselines come through as `null` ratios, which is
+        # the record correctly saying the window is unlabelled rather than
+        # claiming it was nominal.
+        record += ",\"canary\":"
+        if canary_on:
+            record += canary_json(canary_start, canary_end, baseline, regime)
+        else:
+            record += canary_disabled_json()
         record += "}"
         print("json_summary:", record)
         var json_path = getenv("MOJOTREES_BENCH_JSON")
