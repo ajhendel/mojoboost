@@ -100,6 +100,21 @@ verdict as every other arm; see "Interleaved LightGBM arm" below. Until the
 1,000,000-row row is retaken that way, the 6.5 percent margin is a comparison
 against an unrepeated single sample and should be quoted as one.
 
+The arm now runs end to end and reports what the margin was missing. Per
+arm, LightGBM included, it prints `<arm>_train_s_samples` — every repeat in
+the order it ran — beside `<arm>_spread_pct` and a second
+`<arm>_spread_pct_of_median`, and it writes the same lists into a one-line
+`json_summary` record (also to a file under `MOJOTREES_BENCH_JSON`). So the
+noise floor the 6.5 percent has to clear is now a quantity the run produces
+rather than one nobody has. **No LightGBM spread has been measured yet.**
+Nothing in this file was retaken for this change and no number above moved:
+the arm was exercised only at a toy shape to prove it executes, on a machine
+that was busy at the time, and a toy shape on a busy machine is not a
+measurement. What exists is the instrument. The command that produces the
+figure is the first one under "Interleaved LightGBM arm", and until it has
+been run on a quiet box the 1,000,000-row cell stands exactly as written
+above.
+
 **Our marginal cost per row now equals LightGBM's on ten CPU cores.**
 **Fitted** from the measured points, ours is 2.385 then 2.337 microseconds
 per row across the two segments and LightGBM's is 2.325 then 2.461. The four
@@ -222,8 +237,13 @@ pixi run -e bench bench-train-gpu 1000000 50 reg 5 gpu-device-depth,lightgbm
 MOJOTREES_LGBM_THREADS=10 pixi run -e bench bench-train-gpu 1000000 50 reg 5 cpu,lightgbm
 ```
 
-The arm prints `lightgbm_train_s`, `lightgbm_train_s_median`,
-`lightgbm_train_s_max`, `lightgbm_spread_pct`, `lightgbm_n_trees` and
+The arm has been exercised end to end and it runs. That is a smoke test at a
+toy shape on a loaded machine and **no timing was taken from it**; nothing in
+this file changed as a result.
+
+The arm prints `lightgbm_train_s_samples`, `lightgbm_train_s`,
+`lightgbm_train_s_median`, `lightgbm_train_s_max`, `lightgbm_spread_pct`,
+`lightgbm_spread_pct_of_median`, `lightgbm_n_trees` and
 `lightgbm_train_loss` under the same names every other arm uses, plus
 `lightgbm_threads`, `lightgbm_binning_s` and `lightgbm_params` once before
 the loop. The loss is the mean squared residual for `reg` and the mean log
@@ -231,6 +251,40 @@ loss for `binary`, in the same definition `_train_loss` uses in the harness,
 so the two sit in one column and are read against each other. Record the
 `lightgbm_params` line with any result: it is the resolved parameter set the
 run actually used rather than the one a second file says it should have.
+
+### Per-repeat spread, for every arm
+
+`<arm>_train_s_samples` holds one arm's repeats alone, in the order they ran,
+and every arm gets one. The `run N <arm> train_s` lines above it already
+carry the same numbers, but interleaved, so recovering a single arm's
+dispersion from them means picking every n-th line out of a transcript by
+hand — and a spread that is only recoverable by hand is a spread that gets
+dropped when a result is copied into a table. That is not hypothetical here:
+the 6.5 percent margin above was quoted beside a spread that described one
+side only, because the other side had no repeat loop at all.
+
+Two spreads are printed and they are not interchangeable.
+`<arm>_spread_pct` is `(max - min) / min`, unchanged, and is the quantity the
+`<arm>_vs_<baseline>` verdict is computed against, so figures recorded before
+this line existed still mean what they meant. `<arm>_spread_pct_of_median` is
+`(max - min) / median`: the arm's dispersion rather than its excursion above
+its own best sample, and the one to quote beside a median. Neither is chosen
+for the reader, because the choice belongs to whoever quotes the number.
+
+The whole run also prints as one line of JSON, `json_summary:`, carrying the
+per-arm sample lists, both spreads, the losses, the tree counts, the
+comparisons with their verdicts, and LightGBM's resolved threads, binning
+time and parameters. `MOJOTREES_BENCH_JSON=<path>` writes the same record to
+a file. It is printed unconditionally rather than only on request, because
+the transcript is the artifact that actually survives and the per-repeat
+samples are the first thing a hand-copied summary loses.
+`noise_floor_pct` is `-1` at one repeat, which is the null and not a floor of
+zero.
+
+```sh
+MOJOTREES_BENCH_JSON=bench/results/lgbm_1m.json \
+  pixi run -e bench bench-train-gpu 1000000 50 reg 5 gpu-device-depth,lightgbm
+```
 
 What this makes comparable is the time window, which was the hole. What it
 does not:
@@ -284,6 +338,49 @@ device-resident builds. This is not an end-to-end GPU-training benchmark.
 Results from one GPU family must not be presented as representative of other
 devices. Record the accelerator, Mojo/MAX version, dataset dimensions, and
 repetition count with every result.
+
+### Launch-shape A/Bs
+
+Two interleaved A/Bs run after the CPU/GPU comparison, both alternating
+their arms inside one process because this machine's device timings drift
+several-fold across time windows and only adjacent samples compare.
+
+`feature_group_*` is how many feature slots one histogram threadgroup
+accumulates, one against two.
+
+`row_unroll_*` is how many rows one thread keeps in flight in the histogram
+row loop: `HIST_ROW_UNROLL` (on, the default) against one row per iteration
+(off), through `GpuActiveRows.set_row_unroll`. It prints
+`row_unroll_on_samples_ms` and `row_unroll_off_samples_ms` — every repeat, in
+order — then the minimum, the median, the speedup and a verdict against the
+wider of the two arms' quiet bands.
+
+**Neither knob can change a histogram, and the arm names should not be read
+as if one might.** Both row-walk arms visit the same rows of the same range
+and add the same fixed-point integers into the same bins; only the order of
+the adds and of the loads feeding them differs, and integer addition is
+associative and commutative. What differs is instruction count and how many
+memory requests a thread has outstanding, against a higher live register
+count and therefore a residency risk this backend does not let anyone query.
+That is the open question and it is why the knob is a runtime argument
+rather than a comptime one: a comptime knob would have forced a two-build
+comparison, and two builds minutes apart cannot settle anything on this
+machine.
+
+**No row-unroll numbers are recorded here.** The A/B compiles and has not
+been run; it needs a quiet box.
+
+The same A/B **cannot currently be run end to end** through
+`bench_train_gpu.mojo`, and the reason is worth writing down rather than
+discovering twice. `train_gpu` constructs its own `GpuHistogramBuilder`
+internally, `GpuHistogramBuilder` has no `set_row_unroll` forwarder the way
+it has `set_feature_group`, and the knob has deliberately no environment
+variable. Reaching it from an end-to-end arm therefore needs two edits inside
+`src/`: a forwarder on `GpuHistogramBuilder` and a `row_unroll` argument on
+`train_gpu` carried to `builder.set_row_unroll`. The histogram-level A/B
+above needs neither, and it isolates the loop the knob actually changes
+instead of diluting it into a fraction of a whole fit, which is the better
+first measurement in any case.
 
 ## GPU histogram scaling and phase breakdown
 

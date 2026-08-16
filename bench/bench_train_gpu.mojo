@@ -69,6 +69,20 @@ CPU-side threading honors MOJOTREES_NUM_WORKERS / MOJOTREES_PARALLEL_MIN_OPS
 The first repeat of the first GPU arm also pays one-time device setup, which
 is why the summary leads with the minimum rather than the mean.
 
+Every arm, LightGBM included, reports its own repeats back three ways: the
+interleaved `run N <arm> train_s` lines as they happen, an
+`<arm>_train_s_samples` line holding that arm's repeats alone in the order
+they ran, and a one-line `json_summary` record carrying the same lists.
+`MOJOTREES_BENCH_JSON=<path>` writes that record to a file as well. The
+duplication is on purpose: the interleaved lines are the only ones that show
+the alternation, and they are also the ones a reader has to unpick n lines at
+a time to recover a single arm's dispersion, which is how a spread stops
+being copied into a table. Two spreads are printed per arm and they answer
+different questions -- `<arm>_spread_pct` is (max - min) / min, unchanged,
+and is what the verdict below is computed against; `<arm>_spread_pct_of_median`
+is (max - min) / median, which is the arm's dispersion rather than its
+excursion above its own best sample and is the one to quote beside a median.
+
 Usage: mojo run -I src bench/bench_train_gpu.mojo \\
     [n_rows] [n_features] [reg|binary|multi[:classes]] [repeats] [arms] [seed]
 
@@ -625,6 +639,39 @@ def _pct(fraction: Float64) -> Float64:
     return Float64(Int(scaled - 0.5)) / 10.0
 
 
+def _join_floats(values: List[Float64]) -> String:
+    """Space-separated, full precision, in the order the repeats ran."""
+    var out = String("")
+    for i in range(len(values)):
+        if i > 0:
+            out += " "
+        out += String(values[i])
+    return out^
+
+
+def _json_floats(values: List[Float64]) -> String:
+    """The same list as a JSON array."""
+    var out = String("[")
+    for i in range(len(values)):
+        if i > 0:
+            out += ","
+        out += String(values[i])
+    out += "]"
+    return out^
+
+
+def _json_string(s: String) -> String:
+    """A JSON string literal. Escapes the two characters that can appear.
+
+    Only `"` and `\\` are escaped, because everything this file puts through
+    here is an arm name, an objective word, or LightGBM's own resolved
+    parameter line, and none of those carries a control character. A value
+    that did would produce invalid JSON rather than wrong JSON, which is the
+    failure mode to prefer for a record nobody re-reads by hand.
+    """
+    return String("\"", s.replace("\\", "\\\\").replace("\"", "\\\""), "\"")
+
+
 def main() raises:
     comptime if not has_accelerator():
         print("no accelerator present; GPU training benchmark skipped")
@@ -746,7 +793,8 @@ def main() raises:
         var mapper = fit_bins(features, n_rows, n_features, 255)
         var data = mapper.transform(features, n_rows)
         var t1 = perf_counter_ns()
-        print("binning_s:", Float64(t1 - t0) / 1e9)
+        var binning_s = Float64(t1 - t0) / 1e9
+        print("binning_s:", binning_s)
 
         var n_arms = len(arms)
         var arm_list = String("")
@@ -768,6 +816,9 @@ def main() raises:
         # Dataset construction. Its binning time is printed beside ours
         # rather than folded into either arm's training number.
         var lgbm = Optional[PythonObject]()
+        var lgbm_threads = 0
+        var lgbm_binning_s = -1.0
+        var lgbm_params = String("")
         if want_lgbm:
             var state = _lgbm_arm(
                 n_rows,
@@ -777,9 +828,12 @@ def main() raises:
                 BoosterParams.default(),
                 255,
             )
-            print("lightgbm_threads:", Int(py=state.resolved_threads()))
-            print("lightgbm_binning_s:", Float64(py=state.binning_s))
-            print("lightgbm_params:", String(py=state.summary()))
+            lgbm_threads = Int(py=state.resolved_threads())
+            lgbm_binning_s = Float64(py=state.binning_s)
+            lgbm_params = String(py=state.summary())
+            print("lightgbm_threads:", lgbm_threads)
+            print("lightgbm_binning_s:", lgbm_binning_s)
+            print("lightgbm_params:", lgbm_params)
             lgbm = Optional[PythonObject](state)
 
         # Interleaved, not blocked: one repeat runs every arm before the next
@@ -817,34 +871,92 @@ def main() raises:
         # thermal drift and by the one-time device setup the first GPU run
         # pays. The spread beside it is what says whether the minimum can be
         # trusted at all.
+        #
+        # Every arm also prints its own repeats back, in the order they ran,
+        # on one `<arm>_train_s_samples` line, and the same list goes into
+        # the JSON record below. That is deliberate duplication of the `run N`
+        # lines above: those interleave the arms, so reading one arm's
+        # dispersion off them means picking every n-th line out of a
+        # transcript by hand, and a spread that is only recoverable by hand is
+        # a spread that gets dropped when a result is copied into a table.
+        # The comparator is the reason this matters. LightGBM's own repeat
+        # spread on this machine has never been recorded, so there is no
+        # measured noise floor to read a few-percent margin against, and a
+        # margin quoted against an unmeasured floor is not a result.
+        #
+        # Two spreads are reported per arm and they are not interchangeable.
+        # `_spread_pct` is (max - min) / min, which is the one the verdict
+        # below uses, kept unchanged so figures recorded before this line
+        # existed still mean what they meant. `_spread_pct_of_median` is
+        # (max - min) / median, which is the dispersion of the arm as a whole
+        # rather than the excursion above its best sample; it is the smaller
+        # of the two whenever the minimum is an outlier low, and it is the
+        # honest one to quote beside a median. Both are printed rather than
+        # one being chosen here, because the choice belongs to whoever quotes
+        # the number.
         var mins = List[Float64](capacity=n_arms)
+        var meds = List[Float64](capacity=n_arms)
+        var maxs = List[Float64](capacity=n_arms)
         var spreads = List[Float64](capacity=n_arms)
+        var spreads_med = List[Float64](capacity=n_arms)
+        var per_arm = List[String](capacity=n_arms)
         for a in range(n_arms):
             var vals = List[Float64](capacity=repeats)
             for rep in range(repeats):
                 vals.append(samples[rep * n_arms + a])
             var lo = _min_of(vals)
             var hi = _max_of(vals)
+            var med = _median_of(vals)
             mins.append(lo)
+            meds.append(med)
+            maxs.append(hi)
             spreads.append((hi - lo) / lo)
+            spreads_med.append((hi - lo) / med)
             var key = _arm_key(arms[a])
+            print(key + "_train_s_samples:", _join_floats(vals))
             print(key + "_train_s:", lo)
-            print(key + "_train_s_median:", _median_of(vals))
+            print(key + "_train_s_median:", med)
             print(key + "_train_s_max:", hi)
             print(key + "_spread_pct:", _pct(spreads[a]))
+            print(key + "_spread_pct_of_median:", _pct(spreads_med[a]))
             print(key + "_n_trees:", tree_counts[a])
             print(key + "_train_loss:", losses[a])
+            per_arm.append(
+                String(
+                    "{\"name\":",
+                    _json_string(_arm_name(arms[a])),
+                    ",\"samples_s\":",
+                    _json_floats(vals),
+                    ",\"min_s\":",
+                    lo,
+                    ",\"median_s\":",
+                    med,
+                    ",\"max_s\":",
+                    hi,
+                    ",\"spread_pct_of_min\":",
+                    _pct(spreads[a]),
+                    ",\"spread_pct_of_median\":",
+                    _pct(spreads_med[a]),
+                    ",\"n_trees\":",
+                    tree_counts[a],
+                    ",\"train_loss\":",
+                    losses[a],
+                    "}",
+                )
+            )
 
         # Every delta is reported against the noise floor that produced it,
         # taken as the wider of the two arms' own spreads. A gap smaller than
         # that floor is not a result however many decimals it carries, and
         # saying so here is the whole point of the repeat count.
         var base_key = _arm_key(arms[0])
+        var comparisons = List[String](capacity=n_arms)
         for a in range(1, n_arms):
             var key = _arm_key(arms[a])
             var delta = (mins[a] - mins[0]) / mins[0]
             var magnitude = delta if delta >= 0.0 else -delta
             var floor = spreads[0] if spreads[0] > spreads[a] else spreads[a]
+            var verdict = String("unresolvable")
             print(key + "_speedup_x:", mins[0] / mins[a])
             if repeats == 1:
                 # A single sample per arm has a spread of zero by
@@ -857,11 +969,84 @@ def main() raises:
                     "noise_floor_pct unmeasured-at-1-repeat",
                 )
             else:
+                verdict = String(
+                    "indistinguishable"
+                ) if magnitude <= floor else String("resolved")
                 print(
                     key + "_vs_" + base_key + ":",
-                    "indistinguishable" if magnitude <= floor else "resolved",
+                    verdict,
                     "delta_pct",
                     _pct(delta),
                     "noise_floor_pct",
                     _pct(floor),
                 )
+            comparisons.append(
+                String(
+                    "{\"arm\":",
+                    _json_string(_arm_name(arms[a])),
+                    ",\"baseline\":",
+                    _json_string(_arm_name(arms[0])),
+                    ",\"speedup_x\":",
+                    mins[0] / mins[a],
+                    ",\"delta_pct\":",
+                    _pct(delta),
+                    ",\"noise_floor_pct\":",
+                    -1.0 if repeats == 1 else _pct(floor),
+                    ",\"verdict\":",
+                    _json_string(verdict),
+                    "}",
+                )
+            )
+
+        # One machine-readable record of the whole run, printed on one line
+        # and, when MOJOTREES_BENCH_JSON names a path, written there too.
+        # Printed unconditionally because the transcript is the artifact that
+        # actually survives: this project has twice had to discard a number
+        # because the conditions it was taken under were not written down
+        # beside it, and the per-repeat samples are the first thing a
+        # hand-copied summary loses. `noise_floor_pct` is -1 at one repeat,
+        # which is the null and not a floor of zero.
+        var record = String(
+            "{\"n_rows\":",
+            n_rows,
+            ",\"n_features\":",
+            n_features,
+            ",\"objective\":",
+            _json_string(obj_name),
+            ",\"n_classes\":",
+            n_classes,
+            ",\"seed\":",
+            seed,
+            ",\"repeats\":",
+            repeats,
+            ",\"binning_s\":",
+            binning_s,
+            ",\"arms\":[",
+        )
+        for i in range(len(per_arm)):
+            if i > 0:
+                record += ","
+            record += per_arm[i]
+        record += "],\"comparisons\":["
+        for i in range(len(comparisons)):
+            if i > 0:
+                record += ","
+            record += comparisons[i]
+        record += "]"
+        if want_lgbm:
+            record += String(
+                ",\"lightgbm\":{\"threads\":",
+                lgbm_threads,
+                ",\"binning_s\":",
+                lgbm_binning_s,
+                ",\"params\":",
+                _json_string(lgbm_params),
+                "}",
+            )
+        record += "}"
+        print("json_summary:", record)
+        var json_path = getenv("MOJOTREES_BENCH_JSON")
+        if json_path.byte_length() > 0:
+            with open(json_path, "w") as handle:
+                handle.write(record + "\n")
+            print("json_summary_path:", json_path)

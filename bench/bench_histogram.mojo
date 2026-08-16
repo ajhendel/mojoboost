@@ -6,6 +6,13 @@ device-resident rebuild time (gradient upload + kernel + download), the part
 that recurs every boosting round; `gpu_first_s` additionally carries binned
 matrix upload and context setup, paid once per dataset.
 
+Two interleaved A/Bs of the histogram launch run after it, both alternating
+their arms inside this process because this machine's device timings drift
+several-fold across time windows and only adjacent samples compare:
+`_feature_group_arms` on how many feature slots one threadgroup accumulates,
+and `_row_unroll_arms` on how many rows one thread keeps in flight. Neither
+knob can change a histogram, and each function says why in its own docstring.
+
 Usage: mojo run -I src bench/bench_histogram.mojo [n_rows] [n_features] [reps]
 """
 
@@ -88,7 +95,16 @@ def main() raises:
             gg += gpu_hist.grad[b]
         print("feature0 grad totals (cpu, gpu):", cg, gg)
 
+        # The group the builder resolved for this dataset, read before the
+        # feature-group A/B moves it. `_feature_group_arms` leaves the
+        # builder on group 1, which is not the default on every backend, and
+        # the row-walk A/B has no business being measured under a launch
+        # shape the trainer would not have chosen.
+        var default_group = builder.feature_group()
         _feature_group_arms(builder, reps)
+        builder.set_feature_group(default_group)
+        print("row_unroll_feature_group:", default_group)
+        _row_unroll_arms(builder, reps)
 
 
 def _quiet_band(times: List[Float64]) -> Float64:
@@ -165,3 +181,106 @@ def _feature_group_arms(mut builder: GpuHistogramBuilder, reps: Int) raises:
         print("feature_group_verdict: resolved, band_pct", floor)
     else:
         print("feature_group_verdict: indistinguishable, band_pct", floor)
+
+
+def _join_ms(times: List[Float64]) -> String:
+    """Every repeat in milliseconds, space separated, sorted as passed in."""
+    var out = String("")
+    for i in range(len(times)):
+        if i > 0:
+            out += " "
+        out += String(times[i] * 1e3)
+    return out^
+
+
+def _row_unroll_arms(mut builder: GpuHistogramBuilder, reps: Int) raises:
+    """Interleaved A/B of the histogram row walk: `HIST_ROW_UNROLL` rows in
+    flight per thread against one row per iteration
+    (`GpuActiveRows.set_row_unroll`).
+
+    **This is a launch shape and it cannot change a histogram.** Both arms
+    visit exactly the same rows of the same range and add exactly the same
+    fixed-point integers into the same bins; only the order of the adds, and
+    of the loads that feed them, differs, and integer addition is associative
+    and commutative. `set_row_unroll`'s own docstring is where that argument
+    is written out, and it is the reason the arm names below say `on` and
+    `off` rather than anything suggesting two results. Nothing here checks
+    the two histograms against each other, because there is nothing for such
+    a check to catch: it would be asserting that integer addition is still
+    associative.
+
+    What the arms do differ in is instruction count and memory-level
+    parallelism. The row loop's per-row work is a chain of dependent gathers,
+    so written one row at a time a thread has one request outstanding and
+    runs at the latency of the gather rather than the bandwidth of it; the
+    unrolled arm issues four stages' loads together. Against that, the
+    unrolled arm holds more live registers, and threadgroup residency on this
+    backend is bounded by quantities this project cannot query. Which of
+    those wins is exactly the open question, and it is why the knob is a
+    runtime argument rather than a comptime one: this machine's device
+    timings drift several-fold across time windows, so two builds compared
+    minutes apart cannot settle it and only back-to-back interleaved repeats
+    can.
+
+    The knob is reached as `builder.rows.set_row_unroll` rather than through
+    a forwarder on the builder, because `GpuHistogramBuilder` has no
+    `set_row_unroll` of its own the way it has `set_feature_group`, and this
+    lane does not own `src/`. A forwarder mirroring `set_feature_group` is
+    the clean version and is a two-line edit somebody else should make.
+
+    Every repeat is printed, not just the reduction, for the same reason
+    bench_train_gpu.mojo prints its samples: a dispersion that has to be
+    recovered by hand is a dispersion that gets dropped when a result is
+    copied into a table.
+    """
+    var on = List[Float64](capacity=reps)
+    var off = List[Float64](capacity=reps)
+    builder.begin_tree()
+    # Both arms are one kernel instantiation reading a runtime flag, so
+    # neither pays a compilation the other does not; the untimed pair below
+    # is still run so that the first timed sample of each arm is not the
+    # first launch of the session.
+    for _ in range(2):
+        builder.rows.set_row_unroll(True)
+        builder.enqueue_leaf(0)
+        builder.synchronize()
+        builder.rows.set_row_unroll(False)
+        builder.enqueue_leaf(0)
+        builder.synchronize()
+
+    for _ in range(reps):
+        builder.rows.set_row_unroll(True)
+        var a0 = perf_counter_ns()
+        builder.enqueue_leaf(0)
+        builder.synchronize()
+        var a1 = perf_counter_ns()
+        on.append(Float64(a1 - a0) / 1e9)
+
+        builder.rows.set_row_unroll(False)
+        var b0 = perf_counter_ns()
+        builder.enqueue_leaf(0)
+        builder.synchronize()
+        var b1 = perf_counter_ns()
+        off.append(Float64(b1 - b0) / 1e9)
+    # Leave the builder on the module default rather than on whichever arm
+    # ran last, so a later section of this benchmark cannot inherit an arm.
+    builder.rows.set_row_unroll(True)
+
+    print("row_unroll_on_samples_ms:", _join_ms(on))
+    print("row_unroll_off_samples_ms:", _join_ms(off))
+    sort(on)
+    sort(off)
+    var band_on = _quiet_band(on)
+    var band_off = _quiet_band(off)
+    var floor = band_on if band_on > band_off else band_off
+    print("row_unroll_on_min_ms:", on[0] * 1e3)
+    print("row_unroll_on_median_ms:", on[len(on) // 2] * 1e3)
+    print("row_unroll_off_min_ms:", off[0] * 1e3)
+    print("row_unroll_off_median_ms:", off[len(off) // 2] * 1e3)
+    var speedup = off[len(off) // 2] / on[len(on) // 2]
+    var delta = 100.0 * (speedup - 1.0)
+    print("row_unroll_on_vs_off_speedup:", speedup)
+    if abs(delta) > floor:
+        print("row_unroll_verdict: resolved, band_pct", floor)
+    else:
+        print("row_unroll_verdict: indistinguishable, band_pct", floor)
