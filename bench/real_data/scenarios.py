@@ -569,9 +569,14 @@ CATBOOST_UNMATCHABLE = {
         "subsamples rows on every tree. LightGBM and mojotrees do not "
         "subsample at their defaults. MVS is minimum-variance sampling "
         "weighted by gradient magnitude, not uniform bagging, so mojotrees's "
-        "bagging_fraction is not an emulation of it and the CatBoost-mode "
-        "arm does not try. The CatBoost arm therefore sees about 80 percent "
-        "of the rows per tree and the other two see all of them"
+        "bagging_fraction is not an emulation of it. The CatBoost arm "
+        "therefore sees about 80 percent of the rows per tree and the other "
+        "two see all of them. As of 2026-08-16 mojotrees HAS an MVS sampler "
+        "of its own, built from CatBoost's source and off by default, so "
+        "'the CatBoost-mode arm does not try' has gone from a statement "
+        "about what we can do to a statement about what is wired: nothing "
+        "calls the sampler from a round loop yet. When something does, this "
+        "entry becomes matchable and should move out of this table"
     ),
     "split_scoring": (
         "CatBoost's default score_function is Cosine and its "
