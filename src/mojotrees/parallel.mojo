@@ -123,6 +123,28 @@ rebuild. Lowering it is the single knob that decides how much of an
 asymmetric machine a mid-sized loop reaches, and bench/bench_profile.mojo on
 an idle machine is what would settle it.
 
+Who carries the snapshot
+------------------------
+`DispatchSettings.resolve()` is called once per fit, in each CPU trainer in
+`boosting.mojo`, next to where the fit's `GrowScratch` is built. From there it
+travels as a `settings` argument, defaulted to `DispatchSettings.unresolved()`
+so that a call site that has not been wired keeps the live reads it always
+had. Wired today:
+
+- `boosting.fill_grad_hess` and the score update (`_add_tree_scores`,
+  `_add_by_leaf`, `_add_by_traversal`), which is every per-round dispatch the
+  CPU trainers make.
+- Every dispatch in `histogram.mojo` except the frozen replica builder: the
+  accumulation planner, the excluded-feature zeroing, the gradient gather,
+  both accumulation ladders, and the sibling subtraction.
+- The split scan in `split.mojo`.
+
+Not wired, and this is the gap that matters: `tree.mojo` is what calls the
+histogram builders and the split scan once per node, and it does not hold a
+snapshot to pass. Until it does, those entry points take the sentinel and the
+per-node reads are still made. The receiving half is here so that filling it
+in is one field on `GrowScratch` and five argument passes.
+
 Nesting. These dispatches are not reentrant-aware: a `sync_parallelize`
 inside a task would oversubscribe the machine with no scheduler to arbitrate
 it. Every caller in this package dispatches from the single-threaded part of
@@ -273,6 +295,21 @@ struct DispatchSettings(Copyable, Movable):
     var min_ops: Int
     var min_task_ops: Int
 
+    var resolved: Bool
+    """Whether this value is a snapshot or the sentinel.
+
+    False only for `unresolved()`, which is what a defaulted threading
+    parameter carries at a call site nobody has wired yet. `plan_tasks_with`
+    and every `*_with` dispatch below test it first and fall through to the
+    live rule, so an unresolved settings value is indistinguishable from not
+    having passed one -- same answer, same `getenv` calls, same order.
+
+    Its purpose is staging, not policy. A parameter that had no default would
+    have to be filled in at every call site in the package in one commit,
+    across files that three different lanes own; with a default, the
+    receiving half lands first and each call site is wired when its owner can
+    wire it. A hot call site still holding the sentinel is not finished."""
+
     @staticmethod
     def resolve() raises -> DispatchSettings:
         """One detection of the machine and one read of each variable.
@@ -285,9 +322,20 @@ struct DispatchSettings(Copyable, Movable):
             env_num_workers(),
             env_parallel_min_ops(),
             env_parallel_min_task_ops(),
+            True,
         )
 
+    @staticmethod
+    def unresolved() -> DispatchSettings:
+        """The sentinel. No machine detection and no `getenv`, so building one
+        costs a few integer stores; it is what every defaulted `settings`
+        parameter in this package constructs, once per call, on a path that
+        then goes on to read the environment live exactly as it always did."""
+        return DispatchSettings(ResolvedCpuPolicy.unresolved(), 0, 0, 0, False)
+
     def describe(self) -> String:
+        if not self.resolved:
+            return String("unresolved (live reads)")
         return String(
             self.policy.describe(),
             " workers=",
@@ -327,7 +375,13 @@ def plan_tasks_with(
     per-node path should be reaching this form; `plan_tasks` remains for
     callers that have no snapshot to hand and for tests that change a
     variable between calls.
+
+    The unresolved sentinel falls through to `plan_tasks`, so a defaulted
+    `settings` parameter reads the environment exactly as the call site did
+    before the parameter existed.
     """
+    if not settings.resolved:
+        return plan_tasks(n_items, total_ops)
     if n_items <= 1:
         return 1
     if settings.num_workers == 1:

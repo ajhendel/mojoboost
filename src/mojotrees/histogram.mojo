@@ -168,18 +168,20 @@ from std.math import round
 from std.sys.info import simd_width_of
 
 from .apple_cpu_policy import (
-    cpu_profile,
-    derive_accumulation_plan,
+    AccumulationPlan,
+    derive_accumulation_plan_with,
     subtract_ops,
     subtract_ops_for_planes,
 )
 from .binning import BinnedMatrix
 from .objective_registry import HUBER, L1, QUANTILE, SQUARED_ERROR
 from .parallel import (
+    DispatchSettings,
     _env_int,
-    dispatch_feature_ranges,
+    dispatch_feature_ranges_with,
     dispatch_features,
     dispatch_rows,
+    dispatch_rows_with,
 )
 
 comptime SIMD_LANES = 4 * simd_width_of[DType.float64]()
@@ -436,12 +438,17 @@ def _zero_excluded(
     n_bins: Int,
     features: List[Int],
     total_ops: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """Zero the slices of every feature this build will not accumulate.
 
     Only reached under feature subsampling. The active features' slices are
     zeroed by the accumulation pass itself, on the task that is about to fill
     them, so this covers exactly the rest.
+
+    `settings` is the fit's dispatch snapshot; the default sentinel reads the
+    environment live, which is what `build_histogram_subset_replica_into`
+    (whose signature is frozen for the hybrid scheduler) still does.
     """
     if len(features) == 0 or n_features <= 0 or n_bins <= 0:
         return
@@ -479,7 +486,7 @@ def _zero_excluded(
                     cp.unsafe_store(base + b, 0)
                     b += 1
 
-    dispatch_feature_ranges(zero_range, n_features, total_ops)
+    dispatch_feature_ranges_with(settings, zero_range, n_features, total_ops)
 
 
 def build_histogram(
@@ -488,6 +495,7 @@ def build_histogram(
     hess: List[Float64],
     features: List[Int] = [],
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises -> Histogram:
     """Build a full-dataset histogram from per-row gradients and hessians.
     With a non-empty `features`, only those features are accumulated and the
@@ -499,7 +507,9 @@ def build_histogram(
     bit-identical either way.
     """
     var out = Histogram.zeroed(data.n_features, data.n_bins)
-    build_histogram_into(out, data, grad, hess, features, const_hessian)
+    build_histogram_into(
+        out, data, grad, hess, features, const_hessian, settings
+    )
     return out^
 
 
@@ -510,11 +520,21 @@ def build_histogram_into(
     hess: List[Float64],
     features: List[Int] = [],
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """`build_histogram` into a caller-owned buffer, every cell of which is
     written: the accumulation pass zeroes each slice before filling it, so a
     buffer holding another node's histogram comes back holding exactly this
-    one. Identical results to the allocating form, one fewer allocation."""
+    one. Identical results to the allocating form, one fewer allocation.
+
+    `settings` is the fit's `parallel.DispatchSettings` snapshot. Passing one
+    means this build reads no environment variable and detects no core count:
+    it plans its three dispatches from the values the fit resolved once. The
+    default sentinel reads them live per build, exactly as this function did
+    before the parameter existed, and produces the same histogram cell for
+    cell either way -- a snapshot changes only how many tasks the work is cut
+    into, and every dispatch shape here keeps each feature's summation inside
+    one task."""
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
     if not out.matches(data.n_features, data.n_bins):
@@ -528,7 +548,34 @@ def build_histogram_into(
     # reached through `out`: a pointer taken from a struct field carries that
     # field's origin, which a worker closure cannot capture.
     _accumulate_full(
-        out.grad, out.hess, out.count, data, grad, hess, features, const_h
+        out.grad, out.hess, out.count, data, grad, hess, features, const_h,
+        settings,
+    )
+
+
+def _plan_accumulation(
+    settings: DispatchSettings,
+    n_features: Int,
+    n_active: Int,
+    n_bins: Int,
+    n_rows_touched: Int,
+    rows_are_indirect: Bool,
+) raises -> AccumulationPlan:
+    """The one place a histogram build decides its shape.
+
+    Both builders go through here so there is a single answer to "did this
+    build read the environment". With a resolved snapshot it did not, and the
+    `CpuProfile.detect()` that used to sit inside the argument list of every
+    `derive_accumulation_plan` call is gone with it; with the sentinel it did,
+    once, exactly as before.
+    """
+    return derive_accumulation_plan_with(
+        settings.policy,
+        n_features,
+        n_active,
+        n_bins,
+        n_rows_touched,
+        rows_are_indirect,
     )
 
 
@@ -541,19 +588,20 @@ def _accumulate_full(
     hess: List[Float64],
     features: List[Int],
     const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     var n_rows = data.n_rows
     var n_bins = data.n_bins
     var n_features = data.n_features
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
-    var plan = derive_accumulation_plan(
-        cpu_profile(), n_features, n_active, n_bins, n_rows, False
+    var plan = _plan_accumulation(
+        settings, n_features, n_active, n_bins, n_rows, False
     )
 
     _zero_excluded(
         out_grad, out_hess, out_count,
-        n_features, n_bins, features, plan.excluded_ops,
+        n_features, n_bins, features, plan.excluded_ops, settings,
     )
 
     # The ladder, dispatched from the host exactly as the GPU histogram family
@@ -566,27 +614,27 @@ def _accumulate_full(
     if group >= 16:
         _accumulate_full_at[16](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops, const_h,
+            n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     elif group >= 8:
         _accumulate_full_at[8](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops, const_h,
+            n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     elif group >= 4:
         _accumulate_full_at[4](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops, const_h,
+            n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     elif group >= 2:
         _accumulate_full_at[2](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops, const_h,
+            n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     else:
         _accumulate_full_at[1](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops, const_h,
+            n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
 
 
@@ -604,6 +652,7 @@ def _accumulate_full_at[
     n_groups: Int,
     active_ops: Int,
     const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """The full-dataset accumulation at one interleave width.
 
@@ -790,7 +839,9 @@ def _accumulate_full_at[
                             )
                             fb += 1
 
-    dispatch_feature_ranges(accumulate_groups, n_groups, active_ops)
+    dispatch_feature_ranges_with(
+        settings, accumulate_groups, n_groups, active_ops
+    )
 
 
 def build_histogram_subset(
@@ -800,6 +851,7 @@ def build_histogram_subset(
     rows: List[Int],
     features: List[Int] = [],
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises -> Histogram:
     """Build a histogram over a subset of rows (one tree node's rows). With a
     non-empty `features`, only those features are accumulated and the rest of
@@ -810,7 +862,8 @@ def build_histogram_subset(
     """
     var out = Histogram.zeroed(data.n_features, data.n_bins)
     build_histogram_subset_into(
-        out, data, grad, hess, rows, 0, len(rows), features, const_hessian
+        out, data, grad, hess, rows, 0, len(rows), features, const_hessian,
+        settings,
     )
     return out^
 
@@ -825,6 +878,7 @@ def build_histogram_subset_into(
     row_count: Int,
     features: List[Int] = [],
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """`build_histogram_subset` over the window `rows[row_start :
     row_start + row_count]`, into a caller-owned buffer every cell of which
@@ -843,7 +897,7 @@ def build_histogram_subset_into(
     var pairs = List[Float64]()
     build_histogram_subset_into_scratch(
         out, pairs, data, grad, hess, rows, row_start, row_count, features,
-        const_hessian,
+        const_hessian, settings,
     )
 
 
@@ -858,6 +912,7 @@ def build_histogram_subset_into_scratch(
     row_count: Int,
     features: List[Int] = [],
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """`build_histogram_subset_into` with a caller-owned scratch buffer.
 
@@ -883,6 +938,14 @@ def build_histogram_subset_into_scratch(
     objective is a worse thing to own than one wasted store per row. The
     saving that matters is in the feature loop, which visits the buffer
     `n_active` times.
+
+    `settings` is the fit's dispatch snapshot, and this is the call that
+    matters most for it: a grower reaches this function once per node, and
+    without a snapshot each of those calls re-detects the machine and
+    re-reads five environment variables to plan three dispatches whose answer
+    was fixed when the fit started. Passing one reads nothing. It cannot move
+    a cell: the gather is elementwise over ascending disjoint blocks and the
+    accumulation keeps each feature inside one task at every task count.
     """
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
@@ -898,6 +961,7 @@ def build_histogram_subset_into_scratch(
     _accumulate_subset(
         out.grad, out.hess, out.count, pairs,
         data, grad, hess, rows, row_start, row_count, features, const_h,
+        settings,
     )
 
 
@@ -914,19 +978,20 @@ def _accumulate_subset(
     row_count: Int,
     features: List[Int],
     const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     var n_bins = data.n_bins
     var n_features = data.n_features
     var n_sub = row_count
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
-    var plan = derive_accumulation_plan(
-        cpu_profile(), n_features, n_active, n_bins, n_sub, True
+    var plan = _plan_accumulation(
+        settings, n_features, n_active, n_bins, n_sub, True
     )
 
     _zero_excluded(
         out_grad, out_hess, out_count,
-        n_features, n_bins, features, plan.excluded_ops,
+        n_features, n_bins, features, plan.excluded_ops, settings,
     )
     if plan.compact_rows:
         ensure_pair_capacity(pairs, n_sub)
@@ -946,7 +1011,7 @@ def _accumulate_subset(
             pairs_p.unsafe_store(2 * i + 1, hess_p.unsafe_load(r))
 
     if plan.compact_rows:
-        dispatch_rows(fill_pairs, n_sub, plan.gather_ops)
+        dispatch_rows_with(settings, fill_pairs, n_sub, plan.gather_ops)
 
     # The ladder, dispatched as in `_accumulate_full` above.
     var group = plan.group_width
@@ -955,35 +1020,35 @@ def _accumulate_subset(
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
-            const_h,
+            const_h, settings,
         )
     elif group >= 8:
         _accumulate_subset_at[8](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
-            const_h,
+            const_h, settings,
         )
     elif group >= 4:
         _accumulate_subset_at[4](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
-            const_h,
+            const_h, settings,
         )
     elif group >= 2:
         _accumulate_subset_at[2](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
-            const_h,
+            const_h, settings,
         )
     else:
         _accumulate_subset_at[1](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
-            const_h,
+            const_h, settings,
         )
 
 
@@ -1006,6 +1071,7 @@ def _accumulate_subset_at[
     n_groups: Int,
     active_ops: Int,
     const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """The subset accumulation at one interleave width.
 
@@ -1161,7 +1227,9 @@ def _accumulate_subset_at[
                             )
                             fb += 1
 
-    dispatch_feature_ranges(accumulate_groups, n_groups, active_ops)
+    dispatch_feature_ranges_with(
+        settings, accumulate_groups, n_groups, active_ops
+    )
 
 
 def build_histogram_subset_replica_into[
@@ -1436,12 +1504,15 @@ def feature_totals(hist: Histogram, feature: Int) raises -> FeatureTotals:
 
 
 def subtract_histogram(
-    parent: Histogram, child: Histogram, const_hessian: Bool = False
+    parent: Histogram,
+    child: Histogram,
+    const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises -> Histogram:
     """Sibling histogram via the subtraction trick: build the smaller child
     directly, get the larger one as parent - child for free."""
     var out = Histogram.zeroed(parent.n_features, parent.n_bins)
-    subtract_histogram_into(out, parent, child, const_hessian)
+    subtract_histogram_into(out, parent, child, const_hessian, settings)
     return out^
 
 
@@ -1457,6 +1528,7 @@ def _subtract_histogram_arrays(
     child_count: List[Int],
     size: Int,
     const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """Parallel SIMD sibling subtraction over independent array borrows.
 
@@ -1536,7 +1608,7 @@ def _subtract_histogram_arrays(
     var ops = subtract_ops_for_planes(size, 2) if const_h else subtract_ops(
         size
     )
-    dispatch_rows(subtract_block, size, ops)
+    dispatch_rows_with(settings, subtract_block, size, ops)
 
 
 def subtract_histogram_into(
@@ -1544,6 +1616,7 @@ def subtract_histogram_into(
     parent: Histogram,
     child: Histogram,
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """`subtract_histogram` into a caller-owned buffer. Every element is
     written, so unlike the accumulating builders this one needs no zeroing
@@ -1588,4 +1661,5 @@ def subtract_histogram_into(
         child.count,
         parent.n_features * parent.n_bins,
         _resolve_const_hessian(const_hessian),
+        settings,
     )

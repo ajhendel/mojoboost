@@ -36,7 +36,12 @@ from std.os import getenv
 
 from .binning import BinnedMatrix
 from .efb import EfbSettings, prepare_bundling
-from .parallel import dispatch_rows, elementwise_row_ops
+from .parallel import (
+    DispatchSettings,
+    dispatch_rows,
+    dispatch_rows_with,
+    elementwise_row_ops,
+)
 from .metrics import _argsort
 from .bagging import (
     BaggingParams,
@@ -441,6 +446,7 @@ def fill_grad_hess(
     alpha: Float64,
     mut grad: List[Float64],
     mut hess: List[Float64],
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """Per-row first and second derivatives of `objective` at the current raw
     scores, written into `grad` and `hess`.
@@ -465,7 +471,7 @@ def fill_grad_hess(
     if len(hess) != n:
         hess.resize(n, 0.0)
     _fill_grad_hess_into(
-        grad, hess, raw, target, objective, weights, alpha, n
+        grad, hess, raw, target, objective, weights, alpha, n, settings
     )
 
 
@@ -478,6 +484,7 @@ def _fill_grad_hess_into(
     weights: List[Float64],
     alpha: Float64,
     n: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     var gp = grad.unsafe_ptr()
     var hp = hess.unsafe_ptr()
@@ -592,7 +599,7 @@ def _fill_grad_hess_into(
     # the unscaled count, 100k rows asked for one task per core and
     # bench/bench_profile.mojo timed the fan-out well below the serial path,
     # the work per task being far too small to pay for scheduling it.
-    dispatch_rows(block, n, elementwise_row_ops(n))
+    dispatch_rows_with(settings, block, n, elementwise_row_ops(n))
 
 
 def _fill_grad_hess(
@@ -603,8 +610,11 @@ def _fill_grad_hess(
     alpha: Float64,
     mut grad: List[Float64],
     mut hess: List[Float64],
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
-    fill_grad_hess(raw, target, objective, weights, alpha, grad, hess)
+    fill_grad_hess(
+        raw, target, objective, weights, alpha, grad, hess, settings
+    )
 
 
 def round_has_constant_hessian(
@@ -1175,6 +1185,7 @@ def _add_by_traversal(
     learning_rate: Float64,
     stride: Int,
     offset: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """`raw[r * stride + offset] += learning_rate * tree.predict_row(data, r)`
     for every row of `data`.
@@ -1208,7 +1219,7 @@ def _add_by_traversal(
                 + learning_rate * tree.predict_row(data, r),
             )
 
-    dispatch_rows(apply, n, n * _TRAVERSAL_ROW_OPS)
+    dispatch_rows_with(settings, apply, n, n * _TRAVERSAL_ROW_OPS)
 
 
 def _add_by_leaf(
@@ -1219,6 +1230,7 @@ def _add_by_leaf(
     n_rows: Int,
     stride: Int,
     offset: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """The same update, routed through the leaf membership growth handed back
     (see `tree.LeafMembership`).
@@ -1275,7 +1287,7 @@ def _add_by_leaf(
     # leaf's rows are the contiguous unit here. Leaf-wise growth does not make
     # equal leaves, so the blocks are not equal work; that imbalance has not
     # been measured and is the obvious thing to revisit.
-    dispatch_rows(apply, n_leaves, n_rows * _LEAF_ROW_OPS)
+    dispatch_rows_with(settings, apply, n_leaves, n_rows * _LEAF_ROW_OPS)
 
 
 def _add_tree_scores(
@@ -1287,6 +1299,7 @@ def _add_tree_scores(
     by_leaf: Bool,
     stride: Int = 1,
     offset: Int = 0,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """End a boosting round: add `learning_rate` times this tree's output to
     the raw score of every training row.
@@ -1302,10 +1315,13 @@ def _add_tree_scores(
     """
     if by_leaf and leaves.covers_all_rows:
         _add_by_leaf(
-            raw, tree, leaves, learning_rate, data.n_rows, stride, offset
+            raw, tree, leaves, learning_rate, data.n_rows, stride, offset,
+            settings,
         )
         return
-    _add_by_traversal(raw, tree, data, learning_rate, stride, offset)
+    _add_by_traversal(
+        raw, tree, data, learning_rate, stride, offset, settings
+    )
 
 
 def _boost_rounds(
@@ -1384,6 +1400,17 @@ def _boost_rounds(
     # One histogram pool and one gather buffer for the whole fit rather than
     # per tree (see `tree.GrowScratch`), and one membership record refilled
     # each round (see `tree.LeafMembership`).
+    # The fit's one reading of the dispatch environment and of the machine's
+    # core counts (parallel.DispatchSettings). Every stage below that takes a
+    # `settings` argument plans its fan-out from this value instead of asking
+    # the operating system again, and asking again is what the round loop used
+    # to do at every dispatch of every node. It is a snapshot: a `setenv`
+    # during a fit is not observed by this fit, which is the documented
+    # contract and the reason there is no cache to invalidate. It resolves
+    # here rather than at module scope because resolving raises on an
+    # off-ladder `MOJOTREES_CPU_FEATURE_GROUP`, and once per fit is where that
+    # refusal belongs.
+    var settings = DispatchSettings.resolve()
     var scratch = GrowScratch(data.n_features, data.n_bins)
     var leaves = LeafMembership()
     var by_leaf = _leaf_score_update_enabled()
@@ -1412,7 +1439,8 @@ def _boost_rounds(
             refresh_bag(bag, bagging, n, round)
         var grad_started = profile.clock()
         _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
+            raw, target, objective, sample_weight, alpha, grad, hess,
+            settings,
         )
         goss_round(bag, grad, hess, goss, round, learning_rate)
         # Round-level work belonging to no node, so it is charged at the
@@ -1465,7 +1493,9 @@ def _boost_rounds(
         # walk when the membership covers the dataset, the full-tree traversal
         # per row otherwise -- be read against the same denominator.
         var update_started = profile.clock()
-        _add_tree_scores(raw, tree, leaves, data, learning_rate, by_leaf)
+        _add_tree_scores(
+            raw, tree, leaves, data, learning_rate, by_leaf, 1, 0, settings
+        )
         profile.charge(PROF_SCORE_UPDATE, n, update_started)
         trees.append(tree^)
         profile.note_wall(post_started)
@@ -1735,6 +1765,17 @@ def train_with_valid(
     var best_n_trees = 0
     var bag = List[Int]()
     var balanced = class_bagging.enabled() and has_positive_rows(target)
+    # The fit's one reading of the dispatch environment and of the machine's
+    # core counts (parallel.DispatchSettings). Every stage below that takes a
+    # `settings` argument plans its fan-out from this value instead of asking
+    # the operating system again, and asking again is what the round loop used
+    # to do at every dispatch of every node. It is a snapshot: a `setenv`
+    # during a fit is not observed by this fit, which is the documented
+    # contract and the reason there is no cache to invalidate. It resolves
+    # here rather than at module scope because resolving raises on an
+    # off-ladder `MOJOTREES_CPU_FEATURE_GROUP`, and once per fit is where that
+    # refusal belongs.
+    var settings = DispatchSettings.resolve()
     var scratch = GrowScratch(data.n_features, data.n_bins)
     var leaves = LeafMembership()
     var by_leaf = _leaf_score_update_enabled()
@@ -1751,7 +1792,8 @@ def train_with_valid(
         else:
             refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
+            raw, target, objective, sample_weight, alpha, grad, hess,
+            settings,
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
         var tree = grow_tree_leaves(
@@ -1780,13 +1822,14 @@ def train_with_valid(
             break
 
         _add_tree_scores(
-            raw, tree, leaves, data, params.learning_rate, by_leaf
+            raw, tree, leaves, data, params.learning_rate, by_leaf, 1, 0,
+            settings,
         )
         # The validation matrix has no membership and cannot: growth
         # partitioned the training rows and knows nothing about these. It
         # keeps the traversal, now over row blocks.
         _add_by_traversal(
-            valid_raw, tree, valid_data, params.learning_rate, 1, 0
+            valid_raw, tree, valid_data, params.learning_rate, 1, 0, settings
         )
         trees.append(tree^)
 
@@ -2111,6 +2154,17 @@ def _boost_rounds_multiclass(
     var grown = 0
     # Shared by every class's tree in every round: the histogram shape is the
     # dataset's, not the class's, so one pool serves them all.
+    # The fit's one reading of the dispatch environment and of the machine's
+    # core counts (parallel.DispatchSettings). Every stage below that takes a
+    # `settings` argument plans its fan-out from this value instead of asking
+    # the operating system again, and asking again is what the round loop used
+    # to do at every dispatch of every node. It is a snapshot: a `setenv`
+    # during a fit is not observed by this fit, which is the documented
+    # contract and the reason there is no cache to invalidate. It resolves
+    # here rather than at module scope because resolving raises on an
+    # off-ladder `MOJOTREES_CPU_FEATURE_GROUP`, and once per fit is where that
+    # refusal belongs.
+    var settings = DispatchSettings.resolve()
     var scratch = GrowScratch(data.n_features, data.n_bins)
     var leaves = LeafMembership()
     var by_leaf = _leaf_score_update_enabled()
@@ -2168,7 +2222,8 @@ def _boost_rounds_multiclass(
             # updated `raw`, exactly as they did before: the trees are popped
             # and the scores are not, and this changes nothing about that.
             _add_tree_scores(
-                raw, tree, leaves, data, learning_rate, by_leaf, n_classes, k
+                raw, tree, leaves, data, learning_rate, by_leaf, n_classes, k,
+                settings,
             )
             trees.append(tree^)
 
@@ -2440,6 +2495,17 @@ def train_multiclass_with_valid(
     var best_n_rounds = 0
     var n_rounds = 0
     var bag = List[Int]()
+    # The fit's one reading of the dispatch environment and of the machine's
+    # core counts (parallel.DispatchSettings). Every stage below that takes a
+    # `settings` argument plans its fan-out from this value instead of asking
+    # the operating system again, and asking again is what the round loop used
+    # to do at every dispatch of every node. It is a snapshot: a `setenv`
+    # during a fit is not observed by this fit, which is the documented
+    # contract and the reason there is no cache to invalidate. It resolves
+    # here rather than at module scope because resolving raises on an
+    # off-ladder `MOJOTREES_CPU_FEATURE_GROUP`, and once per fit is where that
+    # refusal belongs.
+    var settings = DispatchSettings.resolve()
     var scratch = GrowScratch(data.n_features, data.n_bins)
     var leaves = LeafMembership()
     var by_leaf = _leaf_score_update_enabled()
@@ -2499,6 +2565,7 @@ def train_multiclass_with_valid(
                 by_leaf,
                 n_classes,
                 k,
+                settings,
             )
             # The validation rows were never partitioned, so they keep the
             # traversal; see `train_with_valid`.
@@ -2509,6 +2576,7 @@ def train_multiclass_with_valid(
                 params.learning_rate,
                 n_classes,
                 k,
+                settings,
             )
             trees.append(tree^)
 

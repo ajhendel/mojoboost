@@ -35,6 +35,38 @@ settle that is not this one and the harness is bench/, not tests/.
    snapshot too: it does not observe a `setenv` that happens after it is
    taken, and the unresolved functions do, which is the whole of the
    invalidation contract.
+
+4. **A snapshot handed to a builder makes that builder read nothing.** This
+   is the one the other three cannot establish. Sections 1 and 3 compare
+   answers, and the answers were equal before any of this was wired -- which
+   is exactly how the snapshot mechanism passed a whole round of tests
+   without a single caller in `src/`. Equality proves nothing about *when*
+   the environment was read.
+
+   So section 4 counts the reads instead, and it counts them by poisoning.
+   `MOJOTREES_CPU_FEATURE_GROUP=3` is off the ladder, and
+   `apple_cpu_policy.env_feature_group` *raises* on it rather than rounding
+   it, which makes one environment read observable as an exception. Set the
+   poison, then drive many node-sized histogram builds through a snapshot
+   resolved before it: every build that read the variable would raise, so a
+   run that completes read it zero times across all of them. The control is
+   the same workload on the same poisoned environment with no snapshot, which
+   must raise on the first build. Zero reads over N nodes against at least
+   one read per node is the O(1)-versus-O(nodes) claim, asserted rather than
+   argued.
+
+   What this does and does not establish is worth being exact about, because
+   the whole point of the section is not to accept a proxy. It establishes,
+   exactly, that the histogram builders perform **no** read of
+   `MOJOTREES_CPU_FEATURE_GROUP` and **no** call of the live
+   `derive_accumulation_plan` (and therefore no `CpuProfile.detect()` from
+   that site) when handed a snapshot. It does not establish the same for
+   `MOJOTREES_NUM_WORKERS` and the four other scheduling variables, because
+   those are read by functions that swallow a bad value by design and so
+   cannot be poisoned. For those, what is asserted is the divergence
+   property directly on `plan_tasks_with`: after a `setenv` of all five, a
+   snapshot still answers what it answered, which is only possible if it read
+   none of them.
 """
 
 from std.os import setenv
@@ -53,7 +85,13 @@ from mojotrees.apple_cpu_policy import (
     plan_feature_group,
     split_scan_ops,
 )
-from mojotrees.histogram import Histogram
+from mojotrees.binning import BinnedMatrix
+from mojotrees.histogram import (
+    Histogram,
+    build_histogram_into,
+    build_histogram_subset_into_scratch,
+    subtract_histogram_into,
+)
 from mojotrees.parallel import (
     DEFAULT_MIN_TASK_OPS,
     DispatchSettings,
@@ -615,6 +653,380 @@ def test_a_snapshot_is_a_snapshot_and_a_live_read_is_live() raises:
     var again = DispatchSettings.resolve()
     assert_equal(again.num_workers, 4)
     assert_equal(plan_tasks_with(again, 1_000_000, 99 * PARALLEL_MIN_OPS), 4)
+    _auto()
+
+
+# --------------------------------------------------------------------------
+# 4. The wiring: a snapshot handed down makes the per-node path read nothing.
+# --------------------------------------------------------------------------
+
+# The off-ladder width. `env_feature_group` refuses it rather than rounding
+# it, which is what turns one environment read into an observable event. 3 is
+# used rather than a word so the refusal is the ladder check and not the
+# integer parse.
+comptime _POISON = "3"
+
+# Nodes driven through the builders under the poison. Large enough that "the
+# reads did not scale with the node count" is a statement about a trend and
+# not about a single call, and small enough that the file stays a test.
+comptime _POISON_NODES = 200
+
+
+def _poison():
+    _ = setenv("MOJOTREES_CPU_FEATURE_GROUP", _POISON)
+
+
+def _unpoison():
+    _ = setenv("MOJOTREES_CPU_FEATURE_GROUP", "")
+
+
+def _matrix(n_rows: Int, n_features: Int, n_bins: Int) raises -> BinnedMatrix:
+    """A deterministic binned matrix, column-major as `BinnedMatrix` stores
+    it. The bin ids are a fixed mixing of (row, feature) so every feature has
+    a different occupancy and no two runs of this file differ."""
+    var bins = List[UInt8](capacity=n_rows * n_features)
+    bins.resize(n_rows * n_features, UInt8(0))
+    for f in range(n_features):
+        for r in range(n_rows):
+            var v = (r * 7 + f * 13 + (r % 5) * (f % 3)) % n_bins
+            bins[f * n_rows + r] = UInt8(v)
+    return BinnedMatrix(bins^, n_rows, n_features, n_bins)
+
+
+def _grad(n_rows: Int) -> List[Float64]:
+    var g = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        g.append(0.5 - Float64((r * 11) % 17) / 8.0)
+    return g^
+
+
+def _hess(n_rows: Int) -> List[Float64]:
+    var h = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        h.append(1.0 + Float64((r * 5) % 9) / 16.0)
+    return h^
+
+
+def _node_rows(n_rows: Int) -> List[Int]:
+    """Row ids of a node: every third row, which is the indirect,
+    non-contiguous shape a real node has."""
+    var rows = List[Int]()
+    for r in range(n_rows):
+        if r % 3 != 2:
+            rows.append(r)
+    return rows^
+
+
+def _assert_same_histogram(a: Histogram, b: Histogram) raises:
+    """Bit equality on both float planes and integer equality on the count
+    plane. `to_bits()` rather than `==` so a NaN or a signed zero would be
+    caught, and no tolerance anywhere: a scheduling change that moved a bit
+    would be a defect in the change, not a rounding difference to absorb."""
+    assert_equal(a.n_features, b.n_features)
+    assert_equal(a.n_bins, b.n_bins)
+    assert_equal(len(a.grad), len(b.grad))
+    for i in range(len(a.grad)):
+        assert_equal(a.grad[i].to_bits(), b.grad[i].to_bits())
+        assert_equal(a.hess[i].to_bits(), b.hess[i].to_bits())
+        assert_equal(a.count[i], b.count[i])
+
+
+def test_resolving_the_snapshot_is_where_a_bad_width_is_refused() raises:
+    """The poison is real, and it is reported at the snapshot.
+
+    The positive control for everything below it. If `resolve()` stopped
+    raising here, the tests that follow would pass by reading nothing that
+    could ever have failed, which is the failure mode this section exists to
+    avoid.
+    """
+    _auto()
+    _poison()
+    var raised = False
+    try:
+        _ = DispatchSettings.resolve()
+    except:
+        raised = True
+    _unpoison()
+    assert_true(raised)
+    # And with the poison cleared it resolves, so the refusal is the value
+    # and not the act of resolving.
+    var ok = DispatchSettings.resolve()
+    assert_true(ok.resolved)
+
+
+def test_a_snapshot_makes_node_histograms_read_no_environment() raises:
+    """Zero reads of the poisoned variable over 200 node builds, against at
+    least one read on the very first build without a snapshot.
+
+    This is the assertion the lane exists for, and it is a count rather than
+    a comparison. The snapshot is taken while the environment is clean; the
+    poison is set afterwards. Any `getenv` of `MOJOTREES_CPU_FEATURE_GROUP`
+    on the per-node path would then raise, so completing the loop is a proof
+    that the count over 200 nodes is exactly zero.
+
+    Both builders are driven, because they plan separately: the full-dataset
+    build and the subset build each call the accumulation planner once, and a
+    wiring that reached one and not the other would otherwise pass.
+    """
+    _auto()
+    _unpoison()
+    var n_rows = 400
+    var n_features = 6
+    var n_bins = 17
+    var data = _matrix(n_rows, n_features, n_bins)
+    var grad = _grad(n_rows)
+    var hess = _hess(n_rows)
+    var rows = _node_rows(n_rows)
+
+    var settings = DispatchSettings.resolve()
+    assert_true(settings.resolved)
+
+    _poison()
+    var out = Histogram.zeroed(n_features, n_bins)
+    var pairs = List[Float64]()
+    var parent = Histogram.zeroed(n_features, n_bins)
+    var sibling = Histogram.zeroed(n_features, n_bins)
+    # Not one call: the claim is that the read count does not grow with the
+    # node count, so the loop is what makes the claim testable at all.
+    for _ in range(_POISON_NODES):
+        build_histogram_subset_into_scratch(
+            out, pairs, data, grad, hess, rows, 0, len(rows), [], False,
+            settings,
+        )
+        build_histogram_into(parent, data, grad, hess, [], False, settings)
+        subtract_histogram_into(sibling, parent, out, False, settings)
+        _ = find_best_split(
+            out, lambda_reg=1.0, min_child_hess=1e-3, settings=settings
+        )
+
+    # The control, on the same poisoned environment: one build with no
+    # snapshot must raise, which is what makes the zero above meaningful.
+    var raised_full = False
+    try:
+        build_histogram_into(parent, data, grad, hess)
+    except:
+        raised_full = True
+    var raised_subset = False
+    try:
+        build_histogram_subset_into_scratch(
+            out, pairs, data, grad, hess, rows, 0, len(rows)
+        )
+    except:
+        raised_subset = True
+    _unpoison()
+    assert_true(raised_full)
+    assert_true(raised_subset)
+
+
+def test_the_sentinel_default_is_the_pre_change_path() raises:
+    """An unwired call site behaves exactly as it did, reads included.
+
+    Two halves. The values: the sentinel plans what a live read plans, at
+    every shape in the sweep. The reads: under the poison, a build with the
+    sentinel raises exactly as a build with no argument at all does, which is
+    what says the default did not quietly acquire a snapshot's silence.
+    """
+    _auto()
+    _unpoison()
+    var unresolved = ResolvedCpuPolicy.unresolved()
+    assert_true(not unresolved.resolved)
+    var fresh = CpuProfile.detect()
+    assert_equal(unresolved.dispatch_cores(), fresh.dispatch_cores())
+    assert_equal(unresolved.max_auto_tasks(), fresh.max_auto_tasks())
+
+    var rows = [0, 1, 255, 256, 4096, 1_000_000]
+    var actives = [0, 1, 2, 7, 50]
+    for i in range(len(rows)):
+        for j in range(len(actives)):
+            for k in range(2):
+                var indirect = k == 1
+                var a = derive_accumulation_plan_with(
+                    unresolved, 50, actives[j], 255, rows[i], indirect
+                )
+                var b = derive_accumulation_plan(
+                    fresh, 50, actives[j], 255, rows[i], indirect
+                )
+                assert_equal(a.group_width, b.group_width)
+                assert_equal(a.group_count, b.group_count)
+                assert_equal(a.compact_rows, b.compact_rows)
+                assert_equal(a.active_ops, b.active_ops)
+                assert_equal(a.excluded_ops, b.excluded_ops)
+                assert_equal(a.gather_ops, b.gather_ops)
+
+    var sentinel = DispatchSettings.unresolved()
+    assert_true(not sentinel.resolved)
+    var items = [1, 2, 40, 1_000_000]
+    var ops = [0, PARALLEL_MIN_OPS - 1, PARALLEL_MIN_OPS, 99 * PARALLEL_MIN_OPS]
+    for i in range(len(items)):
+        for j in range(len(ops)):
+            assert_equal(
+                plan_tasks_with(sentinel, items[i], ops[j]),
+                plan_tasks(items[i], ops[j]),
+            )
+
+    var n_rows = 200
+    var data = _matrix(n_rows, 5, 13)
+    var grad = _grad(n_rows)
+    var hess = _hess(n_rows)
+    var out = Histogram.zeroed(5, 13)
+    _poison()
+    var raised = False
+    try:
+        build_histogram_into(out, data, grad, hess, [], False, sentinel)
+    except:
+        raised = True
+    _unpoison()
+    assert_true(raised)
+
+
+def test_a_snapshot_ignores_a_setenv_of_every_scheduling_variable() raises:
+    """After the snapshot is taken, all five variables move and it does not.
+
+    The poison covers one variable exactly; this covers the other five by the
+    only instrument they admit, which is that their effect on the plan is
+    visible and a snapshot's plan does not move when they do. It is a weaker
+    statement than a count -- it proves the snapshot did not re-read them at
+    the moment `plan_tasks_with` was called, which is the same thing said
+    from the other side.
+    """
+    _serial()
+    _clear_grain()
+    _ = setenv("MOJOTREES_CPU_TASKS_PER_CORE", "1")
+    _ = setenv("MOJOTREES_CPU_CORE_POOL", "")
+    var snapshot = DispatchSettings.resolve()
+    var before = plan_tasks_with(snapshot, 1_000_000, 99 * PARALLEL_MIN_OPS)
+    assert_equal(before, 1)
+
+    _ = setenv("MOJOTREES_NUM_WORKERS", "8")
+    _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "1")
+    _ = setenv("MOJOTREES_PARALLEL_MIN_TASK_OPS", "1")
+    _ = setenv("MOJOTREES_CPU_TASKS_PER_CORE", "16")
+    _ = setenv("MOJOTREES_CPU_CORE_POOL", "performance")
+
+    assert_equal(
+        plan_tasks_with(snapshot, 1_000_000, 99 * PARALLEL_MIN_OPS), before
+    )
+    assert_equal(snapshot.num_workers, 1)
+    assert_equal(snapshot.min_ops, PARALLEL_MIN_OPS)
+    assert_equal(snapshot.policy.tasks_per_core, 1)
+    assert_equal(snapshot.policy.core_pool, CORE_POOL_ALL)
+    # The live read moved, which is what says the flips landed at all.
+    assert_equal(plan_tasks(1_000_000, 99 * PARALLEL_MIN_OPS), 8)
+
+    _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "")
+    _ = setenv("MOJOTREES_CPU_TASKS_PER_CORE", "")
+    _ = setenv("MOJOTREES_CPU_CORE_POOL", "")
+    _clear_grain()
+    _auto()
+
+
+def _build_all(
+    settings: DispatchSettings,
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    n_features: Int,
+    n_bins: Int,
+) raises -> Histogram:
+    """One node's worth of the wired path, ending in a histogram that carries
+    every stage's output: the subset build, the full build, and the sibling
+    subtraction, folded so that a single comparison covers all three."""
+    var node = Histogram.zeroed(n_features, n_bins)
+    var pairs = List[Float64]()
+    build_histogram_subset_into_scratch(
+        node, pairs, data, grad, hess, rows, 0, len(rows), [], False, settings
+    )
+    var parent = Histogram.zeroed(n_features, n_bins)
+    build_histogram_into(parent, data, grad, hess, [], False, settings)
+    var sibling = Histogram.zeroed(n_features, n_bins)
+    subtract_histogram_into(sibling, parent, node, False, settings)
+    # Fold the three into one value so the comparison cannot miss a plane:
+    # the sibling carries the subtraction, and the counts carry both builds.
+    for i in range(len(node.grad)):
+        node.grad[i] = node.grad[i] + sibling.grad[i]
+        node.hess[i] = node.hess[i] + sibling.hess[i]
+        node.count[i] = node.count[i] + sibling.count[i]
+    return node^
+
+
+def test_the_wired_path_is_identical_at_one_three_and_eight_workers() raises:
+    """Determinism across `MOJOTREES_NUM_WORKERS`, on the paths this lane
+    rewired, with the snapshot resolved under each setting so the task counts
+    genuinely differ.
+
+    Exact comparison on every plane and no tolerance anywhere. The lane moves
+    no arithmetic at all -- it removes environment reads and core detections
+    and nothing else -- so anything but bit equality here is a defect in the
+    change rather than a rounding difference to accept.
+    """
+    _unpoison()
+    _clear_grain()
+    var n_rows = 500
+    var n_features = 7
+    var n_bins = 19
+    var data = _matrix(n_rows, n_features, n_bins)
+    var grad = _grad(n_rows)
+    var hess = _hess(n_rows)
+    var rows = _node_rows(n_rows)
+
+    _serial()
+    var one = _build_all(
+        DispatchSettings.resolve(), data, grad, hess, rows, n_features, n_bins
+    )
+    var workers = ["3", "8"]
+    for i in range(len(workers)):
+        _ = setenv("MOJOTREES_NUM_WORKERS", workers[i])
+        var settings = DispatchSettings.resolve()
+        assert_equal(settings.num_workers, Int(workers[i]))
+        _assert_same_histogram(
+            one,
+            _build_all(settings, data, grad, hess, rows, n_features, n_bins),
+        )
+        # And the unwired default, at the same worker count, agrees with the
+        # snapshot: the two differ in when they read, never in what they
+        # compute.
+        _assert_same_histogram(
+            one,
+            _build_all(
+                DispatchSettings.unresolved(),
+                data, grad, hess, rows, n_features, n_bins,
+            ),
+        )
+    _auto()
+
+
+def test_the_split_scan_is_identical_with_and_without_a_snapshot() raises:
+    """`find_best_split` chooses the same split from a snapshot as from a
+    live read, at every worker count, including the tie-break.
+
+    The scan is the other per-node dispatch this lane rewired, and its output
+    is a choice rather than an array, so it gets its own comparison: a fold
+    that resolved ties by arrival would be exposed by a task count that
+    changed, and the snapshot is what changes it here.
+    """
+    _unpoison()
+    _clear_grain()
+    var h = _tied_histogram(13, 23, 3)
+    _serial()
+    var serial = find_best_split(
+        h, lambda_reg=1.0, min_child_hess=1e-3,
+        settings=DispatchSettings.resolve(),
+    )
+    assert_true(serial.found)
+    var workers = ["1", "3", "8", ""]
+    for i in range(len(workers)):
+        _ = setenv("MOJOTREES_NUM_WORKERS", workers[i])
+        var settings = DispatchSettings.resolve()
+        _assert_same_split(
+            serial,
+            find_best_split(
+                h, lambda_reg=1.0, min_child_hess=1e-3, settings=settings
+            ),
+        )
+        _assert_same_split(
+            serial, find_best_split(h, lambda_reg=1.0, min_child_hess=1e-3)
+        )
     _auto()
 
 
