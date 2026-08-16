@@ -584,17 +584,36 @@ CATBOOST_UNMATCHABLE = {
         "and now neither needs to be"
     ),
     "row_sampling": (
-        "STILL UNMATCHED, and now for a narrower reason than before. "
-        "CatBoost's default bootstrap_type is MVS with subsample 0.8, so it "
-        "subsamples rows on every tree, weighted by gradient magnitude "
-        "rather than uniformly. mojotrees HAS an MVS sampler now, built from "
-        "CatBoost's source and wired into the round loop -- but the bundle "
-        "cannot travel from Python: bindings/_mojotrees.mojo does not parse "
-        "bootstrap_type and model.fit does not forward it, so the estimator "
-        "still refuses the key. This arm therefore sees every row where "
-        "CatBoost sees about 80 percent. The missing edge is two files and "
-        "is named in the sampler-wire lane report; until it lands this is a "
-        "wiring gap, not a capability gap"
+        "CLOSED 2026-08-16 ON THE SINGLE-OUTPUT DENSE CPU SCENARIOS, AND "
+        "STILL OPEN ON TWO. CatBoost's default bootstrap_type is MVS with "
+        "subsample 0.8, so it subsamples rows on every tree, weighted by "
+        "gradient magnitude rather than uniformly, and this arm used to see "
+        "every row. The sampler was built from CatBoost's source and wired "
+        "into boosting.train's round loop a wave earlier; what was missing "
+        "was the edge from Python, and that edge now exists -- "
+        "bindings/_mojotrees.mojo parses bootstrap_type into a "
+        "sampling.BootstrapParams, model.fit and trainset.train_dataset "
+        "forward it to boosting.train, and MOJOTREES_CATBOOST_MODE asks for "
+        "it by name. dense_regression, imbalanced_binary, "
+        "ordered_boosting_small and high_cardinality_categorical are matched "
+        "on this axis for the first time. "
+        "WHAT IS STILL OPEN, and it is a CAPABILITY gap rather than the "
+        "wiring gap this entry used to describe: neither the multiclass "
+        "trainers (boosting.train_multiclass, train_multiclass_gpu) nor the "
+        "sparse ones (boosting_sparse.train_sparse) call "
+        "sampling.bootstrap_round, so they refuse an enabled bundle by name. "
+        "With MOJOTREES_CATBOOST_MODE setting bootstrap_type, the multiclass "
+        "and sparse_highdim cells therefore RAISE instead of producing a "
+        "row. That is the designed behavior for a parameter that cannot be "
+        "honored, and it is also a scheduling problem that has to be settled "
+        "before the next full matrix: either those two scenarios drop these "
+        "two keys, or a multiclass and sparse bootstrap gets built. Note "
+        "that dropping them for multiclass is the more faithful choice "
+        "anyway, because CatBoost does not run MVS for multiclass either. "
+        "The GPU is a third case and is refused for the same reason: "
+        "train_gpu takes no bundle, so a CatBoost-mode arm on the "
+        "accelerator raises rather than reporting an unsampled fit as a "
+        "sampled one"
     ),
     "split_scoring": (
         "HALF CLOSED. CatBoost's default score_function is Cosine and this "
@@ -1004,16 +1023,43 @@ CATBOOST_DETERMINISM = {
 #: The entries are canonical `shared_params` names, applied over
 #: `BASE_PARAMS` before translation, so the CatBoost-mode arm and the plain
 #: arm differ in exactly this dict and a reader can diff two records to see
-#: it. What is deliberately absent is as much of the definition as what is
-#: present: there is no bagging entry, because CatBoost's MVS is not uniform
-#: row sampling and a bagging_fraction of 0.8 would be an imitation of the
-#: number rather than of the method.
+#: it. There is still no `bagging_fraction` entry, and now for a stronger
+#: reason than before: `bootstrap_type="MVS"` beside `bagging_fraction` is
+#: two CatBoost bootstrap types at once and is refused
+#: (`boosting._check_bootstrap`).
+#:
+#: **READ THIS BEFORE SCHEDULING A MATRIX.** `bootstrap_type` and `subsample`
+#: joined this dict on 2026-08-16 and are honored on the **dense,
+#: single-output, CPU** trainer only. Two of the six scenarios that run this
+#: arm do not go through that trainer and will RAISE rather than train:
+#: `multiclass` (`trainset.train_dataset_multiclass`, which takes no bundle)
+#: and `sparse_highdim` (`model_sparse.fit_csc`, likewise). Both refusals name
+#: the entry point and the reason, which is the intended behavior for a
+#: parameter that cannot be honored -- a silently unsampled multiclass row
+#: labelled "CatBoost mode" is the outcome this whole campaign exists to
+#: prevent -- but it means those two cells need either a per-scenario
+#: exclusion of these two keys or an MVS-capable multiclass and sparse
+#: trainer before the next full matrix runs. That decision belongs to whoever
+#: owns this harness; see CATBOOST_UNMATCHABLE["row_sampling"].
+#:
+#: **DO NOT ADD boosting_type="Ordered" TO THIS DICT.** `boosting.mojo:2481`
+#: refuses ordered boosting beside any bootstrap_type, because a dropped or
+#: reweighted row changes which prefix each ordered fold was fitted on. This
+#: arm now carries CatBoost's row sampling and therefore forecloses ordered
+#: boosting on the same arm; a mojotrees ordered-boosting row has to be its
+#: own arm, without the bootstrap. That costs nothing against CatBoost's own
+#: defaults: CatBoost's boosting_type resolves to Plain at every tier this
+#: suite runs, because defaults_helper.h::UpdateBoostingTypeOption turns
+#: Ordered OFF and its other clause is IterationCount < 500, which fires at
+#: 100 estimators regardless of row count. Ordered is a GPU-task-type default
+#: and this suite runs CPU. See ORDERED_BOOSTING_ROWS, which records the same
+#: reading from the other side.
 MOJOTREES_CATBOOST_MODE = {
     # CatBoost's actual CPU defaults, to the extent this surface can now
     # reach them. Four knobs became reachable on 2026-08-16 and are set here
     # for the first time: grow_policy, score_function, random_strength and
-    # leaf_estimation_iterations. Two are still refused and are listed under
-    # "what is still unmatched" below.
+    # leaf_estimation_iterations. Two more became reachable later the same
+    # day: bootstrap_type and subsample.
     "grow_policy": "symmetrictree",
     "max_depth": 6,
     "num_leaves": 64,
@@ -1025,6 +1071,14 @@ MOJOTREES_CATBOOST_MODE = {
     "random_strength": 1.0,
     "leaf_estimation_iterations": 1,
     "max_bin": 255,
+    "bootstrap_type": "MVS",
+    # NOT row bagging. Under `bootstrap_type="MVS"` this key is the MVS rate
+    # and row bagging is off, which is CatBoost's own contract for the
+    # parameter and is resolved in `python/mojotrees/sklearn.py`'s
+    # `_resolve_bootstrap`. Passing it without `bootstrap_type` would mean
+    # uniform bagging, which is a different sampler and would be an
+    # imitation of the number rather than of the method.
+    "subsample": 0.8,
 }
 
 #: Why each entry above is what it is, carried into the record beside the
@@ -1056,6 +1110,36 @@ MOJOTREES_CATBOOST_MODE_REASONS = {
         "CatBoost's resolved value for the objectives this suite runs. It is "
         "1 for RMSE and Logloss and this arm does not run the losses where "
         "CatBoost resolves it higher"
+    ),
+    "bootstrap_type": (
+        "CatBoost's actual CPU default sampler, and the largest single "
+        "difference this arm still carried. SetNotSpecifiedOptionsToDefaults "
+        "installs MVS whenever the user set nothing, the loss is neither "
+        "multiclass-only nor multi-regression, task_type is CPU and "
+        "sampling_unit is Object; RMSE and Logloss satisfy all four, so "
+        "every CatBoost number this suite has ever published came from an "
+        "MVS fit while the two rows beside it saw every row. Reachable from "
+        "Python for the first time on 2026-08-16: the sampler had been built "
+        "and wired into boosting.train's round loop for a wave, and the "
+        "missing edge was bindings/_mojotrees.mojo not parsing the key and "
+        "model.fit not forwarding it. HONORED ON THE DENSE SINGLE-OUTPUT CPU "
+        "TRAINER ONLY. The multiclass and sparse scenarios refuse it by name "
+        "rather than training an unsampled model, which is correct behavior "
+        "and is also a live scheduling problem; see the header comment on "
+        "MOJOTREES_CATBOOST_MODE. Note that CatBoost does not run MVS for "
+        "multiclass either -- its own defaulting block excludes the "
+        "multiclass-only losses and falls back to the Bayesian bootstrap -- "
+        "so the honest CatBoost-mode multiclass arm is not this value at all"
+    ),
+    "subsample": (
+        "0.8, which is the value MVS installs, and NOT the 0.66 the "
+        "TBootstrapConfig constructor suggests: anyone reading 0.66 out of "
+        "the header is wrong by a fifth of the rows. Under "
+        "bootstrap_type=MVS this key is the MVS rate and row bagging is off, "
+        "which is CatBoost's own meaning for the parameter. It is not "
+        "bagging_fraction: bagging_fraction IS CatBoost's Bernoulli "
+        "bootstrap under mojotrees's name, so setting both would ask for two "
+        "bootstrap types at once and is refused"
     ),
     "max_bin": (
         "CatBoost's border_count of 254 counts THRESHOLDS where max_bin "
@@ -2572,14 +2656,20 @@ def mojotrees_catboost_mode_params(spec, device, extra=None):
     lacked them but because `python/mojotrees/sklearn.py` refused the keys
     and this harness reaches only what that file validates.
 
-    What it still does not do is **sample rows**. CatBoost's default MVS
-    takes about 80 percent of them per tree, weighted by gradient magnitude;
-    this arm sees all of them. The sampler exists and is wired into the round
-    loop -- the gap is that `bindings/_mojotrees.mojo` does not parse
-    `bootstrap_type` and `model.fit` does not forward it, so the bundle
-    cannot travel from Python. That is a wiring gap rather than a capability
-    gap and it is the one entry in `CATBOOST_UNMATCHABLE` expected to close
-    next. It travels with the record either way.
+    It **samples rows** as of later the same day, which this paragraph used
+    to say it did not. CatBoost's default MVS takes about 80 percent of them
+    per tree, weighted by gradient magnitude, and this arm now asks for it by
+    name: `bootstrap_type` parses into a `sampling.BootstrapParams` at the
+    binding and reaches `boosting.train` through `model.fit` and
+    `trainset.train_dataset`.
+
+    **On four of the six scenarios that run this arm.** The multiclass and
+    sparse trainers call no `bootstrap_round` and refuse the bundle by name,
+    so the `multiclass` and `sparse_highdim` cells raise rather than
+    producing an unsampled row labelled "CatBoost mode". Read
+    `CATBOOST_UNMATCHABLE["row_sampling"]` and the header comment on
+    `MOJOTREES_CATBOOST_MODE` before scheduling a matrix; it travels with the
+    record either way.
 
     The override is applied to the resolved dict rather than to the
     scenario's `params`, and that is a correction rather than a shortcut.

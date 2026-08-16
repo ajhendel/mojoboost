@@ -418,6 +418,164 @@ def test_unknown_score_function_is_refused_by_name():
 
 
 # --------------------------------------------------------------------------
+# bootstrap_type
+# --------------------------------------------------------------------------
+#
+# UNRUN. Written in a session where running Python tests was forbidden; no
+# arm of any test in this section has been executed. The claims below are
+# read off the source, not off a run.
+
+
+def test_bootstrap_type_mvs_moves_the_fit():
+    """`bootstrap_type="MVS"` is CatBoost's own CPU default sampler and it
+    must reach the trainer, not merely validate.
+
+    MVS drops rows outright: a zero weight is a dropped row, not a
+    down-weighted one (`sampling.mvs_kept_rows`,
+    `SetControlNoZeroWeighted`), so a tree grown under it sees a different
+    row set and a different weighted gradient. Both arms are the same
+    estimator, the same seed and the same data, so the only thing that can
+    differ is the draw.
+    """
+    X, y = _regression()
+    plain = MojoTreesRegressor(
+        n_estimators=8, num_leaves=15, random_state=5
+    ).fit(X, y)
+    mvs = MojoTreesRegressor(
+        n_estimators=8,
+        num_leaves=15,
+        random_state=5,
+        bootstrap_type="MVS",
+        subsample=0.8,
+    ).fit(X, y)
+    assert not np.array_equal(plain.predict(X), mvs.predict(X))
+
+
+def test_bootstrap_type_bayesian_moves_the_fit():
+    """`bootstrap_type="Bayesian"` with a temperature reaches the same
+    argument by the other arm of `_parse_bootstrap`. It keeps every row and
+    reweights it, so the fit moves without any row being dropped."""
+    X, y = _regression()
+    plain = MojoTreesRegressor(
+        n_estimators=8, num_leaves=15, random_state=5
+    ).fit(X, y)
+    bayesian = MojoTreesRegressor(
+        n_estimators=8,
+        num_leaves=15,
+        random_state=5,
+        bootstrap_type="Bayesian",
+        bagging_temperature=1.0,
+    ).fit(X, y)
+    assert not np.array_equal(plain.predict(X), bayesian.predict(X))
+
+
+def test_bootstrap_type_mvs_repeats_under_the_same_seed():
+    """The MVS draw is counter-based and keyed on `(seed, tree, row)` with
+    its own domain constant (`sampling._mvs_stream`, `_MVS_DOMAIN`), so two
+    fits at the same `random_state` are the same model. A sequential draw
+    whose order depended on thread scheduling would fail this under a
+    different `MOJOTREES_NUM_WORKERS`, which is why the property is a
+    contract and not a hope."""
+    X, y = _regression()
+    kwargs = dict(
+        n_estimators=6,
+        num_leaves=15,
+        random_state=5,
+        bootstrap_type="MVS",
+        subsample=0.8,
+    )
+    first = MojoTreesRegressor(**kwargs).fit(X, y)
+    second = MojoTreesRegressor(**kwargs).fit(X, y)
+    np.testing.assert_array_equal(first.predict(X), second.predict(X))
+
+
+@pytest.mark.parametrize("spelling", ["mvs", "MVS", "MvS"])
+def test_bootstrap_type_value_is_case_insensitive(spelling):
+    """docs/PARAMETER_NAMING.md makes value strings case insensitive and the
+    fold happens once, in the estimator, before the native
+    `canonical_bootstrap_type`, which takes canonical lowercase."""
+    X, y = _regression()
+    canonical = MojoTreesRegressor(
+        n_estimators=4, random_state=5, bootstrap_type="MVS", subsample=0.8
+    ).fit(X, y)
+    other = MojoTreesRegressor(
+        n_estimators=4, random_state=5, bootstrap_type=spelling, subsample=0.8
+    ).fit(X, y)
+    np.testing.assert_array_equal(canonical.predict(X), other.predict(X))
+
+
+@pytest.mark.parametrize(
+    "kwargs,fragment",
+    [
+        # `bagging_temperature` belongs to Bayesian and MVS never reads it.
+        # CatBoost accepts this pair, ignores the temperature and drops it in
+        # Save; mojotrees refuses it (sampling.check_mvs_bagging_temperature).
+        (
+            {"bootstrap_type": "MVS", "bagging_temperature": 1.0},
+            "bagging_temperature",
+        ),
+        # The Bayesian bootstrap keeps every row, so there is no fraction.
+        # CatBoost refuses the same pair.
+        ({"bootstrap_type": "Bayesian", "subsample": 0.8}, "subsample"),
+        # Two bootstrap types at once: bagging_fraction IS Bernoulli.
+        (
+            {"bootstrap_type": "MVS", "bagging_fraction": 0.8},
+            "bagging_fraction",
+        ),
+        # A bagging schedule beside a per-tree sampler.
+        (
+            {"bootstrap_type": "MVS", "subsample": 0.8, "subsample_freq": 1},
+            "subsample_freq",
+        ),
+        # The temperature on its own names nothing.
+        ({"bagging_temperature": 1.0}, "bagging_temperature"),
+        # Still genuinely unreachable, and refused by name rather than as an
+        # unknown value.
+        ({"bootstrap_type": "Bernoulli"}, "Bernoulli"),
+        ({"bootstrap_type": "Poisson"}, "Poisson"),
+        ({"bootstrap_type": "Uniform"}, "bootstrap_type"),
+    ],
+)
+def test_a_bootstrap_configuration_that_names_two_things_is_refused(
+    kwargs, fragment
+):
+    """A parameter that belongs to another `bootstrap_type` is refused by
+    name with the reason, never accepted and dropped. CatBoost's own
+    `TBootstrapConfig::Validate` misses one of these
+    (`bagging_temperature` beside MVS) and that divergence is deliberate."""
+    X, y = _regression(n_rows=120)
+    with pytest.raises((ValueError, RuntimeError)) as excinfo:
+        MojoTreesRegressor(n_estimators=3, **kwargs).fit(X, y)
+    assert fragment in str(excinfo.value)
+
+
+def test_bootstrap_type_refuses_on_a_multiclass_fit():
+    """Multiclass has no bootstrap and must say so. Neither
+    `boosting.train_multiclass` nor `train_multiclass_gpu` takes the bundle,
+    and CatBoost agrees about the shape of the hole: its own defaulting
+    block excludes the multiclass-only losses from the MVS default."""
+    X, y = _regression(n_rows=180)
+    labels = np.digitize(y, np.quantile(y, [0.33, 0.66]))
+    with pytest.raises((ValueError, RuntimeError)):
+        MojoTreesClassifier(
+            n_estimators=3, bootstrap_type="MVS", subsample=0.8
+        ).fit(X, labels)
+
+
+def test_bootstrap_type_no_is_bit_for_bit_the_default():
+    """Naming the default must not move a fit. `"No"` is
+    `BootstrapParams.disabled()`, which is the bundle every fit already
+    carries, so "absent" and `"No"` are the same object down the same
+    path."""
+    X, y = _regression()
+    absent = MojoTreesRegressor(n_estimators=6, random_state=5).fit(X, y)
+    named = MojoTreesRegressor(
+        n_estimators=6, random_state=5, bootstrap_type="No"
+    ).fit(X, y)
+    np.testing.assert_array_equal(absent.predict(X), named.predict(X))
+
+
+# --------------------------------------------------------------------------
 # The standing gate
 # --------------------------------------------------------------------------
 
@@ -427,12 +585,18 @@ def test_unknown_score_function_is_refused_by_name():
 #: A name leaves this table by being wired, never by being deleted.
 UNREACHABLE = [
     ("random_strength", 1.0, "random_score_scale"),
-    ("bagging_temperature", 1.0, "bayesian_bootstrap_weights"),
     ("max_ctr_complexity", 2, "ctr.mojo"),
 ]
 # `score_function` left this table by being wired, which is the only way a
 # row may leave it. Its moves-the-fit tests are
 # `test_score_function_cosine_moves_the_fit` and the two beside it above.
+#
+# `bagging_temperature` left it the same way on 2026-08-16 and did NOT stop
+# raising: set on its own it still refuses, because the temperature belongs
+# to `bootstrap_type="Bayesian"` and naming it alone names nothing. What
+# changed is that the refusal is now about a missing companion parameter
+# rather than about a missing edge, so the row's premise was false. Its
+# moves-the-fit tests are the `bootstrap_type` section below.
 
 
 @pytest.mark.parametrize("name,value,missing", UNREACHABLE)

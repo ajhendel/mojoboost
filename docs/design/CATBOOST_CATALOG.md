@@ -267,6 +267,184 @@ that:
   `mojo.objective_names` block closes that; the Python mirror is left to its
   owner and is recorded here as the remaining duplicate.
 | A33 | **Reachability of A13/A14, A17/A18, A20, A28 and A29's ONNX half.** Not a CatBoost mechanism: the edge between a mechanism and a user. `python/mojotrees/features.py`, `python/mojotrees/onnx_export.py`, `python/mojotrees/_multi_target.py`, `bindings/catboost_reach_bindings.mojo` | Six native modules were compiled, tested and reached by no entry point (`tools/connectivity_audit.py`, 2026-08-16: eleven orphans of 108). Two edges closed four of them (`multi_target` reaches `target_matrix`, `text_features` reaches `text_processing`) and two more closed the rest | No. Nothing here changes an existing default, an existing objective or an existing fit; every mechanism it reaches is still off unless asked for by name | Yes, and it is the whole of bucket C for these six: a capability nobody can invoke is not a capability, and no comparison against CatBoost can be run through one | `multi_target.mojo`, `text_features.mojo` (entry points), `bindings/catboost_reach_bindings.mojo`, `python/mojotrees/{features,onnx_export,_multi_target}.py`, `sklearn.py` (2-D `y`, langevin refusals) | A33 note. **CONNECTED**: MultiRMSE (2-D `y`), text features, embedding features, ONNX export. **REFUSED BY NAME**: langevin, `diffusion_temperature`, `model_shrink_rate`, `model_shrink_mode` |
+| A34 | `bootstrap_type` as a **reachable** parameter: the Python-to-trainer edge for A4 and A11 (no new CatBoost mechanism; the source claims are A4's and A11's, re-read from their notes and **NOT independently re-verified against CatBoost source in this lane**) | Nothing about the sampler. A11 built the MVS draw and `boosting.train` already applied it; what did not exist was any way for a user to ask for it. `bindings/_mojotrees.mojo` did not parse `bootstrap_type`, `model.fit` had no `bootstrap` argument, and the estimator refused the key outright | Yes when the user names it; nothing moves when they do not (`BootstrapParams.disabled()` is the default at every new argument) | Yes, and it is the whole point: `bootstrap_type=MVS, subsample=0.8` is CatBoost's CPU default and the CatBoost-mode arm fit on 100 percent of the rows while CatBoost fit on about 80. Reachable now on the **dense single-output CPU** fit only | `bindings/_mojotrees.mojo`, `src/mojotrees/model.mojo`, `python/mojotrees/sklearn.py` | (1) inert when unset, (3) when set. **`subsample` changes meaning under `bootstrap_type=MVS`**, which is CatBoost's own contract and is resolved in the estimator, not silently: see the A34 note. Every entry point that cannot draw refuses by name (`sampling.check_bootstrap_honored`), GPU included. The arm that carries this **forecloses `boosting_type='ordered'` on the same arm** (`boosting.mojo:2481`), and it found and fixed a round-loop defect that made every MVS fit stop after one tree |
+
+### A34 note: making `bootstrap_type` reachable, and the `subsample` collision
+
+Status: **glue, not a mechanism.** No CatBoost source was read in this lane.
+Every claim below about what CatBoost does is taken from the A4 and A11 notes
+in this file, which say **verified from source** and cite the files; this lane
+re-read those notes and did not re-open CatBoost. Where a claim matters it is
+labeled with which note it comes from. Nothing here is measured; this lane ran
+no benchmark.
+
+#### 1. The three CatBoost facts this lane depends on
+
+- **MVS is CatBoost's CPU default `bootstrap_type` for both RMSE and
+  Logloss.** From the A11 note, section 1, quoting
+  `catboost_options.cpp::SetNotSpecifiedOptionsToDefaults`: the default is
+  installed when the user set nothing, the loss is neither multiclass-only nor
+  multi-regression, `task_type=CPU`, and `sampling_unit=Object`. RMSE and
+  Logloss satisfy all four. **Verified from source by the A11 lane, not by
+  this one.**
+- **`subsample` defaults to 0.8 under MVS**, not to the 0.66 in the
+  `TBootstrapConfig` constructor. From the A11 note, section 2, and restated
+  in `sampling.MvsBootstrapParams`'s docstring and `DEFAULT_MVS_SUBSAMPLE`.
+  **Verified from source by the A11 lane, not by this one.**
+- **`bagging_temperature` belongs to Bayesian and is never read by MVS.**
+  From `sampling.check_mvs_bagging_temperature`, which cites
+  `TBootstrapConfig::Validate` and records the divergence: CatBoost *accepts*
+  `bootstrap_type=MVS, bagging_temperature=5`, ignores the temperature, and
+  drops it in `Save`. mojotrees refuses the pair. This lane keeps that
+  refusal and moves it to where a Python user hits it. **Verified from source
+  by the A4/A11 lanes, not by this one.**
+
+#### 2. The `subsample` collision, and how it is resolved
+
+mojotrees's `subsample` is LightGBM's `bagging_fraction` under scikit-learn's
+name: uniform row bagging with `subsample_freq`. CatBoost's `subsample` is a
+member of the *bootstrap* options and its meaning is decided by
+`bootstrap_type`; under `MVS` it is the MVS rate, and under `Bernoulli` it is
+the bagging fraction, which is the same draw.
+
+So `bootstrap_type=MVS, subsample=0.8` names one thing in CatBoost and two
+things here, and passing both through unchanged would hand
+`boosting._check_bootstrap` an enabled MVS bundle beside an enabled
+`BaggingParams` -- which it refuses, correctly, as "two bootstrap types at
+once" (`boosting.mojo`, the `bagging_fraction IS CatBoost's Bernoulli
+bootstrap` error).
+
+**Resolution: under `bootstrap_type=MVS` the estimator routes `subsample` to
+the MVS rate and leaves row bagging off.** That is CatBoost's contract read
+literally, and it is done in `_resolve_bootstrap` in `python/mojotrees/sklearn.py`
+where both values are still visible, rather than in the binding where only the
+resolved numbers arrive. Three refusals hold the line so that nothing is
+silently reinterpreted:
+
+- `bagging_fraction` named explicitly (below 1.0) beside `bootstrap_type=MVS`
+  or `Bayesian` is refused. `bagging_fraction` is the LightGBM spelling and it
+  has only ever meant bagging, so a user who wrote it meant Bernoulli, and
+  Bernoulli beside MVS is the two-at-once case.
+- `subsample_freq` / `bagging_freq` named explicitly beside a bootstrap type
+  is refused for the same reason: a frequency is a bagging knob and MVS
+  redraws every tree unconditionally.
+- `subsample` beside `bootstrap_type=Bayesian` is refused, which is CatBoost's
+  own rule ("bayesian bootstrap doesn't support 'subsample' option", quoted in
+  `sampling.BayesianBootstrapParams`).
+
+With `bootstrap_type` unset or `No`, `subsample` keeps exactly the meaning it
+has always had and no fit moves a bit.
+
+#### 3. What is reachable, and what refuses
+
+Reachable: the **dense, single-output, CPU** fit. `_mojotrees.fit` ->
+`model.fit` -> `boosting.train(bootstrap=...)`, which is the one round loop
+that calls `sampling.bootstrap_round`.
+
+Refused by name, with the reason, rather than accepted and dropped -- every
+one of these raises `sampling.check_bootstrap_honored`'s message or a message
+naming the entry point:
+
+- **GPU.** `model.fit` resolves the device and may land on `train_gpu`, which
+  takes no bundle and whose round loop never draws. An enabled bootstrap that
+  resolves to GPU raises naming the GPU. This is a real refusal and not a
+  formality: `device="auto"` can select the accelerator from `model.fit`.
+- **Multiclass** (`model.fit_multiclass`, `boosting.train_multiclass`, the
+  softmax metric path, `train_dataset_multiclass`, `booster_update_multiclass`).
+  Consistent with CatBoost, which falls back to Bayesian for multiclass and
+  never runs MVS there at all.
+- **Custom objectives** (`model.fit_custom`, `objective.train_custom`).
+  `boosting._check_bootstrap` already refuses the pair for the reason that a
+  callback's derivatives are the caller's and the draw would silently rescale
+  them.
+- **The eval_set / callback path** (`custom_metric.fit_with_metrics` and
+  friends), **sparse CSC fits**, **rankers**, **`Dataset` fits**, and
+  **`booster_update`**: none of their loops calls `bootstrap_round`.
+- **`linear_tree=True`**, which routes to the metric trainer, so it lands on
+  the line above.
+- **`bootstrap_type='Bernoulli'` and `'Poisson'`** stay refused by name. The
+  estimator keeps its own message for these two because it can point at the
+  parameter that DOES do the thing (`subsample` with `subsample_freq`), which
+  `sampling.canonical_bootstrap_type` cannot know about; the native resolver
+  refuses them a second time for the parameter-string and CLI surfaces.
+- **`boosting_type='ordered'`.** `boosting.mojo:2481` raises on
+  `ordered.enabled and bootstrap.enabled()`: a dropped or reweighted row
+  changes which prefix each ordered fold was fitted on. **Verified by reading
+  that line.** The consequence for the harness is a standing one and is
+  written here so nobody rediscovers it: **the CatBoost-mode arm now carries
+  CatBoost's row sampling and therefore forecloses ordered boosting on the
+  same arm.** A mojotrees ordered-boosting row has to be its own arm, without
+  the bootstrap. `MOJOTREES_CATBOOST_MODE` does not set `boosting_type` today,
+  so nothing breaks; adding `boosting_type="Ordered"` to that dict would.
+
+  Two facts about CatBoost that keep this from being a gap, both **verified
+  from CatBoost source by the ordered-boosting lane and relayed here, not
+  re-read by this lane**. First, CatBoost's own default `boosting_type` at
+  every tier this suite runs is **Plain**: `defaults_helper.h::
+  UpdateBoostingTypeOption` turns Ordered **off**, and its condition is a
+  disjunction whose other half is `IterationCount < 500`, which fires at every
+  tier because the suite runs 100 estimators; Ordered is only installed as a
+  default on the GPU task type and we run CPU. So this arm is not missing
+  ordered boosting relative to CatBoost's defaults, it matches them, and MVS
+  is not closing the last gap to a CatBoost that runs ordered. Second,
+  CatBoost refuses Ordered together with a nonsymmetric grow policy outright
+  (`catboost_options.cpp:1046-1050`, `CB_ENSURE(BoostingType == Plain)`)
+  rather than silently resolving to Plain, which is the same shape of refusal
+  as ours.
+
+#### 4. Determinism, checked rather than assumed
+
+The MVS keep decision is `uniform(stream + row)` with
+`stream = _mvs_stream(seed, tree_index)`, and `_mvs_stream` is
+`splitmix64` over `(seed ^ _MVS_DOMAIN)` mixed with the tree index --
+counter-based, keyed on `(seed, tree, row)`, with its own domain constant
+`_MVS_DOMAIN` separating it from the feature and bagging streams. No draw's
+value depends on how many draws preceded it, so no partition of the rows
+across workers changes a weight. The threshold is solved per fixed-size block
+over candidates written in row order. This is `sampling.mvs_bootstrap_weights`'s
+own determinism paragraph and this lane read the code to confirm it before
+relying on it. The seed reaching that stream is `bootstrap_seed` on the wire,
+which the estimator fills from `random_state` when one is set and leaves at
+`sampling.DEFAULT_BOOTSTRAP_SEED` otherwise.
+
+#### 5. A round-loop bug the first reachable fit found immediately
+
+Making the path reachable exposed a defect that no unit test could see,
+because until now nothing ran more than one bootstrapped round through
+`boosting.train`: **every MVS fit stopped after exactly one tree.**
+
+`sampling.bootstrap_round` writes MVS's kept rows back into the round loop's
+`bag`, because a dropped row has to leave through the row list. On the next
+round `bagging.refresh_bag` returns without touching `bag` (bagging is off,
+and it must be off, `_check_bootstrap` refuses the pair), so the previous
+round's kept set was still sitting there when `bootstrap_round` was called
+again. That function refuses a non-empty row list beside MVS -- correctly,
+because a real bag would be silently intersected with a draw that never saw
+it -- so the refusal fired on the sampler's own output.
+
+The fix is `bag.clear()` immediately before `bootstrap_round` in `train` and
+in `train_with_valid`. It cannot discard a real bag: `_check_bootstrap`
+refuses `bootstrap_type` beside `bagging_fraction`, GOSS and balanced bagging
+at fit setup, so the only thing in `bag` at that point is last round's kept
+set, which this round is about to redraw.
+
+This is the argument for reachability tests over mechanism tests in one
+paragraph. `tests/test_bootstrap_wire.mojo` asserted the exclusion and passed;
+`tests/test_mvs_bootstrap.mojo` asserted the draw and passed. Neither ran two
+rounds through a real trainer.
+
+#### 6. What this lane did NOT do
+
+No benchmark, no measurement, no accuracy claim. MVS drops rows, so a
+CatBoost-mode arm with it on will touch fewer rows per tree; whether that is
+faster, and what it costs in accuracy, is unmeasured here. It also disables
+the constant-hessian plane (A4, A11), which is a cost the notes above already
+price and this lane did not re-check.
+
+`mvs_reg` has no estimator parameter. The wire carries the key and the binding
+honors it, so the Mojo API and a future estimator parameter both reach it, but
+from Python it is always "unset", which is CatBoost's own default and the
+configuration `sampling.check_mvs_reg` argues is the only sensible one.
 
 ### A4 note: Bayesian bootstrap, verified from source
 

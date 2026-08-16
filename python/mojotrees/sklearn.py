@@ -239,6 +239,29 @@ class _Base(_ParamsMixin):
     CatBoost's `random_seed`) sets every per-component seed at once, leaving
     any seed you named yourself alone.
 
+    `bootstrap_type` is CatBoost's parameter of that name and selects a
+    different row sampler: `"MVS"` is Minimal Variance Sampling, CatBoost's
+    own CPU default, which keeps large-gradient rows certainly and small ones
+    with probability proportional to their gradient magnitude, weighting each
+    survivor by the inverse of that probability; `"Bayesian"` keeps every row
+    and reweights it by `bagging_temperature`; `"No"` is what an unbagged fit
+    already is. `"Bernoulli"` is refused by name because it is row bagging
+    under another name and is `subsample` with `subsample_freq` here, and
+    `"Poisson"` is refused because CatBoost itself refuses it on the CPU.
+
+    **`subsample` means the MVS rate under `bootstrap_type="MVS"`**, which is
+    CatBoost's own contract, and row bagging is off there: `bootstrap_type`
+    and `bagging_fraction` are two values of one CatBoost enum and cannot both
+    be set. `bagging_temperature` belongs to `"Bayesian"` and is refused
+    beside any other type, which is a deliberate divergence -- CatBoost
+    accepts it beside MVS, never reads it, and tells the user nothing.
+
+    A bootstrap runs on the **dense, single-output, CPU** fit only. Every
+    other entry point -- the GPU, multiclass, sparse, rankers, custom
+    objectives, `eval_set`, `linear_tree`, dart, rf, and the `Dataset` API --
+    refuses an enabled `bootstrap_type` by name rather than training an
+    unsampled model and reporting a sampled one.
+
     `boosting_type` (LightGBM's `boosting`, XGBoost's `booster`) selects the
     training strategy: "gbdt", the default, trains every tree on
     every row, and "goss" is Gradient-based One-Side Sampling. CatBoost's
@@ -339,14 +362,14 @@ class _Base(_ParamsMixin):
 
     **Not wired, and refused by name with the missing piece.**
     `random_strength` (the noise is implemented; its per-tree scale is
-    computed by a function with no callers),
-    `bootstrap_type` and `bagging_temperature` (the Bayesian and MVS weights
-    are implemented; no trainer takes the bundle -- CatBoost's `"Bernoulli"`
-    is row bagging under another name and is `subsample` with
-    `subsample_freq`, and `"No"` is what an unbagged fit already is), and
+    computed by a function with no callers) and
     `max_ctr_complexity` (the CTR modules are implemented; nothing imports
-    them, so no fit builds a CTR column). None of these is accepted and
-    ignored.
+    them, so no fit builds a CTR column). Neither is accepted and ignored.
+
+    `bootstrap_type` and `bagging_temperature` left that list: both now reach
+    `boosting.train`'s `bootstrap` argument on the dense single-output CPU
+    fit, and refuse by entry point everywhere else. See the `bootstrap_type`
+    paragraph above.
 
     `use_missing` is LightGBM's parameter of the same name. With it (the
     default), `NaN` is a missing value: a feature that has any in training
@@ -1420,46 +1443,186 @@ class _Base(_ParamsMixin):
                 "tables are model state and the model format carries no "
                 "section for them. Follow catalog A29."
             )
-        if self.bagging_temperature is not None:
-            raise ValueError(
-                "bagging_temperature is not reachable: the Bayesian "
-                "bootstrap's weights are implemented "
-                "(sampling.BayesianBootstrapParams, "
-                "sampling.bayesian_bootstrap_weights, "
-                "sampling.refresh_bayesian_bootstrap), but no trainer takes "
-                "the bundle -- boosting.train's row sampler is BaggingParams "
-                "and GossParams and nothing else -- so no Python or Mojo "
-                "entry point applies the weights. CatBoost's Bernoulli "
-                "bootstrap is row bagging under another name and is "
-                "reachable here as subsample with subsample_freq."
-            )
-        if self.bootstrap_type is not None:
+        # `bootstrap_type` and `bagging_temperature` used to be refused here
+        # and are not any more: both travel on the wire and reach
+        # `boosting.train`'s `bootstrap` argument through `_resolve_bootstrap`
+        # below, `_parse_bootstrap` in bindings/_mojotrees.mojo, and
+        # `model.fit`. The two spellings that stay unreachable are refused
+        # there, by name, by `sampling.canonical_bootstrap_type`, which is the
+        # one resolver the parameter string and the CLI also reach.
+
+    #: The five wire keys of CatBoost's `bootstrap_type` and the value each
+    #: takes when the estimator names nothing. Every key is sent on every
+    #: fit, defaults included, because `_parse_bootstrap` in
+    #: bindings/_mojotrees.mojo subscripts the mapping rather than testing
+    #: for a key: a missing one is a KeyError at the boundary, not a default.
+    #:
+    #: **The three negative values are sentinels, not values.** CatBoost's
+    #: ranges are `subsample` in (0, 1], `bagging_temperature` >= 0 and
+    #: `mvs_reg` >= 0, so a negative number cannot be a setting and is free
+    #: to mean "the user did not name this". The distinction has to survive
+    #: the wire because `bagging_temperature` beside MVS is refused and a
+    #: *defaulted* temperature is not a user setting
+    #: (`sampling.check_mvs_bagging_temperature`, CatBoost's
+    #: `TOption::IsSet`).
+    #:
+    #: `bootstrap_subsample` is not spelled `subsample`, and that is the
+    #: whole `subsample` collision in one line: LightGBM's `subsample` is
+    #: `bagging_fraction`, which already has its own wire key, and CatBoost's
+    #: is the bootstrap rate. `_resolve_bootstrap` decides which of the two
+    #: the user meant while both are still visible and sends the resolved
+    #: number under an unambiguous name.
+    _BOOTSTRAP_DEFAULTS = {
+        "bootstrap_type": "no",
+        "bootstrap_subsample": -1.0,
+        "bagging_temperature": -1.0,
+        "mvs_reg": -1.0,
+        # `sampling.DEFAULT_BOOTSTRAP_SEED`.
+        "bootstrap_seed": 0,
+    }
+
+    def _resolve_bootstrap(self, bagging_fraction, bagging_freq):
+        """CatBoost's `bootstrap_type` group as wire keys, plus the row
+        bagging that survives beside it.
+
+        Returns `(knobs, bagging_fraction, bagging_freq)`. The two bagging
+        values come back changed under a real bootstrap type, and that is the
+        point of the method: **`subsample` means different things under
+        different `bootstrap_type` values, in CatBoost and therefore here**,
+        and the choice has to be made where both the raw `subsample` and the
+        raw `bagging_fraction` are still visible.
+
+        CatBoost's `subsample` is a member of the bootstrap options. Under
+        `MVS` it is the MVS rate; under `Bernoulli` it is the fraction of
+        rows kept, which is the same draw mojotrees calls `bagging_fraction`.
+        This estimator's `subsample` is scikit-learn's spelling of
+        `bagging_fraction` and has only ever meant the second. So
+        `bootstrap_type="MVS", subsample=0.8` -- which is CatBoost's own CPU
+        default configuration -- names one sampler there and would build two
+        here, and `boosting._check_bootstrap` refuses exactly that pair:
+        `bagging_fraction` IS CatBoost's Bernoulli bootstrap under mojotrees's
+        name, so MVS beside it is two bootstrap types at once.
+
+        The resolution is CatBoost's contract read literally: under `MVS`,
+        `subsample` is the MVS rate and row bagging is off. Nothing is
+        silently reinterpreted, because every other reading is refused by
+        name -- an explicit `bagging_fraction` below 1, an explicit
+        `subsample_freq` or `bagging_freq`, and `subsample` beside Bayesian
+        (which CatBoost refuses too: "bayesian bootstrap doesn't support
+        'subsample' option").
+
+        With `bootstrap_type` unset or `"No"`, every one of those parameters
+        keeps the meaning it has always had and no fit moves a bit.
+        """
+        knobs = dict(self._BOOTSTRAP_DEFAULTS)
+        # The draw is keyed on (seed, tree, row) with its own domain constant
+        # (`sampling._mvs_stream`, `_MVS_DOMAIN`), so a seed is all it takes
+        # to make a bootstrapped fit repeat. `random_state` is the estimator's
+        # one seed and there is no `bootstrap_seed` parameter, so an unseeded
+        # fit runs at the native default and a seeded one follows the seed.
+        global_seed = self._resolve_alias("random_state", "seed", None)
+        global_seed = self._resolve_alias(
+            "random_state", "random_seed", None, global_seed
+        )
+        if global_seed is not None:
+            if int(global_seed) < 0:
+                raise ValueError("random_state must be nonnegative")
+            knobs["bootstrap_seed"] = int(global_seed)
+
+        if self.bootstrap_type is None:
+            kind = "no"
+        else:
+            # Values are case-insensitive and fold once, here, before the
+            # native `canonical_bootstrap_type`, which takes canonical
+            # lowercase (docs/PARAMETER_NAMING.md, and the same contract
+            # `device_type` and `score_function` keep).
             kind = str(self.bootstrap_type).lower()
-            if kind in ("no", "none"):
-                # Exactly what an unbagged fit already is.
-                return
-            if kind == "bernoulli":
-                raise ValueError(
-                    "bootstrap_type='Bernoulli' is row bagging under another "
-                    "name; use subsample with subsample_freq."
-                )
-            if kind in ("bayesian", "mvs"):
-                raise ValueError(
-                    f"bootstrap_type={self.bootstrap_type!r} is reachable "
-                    "from the Mojo API only: it needs a parameter bundle "
-                    "handed to a trainer (BayesianBootstrapParams, "
-                    "MvsBootstrapParams in src/mojotrees/sampling.mojo) and "
-                    "no Python entry point builds one."
-                )
-            if kind == "poisson":
-                raise ValueError(
-                    "bootstrap_type='Poisson' is not implemented; CatBoost "
-                    "itself refuses it on the CPU."
-                )
+
+        # The two spellings that name a real CatBoost bootstrap type this
+        # build does not run. Refused here rather than left to the native
+        # resolver so that the message can point at the parameter that DOES
+        # do the thing, which the native resolver cannot know about.
+        if kind == "bernoulli":
+            raise ValueError(
+                "bootstrap_type='Bernoulli' is row bagging under another "
+                "name; use subsample with subsample_freq."
+            )
+        if kind == "poisson":
+            raise ValueError(
+                "bootstrap_type='Poisson' is not implemented; CatBoost "
+                "itself refuses it on the CPU."
+            )
+        if kind not in ("no", "none", "bayesian", "mvs"):
             raise ValueError(
                 f"unknown bootstrap_type {self.bootstrap_type!r}; expected "
                 "No, Bayesian, Bernoulli, MVS, or Poisson"
             )
+
+        if kind in ("no", "none"):
+            knobs["bootstrap_type"] = "no"
+            if self.bagging_temperature is not None:
+                raise ValueError(
+                    "bagging_temperature belongs to bootstrap_type="
+                    "'Bayesian' and is read by no other type "
+                    "(sampling.bayesian_bootstrap_weights). Set "
+                    "bootstrap_type='Bayesian' or remove it."
+                )
+            return knobs, bagging_fraction, bagging_freq
+
+        # From here on a real sampler is configured, and row bagging is the
+        # other bootstrap type. Refusing the pair is `_check_bootstrap`'s
+        # rule, restated at the surface so the message can name the
+        # parameters the user actually typed.
+        if float(self.bagging_fraction) != 1.0:
+            raise ValueError(
+                f"bagging_fraction={self.bagging_fraction} cannot be set "
+                f"beside bootstrap_type={self.bootstrap_type!r}: "
+                "bagging_fraction IS CatBoost's Bernoulli bootstrap under "
+                "mojotrees's name, so this asks for two bootstrap types at "
+                "once. Use subsample for the MVS rate, or drop "
+                "bootstrap_type."
+            )
+        if int(self.bagging_freq) != 0 or self.subsample_freq is not None:
+            raise ValueError(
+                "subsample_freq is a row-bagging schedule and cannot be set "
+                f"beside bootstrap_type={self.bootstrap_type!r}: both MVS "
+                "and the Bayesian bootstrap redraw once per tree "
+                "unconditionally (CatBoost's sampling_frequency=PerTree "
+                "default), so there is no frequency to set."
+            )
+
+        if kind == "mvs":
+            knobs["bootstrap_type"] = "mvs"
+            if self.subsample is not None:
+                rate = float(self.subsample)
+                if not 0.0 < rate <= 1.0:
+                    raise ValueError("subsample must be in (0, 1]")
+                knobs["bootstrap_subsample"] = rate
+            # `bagging_temperature` beside MVS is refused natively, by
+            # `sampling.check_mvs_bagging_temperature`, which carries the
+            # argument and the CatBoost divergence. Emitting it and letting
+            # that function refuse keeps one authority for the rule.
+            if self.bagging_temperature is not None:
+                knobs["bagging_temperature"] = float(self.bagging_temperature)
+            # Row bagging is off under a bootstrap type: the value the alias
+            # resolution folded out of `subsample` was the MVS rate.
+            return knobs, 1.0, 0
+
+        knobs["bootstrap_type"] = "bayesian"
+        if self.subsample is not None:
+            raise ValueError(
+                "bootstrap_type='Bayesian' does not take subsample: the "
+                "Bayesian bootstrap keeps every row and reweights it, so "
+                "there is no fraction to set. CatBoost refuses the same "
+                "pair. Use bootstrap_type='MVS' to subsample by gradient "
+                "magnitude, or drop bootstrap_type for uniform row bagging."
+            )
+        if self.bagging_temperature is not None:
+            temperature = float(self.bagging_temperature)
+            if not temperature >= 0.0:
+                raise ValueError("bagging_temperature must be >= 0")
+            knobs["bagging_temperature"] = temperature
+        return knobs, 1.0, 0
 
     def _check_langevin(self):
         """CatBoost's `langevin` / `diffusion_temperature` /
@@ -1747,6 +1910,19 @@ class _Base(_ParamsMixin):
         self._check_n_jobs()
         self._check_catboost_only()
         self._check_langevin()
+        # CatBoost's `bootstrap_type` (src/mojotrees/sampling.mojo), and the
+        # one place in this method where a resolved value is UNRESOLVED
+        # again. Under a real bootstrap type the number that `subsample`
+        # folded onto `bagging_fraction` two blocks up was never the bagging
+        # fraction: it was the MVS rate, and the pair would otherwise be two
+        # bootstrap types at once. See `_resolve_bootstrap`.
+        #
+        # It runs before the implied-frequency fix below on purpose: with
+        # `bagging_fraction` back at 1.0, that block cannot fire and turn a
+        # bootstrap fit into a bagged one.
+        bootstrap_knobs, bagging_fraction, bagging_freq = (
+            self._resolve_bootstrap(bagging_fraction, bagging_freq)
+        )
         # THE BEHAVIOR FIX. `subsample < 1` with `subsample_freq` unset is a
         # silent no-op in LightGBM: bagging never runs, and the user who
         # asked for it is told nothing. Here an unset frequency becomes 1
@@ -1891,6 +2067,18 @@ class _Base(_ParamsMixin):
             "other_rate": float(self.other_rate),
             "goss_seed": int(seeds["goss_seed"]),
             "goss_warmup_rounds": int(self.goss_warmup_rounds),
+            # CatBoost's `bootstrap_type` group, read by `_parse_bootstrap`
+            # in bindings/_mojotrees.mojo into the `BootstrapParams` that
+            # `model.fit` hands to `boosting.train`. Emitted here rather than
+            # refused above: the MVS and Bayesian draws are implemented
+            # (src/mojotrees/sampling.mojo) and `boosting.train` has applied
+            # them since the sampler landed, so a value that stopped at the
+            # estimator was the one defect this whole sequence exists to
+            # remove -- a parameter accepted and silently ignored. Every
+            # entry point whose round loop does not call
+            # `sampling.bootstrap_round` refuses an enabled bundle by name,
+            # the GPU included.
+            **bootstrap_knobs,
             # LightGBM's `boosting` by name; the binding routes dart and rf
             # to alternate_boosting.fit_boosting and leaves gbdt and goss on
             # the trainer they always used. The dart bundle is read only

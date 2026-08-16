@@ -2607,6 +2607,18 @@ def _boost_rounds(
         # It is computed here rather than inside the sampler because the
         # second branch reads the ensemble, which sampling.mojo cannot see.
         if bootstrap.enabled():
+            # MVS WRITES ITS KEPT ROWS INTO `bag`, so the bag arriving here
+            # on round 1 and later is the PREVIOUS round's draw, not a bag.
+            # `bootstrap_round` refuses a non-empty row list beside MVS --
+            # correctly, because a real bag would be silently intersected
+            # with a draw that never saw it -- and without this clear that
+            # refusal fires on the sampler's own output and every MVS fit
+            # stops after exactly one tree. A real bag cannot reach here:
+            # `_check_bootstrap` refuses `bootstrap_type` beside
+            # `bagging_fraction`, GOSS and balanced bagging at fit setup, so
+            # the only thing this can be discarding is last round's kept set,
+            # which this round is about to redraw anyway.
+            bag.clear()
             var auto_lambda = 0.0
             if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
                 if n_last_leaves > 0:
@@ -3185,6 +3197,18 @@ def train_with_valid(
                 params.tree.extra, grad, n, i, params.learning_rate
             )
         if bootstrap.enabled():
+            # MVS WRITES ITS KEPT ROWS INTO `bag`, so the bag arriving here
+            # on round 1 and later is the PREVIOUS round's draw, not a bag.
+            # `bootstrap_round` refuses a non-empty row list beside MVS --
+            # correctly, because a real bag would be silently intersected
+            # with a draw that never saw it -- and without this clear that
+            # refusal fires on the sampler's own output and every MVS fit
+            # stops after exactly one tree. A real bag cannot reach here:
+            # `_check_bootstrap` refuses `bootstrap_type` beside
+            # `bagging_fraction`, GOSS and balanced bagging at fit setup, so
+            # the only thing this can be discarding is last round's kept set,
+            # which this round is about to redraw anyway.
+            bag.clear()
             var auto_lambda = 0.0
             if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
                 if n_last_leaves > 0:

@@ -234,6 +234,12 @@ from mojotrees.gpu_predict import (
     validation_host_metric,
 )
 from mojotrees.goss import GossParams
+from mojotrees.sampling import (
+    BootstrapParams,
+    canonical_bootstrap_type,
+    check_bootstrap_honored,
+    check_mvs_bagging_temperature,
+)
 from mojotrees.alternate_boosting import (
     BOOSTING_DART,
     BOOSTING_RF,
@@ -926,6 +932,102 @@ def _parse_goss(params: PythonObject) raises -> GossParams:
     )
 
 
+def _parse_bootstrap(params: PythonObject) raises -> BootstrapParams:
+    """CatBoost's `bootstrap_type` from the params dict, as one bundle.
+
+    Modeled on `_parse_goss` above: the values are read, a bundle is built,
+    and the trainer validates it again, so the rules in sampling.mojo stay the
+    only ones. `canonical_bootstrap_type` is the resolver, the same one the
+    parameter string and the CLI reach, so `Bernoulli` and `Poisson` are
+    refused by name here for free and no copy of those two messages lives at
+    this boundary.
+
+    Three keys arrive as **sentinels rather than defaults**, and the reason is
+    that a defaulted value and a value the user wrote down have to be
+    distinguishable to refuse the wrong pairing at all:
+
+    - `bootstrap_subsample` below 0 means "the user did not name `subsample`",
+      and MVS takes `DEFAULT_MVS_SUBSAMPLE`. It is NOT spelled `subsample` on
+      the wire, because `bagging_fraction` already carries LightGBM's meaning
+      of that word and the two are different samplers; the estimator decides
+      which meaning the user's `subsample` had while both are still visible
+      (`_resolve_bootstrap` in python/mojotrees/sklearn.py) and sends the
+      resolved number here.
+    - `bagging_temperature` below 0 means "not set". CatBoost's own range is
+      `>= 0`, so no real value is lost. This is `TOption::IsSet` on the wire,
+      and `check_mvs_bagging_temperature` needs exactly that flag.
+    - `mvs_reg` below 0 means "not set", which is a real state in CatBoost
+      (`TMaybe<float>`) and not a magic number: unset derives the lambda from
+      the data every tree.
+
+    Every parameter that belongs to a bootstrap type other than the one
+    selected is refused by name with the reason. A knob accepted and never
+    read is a silent wrong answer to the user who set it, and CatBoost itself
+    makes that mistake with `bagging_temperature` beside MVS (see
+    `sampling.check_mvs_bagging_temperature`).
+    """
+    var kind = canonical_bootstrap_type(String(py=params["bootstrap_type"]))
+    var subsample = Float64(py=params["bootstrap_subsample"])
+    var subsample_is_set = subsample >= 0.0
+    var temperature = Float64(py=params["bagging_temperature"])
+    var temperature_is_set = temperature >= 0.0
+    var reg = Float64(py=params["mvs_reg"])
+    var reg_is_set = reg >= 0.0
+    var seed = Int(py=params["bootstrap_seed"])
+
+    if kind == "no":
+        if subsample_is_set:
+            raise Error(
+                "subsample is the bootstrap rate only under"
+                " bootstrap_type='mvs'; with no bootstrap type it is row"
+                " bagging and reaches the fit as bagging_fraction"
+            )
+        if temperature_is_set:
+            raise Error(
+                "bagging_temperature belongs to bootstrap_type 'bayesian' and"
+                " is read by no other type; remove it or set bootstrap_type"
+            )
+        if reg_is_set:
+            raise Error(
+                "mvs_reg belongs to bootstrap_type 'mvs' and is read by no"
+                " other type; remove it or set bootstrap_type='mvs'"
+            )
+        return BootstrapParams.disabled()
+
+    if kind == "mvs":
+        var mvs: BootstrapParams
+        if reg_is_set:
+            if subsample_is_set:
+                mvs = BootstrapParams.mvs_with_reg(reg, subsample, seed)
+            else:
+                mvs = BootstrapParams.mvs_with_reg(reg, seed=seed)
+        elif subsample_is_set:
+            mvs = BootstrapParams.mvs_at(subsample, seed)
+        else:
+            mvs = BootstrapParams.mvs_at(seed=seed)
+        # The refusal that CatBoost does not make: `bagging_temperature`
+        # beside MVS is accepted there, never read, and dropped in `Save`.
+        check_mvs_bagging_temperature(mvs.mvs, temperature_is_set)
+        return mvs^
+
+    # `canonical_bootstrap_type` returns only "no", "mvs" and "bayesian"; the
+    # other three spellings raise inside it.
+    if subsample_is_set:
+        raise Error(
+            "bootstrap_type='bayesian' does not take subsample: the Bayesian"
+            " bootstrap keeps every row and reweights it, so there is no"
+            " fraction to set. CatBoost refuses the same pair"
+        )
+    if reg_is_set:
+        raise Error(
+            "mvs_reg belongs to bootstrap_type 'mvs' and is never read by the"
+            " Bayesian bootstrap, which has no lambda at all"
+        )
+    if temperature_is_set:
+        return BootstrapParams.bayesian_at(temperature, seed)
+    return BootstrapParams.bayesian_at(seed=seed)
+
+
 def _parse_boosting(params: PythonObject) raises -> AlternateBoostingParams:
     """LightGBM's `boosting` from the params dict: the mode by name, and the
     DART bundle from the `drop_*` keys when the mode is dart. `goss` keeps
@@ -1027,6 +1129,12 @@ def fit(
         score_function_ok=True,
     )
     var weights = _parse_weights(params, nr)
+    # CatBoost's `bootstrap_type`. This entry point is the ONLY one in this
+    # file that can honor it: `model.fit` on the CPU reaches `boosting.train`,
+    # whose round loop calls `sampling.bootstrap_round`. Every branch below
+    # that leaves that path refuses an enabled bundle by name rather than
+    # dropping it, and `model.fit` itself refuses one that resolved to the GPU.
+    var bootstrap = _parse_bootstrap(params)
     var boosting = _parse_boosting(params)
     if bp.ordered.enabled and (
         boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF
@@ -1059,6 +1167,13 @@ def fit(
                 "boosting='dart' and boosting='rf' train on the CPU only;"
                 " set device='cpu'"
             )
+        check_bootstrap_honored(
+            bootstrap,
+            String(
+                "boosting='dart' and boosting='rf'"
+                " (alternate_boosting.fit_boosting)"
+            ),
+        )
         var routed = fit_boosting(
             features,
             nr,
@@ -1086,6 +1201,10 @@ def fit(
             raise Error(
                 "linear_tree=True trains on the CPU only; set device='cpu'"
             )
+        check_bootstrap_honored(
+            bootstrap,
+            String("linear_tree=True (custom_metric.fit_with_metrics)"),
+        )
         var train_set = List[RawValidSet]()
         train_set.append(
             RawValidSet(
@@ -1134,6 +1253,7 @@ def fit(
         _parse_goss(params),
         use_missing=_parse_use_missing(params),
         categorical_features=_parse_categorical(params),
+        bootstrap=bootstrap,
     )
     return PythonObject(alloc=model^)
 
@@ -1164,6 +1284,10 @@ def distributed_train_local(
     # reported as a Cosine one. Refused by name instead.
     var bp = _parse_params(
         params, nf, cpu=True, entry=String("distributed_train_local")
+    )
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("distributed_train_local (tree_learner other than 'serial')"),
     )
     var weights = _parse_weights(params, nr)
     var model = train_local_world(
@@ -1213,6 +1337,13 @@ def fit_custom(
         unbundled="fit_custom",
         entry=String("fit_custom"),
         score_function_ok=True,
+    )
+    # `boosting._check_bootstrap` refuses the pair outright rather than for
+    # want of wiring: a callback's derivatives are the caller's, and a draw
+    # would rescale them behind the caller's back.
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("fit_custom (a custom objective)"),
     )
     var weights = _parse_weights(params, nr)
 
@@ -1314,6 +1445,13 @@ def fit_with_metrics(
         nf,
         unbundled="fit_with_metrics",
         score_function_ok=True,
+    )
+    # An eval_set, a callback, or linear_tree routes here rather than to
+    # `boosting.train_with_valid`, and `custom_metric`'s round loop does not
+    # call `sampling.bootstrap_round`.
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("fit_with_metrics (an eval_set or callback fit)"),
     )
     var weights = _parse_weights(params, nr)
 
@@ -1555,6 +1693,10 @@ def fit_multiclass_with_metrics(
         unbundled="fit_multiclass_with_metrics",
         score_function_ok=True,
     )
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("fit_multiclass_with_metrics (a softmax eval_set fit)"),
+    )
     var weights = _parse_weights(params, nr)
     var pred_p = _pred_pointer(params)
     var valid_sets = _parse_valid_sets(params, nf)
@@ -1623,6 +1765,10 @@ def fit_ranker_with_metrics(
         nf,
         unbundled="fit_ranker_with_metrics",
         score_function_ok=True,
+    )
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("fit_ranker_with_metrics (a LambdaRank eval_set fit)"),
     )
     var advanced = _parse_advanced_rank_params(params)
     var positions = _parse_positions(params, nr)
@@ -1816,6 +1962,14 @@ def fit_multiclass(
         entry=String("the multiclass trainers"),
         score_function_ok=True,
     )
+    # `model.fit_multiclass` refuses an enabled bundle itself, on either
+    # backend; parsing here means the value is refused with the same message
+    # whether or not the trainer is ever reached, and that `bagging_temperature`
+    # beside MVS is caught before anything else runs.
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("the multiclass trainers (boosting.train_multiclass)"),
+    )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass(
         features,
@@ -1854,6 +2008,10 @@ def fit_csc(
         entry=String("a sparse (CSC) fit"),
         score_function_ok=True,
     )
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("a sparse (CSC) fit (model_sparse.fit_csc)"),
+    )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_csc(
         csc,
@@ -1887,6 +2045,10 @@ def fit_multiclass_csc(
         csc.n_features,
         entry=String("a sparse (CSC) fit"),
         score_function_ok=True,
+    )
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("a sparse (CSC) multiclass fit (model_sparse.fit_multiclass_csc)"),
     )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass_csc(
@@ -2050,6 +2212,10 @@ def fit_ranker(
         unbundled="fit_ranker",
         entry=String("fit_ranker"),
         score_function_ok=True,
+    )
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("fit_ranker (the LambdaRank trainers)"),
     )
     var weights = _parse_weights(params, nr)
     var advanced = _parse_advanced_rank_params(params)
@@ -3362,6 +3528,11 @@ def train_dataset(
         device,
         _parse_bagging(params),
         _parse_goss(params),
+        # The second reachable path, and the one `bench/real_data`'s dense
+        # arm actually takes: `mojotrees.train(params, Dataset)` never
+        # touches `model.fit`. `trainset.train_dataset` honors the bundle on
+        # its dense CPU arm and refuses it on the sparse and GPU arms.
+        _parse_bootstrap(params),
     )
     return PythonObject(alloc=model^)
 
@@ -3374,6 +3545,10 @@ def train_dataset_multiclass(
     var d = dataset.downcast_value_ptr[Dataset]()
     # Read the device first, for the reason `fit` does.
     var device = _parse_device(params)
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("a Dataset multiclass fit (trainset.train_dataset_multiclass)"),
+    )
     var model = mojo_train_dataset_multiclass(
         d[],
         Int(py=params["n_classes"]),
@@ -3397,6 +3572,10 @@ def train_dataset_ranker(
     """Train a LambdaRank model on a constructed dataset, whose `group`
     holds the per-query row counts."""
     var d = dataset.downcast_value_ptr[Dataset]()
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("a Dataset ranker fit (trainset.train_dataset_ranker)"),
+    )
     var model = mojo_train_dataset_ranker_advanced(
         d[],
         _parse_params(
@@ -3421,6 +3600,10 @@ def booster_update(
     checks; see `trainset.update_dataset`."""
     var m = model.downcast_value_ptr[Model]()
     var d = dataset.downcast_value_ptr[Dataset]()
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String("booster_update (trainset.update_dataset)"),
+    )
     var added = mojo_update_dataset(
         m[],
         d[],
@@ -3445,6 +3628,13 @@ def booster_update_multiclass(
     See `trainset.update_dataset_multiclass`."""
     var m = model.downcast_value_ptr[MulticlassModel]()
     var d = dataset.downcast_value_ptr[Dataset]()
+    check_bootstrap_honored(
+        _parse_bootstrap(params),
+        String(
+            "booster_update_multiclass"
+            " (trainset.update_dataset_multiclass)"
+        ),
+    )
     var added = mojo_update_dataset_multiclass(
         m[],
         d[],
