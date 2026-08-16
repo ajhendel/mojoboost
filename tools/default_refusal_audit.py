@@ -104,11 +104,26 @@ SEARCH_DIRS = (
 #: not evaluated; it is there so a reader knows what is being asked for.
 DEFAULT_SETS = {
     # Andrew, 2026-08-16: mojotrees's shipped defaults become CatBoost's CPU
-    # defaults, except n_estimators, where CatBoost's 1000 becomes 500.
+    # defaults, except n_estimators, where CatBoost's 1000 becomes **360**.
+    #
+    # It was 500 for several hours and this table carried the 500 as DATA
+    # rather than as prose, so `--check` and `--removing` were reasoning about
+    # a default set that was not the default. Caught by the other campaign
+    # with a grep, in ninety seconds, which is the cheap part; the expensive
+    # part is that nothing would ever have told either of us to look.
+    #
+    # **And the count is NOT inert here, which was the real question.**
+    # CatBoost's UpdateBoostingTypeOption hard-sets Plain when the option is
+    # unset and `(learnSampleCount >= 50000 || IterationCount < 500)`. At
+    # T=500 that iteration clause is FALSE, so a scenario under 50,000 rows
+    # falls through both halves and CatBoost's own default becomes **Ordered**.
+    # At T=360 the clause is TRUE and it is Plain everywhere. So the tree
+    # count silently decided what the CatBoost-as-shipped arm computes on
+    # every small-row scenario, and 500 was the value that made it Ordered.
     "catboost_defaults": {
         "grow_policy": "symmetrictree",
         "max_depth": 6,
-        "n_estimators": 500,
+        "n_estimators": 360,
         "learning_rate": "auto",
         "auto_learning_rate": True,
         "boosting_type": "plain",
@@ -281,7 +296,7 @@ ACKNOWLEDGED = {
         "RESOLVED",
         "the site is :2238, which is random_strength's per-tree scale "
         "refusal; it matched here only because its message names the round "
-        "index. 500 trees cannot make a gradient standard deviation "
+        "index. 360 trees cannot make a gradient standard deviation "
         "nonpositive. See the random_strength row for this file",
     ),
     ("n_estimators", "src/mojotrees/distributed.mojo"): (
