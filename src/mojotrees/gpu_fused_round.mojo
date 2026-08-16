@@ -568,6 +568,26 @@ comptime ROUND_CUSTOM_OBJECTIVE = 1
 comptime ROUND_NO_DEVICE_KERNEL = 2
 comptime ROUND_BAGGING_OUT_OF_BAG = 3
 comptime ROUND_GOSS_RANK_PRECISION = 4
+comptime ROUND_MVS_HOST_MAGNITUDES = 5
+"""`bootstrap_type=MVS`. Its per-row keep probability is
+`min(1, |g_r| / threshold)` over a threshold solved per 8192-row block from
+the round's own gradient magnitudes (`sampling._mvs_threshold`), and it drops
+the rows it did not keep, so the draw needs this round's gradients on the host
+*before* the histogram is accumulated and it rewrites the row set afterwards.
+
+The device round has neither. Its gradients never leave the device except as
+two scalar magnitude sums, and its row plane has no compaction step a host
+draw could write into. Reading them back would be a round trip per round on
+the path whose entire claim is that it makes none.
+
+**Not a permanent property of MVS on the GPU.** Downgrading to the
+host-gradient arm honors it exactly -- `sampling.bootstrap_round` runs there,
+the kept rows become the tree's bag, and the trees are still grown on the
+device -- so this is a blocker on the device *round*, not on the sampler, and
+AUTO resolves it by taking the arm that works. The Bayesian bootstrap is not
+here: it draws from `(seed, tree, row)` alone, reads no gradient, drops no
+row, and is honored on the device round through the objective state's weight
+plane."""
 
 
 def round_eligibility(
@@ -577,6 +597,7 @@ def round_eligibility(
     goss_on: Bool,
     allow_device_ranking: Bool = False,
     routes_all_rows: Bool = False,
+    mvs_on: Bool = False,
 ) raises -> Int:
     """Which reason, if any, keeps this configuration off the device
     round.
@@ -627,6 +648,12 @@ def round_eligibility(
         return ROUND_BAGGING_OUT_OF_BAG
     if goss_on and not allow_device_ranking:
         return ROUND_GOSS_RANK_PRECISION
+    # Last, and after GOSS, because the three row samplers are mutually
+    # exclusive at fit setup (`boosting._check_bootstrap`) and the order among
+    # them therefore only decides which sentence an impossible combination
+    # would get.
+    if mvs_on:
+        return ROUND_MVS_HOST_MAGNITUDES
     return ROUND_OK
 
 
@@ -658,6 +685,18 @@ def round_eligibility_reason(code: Int) -> String:
             "GOSS ranks rows by |grad * hess|, and the device scores are"
             " Float32, so the sample can differ from the CPU trainer's near"
             " the threshold; pass allow_device_ranking=True to accept that"
+        )
+    if code == ROUND_MVS_HOST_MAGNITUDES:
+        return String(
+            "bootstrap_type=MVS solves its keep threshold from this round's"
+            " per-row gradient magnitudes and then drops the rows it did not"
+            " keep, and the device round holds neither the magnitudes nor a"
+            " row compaction the host draw could write into; use"
+            " objective_source=OBJECTIVE_SOURCE_HOST (or"
+            " MOJOTREES_GPU_OBJECTIVE=host), which draws the sampler exactly"
+            " and still grows the trees on the device, or"
+            " bootstrap_type=Bayesian, which reads no gradient and is served"
+            " by the device weight plane"
         )
     return String("unknown round eligibility code")
 

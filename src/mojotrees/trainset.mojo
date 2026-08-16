@@ -1519,14 +1519,12 @@ def train_dataset(
     if backend == GPU_DEVICE:
         if len(dataset.init_score) != 0:
             raise Error("init_score is a CPU training path; use device='cpu'")
-        if bootstrap.enabled():
-            raise Error(
-                "bootstrap_type is not implemented on the GPU: train_gpu"
-                " takes no bootstrap bundle and its round loop never draws"
-                " one, so the fit would be unsampled. This fit resolved to"
-                " the GPU (device='gpu', or device='auto' on a shape the"
-                " policy sends there); set device='cpu' or drop bootstrap_type"
-            )
+        # The bundle crosses instead of being refused here, as it does in
+        # `model.fit`: `train_gpu` draws it per round now, through
+        # `sampling.bootstrap_round` on the host-gradient arm and through the
+        # device objective state's weight plane for the Bayesian draw. The
+        # refusal this replaced said "train_gpu takes no bootstrap bundle",
+        # which stopped being true on 2026-08-16.
         booster = train_gpu(
             dataset.data,
             dataset.label,
@@ -1536,6 +1534,7 @@ def train_dataset(
             alpha,
             bagging,
             goss,
+            bootstrap=bootstrap,
         )
     else:
         booster = train(
