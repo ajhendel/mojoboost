@@ -839,3 +839,78 @@ The harness's `conditions` line reports `row_unroll`, `narrow_index`,
 not the scale shape** -- the two arms in this wave that change numerics rather
 than launch shape. A results file that names the launch shape and omits the
 arithmetic is the wrong way round. Not fixed here; `bench/` has a live lane.
+
+---
+
+## The CPU/GPU prediction disagreement is not a tie-break bug, and probably not a bug
+
+The lane briefed to fix it was told to establish that ties were the cause before
+assuming it. **They are not**, and the refutation is thorough enough to close the
+hypothesis.
+
+### The host's rule, and one part of it nobody had written down
+
+Read from `split.mojo` rather than from the brief: **highest gain; among equal
+gains, the first in scan order**, where scan order is three levels -- bins
+ascending within a feature, **missing-left before missing-right inside a bin**,
+then feature slots ascending. The middle one is a real tie-break that the brief
+did not mention and that nothing had documented.
+
+**The tolerance the host applies to an equal gain is exactly zero** -- a bare
+Float64 `>`. `SPLIT_TIE_RELATIVE` is not part of any decision on either backend;
+it is only the width of a *report*.
+
+### The device already matches, and this was tested rather than read
+
+Every device arm encodes the same order, including the missing-direction rule as
+an ascending candidate ordinal, and the default block reduction (`block.max` on
+gain, then `block.min` on the slot) is sound because those primitives broadcast.
+
+- **A 96-slot node with its winning gain tied at slots 6, 70 and 71.** At 64
+  reduce threads that requires both the intra-thread ascending walk (6 beats 70)
+  and the cross-thread `block.min` (6 beats 71), and it spans more than one warp.
+  **No device test had ever fed the reduction a tie** -- the existing tie case
+  exercised the host replica only, and every device case had a unique winner.
+- **1,200 pseudo-random histograms**, 200 cases x 3 gradient regimes x 2 gain
+  forms: given the *same* histogram, device replica and host scan chose the
+  identical (feature, bin, direction) **1,200 times out of 1,200**.
+
+### What it actually is
+
+**The two backends do not read the same histogram.** The device reads fixed-point
+sums of quantized gradients; the host reads Float64 sums. The 1,200-case sweep
+agrees perfectly precisely because it fed both the same integers -- which
+isolates the cause by construction.
+
+Three pieces of corroboration that this is expected rather than broken:
+`bench/real_data/verify.py` already downgrades this failure to a WARN citing the
+documented near-tie divergence; multiclass predictions are sha256-**identical**
+across backends while the two regression scenarios differ; and where they differ,
+**metrics agree to 3.8e-05 and 2.2e-06 with GPU RMSE very slightly better**,
+which a broken tie-break would not produce.
+
+So the honest reframing: **row-level prediction parity is not achievable while
+the backends deliberately read different histograms, and metric parity holds to
+five decimal places.** The 0.115-0.169 figure has been treated as a defect all
+week. It is the visible consequence of a design decision this project made on
+purpose.
+
+### What the lane did change, and a fifth dead mechanism
+
+`SPLIT_TIE_RELATIVE` is a fraction of the **gain**, but this scan's resolution is
+set by `parent_score / gain`, which the module's own docstring says and whose
+measured table ranges to 293. At that ratio the indistinguishable width is more
+than an order of magnitude past `SPLIT_TIE_RELATIVE * gain`, **so the near-tie
+test was calling coin flips resolved exactly where the flips happen.**
+`resolution_floor()` now takes the wider of the two widths, with the old
+behaviour reachable and strictly narrower.
+
+And the module's own remedy for this whole class, `host_rescan_recommended`, has
+**no caller anywhere in `src/`**. Built, documented, dead. That is the fifth
+instance -- after `HostGradientStage`, `DispatchSettings`, the stale
+`tree_resident_requested` gate, and the hand-written scale mirror in
+`distributed_gpu`.
+
+**No bits move.** Nothing touches a scan, a reduction, or a gain expression; the
+only behavioural change is which nodes a fallback that nothing calls would flag,
+and it can only flag more.
