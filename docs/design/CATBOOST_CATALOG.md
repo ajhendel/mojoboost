@@ -191,6 +191,7 @@ chosen. Building it would be building a gate that cannot open.
 | A28 | `MultiRMSE` (`error_functions.h:191-218` `TMultiRMSEError`; `approx_dimension.cpp`; `online_predictor.cpp` `CalcDeltaNewtonMulti`; `hessian.cpp` `TDiagonalHessian::SolveNewtonEquation`; multi-dim score accumulation `catboost/private/libs/algo/scoring.cpp:741-767`; metric `metric.cpp:474-515`) -- **verified from source**, see the A28 note | Multi-target regression. **T label columns per row**, approx dimension T, diagonal hessian, `der[i] = w*(y[i] - p[i])`, `der2[i] = -w`. **One tree per iteration with a vector leaf value** (`model.h:118`, `LeafValues[leafId * ApproxDimension + dim]`), and the split score is the **sum over dimensions into one accumulator** | New objective **and a new tree shape** | The derivatives and the metric yes. The tree shape is `multiclass_tree_count` again, and this time it is not a cosmetic difference: see the A28 note | CPU (`multi_target.mojo`), tree shape unowned (`tree.mojo`, `histogram.mojo`) | (3) when selected. **The shared tree structure is the entire modeling content of MultiRMSE**; without it the objective degenerates into T independent RMSE fits |
 | A29 | Model save/load and interchange export (`catboost/libs/model/model_export/`: `cbm`, `json`, `onnx`, `coreml`, `python`, `cpp`) | CatBoost saves every fitted artifact the model needs to score, CTR tables and text dictionaries included, and can additionally emit an ONNX `ai.onnx.ml` tree ensemble | No. Nothing here changes a trained model; the whole rule is that a reloaded model scores **bit-identically** | Yes, and it is bucket C: an arm we cannot save is an arm nobody can ship, and an export that silently drops fitted state is a wrong comparison that looks fine | `serialize.mojo` (mine), `onnx_export.mojo` (new, mine) | A29 note. **Enumeration is the deliverable.** Format: NO version bump needed for A8/A11-A16; ONNX exporter BUILT for the numerical/expressible subset and REFUSES the rest by name |
 | A30 | CTR feature combinations: `max_ctr_complexity`, `ctr_leaf_count_limit`, `TreeCtrs` (`greedy_tensor_search.cpp::AddTreeCtrs`, `index_hash_calcer.cpp::CalcHashes` and `ComputeReindexHash`, `ctr_helper.h::GetCtrInfo`) -- **verified from source**, see the A30 note | A projection of several categorical columns plus float and one-hot splits, hashed to one bucket per row and fed to A19's ordered machinery. Candidates are **grown from the splits already in the tree**, one feature at a time -- NOT exhaustive to depth 4 -- and `max_ctr_complexity` silently resolves to **1**, not 4, whenever the iteration count is under 200 | Yes when on | Built, off by default, reached by nothing. **CatBoost's default of 4 is not affordable at 1M rows** (about 1.6e9 element ops and 1.1 GB of CTR columns per tree, against 3e8 for a 50-feature histogram build), so record the 4 and wire 1 | CPU (`ctr_combinations.mojo`, beside `ctr.mojo`) | (3) when on |
+| A31 | The `boosting_type` DEFAULT as the comparison table has to state it (`boosting_options.cpp:16`; `defaults_helper.h::UpdateBoostingTypeOption`; `catboost_options.cpp:785-790` and `:1046-1050`) -- **verified from source**, re-read independently on 2026-08-16, see the A31 note | Not a new mechanism. A7 is the mechanism; this row is the one fact a reader of the CPU-vs-GPU-vs-LightGBM-vs-CatBoost table needs, which is which `boosting_type` the CatBoost arms actually ran under and what may therefore be said about CatBoost's Ordered mode. **CatBoost's CPU default is `Plain`, at every row count, and at our 100 iterations it is `Plain` twice over** | No. It changes what a published row may CLAIM, not what any engine computes | Bucket C. The harness needs a third CatBoost arm passing `boosting_type=Ordered` explicitly, the same shape as `catboost_lossguide`. **NOT BUILT and deliberately not landed before the comparison run**; the design is `docs/design/HARNESS_ARM_SKIPS.md` | `bench/real_data` (`engines.py`, `scenarios.py`), after the run | Not a trade and not a switch. It is a **stated limit of the results table**: no row in the comparison covers CatBoost's ordered boosting, and a reader must not read one as if it did |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -4605,3 +4606,129 @@ lines. So the honest scope is: **one border, ten lines, unblocks the default
 comparison; all borders, one DP mode, ~seventy lines.** Neither is 500. It
 belongs to whichever lane owns `binning.mojo`'s `check_border_type`, which is
 not this one, and the `BORDER_MIN_ENTROPY` refusal is left standing here.
+
+### A31 note: which `boosting_type` the comparison actually ran, verified from source
+
+Status: **verified from CatBoost source**, `master`, read 2026-08-16 by this
+lane, independently of the A7 lane and agreeing with it. Nothing here is
+measured and nothing here was fitted. This note exists because the A7 note
+answers "what is ordered boosting", and a reader of the comparison table needs
+a different question answered: **what did the CatBoost rows in front of me
+actually run, and what may I therefore say about CatBoost's headline
+mechanism.**
+
+#### The answer in one sentence
+
+At the tier this harness compares on, CatBoost's own default `boosting_type`
+is **`Plain`**, so **no row in the comparison covers CatBoost's ordered
+boosting, and none may be read as if it did**; an explicit `Ordered` arm would
+be a third data point, not a correction to the two arms we have.
+
+#### The constant, the file, and the two clauses
+
+There are three places in CatBoost that decide `boosting_type`, and only the
+combination answers the question.
+
+1. `catboost/private/libs/options/boosting_options.cpp:16` constructs the
+   option as
+   `BoostingType("boosting_type", EBoostingType::Plain)`.
+   **The constructed default is `Plain`**, not `Ordered`.
+
+2. `catboost/private/libs/options/catboost_options.cpp:785-790` is the only
+   place `Ordered` is ever installed as a default, and its condition includes
+   `TaskType == ETaskType::GPU`:
+
+       if (!IsMultiClassOnlyMetric(lossFunction)
+           && !EqualToOneOf(lossFunction, ELossFunction::RMSEWithUncertainty,
+                            ELossFunction::MultiLogloss,
+                            ELossFunction::MultiCrossEntropy)
+           && TaskType == ETaskType::GPU && !boostingType.IsSet()
+       ) {
+           boostingType.SetDefault(EBoostingType::Ordered);
+       }
+
+   This harness runs CatBoost with `task_type` CPU
+   (`scenarios.CATBOOST_LEFT_AT_STOCK["task_type"] == "CPU"`, and the adapter
+   refuses a non-CPU device by name), so this branch is not taken on any row
+   of this comparison.
+
+3. `catboost/private/libs/options/defaults_helper.h::UpdateBoostingTypeOption`
+   then hard-sets `Plain`:
+
+       if (boostingTypeOption.NotSet()
+           && (learnSampleCount >= 50000
+               || catBoostOptions->BoostingOptions->IterationCount < 500)
+           && !(catBoostOptions->GetTaskType() == ETaskType::CPU
+                && catBoostOptions->BoostingOptions->ApproxOnFullHistory.Get())
+       ) {
+           boostingTypeOption = EBoostingType::Plain;
+       }
+
+**So the famous 50,000 is real, it is the constant, and it is the threshold
+for turning `Ordered` OFF, not for turning it on.** It lives in
+`defaults_helper.h`, not in the boosting options, which is part of why it gets
+retold wrongly. Two further things every retelling drops:
+
+- The clause is `learnSampleCount >= 50000 || IterationCount < 500`. It is a
+  **disjunction**, and the iteration half is enough on its own.
+- It fires only while the option is `NotSet()`. `TOption::SetDefault` does not
+  raise the set flag, so the GPU default installed at step 2 is still `NotSet`
+  here and this test wins over it. A value the **user** passed is set, and
+  survives.
+
+#### Is our comparison tier above or below the constant
+
+**Above it on one clause and inside it on the other, so the answer is `Plain`
+twice over, and the row count is not even the binding reason.**
+
+- Rows. `scenarios.ORDERED_BOOSTING_ROWS` is 50,000, and the clause is
+  `>= 50000`. Our tier is therefore **at or above** the threshold, on the
+  `Plain` side of it. Every other scenario in the suite is larger still.
+- Iterations. `scenarios.BASE_PARAMS["n_estimators"]` is **100**, and the
+  clause is `IterationCount < 500`. **100 < 500 is true**, so this half of the
+  disjunction fires on every scenario in the suite at every tier, whatever the
+  row count. A tier drawn at 5,000 rows would still resolve `Plain`.
+
+That second point is the one worth carrying, because it is what makes the
+answer robust: shrinking the scenario would not buy an Ordered row. Only
+passing `boosting_type=Ordered` would.
+
+#### What this settles that was previously an assumption
+
+`scenarios.ORDERED_BOOSTING_ROWS` already records this correction and this
+note agrees with it on an independent read. It also explains the harness's own
+older contrary evidence: `CATBOOST_LEFT_AT_STOCK` records
+`boosting_type: "Plain"` read from `get_all_params()` after a two-iteration
+fit on 20,000 rows, which is well under 50,000. That reading was never
+evidence that the threshold was lower. It was the iteration clause firing, and
+the constructed default standing.
+
+#### One constraint on the arm that does not exist yet, also verified
+
+`catboost_options.cpp:1046-1050` refuses `Ordered` outright when the grow
+policy is not symmetric:
+
+       if (ObliviousTreeOptions->GrowPolicy != EGrowPolicy::SymmetricTree) {
+           CB_ENSURE(BoostingOptions->BoostingType == EBoostingType::Plain,
+               "Ordered boosting is not supported for nonsymmetric trees.");
+       }
+
+Two consequences for the harness, both recorded now so the future arm is
+cheap. A third arm that sets `boosting_type=Ordered` must **not** also set
+`grow_policy`; inheriting CatBoost's SymmetricTree default is what makes it
+legal. And the `catboost_lossguide` arm can never become an ordered row, which
+is a **refusal** rather than the silent resolve-to-Plain that
+`scenarios.SCENARIOS["ordered_boosting_small"]`'s second caveat guesses at.
+That caveat is now answerable and should be corrected when `bench/` reopens;
+this lane deliberately landed nothing under `bench/`.
+
+#### What is NOT verified here
+
+- Nothing in this note was measured, fitted, or timed. It is a source read.
+- The line numbers are `master` as of 2026-08-16. `catboost 1.2.10` is the
+  version this harness pins (`CATBOOST_DEFAULTS_SOURCE`) and its line numbers
+  will differ; the conditions were checked, not the offsets.
+- Whether an explicit `Ordered` fit at our budget is affordable is unmeasured.
+  A7 gives the shape (a geometric rung ladder, three learning permutations at
+  CatBoost's defaults), which says it is dearer than `Plain` and does not say
+  by how much.
