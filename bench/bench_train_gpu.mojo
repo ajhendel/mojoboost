@@ -1188,15 +1188,39 @@ def main() raises:
         # taken as the wider of the two arms' own spreads. A gap smaller than
         # that floor is not a result however many decimals it carries, and
         # saying so here is the whole point of the repeat count.
+        #
+        # **Median, not minimum, and this was a real bug until 2026-08-16.**
+        # This block computed both the delta and the floor from the arms'
+        # *minima* while `PROFILE_PROTOCOL.md` requires the median and says
+        # why: the minimum is the luckiest sample, and contention on this
+        # machine is the finding rather than noise, so a statistic that
+        # discards contention hides exactly what is being measured.
+        #
+        # It was not academic. At 50,000 rows against LightGBM the two
+        # statistics disagreed on the verdict word: **resolved** on minima
+        # (13.9 percent against a 10.8 percent floor), **consistent, not
+        # resolved** on medians. That shape is this project's one claimed win
+        # over LightGBM, at the size a user meets first, and it was resting on
+        # the statistic the protocol had rejected in writing. Found by the CPU
+        # campaign reading its own output rather than by anything here.
+        #
+        # `_spread_pct` (max-min)/min is still printed unchanged so figures
+        # recorded before this commit still mean what they meant; what changed
+        # is only which pair of numbers the verdict is computed from.
         var base_key = _arm_key(arms[0])
         var comparisons = List[String](capacity=n_arms)
         for a in range(1, n_arms):
             var key = _arm_key(arms[a])
-            var delta = (mins[a] - mins[0]) / mins[0]
+            var delta = (meds[a] - meds[0]) / meds[0]
             var magnitude = delta if delta >= 0.0 else -delta
-            var floor = spreads[0] if spreads[0] > spreads[a] else spreads[a]
+            var floor = (
+                spreads_med[0] if spreads_med[0]
+                > spreads_med[a] else spreads_med[a]
+            )
             var verdict = String("unresolvable")
-            print(key + "_speedup_x:", mins[0] / mins[a])
+            # Median here too, so the printed ratio and the verdict beside
+            # it cannot come from different statistics.
+            print(key + "_speedup_x:", meds[0] / meds[a])
             if repeats == 1:
                 # A single sample per arm has a spread of zero by
                 # construction, not a noise floor of zero, so no delta can be
@@ -1226,7 +1250,7 @@ def main() raises:
                     ",\"baseline\":",
                     _json_string(_arm_name(arms[0])),
                     ",\"speedup_x\":",
-                    mins[0] / mins[a],
+                    meds[0] / meds[a],
                     ",\"delta_pct\":",
                     _pct(delta),
                     ",\"noise_floor_pct\":",
