@@ -85,6 +85,10 @@ is one copy of one device-side concatenation rather than six
 four (`gpu_split_search.GpuSplitSearcher.set_table_upload_hoisting`). What is
 left is one upload, one download, and the `synchronize`, which waits on
 nothing because the copy before it already drained.
+
+**CORRECTED 2026-08-16: a copy into a pinned `HostBuffer` on Metal is ASYNCHRONOUS** (measured by execution; only a copy into an arbitrary host pointer drains). Any `synchronize` after a pinned copy is load-bearing, not redundant. See `docs/GPU_PORTABILITY.md` 6.5.
+The sentence above was wrong: these destinations are pinned, so the copy did
+not drain and the `synchronize` is what makes the readback correct.
 `grow_tree_device_resident` itemizes all three. Every replacement has a second
 arm reachable at run time, because this machine's timings drift several-fold
 across time windows and only interleaved arms compare.
@@ -1487,8 +1491,9 @@ def grow_tree_device_resident(
       round trip before and it is one round trip now; what changed is that the
       round trip is made of one copy instead of six.
       `set_packed_download(False)`, or `MOJOTREES_GPU_PACKED_DOWNLOAD=0`, is
-      the six-copy arm. The `synchronize` waits on nothing, since the copy
-      before it already drained, and it stays because it is what keeps this
+      the six-copy arm. **CORRECTED 2026-08-16: a copy into a pinned `HostBuffer` on Metal is ASYNCHRONOUS** (measured by execution; only a copy into an arbitrary host pointer drains). Any `synchronize` after a pinned copy is load-bearing, not redundant. See `docs/GPU_PORTABILITY.md` 6.5. The `synchronize` does NOT wait on
+      nothing -- these six destinations are pinned buffers, so it is the only
+      thing making the arm correct, and it stays because it is what keeps this
       correct on a backend where a copy really is asynchronous.
 
     **Three copies**, then, of which one is an upload, one a download and one

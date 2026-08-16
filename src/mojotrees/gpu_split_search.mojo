@@ -3563,7 +3563,10 @@ struct GpuSplitSearcher(Movable):
         self.mono_uploaded = True
         # The table copy above reads a pinned buffer the tables reuse every
         # node, so the session starts with it retired rather than in
-        # flight. On Metal the copy already drained the queue
+        # flight. CORRECTED 2026-08-16: on Metal a copy into a pinned
+        # HostBuffer does NOT drain the queue -- only one into an arbitrary
+        # host pointer does. See docs/GPU_PORTABILITY.md 6.5. The wait below
+        # is load-bearing if this destination is pinned
         # (`docs/GPU_PORTABILITY.md` section 6.1) and this call is therefore
         # redundant there; it is kept because it is what makes the sequence
         # correct on a backend where the copy is asynchronous, and because

@@ -2996,9 +2996,23 @@ struct DeviceTreeTables(Movable):
         0.016 seconds at 1,000,000 x 50 against a registered prediction of
         0.64, a null under M0. It is kept for the copy count, which predicts
         portability risk and where a stale byte can hide, and not for the
-        clock. The `synchronize` afterwards stays in both arms even though it
-        waits on nothing on Metal, because it is what keeps this correct on a
-        backend where a copy really is asynchronous.
+        clock.
+
+        **The `synchronize` afterwards is LOAD-BEARING, and the reason given
+        here until 2026-08-16 was false.** It said the wait "waits on nothing
+        on Metal" and stayed only for a hypothetical backend where a copy is
+        really asynchronous. On Metal a copy into a **pinned `HostBuffer` --
+        which is what all six of these destinations are -- IS asynchronous**,
+        measured by execution: a pinned copy read without an intervening
+        `synchronize` returned 64 of 64 stale words on 4 of 4 attempts behind
+        a slow kernel. Only a copy into an arbitrary host pointer drains.
+
+        So this wait is the only thing making the six-copy arm correct.
+        Deleting it on the old reasoning would produce a readback that is
+        right under a fast kernel and wrong under a slow one -- green on a
+        small fixture, silently wrong on a real fit, which is the same shape
+        as the stale-row-range bug that once cost this plane every tree after
+        the first.
 
         Everything below the fetch is common to both arms deliberately: the
         packed arm ends by scattering into the same six pinned buffers the
