@@ -35,6 +35,35 @@ wish list. A row saying `supported` means the named behavior exists, is
 reachable from a public entry point, and has a test that would fail if it
 stopped working.
 
+## What mirroring does and does not cover
+
+**Decided 2026-08-16, and written here because both halves would otherwise
+read as parity breaks to the first person who diffed them.**
+
+mojotrees's shipped defaults differ **by growth policy**, and each policy
+mirrors a different engine. **In both cases the mirroring covers the
+internals and the per-parameter defaults, and NOT the tree budget.**
+
+| policy | mirrors | tree budget |
+|---|---|---|
+| `lossguide` | **LightGBM's** algorithm and per-parameter defaults: `learning_rate` 0.1, 31 leaves, its categorical rules | **ours: `n_estimators` 72**, where LightGBM ships 100 |
+| `symmetrictree` (the default policy) | **CatBoost's** algorithm and per-parameter defaults: symmetric depth 6, derived learning rate, MVS at 0.8, Cosine, `l2_leaf_reg` 3, `border_count` 254 | **ours: `n_estimators` 360**, where CatBoost ships 1000 |
+
+So a reader who finds `lossguide` at 72 trees has not found a parity break,
+and neither has one who finds `symmetrictree` at 360. **Every per-parameter
+default is the mirrored engine's; the budget is a decision of ours and is
+deliberately different from the engine we test against.**
+
+**This is also why a benchmark row cannot be read across tree counts.** The
+comparison rows in `bench/real_data` match budgets deliberately: LightGBM
+stock plus `deterministic` at 100 trees against us mirroring that shape at
+100, and CatBoost at its shipped defaults against us mirroring its read-back
+at the same count. The two **"mojotrees defaults"** rows, symmetric at 360 and
+lossguide at 72, exist to show **what we ship** and are **never** a claim of a
+win against a competitor at a different count. The report enforces that
+structurally, by grouping verdicts and rankings within a tree count and
+putting the defaults rows in their own block, rather than by captioning it.
+
 ## How to use this document
 
 - **Before implementing** a LightGBM feature, find its row. If it already
