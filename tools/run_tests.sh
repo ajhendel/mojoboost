@@ -120,6 +120,7 @@ test_gpu_runtime
 test_gpu_scan_primitives
 test_gpu_sparse
 test_gpu_sparse_skip
+test_gpu_speculation_build
 test_gpu_split_scan
 test_gpu_split_search
 test_gpu_strategies

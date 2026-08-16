@@ -1177,6 +1177,19 @@ same way: batching seven multiclass trees into one launch was indistinguishable
 from not batching, 15.45 against 15.30 seconds, because per-dispatch cost is not
 what the round spends its time on.
 
+**Since this was written, a K=1 speculative expansion has been built anyway**,
+behind `MOJOTREES_GPU_SPECULATION=1` and off by default
+(`src/mojotrees/gpu_resident_round.mojo`). It is here as a measurable arm and
+not as a contradiction of the paragraph above: the trade this section rejects
+is exactly the trade it has to win, and **nobody has timed it**. Two facts
+this section did not have are now measured. The hit rate at 1,000,000 x 50 is
+66.8 percent, so a third of the prebuilt work is thrown away. And the waste is
+smaller than the commit-log census predicts, because the shipped speculation
+declines to publish on a dead step, on a spent budget, on a frontier with no
+admissible pre-existing leaf, and on a full slot pool: on an early-stopping
+fixture the census predicts 29 builds and the device issues 2. If the arm
+loses when it is measured, this section was right and the arm should go.
+
 ### 5.7 One algorithmic change I would make
 
 Not a growth policy change, but worth naming because it addresses the small-node

@@ -137,6 +137,10 @@ therefore enqueued before the first split has happened:
                        performing it            (gpu_tree_tables)
     per tree, once     download the tables      <- the one round trip
 
+Eleven launches a step rather than ten when the K=1 speculative prebuild is
+armed; the armed schedule is written out under "K=1 speculative prebuild"
+below, and it adds no round trip.
+
 The step count is `num_leaves - 1`, because a tree of L leaves is L-1 splits.
 The step *after* those is not a split and is not optional: a terminal status
 is a word that some execution of the commit kernel stores, and a step that
@@ -293,13 +297,15 @@ K2 in `bench/results/PHASE2_PREREGISTRATION.md` is to recover the other half
 without changing the tree: **while step k commits, speculatively build the
 child histograms of the leaf step k+1 is most likely to pick.**
 
-**What ships here is the census, not the speculation.** The speculation is
-not built, and the reason is stated at "What is not built" below. What is
-built is the instrument that decides whether it is worth building, because
-the registration says so in as many words: *the measured hit rate is what
-makes K=1 sufficient or not*. That number turns out to cost nothing at all --
-no extra launch, no extra round trip, no extra byte moved -- and everything
-below is the argument for why.
+**Both ship: the census, and the speculation the census gates.** The census
+landed first and alone, because the registration says in as many words that
+*the measured hit rate is what makes K=1 sufficient or not*, and a hit rate
+of 66.8 percent at 1,000,000 x 50 is what cleared the bar it had registered
+in advance. The build followed and is behind `MOJOTREES_GPU_SPECULATION=1`,
+off by default; `speculative_build_enabled` says why the default reads that
+way and what has to be measured before it moves. "What the speculation
+actually is" below is the schedule, and it is eleven launches a step where
+the unarmed loop is ten.
 
 **The speculatable set, which is a theorem and not a census.** At step k the
 only leaves whose splits are known are the ones live *before* step k. The two
@@ -398,61 +404,115 @@ nor the arithmetic can differ:
   interaction constraints are refused by name), so there is no per-node
   narrowing that a speculative build could get wrong.
 
-The two named assumptions, so that a later reader can check them rather than
-inherit them: **(a)** the search records of leaves other than the one being
-split are never written, which is a property of `_copy_records_kernel`'s two
-destinations and would break the moment a step wrote a third record; and
-**(b)** rows within a leaf's window are order-insensitive to every consumer,
-which holds for the histogram (above), for `update_raw_device` (it broadcasts
-one leaf value over a window), and for a later partition (set-preserving), and
-would break if anything ever indexed a row by its position in the window.
+The two named assumptions, and both were checked against the code rather than
+inherited when the build landed:
+
+**(a) The search records of leaves other than the one being split are never
+written.** Checked. A step writes exactly two records, and it writes them
+through one kernel: `_copy_records_kernel`, whose two destinations are
+`STEP_LEFT_REC` and `STEP_RIGHT_REC`, which `_pick_and_commit_kernel` sets to
+the split leaf's own record index and to `n_live`. `n_live` is the index the
+appended right child takes, so it belongs to a leaf that did not exist a
+launch earlier. No third record is written anywhere in the step, and the
+searcher's two scratch records are outside the frontier's range entirely.
+This would break the moment a step wrote a third, which is why it is stated
+as a standing property rather than as a one-time reading. It is also what the
+speculation's own correctness rests on twice over: it is why the runner-up's
+gains cannot move, and it is why the runner-up kernel must exclude the two
+slots this step's commit just wrote -- their records have *not* been written
+yet at the launch that reads them, and reducing over them would read an
+earlier step's memory.
+
+**(b) Rows within a leaf's window are order-insensitive to every consumer.**
+Checked, and this one is load-bearing in a way the plan did not anticipate.
+A speculative partition permutes the window of a leaf that may never be
+split, so the armed plane leaves the active-row buffer in a **different
+permutation** from the unarmed one -- same rows in the same windows, in a
+different order inside some of them. Every consumer was checked against
+that: the histogram is a function of the multiset (fixed-point Int32, above);
+`update_raw_device` broadcasts one leaf value over a window and never looks
+at which row is where; a later partition is stable and set-preserving, and
+re-running one over an already-partitioned window is the identity, which is
+also why a consumed step may skip its partition entirely. Nothing in the
+package indexes a row by its position within a window. A test that compared
+row buffers between the two arms would fail and would be asserting an
+invariant this package does not hold; `tests/test_gpu_speculation_build.mojo`
+says so at its head and compares trees instead, node for node, `value` and
+`split_gain` as bit patterns, over eight rounds so that a divergence visible
+only in the raw scores would show.
 
 **Where the speculation must not fold the subtraction in.** `enqueue_desc_child`
 builds the smaller child into a fresh slot and derives the larger by
 subtracting *in place from the parent's slot*, which destroys the parent's
 histogram. A speculative step must not do that: leaf B is still live and its
-histogram must survive a miss. So a speculative build builds the smaller
-child into a spare slot and leaves the subtraction to the consuming step,
-which needs one more pool slot than the frontier (`open_resident(num_leaves)`
-becomes `num_leaves + 1`) and two more scratch records than
-`RESIDENT_SCRATCH_RECORDS` names today.
+histogram must survive a miss. So the speculative build runs with `do_sub`
+off (`GpuActiveRows.enqueue_desc_histogram` reads that off the descriptor
+target, because it is the same decision and not a second one), leaves a
+whole unsubtracted child histogram behind, and the subtraction a *consumed*
+step owes is done afterwards by `_spec_subtract_kernel`.
 
-**Dead steps make the speculation worse, not neutral.** A step past the end of
-growth is nearly free today because every descriptor-aware kernel reads
-`STEP_LIVE` and returns; the exception the docstring names above is the search
-pair, which is not descriptor-aware. A speculative build adds a second
-partition and a second histogram launch to *every* step including the dead
-ones, and its own search pair on top. So a tree that stops at seventeen leaves
-of a thirty-one budget pays fourteen wasted speculative builds it could not
-possibly consume, which is why `dead` is reported next to `builds` rather than
-folded into it.
+**And it needs no extra pool slot to do it**, which is a correction to the
+plan this section used to carry. The plan was to build into a spare slot,
+making `open_resident(num_leaves)` into `num_leaves + 1` and adding two to
+`RESIDENT_SCRATCH_RECORDS`. Neither is necessary and neither shipped.
+`_pick_runner_up_kernel` builds into the slot the *next commit will acquire*,
+which is not a guess: the commit kernel takes the lowest free slot by
+scanning `slot_owner` upward, the runner-up kernel scans the same vector the
+same way and writes nothing to it, and between the two nothing acquires and
+nothing releases. On a miss that slot holds a histogram nobody wants and the
+next real build zeroes it before accumulating, so a miss costs work and never
+correctness. The records need no addition either, because the speculation
+runs no search: it produces a histogram, and the consuming step's own search
+pair reads it.
 
-**What is not built, and exactly what it needs.** The speculation itself is
-not implementable from this file. Every descriptor-aware launch reads one
-fixed buffer, `GpuActiveRows.step_dev`: `enqueue_partition_desc` and
-`enqueue_desc_histogram` both pass `self.step_dev.unsafe_ptr()` rather than a
-descriptor the caller hands in, and `_zero_slot_desc_kernel` and the atomic
-family take the pointer from the same place. A speculative step needs a
-*second* descriptor and a kernel that publishes a runner-up into it without
-committing anything. Concretely, and in the two files this lane may not edit:
+**Dead steps are nearly free, which is a measured correction to what this
+section used to claim.** The claim was that a speculative build adds a
+partition, a histogram and a search pair to *every* step including the dead
+ones, so a tree that stops at seventeen leaves of a thirty-one budget pays
+fourteen builds it cannot consume. That is not what shipped.
+`_pick_runner_up_kernel` returns on `STEP_LIVE` before it reads the frontier,
+so a dead step publishes nothing, and the speculative partition and
+histogram launched behind it read one word and return exactly as the real
+ones do. A dead step therefore costs three near-empty launches and no work
+at all, and the speculation runs no search pair on any step.
 
-- `gpu_active_rows.mojo`: give `enqueue_partition_desc` and
-  `enqueue_desc_histogram` a descriptor-pointer parameter, exactly as
-  `DeviceTreeTables.enqueue_step` already has one, defaulting to `step_dev`
-  so no existing call site moves; and allocate a second `STEP_WORDS` buffer
-  for the speculative row. The kernels already take the descriptor as an
-  argument and already have a "ignore the descriptor" flag, so nothing below
-  the launch changes.
-- `gpu_tree_tables.mojo`: a `_pick_runner_up_kernel`, which is
-  `_pick_and_commit_kernel`'s phase two with the committing third phase
-  replaced by a descriptor write -- same strided walk, same shape rules, same
-  `block.max`/`block.min`, excluding the slot this step's commit took. It must
-  write no table, so it cannot reuse phase three at all.
+**Measured**, on the early-stopping fixture in
+`tests/test_gpu_speculation_build.mojo` (31-leaf budget, `min_data_in_leaf`
+400, four commits and twenty-six dead steps per tree): the commit-log census
+reports `builds=29 wasted=27`, and the device counters report
+`device_builds=2 device_consumed=2`. **Twenty-seven wasted builds predicted,
+zero issued.** The prediction was the census's, and the gap is not a census
+bug so much as the limit of what a commit log can see; `SpeculationCensus.
+builds` now states the four ways it overcounts and names the counter that
+does not.
 
-Neither is large and neither is this lane's to make. **The order to do them in
-is census first**: if the measured hit rate is materially below one, the
-speculation is a second partition and a second histogram per step bought for
-a fraction of a step, and the honest outcome is to report that.
+**What the speculation actually is.** Every descriptor-aware launch used to
+read one fixed buffer, `GpuActiveRows.step_dev`. There are now three, chosen
+by `GpuActiveRows.set_descriptor_target`, and every kernel below the launch
+is unchanged: `step_dev` is the commit descriptor, `spec_dev` is the
+runner-up's publication, and `build_dev` is what the real partition and the
+real child histogram read. The consuming step is the one whose `build_dev`
+says `STEP_LIVE = 0`, so a hit is expressed as a step the existing kernels
+decline to do -- no kernel in this package knows what a speculation is.
+
+Per step, armed, in order, with the six that are new marked:
+
+    pick and commit                   (gpu_tree_tables)
+    consume, publish build_dev        (gpu_active_rows)          NEW
+    stage the two searches            (gpu_tree_tables)
+    partition          x3   against build_dev
+    build the child    x2   against build_dev
+    subtract a consumed prebuild      (gpu_active_rows)          NEW
+    search both children x2           (gpu_split_search)
+    file the two records              (gpu_tree_tables)
+    publish the runner-up             (gpu_tree_tables)          NEW
+    speculative partition x3 against spec_dev                    NEW
+    speculative child     x2 against spec_dev                    NEW
+
+The ordering constraint that is not implied by data flow, and the only one:
+the consume kernel compares against the *previous* step's publication and
+there is one buffer holding it, so it must run before this step's runner-up
+kernel overwrites it.
 
 Numerics
 --------
@@ -470,7 +530,15 @@ register) are both outside every arithmetic expression.
 from std.os import getenv
 from max.gpu.host import DeviceBuffer
 
-from .gpu_active_rows import STEP_WORDS, LeafRange
+from .gpu_active_rows import (
+    DESC_BUILD,
+    DESC_SPEC,
+    DESC_STEP,
+    SPEC_STAT_BUILDS,
+    SPEC_STAT_CONSUMED,
+    STEP_WORDS,
+    LeafRange,
+)
 from .gpu_split_search import (
     GpuSplitParams,
     GpuSplitSearcher,
@@ -696,6 +764,54 @@ set the census line goes here only, so that a census run's output file holds
 one line per tree and nothing else."""
 
 
+comptime SPECULATION_BUILD_VAR = "MOJOTREES_GPU_SPECULATION"
+"""`1` arms the K=1 speculative prebuild. Anything else, including unset,
+leaves it off.
+
+**Off by default, and the polarity is the whole content of that decision.**
+`MOJOTREES_GPU_TREE_RESIDENT` reads the other way round -- an inequality
+against "0" -- because that plane has three measured results behind it. This
+one has none. What is registered before the first run, in
+`bench/results/session3_2026-08-16/RESULTS.md`, is that the census measured a
+**66.8 percent** hit rate at 1,000,000 rows and that the honest cost is **964
+wasted builds per fit** at the same shape, each a partition and a histogram
+over a child window spent on a child that is discarded. So the trade is
+roughly a third more child histogram builds for a better launch shape, and
+whether that wins is a measurement nobody has taken.
+
+The condition that decides it is registered here rather than left to whoever
+reads the first number: **the launch-shape gain has to beat the wasted work
+in a whole fit, not in a phase.** A phase-level win the fit does not show is
+the row-tile floor again, which measured 22 to 36 percent slower end to end
+while doing exactly what its author intended. Both shapes are expected to
+answer differently and both must be taken: 50,000 rows, where launch shape
+dominates and the effect should be largest, and 1,000,000, where compute is
+roughly 60 percent of the run and the wasted builds are paid in full."""
+
+
+def speculative_build_enabled() -> Bool:
+    """Whether the K=1 speculative prebuild is armed.
+
+    An equality against "1", which is how an *unproven* arm is spelled in
+    this repository, so that an unset variable and a variable set to
+    something unrecognized both land on off. The measured arms
+    (`MOJOTREES_GPU_TREE_RESIDENT`, `MOJOTREES_GPU_SPLIT_RESIDENT`) are
+    spelled as inequalities against "0" instead, and the difference between
+    the two spellings is exactly the difference between a default that has
+    been measured and one that has not.
+
+    Reachable at run time in one binary, in the style of
+    `GpuActiveRows.set_row_unroll`, and that is a standing requirement rather
+    than a courtesy: this machine drifts two- to threefold between time
+    windows, so only interleaved arms compare, and a rebuild between arms
+    would put a different compile and a different thermal state on either
+    side of the comparison.
+
+    Read once per tree, next to the trace and census sinks, for the reason
+    stated at `resident_trace_sink`."""
+    return getenv(SPECULATION_BUILD_VAR) == "1"
+
+
 def speculation_census_sink() -> String:
     """The census destination, or the empty string when the census is off.
 
@@ -744,11 +860,26 @@ struct SpeculationCensus(Copyable, Movable):
     root, which is also the pick, so the candidate set is empty and there is
     nothing to speculate on.
 
-    An **upper bound** in one narrow case: a live step whose pre-existing
-    leaves are all inadmissible would issue no build, and the commit log
-    cannot distinguish that from a build that missed. The bound is tight
-    whenever any pre-existing leaf is admissible, which after the first few
-    splits is essentially always."""
+    An **upper bound, and on some tree shapes a very loose one.** This was
+    written as "an upper bound in one narrow case"; the shipped speculation
+    has a device counter beside it now and the two disagree by more than the
+    narrow case allows. `gpu_tree_tables._pick_runner_up_kernel` declines to
+    publish in four situations, and a commit log can see none of them:
+
+    - the step committed nothing, which is every dead step;
+    - the leaf budget is spent after this commit, so the next step cannot
+      commit -- this alone costs the *last* growth step of every full-budget
+      tree, making the bound loose by one on every such tree;
+    - every pre-existing leaf is inadmissible;
+    - the slot pool has nothing free.
+
+    **Measured** on `tests/test_gpu_speculation_build.mojo`'s early-stopping
+    fixture: this field reports 29 where the device issued **2**. On its
+    full-budget 31-leaf fixture it reports 29 where the device issued 28. So
+    `wasted`, which is this minus `consumed`, is an upper bound on wasted
+    work and not an estimate of it, and a fit that wants the real figure
+    should read `device_builds` off the census line, which is present
+    whenever the speculation is armed."""
 
     var consumed: Int
     """Builds whose leaf was picked by the very next commit. This is the hit
@@ -758,7 +889,11 @@ struct SpeculationCensus(Copyable, Movable):
     var wasted: Int
     """`builds - consumed`. Real device work -- a partition and a histogram
     accumulation over a whole leaf's rows -- spent on a child that is
-    discarded."""
+    discarded.
+
+    An upper bound, and inheriting `builds`'s looseness in full: read
+    `device_builds - device_consumed` off the census line for what the device
+    actually threw away."""
 
     def __init__(out self, steps: Int, commits: Int, consumed: Int):
         self.steps = steps
@@ -1462,6 +1597,29 @@ def grow_tree_device_resident(
     configurations, and asserts on the plane's own trace that the plane is
     what produced them.
 
+    6. **The K=1 speculative prebuild moves no bit**, when it is armed.
+       Nothing in claims one through five changes: the same rows are
+       partitioned by the same rule into the same windows, and the same
+       multiset of rows is accumulated into the same fixed-point Int32 bins
+       under the same per-round scales. What moves is *when* the work
+       happens, and on a consumed step the work does not happen twice --
+       `build_dev` tells the partition and the accumulation that the step is
+       dead, and `gpu_active_rows._spec_subtract_kernel` does the one thing
+       the prebuild could not do ahead of time. Checked, not argued:
+       `tests/test_gpu_speculation_build.mojo` runs the same fit with the
+       speculation off and on and compares the forests node for node, `value`
+       and `split_gain` as bit patterns, over eight rounds.
+
+       The one thing that is deliberately *not* identical is the order of
+       rows inside a window whose leaf was speculated on and never split.
+       Assumption (b) in the module docstring is the check that nothing
+       consumes it.
+
+    **Still one round trip per tree when armed.** The speculation adds five
+    launches to a step and no download: its two counters come home only when
+    a caller has named a census sink, and then only after
+    `download_desc_tables` has already drained the queue.
+
     **Not instrumented.** `PhaseProfile` is not threaded through this loop and
     a profiled run of a fit that takes this plane will report an empty table
     rather than a wrong one. That is the same honest failure
@@ -1501,10 +1659,33 @@ def grow_tree_device_resident(
     var widest = len(searcher.active)
     if widest < 1:
         widest = len(tree_features)
-    # All three read once, before the first launch. See `resident_trace_sink`.
+    # All four read once, before the first launch. See `resident_trace_sink`.
     var trace = resident_trace_sink()
     var trace_steps = trace != "" and resident_trace_steps_requested()
     var census_sink = speculation_census_sink()
+    var spec = speculative_build_enabled()
+    # Four handles onto buffers the builder already owns, taken once.
+    #
+    # Handles rather than pointers because of a language constraint that has
+    # shaped every seam in this plane: Mojo will not let a pointer derived
+    # from one field of an object cross a call that mutably borrows a sibling
+    # field, and every speculative launch needs exactly that pairing --
+    # `builder.resident_tables` with `builder.rows.spec_dev`, `builder.rows`
+    # with `builder.batcher[0].out_dev`. A `DeviceBuffer` is a copyable
+    # handle, so copying it here ends the borrow at this line and the calls
+    # below take ordinary arguments. It moves no bytes and enqueues nothing.
+    #
+    # Taken unconditionally rather than inside `if spec`, because a
+    # conditionally initialized local is a shape this file has no reason to
+    # carry for four refcount bumps per tree.
+    var pool_handle = builder.batcher[0].out_dev.copy()
+    var step_handle = builder.rows.step_dev.copy()
+    var spec_handle = builder.rows.spec_dev.copy()
+    var stats_handle = builder.rows.spec_stats_dev.copy()
+    # The row bound every descriptor-driven launch is sized by, real and
+    # speculative alike. An upper bound and not a length: no live window can
+    # exceed the active prefix, and the geometry never reaches the answer.
+    var row_bound = n_root if n_root > 0 else 1
 
     # --- Per-tree staging, all of it, before any split ---------------------
     #
@@ -1583,6 +1764,18 @@ def grow_tree_device_resident(
     # body that reads the device back, and it is off unless a variable turns
     # it on, precisely so that this stays true of every run that is not being
     # debugged.
+    #
+    # When the K=1 speculative prebuild is armed the body gains five launches
+    # and one descriptor, and the whole of the addition is written out below
+    # in place rather than split into a helper, because the *order* of the
+    # eleven launches is the only thing keeping it correct and an order is
+    # read, not called.
+    if spec:
+        # `spec_dev` has to start dead: step 0's consume kernel reads it
+        # before any runner-up kernel has written it. The counters are zeroed
+        # with it because a fit's hit rate is a sum over trees of counts, and
+        # a counter carried across trees would be the wrong denominator.
+        builder.rows.enqueue_spec_reset()
     for step in range(params.num_leaves - 1):
         # Pick the leaf, commit the split, write the tree, move the slot
         # pool, and publish the step descriptor. One block, one launch.
@@ -1593,18 +1786,45 @@ def grow_tree_device_resident(
             params.max_depth,
             params.min_data_in_leaf,
         )
+        if spec:
+            # Was the split this step just committed the split the previous
+            # step prebuilt? The answer goes into `build_dev`, which the
+            # partition and the child histogram below read instead of
+            # `step_dev`: on a hit it says the step is dead and both of them
+            # return at their first word. This is where `SPEC_STAT_CONSUMED`
+            # moves, and it is the only place it moves.
+            #
+            # It has to run here: after the commit that wrote `step_dev`, and
+            # before this step's own runner-up kernel overwrites `spec_dev`
+            # with a publication for the step after this one.
+            builder.rows.enqueue_spec_consume()
+            builder.rows.set_descriptor_target(DESC_BUILD)
         # Point the two scratch search records at the children's pool slots.
-        # The only per-record word this loop writes on the device.
+        # The only per-record word this loop writes on the device. Reads
+        # `step_dev` whatever the speculation decided, because a consumed step
+        # still searches both of its children and still files both records.
         builder.enqueue_desc_stage_search(
             searcher.node_dev, slot_cells, scratch_l, scratch_r
         )
         # Reassign the parent's rows to its two children. Three launches at a
-        # grid sized for the whole active prefix.
-        builder.enqueue_desc_partition(n_root if n_root > 0 else 1)
+        # grid sized for the whole active prefix. Skipped on a consumed step,
+        # where the previous step's speculative partition already produced
+        # this exact permutation.
+        builder.enqueue_desc_partition(row_bound)
         # Accumulate the smaller child from its own rows and derive the larger
         # by subtracting inside the same kernel. Two launches: the slot
-        # zeroing the atomic strategy needs, and the accumulation.
-        builder.enqueue_desc_child(n_root if n_root > 0 else 1)
+        # zeroing the atomic strategy needs, and the accumulation. Both
+        # skipped on a consumed step.
+        builder.enqueue_desc_child(row_bound)
+        if spec:
+            builder.rows.set_descriptor_target(DESC_STEP)
+            # The one thing a prebuild could not do ahead of time: the
+            # sibling subtraction. It is deliberately not folded into the
+            # speculative accumulation, because the leaf being speculated on
+            # is still live and deriving its larger child in place would
+            # destroy the histogram the next pick reads on a miss. On a miss
+            # this launch reads one word and returns.
+            builder.rows.enqueue_spec_subtract(pool_handle, slot_cells)
         # Search both children in one launch pair, into the scratch records.
         _launch_child_search(
             searcher,
@@ -1618,6 +1838,32 @@ def grow_tree_device_resident(
         builder.enqueue_desc_copy_records(
             searcher.rec_i_dev, searcher.rec_f_dev, scratch_l, scratch_r
         )
+        if spec:
+            # Name the leaf the *next* step is most likely to pick, and build
+            # its smaller child now. The runner-up kernel excludes the two
+            # slots this step's commit just wrote, which is a correctness
+            # requirement and not a refinement: their records have not been
+            # written yet at the launch that reads them, so including them
+            # would reduce over an earlier step's memory.
+            #
+            # The two launches after it are the ordinary partition and the
+            # ordinary child build, aimed at a different descriptor. Nothing
+            # about either kernel is speculation-aware, which is the whole
+            # reason the descriptor is a table in device memory.
+            builder.resident_tables[0].enqueue_runner_up(
+                searcher.rec_i_dev,
+                searcher.rec_f_dev,
+                step_handle,
+                spec_handle,
+                stats_handle,
+                params.num_leaves,
+                params.max_depth,
+                params.min_data_in_leaf,
+            )
+            builder.rows.set_descriptor_target(DESC_SPEC)
+            builder.enqueue_desc_partition(row_bound)
+            builder.enqueue_desc_child(row_bound)
+            builder.rows.set_descriptor_target(DESC_STEP)
         if trace_steps:
             # A download inside the loop, which is the wait this plane exists
             # to remove, taken deliberately and only when asked for. See
@@ -1767,6 +2013,42 @@ def grow_tree_device_resident(
         var census = speculation_census(
             snap.commit_order, params.num_leaves - 1
         )
+        var line = census.trace_line()
+        if spec:
+            # What the device actually did, beside what the commit log says it
+            # would have done. Two independent instruments over one tree, and
+            # the point of carrying both is that they can disagree: the host
+            # census counts a build on every step but the first, because a
+            # commit log cannot see a step whose pre-existing leaves were all
+            # inadmissible or whose pool had nothing free, while
+            # `_pick_runner_up_kernel` declines on exactly those and says so.
+            # So `device_builds <= builds` always, and the gap is the census's
+            # own overcount made visible rather than argued.
+            #
+            # `device_consumed` and `consumed` are expected to be **equal**,
+            # and that is a theorem rather than a hope. A commit consumes
+            # under the host rule exactly when the leaf it splits predates the
+            # previous commit; it consumes under the device rule exactly when
+            # that leaf is the one the runner-up named. Those coincide because
+            # admissibility and gain are invariant for a leaf that was not
+            # touched, so a pre-existing leaf that wins the pick at step k+1
+            # was also the best pre-existing leaf at step k. An inequality
+            # between them is therefore a fault report, which is what makes
+            # printing both worth the transfer.
+            #
+            # The transfer: one copy of two Int32 and one `synchronize`, after
+            # the queue has already drained at `download_desc_tables`. It
+            # happens only because an instrument was named, so no measured run
+            # pays it.
+            var stats = builder.rows.download_spec_stats()
+            line += String(
+                " spec=on device_builds=",
+                stats[SPEC_STAT_BUILDS],
+                " device_consumed=",
+                stats[SPEC_STAT_CONSUMED],
+            )
+        else:
+            line += String(" spec=off")
         # The census's own sink when it has one, so that a census run's file
         # holds one line per tree and nothing else; the trace otherwise, so
         # that a debugging trace is never missing it. See
@@ -1776,7 +2058,7 @@ def grow_tree_device_resident(
             sink,
             String(
                 "mojotrees.speculation ",
-                census.trace_line(),
+                line,
                 " root_rows=",
                 n_root,
                 "\n",

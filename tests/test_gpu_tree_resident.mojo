@@ -679,12 +679,12 @@ def test_the_speculation_census_reaches_the_plane_and_is_not_vacuous() raises:
     `tests/test_gpu_speculation_census.mojo`, which runs the same function
     over commit logs written out by hand at both poles and needs no device.
 
-    **This is not a test that a speculative build was consumed**, because no
-    speculative build is shipped. `gpu_resident_round.mojo` says what the
-    speculation needs from `gpu_active_rows.mojo` and `gpu_tree_tables.mojo`,
-    and states what the consumption test must assert once it exists: a device
-    counter incremented only on the consuming branch, downloaded with the
-    tables. Counting launches would not do it.
+    **This is not a test that a speculative build was consumed.** It runs
+    with the speculation unarmed, which is the default, so what it exercises
+    is the instrument and not the mechanism. The consumption test is
+    `tests/test_gpu_speculation_build.mojo`, which arms
+    `MOJOTREES_GPU_SPECULATION` and asserts on a device counter incremented
+    only on the consuming branch. Counting launches would not do it.
 
     One round, one tree, because this exercises an instrument and not a model.
     """

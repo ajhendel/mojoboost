@@ -35,24 +35,36 @@ the two nodes the previous commit created. Every log below is written out
 node by node against that rule rather than generated, so a reader can check
 the expected counts by hand.
 
-What this file does NOT prove, and what would
----------------------------------------------
-It does not prove that a speculative build was consumed, because no
-speculative build is shipped: `gpu_resident_round.mojo` says at length why the
-speculation needs a second step descriptor in `gpu_active_rows.mojo` and a
-non-committing pick kernel in `gpu_tree_tables.mojo`, neither of which the
-lane that wrote this owned. What it proves is the precondition: that the
-quantity gating the decision is measured by something that can come back with
-either answer.
+What this file does NOT prove, and what does
+--------------------------------------------
+It does not prove that a speculative build was consumed. It cannot: it opens
+no device and grows no tree, and a consumption is a thing a kernel does.
+What it proves is the precondition -- that the quantity gating the decision
+is measured by something that can come back with either answer.
 
-When the build does exist, the test that proves consumption cannot be this
-one and cannot be a count of launches. It has to assert on an observable that
-only a *consuming* step can produce -- a device counter incremented on the
-consume branch of the step kernel and nowhere else, downloaded with the
-tables and asserted strictly positive on a fixture whose census here reports
-a nonzero `consumed`. Asserting that the speculative launches ran would pass
-on a speculation that never once hit, which is exactly the shape of the
-six-fixture failure above.
+The speculative build now exists, behind `MOJOTREES_GPU_SPECULATION=1`, and
+the test that proves consumption is `tests/test_gpu_speculation_build.mojo`.
+It asserts on an observable only a *consuming* step can produce: a device
+counter (`gpu_active_rows.SPEC_STAT_CONSUMED`) incremented on the branch of
+`_spec_consume_kernel` that suppresses the real build and nowhere else,
+downloaded with the tree and asserted strictly positive. Asserting that the
+speculative launches ran would pass on a speculation that never once hit,
+which is exactly the shape of the six-fixture failure above.
+
+**This file is what makes that device counter two-sided.** That test also
+asserts the device counter equal to `speculation_census`'s `consumed`, per
+tree, which is only evidence because the census below is shown here to reach
+zero, to reach everything, and to separate hits from misses inside one log.
+A counter pinned to a constant instrument would prove nothing; a counter
+pinned to this one cannot be constant unless this one is.
+
+One thing the census gets wrong, which the device counter found and which
+`SpeculationCensus.builds` now states: `builds` is `steps - 1`, and a commit
+log cannot see the four situations in which the shipped speculation declines
+to publish at all. On an early-stopping tree it reports 29 builds where the
+device issued 2. The counts below are all exactly right *for the design the
+census describes*, which is an enqueue-blind one; the shipped design is not
+blind, and `wasted` is an upper bound rather than an estimate.
 """
 
 # run_tests: cpu-safe -- host arithmetic only, opens no device.
@@ -216,6 +228,15 @@ def test_dead_steps_are_counted_and_every_one_of_them_is_wasted() raises:
     step: under an enqueue-blind design it issues its own partition and its
     own histogram and cannot possibly be consumed. So `dead` is reported next
     to `builds`, and the wasted count includes those steps.
+
+    **The shipped speculation is not enqueue-blind and this count therefore
+    overstates it.** `gpu_tree_tables._pick_runner_up_kernel` returns on
+    `STEP_LIVE` before it reads anything, so a dead step publishes nothing
+    and the launches behind it read one word and return. The nine below is
+    the right answer to the question this function asks; the device issues
+    two. Kept as it is, because a census over a commit log cannot answer the
+    other question and pretending it could is how an upper bound becomes a
+    quoted figure.
 
     Four commits against ten enqueued steps: six dead, nine builds, and the
     two decisions that could have consumed did.

@@ -275,6 +275,7 @@ from .categorical import (
     cat_empty,
 )
 from .gpu_active_rows import (
+    SPEC_STAT_BUILDS,
     STEP_BUILT_BEGIN,
     STEP_BUILT_COUNT,
     STEP_BUILT_SLOT,
@@ -1317,6 +1318,224 @@ def _pick_and_commit_kernel(
     ctr[unsafe_offset=CTR_PICK_NODE] = Int32(parent)
     ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_RUNNING)
     ctr[unsafe_offset=CTR_COMMITS] = Int32(commits + 1)
+
+
+def _pick_runner_up_kernel(
+    front: MutPointer[Int32, MutAnyOrigin],
+    ctr: MutPointer[Int32, MutAnyOrigin],
+    slot_owner: MutPointer[Int32, MutAnyOrigin],
+    missing: MutPointer[Int32, MutAnyOrigin],
+    rec_i: MutPointer[Int32, MutAnyOrigin],
+    rec_f: MutPointer[Float32, MutAnyOrigin],
+    step: MutPointer[Int32, MutAnyOrigin],
+    spec: MutPointer[Int32, MutAnyOrigin],
+    stats: MutPointer[Int32, MutAnyOrigin],
+    num_leaves: Int32,
+    max_depth: Int32,
+    min_data_in_leaf: Int32,
+    pool_capacity: Int32,
+):
+    """Publish the split the *next* step is most likely to commit, so that its
+    child histogram can be built now instead of then. Writes a descriptor and
+    no table.
+
+    Phase two of `_pick_and_commit_kernel` with its committing phase three
+    replaced by a descriptor write: the same strided walk in ascending slot
+    order, the same shape rules, the same strict `>`, the same
+    `block.max` then `block.min`, and therefore the same tie resolution. It
+    has to be the same rule and not an equivalent-looking one, because the
+    whole value of the prebuild is that the leaf it names is the leaf the
+    next commit names.
+
+    **Why one candidate is the whole of the candidate set**, which is a
+    theorem rather than a tuning choice and is argued at length in
+    `gpu_resident_round.mojo`: at this point in a step the two children the
+    commit just created have no search records yet -- the child search has
+    not run -- so they cannot be speculated on at all, and their candidacy is
+    established at exactly the moment speculating on them stops being
+    speculation. The candidate set is therefore the leaves that were live
+    *before* this step, and over that set a commit moves no ranking: it
+    writes only the split leaf's frontier row, the appended row at `n_live`,
+    and the two records those children own. Every other leaf keeps its slot,
+    its record, its depth and its row count bit for bit, so the best
+    pre-existing leaf at the next step is exactly the best one here. A second
+    speculative candidate would be a leaf that provably cannot be picked
+    next.
+
+    **The two slots this excludes, and why the exclusion is a correctness
+    requirement rather than an optimization.** Slot `CTR_PICK` now holds the
+    left child and slot `n_live - 1` holds the right child, and both of them
+    carry record indices whose contents this step has not written yet: the
+    search that will fill them is enqueued after this launch. Including
+    either would reduce over a record left by an earlier step or an earlier
+    tree, which can carry `FLAG_FOUND` and an arbitrarily large gain. That is
+    not a wrong guess, it is a read of stale memory, and it is the one way
+    this kernel could publish a descriptor that partitions a window by a
+    split nothing chose.
+
+    **Four ways it declines, and all four write `STEP_LIVE = 0`.** A step
+    that committed nothing has nothing to speculate behind; a step after
+    which the leaf budget is spent is followed by a step that returns on the
+    budget before it reads anything; a frontier whose pre-existing leaves are
+    all inadmissible offers no candidate; and a slot pool with nothing free
+    has nowhere to build. The last of those cannot happen while a next commit
+    can, since a commit needs a free slot too, and it is checked anyway
+    because a speculative build writing into slot -1 would be a device fault
+    rather than a wrong answer.
+
+    **The slot it builds into is the slot the next commit will acquire, and
+    that is a prediction with a proof rather than a guess.** The commit
+    kernel takes the lowest free slot by scanning `slot_owner` upward; this
+    kernel scans the same vector the same way and writes nothing to it.
+    Between here and the next commit nothing acquires and nothing releases,
+    so the lowest free slot is the same slot. Building there rather than into
+    a reserved spare is what keeps the pool at `num_leaves` slots and keeps
+    `open_resident`'s size argument, which lives in a file this lane does not
+    own, exactly where it is. On a miss the slot holds a histogram nobody
+    wants, and the next real build zeroes it before accumulating
+    (`_zero_slot_desc_kernel`), so a miss costs work and never correctness.
+
+    **`STEP_SUB_SLOT` is written and must not be used by the prebuild.** The
+    speculative histogram launch passes `do_sub = 0`, so the word is inert
+    there; it is written because the descriptor's contract is that every word
+    is written on every publication, and because `_spec_subtract_kernel`
+    reads the same word off the *build* descriptor when the prebuild is
+    consumed.
+
+    No floating-point arithmetic: gains are compared and record words are
+    copied. Same as the commit kernel and for the same reason.
+    """
+    var tid = Int(thread_idx.x)
+
+    # Nothing committed, so there is no "next step" to serve and, worse, the
+    # frontier this would reduce over is the one the *previous* commit left.
+    # Written by thread 0 alone and returned from uniformly.
+    if step[unsafe_offset=STEP_LIVE][0] == Int32(0):
+        if tid == 0:
+            spec[unsafe_offset=STEP_LIVE] = Int32(0)
+        return
+
+    var n_live = Int(ctr[unsafe_offset=CTR_N_LIVE][0])
+    # The next step's phase one, evaluated one step early. A step that would
+    # return on the budget commits nothing, so a prebuild for it is pure
+    # waste; declining here is what keeps the schedule's tail free.
+    if n_live >= Int(num_leaves):
+        if tid == 0:
+            spec[unsafe_offset=STEP_LIVE] = Int32(0)
+        return
+
+    var taken = Int(ctr[unsafe_offset=CTR_PICK][0])
+    var appended = n_live - 1
+
+    var my_gain = Float32(0.0)
+    var my_slot = NO_PICK
+    var s = tid
+    while s < n_live:
+        if s != taken and s != appended:
+            var fo = s * FRONT_WORDS
+            var rec = Int(front[unsafe_offset = fo + FRONT_RECORD][0])
+            var flags = rec_i[unsafe_offset = rec * SPLIT_IWORDS + IREC_FLAGS][
+                0
+            ]
+            var admissible = (flags & Int32(FLAG_FOUND)) != Int32(0)
+            var depth = front[unsafe_offset = fo + FRONT_DEPTH][0]
+            var rows = front[unsafe_offset = fo + FRONT_ROW_COUNT][0]
+            if max_depth > Int32(0) and depth >= max_depth:
+                admissible = False
+            if rows < Int32(2) * min_data_in_leaf or rows < Int32(2):
+                admissible = False
+            if admissible:
+                var gain = rec_f[
+                    unsafe_offset = rec * SPLIT_FWORDS + FREC_GAIN
+                ][0]
+                if gain > my_gain:
+                    my_gain = gain
+                    my_slot = Int32(s)
+        s += PICK_THREADS
+
+    var top = block.max[block_size=PICK_THREADS](my_gain)
+    var mine = NO_PICK
+    if my_gain == top:
+        mine = my_slot
+    var best = block.min[block_size=PICK_THREADS](mine)
+
+    if tid != 0:
+        return
+
+    if top <= Float32(0.0):
+        spec[unsafe_offset=STEP_LIVE] = Int32(0)
+        return
+
+    var slot = Int(best)
+    var fo = slot * FRONT_WORDS
+    var begin = Int(front[unsafe_offset = fo + FRONT_ROW_BEGIN][0])
+    var parent_slot = Int(front[unsafe_offset = fo + FRONT_HIST_SLOT][0])
+    var rec = Int(front[unsafe_offset = fo + FRONT_RECORD][0])
+    var ri = rec * SPLIT_IWORDS
+
+    var flags = rec_i[unsafe_offset = ri + IREC_FLAGS][0]
+    var is_cat = (flags & Int32(FLAG_CATEGORICAL)) != Int32(0)
+    var feature = rec_i[unsafe_offset = ri + IREC_FEATURE][0]
+    var n_left = rec_i[unsafe_offset = ri + IREC_LEFT_COUNT][0]
+    var n_right = rec_i[unsafe_offset = ri + IREC_RIGHT_COUNT][0]
+
+    # The slot the next commit will acquire, by the commit's own rule.
+    var built_slot = -1
+    for i in range(Int(pool_capacity)):
+        if slot_owner[unsafe_offset=i][0] < Int32(0):
+            built_slot = i
+            break
+    if built_slot < 0:
+        spec[unsafe_offset=STEP_LIVE] = Int32(0)
+        return
+
+    spec[unsafe_offset=STEP_LIVE] = Int32(1)
+    spec[unsafe_offset=STEP_ROW_BEGIN] = Int32(begin)
+    spec[unsafe_offset=STEP_ROW_COUNT] = n_left + n_right
+    spec[unsafe_offset=STEP_FEATURE] = feature
+    spec[unsafe_offset=STEP_IS_CAT] = Int32(1) if is_cat else Int32(0)
+    if is_cat:
+        spec[unsafe_offset=STEP_THRESHOLD] = Int32(-1)
+        spec[unsafe_offset=STEP_MISSING_BIN] = Int32(-1)
+        spec[unsafe_offset=STEP_DEFAULT_LEFT] = Int32(0)
+    else:
+        spec[unsafe_offset=STEP_THRESHOLD] = rec_i[
+            unsafe_offset = ri + IREC_BIN
+        ][0]
+        spec[unsafe_offset=STEP_MISSING_BIN] = missing[
+            unsafe_offset = Int(feature)
+        ][0]
+        var sdl = Int32(0)
+        if (flags & Int32(FLAG_DEFAULT_LEFT)) != Int32(0):
+            sdl = Int32(1)
+        spec[unsafe_offset=STEP_DEFAULT_LEFT] = sdl
+    for w in range(CAT_WORDS):
+        spec[unsafe_offset = STEP_CAT0 + w] = rec_i[
+            unsafe_offset = ri + IREC_CAT0 + w
+        ][0]
+    # `subtraction_builds_left`, the same integer comparison the commit makes,
+    # so the child this accumulates is the child that commit would accumulate.
+    var build_left = n_left <= n_right
+    if build_left:
+        spec[unsafe_offset=STEP_BUILT_BEGIN] = Int32(begin)
+        spec[unsafe_offset=STEP_BUILT_COUNT] = n_left
+    else:
+        spec[unsafe_offset=STEP_BUILT_BEGIN] = Int32(begin) + n_left
+        spec[unsafe_offset=STEP_BUILT_COUNT] = n_right
+    spec[unsafe_offset=STEP_BUILT_SLOT] = Int32(built_slot)
+    spec[unsafe_offset=STEP_SUB_SLOT] = Int32(parent_slot)
+    var left_slot = parent_slot
+    var right_slot = built_slot
+    if build_left:
+        left_slot = built_slot
+        right_slot = parent_slot
+    spec[unsafe_offset=STEP_LEFT_SLOT] = Int32(left_slot)
+    spec[unsafe_offset=STEP_RIGHT_SLOT] = Int32(right_slot)
+    spec[unsafe_offset=STEP_LEFT_REC] = Int32(rec)
+    spec[unsafe_offset=STEP_RIGHT_REC] = Int32(n_live)
+    stats[unsafe_offset=SPEC_STAT_BUILDS] = (
+        stats[unsafe_offset=SPEC_STAT_BUILDS][0] + Int32(1)
+    )
 
 
 def _reset_tables_kernel(
@@ -2488,6 +2707,67 @@ struct DeviceTreeTables(Movable):
                 Int32(self.pool_capacity),
                 Int32(self.leaf_capacity),
                 Int32(self.node_capacity),
+                grid_dim=1,
+                block_dim=PICK_THREADS,
+            )
+
+    def enqueue_runner_up(
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        mut step: DeviceBuffer[DType.int32],
+        mut spec: DeviceBuffer[DType.int32],
+        mut stats: DeviceBuffer[DType.int32],
+        num_leaves: Int,
+        max_depth: Int,
+        min_data_in_leaf: Int,
+    ) raises:
+        """Publish the K=1 speculative descriptor for the step after this one.
+        Writes no table, transfers nothing, synchronizes nothing.
+
+        One launch, one block, `PICK_THREADS` threads -- the same shape as
+        `enqueue_step`, because it is the same reduction over the same
+        frontier. See `_pick_runner_up_kernel`.
+
+        The three descriptors cross as `DeviceBuffer`s rather than as
+        pointers, which is not the convention `enqueue_step` uses and is
+        deliberate. Its caller can take a pointer because the buffer belongs
+        to a different object; this one's caller holds `step` and `spec` on
+        one field of the builder and reaches these tables through another,
+        and Mojo will not let a pointer derived from one field cross a call
+        that mutably borrows a sibling. A `DeviceBuffer` is a copyable handle,
+        so a caller hands in copies and no borrow spans the call. It moves no
+        bytes.
+
+        `stats` is the speculation's two-word counter; this kernel increments
+        `SPEC_STAT_BUILDS` on every publication and touches nothing else in
+        it. The counter that matters -- consumption -- is incremented
+        somewhere else entirely, by `gpu_active_rows._spec_consume_kernel`, on
+        the branch that suppresses the real build. Splitting the two is what
+        makes the pair evidence: a mechanism that published perfectly and
+        consumed nothing would show it.
+        """
+        self._check_step_args(num_leaves, min_data_in_leaf)
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_pick_runner_up_kernel](
+                self.front_dev.unsafe_ptr(),
+                self.ctr_dev.unsafe_ptr(),
+                self.slot_dev.unsafe_ptr(),
+                self.missing_dev.unsafe_ptr(),
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                step.unsafe_ptr(),
+                spec.unsafe_ptr(),
+                stats.unsafe_ptr(),
+                Int32(num_leaves),
+                Int32(max_depth),
+                Int32(min_data_in_leaf),
+                Int32(self.pool_capacity),
                 grid_dim=1,
                 block_dim=PICK_THREADS,
             )

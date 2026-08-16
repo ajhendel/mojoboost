@@ -362,7 +362,64 @@ comptime STEP_CAT0 = 16
 packing. Copied out of the record without reinterpretation, and unpacked
 into the four UInt64 the routing rule wants by `_step_cat_word` below."""
 
-comptime STEP_WORDS = STEP_CAT0 + CAT_WORDS
+comptime STEP_SPEC_HIT = STEP_CAT0 + CAT_WORDS
+"""1 when this descriptor describes a step whose child histogram was already
+built speculatively during the previous step, 0 otherwise.
+
+**Written by `_spec_consume_kernel` and by nothing else**, which means it is
+meaningful on the *build* descriptor that kernel produces and is stale on
+`step_dev`. `_pick_and_commit_kernel` writes every word up to and including
+the category set and stops there, so the commit never touches this one; no
+kernel reads it off `step_dev`, and the only reader is
+`_spec_subtract_kernel`, which is launched against the build descriptor.
+
+It is one word rather than a separate buffer so that the decision and the
+slot numbers it applies to travel together: a subtraction that read its hit
+flag from one place and its two slots from another could be handed a hit
+from step k and slots from step k+1, and would silently corrupt one
+histogram."""
+
+comptime STEP_WORDS = STEP_SPEC_HIT + 1
+
+
+# --- The descriptor a descriptor-aware launch reads -----------------------
+#
+# There are three of them once the K=1 speculative prebuild is armed, and
+# every descriptor-aware launch reads exactly one, chosen by
+# `GpuActiveRows.set_descriptor_target`. A field rather than a parameter
+# because the choice has to reach `_enqueue_atomic_at`, four call sites deep
+# through two dispatch layers whose signatures are already eighteen
+# arguments wide, and because the alternative -- passing a pointer down from
+# a caller that also holds `mut self` -- is an aliasing the compiler
+# correctly refuses.
+#
+# The default is `DESC_STEP`, which is what every path that predates the
+# speculation reads, so an unarmed fit sees byte-for-byte the launches it
+# saw before.
+
+comptime DESC_STEP = 0
+"""`step_dev`: the commit descriptor `gpu_tree_tables._pick_and_commit_kernel`
+writes. The default, and the only target any caller outside
+`gpu_resident_round`'s speculative arm ever selects."""
+
+comptime DESC_BUILD = 1
+"""`build_dev`: what the *real* step's partition and child histogram read.
+
+A copy of `step_dev` on a speculation miss, and a copy with `STEP_LIVE`
+forced to zero on a hit, so that a hit skips both without any kernel having
+to learn what a speculation is. That is the whole mechanism by which a
+prebuild is consumed rather than merely computed: the work the consuming
+step would have done reads a descriptor that says the step is dead, and a
+slot-sized subtraction runs in its place."""
+
+comptime DESC_SPEC = 2
+"""`spec_dev`: the speculative descriptor `gpu_tree_tables._pick_runner_up_
+kernel` publishes, naming the leaf the *next* step is most likely to pick.
+
+A launch against this target also suppresses the sibling subtraction, which
+is not a second knob but the same one: the speculation must not derive the
+larger child in place from its parent's slot, because the parent is a leaf
+that is still live and whose histogram has to survive a miss."""
 
 
 @always_inline
@@ -603,6 +660,205 @@ def _zero_slot_desc_kernel(
     var i = Int(global_idx.x)
     while i < Int(cells):
         pool[unsafe_offset = base + i] = Int32(0)
+        i += stride
+
+
+# --- The speculation's two kernels ----------------------------------------
+#
+# Both are mine to state plainly because the whole correctness of the K=1
+# prebuild sits in them: one decides whether the work already done is the
+# work this step needs, and the other is what the step does instead of that
+# work when it is. The prebuild itself uses no kernel of its own -- it is
+# `enqueue_partition_desc` and `enqueue_desc_histogram` launched against a
+# different descriptor, which is the point of the descriptor being a table
+# in device memory rather than a launch argument.
+
+comptime SPEC_STAT_BUILDS = 0
+"""Speculative builds this tree actually issued.
+
+Not `steps - 1`. `_pick_runner_up_kernel` declines to publish on a step that
+committed nothing, on a step after which the leaf budget is spent, on a step
+whose pre-existing leaves are all inadmissible, and on a step where the slot
+pool has nothing free. Each of those is a step the host census counts as a
+build because the commit log cannot see the difference; this counter can, so
+the two together bound the census's own overcount."""
+
+comptime SPEC_STAT_CONSUMED = 1
+"""Speculative builds a later commit actually used.
+
+**Incremented on the consuming branch of `_spec_consume_kernel` and nowhere
+else.** That is the whole reason this counter exists rather than a count of
+launches: a speculation that never once hit would launch exactly as many
+kernels as one that always hits, so a test that counted launches would pass
+on a mechanism that does nothing. This increments only where the step's own
+descriptor and the previous step's speculative descriptor agree field for
+field, which is the same branch that suppresses the real build."""
+
+comptime SPEC_STAT_WORDS = 2
+
+
+def _spec_consume_kernel(
+    step: MutPointer[Int32, MutAnyOrigin],
+    spec: MutPointer[Int32, MutAnyOrigin],
+    build: MutPointer[Int32, MutAnyOrigin],
+    stats: MutPointer[Int32, MutAnyOrigin],
+):
+    """Decide whether this step's committed split is the one the previous step
+    speculatively built, and publish the descriptor the real build will read.
+
+    One thread. It reads two flat rows of `STEP_WORDS` Int32 and writes one,
+    which is why it is not worth a grid.
+
+    **The decision is by identity of the work, not by identity of the leaf.**
+    The obvious test is "is the node this step split the node the speculation
+    guessed", and the theorem in `gpu_resident_round.mojo` says that test is
+    equivalent to this one. This kernel does not rely on the theorem. It
+    compares every descriptor field the speculative partition and the
+    speculative histogram actually consumed --- the window, the routing rule,
+    the built child's own window, and the slot it was built into --- and
+    consumes only when all of them are equal. So a hit means, literally, that
+    the launches already run were handed the same arguments this step's
+    launches would be handed.
+
+    That direction matters and it is deliberate. A comparison that was too
+    strict costs a hit and nothing else: the real build runs, as it always
+    did. A comparison that was too loose would hand a step a histogram of
+    some other leaf's rows, which is a wrong tree that nothing downstream
+    could detect. Every extra field in the conjunction below moves the error
+    into the direction that is merely slower.
+
+    `build` is a full copy of `step` with one word changed on a hit. Copying
+    rather than aliasing is what lets `STEP_LIVE` be forced to zero for the
+    partition and the histogram while `gpu_tree_tables._stage_child_search_
+    kernel` and `_copy_records_kernel` -- which must still run, because a
+    consumed step still searches its two children and still files their
+    records -- keep reading the live commit descriptor.
+
+    A dead step (`step[STEP_LIVE] == 0`) copies through as dead and consumes
+    nothing, which is right twice over: there is no commit to serve, and the
+    speculative descriptor from the step before it is the one thing on this
+    path that could be stale.
+    """
+    if Int(global_idx.x) != 0:
+        return
+    for w in range(STEP_WORDS):
+        build[unsafe_offset=w] = step[unsafe_offset=w][0]
+    build[unsafe_offset=STEP_SPEC_HIT] = Int32(0)
+    if step[unsafe_offset=STEP_LIVE][0] == Int32(0):
+        return
+    if spec[unsafe_offset=STEP_LIVE][0] == Int32(0):
+        return
+    # The window this step is about to partition, the rule it will route by,
+    # the child window it will accumulate, and the slot it will accumulate
+    # into. Every one of them is an input the speculative launches already
+    # consumed, so equality here is equality of the work and not a guess
+    # about it.
+    var same = True
+    if step[unsafe_offset=STEP_ROW_BEGIN][0] != spec[
+        unsafe_offset=STEP_ROW_BEGIN
+    ][0]:
+        same = False
+    if step[unsafe_offset=STEP_ROW_COUNT][0] != spec[
+        unsafe_offset=STEP_ROW_COUNT
+    ][0]:
+        same = False
+    if step[unsafe_offset=STEP_FEATURE][0] != spec[unsafe_offset=STEP_FEATURE][
+        0
+    ]:
+        same = False
+    if step[unsafe_offset=STEP_THRESHOLD][0] != spec[
+        unsafe_offset=STEP_THRESHOLD
+    ][0]:
+        same = False
+    if step[unsafe_offset=STEP_MISSING_BIN][0] != spec[
+        unsafe_offset=STEP_MISSING_BIN
+    ][0]:
+        same = False
+    if step[unsafe_offset=STEP_DEFAULT_LEFT][0] != spec[
+        unsafe_offset=STEP_DEFAULT_LEFT
+    ][0]:
+        same = False
+    if step[unsafe_offset=STEP_IS_CAT][0] != spec[unsafe_offset=STEP_IS_CAT][
+        0
+    ]:
+        same = False
+    if step[unsafe_offset=STEP_BUILT_BEGIN][0] != spec[
+        unsafe_offset=STEP_BUILT_BEGIN
+    ][0]:
+        same = False
+    if step[unsafe_offset=STEP_BUILT_COUNT][0] != spec[
+        unsafe_offset=STEP_BUILT_COUNT
+    ][0]:
+        same = False
+    if step[unsafe_offset=STEP_BUILT_SLOT][0] != spec[
+        unsafe_offset=STEP_BUILT_SLOT
+    ][0]:
+        same = False
+    if step[unsafe_offset=STEP_IS_CAT][0] != Int32(0):
+        for w in range(CAT_WORDS):
+            if step[unsafe_offset = STEP_CAT0 + w][0] != spec[
+                unsafe_offset = STEP_CAT0 + w
+            ][0]:
+                same = False
+    if not same:
+        return
+    # The consuming branch, and the only place `SPEC_STAT_CONSUMED` moves.
+    build[unsafe_offset=STEP_LIVE] = Int32(0)
+    build[unsafe_offset=STEP_SPEC_HIT] = Int32(1)
+    stats[unsafe_offset=SPEC_STAT_CONSUMED] = (
+        stats[unsafe_offset=SPEC_STAT_CONSUMED][0] + Int32(1)
+    )
+
+
+def _spec_subtract_kernel(
+    pool: MutPointer[Int32, MutAnyOrigin],
+    cells: Int32,
+    build: MutPointer[Int32, MutAnyOrigin],
+):
+    """On a consumed step, derive the sibling the skipped build would have
+    derived: `pool[sub_slot] -= pool[built_slot]`, cell for cell.
+
+    The one piece of a consuming step's work that the prebuild could not do
+    ahead of time, and the reason it could not is the design correction this
+    whole lane turns on. `_range_hist_atomic_kernel` folds the sibling
+    subtraction into the accumulation, subtracting the built child out of the
+    parent's slot as it goes. A speculative build must not: the parent is a
+    leaf that is still live, and on a miss its histogram is the one the next
+    pick reads. So the prebuild runs with `do_sub` off and leaves a whole,
+    unsubtracted child histogram in the slot, and this kernel does the
+    subtraction later, once the commit has proved the parent is a parent.
+
+    **Exact, and for the same reason the fused form is.** Both operands are
+    fixed-point Int32 under one round's scales, so the difference is integer
+    arithmetic with no rounding anywhere. The fused form touches only cells
+    the accumulation wrote and this one touches every cell of the slot; the
+    difference is cells where the built child's value is zero, and
+    subtracting zero is the identity. `_zero_slot_desc_kernel` is what makes
+    that true of the inactive feature slices as well: the speculative build
+    zeroes the whole slot before it accumulates, exactly as the real one
+    does.
+
+    Grid-strided over a slot's cells, which is a per-fit constant, so the
+    caller sizes the grid once.
+
+    Guarded on `STEP_SPEC_HIT` rather than on `STEP_LIVE`, and the two are
+    opposite here: the build descriptor says *dead* on precisely the steps
+    this kernel must act on. Reading the wrong one of those two words would
+    subtract on every miss, which would corrupt the parent's histogram on
+    two thirds of all steps.
+    """
+    if build[unsafe_offset=STEP_SPEC_HIT][0] != Int32(1):
+        return
+    var n = Int(cells)
+    var built = Int(build[unsafe_offset=STEP_BUILT_SLOT][0]) * n
+    var sub = Int(build[unsafe_offset=STEP_SUB_SLOT][0]) * n
+    var stride = Int(block_dim.x) * Int(grid_dim.x)
+    var i = Int(global_idx.x)
+    while i < n:
+        pool[unsafe_offset = sub + i] = (
+            pool[unsafe_offset = sub + i][0]
+            - pool[unsafe_offset = built + i][0]
+        )
         i += stride
 
 
@@ -3413,6 +3669,26 @@ struct GpuActiveRows(Movable):
     # takes this pointer and its commit kernel fills it, which is the whole
     # of the coupling between that module and this one.
     var step_dev: DeviceBuffer[DType.int32]
+    # The K=1 speculation's two extra descriptors and its two counters. All
+    # three are allocated unconditionally and all three are inert unless
+    # `set_descriptor_target` is ever moved off `DESC_STEP`: `STEP_WORDS` and
+    # `SPEC_STAT_WORDS` Int32 are together under 200 bytes, which is not worth
+    # a conditional allocation and a nullable field to save.
+    #
+    # `spec_dev` is written by `gpu_tree_tables._pick_runner_up_kernel` and
+    # read by the speculative partition and the speculative histogram.
+    # `build_dev` is written by `_spec_consume_kernel` and read by the real
+    # ones. `spec_stats_dev` is written by both of those kernels and read only
+    # by a caller that asks for it, so that a measured run moves no bytes it
+    # did not before.
+    var spec_dev: DeviceBuffer[DType.int32]
+    var build_dev: DeviceBuffer[DType.int32]
+    var spec_stats_dev: DeviceBuffer[DType.int32]
+    # Which of the three descriptors a descriptor-aware launch reads. See the
+    # `DESC_*` constants; `DESC_STEP` is what everything that predates the
+    # speculation selects and is what this is reset to after every
+    # speculative launch.
+    var desc_target: Int
     var host_total: HostBuffer[DType.int32]
     var host_rows: HostBuffer[DType.int32]
     var stage_rows: HostBuffer[DType.int32]
@@ -3614,6 +3890,12 @@ struct GpuActiveRows(Movable):
         )
         self.total_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
         self.step_dev = self.ctx.enqueue_create_buffer[DType.int32](STEP_WORDS)
+        self.spec_dev = self.ctx.enqueue_create_buffer[DType.int32](STEP_WORDS)
+        self.build_dev = self.ctx.enqueue_create_buffer[DType.int32](STEP_WORDS)
+        self.spec_stats_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            SPEC_STAT_WORDS
+        )
+        self.desc_target = DESC_STEP
         self.host_total = self.ctx.enqueue_create_host_buffer[DType.int32](1)
         self.host_rows = self.ctx.enqueue_create_host_buffer[DType.int32](
             n_rows
@@ -4354,6 +4636,11 @@ struct GpuActiveRows(Movable):
         var cat = routing.cat_bitset
         var default_left = Int32(1) if routing.default_left else Int32(0)
         var is_cat = Int32(1) if routing.is_categorical else Int32(0)
+        # Inert when `use_desc` is zero, which is the host arm; the selected
+        # descriptor otherwise. `desc_target` is `DESC_STEP` unless the K=1
+        # speculation armed it, so the host arm's pointer is the one it has
+        # always been passed.
+        var desc = self._desc_buffer()
         self.ctx.enqueue_function[_flag_scan_prim_kernel[width]](
             bins,
             self.rows_dev.unsafe_ptr(),
@@ -4372,7 +4659,7 @@ struct GpuActiveRows(Movable):
             cat[2],
             cat[3],
             Int32(tiles),
-            self.step_dev.unsafe_ptr(),
+            desc.unsafe_ptr(),
             use_desc,
             grid_dim=blocks,
             block_dim=width,
@@ -4387,11 +4674,203 @@ struct GpuActiveRows(Movable):
             Int32(n),
             Int32(tiles),
             Int32(blocks),
-            self.step_dev.unsafe_ptr(),
+            desc.unsafe_ptr(),
             use_desc,
             grid_dim=blocks,
             block_dim=width,
         )
+
+    # --- The K=1 speculative prebuild -------------------------------------
+    #
+    # Five small members, and between them they are the whole of what this
+    # file contributes to the speculation. Nothing about a partition or a
+    # histogram changes; what changes is which flat Int32 row the launch
+    # reads its window and its split out of, which is exactly the freedom the
+    # step descriptor was introduced to create.
+    #
+    # The argument for why a speculatively built histogram is bit-identical
+    # to the one the consuming step would have built is in
+    # `gpu_resident_round.mojo` under "Exactness, by construction". The two
+    # legs of it that live here are that a partition's permutation is a
+    # function of the routing flags and the row's position in its window and
+    # of nothing else (`_scatter_kernel`), and that accumulation is
+    # fixed-point Int32 so a histogram is a function of the multiset of rows
+    # and not of their order (`_range_hist_atomic_kernel`).
+
+    def set_descriptor_target(mut self, target: Int) raises:
+        """Choose which step descriptor the next descriptor-aware launch
+        reads.
+
+        `DESC_STEP`, `DESC_BUILD` or `DESC_SPEC`. A run-time arm in the same
+        style as `set_row_unroll`, and for the same reason this repository
+        insists on that style: the two arms have to be reachable in one
+        binary, because this machine's timings drift several-fold between
+        time windows and a rebuild between arms would put a different compile
+        and a different thermal state on either side of the comparison.
+
+        Not sticky by convention: `gpu_resident_round` sets it immediately
+        before each launch and puts it back to `DESC_STEP` immediately after,
+        so that any path that has not heard of the speculation -- the host
+        partition, the host histogram, the whole non-resident plane -- reads
+        the buffer it has always read. A target left set would not corrupt
+        anything on those paths, since they pass `use_desc = 0` and the
+        pointer is inert, but "would not corrupt anything" is a property that
+        stops being true the first time someone gives one of them a
+        descriptor.
+        """
+        if target != DESC_STEP and target != DESC_BUILD and target != DESC_SPEC:
+            raise Error("unknown step descriptor target")
+        self.desc_target = target
+
+    def _desc_buffer(self) -> DeviceBuffer[DType.int32]:
+        """The descriptor buffer `desc_target` names, as a handle a launch can
+        take a pointer out of.
+
+        A returned handle rather than a returned pointer, and that is a
+        language constraint rather than a preference. `DeviceBuffer.
+        unsafe_ptr` carries the origin of the buffer it came from, so the
+        three fields' pointers have three incompatible types and cannot be
+        selected between by an `if`; a `DeviceBuffer` is a copyable handle, so
+        the three *buffers* can be, and the pointer is then taken once from
+        the local. The copy is a handle copy on the host and enqueues
+        nothing.
+        """
+        if self.desc_target == DESC_BUILD:
+            return self.build_dev.copy()
+        if self.desc_target == DESC_SPEC:
+            return self.spec_dev.copy()
+        return self.step_dev.copy()
+
+    def enqueue_spec_reset(mut self) raises:
+        """Zero the speculative descriptor and the two counters, once per
+        tree.
+
+        `spec_dev` has to start dead rather than uninitialized, because the
+        first step's consume kernel reads it before any runner-up kernel has
+        written it. An uninitialized `STEP_LIVE` that happened to be 1 would
+        make step 0 compare its commit against uninitialized memory, and the
+        conjunction in `_spec_consume_kernel` makes a false hit unlikely
+        rather than impossible.
+
+        The counters are per tree for the same reason the census is per tree:
+        a fit's hit rate is the sum of the counts over the sum of the counts,
+        and a counter that accumulated across trees would be an answer to a
+        question nobody asked and would silently be the wrong denominator.
+
+        One launch, no transfer, no synchronization.
+        """
+        comptime if not has_accelerator():
+            raise Error(
+                "the speculative prebuild needs an accelerator; this binary"
+                " was built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_zero_int32_kernel](
+                self.spec_dev.unsafe_ptr(),
+                Int32(STEP_WORDS),
+                grid_dim=1,
+                block_dim=STEP_WORDS,
+            )
+            self.ctx.enqueue_function[_zero_int32_kernel](
+                self.spec_stats_dev.unsafe_ptr(),
+                Int32(SPEC_STAT_WORDS),
+                grid_dim=1,
+                block_dim=SPEC_STAT_WORDS,
+            )
+
+    def enqueue_spec_consume(mut self) raises:
+        """Publish the build descriptor for this step, consuming the previous
+        step's prebuild when it is the work this step needs.
+
+        Must be enqueued after the commit that wrote `step_dev` and before
+        anything reads `build_dev`, which is to say between
+        `enqueue_desc_step` and the real partition. It must also be enqueued
+        *before* this step's own runner-up kernel overwrites `spec_dev`,
+        which is the one ordering constraint in the whole schedule that is
+        not implied by data flow: the comparison is against the previous
+        step's publication, and there is exactly one buffer holding it.
+
+        One launch of one thread. See `_spec_consume_kernel`.
+        """
+        comptime if not has_accelerator():
+            raise Error(
+                "the speculative prebuild needs an accelerator; this binary"
+                " was built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_spec_consume_kernel](
+                self.step_dev.unsafe_ptr(),
+                self.spec_dev.unsafe_ptr(),
+                self.build_dev.unsafe_ptr(),
+                self.spec_stats_dev.unsafe_ptr(),
+                grid_dim=1,
+                block_dim=1,
+            )
+
+    def enqueue_spec_subtract(
+        mut self, mut pool: DeviceBuffer[DType.int32], cells: Int
+    ) raises:
+        """The sibling subtraction a consumed step owes, and a no-op on every
+        step that consumed nothing.
+
+        `pool` is the resident histogram pool's base buffer and `cells` is one
+        slot's width, `3 * n_features * n_bins`. Both come from the builder
+        rather than from here, exactly as they do for the ordinary child
+        build, because this struct owns rows and descriptors and not
+        histograms.
+
+        Enqueued unconditionally on every step of an armed fit. That is a
+        launch on a step that will not act, which is the same bargain every
+        other descriptor-aware kernel on this plane already takes: the host
+        does not know what the device decided and asking costs the round trip
+        the plane exists to remove.
+        """
+        if cells < 1:
+            raise Error("a histogram slot cannot have zero cells")
+        comptime if not has_accelerator():
+            raise Error(
+                "the speculative prebuild needs an accelerator; this binary"
+                " was built without one"
+            )
+        else:
+            var threads = self.block_threads
+            var blocks = (cells + threads - 1) // threads
+            if blocks > 256:
+                blocks = 256
+            if blocks < 1:
+                blocks = 1
+            self.ctx.enqueue_function[_spec_subtract_kernel](
+                pool.unsafe_ptr(),
+                Int32(cells),
+                self.build_dev.unsafe_ptr(),
+                grid_dim=blocks,
+                block_dim=threads,
+            )
+
+    def download_spec_stats(mut self) raises -> List[Int]:
+        """`[builds, consumed]` for the tree just grown.
+
+        **A transfer, and therefore not on any measured path.** The caller
+        asks for this only when an instrument wants it; the speculation
+        itself never reads it, and neither does any kernel. It is here so
+        that a test can assert on an observable only a *consuming* step can
+        produce, which a count of launches is not: a speculation that never
+        once hit would enqueue exactly the same kernels as one that always
+        does.
+
+        Synchronizes, so a caller inside a growth loop would be reinstating
+        the per-split wait the plane removes. `gpu_resident_round` calls it
+        after `download_desc_tables`, where the queue has already drained.
+        """
+        var host = self.ctx.enqueue_create_host_buffer[DType.int32](
+            SPEC_STAT_WORDS
+        )
+        self.ctx.enqueue_copy(host, self.spec_stats_dev)
+        self.ctx.synchronize()
+        var out = List[Int](capacity=SPEC_STAT_WORDS)
+        for i in range(SPEC_STAT_WORDS):
+            out.append(Int(host[i]))
+        return out^
 
     def enqueue_partition_desc[
         bins_origin: MutOrigin, //
@@ -4464,6 +4943,11 @@ struct GpuActiveRows(Movable):
         var grid = _partition_grid(bound, threads, self.partition_block_cap)
         var blocks = grid[0]
         var tiles = grid[1]
+        # Which descriptor this partition routes by. `DESC_STEP` for every
+        # caller that predates the K=1 speculation, which is every caller
+        # today apart from `gpu_resident_round`'s armed loop; see
+        # `set_descriptor_target`.
+        var desc = self._desc_buffer()
 
         # The routing arguments are placeholders: `use_desc` is 1, so every
         # kernel below reads the split out of `step_dev` and ignores them. A
@@ -4520,7 +5004,7 @@ struct GpuActiveRows(Movable):
                 UInt64(0),
                 UInt64(0),
                 Int32(tiles),
-                self.step_dev.unsafe_ptr(),
+                desc.unsafe_ptr(),
                 Int32(1),
                 grid_dim=blocks,
                 block_dim=threads,
@@ -4535,7 +5019,7 @@ struct GpuActiveRows(Movable):
                 Int32(bound),
                 Int32(tiles),
                 Int32(blocks),
-                self.step_dev.unsafe_ptr(),
+                desc.unsafe_ptr(),
                 Int32(1),
                 grid_dim=blocks,
                 block_dim=threads,
@@ -4550,7 +5034,7 @@ struct GpuActiveRows(Movable):
             self.scratch_dev.unsafe_ptr(),
             Int32(0),
             Int32(bound),
-            self.step_dev.unsafe_ptr(),
+            desc.unsafe_ptr(),
             Int32(1),
             grid_dim=blocks,
             block_dim=threads,
@@ -4623,6 +5107,18 @@ struct GpuActiveRows(Movable):
         if max_rows < 1:
             raise Error("a descriptor histogram needs a positive row bound")
 
+        # Which descriptor this build reads, and -- the same decision, not a
+        # second one -- whether it folds the sibling subtraction in. A
+        # speculative build must not: `DESC_SPEC` names a leaf that is still
+        # live, and deriving the larger child in place from that leaf's slot
+        # would destroy the histogram of the very leaf being speculated on,
+        # which on a miss is the histogram the next pick reads. The
+        # subtraction a consumed step owes is done later by
+        # `_spec_subtract_kernel`, once the commit has proved the leaf is a
+        # parent.
+        var desc = self._desc_buffer()
+        var do_sub = Int32(0) if self.desc_target == DESC_SPEC else Int32(1)
+
         var hist_size = self.n_features * self.n_bins
         var cells = 3 * hist_size
         # The two tiling requests are passed here for the same reason
@@ -4660,7 +5156,7 @@ struct GpuActiveRows(Movable):
         self.ctx.enqueue_function[_zero_slot_desc_kernel](
             pool,
             Int32(cells),
-            self.step_dev.unsafe_ptr(),
+            desc.unsafe_ptr(),
             grid_dim=zero_blocks,
             block_dim=threads,
         )
@@ -4688,14 +5184,15 @@ struct GpuActiveRows(Movable):
             tiling.rows_per_tile,
             # Window, destination slot and subtraction offset all come out of
             # the descriptor, so these three are placeholders the kernel
-            # overwrites. The subtraction is always on: a device-owned split
-            # always derives one child from the parent's slot.
+            # overwrites. The subtraction is on for a real split, which always
+            # derives one child from the parent's slot, and off for a
+            # speculative one; see `do_sub` above.
             0,
             max_rows,
             g_scale,
             h_scale,
             0,
-            Int32(1),
+            do_sub,
             use_quant,
             const_hess,
             tiling.n_tiles,
@@ -5616,6 +6113,13 @@ struct GpuActiveRows(Movable):
         # dereferences it at stride one.
         var rstride = Int32(self.blocked_row_stride())
         var blocked_ptr = self.blocked_dev.unsafe_ptr()
+        # Inert when `use_desc` is zero, which is every host-argument caller;
+        # the descriptor `set_descriptor_target` selected otherwise. Read here
+        # rather than threaded through `_enqueue_atomic_family` for the same
+        # reason `unroll` is: the dispatch above is already eighteen arguments
+        # wide, and a pointer cannot be handed down from a caller that also
+        # holds `mut self`.
+        var desc = self._desc_buffer()
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 32]](
                 bins,
@@ -5638,7 +6142,7 @@ struct GpuActiveRows(Movable):
                 do_sub,
                 use_quant,
                 const_hess,
-                self.step_dev.unsafe_ptr(),
+                desc.unsafe_ptr(),
                 use_desc,
                 unroll,
                 narrow,
@@ -5670,7 +6174,7 @@ struct GpuActiveRows(Movable):
                 do_sub,
                 use_quant,
                 const_hess,
-                self.step_dev.unsafe_ptr(),
+                desc.unsafe_ptr(),
                 use_desc,
                 unroll,
                 narrow,
@@ -5702,7 +6206,7 @@ struct GpuActiveRows(Movable):
                 do_sub,
                 use_quant,
                 const_hess,
-                self.step_dev.unsafe_ptr(),
+                desc.unsafe_ptr(),
                 use_desc,
                 unroll,
                 narrow,
@@ -5734,7 +6238,7 @@ struct GpuActiveRows(Movable):
                 do_sub,
                 use_quant,
                 const_hess,
-                self.step_dev.unsafe_ptr(),
+                desc.unsafe_ptr(),
                 use_desc,
                 unroll,
                 narrow,
