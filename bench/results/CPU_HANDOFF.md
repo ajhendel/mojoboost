@@ -152,9 +152,34 @@ silent downgrade every time.
 
 ## Out with lanes right now
 
-`ordered-ts-2`, `row-major-auto`, `interleave-finish`, `objective-marshaller`.
-All four branched off **`cpu-round-2` at `bfd6187`**, not `perf-round-2`,
-because that head is far ahead now.
+Five, all branched off **`7e41e16`** and all in worktrees under
+`scratchpad/wt9/`, all briefed to `source tools/lane_env.sh` rather than run
+bare `pixi run`:
+
+| lane | job | gates the SHA |
+|---|---|---|
+| `mvs-forward` | parse `bootstrap_type`/`subsample`/`bagging_temperature` in the binding, forward `BootstrapParams` through `model.fit` into `train`, delete the sklearn refusals, set the CatBoost-mode arm to MVS at 0.8 | **yes** |
+| `ctr-serialize` | a CTR section in the model format, save and load, then lift the six model-producing refusals and the three writer checks | **yes** |
+| `objective-codes` | ranking and survival codes into `objective_registry` with Python names, snapshot frozen in the same commit | no |
+| `reachability-rest` | the rest of the unreachable modules: MultiRMSE 2-D `y`, text, embedding, langevin, onnx export, each with a traced path or a stated reason | no |
+| `harness-arms` | `ENGINE_SCENARIO_SKIP` and the explicit `boosting_type=Ordered` third CatBoost arm | no, and held first |
+
+**The rule this round: MVS and CTR decide when the SHA is cut.** Whatever else
+is merged by then rides in the run's head; whatever is not waits and merges
+*after* the run. Nothing that changes the run's arms goes in late, which makes
+`harness-arms` the one lane to drop rather than rush. All compiling stops when
+the SHA is cut, because the box belongs to the run from that moment.
+
+Three of the five are inside `bindings/_mojotrees.mojo` and
+`python/mojotrees/sklearn.py` at once, partitioned by *parameter region*
+rather than by file: MVS owns the bootstrap keys, CTR delivers a wire note
+instead of editing, reachability owns its own five mechanisms. Region
+ownership inside a shared file is a merge strategy, not a guarantee; check
+the hunks.
+
+Historical, from the previous wave: `ordered-ts-2`, `row-major-auto`,
+`interleave-finish`, `objective-marshaller`, all branched off `cpu-round-2`
+at `bfd6187`.
 
 **`lane/ordered-ts` produced nothing at all** -- empty branch, empty worktree,
 no report, across two sessions. Retired as `lane/ordered-ts-abandoned` and
@@ -367,6 +392,27 @@ of rule 1 and it is currently non-strict.
   every Chromium `mojom` helper in VS Code, Chrome and Docker. Use the
   anchored form `ps -Ao comm | grep "mojo$"`. Do not use `-x` on the
   basename; the pixi env path means the binary is not always plain `mojo`.
+- **A matrix that nests repeat inside engine measures thermal drift and
+  reports it as a difference between engines.** `build_matrix` did exactly
+  that: every repeat of one arm, then every repeat of the next, so at the
+  comparison tier the fifth arm started about an hour after the first on a
+  box measured drifting two to three times across windows that size. The
+  failure is silent in the worst way, because each arm's own spread stays
+  tight inside its own window, so the table looks precise and the ranking is
+  temperature. Fixed at `4eec7a9` with a stable sort by repeat at the
+  execution site, and the manifest now carries `arm_order` because `jobs` is
+  still in build order and a reader reconstructing the sequence from it would
+  get the wrong one. Found with `--dry-run`, by reading the harness rather
+  than the results.
+- **An extension is not the source it was built from.** `envinfo` recorded
+  `mojotrees.__version__`, a string that does not move between two builds of
+  the same tree, so a run against a 22-hour-old `.so` with 76 newer `.mojo`
+  files would have produced a fully plausible and entirely invalid table with
+  nothing in the record saying so. `envinfo.collect()` now reports
+  `built_extension` with `stale_sources`, the stale paths, and the binary's
+  own sha256; the sha256 is the stronger half, because a git SHA says what was
+  written and only the hash says what ran. Proven by backdating the binary to
+  the observed timestamp and watching it report exactly 76.
 - A five-repeat median measures the warm-up transient, not steady state. Both
   engines climb about 8 repeats before plateauing. Use twelve and compare the
   plateau, and normalize cross-invocation comparisons by the LightGBM arm
