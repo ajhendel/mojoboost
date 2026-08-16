@@ -676,12 +676,29 @@ def grow_tree_device_resident(
       `MOJOTREES_GPU_TABLE_RESET=0` for a caller that cannot reach the
       setter, puts the five copies back; that is the arm a benchmark holds
       against this one.
-    - **four uploads** in `searcher.enqueue_frontier`, which is
-      `GpuSplitSearcher._copy_tables`: the node table, the feature table, the
-      allow mask and the float parameter block. One per table for the whole
-      record range, not one per record, which is what that entry point buys.
-      These are the four that are left, and they live in a module this lane
-      did not own.
+    - **one upload** in `searcher.enqueue_frontier`, which is
+      `GpuSplitSearcher._copy_tables`. It used to be four, one each for the
+      node table, the feature table, the allow mask and the float parameter
+      block. The four now live as `create_sub_buffer` windows onto a single
+      parent allocation, so one copy of the parent writes all four regions
+      and every kernel signature and call site is unchanged. That also makes
+      staleness structurally impossible rather than merely unlikely: no
+      region can hold a previous call's bytes while another is fresh, which
+      is a stronger property than the per-table dirty flags originally asked
+      for, and is why those flags were dropped rather than added.
+      `set_table_upload_hoisting(False)`, or
+      `MOJOTREES_GPU_SPLIT_TABLE_PACK=0`, restores the four copies.
+
+      Two findings from that work are worth keeping here because both
+      contradict what was assumed when this list was written. The float
+      parameter block is **not** fit-constant: `PF_G_INV` and `PF_H_INV` are
+      reciprocals of the builder's `g_scale`/`h_scale`, which
+      `upload_gradients` recomputes every round from the round's actual
+      gradient magnitudes. And the node table has a **device** writer,
+      `GpuTreeTables.enqueue_stage_child_search`, reached through the public
+      `searcher.node_dev` field, so the host staging buffer is not a mirror
+      of the device's contents and no host-side flag could have been evidence
+      about them.
     - **one download plus one `synchronize`** in `download_desc_tables`. It
       used to be six downloads: a kernel now concatenates the six tables into
       one device buffer and one copy brings the concatenation home, which is
@@ -692,10 +709,25 @@ def grow_tree_device_resident(
       because it is what keeps this correct on a backend where a copy really
       is asynchronous.
 
-    Six, then, of which four are uploads, where it was sixteen of which nine
-    were uploads. Ten of the ten removed were copies of bytes that either the
-    device could have written itself or that were already sitting next to
-    each other in device memory. **None of that is a measurement**: it is a
+    **Three**, then, of which one is an upload, one a download and one the
+    trailing `synchronize`, where it was sixteen of which nine were uploads.
+    All thirteen removed were copies of bytes that either the device could
+    have written itself or that were already sitting next to each other in
+    device memory; not one of them was removed by moving less data, and the
+    data moved is very nearly unchanged. That is the whole shape of this
+    round: on Metal the cost is the drain, not the bytes.
+
+    Two lanes produced that thirteen and neither could see the other, so the
+    two intermediate figures each lane reported are both correct against the
+    baseline it branched from and neither is the total. The tables lane took
+    sixteen to six; the search lane, branching from the same sixteen, took
+    its own four to one and reported thirteen. Composed, it is three. This is
+    the arithmetic that gets misreported when two lanes land in the same
+    round, so it is written out rather than left to be recomputed.
+
+    Outside this function and not in the three: the monotone vector's
+    `map_to_host` went from once per tree to once per fit, and the raw-score
+    update's two copies became one. **None of that is a measurement**: it is a
     static count read off the source. That a copy is a wait at all is
     measured in `docs/GPU_PORTABILITY.md` section 6.1, and what one wait
     costs is measured in `docs/METAL_TIMELINE.md:550` at 606 microseconds for

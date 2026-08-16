@@ -324,7 +324,10 @@ fixed here rather than in the write-up.
 Removing **ten** of sixteen waits per tree in the tables path (five uploads in
 `begin_tree`, five of six downloads in `download_desc_tables`), three of four in
 the search path, and one of two in the raw-score update is **fourteen** fewer
-waits per tree. At the **measured** 458 microseconds per synchronization over
+waits per tree. Both lanes have now landed and the composed figure is sixteen
+per tree down to **three**, plus the monotone map moving from per-tree to
+per-fit, so fifteen rather than fourteen. The estimate below is not rescaled for
+that one wait; it stays as registered. At the **measured** 458 microseconds per synchronization over
 100 trees that is an **estimated** 0.64 seconds, taking a 3.17 second leaf-wise
 fit to roughly 2.5. The total is unchanged because the two other lanes' shares
 were counted separately; only its composition moved.
