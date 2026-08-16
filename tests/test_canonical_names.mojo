@@ -445,11 +445,23 @@ def test_verbose_accepts_silence_and_refuses_a_log() raises:
 def test_catboost_only_names_state_or_refuse() raises:
     """`score_function` and `max_ctr_complexity`: the value that names what
     mojotrees already does is accepted, and everything else is refused with
-    what it would take."""
+    what it would take.
+
+    UNRUN, as is every change in this file's `score_function` case.
+    `score_function` is now honored on this surface rather than accepted
+    only at `L2`: it writes `ExtraTreeParams.score_function`, which
+    `tree._search` passes into `split.find_best_split`. Both CatBoost
+    spellings of both values parse, because the parameter string folds case
+    once (`_lower_ascii`) before `parse_score_function`, which takes
+    canonical lowercase. An unknown value is still refused rather than
+    resolved to the default.
+    """
     _ = parse_params(String("score_function=L2"))
     _ = parse_params(String("score_function=l2"))
-    with assert_raises(contains="G^2/(H+lambda)"):
-        _ = parse_params(String("score_function=Cosine"))
+    _ = parse_params(String("score_function=Cosine"))
+    _ = parse_params(String("score_function=cosine"))
+    with assert_raises(contains="score_function"):
+        _ = parse_params(String("score_function=NewtonCosine"))
     with assert_raises(contains="CTR"):
         _ = parse_params(String("max_ctr_complexity=4"))
     # `random_strength` and `leaf_estimation_iterations` already had this

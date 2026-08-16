@@ -287,11 +287,32 @@ class _Base(_ParamsMixin):
     loss is exactly the quadratic one Newton step already minimizes.
     `boosting_type="ordered"` and its five knobs are described above.
 
+    `score_function` selects the functional a split candidate is scored by:
+    `"L2"` (the default) is `G**2 / (H + reg_lambda)`, which is what every
+    fit here has always maximized, and `"Cosine"` is CatBoost's own default,
+    a ratio rather than a sum. Both names are case insensitive. It reaches
+    `split.find_best_split` through `ExtraTreeParams.score_function`, which
+    `tree._search` and `tree._grow_oblivious_levels` pass in, so every
+    grower in this package honors it except the distributed prototype
+    (`tree_learner` other than `"serial"`), which is refused by name.
+
+    **`"Cosine"` is not a no-op, and it is not an alias for `"L2"`
+    either.** At `reg_lambda=0` its numerator and denominator collapse onto
+    the same expression, so it degenerates to `sqrt` of the L2 score and,
+    `sqrt` being strictly increasing, cannot move the argmax *within one
+    node*. That is the only claim the derivation supports. It can still move
+    the tree at `reg_lambda=0` under leaf-wise growth, which is the default,
+    because the queue compares gains from different parents and `sqrt` does
+    not preserve that ordering. CatBoost-mode comparisons set `reg_lambda=3`,
+    which is off the degenerate point outright.
+    Categorical features are refused under `"Cosine"`: a category set is
+    searched and scored with the L2 gain, and only that search's winner
+    reaches the numerical scan, so the two functionals would end up inside
+    one argmax.
+
     **Not wired, and refused by name with the missing piece.**
     `random_strength` (the noise is implemented; its per-tree scale is
-    computed by a function with no callers), `score_function` (the Cosine
-    scorer is implemented; no parameter field carries the choice, so it is
-    accepted only at `"L2"`, and it is not a no-op above `reg_lambda=0`),
+    computed by a function with no callers),
     `bootstrap_type` and `bagging_temperature` (the Bayesian and MVS weights
     are implemented; no trainer takes the bundle -- CatBoost's `"Bernoulli"`
     is row bagging under another name and is `subsample` with
@@ -1350,39 +1371,6 @@ class _Base(_ParamsMixin):
                     "0.0 is LightGBM's behavior and mojotrees's, and is "
                     "accepted."
                 )
-        if self.score_function is not None:
-            # `Cosine` is CatBoost's default and is **not** a no-op here.
-            # It degenerates to `sqrt(L2)`, and so cannot move the argmax,
-            # at `lambda_l2 = 0` and only there: its numerator is the L2 sum
-            # and at zero regularizer its denominator collapses onto the same
-            # expression (docs/design/CATBOOST_CATALOG.md, A10 section 3).
-            # Every CatBoost-mode comparison this repository runs sets
-            # `lambda_l2 = 3`, which is off that point, so treating the two
-            # as aliases would silently score every candidate with the wrong
-            # functional in exactly the arm that names CatBoost.
-            #
-            # The arithmetic exists: `split.SCORE_COSINE`, `_cosine_pair`,
-            # `_cosine_score` and the `cosine` arms of `find_best_split` and
-            # `find_best_split_shared` are all merged. What is missing is a
-            # field to carry the choice. `find_best_split(score_function=...)`
-            # is a default argument that every caller leaves alone, no
-            # `TreeParams` or `ExtraTreeParams` field holds it, and
-            # `tree._search` therefore has nothing to pass. Wiring it is two
-            # lines in files this lane does not own; until they land, the
-            # value is refused rather than accepted and dropped.
-            if str(self.score_function).lower() != "l2":
-                raise ValueError(
-                    f"score_function={self.score_function!r} is not reachable "
-                    "from Python: the Cosine scorer is implemented "
-                    "(split.SCORE_COSINE and the cosine arms of "
-                    "split.find_best_split), but no TreeParams or "
-                    "ExtraTreeParams field carries the choice, so "
-                    "tree._search leaves find_best_split at its SCORE_L2 "
-                    "default. 'L2' is what every fit scores with -- "
-                    "G^2/(H+lambda) -- and is accepted. Cosine picks the same "
-                    "split at reg_lambda=0, where it degenerates to sqrt(L2), "
-                    "but not above it, so it is not accepted as an alias."
-                )
         if self.max_ctr_complexity is not None:
             raise ValueError(
                 "max_ctr_complexity is not reachable: CatBoost's "
@@ -1883,6 +1871,26 @@ class _Base(_ParamsMixin):
                 1
                 if self.leaf_estimation_iterations is None
                 else int(self.leaf_estimation_iterations)
+            ),
+            # CatBoost's `score_function`: which functional a split candidate
+            # is scored by (`split.SCORE_L2` / `split.SCORE_COSINE`).
+            # Lowercased here and nowhere else -- the native
+            # `parse_score_function` takes canonical lowercase, the same
+            # contract `device_type` and `bootstrap_type` keep -- so one
+            # spelling of a value resolves to one code no matter which
+            # surface it was typed at. `"l2"` is the default and is the
+            # native default, so a fit that leaves the parameter None makes
+            # the call it made before this key existed.
+            #
+            # An unknown name raises in `parse_score_function`, and
+            # `"cosine"` raises by entry point in `_parse_params` for the
+            # one trainer that cannot honor it (`distributed_train_local`,
+            # i.e. tree_learner other than 'serial'). Neither is accepted
+            # and dropped.
+            "score_function": (
+                "l2"
+                if self.score_function is None
+                else str(self.score_function).lower()
             ),
             "max_delta_step": float(self.max_delta_step),
             "path_smooth": float(self.path_smooth),

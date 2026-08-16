@@ -329,6 +329,95 @@ def test_ordered_knobs_without_ordered_raise():
 
 
 # --------------------------------------------------------------------------
+# score_function
+# --------------------------------------------------------------------------
+#
+# UNRUN. Written in a session where running anything was forbidden; no arm
+# of any test in this section has been executed. The claims below are read
+# off the source, not off a run.
+
+
+def test_score_function_cosine_moves_the_fit():
+    """`score_function="Cosine"` elects different splits, at the only
+    setting where it can.
+
+    **`reg_lambda` is not decoration here, it is the whole test.** Cosine's
+    numerator is the L2 sum, and at `reg_lambda=0` its denominator collapses
+    onto the same expression, so it degenerates to `sqrt` of the L2 score;
+    `sqrt` is strictly increasing, so the argmax cannot move and the two arms
+    would be the same tree (docs/design/CATBOOST_CATALOG.md A10 section 3).
+    A moves-the-fit test written at the estimator's default `reg_lambda=0`
+    would therefore fail against a *correct* wiring, and passing it would
+    mean the arithmetic was wrong. Both arms set `reg_lambda=3.0`, which is
+    what the CatBoost-mode comparisons in this repository use and is off
+    that degenerate point.
+
+    Everything else is held equal: same estimator, same seed, same data, so
+    every draw is identical and both fits are deterministic.
+    """
+    X, y = _regression()
+    l2 = MojoTreesRegressor(
+        n_estimators=8, num_leaves=15, reg_lambda=3.0, random_state=5
+    ).fit(X, y)
+    cosine = MojoTreesRegressor(
+        n_estimators=8,
+        num_leaves=15,
+        reg_lambda=3.0,
+        random_state=5,
+        score_function="Cosine",
+    ).fit(X, y)
+    assert not np.array_equal(l2.predict(X), cosine.predict(X))
+
+
+def test_score_function_l2_is_the_default_bit_for_bit():
+    """Naming the default must not move a fit. `SCORE_L2` is the field's
+    default and `split.find_best_split`'s, so "absent" and `"L2"` are the
+    same integer down the same path."""
+    X, y = _regression()
+    absent = MojoTreesRegressor(
+        n_estimators=6, reg_lambda=3.0, random_state=5
+    ).fit(X, y)
+    named = MojoTreesRegressor(
+        n_estimators=6, reg_lambda=3.0, random_state=5, score_function="L2"
+    ).fit(X, y)
+    np.testing.assert_array_equal(absent.predict(X), named.predict(X))
+
+
+@pytest.mark.parametrize("spelling", ["cosine", "COSINE", "CoSiNe"])
+def test_score_function_value_is_case_insensitive(spelling):
+    """docs/PARAMETER_NAMING.md makes value strings case insensitive, and
+    the fold happens once, in the estimator, before the native
+    `parse_score_function` (which takes canonical lowercase, as
+    `parse_device` and `canonical_bootstrap_type` do). Every spelling must
+    therefore reach the same code and produce the same fit."""
+    X, y = _regression(n_rows=120)
+    canonical = MojoTreesRegressor(
+        n_estimators=4,
+        reg_lambda=3.0,
+        random_state=5,
+        score_function="Cosine",
+    ).fit(X, y)
+    other = MojoTreesRegressor(
+        n_estimators=4,
+        reg_lambda=3.0,
+        random_state=5,
+        score_function=spelling,
+    ).fit(X, y)
+    np.testing.assert_array_equal(canonical.predict(X), other.predict(X))
+
+
+def test_unknown_score_function_is_refused_by_name():
+    """An unknown value is refused rather than resolved to the default: a
+    mistake that resolved to L2 would run one arm of an A/B under the
+    other's label."""
+    X, y = _regression(n_rows=120)
+    with pytest.raises(ValueError, match="score_function"):
+        MojoTreesRegressor(n_estimators=3, score_function="NewtonCosine").fit(
+            X, y
+        )
+
+
+# --------------------------------------------------------------------------
 # The standing gate
 # --------------------------------------------------------------------------
 
@@ -338,10 +427,12 @@ def test_ordered_knobs_without_ordered_raise():
 #: A name leaves this table by being wired, never by being deleted.
 UNREACHABLE = [
     ("random_strength", 1.0, "random_score_scale"),
-    ("score_function", "Cosine", "SCORE_COSINE"),
     ("bagging_temperature", 1.0, "bayesian_bootstrap_weights"),
     ("max_ctr_complexity", 2, "ctr.mojo"),
 ]
+# `score_function` left this table by being wired, which is the only way a
+# row may leave it. Its moves-the-fit tests are
+# `test_score_function_cosine_moves_the_fit` and the two beside it above.
 
 
 @pytest.mark.parametrize("name,value,missing", UNREACHABLE)

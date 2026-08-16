@@ -977,6 +977,104 @@ def derivative_precision_name(precision: Int) raises -> String:
 
 
 # ---------------------------------------------------------------------------
+# score_function: which functional of the children's sums is maximized
+# ---------------------------------------------------------------------------
+#
+# The codes and their validator live here, beside the `ExtraTreeParams` field
+# that carries the choice, and `split.mojo` imports them rather than the
+# other way round. That direction is forced: `split` already imports this
+# module, so a symbol defined in `split` and read here would close a cycle.
+# It is also the direction `MONOTONE_BASIC` and `DERIV_PRECISION_FLOAT32`
+# already take, for the same reason. `split.SCORE_L2` and
+# `split.SCORE_COSINE` remain the public names -- `split.mojo` re-exports
+# them, exactly as it re-exports `soft_threshold_l1` from `gain.mojo` -- so
+# nothing that already reads them has to change.
+#
+# The arithmetic is entirely in `split.mojo` (`_cosine_pair`, `_cosine_score`
+# and the `cosine` arms of `find_best_split` and `find_best_split_shared`).
+# Two integers and a range check are all that has to be visible from here.
+
+comptime SCORE_L2 = 0
+"""LightGBM's second-order gain, `split._split_gain`. The default, and what
+every fit that does not name `score_function` has always scored with."""
+
+comptime SCORE_COSINE = 1
+"""CatBoost `score_function=Cosine`: `sum(-out * G) / sqrt(sum(out^2 * H))`
+over the children, minus the same functional of the unsplit node
+(`catboost/private/libs/options/oblivious_tree_options.cpp`, which makes
+this CatBoost's own CPU default; `docs/design/CATBOOST_CATALOG.md` A10 has
+the derivation).
+
+**Not a no-op, and not an alias for `SCORE_L2` either.** At `lambda_l2 = 0`
+substituting the free Newton step makes Cosine's numerator and denominator
+the same expression, so it degenerates to `sqrt` of the L2 score, `sqrt` is
+strictly increasing, and **the argmax within one node cannot move**.
+mojotrees stock is `lambda_l2 = 0`, so that is the degenerate point at stock
+settings.
+
+Three things take it off that point, and two of them are stock here.
+`lambda_l2 > 0` is the first, and every CatBoost-mode comparison in this
+repository sets `lambda_l2 = 3`. The second is leaf-wise growth, the
+default `grow_policy`: its queue compares gains from *different parents*,
+and `sqrt(a) - sqrt(p)` does not order the same way as `a - p` when `p`
+varies, so a leaf-wise tree can move even at `lambda_l2 = 0`
+(docs/design/CATBOOST_CATALOG.md A10 section 5, which reads this off
+CatBoost's Lossguide path). The third is any absolute per-candidate cost --
+`min_gain_to_split`, `feature_contri`, the CEGB charges, `random_strength`
+-- whose units the ratio has changed. That is why the selector is carried
+as a field rather than folded away.
+"""
+
+
+def check_score_function(score_function: Int) raises:
+    """Refuse an unknown selector by name rather than falling through to the
+    default, which would silently give an L2 answer to a caller who asked for
+    something else."""
+    if score_function != SCORE_L2 and score_function != SCORE_COSINE:
+        raise Error(
+            "score_function must be split.SCORE_L2 (0) or split.SCORE_COSINE"
+            " (1); got ",
+            score_function,
+        )
+
+
+def parse_score_function(name: String) raises -> Int:
+    """The code for a `score_function` value.
+
+    CatBoost spells these `L2` and `Cosine`, and
+    `docs/PARAMETER_NAMING.md` makes value strings case insensitive. Names
+    are **canonical lowercase here**, as in `device_policy.parse_device` and
+    `sampling.canonical_bootstrap_type`: the two surfaces a user types at
+    fold the case before calling in (`params._lower_ascii` on the parameter
+    string, `str(...).lower()` in the Python estimator), so there is one
+    fold rather than one per parser.
+
+    Anything that is not one of the two names is refused rather than
+    resolved to the default: a mistake that resolved to `l2` would run one
+    arm of an A/B under the other's label.
+    """
+    if name == "l2":
+        return SCORE_L2
+    if name == "cosine":
+        return SCORE_COSINE
+    raise Error(
+        "unknown score_function '",
+        name,
+        "'; expected 'L2' or 'Cosine' (case insensitive)",
+    )
+
+
+def score_function_name(score_function: Int) raises -> String:
+    """The name for a `score_function` code, for reporting. CatBoost's
+    capitalization, which is what a user typed."""
+    if score_function == SCORE_L2:
+        return "L2"
+    if score_function == SCORE_COSINE:
+        return "Cosine"
+    raise Error("unknown score_function code ", score_function)
+
+
+# ---------------------------------------------------------------------------
 # Forced splits
 # ---------------------------------------------------------------------------
 
@@ -1484,6 +1582,21 @@ struct ExtraTreeParams(Copyable, Movable):
     # this package draws between a parameter and a `MOJOTREES_*` knob.
     var derivative_precision: Int
 
+    # CatBoost's `score_function`, the third name on this bundle that is
+    # CatBoost's rather than LightGBM's, and the one field here that selects
+    # a *different functional* rather than adjusting the one already
+    # computed. `SCORE_L2` is the default and is what every fit scored with
+    # before this field existed, so an untouched bundle takes the identical
+    # path through `split.find_best_split`.
+    #
+    # This is the only carrier of the choice. `split.find_best_split` and
+    # `split.find_best_split_shared` both take `score_function` as an
+    # argument defaulted to `SCORE_L2`, and `tree._search` and
+    # `tree._grow_oblivious_levels` pass this field into it; nothing else in
+    # the package passes it, which is why `is_active()` below names it and
+    # so puts every path that does not read it out of reach.
+    var score_function: Int
+
     def __init__(out self):
         self.min_gain_to_split = 0.0
         self.max_delta_step = 0.0
@@ -1503,6 +1616,7 @@ struct ExtraTreeParams(Copyable, Movable):
         self.stochastic_rounding = True
         self.leaf_estimation_iterations = DEFAULT_LEAF_ESTIMATION_ITERATIONS
         self.derivative_precision = DERIV_PRECISION_FLOAT32
+        self.score_function = SCORE_L2
 
     @staticmethod
     def default() -> ExtraTreeParams:
@@ -1565,6 +1679,24 @@ struct ExtraTreeParams(Copyable, Movable):
         derivatives as Float32 and has no Float64 to carry them in. That is a
         refusal with a reason in its message, at the backend that knows the
         answer, instead of a fit quietly losing the device scan.
+
+        **`score_function` is in this test, and it is the one entry here
+        that belongs in it for the second reason rather than the first.**
+        Both reasons hold. The gain a Cosine scan produces is a ratio, so
+        `split._feature_gain`'s absolute costs are being subtracted from a
+        quantity in different units and the pass has to run; and the device
+        split kernel scores `G^2/(H+lambda)` and nothing else, so a Cosine
+        fit that reached it would get an L2 tree under a Cosine label. Every
+        device path this repository has gates itself on this predicate --
+        `train_gpu._check_device_search_supported` raises on it,
+        `gpu_tree_tables` and `gpu_resident_round` decline the resident and
+        oblivious device trees on it and fall back to the host scan, which
+        reads the field -- so naming it here is what makes the parameter
+        either honored or refused everywhere, with no third outcome.
+
+        The default costs nothing: `SCORE_L2` is the default, this term is
+        False for it, and a fit that does not name `score_function` reaches
+        every one of those paths exactly as before.
         """
         return (
             self.min_gain_to_split > 0.0
@@ -1576,6 +1708,7 @@ struct ExtraTreeParams(Copyable, Movable):
             or not self.forced.is_empty()
             or self.random_strength > 0.0
             or self.use_quantized_grad
+            or self.score_function != SCORE_L2
         )
 
     def random_score_stdev(self) -> Float64:
@@ -1692,6 +1825,12 @@ struct ExtraTreeParams(Copyable, Movable):
         self.check_quantized_grad()
         self.check_leaf_estimation()
         self.check_derivative_precision()
+        # An out-of-range `score_function` code is caught here rather than
+        # only at `split.find_best_split`, so a parameter string carrying one
+        # is rejected before any data is read. `find_best_split` still calls
+        # `check_score_function` itself, because it is a public entry point
+        # that a caller can reach without a bundle.
+        check_score_function(self.score_function)
         if self.monotone_method != MONOTONE_BASIC:
             raise Error(
                 "monotone_constraints_method '",

@@ -87,6 +87,7 @@ from .tree_parameters_extra import (
     check_feature_pre_filter,
     parse_derivative_precision,
     parse_monotone_method,
+    parse_score_function,
 )
 
 # `TrainConfig.objective` when the parameter string selects softmax
@@ -1014,32 +1015,34 @@ def parse_params(spec: String) raises -> TrainConfig:
                     " log. 'Silent' is what this surface already does and is"
                     " accepted",
                 )
-        # CatBoost's `score_function`, the split-gain shape. mojotrees
-        # scores every split as `G^2 / (H + lambda)`, which is CatBoost's
-        # `L2` (see the note in tree_parameters_extra.mojo), so naming `L2`
-        # states what already happens and is accepted.
+        # CatBoost's `score_function`, the functional a split candidate is
+        # scored by. `L2` is `G^2 / (H + lambda)`, which is what mojotrees
+        # has always maximized and is the default; `Cosine` is CatBoost's own
+        # default, a ratio rather than a sum
+        # (`tree_parameters_extra.SCORE_COSINE`, and
+        # docs/design/CATBOOST_CATALOG.md A10 for the derivation).
         #
-        # `Cosine`, CatBoost's own default, is refused rather than accepted
-        # as an equivalent, even though at THIS library's stock settings it
-        # would pick the same split: Cosine's numerator is the L2 sum and at
-        # `lambda_l2 = 0` its denominator collapses onto the same
-        # expression, so it degenerates to `sqrt(L2)` and the argmax cannot
-        # move (docs/design/CATBOOST_CATALOG.md, A10 section 3). That
-        # equivalence is conditional on `lambda_l2 = 0`, which is stock but
-        # is a value a user may change, and it bites under leaf-wise growth,
-        # which is the default. Accepting the name on a condition the user
-        # can silently break is the shape this package refuses.
+        # Both are now honored rather than one of them refused. The field
+        # this writes, `ExtraTreeParams.score_function`, is read by
+        # `tree._search` and `tree._grow_oblivious_levels`, which pass it
+        # into `split.find_best_split` and `split.find_best_split_shared`;
+        # `ExtraTreeParams.is_active()` names it, so the device split search
+        # -- which scores `G^2/(H+lambda)` and nothing else -- refuses or
+        # declines instead of returning an L2 tree under a Cosine label.
+        #
+        # Worth stating because it is the reason the two are NOT aliases:
+        # Cosine's numerator is the L2 sum and at `lambda_l2 = 0` its
+        # denominator collapses onto the same expression, so it degenerates
+        # to `sqrt(L2)` and the argmax *within one node* cannot move.
+        # `lambda_l2 = 0` is this package's stock value. It is still not an
+        # alias there: leaf-wise growth, the default, compares gains from
+        # different parents, and `sqrt` does not preserve that ordering
+        # (CATBOOST_CATALOG A10 section 5). The CatBoost-mode arm sets
+        # `lambda_l2 = 3`, which is off the degenerate point outright.
         elif key == "score_function":
-            if lowered != "l2":
-                raise Error(
-                    "score_function '",
-                    value,
-                    "' is not implemented; mojotrees scores a split as"
-                    " G^2/(H+lambda), which is CatBoost's 'L2', and that is"
-                    " the only value accepted. 'Cosine' picks the same split"
-                    " at lambda_l2=0, where it degenerates to sqrt(L2), but"
-                    " not above it, so it is not accepted as an alias",
-                )
+            config.booster.tree.extra.score_function = parse_score_function(
+                lowered
+            )
         # CatBoost's `max_ctr_complexity`. Refused for any value, its own
         # default included: CTRs -- ordered target statistics over
         # categorical combinations -- are the feature construction the name
