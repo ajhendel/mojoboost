@@ -3,17 +3,19 @@
 The GPU trainer in train_gpu.mojo computes every round's derivatives on the
 host (`_fill_grad_hess` over Float64 lists) and then uploads `2 * n_rows`
 Float32 to the device. That upload is pure overhead: the labels never change,
-the sample weights never change, and the raw scores are the only thing that
-moves between rounds, by an amount the device already knows (each row's leaf
-and that leaf's value). This module keeps all three device-resident so a
+the user's sample weights never change, and the raw scores are the only thing
+that moves between rounds, by an amount the device already knows (each row's
+leaf and that leaf's value). This module keeps all three device-resident so a
 boosting round costs no per-row host-to-device traffic at all.
 
 What lives here:
 
   `GpuObjectiveState`   the per-session device buffers: target (or class
                         label), sample weight, raw scores, and softmax
-                        probabilities. Uploaded once at construction, never
-                        again.
+                        probabilities. Uploaded once at construction. The
+                        weight plane is the one exception, because CatBoost's
+                        Bayesian bootstrap redraws it per tree; see
+                        `refresh_weights`.
   gradient kernels      one thread per row, one straight-line body per
                         objective, writing into gradient/hessian buffers the
                         caller owns (in practice `GpuHistogramBuilder`'s, so
@@ -67,6 +69,53 @@ Sample weights follow the built-in convention exactly: the kernel multiplies
 both derivatives by the row weight in the same operand order as
 `_fill_grad_hess_into`, so a zero-weight row produces a zero gradient and a
 zero hessian and is invisible to every histogram, on either backend.
+
+Where the weight is applied, and why it is not in the histogram
+--------------------------------------------------------------
+A weight is a per-row multiplier on the gradient and on the hessian, and it
+could be applied in either of two places. The CPU applies it in the objective,
+before anything is quantized: `boosting._fill_grad_hess_into` loads
+`w = weights[r]` as the first statement of every objective's row body and
+stores `w * (...)` into `grad` and `hess`. Nothing downstream of that carries a
+weight at all -- `histogram.build_histogram` takes `grad`, `hess`, the bins and
+the constant-hessian flag, and there is no weight argument anywhere in the
+histogram API on either backend.
+
+The device matches that exactly. `_grad_hess_kernel` and
+`_softmax_grad_hess_kernel` apply the weight, and the histogram accumulation is
+untouched: no weight plane is fetched per (row, feature) visit and no multiply
+is added to the hottest loop in the codebase. The alternative -- carrying the
+weight into the accumulation -- would put the two backends on different
+arithmetic (a weighted product formed once per row against one formed once per
+visit) and buy nothing, since the row's weight is loop-invariant across its
+features.
+
+The corollary for the host-gradient path: `GpuHistogramBuilder.stage_gradients`
+needs nothing added to it. The Float64 gradients it stages already have the
+weight multiplied in by `_fill_grad_hess_into`, so a weighted fit on that path
+was already correct and is unchanged by anything here.
+
+What a weighted fit costs the staging arm
+-----------------------------------------
+`boosting.round_has_constant_hessian` ends in
+`objective_has_constant_hessian(objective, len(sample_weight) > 0)`, so a
+non-empty weight vector refuses the constant-hessian declaration for every
+objective. That is a definition rather than a conservatism: under squared
+error, L1, huber and quantile the CPU stores the bare weight as the hessian
+(`hp.unsafe_store(r, derivative[NARROW](w))`), so the hessian *is* the weight
+and a builder told to rebuild that plane from the row count would rebuild the
+wrong plane.
+
+Priced on the Int16 gradient-staging arm, per
+`GpuActiveRows.staged_gradient_bytes_per_row`, that costs the better half of
+the arm. A constant-hessian round stages the gradient alone, 2 bytes per row;
+a weighted round stages both planes, 4. At the default feature group of one,
+each (row, feature) visit fetches 4 bytes of row index plus the staged
+derivative plus 1 bin byte, so a weighted fit is on **9 bytes per visit where
+an unweighted one is on 7**. Every fit under a per-row weight -- a user's
+`sample_weight`, a class weight folded into it, or a Bayesian bootstrap draw
+-- is on the 9-byte width by construction. That is the arithmetic of the
+declaration and not a regression in anything measured here.
 """
 
 from std.gpu import block_idx, global_idx, thread_idx
@@ -738,6 +787,23 @@ def sum_abs_partials[partials_origin: MutOrigin, //](
     return GradMagnitudes(g_total, h_total)
 
 
+def _check_weight_vector(weights: List[Float64], n_rows: Int) raises:
+    """The one definition of a valid per-row weight vector on this side: one
+    finite, nonnegative entry per row.
+
+    Shared by the constructor and by `refresh_weights` so a bootstrap draw
+    cannot reach the device through a weaker check than a user's
+    `sample_weight` does. Nonnegative rather than positive because zero is a
+    meaningful weight -- it is how a row is excluded -- and the kernels carry
+    it through to an exactly zero gradient and hessian.
+    """
+    if len(weights) != n_rows:
+        raise Error("sample_weight length must equal the target length")
+    for r in range(n_rows):
+        if not isfinite(weights[r]) or weights[r] < 0.0:
+            raise Error("sample_weight must be finite and nonnegative")
+
+
 struct GpuObjectiveState(Movable):
     """Device-resident labels, weights, and raw scores for one training run.
 
@@ -756,7 +822,14 @@ struct GpuObjectiveState(Movable):
     """The regression target, or the integer class label for softmax."""
     var weight_dev: DeviceBuffer[DType.float32]
     """Sample weights, or a one-element placeholder when unweighted:
-    zero-length device buffers are not portable."""
+    zero-length device buffers are not portable.
+
+    The one plane here that a caller may rewrite after construction, because
+    CatBoost's Bayesian bootstrap draws a fresh per-row weight every tree and
+    the round's effective weight is that draw times the user's own
+    `sample_weight` (`sampling.refresh_bayesian_bootstrap`). See
+    `refresh_weights`, which is also what grows this buffer from the
+    placeholder on a fit that started unweighted."""
     var raw_dev: DeviceBuffer[DType.float32]
     """Row-major raw scores, `raw[r * n_classes + k]`."""
     var prob_dev: DeviceBuffer[DType.float32]
@@ -810,6 +883,18 @@ struct GpuObjectiveState(Movable):
     reader of `step_dev` and it still writes through a `map_to_host`
     mapping, which is a per-tree bidirectional transfer this lane counted
     and deliberately did not touch."""
+    var stage_weight: HostBuffer[DType.float32]
+    """Pinned staging for `weight_dev`, on the same grounds as `stage_value`,
+    and allocated by the first `refresh_weights` rather than at construction:
+    an unbootstrapped fit never refreshes its weights and must not pay
+    `4 * n_rows` of pinned memory for a buffer it will not write.
+
+    A one-element placeholder until then. `weight_stage_rows` is what says
+    which of the two it currently is."""
+    var weight_stage_rows: Int
+    """Rows `stage_weight` is sized for: 0 while it is the placeholder,
+    `n_rows` once `refresh_weights` has grown it. One number rather than a
+    second flag, so the buffer and the claim about it cannot disagree."""
     var part_pending: Int
     """How many magnitude reductions have been enqueued into `host_part` and
     not yet folded.
@@ -855,14 +940,11 @@ struct GpuObjectiveState(Movable):
             raise Error("n_classes must be positive")
         if max_nodes < 1:
             raise Error("max_nodes must be positive")
-        if len(sample_weight) > 0 and len(sample_weight) != len(target):
-            raise Error("sample_weight length must equal the target length")
+        if len(sample_weight) > 0:
+            _check_weight_vector(sample_weight, len(target))
         for r in range(len(target)):
             if not isfinite(target[r]):
                 raise Error("target must be finite")
-        for r in range(len(sample_weight)):
-            if not isfinite(sample_weight[r]) or sample_weight[r] < 0.0:
-                raise Error("sample_weight must be finite and nonnegative")
         if n_classes > 1:
             for r in range(len(target)):
                 var label = Int(target[r])
@@ -916,6 +998,9 @@ struct GpuObjectiveState(Movable):
         self.stage_seg = ctx.enqueue_create_host_buffer[DType.int32](
             max_nodes * SEG_WORDS
         )
+        # Placeholder until a caller refreshes the weights; see the field.
+        self.stage_weight = ctx.enqueue_create_host_buffer[DType.float32](1)
+        self.weight_stage_rows = 0
 
         # One-time uploads. Both buffers are written through the mapping
         # rather than staged, because this runs once per session and the
@@ -982,6 +1067,96 @@ struct GpuObjectiveState(Movable):
             for i in range(n):
                 dst.unsafe_store(i, Float32(raw[i]))
         self.has_raw = True
+
+    def refresh_weights(
+        mut self, ctx: DeviceContext, weights: List[Float64]
+    ) raises:
+        """Replace the device-resident per-row weights, for the one sampler
+        whose weights are not fixed for the whole fit.
+
+        CatBoost's Bayesian bootstrap draws a fresh weight per row per tree,
+        and the round's *effective* weight is that draw times the user's own
+        `sample_weight` -- `sampling.refresh_bayesian_bootstrap` is where the
+        product is formed, and it is formed on the host, in Float64, because
+        the draw is a `splitmix64` stream the device has no image of. What
+        crosses to the device is the finished product, one Float32 per row,
+        once per tree. (MVS is refused by name in
+        `sampling.canonical_bootstrap_type` and produces no weights to carry;
+        when it does, it produces them the same way and arrives here
+        unchanged.)
+
+        Where the weight lands, and where it deliberately does not
+        ----------------------------------------------------------
+        Into the *objective*, which is where the CPU puts it. The plane this
+        writes is read only by `_grad_hess_kernel` and
+        `_softmax_grad_hess_kernel`, which multiply both derivatives by it
+        exactly as `boosting._fill_grad_hess_into` does, before anything is
+        quantized. The histogram accumulation never sees a weight on either
+        backend and gains no multiply and no fetch from this. The module
+        docstring argues why that is the only defensible half of the choice.
+
+        Cost and cadence
+        ----------------
+        `4 * n_rows` host to device per tree, plus one drain. That is the
+        same shape and the same cadence as `_stage_values`, and a third of
+        the traffic a host-gradient round already pays; it is not on the
+        default path at all, because nothing calls this unless a bootstrap is
+        configured.
+
+        The drain is the difference from `_stage_values`, which argues it can
+        skip one because the round's magnitude reduction synchronizes before
+        the staging arena is rewritten. This cannot borrow that argument:
+        `GpuHistogramBuilder.set_scale_refresh` can defer that reduction by up
+        to `SCALE_WINDOW_MAX` rounds, so on a windowed fit there is no
+        guaranteed drain between two calls here and the pinned buffer could be
+        rewritten under a copy still reading it. On Metal the hazard is
+        unreachable anyway (`enqueue_copy` is itself a synchronous full-queue
+        drain, `docs/GPU_PORTABILITY.md` section 6.1), so this costs an
+        ordering point and not a wait there; on a backend whose copies are
+        genuinely asynchronous it is the whole guarantee. The same trade
+        `stage_gradients` makes, for the same reason, and the alternative is
+        the silent staleness this project has already been bitten by.
+
+        Growing the plane
+        -----------------
+        A fit with no `sample_weight` constructed a one-element placeholder,
+        so the first call here allocates the real `n_rows` buffer and its
+        pinned staging and flips `weighted`. That happens once per fit, under
+        the same synchronize, and every later call is the copy alone.
+
+        An empty vector is refused rather than read as "go back to
+        unweighted". `refresh_bayesian_bootstrap` returns an empty list only
+        when the bundle is disabled, which is a fit that should not be
+        calling this per tree at all, and silently un-weighting a round would
+        be a wrong model rather than an error.
+        """
+        if len(weights) == 0:
+            raise Error(
+                "refresh_weights needs one weight per row; an empty vector is"
+                " the unweighted convention and there is nothing to refresh"
+            )
+        _check_weight_vector(weights, self.n_rows)
+
+        # Two hazards, one drain: a kernel still holding the placeholder
+        # buffer that the growth below drops, and a copy still reading the
+        # staging arena that the fill below overwrites. See the docstring.
+        ctx.synchronize()
+
+        if not self.weighted:
+            self.weight_dev = ctx.enqueue_create_buffer[DType.float32](
+                self.n_rows
+            )
+        if self.weight_stage_rows != self.n_rows:
+            self.stage_weight = ctx.enqueue_create_host_buffer[DType.float32](
+                self.n_rows
+            )
+            self.weight_stage_rows = self.n_rows
+
+        var dst = self.stage_weight.unsafe_ptr()
+        for r in range(self.n_rows):
+            dst.unsafe_store(r, Float32(weights[r]))
+        ctx.enqueue_copy(dst_buf=self.weight_dev, src_ptr=dst)
+        self.weighted = True
 
     def fill_grad_hess(
         mut self,
