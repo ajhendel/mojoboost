@@ -169,6 +169,22 @@ The GPU path escapes the reassociation argument entirely, rather than
 accepting it, because it accumulates in fixed-point Int32 where addition *is*
 associative; see `_range_hist_partial_kernel` in `gpu_active_rows.mojo`.
 
+**And so does the CPU quantized path, which is now built on this same
+decomposition.** `quantized_gradient.build_histogram_subset_quantized_into_scratch`
+is the row-blocked kernel above over interleaved Int64 cells: the same
+`plan_row_block_count`, the same contiguous ascending blocks, the same private
+partials, the same ascending fold. Integer addition is associative, so on that
+path the fold is **exact** rather than merely deterministic, and every
+paragraph above that had to argue the block count is a *value* stops applying:
+`MOJOTREES_CPU_ROW_BLOCKS` cannot move a quantized cell at any setting, so it
+is a pure scheduling A/B there and an answer-changing knob only here. It also
+means the full-dataset builder and the subset builder, which sum the same rows
+in two orders and so differ by a few ulp in Float64, agree bit for bit once
+both are quantized. That kernel lives in `quantized_gradient.mojo` and not in
+this file only because this file is on the wrong side of the import edge --
+`quantized_gradient` imports `Histogram` from here, so the reverse import
+would be a cycle.
+
 **Where blocking does not run.** The full-dataset builder never blocks: it
 has no caller-owned scratch to keep the private histograms in, and allocating
 them per call is the cost this decomposition exists to avoid. A node too small

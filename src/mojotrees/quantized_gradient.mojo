@@ -193,8 +193,25 @@ from being applied twice.
 
 STATUS
 ------
-Disabled, and not reachable from any public entry point. `CONNECTED` is
-False, `QuantGradParams.default()` is disabled, and `decide` returns
+**The CPU histogram builder is here and works; no trainer calls it.** That is
+the whole of the change of state. `build_histogram_subset_quantized_into_scratch`
+accumulates a node into interleaved Int64 cells over the same row blocks the
+Float64 builder uses, `quantize_round_cpu` is the once-per-round map that
+feeds it, `decide_cpu_histogram` is the decision for a caller whose backend is
+that builder, and `QuantBuildReport` is the marker that says the integer
+kernel actually ran. LightGBM's four parameters are on the parameter surface
+(`tree_parameters_extra.ExtraTreeParams`, `params.parse_params`) with
+LightGBM's four defaults, and `use_quantized_grad=true` is refused there with
+a sentence rather than accepted and ignored.
+
+What is still missing is exactly one thing: `boosting.mojo` and `tree.mojo`
+have to call `quantize_round_cpu` once per round and
+`build_histogram_subset_maybe_quantized` per node, and the split search has to
+either read the dequantized `Histogram` (which it can, today, unchanged) or
+learn `quantized_split_gain`. Until that lands `CONNECTED` stays False.
+
+Disabled, then, and not reachable from any *training* entry point. `CONNECTED`
+is False, `QuantGradParams.default()` is disabled, and `decide` returns
 `MODE_FLOAT` with `QUANT_REASON_NOT_CONNECTED` for any request while `CONNECTED`
 is False, whatever the parameters say. A caller that explicitly asked for
 quantized training gets `check_supported`'s error rather than a silent
@@ -208,11 +225,28 @@ policy in prose.
 
 from std.math import floor, isfinite, round
 from std.memory import bitcast
+from std.sys.info import simd_width_of
 
+from .apple_cpu_policy import (
+    AccumulationPlan,
+    derive_accumulation_plan_with,
+)
 from .binning import BinnedMatrix
 from .gain import leaf_score
-from .histogram import Histogram, _zeroed_f64, _zeroed_int
-from .parallel import dispatch_feature_ranges
+from .histogram import (
+    CONSTANT_HESSIAN,
+    Histogram,
+    _zeroed_f64,
+    _zeroed_int,
+    build_histogram_subset_into_scratch,
+)
+from .parallel import (
+    DispatchSettings,
+    _env_int,
+    dispatch_feature_ranges,
+    dispatch_feature_ranges_with,
+    dispatch_rows_with,
+)
 from .rng import GOLDEN, splitmix64, uniform
 from .tree_parameters_extra import raw_leaf_output
 
@@ -415,6 +449,12 @@ comptime DEFAULT_QUANT_SEED = 11
 every seed at its default does not dither, bag, and subsample off related
 streams. The streams are independently mixed anyway; distinct defaults make
 that visible rather than merely true."""
+
+comptime QUANT_SIMD_LANES = 4 * simd_width_of[DType.int64]()
+"""Lanes the integer zeroing and fold loops use, sized above the hardware
+width so several vector operations stay in flight. The Int64 twin of
+`histogram.SIMD_LANES`, and the same reasoning: these are the elementwise
+kernels, not the scatter, and a scatter cannot be vectorized at all."""
 
 comptime INT16_LIMIT = Int64(32767)
 comptime INT32_LIMIT = Int64(2147483647)
@@ -1189,9 +1229,27 @@ struct QuantScales(Copyable, Movable):
 
 
 def derive_scales(
-    stats: GradientStats, params: QuantGradParams
+    stats: GradientStats,
+    params: QuantGradParams,
+    const_hessian: Bool = False,
 ) raises -> QuantScales:
     """This round's lattice, from the measured magnitudes and the rule.
+
+    `const_hessian` is the objective's guarantee that every row's hessian is
+    exactly `histogram.CONSTANT_HESSIAN`, the same declaration the float
+    builders take. LightGBM has it too, and it changes the hessian lattice:
+    `GradientDiscretizer::DiscretizeGradients` sets
+    `hessian_scale_ = max_hessian_abs_` when `is_constant_hessian_` and
+    `max_hessian_abs_ / num_grad_quant_bins` otherwise
+    (`src/treelearner/gradient_discretizer.cpp`, LightGBM 4.7.0.99), so the
+    constant-hessian lattice is exactly one unit wide and every row's hessian
+    quantizes to the integer 1. That is what makes the dequantized hessian
+    plane come back as `Float64(count)` -- bit for bit the float path's
+    hessian plane -- rather than as an approximation of it, and it is why the
+    declaration is worth threading this far down. Under
+    `SCALE_MAGNITUDE_SUM` the flag changes nothing: that rule derives the
+    hessian factor from `sum|h|` and lands on a power of two, which is
+    already an exact-integer lattice for a constant hessian.
 
     Call after `gradient_stats`, which must itself be called after GOSS
     scaling and on the row subset the tree will see. For multiclass, call
@@ -1206,6 +1264,26 @@ def derive_scales(
     to use one.
     """
     params.validate()
+    # LightGBM's constant-hessian hessian lattice, applied under *both* rules
+    # rather than only under its own. `hessian_scale_ = max_hessian_abs_`
+    # makes one lattice unit stand for exactly the constant, so every row
+    # quantizes to the integer 1, a bin's hessian sum is its row count, and
+    # the dequantized hessian plane is `Float64(count)` -- bit for bit what
+    # the Float64 builder produces. Deriving the hessian factor from
+    # `sum|h|` instead would land on some power of two `2^k`, quantize every
+    # row to `2^k`, and give back the same Float64 the long way round while
+    # costing `k` bits of the packed cell's low field for nothing. This is
+    # the one place the magnitude-sum rule adopts LightGBM's, and it adopts
+    # it because it is strictly better here.
+    var h_const_units = 0.0
+    if const_hessian:
+        var hm = stats.max_abs_hess
+        if not isfinite(hm):
+            raise Error("gradients and hessians must be finite")
+        if hm < MAGNITUDE_FLOOR:
+            hm = MAGNITUDE_FLOOR
+        h_const_units = 1.0 / hm
+
     if params.scale_rule == SCALE_MAGNITUDE_SUM:
         # Float32 on purpose: the device stores the scale at that width and
         # multiplies by it, so a host factor of any other precision would
@@ -1215,6 +1293,15 @@ def derive_scales(
         # is unchanged so the arbitrary arm keeps the property it needs.
         var g_units = Float64(fixed_point_scale(stats.sum_abs_grad))
         var h_units = Float64(fixed_point_scale(stats.sum_abs_hess))
+        if const_hessian:
+            return QuantScales(
+                g_units,
+                h_const_units,
+                Int64(FIXED_ONE),
+                Int64(1),
+                BOUND_TOTAL,
+                SCALE_MAGNITUDE_SUM,
+            )
         return QuantScales(
             g_units,
             h_units,
@@ -1232,8 +1319,13 @@ def derive_scales(
         g_max = MAGNITUDE_FLOOR
     if h_max < MAGNITUDE_FLOOR:
         h_max = MAGNITUDE_FLOOR
+    # LightGBM's `hessian_scale_`, inverted. One unit for the whole hessian
+    # range under a constant hessian, `num_grad_quant_bins` units otherwise.
+    var h_max_unit = Int64(1) if const_hessian else params.hess_max_unit()
     var g_units = Float64(params.grad_max_unit()) / g_max
-    var h_units = Float64(params.hess_max_unit()) / h_max
+    var h_units = h_const_units if const_hessian else (
+        Float64(h_max_unit) / h_max
+    )
     if not (isfinite(g_units) and isfinite(h_units)):
         raise Error(
             "gradient/hessian magnitudes are out of range for a quantized"
@@ -1243,7 +1335,7 @@ def derive_scales(
         g_units,
         h_units,
         params.grad_max_unit(),
-        params.hess_max_unit(),
+        h_max_unit,
         BOUND_PER_ROW,
         SCALE_MAX_ABS,
     )
@@ -1288,12 +1380,40 @@ def quantize_scalar(
     handoff lists confirming the tie rule as an unrun check; nothing here
     depends on which rule it is, only on both sides calling it.
 
-    `ROUND_STOCHASTIC` applies `floor(x + u)` with `u` from
-    `quant_uniform(counter)`. That is unbiased: a value 0.3 of the way to
-    the next unit lands there with probability 0.3, so a sum of many
+    `ROUND_STOCHASTIC` is **LightGBM's rule, magnitude-symmetric**, not
+    `floor(x + u)`. Read off `src/treelearner/gradient_discretizer.cpp`
+    (`GradientDiscretizer::DiscretizeGradients`, LightGBM 4.7.0.99), which
+    spells it
+
+        gradient >= 0 ? int8(g * inv_scale + u) : int8(g * inv_scale - u)
+
+    with `static_cast<int8_t>` truncating toward zero. So the magnitude is
+    what gets the dither: `|q| = floor(|y| + u)`, and the sign is carried
+    through untouched. That is *not* the same integer as `floor(y + u)` for a
+    negative `y` -- at `y = -1.3, u = 0.9` the symmetric rule gives -2 and
+    `floor` gives -1 -- and it is the LightGBM one that this package matches,
+    because matching a comparator's arithmetic is the whole point of naming
+    the parameter after it. Both spellings are unbiased and both move a value
+    by strictly less than one unit, so `accumulation_bound` is unaffected.
+
+    That rounding is unbiased in the sense that matters: a value 0.3 of the
+    way to the next unit lands there with probability 0.3, so a sum of many
     quantized values converges on the exact scaled sum instead of on a
-    systematically rounded one. It also costs twice the residue bound, which
-    `accumulation_bound` accounts for.
+    systematically rounded one. It costs twice the residue bound of
+    round-to-nearest, which `accumulation_bound` accounts for.
+
+    `u` comes from `quant_uniform(counter)`, a counter-based draw and not an
+    engine. LightGBM's own stochastic rounding is **not reproducible**: it
+    fills `gradient_random_values_` from one `std::mt19937(seed + thread_id)`
+    per OpenMP block, so the draw a row gets depends on how many threads ran,
+    and it then rotates the array by a fresh `random_values_use_start` every
+    round. Neither of those can be reproduced at a different worker count.
+    mojotrees keys the draw on `(seed, round, class, plane, row)` instead, so
+    the same row gets the same `u` at one worker and at eight, on the CPU and
+    on a device. That is a deliberate divergence from LightGBM and it is in
+    the safe direction: LightGBM's scheme is a *distribution* over roundings
+    and any member of it is as valid as any other, while a distribution that
+    depends on the thread count is not something a test can assert on.
 
     Clamping happens before rounding, in float, so the clamp cannot be
     escaped by a rounding that pushes a value one unit past the limit: the
@@ -1306,7 +1426,10 @@ def quantize_scalar(
     elif y < -lim:
         y = -lim
     if mode == ROUND_STOCHASTIC:
-        return Int64(floor(y + quant_uniform(counter)))
+        var u = quant_uniform(counter)
+        if y >= 0.0:
+            return Int64(floor(y + u))
+        return -Int64(floor(-y + u))
     return Int64(round(y))
 
 
@@ -1978,6 +2101,1033 @@ def build_quantized_histogram(
         out, data, qgrad, qhess, rows, 0, len(rows), features
     )
     return out^
+
+
+# ---------------------------------------------------------------------------
+# The CPU quantized accumulation path
+# ---------------------------------------------------------------------------
+#
+# What this is, in one paragraph. `histogram.mojo` accumulates a node into
+# three Float64 planes, optionally over contiguous ascending row blocks with
+# a private histogram per block and an ascending fold
+# (`_accumulate_subset_blocked_at`). Everything below is that same
+# decomposition over **integer** cells: the node's rows are quantized once
+# onto this round's lattice, the blocks accumulate Int64 counts of lattice
+# units, the fold sums the blocks, and the fold dequantizes into the caller's
+# `Histogram` on the way out.
+#
+# WHY IT LIVES HERE AND NOT IN `histogram.mojo`
+# ---------------------------------------------
+# `quantized_gradient` already imports `histogram` (for `Histogram` itself and
+# for the zeroed-plane helpers), so `histogram` cannot import this module back
+# without a cycle. The kernel therefore sits on the side of the edge that can
+# see both, and it reaches the row-block policy through `apple_cpu_policy`
+# directly -- which imports nothing from this package, so nothing here widens
+# the dependency graph. The alternative, moving `QuantScales` and the rounding
+# into `histogram.mojo`, would put the package's numerical policy inside its
+# hottest kernel file and is the wrong direction.
+#
+# WHAT INTEGER CELLS BUY, STATED EXACTLY
+# --------------------------------------
+# **The fold becomes exact rather than merely deterministic, and that is a
+# real simplification and not a slogan.** The Float64 blocked kernel has to
+# argue at length that the block count is a *value* and not a schedule: a fold
+# over `B` partial sums is a different Float64 from one ascending sum, so
+# `plan_row_block_count` is forbidden to look at the core count and the fold
+# is forbidden to run out of order. Integer addition is associative and
+# commutative, so none of that argument is needed here. A cell's value is the
+# exact integer sum of its rows' quantized gradients at **every** block count,
+# in **every** fold order, at **every** worker count, with the blocks visited
+# in any order at all. The block count stops being part of the result and goes
+# back to being what it looks like: a scheduling knob.
+#
+# Two consequences worth naming. First, `MOJOTREES_CPU_ROW_BLOCKS` cannot move
+# a bit on this path, so it is a pure A/B here where on the float path it is
+# the one environment variable that changes an answer. Second, sibling
+# subtraction over these cells is exact (`subtract_quantized`), where the
+# Float64 one is exact only up to cancellation.
+#
+# THE CELL LAYOUT IS LIGHTGBM'S, NOT THIS PACKAGE'S
+# -------------------------------------------------
+# A cell is a **packed `(gradient, hessian)` pair in one integer**: the
+# gradient in the high `HIST_BITS` bits, the hessian in the low ones, and one
+# row's contribution to a bin is **one integer add**. That is
+# `DenseBin::ConstructHistogramIntInner` (`src/io/dense_bin.hpp`), and the two
+# widths are LightGBM's two: an int16 pair inside an int32, and an int32 pair
+# inside an int64. `serial_tree_learner.cpp` branches on `hist_bits <= 16` and
+# so does `build_histogram_subset_quantized_into_scratch`.
+#
+# The overflow rule is LightGBM's too (`histogram_bits_for_node`, from
+# `GradientDiscretizer::SetNumBitsInHistogramBin`) and it is *not* this
+# package's 2^30 fixed-point bound, which was derived for a per-plane Int32
+# accumulator and does not transfer to a two-field cell. Where they disagree
+# the LightGBM rule wins here, and that function names the disagreement.
+#
+# On the constant-hessian arm LightGBM packs the literal 1 into the low field,
+# so the low field accumulates the row **count** and the histogram carries no
+# count plane at all. That is the arm `lane/lgbm-cell-layout` is landing on
+# the Float64 side, with leaf counts coming from the partition. On the general
+# arm this builder does still keep a count plane, because mojotrees's
+# `Histogram` promises a per-bin count and a data partition is a per-leaf
+# number that cannot answer a per-bin question. **That is the one place this
+# lane guessed**: if the incoming layout drops per-bin counts unconditionally,
+# the general arm's count plane and its fold loop are what come out, and
+# nothing else here changes.
+
+
+def cpu_quant_grad_allowed() -> Bool:
+    """Whether the CPU quantized accumulation path may run at all.
+
+    `MOJOTREES_CPU_QUANT_GRAD=0` forces every build back onto the Float64
+    accumulation regardless of what a caller asked for, which is the off
+    switch a bisection wants. Anything else, including unset, leaves the path
+    available; it still does nothing until a caller enables
+    `use_quantized_grad`, which is off by default.
+
+    The convention is `parallel.mojo`'s and `histogram.const_hessian_allowed`'s:
+    an integer read through `_env_int`, a default that means "unchanged
+    behavior", and zero meaning off. It is an environment override and not a
+    public parameter on purpose -- the public surface is exactly LightGBM's
+    four names -- for the reason `histogram.const_hessian_allowed` gives.
+    """
+    return _env_int("MOJOTREES_CPU_QUANT_GRAD", 1) != 0
+
+
+def env_cpu_quant_scale_rule() -> Int:
+    """Which lattice the CPU quantized path derives, as an A/B override.
+
+    `MOJOTREES_CPU_QUANT_SCALE=0` selects `SCALE_MAX_ABS`, which is LightGBM's
+    rule and the only one it has: `units = (num_grad_quant_bins / 2) / max|g|`,
+    a lattice four units wide at the default bin count. Anything else,
+    including unset, selects `SCALE_MAGNITUDE_SUM` at `SCALE_SHAPE_POW2`,
+    which is the rule the GPU histogram already ships.
+
+    **The default is the magnitude-sum rule, and that is a decision with a
+    consequence worth stating rather than burying.** It puts the CPU on the
+    same lattice as the device, which is what makes a CPU histogram and a GPU
+    histogram of the same node comparable at all and what
+    `histogram.build_histogram_subset_replica_into` already assumes. It also
+    means that at the default, `num_grad_quant_bins` **does not affect the
+    lattice**: the magnitude-sum rule derives its factor from `sum|g|` and
+    ignores the bin count. The parameter is still validated, still carried,
+    and becomes load-bearing the moment this variable selects `SCALE_MAX_ABS`.
+    A caller comparing against LightGBM's own quantized arm value for value
+    wants `MOJOTREES_CPU_QUANT_SCALE=0`; a caller comparing the CPU against
+    this package's own GPU wants the default.
+
+    It is an environment variable and not a parameter because the public
+    surface is exactly LightGBM's names, and LightGBM has no scale-rule
+    parameter to be exactly.
+    """
+    if _env_int("MOJOTREES_CPU_QUANT_SCALE", 1) == 0:
+        return SCALE_MAX_ABS
+    return SCALE_MAGNITUDE_SUM
+
+
+def cpu_quant_params(
+    use_quantized_grad: Bool,
+    num_grad_quant_bins: Int = DEFAULT_NUM_GRAD_QUANT_BINS,
+    quant_train_renew_leaf: Bool = False,
+    stochastic_rounding: Bool = True,
+) raises -> QuantGradParams:
+    """LightGBM's four parameters, with this build's scale rule folded in.
+
+    The one constructor a CPU caller should use: it takes exactly LightGBM's
+    names and defaults (`use_quantized_grad=false`,
+    `num_grad_quant_bins=4`, `quant_train_renew_leaf=false`,
+    `stochastic_rounding=true`, all read off `include/LightGBM/config.h` of
+    LightGBM 4.7.0.99) and supplies the two fields LightGBM has no parameter
+    for: the rounding seed, and the scale rule, which comes from
+    `env_cpu_quant_scale_rule`.
+
+    `max_width` is `WIDTH_64` because the host accumulator here is Int64. A
+    narrower device or transport asks `accumulator_width` for its own answer.
+    """
+    var p = QuantGradParams(
+        use_quantized_grad,
+        num_grad_quant_bins,
+        stochastic_rounding,
+        quant_train_renew_leaf,
+        DEFAULT_QUANT_SEED,
+        env_cpu_quant_scale_rule(),
+        WIDTH_64,
+    )
+    p.validate()
+    return p^
+
+
+def decide_cpu_histogram(
+    stats: GradientStats,
+    params: QuantGradParams,
+    max_node_rows: Int,
+    const_hessian: Bool = False,
+) raises -> QuantDecision:
+    """`decide`, for a caller whose accumulation path is the one below.
+
+    `const_hessian` is threaded through to `derive_scales` and must be the
+    same declaration `quantize_round_cpu` was given, or the round's rows are
+    quantized on one hessian lattice and its histograms dequantized on
+    another. That is a silent wrongness rather than an error, so the two calls
+    take the same flag and a test asserts the two lattices come out equal.
+
+    Identical to `decide` in every check except the `CONNECTED` gate, which it
+    does not consult, and this is the one place in the module that skips it.
+    The distinction is exact and it is not a loophole: `CONNECTED` is the
+    package's statement that **a trainer** has been wired to this module and
+    validated against the float path, and that is still False -- no trainer
+    calls any of this, `boosting.mojo` and `tree.mojo` are untouched, and
+    `decide` still refuses every request. What *is* now true is the narrower
+    claim this function makes, that a CPU histogram builder exists and holds
+    its bounds, and a test of that builder needs a way to say so without
+    asserting the wider claim.
+
+    Flipping `CONNECTED` remains the last step of the connection sequence in
+    `handoffs/remaining_06_quantized_gradients.md`, and this function is not
+    it.
+    """
+    params.validate()
+    if not params.enabled:
+        return QuantDecision.floating(QUANT_REASON_NOT_REQUESTED)
+    if not cpu_quant_grad_allowed():
+        return QuantDecision.floating(QUANT_REASON_BACKEND)
+    if stats.n_rows <= 0 or max_node_rows <= 0:
+        return QuantDecision.floating(QUANT_REASON_NO_ROWS)
+    if not stats.finite:
+        return QuantDecision.floating(QUANT_REASON_NON_FINITE)
+    if stats.is_degenerate():
+        return QuantDecision.floating(QUANT_REASON_DEGENERATE)
+
+    var scales = derive_scales(stats, params, const_hessian)
+    if not scales.is_usable():
+        return QuantDecision.floating(QUANT_REASON_DEGENERATE)
+    var width = accumulator_width(max_node_rows, scales, params)
+    if width == WIDTH_NONE:
+        return QuantDecision.floating(QUANT_REASON_OVERFLOW)
+    return QuantDecision(MODE_QUANTIZED, QUANT_REASON_OK, width, scales.copy())
+
+
+@fieldwise_init
+struct QuantBuildReport(Copyable, Movable):
+    """What one histogram build actually did: **the path marker**.
+
+    A test that compares a quantized histogram against a float one and passes
+    whether or not quantization fired establishes nothing, and this package
+    has shipped that test three times. So the builder reports, and the
+    assertions are on the report rather than on an inference from the values.
+
+    `row_accumulations` is the load-bearing field: the number of
+    `(node row, active feature)` integer accumulations the kernel performed.
+    It is `n_active * row_count` on the quantized path and **exactly zero** on
+    the float path, so no fixture can pass while silently running the float
+    builder. `blocks` and `group_width` are the shape the plan chose, so a
+    fixture meant to exercise the blocked kernel can assert it got one.
+
+    `hist_bits` is the width of each half of the packed cell, from
+    `histogram_bits_for_node`, so a fixture can assert which of LightGBM's two
+    arms it exercised. `const_hessian_elided` says whether the low field
+    carried the row count instead of a quantized hessian, which is the arm on
+    which the count plane disappears entirely.
+
+    There is deliberately no rounding-mode field. Rounding happens once per
+    round in `quantize_round_cpu`, not per node, and a builder handed an
+    integer array cannot tell how it was rounded. Reporting a guess would be
+    exactly the kind of marker that establishes nothing.
+    """
+
+    var mode: Int
+    var reason: Int
+    var scale_rule: Int
+    var hist_bits: Int
+    var blocks: Int
+    var group_width: Int
+    var row_accumulations: Int
+    var const_hessian_elided: Bool
+    var scales: QuantScales
+
+    @staticmethod
+    def floating(reason: Int) -> QuantBuildReport:
+        return QuantBuildReport(
+            MODE_FLOAT, reason, SCALE_MAX_ABS,
+            0, 1, 1, 0, False, QuantScales.identity(),
+        )
+
+    def is_quantized(self) -> Bool:
+        return self.mode == MODE_QUANTIZED
+
+    def describe(self) -> String:
+        if not self.is_quantized():
+            return String(
+                "cpu histogram: float (", describe_reason(self.reason), ")"
+            )
+        return String(
+            "cpu histogram: quantized, ",
+            describe_scale_rule(self.scale_rule),
+            " lattice, ",
+            describe_histogram_bits(self.hist_bits),
+            " cells, ",
+            String(self.blocks),
+            " row blocks, group width ",
+            String(self.group_width),
+            ", ",
+            String(self.row_accumulations),
+            " packed accumulations",
+        )
+
+
+def quantize_round_cpu(
+    grad: List[Float64],
+    hess: List[Float64],
+    params: QuantGradParams,
+    key: QuantRoundKey,
+    mut qgrad: List[Int64],
+    mut qhess: List[Int64],
+    rows: List[Int] = [],
+    const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> QuantScales:
+    """One round's quantization, start to finish: measure, derive, quantize.
+
+    The three existing steps in the order this module's contract fixes --
+    `gradient_stats` on the row subset the tree will see, then
+    `derive_scales`, then the per-row rounding -- composed so a trainer makes
+    one call per round instead of three that could be reordered. `rows` is the
+    bag or the GOSS selection, empty for every row, and it must already carry
+    whatever GOSS scaling this round applied.
+
+    Every row of the dataset is quantized, not just the sampled ones, for the
+    reason `quantize_rows` gives: the quantized arrays stay indexed by row id
+    like the float ones, so a node's row window indexes them directly and a
+    bagged and an unbagged round produce the same integer for the same row.
+
+    Parallel, and deterministic because row `r` draws from `stream + r` and
+    from nothing else. The dispatch is elementwise over disjoint ascending
+    blocks, so the arrays that come out are identical at every worker count
+    and at every task count -- this is not an argument about summation order
+    because there is no summation here, only a map.
+
+    **Derived bound on the pass**, not measured: two Float64 reads and two
+    Int64 writes per row, 32 bytes, plus the `gradient_stats` pass ahead of it
+    at 16 bytes read per row. 48 bytes per row per round against a round whose
+    histogram passes read the same gradients `n_active` times.
+    """
+    if len(grad) != len(hess):
+        raise Error("gradient/hessian length must match")
+    var stats = gradient_stats(grad, hess, rows)
+    var scales = derive_scales(stats, params, const_hessian)
+    if not scales.is_usable():
+        raise Error("quantization scales must be finite and positive")
+
+    var n = len(grad)
+    if len(qgrad) != n:
+        qgrad.resize(n, Int64(0))
+    if len(qhess) != n:
+        qhess.resize(n, Int64(0))
+
+    var mode = params.rounding_mode()
+    var g_stream = key.grad_stream()
+    var h_stream = key.hess_stream()
+    var gp = grad.unsafe_ptr()
+    var hp = hess.unsafe_ptr()
+    var qg = qgrad.unsafe_ptr()
+    var qh = qhess.unsafe_ptr()
+    var g_units = scales.grad_units
+    var h_units = scales.hess_units
+    var g_lim = scales.grad_max_unit
+    var h_lim = scales.hess_max_unit
+
+    def quantize_range(start: Int, end: Int) {imm}:
+        for r in range(start, end):
+            qg.unsafe_store(
+                r,
+                quantize_scalar(
+                    gp.unsafe_load(r), g_units, g_lim, mode,
+                    g_stream + UInt64(r),
+                ),
+            )
+            qh.unsafe_store(
+                r,
+                quantize_scalar(
+                    hp.unsafe_load(r), h_units, h_lim, mode,
+                    h_stream + UInt64(r),
+                ),
+            )
+
+    dispatch_rows_with(settings, quantize_range, n, 4 * n)
+    return scales^
+
+comptime HIST_BITS_16 = 16
+"""LightGBM's narrow packed cell: an int16 `(gradient, hessian)` pair inside
+one int32. `serial_tree_learner.cpp` branches on `hist_bits <= 16` and this is
+that arm."""
+
+comptime HIST_BITS_32 = 32
+"""LightGBM's wide packed cell: an int32 pair inside one int64."""
+
+comptime HIST_BITS_NONE = 0
+"""No supported packed cell holds this node's bound. A fallback condition,
+not an error."""
+
+
+def histogram_bits_for_node(
+    n_rows: Int, scales: QuantScales, mode: Int
+) raises -> Int:
+    """How wide each half of the packed histogram cell has to be, in bits.
+
+    **This is LightGBM's rule, and it is theirs rather than ours.** Read off
+    `GradientDiscretizer::SetNumBitsInHistogramBin`
+    (`src/treelearner/gradient_discretizer.cpp`, LightGBM 4.7.0.99), which is
+    verbatim:
+
+        max_stat_per_bin = num_data_in_leaf * num_grad_quant_bins
+        if      max_stat_per_bin < 256   -> 8
+        else if max_stat_per_bin < 65536 -> 16
+        else                             -> 32
+
+    per leaf, recomputed for both children at every split. It is a bound on
+    the **hessian half**, which is the binding one: with `hess_max_unit = B`
+    and `grad_max_unit = B / 2` the hessian sum is at most `n * B` and the
+    gradient sum at most `n * B / 2`, so `n * B < 2^bits` bounds the unsigned
+    low field and simultaneously puts the signed high field inside
+    `2^(bits-1)`. One test, both halves.
+
+    WHY THIS RULE AND NOT THE PACKAGE'S 2^30 ONE
+    --------------------------------------------
+    The repository's overflow argument (`docs/GPU_PORTABILITY.md`,
+    `fixed_point_scale_pow2`) bounds a **per-plane Int32 accumulator** under a
+    power-of-two magnitude-sum scale: the exact scaled total is at most 2^30,
+    a node is a subset, deterministic rounding adds `n/2`, so a cell fits
+    Int32. It is correct and it **does not transfer to a packed pair**,
+    because a packed cell has two fields and the argument bounds one plane.
+    Where the two disagree, the rule below wins, and the disagreement is worth
+    naming: the 2^30 argument would say "Int32 suffices" and, applied
+    naively to a packed cell, would produce an int16 pair inside an int32 that
+    overflows at the root of any dataset above about 32,000 rows.
+
+    They do not actually conflict once both are stated as field bounds, and
+    this function is where that reconciliation lives. It generalizes
+    LightGBM's rule to the two lattices this package derives, by bounding each
+    half separately:
+
+    - `BOUND_PER_ROW` (LightGBM's `SCALE_MAX_ABS`): low field `n *
+      hess_max_unit`, high field `n * grad_max_unit`. At `hess_max_unit = B`
+      and `grad_max_unit = B/2` this reduces to LightGBM's single test,
+      exactly.
+    - `BOUND_TOTAL` (`SCALE_MAGNITUDE_SUM` at `SCALE_SHAPE_POW2`): the scale
+      bounds the *total* at `FIXED_ONE`, so each field is at most
+      `2^30 + n * residue`. That is above 2^16 for every nonempty node, so
+      **the magnitude-sum lattice always lands on the 32-bit arm**, an int32
+      pair inside an int64. That is not a defect of the rule, it is what a
+      30-bit lattice costs, and it is the honest reason LightGBM can use a
+      4-byte cell where this package's default cannot.
+    - Under a declared constant hessian the low field accumulates the row
+      **count** (LightGBM packs the literal 1; see `_packed_row_value`), so
+      its bound is `n` whichever lattice is in use.
+
+    ONE DIVERGENCE, DELIBERATE
+    --------------------------
+    LightGBM's ladder ends in an unconditional `else 32` and therefore
+    silently wraps when `n * B >= 2^32`, which at `B = 4` is any leaf above
+    about 1.07 billion rows. This returns `HIST_BITS_NONE` there instead, and
+    the caller falls back to Float64 accumulation with a named reason. A
+    silent integer wraparound in a histogram is the one failure this whole
+    module exists to make impossible, so reproducing it for parity would be
+    the wrong kind of faithfulness.
+
+    **Derived bound**, not measured, on where each arm applies at LightGBM's
+    defaults (`B = 4`, non-constant hessian): the 16-bit arm holds while
+    `4n < 65536`, i.e. **n < 16,384 rows in the node**, and the 32-bit arm
+    above it. So a million-row root is on the wide arm and everything below
+    roughly the fourteenth level of the tree is on the narrow one.
+    """
+    if n_rows < 0:
+        raise Error("row count must not be negative")
+    var rows = Float64(n_rows)
+    var hi: Float64
+    var lo: Float64
+    if scales.bound_kind == BOUND_TOTAL:
+        hi = FIXED_ONE + rows * residue_per_row(mode)
+        # `hess_max_unit == 1` is how `derive_scales` records a constant
+        # hessian: one lattice unit per row, so the low field is the count.
+        lo = rows if scales.hess_max_unit == Int64(1) else hi
+    else:
+        hi = rows * Float64(scales.grad_max_unit)
+        lo = rows * Float64(scales.hess_max_unit)
+    if not (isfinite(hi) and isfinite(lo)):
+        return HIST_BITS_NONE
+    # The signed high field needs `hi < 2^(bits-1)`; the unsigned low field
+    # needs `lo < 2^bits`. Testing `2 * hi` against the same threshold as `lo`
+    # is the same statement with one comparison per width.
+    var need = 2.0 * hi
+    if lo > need:
+        need = lo
+    if need < 65536.0:
+        return HIST_BITS_16
+    if need < 4294967296.0:
+        return HIST_BITS_32
+    return HIST_BITS_NONE
+
+
+def describe_histogram_bits(bits: Int) -> String:
+    if bits == HIST_BITS_16:
+        return "int16 pair in int32"
+    if bits == HIST_BITS_32:
+        return "int32 pair in int64"
+    return "none"
+
+
+def build_histogram_subset_quantized_into_scratch(
+    mut out: Histogram,
+    mut qscratch: List[Int64],
+    data: BinnedMatrix,
+    qgrad: List[Int64],
+    qhess: List[Int64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    scales: QuantScales,
+    features: List[Int] = [],
+    const_hessian: Bool = False,
+    rounding: Int = ROUND_NEAREST,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> QuantBuildReport:
+    """The packed integer accumulation of one node, dequantized into `out`.
+
+    The quantized twin of `histogram.build_histogram_subset_into_scratch`,
+    over the window `rows[row_start : row_start + row_count]`, and it takes
+    the same shape of arguments for the same reasons: a caller-owned scratch
+    so a grower visiting hundreds of nodes allocates once per tree, a row
+    window so node row ids live in one shared arena, an optional feature
+    subset whose excluded slices come back zeroed, and a `DispatchSettings`
+    snapshot so the build reads no environment variable.
+
+    `qgrad` and `qhess` are the whole round's quantized derivatives, indexed
+    by row id, from `quantize_round_cpu`. `scales` is the lattice they were
+    quantized on and is what the fold dequantizes with; handing a lattice that
+    does not match the arrays produces a wrong histogram and nothing here can
+    detect it, which is why `quantize_round_cpu` returns the two together.
+    `rounding` is the mode those arrays were rounded with, and it is used for
+    one thing only: `histogram_bits_for_node` needs the residue bound.
+
+    THE CELL, WHICH IS LIGHTGBM'S AND NOT THIS PACKAGE'S
+    ----------------------------------------------------
+    One cell is a **packed `(gradient, hessian)` pair in a single integer**,
+    high field gradient and low field hessian, and one row's contribution is
+    **one integer add**. That is `DenseBin::ConstructHistogramIntInner`
+    (`src/io/dense_bin.hpp`, LightGBM 4.7.0.99) exactly:
+
+        gradient_packed = (int8_t(gradient_16 >> 8) << HIST_BITS)
+                          | (gradient_16 & 0xff)
+        out_ptr[ti] += gradient_packed
+
+    and the constant-hessian arm of the same function packs the literal `1`
+    into the low field instead of the hessian, so the low field accumulates
+    the **row count**. Two consequences follow and both are load-bearing here:
+    the histogram carries no count plane on that arm, which is what
+    `lane/lgbm-cell-layout` is landing on the Float64 side, and unpacking is
+    two instructions rather than two loads.
+
+    Componentwise addition of packed values is exact provided the low field
+    never carries into the high one, which is precisely what
+    `histogram_bits_for_node` guarantees, and it is the reason that rule is
+    LightGBM's rather than this package's 2^30 one -- see that function.
+
+    **The fold stays exact.** Packing does not weaken it. Integer addition is
+    associative and commutative whether the integers carry one field or two,
+    so the row-block fold below is the exact sum at every block count, in
+    every order, at every worker count. Nothing in this file has to argue that
+    the block count is a value rather than a schedule, which is the argument
+    `histogram.mojo` has to make at length for its Float64 twin.
+
+    THE SCRATCH, WHICH THIS FUNCTION DEFINES
+    ----------------------------------------
+    One `List[Int64]`, grown and never shrunk, contents irrelevant on entry
+    and unspecified on exit, viewed through a pointer of the cell type. In
+    cell units:
+
+        [0, row_count)                  the node's packed per-row values
+        [.., + blocks * cells)          private packed histograms
+        [.., + blocks * cells)          private counts, general arm only
+
+    with `cells = n_active * n_bins`, the compact active-slice shape. An
+    excluded feature gets no private storage and no fold.
+
+    **Derived bound on the scattered traffic**, not measured, per (row, active
+    feature), and this is the whole argument for the packing:
+
+        Float64 builder          3 read-modify-writes, 3 lines, 48 bytes
+        packed, general arm      2 read-modify-writes, 2 lines, 32 or 24 bytes
+        packed, constant hessian 1 read-modify-write,  1 line,  16 or 8 bytes
+
+    The two figures per packed row are the 32-bit and the 16-bit cell. The
+    general arm still pays a count plane because `Histogram` promises a
+    per-bin count and LightGBM's does not -- LightGBM takes leaf counts from
+    its data partition, which is a per-leaf number and cannot answer a
+    per-bin question. On the constant-hessian arm that plane disappears
+    entirely, because the low field is the count.
+
+    **Derived bound on the per-row payload**: the Float64 gather writes and
+    then re-reads 16 bytes per row (a `(g, h)` Float64 pair); the packed
+    gather writes 8 or 4. At a million rows that is 16 MB against 8 MB or
+    4 MB, streamed once per feature group.
+
+    Returns a `QuantBuildReport`. Read `row_accumulations` before believing a
+    fixture.
+    """
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
+    var n_features = data.n_features
+    if len(qgrad) != n_rows or len(qhess) != n_rows:
+        raise Error("quantized gradient/hessian length must equal n_rows")
+    if not out.matches(n_features, n_bins):
+        raise Error("output histogram shape must match the data")
+    if row_start < 0 or row_count < 0 or row_start + row_count > len(rows):
+        raise Error("row window out of range")
+    if not scales.is_usable():
+        raise Error("quantization scales must be finite and positive")
+    for i in range(len(features)):
+        if features[i] < 0 or features[i] >= n_features:
+            raise Error("feature index out of range")
+
+    var use_all = len(features) == 0
+    var n_active = n_features if use_all else len(features)
+
+    # Excluded features' slices are never accumulated and never folded, so
+    # they are zeroed here. Serial and outside the parallel section: it is
+    # `(n_features - n_active) * n_bins` cells and it is zero in the common
+    # case of no feature subsampling.
+    if not use_all:
+        var active = List[UInt8](capacity=n_features)
+        active.resize(n_features, UInt8(0))
+        for i in range(len(features)):
+            active[features[i]] = UInt8(1)
+        for f in range(n_features):
+            if active[f] == UInt8(0):
+                var base = f * n_bins
+                for b in range(n_bins):
+                    out.set_grad_at(base + b, 0.0)
+                    out.set_hess_at(base + b, 0.0)
+                    out.set_count_at(base + b, 0)
+
+    var bits = histogram_bits_for_node(row_count, scales, rounding)
+    if bits == HIST_BITS_NONE:
+        # No supported packed cell holds this node's field bounds. A caller
+        # that reaches this has asked for a node past a billion rows on
+        # LightGBM's lattice; the answer is the float path, named, not a
+        # silent wraparound.
+        return QuantBuildReport.floating(QUANT_REASON_OVERFLOW)
+
+    var plan = derive_accumulation_plan_with(
+        settings.policy, n_features, n_active, n_bins, row_count, True
+    )
+    var blocks = plan.row_blocks if plan.row_blocks > 0 else 1
+    var block_rows = plan.block_rows if blocks > 1 else row_count
+    var cells = n_active * n_bins
+
+    if n_active <= 0 or row_count <= 0 or n_bins <= 0:
+        # Nothing to accumulate. Every active slice still has to come back
+        # zeroed, which the excluded-feature loop above did not cover.
+        for j in range(n_active):
+            var f = j if use_all else features[j]
+            var base = f * n_bins
+            for b in range(n_bins):
+                out.set_grad_at(base + b, 0.0)
+                out.set_hess_at(base + b, 0.0)
+                out.set_count_at(base + b, 0)
+        return QuantBuildReport(
+            MODE_QUANTIZED, QUANT_REASON_OK, scales.rule, bits, 1,
+            plan.group_width, 0, False, scales.copy(),
+        )
+
+    # `derive_scales` records a declared constant hessian as a one-unit
+    # hessian lattice, so this is the check rather than a second flag: the
+    # elision is exact only when every row's hessian quantizes to the integer
+    # 1, and `hess_max_unit == 1` is precisely that lattice. Checked rather
+    # than trusted, because the caller's `const_hessian` and the lattice it
+    # derived are two statements that could drift.
+    var const_h = const_hessian and scales.hess_max_unit == Int64(1)
+
+    # Scratch, in cell units, then converted to the Int64 slots the caller
+    # owns. The count plane is not allocated on the constant-hessian arm at
+    # all, which is where the traffic bound above comes from.
+    var cell_slots = row_count + blocks * cells
+    if not const_h:
+        cell_slots += blocks * cells
+    var cell_bytes = 4 if bits == HIST_BITS_16 else 8
+    var wanted = (cell_slots * cell_bytes + 7) // 8
+    if len(qscratch) < wanted:
+        qscratch.resize(wanted, Int64(0))
+
+    var group = plan.group_width
+    if bits == HIST_BITS_16:
+        if group >= 16:
+            _accumulate_packed_at[DType.int32, HIST_BITS_16, 16](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+        elif group >= 8:
+            _accumulate_packed_at[DType.int32, HIST_BITS_16, 8](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+        elif group >= 4:
+            _accumulate_packed_at[DType.int32, HIST_BITS_16, 4](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+        elif group >= 2:
+            _accumulate_packed_at[DType.int32, HIST_BITS_16, 2](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+        else:
+            _accumulate_packed_at[DType.int32, HIST_BITS_16, 1](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+    else:
+        if group >= 16:
+            _accumulate_packed_at[DType.int64, HIST_BITS_32, 16](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+        elif group >= 8:
+            _accumulate_packed_at[DType.int64, HIST_BITS_32, 8](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+        elif group >= 4:
+            _accumulate_packed_at[DType.int64, HIST_BITS_32, 4](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+        elif group >= 2:
+            _accumulate_packed_at[DType.int64, HIST_BITS_32, 2](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+        else:
+            _accumulate_packed_at[DType.int64, HIST_BITS_32, 1](
+                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                rows, row_start, row_count, features, plan, blocks, block_rows,
+                cells, n_active, scales, const_h, settings,
+            )
+
+    return QuantBuildReport(
+        MODE_QUANTIZED,
+        QUANT_REASON_OK,
+        scales.rule,
+        bits,
+        blocks,
+        plan.group_width,
+        n_active * row_count,
+        const_h,
+        scales.copy(),
+    )
+
+
+def _accumulate_packed_at[
+    CELL: DType, HIST_BITS: Int, GROUP: Int
+](
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    mut scratch: List[Int64],
+    data: BinnedMatrix,
+    qgrad: List[Int64],
+    qhess: List[Int64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int],
+    plan: AccumulationPlan,
+    blocks: Int,
+    block_rows: Int,
+    cells: Int,
+    n_active: Int,
+    scales: QuantScales,
+    const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """The packed accumulation at one cell width and one interleave width.
+
+    Structurally `histogram._accumulate_subset_blocked_at` with LightGBM's
+    packed cell in place of three Float64 planes: a `(block, group)` dispatch
+    unit, a private histogram per block over the active slots, and an
+    ascending fold. Four differences, and each of them is a simplification the
+    packing or the integers pay for.
+
+    **One kernel, not four.** The Float64 subset builder instantiates a
+    blocked arm and an unblocked arm, and each has a gathered and a
+    non-gathered row loop. Here there is one arm at `blocks == 1` and at
+    `blocks > 1` alike, because a fold of one block is a copy and costs
+    nothing to express, and the rows always come through the packed gather,
+    because a row's value has to be quantized and packed once rather than once
+    per feature -- the same hoist `histogram._accumulate_replica` documents.
+
+    **One read-modify-write per (row, slot).** The gradient and the hessian
+    share a cell, so the inner step is `cell += packed` and nothing else. On
+    the constant-hessian arm that is the entire inner loop; on the general arm
+    there is a second store into the count plane, which exists because
+    `Histogram` promises a per-bin count that LightGBM's histogram does not
+    have and its data partition cannot supply.
+
+    **The fold folds in place, and it is exact.** Blocks 1 upward are summed
+    into block 0's slice, which is then unpacked and dequantized. In Float64
+    that would be a summation order worth arguing about; in packed integers it
+    is the exact sum whatever order it runs in, so block 0 is simply the
+    accumulator and `MOJOTREES_CPU_ROW_BLOCKS` cannot move a cell.
+
+    **Unpacking is arithmetic, not addressing.** `cell >> HIST_BITS` is the
+    gradient (an arithmetic shift, so the sign survives) and `cell & mask` is
+    the hessian or the count. The low field is nonnegative by construction and
+    bounded by `histogram_bits_for_node`, which is exactly what makes the
+    shift recover the high field rather than a high field plus a borrow.
+
+    The tail group owning fewer than `GROUP` slots and the SIMD-lane slot
+    arrays are as in the Float64 kernel. The single scratch pointer is
+    load-bearing rather than stylistic: the packed rows and the private
+    histograms live in one `List[Int64]`, and two pointers carrying one origin
+    into a parallel closure is a thing Mojo refuses to compile, so the region
+    offsets are folded into every index instead.
+    """
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
+    var n_sub = row_count
+    var use_all = len(features) == 0
+    var n_groups = plan.group_count
+    var hist_off = n_sub
+    var count_off = n_sub + blocks * cells
+
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
+    var sp = scratch.unsafe_ptr().unsafe_bitcast[Scalar[CELL]]()
+    var qg = qgrad.unsafe_ptr()
+    var qh = qhess.unsafe_ptr()
+    var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
+    var bins_all_p = data.bins.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+    comptime W = 4 * simd_width_of[CELL]()
+    comptime SHIFT = Scalar[CELL](HIST_BITS)
+    comptime MASK = (Scalar[CELL](1) << SHIFT) - Scalar[CELL](1)
+    comptime ONE = Scalar[CELL](1)
+    comptime ZERO = Scalar[CELL](0)
+
+    # The gather, and the pack. `(g << HIST_BITS) | (h & MASK)` is
+    # `DenseBin::ConstructHistogramIntInner`'s `gradient_packed`, and the
+    # constant-hessian arm's `| 1` is theirs too. Elementwise over disjoint
+    # ascending blocks, so the buffer is identical at every task count.
+    def gather_packed(start: Int, end: Int) {imm}:
+        for i in range(start, end):
+            var r = rows_p.unsafe_load(i)
+            var g = qg.unsafe_load(r).cast[CELL]()
+            var low = ONE if const_h else (qh.unsafe_load(r).cast[CELL]() & MASK)
+            sp.unsafe_store(i, (g << SHIFT) | low)
+
+    dispatch_rows_with(settings, gather_packed, n_sub, 3 * n_sub)
+
+    def accumulate_units(u_start: Int, u_end: Int) {imm}:
+        for u in range(u_start, u_end):
+            var blk = u // n_groups
+            var grp = u - blk * n_groups
+            var r0 = blk * block_rows
+            var r1 = r0 + block_rows
+            if r1 > n_sub:
+                r1 = n_sub
+            var slot0 = grp * GROUP
+            var owned = n_active - slot0
+            if owned > GROUP:
+                owned = GROUP
+            # `base` indexes the block's private packed slice by active slot,
+            # `cbase` the count slice, `col` the binned matrix by feature id.
+            var base = SIMD[DType.int, GROUP](0)
+            var cbase = SIMD[DType.int, GROUP](0)
+            var col = SIMD[DType.int, GROUP](0)
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var f = (
+                        (slot0 + k) if use_all
+                        else feat_p.unsafe_load(slot0 + k)
+                    )
+                    base[k] = hist_off + blk * cells + (slot0 + k) * n_bins
+                    cbase[k] = count_off + blk * cells + (slot0 + k) * n_bins
+                    col[k] = f * n_rows
+
+            # Zeroing stays fused into the pass that fills the slice.
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var z0 = Int(base[k])
+                    var zb = 0
+                    while zb + W <= n_bins:
+                        sp.unsafe_store(z0 + zb, SIMD[CELL, W](0))
+                        zb += W
+                    while zb < n_bins:
+                        sp.unsafe_store(z0 + zb, ZERO)
+                        zb += 1
+                    if not const_h:
+                        var zc = Int(cbase[k])
+                        var cb = 0
+                        while cb + W <= n_bins:
+                            sp.unsafe_store(zc + cb, SIMD[CELL, W](0))
+                            cb += W
+                        while cb < n_bins:
+                            sp.unsafe_store(zc + cb, ZERO)
+                            cb += 1
+
+            if const_h:
+                # LightGBM's `USE_HESSIAN=false` arm, cell for cell: one add,
+                # and the low field of the accumulated cell is the row count.
+                for i_row in range(r0, r1):
+                    var r = rows_p.unsafe_load(i_row)
+                    var packed = sp.unsafe_load(i_row)
+                    comptime for k in range(GROUP):
+                        if k < owned:
+                            var c = Int(base[k]) + Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            sp.unsafe_store(c, sp.unsafe_load(c) + packed)
+            else:
+                for i_row in range(r0, r1):
+                    var r = rows_p.unsafe_load(i_row)
+                    var packed = sp.unsafe_load(i_row)
+                    comptime for k in range(GROUP):
+                        if k < owned:
+                            var bin = Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            var c = Int(base[k]) + bin
+                            sp.unsafe_store(c, sp.unsafe_load(c) + packed)
+                            var cc = Int(cbase[k]) + bin
+                            sp.unsafe_store(cc, sp.unsafe_load(cc) + ONE)
+
+    var acc_ops = plan.block_ops if plan.blocked() else plan.active_ops
+    dispatch_feature_ranges_with(
+        settings, accumulate_units, blocks * n_groups, acc_ops
+    )
+
+    var g_inv = 1.0 / scales.grad_units
+    var h_inv = 1.0 / scales.hess_units
+
+    # The fold, the unpack and the dequantization, in one pass per active
+    # slot. Blocks 1 upward are summed into block 0's slice and block 0 is
+    # then read out. Exact at every block count and in every order.
+    def fold_slots(s_start: Int, s_end: Int) {imm}:
+        for j in range(s_start, s_end):
+            var f = j if use_all else feat_p.unsafe_load(j)
+            var p0 = hist_off + j * n_bins
+            var c0 = count_off + j * n_bins
+            for blk in range(1, blocks):
+                var po = p0 + blk * cells
+                var i = 0
+                while i + W <= n_bins:
+                    sp.unsafe_store(
+                        p0 + i,
+                        sp.unsafe_load[width=W](p0 + i)
+                        + sp.unsafe_load[width=W](po + i),
+                    )
+                    i += W
+                while i < n_bins:
+                    sp.unsafe_store(
+                        p0 + i, sp.unsafe_load(p0 + i) + sp.unsafe_load(po + i)
+                    )
+                    i += 1
+                if not const_h:
+                    var co = c0 + blk * cells
+                    var b2 = 0
+                    while b2 + W <= n_bins:
+                        sp.unsafe_store(
+                            c0 + b2,
+                            sp.unsafe_load[width=W](c0 + b2)
+                            + sp.unsafe_load[width=W](co + b2),
+                        )
+                        b2 += W
+                    while b2 < n_bins:
+                        sp.unsafe_store(
+                            c0 + b2,
+                            sp.unsafe_load(c0 + b2) + sp.unsafe_load(co + b2),
+                        )
+                        b2 += 1
+
+            var out0 = f * n_bins
+            for b in range(n_bins):
+                var cell = sp.unsafe_load(p0 + b)
+                # Arithmetic shift for the signed high field, mask for the
+                # nonnegative low one. `histogram_bits_for_node` is what makes
+                # both exact: no carry ever crossed the boundary.
+                var gq = (cell >> SHIFT).cast[DType.int64]()
+                var lo = (cell & MASK).cast[DType.int64]()
+                # Written as a branch and not a conditional expression: the
+                # count plane is not allocated at all on the elided arm, so
+                # `sp.unsafe_load(c0 + b)` there would be a read past the end
+                # of the caller's scratch even if its value were discarded.
+                var cq = lo
+                if not const_h:
+                    cq = sp.unsafe_load(c0 + b).cast[DType.int64]()
+                gp.unsafe_store(out0 + b, Float64(gq) * g_inv)
+                hp.unsafe_store(out0 + b, Float64(lo) * h_inv)
+                cp.unsafe_store(out0 + b, Int(cq))
+
+    var fold_ops = plan.fold_ops if plan.blocked() else 3 * cells
+    dispatch_feature_ranges_with(settings, fold_slots, n_active, fold_ops)
+
+
+def build_histogram_subset_maybe_quantized(
+    mut out: Histogram,
+    mut pairs: List[Float64],
+    mut qscratch: List[Int64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    qgrad: List[Int64],
+    qhess: List[Int64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    decision: QuantDecision,
+    features: List[Int] = [],
+    const_hessian: Bool = False,
+    rounding: Int = ROUND_NEAREST,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> QuantBuildReport:
+    """The one entry point a node-level caller needs: quantized when the
+    round decided to be, Float64 when it did not.
+
+    **Off is not a special case of on, it is the untouched builder.** When
+    `decision` is `MODE_FLOAT` this calls
+    `histogram.build_histogram_subset_into_scratch`, unchanged, with the same
+    arguments it would have received had this function never existed, and
+    returns a float report. Nothing about the Float64 path is rewritten,
+    re-planned, or re-dispatched, so "bit-identical to today when off" is a
+    property of the control flow rather than of an argument about numerics,
+    and `tests/test_cpu_quantized_grad.mojo` establishes it with `to_bits()`
+    anyway.
+
+    `decision` comes from `decide_cpu_histogram` once per round and is not
+    re-derived per node, which is the same rule `decide` states: the bound is
+    checked against the worst node once, so two nodes of one tree cannot end
+    up on different lattices and sibling subtraction stays exact.
+
+    `qgrad`/`qhess` may be empty when the decision is float; they are not read.
+    """
+    if not decision.is_quantized():
+        build_histogram_subset_into_scratch(
+            out, pairs, data, grad, hess, rows, row_start, row_count,
+            features, const_hessian, settings,
+        )
+        return QuantBuildReport.floating(decision.reason)
+    return build_histogram_subset_quantized_into_scratch(
+        out, qscratch, data, qgrad, qhess, rows, row_start, row_count,
+        decision.scales, features, const_hessian, rounding, settings,
+    )
 
 
 # ---------------------------------------------------------------------------

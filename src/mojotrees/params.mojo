@@ -77,7 +77,9 @@ comptime SUPPORTED_KEYS = String(
     " cegb_penalty_split, linear_tree, linear_lambda, enable_bundle,"
     " max_conflict_rate, feature_pre_filter,"
     " data_sample_strategy, max_bin, alpha, fair_c,"
-    " tweedie_variance_power, device, use_missing"
+    " tweedie_variance_power, device, use_missing,"
+    " use_quantized_grad, num_grad_quant_bins, quant_train_renew_leaf,"
+    " stochastic_rounding"
 )
 
 # Parameters that name a real LightGBM feature this parser does not cover,
@@ -546,6 +548,30 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.extra.extra_trees = _parse_bool(key, value)
         elif key == "extra_seed":
             config.booster.tree.extra.extra_seed = _parse_int(key, value)
+        # LightGBM's quantized-training family. The four names and no others:
+        # LightGBM has no scale-rule, seed, or accumulator-width parameter,
+        # and this surface is exactly LightGBM's, so mojotrees's three extra
+        # decisions are `MOJOTREES_*` environment overrides instead of keys.
+        # `use_quantized_grad=true` parses and then fails validation with a
+        # sentence naming what is missing (`ExtraTreeParams.
+        # check_quantized_grad`), which is the package's refuse-rather-than-
+        # ignore rule; it is not accepted here and dropped later.
+        elif key == "use_quantized_grad":
+            config.booster.tree.extra.use_quantized_grad = _parse_bool(
+                key, value
+            )
+        elif key == "num_grad_quant_bins":
+            config.booster.tree.extra.num_grad_quant_bins = _parse_int(
+                key, value
+            )
+        elif key == "quant_train_renew_leaf":
+            config.booster.tree.extra.quant_train_renew_leaf = _parse_bool(
+                key, value
+            )
+        elif key == "stochastic_rounding":
+            config.booster.tree.extra.stochastic_rounding = _parse_bool(
+                key, value
+            )
         elif (
             key == "monotone_penalty"
             or key == "monotone_splits_penalty"
