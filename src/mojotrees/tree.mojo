@@ -88,7 +88,7 @@ from .efb import (
 from .histogram import (
     ConstHessianSettings,
     Histogram,
-    build_histogram_into,
+    build_histogram_into_scratch,
     build_histogram_subset_into_scratch,
     subtract_histogram_into,
 )
@@ -1398,9 +1398,15 @@ struct GrowScratch(Movable):
       times and paid the first-few-nodes cost 100 times. Held here, one pool
       serves a whole fit.
     - `pairs`, the gradient/hessian gather buffer
-      `histogram.build_histogram_subset_into_scratch` fills. The non-scratch
-      form allocates and frees it per node, which its own docstring says a
-      grower should not do.
+      `histogram.build_histogram_subset_into_scratch` fills, and behind it
+      the row-blocked kernel's private histograms. The non-scratch form
+      allocates and frees it per node, which its own docstring says a grower
+      should not do. `_hist_full` takes the same list for the root build,
+      where there is no gather and the partials sit at offset 0; that build
+      is reached once per tree and its share of this buffer is the whole
+      `apple_cpu_policy.MAX_ROW_BLOCK_SCRATCH_BYTES` budget at a large fit,
+      so holding it here is one allocation and one page-fault pass per fit
+      instead of one per tree.
 
     Neither buffer carries meaning between uses. A pooled histogram's
     contents are undefined on `take` and every `_into` builder writes every
@@ -1621,6 +1627,7 @@ def _expand_bundled(
 def _hist_full(
     mut hist: Histogram,
     mut scratch: Histogram,
+    mut pairs: List[Float64],
     data: BinnedMatrix,
     bundled: BundledMatrix,
     grad: List[Float64],
@@ -1655,16 +1662,36 @@ def _hist_full(
     the count before the builder returns, so `scratch` holds three complete
     planes by the time `_expand_bundled` reads it and the expansion sees
     exactly what it would have seen on the three-plane path.
+
+    `pairs` is the grower's scratch list, the same one `_hist_subset` hands
+    to the subset builder, and here it carries only the row-blocked kernel's
+    private histograms -- the whole-dataset builder reads its derivatives
+    sequentially and never gathers, so the `[0, n_sub)` prefix that
+    `_hist_subset` reserves for the gather has no counterpart on this path
+    and the partials start at offset 0. `build_histogram_into` is this call
+    with a fresh empty list in its place: it allocated
+    `plan.block_scratch_floats()` Float64 -- the whole
+    `MAX_ROW_BLOCK_SCRATCH_BYTES` budget at the root of a large fit -- and
+    zero-filled it once per tree, then freed it.
+
+    Nothing reads the zero fill. `_accumulate_blocked_at` zeroes each
+    `(block, group)` unit's private slice as the first thing that unit does,
+    and the fold reads only slices that pass zeroed, so the buffer's contents
+    on entry are irrelevant exactly as they are for `_hist_subset`. That is
+    the same contract `build_histogram_into_scratch` documents and the same
+    one the subset builder has relied on since the grower started holding
+    this list across nodes; the histogram that comes out is the one the
+    allocating form produced, cell for cell.
     """
     if not bundled.active:
-        build_histogram_into(
-            hist, data, grad, hess, features, const_hessian, settings,
+        build_histogram_into_scratch(
+            hist, pairs, data, grad, hess, features, const_hessian, settings,
             const_hessian_env,
         )
         return
-    build_histogram_into(
-        scratch, bundled.data, grad, hess, columns, const_hessian, settings,
-        const_hessian_env,
+    build_histogram_into_scratch(
+        scratch, pairs, bundled.data, grad, hess, columns, const_hessian,
+        settings, const_hessian_env,
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -2788,9 +2815,9 @@ def grow_tree_leaves_profiled(
         )
         var root_hist_started = profile.clock()
         _hist_full(
-            root_hist, bundle_scratch, data, bundling, grad, hess,
-            tree_features, tree_columns, const_hessian, scratch.settings,
-            const_h_env,
+            root_hist, bundle_scratch, scratch.pairs, data, bundling, grad,
+            hess, tree_features, tree_columns, const_hessian,
+            scratch.settings, const_h_env,
         )
         profile.note_node()
         profile.charge(
