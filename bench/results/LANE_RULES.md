@@ -60,6 +60,15 @@ product floor.
 - **your own test file(s), named explicitly, one at a time**:
   `bash tools/run_tests.sh cpu <your_test_name>`
 
+  **Run it once, after your last edit, and never a second file to confirm.**
+  For one or two files add `MOJOTREES_TEST_PKG=0`, which skips the package
+  build and compiles only the modules your test imports. Measured on one
+  49-test file, warm, interleaved, two repeats each: **0.75 s against 12.2 s**,
+  and at two files 5.4 s against 16.3 s. The package build pays for itself only
+  across several files, which is the suite case and not yours. It is also
+  skipped automatically now when nothing under `src/` has changed since the
+  last build, so a re-run of an unedited file costs about a second either way.
+
 **You may NOT run**, under any circumstance, without exception:
 - any test suite: `tools/run_tests.sh all|cpu|gpu` with no file named, or
   `pixi run test*`. **A suite counts as a compile** and invalidates the other
@@ -99,6 +108,19 @@ only there.
   of the index. Add by explicit path, always.
 - Do not merge your own branch anywhere. The orchestrator merges, one lane at
   a time, and runs the suites between merges.
+- **Run `source tools/lane_env.sh` once, before anything else.** A worktree
+  contains `pixi.toml`, so a bare `pixi run` treats it as its own project and
+  installs a second complete copy of the environment into `<worktree>/.pixi`,
+  about 1.1 GB, before it compiles a line. It also gives you your own empty
+  Mojo compile cache, because `MODULAR_HOME` follows the environment.
+  Measured 2026-08-16: 46 lane worktrees had done this, **49 GB** of
+  duplicated environments, with caches of 1.1 MB to 243 MB against the main
+  checkout's 8.7 GB. Every lane was starting cold and sharing nothing.
+  Sourcing that file points `PATH` and `MODULAR_HOME` at the main checkout's
+  environment, copies nothing, and declines with a message if your
+  `pixi.toml` differs from the main one. `tools/run_tests.sh` already does it
+  for you; the commands that need you to do it yourself are `pixi run
+  build-pkg` and any bare `mojo build`.
 
 ## File ownership, which is the only isolation this round has
 

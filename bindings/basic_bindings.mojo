@@ -90,6 +90,14 @@ def decide_device_workload(
     | `categorical` | the run declares categorical features (0/1) |
     | `has_missing` | the run uses missing handling (0/1) |
     | `uses_validation` | the run has an eval set (0/1) |
+    | `ordered_boosting` | `boosting_type='ordered'` (0/1) |
+    | `score_function` | `split.SCORE_L2` (0) or `split.SCORE_COSINE` (1) |
+
+    The last two are required keys, not optional ones, and that is the same
+    convention every other key here follows: `device_selection.py` is the only
+    sender and it always sends the whole mapping. A key read with a default
+    would let a stale sender silently mean "L2, plain boosting", which is the
+    answer that needs refusing.
 
     Returns the `key=value` lines `DeviceDecision.serialize` produces; see
     `serialize` in device_policy.mojo for the format and
@@ -138,6 +146,16 @@ def decide_device_workload(
             flag(workload["categorical"], "categorical"),
             flag(workload["has_missing"], "has_missing"),
             flag(workload["uses_validation"], "uses_validation"),
+            # Keyword-passed because they sit past ten positional arguments,
+            # which is further than anything in this module has been carried;
+            # `bundling`, `linear_tree` and `forced_splits` sit between them
+            # and `uses_validation` in the native signature and are NOT sent
+            # from Python, so passing these two positionally would bind them
+            # to those three instead. That failure compiles and answers.
+            ordered_boosting=flag(
+                workload["ordered_boosting"], "ordered_boosting"
+            ),
+            score_function=Int(py=workload["score_function"]),
         )
     )
 

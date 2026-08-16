@@ -38,7 +38,13 @@ run_gate() {
     parity)       "$PY" tools/check_parity.py ;;
     pixi)         "$PY" tools/check_pixi_tasks.py ;;
     connectivity) "$PY" tools/connectivity_audit.py ;;
-    integration)  "$PY" tools/audit_integration.py ;;
+    # --strict, so an unrecorded disconnection FAILS here rather than being
+    # printed and passed over. Without it this gate exits 0 while printing
+    # the GAP it found, which makes the pre-commit hook report a problem and
+    # allow the commit anyway -- the exact report-but-do-not-fail shape this
+    # repository has now been caught by four times. CI runs it with the same
+    # flag (.github/workflows/ci.yml, connectivity-audit).
+    integration)  "$PY" tools/audit_integration.py --strict ;;
     *)            echo "unknown gate: $1" >&2; return 2 ;;
   esac
 }

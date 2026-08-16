@@ -36,8 +36,11 @@ against CatBoost source line by line and is almost certainly correct. It is
 *unreachable*, which is a different and much cheaper thing to check.
 """
 
+import json
 import pathlib
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -168,3 +171,43 @@ def test_the_orphan_list_is_a_twelfth_of_the_package():
 def test_every_listed_orphan_still_exists(name):
     """A row that names a deleted file is a row nobody has read in a while."""
     assert (_PKG / f"{name}.mojo").is_file()
+
+
+def test_orphan_list_agrees_with_the_connectivity_audit():
+    """`ORPHANS` and `tools/connectivity_audit.py` must name the same modules.
+
+    Both landed within an hour of each other, independently, against the same
+    problem, and they agreed on all thirteen -- which is reassuring exactly
+    once. After that they are two hand-maintained copies of one judgment, and
+    `docs/INTEGRATION_INVENTORY.md` has a standing section about what happens
+    to those: one gets updated, the other does not, and the question quietly
+    has two answers.
+
+    This does not merge them, because they are not the same artifact. The
+    `CLASSIFICATION` table carries a severity and an owner for the tooling and
+    the CI gate; `ORPHANS` carries the sentence a reader needs. What this
+    forbids is the two disagreeing about the *facts*, which is the part
+    neither of them gets to have an opinion about. Whichever one is stale, the
+    failure names it.
+
+    It shells out rather than importing, because `tools/connectivity_audit.py`
+    is a script and `--json` is the interface it documents.
+    """
+    proc = subprocess.run(
+        [sys.executable, "tools/connectivity_audit.py", "--json"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    audited = {
+        f["subject"] for f in json.loads(proc.stdout).get("orphans", [])
+    }
+    assert audited == set(ORPHANS), (
+        "ORPHANS and tools/connectivity_audit.py disagree. Only in ORPHANS: "
+        + (", ".join(sorted(set(ORPHANS) - audited)) or "none")
+        + ". Only in the audit: "
+        + (", ".join(sorted(audited - set(ORPHANS))) or "none")
+        + ". Update whichever is stale; docs/INTEGRATION_INVENTORY.md is "
+        "rendered from the audit and moves with it."
+    )

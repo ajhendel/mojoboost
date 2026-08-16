@@ -112,18 +112,31 @@ jobs:
       - name: pixi task manifest
         run: python3 tools/check_pixi_tasks.py
 
-  # Informational only. Logs the reachable-surface report so a lane's claim
-  # that its audit section improved can be checked from the PR. Non-blocking
-  # until docs/INTEGRATION_INVENTORY.md is caught up.
+  # Logs the reachable-surface report so a lane's claim that its audit
+  # section improved can be checked from the PR, and fails when a module no
+  # entry point reaches is not recorded in docs/INTEGRATION_INVENTORY.md.
+  #
+  # This was non-blocking "until docs/INTEGRATION_INVENTORY.md is caught up".
+  # It is caught up as of 2026-08-16, so the qualifier is spent and the job
+  # blocks. The reason for closing it rather than leaving it informational:
+  # the inventory went from two unrecorded orphans to eleven inside half an
+  # hour of lanes merging, and a report nobody is required to read does not
+  # slow that down. `--strict` makes a GAP exit 1, so a lane that lands an
+  # unreachable module classifies it in the same change.
+  #
+  # Being unreachable is NOT what this fails on. Landing a capability built
+  # and not yet wired is a legitimate and deliberate state in this repository;
+  # leaving it unrecorded is the thing that costs somebody a rediscovery. The
+  # fix for a red job here is one row in CLASSIFICATION and one in the
+  # inventory table, which `--table` prints for you.
   connectivity-audit:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Connectivity audit
         run: python3 tools/connectivity_audit.py
       - name: Integration inventory audit
-        run: python3 tools/audit_integration.py
+        run: python3 tools/audit_integration.py --strict
 
   # Manual benchmark profiles (workflow_dispatch) on x86-64 and ARM64.
   # lscpu flags show whether the x86 runner has avx2/avx512f, which is the

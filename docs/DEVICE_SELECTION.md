@@ -222,10 +222,33 @@ raises on it and `"auto"` takes the CPU:
 | `linear_tree` | `linear-tree` | linear leaves need the raw feature matrix and every GPU trainer takes a binned one; same function |
 | A forced-split document | `forced-splits` | applied by `tree.grow_tree` and nothing else; `_check_gpu_forced_splits` in `src/mojotrees/train_gpu.mojo` |
 | `MOJOTREES_CONST_HESSIAN_VERIFY=1` | `const-hessian-verify` | the audit walks the host hessian array, which only the CPU builders do; `_check_gpu_const_hessian_verify` there |
+| `boosting_type='ordered'` | `ordered-boosting` | the per-permutation rung planes are built in `src/mojotrees/ordered_boosting.mojo` and advanced by `boosting.train`; no device trainer builds them. Trainer halves: `_check_gpu_booster_params` and `_refuse_unhonored` in `train_gpu_sparse.mojo` |
+| `score_function` other than `L2` | `score-function` | the device split search computes `G^2/(H+lambda)` only, which is CatBoost's `score_function=L2`; no accelerator path evaluates the Cosine ratio |
 
-The last four arrived together on 2026-08-16 from the refusal sweep, and
-each of them was, until that day, accepted and silently not applied. The
-enumeration that found them is the next section.
+The four before the last two arrived together on 2026-08-16 from the refusal
+sweep, and each of them was, until that day, accepted and silently not
+applied. The enumeration that found them is the next section.
+
+**The last two arrived the same evening, by a different route, and the route
+is the point.** Neither was found by a sweep of the parameter surface, because
+on the morning of that day neither parameter could reach a fit: `params.mojo`
+refused `score_function` other than L2 by name, and `boosting_type` reached no
+trainer. The CatBoost reachability work removed both refusals at the Python
+surface, and **wiring a feature opened a hole in a gate that a different lane
+owned.** No reachability walk finds that: this gate is imported, is called on
+every fit, and was merely *blind* to the parameter it should have refused on.
+So the audit has two halves, not one -- is there code that reads this setting,
+**and** is there a gate that should refuse this combination, and can it see the
+parameter it would refuse on.
+
+Note on `score_function`: the block is written `!= SCORE_L2` rather than
+`== SCORE_COSINE`, so a third selector added later refuses the device instead
+of silently receiving an L2 answer. It is **not** waived when Cosine and L2
+provably agree. They have the same argmax at `lambda_l2 = 0`, but that identity
+is per node and per parent, and it breaks under a positive `lambda_l2` (the
+CatBoost-mode arm uses 3), under a leaf-wise queue comparing gains across
+parents, and beside `random_strength`, whose units Cosine changes. This gate
+sees none of those three.
 
 **Soft uncertainty** is a workload nobody has measured or documented as
 covered, most often an objective outside the set `device.mojo` names
@@ -362,7 +385,10 @@ measurement.
 
 **The table is native, not Python.** It lives in
 `crossover_rules()` in `src/mojotrees/device_policy.mojo`, carries
-`POLICY_VERSION = 6`, and holds two rules. The Python module no longer
+`POLICY_VERSION = 7`, and holds two rules. Version 7 added two blocks and
+moved no rule, so the table is unchanged from version 6; the bump exists
+because a request that sets `boosting_type='ordered'` or a non-L2
+`score_function` gets a different answer than it did under 6. The Python module no longer
 defines `RULES_VERSION`, `CROSSOVER_RULES`, or a `CrossoverRule` type at
 all: it formats the native decision and adds nothing to it, so a rule that
 existed only in Python would be a rule the Mojo API, the CLI, and the C API
