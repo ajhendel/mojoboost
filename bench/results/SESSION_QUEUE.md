@@ -390,3 +390,50 @@ of these is on the default 1M leaf-wise path, which is why none was taken.
   correctness-neutral simplification, not a performance change.
 - The session ledger charges `SLOT_GRAD` and `SLOT_HESS` separately. Bytes are
   still right; the allocation count those entries imply is now one high.
+
+---
+
+# The wave window, in order, when `cheap-sync` reports and the CPU wave merges
+
+One window. Interleaved where the harness supports it, five repeats, **medians**
+per the amended M0, and a `conditions` line on every row -- which now records the
+environment-driven arms, after a `gpu-device` arm with
+`MOJOTREES_GPU_TREE_RESIDENT=0` was found printing a line identical to one with
+it on, across a 0.75-second difference.
+
+1. **Canary calibration.** `pixi run bench-canary 7`. It refused itself once
+   already at 10.9 percent spread against its own 3 percent bar, which is the
+   instrument working; do not record a baseline it declines to give.
+2. **GPU headline, 1M / 250k / 50k against stock+det.** This is where 2.58
+   seconds at 1M becomes a number or does not.
+3. **Depthwise probe arm.**
+4. **K1's four arms, resident plane ON.** Only meaningful since
+   `enqueue_desc_child` began passing the tiling requests -- before that the tile
+   arms reached one node in sixty-one. Note K3's arm design assumed
+   `feature_group = 1` is shipping; **it is 2 on Metal**, so arm A is not the
+   shipping configuration.
+5. **K2 speculation on/off**, at 50,000 and 1,000,000 separately. The registered
+   condition binds: the launch-shape gain must beat the wasted work in a **whole
+   fit**, not a phase.
+6. **`cheap-sync`'s readback arms.**
+7. **Queue depth on/off.**
+8. **Atomic-fraction arms.**
+
+## After the window, before any new lane opens
+
+Report: **merged / moved / blocked**, one line each, and the one number that
+matters -- **GPU against stock+det at three shapes, with accuracy beside it**.
+Speed and accuracy are reported together against one comparator or not at all.
+
+## Bucket line, required on every brief from here
+
+Every lane brief states its bucket, and nothing outside these three launches:
+
+- **A -- speed**
+- **B -- accuracy**
+- **C -- comparison validity**
+
+The third exists because four of this week's most consequential findings were in
+it: the throttled comparator, the `force_row_wise` pin, the inverted binning pin,
+and the conditions line that could not distinguish two arms differing by 0.75
+seconds.
