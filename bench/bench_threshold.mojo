@@ -33,7 +33,7 @@ def _timed_builds(
     data: BinnedMatrix, grad: List[Float64], hess: List[Float64], reps: Int
 ) raises -> Float64:
     var hist = build_histogram(data, grad, hess)  # warm-up
-    _ = hist.grad[0]
+    _ = hist.grad_at(0)
     var t0 = perf_counter_ns()
     for _ in range(reps):
         hist = build_histogram(data, grad, hess)

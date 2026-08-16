@@ -115,11 +115,11 @@ def _identical(a: Histogram, b: Histogram) -> Bool:
     if a.n_features != b.n_features or a.n_bins != b.n_bins:
         return False
     for i in range(a.n_features * a.n_bins):
-        if a.grad[i] != b.grad[i]:
+        if a.grad_at(i) != b.grad_at(i):
             return False
-        if a.hess[i] != b.hess[i]:
+        if a.hess_at(i) != b.hess_at(i):
             return False
-        if a.count[i] != b.count[i]:
+        if a.count_at(i) != b.count_at(i):
             return False
     return True
 
