@@ -90,8 +90,8 @@ listed as unjudged rather than ranked. A 360-tree arm therefore has no path to
 a table beside a 100-tree competitor, and a reader who wanted to draw that
 comparison would have to build the table themselves.
 
-THE AUTO RATE, AND THE ONE COMBINATION THAT CANNOT BE BUILT
------------------------------------------------------------
+THE AUTO RATE, AND WHAT THE MODE SUPPLIES BESIDE IT
+---------------------------------------------------
 
 `T@auto` here means `auto_learning_rate=True` with `learning_rate` left
 unset, so the rate is derived by CatBoost's own formula from the train row
@@ -105,20 +105,37 @@ datasets, so the rate moves with rows and features as well as with T. An arm
 that carried a rate measured at another budget would be a different fit
 wearing this one's label.
 
-**`lambda_l2=3` and a derived rate cannot both be asked for today, and Base A
-therefore runs at `lambda_l2 = 0.0` rather than at CatBoost's 3.** CatBoost's
-gate (`options_helper.cpp:276-281`) fires only when `l2_leaf_reg` was never
-SET, where set is provenance and not a value, and
-`sklearn.py::_auto_learning_rate_knobs` reproduces that faithfully: naming
-`lambda_l2` closes the gate, and naming it beside an explicit
-`auto_learning_rate=True` raises. CatBoost gets both because its 3 arrives as
-a library default; mojotrees cannot, because an unset `lambda_l2` resolves to
-LightGBM's stock 0.0 and there is no symmetrictree mode default for it. See
-`UNREACHABLE["l2_3_with_auto_rate"]` for the two exits. The cost is not
-cosmetic: `sklearn.py` records that Cosine at `reg_lambda=0` collapses onto
-`sqrt` of the L2 score, so Base A's Cosine axis is close to degenerate at the
-l2 this arm can actually reach, and a reader must not take Base A as "CatBoost's
-shape" without that sentence.
+**Base A runs at `lambda_l2 = 3.0` AND a derived rate, both, and the way it
+gets both is the mode-defaults layer** (`params._apply_catboost_mode_defaults`
+on the string surface, `_Base._params`'s `l2_default` on the Python one, which
+is the surface this harness trains through). Under
+`grow_policy=symmetrictree` the mode supplies `learning_rate` 0.03,
+`reg_lambda` 3.0, a per-objective `leaf_estimation_iterations`,
+`random_strength` 1.0 on the CPU, and `max_depth` 6 when none was given. Every
+one of them is supplied with `TOption::SetDefault` semantics: the value is
+assigned and the provenance flag is NOT raised, exactly as CatBoost does it
+(`catboost_options.cpp:302`), so the two of them that are keys of the
+automatic-learning-rate gate do not close it. The demonstrated behavior is a
+symmetric fit with nothing named deriving 0.29699 and recording
+`auto_lr_gate_open` while carrying `l2_leaf_reg = 3.0`.
+
+**So the arms must leave those keys UNNAMED, and that is the whole
+requirement.** A value a caller types arrives through `operator=`, raises the
+flag, and pins the rate back to the constant 0.03 with
+`auto_lr_skipped:l2_leaf_reg` recorded. Base A therefore names none of
+`learning_rate`, `lambda_l2` or `leaf_estimation_iterations`, and it is
+CatBoost's regularizer that it runs at rather than LightGBM's.
+
+**This paragraph replaces a finding this lane reported and got wrong**, and
+the correction is recorded in `RESOLVED_SINCE` rather than quietly swapped:
+the first version of this file said the combination could not be built at all
+and drew the sharpest consequence from it, that Cosine at `reg_lambda = 0`
+collapses onto `sqrt` of the L2 score and Base A's Cosine axis therefore sat
+near its degenerate point. **That does not hold.** At `reg_lambda = 3` the
+score function is off the degenerate point outright, which is what
+`sklearn.py` says of exactly this configuration. The reasoning was correct on
+the tree it was taken from (`bda3b41`); the mode-defaults layer merged after
+it at `ad6c2b6`.
 
 WHAT IS NOT WIRED
 -----------------
@@ -146,11 +163,20 @@ FRONTIER_ID = "frontier-1"
 FRONTIER_VERSION = 1
 FRONTIER_REGISTERED = "lane/frontier-block, 2026-08-16"
 
-#: Repeats per cell. Five, ruled by Andrew, and the same five
-#: `COMPARISON_RUN_2026-08-16.md` ran: three is the minimum that shows a
-#: spread and twelve is the number the canary refused. A cell is one whole
-#: process, so cells = arms x REPEATS and nothing else.
-REPEATS = 5
+#: Repeats per cell. **Three, ruled by Andrew on 2026-08-16**, against the
+#: five this lane costed and the five `COMPARISON_RUN_2026-08-16.md` ran.
+#: Three is the minimum that shows a spread; twelve is the number the canary
+#: refused. A cell is one whole process, so cells = arms x REPEATS and
+#: nothing else, and repeats scale the wall clock linearly.
+#:
+#: **What three costs, stated because the choice was made against a price.**
+#: This repository resolves a margin by disjoint ranges rather than by
+#: medians -- Block A's headline stands because our slowest repeat beat
+#: LightGBM's fastest -- and three repeats makes a range easier to overlap.
+#: A 10 percent effect that five repeats would resolve may come back
+#: indistinguishable. The other cut this lane priced, dropping the 1000-tree
+#: arms, was DECLINED: they stay.
+REPEATS = 3
 
 #: Tree counts the competitor rows run at. Every mojotrees arm's tree count
 #: must appear here or its verdict has nothing to stand on: `verify.py`
@@ -336,18 +362,44 @@ BASES = {
         # written down look like nine arms nobody thought of.
         "devices": ("cpu", "gpu"),
         "device_reason": (
-            "CPU on every scenario, for two independent refusals. (1) MVS: "
-            "`model.fit` raises \"bootstrap_type is not implemented on the "
-            "GPU: train_gpu takes no bootstrap bundle and its round loop "
-            "never draws one\". (2) symmetric trees under Cosine: "
-            "`train_gpu` raises \"grow_policy=oblivious cannot be grown on "
-            "this device\" because `ExtraTreeParams.is_active()` is true "
-            "under `score_function != SCORE_L2` and "
-            "`oblivious_device_supported` declines on it. Lifting either one "
-            "alone does not move this arm to the accelerator"
+            "CPU on every scenario, for two independent refusals AT THIS "
+            "HEAD, and the two have different futures. (1) MVS: `model.fit` "
+            "raises \"bootstrap_type is not implemented on the GPU: "
+            "train_gpu takes no bootstrap bundle and its round loop never "
+            "draws one\". Nothing in flight changes that. (2) symmetric "
+            "trees under Cosine: `train_gpu` raises \"grow_policy=oblivious "
+            "cannot be grown on this device\" because "
+            "`ExtraTreeParams.is_active()` is true under `score_function != "
+            "SCORE_L2` and `oblivious_device_supported` declines on it. "
+            "**That one is being closed on branches that have not merged**, "
+            "`lane/cosine-device` (the device split search evaluating "
+            "Cosine) and `lane/oblivious-cosine` (a level's Cosine score as "
+            "one ratio rather than a sum of ratios). When they land, refusal "
+            "(2) goes and refusal (1) still keeps this arm on the CPU, so "
+            "the answer does not change and only the count of reasons does"
+        ),
+        "device_divergence_if_cosine_lands": (
+            "read this before scheduling a symmetric accelerator row later. "
+            "`random_strength` is a mode default that DECLINES on the GPU "
+            "(`_apply_catboost_mode_defaults` supplies 1.0 only when "
+            "`config.device == CPU_DEVICE`, because the per-tree scale is "
+            "computed by the dense CPU round loops and by nothing else). So "
+            "a symmetric GPU fit would carry `random_strength = 0.0` where "
+            "the CPU fit carries 1.0: same arm name, different regularizer, "
+            "different trees. That is a configuration difference and not a "
+            "backend difference, and a cpu-vs-gpu row that did not say so "
+            "would be comparing two arms while claiming to compare two "
+            "backends"
         ),
         "params": {
             "grow_policy": "symmetrictree",
+            # Named, and it is the one mode default this base states rather
+            # than inherits. `max_depth` is resolved from the VALUE and not
+            # from provenance -- -1 is the absence of a bound and not a depth
+            # -- and it is not one of CatBoost's four gate keys, so naming 6
+            # cannot close the derivation gate under either reading. It is
+            # here because a symmetric tree is bounded by its depth and by
+            # nothing else, and `BASE_PARAMS` carries -1.
             "max_depth": 6,
             "num_leaves": 64,
             "min_data_in_leaf": 1,
@@ -361,12 +413,30 @@ BASES = {
         "dataset_params": {"max_bin": 254},
         "env": {"MOJOTREES_DERIVATIVE_PRECISION": "float32"},
         "learning_rate": "auto",
+        #: Supplied by the mode, not by this dict, and the distinction is the
+        #: mechanism. Each of these is assigned with the provenance flag left
+        #: down, so the two that are gate keys leave the derivation open.
+        "mode_supplies": {
+            "reg_lambda": "3.0, CatBoost's l2_leaf_reg",
+            "learning_rate": (
+                "0.03, the constant this base does not use, because the "
+                "derivation fires and replaces it"
+            ),
+            "leaf_estimation_iterations": (
+                "CatBoost's per-objective count with the small-run stomp; 1 "
+                "under RMSE, which is what both dense rows are"
+            ),
+            "random_strength": "1.0, on the CPU only",
+            "max_depth": "6 when unnamed; this base names it anyway",
+        },
         "not_set": (
-            "learning_rate, because naming it closes CatBoost's gate and the "
-            "derived rate is the point of this base",
-            "lambda_l2, for the same gate. This base therefore runs at "
-            "lambda_l2 = 0.0 and NOT at CatBoost's 3. See "
-            "UNREACHABLE['l2_3_with_auto_rate']",
+            "learning_rate, lambda_l2 and leaf_estimation_iterations, all "
+            "three for one reason: a value a caller TYPES raises the "
+            "provenance flag and pins the rate back to the constant 0.03, "
+            "recorded as auto_lr_skipped:<key>. Left unnamed they arrive "
+            "from the mode with the flag down and the gate open. This base "
+            "therefore runs at CatBoost's lambda_l2 of 3.0 AND at a derived "
+            "rate, which is what CatBoost itself does",
         ),
     },
     "B": {
@@ -524,27 +594,26 @@ UNREACHABLE = {
         "'high_cardinality_categorical']). Separately, `score_function="
         "Cosine` refuses categorical features outright, because a category "
         "set is searched and scored with the L2 gain and only its winner "
-        "reaches the numerical scan. So the whole of Base A skips the "
-        "categorical row, and the categorical row measures Base B alone"
+        "reaches the numerical scan. **A third refusal joined these two with "
+        "the mode-defaults merge**: the mode now supplies `random_strength = "
+        "1.0` on the CPU, and `split.find_best_split` refuses a noised scan "
+        "beside any SEARCHABLE categorical feature, because noising one "
+        "winner per categorical column while every numerical candidate is "
+        "noised is a different regularizer wearing the same name. So the "
+        "whole of Base A skips the categorical row, on three unconditional "
+        "refusals rather than two, and the categorical row measures Base B "
+        "alone"
     ),
-    "l2_3_with_auto_rate": (
-        "`lambda_l2=3` and a derived learning rate cannot both be asked for. "
-        "CatBoost's gate fires only on an UNSET `l2_leaf_reg` "
-        "(options_helper.cpp:280) and `sklearn._auto_learning_rate_knobs` "
-        "reproduces that as provenance: naming `lambda_l2` closes the gate "
-        "silently under the mode default and RAISES beside an explicit "
-        "`auto_learning_rate=True`. CatBoost gets both because its 3 is a "
-        "library default; ours resolves an unset `lambda_l2` to LightGBM's "
-        "stock 0.0. Two exits, neither of them this lane's file: (1) the "
-        "estimator grows a symmetrictree mode default for `lambda_l2` the "
-        "way it already has one for `leaf_estimation_iterations` and "
-        "`boost_from_average` (`catboost_mode_defaults` in sklearn.py), "
-        "after which 3 arrives unnamed and the gate stays open; or (2) the "
-        "rate is taken from the CatBoost read-back at the MATCHING tree "
-        "count and passed explicitly, which needs "
-        "`catboost_readback_key` to carry `n_estimators` -- it carries "
-        "scenario, tier and variant only, so today the three competitor tree "
-        "counts would collide on one key"
+    "named_l2_pins_the_rate": (
+        "NOT a refusal by the trainer and not a skip that removes an arm: a "
+        "trap for whoever edits Base A. `lambda_l2=3` TYPED beside the "
+        "symmetric mode closes CatBoost's derivation gate "
+        "(options_helper.cpp:280) and pins the rate back to the constant "
+        "0.03, recorded as `auto_lr_skipped:l2_leaf_reg`, while the arm's "
+        "label still says `@auto`. The mode supplies the same 3.0 with the "
+        "provenance flag down and the gate open, so the correct action is to "
+        "name nothing. Kept in this table because the wrong version of it "
+        "cost this lane a finding: see RESOLVED_SINCE"
     ),
     "mvs_on_multiclass_and_sparse": (
         "not reached by this frontier and stated so that adding a scenario "
@@ -702,26 +771,72 @@ def _apply_subsample(params, fraction, kind):
     return params
 
 
-def _skip_for(base_id, device, axis, value, row):
+#: What the trainer can do, at the head this file was last checked against.
+#:
+#: Two of these are FALSE and are expected to become true, which is why they
+#: are flags and not sentences. Andrew has ruled that the frontier does not
+#: run until a symmetric-tree accelerator row can exist, so the plan has two
+#: cell counts -- what it is at this head, and what it becomes when the two
+#: merges land -- and both are computed from this dict rather than estimated.
+#: Re-check them after any rebase; `CAPABILITIES_CHECKED_AT` says against
+#: what.
+CAPABILITIES_AT_HEAD = {
+    "gpu_bootstrap": False,
+    "gpu_oblivious_cosine": False,
+}
+
+CAPABILITIES_CHECKED_AT = (
+    "1624647, 2026-08-16. `model.fit` still raises \"bootstrap_type is not "
+    "implemented on the GPU\", and `lane/cosine-device` and "
+    "`lane/oblivious-cosine` are both unmerged (checked with `git merge-base "
+    "--is-ancestor`). The mode-defaults merge at ad6c2b6 did fix the defect "
+    "where symmetric mode raised on every fit for want of a depth bound, and "
+    "that fix does not move either of these two: it made the mode usable at "
+    "all, on the backend that already had it"
+)
+
+#: Everything true when both merges land. Not a prediction about when.
+CAPABILITIES_WHEN_MERGED = {
+    "gpu_bootstrap": True,
+    "gpu_oblivious_cosine": True,
+}
+
+
+def _skip_for(base_id, device, axis, value, row, caps=None):
     """The declared reason this arm cannot run, or None.
 
     Every branch names a `UNREACHABLE` key rather than writing a second copy
-    of the sentence, so a reason that changes changes in one place.
+    of the sentence, so a reason that changes changes in one place. `caps`
+    decides which of the two accelerator refusals are live, so the same
+    enumeration answers both "what runs today" and "what runs once the two
+    merges land" without a second copy of the arm list.
     """
-    if base_id == "A" and device == "gpu":
-        return UNREACHABLE["base_a_on_gpu"]
+    caps = CAPABILITIES_AT_HEAD if caps is None else caps
     if base_id == "A" and row["scenario"] in (
         "high_cardinality_categorical", "categorical_missing"
     ):
+        # First, and unconditional: this one is not waiting on anything.
         return UNREACHABLE["symmetric_categorical"]
     if device == "gpu" and axis == "precision" and value == "float64":
+        # Also unconditional. The device has no Float64 to carry a derivative
+        # in, which is not a merge away.
         return UNREACHABLE["float64_on_gpu"]
+    if base_id == "A" and device == "gpu":
+        missing = [
+            name for name in ("gpu_bootstrap", "gpu_oblivious_cosine")
+            if not caps[name]
+        ]
+        if missing:
+            return UNREACHABLE["base_a_on_gpu"]
+        return None
     if device == "gpu" and axis == "subsample" and value[1] == "MVS":
-        return UNREACHABLE["mvs_on_gpu"]
+        if not caps["gpu_bootstrap"]:
+            return UNREACHABLE["mvs_on_gpu"]
+        return None
     return None
 
 
-def base_arms(row, base_id):
+def base_arms(row, base_id, caps=None):
     """Every arm of one base on one scenario row, base point included once.
 
     One axis at a time: each arm below differs from the base in exactly one
@@ -754,7 +869,7 @@ def base_arms(row, base_id):
                 _arm(
                     row, base_id, device, axis, value, params, dataset_params,
                     env, int(n_estimators), rate,
-                    _skip_for(base_id, device, axis, value, row),
+                    _skip_for(base_id, device, axis, value, row, caps),
                 )
             )
 
@@ -772,7 +887,7 @@ def base_arms(row, base_id):
                     f"{fraction}{'' if kind is None else '-' + kind}",
                     params, dataset_params, env,
                     int(base["params"]["n_estimators"]), base["learning_rate"],
-                    _skip_for(base_id, device, "subsample", value, row),
+                    _skip_for(base_id, device, "subsample", value, row, caps),
                 )
             )
 
@@ -786,7 +901,7 @@ def base_arms(row, base_id):
                     row, base_id, device, "max_bin", max_bin, params,
                     dataset_params, env,
                     int(base["params"]["n_estimators"]), base["learning_rate"],
-                    _skip_for(base_id, device, "max_bin", max_bin, row),
+                    _skip_for(base_id, device, "max_bin", max_bin, row, caps),
                 )
             )
 
@@ -800,7 +915,7 @@ def base_arms(row, base_id):
                     row, base_id, device, "precision", precision, params,
                     dataset_params, env,
                     int(base["params"]["n_estimators"]), base["learning_rate"],
-                    _skip_for(base_id, device, "precision", precision, row),
+                    _skip_for(base_id, device, "precision", precision, row, caps),
                 )
             )
     return out
@@ -873,12 +988,18 @@ def competitor_arms(row):
     return out
 
 
-def arms():
-    """Every arm of the frontier, runnable and skipped alike, in run order."""
+def arms(caps=None):
+    """Every arm of the frontier, runnable and skipped alike, in run order.
+
+    Run order is the window order: one scenario row per window, dense
+    synthetic first, real second, categorical third, which is `SCENARIO_ROWS`
+    as written. Andrew ruled that on 2026-08-16 and it costs nothing, because
+    the rows are independent and round-interleaving never spanned them.
+    """
     out = []
     for row in SCENARIO_ROWS:
         for base_id in ("A", "B"):
-            out.extend(base_arms(row, base_id))
+            out.extend(base_arms(row, base_id, caps))
         out.extend(competitor_arms(row))
     return out
 
@@ -996,6 +1117,55 @@ def estimate(all_arms=None):
     return {"rows": rows, "total": total}
 
 
+def projected():
+    """The plan once the two accelerator merges land, computed not guessed.
+
+    **This is the count Andrew will actually run**, because the frontier is
+    sequenced not to start until a symmetric-tree accelerator row can exist.
+    The arms are the same arms: only `CAPABILITIES_AT_HEAD` moves, so the
+    difference between the two counts is exactly the set of cells the two
+    merges unblock and nothing else.
+
+    Note what does NOT come back. Base A on the categorical row stays skipped
+    on three unconditional refusals, and `float64` on the accelerator stays
+    skipped because the device has no Float64 to carry a derivative in.
+    Neither is a merge away.
+    """
+    head = estimate(arms(CAPABILITIES_AT_HEAD))["total"]
+    merged = estimate(arms(CAPABILITIES_WHEN_MERGED))["total"]
+    return {
+        "at_head": {
+            "arms": head["arms"], "cells": head["cells"],
+            "skipped": head["skipped"],
+            "wall_s": head["wall_s"],
+        },
+        "when_merged": {
+            "arms": merged["arms"], "cells": merged["cells"],
+            "skipped": merged["skipped"],
+            "wall_s": merged["wall_s"],
+            "unpriced": merged["unpriced"],
+        },
+        "unblocked_arms": merged["arms"] - head["arms"],
+        "still_skipped": merged["skipped"],
+        "waits_on": (
+            "bootstrap_type on the accelerator (the other campaign's, in "
+            "flight) and score_function=Cosine on the device split search "
+            "plus a level's Cosine score as one ratio (`lane/cosine-device` "
+            "and `lane/oblivious-cosine`, both unmerged). Base A needs both; "
+            "Base B's two MVS arms need the first alone"
+        ),
+        "unpriced_warning": (
+            "the arms this unblocks are Base A on the accelerator, and "
+            "MEASURED_TRAIN_S_AT_100 has no entry for that cell because it "
+            "has never run. They are counted and NOT priced, so the "
+            "when_merged wall clock is a floor rather than an estimate. What "
+            "is knowable is a bound in the wrong direction: Base A on the "
+            "CPU is the slowest arm in the plan, and a device symmetric "
+            "grower exists to be faster than it"
+        ),
+    }
+
+
 def levers(all_arms=None):
     """What each way of making this cheaper would actually save.
 
@@ -1063,6 +1233,11 @@ def levers(all_arms=None):
 # ---------------------------------------------------------------------------
 # What has to change outside this lane before any of this can be scheduled.
 # ---------------------------------------------------------------------------
+#: **A separate lane is building all six of these.** They are recorded here
+#: because the plan cannot be scheduled without them and a reader has to know
+#: what "not runnable yet" consists of; they are NOT this lane's to build, and
+#: this lane is not building them. When they land, the arms become
+#: schedulable and the count in this file is reported again.
 WIRE_NOTES = {
     "arm_dimension": {
         "file": "bench/real_data/run.py, worker.py",
@@ -1102,18 +1277,20 @@ WIRE_NOTES = {
         "owner": "not this lane",
     },
     "per_cell_env": {
-        "file": "bench/real_data/run.py",
+        "file": "bench/real_data/run.py, python/mojotrees/sklearn.py",
         "note": (
-            "`derivative_precision` has no Python parameter at all: "
-            "`python/mojotrees/sklearn.py` has no such keyword, and the only "
-            "entry is `MOJOTREES_DERIVATIVE_PRECISION`, read by "
-            "`histogram.derivative_precision_narrows`. run.py already builds "
-            "a per-run env dict for the thread count; the precision axis "
-            "needs a per-CELL one. It must be unset again for a GPU cell, "
-            "because `check_device_derivative_precision` refuses a leftover "
-            "float64 there by name"
+            "`derivative_precision` has no Python parameter at this head: "
+            "`sklearn.py` has no such keyword and the only entry is "
+            "`MOJOTREES_DERIVATIVE_PRECISION`, read by "
+            "`histogram.derivative_precision_narrows`. **A separate lane is "
+            "making it a real keyword**, which is the better fix and removes "
+            "the per-cell environment question rather than answering it. "
+            "Whichever way it lands, a GPU cell must not inherit a float64 "
+            "setting from a CPU cell: "
+            "`check_device_derivative_precision` refuses a leftover one by "
+            "name, which is the behavior to keep"
         ),
-        "owner": "not this lane",
+        "owner": "not this lane, and a lane is on it",
     },
     "readback_key_has_no_tree_count": {
         "file": "bench/real_data/scenarios.py",
@@ -1127,17 +1304,70 @@ WIRE_NOTES = {
         ),
         "owner": "not this lane",
     },
-    "lambda_l2_mode_default": {
-        "file": "python/mojotrees/sklearn.py",
-        "note": (
-            "there is no symmetrictree mode default for `lambda_l2`, so "
-            "CatBoost's 3 cannot arrive unnamed and Base A runs at 0.0. "
-            "`catboost_mode_defaults` already carries exactly this idea for "
-            "`leaf_estimation_iterations` and `boost_from_average`. Until it "
-            "does, Base A is the shipped shape at LightGBM's regularizer and "
-            "its Cosine axis is near the degenerate point"
+}
+
+#: Findings this file made and had to withdraw, kept rather than deleted.
+#:
+#: A frontier that is honest about its gaps has to be honest about its
+#: mistakes in the same file, and a retracted claim that leaves no trace gets
+#: re-derived by the next reader from the same stale tree.
+RESOLVED_SINCE = {
+    "l2_3_with_auto_rate": {
+        "claimed": (
+            "that `lambda_l2 = 3` and a derived learning rate could not both "
+            "be asked for, so Base A would run at LightGBM's 0.0; and, as the "
+            "sharpest consequence, that Cosine at `reg_lambda = 0` collapses "
+            "onto `sqrt` of the L2 score and Base A's Cosine axis therefore "
+            "sat near its degenerate point"
         ),
-        "owner": "not this lane",
+        "wrong_because": (
+            "the mode-defaults layer merged at `ad6c2b6`, after the "
+            "`bda3b41` this lane branched from. "
+            "`params._apply_catboost_mode_defaults` and, on the surface this "
+            "harness actually trains through, `_Base._params`'s `l2_default` "
+            "supply `reg_lambda = 3.0` under `symmetrictree` with "
+            "`TOption::SetDefault` semantics: assigned, provenance flag left "
+            "down. Two of the four keys CatBoost's gate reads are among the "
+            "values supplied, so supplying them cannot close it. "
+            "Demonstrated by the lane that landed it: a symmetric fit with "
+            "nothing named derived 0.29699 and recorded `auto_lr_gate_open` "
+            "while carrying `l2_leaf_reg = 3.0`"
+        ),
+        "now": (
+            "Base A runs at `lambda_l2 = 3.0` AND a derived rate, and at "
+            "`reg_lambda = 3` the Cosine score function is off its "
+            "degenerate point outright. The requirement on the arms is only "
+            "that they NAME none of the gate keys, which is "
+            "UNREACHABLE['named_l2_pins_the_rate']"
+        ),
+        "how_it_happened": (
+            "a branch merged into the file this lane was reasoning about "
+            "while the lane held an older head. The reasoning was sound on "
+            "the tree it had. The check that would have caught it is `git "
+            "log --oneline -5` before re-deriving anything, which is now the "
+            "first line of this lane's rebase routine"
+        ),
+    },
+    "selfcheck_pandas": {
+        "claimed": (
+            "that `selfcheck.py` had one pre-existing failure, the CatBoost "
+            "categorical encoder unable to import pandas, and that this was "
+            "an environment gap in the repository"
+        ),
+        "wrong_because": (
+            "it was the INTERPRETER. `pixi run -e bench python "
+            "bench/real_data/selfcheck.py` passes; bare `python3` does not, "
+            "because pandas lives in the bench feature. The stash test this "
+            "lane ran was sound and proved what it could -- the failure was "
+            "not this lane's change -- and the step not taken was checking "
+            "whether the dependency existed at all under the right python"
+        ),
+        "now": (
+            "selfcheck prints `sys.executable` beside any import-shaped "
+            "failure as of `1624647`, so the next reader is told which "
+            "python could not import rather than left to conclude the "
+            "repository is broken. **Run it under the bench environment**"
+        ),
     },
 }
 
@@ -1214,8 +1444,12 @@ def plan():
         "unreachable": dict(UNREACHABLE),
         "interaction_check": dict(INTERACTION_CHECK),
         "wire_notes": dict(WIRE_NOTES),
+        "capabilities_at_head": dict(CAPABILITIES_AT_HEAD),
+        "capabilities_checked_at": CAPABILITIES_CHECKED_AT,
+        "resolved_since": dict(RESOLVED_SINCE),
         "arms": all_arms,
         "estimate": estimate(all_arms),
+        "when_gpu_symmetric_lands": projected(),
         "levers": levers(all_arms),
         "cannot_answer": [
             "one axis at a time from two bases is NOT a grid: no interaction "
@@ -1224,12 +1458,16 @@ def plan():
             "the fastest point named is the fastest AMONG THESE ARMS, which "
             "is weaker than the fastest configuration: a better point two "
             "axes away from both bases is invisible here",
-            "there is no symmetric-tree accelerator row anywhere in the "
-            "frontier, so 'both grow policies on both backends' is answered "
-            "for lossguide only",
-            "Base A runs at lambda_l2 = 0.0 and not at CatBoost's 3, so it "
-            "is the shipped grower at LightGBM's regularizer and its Cosine "
-            "score function sits near its degenerate point",
+            "AT THIS HEAD there is no symmetric-tree accelerator row, so "
+            "'both grow policies on both backends' is answered for lossguide "
+            "only. This is the one gap with a scheduled exit: the run is "
+            "sequenced behind the two merges that close it, and `projected()` "
+            "counts what they unblock. It is a gap in the plan's timing "
+            "rather than in its design",
+            "the four axes are read on the CPU for the symmetric policy and "
+            "on both backends for lossguide, so an axis effect that is "
+            "backend-specific under symmetric growth is invisible until "
+            "those merges land and the arms are re-costed",
             "the wall clock in this plan is estimated from ONE battery-powered "
             "window on one machine, and this repository has measured the "
             "same benchmark drifting two to three times between windows",
@@ -1296,16 +1534,42 @@ def render(payload, out):
     )
 
     out(
-        "\nAndrew's target is on the order of an hour or two per scenario at "
-        "five repeats. The dense synthetic row does NOT meet it and the "
-        "total is about five hours. The design is reported at its real cost; "
-        "these are the prices of the cuts, and none of them is applied:\n"
+        "\nTHE TWO CUTS ARE RESOLVED. Andrew ruled on 2026-08-16: three "
+        "repeats rather than five, taken, and it is the reason the total "
+        "above is what it is; the 1000-tree arms KEPT, declined; one "
+        "scenario row per window, which costs nothing because the rows are "
+        "independent and round-interleaving never spanned them. Order is "
+        "dense synthetic, then real, then categorical, and it is the order "
+        "SCENARIO_ROWS is written in.\n"
     )
-    options = payload["levers"]["options"]
-    for name, option in options.items():
-        wall = option["wall_s"]
-        cost = f"{_fmt_hms(wall)} total" if wall else "no change to the total"
-        out(f"  {name}: {cost}\n")
+    out(
+        f"  what three repeats cost: a margin here is resolved by disjoint "
+        "ranges rather than by medians, and three ranges overlap more "
+        "easily than five. A 10 percent effect five repeats would resolve "
+        "may come back indistinguishable.\n"
+    )
+    out(
+        f"  if the 1000-tree arms had been dropped instead: "
+        f"{_fmt_hms(payload['levers']['options']['drop_the_1000_tree_arms']['wall_s'])}"
+        " total. Declined, and not applied.\n"
+    )
+
+    projection = payload["when_gpu_symmetric_lands"]
+    out(
+        "\nWHEN THE TWO ACCELERATOR MERGES LAND, which is what this run is "
+        "sequenced behind:\n"
+    )
+    out(
+        f"  {projection['at_head']['arms']} arms / "
+        f"{projection['at_head']['cells']} cells today, becoming "
+        f"{projection['when_merged']['arms']} arms / "
+        f"{projection['when_merged']['cells']} cells, so the two merges "
+        f"unblock {projection['unblocked_arms']} arms. "
+        f"{projection['still_skipped']} arms stay skipped on refusals no "
+        "merge addresses.\n"
+    )
+    out(f"  waits on: {projection['waits_on']}\n")
+    out(f"  {projection['unpriced_warning']}\n")
 
     out("\nDECLARED SKIPS\n")
     counts = {}

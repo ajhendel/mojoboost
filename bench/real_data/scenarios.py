@@ -4526,15 +4526,21 @@ FRONTIER_ARMS_MODULE = "bench/real_data/frontier.py"
 #: substituting another count. `catboost_readback_key` is (scenario, tier,
 #: variant) and carries no tree count, so a run that puts CatBoost at more
 #: than one tree count on one cell writes every read-back to one key and the
-#: last one wins. Nothing reads it today -- no frontier arm takes the
-#: read-back route -- and it blocks the route that would let Base A carry
-#: CatBoost's l2 of 3 beside a derived rate. Named here rather than only in
-#: the frontier module because the key is defined here.
+#: last one wins. The frontier runs CatBoost at five tree counts per cell.
+#:
+#: Nothing in the frontier reads it -- no frontier arm takes the read-back
+#: route, because the mode-defaults layer means Base A derives its own rate
+#: while carrying CatBoost's l2 of 3 -- so this is a latent collision rather
+#: than a live defect. It is named here because the key is defined here, and
+#: because `mojotrees_catboost_mode` DOES take the read-back route: a frontier
+#: run that also scheduled that arm would hand it whichever tree count wrote
+#: last.
 FRONTIER_READBACK_LIMITATION = (
-    "catboost_readback_key carries no n_estimators, so three competitor tree "
-    "counts on one cell collide on one key. See frontier.WIRE_NOTES["
-    "'readback_key_has_no_tree_count'] and "
-    "frontier.UNREACHABLE['l2_3_with_auto_rate']"
+    "catboost_readback_key carries no n_estimators, so the frontier's five "
+    "competitor tree counts on one cell collide on one key. Latent while no "
+    "frontier arm reads it; live the moment a frontier run also schedules "
+    "mojotrees_catboost_mode. See frontier.WIRE_NOTES["
+    "'readback_key_has_no_tree_count']"
 )
 
 for _frontier_scenario in SCENARIOS:
