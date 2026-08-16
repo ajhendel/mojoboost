@@ -765,10 +765,18 @@ def fill_identity_rows(
     reaches the parallel path later than the partition does on the same `n` --
     deliberately, since a fill that fits in the dispatch overhead should stay
     on one core.
+
+    The length is taken without initializing the new elements, which is what
+    the caller's next act -- writing every one of them -- makes safe, and it
+    is worth a pass: `resize(n, 0)` writes `8 * n` bytes of zeros that the
+    fill then immediately overwrites, so the root list cost `16 MB` of stores
+    at a million rows where it needs `8 MB`. `Int` is trivially destructible,
+    so shrinking this way cannot leak, and no element is readable before the
+    fill covers it.
     """
     if n < 0:
         raise Error("row count must be nonnegative")
-    rows.resize(n, 0)
+    rows.resize(unsafe_uninit_length=n)
     if n == 0:
         return
     var p = rows.unsafe_ptr()
