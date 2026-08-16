@@ -10,6 +10,37 @@ amended by A2**. Every block carries a **canary line** and a regime label.
 
 ## The head, and the honest state of it
 
+**Updated 2026-08-16. The head has moved twice and is not yet final.**
+`a3cac1f` (below) was superseded by `174fd68`, which **did not compile** -- two
+`raises`-context errors from the CTR lane, merged unrun -- and then by
+`b47b939`, which does. `b47b939` is still not the run head: two more lanes (MVS
+0.8 forwarding into the CatBoost-mode arm, and CTR model serialization) are
+landing, and the run holds for the SHA that carries them. The sequence on that
+SHA is fixed: `build-python`, `--dry-run`, one smoke-tier pass at 5k x 20 so an
+arm that dies at fit dies there rather than in the window, canary, then the run.
+
+**Read `built_extension.stale_sources` in the record before reading any number
+in the table.** It was added at `b47b939` after this session found
+`python/mojotrees/_mojotrees.so` twenty-two hours stale with 76 `.mojo` files
+newer than it, which would have run both mojotrees arms against the previous
+day's binary with nothing in the record saying so. Above zero means the run did
+not execute the code its commit says it did. The block also carries the
+binary's sha256, so two records can be shown to have run the same *build* and
+not merely the same source commit.
+
+**Two harness defects were found in the hold, by reading rather than by
+measuring, and both are fixed.** `4eec7a9`: `build_matrix` nested repeat inside
+engine, so the runner executed every repeat of one arm and then every repeat of
+the next, putting the five arms in five different thermal windows on a machine
+measured drifting two to three times across windows that size -- with
+`mojotrees.gpu`, the headline row, sorting last. It would not have looked
+wrong, because each arm's spread stays tight inside its own window. Execution is
+now round-interleaved and the manifest records `arm_order`. `7e41e16`: the
+CatBoost-mode GPU skip led with a reason that a queued lane is about to delete;
+it now leads with the permanent one.
+
+---
+
 **`a3cac1f`** on `perf-round-2`, verified by `git cat-file -t`. Clean but for an
 uncommitted `pixi.lock`, which is the CatBoost dependency solving against a
 `pixi.toml` that already carries `catboost = ">=1.2"` at the committed head.
@@ -29,6 +60,20 @@ first-execution failure costs the cheapest row rather than the decision row.
 - **No pre-runs and no re-runs to confirm.** A row that fails is a result and
   gets reported as one.
 - **Twelve repeats only if the canary holds; otherwise five, said out loud.**
+  **Status, measured 2026-08-16 on `b47b939`: the canary refused the window and
+  no baseline was recorded.** `pixi run bench-canary 7` on a box with no mojo,
+  no pixi and no build anywhere, load 1.8, returned `cpu_spread_pct 15.9` and
+  `gpu_spread_pct 7.7` against a 3 percent calibration bar, and printed
+  `calibration_warning: ... Do not record these numbers`. They were not
+  recorded; `bench/canary_baseline.json` is still null, which is the correct
+  output and not a gap. The A1 capture says why and it is not a lane:
+  WindowServer at 14.6 percent, Chrome, VS Code, three `claude` processes.
+  **That is the ambient desktop, and waiting does not remove it.** So a canary
+  *ratio* is unavailable unless those applications are closed for the
+  calibration and kept closed through the run. Absent that, the run is five
+  repeats and the header states that no baseline could be established and why.
+  One retake remains unspent, per the rule, and it is reserved for the window
+  itself rather than for another calibration attempt.
 - **If the canary refuses the window, wait for a cool box and take it once
   more, and that is the last time.**
 - **Accuracy beside every speed number in the same table. Both or nothing.**
@@ -43,18 +88,53 @@ process; **the 50k row is dropped**; `--dry-run` first is permitted and is not
 a test; dense first, `high_cardinality_categorical` last; canary recorded,
 interleaved, twelve repeats if the canary holds else five and say so.
 
-**The consequence, which follows from `2de4102` and needs to be read before
-the arm list is trusted.** The CatBoost-mode arm is being set to CatBoost's
-real CPU defaults, and those include `score_function=Cosine`. The device split
-search computes `G^2/(H+lambda)` only, and rather than implement a second gain
-functional in a kernel that cannot be tested under the no-test order, this
-session refused it: `BLOCK_SCORE_FUNCTION`, with `device='auto'` routing to
-the CPU and an explicit `device='gpu'` raising.
+**A consequence was recorded here from `2de4102`, and it is WITHDRAWN. The
+block it describes is a defect, and the defect is this session's.** What was
+written, and believed, is kept below because the point of registering a plan
+before the data is that a later reader can see what was believed when:
 
-So **`mojotrees_catboost_mode` cannot run on the GPU.** Under `auto` it
-resolves to the CPU and the record will say `device_used=cpu`; under an
-explicit `gpu` it raises. "Us in CatBoost mode on both backends" is therefore
-a CPU row and an empty GPU cell.
+> The CatBoost-mode arm is being set to CatBoost's real CPU defaults, and
+> those include `score_function=Cosine`. The device split search computes
+> `G^2/(H+lambda)` only, and rather than implement a second gain functional in
+> a kernel that cannot be tested under the no-test order, this session refused
+> it: `BLOCK_SCORE_FUNCTION`, with `device='auto'` routing to the CPU and an
+> explicit `device='gpu'` raising. So `mojotrees_catboost_mode` cannot run on
+> the GPU.
+
+The first sentence is true. **The conclusion does not follow from it, and it
+was not checked before the block was written.** A GPU fit does not have to use
+the device split search:
+
+- `resolve_split_search` in `train_gpu.mojo` defaults to `SPLIT_SEARCH_HOST`.
+  The host scan **is** the default, and every refusal string in
+  `gpu_split_search.mojo` says so in as many words.
+- `train_gpu._device_search_semantics_supported` is a deliberately
+  non-raising AUTO gate. Its docstring: AUTO needs a non-raising eligibility
+  answer "so it can retain the fully featured host scan instead of failing a
+  fit."
+- `ExtraTreeParams.is_active()` names `score_function`, and its own docstring
+  states the consequence: the device-scan grower raises on it, while
+  `gpu_tree_tables` and `gpu_resident_round` decline the resident and
+  oblivious device trees and fall back to the host scan, "which reads the
+  field".
+- `_check_device_search_supported`, the raising check, is called at the head
+  of the device-scan grower, not at the head of the GPU trainer.
+
+So before the block, `device='gpu'` with `score_function=Cosine` **worked at
+defaults**: GPU histograms, GPU everything else, host split scan, Cosine
+honored correctly. The block replaced a correct GPU fit with a refusal, to
+prevent a wrong answer the existing gates were already preventing.
+
+**The arm set does not change, and neither does any number in this table.**
+`mojotrees_catboost_mode` is still a CPU row with an empty GPU cell, because
+CatBoost is CPU-only in this harness and that row has no counterpart to be read
+against on any device -- which is the ground `bench/real_data/run.py` now
+states first, ahead of the block, precisely so that removing the block does not
+silently add a column. The removal is queued for after the run under the same
+rule this file applies to the ordered-boosting hole below: the comparison head
+does not take unverified code, under a no-test order, to close a hole the run
+does not touch. That rule applies to this session's own mistakes or it is not a
+rule.
 
 **And that costs almost nothing, which was checked rather than assumed, after
 this session first wrote down that it cost a lot.** `CatBoostEngine.load` in
@@ -209,9 +289,18 @@ continuation; none is about the device.
 
 **This run does not reach it** -- `MOJOTREES_CATBOOST_MODE` sets no
 `boosting_type` -- and the comparison head must not take unverified code under a
-no-test order to close a hole the run does not touch. `a3cac1f` stands
-unchanged. Queued as a refusal block for when building resumes; the evidence is
-in `CPU_HANDOFF.md`.
+no-test order to close a hole the run does not touch. `a3cac1f` stood unchanged
+at the time this was written; the evidence is in `CPU_HANDOFF.md`.
+
+**Updated 2026-08-16: Andrew assigned it, and it was closed in `2de4102`**, as
+`BLOCK_ORDERED_BOOSTING` in `device_policy.mojo` plus trainer-side raises in
+`train_gpu.mojo` and `train_gpu_sparse.mojo`, wired through the bindings and
+`sklearn.py` so it is not another built-but-unreachable gate. That block is
+correct and stays. The `score_function` block added in the same commit is not,
+and is withdrawn above -- **one commit, two blocks, one right and one wrong**,
+which is worth recording as its own lesson: the two were written together,
+justified in the same paragraph, and reviewed as a pair, and being right about
+the first is exactly what made the second easy to believe.
 
 It is worth naming as a second category beside "modules nothing imports". A
 transitive reachability walk finds an unreachable module. **No walk finds a gate
