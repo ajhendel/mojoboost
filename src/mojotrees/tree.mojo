@@ -2674,6 +2674,30 @@ def grow_tree_leaves_profiled(
     var const_h_env = const_hessian_env.copy()
     if not const_h_env.resolved:
         const_h_env = ConstHessianSettings.resolve()
+    # The `derivative_precision` **parameter**, folded onto whichever
+    # snapshot we ended up with. This is the hop that makes the parameter and
+    # `MOJOTREES_DERIVATIVE_PRECISION` the same switch instead of two, and it
+    # sits here rather than at the trainers because this is the single point
+    # every dense CPU grower passes through: `boosting`, `alternate_boosting`
+    # (DART and GOSS-boosting), `boosting_rf`, `custom_metric`, `ranking`,
+    # `ranking_advanced` and `objective` all reach their histograms from
+    # below this line. Folding at each trainer instead would be seven edits
+    # that a new trainer could forget; folding here, a trainer cannot.
+    #
+    # `float64` from either entry wins -- see
+    # `histogram.ConstHessianSettings.widened` for why that direction and not
+    # the other. It applies on both arms above, the passed snapshot and the
+    # per-tree fallback, because a trainer that resolved one for the whole
+    # fit did not thereby decline the parameter.
+    #
+    # This is the histogram read side only. The objective side
+    # (`boosting.fill_grad_hess`) still reads the environment and takes no
+    # parameter, which is why `ExtraTreeParams.check_derivative_precision`
+    # still refuses `float64` set through the parameters: the two halves have
+    # to move together or the fit is a third thing that is neither arm.
+    const_h_env = const_h_env.widened(
+        params.extra.wants_float64_derivatives()
+    )
     var tree_features = select_tree_features(
         data.n_features,
         params.feature_fraction,
