@@ -810,6 +810,13 @@ class Dataset:
         self.params = {
             "max_bin": int(meta["max_bin"]),
             "use_missing": bool(meta["use_missing"]),
+            # Present so this dict has the same keys as a binned Dataset's
+            # and nothing reading it hits a KeyError. It is NOT a reading:
+            # `dataset_metadata` does not report the ctr source rule, and
+            # this Dataset wraps columns somebody else binned and will never
+            # re-bin them, so the value is the default rather than a fact
+            # about the handle.
+            "ctr": "auto",
         }
         self.free_raw_data = False
         self.keep_raw = bool(meta["has_raw"])
