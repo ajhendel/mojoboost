@@ -194,7 +194,10 @@ def check_params():
         if spec["task"] == "multiclass":
             spec = dict(spec)
         extra = {"num_class": 3} if spec["task"] == "multiclass" else None
-        lgb = scenarios.lightgbm_params(spec, 4, dict(extra or {}, bin_construct_sample_cnt=1000))
+        # No `bin_construct_sample_cnt` injected: this is the dict the
+        # adapter now builds, and the point of the two checks below is that
+        # nothing adds one.
+        lgb = scenarios.lightgbm_params(spec, 4, dict(extra or {}))
         mb = scenarios.mojotrees_params(spec, "cpu", extra)
         ds = scenarios.dataset_params(spec)
         check(lgb["num_threads"] == 4, f"{name}: lightgbm thread count did not survive translation")
@@ -239,15 +242,27 @@ def check_params():
                     f"{mb.get(canonical)!r}",
                 )
 
-        # mojotrees's numerical binner has no minimum-population rule, so
-        # this is the LightGBM setting that matches it. At LightGBM's
-        # default of 3 the two engines bin low-cardinality columns
-        # differently and mojotrees carries the extra bins.
+        # `min_data_in_bin` used to be pinned to 1 on the LightGBM side,
+        # because mojotrees's numerical binner had no minimum-population
+        # rule and LightGBM's default of 3 would have merged levels
+        # mojotrees kept. mojotrees's binner defaults to 3 now, so the pin
+        # is gone from LIGHTGBM_ALIGNMENT and both engines run stock: this
+        # check is not "is it 1" any more, it is "is neither side pinning
+        # it", which is what the two assertions below say. Reading
+        # `lgb["min_data_in_bin"]` here would now raise KeyError.
         check(
-            lgb["min_data_in_bin"] == 1,
-            f"{name}: lightgbm min_data_in_bin is "
-            f"{lgb['min_data_in_bin']!r}, not 1, so it is merging levels "
-            "that mojotrees keeps as separate bins",
+            "min_data_in_bin" not in lgb,
+            f"{name}: lightgbm min_data_in_bin is pinned to "
+            f"{lgb.get('min_data_in_bin')!r}; both binners default to 3 now, "
+            "so a pin here makes the comparator bin differently from us for "
+            "a reason this repository imposed",
+        )
+        check(
+            "bin_construct_sample_cnt" not in lgb,
+            f"{name}: lightgbm bin_construct_sample_cnt is pinned to "
+            f"{lgb.get('bin_construct_sample_cnt')!r}; both engines sample "
+            "200,000 rows by default, so a pin here is inverted rather than "
+            "dropped and buys us binning time the stock comparison does not",
         )
         if spec["task"] == "ranking":
             for key in ("lambdarank_truncation_level", "sigmoid", "lambdarank_norm"):

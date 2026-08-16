@@ -129,12 +129,34 @@ def test_use_missing_false_bins_nan_as_zero() raises:
 
 
 def test_clean_data_binning_is_unchanged() raises:
-    # With missing support on but no NaN anywhere, binning must be exactly
-    # what it was before: 8 distinct values into 8 bins is still the identity.
+    # What "unchanged" means here is *unchanged by missing support*: this
+    # test belongs to `use_missing`, not to the quantile rule. So the claim
+    # is stated as the comparison it always was in spirit -- a column with no
+    # NaN in it must bin identically whether missing support is on or off,
+    # and must reserve no bin -- and it is asserted at the stock defaults, so
+    # it keeps meaning something as those defaults move.
     var features: List[Float64] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
-    var mapper = fit_bins(features, n_rows=8, n_features=1, max_bins=8)
-    assert_equal(mapper.missing_bin[0], -1)
-    var data = mapper.transform(features, 8)
+    var on = fit_bins(features, n_rows=8, n_features=1, max_bins=8)
+    var off = fit_bins(
+        features, n_rows=8, n_features=1, max_bins=8, use_missing=False
+    )
+    assert_equal(on.missing_bin[0], -1)
+    assert_equal(off.missing_bin[0], -1)
+    assert_equal(len(on.edges), len(off.edges))
+    for i in range(len(on.edges)):
+        assert_equal(on.edges[i].to_bits(), off.edges[i].to_bits())
+
+    # And the identity itself, which is a statement about the edge rule and
+    # therefore about `min_data_in_bin=1`: eight distinct values into eight
+    # bins is one bin per level. At the stock minimum of 3 these eight
+    # singleton levels merge three at a time and the identity is not the
+    # expected answer any more (see `test_quantile_binning_identity` in
+    # tests/test_mojotrees.mojo, which asserts what the default does).
+    var one = fit_bins(
+        features, n_rows=8, n_features=1, max_bins=8, min_data_in_bin=1
+    )
+    assert_equal(one.missing_bin[0], -1)
+    var data = one.transform(features, 8)
     for r in range(8):
         assert_equal(data.bin_at(r, 0), r)
 

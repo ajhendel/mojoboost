@@ -128,14 +128,25 @@ whose two engines report different digests before it looks at anything else.
 down.** `scenarios.py` sets `lambda_l2` explicitly because the two defaults
 differ, disables exclusive feature bundling because mojotrees has none,
 disables LightGBM's feature pre-filter because it deletes columns at Dataset
-build time, raises `bin_construct_sample_cnt` to the training row count
-because LightGBM otherwise builds its bin edges from a 200000-row subsample
-while mojotrees bins from every row, and sets `min_data_in_bin` to 1 because
-mojotrees's numerical binner has no minimum-population rule and LightGBM's
-default of 3 would merge low-cardinality levels that mojotrees keeps apart.
-That last one moves LightGBM onto our rule and leaves us with the larger bin
-counts, so it makes the comparison stricter against us rather than laxer.
-Each one is justified where it is set. Threads are matched by count rather
+build time, and leaves the two binning population settings alone.
+
+Those two used to be pinned and are not any more, which is worth recording
+because the reasoning that justified the pins is the reasoning that now
+forbids them. `bin_construct_sample_cnt` was raised to the training row
+count, because LightGBM built its bin edges from a 200000-row subsample
+while mojotrees binned every row; `min_data_in_bin` was set to 1, because
+mojotrees's numerical binner had no minimum-population rule and LightGBM's
+default of 3 would have merged low-cardinality levels that mojotrees kept
+apart. Both pins moved LightGBM onto our rule, which made the comparison
+stricter against us rather than laxer, and both were correct while they
+held. mojotrees's binner now defaults to LightGBM's own 3 and 200000, so
+the same pins would move LightGBM *away* from a rule it already shares with
+us and make it do strictly more binning work than the subject does. They are
+inverted rather than merely stale, so they are gone and both engines bin
+stock. `feature_pre_filter` stays pinned off, because that one is still a
+real difference: LightGBM's `NeedFilter` is not implemented here.
+
+Each remaining alignment is justified where it is set. Threads are matched by count rather
 than by parameter name: LightGBM reads `num_threads`, mojotrees reads
 `MOJOTREES_NUM_WORKERS`, and the runner sets both from one number before
 either library is imported.
