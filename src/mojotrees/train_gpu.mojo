@@ -91,6 +91,124 @@ Which configurations the device round can serve is not decided here. That
 question has one answer in the package, `gpu_fused_round.round_eligibility`,
 and `device_gradients` below is the trainer's binding of it rather than a
 second list of blockers that could drift from it.
+
+Round trips per fit, which is the count that predicts time
+----------------------------------------------------------
+
+A **round trip** is host code that blocks on a device answer it needs before
+it can decide what to enqueue next. A **copy** is an `enqueue_copy` or a
+`synchronize`, which on Metal drains the queue (`docs/GPU_PORTABILITY.md`
+section 6.1, **measured** by disassembly) but which costs nothing when the
+queue holds nothing. Section 6.1.1 records why the two counts may not be
+added: removing thirteen copies per tree, about 1,300 per fit, **measured**
+0.016 seconds against a registered prediction of 0.64, while removing about
+thirty round trips per tree **measured** 0.75 in the same session on the same
+machine. Count round trips to predict time; count copies to predict
+portability risk and ordering hazards.
+
+Counted in source on 2026-08-16, over a whole fit rather than over one tree,
+because the per-tree counts this file kept were what hid the per-round ones.
+`R` is `n_estimators` and `K` is `n_classes`. The default shape this
+repository benchmarks is 1,000,000 x 50 with `R = 100`, squared error, no
+bagging and no GOSS, which resolves to device gradients and the
+device-resident split plane.
+
+  phase                                    round trips   default arm
+  ---------------------------------------  ------------  -----------
+  builder, searcher and table construction  0             0
+  per round, `magnitude_sums` readback      R             100
+  per round, `upload_gradients`             0             0
+  per tree, `download_desc_tables`          R             100
+  per tree, `update_raw_device`             0             0
+  per tree, `begin_tree`                    0             0
+  per round, device validation scorer       R             0, off
+  ---------------------------------------  ------------  -----------
+  total on the default arm                  2R            200
+
+Multiply by `K` for a multiclass fit, since a class is a tree and each pays
+both. **Estimated** at the ~458 microsecond per-round-trip constant
+**derived** from the depthwise A/B, 200 round trips is 0.09 seconds against a
+fit **measured** at about 2.58 seconds, or 3.5%. Each half on its own is
+about 0.046 seconds, which M0 does not resolve here: arm spreads run from
+0.02 in a quiet window to several tenths in a slow one, and the machine
+drifts two- to threefold between windows. Nothing was cut on the strength of
+this table and nothing should be until something can measure it.
+
+The two that remain, and what removing either would cost:
+
+  **The scale readback**, once per round on the device-gradient arm.
+  `GpuHistogramBuilder.fill_gradients_device` reduces `|grad|` and `|hess|` on
+  the device and the host folds the partials in Float64 into
+  `g_scale`/`h_scale`, which every histogram launch afterwards takes as a
+  launch argument. Nothing can be enqueued until that answer is home, so it
+  is a round trip and not a drain. Removing it means the scale living in a
+  device buffer that the quantization and histogram kernels read, which is
+  three files this one does not own, and it moves where the Float64 fold
+  happens, which is an accuracy question before it is a speed one.
+  `_train_multiclass_gpu_batched` is the only mitigation that exists: a batch
+  of classes reduces together, so a round pays one readback per batch instead
+  of one per class. It is opt-in and nothing has measured it.
+
+  **The tree download**, once per tree. `grow_tree_device_resident` enqueues
+  a whole tree and reads the tables once at the end; the host needs that tree
+  to append it to the ensemble and to hand its leaf values to
+  `update_raw_device`. Removing it means several trees resident at once,
+  which that docstring says would be a matter of indexing rather than of
+  restructuring. It also says no further lane should be spent on the control
+  plane it describes, and this table is the arithmetic behind that sentence
+  rather than an argument against it.
+
+What is **not** a round trip, checked rather than assumed, because all three
+have been reported as waits at some point:
+
+  `upload_gradients` on the host-gradient arm is one `synchronize` protecting
+  the staging arena and one copy. That synchronize runs after the previous
+  tree's download has already drained the queue, and no host decision reads a
+  device answer through it. `GpuObjectiveState.update_raw_ranges` is one copy
+  of the range descriptors and one launch per tree. `GpuActiveRows.begin_tree`
+  is one launch unbagged, and one synchronize plus one copy bagged.
+
+The contrast is the two paths the resident plane replaced, and it is what
+makes 2R a small number rather than a suspicious one.
+`_device_search_resident` downloads a frontier per split and decides the next
+split from what it read, which is `num_leaves` round trips per tree and 3,100
+per fit at the default budget; `grow_tree_gpu_profiled`'s host scan downloads
+a histogram per histogram it builds. Those are the counts a 0.75 second
+result came off, and there is no third such reduction left in this file.
+Under depth-wise growth `_device_search_resident` searches a whole planned
+level at once, which its docstring counts as 5 waits per tree rather than 30;
+that is the figure the resident plane's 1 already beats, and depth-wise is
+one of the configurations the plane refuses, so the 5 is what a depth-wise
+fit actually pays.
+
+Taking this census on a run rather than reading it here
+-------------------------------------------------------
+
+`MOJOTREES_PHASE_PROFILE` prints a `syncs` column per phase, and as of
+2026-08-16 every round trip in the table above increments it: the scale
+readback through `PROF_GRAD_FILL` and the resident plane's download through
+`PROF_TRANSFER`, the latter counted with no clock and no fence so that a
+count nobody timed is still true. Before that both read zero, the resident
+plane emitted no rows at all, and a profile could not tell a fit making one
+wait per tree from one making thirty-one. A wait count is the right first
+instrument here precisely because it does not need a quiet machine: it is a
+static property of the schedule, so it says whether a change is worth timing
+before anything is timed.
+
+Two blind spots remain around it, both outside this file and both worth
+naming here because this is where the census lives.
+`bench/bench_train_gpu.mojo`'s `arm_conditions` line records the trainer, the
+split strategy, the growth policy and the four launch shapes, and records
+none of the switches that decide the wait count: `MOJOTREES_GPU_TREE_RESIDENT`,
+`MOJOTREES_GPU_SPLIT_RESIDENT` and `MOJOTREES_GPU_OBJECTIVE` among them. Two
+arms whose round-trip counts differ thirty-fold print the same line, which is
+the same "conditions inherited from an environment variable" failure that
+docstring says has already cost this file a number once. It also records
+neither the gain form nor the fixed-point scale shape, which are the arms in
+this wave that change arithmetic rather than shape. A phase profile now
+distinguishes those arms by their `syncs` column even though the conditions
+line does not, which makes the profile the instrument to quote until the line
+is widened.
 """
 
 from std.math import log, min
@@ -1106,17 +1224,24 @@ def _grow_tree_gpu_device_search(
         # falls through to the loop below rather than being approximated.
         # See gpu_resident_round.mojo.
         #
-        # **It is not instrumented, and the default flip is what makes that
-        # matter.** `profile` is not threaded into it: it has no per-node
-        # host phases to time, because the whole point of it is that the
-        # host does not see the nodes. So a `PhaseProfile` of a
-        # device-search fit now comes back empty by default where it used to
-        # come back full, which is the honest failure rather than a wrong
-        # one, but it is a change in what the instrument covers and not only
-        # in what the trainer does. `MOJOTREES_GPU_TREE_RESIDENT=0` gets the
-        # instrumented loop back; the plane's own trace
-        # (`MOJOTREES_GPU_TREE_RESIDENT_TRACE`) is what replaces it, and a
-        # Metal timeline from outside the process is what sees the rest.
+        # **It is not timed, and it is now counted.** `profile` is not
+        # threaded into it and should not be: it has no per-node host phases
+        # to time, because the whole point of it is that the host does not
+        # see the nodes, and separating device phases needs fences that would
+        # measure the instrument. So a `PhaseProfile` of a device-search fit
+        # attributes none of the tree's time to a phase, which is the honest
+        # failure rather than a wrong one.
+        #
+        # What changed on 2026-08-16 is that it no longer comes back *empty*.
+        # The bracket below opens and closes the tree and charges the plane's
+        # one round trip, with no clock and no fence; see there for why one.
+        # An empty table could not distinguish a plane making one wait per
+        # tree from the loop below making thirty-one, which made the profile
+        # useless for the one question a control-plane lane asks of it.
+        # `MOJOTREES_GPU_TREE_RESIDENT=0` gets the fully instrumented loop
+        # back; the plane's own trace (`MOJOTREES_GPU_TREE_RESIDENT_TRACE`)
+        # is what replaces the per-node detail, and a Metal timeline from
+        # outside the process is what sees the rest.
         if resident_round_enabled():
             var why = resident_round_supported(
                 params, builder, cache.searchers[0].max_records
@@ -1126,7 +1251,33 @@ def _grow_tree_gpu_device_search(
             ):
                 why = RESIDENT_NO_POOL
             if why == RESIDENT_OK:
-                return grow_tree_device_resident(
+                # Counted, not timed, and the distinction is the whole of
+                # what this bracket claims. The plane takes no `profile` and
+                # will not: its phases are device phases and separating them
+                # needs fences, which would measure the instrument rather
+                # than the plane. But its **wait count** needs no clock and
+                # no fence, and a wait count is a static reproducible fact
+                # where a time on this machine is not. So the tree is opened
+                # and closed here for the wall total and the tree count, and
+                # exactly one `PROF_TRANSFER` charge is made with a zero
+                # start, which `PhaseProfile.charge` documents as charging
+                # the counts and no time.
+                #
+                # One, because `grow_tree_device_resident` makes exactly one
+                # round trip: `download_desc_tables` at the end, after every
+                # step is enqueued. The step trace can add one per step and
+                # is off unless a variable turns it on, which is why this
+                # counts the contract rather than reading a counter back out
+                # of the plane. What the report shows for a default fit is
+                # therefore `trees` trees, one transfer call and one sync
+                # apiece, and the whole of the tree's time in the
+                # unattributed remainder, which is true. Before this it
+                # showed nothing at all, and a census taken off the profile
+                # could not tell a fit that made one wait per tree from a
+                # fit that made thirty-one.
+                profile.begin_tree(n_root, builder.n_rows)
+                var resident_started = profile.clock()
+                var grown = grow_tree_device_resident(
                     builder,
                     cache.searchers[0],
                     split_params,
@@ -1134,6 +1285,9 @@ def _grow_tree_gpu_device_search(
                     tree_features,
                     n_root,
                 )
+                profile.charge(PROF_TRANSFER, n_root, 0, syncs=1)
+                profile.end_tree(resident_started)
+                return grown^
             if tree_index == 0:
                 # Once per fit rather than once per tree, and named down to
                 # the layer that refused.
@@ -1960,7 +2114,6 @@ def grow_tree_gpu(
     bag: List[Int] = [],
     tree_index: Int = 0,
     split_search: Int = SPLIT_SEARCH_AUTO,
-    data: BinnedMatrix = BinnedMatrix(List[UInt8](), 0, 0, 0),
 ) raises -> Tree:
     """`grow_tree_gpu` for a caller that grows one tree and keeps nothing.
 
@@ -1978,7 +2131,7 @@ def grow_tree_gpu(
     """
     var cache = GpuSplitSearcherCache()
     return grow_tree_gpu(
-        builder, cache, params, bag, tree_index, split_search, data=data
+        builder, cache, params, bag, tree_index, split_search
     )
 
 
@@ -1989,7 +2142,6 @@ def grow_tree_gpu(
     bag: List[Int] = [],
     tree_index: Int = 0,
     split_search: Int = SPLIT_SEARCH_AUTO,
-    data: BinnedMatrix = BinnedMatrix(List[UInt8](), 0, 0, 0),
 ) raises -> Tree:
     """`grow_tree_gpu` with a caller-owned searcher cache, profiled per tree.
 
@@ -1998,7 +2150,7 @@ def grow_tree_gpu(
     """
     var profile = PhaseProfile.from_env(SCOPE_TREE, String("grow_tree_gpu"))
     var tree = grow_tree_gpu_profiled(
-        profile, builder, cache, params, bag, tree_index, split_search, data
+        profile, builder, cache, params, bag, tree_index, split_search
     )
     profile.print_report()
     return tree^
@@ -2012,7 +2164,6 @@ def grow_tree_gpu_profiled(
     bag: List[Int] = [],
     tree_index: Int = 0,
     split_search: Int = SPLIT_SEARCH_AUTO,
-    data: BinnedMatrix = BinnedMatrix(List[UInt8](), 0, 0, 0),
 ) raises -> Tree:
     """Grow one tree, leaf-wise, with histogram accumulation and row
     partitioning on the GPU. Gradients for this round must already be
@@ -2063,13 +2214,18 @@ def grow_tree_gpu_profiled(
     accumulation under one scale makes a parent's bins the exact integer sum
     of its children's, so no split decision can tell which ran.
 
-    `data` is the caller's host-resident binned matrix. It existed for the
-    hybrid CPU/GPU leaf scheduler, which was deleted 2026-08-16 once the
-    device-resident tree plane beat the host path at every measured shape
-    (bench/results/session3_2026-08-16/RESULTS.md). No arm of this grower
-    reads it any more; the parameter is kept only so the callers threading
-    it are not rewritten in the same change, and it should go with the next
-    edit to this signature."""
+    There is no `data` parameter, and its absence is the record of something
+    this grower stopped needing. All three entry points took the caller's
+    host-resident `BinnedMatrix` for the hybrid CPU/GPU leaf scheduler, which
+    was deleted 2026-08-16 once the device-resident tree plane beat the host
+    path at every measured shape (bench/results/session3_2026-08-16). After
+    that deletion no arm read it, and it was kept for one commit only so the
+    seven call sites threading it were not rewritten in the same change; it
+    came out on 2026-08-16 with the round-trip census. A GPU grower that
+    needs the host matrix is a grower whose data plane is not on the device,
+    so a future edit that wants it back should say which arm needs it and
+    why, rather than restoring the argument. Every arm here reaches the bins
+    through `builder`, where they are already resident."""
     # Resolved once, kept whole, and printed under trace. The reason, the
     # normalized work, the threshold, and whether the workload sits exactly
     # on the crossover are the only record of why this fit is taking the
@@ -2604,11 +2760,23 @@ def _train_gpu_rounds[
                 refresh_bag(dev_bag, bagging, n, i)
                 var dev_grad_started = profile.clock()
                 builder.fill_gradients_device(state, objective, alpha)
-                # The device objective kernels. Enqueued, not waited for, so
-                # under `async` this charge is the enqueue and the work lands
-                # in whatever waits next; that is the same caveat the device
-                # histogram line carries.
-                profile.charge(PROF_GRAD_FILL, n, dev_grad_started)
+                # `syncs=1`, and the comment this replaced said the opposite.
+                # It read "enqueued, not waited for", borrowed from the device
+                # histogram line, and it was wrong about this call:
+                # `fill_gradients_device` enqueues the derivative kernels and
+                # then calls `magnitude_sums`, which reduces `|grad|` and
+                # `|hess|` on the device, copies the partials home and
+                # synchronizes, because the host folds them in Float64 into
+                # `g_scale`/`h_scale` and every histogram launch after this
+                # takes those as launch arguments. Nothing can be enqueued
+                # until the answer is home, so this is a **round trip** in the
+                # sense of `docs/GPU_PORTABILITY.md` section 6.1.1 and not a
+                # drain, and it is one of the two the module docstring's
+                # census counts. The clock stays as it was; what was missing
+                # was the count, so a wait census taken off a phase profile
+                # read zero here and the fit's most reducible round trip was
+                # invisible to the instrument that exists to find it.
+                profile.charge(PROF_GRAD_FILL, n, dev_grad_started, syncs=1)
                 profile.note_wall(dev_grad_started)
                 life.begin_tree()
                 var tree = grow_tree_gpu_profiled(
@@ -2619,7 +2787,6 @@ def _train_gpu_rounds[
                     dev_bag,
                     i,
                     split_search,
-                    data=data,
                 )
                 life.end_tree()
                 var dev_post_started = profile.clock()
@@ -2703,7 +2870,6 @@ def _train_gpu_rounds[
                 bag,
                 i,
                 split_search,
-                data=data,
             )
             life.end_tree()
             var post_started = profile.clock()
@@ -3018,7 +3184,6 @@ def _train_custom_gpu_rounds[
                 [],
                 i,
                 split_search,
-                data=data,
             )
             life.end_tree()
 
@@ -3246,7 +3411,6 @@ def _train_multiclass_gpu_batched[
                         [],
                         i * n_classes + k,
                         split_search,
-                        data=data,
                     )
                     life.end_tree()
                     guard.note_tree(k)
@@ -3379,7 +3543,6 @@ def _train_multiclass_gpu_rounds[
                         [],
                         i * n_classes + k,
                         split_search,
-                        data=data,
                     )
                     life.end_tree()
                     guard.note_tree(k)
@@ -3465,7 +3628,6 @@ def _train_multiclass_gpu_rounds[
                     bag,
                     i * n_classes + k,
                     split_search,
-                    data=data,
                 )
                 life.end_tree()
                 guard.note_tree(k)
@@ -3926,7 +4088,6 @@ def _train_gpu_valid_rounds[
                 bag,
                 i,
                 split_search,
-                data=data,
             )
             if renews:
                 _renew_leaf_values(
