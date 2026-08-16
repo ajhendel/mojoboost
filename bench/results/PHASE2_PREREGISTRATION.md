@@ -133,10 +133,37 @@ selects the GPU. A shipped-default bug, not a performance lane, and it ships now
   per tree. The chapter is closed and the docstrings say so.
 - **No depthwise-specific work.** It is a benchmark row and an opt-in under S2,
   and it becomes the commit rule inside the one plane rather than a second path.
-- **No int16 packing.** The repo's own bound `2^(W-1)-2` gives 32,766 safe rows
+- ~~**No int16 packing.**~~ **RETRACTED 2026-08-16, and the error was mine.**
+
+  The exclusion read: the repo's bound `2^(W-1)-2` gives 32,766 safe rows
   against a 1,000,000-row target, and packing makes overflow carry into the
-  neighbouring field, which destroys the modular-arithmetic argument that makes
-  sibling subtraction exact.
+  neighbouring field rather than wrap, destroying the modular-arithmetic
+  argument that makes sibling subtraction exact.
+
+  **The arithmetic is right and the conclusion does not follow, because the
+  bound is per NODE and I applied it to the fit.** LightGBM's quantized
+  histogram kernels pack grad and hess into one integer accumulator -- an int16
+  pair inside an int32 -- and select between 16-bit and 32-bit accumulation per
+  node via `HIST_BITS`. 32,766 rows is not a refutation of packing; it is
+  exactly the condition that selects the narrow variant. **Most nodes in a real
+  tree are far below it** -- the same fact that makes a layout change look
+  better at the root than where the work is.
+
+  And the overflow-carry objection dissolves under the same reading. It matters
+  only if overflow occurs. Under a respected per-node bound it does not, so
+  exactness needs no modular-arithmetic argument at all: there is simply no
+  wrap. The modular argument was load-bearing for the *unpacked* Int32 case
+  precisely because that case has no per-node guard.
+
+  Added to K3's option list as a **packed-pair variant**, bounded by LightGBM's
+  own rule, measured in the wave window beside K3's other arms. **If it does not
+  win end to end it does not ship**, per the standing rule that a phase win the
+  fit does not show is the row-tile floor again.
+
+  Filed here rather than quietly edited because it is the clearest example this
+  round of the failure mode amendment A5b names: a claim that was correct under
+  an assumption its author never stated -- here, that the bound is global -- and
+  therefore never invited anyone to test.
 - **No more hygiene lanes.** The last batch was six of them. Justified once,
   after the week this was; twice would be drift.
 - **Nothing touching CPU-campaign files** without a stop-and-report.
@@ -361,3 +388,19 @@ protocol.
 Two baselines get recorded rather than one: **pre-stock**, which is the reference
 for "did a precision change cost anything", and **post-stock**, which is the
 user-facing number.
+
+
+## Partial histograms are reduced over bin ranges, in parallel
+
+Source-verified from LightGBM: its per-thread partial histograms are reduced
+**in parallel over bin ranges**, not serially and not one thread per whole
+histogram. **If K3 or the tile path keeps partials, they are reduced the same
+way.**
+
+This bears directly on the tile question. The row-tile floor's measured loss (22
+percent at 50 features, 36 percent at 100) was attributed to per-tile
+zero-and-flush traffic; if the flush is a serial reduction where LightGBM's is a
+parallel range reduction, that is a candidate mechanism for the loss rather than
+evidence that tiling is wrong -- and it would mean the untested downward
+direction and the reduction shape are two separate questions that the earlier
+experiment confounded.
