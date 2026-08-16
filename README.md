@@ -177,14 +177,12 @@ indistinguishable rather than a win. Because the tree lives on the GPU,
 training leaves the other CPU cores free; LightGBM and CatBoost use all of
 them.
 
-The GPU-resident path is now the only GPU path. There is no host-scan
-alternative and no switch that chooses between them: the older loop and the
-profitability gate that guarded it were **deleted** (`b8d3b74`, `56dff16`)
-after a sweep found the device plane faster at every shape measured, from 100k
-to 700k rows, by **1.29x to 1.85x**, with the margin **widest at the smallest
-shape**. That is the opposite of what the gate assumed, so the gate was removed
-rather than re-tuned. Those figures are the justification for the deletion,
-not a current comparison: the arm they were measured against no longer exists.
+A sweep found the GPU-resident plane faster than the older host-scan loop at
+every shape measured, from 100k to 700k rows, by **1.29x to 1.85x**, with the
+margin **widest at the smallest shape**. That is the opposite of what the
+profitability gate guarding it assumed, so the gate is being removed rather
+than re-tuned, and the host-scan loop with it. **Both still ship as of this
+commit**; the removal is on a branch and is not in this tree.
 
 The CPU backend uses all cores and is the path for machines without an
 accelerator, for configurations the device refuses (sparse input, a custom
