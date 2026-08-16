@@ -1432,6 +1432,7 @@ def _plan_accumulation(
     n_bins: Int,
     n_rows_touched: Int,
     rows_are_indirect: Bool,
+    const_h: Bool = False,
 ) raises -> AccumulationPlan:
     """The one place a histogram build decides its shape.
 
@@ -1440,6 +1441,19 @@ def _plan_accumulation(
     `CpuProfile.detect()` that used to sit inside the argument list of every
     `derive_accumulation_plan` call is gone with it; with the sentinel it did,
     once, exactly as before.
+
+    `const_h` reaches the width clamp and nothing else. **All three callers
+    pass their real value**, which is the point: the parameter defaults to
+    `False` for the reporting helpers and the tests that have no objective to
+    hand, and a default that every call site took would leave the clamp
+    exactly as wrong as it was. See `apple_cpu_policy._cache_group`.
+
+    It cannot desynchronize the two builders. The width is a schedule; what
+    the two layouts must agree on is the *block count*, and that is derived
+    by `plan_row_block_count_at` from the row count, the bin count, the
+    active feature count and the amortization ratio -- `const_h` reaches none
+    of them, and `ROW_BLOCK_PLANES` stays at 3 unconditionally so the
+    allocation the count is bounded by does not move either.
     """
     return derive_accumulation_plan_with(
         settings.policy,
@@ -1448,6 +1462,7 @@ def _plan_accumulation(
         n_bins,
         n_rows_touched,
         rows_are_indirect,
+        const_h,
     )
 
 
@@ -1470,7 +1485,7 @@ def _accumulate_full[
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
     var plan = _plan_accumulation(
-        settings, n_features, n_active, n_bins, n_rows, False
+        settings, n_features, n_active, n_bins, n_rows, False, const_h
     )
 
     _zero_excluded(
@@ -2068,7 +2083,7 @@ def _accumulate_subset[
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
     var plan = _plan_accumulation(
-        settings, n_features, n_active, n_bins, n_sub, True
+        settings, n_features, n_active, n_bins, n_sub, True, const_h
     )
 
     _zero_excluded(
@@ -3586,7 +3601,7 @@ def _accumulate_subset_row_major[
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
     var plan = _plan_accumulation(
-        settings, n_features, n_active, n_bins, n_sub, True
+        settings, n_features, n_active, n_bins, n_sub, True, const_h
     )
 
     _zero_excluded(

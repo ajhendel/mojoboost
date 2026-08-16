@@ -119,8 +119,9 @@ comptime ARM_LGBM = 3
 # (`MOJOTREES_CPU_FEATURE_GROUP`) rather than by editing the constant, so a
 # result here is evidence about the floor without anybody having shipped a
 # change to it first.
-comptime ARM_GROUP8 = 4
-comptime ARM_GROUP16 = 5
+comptime ARM_GROUP4 = 4
+comptime ARM_GROUP8 = 5
+comptime ARM_GROUP16 = 6
 
 
 def _arm_name(arm: Int) -> String:
@@ -130,6 +131,8 @@ def _arm_name(arm: Int) -> String:
         return String("row")
     if arm == ARM_AUTO:
         return String("auto")
+    if arm == ARM_GROUP4:
+        return String("group4")
     if arm == ARM_GROUP8:
         return String("group8")
     if arm == ARM_GROUP16:
@@ -146,7 +149,7 @@ def _arm_layout_word(arm: Int) -> String:
     different interleave, so they export `feature`: leaving the layout at
     `auto` there would confound a width result with a layout result.
     """
-    if arm == ARM_GROUP8 or arm == ARM_GROUP16:
+    if arm == ARM_GROUP4 or arm == ARM_GROUP8 or arm == ARM_GROUP16:
         return String("feature")
     return _arm_name(arm)
 
@@ -159,6 +162,8 @@ def _arm_group_word(arm: Int) -> String:
     variable that a previous arm set is the classic way an A/B runs one arm
     under the other's label.
     """
+    if arm == ARM_GROUP4:
+        return String("4")
     if arm == ARM_GROUP8:
         return String("8")
     if arm == ARM_GROUP16:
@@ -173,6 +178,8 @@ def _arm_from_name(word: String) raises -> Int:
         return ARM_ROW
     if word == "auto":
         return ARM_AUTO
+    if word == "group4":
+        return ARM_GROUP4
     if word == "group8":
         return ARM_GROUP8
     if word == "group16":
@@ -183,7 +190,8 @@ def _arm_from_name(word: String) raises -> Int:
         String(
             'unknown arm "',
             word,
-            '"; expected feature, row, auto, group8, group16 or lightgbm',
+            '"; expected feature, row, auto, group4, group8, group16 or'
+            " lightgbm",
         )
     )
 
@@ -318,8 +326,13 @@ def _traffic_report(
     var stride = 2 if const_h else 3
     var pair_bytes = 8
     var blocks = plan_row_block_count(0, rows, n_bins, n_active, True)
+    # `const_h` is passed, and this is the line that makes the table describe
+    # the dispatch the kernel is actually making. Without it this reported
+    # width 4 while a squared-error fit ran width 8, which is precisely the
+    # "instrument describes a dispatch the kernels are not making" failure
+    # this function's docstring claims it cannot have.
     var group = plan_feature_group(
-        CpuProfile.detect(), n_bins, n_active, blocks
+        CpuProfile.detect(), n_bins, n_active, blocks, const_h
     )
     var groups = feature_group_count(n_active, group)
     var cells = n_active * n_bins
@@ -424,7 +437,7 @@ def main() raises:
     var n_features = 100
     var repeats = 12
     var seed = 0
-    var arm_words = String("feature,row,auto,group8,group16,lightgbm")
+    var arm_words = String("feature,group4,row,auto,lightgbm")
     if len(args) > 1:
         n_rows = Int(String(args[1]))
     if len(args) > 2:
@@ -527,7 +540,7 @@ def main() raises:
     for rep in range(repeats):
         for a in range(len(arms)):
             var arm = arms[a]
-            var seconds = 0.0
+            var seconds: Float64
             if arm == ARM_LGBM:
                 var t = perf_counter_ns()
                 _ = Int(py=lgbm.value().train())
@@ -651,8 +664,6 @@ def main() raises:
         var t1m = _plateau(samples[a], drop)
         var m0 = _median(t0m)
         var m1 = _median(t1m)
-        var s0 = 0.0
-        var s1 = 0.0
         var lo0 = t0m[0]
         var hi0 = t0m[0]
         for i in range(len(t0m)):
@@ -660,7 +671,7 @@ def main() raises:
                 lo0 = t0m[i]
             if t0m[i] > hi0:
                 hi0 = t0m[i]
-        s0 = hi0 - lo0
+        var s0 = hi0 - lo0
         var lo1 = t1m[0]
         var hi1 = t1m[0]
         for i in range(len(t1m)):
@@ -668,7 +679,7 @@ def main() raises:
                 lo1 = t1m[i]
             if t1m[i] > hi1:
                 hi1 = t1m[i]
-        s1 = hi1 - lo1
+        var s1 = hi1 - lo1
         var widest = s0 if s0 > s1 else s1
         var delta = m0 - m1
         var mag = delta if delta > 0.0 else -delta

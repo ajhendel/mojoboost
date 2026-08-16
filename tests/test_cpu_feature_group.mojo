@@ -54,6 +54,7 @@ from mojotrees.apple_cpu_policy import (
     TASK_BALANCE_FACTOR,
     cache_feature_group,
     cpu_profile,
+    private_cell_bytes,
     derive_accumulation_plan,
     describe_cpu_policy,
     dispatch_rounds,
@@ -319,6 +320,51 @@ def test_the_balance_rule_binds_before_the_cache_estimate() raises:
     # At 255 bins the cache estimate takes over above width 4, so a very wide
     # matrix stops at 4 however many features it has.
     assert_equal(plan_feature_group(machine, 255, 320), 4)
+
+
+def test_the_cache_clamp_sizes_the_private_cell_not_the_output_cell() raises:
+    """The clamp protects the cell the accumulate kernels read and write, and
+    under a constant hessian that is two Float64 rather than three.
+
+    This is a regression test for a defect, so it asserts both arms by
+    literal rung rather than asserting a relation between them. The clamp
+    used to size every fit with `HISTOGRAM_BYTES_PER_CELL`, which is 24 and
+    describes the *output* `Histogram`; the private cell in
+    `histogram._accumulate_blocked_at` is `ROW_BLOCK_CELL_FLOATS_CONST_H`
+    floats, which is 16 bytes, whenever the objective guarantees a constant
+    hessian. Squared error does, so the default objective was running an
+    interleave one rung narrower than its own working set allows, and the
+    width divides the number of times the accumulate re-walks the node's
+    row-id list and its gathered derivatives.
+
+    The three-plane arm is asserted too, and not as an afterthought: it is
+    the arm every caller without an objective still gets, and a fix that
+    silently widened it as well would have widened it past the working set
+    it really has.
+    """
+    _reset_env()
+    var machine = CpuProfile.synthetic(10, 4)
+    assert_equal(private_cell_bytes(False), 24)
+    assert_equal(private_cell_bytes(True), 16)
+    # 65536 / 2 = 32768 budget. 32768 / (255 * 24 = 6120) = 5 -> rung 4.
+    assert_equal(cache_feature_group(machine, 255, False), 4)
+    # 32768 / (255 * 16 = 4080) = 8 -> rung 8.
+    assert_equal(cache_feature_group(machine, 255, True), 8)
+    # It reaches the planner, with enough blocks that the balance rule does
+    # not bind first and enough features that the active floor does not
+    # either. This is the assertion that would have failed before the fix.
+    assert_equal(plan_feature_group(machine, 255, 100, 27, False), 4)
+    assert_equal(plan_feature_group(machine, 255, 100, 27, True), 8)
+    # At low cardinality the cache estimate was never what bound, so the
+    # correction changes nothing there and the two arms agree.
+    assert_equal(cache_feature_group(machine, 32, False), 16)
+    assert_equal(cache_feature_group(machine, 32, True), 16)
+    # An explicit request still bypasses the clamp at either cell size; the
+    # knob exists to test the estimate, so the estimate must not bound it.
+    _ = setenv("MOJOTREES_CPU_FEATURE_GROUP", "16")
+    assert_equal(plan_feature_group(machine, 255, 100, 27, False), 16)
+    assert_equal(plan_feature_group(machine, 255, 100, 27, True), 16)
+    _reset_env()
 
 
 def test_the_balance_rule_counts_block_group_units() raises:
