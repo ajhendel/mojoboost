@@ -23,9 +23,13 @@ become false and a deferred row cannot quietly stay false:
 10. every trainer that returns a booster passes the monotone constraints it
     trained under into it, rather than letting them fall back to the
     "no constraints" default
-11. the binning defaults are LightGBM's stock values and `fit_bins` still
-    defaults to them, and `feature_pre_filter=true` is still refused rather
-    than accepted without the feature deletion it names
+11. **every** default this library states is LightGBM's stock value, on
+    every surface that states one -- the `DEFAULT_*` constants, the four
+    hyperparameter structs, and the Python estimator signature -- with the
+    handful of deliberate divergences asserted *as* divergences so that
+    "fixing" one without retiring its reason fails too; `fit_bins` still
+    defaults to the constants; and `feature_pre_filter=true` is still
+    refused rather than accepted without the feature deletion it names
 
 Check 9 exists because check 7 has a blind spot: it only looks at rows that
 say `deferred` or `unsupported`, so a `partial` row can keep claiming a
@@ -1377,58 +1381,657 @@ def monotone_passthrough(problems):
         )
 
 
-#: The binning defaults that must be LightGBM's, as
-#: `(constant, value, the LightGBM parameter it is)`. mojotrees's defaults
-#: are LightGBM's stock defaults, so that a comparison between the two
-#: libraries at their own defaults is the comparison a user can act on.
-#: Drifting one back is a silent model change on every fit that says
-#: nothing, which is exactly the class of difference a reader cannot see.
-STOCK_BINNING_DEFAULTS = (
-    ("DEFAULT_MIN_DATA_IN_BIN", 3, "min_data_in_bin"),
-    ("DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT", 200_000, "bin_construct_sample_cnt"),
-    ("DEFAULT_DATA_RANDOM_SEED", 1, "data_random_seed"),
+#: LightGBM's stock default for every parameter mojotrees also defaults.
+#:
+#: Read from **microsoft/LightGBM `include/LightGBM/config.h` at tag
+#: v4.7.0**, and cross-checked against `docs/Parameters.rst` at the same
+#: tag, on 2026-08-16. `config.h` is the authority where the two could
+#: disagree: it is what the library compiles. `num_leaves` is the one entry
+#: config.h states indirectly, as `kDefaultNumLeaves`; its value of 31 is
+#: taken from `docs/Parameters.rst`.
+#:
+#: **mojotrees's defaults ARE LightGBM's stock defaults.** That is the
+#: policy, not an aspiration, and it is what makes "mojotrees against
+#: LightGBM, both at their own defaults" a comparison a reader can act on
+#: rather than two libraries answering two different questions. A default
+#: that drifts off this table is a silent model change on every fit that
+#: did not set the parameter, and it is invisible in a diff of results.
+#:
+#: This table used to hold three binning constants. It was widened on
+#: 2026-08-16, when `lambda_l2` was found sitting at 1.0 against LightGBM's
+#: 0.0 -- the third comparator-configuration defect this repository found
+#: in a week -- and the lesson taken was that checking the defaults anyone
+#: had thought to check is not a gate. Anything genuinely allowed to
+#: diverge goes in `STOCK_DIVERGENCES` with its reason and its exit
+#: condition, so a divergence is an argument on the page rather than an
+#: absence from a list.
+LIGHTGBM_STOCK = {
+    "num_leaves": 31,
+    "max_depth": -1,
+    "learning_rate": 0.1,
+    "num_iterations": 100,
+    "min_data_in_leaf": 20,
+    "min_sum_hessian_in_leaf": 1e-3,
+    "lambda_l1": 0.0,
+    "lambda_l2": 0.0,
+    "min_gain_to_split": 0.0,
+    "max_delta_step": 0.0,
+    "path_smooth": 0.0,
+    "monotone_penalty": 0.0,
+    "extra_trees": False,
+    "feature_fraction": 1.0,
+    "feature_fraction_bynode": 1.0,
+    "pos_bagging_fraction": 1.0,
+    "neg_bagging_fraction": 1.0,
+    "bagging_fraction": 1.0,
+    "bagging_freq": 0,
+    "max_bin": 255,
+    "min_data_in_bin": 3,
+    "bin_construct_sample_cnt": 200_000,
+    "data_random_seed": 1,
+    "feature_fraction_seed": 2,
+    "bagging_seed": 3,
+    "drop_seed": 4,
+    "objective_seed": 5,
+    "extra_seed": 6,
+    "top_k": 20,
+    "max_cat_to_onehot": 4,
+    "max_cat_threshold": 32,
+    "cat_smooth": 10.0,
+    "cat_l2": 10.0,
+    "min_data_per_group": 100,
+    "sigmoid": 1.0,
+    "lambdarank_truncation_level": 30,
+    "lambdarank_position_bias_regularization": 0.0,
+    "fair_c": 1.0,
+    "tweedie_variance_power": 1.5,
+    "drop_rate": 0.1,
+    "max_drop": 50,
+    "skip_drop": 0.5,
+    "uniform_drop": False,
+    "num_grad_quant_bins": 4,
+    "use_quantized_grad": False,
+    "stochastic_rounding": True,
+    "quant_train_renew_leaf": False,
+    "refit_decay_rate": 0.9,
+}
+
+#: Defaults that are deliberately NOT LightGBM's, asserted as divergent so
+#: that "fixing" one without retiring its reason fails here too. A silent
+#: convergence is as much a surprise as a silent divergence: the value in
+#: the second column is what the code says today and what the
+#: documentation is written against.
+STOCK_DIVERGENCES = {
+    "enable_bundle": (
+        True,
+        False,
+        "exclusive feature bundling changes the feature space before "
+        "binning, and mojotrees's EFB is not applied by every trainer yet "
+        "(the ranking trainer refuses an active bundling switch by name). "
+        "Off by default until it is; see the enable_bundle row of "
+        "docs/LIGHTGBM_PARITY.md",
+    ),
+}
+
+#: `(module, comptime constant, the LightGBM parameter it is)`, checked
+#: against `LIGHTGBM_STOCK` above. A constant named here that is not a
+#: plain literal, or a module that has moved, fails rather than being
+#: skipped.
+STOCK_COMPTIME_DEFAULTS = (
+    ("binning.mojo", "DEFAULT_MIN_DATA_IN_BIN", "min_data_in_bin"),
+    (
+        "binning.mojo",
+        "DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT",
+        "bin_construct_sample_cnt",
+    ),
+    ("binning.mojo", "DEFAULT_DATA_RANDOM_SEED", "data_random_seed"),
+    ("binning.mojo", "DEFAULT_MIN_DATA_IN_LEAF", "min_data_in_leaf"),
+    ("sampling.mojo", "DEFAULT_FEATURE_FRACTION_SEED", "feature_fraction_seed"),
+    (
+        "sampling.mojo",
+        "DEFAULT_POS_BAGGING_FRACTION",
+        "pos_bagging_fraction",
+    ),
+    (
+        "sampling.mojo",
+        "DEFAULT_NEG_BAGGING_FRACTION",
+        "neg_bagging_fraction",
+    ),
+    ("bagging.mojo", "DEFAULT_BAGGING_SEED", "bagging_seed"),
+    ("boosting_dart.mojo", "DEFAULT_DROP_RATE", "drop_rate"),
+    ("boosting_dart.mojo", "DEFAULT_MAX_DROP", "max_drop"),
+    ("boosting_dart.mojo", "DEFAULT_SKIP_DROP", "skip_drop"),
+    ("boosting_dart.mojo", "DEFAULT_DROP_SEED", "drop_seed"),
+    ("boosting_dart.mojo", "DEFAULT_UNIFORM_DROP", "uniform_drop"),
+    (
+        "ranking.mojo",
+        "DEFAULT_TRUNCATION_LEVEL",
+        "lambdarank_truncation_level",
+    ),
+    ("ranking.mojo", "DEFAULT_SIGMOID", "sigmoid"),
+    (
+        "ranking_advanced.mojo",
+        "DEFAULT_POSITION_BIAS_REGULARIZATION",
+        "lambdarank_position_bias_regularization",
+    ),
+    ("ranking_advanced.mojo", "DEFAULT_PAIR_SAMPLING_SEED", "objective_seed"),
+    ("distributed_strategies.mojo", "DEFAULT_TOP_K", "top_k"),
+    ("objective_registry.mojo", "DEFAULT_FAIR_C", "fair_c"),
+    (
+        "objective_registry.mojo",
+        "DEFAULT_TWEEDIE_VARIANCE_POWER",
+        "tweedie_variance_power",
+    ),
+    ("tree_parameters_extra.mojo", "DEFAULT_EXTRA_SEED", "extra_seed"),
+    (
+        "tree_parameters_extra.mojo",
+        "DEFAULT_NUM_GRAD_QUANT_BINS",
+        "num_grad_quant_bins",
+    ),
+    (
+        "quantized_gradient.mojo",
+        "DEFAULT_NUM_GRAD_QUANT_BINS",
+        "num_grad_quant_bins",
+    ),
+    ("efb.mojo", "DEFAULT_ENABLE_BUNDLE", "enable_bundle"),
 )
+
+#: `(module, struct, "how to read its defaults", {mojotrees field: LightGBM
+#: parameter})`. Three readers, because the three places a Mojo default can
+#: live are three different pieces of syntax:
+#:
+#:   "static"  a `@staticmethod def default()` whose body constructs the
+#:             struct; the arguments are zipped against the constructor's
+#:             parameter order, so an inserted field is caught rather than
+#:             shifting every check one place along
+#:   "signature"  a defaulted argument on `__init__`
+#:   "assign"  `self.x = <literal>` in a no-argument `__init__`
+STOCK_STRUCT_DEFAULTS = (
+    (
+        "tree.mojo",
+        "TreeParams",
+        "static",
+        {
+            "num_leaves": "num_leaves",
+            "min_data_in_leaf": "min_data_in_leaf",
+            "lambda_reg": "lambda_l2",
+            "min_child_hess": "min_sum_hessian_in_leaf",
+            "lambda_l1": "lambda_l1",
+        },
+    ),
+    (
+        "tree.mojo",
+        "TreeParams",
+        "signature",
+        {
+            "max_depth": "max_depth",
+            "feature_fraction": "feature_fraction",
+            "feature_fraction_bynode": "feature_fraction_bynode",
+        },
+    ),
+    (
+        "boosting.mojo",
+        "BoosterParams",
+        "static",
+        {
+            "n_estimators": "num_iterations",
+            "learning_rate": "learning_rate",
+        },
+    ),
+    (
+        "categorical.mojo",
+        "CategoricalParams",
+        "static",
+        {
+            "max_cat_to_onehot": "max_cat_to_onehot",
+            "max_cat_threshold": "max_cat_threshold",
+            "cat_smooth": "cat_smooth",
+            "cat_l2": "cat_l2",
+            "min_data_per_group": "min_data_per_group",
+        },
+    ),
+    (
+        "model_editing.mojo",
+        "RefitParams",
+        "static",
+        {"decay_rate": "refit_decay_rate"},
+    ),
+    (
+        "tree_parameters_extra.mojo",
+        "ExtraTreeParams",
+        "assign",
+        {
+            "min_gain_to_split": "min_gain_to_split",
+            "max_delta_step": "max_delta_step",
+            "path_smooth": "path_smooth",
+            "monotone_penalty": "monotone_penalty",
+            "extra_trees": "extra_trees",
+            "extra_seed": "extra_seed",
+            "use_quantized_grad": "use_quantized_grad",
+            "num_grad_quant_bins": "num_grad_quant_bins",
+            "quant_train_renew_leaf": "quant_train_renew_leaf",
+            "stochastic_rounding": "stochastic_rounding",
+        },
+    ),
+)
+
+#: The same defaults again on the Python surface, `{python name: LightGBM
+#: parameter}` per construct in `python/mojotrees/sklearn.py`.
+#:
+#: This half exists because the Mojo default and the Python default are two
+#: separate literals with nothing joining them, and **the Python one is what
+#: `bench/real_data` actually fits**: its mojotrees arm goes through
+#: `mojotrees.train`, which builds a `MojoTrees*` estimator, which resolves
+#: every unset hyperparameter from this signature and never reads
+#: `TreeParams.default()`. Changing the Mojo default alone would leave the
+#: headline comparison running our Python default against LightGBM's C++
+#: one, which is a worse state than the divergence being fixed. So both are
+#: checked, against one table.
+STOCK_PYTHON_CONSTANTS = {
+    "_LAMBDA_L1": "lambda_l1",
+    "_LAMBDA_L2": "lambda_l2",
+}
+
+STOCK_PYTHON_SIGNATURE = {
+    "num_leaves": "num_leaves",
+    "max_depth": "max_depth",
+    "learning_rate": "learning_rate",
+    "n_estimators": "num_iterations",
+    "min_data_in_leaf": "min_data_in_leaf",
+    "min_child_hess": "min_sum_hessian_in_leaf",
+    "max_bin": "max_bin",
+    "bagging_fraction": "bagging_fraction",
+    "bagging_freq": "bagging_freq",
+    "feature_fraction": "feature_fraction",
+    "feature_fraction_bynode": "feature_fraction_bynode",
+    "min_gain_to_split": "min_gain_to_split",
+    "max_delta_step": "max_delta_step",
+    "path_smooth": "path_smooth",
+}
+
+
+def _mojo_literal(token, constants):
+    """A Mojo literal as a Python value, or `None` if this gate cannot read
+    it. Names resolve through `constants` first, so a default written as a
+    named constant is checked as its value."""
+    token = token.strip()
+    if not token:
+        return None
+    if token in constants:
+        return constants[token]
+    if token == "True":
+        return True
+    if token == "False":
+        return False
+    plain = token.replace("_", "")
+    if re.fullmatch(r"[+-]?[0-9]+", plain):
+        return int(plain)
+    float_re = (
+        r"[+-]?(?:[0-9]*\.[0-9]*(?:[eE][+-]?[0-9]+)?"
+        r"|[0-9]+[eE][+-]?[0-9]+)"
+    )
+    if re.fullmatch(float_re, plain):
+        return float(plain)
+    return None
+
+
+def _mojo_constants(problems):
+    """Every `comptime NAME = <literal>` in the package, as Python values.
+
+    Two modules defining the same name with *different* values is reported
+    rather than resolved: the table below names constants by module, and a
+    reader who sees one name meaning two numbers is looking at a bug.
+    """
+    values = {}
+    for path in sorted((ROOT / "src" / "mojotrees").glob("*.mojo")):
+        for m in re.finditer(
+            r"^comptime\s+(\w+)\s*=\s*([^\n#]+?)\s*$", path.read_text(), re.M
+        ):
+            value = _mojo_literal(m.group(2), {})
+            if value is None:
+                continue
+            name = m.group(1)
+            if name in values and values[name] != value:
+                fail(
+                    problems,
+                    f"stock defaults: the constant {name} is defined with "
+                    f"two different values ({values[name]!r} and {value!r}); "
+                    "this gate cannot say which one a default means",
+                )
+            values[name] = value
+    return values
+
+
+def _top_level_split(args):
+    """Split a call's argument text on commas that are not inside brackets."""
+    out, depth, start = [], 0, 0
+    for i, ch in enumerate(args):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            out.append(args[start:i])
+            start = i + 1
+    out.append(args[start:])
+    return [a for a in out if a.strip()]
+
+
+def _ctor_param_names(block):
+    """The constructor's parameter names, in order.
+
+    An explicit `def __init__` wins; a `@fieldwise_init` struct has no
+    `__init__` to read, and its constructor is its field order.
+    """
+    m = re.search(r"def __init__\s*\(", block)
+    if m:
+        args = _call_args(block, m.end() - 1)
+        if args is None:
+            return []
+        names = []
+        for arg in _top_level_split(args):
+            arg = arg.strip()
+            if arg in ("self", "out self", "mut self"):
+                continue
+            arg = re.sub(r"^(?:var|owned|ref|mut|read)\s+", "", arg)
+            name = re.match(r"(\w+)", arg)
+            if name:
+                names.append(name.group(1))
+        return names
+    return re.findall(r"^\s+var\s+(\w+)\s*:", block, re.M)
+
+
+def _signature_defaults(block, constants):
+    """`{parameter: value}` for every `__init__` argument with a literal
+    default this gate can read."""
+    m = re.search(r"def __init__\s*\(", block)
+    if not m:
+        return {}
+    args = _call_args(block, m.end() - 1)
+    if args is None:
+        return {}
+    out = {}
+    for arg in _top_level_split(args):
+        parts = arg.split("=", 1)
+        if len(parts) != 2:
+            continue
+        name = re.match(r"\s*(?:var|owned|ref|mut|read)?\s*(\w+)", parts[0])
+        if not name:
+            continue
+        value = _mojo_literal(parts[1], constants)
+        if value is not None:
+            out[name.group(1)] = value
+    return out
+
+
+def _static_default_values(block, struct, constants):
+    """`{field: value}` from a `@staticmethod def default()` that
+    constructs the struct, zipped against the constructor's parameter
+    order so that an inserted field fails instead of shifting the check."""
+    offset = block.find("def default")
+    if offset < 0:
+        return None
+    m = re.search(r"(?<![\w.])" + struct + r"\s*\(", block[offset:])
+    if not m:
+        return None
+    args = _call_args(block, offset + m.end() - 1)
+    if args is None:
+        return None
+    names = _ctor_param_names(block)
+    out = {}
+    for i, arg in enumerate(_top_level_split(args)):
+        if "=" in arg and not re.match(r"\s*[-+0-9.]", arg):
+            key, _, raw = arg.partition("=")
+            key = key.strip()
+        elif i < len(names):
+            key, raw = names[i], arg
+        else:
+            continue
+        value = _mojo_literal(raw, constants)
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def _assigned_defaults(block, constants):
+    """`{field: value}` from `self.x = <literal>` in a no-argument
+    `__init__`."""
+    out = {}
+    for m in re.finditer(r"^\s+self\.(\w+)\s*=\s*([^\n#]+?)\s*$", block, re.M):
+        value = _mojo_literal(m.group(2), constants)
+        if value is not None:
+            out[m.group(1)] = value
+    return out
+
+
+def _same(got, want):
+    """Exact equality, with `1e-3` written as a float and `20` as an int
+    counting as equal to each other's spelling but not to a different
+    number. `True == 1` is refused, because a flag and a count are not the
+    same default."""
+    if isinstance(got, bool) != isinstance(want, bool):
+        return False
+    if isinstance(got, bool):
+        return got is want
+    return float(got) == float(want)
+
+
+#: Filled in by `_check_stock`, read by `stock_defaults` to prove the table
+#: above is a checklist rather than a wish list.
+_STOCK_PROBED: set[str] = set()
+
+
+def _check_stock(problems, where, mojo_name, lgbm_name, got):
+    _STOCK_PROBED.add(lgbm_name)
+    want = LIGHTGBM_STOCK[lgbm_name]
+    if not _same(got, want):
+        fail(
+            problems,
+            f"stock defaults: {where} defaults {mojo_name} to {got!r}, and "
+            f"LightGBM's {lgbm_name} is {want!r}. mojotrees's defaults are "
+            "LightGBM's stock defaults, which is what makes a both-at-their-"
+            "own-defaults comparison mean anything; change this back, or "
+            "move the parameter into STOCK_DIVERGENCES here with its reason "
+            "and its exit condition and argue it in "
+            "docs/LIGHTGBM_PARITY.md, in one commit",
+        )
 
 
 def stock_defaults(problems):
-    """The binning defaults are LightGBM's, and `fit_bins` still uses them.
+    """**Every** default this library states is LightGBM's stock value, on
+    every surface that states one, and `fit_bins` still uses the constants.
 
-    Two things, because either alone can be true while the package binns
-    something else. The constants are checked against the numbers above, and
-    `fit_bins`'s signature is checked to default to the *constants* rather
-    than to a literal, so a signature that drifted back to `= 1` would fail
-    here even with the constant left correct.
+    Four readings, because a default can be wrong in four independent
+    places and being right in three of them changes nothing:
+
+    1. the `comptime DEFAULT_*` constants across the package
+       (`STOCK_COMPTIME_DEFAULTS`)
+    2. the hyperparameter structs -- `TreeParams`, `BoosterParams`,
+       `CategoricalParams`, `ExtraTreeParams` -- read through their
+       `default()` bodies, their `__init__` signatures, and their `__init__`
+       assignments (`STOCK_STRUCT_DEFAULTS`)
+    3. the Python estimator signature, which is what `bench/real_data`
+       actually fits and which shares no literal with the Mojo side
+       (`STOCK_PYTHON_*`)
+    4. `fit_bins`, checked to default to the *constants* rather than to a
+       literal, so a signature that drifted back to `= 1` fails here even
+       with the constant left correct
+
+    This gate checked three binning constants until 2026-08-16. It was
+    widened the day `lambda_l2` was found defaulting to 1.0 against
+    LightGBM's 0.0 -- a divergence that had been *documented* for months,
+    in the README and in two rows of the contract, and was therefore not
+    hidden at all, merely never gated. Documentation is not a gate. That is
+    the whole argument for the size of the table above.
 
     `feature_pre_filter` is checked separately, by `feature_pre_filter_gate`.
     It is not a binning *default* on this side -- `fit_bins` defaults it to
-    `False` and has to, because `False` is the fit that preceded the option --
-    so it does not belong in the table above.
+    `False` and has to, because `False` is the fit that preceded the option.
     """
+    constants = _mojo_constants(problems)
+    src = ROOT / "src" / "mojotrees"
+    _STOCK_PROBED.clear()
+    divergences_probed = set()
+
+    # 1. the package's DEFAULT_* constants.
+    for module, name, lgbm in STOCK_COMPTIME_DEFAULTS:
+        path = src / module
+        if not path.is_file():
+            fail(
+                problems,
+                f"stock defaults: src/mojotrees/{module} is missing, so "
+                f"{name} cannot be checked against LightGBM's {lgbm}",
+            )
+            continue
+        m = re.search(
+            r"^comptime\s+" + name + r"\s*=\s*([^\n#]+?)\s*$",
+            path.read_text(),
+            re.M,
+        )
+        got = _mojo_literal(m.group(1), constants) if m else None
+        if got is None:
+            fail(
+                problems,
+                f"stock defaults: {name} is not defined in {module} as a "
+                "literal comptime, so this gate cannot read it",
+            )
+            continue
+        if lgbm in STOCK_DIVERGENCES:
+            divergences_probed.add(lgbm)
+            stock, declared, why = STOCK_DIVERGENCES[lgbm]
+            if not _same(got, declared):
+                fail(
+                    problems,
+                    f"stock defaults: {name} in {module} is {got!r}, and "
+                    f"STOCK_DIVERGENCES declares {lgbm} as {declared!r} "
+                    f"against LightGBM's {stock!r} because {why}. Either "
+                    "the declaration is stale or the default moved without "
+                    "it; settle which, in one commit",
+                )
+            continue
+        _check_stock(problems, module, name, lgbm, got)
+
+    # 2. the hyperparameter structs.
+    for module, struct, how, fields in STOCK_STRUCT_DEFAULTS:
+        path = src / module
+        if not path.is_file():
+            fail(
+                problems,
+                f"stock defaults: src/mojotrees/{module} is missing",
+            )
+            continue
+        block = None
+        for name, candidate in _struct_blocks(path.read_text()):
+            if name == struct:
+                block = candidate
+                break
+        if block is None:
+            fail(
+                problems,
+                f"stock defaults: struct {struct} is not in {module} any "
+                "more, so its defaults are unchecked",
+            )
+            continue
+        if how == "static":
+            values = _static_default_values(block, struct, constants)
+            where = f"{struct}.default() in {module}"
+        elif how == "signature":
+            values = _signature_defaults(block, constants)
+            where = f"{struct}.__init__ in {module}"
+        else:
+            values = _assigned_defaults(block, constants)
+            where = f"{struct}.__init__ in {module}"
+        if values is None:
+            fail(
+                problems,
+                f"stock defaults: {where} is not in a shape this gate can "
+                f"read, so {len(fields)} defaults are unchecked",
+            )
+            continue
+        for field, lgbm in fields.items():
+            if field not in values:
+                fail(
+                    problems,
+                    f"stock defaults: {where} no longer sets {field} to a "
+                    f"literal this gate can read, so LightGBM's {lgbm} is "
+                    "unchecked here",
+                )
+                continue
+            _check_stock(problems, where, field, lgbm, values[field])
+
+    # 3. the Python estimator, which is the surface bench/real_data fits.
+    sklearn = ROOT / "python" / "mojotrees" / "sklearn.py"
+    if not sklearn.is_file():
+        fail(
+            problems,
+            "stock defaults: python/mojotrees/sklearn.py is missing",
+        )
+    else:
+        text = sklearn.read_text()
+        py_constants = {}
+        for name, lgbm in STOCK_PYTHON_CONSTANTS.items():
+            m = re.search(r"^" + name + r"\s*=\s*([^\n#]+?)\s*$", text, re.M)
+            got = _mojo_literal(m.group(1), {}) if m else None
+            if got is None:
+                fail(
+                    problems,
+                    f"stock defaults: {name} is not a literal at the top of "
+                    "python/mojotrees/sklearn.py, so this gate cannot read "
+                    f"the Python default for {lgbm}",
+                )
+                continue
+            py_constants[name] = got
+            _check_stock(
+                problems, "python/mojotrees/sklearn.py", name, lgbm, got
+            )
+        base = re.search(r"^class _Base\b", text, re.M)
+        init = (
+            re.search(r"^    def __init__\s*\(", text[base.start() :], re.M)
+            if base
+            else None
+        )
+        if not init:
+            fail(
+                problems,
+                "stock defaults: _Base.__init__ is not where this expects it "
+                "in python/mojotrees/sklearn.py, so the estimator signature "
+                "-- the defaults bench/real_data actually fits -- is "
+                "unchecked",
+            )
+        else:
+            args = _call_args(text, base.start() + init.end() - 1)
+            found = {}
+            for arg in _top_level_split(args or ""):
+                key, _, raw = arg.partition("=")
+                if not raw:
+                    continue
+                value = _mojo_literal(raw, py_constants)
+                if value is not None:
+                    found[key.strip()] = value
+            for field, lgbm in STOCK_PYTHON_SIGNATURE.items():
+                if field not in found:
+                    fail(
+                        problems,
+                        f"stock defaults: _Base.__init__ no longer defaults "
+                        f"{field} to a literal, so LightGBM's {lgbm} is "
+                        "unchecked on the Python surface, which is the one "
+                        "bench/real_data fits",
+                    )
+                    continue
+                _check_stock(
+                    problems,
+                    "_Base.__init__ in python/mojotrees/sklearn.py",
+                    field,
+                    lgbm,
+                    found[field],
+                )
+
+    # 4. fit_bins still reaches the constants.
     binning = ROOT / "src" / "mojotrees" / "binning.mojo"
     if not binning.is_file():
         fail(problems, "stock defaults: src/mojotrees/binning.mojo is missing")
         return
     text = binning.read_text()
-    for name, want, lgbm in STOCK_BINNING_DEFAULTS:
-        m = re.search(
-            r"^comptime\s+" + name + r"\s*=\s*([0-9_]+)\s*$", text, re.M
-        )
-        if not m:
-            fail(
-                problems,
-                f"stock defaults: {name} is not defined in binning.mojo as a "
-                "plain integer comptime, so this gate cannot read it",
-            )
-            continue
-        got = int(m.group(1).replace("_", ""))
-        if got != want:
-            fail(
-                problems,
-                f"stock defaults: {name} is {got}, and LightGBM's {lgbm} is "
-                f"{want}. mojotrees's defaults are LightGBM's; change this "
-                "back or argue the divergence in docs/LIGHTGBM_PARITY.md and "
-                "in STOCK_BINNING_DEFAULTS here, in one commit",
-            )
     sig = re.search(r"^def fit_bins\[", text, re.M)
     if not sig:
         fail(problems, "stock defaults: fit_bins is not where this expects it")
@@ -1448,6 +2051,31 @@ def stock_defaults(problems):
                     f"{name}, so the constant above is not what a caller who "
                     "says nothing gets",
                 )
+
+    # 5. the tables above are checklists, not wish lists. An entry nothing
+    # probes reads as coverage and provides none, which is the failure the
+    # `min_data_in_bin` pin and the `lambda_l2` default both had in common:
+    # written down somewhere, checked nowhere.
+    unprobed = sorted(set(LIGHTGBM_STOCK) - _STOCK_PROBED)
+    if unprobed:
+        fail(
+            problems,
+            "stock defaults: nothing in this repository was probed for "
+            + ", ".join(unprobed)
+            + ". Either give each a row in STOCK_COMPTIME_DEFAULTS, "
+            "STOCK_STRUCT_DEFAULTS or STOCK_PYTHON_SIGNATURE, or drop it "
+            "from LIGHTGBM_STOCK; an entry nothing reads looks like "
+            "coverage and is not",
+        )
+    stale = sorted(set(STOCK_DIVERGENCES) - divergences_probed)
+    if stale:
+        fail(
+            problems,
+            "stock defaults: STOCK_DIVERGENCES declares "
+            + ", ".join(stale)
+            + " as a deliberate divergence, and no default was read for it, "
+            "so the divergence is neither enforced nor retired",
+        )
 
 
 # The growers that draw a tree's feature set. Each calls
