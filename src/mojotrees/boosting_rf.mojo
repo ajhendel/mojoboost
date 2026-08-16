@@ -833,7 +833,8 @@ def train_forest(
     var grad0 = List[Float64](capacity=n)
     var hess0 = List[Float64](capacity=n)
     _fill_grad_hess(
-        init_raw, target, objective, sample_weight, alpha, grad0, hess0
+        init_raw, target, objective, sample_weight, alpha, grad0, hess0,
+        float64_derivatives=params.tree.extra.wants_float64_derivatives(),
     )
 
     var trees = List[Tree]()
@@ -909,6 +910,7 @@ def train_forest_more(
         alpha,
         grad0,
         hess0,
+        float64_derivatives=params.tree.extra.wants_float64_derivatives(),
     )
 
     var grown = List[Tree]()
@@ -1066,6 +1068,7 @@ def train_rf_more(
         alpha,
         grad0,
         hess0,
+        float64_derivatives=params.tree.extra.wants_float64_derivatives(),
     )
 
     var grown = List[Tree]()
@@ -1146,7 +1149,8 @@ def train_forest_with_valid(
     var grad0 = List[Float64](capacity=n)
     var hess0 = List[Float64](capacity=n)
     _fill_grad_hess(
-        init_raw, target, objective, sample_weight, alpha, grad0, hess0
+        init_raw, target, objective, sample_weight, alpha, grad0, hess0,
+        float64_derivatives=params.tree.extra.wants_float64_derivatives(),
     )
 
     # Running totals of the tree outputs on the validation rows, divided by
@@ -1410,7 +1414,8 @@ def _rf_rounds_multiclass(
             bag.clear()
             if params.goss.active(round, RF_SHRINKAGE):
                 selection = _multiclass_goss_select(
-                    prob, labels, n_classes, sample_weight, params.goss, round
+                    prob, labels, n_classes, sample_weight, params.goss, round,
+                    float64_derivatives=params.tree.extra.wants_float64_derivatives(),
                 )
                 bag = selection.rows.copy()
         else:
@@ -1452,16 +1457,28 @@ def _multiclass_rf_gradients(
     sample_weight: List[Float64],
     mut grads: List[List[Float64]],
     mut hesses: List[List[Float64]],
-):
+    float64_derivatives: Bool = False,
+) raises:
     """The whole run's per-class gradients, taken once at the constant softmax
-    probabilities."""
+    probabilities.
+
+    **This declares `raises` now, and that one word closes the last hole in
+    the `MOJOTREES_DERIVATIVE_PRECISION` typo refusal.** It was the only
+    caller of `boosting._fill_softmax_grad_hess` that could not raise, which
+    is why that function could not call `check_derivative_precision`, which
+    is why a mistyped value on a multiclass random-forest fit silently
+    selected the default -- one arm of an A/B running under the other's
+    label. Nothing here raises in practice; the declaration exists so the
+    refusal can.
+    """
     grads.clear()
     hesses.clear()
     for k in range(n_classes):
         var grad = List[Float64]()
         var hess = List[Float64]()
         _fill_softmax_grad_hess(
-            prob, labels, k, n_classes, sample_weight, grad, hess
+            prob, labels, k, n_classes, sample_weight, grad, hess,
+            float64_derivatives=float64_derivatives,
         )
         grads.append(grad^)
         hesses.append(hess^)
@@ -1498,7 +1515,8 @@ def train_forest_multiclass(
     var grads = List[List[Float64]]()
     var hesses = List[List[Float64]]()
     _multiclass_rf_gradients(
-        prob, labels, n_classes, sample_weight, grads, hesses
+        prob, labels, n_classes, sample_weight, grads, hesses,
+        float64_derivatives=params.tree.extra.wants_float64_derivatives(),
     )
 
     var trees = List[Tree]()
@@ -1556,7 +1574,8 @@ def train_forest_multiclass_more(
     var grads = List[List[Float64]]()
     var hesses = List[List[Float64]]()
     _multiclass_rf_gradients(
-        prob, labels, forest.n_classes, sample_weight, grads, hesses
+        prob, labels, forest.n_classes, sample_weight, grads, hesses,
+        float64_derivatives=params.tree.extra.wants_float64_derivatives(),
     )
 
     var grown = List[Tree]()
@@ -1620,7 +1639,8 @@ def train_forest_multiclass_with_valid(
     var grads = List[List[Float64]]()
     var hesses = List[List[Float64]]()
     _multiclass_rf_gradients(
-        prob, labels, n_classes, sample_weight, grads, hesses
+        prob, labels, n_classes, sample_weight, grads, hesses,
+        float64_derivatives=params.tree.extra.wants_float64_derivatives(),
     )
 
     var valid_total = _constant_scores(n_valid * n_classes, 0.0)

@@ -458,6 +458,7 @@ def fill_grad_hess(
     mut grad: List[Float64],
     mut hess: List[Float64],
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    float64_derivatives: Bool = False,
 ) raises:
     """Per-row first and second derivatives of `objective` at the current raw
     scores, written into `grad` and `hess`.
@@ -493,17 +494,33 @@ def fill_grad_hess(
 
     **`derivative_precision` decides whether it narrows at all.** The
     narrowing is the default and is what the paragraphs above describe;
-    `float64` stores what the objective computed. The setting is read here,
-    from the environment, **once per call** -- which is once per round, not
-    once per node and not once per row -- and it then selects between two
-    compile-time instantiations of the row loops below, so neither arm's
-    loop carries a test the other put there. This is the objective side of
-    the switch; `histogram.ConstHessianSettings.narrow` is the read side,
-    and it is a snapshot field rather than a live read for the reason
-    stated there.
+    `float64` stores what the objective computed. The decision is taken here
+    **once per call** -- which is once per round, not once per node and not
+    once per row -- and it then selects between two compile-time
+    instantiations of the row loops below, so neither arm's loop carries a
+    test the other put there. This is the objective side of the switch;
+    `histogram.ConstHessianSettings.narrow` is the read side, and it is a
+    snapshot field rather than a live read for the reason stated there.
 
-    Reading it live here is what makes the setting reach a fit that never
-    resolves a snapshot: this entry is on every trainer's path.
+    **Both entries are honored here, and `float64` wins from either.**
+    `float64_derivatives` is the parameter entry
+    (`ExtraTreeParams.wants_float64_derivatives()`), forwarded by every
+    trainer; the environment entry is read live. The precedence is
+    `histogram.ConstHessianSettings.widened`'s and is deliberately the same
+    one, because the objective side and the read side of a single switch
+    disagreeing about which entry wins is worse than either rule.
+
+    Reading the environment live here is what makes the setting reach a fit
+    that never resolves a snapshot: this entry is on every trainer's path.
+    Taking the parameter as an argument is what makes it reach a fit whose
+    caller never touched the environment, and the two together are what
+    lifted the refusal in
+    `ExtraTreeParams.check_derivative_precision`. **A trainer that forgets to
+    forward it gets the environment-only behavior**, which is the old,
+    documented behavior and not a wrong answer -- but it is a fit that
+    ignores a parameter it accepted, so the default here is `False` rather
+    than something cleverer precisely so that a missed call site is a missing
+    feature and never a silent numerical difference.
 
     Public because it is the gradient-generation stage the CPU profiler times
     (bench/bench_profile.mojo); training calls it through the same entry.
@@ -518,7 +535,7 @@ def fill_grad_hess(
     if len(hess) != n:
         hess.resize(n, 0.0)
     check_derivative_precision()
-    if derivative_precision_narrows():
+    if derivative_precision_narrows() and not float64_derivatives:
         _fill_grad_hess_into[True](
             grad, hess, raw, target, objective, weights, alpha, n, settings
         )
@@ -674,9 +691,11 @@ def _fill_grad_hess(
     mut grad: List[Float64],
     mut hess: List[Float64],
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    float64_derivatives: Bool = False,
 ) raises:
     fill_grad_hess(
-        raw, target, objective, weights, alpha, grad, hess, settings
+        raw, target, objective, weights, alpha, grad, hess, settings,
+        float64_derivatives,
     )
 
 
@@ -1169,6 +1188,7 @@ def _estimate_leaf_values(
     monotone: List[Int] = [],
     leaves: LeafMembership = LeafMembership(),
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    float64_derivatives: Bool = False,
 ) raises:
     """CatBoost's `leaf_estimation_iterations`: keep taking Newton steps on a
     leaf's own rows after the tree's structure is fixed.
@@ -1315,8 +1335,13 @@ def _estimate_leaf_values(
         for _ in range(iterations - 1):
             for i in range(n_l):
                 raw_l[i] = raw[rows[i]] + v
+            # The extra Newton steps read derivatives at the same precision
+            # the round's first step did. A leaf re-estimated at a different
+            # precision from the one its structure was chosen at is a leaf
+            # value that does not correspond to any single arm of the switch.
             fill_grad_hess(
-                raw_l, tgt_l, objective, w_l, alpha, grad_l, hess_l, settings
+                raw_l, tgt_l, objective, w_l, alpha, grad_l, hess_l, settings,
+                float64_derivatives,
             )
             var g_sum = 0.0
             var h_sum = 0.0
@@ -2023,6 +2048,7 @@ def _boost_rounds(
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess,
             settings,
+            float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
         goss_round(bag, grad, hess, goss, round, learning_rate)
         # Round-level work belonging to no node, so it is charged at the
@@ -2070,6 +2096,7 @@ def _boost_rounds(
             tree, data, target, raw, objective, sample_weight, alpha,
             leaf_iters, params.tree.lambda_l1, params.tree.lambda_reg,
             params.tree.extra.max_delta_step, bag, signs, leaves, settings,
+            float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
 
         # A single-leaf tree with a near-zero value means the objective has
@@ -2397,6 +2424,7 @@ def train_with_valid(
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess,
             settings,
+            float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
         var tree = grow_tree_leaves(
@@ -2428,6 +2456,7 @@ def train_with_valid(
             tree, data, target, raw, objective, sample_weight, alpha,
             leaf_iters, params.tree.lambda_l1, params.tree.lambda_reg,
             params.tree.extra.max_delta_step, bag, signs, leaves, settings,
+            float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
         # Under any row sampler a degenerate tree indicts the sample, not
         # the run.
@@ -2506,7 +2535,8 @@ def _fill_softmax_grad_hess(
     weights: List[Float64],
     mut grad: List[Float64],
     mut hess: List[Float64],
-):
+    float64_derivatives: Bool = False,
+) raises:
     """One-vs-rest gradients and hessians for class `k` from row-major
     softmax probabilities.
 
@@ -2515,11 +2545,24 @@ def _fill_softmax_grad_hess(
     derivative they read anyway, and narrowing at the source is what keeps
     this class's numbers the same whichever accumulation path a node takes.
 
-    `derivative_precision` reaches this the same way it reaches
-    `fill_grad_hess`: read once per call, which is once per class per round,
-    and used to select a compile-time instantiation of the row loop.
+    `derivative_precision` reaches this exactly the way it reaches
+    `fill_grad_hess`, and on the same precedence: the parameter through
+    `float64_derivatives`, the environment through a live read, `float64`
+    winning from either. Decided once per call, which is once per class per
+    round, and used to select a compile-time instantiation of the row loop.
+
+    **This now `raises`, and that closes the last gap in the typo refusal.**
+    `check_derivative_precision` was called from every entry that could
+    raise, and the multiclass and random-forest paths whose only derivative
+    site is this one could not, so a mistyped
+    `MOJOTREES_DERIVATIVE_PRECISION` on those paths silently selected the
+    default -- one arm of an A/B running under the other's label, which is
+    the exact failure the refusal exists to prevent. The only thing that
+    stood in the way was `boosting_rf._multiclass_rf_gradients` not declaring
+    `raises`; it does now.
     """
-    if derivative_precision_narrows():
+    check_derivative_precision()
+    if derivative_precision_narrows() and not float64_derivatives:
         _fill_softmax_grad_hess_at[True](
             prob, labels, k, n_classes, weights, grad, hess
         )
@@ -2569,6 +2612,7 @@ def _multiclass_goss_select(
     weights: List[Float64],
     goss: GossParams,
     round: Int,
+    float64_derivatives: Bool = False,
 ) raises -> GossSelection:
     """One row sample for a whole multiclass round. LightGBM sums the
     per-row `|grad * hess|` over the round's trees before sampling, so every
@@ -2581,8 +2625,13 @@ def _multiclass_goss_select(
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
     for k in range(n_classes):
+        # The GOSS ranking is a function of the derivatives, so it has to be
+        # taken at the precision the round will train at. Ranking rows at
+        # float32 and then training on them at float64 samples a different
+        # set of rows than either arm does on its own.
         _fill_softmax_grad_hess(
-            prob, labels, k, n_classes, weights, grad, hess
+            prob, labels, k, n_classes, weights, grad, hess,
+            float64_derivatives,
         )
         for r in range(n):
             importance[r] += abs(grad[r] * hess[r])
@@ -2839,14 +2888,16 @@ def _boost_rounds_multiclass(
         var selection = GossSelection.all_rows()
         if goss.active(round, learning_rate):
             selection = _multiclass_goss_select(
-                prob, labels, n_classes, sample_weight, goss, round
+                prob, labels, n_classes, sample_weight, goss, round,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             bag = selection.rows.copy()
 
         var made_progress = False
         for k in range(n_classes):
             _fill_softmax_grad_hess(
-                prob, labels, k, n_classes, sample_weight, grad, hess
+                prob, labels, k, n_classes, sample_weight, grad, hess,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree
@@ -3182,14 +3233,16 @@ def train_multiclass_with_valid(
         var selection = GossSelection.all_rows()
         if goss.active(i, params.learning_rate):
             selection = _multiclass_goss_select(
-                prob, labels, n_classes, sample_weight, goss, i
+                prob, labels, n_classes, sample_weight, goss, i,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             bag = selection.rows.copy()
 
         var made_progress = False
         for k in range(n_classes):
             _fill_softmax_grad_hess(
-                prob, labels, k, n_classes, sample_weight, grad, hess
+                prob, labels, k, n_classes, sample_weight, grad, hess,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree

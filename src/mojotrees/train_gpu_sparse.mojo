@@ -96,7 +96,11 @@ from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .gpu_categorical import CatSetPool, apply_categorical_split_pooled
 from .gpu_sparse import GpuSparseHistogramBuilder
 from .growth_policy import GrowthSchedule, LeafCandidate, check_grow_policy
-from .histogram import Histogram, subtract_histogram
+from .histogram import (
+    Histogram,
+    check_device_derivative_precision,
+    subtract_histogram,
+)
 from .interaction import extend_branch
 from .monotone import (
     MONOTONE_FREE,
@@ -238,6 +242,11 @@ def grow_tree_gpu_sparse(
         params.num_leaves,
         params.max_depth,
         params.min_data_in_leaf,
+    )
+    # Refused, not ignored: the device has no Float64 to carry a derivative
+    # in. See `histogram.check_device_derivative_precision`.
+    check_device_derivative_precision(
+        params.extra.wants_float64_derivatives()
     )
     var max_delta_step = params.extra.max_delta_step
     var path_smooth = params.extra.path_smooth

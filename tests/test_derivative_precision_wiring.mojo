@@ -1,48 +1,40 @@
-"""The wiring from the `derivative_precision` **parameter** to the fit, and
-the exact boundary of what that wiring reaches.
+"""The `derivative_precision` switch, end to end, through both of its
+entries.
 
 `tests/test_derivative_precision.mojo` proves the switch itself: that the two
 arms are different numbers and that every read site honors the snapshot it is
-handed. This file proves the hop *before* that one -- that
-`ExtraTreeParams.derivative_precision` reaches the snapshot at all -- and,
-just as importantly, marks where it stops.
+handed. This file proves that the **parameter** reaches those read sites and
+the objective alike, that it reaches them identically to
+`MOJOTREES_DERIVATIVE_PRECISION`, and that the one backend which cannot carry
+the setting refuses it instead of ignoring it.
 
-Three claims, none of them allowed a tolerance.
+Four claims, none of them allowed a tolerance.
 
 **The default does not move.** `widened(False)` is the identity on all four
-fields, and a fit that sets nothing resolves the snapshot it always resolved.
+snapshot fields, and a fit that sets nothing trains the model this package
+has always trained.
 
-**The parameter entry and the environment entry produce the same snapshot,
-and therefore the same cells.** That is the assertion that proves the wiring
-rather than assuming it, and it is taken at the histogram cell, bit for bit,
-not at the flag. Both arms are also asserted *different* from the default, so
-the test cannot pass by both arms being vacuously equal -- the failure this
-repository has shipped twice.
+**The two entries produce the same model, bit for bit.** Asserted at the
+ensemble -- every split feature, every threshold bin, every leaf value --
+rather than at a flag or at a prediction, because a prediction can hide a
+leaf that moved behind a split that moved the other way. Taken plain and
+again under a weighted round, which is the case where honoring the setting at
+only one of the two halves produces a third answer that is neither arm.
 
-**The refusal that is left is the objective, and it is asserted rather than
-described.** `check_derivative_precision` still raises on `float64` set
-through the parameters, because `boosting.fill_grad_hess` selects its row
-loop from the environment alone. A fit configured through the parameter would
-narrow at the objective and not re-narrow at the histogram, which is neither
-arm of the switch. When that raise stops firing, `test_the_objective_half_is
-_still_missing` fails, which is deliberate: it is the tripwire on the day the
-other half lands.
+**Every comparison is gated.** Each equality is preceded by an assertion that
+the default arm *differs*, so a wiring that did nothing would fail here
+rather than pass by making all three arms equal. This repository has shipped
+that failure twice.
 
-Determinism across `MOJOTREES_NUM_WORKERS` is inherited rather than
-re-measured, and `test_the_parameter_snapshot_is_field_identical_to_the
-_environment_snapshot` is what makes that legitimate: the parameter produces
-a snapshot whose four fields equal the environment's, so it is the same input
-to the same builder that
-`test_derivative_precision.test_determinism_across_worker_counts_in_both
-_settings` already checked at 1, 3 and 8 workers. Re-running a 4096-row
-dispatch here would re-measure a proven property and cost the orchestrator a
-compile for it.
+**Determinism holds at the parameter entry**, at `MOJOTREES_NUM_WORKERS` 1, 3
+and 8, bit for bit. Not inherited: the `float64` arm runs the unblocked
+accumulation ladder, and the parameter is a route into it that no other test
+drives.
 
 Deliberately not named `test_gpu_*`: `tools/run_tests.sh` selects the
 accelerator subset by name, and a CPU test wearing that prefix is silently
 dropped from the CPU suite.
 """
-
 from std.os import setenv
 from std.testing import (
     assert_equal,
@@ -53,13 +45,22 @@ from std.testing import (
 )
 
 from mojotrees.binning import BinnedMatrix, bin_equal_width
+from mojotrees.boosting import (
+    Booster,
+    BoosterParams,
+    SQUARED_ERROR,
+    train,
+)
 from mojotrees.histogram import (
     ConstHessianSettings,
     Histogram,
     build_histogram,
+    check_device_derivative_precision,
     derivative,
 )
 from mojotrees.parallel import DispatchSettings
+from mojotrees.params import parse_params
+from mojotrees.tree import TreeParams
 from mojotrees.tree_parameters_extra import (
     DERIV_PRECISION_FLOAT32,
     DERIV_PRECISION_FLOAT64,
@@ -73,11 +74,9 @@ comptime ENV = String("MOJOTREES_DERIVATIVE_PRECISION")
 def _extra_at(precision: Int) -> ExtraTreeParams:
     """An otherwise-default bundle at one `derivative_precision` code.
 
-    Built by assignment rather than through `parse_params`, because the
-    parameter string is refused for `float64` (see
-    `test_the_objective_half_is_still_missing`) and this file has to be able
-    to construct the value the refusal is about in order to test the wiring
-    underneath it.
+    Built by assignment rather than through `parse_params` so that a nonsense
+    code can be constructed too; `test_the_parameter_is_no_longer_refused`
+    checks the string route separately.
     """
     var extra = ExtraTreeParams()
     extra.derivative_precision = precision
@@ -144,6 +143,95 @@ def _assert_cells_equal(a: Histogram, b: Histogram) raises:
 def _cells_differ(a: Histogram, b: Histogram) raises -> Bool:
     for i in range(a.n_cells()):
         if a.grad_at(i).to_bits() != b.grad_at(i).to_bits():
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Fit-level fixtures
+# ---------------------------------------------------------------------------
+
+
+def _booster_params(precision: Int) raises -> BoosterParams:
+    """An otherwise-default booster at one `derivative_precision`.
+
+    Everything else is the package default, which is the point: the only
+    thing that may differ between the arms compared below is this field.
+    """
+    var extra = ExtraTreeParams()
+    extra.derivative_precision = precision
+    return BoosterParams(
+        6, 0.1, TreeParams(8, 5, 1.0, 1e-3, 0.0, extra=extra^)
+    )
+
+
+def _fit_features(n_rows: Int, n_features: Int) -> List[Float64]:
+    """Column-major features with no exact ties inside a column, so a split
+    decision is decided by the gains rather than by a tie-break."""
+    var out = List[Float64](capacity=n_rows * n_features)
+    for f in range(n_features):
+        for r in range(n_rows):
+            out.append(Float64(((r * 37 + f * 11) % n_rows)) / 7.0)
+    return out^
+
+
+def _fit_target(features: List[Float64], n_rows: Int) -> List[Float64]:
+    """A target whose derivatives are not Float32-exact.
+
+    The `/ 3.0` is what does it: a third is not a dyadic rational, so the
+    residual the objective differentiates has a full significand and the two
+    precisions genuinely disagree. That the disagreement actually reaches
+    the model is not assumed: every fit-level test below asserts the default
+    arm differs from the float64 arm before it asserts anything else.
+    """
+    var out = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        out.append(
+            2.0 * features[r]
+            - features[n_rows + r]
+            + Float64(r % 13) / 3.0
+        )
+    return out^
+
+
+def _bits(v: Float64) -> UInt64:
+    return UInt64(v.to_bits())
+
+
+def _ensemble_bits(booster: Booster) -> List[UInt64]:
+    """Every split feature, every threshold bin and every leaf value in the
+    ensemble, as integers.
+
+    Compared instead of a prediction because a prediction can hide a leaf
+    that moved behind a split that moved the other way. Same shape as
+    `tests/test_leaf_estimation._ensemble_bits`.
+    """
+    var out = List[UInt64]()
+    out.append(UInt64(len(booster.trees)))
+    out.append(_bits(booster.base_score))
+    for t in range(len(booster.trees)):
+        ref tree = booster.trees[t]
+        out.append(UInt64(len(tree.feature)))
+        for node in range(len(tree.feature)):
+            out.append(UInt64(tree.feature[node]))
+            out.append(UInt64(tree.threshold_bin[node]))
+            out.append(_bits(tree.value[node]))
+    return out^
+
+
+def _assert_same_bits(
+    a: List[UInt64], b: List[UInt64], what: String
+) raises:
+    assert_equal(len(a), len(b), what)
+    for i in range(len(a)):
+        assert_equal(a[i], b[i], what)
+
+
+def _bits_differ(a: List[UInt64], b: List[UInt64]) -> Bool:
+    if len(a) != len(b):
+        return True
+    for i in range(len(a)):
+        if a[i] != b[i]:
             return True
     return False
 
@@ -430,39 +518,221 @@ def test_the_sentinel_path_honors_the_parameter_too() raises:
 # ---------------------------------------------------------------------------
 
 
-def test_the_objective_half_is_still_missing() raises:
-    """`derivative_precision = "float64"` set through the parameters is
-    still refused, and this test is the tripwire on the day it stops being.
-
-    The histogram half is wired -- every test above proves it -- but
-    `boosting.fill_grad_hess` and `boosting._fill_softmax_grad_hess` still
-    select their row loop from `MOJOTREES_DERIVATIVE_PRECISION` alone and
-    take no parameter. A fit configured through the field alone would narrow
-    at the objective and *not* re-narrow at the histogram, which is neither
-    arm: not `float32`, because the gathered pair buffer and the row-blocked
-    histograms are off and a GOSS or weighted round accumulates
-    `w * Float32(g)` un-re-narrowed; and not `float64`, because the
-    objective already discarded the low 29 significand bits the setting
-    exists to keep.
-
-    When the objective carries the field, delete this test and assert the
-    end-to-end equality it is standing in for: a fit at
-    `derivative_precision = "float64"` predicting bit-identically to the same
-    fit under `MOJOTREES_DERIVATIVE_PRECISION=float64`, and differently from
+def test_the_parameter_and_the_environment_train_the_same_model() raises:
+    """The end-to-end claim, and the one this whole lane exists to make
+    true: a fit configured with `derivative_precision = "float64"` is the
+    same model, bit for bit, as the same fit under
+    `MOJOTREES_DERIVATIVE_PRECISION=float64` -- and a different model from
     the default.
-    """
-    var extra = _extra_at(DERIV_PRECISION_FLOAT64)
-    with assert_raises():
-        extra.check_derivative_precision()
-    with assert_raises():
-        extra.check_scalars(20)
 
-    # The default is not refused, at either setting of the environment, so
-    # the refusal above is about the parameter and not about the switch.
-    _ = setenv(ENV, "float64")
-    ExtraTreeParams().check_derivative_precision()
+    This test replaces `test_the_objective_half_is_still_missing`, which
+    asserted the refusal that stood while only the histogram half was wired.
+    Its docstring specified exactly this assertion as its successor.
+
+    Compared as `_ensemble_bits`: every split feature, every threshold bin
+    and every leaf value in every tree. A prediction could hide a leaf that
+    moved behind a split that moved the other way; this cannot.
+
+    **The gate is the third arm.** Without `assert_true` on the default arm
+    differing, a wiring that did nothing would make all three ensembles
+    equal and this test would pass having established nothing -- the exact
+    failure this repository has shipped twice.
+    """
+    var n_rows = 240
+    var n_features = 4
+    var n_bins = 16
+    var features = _fit_features(n_rows, n_features)
+    var data = bin_equal_width(features, n_rows, n_features, n_bins)
+    var target = _fit_target(features, n_rows)
+
+    var default_params = _booster_params(DERIV_PRECISION_FLOAT32)
+    var param_params = _booster_params(DERIV_PRECISION_FLOAT64)
+
     _ = setenv(ENV, "")
-    ExtraTreeParams().check_derivative_precision()
+    var default_arm = _ensemble_bits(
+        train(data, target, SQUARED_ERROR, default_params)
+    )
+    var param_arm = _ensemble_bits(
+        train(data, target, SQUARED_ERROR, param_params)
+    )
+
+    _ = setenv(ENV, "float64")
+    var env_arm = _ensemble_bits(
+        train(data, target, SQUARED_ERROR, default_params)
+    )
+    # Both entries at once: monotone, so this must equal each of them.
+    var both_arm = _ensemble_bits(
+        train(data, target, SQUARED_ERROR, param_params)
+    )
+    _ = setenv(ENV, "")
+
+    # The gate, asserted before the claim so a vacuous pass is impossible.
+    assert_true(_bits_differ(default_arm, env_arm))
+
+    # The claim.
+    _assert_same_bits(param_arm, env_arm, "parameter vs environment")
+    _assert_same_bits(both_arm, env_arm, "both entries vs environment")
+
+    # And the default is still the default: a fit that set nothing and had
+    # nothing set is the fit this package has always produced.
+    var again = _ensemble_bits(
+        train(data, target, SQUARED_ERROR, default_params)
+    )
+    _assert_same_bits(again, default_arm, "default is stable")
+
+
+def test_the_two_entries_agree_under_a_weighted_round() raises:
+    """The same claim where the two halves are hardest to keep in step.
+
+    A weighted round multiplies a stored derivative by `w` after the
+    objective wrote it, so the product is not Float32-representable and the
+    histogram read site's narrowing is no longer idempotent. That is exactly
+    the case where honoring the setting at only one of the two halves
+    produces a third answer, and it is the case the sparse and distributed
+    growers were silently getting wrong.
+    """
+    var n_rows = 240
+    var n_features = 4
+    var n_bins = 16
+    var features = _fit_features(n_rows, n_features)
+    var data = bin_equal_width(features, n_rows, n_features, n_bins)
+    var target = _fit_target(features, n_rows)
+    var weights = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        # Never 1.0 and never Float32-exact, so the multiply always moves
+        # bits the read site would otherwise have to reproduce.
+        weights.append(0.5 + Float64((r * 7) % 11) / 3.0)
+
+    var default_params = _booster_params(DERIV_PRECISION_FLOAT32)
+    var param_params = _booster_params(DERIV_PRECISION_FLOAT64)
+
+    _ = setenv(ENV, "")
+    var default_arm = _ensemble_bits(
+        train(data, target, SQUARED_ERROR, default_params, weights)
+    )
+    var param_arm = _ensemble_bits(
+        train(data, target, SQUARED_ERROR, param_params, weights)
+    )
+    _ = setenv(ENV, "float64")
+    var env_arm = _ensemble_bits(
+        train(data, target, SQUARED_ERROR, default_params, weights)
+    )
+    _ = setenv(ENV, "")
+
+    assert_true(_bits_differ(default_arm, env_arm))
+    _assert_same_bits(param_arm, env_arm, "weighted parameter vs environment")
+
+
+def test_determinism_across_worker_counts_at_the_parameter_entry() raises:
+    """1, 3 and 8 workers, bit for bit, on a fit configured through the
+    parameter.
+
+    Required by the round's correctness contract and not inherited from
+    anywhere: the `float64` arm runs the unblocked accumulation ladder,
+    which is a different kernel from the default arm's, and it now reaches
+    that kernel by a route (the parameter) that no existing test drives.
+    """
+    var n_rows = 240
+    var n_features = 4
+    var n_bins = 16
+    var features = _fit_features(n_rows, n_features)
+    var data = bin_equal_width(features, n_rows, n_features, n_bins)
+    var target = _fit_target(features, n_rows)
+    var params = _booster_params(DERIV_PRECISION_FLOAT64)
+
+    _ = setenv(ENV, "")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "1")
+    var baseline = _ensemble_bits(
+        train(data, target, SQUARED_ERROR, params)
+    )
+    var counts: List[String] = ["1", "3", "8"]
+    for i in range(len(counts)):
+        _ = setenv("MOJOTREES_NUM_WORKERS", counts[i])
+        var got = _ensemble_bits(train(data, target, SQUARED_ERROR, params))
+        _assert_same_bits(got, baseline, "workers=" + counts[i])
+    _ = setenv("MOJOTREES_NUM_WORKERS", "")
+
+
+def test_the_parameter_is_no_longer_refused() raises:
+    """The refusal is gone, and the range check is not.
+
+    `float64` is accepted because both halves carry it now. A code that is
+    neither name is still refused, because a value that is not a value is
+    still a mistake.
+    """
+    _extra_at(DERIV_PRECISION_FLOAT64).check_derivative_precision()
+    _extra_at(DERIV_PRECISION_FLOAT64).check_scalars(20)
+    _extra_at(DERIV_PRECISION_FLOAT32).check_derivative_precision()
+
+    var nonsense = ExtraTreeParams()
+    nonsense.derivative_precision = 7
+    with assert_raises():
+        nonsense.check_derivative_precision()
+
+    # And the parameter string is accepted end to end now.
+    var config = parse_params("derivative_precision=float64")
+    assert_equal(
+        config.booster.tree.extra.derivative_precision,
+        DERIV_PRECISION_FLOAT64,
+    )
+    with assert_raises():
+        _ = parse_params("derivative_precision=double")
+
+
+def test_derivative_precision_does_not_move_is_active() raises:
+    """The exclusion that makes the end-to-end equality above true rather
+    than merely likely.
+
+    `is_active()` means "the gain needs `split._feature_gain`'s adjustment
+    pass and the device kernel cannot score this". `derivative_precision`
+    needs neither, and while it was in this predicate the parameter entry
+    took `_feature_gain`'s active path while the environment entry took the
+    inactive one -- the two entries of one switch on two code paths.
+
+    **That divergence was measured, and it is inert**: with
+    `derivative_precision` put back into the predicate, the two end-to-end
+    arms above are still bit-identical, because the active path's only effect
+    at these defaults is to clamp a non-positive gain to 0.0 and the fold
+    accepts only a gain strictly greater than a best that starts at 0.0. So
+    this assertion guards no live bug. It guards the *mechanism*: while that
+    predicate could see the parameter and not the environment, "the two
+    entries produce the same model" was a coincidence of the gain arithmetic
+    rather than a property, and a future change to `_feature_gain` could have
+    ended it silently.
+    """
+    assert_false(_extra_at(DERIV_PRECISION_FLOAT64).is_active())
+    assert_false(_extra_at(DERIV_PRECISION_FLOAT32).is_active())
+    # The predicate still answers True for the things it is about, so this
+    # exclusion did not empty it.
+    var gain_floor = ExtraTreeParams()
+    gain_floor.min_gain_to_split = 0.5
+    assert_true(gain_floor.is_active())
+
+
+def test_the_device_refuses_float64_by_name() raises:
+    """A backend that cannot carry the setting refuses it rather than
+    ignoring it, from either entry.
+
+    The device stores every derivative as Float32 on upload
+    (`gpu_gradient_stream.stage_gradients`), so there is no threading that
+    could make `float64` mean anything there. Asserted at the check itself
+    rather than through a GPU fit, because this is a CPU test file and the
+    check is the whole of the behavior.
+    """
+    _ = setenv(ENV, "")
+    # The default is allowed through, or every GPU fit would fail.
+    check_device_derivative_precision(False)
+    # The parameter entry is refused.
+    with assert_raises():
+        check_device_derivative_precision(True)
+    # And so is the environment entry, which is the one likelier to be left
+    # set by accident after a CPU comparison.
+    _ = setenv(ENV, "float64")
+    with assert_raises():
+        check_device_derivative_precision(False)
+    with assert_raises():
+        check_device_derivative_precision(True)
+    _ = setenv(ENV, "")
 
 
 def main() raises:

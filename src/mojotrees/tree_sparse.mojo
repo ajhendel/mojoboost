@@ -59,7 +59,7 @@ from .efb import (
     columns_for_features,
     expand_bundled_histogram,
 )
-from .histogram import Histogram, subtract_histogram
+from .histogram import ConstHessianSettings, Histogram, subtract_histogram
 from .histogram_sparse import (
     NodeTotals,
     SparseEntryOrder,
@@ -476,8 +476,16 @@ def _node_histogram(
     bundles: SparseBundling,
     features: List[Int],
     columns: List[Int],
+    narrow: Bool = True,
 ) raises -> Histogram:
     """One node's histogram, always in the original per-feature shape.
+
+    `narrow` is `histogram.derivative_precision`, and it has to be the same
+    value `totals` was summed at: the leftover assigned to the default bin is
+    `totals` minus what the stored entries accumulated, so a mismatch would
+    put the whole node's rounding difference into one bin
+    (`histogram_sparse.build_histogram_sparse_node` states the pairing). Every
+    caller below takes both from the same `narrow` local for that reason.
 
     Without bundling that is one call to the sparse accumulator over the
     node's entry ranges. With it, the accumulation runs over the bundle
@@ -492,7 +500,7 @@ def _node_histogram(
     subtracting first and expanding the difference would.
     """
     var raw = build_histogram_sparse_node(
-        data, grad, hess, order, entries, totals, columns
+        data, grad, hess, order, entries, totals, columns, narrow
     )
     if not bundles.active:
         return raw^
@@ -520,10 +528,31 @@ def grow_tree_sparse(
     bag: List[Int] = [],
     tree_index: Int = 0,
     bundling: SparseBundling = SparseBundling.none(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises -> SparseTreeResult:
     """Grow one tree on sparse data, leaf-wise by default or depth-wise
     under `params.grow_policy == GROW_DEPTHWISE` (the same `GrowthSchedule`
     order the dense grower follows, so both growers make the same choice).
+
+    `const_hessian_env` is the fit's histogram snapshot
+    (`histogram.ConstHessianSettings`), and it is here for one field:
+    `narrow`, which is `derivative_precision`. **Before it existed this
+    grower passed the `narrow = True` default to every sparse builder and
+    every node total, so a sparse fit ignored
+    `MOJOTREES_DERIVATIVE_PRECISION=float64` at the histogram while the
+    objective honored it** -- the objective stopped narrowing, the grower
+    re-narrowed, and a GOSS or weighted round accumulated `Float32(w * g)`
+    where the arm the caller asked for accumulates `w * g`. That is the
+    accepted-then-ignored failure this argument closes; the semantics now
+    match `tree.grow_tree_leaves_profiled` exactly, including the sentinel
+    resolving once per tree and the `derivative_precision` parameter being
+    folded on top of whichever snapshot we end up with.
+
+    The two constant-hessian fields are carried but unused here: the sparse
+    accumulator has no three-plane elision to switch off, so a resolved
+    snapshot and the sentinel choose the same kernel. They are on the type
+    and threading them costs nothing, and a sparse const-hessian elision
+    would find them already in place.
 
     Arguments and semantics match `grow_tree`: a non-empty `bag` restricts
     growth to those rows (they must be unique here, which is what
@@ -609,6 +638,22 @@ def grow_tree_sparse(
     var row_side = List[UInt8](capacity=data.n_rows)
     row_side.resize(data.n_rows, 0)
 
+    # The fit's histogram snapshot, resolved at most once for this tree, and
+    # then the `derivative_precision` parameter folded on top of it. Same two
+    # steps and the same precedence as `tree.grow_tree_leaves_profiled`:
+    # `float64` wins from either the parameter or the environment.
+    #
+    # `narrow` is read out once here and passed to every builder and every
+    # node total below, rather than each site reaching for the snapshot. That
+    # is what makes it impossible for a total and its accumulation to
+    # disagree, which is the one pairing the sparse builder requires.
+    var const_h_env = const_hessian_env.copy()
+    if not const_h_env.resolved:
+        const_h_env = ConstHessianSettings.resolve()
+    var narrow = const_h_env.widened(
+        params.extra.wants_float64_derivatives()
+    ).narrow
+
     var root_rows: List[Int]
     var root_entries: SparseNodeEntries
     var root_totals: NodeTotals
@@ -617,11 +662,11 @@ def grow_tree_sparse(
         for r in range(data.n_rows):
             root_rows.append(r)
         root_entries = SparseNodeEntries.root(data)
-        root_totals = sum_all(grad, hess)
+        root_totals = sum_all(grad, hess, narrow)
     else:
         root_entries = _bag_entries(data, order, bag, row_side)
         root_rows = bag.copy()
-        root_totals = sum_rows(grad, hess, bag)
+        root_totals = sum_rows(grad, hess, bag, narrow)
 
     var root_hist = _node_histogram(
         data,
@@ -633,6 +678,7 @@ def grow_tree_sparse(
         bundles,
         tree_features,
         tree_columns,
+        narrow,
     )
     var root_branch = List[Int]()
     # The root's value comes before its search, because path smoothing makes a
@@ -781,10 +827,11 @@ def grow_tree_sparse(
                 hess,
                 order,
                 left_entries,
-                sum_rows(grad, hess, left_rows),
+                sum_rows(grad, hess, left_rows, narrow),
                 bundles,
                 tree_features,
                 tree_columns,
+                narrow,
             )
             right_hist = subtract_histogram(frontier[best_i].hist, left_hist)
         else:
@@ -794,10 +841,11 @@ def grow_tree_sparse(
                 hess,
                 order,
                 right_entries,
-                sum_rows(grad, hess, right_rows),
+                sum_rows(grad, hess, right_rows, narrow),
                 bundles,
                 tree_features,
                 tree_columns,
+                narrow,
             )
             left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
 

@@ -131,9 +131,11 @@ from .distributed_transport import (
     split_digest,
 )
 from .histogram import (
+    ConstHessianSettings,
     Histogram,
     build_histogram,
     build_histogram_subset,
+    derivative_precision_narrows,
     subtract_histogram,
 )
 from .interaction import extend_branch
@@ -858,7 +860,56 @@ def _schema_values(
     _push_f64(values, params.feature_fraction_bylevel)
     _push_f64(values, params.extra.max_delta_step)
     _push_f64(values, params.extra.path_smooth)
+    _push_derivative_precision(values, params)
     return values^
+
+
+comptime _SCHEMA_DERIVATIVE_FLOAT64 = 6616141
+"""The schema marker a `derivative_precision = float64` fit appends.
+
+Arbitrary and large on purpose; see `_push_derivative_precision`.
+"""
+
+
+def _push_derivative_precision(mut values: List[Int], params: TreeParams):
+    """Fold the resolved `derivative_precision` into the schema, and append
+    **nothing at all** when it is the default.
+
+    Two things this has to do at once.
+
+    It has to catch a **heterogeneous environment**, which is the only way
+    this setting can differ between ranks without any parameter differing.
+    `MOJOTREES_DERIVATIVE_PRECISION` is read per process, so an operator who
+    exports it on one rank configures two different fits, and the all-reduce
+    would then sum histograms accumulated at two precisions into a number
+    that is neither. The digest therefore folds in the *resolved* answer --
+    parameter and environment together, through the same
+    `_histogram_env` the growers use -- rather than the parameter alone.
+
+    And it must not **invalidate a checkpoint** that was taken before this
+    line existed. `run_schema_digest` is what a checkpoint records as the
+    schema it was taken under, and a restart against a different digest is
+    refused rather than resumed. So the default appends nothing and every
+    existing digest is unchanged, bit for bit; only a fit that actually asked
+    for Float64 derivatives gets the extra word. A float64 rank and a float32
+    rank still disagree, which is the whole requirement -- one appends the
+    marker and the other does not.
+
+    The marker is a large constant rather than 1 so that it cannot collide
+    with a plausible future one-value append here.
+
+    Spelled from the two reads rather than through `_histogram_env` because a
+    digest must not raise: `resolve()` refuses a mistyped environment, and
+    the three digest functions and their callers are all non-raising. The
+    typo is still refused, at `_histogram_env` in whichever grower runs
+    immediately after, which is the same fit. What is asserted here is only
+    the resolved answer, and these are the same two reads it is made of.
+    """
+    if derivative_precision_narrows() and (
+        not params.extra.wants_float64_derivatives()
+    ):
+        return
+    values.append(_SCHEMA_DERIVATIVE_FLOAT64)
 
 
 def tree_schema_digest(
@@ -1161,6 +1212,36 @@ def model_digest(model: Booster) -> UInt64:
     return digest_ints(values)
 
 
+def _histogram_env(params: TreeParams) raises -> ConstHessianSettings:
+    """The histogram snapshot one distributed tree is grown under.
+
+    Resolved once per tree in each of the three growers and passed to every
+    `build_histogram` and `build_histogram_subset` below. **Before it existed
+    those nine calls took the sentinel**, which means `narrow = True`, which
+    means a distributed fit re-narrowed every derivative at the histogram
+    while `boosting.fill_grad_hess` had stopped narrowing at the objective
+    under `MOJOTREES_DERIVATIVE_PRECISION=float64`. The caller got the cost of
+    the wide arm and the precision of the narrow one, silently. Same defect
+    the sparse grower had and the same fix.
+
+    Only `narrow` changes anything here. This grower never declares a constant
+    hessian, and `histogram._resolve_const_hessian` returns before it consults
+    the snapshot whenever the declaration is absent, so `allowed` and `verify`
+    are carried and never read and no histogram cell moves because this became
+    resolved.
+
+    **What it does not do is agree the answer across ranks.** The environment
+    is read per process, so an operator who exports the variable on one rank
+    and not another configures two different fits. `tree_schema_digest` closes
+    that: the resolved answer is folded into the digest ranks compare before
+    they grow anything, so the run fails at the agreement instead of producing
+    divergent trees that all-reduce into nonsense.
+    """
+    return ConstHessianSettings.resolve_with(
+        params.extra.wants_float64_derivatives()
+    )
+
+
 def _grow_tree_distributed[
     C: Collective
 ](
@@ -1213,6 +1294,7 @@ def _grow_tree_data_parallel[
     var n_features = shards[0].data.n_features
     var n_bins = shards[0].data.n_bins
     var n_local = len(shards)
+    var hist_env = _histogram_env(params)
 
     # The parts of the bundle this grower does honor are validated the way the
     # single-node grower validates them, against this dataset. Every rank runs
@@ -1236,7 +1318,11 @@ def _grow_tree_data_parallel[
             rows.append(r)
         root_rows.append(rows^)
         _accumulate_histogram(
-            root_hist, build_histogram(shards[i].data, grad[i], hess[i])
+            root_hist,
+            build_histogram(
+                shards[i].data, grad[i], hess[i],
+                const_hessian_env=hist_env,
+            ),
         )
     allreduce_histogram(comm, root_hist)
 
@@ -1326,7 +1412,8 @@ def _grow_tree_data_parallel[
                 _accumulate_histogram(
                     left_hist,
                     build_histogram_subset(
-                        shards[i].data, grad[i], hess[i], left_rows[i]
+                        shards[i].data, grad[i], hess[i], left_rows[i],
+                        const_hessian_env=hist_env,
                     ),
                 )
             allreduce_histogram(comm, left_hist)
@@ -1337,7 +1424,8 @@ def _grow_tree_data_parallel[
                 _accumulate_histogram(
                     right_hist,
                     build_histogram_subset(
-                        shards[i].data, grad[i], hess[i], right_rows[i]
+                        shards[i].data, grad[i], hess[i], right_rows[i],
+                        const_hessian_env=hist_env,
                     ),
                 )
             allreduce_histogram(comm, right_hist)
@@ -1555,6 +1643,7 @@ def _grow_tree_feature_parallel[
     var built = List[List[Int]](capacity=n_local)
     for i in range(n_local):
         built.append(_built_features(partition, comm.local_rank(i)))
+    var hist_env = _histogram_env(params)
 
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
@@ -1569,7 +1658,10 @@ def _grow_tree_feature_parallel[
     var root_hists = List[Histogram](capacity=n_local)
     for i in range(n_local):
         root_hists.append(
-            build_histogram(shards[i].data, grad[i], hess[i], built[i])
+            build_histogram(
+                shards[i].data, grad[i], hess[i], built[i],
+                const_hessian_env=hist_env,
+            )
         )
     var root_branch = List[Int]()
     var root = tree._add_node(
@@ -1634,7 +1726,8 @@ def _grow_tree_feature_parallel[
         for i in range(n_local):
             if n_left <= n_right:
                 var lh = build_histogram_subset(
-                    shards[i].data, grad[i], hess[i], left_rows, built[i]
+                    shards[i].data, grad[i], hess[i], left_rows, built[i],
+                    const_hessian_env=hist_env,
                 )
                 right_hists.append(
                     subtract_histogram(frontier[best_i].hists[i], lh)
@@ -1642,7 +1735,8 @@ def _grow_tree_feature_parallel[
                 left_hists.append(lh^)
             else:
                 var rh = build_histogram_subset(
-                    shards[i].data, grad[i], hess[i], right_rows, built[i]
+                    shards[i].data, grad[i], hess[i], right_rows, built[i],
+                    const_hessian_env=hist_env,
                 )
                 left_hists.append(
                     subtract_histogram(frontier[best_i].hists[i], rh)
@@ -1891,6 +1985,7 @@ def _grow_tree_voting_parallel[
     )
     var max_delta_step = params.extra.max_delta_step
     var path_smooth = params.extra.path_smooth
+    var hist_env = _histogram_env(params)
 
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
@@ -1906,7 +2001,12 @@ def _grow_tree_voting_parallel[
         for r in range(shards[i].data.n_rows):
             rows.append(r)
         root_rows.append(rows^)
-        root_hists.append(build_histogram(shards[i].data, grad[i], hess[i]))
+        root_hists.append(
+            build_histogram(
+                shards[i].data, grad[i], hess[i],
+                const_hessian_env=hist_env,
+            )
+        )
         root_counts.append(shards[i].data.n_rows)
         local_total[0] += shards[i].data.n_rows
     comm.allreduce_sum_int(local_total)
@@ -1990,7 +2090,8 @@ def _grow_tree_voting_parallel[
         for i in range(n_local):
             if n_left <= n_right:
                 var lh = build_histogram_subset(
-                    shards[i].data, grad[i], hess[i], left_rows[i]
+                    shards[i].data, grad[i], hess[i], left_rows[i],
+                    const_hessian_env=hist_env,
                 )
                 right_hists.append(
                     subtract_histogram(frontier[best_i].hists[i], lh)
@@ -1998,7 +2099,8 @@ def _grow_tree_voting_parallel[
                 left_hists.append(lh^)
             else:
                 var rh = build_histogram_subset(
-                    shards[i].data, grad[i], hess[i], right_rows[i]
+                    shards[i].data, grad[i], hess[i], right_rows[i],
+                    const_hessian_env=hist_env,
                 )
                 left_hists.append(
                     subtract_histogram(frontier[best_i].hists[i], rh)
@@ -2405,6 +2507,7 @@ def train_distributed_run[
                 alpha,
                 g,
                 h,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             grad.append(g^)
             hess.append(h^)

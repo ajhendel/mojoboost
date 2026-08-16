@@ -500,7 +500,8 @@ def _dart_rounds(
 
         refresh_bag(bag, bagging, n, round)
         _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
+            raw, target, objective, sample_weight, alpha, grad, hess,
+            float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
         var tree = grow_tree(
             data, grad, hess, params.tree, bag, round, bundling
@@ -830,7 +831,8 @@ def train_dart_with_valid(
 
         refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
+            raw, target, objective, sample_weight, alpha, grad, hess,
+            float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
         var tree = grow_tree(data, grad, hess, params.tree, bag, i, bundling)
         if renews:
@@ -949,7 +951,8 @@ def _dart_rounds_multiclass(
         var made_progress = False
         for k in range(n_classes):
             _fill_softmax_grad_hess(
-                prob, labels, k, n_classes, sample_weight, grad, hess
+                prob, labels, k, n_classes, sample_weight, grad, hess,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             var tree = grow_tree(
                 data,
@@ -1242,7 +1245,8 @@ def train_dart_multiclass_with_valid(
         var made_progress = False
         for k in range(n_classes):
             _fill_softmax_grad_hess(
-                prob, labels, k, n_classes, sample_weight, grad, hess
+                prob, labels, k, n_classes, sample_weight, grad, hess,
+                float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             var tree = grow_tree(
                 data, grad, hess, params.tree, bag, i * n_classes + k, bundling
