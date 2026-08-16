@@ -663,6 +663,107 @@ def _zero_slot_desc_kernel(
         i += stride
 
 
+def _copy_back_zero_slot_kernel(
+    rows: MutPointer[Int32, MutAnyOrigin],
+    scratch: MutPointer[Int32, MutAnyOrigin],
+    pool: MutPointer[Int32, MutAnyOrigin],
+    cells: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+):
+    """`_copy_back_kernel`'s descriptor arm and `_zero_slot_desc_kernel`, in
+    one command buffer.
+
+    Why this exists at all
+    ----------------------
+    On Metal every `enqueue_function` becomes its own single-encoder command
+    buffer and the queue holds 64 of them (`docs/GPU_PORTABILITY.md` 6.2). The
+    per-launch enqueue cost is flat at 6 to 7 microseconds through a stream of
+    64 and rises to 14 to 17 beyond it, which is a knee exactly where that
+    depth predicts. The device-resident growth loop emits on the order of 306
+    command buffers between waits, so it sits past the knee for most of every
+    tree and pays roughly double per launch. A launch removed from the step
+    body is removed thirty times a tree.
+
+    What makes these two the pair that can be folded
+    ------------------------------------------------
+    They are adjacent in the stream -- the copy-back is the last launch of
+    `enqueue_partition_desc` and the slot zeroing is the first of
+    `enqueue_desc_histogram`, with nothing between them and no host decision
+    anywhere near them -- and they are independent of each other in every way
+    that a launch boundary could matter:
+
+    - **Disjoint memory.** The copy-back writes `rows` and reads `scratch`;
+      the zeroing writes `pool`. No address is touched by both halves, so
+      there is no ordering between them to preserve and no barrier standing
+      between them to remove. A fused kernel could run the two loops in either
+      order, or interleaved, and produce the same bytes.
+    - **The same guard, on the same word of the same descriptor.** Both halves
+      return on `STEP_LIVE == 0` and neither writes the descriptor, so this
+      folds two reads of one word into one read of it. It does **not** fold
+      across a descriptor *write*, which is the thing that would break: a
+      write is what makes the next kernel's read meaningful, and there is no
+      write anywhere between these two.
+    - **Both were already grid-strided**, so neither has a launch geometry
+      that reaches its answer, and one grid can serve both. `_copy_back_kernel`
+      walks `[begin, begin + count)` of the window the descriptor names;
+      `_zero_slot_desc_kernel` walks `cells` of the slot the descriptor names.
+      Each thread visits distinct positions of its own range in both arms, and
+      an Int32 store is not an accumulation, so nothing about the number of
+      blocks or the number of threads changes what is stored.
+
+    What the launch boundary that *stays* is for. The barrier this fusion does
+    not touch is the one before it: the scatter's writes to `scratch` land at
+    positions derived from a global prefix, so a block of the copy-back may
+    read a word some other block of the scatter wrote, and that is a
+    device-wide dependency a threadgroup barrier cannot express. Same for the
+    barrier after: the atomic accumulation reads `rows` and adds onto `pool`,
+    both of which this kernel writes across blocks. So the partition's three
+    launches stay three-minus-one and the histogram's two stay two-minus-one,
+    and this is the only place in the step where two adjacent launches are
+    genuinely unordered with respect to each other.
+
+    **Exactness.** Fusing changes the schedule and not the arithmetic. Every
+    store this kernel makes is a store one of the two kernels it replaces made,
+    of the same value, to the same address, under the same guard. There is no
+    arithmetic here at all beyond index formation, and no floating point
+    anywhere, so `docs/NUMERICS.md`'s contraction rule has nothing to act on.
+
+    What moves in the stream, exactly: the copy-back was the launch before the
+    zeroing and is now the same launch. Two optional passes may be enqueued
+    between this kernel and the accumulation that consumes it -- the gradient
+    quantization and the bin re-layout -- and neither reads the active-row
+    buffer (`_quantize_grad_hess_kernel` is indexed by row id and not by the
+    permutation, which its own docstring records; the re-layout reads the
+    binned matrix). So the copy-back is still after every write to `scratch`
+    and still before every read of `rows`, which is the whole of what its
+    position had to satisfy.
+
+    The two loops are written out rather than sharing one bounds test because
+    their extents are different quantities -- a row window and a slot's cell
+    count -- and a merged loop would have to carry both bounds anyway.
+    """
+    if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+        return
+    var stride = Int(block_dim.x) * Int(grid_dim.x)
+
+    # Half one: the copy-back. `_copy_back_kernel`'s descriptor arm verbatim,
+    # window and all, with `use_desc` folded to the constant it always is here.
+    var b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+    var n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+    var j = Int(global_idx.x)
+    while j < n:
+        var i = b + j
+        rows[unsafe_offset=i] = scratch[unsafe_offset=i][0]
+        j += stride
+
+    # Half two: the slot zeroing. `_zero_slot_desc_kernel` verbatim.
+    var base = Int(desc[unsafe_offset=STEP_BUILT_SLOT][0]) * Int(cells)
+    var k = Int(global_idx.x)
+    while k < Int(cells):
+        pool[unsafe_offset = base + k] = Int32(0)
+        k += stride
+
+
 # --- The speculation's two kernels ----------------------------------------
 #
 # Both are mine to state plainly because the whole correctness of the K=1
@@ -3829,6 +3930,32 @@ struct GpuActiveRows(Movable):
     # speculation selects and is what this is reset to after every
     # speculative launch.
     var desc_target: Int
+    # launch-fusion lane: whether the descriptor partition's copy-back is
+    # folded into the descriptor histogram's slot zeroing, which is one fewer
+    # command buffer per growth step. See `set_partition_fusion` for the arm
+    # and `_copy_back_zero_slot_kernel` for why these two and no others.
+    var fuse_partition_tail: Bool
+    # Whether a `enqueue_partition_desc` has deferred its copy-back to the
+    # `enqueue_desc_histogram` that must follow it. True for the width of that
+    # one pairing and never across a call the pairing does not contain; every
+    # entry point that could observe the row buffer in between refuses while it
+    # is set, so a caller that breaks the pairing gets an error rather than a
+    # window of rows that are half in `scratch`.
+    var copy_back_debt: Bool
+    # The block count the deferred copy-back would have launched at, carried
+    # from the partition to the fused launch so the fused grid is at least as
+    # wide as either half's was. Correctness does not depend on it -- both
+    # halves are grid-strided -- but a grid narrower than the copy-back's would
+    # make each thread walk further for no reason.
+    var copy_back_blocks: Int
+    # How many fused copy-back-and-zero launches this instance has issued, ever.
+    # A count of launches actually enqueued and not a prediction of how many
+    # there should be, which is the whole reason it is worth carrying: the arm
+    # can be asserted to have engaged rather than assumed to have. Monotone
+    # across the fit; a caller that wants a per-tree figure takes the
+    # difference, which is what `gpu_resident_round` puts in its trace. One Int
+    # increment per growth step on the host, no launch and no transfer.
+    var copy_back_folds: Int
     var host_total: HostBuffer[DType.int32]
     var host_rows: HostBuffer[DType.int32]
     var stage_rows: HostBuffer[DType.int32]
@@ -4049,6 +4176,18 @@ struct GpuActiveRows(Movable):
             SPEC_STAT_WORDS
         )
         self.desc_target = DESC_STEP
+        # The partition-tail fusion is **on**, which is the polarity this
+        # repository reserves for an arm that has been measured -- and this one
+        # does not need measuring, which is a stronger claim than a measurement.
+        # It is strictly one fewer command buffer per growth step, storing the
+        # same bytes to the same addresses under the same guard; there is no
+        # trade-off here for a benchmark to resolve, only a launch that is not
+        # issued. `set_partition_fusion(False)` is the arm a window holds it
+        # against.
+        self.fuse_partition_tail = True
+        self.copy_back_debt = False
+        self.copy_back_blocks = 1
+        self.copy_back_folds = 0
         self.host_total = self.ctx.enqueue_create_host_buffer[DType.int32](1)
         self.host_rows = self.ctx.enqueue_create_host_buffer[DType.int32](
             n_rows
@@ -4654,6 +4793,10 @@ struct GpuActiveRows(Movable):
         """
         if len(bag) > self.n_rows:
             raise Error("bag is larger than the dataset")
+        # A tree boundary with a copy-back still owed means the previous tree's
+        # last partition was never paired with a histogram, which is a broken
+        # schedule and not something to reseed over.
+        self._refuse_copy_back_debt("starting a tree")
         # A new tree may carry a new round's gradients; the quantized copy
         # is rebuilt on the first histogram that asks for it.
         self.quant_valid = False
@@ -4950,7 +5093,90 @@ struct GpuActiveRows(Movable):
         """
         if target != DESC_STEP and target != DESC_BUILD and target != DESC_SPEC:
             raise Error("unknown step descriptor target")
+        # A deferred copy-back is owed against the descriptor the partition
+        # that deferred it read. Moving the target under it would pay it
+        # against a different window, which is the one way this fusion could
+        # produce a wrong permutation rather than an error.
+        self._refuse_copy_back_debt("changing the step descriptor target")
         self.desc_target = target
+
+    def set_partition_fusion(mut self, on: Bool) raises:
+        """Whether the descriptor partition's copy-back is folded into the
+        descriptor histogram's slot zeroing.
+
+        On is the default and off is the arm a window holds it against. A
+        run-time arm in the same style as `set_row_unroll` and
+        `set_descriptor_target`, and for the same standing reason: this
+        machine's device timings drift two- to threefold between time windows,
+        so only interleaved arms compare, and a comptime knob would put a
+        different compile and a different thermal state on either side of the
+        comparison.
+
+        **It cannot change a histogram, a tree or a score.** Both arms store
+        the same values to the same addresses under the same `STEP_LIVE`
+        guard; what differs is how many command buffers carry those stores.
+        `_copy_back_zero_slot_kernel` writes the whole argument out, including
+        why these two launches and no other adjacent pair in the growth step
+        may be folded.
+
+        The pairing contract, which is the only thing a caller has to hold up
+        --------------------------------------------------------------------
+        With this on, `enqueue_partition_desc` does not launch its copy-back;
+        it records a debt that the very next `enqueue_desc_histogram` pays,
+        against the same descriptor. That is the shape
+        `gpu_resident_round.grow_tree_device_resident` already has -- its
+        partition and its child build are adjacent in both the unarmed and the
+        armed schedules, against `DESC_STEP`/`DESC_BUILD` and against
+        `DESC_SPEC` respectively -- and it is the only shape in the package
+        that pairs them at all.
+
+        A caller that breaks the pairing does not get a wrong answer quietly:
+        `begin_tree`, `download_rows`, `download_range` and a second
+        `enqueue_partition_desc` all refuse while a debt is outstanding, and
+        the refusal names this method. That is deliberate rather than
+        defensive. The bug this plane already shipped once was a caller that
+        did not know it had host state to maintain (`_publish_row_ranges`), so
+        a rule the callers have to remember is a rule that has already failed
+        here.
+
+        Turning it off while a debt is outstanding is refused for the same
+        reason: the debt was incurred under the other arm and the launch that
+        would have paid it is the one being turned off.
+        """
+        if self.copy_back_debt:
+            raise Error(
+                "the descriptor partition's copy-back is still owed to the"
+                " next descriptor histogram; set_partition_fusion cannot"
+                " change arms in the middle of that pairing"
+            )
+        self.fuse_partition_tail = on
+
+    def partition_fusion_pending(self) -> Bool:
+        """Whether a deferred copy-back is outstanding.
+
+        Exposed so a test can assert that the fused arm actually deferred
+        something rather than quietly taking the unfused path, which is the
+        vacuous pass this whole lane's assertions are written against.
+        """
+        return self.copy_back_debt
+
+    def _refuse_copy_back_debt(self, what: String) raises:
+        """Refuse an operation that would observe the row buffer, or start a
+        new tree, while the partition's copy-back has not been paid.
+
+        Named rather than inlined so every refusal reads the same and points at
+        the same method, and so the list of places that make it is greppable.
+        """
+        if self.copy_back_debt:
+            raise Error(
+                what
+                + " while the descriptor partition's copy-back is still owed"
+                " to the next descriptor histogram: the active rows of the"
+                " window being split are in the scratch buffer, not in the"
+                " row buffer. Every enqueue_partition_desc under"
+                " set_partition_fusion(True) must be followed immediately by"
+                " the enqueue_desc_histogram that pays it"
+            )
 
     def _desc_buffer(self) -> DeviceBuffer[DType.int32]:
         """The descriptor buffer `desc_target` names, as a handle a launch can
@@ -5167,7 +5393,17 @@ struct GpuActiveRows(Movable):
         `bound` is `max_count`, validated. The validation moved into
         `begin_descriptor_partition` with it so that there is no version of
         this entry point that checks its bound and forgets to arm.
+
+        **Three launches, or two under `set_partition_fusion(True)`, which is
+        the default.** The third, `_copy_back_kernel`, is then not issued here
+        at all: the debt is recorded and the next `enqueue_desc_histogram`
+        discharges it in the same command buffer as its slot zeroing, which is
+        one fewer command buffer per growth step on a queue that is 64 deep and
+        past its knee. See `set_partition_fusion` for the pairing contract and
+        `_copy_back_zero_slot_kernel` for why the fold is exact and why the
+        other two launches here cannot be folded into anything.
         """
+        self._refuse_copy_back_debt("a second descriptor partition")
         var bound = self.ranges.begin_descriptor_partition(max_count)
         var threads = self.block_threads
         var grid = _partition_grid(bound, threads, self.partition_block_cap)
@@ -5254,6 +5490,17 @@ struct GpuActiveRows(Movable):
                 grid_dim=blocks,
                 block_dim=threads,
             )
+        # Under the fusion the copy-back is not a launch of its own: the next
+        # descriptor histogram folds it into its slot zeroing, which is a
+        # launch that has to happen anyway and is unordered with respect to
+        # this one. Nothing else is deferred and nothing is skipped -- the same
+        # stores are made, in the next command buffer instead of this one, and
+        # still before the accumulation that reads them.
+        if self.fuse_partition_tail:
+            self.copy_back_debt = True
+            self.copy_back_blocks = blocks
+            return
+
         # The copy back runs on the capped grid here, not on the uncapped
         # `ceil(count / threads)` one the host arm gives it, because a count
         # this launch does not know cannot size a grid. It is grid-strided, so
@@ -5395,13 +5642,40 @@ struct GpuActiveRows(Movable):
             zero_blocks = pool_slots * 4
         if zero_blocks < 1:
             zero_blocks = 1
-        self.ctx.enqueue_function[_zero_slot_desc_kernel](
-            pool,
-            Int32(cells),
-            desc.unsafe_ptr(),
-            grid_dim=zero_blocks,
-            block_dim=threads,
-        )
+        if self.copy_back_debt:
+            # The partition immediately before this one deferred its
+            # copy-back, so this launch carries both halves. One command
+            # buffer where the step used to spend two, with every store
+            # unchanged; `_copy_back_zero_slot_kernel` argues that in full.
+            #
+            # The grid is the wider of the two the halves would have had.
+            # Neither half's answer depends on it -- both are grid-strided over
+            # distinct positions of their own range -- so this is a work
+            # distribution and not a correctness input. `threads` is the
+            # histogram's block width rather than the partition's; the same
+            # argument covers it.
+            var fused_blocks = zero_blocks
+            if self.copy_back_blocks > fused_blocks:
+                fused_blocks = self.copy_back_blocks
+            self.ctx.enqueue_function[_copy_back_zero_slot_kernel](
+                self.rows_dev.unsafe_ptr(),
+                self.scratch_dev.unsafe_ptr(),
+                pool,
+                Int32(cells),
+                desc.unsafe_ptr(),
+                grid_dim=fused_blocks,
+                block_dim=threads,
+            )
+            self.copy_back_debt = False
+            self.copy_back_folds += 1
+        else:
+            self.ctx.enqueue_function[_zero_slot_desc_kernel](
+                pool,
+                Int32(cells),
+                desc.unsafe_ptr(),
+                grid_dim=zero_blocks,
+                block_dim=threads,
+            )
 
         var use_quant = Int32(0)
         if self.quantized_gradients:
@@ -6560,6 +6834,11 @@ struct GpuActiveRows(Movable):
         """The whole active-row buffer, host side. Synchronizes, and is for
         tests and debugging: training never needs the permutation on the
         host."""
+        # A deferred copy-back means the split window's rows are in `scratch`
+        # and not in `rows_dev` yet, so this would return a permutation correct
+        # everywhere except the one window a reader is most likely looking at.
+        # See `set_partition_fusion`.
+        self._refuse_copy_back_debt("downloading the active rows")
         self.ctx.enqueue_copy(
             dst_ptr=self.host_rows.unsafe_ptr(), src_buf=self.rows_dev
         )
