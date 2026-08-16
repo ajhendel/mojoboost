@@ -165,6 +165,7 @@ difference is the failure mode this file exists to prevent.
 """
 
 import copy
+import struct
 
 #: Parameters both engines get, under the names both engines accept.
 #: Every one of these is LightGBM's stock default, stated rather than
@@ -353,22 +354,61 @@ LIGHTGBM_STOCK_DEFAULTS = {
 #   "us in CatBoost mode vs CatBoost defaults"   engine mojotrees_catboost_mode
 #   "our defaults vs CatBoost defaults"          engine mojotrees
 #
-# Both at matched tree count and matched learning rate, which for CatBoost is
-# not a formality: CatBoost picks `learning_rate` itself from the iteration
-# count and the dataset when it is not given one. Measured on this machine on
-# 2026-08-16 at 20,000 rows by 20 features, CatBoost 1.2.10 resolved
-# `learning_rate` to 0.5 at 2 iterations, 0.4273 at 100 and 0.06573 at 1000.
-# A run that left it alone would compare two different models and call the
-# difference a benchmark.
+# Both at a matched TREE COUNT and at each engine's OWN learning rate. That
+# second half changed on 2026-08-16 and it is the largest change this arm has
+# ever taken, so it is stated here before anything else in the section.
+#
+# CatBoost derives `learning_rate` from the iteration count and the dataset
+# when it is not given one. Measured on this machine on 2026-08-16 at 20,000
+# rows by 20 features, CatBoost 1.2.10 resolved it to 0.5 at 2 iterations,
+# **0.4273 at 100** and 0.06573 at 1000. This harness used to PIN the rate to
+# BASE_PARAMS['learning_rate'] = 0.1 on the CatBoost side so that the three
+# arms ran one rate; it does not any more. The measurements above stay in the
+# file because they are now the EXPLANATION of the arm rather than the
+# argument against it: they are why the CatBoost column trains at roughly
+# 0.43 while the LightGBM comparator trains at 0.1, which a reader will
+# otherwise take for a bug.
+#
+# The two comparisons this is choosing between, because both are defensible
+# and only one of them can be the row:
+#
+#   like-for-like on model shape     both engines pinned to one rate, so a
+#                                    metric difference is tree shape and
+#                                    regularization. What this arm was.
+#   as shipped                       each engine at its own resolved default
+#                                    at a matched tree budget, so the row is
+#                                    what a user gets out of the box. What
+#                                    this arm IS, by Andrew's decision on
+#                                    2026-08-16.
+#
+# READ THIS BEFORE QUOTING THE CATBOOST ACCURACY NUMBER. At a fixed 100-tree
+# budget an engine training at 0.4273 walks much further down its loss curve
+# than one training at 0.1, so CatBoost's accuracy column may improve
+# substantially against the previous arm. That movement is a learning-rate-
+# times-budget interaction and is NOT evidence that CatBoost's engine is more
+# accurate than either arm beside it. See CATBOOST_DELIBERATE_DIVERGENCE.
 
 #: The peer arm's identity. Read beside `comparator_id()`, never in place of
-#: it. Bump the version when `CATBOOST_ALIGNMENT` or `CATBOOST_MATCHED`
-#: changes in a way that makes two CatBoost numbers non-comparable.
-CATBOOST_ARM_ID = "cb-default"
+#: it. Bump the version when `CATBOOST_ALIGNMENT`, `CATBOOST_MATCHED` or
+#: `CATBOOST_DELIBERATE_DIVERGENCE` changes in a way that makes two CatBoost
+#: numbers non-comparable.
+#:
+#: The id itself changed on 2026-08-16, which is rarer than a version bump and
+#: is deliberate: `cb-default@v1` pinned CatBoost's learning rate and this arm
+#: does not, so the two ids compute materially different models and no reader
+#: should have to notice a version digit to tell them apart. Every published
+#: `cb-default@v1` number is superseded; see `CATBOOST_ARM_SUPERSEDES`.
+CATBOOST_ARM_ID = "cb-shipped"
 CATBOOST_ARM_VERSION = 1
-CATBOOST_ARM_LABEL = (
-    "CatBoost at its own defaults, at matched tree count and matched "
-    "learning rate"
+CATBOOST_ARM_LABEL = "CatBoost defaults (as shipped), at a matched tree count"
+CATBOOST_ARM_SUPERSEDES = (
+    "cb-default@v1, which pinned learning_rate to BASE_PARAMS['learning_rate']"
+    " = 0.1 on the CatBoost side. Every CatBoost number taken under that id "
+    "is SUPERSEDED and not merely re-labelled: CatBoost resolves its own rate "
+    "to roughly 0.43 at 100 iterations on a 20,000 by 20 shape, so the model "
+    "this arm fits now is a different model. bench/results/"
+    "COMPARISON_RUN_2026-08-16.md carries cb-default@v1 numbers throughout "
+    "and none of its CatBoost rows survives this change"
 )
 CATBOOST_ARM_REGISTERED = (
     "bench/results/PROFILE_PROTOCOL.md section C9 names one comparator, "
@@ -420,22 +460,84 @@ CATBOOST_MIN_VERSION = (1, 2)
 #: deviation from stock with a reason and an exit condition, or as a harness
 #: setting that changes neither the model nor the work.
 #:
-#: The two matched parameters are deliberately NOT here. They come from
-#: `BASE_PARAMS` through `CATBOOST_MATCHED`, so that "matched tree count and
-#: matched learning rate" is a structural property of the translation rather
-#: than two numbers copied into a second dict where they can drift.
+#: The matched parameter is deliberately NOT here. It comes from
+#: `BASE_PARAMS` through `CATBOOST_MATCHED`, so that "matched tree count" is a
+#: structural property of the translation rather than a number copied into a
+#: second dict where it can drift.
 CATBOOST_ALIGNMENT = {
     "allow_writing_files": False,
     "logging_level": "Silent",
     "random_seed": 190019,
 }
 
-#: The two shared parameters that are forced onto the CatBoost arm, and the
-#: `BASE_PARAMS` key each is taken from. `selfcheck.check_catboost_arm`
-#: proves the resolved dict carries the same value the other two engines get.
+#: The ONE shared parameter that is forced onto the CatBoost arm, and the
+#: `BASE_PARAMS` key it is taken from. `selfcheck.check_catboost_arm` proves
+#: the resolved dict carries the same value the other two engines get.
+#:
+#: `learning_rate` left this dict on 2026-08-16. It is now a declared
+#: divergence rather than a match; see `CATBOOST_DELIBERATE_DIVERGENCE`.
 CATBOOST_MATCHED = {
     "iterations": "n_estimators",
-    "learning_rate": "learning_rate",
+}
+
+#: Where this arm DELIBERATELY does not match, with the decision and the
+#: reason. The opposite of `CATBOOST_UNMATCHABLE`, which is about differences
+#: no parameter can close: everything here COULD be closed by passing a value
+#: and is not, on purpose.
+#:
+#: A separate table because the two failure modes are opposite. An
+#: unmatchable difference is a fact about the engines; a deliberate divergence
+#: is a choice about the row, and a choice that is not written down is
+#: indistinguishable from an oversight six weeks later.
+CATBOOST_DELIBERATE_DIVERGENCE = {
+    "learning_rate": {
+        "catboost": (
+            "CatBoost's own resolution, read back per fit through "
+            "get_all_params(). Roughly 0.4273 at 100 iterations on a 20,000 "
+            "by 20 shape; the exact value is dataset-dependent and is "
+            "recorded per run, never asserted here"
+        ),
+        "lightgbm": "BASE_PARAMS['learning_rate'] = 0.1, unchanged",
+        "mojotrees": "BASE_PARAMS['learning_rate'] = 0.1, unchanged",
+        "mojotrees_catboost_mode": (
+            "CatBoost's resolved value for the same cell, taken from the "
+            "read-back. This arm's whole claim is 'us in CatBoost's shape', "
+            "and a hand-written 0.1 beside a CatBoost fit at 0.43 was that "
+            "claim being false in the single parameter that moves a metric "
+            "most"
+        ),
+        "decision": (
+            "Andrew, 2026-08-16. Each engine runs its own shipped default at "
+            "a matched tree count. The alternative -- both engines pinned to "
+            "one rate, which is what this arm did until now -- is a "
+            "like-for-like on model shape and is a different row, not a "
+            "better version of this one"
+        ),
+        "measured": {
+            "2_iterations": 0.5,
+            "100_iterations": 0.4273,
+            "1000_iterations": 0.06573,
+            "shape": "20,000 rows by 20 features, catboost 1.2.10, "
+                     "task_type CPU, RMSE, this machine, 2026-08-16",
+        },
+        "how_to_misread_it": (
+            "as an engine claim. At a fixed 100-tree budget an engine "
+            "training at 0.4273 converges much further than one training at "
+            "0.1, so CatBoost's accuracy column can improve substantially "
+            "against cb-default@v1 without a single line of CatBoost running "
+            "faster or fitting better. The difference is a learning rate "
+            "times a budget. A table that prints this column beside the "
+            "comparator MUST carry this sentence or it is inviting the "
+            "misreading"
+        ),
+        "how_to_read_it": (
+            "as an out-of-the-box claim, which is what it is. A user who "
+            "installs CatBoost and asks for 100 trees gets roughly 0.43 and "
+            "a user who installs LightGBM and asks for 100 trees gets 0.1. "
+            "That is a real difference between the products and this row "
+            "measures it"
+        ),
+    },
 }
 
 #: Every entry in `CATBOOST_ALIGNMENT` and `CATBOOST_MATCHED` that differs
@@ -456,23 +558,12 @@ CATBOOST_DEVIATIONS_FROM_STOCK = {
             "in a differently labelled row"
         ),
     },
-    "learning_rate": {
-        "stock": "chosen by CatBoost from the iteration count and the "
-                 "dataset when it is not given one",
-        "here": "BASE_PARAMS['learning_rate']",
-        "why": (
-            "CatBoost auto-selects the learning rate, and the value it "
-            "picks moves with the budget: 0.5 at 2 iterations, 0.4273 at "
-            "100 and 0.06573 at 1000, measured on this machine on "
-            "2026-08-16 at 20,000 rows by 20 features. Leaving it alone "
-            "would compare two different models and read the difference as "
-            "engine quality"
-        ),
-        "removed_when": (
-            "never, while this is a matched-rate column. CatBoost's own "
-            "auto rate is worth a separate row and it is not this one"
-        ),
-    },
+    # `learning_rate` is NOT here any more, and its absence is the point of
+    # cb-shipped. It is not passed, so it is not a deviation from CatBoost's
+    # default: it IS CatBoost's default. The reasoning that used to live here
+    # moved to CATBOOST_DELIBERATE_DIVERGENCE, with the measurements intact,
+    # because a reader who sees a CatBoost column at 0.43 beside a LightGBM
+    # column at 0.1 needs an explanation and not a deletion.
     "allow_writing_files": {
         "stock": True,
         "here": False,
@@ -558,6 +649,33 @@ CATBOOST_LEFT_AT_STOCK = {
     "ctr_target_border_count": 1,
     "store_all_simple_ctr": False,
     "has_time": False,
+}
+
+#: The CatBoost parameters that have NO static value, because CatBoost derives
+#: them from the fit. They are absent from `CATBOOST_LEFT_AT_STOCK` on purpose:
+#: a constant in that table is a claim, and a claim about a derived value is
+#: false on every shape but the one it was read on.
+#:
+#: The only way to know one of these is to read it back off the fitted model,
+#: which is what `engines.CatBoostEngine.run` does through
+#: `CatBoost.get_all_params()` and records as `engine_resolved_params`. Every
+#: consumer of a value in this table has to come from there or refuse.
+#:
+#: `boosting_type` is deliberately NOT here even though CatBoost documents it
+#: as data-dependent. See `ORDERED_BOOSTING_ROWS`: the only default that
+#: installs `Ordered` is inside a `TaskType == GPU` branch, so on CPU it is
+#: `Plain` at every row count and it is a constant, not a reading.
+CATBOOST_RESOLVED_PER_FIT = {
+    "learning_rate": (
+        "derived from the iteration count and the dataset. 0.5 at 2 "
+        "iterations, 0.4273 at 100 and 0.06573 at 1000, on 20,000 rows by 20 "
+        "features, catboost 1.2.10, this machine, 2026-08-16. Those three "
+        "numbers are a demonstration that it MOVES, not a table to look a "
+        "value up in: the row count and the feature count are both inputs, so "
+        "a scenario with a different shape resolves a different rate. "
+        "cb-shipped no longer passes it, so every cell's value comes from "
+        "that cell's own read-back. See CATBOOST_DELIBERATE_DIVERGENCE"
+    ),
 }
 
 #: The differences between CatBoost's defaults and this harness's shared
@@ -666,9 +784,41 @@ CATBOOST_UNMATCHABLE = {
         "side is, CatBoost putting NaN at bin 0 and both of the others last"
     ),
     "learning_rate_precision": (
-        "CatBoost stores learning_rate as a 32-bit float. A matched rate of "
-        "0.1 resolves to 0.10000000149011612 in get_all_params(), so the "
-        "rates are matched to float32 and not exactly"
+        "CatBoost stores learning_rate as a 32-bit float, so a rate that "
+        "leaves get_all_params() is a float32 widened to a double: a passed "
+        "0.1 reads back as 0.10000000149011612. This mattered when the arm "
+        "PINNED the rate and the claim was that the three arms ran the same "
+        "number; under cb-shipped it matters for a different reason, which is "
+        "that the mojotrees CatBoost-mode arm takes CatBoost's resolved rate "
+        "and can only take it to float32 precision. Every comparison of the "
+        "two rates therefore folds through a float32 round trip "
+        "(scenarios._parity_equal) rather than asking for equality"
+    ),
+    "leaf_estimation_method": (
+        "CatBoost resolves leaf_estimation_method to Newton and mojotrees has "
+        "no such parameter. Searched on 2026-08-16 across python/mojotrees, "
+        "bindings/ and docs/PARAMETER_NAMING.md: the name appears nowhere, so "
+        "there is no key to set and no key to diff. What the comment at "
+        "python/mojotrees/sklearn.py:2150 does say is that "
+        "leaf_estimation_iterations 'keeps taking Newton steps on a leaf's "
+        "own rows' through boosting._estimate_leaf_values, which is the same "
+        "estimator CatBoost names -- but that is a reading of a comment about "
+        "a NEIGHBOURING parameter and it is not evidence a record can carry. "
+        "The honest statement is that the two engines are believed to agree "
+        "here and that nothing in either resolved dict proves it. Closing "
+        "this needs a leaf_estimation_method parameter on our side, or a "
+        "source-level verification note in the catalog, and it has neither"
+    ),
+    "border_placement": (
+        "CatBoost's feature_border_type resolves to GreedyLogSum, a recursive "
+        "median split, and mojotrees bins equal-frequency. Neither surface "
+        "has a parameter for the other's rule: feature_border_type appears "
+        "nowhere in python/mojotrees, bindings/ or "
+        "docs/PARAMETER_NAMING.md, searched 2026-08-16. Read this with "
+        "'binning_budget' above, which is the COUNT question and is closed: "
+        "the two engines produce the same number of borders and put them in "
+        "different places. This entry is the placement half and it is open "
+        "and unclosable by any parameter"
     ),
     "multiclass_tree_count": (
         "CatBoost builds one tree per iteration with a vector leaf value "
@@ -1205,6 +1355,468 @@ MOJOTREES_CATBOOST_MODE_REASONS = {
     ),
     "lambda_l1": "CatBoost applies no L1 to leaf values at its defaults",
     "lambda_l2": "CatBoost's l2_leaf_reg default of 3",
+    "learning_rate": (
+        "CatBoost's own resolved rate for THIS CELL, taken from that cell's "
+        "get_all_params() read-back and never from a constant. It has no "
+        "entry in the dict above because it has no static value: the rate "
+        "moves with the row count, the feature count and the iteration count. "
+        "MOJOTREES_CATBOOST_MODE_FROM_READBACK is where it lives instead, and "
+        "an arm built without a read-back REFUSES rather than falling back to "
+        "BASE_PARAMS['learning_rate']"
+    ),
+}
+
+#: The `MOJOTREES_CATBOOST_MODE` keys that have no static value and must come
+#: from CatBoost's own read-back for the same cell, mapped to the CatBoost key
+#: they are read from.
+#:
+#: **This is what makes the arm honest and it is also what makes it refuse.**
+#: Every other entry in `MOJOTREES_CATBOOST_MODE` is a constant because
+#: CatBoost resolves it to a constant, verified across three shapes and two
+#: losses at `CATBOOST_DEFAULTS_SOURCE`. `learning_rate` is not one of those.
+#: There is no value that could be written here that would be right on more
+#: than one scenario, so the arm takes it from the fitted CatBoost model or it
+#: does not run.
+#:
+#: **Consequence, stated rather than discovered.** `mojotrees_catboost_mode`
+#: cannot be built from `scenarios.py` alone any more. It needs the CatBoost
+#: cell for the same scenario, tier and variant to have run first and to have
+#: left its `engine_resolved_params` where the mojotrees cell can find it. The
+#: wiring for that is `catboost_readback_key`, `catboost_readback_entry` and
+#: `load_catboost_readback` below, plus one edit each to `run.py` and
+#: `worker.py` that this lane did not own; until those land, this arm raises
+#: `CatBoostReadbackMissing` by name. It does not fall back. A fallback here
+#: is exactly the hand-written belief the whole change removes.
+MOJOTREES_CATBOOST_MODE_FROM_READBACK = {
+    "learning_rate": "learning_rate",
+}
+
+# ---------------------------------------------------------------------------
+# The resolved-parameter parity map. CatBoost's key on the left, ours on the
+# right, and a verdict that is checked rather than asserted.
+# ---------------------------------------------------------------------------
+#
+# **What this replaces.** `MOJOTREES_CATBOOST_MODE` was a hand-written dict of
+# what somebody believed CatBoost's defaults to be, and
+# `selfcheck.check_catboost_arm` checked it against itself: it proved the
+# translator did not DROP a key, which is a real thing to prove, and it could
+# not tell whether any value in it was RIGHT. This table is the other half.
+# Every key CatBoost resolves is classified, and the classification is
+# enforced:
+#
+#   matched       our resolved value must equal CatBoost's resolved value
+#                 after `translate`, or selfcheck FAILS.
+#   unmatchable   no parameter closes it. Must name a live
+#                 `CATBOOST_UNMATCHABLE` entry.
+#   not_reached   we have the knob and this arm does not set it, because no
+#                 scenario it runs reaches it. Must say so, and must name the
+#                 scenarios that would make it reachable, so that turning one
+#                 of them on for this arm fails the check instead of quietly
+#                 running unmatched.
+#
+# Nothing may be absent. `selfcheck` walks the whole resolved CatBoost dict
+# and fails on any key that is in neither this table nor
+# `CATBOOST_PARAM_NOT_MAPPED`, because a key nobody classified is exactly the
+# hand-written belief this table exists to remove.
+#
+# **`ours` names a key in the arm's RESOLVED dict**, which spans two
+# containers: the training params from `mojotrees_catboost_mode_params` and
+# the Dataset params from `dataset_params`. `mojotrees_catboost_mode_resolved`
+# is the union and `ours_container` says which side a key comes from.
+# `border_count` is the whole reason that distinction is in the table: it maps
+# to `max_bin`, `max_bin` belongs to the Dataset, and putting `max_bin` into
+# `MOJOTREES_CATBOOST_MODE` -- which is applied over the TRAINING dict --
+# raised "'max_bin' describes the data, not the training run" and killed a
+# smoke pass on 2026-08-16. It is checked here and it is not set there.
+#
+# **`our_default` is the fallback when the arm's dict does not carry the key**,
+# with `our_default_source` saying where the default was read. The lookup
+# prefers the arm's resolved value, so adding a wrong value to
+# `MOJOTREES_CATBOOST_MODE` later fails this check rather than being masked by
+# the declared default.
+#
+# **`static: False`** marks a key whose CatBoost value is derived per fit and
+# cannot be diffed without a run. `learning_rate` is the only one. selfcheck
+# checks its WIRING statically -- that it is sourced from the read-back on our
+# side and from nothing on CatBoost's -- and `catboost_parity_from_records`
+# checks its VALUE against two finished records.
+
+#: Translation names, resolved through `_PARITY_TRANSLATORS`. Strings rather
+#: than callables because `catboost_arm_block()` must stay JSON-serializable,
+#: and `selfcheck` checks that it does.
+CATBOOST_PARAM_MAP = {
+    # --- passed by the harness -------------------------------------------
+    "loss_function": {
+        "ours": "objective",
+        "verdict": "matched",
+        "translate": "loss_to_objective",
+        "note": "the problem statement, not a setting. Inverted through "
+                "CATBOOST_LOSS",
+    },
+    "iterations": {
+        "ours": "n_estimators",
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "the one matched parameter. CATBOOST_MATCHED. Note that the "
+                "mojotrees adapter adds n_estimators to the translated dict "
+                "itself (engines.MojoTreesEngine._run_dense), so "
+                "mojotrees_catboost_mode_resolved mirrors that rather than "
+                "reading it out of MOJOTREES_CATBOOST_MODE",
+    },
+    "classes_count": {
+        "ours": "num_class",
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "multiclass only, and this arm runs no multiclass cell. "
+                "Mapped anyway so that the scenario walk cannot meet an "
+                "unclassified key if one is ever turned on",
+    },
+    # --- derived by CatBoost, taken from the read-back --------------------
+    "learning_rate": {
+        "ours": "learning_rate",
+        "verdict": "matched",
+        "translate": "identity",
+        "static": False,
+        "note": "NOT passed and NOT a constant. CatBoost resolves it from the "
+                "iteration count and the dataset, our arm takes that resolved "
+                "value out of the read-back "
+                "(MOJOTREES_CATBOOST_MODE_FROM_READBACK), and the equality is "
+                "checked against two finished records rather than statically. "
+                "Compared through a float32 round trip because CatBoost "
+                "stores it as a 32-bit float: see "
+                "CATBOOST_UNMATCHABLE['learning_rate_precision']",
+    },
+    # --- CatBoost's resolved constants ------------------------------------
+    "depth": {"ours": "max_depth", "verdict": "matched", "translate": "identity"},
+    "max_leaves": {
+        "ours": "num_leaves",
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "CatBoost's max_leaves resolves to 2**depth = 64 and our "
+                "num_leaves is set to the same, so the leaf cap does not bind "
+                "before the depth cap does",
+    },
+    "grow_policy": {
+        "ours": "grow_policy",
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "SymmetricTree against symmetrictree. Value strings are "
+                "case-insensitive on both surfaces "
+                "(docs/PARAMETER_NAMING.md), so _parity_equal folds case",
+    },
+    "min_data_in_leaf": {
+        "ours": "min_data_in_leaf",
+        "verdict": "matched",
+        "translate": "identity",
+    },
+    "l2_leaf_reg": {
+        "ours": "lambda_l2",
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "docs/PARAMETER_NAMING.md maps CatBoost l2_leaf_reg to our "
+                "reg_lambda, whose LightGBM spelling lambda_l2 is what this "
+                "harness passes",
+    },
+    "border_count": {
+        "ours": "max_bin",
+        "ours_container": "dataset",
+        "verdict": "matched",
+        "translate": "borders_to_bins",
+        "note": "254 borders against 255 bins is the SAME granularity budget, "
+                "which is why the translation is +1 and not identity. It "
+                "lives in dataset_params and must never be added to "
+                "MOJOTREES_CATBOOST_MODE: that dict is applied over the "
+                "training params and mojotrees.train refuses max_bin by name",
+    },
+    "bootstrap_type": {
+        "ours": "bootstrap_type",
+        "verdict": "matched",
+        "translate": "identity",
+    },
+    "subsample": {
+        "ours": "subsample",
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "under bootstrap_type=MVS this is the MVS rate on both sides, "
+                "not a bagging fraction. python/mojotrees/sklearn.py "
+                "_resolve_bootstrap keeps CatBoost's contract literally",
+    },
+    "random_strength": {
+        "ours": "random_strength",
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "the VALUE matches and the draws do not. See "
+                "CATBOOST_UNMATCHABLE['split_scoring']: same distribution, "
+                "different streams, and no parameter makes them the same draw",
+    },
+    "score_function": {
+        "ours": "score_function",
+        "verdict": "matched",
+        "translate": "identity",
+    },
+    "leaf_estimation_iterations": {
+        "ours": "leaf_estimation_iterations",
+        "verdict": "matched",
+        "translate": "identity",
+    },
+    "boosting_type": {
+        "ours": "boosting_type",
+        "verdict": "matched",
+        "translate": "boosting_alias",
+        "our_default": "gbdt",
+        "our_default_source": (
+            "python/mojotrees/sklearn.py _BOOSTING_ALIASES maps CatBoost's "
+            "'plain' onto 'gbdt', which is the estimator's own default, so "
+            "neither BASE_PARAMS nor MOJOTREES_CATBOOST_MODE sets the key"
+        ),
+        "note": "Plain at every tier this suite runs. ORDERED_BOOSTING_ROWS "
+                "carries the source verification: the only default that "
+                "installs Ordered is behind TaskType == GPU",
+    },
+    "rsm": {
+        "ours": "feature_fraction",
+        "verdict": "matched",
+        "translate": "identity",
+        "our_default": 1.0,
+        "our_default_source": (
+            "LightGBM's stock feature_fraction, which mojotrees defaults to "
+            "as well. Unset on every arm in this harness"
+        ),
+    },
+    "boost_from_average": {
+        "ours": "boost_from_average",
+        "verdict": "matched",
+        "translate": "identity",
+        "our_default": True,
+        "our_default_source": (
+            "LIGHTGBM_STOCK_DEFAULTS['boost_from_average'], stock on all "
+            "three engines and passed by none of them"
+        ),
+    },
+    "task_type": {
+        "ours": "device",
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "CPU against cpu, folded case. The CatBoost adapter refuses "
+                "any other device outright (engines.CatBoostEngine.load)",
+    },
+    # --- we have the knob and this arm does not reach it -------------------
+    "random_seed": {
+        "ours": "seed",
+        "verdict": "not_reached",
+        "our_default": None,
+        "reason": (
+            "CatBoost and LightGBM are both pinned to 190019 and the "
+            "mojotrees arms are pinned to nothing: mojotrees_params passes no "
+            "seed, on the argument in its own docstring that mojotrees is "
+            "reproducible across thread counts with no parameter. That "
+            "argument is about REPEATABILITY and it does not make two arms "
+            "share a random stream. It cost nothing while this arm was "
+            "deterministic; it costs something now, because "
+            "random_strength=1.0 makes the arm's split scores depend on a "
+            "seed (the draw is keyed on (seed, tree, row), "
+            "python/mojotrees/sklearn.py _resolve_bootstrap and "
+            "CATBOOST_UNMATCHABLE['split_scoring']). Matching the NUMBER "
+            "would not match the DRAWS, which is why this is left unset "
+            "rather than set to 190019 and called matched. It is recorded "
+            "here so that a reader knows the three arms are seeded from two "
+            "different constants"
+        ),
+        "required_when_scenarios": (),
+    },
+    "one_hot_max_size": {
+        "ours": "max_cat_to_onehot",
+        "verdict": "not_reached",
+        "our_default": 4,
+        "our_default_source": (
+            "CATEGORICAL_PARAMS['max_cat_to_onehot'] = 4, and "
+            "python/mojotrees/sklearn.py resolves the alias with the same "
+            "default"
+        ),
+        "reason": (
+            "CatBoost resolves 2 and our default is 4, so this arm and the "
+            "CatBoost arm WOULD differ on a categorical scenario. Neither "
+            "categorical scenario runs this arm "
+            "(MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT skips both), so today "
+            "the key reaches no cell and setting it would be a value nothing "
+            "reads. It is deliberately NOT added to MOJOTREES_CATBOOST_MODE "
+            "for that reason and for one more: the last key added to that "
+            "dict without a run behind it was max_bin, which killed the smoke "
+            "pass, and this lane could not run one. `required_when_scenarios` "
+            "makes the omission fail loudly the moment either categorical "
+            "scenario is turned on for this arm"
+        ),
+        "required_when_scenarios": (
+            "high_cardinality_categorical",
+            "categorical_missing",
+        ),
+    },
+    # --- no parameter closes it --------------------------------------------
+    "feature_border_type": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "border_placement",
+    },
+    "nan_mode": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "missing_values",
+    },
+    "leaf_estimation_method": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "leaf_estimation_method",
+    },
+    "leaf_estimation_backtracking": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "leaf_estimation_method",
+        "reason": (
+            "AnyImprovement, and mojotrees has no backtracking step to "
+            "configure: boosting._estimate_leaf_values takes its Newton "
+            "steps unconditionally. Filed under the same entry as "
+            "leaf_estimation_method because it is the same missing surface"
+        ),
+    },
+    "sampling_frequency": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "row_sampling",
+        "reason": (
+            "PerTree, and there is no frequency parameter on this arm: "
+            "python/mojotrees/sklearn.py _resolve_bootstrap refuses an "
+            "explicit subsample_freq or bagging_freq beside a bootstrap_type. "
+            "The sampler does run once per tree, from boosting.train's round "
+            "loop, so the two are believed to agree -- and no value in either "
+            "resolved dict proves it, which is what puts this here rather "
+            "than under matched"
+        ),
+    },
+    "random_score_type": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "split_scoring",
+    },
+    "max_ctr_complexity": {
+        "ours": "max_ctr_complexity",
+        "verdict": "unmatchable",
+        "unmatchable_key": "ctr_combinations",
+        "reason": (
+            "CatBoost resolves 1. Our surface HAS the name and refuses every "
+            "value of it: python/mojotrees/sklearn.py refuses above 1 because "
+            "no grow loop drives the projection enumeration, and refuses 1 "
+            "itself because the fitted CTR tables are MODEL STATE and the "
+            "model format carries no section for them, so a CTR fit would "
+            "write a file that loads with empty tables and scores wrong "
+            "(ctr.check_ctr_model_support, serialize.check_ctr_serializable, "
+            "catalog A29). A knob that refuses every value is not a knob"
+        ),
+    },
+    "counter_calc_method": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "categorical_encoding",
+    },
+    "ctr_target_border_count": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "categorical_encoding",
+    },
+    "store_all_simple_ctr": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "categorical_encoding",
+    },
+    "has_time": {
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "categorical_encoding",
+        "reason": (
+            "False, so CatBoost permutes the rows, and the ordered "
+            "permutation is the whole of what an ordered target statistic is. "
+            "mojotrees has no row-order parameter and no CTR to order. Filed "
+            "under categorical_encoding, which is the entry that says the two "
+            "engines build a different feature from a categorical column"
+        ),
+    },
+}
+
+#: CatBoost keys this harness deliberately does NOT diff, with the reason and,
+#: where the reason depends on the value, the value it depends on.
+#:
+#: `holds_while` is the teeth. Every entry below is inert or harness-only AT
+#: THE VALUE CATBOOST CURRENTLY RESOLVES, and several of them stop being inert
+#: at another value: `model_shrink_rate` is a no-op at 0 and a per-round
+#: multiplier above it. So the reason is recorded together with the value it
+#: rests on, and `selfcheck` fails if the declared resolution moves off it.
+#: `None` means the reason does not depend on the value.
+CATBOOST_PARAM_NOT_MAPPED = {
+    "thread_count": {
+        "why": "set by the runner on every arm from one number. mojotrees "
+               "takes it from MOJOTREES_NUM_WORKERS in the environment rather "
+               "than as a parameter, so there is no key on our side to diff",
+        "holds_while": None,
+    },
+    "allow_writing_files": {
+        "why": "a declared deviation that removes filesystem work from inside "
+               "the timed region. It moves no bit of the model and mojotrees "
+               "writes no such log, so there is nothing to match",
+        "holds_while": False,
+    },
+    "logging_level": {
+        "why": "a declared harness setting that keeps CatBoost's progress "
+               "table off the stdout stream run.py parses for backend proof. "
+               "Reporting, not model",
+        "holds_while": "Silent",
+    },
+    "model_shrink_rate": {
+        "why": "model shrinkage, resolved OFF. mojotrees has no "
+               "model-shrinkage parameter on the Python surface (catalog A14 "
+               "records it as refused by name), so this arm cannot turn on "
+               "something CatBoost has turned off. There is nothing to diff "
+               "while the rate is 0 and there is a real gap the moment it is "
+               "not, which is what holds_while is for",
+        "holds_while": 0,
+    },
+    "model_shrink_mode": {
+        "why": "the shape of a shrinkage that is off. Read with "
+               "model_shrink_rate",
+        "holds_while": "Constant",
+    },
+    "model_size_reg": {
+        "why": "CatBoost penalizes model size when building CTR features from "
+               "high-cardinality columns. mojotrees has no counterpart, and "
+               "this arm builds no CTRs at all "
+               "(CATBOOST_UNMATCHABLE['ctr_combinations']), so on the "
+               "scenarios it runs the parameter has nothing to act on",
+        "holds_while": 0.5,
+    },
+    "penalties_coefficient": {
+        "why": "the multiplier on CatBoost's per-feature and per-split "
+               "penalties, none of which this arm sets, so it multiplies "
+               "zero. mojotrees's counterpart is the CEGB ledger and it is "
+               "off on every arm here",
+        "holds_while": 1,
+    },
+    "sparse_features_conflict_fraction": {
+        "why": "exclusive feature bundling, resolved OFF, which is the same "
+               "state enable_bundle=False puts the comparator in. Refused by "
+               "name in CATBOOST_REFUSED_PARAMS as well, because pinning it "
+               "would be pinning it to what it already is",
+        "holds_while": 0.0,
+    },
+    "bayesian_matrix_reg": {
+        "why": "a Bayesian-bootstrap parameter, and this arm's bootstrap_type "
+               "resolves to MVS, so it is not read at all",
+        "holds_while": 0.1,
+    },
+    "posterior_sampling": {
+        "why": "SGLD-style posterior sampling, resolved off. mojotrees's "
+               "langevin counterpart is refused by name (catalog A13), so "
+               "there is no state in which the two arms could agree on a "
+               "non-default value",
+        "holds_while": False,
+    },
 }
 
 #: The CatBoost parameters this harness refuses to be handed.
@@ -1218,6 +1830,14 @@ MOJOTREES_CATBOOST_MODE_REASONS = {
 #: rule that lives only in a comment survives exactly until the next call
 #: site.
 CATBOOST_REFUSED_PARAMS = {
+    "learning_rate": (
+        "CatBoost's own resolution, as of cb-shipped. This was PASSED until "
+        "2026-08-16 and the pin came out by decision, so it is refused here "
+        "rather than merely dropped: a caller putting it back through `extra` "
+        "would restore cb-default's model under cb-shipped's label, which is "
+        "precisely the defect CATBOOST_REFUSED_PARAMS exists to make "
+        "impossible. See CATBOOST_DELIBERATE_DIVERGENCE"
+    ),
     "border_count": (
         "the binning budget. Stock is 254 borders and it stays stock, for "
         "the same reason max_bin is not pinned on the LightGBM side"
@@ -1722,9 +2342,12 @@ def catboost_arm_block():
         "label": CATBOOST_ARM_LABEL,
         "registered": CATBOOST_ARM_REGISTERED,
         "one_line": catboost_arm_id(),
+        "supersedes": CATBOOST_ARM_SUPERSEDES,
         "is_the_comparator": False,
         "catboost_passed": dict(CATBOOST_ALIGNMENT),
         "catboost_matched_from_base_params": dict(CATBOOST_MATCHED),
+        "deliberate_divergence": copy.deepcopy(CATBOOST_DELIBERATE_DIVERGENCE),
+        "catboost_resolved_per_fit": dict(CATBOOST_RESOLVED_PER_FIT),
         "catboost_deviations_from_stock": copy.deepcopy(
             CATBOOST_DEVIATIONS_FROM_STOCK
         ),
@@ -1773,17 +2396,81 @@ def catboost_arm_block():
             ),
         },
         "mojotrees_catboost_mode": dict(MOJOTREES_CATBOOST_MODE),
+        "mojotrees_catboost_mode_from_readback": dict(
+            MOJOTREES_CATBOOST_MODE_FROM_READBACK
+        ),
         "mojotrees_catboost_mode_reasons": dict(
             MOJOTREES_CATBOOST_MODE_REASONS
         ),
+        # The key-by-key diff between the two resolved dicts, per scenario,
+        # in the block that already travels into the manifest, records.json
+        # and the CSV comparator column. A reader of any published CatBoost
+        # number can therefore see what each engine actually ran rather than
+        # what the heading claims, which is the field this arm was missing.
+        "parity_map": copy.deepcopy(CATBOOST_PARAM_MAP),
+        "parity_not_mapped": copy.deepcopy(CATBOOST_PARAM_NOT_MAPPED),
+        "resolved_parity": resolved_parity_block(),
         "matched": (
-            "tree count and learning rate. Both rows run the same number of "
-            "boosting iterations and the same learning rate on both sides, "
-            "because a comparison at different budgets is not a comparison "
-            "and because CatBoost picks its own learning rate from the "
-            "budget when it is not given one"
+            "tree count, and nothing else by decision. Both rows run the same "
+            "number of boosting iterations, because a comparison at different "
+            "budgets is not a comparison. The LEARNING RATE is deliberately "
+            "not matched as of 2026-08-16: CatBoost resolves its own from the "
+            "budget and the dataset, roughly 0.4273 at 100 iterations against "
+            "the 0.1 the LightGBM comparator and the plain mojotrees arm run. "
+            "Read deliberate_divergence before quoting any accuracy number "
+            "from this column"
         ),
     }
+
+
+def resolved_parity_block():
+    """Both resolved dicts and their key-by-key diff, per scenario.
+
+    Wrapped defensively on purpose. This is called from `catboost_arm_block`,
+    which `run.py` calls before the first cell runs and writes into every
+    manifest, so an exception in here would take down a whole matrix over a
+    reporting field. A scenario that cannot produce a table records the
+    failure and the run continues; `selfcheck` is where a broken table is a
+    failure, and it walks the same function.
+    """
+    block = {}
+    for name in MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS:
+        try:
+            spec = resolve(name, "standard")
+            rows = catboost_parity_rows(spec)
+            block[name] = {
+                "catboost_resolved_declared": catboost_resolved_declared(spec),
+                "mojotrees_catboost_mode_resolved": (
+                    mojotrees_catboost_mode_resolved(
+                        spec, "cpu", None, _READBACK_STANDIN(spec)
+                    )
+                ),
+                "rows": rows,
+                "failures": catboost_parity_failures(rows),
+                "scheduled": (
+                    MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT.get(name) is None
+                ),
+                "note": (
+                    "catboost_resolved_declared is this file's transcription "
+                    "of get_all_params(), not a live read-back, and it omits "
+                    "every CATBOOST_RESOLVED_PER_FIT key because no static "
+                    "value for those is honest. The live values are in each "
+                    "CatBoost record's engine_resolved_params; "
+                    "check_catboost_readback compares the two and "
+                    "catboost_parity_from_records compares the deferred keys"
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001 - a reporting field, not a fit
+            block[name] = {
+                "error": f"{type(exc).__name__}: {exc}",
+                "note": (
+                    "the parity table could not be built for this scenario. "
+                    "selfcheck.check_catboost_arm fails on this; a run "
+                    "records it and continues rather than losing a matrix to "
+                    "a reporting field"
+                ),
+            }
+    return block
 
 
 def peer_arms_block():
@@ -1817,6 +2504,11 @@ def peer_banner():
         f"{block['registered']}\n"
         f"  catboost gets: {passed}\n"
         f"  matched from BASE_PARAMS: {matched}\n"
+        f"  NOT matched, by decision: learning_rate. CatBoost resolves its "
+        f"own (about 0.4273 at 100 iterations) where the comparator runs "
+        f"0.1.\n"
+        f"    {block['deliberate_divergence']['learning_rate']['how_to_misread_it']}\n"
+        f"  supersedes: {block['supersedes']}\n"
         f"  everything else is CatBoost's own default "
         f"({block['catboost_defaults_source']})\n"
         f"  determinism: {block['determinism']['status']}. "
@@ -2641,9 +3333,28 @@ def catboost_params(spec, threads, extra=None):
     """`shared_params` translated into a CatBoost parameter dict.
 
     Only three things reach CatBoost that are not the problem statement:
-    `CATBOOST_ALIGNMENT`, the thread count, and the two matched parameters
-    in `CATBOOST_MATCHED`. Everything else is CatBoost's own default and is
-    recorded in `CATBOOST_LEFT_AT_STOCK` rather than passed.
+    `CATBOOST_ALIGNMENT`, the thread count, and the one matched parameter in
+    `CATBOOST_MATCHED`. Everything else is CatBoost's own default and is
+    recorded in `CATBOOST_LEFT_AT_STOCK` -- or, when CatBoost derives it per
+    fit, in `CATBOOST_RESOLVED_PER_FIT` -- rather than passed.
+
+    **`learning_rate` is not passed as of 2026-08-16.** It used to be, from
+    `BASE_PARAMS`, and removing it is what turned `cb-default` into
+    `cb-shipped`. CatBoost now resolves its own rate, which is roughly 0.4273
+    at 100 iterations rather than the 0.1 the other two arms run.
+    `CATBOOST_DELIBERATE_DIVERGENCE` carries the decision, the measurements
+    and the sentence that stops the resulting accuracy column being read as an
+    engine claim.
+
+    **`CATBOOST_ALIGNMENT` survives the change and is worth defending here**,
+    because "pass CatBoost nothing" would sweep it away with the rate and it
+    must not. `allow_writing_files=False` removes a `catboost_info` directory
+    write from inside the timed region, which is filesystem work neither other
+    engine does; `logging_level="Silent"` keeps CatBoost's progress table off
+    the stdout stream `run.py` parses for backend proof, so turning it on
+    breaks the runner rather than making the arm more faithful. Neither moves
+    a bit of the model. Both are declared, one as a deviation with an exit
+    condition and one as a harness setting.
 
     The refusal list is the point of this function existing rather than the
     adapter building the dict itself. `bin_construct_sample_cnt` at the
@@ -2679,7 +3390,9 @@ def catboost_params(spec, threads, extra=None):
         # three engines cannot be asked for different budgets by an edit to
         # one dict.
         "iterations": int(shared[CATBOOST_MATCHED["iterations"]]),
-        "learning_rate": float(shared[CATBOOST_MATCHED["learning_rate"]]),
+        # No `learning_rate`. See the docstring and
+        # CATBOOST_DELIBERATE_DIVERGENCE: CatBoost resolves its own, and the
+        # value it resolves is read back per fit rather than predicted here.
         # The same quantity MOJOTREES_NUM_WORKERS and num_threads carry on
         # the other two arms, set from one number by the runner.
         "thread_count": int(threads),
@@ -2694,7 +3407,9 @@ def catboost_params(spec, threads, extra=None):
     return params
 
 
-def mojotrees_catboost_mode_params(spec, device, extra=None):
+def mojotrees_catboost_mode_params(
+    spec, device, extra=None, catboost_readback=None
+):
     """The "us in CatBoost mode" arm: `mojotrees_params` with
     `MOJOTREES_CATBOOST_MODE` applied over the shared defaults.
 
@@ -2736,10 +3451,615 @@ def mojotrees_catboost_mode_params(spec, device, extra=None):
     compare. `selfcheck.check_catboost_arm` caught it by diffing the two
     resolved dicts against `MOJOTREES_CATBOOST_MODE`, and that check is the
     reason this comment can be specific.
+
+    **`catboost_readback` is required as of 2026-08-16 and the arm refuses
+    without it.** Every key in `MOJOTREES_CATBOOST_MODE_FROM_READBACK` --
+    today that is `learning_rate` and only that -- has no static value,
+    because CatBoost derives it from the fit. The argument for refusing rather
+    than falling back to `BASE_PARAMS['learning_rate']` is the whole point of
+    this lane: a fallback would be a hand-written belief about CatBoost's
+    resolution, silently wrong by a factor of four at 100 iterations, in the
+    single parameter that moves a metric most.
     """
     params = mojotrees_params(spec, device, extra)
     params.update(MOJOTREES_CATBOOST_MODE)
+    params.update(catboost_readback_values(spec, catboost_readback))
     return params
+
+
+# ---------------------------------------------------------------------------
+# The read-back contract, and the parity check it makes possible.
+# ---------------------------------------------------------------------------
+
+
+class CatBoostReadbackMissing(RuntimeError):
+    """The CatBoost-mode arm was built without CatBoost's resolved parameters.
+
+    Raised by name rather than defaulted around. See
+    `MOJOTREES_CATBOOST_MODE_FROM_READBACK` for why there is no fallback and
+    `WIRE_NOTE_resolved_param_parity.md` in the worktree root for the four
+    call-site edits that supply it.
+    """
+
+
+def catboost_readback_key(spec):
+    """The cell a CatBoost read-back belongs to.
+
+    Scenario, tier and variant, because CatBoost's derived values move with
+    the DATA: the resolved learning rate is a function of the row count, the
+    feature count and the iteration count, so a read-back from
+    `dense_regression` at `standard` says nothing about the same scenario at
+    `large` and nothing at all about a different scenario.
+
+    The variant is the REQUESTED one (`resolve` writes `variant_requested`,
+    not `variant`), which is what both cells of a pair are handed by the same
+    job. It is not the variant that was loaded: `auto` resolves to real or
+    synthetic at load time, and if two cells of one run resolved it
+    differently they would share a key while holding different data. That has
+    never been observed and nothing here would catch it.
+    """
+    scenario = spec["id"] if isinstance(spec, dict) else str(spec)
+    tier = spec.get("tier") if isinstance(spec, dict) else None
+    variant = (
+        spec.get("variant_requested") or spec.get("variant")
+        if isinstance(spec, dict)
+        else None
+    )
+    return "|".join([scenario, str(tier or "standard"), str(variant or "auto")])
+
+
+def catboost_readback_entry(spec, resolved, engine_version=None):
+    """One cell's read-back, in the shape `load_catboost_readback` expects.
+
+    `resolved` is `CatBoost.get_all_params()` off the fitted model, which is
+    what `engines.CatBoostEngine.run` already records as
+    `engine_resolved_params`. Nothing is filtered out of it here: the sidecar
+    carries the library's answer verbatim and the parity map decides what is
+    read from it.
+    """
+    return {
+        "key": catboost_readback_key(spec),
+        "arm": catboost_arm_id(),
+        "engine_version": engine_version,
+        "resolved": dict(resolved or {}),
+    }
+
+
+def catboost_readback_values(spec, readback):
+    """The `MOJOTREES_CATBOOST_MODE` entries that come from the read-back.
+
+    Raises `CatBoostReadbackMissing` when the read-back is absent, does not
+    cover this cell, or is missing one of the keys, and the message names the
+    cell and the keys rather than the type. An arm that trained on a guessed
+    learning rate under a heading that says "CatBoost's shape" is the exact
+    outcome this campaign exists to prevent, so the failure is loud.
+    """
+    wanted = dict(MOJOTREES_CATBOOST_MODE_FROM_READBACK)
+    if not wanted:
+        return {}
+    key = catboost_readback_key(spec)
+    if readback is None:
+        raise CatBoostReadbackMissing(
+            f"the mojotrees CatBoost-mode arm on cell {key} needs CatBoost's "
+            f"resolved {', '.join(sorted(wanted))} and was given no read-back. "
+            f"{CATBOOST_ARM_LABEL} does not pass a learning rate any more, so "
+            "CatBoost resolves its own (roughly 0.4273 at 100 iterations "
+            "against the 0.1 the other two arms run) and this arm has to take "
+            "that value rather than assume one. There is deliberately no "
+            "fallback: see MOJOTREES_CATBOOST_MODE_FROM_READBACK and "
+            "CATBOOST_DELIBERATE_DIVERGENCE. Supplying it needs the CatBoost "
+            "cell for this scenario, tier and variant to run first and to "
+            "write its engine_resolved_params where this cell can read them"
+        )
+    entry = load_catboost_readback(readback, spec)
+    resolved = entry.get("resolved") or {}
+    values, missing = {}, []
+    for ours, theirs in sorted(wanted.items()):
+        if theirs not in resolved:
+            missing.append(f"{theirs} (for our {ours})")
+            continue
+        values[ours] = resolved[theirs]
+    if missing:
+        raise CatBoostReadbackMissing(
+            f"the CatBoost read-back for cell {key} does not carry "
+            f"{', '.join(missing)}. get_all_params() returned "
+            f"{len(resolved)} keys and none of them is what this arm needs, "
+            "so either the read-back is from a different CatBoost or "
+            "engine_resolved_params_source says why it failed. Read that "
+            "field before changing anything here"
+        )
+    return values
+
+
+def load_catboost_readback(source, spec):
+    """One cell's read-back out of whatever the caller has.
+
+    Accepts the entry itself, a mapping of cell key to entry, or a path to a
+    JSON file holding either. A caller that has a whole run's worth of
+    read-backs passes the mapping and gets the right cell rather than the
+    first one, which is the failure this function exists to prevent: two
+    scenarios resolve two different learning rates and nothing about the value
+    itself says which cell it came from.
+    """
+    key = catboost_readback_key(spec)
+    if isinstance(source, str):
+        import json
+
+        with open(source) as handle:
+            source = json.load(handle)
+    if not isinstance(source, dict):
+        raise CatBoostReadbackMissing(
+            f"a CatBoost read-back for cell {key} must be a mapping or a path "
+            f"to one, and this is a {type(source).__name__}"
+        )
+    if "resolved" in source and "key" in source:
+        if source["key"] != key:
+            raise CatBoostReadbackMissing(
+                f"this CatBoost read-back is for cell {source['key']!r} and "
+                f"the arm being built is cell {key!r}. CatBoost resolves a "
+                "different learning rate per shape, so a read-back from "
+                "another cell is a wrong number rather than a near one"
+            )
+        return source
+    if key in source:
+        return source[key]
+    raise CatBoostReadbackMissing(
+        f"no CatBoost read-back for cell {key}. The mapping holds "
+        f"{sorted(source)[:8]}"
+    )
+
+
+#: Value translations, by the name `CATBOOST_PARAM_MAP` records.
+_PARITY_TRANSLATORS = {
+    "identity": lambda value: value,
+    # CatBoost counts THRESHOLDS and LightGBM counts BINS, so 254 there is 255
+    # here and the two describe the same granularity budget.
+    "borders_to_bins": lambda value: int(value) + 1,
+    "boosting_alias": lambda value: {
+        "plain": "gbdt", "ordered": "ordered",
+    }.get(str(value).strip().lower(), str(value).strip().lower()),
+    "loss_to_objective": lambda value: {
+        loss: task for task, loss in CATBOOST_LOSS.items()
+    }.get(str(value), str(value)),
+}
+
+
+def _parity_translate(name, value):
+    if name not in _PARITY_TRANSLATORS:
+        raise KeyError(
+            f"CATBOOST_PARAM_MAP names translation {name!r}, which "
+            f"_PARITY_TRANSLATORS does not define. Known: "
+            + ", ".join(sorted(_PARITY_TRANSLATORS))
+        )
+    return _PARITY_TRANSLATORS[name](value)
+
+
+def _float32(value):
+    """`value` through a 32-bit float and back, or `None` if it will not go.
+
+    CatBoost stores `learning_rate` as a float32, so a rate that leaves
+    `get_all_params()` is a widened float32 and comparing it to a double for
+    equality fails on a value both sides agree about. Rounding both sides
+    through float32 is the comparison that means what it says.
+    """
+    try:
+        return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+    except (OverflowError, ValueError, TypeError):
+        return None
+
+
+def _parity_equal(theirs, ours):
+    """Whether two resolved values are the same value.
+
+    Three folds and no more, each of them a documented property of the two
+    surfaces rather than a convenience:
+
+    * bools compare as bools, never as 0 and 1, so `False` and `0` disagree.
+    * strings compare case-folded, because `docs/PARAMETER_NAMING.md` states
+      that value strings are case-insensitive on our side and CatBoost spells
+      its own values in CamelCase.
+    * numbers compare through a float32 round trip, because CatBoost stores
+      the one number this arm reads back as a 32-bit float. `3` and `3.0`
+      agree; `3` and `3.0000001` do not, since both survive the round trip
+      distinctly.
+    """
+    if isinstance(theirs, bool) or isinstance(ours, bool):
+        return isinstance(theirs, bool) and isinstance(ours, bool) and theirs == ours
+    if theirs is None or ours is None:
+        return theirs is None and ours is None
+    if isinstance(theirs, str) and isinstance(ours, str):
+        return theirs.strip().casefold() == ours.strip().casefold()
+    if isinstance(theirs, (int, float)) and isinstance(ours, (int, float)):
+        left, right = _float32(theirs), _float32(ours)
+        return left is not None and right is not None and left == right
+    return theirs == ours
+
+
+#: The scenarios the parity gate is evaluated on.
+#:
+#: Deliberately NOT read off `MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT`. That
+#: table says which cells are SCHEDULED, and the arm is parked while the
+#: read-back wiring is missing, so reading the gate off it would mean the gate
+#: switched itself off at the same moment the arm's parameters changed most.
+#: A check that goes quiet when the thing it checks is in flux is not a check.
+MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS = (
+    "dense_regression",
+    "imbalanced_binary",
+    "ordered_boosting_small",
+)
+
+
+def catboost_resolved_declared(spec, threads=None, extra=None):
+    """What this harness declares CatBoost will resolve to for `spec`.
+
+    `CATBOOST_LEFT_AT_STOCK` overlaid with everything `catboost_params`
+    passes. It is the static half of the read-back: every value in it was
+    transcribed from `CatBoost.get_all_params()` at
+    `CATBOOST_DEFAULTS_SOURCE`, and `check_catboost_readback` is what proves a
+    live fit still agrees with it.
+
+    `CATBOOST_RESOLVED_PER_FIT` keys are ABSENT, not defaulted. There is no
+    honest static value for `learning_rate`, so this dict does not carry one.
+    """
+    declared = dict(CATBOOST_LEFT_AT_STOCK)
+    declared.update(catboost_params(spec, 1 if threads is None else threads, extra))
+    if threads is None:
+        declared.pop("thread_count", None)
+    return declared
+
+
+def mojotrees_catboost_mode_resolved(
+    spec, device="cpu", extra=None, catboost_readback=None
+):
+    """The CatBoost-mode arm's resolved configuration, across both containers.
+
+    The training dict from `mojotrees_catboost_mode_params`, plus the two
+    Dataset parameters from `dataset_params`, plus `n_estimators`, which the
+    adapter adds after translation rather than the translator emitting it
+    (`engines.MojoTreesEngine._run_dense`). All three are part of what the arm
+    RAN, and a parity check that saw only the first would report `max_bin` and
+    the tree budget as unmatched when they are matched.
+
+    **This mirrors the adapter and is therefore a coupling.** If
+    `_run_dense` stops adding `n_estimators`, or starts adding something else,
+    this function is stale and the parity table quietly checks the wrong dict.
+    There is no way to assert against a call site from here; the mitigation is
+    that both places name each other.
+    """
+    resolved = dict(
+        mojotrees_catboost_mode_params(
+            spec, device, extra, catboost_readback=catboost_readback
+        )
+    )
+    resolved["n_estimators"] = int(BASE_PARAMS["n_estimators"])
+    resolved.update(dataset_params(spec))
+    return resolved
+
+
+def catboost_parity_rows(spec, device="cpu", extra=None, catboost_readback=None):
+    """The key-by-key diff between the two resolved dicts, as a list of rows.
+
+    One row per key CatBoost resolves, in `CATBOOST_PARAM_MAP` order, each
+    carrying CatBoost's name, our name, both values and a status. This is what
+    `selfcheck.check_catboost_arm` fails on and what `catboost_arm_block`
+    records, so that a reader of a published number sees the same table the
+    gate saw.
+
+    Statuses:
+
+    * `agree`           a matched key whose two values are the same value.
+    * `DISAGREE`        a matched key whose values differ. A failure.
+    * `deferred`        a matched key CatBoost derives per fit, so the values
+                        cannot be compared without a run. `learning_rate`.
+    * `unmatchable`     no parameter closes it; names a CATBOOST_UNMATCHABLE
+                        entry.
+    * `not_reached`     we have the knob and no cell this arm runs reaches it.
+    * `UNCLASSIFIED`    a key in neither table. A failure, and the one this
+                        whole structure exists to make impossible.
+    """
+    declared = catboost_resolved_declared(spec, None, extra)
+    try:
+        ours = mojotrees_catboost_mode_resolved(
+            spec, device, extra, catboost_readback=catboost_readback
+        )
+        ours_error = None
+    except CatBoostReadbackMissing as exc:
+        # The arm cannot be built without a read-back, and the parity table is
+        # still worth producing: every key except `learning_rate` has a static
+        # value on both sides and is checkable here. The one that is not says
+        # so in its own row rather than taking the table down with it.
+        ours = mojotrees_catboost_mode_resolved(
+            spec, device, extra, catboost_readback=_READBACK_STANDIN(spec)
+        )
+        ours_error = str(exc)
+
+    rows = []
+    missing = object()
+    for theirs_key in list(CATBOOST_PARAM_MAP) + sorted(
+        set(declared) - set(CATBOOST_PARAM_MAP) - set(CATBOOST_PARAM_NOT_MAPPED)
+    ):
+        entry = CATBOOST_PARAM_MAP.get(theirs_key)
+        if entry is None:
+            rows.append({
+                "catboost": theirs_key,
+                "catboost_value": declared.get(theirs_key),
+                "mojotrees": None,
+                "mojotrees_value": None,
+                "status": "UNCLASSIFIED",
+                "detail": (
+                    f"CatBoost resolves {theirs_key} and nothing in "
+                    "CATBOOST_PARAM_MAP or CATBOOST_PARAM_NOT_MAPPED says "
+                    "whether this arm matches it. Classify it: a key nobody "
+                    "decided about is the hand-written belief this table "
+                    "removes"
+                ),
+            })
+            continue
+        if theirs_key not in declared and entry.get("static", True):
+            # A mapped key the CatBoost side does not resolve on this cell:
+            # `classes_count` on a regression, for instance. Not an error and
+            # not a comparison either.
+            continue
+        ours_key = entry.get("ours")
+        ours_value = ours.get(ours_key, missing) if ours_key else missing
+        if ours_value is missing and "our_default" in entry:
+            ours_value = entry["our_default"]
+        row = {
+            "catboost": theirs_key,
+            "catboost_value": declared.get(theirs_key),
+            "mojotrees": ours_key,
+            "mojotrees_value": None if ours_value is missing else ours_value,
+            "mojotrees_container": entry.get("ours_container", "train"),
+            "status": entry["verdict"],
+            "detail": entry.get("reason") or entry.get("note") or "",
+        }
+        if entry["verdict"] == "unmatchable":
+            row["unmatchable_key"] = entry.get("unmatchable_key")
+            row["detail"] = row["detail"] or CATBOOST_UNMATCHABLE.get(
+                entry.get("unmatchable_key"), ""
+            )
+        elif entry["verdict"] == "matched":
+            if not entry.get("static", True):
+                row["status"] = "deferred"
+                row["catboost_value"] = None
+                row["detail"] = (
+                    "CatBoost derives this per fit, so the two values are "
+                    "compared against two finished records by "
+                    "catboost_parity_from_records and not here. "
+                    + row["detail"]
+                )
+                if ours_error:
+                    row["mojotrees_value"] = None
+                    row["readback_missing"] = ours_error
+            elif ours_value is missing:
+                row["status"] = "DISAGREE"
+                row["detail"] = (
+                    f"CatBoost resolves {theirs_key}="
+                    f"{declared.get(theirs_key)!r} and this arm has no "
+                    f"{ours_key!r} in either its training params or its "
+                    "dataset params, and CATBOOST_PARAM_MAP declares no "
+                    "our_default for it. Set it in MOJOTREES_CATBOOST_MODE, "
+                    "declare the default it already has, or move the key out "
+                    "of the matched set with a reason"
+                )
+            else:
+                expected = _parity_translate(
+                    entry.get("translate", "identity"), declared[theirs_key]
+                )
+                if _parity_equal(expected, ours_value):
+                    row["status"] = "agree"
+                else:
+                    row["status"] = "DISAGREE"
+                    row["detail"] = (
+                        f"CatBoost resolves {theirs_key}="
+                        f"{declared[theirs_key]!r} and this arm resolves "
+                        f"{ours_key}={ours_value!r}"
+                        + (
+                            f" (CatBoost's value translates to "
+                            f"{expected!r} through "
+                            f"{entry.get('translate', 'identity')})"
+                            if entry.get("translate", "identity") != "identity"
+                            else ""
+                        )
+                        + ". CATBOOST_PARAM_MAP calls this key matched, so "
+                        "the two arms are running different models under one "
+                        "heading. Fix the arm's value, or move the key into "
+                        "CATBOOST_UNMATCHABLE with a reason traced in our "
+                        "code"
+                    )
+        rows.append(row)
+    return rows
+
+
+def catboost_parity_failures(rows):
+    """The rows a run must not ship, as messages. Empty means the arm agrees."""
+    return [
+        f"{row['catboost']} -> {row['mojotrees']}: {row['detail']}"
+        for row in rows
+        if row["status"] in ("DISAGREE", "UNCLASSIFIED")
+    ]
+
+
+def catboost_parity_from_records(catboost_record, mode_record):
+    """The run-time half: the deferred keys, against two finished records.
+
+    `catboost_record` needs `engine_resolved_params`, which
+    `engines.CatBoostEngine.run` already writes; `mode_record` needs
+    `params.engine`. Returns a list of failure messages, empty when they
+    agree. Separate from `catboost_parity_rows` because these are the keys no
+    static check can see: CatBoost derives them from the data, so the only
+    place they can be compared is after both cells have run.
+    """
+    theirs = (catboost_record or {}).get("engine_resolved_params") or {}
+    ours = ((mode_record or {}).get("params") or {}).get("engine") or {}
+    failures = []
+    if not theirs:
+        return [
+            "the CatBoost record carries no engine_resolved_params, so "
+            "nothing checks the values this arm took from it. "
+            + str((catboost_record or {}).get("engine_resolved_params_source"))
+        ]
+    for ours_key, theirs_key in sorted(
+        MOJOTREES_CATBOOST_MODE_FROM_READBACK.items()
+    ):
+        if theirs_key not in theirs:
+            failures.append(
+                f"CatBoost's read-back has no {theirs_key}, which this arm's "
+                f"{ours_key} was supposed to come from"
+            )
+            continue
+        if ours_key not in ours:
+            failures.append(
+                f"the CatBoost-mode record has no {ours_key}, so the arm was "
+                f"built without CatBoost's resolved {theirs_key}="
+                f"{theirs[theirs_key]!r}"
+            )
+            continue
+        if not _parity_equal(theirs[theirs_key], ours[ours_key]):
+            failures.append(
+                f"{theirs_key}: CatBoost ran {theirs[theirs_key]!r} and the "
+                f"CatBoost-mode arm ran {ours_key}={ours[ours_key]!r}. This "
+                "is the key the whole cb-shipped change is about; a "
+                "difference here means the two rows are not the comparison "
+                "the heading claims"
+            )
+    return failures
+
+
+def check_catboost_readback(resolved, spec=None, threads=None, extra=None):
+    """Where a live `get_all_params()` disagrees with this file, as messages.
+
+    The other direction of the same question. `catboost_parity_rows` asks
+    whether our arm matches what we DECLARE CatBoost resolves;  this asks
+    whether CatBoost still resolves what we declare. Both are needed: the
+    first catches our arm drifting, the second catches a CatBoost upgrade
+    moving a default under a table transcribed on 2026-08-16.
+
+    Keys CatBoost returns that this file says nothing about are reported, not
+    failed: `get_all_params()` carries more than this harness classifies and
+    always has.
+    """
+    declared = (
+        catboost_resolved_declared(spec, threads, extra) if spec is not None else
+        dict(CATBOOST_LEFT_AT_STOCK)
+    )
+    drift = []
+    for key, value in sorted(declared.items()):
+        if key not in (resolved or {}):
+            drift.append(
+                f"this harness declares CatBoost resolves {key}={value!r} and "
+                "get_all_params() does not carry the key at all"
+            )
+            continue
+        if not _parity_equal(value, resolved[key]):
+            drift.append(
+                f"{key}: declared {value!r}, CatBoost resolved "
+                f"{resolved[key]!r}. {CATBOOST_DEFAULTS_SOURCE} is the "
+                "transcription this contradicts; re-read it rather than "
+                "editing the number to match"
+            )
+    for key in sorted(CATBOOST_RESOLVED_PER_FIT):
+        if key not in (resolved or {}):
+            drift.append(
+                f"CATBOOST_RESOLVED_PER_FIT names {key} as the value only a "
+                "read-back can supply, and this read-back does not carry it"
+            )
+    return drift
+
+
+#: The file a run collects CatBoost read-backs into, under the run directory.
+CATBOOST_READBACK_FILE = "catboost_readback.json"
+
+
+def append_catboost_readback(path, entry):
+    """Add one cell's read-back to the run's sidecar, keyed by cell.
+
+    Read-modify-write rather than append-only, because the harness runs one
+    job per process and there is no shared handle. Sequential by construction
+    (`run.py` runs cells one at a time and says so in its manifest), so there
+    is no lock here and there must not be a parallel runner without one.
+    """
+    import json
+    import os
+
+    existing = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as handle:
+                existing = json.load(handle)
+        except (OSError, ValueError):
+            existing = {}
+    existing[entry["key"]] = entry
+    with open(path, "w") as handle:
+        json.dump(existing, handle, indent=2, default=str)
+        handle.write("\n")
+    return path
+
+
+def record_parity_block(
+    spec, engine, params_used, dataset_params_used=None, catboost_readback=None
+):
+    """What every result row carries so a reader can see both engines' dicts.
+
+    The point is stated in the negative, because that is what went wrong. A
+    record used to carry what its OWN engine was passed and nothing about what
+    the engine it is being compared against resolved, so a published ratio was
+    readable only by someone who also held the other row and knew which
+    parameters each library derives for itself. This block puts both dicts in
+    front of the reader of either row.
+
+    `catboost_resolved_declared` is this file's transcription and not a live
+    read-back; the live one is `engine_resolved_params` on the CatBoost row.
+    Both are here on purpose, because a difference between them is a CatBoost
+    upgrade moving a default and is exactly what `check_catboost_readback`
+    exists to surface.
+    """
+    block = {
+        "engine": engine,
+        "engine_resolved": dict(params_used or {}),
+        "engine_dataset_resolved": dict(dataset_params_used or {}),
+        "arm": catboost_arm_id(),
+        "catboost_resolved_declared": None,
+        "rows": None,
+        "unavailable_reason": None,
+    }
+    runs, reason = catboost_supports(spec)
+    if not runs:
+        block["unavailable_reason"] = (
+            f"the CatBoost arm does not run {spec.get('id')}, so there is no "
+            f"CatBoost dict to put beside this row: {reason}"
+        )
+        return block
+    try:
+        block["catboost_resolved_declared"] = catboost_resolved_declared(spec)
+        block["rows"] = catboost_parity_rows(
+            spec, catboost_readback=catboost_readback
+        )
+        block["failures"] = catboost_parity_failures(block["rows"])
+    except Exception as exc:  # noqa: BLE001 - a record field, not a fit
+        block["unavailable_reason"] = f"{type(exc).__name__}: {exc}"
+    return block
+
+
+def _READBACK_STANDIN(spec):
+    """A read-back that satisfies the shape and carries no value.
+
+    Used ONLY by `catboost_parity_rows` so that the static half of the table
+    can be produced while the arm itself is unbuildable. The values are
+    `None`, so any row that reads one is marked `deferred` and never `agree`:
+    this cannot make a check pass. It exists because a parity table that
+    disappears whenever the read-back is missing would have gone quiet at
+    exactly the moment the parameters changed.
+    """
+    return {
+        "key": catboost_readback_key(spec),
+        "arm": catboost_arm_id(),
+        "engine_version": None,
+        "resolved": {
+            theirs: None
+            for theirs in MOJOTREES_CATBOOST_MODE_FROM_READBACK.values()
+        },
+    }
 
 
 #: Whether each scenario runs the `mojotrees_catboost_mode` arm, and the exact
@@ -2769,10 +4089,33 @@ def mojotrees_catboost_mode_params(spec, device, extra=None):
 #: run MVS for multiclass either: its own defaulting block excludes
 #: multiclass-only losses and falls back to the Bayesian bootstrap. So the
 #: skip is what CatBoost does, not merely what we cannot do.
+#: The three cells this arm ran until 2026-08-16 are PARKED, not deleted. The
+#: reason is one sentence and the rest of this string is what to do about it.
+MOJOTREES_CATBOOST_MODE_PARKED = (
+    "PARKED 2026-08-16 by the cb-shipped change, and this is a WIRING gap "
+    "rather than a capability one. The CatBoost arm no longer passes a "
+    "learning rate, so CatBoost resolves its own -- roughly 0.4273 at 100 "
+    "iterations against the 0.1 the other two arms run -- and this arm's "
+    "whole claim is that it is us in CatBoost's shape. Taking that value "
+    "needs the CatBoost cell for the same scenario, tier and variant to run "
+    "FIRST and to hand this cell its engine_resolved_params; nothing in "
+    "run.py or worker.py does that yet. The mechanism is built and unrun: "
+    "catboost_readback_key, catboost_readback_entry, load_catboost_readback "
+    "and mojotrees_catboost_mode_params(catboost_readback=...). Parked rather "
+    "than left to raise, because a raising cell is an infrastructure failure "
+    "and this harness withholds the quality verdict for the whole matrix on "
+    "one of those, so three unbuildable cells would suppress the verdict on "
+    "every cell that did run. Parked rather than given a fallback, because a "
+    "fallback to BASE_PARAMS['learning_rate'] is a hand-written belief about "
+    "CatBoost's resolution that is wrong by a factor of four, which is the "
+    "defect this arm was rebuilt to remove. Unpark by applying "
+    "WIRE_NOTE_resolved_param_parity.md and setting these three back to None"
+)
+
 MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT = {
-    "dense_regression": None,
-    "imbalanced_binary": None,
-    "ordered_boosting_small": None,
+    "dense_regression": MOJOTREES_CATBOOST_MODE_PARKED,
+    "imbalanced_binary": MOJOTREES_CATBOOST_MODE_PARKED,
+    "ordered_boosting_small": MOJOTREES_CATBOOST_MODE_PARKED,
     "high_cardinality_categorical": (
         "grow_policy=oblivious is implemented for numerical thresholds "
         "only, and this arm asks for symmetric trees. A level of an "
