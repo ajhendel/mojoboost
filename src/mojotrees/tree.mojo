@@ -752,6 +752,31 @@ struct _HistPool(Movable):
     around 600 KB per node: large enough that the allocator hands back fresh
     pages and faults them in every time. Recycling keeps that cost to the
     first few nodes of the first tree.
+
+    **The free list needs no cap, and this paragraph is here so the idea is
+    not re-proposed.** Follow the counts. The first tree allocates on the root
+    take and on every split thereafter, so it creates exactly `num_leaves + 1`
+    buffers and never more; from the second tree on it creates none, because
+    the frontier drain at the end of a tree returns every buffer it held. The
+    free list is therefore self-bounding at `num_leaves + 1`, which is the
+    same number that is *live* in the frontier at the end of every tree. A cap
+    below that would not lower the high-water mark by one byte -- the buffers
+    it refused to keep are ones the very next tree has to hold simultaneously
+    anyway -- it would only reintroduce the per-tree allocation this pool
+    exists to remove.
+
+    The residency it does imply, as a derived bound rather than a
+    measurement: `(num_leaves + 1) * 24 * n_features * n_bins` bytes, the 24
+    being `Float64` gradient plus `Float64` hessian plus `Int` count per cell.
+    At the benchmark shape (31 leaves, 50 features, 255 bins) that is 9.3 MiB
+    against a 50 MB binned matrix, and it scales with `num_leaves` rather than
+    with rows. If that ceiling ever becomes the problem, the thing to change
+    is the frontier holding one histogram per leaf, not this free list.
+
+    Allocation is also not a speed cost here, and that is measured rather than
+    argued: the in-run phase profile puts `hist_alloc` at 0.005 percent of the
+    serial round at 1,000,000 x 50 (bench/results/cpu_round1_2026-08-16). The
+    pool is already doing its job.
     """
 
     var free: List[Histogram]
