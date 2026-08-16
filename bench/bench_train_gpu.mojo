@@ -986,7 +986,54 @@ def _arm_conditions(arm: Int, n_rows: Int) -> String:
         out += String(" root_tiles_requested=", tiles)
     elif _arm_touches_tiles(arm):
         out += " root_tiles_requested=none(control,zeros)"
+
+    # The environment-driven conditions, which this line omitted until
+    # 2026-08-16 and which are the ones that actually move the number.
+    #
+    # A `gpu-device` arm with `MOJOTREES_GPU_TREE_RESIDENT=0` in the
+    # environment printed a line **identical** to one with it on, and those
+    # two differ by about thirty host round trips per tree -- **the largest
+    # control-plane effect this repository has measured, 0.75 seconds at
+    # 1,000,000 x 50**. So the one condition most able to invalidate a
+    # comparison was the one condition the record did not carry.
+    #
+    # That is the failure this docstring already says cost the file a
+    # number once: "a timing whose split strategy was inherited from an
+    # environment variable". It had been fixed for the split strategy and
+    # not for anything since, and five knobs had accumulated behind it.
+    #
+    # The two numeric arms are here as well as the launch shapes, because a
+    # record that names the launch shape and omits the arithmetic is the
+    # wrong way round: the gain form and the scale shape are the only arms
+    # in this wave that can change a model rather than a schedule.
+    out += " resident=" + _env_word("MOJOTREES_GPU_TREE_RESIDENT", "on")
+    out += " split_resident=" + _env_word("MOJOTREES_GPU_SPLIT_RESIDENT", "on")
+    out += " objective_src=" + _env_word("MOJOTREES_GPU_OBJECTIVE", "auto")
+    out += " table_reset=" + _env_word("MOJOTREES_GPU_TABLE_RESET", "device")
+    out += " packed_download=" + _env_word(
+        "MOJOTREES_GPU_PACKED_DOWNLOAD", "on"
+    )
+    out += " gain_form=" + _env_word("MOJOTREES_GPU_SPLIT_GAIN_FORM", "cross")
+    out += " scale_shape=" + _env_word("MOJOTREES_GPU_SCALE_SHAPE", "pow2")
+    out += " split_strategy=" + _env_word(
+        "MOJOTREES_GPU_SPLIT_STRATEGY", "auto"
+    )
     return out^
+
+
+def _env_word(name: String, default_word: String) -> String:
+    """The environment's value for `name`, or `<default_word>(default)`.
+
+    The default is spelled out rather than printed as an empty string,
+    because a reader comparing two runs has to be able to see that a
+    condition was *considered* and left alone. An absent line and a line
+    reading `resident=on(default)` mean the same thing to the code and very
+    different things to someone auditing why two numbers disagree.
+    """
+    var v = getenv(name)
+    if v.byte_length() == 0:
+        return default_word + "(default)"
+    return v
 
 
 def _tile_legend() -> String:
