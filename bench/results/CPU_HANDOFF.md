@@ -41,7 +41,39 @@ not in the tree.
 - `_multiclass_rf_gradients` needed nothing: it is a `def`, which raises in
   Mojo 1.0. That glue item was a non-issue and is struck.
 
-## The finding to route: oblivious shipped and is unreachable
+## Two findings to route
+
+### `MOJOTREES_DERIVATIVE_PRECISION=float64` is largely a no-op on sparse fits
+
+Found by `lane/derivative-precision-wiring` while auditing every fit path,
+and it **predates that lane** — it is live in the shipping env entry, not
+in anything we added. Under `float64` the objective stops narrowing, but
+`tree_sparse.grow_tree_sparse` still passes `narrow=True` at every
+`histogram_sparse` call site (`tree_sparse.mojo:494, 620, 624, 784, 797`),
+so the cells and the node totals silently re-narrow. GOSS and weighted
+rounds then accumulate `Float32(w*g)` where the arm the user asked for
+accumulates `w*g`. **Nothing says so anywhere.** `distributed.mojo` has the
+identical shape at nine `build_histogram`/`build_histogram_subset` sites.
+
+A user who sets the documented flag on a sparse or distributed fit gets the
+slow arm's cost and the fast arm's precision. That is a wrong answer with no
+signal, which is the same class as the CatBoost `mvs_reg = 0` empty tree.
+Needs a lane, and the fix shape is known: one `ConstHessianSettings` or
+`narrow: Bool` parameter on `grow_tree_sparse`, forwarded.
+
+### The objective half is 25 call sites and there is no chokepoint
+
+To make `derivative_precision` mean anything the parameter has to reach
+`fill_grad_hess` (`boosting.mojo:452`), `_fill_grad_hess` (`:668`) and
+`_fill_softmax_grad_hess` (`:2490`), then be forwarded from about 25 call
+sites across 8 files. The cheap alternative was checked and does not work:
+folding it onto `DispatchSettings` looks like 6 sites, but every trainer
+outside `boosting.mojo` passes the sentinel, so it reproduces the same
+silent-downgrade defect one type over, and `_fill_softmax_grad_hess` takes
+no `settings` at all. `test_the_objective_half_is_still_missing` is the
+tripwire and its docstring carries the fit-level test to write in its place.
+
+### oblivious shipped and is unreachable
 
 `GROW_OBLIVIOUS` merged in wave 4 and I exported it from
 `src/mojotrees/__init__.mojo` myself. It cannot be asked for.
@@ -138,15 +170,18 @@ there is a defect we are not copying.
 - `src/mojotrees/__init__.mojo` — `GROW_OBLIVIOUS` export. **DONE.**
 - `boosting_rf.mojo:1448` — **struck, non-issue.** `_multiclass_rf_gradients`
   is a `def`, which raises in Mojo 1.0.
-- `derivative_precision` onto the resolved `ConstHessianSettings` — **this is
-  not glue and I did not write it.** `ConstHessianSettings.resolve()` has
-  exactly two call sites in the package, `boosting.mojo:1985` and
-  `tree.mojo:2676`, and every other signature takes the `unresolved()`
-  sentinel. Wiring those two and lifting the parameter's refusal would make it
-  work there and **silently ignore it on any fit path that does not resolve a
-  snapshot**, which is the identical silent-downgrade defect the refusal
-  exists to prevent, merely relocated. It needs an audit of every fit path
-  first, so it went to `lane/derivative-precision-wiring` with that analysis.
+- `derivative_precision` onto the resolved `ConstHessianSettings` — **DONE,
+  merged at `fc223da`, and the analysis that sent it to a lane was right for
+  a reason I had not guessed.** The snapshot hop is closed at
+  `tree.mojo:2676`, the single point every dense CPU grower passes through,
+  so seven trainers picked it up with no edit each. **The refusal stays**:
+  the missing half is the OBJECTIVE, not the snapshot. `fill_grad_hess` and
+  `_fill_softmax_grad_hess` pick their row loop from a live `getenv`, so a
+  parameter-only float64 fit stores `Float64(Float32(g))` and reads it
+  un-re-narrowed — not float32, because accumulation order moves, and not
+  float64, because the low 29 significand bits are already gone. A third
+  numerical configuration, which is worse than either arm. No bits moved:
+  `widened(False)` is asserted identity on all four fields.
 
 ## Standing traps, learned the hard way this round
 
