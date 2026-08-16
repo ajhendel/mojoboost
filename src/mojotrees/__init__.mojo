@@ -54,6 +54,7 @@ from .sampling import (
     selection_count,
 )
 from .growth_policy import (
+    GROW_OBLIVIOUS,
     GROW_DEPTHWISE,
     GROW_LEAFWISE,
     grow_policy_name,
