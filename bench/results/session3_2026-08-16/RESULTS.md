@@ -237,6 +237,84 @@ precisely the shape it was built to protect, and re-deriving or deleting it is
 now a live question rather than a tuning exercise. That is a **reduction** in the
 number of paths, not an addition of a small-data path.
 
+---
+
+## The comparator investigation. The 1.50x claim is WITHDRAWN.
+
+Before quoting any margin, three hypotheses had to be separated: the machine was
+slow, the pre-M5 figure came from a setup this harness does not reproduce, or
+**LightGBM is hobbled inside a process that has already initialized Metal and
+Mojo** (thread-pool sizing, affinity, memory pressure, `num_threads` resolution
+after import). The third would make a 1.50x claim an error in our own favor, so
+it was excluded first.
+
+Bracketed in one fast window, standalone / in-process / standalone:
+
+| run | LightGBM, 10 threads | spread |
+|---|---|---|
+| A, standalone, own process | 2.662 | 2.0% |
+| B, in-process, interleaved | 2.802 | 9.6% |
+| C, standalone, own process | 2.822 | 2.9% |
+
+**In-process sits between the two standalone runs. The comparator is not
+hobbled**, and the third hypothesis is refuted. Standalone also reproduces the
+historical 2.767 figure almost exactly, so the first hypothesis is confirmed: the
+5.807 reading earlier in this session was the machine's slow regime and nothing
+else.
+
+### What the slow regime was actually doing
+
+Across the regime change, LightGBM went 2.66 to 5.81, a factor of **2.2**. Our
+GPU arm went 2.59 to 3.86, a factor of **1.5**. Ten CPU cores throttle harder
+than the GPU does.
+
+So the 1.50x figure was a measurement of the comparator being thermally
+throttled harder than we were. Reporting it would have been claiming a win from
+the machine's power state, which is the mislabelled-covertype error with the
+sign reversed, and the first outside reader would have found it.
+
+### The margin, measured properly
+
+Five interleaved in-process runs, fast window, ten threads each side:
+
+| run | ours, resident | LightGBM | ours ahead by |
+|---|---|---|---|
+| 1 | 2.592 | 2.802 | 8.1% |
+| 2 | 2.564 | 2.801 | 5.6% |
+| 3 | 2.551 | 2.883 | 10.4% |
+| 4 | 2.584 | 2.953 | 10.0% |
+| 5 | 2.620 | 3.499 | 11.3% |
+| **median** | **2.584** | **2.883** | **11.6%** |
+
+**Verdict: consistent, not resolved.** Every one of five runs favors us and our
+own arm is remarkably tight at 2.7 percent spread, but LightGBM's spread over
+these runs is 24 percent and drifting upward run over run, which under M0 is
+wider than the effect. The direction is unanimous; the magnitude is not
+established.
+
+Against LightGBM's own best standalone sample in this window, 2.640, our median
+of 2.584 is still ahead, by 2 percent.
+
+### The one asymmetry worth keeping
+
+Our arm did not degrade across five back-to-back runs; LightGBM went 2.80 to
+3.50 over the same sequence as load accumulated. The GPU arm is thermally stable
+under repetition and the ten-core CPU arm is not. That is a real property and it
+is why any single head-to-head number depends on how long the machine has been
+working.
+
+### The three sentences that are now supportable
+
+1. At 1,000,000 x 50 in a fast window, resident leaf-wise is **2.58 seconds**.
+2. LightGBM at ten threads on the same data in the same window is **2.66 to 2.95
+   seconds** depending on how it is run and how warm the machine is.
+3. We are **consistently ahead by 5 to 11 percent, and that margin is not
+   resolved** under this project's own rule, because the comparator's spread is
+   wider than the margin.
+
+Not "1.14x behind". Not "1.50x ahead". Both of those were this project's
+headline within the last twenty-four hours and neither survives.
+
 ## Still open
 - The parallel-grain check at the host-scan shape (M2.5), untaken.
 - M2.3 re-taken in a fast window.
