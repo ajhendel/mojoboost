@@ -1615,7 +1615,7 @@ struct GpuClassBatch(Movable):
             gp.unsafe_store(i, Float64(src.unsafe_load(g_base + i)) * g_inv)
             hp.unsafe_store(i, Float64(src.unsafe_load(h_base + i)) * h_inv)
             cp.unsafe_store(i, Int(src.unsafe_load(c_base + i)))
-        return Histogram(g^, h^, c^, self.n_features, self.n_bins)
+        return Histogram.from_planes(g^, h^, c^, self.n_features, self.n_bins)
 
     def histograms(self, k_count: Int) raises -> List[Histogram]:
         """Every batched class's histogram, in ascending slot order, which is

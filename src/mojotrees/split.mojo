@@ -486,9 +486,9 @@ def find_best_split(
         )
 
     comptime W = SIMD_LANES
-    var grad_p = hist.grad.unsafe_ptr()
-    var hess_p = hist.hess.unsafe_ptr()
-    var count_p = hist.count.unsafe_ptr()
+    var grad_p = hist._grad.unsafe_ptr()
+    var hess_p = hist._hess.unsafe_ptr()
+    var count_p = hist._count.unsafe_ptr()
 
     # One slot per scanned feature. A feature that yields no candidate leaves
     # its gain at 0.0, which the fold below cannot accept because `best.gain`
@@ -587,9 +587,9 @@ def find_best_split(
                     "categorical feature has more categories than bins"
                 )
             var cs = find_best_categorical_split(
-                hist.grad,
-                hist.hess,
-                hist.count,
+                hist._grad,
+                hist._hess,
+                hist._count,
                 base,
                 n_cat,
                 total_g,
@@ -632,9 +632,9 @@ def find_best_split(
         var miss_h = 0.0
         var miss_c = 0
         if missing_bin >= 0:
-            miss_g = hist.grad[base + missing_bin]
-            miss_h = hist.hess[base + missing_bin]
-            miss_c = hist.count[base + missing_bin]
+            miss_g = hist.grad_at(base + missing_bin)
+            miss_h = hist.hess_at(base + missing_bin)
+            miss_c = hist.count_at(base + missing_bin)
 
         # `extra_trees`: one drawn threshold for this feature instead of the
         # whole scan. The candidate space is the same one the scan walks, so
@@ -657,9 +657,9 @@ def find_best_split(
             # split at all when missing rows are there to fill the right child.
             if b == n_scan - 1 and miss_c == 0:
                 break
-            left_g += hist.grad[base + b]
-            left_h += hist.hess[base + b]
-            left_c += hist.count[base + b]
+            left_g += hist.grad_at(base + b)
+            left_h += hist.hess_at(base + b)
+            left_c += hist.count_at(base + b)
             # The prefix sums above are what the drawn threshold is built
             # from, so they are accumulated for every bin below it and only
             # the drawn one is scored.

@@ -784,18 +784,18 @@ def test_unbundle_histogram_recovers_each_member() raises:
     for k in range(3):
         var f = plan.member_at(0, k)
         var local = unbundle_histogram(plan, 0, k, bg, bh, bc, 0)
-        assert_equal(len(local.grad), 3)
+        assert_equal(local.n_cells(), 3)
         var direct = _direct_histogram(data, f, 3, grad, hess)
         var total = 0
         for b in range(3):
-            assert_true(abs(local.grad[b] - direct[b]) < 1e-12)
-            assert_true(abs(local.hess[b] - direct[3 + b]) < 1e-12)
-            total += local.count[b]
+            assert_true(abs(local.grad_at(b) - direct[b]) < 1e-12)
+            assert_true(abs(local.hess_at(b) - direct[3 + b]) < 1e-12)
+            total += local.count_at(b)
         assert_equal(total, 8)
         # The two non-default bins hold one row each in this fixture.
-        assert_equal(local.count[0], 1)
-        assert_equal(local.count[2], 1)
-        assert_equal(local.count[1], 6)
+        assert_equal(local.count_at(0), 1)
+        assert_equal(local.count_at(2), 1)
+        assert_equal(local.count_at(1), 6)
 
     with assert_raises():
         _ = unbundle_histogram(plan, 0, 3, bg, bh, bc, 0)
@@ -814,9 +814,9 @@ def test_unbundle_histogram_passes_a_singleton_through() raises:
     var count: List[Int] = [7, 8, 9]
     var local = unbundle_histogram(plan, 0, 0, grad, hess, count, 0)
     for b in range(3):
-        assert_equal(local.grad[b], grad[b])
-        assert_equal(local.hess[b], hess[b])
-        assert_equal(local.count[b], count[b])
+        assert_equal(local.grad_at(b), grad[b])
+        assert_equal(local.hess_at(b), hess[b])
+        assert_equal(local.count_at(b), count[b])
 
 
 def test_params_and_plan_are_validated() raises:

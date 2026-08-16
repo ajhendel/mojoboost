@@ -180,8 +180,8 @@ def test_compensated_sample_reproduces_full_histogram() raises:
         )
         var total_count = 0
         for b in range(n_bins):
-            accumulated[b] += sampled.grad[b]
-            total_count += sampled.count[b]
+            accumulated[b] += sampled.grad_at(b)
+            total_count += sampled.count_at(b)
         # Counts are sample counts, never full-data counts: that is what
         # min_data_in_leaf sees under GOSS.
         if total_count != len(selection.rows):
@@ -190,7 +190,7 @@ def test_compensated_sample_reproduces_full_histogram() raises:
 
     for b in range(n_bins):
         var mean = accumulated[b] / Float64(n_rounds)
-        assert_true(abs(mean - full.grad[b]) <= 0.02 * total_magnitude)
+        assert_true(abs(mean - full.grad_at(b)) <= 0.02 * total_magnitude)
 
 
 def test_zero_importance_rows_are_never_kept() raises:

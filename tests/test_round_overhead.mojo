@@ -570,11 +570,11 @@ def test_subset_histogram_scratch_matches_allocating_form() raises:
         allocating, data, grad, hess, small, 0, len(small)
     )
 
-    assert_equal(len(reused.grad), len(allocating.grad))
-    for i in range(len(allocating.grad)):
-        _assert_same_float(allocating.grad[i], reused.grad[i])
-        _assert_same_float(allocating.hess[i], reused.hess[i])
-        assert_equal(allocating.count[i], reused.count[i])
+    assert_equal(reused.n_cells(), allocating.n_cells())
+    for i in range(allocating.n_cells()):
+        _assert_same_float(allocating.grad_at(i), reused.grad_at(i))
+        _assert_same_float(allocating.hess_at(i), reused.hess_at(i))
+        assert_equal(allocating.count_at(i), reused.count_at(i))
 
 
 def _serial_predict_reference(

@@ -282,12 +282,12 @@ def _histograms_match(a: Histogram, b: Histogram) -> Bool:
     if a.n_features != b.n_features or a.n_bins != b.n_bins:
         return False
     var size = a.n_features * a.n_bins
-    var ag = a.grad.unsafe_ptr()
-    var bg = b.grad.unsafe_ptr()
-    var ah = a.hess.unsafe_ptr()
-    var bh = b.hess.unsafe_ptr()
-    var ac = a.count.unsafe_ptr()
-    var bc = b.count.unsafe_ptr()
+    var ag = a._grad.unsafe_ptr()
+    var bg = b._grad.unsafe_ptr()
+    var ah = a._hess.unsafe_ptr()
+    var bh = b._hess.unsafe_ptr()
+    var ac = a._count.unsafe_ptr()
+    var bc = b._count.unsafe_ptr()
     for i in range(size):
         if (
             ag.unsafe_load(i) != bg.unsafe_load(i)
@@ -317,7 +317,7 @@ def _count_left(
         else:
             go_left = split.goes_left(b)
         if go_left:
-            total += hist.count[base + b]
+            total += hist.count_at(base + b)
     return total
 
 

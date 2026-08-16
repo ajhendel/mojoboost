@@ -55,9 +55,9 @@ def _assert_identical(a: Histogram, b: Histogram) raises:
     assert_equal(a.n_features, b.n_features)
     assert_equal(a.n_bins, b.n_bins)
     for i in range(a.n_features * a.n_bins):
-        assert_equal(a.grad[i], b.grad[i])
-        assert_equal(a.hess[i], b.hess[i])
-        assert_equal(a.count[i], b.count[i])
+        assert_equal(a.grad_at(i), b.grad_at(i))
+        assert_equal(a.hess_at(i), b.hess_at(i))
+        assert_equal(a.count_at(i), b.count_at(i))
 
 
 def test_device_capabilities_are_usable() raises:
@@ -190,8 +190,8 @@ def test_strategies_agree_on_leaf_filtered_builds() raises:
         var cpu_left = build_histogram_subset(data, gh[0], gh[1], left_rows)
         var cpu_right = build_histogram_subset(data, gh[0], gh[1], right_rows)
         for i in range(n_features * n_bins):
-            assert_equal(cpu_left.count[i], t_left.count[i])
-            assert_equal(cpu_right.count[i], t_right.count[i])
+            assert_equal(cpu_left.count_at(i), t_left.count_at(i))
+            assert_equal(cpu_right.count_at(i), t_right.count_at(i))
 
 
 def _subtraction_paths_agree(strategy: Int) raises:
@@ -281,7 +281,7 @@ def _subtraction_paths_agree(strategy: Int) raises:
     # Slot layout is [grad | hess | count], `hist_size` words apiece, and the
     # derived sibling is the first slot of the download.
     for i in range(hist_size):
-        assert_equal(Int(f_words[2 * hist_size + i]), cpu_right.count[i])
+        assert_equal(Int(f_words[2 * hist_size + i]), cpu_right.count_at(i))
 
     fused.release_resident_all()
     separate.release_resident_all()
@@ -325,9 +325,15 @@ def test_tiled_matches_the_cpu_builder() raises:
         var gpu = tiled.build(gh[0], gh[1])
 
         for i in range(n_features * n_bins):
-            assert_equal(cpu.count[i], gpu.count[i])
-            assert_true(abs(cpu.grad[i] - gpu.grad[i]) <= 1e-4 * g_mag + 1e-6)
-            assert_true(abs(cpu.hess[i] - gpu.hess[i]) <= 1e-4 * h_mag + 1e-6)
+            assert_equal(cpu.count_at(i), gpu.count_at(i))
+            assert_true(
+                abs(cpu.grad_at(i) - gpu.grad_at(i))
+                <= 1e-4 * g_mag + 1e-6
+            )
+            assert_true(
+                abs(cpu.hess_at(i) - gpu.hess_at(i))
+                <= 1e-4 * h_mag + 1e-6
+            )
 
 
 def test_tiled_repeat_builds_are_identical() raises:
@@ -374,7 +380,7 @@ def test_strategies_agree_under_feature_subsampling() raises:
         for f in range(n_features):
             var total = 0
             for b in range(n_bins):
-                total += t.count[f * n_bins + b]
+                total += t.count_at(f * n_bins + b)
             if f == 1 or f == 2 or f == 5:
                 assert_equal(total, n_rows)
             else:

@@ -72,12 +72,12 @@ def test_histogram_sums() raises:
     var hess: List[Float64] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
     var hist = build_histogram(data, grad, hess)
     for b in range(8):
-        assert_equal(hist.count[b], 1)
-        assert_equal(hist.hess[b], 1.0)
+        assert_equal(hist.count_at(b), 1)
+        assert_equal(hist.hess_at(b), 1.0)
         if b < 4:
-            assert_equal(hist.grad[b], -1.0)
+            assert_equal(hist.grad_at(b), -1.0)
         else:
-            assert_equal(hist.grad[b], 1.0)
+            assert_equal(hist.grad_at(b), 1.0)
 
 
 def test_best_split_separates_gradients() raises:
@@ -138,9 +138,13 @@ def test_histogram_subtraction() raises:
     var derived_right = subtract_histogram(parent, left)
     var direct_right = build_histogram_subset(data, grad, hess, right_rows)
     for i in range(2 * 2):
-        assert_true(abs(derived_right.grad[i] - direct_right.grad[i]) < 1e-12)
-        assert_true(abs(derived_right.hess[i] - direct_right.hess[i]) < 1e-12)
-        assert_equal(derived_right.count[i], direct_right.count[i])
+        assert_true(
+            abs(derived_right.grad_at(i) - direct_right.grad_at(i)) < 1e-12
+        )
+        assert_true(
+            abs(derived_right.hess_at(i) - direct_right.hess_at(i)) < 1e-12
+        )
+        assert_equal(derived_right.count_at(i), direct_right.count_at(i))
 
 
 def test_tree_single_split() raises:

@@ -276,7 +276,7 @@ def build_histogram_sparse_node(
         do_feature, n_active, node.n_entries() + data.n_features
     )
 
-    return Histogram(g^, h^, c^, data.n_features, n_bins)
+    return Histogram.from_planes(g^, h^, c^, data.n_features, n_bins)
 
 
 def build_histogram_sparse(
@@ -386,4 +386,4 @@ def build_histogram_sparse_subset(
         do_feature, n_active, data.nnz() + data.n_features
     )
 
-    return Histogram(g^, h^, c^, data.n_features, n_bins)
+    return Histogram.from_planes(g^, h^, c^, data.n_features, n_bins)
