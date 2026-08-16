@@ -308,6 +308,7 @@ from .boosting import (
     _mean_loss,
     _refuse_leaf_estimation,
     _renew_leaf_values,
+    _round_random_score_scale,
     _check_goss,
     _fill_softmax_grad_hess,
     _multiclass_goss_select,
@@ -426,6 +427,7 @@ from .growth_policy import (
 )
 from .gpu_leaf_batching import OBLIVIOUS_MAX_ITEMS
 from .tree import Tree, TreeParams, _leaf_value, _search, node_bounds
+from .tree_parameters_extra import ExtraTreeParams
 
 
 struct _GpuLeafState(Movable):
@@ -1144,6 +1146,57 @@ def _check_gpu_forced_splits(params: TreeParams, grower: String) raises:
         " never reads the document and would return an unforced tree. Train"
         " on the CPU (device='cpu', or device='auto', which routes around"
         " this), or leave forced_splits unset",
+    )
+
+
+def _check_device_gradient_random_strength(
+    extra: ExtraTreeParams, trainer: String
+) raises:
+    """Refuse `random_strength` on the DEVICE-GRADIENT arm, by name and with
+    the reason, rather than training unregularized.
+
+    CatBoost's `scoreStDev` is
+    `random_strength * derivativesStDevFromZero * modelSizeDecrease`, and the
+    middle factor (`CalcDerivativesStDevFromZero`) is the **root mean square**
+    of the round's derivatives: it needs `sum(g_i^2)` over the whole learn
+    set. The device-gradient arm never brings the gradient vector to the host
+    -- that is the point of it, and it is why a round there uploads nothing
+    per row -- so the sum has to be reduced on the device, and **the reduction
+    it would need does not exist.** `GpuObjectiveState.magnitude_sums` is the
+    only whole-vector gradient reduction on that plane and it sums `|g|`, an
+    L1 magnitude, because it exists to pick the fixed-point histogram scales.
+    An L1 sum is not an L2 sum and no arrangement of it becomes one; building
+    the sum-of-squares kernel beside it is a follow-up lane, not a line here.
+
+    So this arm has no scale it could compute, and the two alternatives to
+    refusing are both worse than refusing. Passing zero would be the silent
+    downgrade `ExtraTreeParams.check_random_strength` exists to prevent -- an
+    unregularized model reporting success. Substituting the L1 sum would be a
+    *different* standard deviation under CatBoost's parameter name, off by a
+    factor that depends on the gradient distribution, and no test would catch
+    it because the model would train and score plausibly.
+
+    The host-gradient arm has the vector in `List[Float64]` and computes the
+    scale exactly as `boosting._boost_rounds` does, so the message names it as
+    the way through: `objective_source=OBJECTIVE_SOURCE_HOST`, or
+    `MOJOTREES_GPU_OBJECTIVE=host`.
+    """
+    if not (extra.random_strength > 0.0):
+        return
+    raise Error(
+        "random_strength needs CatBoost's derivativesStDevFromZero, which is"
+        " the root mean square of the round's derivatives, and ",
+        trainer,
+        " generates its gradients on the device and never brings them to the"
+        " host. The only whole-vector gradient reduction on that plane is"
+        " GpuObjectiveState.magnitude_sums, which reduces the L1 magnitude"
+        " for the fixed-point histogram scales; an L2 sum-of-squares"
+        " reduction does not exist there and substituting the L1 one would be"
+        " a different standard deviation under the same parameter name. Use"
+        " objective_source=OBJECTIVE_SOURCE_HOST (or"
+        " MOJOTREES_GPU_OBJECTIVE=host), whose arm holds the gradients in"
+        " Float64 and computes the scale exactly as the CPU trainer does, or"
+        " set random_strength=0",
     )
 
 
@@ -3173,6 +3226,14 @@ def _train_gpu_rounds[
         # which needs the gradients host-side to rank and sample rows, and so
         # does an explicit `objective_source=OBJECTIVE_SOURCE_HOST`.
         if device_grads:
+            # The arm with no gradient vector on the host, and therefore no
+            # way to compute CatBoost's `derivativesStDevFromZero`. Refused by
+            # name at the top of the arm rather than at the first tree, so a
+            # fit that cannot honor `random_strength` says so before it has
+            # allocated a device objective state.
+            _check_device_gradient_random_strength(
+                params.tree.extra, String("the GPU device-gradient round")
+            )
             var state = builder.objective_state(
                 target, sample_weight, 1, 2 * params.tree.num_leaves
             )
@@ -3362,6 +3423,31 @@ def _train_gpu_rounds[
         var grad = List[Float64](capacity=n)
         var hess = List[Float64](capacity=n)
         var bag = List[Int]()
+        # ---- CatBoost's `random_strength`, one scale per tree ----
+        #
+        # THE HOST-GRADIENT ARM IS THE ARM THAT CAN COMPUTE IT, and that is
+        # the whole reason this block is here and its twin above is a refusal.
+        # `grad` below is the round's derivative vector in Float64, on the
+        # host, which is exactly what `derivativesStDevFromZero` needs the sum
+        # of squares of. The device-gradient arm never materializes it.
+        #
+        # `boosting._boost_rounds`'s block, verbatim in intent and calling the
+        # same function, for the reason that loop states: honoring a parameter
+        # on one trainer and not the other is worse than not honoring it, and
+        # a second implementation of the same three factors is a second thing
+        # to drift.
+        #
+        # `params` is borrowed and must stay borrowed -- writing the scale
+        # back into the caller's `BoosterParams` would make a fit mutate its
+        # own argument, so two identical `train_gpu` calls would differ and a
+        # bundle shared between two fits would carry one fit's gradients into
+        # the other. So this arm keeps its own copy of the tree bundle and
+        # hands THAT to the grower. One `TreeParams` copy per fit, not per
+        # tree, and at `random_strength = 0` -- the default, and every
+        # LightGBM-mode fit -- the copy is never written and the grower reads
+        # exactly what it read before.
+        var tree_params = params.tree.copy()
+        var noisy = params.tree.extra.random_strength > 0.0
         for i in range(params.n_estimators):
             life.begin_round()
             var pre_started = profile.clock()
@@ -3370,6 +3456,19 @@ def _train_gpu_rounds[
             _fill_grad_hess(
                 raw, target, objective, sample_weight, alpha, grad, hess
             )
+            # The scale is read from the round's USER-WEIGHTED derivatives,
+            # before any sampler rewrites them: CatBoost's `CalcScoreStDev`
+            # reads the fold's `WeightedDerivatives` while `Bootstrap` writes
+            # `SampleWeightedDerivatives` and leaves those alone, so reading
+            # it after `goss_round` would scale the noise by the sampler.
+            # `goss_round` rescales in place, which is exactly the write this
+            # has to precede.
+            if noisy:
+                tree_params.extra.random_score_scale = (
+                    _round_random_score_scale(
+                        params.tree.extra, grad, n, i, params.learning_rate
+                    )
+                )
             # GOSS rescales the sampled rows' gradients before they are
             # uploaded, so the device histograms already carry the
             # compensation multiplier.
@@ -3383,11 +3482,15 @@ def _train_gpu_rounds[
             profile.charge(PROF_TRANSFER, n, upload_started)
             profile.note_wall(pre_started)
             life.begin_tree()
+            # `tree_params`, not `params.tree`: the only field that differs is
+            # `extra.random_score_scale`, which this round just computed and
+            # which is per-tree ensemble state rather than configuration. At
+            # `random_strength = 0` the two are byte-identical.
             var tree = grow_tree_gpu_profiled(
                 profile,
                 builder,
                 searcher_cache,
-                params.tree,
+                tree_params,
                 bag,
                 i,
                 split_search,
