@@ -177,8 +177,6 @@ chosen. Building it would be building a gate that cannot open.
 | A14 | Model shrinkage: `model_shrink_rate`, `model_shrink_mode` (**verified from source**, see the A13/A14 note) | At the top of every iteration after the first, every accumulated raw score is multiplied by `1 - rate * learning_rate` (Constant) or `1 - rate / iteration` (Decreasing); the products are folded back into the leaf values of the already-grown trees at the end of the fit | Only when on | Yes, `langevin.mojo`, off by default. Built as a deferred fold (strictly less work than CatBoost's per-round rescale of the model, and exact) | CPU (`langevin.mojo`) | (1) as built, off; (3) when on. Refused beside continued training and beside `init_score`, both of which CatBoost also refuses |
 | A15 | `feature_border_type` / `border_count` (`library/cpp/grid_creator/binarization.cpp`, `catboost/libs/data/quantization.cpp`) | CatBoost's float quantization: seven border-selection algorithms, `GreedyLogSum` by default, bounded by `border_count` thresholds | New mode; bit-moving on the arm that selects it, exact on the arm that does not | Yes, opt-in `border_type`, default stays the LightGBM/mojotrees quantile fit | CPU (`binning.mojo`) | A15 note. **BUILT**, five of seven types, `binning.fit_bins(border_type=...)` |
 | A16 | `one_hot_max_size` (`catboost/private/libs/options/cat_feature_options.cpp`, `catboost/private/libs/algo/greedy_tensor_search.cpp`) | CatBoost's categorical one-hot threshold, default 2, `<=` on the count of real categories seen on learn | New mode; bit-moving only when set | Yes, opt-in `CategoricalParams.one_hot_max_size`, default off | CPU (`categorical.mojo`) | A16 note. **BUILT**. It also settles the owed `max_cat_to_onehot` off-by-one, see A12 |
-| A17 | *reserved for `ordered-ts-2`* (ordered target statistics, the follow-on to A5) | — | — | — | — | Left empty by `embedding-features` so the CTR lane can take it; renumber freely on merge |
-| A18 | *reserved for `text-features`* (the text estimators) | — | — | — | — | Left empty by `embedding-features` for the same reason |
 | A19 | `embedding_features`: the `LDA` and `KNN` embedding estimators (`catboost/private/libs/embedding_features/lda.{h,cpp}`, `knn.{h,cpp}`, `catboost/private/libs/feature_estimator/{base_,}embedding_feature_estimators.{h,cpp}`, `catboost/private/libs/options/embedding_processing_options.{h,cpp}`, `catboost/private/libs/algo/{fold,estimated_features}.cpp`) -- **verified from source**, see the A19 note | Host-side generation of numeric columns from a raw embedding column, which are then quantized by the ordinary float binning path. LDA projects the embedding onto the leading generalized eigenvectors of (between-class scatter, within-class scatter); KNN emits per-class neighbour counts (classification) or the neighbour target mean (regression). **Both read the target**, and both are computed **online against the fold's permutation** -- the same `TFold::GetLearnPermutationArray()` the ordered CTRs use | Yes: new columns, so every downstream bit moves | Yes, and it is bucket C before it is bucket B: CatBoost takes a raw embedding column and mojotrees cannot, so an embedding benchmark today is not a comparison at all | CPU (`embedding.mojo`, new file). **Consumes** `ordered-ts-2`'s permutation; does not own one | A19 note. **BUILT, off by default**, no existing default changed, nothing in the package imports it |
 
 ### A4 note: Bayesian bootstrap, verified from source
@@ -1804,9 +1802,13 @@ the file and the function it came from. Paragraphs headed **OURS** are our
 decisions and cite nothing, because there is nothing to cite. Nothing in this
 section is measured; this lane took no timings and ran no benchmark.
 
-Numbering: this lane deliberately skipped A17 and A18 and reserved them in the
-table for `ordered-ts-2` and `text-features`, the two live lanes working the
-same target-aware problem shape. Three lanes collided on numbering last round.
+Numbering: this lane deliberately skipped A17 and A18 and left them for
+`ordered-ts-2` and `text-features`, the two live lanes working the same
+target-aware problem shape, rather than taking the next free number. Three
+lanes collided on numbering last round. Checked after the fact:
+`lane/ordered-ts-2` took A17 and `lane/text-features` took A17 **and** A18, so
+those two collide with each other and neither collides with this row. This
+diff adds A19 and touches no other row of the table.
 
 Files read:
 
@@ -2246,14 +2248,32 @@ and not by a scheduler. No reduction in this module is split across workers.
 
 #### 9. What this row needs from the other two live lanes
 
-**From `ordered-ts-2`:** the permutation, as data. Specifically a stable
-accessor for "the fold's learn permutation as a `List[Int]` of row indices in
-visit order", generated from the run's seed, so that `compute_online_features`
-is handed the *same* permutation the CTRs use rather than generating a second
-one. `CreateEstimatedFeaturesData` and `InitOnlineCtrs` are called from the
-same `TFold` a few lines apart, off the same array; two permutations where
-CatBoost has one would be both slower and a different model. **This lane
-deliberately implemented no permutation.**
+**From `ordered-ts-2`:** the permutation, as data. **Already satisfied**, and
+checked against their branch rather than assumed:
+`ctr.ctr_permutation(n_rows, block_size, seed, permutation_index)` returns
+`List[Int]` with `perm[position] = row`, which is exactly the convention
+`compute_online_features` takes. The consumption is two lines and needs no
+adapter:
+
+```mojo
+var perm = ctr_permutation(n_rows, block_size, seed, fold_index)
+var cols = compute_online_features(embed, targets, n_classes, perm, params)
+```
+
+The reason to insist on *their* permutation rather than a second one is
+CatBoost's own structure: `CreateEstimatedFeaturesData` and `InitOnlineCtrs`
+are called from the same `TFold` a few lines apart, off the same array. Two
+permutations where CatBoost has one would be both slower and a different
+model. **This lane deliberately implemented no permutation, no RNG and no
+fold.**
+
+One wrinkle worth carrying: their permutation index 0 is the identity, which
+is CatBoost's `shuffle = (foldIdx != 0)`. For an embedding estimator that
+means one learning fold computes its features in dataset order, so a dataset
+whose rows arrive sorted by target gets a maximally-correlated prefix on that
+fold. That is CatBoost's behavior and not a bug, but it is the reason
+`identity_permutation` here carries a docstring saying it is not a training
+permutation.
 
 **From `text-features`:** nothing structural, and that is the point --
 `TEmbeddingBaseEstimator` and `TTextBaseEstimator` are siblings under
