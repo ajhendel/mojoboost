@@ -296,7 +296,20 @@ from .monotone import (
     OutputBounds,
 )
 from .rng import GOLDEN, splitmix64, uniform
-from .split import SplitInfo
+
+# `SCORE_L2` and `SCORE_COSINE` are re-exported by `split.mojo` and defined
+# beside the `ExtraTreeParams.score_function` field that carries the choice.
+# They are imported here rather than restated because a device kernel that
+# spelled its own copy of the two codes could drift from the host's, and the
+# whole contract of this module is that the two searches disagree in loop
+# structure and never in what a parameter means.
+from .split import SCORE_COSINE, SCORE_L2, SplitInfo, check_score_function
+
+# `score_function_name` is the one of the four that `split.mojo` does not
+# re-export, so it is taken from the module that defines all four. That
+# module imports only `cegb`, `gain`, `monotone` and `rng`, so this edge adds
+# no cycle; it is the same edge `split.mojo` itself has.
+from .tree_parameters_extra import score_function_name
 
 # The widest histogram the GPU backend accepts (`histogram_gpu.MAX_BINS`).
 comptime MAX_SPLIT_BINS = 256
@@ -896,6 +909,210 @@ def gpu_cat_gain(
     )
 
 
+# --- score_function = Cosine ----------------------------------------------
+#
+# CatBoost's `score_function=Cosine`, `sum(-out * G) / sqrt(sum(out^2 * H))`
+# over the children minus the same functional of the unsplit node, in the
+# device's Float32. The specification is the CPU path and nothing here is an
+# independent derivation: `split._cosine_out`, `split._cosine_unsplit`,
+# `split._cosine_pair` and `split._cosine_score` are the four functions these
+# four mirror, term for term and in the same order, and the CatBoost source
+# each was read from is cited there rather than restated here.
+#
+# WHY THIS IS A SECOND FUNCTIONAL AND NOT A RELABELLING OF THE L2 KERNEL
+# ----------------------------------------------------------------------
+# Because the argmax coincidence is per parent and this module's answer is
+# not consumed per parent. Substituting the free Newton step makes Cosine's
+# numerator and denominator the same expression at `lambda_l2 = 0`, so the
+# score collapses to `sqrt` of the L2 score and `sqrt` is strictly
+# increasing -- within one node. The stock `grow_policy` is `lossguide`,
+# which is a leaf-wise queue over candidates from *different* parents, and
+# `sqrt(a) - sqrt(p)` does not order like `a - p` across two different `p`.
+# The record this module returns carries `FREC_GAIN` into exactly that
+# queue. So the identity is true, is stated at `split._cosine_pair`, and is
+# not available here; scoring Cosine by relabelling the L2 kernel would be
+# wrong at the default growth policy and wrong in a way no single-node test
+# can see.
+#
+# WHAT IS AND IS NOT THE SAME NUMBER AS THE CPU'S
+# ------------------------------------------------
+# The candidate set, the admission guards, the scan order, the tie rule and
+# the accumulation order are the same; see `gpu_cosine_gain`. The
+# arithmetic is not, and the divergence is entirely the one this module
+# already had before Cosine existed -- Float32 against the host's Float64,
+# over a fixed-point histogram against the host's exact Float64 sums -- plus
+# exactly one new elementary operation, the Float32 square root. That one
+# is named because it is the only part of Cosine with no counterpart in the
+# L2 gain and therefore the only part whose divergence this section
+# introduces rather than inherits.
+
+comptime GPU_COSINE_DEN_FLOOR = Float32(1.17549435082228750797e-38)
+"""CatBoost's denominator seed, in the largest form Float32 can carry it.
+
+`split._COSINE_DEN_FLOOR` is 1e-100, which is CatBoost's own
+(`score_calcers.h`, `Scores.resize(splitsCount, {0, 1e-100})`). **1e-100 is
+not representable in Float32 and rounds to zero**, so transcribing the
+constant would silently delete the guard rather than port it, and the guard
+is load-bearing: it is what turns the `0/0` a zero-gradient candidate
+produces into `0`. `_cosine_out` returns 0.0 for a child of non-positive
+weight and a child whose thresholded gradient is exactly zero gives a zero
+numerator too, so `num` and `den` reach the ratio as `0` and `0` together.
+
+The smallest positive normal Float32 is used instead. It is a divide-by-zero
+guard and not a regularizer in either precision: adding it to any `den` a
+`min_child_hess` of even 1e-9 admits is exactly a no-op under Float32
+rounding, because such a `den` exceeds it by more than 2^24. The seed's
+*value* therefore does not enter any candidate's score in either backend,
+only its being nonzero does, and that property is what has been ported.
+`min_child_hess` is what actually keeps H off the floor, on both sides."""
+
+
+@always_inline
+def gpu_cosine_out(g: Float32, h: Float32, lambda_l2: Float32) -> Float32:
+    """`split._cosine_out` in Float32: CatBoost's `leafApprox` in our sign
+    convention, with CatBoost's `CalcAverage` zero-weight guard kept.
+
+    A child of non-positive weight emits zero and contributes nothing to
+    either accumulator, rather than dividing by `lambda_l2` alone. That is
+    why the Cosine branch has no divide-by-zero at `lambda_l2 = 0` where the
+    L2 branch would produce an infinity, and the guard is the host's, not a
+    device concession."""
+    if not (h > Float32(0.0)):
+        return Float32(0.0)
+    return -g / (h + lambda_l2)
+
+
+@always_inline
+def gpu_cosine_score(num: Float32, den: Float32) -> Float32:
+    """`split._cosine_score` in Float32: `Scores[i][0] / sqrt(Scores[i][1])`
+    with the denominator seed folded in.
+
+    One function for the same reason the host keeps one: the seed cannot then
+    be applied twice or forgotten at one of the call sites.
+
+    **This is the square root, and it is the one operation in the Cosine gain
+    with no counterpart in the L2 gain.** IEEE-754 makes `sqrt` correctly
+    rounded, so on any backend that honors the standard this is the same
+    number the host replica computes; a backend compiling with a relaxed
+    `sqrt` is the one place a device record could differ from the replica's
+    by a last bit, and that possibility is stated at `gpu_cosine_gain`
+    rather than assumed away."""
+    return num / sqrt(den + GPU_COSINE_DEN_FLOOR)
+
+
+@always_inline
+def gpu_cosine_parent(
+    total_g: Float32,
+    total_h: Float32,
+    lambda_l1: Float32,
+    lambda_l2: Float32,
+) -> Float32:
+    """`split._cosine_unsplit` scored, which is the node constant the Cosine
+    gain subtracts: CatBoost's `CalcScoreWithoutSplit`, the same calcer run
+    over the node's own totals with an empty second child.
+
+    Hoisted per node by every kernel, exactly as `parent_score` is, and for
+    the same reason: it is constant across a node's candidates -- every
+    feature's bins total to the same sums -- so subtracting it sets the zero
+    point the `> best_gain` test measures from and does nothing else. The
+    gradient arrives *un*-thresholded and is thresholded here, which is what
+    `find_best_split` does when it passes `parent_g` to `_cosine_unsplit`."""
+    var t = gpu_soft_threshold_l1(total_g, lambda_l1)
+    var out = gpu_cosine_out(t, total_h, lambda_l2)
+    return gpu_cosine_score(-out * t, out * out * total_h)
+
+
+@always_inline
+def gpu_cosine_gain(
+    left_g: Float32,
+    left_h: Float32,
+    right_g: Float32,
+    right_h: Float32,
+    lambda_l2: Float32,
+    parent_cos: Float32,
+    sign: Int32,
+    bound_lo: Float32,
+    bound_hi: Float32,
+    constrained: Bool,
+) -> Float32:
+    """One candidate's Cosine gain: `split._cosine_pair` folded into
+    `split._cosine_score` and the node's unsplit score subtracted, which is
+    the two lines `find_best_split` writes at each of its two scoring sites.
+
+    `left_g` and `right_g` arrive already soft-thresholded, as they do at
+    `gpu_split_gain`, and as `tl` and `tr` do on the host.
+
+    A MONOTONE REJECTION IS 0.0 AND NOT A SENTINEL
+    ----------------------------------------------
+    The host carries it out of band, as `_CosineTerms.ok`, because 0.0 is a
+    legitimate *numerator* there and cannot double as a rejection. By the
+    time the value is a gain that ambiguity is gone: `find_best_split` writes
+    `gain = 0.0` and overwrites it only when `ok`, so a rejected candidate
+    scores exactly 0.0 and loses to a `best_gain` that starts at 0.0 under a
+    strict `>`. Returning 0.0 here is therefore the host's rule and not a
+    device shortcut, and it is the same rule `gpu_split_gain`'s constrained
+    branch already follows for L2.
+
+    Note what is subtracted and what is not: a rejection returns 0.0 flat,
+    **not** `-parent_cos`. The two happen to be indistinguishable to the
+    caller today -- `parent_cos` is `|G| / sqrt(H)` and therefore never
+    negative, so `-parent_cos` is never positive and loses to a `best_gain`
+    that starts at 0.0 exactly as 0.0 does. It is written the host's way
+    anyway, because the equivalence rests on a sign argument about a
+    quantity computed elsewhere and the host's spelling rests on nothing.
+
+    WHAT IS THE SAME AS THE HOST, EXACTLY
+    -------------------------------------
+    The addend order in both accumulators is left child then right child,
+    fixed here as it is fixed in `_cosine_pair`, so neither value moves with
+    a worker count or a launch shape. The clamp is applied before the
+    accumulators are built, so they are built from the output the leaf will
+    actually emit, which is what CatBoost's monotone branch does. The two
+    parameters `_cosine_pair` takes that this does not -- `finish` and its
+    `max_delta_step` / `path_smooth` / parent-output arguments -- are refused
+    for the whole device search by `device_search_eligibility`'s
+    `SEARCH_EXTRA_PARAMS`, so there is no configuration in which the host
+    applies them and this does not.
+
+    WHAT IS NOT THE SAME, EXACTLY
+    -----------------------------
+    Three things, and they are worth separating because only one of them is
+    new.
+
+    1. Float32 against Float64. Every operation below is a Float32 operation
+       and the host's is a Float64 one. Inherited: this is what every gain in
+       this module already is.
+    2. A fixed-point histogram against exact Float64 sums. The device's
+       `left_g` was dequantized from an Int32 accumulation. Inherited, and it
+       is the accumulation this module already had; `gpu_right_sum` is where
+       its one avoidable cast lives and Cosine changes nothing about it.
+    3. The square root, at `gpu_cosine_score`. **New**, and the only new one.
+       It is correctly rounded under IEEE-754 and so agrees between the host
+       replica and a conforming device; a backend that compiles `sqrt` in a
+       relaxed mode would differ from the replica in the last bit, which no
+       L2 record could ever do because no L2 record takes a root.
+
+    The two accumulator adds are written as explicit `fma` for the reason
+    `gpu_cross_gain` gives: a product feeding an add is the contractable
+    shape (`docs/NUMERICS.md` section 6), unfused is not expressible and a
+    named local does not block contraction, and this expression is evaluated
+    both in the kernels and in `reference_search` on the host -- which is
+    exactly the pair that must not diverge. That pins one rounding where the
+    host's `+=` spelling leaves two, which is a divergence *in association*
+    from the host and is recorded as one. It is strictly smaller than
+    difference 1 above, which is already present in every term."""
+    var left_out = gpu_cosine_out(left_g, left_h, lambda_l2)
+    var right_out = gpu_cosine_out(right_g, right_h, lambda_l2)
+    if constrained:
+        left_out = gpu_clamp(left_out, bound_lo, bound_hi)
+        right_out = gpu_clamp(right_out, bound_lo, bound_hi)
+        if gpu_violates(sign, left_out, right_out):
+            return Float32(0.0)
+    var num = fma(-right_out, right_g, -left_out * left_g)
+    var den = fma(right_out * right_out, right_h, left_out * left_out * left_h)
+    return gpu_cosine_score(num, den) - parent_cos
+
+
 @always_inline
 def gpu_split_gain(
     left_g: Float32,
@@ -911,6 +1128,8 @@ def gpu_split_gain(
     node_s: Float32 = Float32(0.0),
     cross_offset: Float32 = Float32(0.0),
     form: Int32 = Int32(GAIN_FORM_SUBTRACTIVE),
+    score: Int32 = Int32(SCORE_L2),
+    parent_cos: Float32 = Float32(0.0),
 ) -> Float32:
     """`split._split_gain` in Float32. `left_g` and `right_g` are already
     soft-thresholded; a candidate running against `sign` scores 0.0, which
@@ -930,7 +1149,32 @@ def gpu_split_gain(
     acceptable rather than a gap. Clamping an output moves the gain by far
     more than the cancellation does, so a constrained candidate's gain was
     never resolved to `eps * parent_score` in the first place.
+
+    `score` selects the functional, and `SCORE_L2` -- the default, and the
+    value every existing caller gets without naming it -- is every line
+    below. `SCORE_COSINE` leaves before any of them and takes none of the
+    three trailing gain-form parameters with it: the cross form is an
+    identity about `GL^2/HL' + GR^2/HR' - G^2/S` and there is no such
+    identity for a ratio, so `node_s`, `cross_offset` and `form` are simply
+    not part of Cosine's arithmetic. **They still matter to a Cosine scan,
+    through `gpu_right_sum`**, which is where the right-hand child's sums
+    come from and is upstream of this function under either functional.
+    `parent_cos` is the node constant `gpu_cosine_parent` produced and is
+    ignored under `SCORE_L2`, where it is not read at all.
     """
+    if score == Int32(SCORE_COSINE):
+        return gpu_cosine_gain(
+            left_g,
+            left_h,
+            right_g,
+            right_h,
+            lambda_l2,
+            parent_cos,
+            sign,
+            bound_lo,
+            bound_hi,
+            constrained,
+        )
     if not constrained:
         if form == Int32(GAIN_FORM_CROSS):
             return gpu_cross_gain(
@@ -1438,6 +1682,7 @@ def _scan_slot_kernel(
     cat_min_group: Int32,
     gain_form: Int32,
     noisy: Int32,
+    score_function: Int32,
 ):
     """One threadgroup per (node, active feature slot): scan that feature's
     candidates for that node and write its best one as a per-slot record.
@@ -1543,6 +1788,19 @@ def _scan_slot_kernel(
     var cross_offset = gpu_cross_offset(
         total_g, total_h, lambda_l1, lambda_l2, lambda_l2, node_s
     )
+    # Cosine's node constant, hoisted beside the other three because that is
+    # what it is. Behind the selector, and the selector is read once per slot
+    # into a value the whole scan holds constant, for the reason
+    # `find_best_split` gives for reading it once per node: an L2 scan must
+    # leave this kernel on exactly the instruction sequence it took before
+    # the parameter existed, and the square root is the one operation here
+    # that an L2 scan has never had to issue. See `gpu_cosine_parent`.
+    var cosine = score_function == Int32(SCORE_COSINE)
+    var parent_cos = Float32(0.0)
+    if cosine:
+        parent_cos = gpu_cosine_parent(
+            total_g, total_h, lambda_l1, lambda_l2
+        )
 
     var best_gain = Float32(0.0)
     # The best gain of every candidate this feature scored except the
@@ -1803,6 +2061,8 @@ def _scan_slot_kernel(
                         node_s,
                         cross_offset,
                         form,
+                        score_function,
+                        parent_cos,
                     )
                     if noisy != Int32(0):
                         gain += bin_noise
@@ -1851,6 +2111,8 @@ def _scan_slot_kernel(
                     node_s,
                     cross_offset,
                     form,
+                    score_function,
+                    parent_cos,
                 )
                 if noisy != Int32(0):
                     gain += bin_noise
@@ -1961,6 +2223,7 @@ def _scan_slot_wide_kernel(
     constrained: Int32,
     gain_form: Int32,
     noisy: Int32,
+    score_function: Int32,
 ):
     """`_scan_slot_kernel`'s ordinal scan, spread over a threadgroup instead
     of run on one thread, and it writes the same per-slot record.
@@ -2157,6 +2420,16 @@ def _scan_slot_wide_kernel(
     var cross_offset = gpu_cross_offset(
         total_g, total_h, lambda_l1, lambda_l2, lambda_l2, node_s
     )
+    # Cosine's node constant, behind the selector for the reason
+    # `_scan_slot_kernel` gives: an L2 scan must issue the instructions it
+    # issued before this parameter existed, and the square root is the one
+    # operation an L2 scan has never had to issue.
+    var cosine = score_function == Int32(SCORE_COSINE)
+    var parent_cos = Float32(0.0)
+    if cosine:
+        parent_cos = gpu_cosine_parent(
+            total_g, total_h, lambda_l1, lambda_l2
+        )
 
     var missing_bin = Int(missing[unsafe_offset=f][0])
     var n_scan = missing_bin if missing_bin >= 0 else nb
@@ -2263,6 +2536,8 @@ def _scan_slot_wide_kernel(
                     node_s,
                     cross_offset,
                     form,
+                    score_function,
+                    parent_cos,
                 )
                 if noisy != Int32(0):
                     gain += bin_noise
@@ -2301,6 +2576,8 @@ def _scan_slot_wide_kernel(
                 node_s,
                 cross_offset,
                 form,
+                score_function,
+                parent_cos,
             )
             if noisy != Int32(0):
                 gain += bin_noise
@@ -2408,6 +2685,7 @@ def _scan_slot_wide_primitive_kernel(
     constrained: Int32,
     gain_form: Int32,
     noisy: Int32,
+    score_function: Int32,
 ):
     """`_scan_slot_wide_kernel` with its four hand-rolled reductions written
     as `gpu.primitives.block` collectives, and returning its record bit for
@@ -2543,6 +2821,16 @@ def _scan_slot_wide_primitive_kernel(
     var cross_offset = gpu_cross_offset(
         total_g, total_h, lambda_l1, lambda_l2, lambda_l2, node_s
     )
+    # Cosine's node constant, behind the selector for the reason
+    # `_scan_slot_kernel` gives: an L2 scan must issue the instructions it
+    # issued before this parameter existed, and the square root is the one
+    # operation an L2 scan has never had to issue.
+    var cosine = score_function == Int32(SCORE_COSINE)
+    var parent_cos = Float32(0.0)
+    if cosine:
+        parent_cos = gpu_cosine_parent(
+            total_g, total_h, lambda_l1, lambda_l2
+        )
 
     var missing_bin = Int(missing[unsafe_offset=f][0])
     var n_scan = missing_bin if missing_bin >= 0 else nb
@@ -2647,6 +2935,8 @@ def _scan_slot_wide_primitive_kernel(
                     node_s,
                     cross_offset,
                     form,
+                    score_function,
+                    parent_cos,
                 )
                 if noisy != Int32(0):
                     gain += bin_noise
@@ -2685,6 +2975,8 @@ def _scan_slot_wide_primitive_kernel(
                 node_s,
                 cross_offset,
                 form,
+                score_function,
+                parent_cos,
             )
             if noisy != Int32(0):
                 gain += bin_noise
@@ -4030,6 +4322,7 @@ def _launch_search(
     wide: Bool = False,
     primitives: Bool = True,
     gain_form: Int = DEFAULT_GAIN_FORM,
+    score_function: Int = SCORE_L2,
 ) raises:
     """The launch without a noise plane, which is every caller that does not
     stage one.
@@ -4080,6 +4373,7 @@ def _launch_search(
         primitives,
         gain_form,
         False,
+        score_function,
     )
 
 
@@ -4113,6 +4407,7 @@ def _launch_search(
     primitives: Bool = True,
     gain_form: Int = DEFAULT_GAIN_FORM,
     noisy: Bool = False,
+    score_function: Int = SCORE_L2,
 ) raises:
     """Enqueue the two kernels of one search, over `n_records` consecutive
     nodes starting at `record_base`.
@@ -4160,7 +4455,18 @@ def _launch_search(
     records. `noise` is the per-(record, slot, bin) plane the host filled
     from `random_score_plane`; when `noisy` is False it is a one-element
     placeholder no kernel reads, and every kernel takes the instruction
-    sequence it took before the parameter existed."""
+    sequence it took before the parameter existed.
+
+    `score_function` is the third, and it is not an arm at all in the sense
+    the other two are: it is CatBoost's parameter, `SCORE_L2` or
+    `SCORE_COSINE`, and it selects which functional the scan maximizes
+    rather than which spelling of one functional it uses. It reaches the
+    kernels the same way `gain_form` does, as a launch argument and not a
+    second instantiation. Defaulted to `SCORE_L2` so that every caller that
+    does not name it -- including `gpu_resident_round`'s device-resident
+    loop, which calls this directly -- makes the launch it made before the
+    parameter existed. The oblivious level search deliberately does not take
+    it; `_launch_oblivious_search` says why."""
     # The whole dispatch sits behind a compile-time accelerator test, so a
     # CPU-only extension build never instantiates any of these kernels and
     # never asks the backend for a GPU architecture it was not built with.
@@ -4192,6 +4498,7 @@ def _launch_search(
                 Int32(1) if constrained else Int32(0),
                 Int32(gain_form),
                 Int32(1) if noisy else Int32(0),
+                Int32(score_function),
                 grid_dim=(widest_slots, n_records),
                 block_dim=WIDE_SCAN_THREADS,
             )
@@ -4215,6 +4522,7 @@ def _launch_search(
                 Int32(1) if constrained else Int32(0),
                 Int32(gain_form),
                 Int32(1) if noisy else Int32(0),
+                Int32(score_function),
                 grid_dim=(widest_slots, n_records),
                 block_dim=WIDE_SCAN_THREADS,
             )
@@ -4242,6 +4550,7 @@ def _launch_search(
                 Int32(cat_min_group),
                 Int32(gain_form),
                 Int32(1) if noisy else Int32(0),
+                Int32(score_function),
                 grid_dim=(widest_slots, n_records),
                 block_dim=1,
             )
@@ -4298,6 +4607,7 @@ def _launch_oblivious_search(
     has_categorical: Bool,
     primitives: Bool = True,
     gain_form: Int = DEFAULT_GAIN_FORM,
+    score_function: Int = SCORE_L2,
 ) raises:
     """Enqueue the two kernels of one oblivious *level* search: the cross-leaf
     scan and the ordinary cross-feature reduction over the single record the
@@ -4330,7 +4640,23 @@ def _launch_oblivious_search(
     candidate set than the CPU grower searches, and the accuracy gate for this
     mode is node-identity with no tolerance. A refusal at the launch is a
     reachable, named failure; a quietly narrower search is a wrong tree that
-    looks right."""
+    looks right.
+
+    `score_function` refuses for the same reason and the parameter exists
+    only so that it can. **A level's Cosine score is not the sum of its
+    leaves' Cosine gains**, which is the whole of the difference: gain is
+    additive across leaves, a ratio is not, and
+    `split.find_best_split_shared` accordingly carries two cross-leaf
+    accumulator planes (`den_left`, `den_right`) and takes one square root
+    per candidate at the end, where the L2 arm accumulates a single sum. It
+    also gives an illegal leaf a different treatment -- the L2 arm adds 0.0
+    and the Cosine arm substitutes that leaf's *unsplit* terms, because 0.0
+    is a legitimate numerator once the sum is a ratio. Neither is written in
+    `_scan_slot_oblivious_kernel`, whose leaf loop accumulates
+    `total += gpu_split_gain(...)`, so a Cosine level here would be scored
+    by summing gains that do not sum. This mode's accuracy gate is
+    node-identity against the CPU oblivious grower with no tolerance, and a
+    kernel that cannot meet it must say so rather than round toward it."""
     comptime if not has_accelerator():
         raise Error(
             "the device split search needs an accelerator; this binary was"
@@ -4350,6 +4676,15 @@ def _launch_oblivious_search(
                     " 6 and CatBoost's default; depth 7 is over the measured"
                     " 64-buffer queue knee whatever this kernel does",
                 )
+            )
+        if score_function != SCORE_L2:
+            raise Error(
+                "the oblivious cross-leaf scan evaluates score_function=L2"
+                " only: it sums each leaf's gain, and a Cosine level score is"
+                " a ratio of two cross-leaf accumulators rather than a sum of"
+                " per-leaf ratios, so there is nothing for the leaf loop to"
+                " add. split.find_best_split_shared carries the two extra"
+                " accumulator planes this needs and is the fallback"
             )
         if has_categorical:
             raise Error(
@@ -4641,6 +4976,14 @@ struct GpuSplitSearcher(Movable):
     `GAIN_FORM_CROSS` or `GAIN_FORM_SUBTRACTIVE`, read once at construction
     from `MOJOTREES_GPU_SPLIT_GAIN_FORM` and settable afterwards. **The one
     arm on this searcher that changes a record**; see `set_gain_form`."""
+    var score_function_code: Int
+    """Which functional the scans maximize: `SCORE_L2` or `SCORE_COSINE`.
+
+    `SCORE_L2` at construction and there is no environment variable for it,
+    which is the difference between this and `gain_form_code`: this is
+    CatBoost's `score_function` parameter arriving from a fit, not a numeric
+    arm of one functional that a benchmark alternates. `set_score_function`
+    is the only way it moves."""
     var noise_stdev: Float64
     """CatBoost's `scoreStDev`: `random_strength * random_score_scale`, or
     0.0 for "off", which is the default and every LightGBM-mode fit.
@@ -4757,6 +5100,10 @@ struct GpuSplitSearcher(Movable):
         self.use_primitives = split_primitives_requested()
         self.hoist_tables = table_upload_hoisting_requested()
         self.gain_form_code = gain_form_requested()
+        # CatBoost's `score_function`, which starts at LightGBM's functional
+        # and moves only when a caller asks. No environment entry, for the
+        # reason the field gives.
+        self.score_function_code = SCORE_L2
         # Resolved here rather than per download: `ctx.api()` builds a String
         # and the readback is on the per-split path, where a device context's
         # API cannot change under it.
@@ -5105,6 +5452,75 @@ struct GpuSplitSearcher(Movable):
         """The gain arm `set_gain_form` last chose."""
         return self.gain_form_code
 
+    def set_score_function(mut self, score: Int) raises:
+        """Which functional this searcher's scans maximize: CatBoost's
+        `score_function`, `SCORE_L2` or `SCORE_COSINE`.
+
+        `SCORE_L2` is the default and is LightGBM's second-order gain, which
+        is what every scan this module has ever run computed. `SCORE_COSINE`
+        is `sum(-out * G) / sqrt(sum(out^2 * H))` over the children minus the
+        same functional of the unsplit node; the arithmetic and the
+        CatBoost source it was read from are at `gpu_cosine_gain` and at
+        `split._cosine_pair`, and nothing about them is restated here.
+
+        **This changes records, and it changes them more than
+        `set_gain_form` does.** `set_gain_form` picks between two spellings
+        of one functional whose exact values agree; this picks between two
+        functionals. Gains under the two are not comparable, not on the same
+        scale, and not in the same units, so a fixture taken under one says
+        nothing about the other and `frontier_margin`, `host_rescan_
+        recommended` and `min_gain_to_split` all measure something different
+        under each. That is a property of CatBoost's parameter and not of
+        this implementation.
+
+        **Not waived when the two agree.** They agree on the argmax within
+        one parent at `lambda_l2 = 0`, provably, and it is tempting to route
+        a Cosine request to the cheaper L2 scan on that identity. It must
+        not be: the record's gain feeds a leaf-wise queue that compares
+        candidates from different parents, where `sqrt(a) - sqrt(p)` does not
+        order like `a - p`, and this searcher cannot see the growth policy.
+        The full statement is at the head of the Cosine section.
+
+        REFUSED WITH A CATEGORICAL FEATURE, WHICH IS `find_best_split`'S OWN
+        RULE
+        --------------------------------------------------------------------
+        A categorical feature is searched as category *partitions*, scored
+        with the L2 gain by a search whose winner is the only candidate that
+        reaches the fold. Allowing Cosine on a matrix that has one would put
+        two different score functions inside one argmax, which is why
+        `find_best_split` raises on exactly this pair, and it raises here for
+        exactly that reason and with the same content. The check is over the
+        construction-time category counts, as `set_random_score`'s is, and
+        for the same reason: `cats` is fixed at construction and narrowing a
+        record's feature set can only remove features.
+
+        Refuses an unknown code rather than defaulting to one. That
+        direction is load-bearing and not defensive tidiness: a third
+        selector added later and not taught to these kernels must fail here,
+        because the alternative is that it silently receives an L2 answer
+        under its own label. `check_score_function` is the range check and
+        it is the host's, so the two cannot drift.
+
+        Takes effect on the next launch. It selects a kernel argument and
+        owns no state, so it is safe to change between searches.
+        """
+        check_score_function(score)
+        if score == SCORE_COSINE:
+            for f in range(self.n_features):
+                if self.cat_n[f] >= 2:
+                    raise Error(
+                        "score_function=cosine is implemented for numerical"
+                        " thresholds only; this searcher was constructed with"
+                        " a categorical feature, whose candidates are category"
+                        " partitions scored with the L2 gain, so the two score"
+                        " functions would end up inside one argmax"
+                    )
+        self.score_function_code = score
+
+    def score_function(self) -> Int:
+        """The functional `set_score_function` last chose."""
+        return self.score_function_code
+
     def set_random_score(
         mut self, stdev: Float64, seed: Int = 0, tree_index: Int = 0
     ) raises:
@@ -5303,6 +5719,13 @@ struct GpuSplitSearcher(Movable):
         var gain = String(
             " gain=", describe_gain_form(self.gain_form_code)
         )
+        # And which functional those gains are gains of, for a stronger form
+        # of the same reason: `gain=` names two spellings of one expression,
+        # this names two different expressions, and a number reported without
+        # it cannot even be compared to another number from this searcher.
+        var score = String(
+            " score=", score_function_name(self.score_function_code)
+        )
         # And the readback arm, for the same reason the upload arm is here:
         # it is the round trip that predicts this plane's time, a window
         # interleaves two settings of it, and a run whose arm cannot be read
@@ -5331,11 +5754,18 @@ struct GpuSplitSearcher(Movable):
                 reduction,
                 tables,
                 gain,
+                score,
                 back,
                 noise,
             )
         return String(
-            "scan=serial threads=1", reduction, tables, gain, back, noise
+            "scan=serial threads=1",
+            reduction,
+            tables,
+            gain,
+            score,
+            back,
+            noise,
         )
 
     def _check_record(self, record: Int) raises:
@@ -5853,6 +6283,7 @@ struct GpuSplitSearcher(Movable):
             has_cat,
             self.use_primitives,
             self.gain_form_code,
+            self.score_function_code,
         )
         return self.download(level_record)
 
@@ -5931,6 +6362,7 @@ struct GpuSplitSearcher(Movable):
             self.use_primitives,
             self.gain_form_code,
             self.noise_stdev > 0.0,
+            self.score_function_code,
         )
 
     def _copy_noise(mut self, record_base: Int, n_records: Int) raises:
@@ -6115,6 +6547,7 @@ struct GpuSplitSearcher(Movable):
             has_cat,
             self.use_primitives,
             self.gain_form_code,
+            self.score_function_code,
         )
 
     def enqueue_pick_best(
@@ -6338,6 +6771,7 @@ struct GpuSplitSearcher(Movable):
             # suite run. Keyword-passed like its neighbours so a future
             # argument inserted above cannot silently rebind it.
             gain_form=self.gain_form_code,
+            score_function=self.score_function_code,
             noisy=self.noise_stdev > 0.0,
         )
         return self.download(record)
@@ -6527,6 +6961,7 @@ def reference_search(
     bounds: OutputBounds = OutputBounds.unbounded(),
     gain_form: Int = DEFAULT_GAIN_FORM,
     noise: List[Float32] = [],
+    score_function: Int = SCORE_L2,
 ) raises -> GpuSplitRecord:
     """The kernels' arithmetic, run on the host over the same fixed-point
     histogram.
@@ -6556,6 +6991,15 @@ def reference_search(
     chosen by a partition search, so only that search's winner would be
     noised while every numerical feature had every candidate noised, which is
     a different regularizer wearing the same name.
+
+    `score_function` selects the same functional the kernels take and
+    defaults to the same one they default to, so the replica keeps
+    replicating; the reason it is a parameter here rather than a second
+    function is the reason `gain_form` is. `SCORE_COSINE` is refused with a
+    categorical feature, which is `GpuSplitSearcher.set_score_function`'s
+    refusal and `find_best_split`'s before it: the category partition search
+    scores with the L2 gain, so allowing the pair would put two score
+    functions inside one argmax.
     """
     if len(hist) != 3 * n_features * n_bins:
         raise Error("histogram must hold 3 * n_features * n_bins Int32 words")
@@ -6579,12 +7023,28 @@ def reference_search(
     var cat_l2 = Float32(params.cat.cat_l2)
     var constrained = len(monotone) > 0
     var form = gpu_resolve_gain_form(Int32(gain_form), lambda_l1)
+    # The functional, range-checked by the host's own check so the replica
+    # cannot accept a code a kernel would refuse.
+    check_score_function(score_function)
+    var score_code = Int32(score_function)
 
     var active = features.copy()
     if len(active) == 0:
         active = List[Int](capacity=n_features)
         for f in range(n_features):
             active.append(f)
+
+    if score_function == SCORE_COSINE:
+        for slot in range(len(active)):
+            var cf = active[slot]
+            if cats.is_cat(cf) and cats.n_categories(cf) >= 2:
+                raise Error(
+                    "score_function=cosine is implemented for numerical"
+                    " thresholds only; a categorical feature is searched as"
+                    " category partitions scored with the L2 gain, and only"
+                    " that search's winner would reach the fold, so the two"
+                    " score functions would end up inside one argmax"
+                )
 
     var noisy = len(noise) > 0
     if noisy:
@@ -6654,6 +7114,14 @@ def reference_search(
         var cross_offset = gpu_cross_offset(
             total_g, total_h, lambda_l1, lambda_l2, lambda_l2, node_s
         )
+        # And Cosine's, hoisted per slot behind the selector exactly as
+        # `_scan_slot_kernel` hoists it.
+        var cosine = score_function == SCORE_COSINE
+        var parent_cos = Float32(0.0)
+        if cosine:
+            parent_cos = gpu_cosine_parent(
+                total_g, total_h, lambda_l1, lambda_l2
+            )
         var gain_here = Float32(0.0)
         # The same runner-up rule the kernel applies: the best gain among
         # every candidate this feature scored except the winner.
@@ -6880,6 +7348,8 @@ def reference_search(
                             node_s,
                             cross_offset,
                             form,
+                            score_code,
+                            parent_cos,
                         )
                         if noisy:
                             gain += bin_noise
@@ -6927,6 +7397,8 @@ def reference_search(
                         node_s,
                         cross_offset,
                         form,
+                        score_code,
+                        parent_cos,
                     )
                     if noisy:
                         gain += bin_noise
