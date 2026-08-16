@@ -71,7 +71,7 @@ zero hessian and is invisible to every histogram, on either backend.
 
 from std.gpu import block_idx, global_idx, thread_idx
 from std.math import exp, isfinite
-from std.memory import stack_allocation
+from std.memory import bitcast, stack_allocation
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
@@ -469,19 +469,46 @@ def _range_add_raw_kernel(
 # One device-side range descriptor, in Int32 words. `SEG_START` is where this
 # segment's rows begin in the flattened thread index space (the running sum of
 # the preceding segments' counts), `SEG_BEGIN` is where they begin in the
-# active-row permutation, and `SEG_NODE` is the tree node whose value they
-# take. The fourth word is unused and exists only to keep the stride a power
-# of two, so a descriptor never straddles a cache line.
+# active-row permutation, and `SEG_STEP` is the amount every row in the
+# segment adds to its raw score: `learning_rate * value[node]`, multiplied and
+# rounded on the host, carried here as the Float32's own 32 bits reinterpreted
+# as an Int32. The fourth word is unused and exists only to keep the stride a
+# power of two, so a descriptor never straddles a cache line.
+#
+# Why the step lives in the descriptor and not in a node-indexed plane of its
+# own
+# ---------------------------------------------------------------------------
+# It used to. The host staged a Float32 step per node into `step_dev` and an
+# Int32 descriptor per live leaf into `seg_dev`, and the kernel looked the
+# step up by the node id the descriptor carried in this word. That is two
+# device buffers and therefore two `enqueue_copy` calls per tree, and section
+# 6.1 of `docs/GPU_PORTABILITY.md` establishes **by measurement** (disassembly
+# of the shipped Metal runtime) that an `enqueue_copy` on that backend is a
+# synchronous full-queue drain in both directions whose cost is a host wait
+# rather than a function of the byte count. So the second buffer was buying a
+# second wait to carry a few hundred bytes.
+#
+# Every live leaf has exactly one segment and exactly one node, so the step is
+# a function of the segment and belongs in the segment record. Moving it here
+# costs nothing in bytes (it takes a word that was padding), removes the whole
+# `step_dev` plane from this arm, removes the kernel's second indirect load,
+# and leaves the node id with no remaining reader, which is why this word is
+# now the step instead of the node.
+#
+# The mixed types are the only real obstacle, and they are not a conversion.
+# A Float32 and an Int32 are both 32 bits, so the step travels as its own bit
+# pattern and comes back out of it unchanged; `bitcast` is a reinterpretation
+# and no value is altered in either direction. `update_raw_ranges` states the
+# equality argument in full.
 comptime SEG_WORDS = 4
 comptime SEG_START = 0
 comptime SEG_BEGIN = 1
-comptime SEG_NODE = 2
+comptime SEG_STEP = 2
 
 
 def _range_table_add_raw_kernel(
     rows: MutPointer[Int32, MutAnyOrigin],
     raw: MutPointer[Float32, MutAnyOrigin],
-    steps: MutPointer[Float32, MutAnyOrigin],
     segs: MutPointer[Int32, MutAnyOrigin],
     n_segments: Int32,
     total: Int32,
@@ -492,8 +519,8 @@ def _range_table_add_raw_kernel(
     once, from a device-resident table of that tree's ranges.
 
     The per-leaf kernel above needs one launch per leaf because the leaf's
-    `begin`, `count`, and `node` arrive as launch arguments. Here the same
-    three numbers arrive as a table the host staged once, so a thread can
+    `begin`, `count`, and node value arrive as launch arguments. Here the
+    same numbers arrive as a table the host staged once, so a thread can
     find its own leaf and the whole tree closes in one launch. At the
     31-leaf tree the trainer grows by default that is 1 launch where there
     were 31.
@@ -514,9 +541,10 @@ def _range_table_add_raw_kernel(
     Writing the same expression here produced a different last bit, and the
     reason is instructive: in the per-leaf kernel `node` is a launch
     argument, so `learning_rate * value[node]` is uniform across the launch
-    and is computed and rounded to Float32 on its own; here `node` is
-    per-thread, and the device compiler contracted the multiply and the add
-    into a single fused multiply-add, which rounds once instead of twice.
+    and is computed and rounded to Float32 on its own; here the leaf a
+    thread lands on is per-thread, so the product varied across the launch
+    and the device compiler contracted the multiply and the add into a
+    single fused multiply-add, which rounds once instead of twice.
     Both are legitimate Float32 evaluations of the same expression and they
     differ by one unit in the last place, which is enough to make a model
     not byte-identical to the one this lane started from.
@@ -529,6 +557,23 @@ def _range_table_add_raw_kernel(
     nothing left for a compiler to fuse. The result is equal to the per-leaf
     kernel's by construction rather than by the optimizer's agreement,
     which is the stronger of the two guarantees.
+
+    Where the step comes from, and why it is an Int32 here
+    ------------------------------------------------------
+    The step used to arrive in a Float32 plane of its own, indexed by a node
+    id this descriptor carried. It now arrives in the descriptor, as the
+    Float32's own bit pattern reinterpreted as an Int32 and reinterpreted
+    back by the `bitcast` below. The reason is transfer count, not
+    arithmetic: two device buffers meant two `enqueue_copy` calls per tree,
+    and on Metal a copy is a queue drain rather than a byte movement
+    (`docs/GPU_PORTABILITY.md` section 6.1, **measured** by disassembly). The
+    layout comment above `SEG_WORDS` argues the choice in full.
+
+    A `bitcast` between two 32-bit types is a reinterpretation, so the value
+    that comes out is the value that went in, to the bit. Nothing about the
+    arithmetic moved: the host still computes `Float32(lr) * Float32(value)`,
+    in that form and in that place, for the contraction reason above, and
+    this kernel still contains no multiply.
 
     Ranges are pairwise disjoint (`LeafRangeTable` checks that invariant),
     so no row is written by two threads and no row is written twice; a row
@@ -549,12 +594,12 @@ def _range_table_add_raw_kernel(
     var base = lo * SEG_WORDS
     var j = t - Int(segs[unsafe_offset = base + SEG_START][0])
     var slot = Int(segs[unsafe_offset = base + SEG_BEGIN][0]) + j
-    var node = Int(segs[unsafe_offset = base + SEG_NODE][0])
+    var step = bitcast[DType.float32, 1](
+        segs[unsafe_offset = base + SEG_STEP][0]
+    )
     var r = Int(rows[unsafe_offset=slot][0])
     var i = r * Int(n_classes) + Int(k)
-    raw[unsafe_offset=i] = (
-        raw[unsafe_offset=i][0] + steps[unsafe_offset=node][0]
-    )
+    raw[unsafe_offset=i] = raw[unsafe_offset=i][0] + step
 
 
 def _abs_sum_kernel(
@@ -701,19 +746,25 @@ struct GpuObjectiveState(Movable):
     update arm reads `step_dev` instead."""
     var seg_dev: DeviceBuffer[DType.int32]
     """The current tree's live-range descriptors, `SEG_WORDS` Int32 apiece,
-    which is what lets `update_raw_ranges` close a whole tree in one launch.
-    Sized once at construction from `max_nodes`, never per tree."""
+    which is what lets `update_raw_ranges` close a whole tree in one launch
+    and, since the descriptor carries its own step, in one copy. Sized once
+    at construction from `max_nodes`, never per tree."""
     var part_dev: DeviceBuffer[DType.float32]
     var base_dev: DeviceBuffer[DType.float32]
     var host_part: HostBuffer[DType.float32]
     var host_raw: HostBuffer[DType.float32]
     var step_dev: DeviceBuffer[DType.float32]
     """The current tree's per-node steps, `learning_rate * value[node]`
-    already multiplied and rounded on the host. Read by the range-table
-    kernel and by `_update_raw_kernel`, which is why neither contains a
-    multiply; see either for the rounding argument. The two never hold the
-    same tree's steps at once, since a round closes by one arm or the
-    other."""
+    already multiplied and rounded on the host, which is why
+    `_update_raw_kernel` contains no multiply; see that kernel for the
+    rounding argument.
+
+    Read by `_update_raw_kernel` only. The range-table arm used to read it
+    too and now carries its step inside the range descriptor instead, which
+    is what took that arm from two copies per tree to one; the node-indexed
+    plane survives here because `_update_raw_kernel`'s node ids arrive
+    per-row out of a leaf-assignment array and there is no descriptor to
+    hang a step on."""
     var stage_value: HostBuffer[DType.float32]
     """Pinned staging for the node-value table. `map_to_host` copies in both
     directions on every use and blocks (the reasoning is written out in
@@ -725,10 +776,15 @@ struct GpuObjectiveState(Movable):
     recorded in `docs/GPU_PORTABILITY.md` section 6.1, so what this buys
     over the mapping is the second direction's bytes and not the wait. The
     wait is still there, once per tree."""
-    var stage_step: HostBuffer[DType.float32]
-    """Pinned staging for `step_dev`, on the same grounds."""
     var stage_seg: HostBuffer[DType.int32]
-    """Pinned staging for `seg_dev`, on the same grounds."""
+    """Pinned staging for `seg_dev`, on the same grounds. Since the step
+    moved into the descriptor this is the whole of what
+    `update_raw_ranges` sends, so the arm stages once and copies once.
+
+    There is no `stage_step` beside it: `update_raw` is the only remaining
+    reader of `step_dev` and it still writes through a `map_to_host`
+    mapping, which is a per-tree bidirectional transfer this lane counted
+    and deliberately did not touch."""
     var n_rows: Int
     var n_classes: Int
     var max_nodes: Int
@@ -806,9 +862,6 @@ struct GpuObjectiveState(Movable):
         )
         self.host_raw = ctx.enqueue_create_host_buffer[DType.float32](n_scores)
         self.stage_value = ctx.enqueue_create_host_buffer[DType.float32](
-            max_nodes
-        )
-        self.stage_step = ctx.enqueue_create_host_buffer[DType.float32](
             max_nodes
         )
         self.stage_seg = ctx.enqueue_create_host_buffer[DType.int32](
@@ -1118,41 +1171,83 @@ struct GpuObjectiveState(Movable):
         This used to open a `map_to_host` mapping on the node-value buffer
         and then issue one small launch per live leaf. On the default
         31-leaf tree that was 31 launches and one hidden host
-        synchronization per tree; it is now one launch, two small staged
-        copies (the per-node steps and the range descriptors, both a few
-        hundred bytes), and no synchronization of its own. The descriptors
-        are read by `_range_table_add_raw_kernel`, which finds a thread's
-        leaf by binary search over them.
+        synchronization per tree; it is now one launch and no
+        synchronization of its own. The descriptors are read by
+        `_range_table_add_raw_kernel`, which finds a thread's leaf by binary
+        search over them.
 
-        What did not change is the arithmetic. Each row still receives
-        `learning_rate * value[leaf]` added to its own Float32 raw score,
-        with the multiply rounded to Float32 before the add exactly as the
-        per-leaf kernel rounds it, and the ranges are disjoint, so each row
-        is still written exactly once by exactly one thread. That the
-        multiply now happens on the host is what makes the equality
-        structural rather than dependent on how the device compiler chooses
-        to contract; the kernel's docstring gives that argument in full,
-        including the one-bit divergence that prompted it.
-        `update_raw_ranges_per_leaf` keeps the old shape in the process so a
-        test can assert the agreement rather than a docstring asserting it.
+        One copy, not two
+        -----------------
+        The launch count was already right and the transfer count was not.
+        Between the rewrite above and this one the method issued two
+        `enqueue_copy` calls per tree, one for a Float32 plane of per-node
+        steps and one for the Int32 range descriptors, each a few hundred
+        bytes. Section 6.1 of `docs/GPU_PORTABILITY.md` establishes
+        **by measurement** (disassembly of the shipped Metal runtime, plus a
+        second measurement from outside the process in
+        `docs/METAL_TIMELINE.md`) that on that backend an `enqueue_copy`
+        drains the whole queue and then memcpys, in both directions, so its
+        cost is a host wait and is very nearly independent of the byte
+        count. Two buffers therefore bought two waits to move a few hundred
+        bytes.
+
+        The step is now carried inside the range descriptor, in the word
+        that was padding, as the Float32's own bits reinterpreted as an
+        Int32; the layout comment above `SEG_WORDS` argues why that is the
+        right home for it and why the reinterpretation is free. So this arm
+        stages one buffer and copies once. **Counted in source**, that is two
+        `enqueue_copy` calls per tree before and one after.
+
+        What that saves in seconds is **not measured here and is not
+        estimated here**. It cannot be: section 6.4 of the same document
+        records a live factor-of-five tension between the wait count derived
+        from the source and the wait count a Metal System Trace actually
+        observed, and concludes that the wait count of any path must be
+        measured rather than derived. One of the candidate resolutions there
+        is that a drain on an already-empty queue is cheap. This lane
+        removes a copy that source says is there; how much wall clock it was
+        worth is the coordinator's to measure.
+
+        What did not change is the arithmetic
+        -------------------------------------
+        Every row still receives `learning_rate * value[leaf]` added to its
+        own Float32 raw score, and the multiply is still
+        `Float32(learning_rate) * Float32(values[node])` evaluated on the
+        host, in that expression and in that place. It has to be: doing it
+        in the kernel let the device compiler contract it into an FMA and
+        produced a one-bit divergence from the per-leaf arm, which is the
+        whole reason the multiply is here at all
+        (`_range_table_add_raw_kernel` gives the argument in full). This
+        change moved which buffer the resulting bits travel in and nothing
+        else. A `bitcast` between two 32-bit types is a reinterpretation,
+        not a conversion, so the Float32 the kernel adds is the Float32 the
+        host computed, bit for bit.
+
+        The ranges are disjoint, so each row is still written exactly once
+        by exactly one thread. `update_raw_ranges_per_leaf` keeps the old
+        launch shape and the old node-value lookup, so a test can assert the
+        agreement rather than a docstring asserting it; it is deliberately
+        not packed, which is what makes it an independent arm rather than a
+        second spelling of this one. `tests/test_gpu_fma_consistency.mojo`
+        and `tests/test_gpu_split_launch_overhead.mojo` both run the two
+        against the same state and compare the raw scores bit for bit.
         """
         self._check_range_update(values, learning_rate, k)
+        # Flatten the live ranges into ascending descriptors, each carrying
+        # its own step. Empty ranges are the tree's internal nodes, whose
+        # rows their children own; the per-leaf loop skipped them the same
+        # way, and a node with no live rows contributes no step because
+        # nothing would read it.
+        #
         # `Float32(lr) * Float32(value)` here is the same IEEE 754 single
         # multiply the per-leaf kernel performs on the device, so the step
         # that crosses is bit-identical to the one that kernel would have
         # computed; the kernel then does nothing but add it. See
         # `_range_table_add_raw_kernel` for why the multiply had to leave
-        # the kernel at all.
-        var step_dst = self.stage_step.unsafe_ptr()
-        var lr32 = Float32(learning_rate)
-        for i in range(len(values)):
-            step_dst.unsafe_store(i, lr32 * Float32(values[i]))
-        ctx.enqueue_copy(dst_buf=self.step_dev, src_ptr=step_dst)
-
-        # Flatten the live ranges into ascending descriptors. Empty ranges
-        # are the tree's internal nodes, whose rows their children own; the
-        # per-leaf loop skipped them the same way.
+        # the kernel at all, and note that it has not moved since: only the
+        # buffer it is stored into has.
         var dst = self.stage_seg.unsafe_ptr()
+        var lr32 = Float32(learning_rate)
         var n_segments = 0
         var total = 0
         for node in range(rows.ranges.n_nodes()):
@@ -1162,10 +1257,13 @@ struct GpuObjectiveState(Movable):
             var n = window.count()
             if n <= 0:
                 continue
+            var step = lr32 * Float32(values[node])
             var base = n_segments * SEG_WORDS
             dst.unsafe_store(base + SEG_START, Int32(total))
             dst.unsafe_store(base + SEG_BEGIN, Int32(window.begin))
-            dst.unsafe_store(base + SEG_NODE, Int32(node))
+            dst.unsafe_store(
+                base + SEG_STEP, bitcast[DType.int32, 1](step)
+            )
             dst.unsafe_store(base + SEG_WORDS - 1, Int32(0))
             n_segments += 1
             total += n
@@ -1178,7 +1276,6 @@ struct GpuObjectiveState(Movable):
         ctx.enqueue_function[_range_table_add_raw_kernel](
             rows.rows_dev.unsafe_ptr(),
             self.raw_dev.unsafe_ptr(),
-            self.step_dev.unsafe_ptr(),
             self.seg_dev.unsafe_ptr(),
             Int32(n_segments),
             Int32(total),
