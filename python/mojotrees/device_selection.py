@@ -311,8 +311,36 @@ class Workload:
 
     @property
     def n_outputs(self):
-        """Trees grown per boosting round: 1 for single-output training
-        and for binary classification, the class count beyond that."""
+        """Trees grown per boosting round: 1 for single-output training and
+        for binary classification, the class count beyond that.
+
+        TWO CLASSES IS THE AMBIGUOUS CASE AND THE OBJECTIVE CODE RESOLVES
+        IT. `n_classes == 2` is binary logistic for a classifier that
+        counted two labels in `y`, which grows one tree per round; it is
+        *softmax over two classes* for a caller that wrote
+        `objective='multiclass', num_class=2`, which grows two. The class
+        count alone cannot tell those apart, so this used to collapse both
+        to one output.
+
+        That was invisible while no crossover rule looked at `n_outputs`,
+        and it stopped being invisible on 2026-08-16 when
+        `apple-m4-metal-dense-multiclass` was installed and scoped on
+        exactly that field. The native trainer resolves the device a second
+        time from `n_classes`, so a two-class softmax fit would have had
+        Python answer "cpu" (one output, no rule) while the native
+        `train_dataset_multiclass` answered "gpu" (two outputs, rule
+        matches) -- except that Python's answer is the one that travels in
+        the params dict, so the fit would have quietly stayed on the slower
+        backend and nothing would have said so.
+
+        `_MULTICLASS_OBJECTIVE` is `objective_registry.MULTICLASS`, which a
+        multiclass caller does declare: `_Config.binding_params` in basic.py
+        sets it, and `Workload(objective='multiclass')` resolves to it
+        through the registry. This is not a policy decision; it is reading
+        the field the caller filled in rather than guessing from a count.
+        """
+        if self.objective_code == _MULTICLASS_OBJECTIVE:
+            return self.n_classes
         return self.n_classes if self.n_classes > 2 else 1
 
     @property
@@ -519,6 +547,13 @@ CONTRACT_NARROW = "narrow"
 #: native layer decides what an undeclared field means.
 _BINS_UNSPECIFIED = -1
 _OBJECTIVE_UNSPECIFIED = -2
+
+#: `objective_registry.MULTICLASS`, the softmax marker, spelled out here
+#: because `Workload.n_outputs` has to tell "two labels, binary logistic"
+#: apart from "num_class=2, softmax" and the class count cannot. It is a
+#: real objective code, not a sentinel; see the block above on why -1 and -2
+#: must never be tested with the same comparison.
+_MULTICLASS_OBJECTIVE = -1
 
 
 def _extension():

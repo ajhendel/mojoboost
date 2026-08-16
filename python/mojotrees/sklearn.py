@@ -3900,8 +3900,14 @@ class MojoTreesClassifier(_Base):
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
         mono_buf, mono_addr = self._monotone_buffer(n_features)
         contri_buf, contri_addr = self._feature_contri_buffer(n_features)
-        # Binary is single-output (one tree per round), so it has a GPU
-        # path; only the softmax ensemble is CPU-only.
+        # Binary is single-output (one tree per round) and softmax is one
+        # tree per class per round, so `n_outputs` is what separates them
+        # and both have a GPU path. This comment used to end "only the
+        # softmax ensemble is CPU-only", which stopped being true when
+        # `train_multiclass_gpu` landed and stopped being invisible when
+        # `crossover_rules()` gained `apple-m4-metal-dense-multiclass`:
+        # `auto` now reaches the device for a multiclass fit above the row
+        # floor, on the strength of a measured 1.63x.
         device = self._resolve_device(
             n_rows,
             n_features,

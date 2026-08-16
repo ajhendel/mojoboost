@@ -76,24 +76,42 @@ Three requested devices, and what each one means
 
 Where `auto` reaches the GPU, and where it still does not
 ---------------------------------------------------------
-`crossover_rules()` holds exactly one rule. Its *scope* is as narrow as the
-two records behind it. Both measure end-to-end training on an Apple M4 over
-Metal at 1,000,000 rows by 50 dense features, 255 bins, 31 leaves, 100
-rounds, squared error, in interleaved CPU/GPU arms:
+`crossover_rules()` holds two rules, one single-output and one multiclass,
+and each is as narrow as the records behind it.
+
+The single-output rule's two records both measure end-to-end training on an
+Apple M4 over Metal at 1,000,000 rows by 50 dense features, 255 bins, 31
+leaves, 100 rounds, squared error, in interleaved CPU/GPU arms:
 `bench/results/apple_m4_large_scaling_2026-08-14.md` (GPU 4.289-4.382 s
 against CPU 11.094-11.706 s over three seeds) and the 2026-08-15 section of
 `docs/GPU_VALIDATION.md` (GPU 4.10 s against CPU 11.36 s over five
-repeats). So the rule fires on that device, for that objective, at 50 or
-more features, and nowhere else. Every other backend, every other Apple
-generation, every other objective, and multiclass all keep returning "no
-rule covered this", because nothing here measured them.
+repeats). So it fires on that device, for that objective, at 50 or more
+features, and nowhere else.
 
-Its *row floor* is a different kind of thing and is labelled as one:
-`AUTO_GPU_MIN_ROWS` is a plain provisional constant at 250,000 rows, set
-below the smallest shape the GPU has been measured to win, on a stated
-trade rather than on a measurement. Read the comment on that constant
-before changing it; the measured crossover is scheduled work and this is
-the placeholder standing in for it.
+The multiclass rule's one record is softmax on the same machine at 465,000
+rows by 54 dense features over 7 classes, same bins, leaves and rounds:
+`bench/results/profile_2026-08-15/RESULTS.md`, GPU 15.30 s against CPU 25.47
+s, medians of three at 0.1 and 7.7 percent spread, so the GPU wins by 1.63x
+with the two spreads nowhere near touching. It is scoped by trees per round
+rather than by objective code, because trees-per-round is what the trainers
+branch on and is the one fact every multiclass entry point declares; see
+`crossover_rules()` for why that is the exact scope and not a weakened one.
+Until 2026-08-16 there was no rule here at all, so `auto` handed every
+softmax fit the slower backend at every size.
+
+Every other backend, every other Apple generation, and every other objective
+still return "no rule covered this", because nothing here measured them.
+
+The *row floor* is a different kind of thing and is labelled as one. Both
+rules read `AUTO_GPU_MIN_ROWS`, a plain provisional constant at 250,000
+rows, set below the smallest shape either record covers, on a stated trade
+rather than on a measurement. Read the comment on that constant before
+changing it; the measured crossover is scheduled work and this is the
+placeholder standing in for it. One number for both is itself a decision and
+`crossover_rules()` argues it: a K-class fit does K times the tree work per
+round against the same one-time upload and session cost, so the multiclass
+crossover sits at or below the single-output one and reusing the constant
+cannot over-reach relative to that.
 
 That the table was empty for longer than the evidence warranted was a bug,
 not conservatism: `auto` selected the CPU at every size on every machine,
@@ -149,6 +167,47 @@ validated choice.
 present: `gpu` raises and `auto` chooses the CPU on a machine that does
 have one. It exists to exercise the unavailable-GPU path and to pin a
 mixed fleet to the CPU backend.
+
+Parameters the accelerator cannot honor, and why they are blocks
+----------------------------------------------------------------
+A block is not only "the kernels cannot index this many rows". Three
+*training parameters* are blocks too, and all three arrived on 2026-08-16
+from a sweep whose whole point was that nobody had checked:
+
+- `enable_bundle` (`BLOCK_FEATURE_BUNDLING`),
+- `linear_tree` (`BLOCK_LINEAR_TREE`),
+- a forced-split document (`BLOCK_FORCED_SPLITS`).
+
+Each was accepted by the GPU trainers, applied by none of them, and
+reported as success. The pattern that hid all three, and that hid
+`leaf_estimation_iterations` and `MOJOTREES_DERIVATIVE_PRECISION=float64`
+before them, is an *aggregate guard assumed to cover a knob it does not*:
+`ExtraTreeParams.is_active()` names `forced`, which reads as coverage and
+is coverage only for the non-default `MOJOTREES_GPU_SPLIT_STRATEGY=device`
+path; the shipping host split scan refuses only
+`ExtraTreeParams.needs_grower_support()`, a strictly smaller set. Do not
+read an aggregate as an answer here. Check the knob against the code that
+would have to read it.
+
+The two device requests get different answers, and that asymmetry is the
+whole design: an explicit `device='gpu'` raises, because a caller who named
+a backend is entitled to be told it cannot honor what they asked for, while
+`device='auto'` selects the CPU with `DECISION_AUTO_CPU_BLOCKED`, because a
+caller who asked us to pick asked for the backend that *can*. Blocks are
+collected before `crossover_rules()` is consulted, so no shape is compared
+and `AUTO_GPU_MIN_ROWS` never enters the answer for any of them.
+
+WHAT THIS MODULE CANNOT CLOSE ON ITS OWN. `resolve_device`, which is what
+`model.fit` calls, describes the shape and the objective and nothing else,
+so it cannot see any of these three. `resolve_device_full` takes all of
+them and is the entry point a trainer holding its own `BoosterParams`
+should call; until each call site passes them (one argument each, in
+model.mojo and trainset.mojo, which are other lanes' files) an `auto` fit
+that sets one of the three still reaches `train_gpu` and is refused *there*
+rather than routed. That is the trainers' refusal, not a fallback, and it
+is a strictly better outcome than the silent ignore it replaces -- but it
+is not the outcome this policy specifies, and it is written down here
+rather than left to be rediscovered.
 
 Unknown hardware
 ----------------
@@ -239,7 +298,7 @@ from .boosting import CUSTOM
 # `decide_device` can stay pure. Safe to import: histogram.mojo reaches only
 # binning, objective_registry, apple_cpu_policy and parallel, none of which
 # come back here, and `boosting` (already imported above) reaches it anyway.
-from .histogram import derivative_precision_narrows
+from .histogram import const_hessian_verify, derivative_precision_narrows
 from .initialization import SessionState, warmup_level_name
 
 # The one table of objective facts. Imported rather than restated: this
@@ -360,7 +419,22 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # rather than at it, and `crossover_rules()` states the trade and what would
 # reverse it; a version-4 GPU selection between 250,000 and 1,000,000 rows is
 # a provisional selection and a report carrying this number says so.
-comptime POLICY_VERSION = 4
+# 5: three gates were added and no rule moved. `enable_bundle`, `linear_tree`,
+# and a forced-split document are now blocks (`BLOCK_FEATURE_BUNDLING`,
+# `BLOCK_LINEAR_TREE`, `BLOCK_FORCED_SPLITS`); under version 4 and every
+# version before it they were accepted by the GPU trainers and silently not
+# applied. A version-4 report saying a GPU selection was unblocked and a
+# version-5 report saying the same thing therefore mean different things for
+# a request that set any of the three, which is what this number is for.
+# 6: the multiclass crossover rule, `apple-m4-metal-dense-multiclass`. The
+# table had one rule and it was scoped to a single output, so `auto` selected
+# the CPU for every softmax fit at every size on every machine, including the
+# machine where the GPU is measured 1.63x faster at it. No existing rule
+# moved, no threshold moved, and no single-output request can match the new
+# rule (it requires two or more trees per round). A version-4 report saying
+# "no rule covered this" for a multiclass workload and a version-6 report
+# saying it therefore mean different things.
+comptime POLICY_VERSION = 6
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -439,6 +513,38 @@ comptime BLOCK_OUTPUT_LIMIT = 10
 comptime BLOCK_MEMORY_BUDGET = 11
 comptime BLOCK_DERIVATIVE_PRECISION = 12
 
+# --- The 2026-08-16 refusal sweep -------------------------------------
+#
+# Three parameters that the GPU growers accepted and then did not apply.
+# Each was found the same way the derivative-precision defect above was
+# found: by checking a knob against the code that would have to read it,
+# rather than against an aggregate guard that was assumed to cover it.
+#
+# `ExtraTreeParams.is_active()` names `forced` and so looks like coverage,
+# and it is coverage for exactly one path: `_check_device_search_supported`
+# refuses the whole bundle under `MOJOTREES_GPU_SPLIT_STRATEGY=device`. The
+# host split scan is the *default*, it routes through `tree._search`, and
+# `tree._search` refuses only `needs_grower_support()` -- which is
+# `max_delta_step`, `path_smooth`, `extra_trees`, and `random_strength`, and
+# is not `forced`. So a forced-split document reached the shipping GPU
+# grower, was never read, and produced an unforced tree reported as success.
+# distributed.mojo refuses the same parameter for the same reason
+# (`_UNSUPPORTED_FORCED_SPLITS`), which is the precedent these follow.
+#
+# The fourth is an environment knob rather than a parameter, and it is the
+# most instructive of the four. `MOJOTREES_CONST_HESSIAN` and
+# `MOJOTREES_CONST_HESSIAN_VERIFY` are one pair: the first enables a
+# histogram shortcut, the second audits it. The GPU honors the first through
+# its own read in `gpu_active_rows.GpuActiveRows.__init__` and does not
+# implement the second at all, because the audit walks a host hessian array
+# and the device's hessians are on the device. So a GPU fit under the audit
+# took the shortcut and reported it as checked, which is a worse failure than
+# a knob that merely does nothing: the user has stopped looking.
+comptime BLOCK_FEATURE_BUNDLING = 13
+comptime BLOCK_LINEAR_TREE = 14
+comptime BLOCK_FORCED_SPLITS = 15
+comptime BLOCK_CONST_HESSIAN_VERIFY = 16
+
 
 def block_reason_name(code: Int) -> String:
     if code == BLOCK_NO_ACCELERATOR:
@@ -465,6 +571,14 @@ def block_reason_name(code: Int) -> String:
         return String("memory-budget")
     if code == BLOCK_DERIVATIVE_PRECISION:
         return String("derivative-precision")
+    if code == BLOCK_FEATURE_BUNDLING:
+        return String("feature-bundling")
+    if code == BLOCK_LINEAR_TREE:
+        return String("linear-tree")
+    if code == BLOCK_FORCED_SPLITS:
+        return String("forced-splits")
+    if code == BLOCK_CONST_HESSIAN_VERIFY:
+        return String("const-hessian-verify")
     return String("unknown-block")
 
 
@@ -617,11 +731,16 @@ def gpu_trains_objective(objective: Int) -> Bool:
 
     Deliberately narrower than "does any GPU trainer exist for this". It
     does not for `LAMBDARANK`, which is CPU only; it does for `CUSTOM`
-    (`train_custom_gpu`) and for multiclass (`train_multiclass_gpu`), but
-    neither is reachable through the `device` setting, because each is its
-    own entry point. This predicate answers what the device vocabulary can
-    route, which is the only question this module is asked.
-    `objective_backends` in objective_registry.mojo answers the wider one.
+    (`train_custom_gpu`), which the `device` setting does not route to
+    because reaching it is an explicit call; and it does for multiclass
+    (`train_multiclass_gpu`), which the `device` setting *does* route to,
+    through `model.fit_multiclass`, `trainset.train_dataset_multiclass`, and
+    `external_memory.train_external_multiclass`. So this predicate answering
+    False for `MULTICLASS` is not the whole answer for a multiclass run and
+    must not be read as one: `_collect_blocks` gives multiclass its own
+    branch and does not block it, and `crossover_rules()` gives it its own
+    rule. `objective_backends` in objective_registry.mojo answers the wider
+    question this predicate is narrower than.
 
     `OBJECTIVE_UNSPECIFIED` answers True: a caller that did not name an
     objective is not asserting an unsupported one, and the decision carries
@@ -721,6 +840,27 @@ def env_derivative_precision_is_float64() -> Bool:
     this function is what lets `auto` route around it instead.
     """
     return not derivative_precision_narrows()
+
+
+def env_const_hessian_verify() -> Bool:
+    """Whether this process asked for the constant-hessian audit, through
+    `MOJOTREES_CONST_HESSIAN_VERIFY=1`.
+
+    The one read of that variable on this side of the boundary, and not a
+    second copy of the rule: `histogram.const_hessian_verify` is the rule, and
+    this is it folded into `DeviceCapabilities` so that `decide_device` stays
+    pure. Exactly the arrangement `env_derivative_precision_is_float64` above
+    has, for exactly the same reason.
+
+    Why the device policy cares. The audit is a host walk over the host
+    hessian array (`histogram._check_constant_hessian`), and every CPU builder
+    performs it; no GPU builder can, because the hessians it accumulates from
+    are the device's. Until 2026-08-16 a GPU fit accepted the flag, took the
+    constant-hessian shortcut, and reported an audited result. The trainers
+    now refuse it, which is correct for `device='gpu'`; this function is what
+    lets `auto` route around it instead.
+    """
+    return const_hessian_verify()
 
 
 def env_auto_min_cells() -> Int:
@@ -911,6 +1051,29 @@ struct DeviceRequest(Copyable, Movable):
       not blocked.
     - `uses_validation`: the run has an eval set. Validation metrics are
       scored on the CPU, so a run with one trains there too.
+
+    The last three are the 2026-08-16 refusal sweep, and they are here for
+    one reason: each names a parameter that the GPU growers accepted and
+    silently did not apply, and routing `auto` around a parameter requires
+    the policy to be told about it. They default False, which is each
+    parameter's own default, so a request that does not mention them is the
+    request this struct has always described.
+
+    - `bundling`: `BoosterParams.bundling.enabled`, LightGBM's
+      `enable_bundle`. Only the dense CPU trainers in boosting.mojo build a
+      bundled matrix; `train_gpu` builds its histograms from the unbundled
+      binned matrix and read the setting nowhere.
+      `train_gpu_sparse._refuse_bundling` already refused it, which is what
+      made the dense gap visible.
+    - `linear_tree`: `BoosterParams.linear.enabled`, LightGBM's
+      `linear_tree`. Linear leaves need the raw feature matrix and the GPU
+      trainers take a binned one, exactly as `boosting.train` does; that
+      trainer refuses it (`check_linear_tree_unconnected`) and the GPU ones
+      did not.
+    - `forced_splits`: a non-empty `TreeParams.extra.forced`, LightGBM's
+      `forcedsplits_filename`. Applied by `tree.grow_tree` and by nothing
+      else. See `BLOCK_FORCED_SPLITS` for why the aggregate guard everyone
+      reads did not cover it.
     """
 
     var requested_device: Int
@@ -923,6 +1086,9 @@ struct DeviceRequest(Copyable, Movable):
     var categorical: Bool
     var has_missing: Bool
     var uses_validation: Bool
+    var bundling: Bool
+    var linear_tree: Bool
+    var forced_splits: Bool
 
     def __init__(
         out self,
@@ -936,6 +1102,9 @@ struct DeviceRequest(Copyable, Movable):
         categorical: Bool = False,
         has_missing: Bool = False,
         uses_validation: Bool = False,
+        bundling: Bool = False,
+        linear_tree: Bool = False,
+        forced_splits: Bool = False,
     ):
         self.requested_device = requested_device
         self.n_rows = n_rows
@@ -947,6 +1116,9 @@ struct DeviceRequest(Copyable, Movable):
         self.categorical = categorical
         self.has_missing = has_missing
         self.uses_validation = uses_validation
+        self.bundling = bundling
+        self.linear_tree = linear_tree
+        self.forced_splits = forced_splits
 
     def cells(self) -> Int:
         """`n_rows * n_features`, the size measure the crossover rules and
@@ -992,6 +1164,11 @@ struct DeviceCapabilities(Copyable, Movable):
       grower can honor. A *capability* rather than a preference, which is
       why it lands here beside the kernel limits and not near the crossover
       rules: it blocks, and a block is consulted before any threshold.
+    - `const_hessian_verify`: this process asked for the constant-hessian
+      audit (`MOJOTREES_CONST_HESSIAN_VERIFY=1`), which walks the host
+      hessian array and which no GPU builder performs. Here for the same
+      reason as the line above, and it is the same shape of defect: the flag
+      was accepted and the audit never ran.
     - `session`: how much of the one-time startup cost this process has
       already paid, from initialization.mojo. Reported and warned on, never
       selected on: see `SessionState`.
@@ -1015,6 +1192,7 @@ struct DeviceCapabilities(Copyable, Movable):
     var max_bins: Int
     var auto_min_cells: Int
     var derivative_precision_float64: Bool
+    var const_hessian_verify: Bool
     var session: SessionState
     var transfer: SessionMemoryPlan
 
@@ -1032,6 +1210,7 @@ struct DeviceCapabilities(Copyable, Movable):
         min_bins: Int = MIN_GPU_BINS,
         max_bins: Int = MAX_GPU_BINS,
         derivative_precision_float64: Bool = False,
+        const_hessian_verify: Bool = False,
     ):
         self.gpu_available = gpu_available
         self.built_with_accelerator = built_with_accelerator
@@ -1047,6 +1226,7 @@ struct DeviceCapabilities(Copyable, Movable):
         # constructors below and a fixture built by hand must stay a value
         # the caller wrote down. `detect` and `from_profile` fill it in.
         self.derivative_precision_float64 = derivative_precision_float64
+        self.const_hessian_verify = const_hessian_verify
         self.session = session^
         self.transfer = transfer^
 
@@ -1133,6 +1313,7 @@ struct DeviceCapabilities(Copyable, Movable):
             session^,
             transfer^,
             derivative_precision_float64=env_derivative_precision_is_float64(),
+            const_hessian_verify=env_const_hessian_verify(),
         )
 
     @staticmethod
@@ -1168,6 +1349,7 @@ struct DeviceCapabilities(Copyable, Movable):
             session^,
             transfer^,
             derivative_precision_float64=env_derivative_precision_is_float64(),
+            const_hessian_verify=env_const_hessian_verify(),
         )
 
     @staticmethod
@@ -1413,10 +1595,66 @@ comptime AUTO_GPU_MIN_ROWS = 250_000
 # is the feature count the record was taken at and stays a scope bound
 # rather than a second threshold: a 5,000,000 x 10 matrix is a different
 # ratio of per-node launch cost to per-node work and the record says nothing
-# about it. `max_outputs` keeps multiclass out, which grows one tree per
-# class per round through a different trainer.
+# about it. `max_outputs` keeps multiclass out of *this* rule, which grows
+# one tree per class per round through a different trainer and now has a
+# rule of its own below.
 comptime M4_TRAINING_MIN_FEATURES = 50
 comptime M4_TRAINING_MAX_OUTPUTS = 1
+
+
+# --- The multiclass rule, and the record behind it --------------------
+#
+# One record, Apple M4 over Metal, end-to-end softmax training with the CPU
+# and GPU arms alternated on an otherwise idle machine, at 465,000 rows x 54
+# dense features over 7 classes, 255 bins, 31 leaves, 100 rounds:
+#
+#   bench/results/profile_2026-08-15/RESULTS.md, "Multiclass, measured for
+#   the first time, 465,000 x 54, 7 classes"
+#     medians of three, spread beside each
+#     GPU 15.30 s (0.1 percent)
+#     CPU 25.47 s (7.7 percent)
+#
+#   docs/GPU_VALIDATION.md carries the same table.
+#
+# So the GPU is 1.63x the CPU at this shape, resolved well outside the noise
+# floor: the two spreads do not come close to touching, which is a stronger
+# separation than the single-output record's and far stronger than the 2
+# percent gpu_split_policy.mojo doubles its threshold for.
+#
+# WHY THIS RECORD IS THE FIRST HONEST MULTICLASS NUMBER, which matters
+# because there are older ones on disk that say the opposite.
+# `trainset.train_dataset_multiclass` resolved a device and then discarded
+# the answer, so every multiclass "GPU" timing before 2026-08-15 was a CPU
+# fit wearing a GPU label. That is provable rather than suspected: the
+# covertype CPU and GPU records in
+# `bench/real_data/results/20260815T023123Z` carry byte-identical
+# `predictions_sha256` while the single-output scenarios in the same run do
+# not. The retraction is written out in the RESULTS.md section above, and
+# the 44-to-56-second covertype figure it withdraws must not be cited
+# against this rule.
+comptime M4_MULTICLASS_RULE_NAME = String("apple-m4-metal-dense-multiclass")
+comptime M4_MULTICLASS_EVIDENCE_ID = String(
+    "bench/results/profile_2026-08-15/RESULTS.md 'Multiclass, measured for"
+    " the first time, 465,000 x 54, 7 classes' + docs/GPU_VALIDATION.md"
+    " 'Apple M4, 2026-08-15'"
+)
+comptime M4_MULTICLASS_MEASURED_ON = String(
+    "Apple M4, 10 GPU cores, Metal, macOS 26.5.2 arm64, Mojo 1.0.0, MAX"
+    " 26.5.0; 465,000 x 54 dense, 7 classes, 255 bins, 31 leaves, 100"
+    " rounds, softmax"
+)
+
+# The feature count the record was taken at, and a scope bound for exactly
+# the reason `M4_TRAINING_MIN_FEATURES` is one: nothing here says what a
+# multiclass fit over ten features does. It is 54 rather than 50 because
+# that is the shape that was measured, and rounding a scope bound down to
+# match another rule's is how a rule quietly widens past its record.
+comptime M4_MULTICLASS_MIN_FEATURES = 54
+
+# Trees per round at or above which this rule applies. Two, which is what
+# "multiclass" means: `n_classes` is refused below 2 by every multiclass
+# trainer in this package.
+comptime M4_MULTICLASS_MIN_OUTPUTS = 2
 
 
 struct CrossoverEvidence(Copyable, Movable):
@@ -1449,6 +1687,18 @@ struct CrossoverEvidence(Copyable, Movable):
     var min_cells: Int
     var max_outputs: Int
     """Trees per round the measurement covered. Zero does not constrain."""
+    var min_outputs: Int
+    """Trees per round at or above which the rule applies. Zero does not
+    constrain.
+
+    The lower bound `max_outputs` is the upper bound of, and it exists for
+    the same reason: a rule measured on one tree per round and a rule
+    measured on seven are measurements of different work, and neither may
+    inherit the other's number. A single-output rule sets `max_outputs=1`
+    and leaves this at zero; a multiclass rule sets `min_outputs=2` and, on
+    the evidence installed today, leaves `max_outputs` at zero. See
+    `crossover_rules()` for why that asymmetry is deliberate rather than an
+    omission."""
 
     def __init__(
         out self,
@@ -1462,6 +1712,7 @@ struct CrossoverEvidence(Copyable, Movable):
         min_features: Int = 0,
         min_cells: Int = 0,
         max_outputs: Int = 0,
+        min_outputs: Int = 0,
     ) raises:
         if evidence_id.byte_length() == 0:
             raise Error(
@@ -1478,6 +1729,7 @@ struct CrossoverEvidence(Copyable, Movable):
         self.min_features = min_features
         self.min_cells = min_cells
         self.max_outputs = max_outputs
+        self.min_outputs = min_outputs
 
     def matches(
         self, caps: DeviceCapabilities, request: DeviceRequest
@@ -1503,6 +1755,8 @@ struct CrossoverEvidence(Copyable, Movable):
             return False
         if self.max_outputs != 0 and request.n_outputs > self.max_outputs:
             return False
+        if self.min_outputs != 0 and request.n_outputs < self.min_outputs:
+            return False
         return True
 
     def cite(self) -> String:
@@ -1519,9 +1773,12 @@ struct CrossoverEvidence(Copyable, Movable):
 def crossover_rules() raises -> List[CrossoverEvidence]:
     """The benchmark-derived crossover rules, in priority order.
 
-    One rule, and its shape scope is one provisional constant.
+    Two rules, and they are disjoint: the first is single output, the second
+    is multiclass, and no request can match both. They share one row floor,
+    `AUTO_GPU_MIN_ROWS`, which is a provisional constant for both.
 
-    The rule, as arithmetic. `auto` selects the GPU when *all* of:
+    The single-output rule, as arithmetic. `auto` selects the GPU when *all*
+    of:
 
         profile.api             == metal
         profile.apple_generation == m4
@@ -1530,10 +1787,78 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
         request.n_rows          >= AUTO_GPU_MIN_ROWS   (250,000)
         request.n_features      >= 50
 
-    and the GPU path is otherwise unblocked and the input is dense. There is
-    no cell-count term: `min_cells` is passed 0 and the comment on
-    `AUTO_GPU_MIN_ROWS` says why. Every other (device, workload) pair falls
-    through to `DECISION_AUTO_CPU_BELOW_EVIDENCE` and keeps the CPU.
+    The multiclass rule, as arithmetic. `auto` selects the GPU when *all*
+    of:
+
+        profile.api             == metal
+        profile.apple_generation == m4
+        request.n_outputs       >= 2
+        request.n_rows          >= AUTO_GPU_MIN_ROWS   (250,000)
+        request.n_features      >= 54
+
+    and in both cases the GPU path is otherwise unblocked and the input is
+    dense. There is no cell-count term in either: `min_cells` is passed 0 and
+    the comment on `AUTO_GPU_MIN_ROWS` says why. Every other (device,
+    workload) pair falls through to `DECISION_AUTO_CPU_BELOW_EVIDENCE` and
+    keeps the CPU.
+
+    THE MULTICLASS RULE, AND THE FOUR CHOICES IN IT. It rests on one record,
+    quoted above `M4_MULTICLASS_RULE_NAME`: 465,000 x 54 over 7 classes on an
+    M4, GPU 15.30 s against CPU 25.47 s, medians of three with spreads of 0.1
+    and 7.7 percent. The GPU wins by 1.63x and the two spreads are nowhere
+    near touching, so the *direction* of this rule is the best-resolved
+    performance fact either backend has. Multiclass is also the one workload
+    where the GPU beats our CPU and the CPU is the arm that loses to
+    LightGBM, so an `auto` with no rule here was handing every softmax user
+    the slower backend at every size.
+
+    1. `objective` is left unconstrained, and that is not the objective gate
+       being weakened. The scope this rule needs is "this is a softmax fit",
+       and `n_outputs >= 2` states it more exactly than the objective code
+       does: trees-per-round is the fact the trainers actually branch on
+       (`train_multiclass_gpu` against `train_multiclass`), no single-output
+       objective can present it, and it is there whether or not the caller
+       named an objective. Scoping on `objective == MULTICLASS` instead would
+       have narrowed nothing and would have made the rule unreachable from
+       `model.fit_multiclass`, `trainset.train_dataset_multiclass`, and
+       `external_memory.train_external_multiclass`, none of which declares
+       one -- all three pass `n_classes` as `n_outputs` and stop there. A
+       caller that *does* declare `MULTICLASS` (Python's `binding_params`
+       does) matches this rule too, which is the point: one rule, both
+       spellings, no third place where the two disagree.
+    2. `min_outputs` is 2 and `max_outputs` is left at 0, so the class count
+       is bounded below and not above. The lower bound is what makes the rule
+       disjoint from the single-output one. The upper bound is deliberately
+       absent, and this is the one place the rule reaches past its record:
+       the measurement is at seven classes, and a class is one more
+       independent `grow_tree_gpu` call over the same already-uploaded binned
+       matrix, so a larger K is more of the work that was measured rather
+       than a different kind of work, and it amortizes the device's fixed
+       per-fit cost over more of it. Capping at 7 would have sent a 10-class
+       fit to the CPU while a 7-class fit of the same shape went to the
+       device, which is a discontinuity with nothing behind it. If a large
+       class count is ever measured *losing*, the fix is to set
+       `max_outputs` here and bump `POLICY_VERSION`.
+    3. `min_features` is 54, not 50. It is the feature count the record was
+       taken at, which is the same convention `M4_TRAINING_MIN_FEATURES`
+       follows, and rounding it down to match that rule's number would widen
+       this one past its own evidence to make two constants look tidy.
+    4. `min_rows` is `AUTO_GPU_MIN_ROWS`, THE SAME PROVISIONAL CONSTANT the
+       single-output rule uses, and it is provisional here for the same
+       reason and to a larger degree. The multiclass record is a single point
+       at 465,000 rows; nothing below it has been measured, so the multiclass
+       crossover is unmeasured exactly as the single-output one is. A second
+       number was not invented, and the reason is not tidiness: the one
+       structural argument available says a K-class fit does K times the tree
+       work per round against the same one-time upload, binning, and session
+       cost, so the device's roughly 1.5 s of fixed cost per fit is amortized
+       over K times as much work and the multiclass crossover should sit at
+       or *below* the single-output one, never above. Reusing 250,000
+       therefore cannot over-reach relative to that argument. It is still a
+       constant set ahead of its evidence and it is labelled one, and if a
+       measurement in [250,000, 465,000) shows the GPU losing at some class
+       count, the honest fix is a `M4_MULTICLASS_MIN_ROWS` of its own rather
+       than moving the shared one.
 
     The evidence for the *hardware and objective* scope is the two Apple M4
     records named in `M4_TRAINING_EVIDENCE_ID` and quoted above this
@@ -1589,7 +1914,11 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
       `WARN_HOST_GRADIENT_PATH` exists precisely because some of them come
       back to the host every round. Unmeasured, so declined.
     - `max_outputs`. Multiclass grows one tree per class per round through
-      a different trainer. Unmeasured, so declined.
+      a different trainer, so it is not what this record measured and this
+      rule still declines it. It is no longer *unmeasured*, which is what
+      this bullet used to say: the multiclass rule above carries its own
+      record and its own scope, and the two rules are disjoint rather than
+      one inheriting the other's numbers.
     - `min_features`, and no cell term beside it. A 5,000,000 x 10 matrix
       would clear any cell floor the measured shape clears while carrying a
       tenth of its features, which is a different ratio of per-node launch
@@ -1648,6 +1977,21 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
     Either way it moves by an edit to one constant and a `POLICY_VERSION`
     bump, the way it went in.
 
+    WHAT WOULD FALSIFY THE MULTICLASS RULE, and it splits the same way:
+
+    - the scope. An interleaved CPU/GPU pair at 465,000 x 54 over 7 classes
+      on an M4 where the GPU is not faster, run in one window on an idle
+      machine. The record's 0.1 percent spread against 7.7 makes that a hard
+      result to reverse, which is why the rule is installed at all.
+    - the class count. An interleaved pair at a large K showing the GPU
+      losing where it wins at 7. That does not withdraw the rule; it sets
+      `max_outputs` on it, which is the one bound left open above.
+    - the floor. An interleaved pair anywhere in [250,000, 465,000) rows at
+      54 features over some class count, showing the GPU losing by more than
+      this box's drift. That gives multiclass a `M4_MULTICLASS_MIN_ROWS` of
+      its own; it must not move `AUTO_GPU_MIN_ROWS`, which the single-output
+      rule reads for a different reason.
+
     Do not add a *rule* from reasoning. Add one from a recorded sweep, cite
     it in `evidence_id`, name the device in `measured_on`, and bump
     `POLICY_VERSION`.
@@ -1669,6 +2013,33 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
             # rather than lowered alongside the row floor.
             0,
             M4_TRAINING_MAX_OUTPUTS,
+            # min_outputs: 0, which does not constrain. `max_outputs=1` is
+            # already the whole of this rule's output scope.
+            0,
+        )
+    )
+    rules.append(
+        CrossoverEvidence(
+            M4_MULTICLASS_RULE_NAME,
+            M4_MULTICLASS_EVIDENCE_ID,
+            M4_MULTICLASS_MEASURED_ON,
+            API_METAL,
+            APPLE_GEN_M4,
+            # objective: unconstrained. `n_outputs >= 2` below is the
+            # multiclass scope, and it is the exact one; see item 1 in the
+            # docstring for why scoping on the objective code as well would
+            # narrow nothing and would make the rule unreachable from the
+            # three Mojo entry points that declare no objective.
+            OBJECTIVE_UNSPECIFIED,
+            AUTO_GPU_MIN_ROWS,
+            M4_MULTICLASS_MIN_FEATURES,
+            # min_cells: 0, for the same reason as above.
+            0,
+            # max_outputs: 0, which does not constrain. Item 2 in the
+            # docstring is why the class count is bounded below and not
+            # above, and what measurement would close it.
+            0,
+            M4_MULTICLASS_MIN_OUTPUTS,
         )
     )
     return rules^
@@ -1732,6 +2103,31 @@ def _collect_blocks(
                 " per-row derivatives, and the GPU gradient upload narrows"
                 " every derivative to Float32, so no accelerator path can"
                 " produce that answer"
+            ),
+        )
+
+    if caps.const_hessian_verify:
+        # The same treatment and for the same reason as the line above: an
+        # audit the accelerator does not run is a capability question, not a
+        # size question, so it sits above every shape gate and `auto` never
+        # compares a row count before answering.
+        #
+        # It is worth being precise about what is missing, because the two
+        # halves of this diagnostic pair are NOT in the same state.
+        # `MOJOTREES_CONST_HESSIAN` is honored on the device
+        # (`GpuActiveRows.const_hessian_allowed`, ANDed with the trainer's
+        # declaration), so the shortcut itself obeys its knob. What no device
+        # path has is `histogram._check_constant_hessian`, which walks the
+        # host hessian array. A GPU fit therefore took an *unaudited*
+        # shortcut under a flag whose entire purpose is the audit.
+        blocks.add(
+            BLOCK_CONST_HESSIAN_VERIFY,
+            String(
+                "MOJOTREES_CONST_HESSIAN_VERIFY=1 asks for the declared"
+                " constant hessian to be audited against the data, which is a"
+                " walk over the host hessian array that only the CPU"
+                " histogram builders perform, so no accelerator path can"
+                " report an audited result"
             ),
         )
 
@@ -1811,6 +2207,53 @@ def _collect_blocks(
             String(
                 "validation metrics are scored on the CPU, so a run with an"
                 " eval set trains there too"
+            ),
+        )
+
+    # --- The refusal sweep, 2026-08-16 ---
+    #
+    # Three parameters no GPU grower applies. They sit together, above the
+    # kernel limits and below the objective gates, because each is a fact
+    # about what the device path *implements* rather than about the shape:
+    # the answer is the same at every size, so a report that named a
+    # threshold would send the reader to the wrong knob. `decide_device`
+    # reads the blocks before the crossover table, so `auto` takes the CPU
+    # for these without any shape being compared, exactly as it does for
+    # `BLOCK_DERIVATIVE_PRECISION`.
+    #
+    # The trainers refuse the same three by name (`_check_gpu_params` in
+    # train_gpu.mojo and train_gpu_sparse.mojo). That is not a duplicate
+    # policy: this module decides *where a run goes* and the trainers refuse
+    # *a run that arrived anyway*, which is the only protection a caller who
+    # reaches `train_gpu` directly has.
+    if request.bundling:
+        blocks.add(
+            BLOCK_FEATURE_BUNDLING,
+            String(
+                "enable_bundle is applied by the dense CPU trainers in"
+                " boosting.mojo, which build a bundled matrix before they"
+                " grow; the GPU trainers build their histograms from the"
+                " unbundled binned matrix and cannot apply it"
+            ),
+        )
+
+    if request.linear_tree:
+        blocks.add(
+            BLOCK_LINEAR_TREE,
+            String(
+                "linear_tree fits an affine model in each leaf from the raw"
+                " feature matrix, and the GPU trainers take a binned matrix"
+                " only, so no accelerator path can produce those leaves"
+            ),
+        )
+
+    if request.forced_splits:
+        blocks.add(
+            BLOCK_FORCED_SPLITS,
+            String(
+                "forced splits are applied by tree.grow_tree and by no other"
+                " grower; the GPU growers never read the document, so a GPU"
+                " fit would return an unforced tree"
             ),
         )
 
@@ -2194,6 +2637,13 @@ struct DeviceDecision(Copyable, Movable):
             _bool_text(self.request.uses_validation),
             "\n",
         )
+        out += String("bundling=", _bool_text(self.request.bundling), "\n")
+        out += String(
+            "linear_tree=", _bool_text(self.request.linear_tree), "\n"
+        )
+        out += String(
+            "forced_splits=", _bool_text(self.request.forced_splits), "\n"
+        )
 
         out += String(
             "gpu_available=",
@@ -2255,6 +2705,11 @@ struct DeviceDecision(Copyable, Movable):
         out += String(
             "derivative_precision_float64=",
             _bool_text(self.capabilities.derivative_precision_float64),
+            "\n",
+        )
+        out += String(
+            "const_hessian_verify=",
+            _bool_text(self.capabilities.const_hessian_verify),
             "\n",
         )
 
@@ -2765,6 +3220,9 @@ def decide_device_report(
     categorical: Bool = False,
     has_missing: Bool = False,
     uses_validation: Bool = False,
+    bundling: Bool = False,
+    linear_tree: Bool = False,
+    forced_splits: Bool = False,
 ) raises -> String:
     """The whole contract across a flat boundary: workload in, serialized
     decision out.
@@ -2798,6 +3256,9 @@ def decide_device_report(
         categorical,
         has_missing,
         uses_validation,
+        bundling,
+        linear_tree,
+        forced_splits,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     return decide_device(request, caps).serialize()
@@ -2823,6 +3284,9 @@ def decide_device_report_reported(
     context_open: Bool = True,
     kernels_ready: Bool = False,
     warmup_level: Int = 0,
+    bundling: Bool = False,
+    linear_tree: Bool = False,
+    forced_splits: Bool = False,
 ) raises -> String:
     """`decide_device_report` for a caller that has read the device.
 
@@ -2843,6 +3307,9 @@ def decide_device_report_reported(
         categorical,
         has_missing,
         uses_validation,
+        bundling,
+        linear_tree,
+        forced_splits,
     )
     var caps = capabilities_from_reported(
         reported_api,
@@ -2869,6 +3336,9 @@ def resolve_device_full(
     categorical: Bool = False,
     has_missing: Bool = False,
     uses_validation: Bool = False,
+    bundling: Bool = False,
+    linear_tree: Bool = False,
+    forced_splits: Bool = False,
 ) raises -> Int:
     """Resolve a fully described workload to `CPU_DEVICE` or `GPU_DEVICE`,
     raising the refusal when it cannot run.
@@ -2898,6 +3368,9 @@ def resolve_device_full(
         categorical,
         has_missing,
         uses_validation,
+        bundling,
+        linear_tree,
+        forced_splits,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     var decision = decide_device(request, caps)
