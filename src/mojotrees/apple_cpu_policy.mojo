@@ -341,6 +341,70 @@ comptime MAX_ROW_BLOCK_SCRATCH_BYTES = 16 * 1024 * 1024
 comptime ROW_BLOCK_PLANES = 3
 comptime ROW_BLOCK_PLANE_BYTES = 8
 
+# How a private block cell is *laid out*, which is a different question from
+# how much room it is allocated. `ROW_BLOCK_PLANES` above is the allocation
+# and the byte budget, and it stays at 3 unconditionally so that the block
+# count remains a value independent of `const_hessian` (the paragraph above
+# says why that matters). These two say how many of those three slots the
+# kernel actually addresses, and that they are addressed *interleaved*:
+# cell `c` occupies `[c * stride, c * stride + stride)` rather than living on
+# three planes a megabyte apart.
+#
+# This is LightGBM's `hist_t` layout. `include/LightGBM/bin.h` declares
+# `typedef double hist_t`, `kHistEntrySize = 2 * sizeof(hist_t)` and
+# `GET_GRAD(hist, i) = hist[(i) << 1]`, `GET_HESS(hist, i) = hist[((i) << 1)
+# + 1]`: one 16-byte (gradient, hessian) cell, no count plane. Its
+# constant-hessian arm keeps the same 16 bytes and spends the second slot on
+# a count (`hist_cnt_t* cnt = reinterpret_cast<hist_cnt_t*>(hess)` in
+# `src/io/dense_bin.hpp`), which is the arm `ROW_BLOCK_CELL_FLOATS_CONST_H`
+# names.
+#
+# The general arm keeps a third slot for an exact count where LightGBM
+# derives one from the hessian. That divergence is deliberate and is argued
+# at `histogram.derived_count`: derived counts are exact only when every
+# hessian is `CONSTANT_HESSIAN`, and mojotrees exposes `Histogram.count_at`
+# to a distributed integer allreduce and to the C ABI, neither of which can
+# take a rounded count. Both arms still get the property the interleave is
+# for -- one cache line touched per (row, feature) instead of three.
+comptime ROW_BLOCK_CELL_FLOATS = 3
+comptime ROW_BLOCK_CELL_FLOATS_CONST_H = 2
+
+# LightGBM's cell, for the arithmetic in reports and for the one place the
+# constant-hessian arm's stride is compared against it.
+comptime LGBM_HIST_ENTRY_FLOATS = 2
+comptime LGBM_HIST_ENTRY_BYTES = 16
+
+# One gathered per-row derivative pair, `(gradient, hessian)` as two Float32
+# rather than two Float64. LightGBM's `score_t` is `float`
+# (`include/LightGBM/meta.h`), so its `ordered_gradients` / `ordered_hessians`
+# are 4 bytes per row per plane and this is the same 8 bytes per row. The
+# buffer they live in is still typed `List[Float64]`, because its type is
+# fixed by a signature `tree.mojo` owns; two Float32 per Float64 word is how
+# the narrowing is taken without that signature moving. See
+# `histogram._gather_pairs`.
+comptime SCORE_T_BYTES = 4
+comptime GATHERED_PAIR_BYTES = 2 * SCORE_T_BYTES
+
+# One binned value, `UInt8` in `binning.BinnedMatrix`.
+comptime BINNED_VALUE_BYTES = 1
+
+# How far ahead the scatter loop issues its software prefetch, in rows.
+# LightGBM's `DenseBin::ConstructHistogramInner` uses `const data_size_t
+# pf_offset = 64 / sizeof(VAL_T)` and prefetches `data_[data_indices[i +
+# pf_offset]]`, so at one byte per binned value this is 64 rows. A fixed 64
+# rather than `ASSUMED_CACHE_LINE_BYTES` on purpose: through a row-id list
+# the address is scattered, so the distance is buying latency cover and not
+# line coverage, and the number that has been tuned against real hardware is
+# LightGBM's.
+comptime PREFETCH_ROW_DISTANCE = 64 // BINNED_VALUE_BYTES
+
+# There is deliberately no unroll constant here. An earlier version of this
+# lane's brief called for a four-row unroll of the scatter loop alongside the
+# prefetch, on the understanding that LightGBM had one.
+# `DenseBin::ConstructHistogramInner` does not: its prefetching loop and its
+# tail loop are both scalar, one row per iteration. The unroll was withdrawn
+# rather than kept as an unattributed invention.
+
 
 # Below this many rows a node's gradients and hessians are small enough to
 # stay in cache across every feature's pass, so gathering them into a
@@ -575,14 +639,19 @@ def plan_row_block_count(
     no machine. That is what makes the result independent of
     `MOJOTREES_NUM_WORKERS` and identical on every machine on this toolchain.
 
-    `rows_are_indirect` is False for the full-dataset builder, which never
-    blocks. Not because blocking would be wrong there but because that builder
-    has no caller-owned scratch to keep the private histograms in, and
-    allocating them per call is the cost this decomposition exists to avoid
-    paying (see `histogram._accumulate_subset`).
+    `rows_are_indirect` no longer reaches this decision, and the parameter is
+    kept only because it is part of the plan's argument list. **Both builders
+    block, on this one rule.** The full-dataset builder used to be excluded
+    here, on the grounds that it has no caller-owned scratch and would have to
+    allocate the private histograms per call. That was a cost argument against
+    a *correctness* property: while only one builder blocked, the two
+    disagreed by a few ulp on the same rows, which made "growing on a bag is
+    growing on the dataset of those rows" false and was measured as a
+    four-ulp leaf value in `test_bagged_tree_equals_tree_on_subset_dataset`.
+    The cost is answered instead of accepted:
+    `histogram.build_histogram_into_scratch` lets a caller hand its buffer in,
+    and the full builder is reached once per tree rather than once per node.
     """
-    if not rows_are_indirect:
-        return 1
     if rows <= 0 or n_bins <= 0 or n_active <= 0:
         return 1
     var ceiling = max_row_blocks_for_cells(n_active * n_bins)

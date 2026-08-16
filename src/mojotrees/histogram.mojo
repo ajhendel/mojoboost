@@ -155,9 +155,9 @@ non-associativity means an individual value can move either way -- and the
 commit that landed this states the largest movement actually observed across
 the golden fixtures rather than resting on the bound.
 
-**What the count plane and sibling subtraction do, which is not affected.**
-The count plane is integer addition, which *is* associative, so a blocked
-count is the same integer at any block count. Under the constant-hessian
+**What the count and sibling subtraction do, which is not affected.**
+A blocked count is counted, not summed from hessians, and integer addition
+*is* associative, so it is the same integer at any block count. Under the constant-hessian
 specialization the hessian plane is `Float64(count)` on both operands of a
 sibling subtraction, and both are exactly representable integers below 2^53,
 so that subtraction is exact under blocking exactly as it was without it. The
@@ -169,13 +169,56 @@ The GPU path escapes the reassociation argument entirely, rather than
 accepting it, because it accumulates in fixed-point Int32 where addition *is*
 associative; see `_range_hist_partial_kernel` in `gpu_active_rows.mojo`.
 
-**Where blocking does not run.** The full-dataset builder never blocks: it
-has no caller-owned scratch to keep the private histograms in, and allocating
-them per call is the cost this decomposition exists to avoid. A node too small
-for a block to amortize its own private histogram never blocks either --
-`apple_cpu_policy.row_block_min_rows` is the floor and its derivation is
-there -- so small and tiny nodes keep the accumulation, and the bytes, they
+**Both builders block, on one plan, and that is a correctness property.**
+The full-dataset builder used to be excluded, on the grounds that it has no
+caller-owned scratch and would have to allocate the private histograms per
+call. That was a cost argument standing in front of a correctness one: while
+only the subset builder blocked, "growing on a bag is growing on the dataset
+of those rows" was false, because the bagged tree reached the subset builder
+and folded row blocks while its whole-dataset reference summed flat. It was
+measured at four ulp on a leaf value in
+`test_bagged_tree_equals_tree_on_subset_dataset`, which now asserts bit
+identity again. The cost is answered rather than accepted:
+`build_histogram_into_scratch` lets a caller own the buffer, and this builder
+is reached once per tree where the subset builder is reached once per node.
+The alternative -- have the subset builder skip blocking when its row list
+happens to cover the whole matrix -- puts a discontinuity at `len(bag) ==
+n_rows`, which is worse.
+
+A node too small for a block to amortize its own private histogram still never
+blocks -- `apple_cpu_policy.row_block_min_rows` is the floor and its derivation
+is there -- so small and tiny nodes keep the accumulation, and the bytes, they
 already had.
+
+The LightGBM cell, and the per-row derivative
+---------------------------------------------
+Two things about this file are now LightGBM's rather than this package's, and
+both are about bytes rather than about arithmetic.
+
+**A per-row gradient and hessian is Float32.** `include/LightGBM/meta.h`
+defines `typedef float score_t`, and every derivative LightGBM carries -- from
+the objective's output through `ordered_gradients` into the accumulate -- is
+one. Raw scores, leaf values, gains and every histogram cell stay Float64 on
+both sides. `score_t` in this module is the narrowing and
+`boosting.fill_grad_hess` is where it is applied; the containers stay
+`List[Float64]` because their type is fixed by signatures `tree.mojo` owns, so
+what travels is a Float32 quantity in a Float64 word. The narrowing is
+idempotent and every read site in this file applies it, which is what keeps
+the gathered path and the direct path adding identical Float64s -- and
+therefore keeps `compact_rows`, a policy decision, from moving a bin.
+
+**A private histogram cell is an interleaved `(gradient, hessian)` pair.**
+`include/LightGBM/bin.h` has `typedef double hist_t`, `kHistEntrySize = 2 *
+sizeof(hist_t)`, `GET_GRAD(hist, i) = hist[(i) << 1]` and `GET_HESS(hist, i) =
+hist[((i) << 1) + 1]`: 16 bytes a cell, no count plane. The row-blocked
+kernel's partials are laid out that way, so one row's visit to one feature
+touches one contiguous cell rather than three planes a stride apart --
+`_accumulate_blocked_at` carries the arithmetic and the two divergences (a
+third slot for an exact count off the constant-hessian path, and a stride of
+two rather than a `<< 1`, because the general arm needs three). The
+`Histogram` the builders *produce* still has three separate planes: that
+layout is read by the GPU download path, by the distributed allreduce and by
+the C ABI, and narrowing it is not this lane's to do.
 
 The constant-hessian plane
 --------------------------
@@ -230,9 +273,13 @@ device path does have a multiply and it is an Int32 one, argued in
 
 from std.math import round
 from std.sys.info import simd_width_of
+from std.sys.intrinsics import PrefetchOptions, prefetch
 
 from .apple_cpu_policy import (
     AccumulationPlan,
+    PREFETCH_ROW_DISTANCE,
+    ROW_BLOCK_CELL_FLOATS,
+    ROW_BLOCK_CELL_FLOATS_CONST_H,
     derive_accumulation_plan_with,
     subtract_ops,
     subtract_ops_for_planes,
@@ -337,6 +384,102 @@ def objective_has_constant_hessian(objective: Int, weighted: Bool) -> Bool:
         or objective == HUBER
         or objective == QUANTILE
     )
+
+
+comptime SCATTER_PREFETCH = (
+    PrefetchOptions().for_read().high_locality().to_data_cache()
+)
+"""The scatter loop's software prefetch, matching LightGBM's `PREFETCH_T0`.
+
+`PREFETCH_T0` in `include/LightGBM/utils/common.h` expands to
+`__builtin_prefetch(addr, 0, 3)` (or `_mm_prefetch(..., _MM_HINT_T0)`), which
+is a read with maximum temporal locality into the data cache. These four
+options say the same thing.
+"""
+
+
+@always_inline
+def score_t(v: Float64) -> Float64:
+    """One per-row derivative rounded to single precision, which is the
+    precision LightGBM carries derivatives in.
+
+    `include/LightGBM/meta.h` defines `typedef float score_t` unless
+    `SCORE_T_USE_DOUBLE` is set, and every gradient and hessian in LightGBM
+    -- from the objective's output through `ordered_gradients` to the
+    histogram's accumulate -- is a `score_t`. Only the histogram cell, the
+    leaf value and the gain are `double` (`typedef double hist_t`).
+
+    This package computes derivatives in Float64 and then rounds here, so the
+    value is a Float32 quantity living in a Float64 container. Two reasons it
+    is a round rather than a retype:
+
+    - The containers are `List[Float64]` in signatures `tree.mojo` owns, and
+      this lane does not own that file. A Float64 holding a Float32-exact
+      value is the same 24 bits of significand either way, so the *arithmetic*
+      is LightGBM's now and the *container* narrows when that signature does.
+    - It makes the narrowing idempotent, which is what lets the gathered pair
+      buffer hold Float32 while the un-gathered path reads the array directly
+      and still produce the identical Float64 sum. Without that, `compact_rows`
+      -- a policy decision -- would change a bin, and no policy decision in
+      this file is allowed to.
+
+    `CONSTANT_HESSIAN` is 1.0, which is exactly representable in Float32, so
+    the constant-hessian guarantee survives this untouched.
+    """
+    return Float64(Float32(v))
+
+
+@always_inline
+def cnt_factor(n_data: Int, sum_hessian: Float64) -> Float64:
+    """LightGBM's `cnt_factor`: rows per unit of hessian in one node.
+
+    `src/treelearner/feature_histogram.cpp:186` and the four sites in
+    `feature_histogram.hpp` all compute `const double cnt_factor = num_data /
+    sum_hessian;` from the leaf's row count and the leaf's total hessian, and
+    then recover a bin's row count from its hessian with `derived_count`
+    below. That is why a LightGBM histogram cell has no count plane.
+
+    Under the constant-hessian specialization `sum_hessian` is
+    `CONSTANT_HESSIAN * n_data` and `CONSTANT_HESSIAN` is 1.0, so this is
+    exactly 1.0 and `derived_count` is exact. See there.
+    """
+    if sum_hessian == 0.0:
+        return 0.0
+    return Float64(n_data) / sum_hessian
+
+
+@always_inline
+def derived_count(hess: Float64, factor: Float64) -> Int:
+    """A bin's row count recovered from its hessian, rounded as LightGBM
+    rounds.
+
+    `Common::RoundInt` in `include/LightGBM/utils/common.h:911` is
+
+        inline int RoundInt(double x) { return static_cast<int>(x + 0.5f); }
+
+    -- add a half, then truncate toward zero. `0.5f` widens to the exactly
+    representable double 0.5, so the `f` suffix changes nothing; it is
+    reproduced here as written rather than as `round`, because `round` is
+    round-half-away-from-zero and the two differ on every negative
+    half-integer. A hessian sum is nonnegative on every objective that
+    reaches this, so in practice they agree, and this still says what
+    LightGBM says.
+
+    **Exact under the constant-hessian specialization, and only there.** When
+    every row's hessian is exactly `CONSTANT_HESSIAN = 1.0`, a bin holding
+    `n` rows accumulated `1.0 + 1.0 + ... + 1.0`, whose every partial sum is
+    one of the integers 1 .. n and is therefore exactly representable in
+    Float64 below 2^53. So `hess` is exactly `Float64(n)`, `factor` is
+    exactly 1.0, the product is exactly `Float64(n)`, and `Int(n + 0.5)`
+    truncates back to `n`. No tolerance, no drift, at any n below 2^53.
+
+    Off that path it is LightGBM's approximation and nothing better: a
+    weighted or GOSS or logistic round has a per-row hessian, and a bin's
+    count is not a function of its hessian sum. That is why the general arm
+    of the blocked kernel keeps an exact count slot instead of calling this
+    (see `apple_cpu_policy.ROW_BLOCK_CELL_FLOATS`).
+    """
+    return Int(hess * factor + 0.5)
 
 
 def const_hessian_allowed() -> Bool:
@@ -567,14 +710,21 @@ def _check_features(features: List[Int], n_features: Int) raises:
 def ensure_pair_capacity(mut pairs: List[Float64], n_rows: Int):
     """Size a gradient/hessian pair buffer for a node of `n_rows` rows.
 
+    One Float64 word per row, not two. The word holds the row's `(gradient,
+    hessian)` as two Float32 halves, which is LightGBM's `score_t` precision
+    and half the bytes the pair used to cost; `score_t` above is the whole
+    argument and `_gather_pairs` is where the packing happens. The buffer
+    stays typed `List[Float64]` because its type is fixed by
+    `tree.GrowScratch.pairs` and by three signatures `tree.mojo` owns, and a
+    Float64 word is exactly two Float32 slots.
+
     Grows only. A grower that keeps one buffer across a whole tree allocates
     it once, at the size of the largest node it meets (the root), and every
     later node reuses that allocation: the buffer is written before it is
     read, so stale contents beyond the current node are never observed.
     """
-    var wanted = 2 * n_rows
-    if len(pairs) < wanted:
-        pairs.resize(wanted, 0.0)
+    if len(pairs) < n_rows:
+        pairs.resize(n_rows, 0.0)
 
 
 def _zero_excluded(
@@ -682,6 +832,36 @@ def build_histogram_into(
     cell either way -- a snapshot changes only how many tasks the work is cut
     into, and every dispatch shape here keeps each feature's summation inside
     one task."""
+    var scratch = List[Float64]()
+    build_histogram_into_scratch(
+        out, scratch, data, grad, hess, features, const_hessian, settings
+    )
+
+
+def build_histogram_into_scratch(
+    mut out: Histogram,
+    mut scratch: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    features: List[Int] = [],
+    const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """`build_histogram_into` with a caller-owned scratch buffer, the twin of
+    `build_histogram_subset_into_scratch`.
+
+    `scratch` holds this build's private row-block histograms and is grown,
+    never shrunk, to `plan.block_scratch_floats()`. Its contents on entry are
+    irrelevant and on exit unspecified, so it carries no state between calls
+    beyond its capacity, and an unblocked plan never touches it at all.
+
+    It exists because this builder now blocks (see `_accumulate_full`), and a
+    grower that reaches it once per tree should not allocate the private
+    histograms afresh each time. `build_histogram_into` passes a fresh empty
+    list, which is exactly the allocate-per-call behaviour and is what every
+    caller that has not been wired gets.
+    """
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
     if not out.matches(data.n_features, data.n_bins):
@@ -695,8 +875,8 @@ def build_histogram_into(
     # reached through `out`: a pointer taken from a struct field carries that
     # field's origin, which a worker closure cannot capture.
     _accumulate_full(
-        out._grad, out._hess, out._count, data, grad, hess, features, const_h,
-        settings,
+        out._grad, out._hess, out._count, scratch, data, grad, hess, features,
+        const_h, settings,
     )
 
 
@@ -730,6 +910,7 @@ def _accumulate_full(
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
     mut out_count: List[Int],
+    mut scratch: List[Float64],
     data: BinnedMatrix,
     grad: List[Float64],
     hess: List[Float64],
@@ -750,6 +931,37 @@ def _accumulate_full(
         out_grad, out_hess, out_count,
         n_features, n_bins, features, plan.excluded_ops, settings,
     )
+
+    if plan.blocked():
+        # The full-dataset builder blocks on the same plan the subset builder
+        # blocks on, which is a correctness requirement and not a speed one.
+        # While it did not, "growing on a bag is growing on the dataset of
+        # those rows" was false: the bagged tree reached the subset builder
+        # and folded row blocks, its reference reached this builder and summed
+        # flat, and `test_bagged_tree_equals_tree_on_subset_dataset` measured
+        # the disagreement at four ulp on a leaf value. Blocking both on one
+        # plan makes them the same sequence of Float64 additions again. The
+        # alternative -- have the subset builder skip blocking when its row
+        # list happens to cover the whole matrix -- puts a discontinuity at
+        # `len(bag) == n_rows`, which is worse.
+        #
+        # The scratch is local and per call, which is the objection the
+        # row-block lane raised against blocking here. It stands, and it is
+        # answered by frequency rather than by refutation: this builder is
+        # reached once per tree (`tree._hist_full`, at the root) where the
+        # subset builder is reached once per node, so one allocation per tree
+        # is 61 allocations fewer per tree at the shape this round measures.
+        # `build_histogram_into_scratch` exists so a grower can hand its own
+        # buffer in and pay none; wiring `tree.GrowScratch.pairs` into
+        # `_hist_full` is a one-line change in a file this lane does not own.
+        var wanted = plan.block_scratch_floats()
+        if len(scratch) < wanted:
+            scratch.resize(wanted, 0.0)
+        _accumulate_full_blocked(
+            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            features, plan, n_active, const_h, settings,
+        )
+        return
 
     # The ladder, dispatched from the host exactly as the GPU histogram family
     # is dispatched in `gpu_active_rows._enqueue_atomic_family`: one static
@@ -782,6 +994,60 @@ def _accumulate_full(
         _accumulate_full_at[1](
             out_grad, out_hess, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
+        )
+
+
+def _accumulate_full_blocked(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    mut scratch: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    features: List[Int],
+    plan: AccumulationPlan,
+    n_active: Int,
+    const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """The interleave ladder over the blocked kernel, for the whole dataset.
+
+    `INDIRECT=False`: rows are the loop counter, so the binned columns and
+    the two derivative streams are read sequentially and there is no row-id
+    list to load. `rows` is passed empty and never dereferenced.
+    """
+    var empty = List[Int]()
+    var group = plan.group_width
+    if group >= 16:
+        _accumulate_blocked_at[16, False](
+            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
+            settings,
+        )
+    elif group >= 8:
+        _accumulate_blocked_at[8, False](
+            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
+            settings,
+        )
+    elif group >= 4:
+        _accumulate_blocked_at[4, False](
+            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
+            settings,
+        )
+    elif group >= 2:
+        _accumulate_blocked_at[2, False](
+            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
+            settings,
+        )
+    else:
+        _accumulate_blocked_at[1, False](
+            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
+            settings,
         )
 
 
@@ -836,14 +1102,22 @@ def _accumulate_full_at[
     lines *per row* rather than two streams, and gathering turns 2 * n_active
     indirect loads per row into two.
 
+    Two things have changed under that refutation without disturbing it. The
+    pair buffer now holds two Float32 rather than two Float64, which halves
+    what the *subset* builder streams per group and leaves this builder's
+    arithmetic exactly where it was; and this builder now reads its
+    derivatives through `score_t`, so the Float64 it adds is the Float64 the
+    gathered path adds, which is what lets the two builders be compared bit
+    for bit at all.
+
     That refutation is about the gradient INPUT and says nothing about the
-    histogram OUTPUT. Interleaving the output cells, so that a bin's gradient
-    and hessian are adjacent and one update touches one line instead of two,
-    and narrowing `count` from a 64-bit `Int`, are separate proposals about
-    `Histogram`'s layout. They are exact, they are not refuted here, and they
-    are not this lane's to make: the layout is read by every consumer,
-    including the GPU download path and the C ABI, so it is its own change
-    behind its own profile.
+    histogram OUTPUT. Interleaving the output cells is done -- in the private
+    partials of `_accumulate_blocked_at`, which is where the scatter actually
+    runs -- but the `Histogram` this builder *returns* still has three
+    separate planes and a 64-bit `Int` count. Narrowing that is a different
+    change: the layout is read by the GPU download path, by the distributed
+    integer allreduce and by the C ABI, so it is its own change behind its own
+    profile.
 
     **The elided hessian plane.** With `const_h` the row loop performs two
     read-modify-writes per (row, feature) instead of three, the zeroing pass
@@ -935,7 +1209,7 @@ def _accumulate_full_at[
                 # construction, so the accumulation carries no information the
                 # count does not.
                 for r in range(n_rows):
-                    var g = grad_p.unsafe_load(r)
+                    var g = score_t(grad_p.unsafe_load(r))
                     comptime for k in range(GROUP):
                         if k < owned:
                             var b = Int(base[k]) + Int(
@@ -948,8 +1222,8 @@ def _accumulate_full_at[
                     # Contiguous: the whole dataset is one ascending walk, so
                     # the gradients, the hessians, and all `GROUP` binned
                     # columns are sequential streams.
-                    var g = grad_p.unsafe_load(r)
-                    var h = hess_p.unsafe_load(r)
+                    var g = score_t(grad_p.unsafe_load(r))
+                    var h = score_t(hess_p.unsafe_load(r))
                     comptime for k in range(GROUP):
                         if k < owned:
                             var b = Int(base[k]) + Int(
@@ -1132,17 +1406,31 @@ def _gather_pairs(
 
     Elementwise over disjoint ascending blocks, so the buffer comes out the
     same whatever the task count.
+
+    **The pair is two Float32, packed into one Float64 word.** That is
+    LightGBM's precision for a per-row derivative (`score_t` is `float`; see
+    `score_t` above for why the narrowing is a round here rather than a
+    retype) and it halves what the feature loop streams: the accumulation
+    walks this buffer once per feature group, so at 50 features and width 2 a
+    million-row node reads it 25 times, and 25 passes over 8 MB is 200 MB
+    where 25 passes over 16 MB was 400 MB. Nothing else in the build reads
+    this buffer.
+
+    The narrowing is idempotent -- `Float32(Float64(Float32(x)))` is
+    `Float32(x)` -- and every un-gathered read site applies the same
+    `score_t`, which is what keeps `compact_rows`, a policy decision, from
+    changing a bin.
     """
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
-    var pairs_p = pairs.unsafe_ptr()
+    var pairs_p = pairs.unsafe_ptr().unsafe_bitcast[Float32]()
 
     def fill_pairs(start: Int, end: Int) {imm}:
         for i in range(start, end):
             var r = rows_p.unsafe_load(i)
-            pairs_p.unsafe_store(2 * i, grad_p.unsafe_load(r))
-            pairs_p.unsafe_store(2 * i + 1, hess_p.unsafe_load(r))
+            pairs_p.unsafe_store(2 * i, Float32(grad_p.unsafe_load(r)))
+            pairs_p.unsafe_store(2 * i + 1, Float32(hess_p.unsafe_load(r)))
 
     dispatch_rows_with(settings, fill_pairs, n_sub, gather_ops)
 
@@ -1177,22 +1465,31 @@ def _accumulate_subset(
     )
 
     # The scratch layout, which is this function's to define: the gather
-    # occupies `[0, 2 * n_sub)` when it runs, and the row-blocked private
-    # histograms occupy `[part_off, part_off + plan.block_scratch_floats())`
-    # after it. `pairs` is documented to carry no state between calls beyond
-    # its capacity, so extending its tail costs a grower one growth per fit
-    # rather than an allocation per node -- which is the whole reason the
-    # blocked path can exist without a new parameter on a signature three
-    # other files call.
-    if plan.compact_rows:
+    # occupies `[0, n_sub)` when it runs -- one Float64 word per row, holding
+    # the pair as two Float32 -- and the row-blocked private histograms occupy
+    # `[part_off, part_off + plan.block_scratch_floats())` after it. `pairs`
+    # is documented to carry no state between calls beyond its capacity, so
+    # extending its tail costs a grower one growth per fit rather than an
+    # allocation per node -- which is the whole reason the blocked path can
+    # exist without a new parameter on a signature three other files call.
+    #
+    # A blocked node always gathers, even below `compact_min_rows`. The
+    # blocked kernel has one row source rather than two, which halves what it
+    # has to instantiate now that it also carries the row-indirection arm, and
+    # a node large enough to block is by construction large enough for the
+    # gather to be a rounding error against its own accumulation. It cannot
+    # move a bin: the gather and the direct read deliver the same Float64,
+    # because `score_t` is idempotent and both apply it.
+    var use_pairs = plan.compact_rows or plan.blocked()
+    if use_pairs:
         ensure_pair_capacity(pairs, n_sub)
-    var part_off = (2 * n_sub) if plan.compact_rows else 0
+    var part_off = n_sub if use_pairs else 0
     if plan.blocked():
         var wanted = part_off + plan.block_scratch_floats()
         if len(pairs) < wanted:
             pairs.resize(wanted, 0.0)
 
-    if plan.compact_rows:
+    if use_pairs:
         _gather_pairs(
             pairs, grad, hess, rows, row_start, n_sub, plan.gather_ops,
             settings,
@@ -1204,31 +1501,31 @@ def _accumulate_subset(
         # never re-derived inside the kernel.
         var bgroup = plan.group_width
         if bgroup >= 16:
-            _accumulate_subset_blocked_at[16](
+            _accumulate_blocked_at[16, True](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
             )
         elif bgroup >= 8:
-            _accumulate_subset_blocked_at[8](
+            _accumulate_blocked_at[8, True](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
             )
         elif bgroup >= 4:
-            _accumulate_subset_blocked_at[4](
+            _accumulate_blocked_at[4, True](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
             )
         elif bgroup >= 2:
-            _accumulate_subset_blocked_at[2](
+            _accumulate_blocked_at[2, True](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
             )
         else:
-            _accumulate_subset_blocked_at[1](
+            _accumulate_blocked_at[1, True](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
@@ -1241,35 +1538,35 @@ def _accumulate_subset(
         _accumulate_subset_at[16](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
-            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     elif group >= 8:
         _accumulate_subset_at[8](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
-            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     elif group >= 4:
         _accumulate_subset_at[4](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
-            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     elif group >= 2:
         _accumulate_subset_at[2](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
-            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     else:
         _accumulate_subset_at[1](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
-            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
 
@@ -1331,7 +1628,7 @@ def _accumulate_subset_at[
     var hess_p = hess.unsafe_ptr()
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
     var bins_all_p = data.bins.unsafe_ptr()
-    var pairs_p = pairs.unsafe_ptr()
+    var pairs_p = pairs.unsafe_ptr().unsafe_bitcast[Float32]()
     var feat_p = features.unsafe_ptr()
     comptime W = SIMD_LANES
 
@@ -1377,7 +1674,7 @@ def _accumulate_subset_at[
                         var r = rows_p.unsafe_load(i_row)
                         # The gather still interleaves (g, h); only the
                         # gradient half is read here.
-                        var g = pairs_p.unsafe_load(2 * i_row)
+                        var g = Float64(pairs_p.unsafe_load(2 * i_row))
                         comptime for k in range(GROUP):
                             if k < owned:
                                 var b = Int(base[k]) + Int(
@@ -1388,7 +1685,7 @@ def _accumulate_subset_at[
                 else:
                     for i_row in range(n_sub):
                         var r = rows_p.unsafe_load(i_row)
-                        var g = grad_p.unsafe_load(r)
+                        var g = score_t(grad_p.unsafe_load(r))
                         comptime for k in range(GROUP):
                             if k < owned:
                                 var b = Int(base[k]) + Int(
@@ -1400,8 +1697,8 @@ def _accumulate_subset_at[
                 for i_row in range(n_sub):
                     var r = rows_p.unsafe_load(i_row)
                     # Adjacent, so one cache line carries both.
-                    var g = pairs_p.unsafe_load(2 * i_row)
-                    var h = pairs_p.unsafe_load(2 * i_row + 1)
+                    var g = Float64(pairs_p.unsafe_load(2 * i_row))
+                    var h = Float64(pairs_p.unsafe_load(2 * i_row + 1))
                     comptime for k in range(GROUP):
                         if k < owned:
                             var b = Int(base[k]) + Int(
@@ -1416,8 +1713,8 @@ def _accumulate_subset_at[
                 # row ids as they always were.
                 for i_row in range(n_sub):
                     var r = rows_p.unsafe_load(i_row)
-                    var g = grad_p.unsafe_load(r)
-                    var h = hess_p.unsafe_load(r)
+                    var g = score_t(grad_p.unsafe_load(r))
+                    var h = score_t(hess_p.unsafe_load(r))
                     comptime for k in range(GROUP):
                         if k < owned:
                             var b = Int(base[k]) + Int(
@@ -1454,8 +1751,8 @@ def _accumulate_subset_at[
     )
 
 
-def _accumulate_subset_blocked_at[
-    GROUP: Int
+def _accumulate_blocked_at[
+    GROUP: Int, INDIRECT: Bool
 ](
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
@@ -1474,12 +1771,31 @@ def _accumulate_subset_blocked_at[
     const_h: Bool,
     settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
-    """The row-blocked subset accumulation at one interleave width.
+    """The row-blocked accumulation at one interleave width, for both
+    builders.
 
     The node's rows are cut into `plan.row_blocks` contiguous ascending
     blocks. Each block owns a private histogram over the active features only,
     accumulates its own rows into it, and the partials are then folded into
     the caller's output in ascending block order.
+
+    `INDIRECT` selects the row source and nothing else. True is the subset
+    builder: a row is `rows[row_start + i]` and its derivatives come from the
+    gathered pair buffer. False is the whole-dataset builder: a row *is* the
+    loop counter, `rows` is empty and never dereferenced, and the derivatives
+    are read from the arrays directly. Both arms feed the accumulate the same
+    Float64s, because `score_t` is idempotent and the gather applies it too;
+    that identity is what lets the two builders be compared bit for bit.
+
+    **Both builders block, on one plan, and that is a correctness property.**
+    Until they did, `test_bagged_tree_equals_tree_on_subset_dataset` was
+    false: the bagged tree reached the subset builder and folded row blocks
+    while its whole-dataset reference summed flat, and the two leaf values
+    differed by four ulp. The block count, the boundaries and the fold order
+    come from `apple_cpu_policy.plan_row_block_count`, which reads the row
+    count, the bin count, the active feature count and an explicit request
+    and nothing else -- so the two builders agree, and both are invariant
+    under `MOJOTREES_NUM_WORKERS` and under any task count.
 
     **Two axes, not a replacement for one.** The dispatch unit is a
     `(block, group)` pair and there are `row_blocks * group_count` of them, so
@@ -1493,41 +1809,67 @@ def _accumulate_subset_blocked_at[
     gather buffer and its private histogram live in one core's cache across the
     groups that walk them.
 
-    **What is a value here and what is a schedule.** The block count, the
-    block boundaries, and the fold order are values: they are fixed by
-    `apple_cpu_policy.plan_row_block_count` from the row count, the bin count
-    and the active feature count, and by nothing about the machine. How many
-    tasks the units are cut into, and which core runs which, are schedule:
-    a unit is never split, a block's rows are always walked in ascending
-    order, and the fold always runs block 0 first. So the output is identical
-    at every `MOJOTREES_NUM_WORKERS`, at every task count, and on every
-    machine on this toolchain -- and it is a *different* Float64 from the
-    unblocked path, which is the trade this module's docstring now states.
+    **The private cell is LightGBM's: interleaved, and one cache line.**
+    `include/LightGBM/bin.h` defines `typedef double hist_t`,
+    `kHistEntrySize = 2 * sizeof(hist_t)`, `GET_GRAD(hist, i) = hist[(i) << 1]`
+    and `GET_HESS(hist, i) = hist[((i) << 1) + 1]`: a bin's gradient and
+    hessian are adjacent Float64 and there is no count plane. The partials
+    here are laid out the same way, `stride` floats per cell, so one row's
+    visit to one feature reads and writes one contiguous 16- or 24-byte cell
+    instead of touching three planes a `n_blocks * block_cells` stride apart.
+    Three scattered lines per (row, feature) become one. The zeroing pass and
+    the fold both become contiguous streams for the same reason.
 
-    **The private scratch.** Three planes of `row_blocks * n_active * n_bins`
-    Float64 in the tail of the caller's gather buffer, in the order gradient,
-    count, hessian. The count plane is Float64 rather than `Int` because the
-    buffer is one `List[Float64]`; a count is an integer below 2^53 at every
-    step, so every partial sum is exactly representable and the conversion
-    back to `Int` in the fold is exact rather than approximate. The hessian
-    plane is last so that `const_h`, which never writes it, simply stops
-    before it.
+    `stride` is 2 under `const_h` and 3 otherwise, and the difference is what
+    the second slot means:
 
-    **The elided hessian plane, under blocking.** The three-plane path gives a
-    block's hessian cell the sum of `count_b` copies of the Float64 literal
-    1.0, which is exactly `Float64(count_b)`, and the fold then sums those
-    across blocks -- again exactly, since every partial is an integer below
-    2^53. So the three-plane hessian a blocked build produces is
-    `Float64(total count)`, which is exactly what the elided path writes from
-    the folded count. The elision is bit-identical to the non-elided path on
-    the blocked kernel for the same reason it is on the unblocked one, and
-    critically the *block count does not depend on `const_h`*: the scratch is
-    sized for three planes either way, so a fit cannot move a bin by turning
-    the specialization off.
+    - Under `const_h` the cell is exactly LightGBM's 16 bytes and the second
+      slot is a **count**, as it is in LightGBM: `DenseBin::
+      ConstructHistogramInner`'s `!USE_HESSIAN` arm aliases the hessian slot
+      as `hist_cnt_t*` and does `++cnt[ti]`, and `Dataset::
+      ConstructHistogramsInner` then rewrites it as `data_ptr[i + 1] =
+      static_cast<double>(cnt_dst[i]) * hessians[0]`. This file does the same
+      thing in Float64 rather than through a union: `CONSTANT_HESSIAN` is 1.0,
+      the sum of `n` copies of 1.0 is exactly `Float64(n)` because every
+      partial is an exactly representable integer below 2^53, and the refill
+      is that same Float64. So the count that comes out is **exact, not
+      estimated** -- `derived_count` is called on it to state the rule, and
+      the rule is exact at a factor of 1.0.
+    - Otherwise the cell keeps a third slot for an exact count where LightGBM
+      would derive one from the hessian sum. That divergence is argued at
+      `derived_count`: a derived count is exact only when every hessian is
+      `CONSTANT_HESSIAN`, and `Histogram.count_at` is read by a distributed
+      integer allreduce, by the C ABI, and by the split scan's
+      `min_data_in_leaf` test, none of which should take a rounded number
+      when an exact one costs eight bytes of scratch that is already
+      allocated. LightGBM's authoritative leaf count comes from the data
+      partition (`leaf_count`), not from its histogram, and the same is true
+      here: `split.find_best_split`'s `n_rows` argument is the partition's
+      count and is preferred over the histogram's total wherever the caller
+      supplies one.
 
-    A tail group owning fewer than `GROUP` features, the SIMD-lane slot
-    arrays, and the `compact` pair of row loops are all as in
-    `_accumulate_subset_at`.
+    **The allocation is unconditional at three slots even when the stride is
+    two.** `apple_cpu_policy.ROW_BLOCK_PLANES` stays at 3 for the byte budget
+    so that the *block count* cannot depend on `const_h`; a fit that turned
+    the specialization off would otherwise fold a different number of
+    partials and move a bin. Only the addressing narrows.
+
+    **The prefetch.** `DenseBin::ConstructHistogramInner` runs its loop in two
+    parts: while more than `pf_offset = 64 / sizeof(VAL_T)` rows remain it
+    issues `PREFETCH_T0(data_.data() + data_indices[i + pf_offset])` before
+    each accumulate, then finishes without one. `SCATTER_PREFETCH` is that
+    hint and `PREFETCH_ROW_DISTANCE` is that distance. It is issued only on
+    the `INDIRECT` arm, because it is the row-id indirection that stalls: on
+    the sequential arm the binned column is a unit-stride stream and the
+    hardware prefetcher already owns it. There is **no unroll** -- LightGBM's
+    loop is scalar and this one is too.
+
+    None of the prefetch moves a bit. It is a hint with no architectural
+    effect, and the two loop halves perform the same additions in the same
+    order.
+
+    A tail group owning fewer than `GROUP` features and the SIMD-lane slot
+    arrays are as in `_accumulate_subset_at`.
     """
     var n_rows = data.n_rows
     var n_bins = data.n_bins
@@ -1536,7 +1878,6 @@ def _accumulate_subset_blocked_at[
     var n_groups = plan.group_count
     var block_rows = plan.block_rows
     var block_cells = plan.block_cells
-    var compact = plan.compact_rows
     var use_all = len(features) == 0
     var gp = out_grad.unsafe_ptr()
     var hp = out_hess.unsafe_ptr()
@@ -1546,18 +1887,26 @@ def _accumulate_subset_blocked_at[
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
     var bins_all_p = data.bins.unsafe_ptr()
     var feat_p = features.unsafe_ptr()
-    # ONE pointer into `pairs`, not two. The gather occupies `[0, 2 * n_sub)`
-    # and the private histograms `[part_off, ...)`, and two pointers carrying
-    # the same origin into one parallel closure is an aliasing error Mojo
-    # refuses to compile. So `part_off` is folded into every private index
-    # instead, at `base[k]` and at `in0` below, and there is one `pp`.
+    # ONE pointer into `pairs`, not two. The gather occupies `[0, n_sub)` and
+    # the private histograms `[part_off, ...)`, and two pointers carrying the
+    # same origin into one parallel closure is an aliasing error Mojo refuses
+    # to compile. So `part_off` is folded into every private index instead,
+    # and the Float32 view of the gather is taken inside the closure from this
+    # same pointer.
     var pp = pairs.unsafe_ptr()
-    # Distance between the three private planes, which all sit after
-    # `part_off`: gradient first, then count, then hessian.
-    var plane = n_blocks * block_cells
+    # Floats per private cell, and where the count lives inside one.
+    var stride = (
+        ROW_BLOCK_CELL_FLOATS_CONST_H if const_h else ROW_BLOCK_CELL_FLOATS
+    )
+    var count_slot = 1 if const_h else 2
+    # Floats reserved per block. Always `ROW_BLOCK_CELL_FLOATS` per cell, so
+    # the block count is a value independent of `const_h`; the stride above
+    # only says how many of them are addressed.
+    var region = block_cells * ROW_BLOCK_CELL_FLOATS
     comptime W = SIMD_LANES
 
     def accumulate_units(u_start: Int, u_end: Int) {imm}:
+        var g32 = pp.unsafe_bitcast[Float32]()
         for u in range(u_start, u_end):
             var blk = u // n_groups
             var grp = u - blk * n_groups
@@ -1582,157 +1931,216 @@ def _accumulate_subset_blocked_at[
                         else feat_p.unsafe_load(slot0 + k)
                     )
                     base[k] = (
-                        part_off + blk * block_cells + (slot0 + k) * n_bins
+                        part_off
+                        + blk * region
+                        + (slot0 + k) * n_bins * stride
                     )
                     col[k] = f * n_rows
 
-            # Zeroing stays fused into the pass that fills the slice. Under
-            # `const_h` the private hessian plane is never written and never
-            # read, so it is not zeroed either.
+            # Zeroing stays fused into the pass that fills the slice, and is
+            # now one contiguous run per feature rather than one run per
+            # plane. Under `const_h` the run is `n_bins * 2` floats and the
+            # third slot of every cell is neither zeroed nor read.
             comptime for k in range(GROUP):
                 if k < owned:
                     var z0 = Int(base[k])
+                    var zn = n_bins * stride
                     var zb = 0
-                    while zb + W <= n_bins:
+                    while zb + W <= zn:
                         pp.unsafe_store(
                             z0 + zb, SIMD[DType.float64, W](0.0)
                         )
-                        pp.unsafe_store(
-                            plane + z0 + zb, SIMD[DType.float64, W](0.0)
-                        )
-                        if not const_h:
-                            pp.unsafe_store(
-                                2 * plane + z0 + zb,
-                                SIMD[DType.float64, W](0.0),
-                            )
                         zb += W
-                    while zb < n_bins:
+                    while zb < zn:
                         pp.unsafe_store(z0 + zb, 0.0)
-                        pp.unsafe_store(plane + z0 + zb, 0.0)
-                        if not const_h:
-                            pp.unsafe_store(2 * plane + z0 + zb, 0.0)
                         zb += 1
 
+            # The scatter. Two halves on the indirect arm, as LightGBM has
+            # them: the first issues the prefetch and the second is the tail
+            # that has nothing left to prefetch. Same additions, same order.
+            var pf_end = r1 - PREFETCH_ROW_DISTANCE
+            var i_row = r0
             if const_h:
-                if compact:
-                    for i_row in range(r0, r1):
+                comptime if INDIRECT:
+                    while i_row < pf_end:
                         var r = rows_p.unsafe_load(i_row)
-                        var g = pp.unsafe_load(2 * i_row)
+                        var g = Float64(g32.unsafe_load(2 * i_row))
+                        var rf = rows_p.unsafe_load(
+                            i_row + PREFETCH_ROW_DISTANCE
+                        )
                         comptime for k in range(GROUP):
                             if k < owned:
-                                var b = Int(base[k]) + Int(
+                                prefetch[SCATTER_PREFETCH](
+                                    bins_all_p.unsafe_offset(Int(col[k]) + rf)
+                                )
+                                var b = Int(base[k]) + stride * Int(
                                     bins_all_p.unsafe_load(Int(col[k]) + r)
                                 )
+                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
                                 pp.unsafe_store(
-                                    b, pp.unsafe_load(b) + g
+                                    b + 1, pp.unsafe_load(b + 1) + 1.0
                                 )
+                        i_row += 1
+                    while i_row < r1:
+                        var r = rows_p.unsafe_load(i_row)
+                        var g = Float64(g32.unsafe_load(2 * i_row))
+                        comptime for k in range(GROUP):
+                            if k < owned:
+                                var b = Int(base[k]) + stride * Int(
+                                    bins_all_p.unsafe_load(Int(col[k]) + r)
+                                )
+                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
                                 pp.unsafe_store(
-                                    plane + b,
-                                    pp.unsafe_load(plane + b) + 1.0,
+                                    b + 1, pp.unsafe_load(b + 1) + 1.0
                                 )
+                        i_row += 1
                 else:
-                    for i_row in range(r0, r1):
-                        var r = rows_p.unsafe_load(i_row)
-                        var g = grad_p.unsafe_load(r)
+                    while i_row < r1:
+                        var g = score_t(grad_p.unsafe_load(i_row))
                         comptime for k in range(GROUP):
                             if k < owned:
-                                var b = Int(base[k]) + Int(
+                                var b = Int(base[k]) + stride * Int(
+                                    bins_all_p.unsafe_load(
+                                        Int(col[k]) + i_row
+                                    )
+                                )
+                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                                pp.unsafe_store(
+                                    b + 1, pp.unsafe_load(b + 1) + 1.0
+                                )
+                        i_row += 1
+            else:
+                comptime if INDIRECT:
+                    while i_row < pf_end:
+                        var r = rows_p.unsafe_load(i_row)
+                        var gh = g32.unsafe_load[width=2](2 * i_row)
+                        var g = Float64(gh[0])
+                        var h = Float64(gh[1])
+                        var rf = rows_p.unsafe_load(
+                            i_row + PREFETCH_ROW_DISTANCE
+                        )
+                        comptime for k in range(GROUP):
+                            if k < owned:
+                                prefetch[SCATTER_PREFETCH](
+                                    bins_all_p.unsafe_offset(Int(col[k]) + rf)
+                                )
+                                var b = Int(base[k]) + stride * Int(
                                     bins_all_p.unsafe_load(Int(col[k]) + r)
                                 )
+                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
                                 pp.unsafe_store(
-                                    b, pp.unsafe_load(b) + g
+                                    b + 1, pp.unsafe_load(b + 1) + h
                                 )
                                 pp.unsafe_store(
-                                    plane + b,
-                                    pp.unsafe_load(plane + b) + 1.0,
+                                    b + 2, pp.unsafe_load(b + 2) + 1.0
                                 )
-            elif compact:
-                for i_row in range(r0, r1):
-                    var r = rows_p.unsafe_load(i_row)
-                    var g = pp.unsafe_load(2 * i_row)
-                    var h = pp.unsafe_load(2 * i_row + 1)
-                    comptime for k in range(GROUP):
-                        if k < owned:
-                            var b = Int(base[k]) + Int(
-                                bins_all_p.unsafe_load(Int(col[k]) + r)
-                            )
-                            pp.unsafe_store(b, pp.unsafe_load(b) + g)
-                            pp.unsafe_store(
-                                plane + b, pp.unsafe_load(plane + b) + 1.0
-                            )
-                            pp.unsafe_store(
-                                2 * plane + b,
-                                pp.unsafe_load(2 * plane + b) + h,
-                            )
-            else:
-                for i_row in range(r0, r1):
-                    var r = rows_p.unsafe_load(i_row)
-                    var g = grad_p.unsafe_load(r)
-                    var h = hess_p.unsafe_load(r)
-                    comptime for k in range(GROUP):
-                        if k < owned:
-                            var b = Int(base[k]) + Int(
-                                bins_all_p.unsafe_load(Int(col[k]) + r)
-                            )
-                            pp.unsafe_store(b, pp.unsafe_load(b) + g)
-                            pp.unsafe_store(
-                                plane + b, pp.unsafe_load(plane + b) + 1.0
-                            )
-                            pp.unsafe_store(
-                                2 * plane + b,
-                                pp.unsafe_load(2 * plane + b) + h,
-                            )
+                        i_row += 1
+                    while i_row < r1:
+                        var r = rows_p.unsafe_load(i_row)
+                        var gh = g32.unsafe_load[width=2](2 * i_row)
+                        var g = Float64(gh[0])
+                        var h = Float64(gh[1])
+                        comptime for k in range(GROUP):
+                            if k < owned:
+                                var b = Int(base[k]) + stride * Int(
+                                    bins_all_p.unsafe_load(Int(col[k]) + r)
+                                )
+                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                                pp.unsafe_store(
+                                    b + 1, pp.unsafe_load(b + 1) + h
+                                )
+                                pp.unsafe_store(
+                                    b + 2, pp.unsafe_load(b + 2) + 1.0
+                                )
+                        i_row += 1
+                else:
+                    while i_row < r1:
+                        var g = score_t(grad_p.unsafe_load(i_row))
+                        var h = score_t(hess_p.unsafe_load(i_row))
+                        comptime for k in range(GROUP):
+                            if k < owned:
+                                var b = Int(base[k]) + stride * Int(
+                                    bins_all_p.unsafe_load(
+                                        Int(col[k]) + i_row
+                                    )
+                                )
+                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                                pp.unsafe_store(
+                                    b + 1, pp.unsafe_load(b + 1) + h
+                                )
+                                pp.unsafe_store(
+                                    b + 2, pp.unsafe_load(b + 2) + 1.0
+                                )
+                        i_row += 1
 
     dispatch_feature_ranges_with(
         settings, accumulate_units, n_blocks * n_groups, plan.block_ops
     )
 
+    # The node's count factor, LightGBM's `num_data / sum_hessian`. Under
+    # `const_h` the second slot of a private cell counted rows rather than
+    # summing hessians, so the node's total is `CONSTANT_HESSIAN * n_sub` and
+    # this is exactly 1.0 -- which is what makes `derived_count` below exact
+    # rather than an estimate. It is computed once for the whole build, from
+    # the row count the caller already knows, and never from a reduction.
+    var factor = cnt_factor(n_sub, CONSTANT_HESSIAN * Float64(n_sub))
+
     # The fold. One task per contiguous run of active slots; a slot writes
     # only its own output slice, and inside it every cell sums the blocks in
     # ascending order. That inner order is what the task count cannot touch,
     # and it is the whole of the determinism argument for this kernel.
+    #
+    # It runs in two passes over one slot. The first sums blocks 1..n-1 into
+    # block 0's slots *in place*, which is elementwise over a contiguous run
+    # of `n_bins * stride` floats and therefore vectorizes at full width; the
+    # interleaved cell is what makes that run contiguous, where the three
+    # separate planes it replaced forced three strided streams. The second
+    # walks the folded cells once per bin and writes the three output planes.
+    # The addition order per slot is block 0, then block 1, and so on, which
+    # is the order the previous per-cell fold used.
     def fold_slots(s_start: Int, s_end: Int) {imm}:
         for j in range(s_start, s_end):
             var f = j if use_all else feat_p.unsafe_load(j)
             var out0 = f * n_bins
-            var in0 = part_off + j * n_bins
-            var b = 0
-            while b + W <= n_bins:
-                var sg = pp.unsafe_load[width=W](in0 + b)
-                var sc = pp.unsafe_load[width=W](plane + in0 + b)
-                var sh = SIMD[DType.float64, W](0.0)
-                if not const_h:
-                    sh = pp.unsafe_load[width=W](2 * plane + in0 + b)
-                for blk in range(1, n_blocks):
-                    var off = blk * block_cells + in0 + b
-                    sg += pp.unsafe_load[width=W](off)
-                    sc += pp.unsafe_load[width=W](plane + off)
-                    if not const_h:
-                        sh += pp.unsafe_load[width=W](2 * plane + off)
-                gp.unsafe_store(out0 + b, sg)
-                cp.unsafe_store(out0 + b, sc.cast[DType.int]())
-                hp.unsafe_store(out0 + b, sc if const_h else sh)
-                b += W
-            while b < n_bins:
-                var sg1 = pp.unsafe_load(in0 + b)
-                var sc1 = pp.unsafe_load(plane + in0 + b)
-                var sh1 = Float64(0.0)
-                if not const_h:
-                    sh1 = pp.unsafe_load(2 * plane + in0 + b)
-                for blk in range(1, n_blocks):
-                    var off = blk * block_cells + in0 + b
-                    sg1 += pp.unsafe_load(off)
-                    sc1 += pp.unsafe_load(plane + off)
-                    if not const_h:
-                        sh1 += pp.unsafe_load(2 * plane + off)
-                gp.unsafe_store(out0 + b, sg1)
-                cp.unsafe_store(out0 + b, Int(sc1))
-                hp.unsafe_store(out0 + b, sc1 if const_h else sh1)
-                b += 1
+            var in0 = part_off + j * n_bins * stride
+            var span = n_bins * stride
+            for blk in range(1, n_blocks):
+                var off = in0 + blk * region
+                var i = 0
+                while i + W <= span:
+                    pp.unsafe_store(
+                        in0 + i,
+                        pp.unsafe_load[width=W](in0 + i)
+                        + pp.unsafe_load[width=W](off + i),
+                    )
+                    i += W
+                while i < span:
+                    pp.unsafe_store(
+                        in0 + i, pp.unsafe_load(in0 + i) + pp.unsafe_load(
+                            off + i
+                        )
+                    )
+                    i += 1
+            for b in range(n_bins):
+                var c0 = in0 + b * stride
+                gp.unsafe_store(out0 + b, pp.unsafe_load(c0))
+                var sc = pp.unsafe_load(c0 + count_slot)
+                if const_h:
+                    # `sc` counted rows, so it is exactly `Float64(count)`;
+                    # `factor` is exactly 1.0 and `derived_count` truncates
+                    # `count + 0.5` back to `count`. The hessian plane is that
+                    # same Float64, which is what the three-plane path
+                    # accumulated cell for cell.
+                    cp.unsafe_store(out0 + b, derived_count(sc, factor))
+                    hp.unsafe_store(out0 + b, sc)
+                else:
+                    cp.unsafe_store(out0 + b, Int(sc))
+                    hp.unsafe_store(out0 + b, pp.unsafe_load(c0 + 1))
 
     dispatch_feature_ranges_with(
         settings, fold_slots, n_active, plan.fold_ops
     )
+
 
 
 def build_histogram_subset_replica_into[
