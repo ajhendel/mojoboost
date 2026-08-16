@@ -1,0 +1,10 @@
+cpu_train_s: 5.576156
+cpu_train_s_median: 5.941975
+cpu_train_s_max: 6.329801
+cpu_spread_pct: 13.5
+gpu_train_s: 3.752706
+gpu_train_s_median: 3.755906
+gpu_train_s_max: 3.818575
+gpu_spread_pct: 1.8
+gpu_speedup_x: 1.4859027059407266
+gpu_vs_cpu: resolved delta_pct -32.7 noise_floor_pct 13.5

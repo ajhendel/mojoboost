@@ -1,0 +1,9 @@
+run 1 gpu-depth train_s: 2.58775
+run 2 gpu-depth train_s: 2.5871
+run 3 gpu-depth train_s: 2.581632
+run 4 gpu-depth train_s: 2.584829
+run 5 gpu-depth train_s: 2.589751
+gpu_depth_train_s: 2.581632
+gpu_depth_train_s_median: 2.5871
+gpu_depth_train_s_max: 2.589751
+gpu_depth_spread_pct: 0.3

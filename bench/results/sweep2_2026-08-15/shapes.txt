@@ -1,0 +1,12 @@
+### 250000 ###
+cpu_train_s_median: 1.649032
+cpu_spread_pct: 9.3
+gpu_train_s_median: 1.967352
+gpu_spread_pct: 1.1
+gpu-depth: gpu_depth_train_s_median: 1.908929 gpu_depth_spread_pct: 6.7 
+### 2000000 ###
+cpu_train_s_median: 13.482933
+cpu_spread_pct: 35.6
+gpu_train_s_median: 6.092568
+gpu_spread_pct: 12.5
+gpu-depth: gpu_depth_train_s_median: 5.417343 gpu_depth_spread_pct: 10.8 

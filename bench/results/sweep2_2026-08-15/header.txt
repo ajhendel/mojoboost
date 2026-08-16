@@ -1,0 +1,4 @@
+toolchain: Mojo 1.0.0 (ed45d567)
+machine: Apple M4 cores=10 perf=4 eff=6
+thermal: Note: No thermal warning level has been recorded
+commit: 7443673
