@@ -260,7 +260,7 @@ passes `boosting_type=Ordered`. No row may be read as covering it.
 
 **Confirmed from CatBoost's source rather than assumed, 2026-08-16, and the
 usual reading of the threshold is backwards.** `boosting_options.cpp:16`
-constructs the default as Plain. `catboost_options.cpp:785-790` is the only
+constructs the default as Plain. `catboost_options.cpp:806` is the only
 place Ordered is installed as a default, and its condition includes
 `TaskType == GPU`; every arm here is CPU. `defaults_helper.h::UpdateBoostingTypeOption`
 hard-sets Plain when the option is unset and
@@ -270,6 +270,23 @@ dropped in conversation is `IterationCount < 500`: at `BASE_PARAMS`'
 100 estimators that clause fires at **every** tier, so shrinking a scenario
 would not buy an Ordered row either. A future explicit Ordered arm is a third
 data point, not a correction to a wrong one.
+
+**Verified directly at v1.2.10 on 2026-08-16 evening, and one citation
+corrected.** The three sites are `boosting_options.cpp:16` (the constructed
+default is Plain), `catboost_options.cpp:806` (the only site that installs
+Ordered as a default, guarded by `TaskType == ETaskType::GPU`), and
+`defaults_helper.h:33-42` (`UpdateBoostingTypeOption`, which only ever *sets*
+Plain and leaves the option NotSet otherwise). The line above previously read
+`785-790`, taken from a relay and never opened -- **a right claim with a wrong
+citation, which is as wrong as the reverse and harder to notice.**
+
+**The consequence is stronger than the original sentence.** Because the Ordered
+site is GPU-gated and the constructed default is Plain, **NotSet resolves to
+Plain on CPU**, so the tree count cannot switch the mode however the
+`(rows >= 50000 || iterations < 500)` disjunction lands. At 500 trees and under
+50,000 rows the hard-set does not fire and the answer is still Plain. Every
+CatBoost row this project runs on CPU is Plain, at any tree count, and that is
+now a property rather than an observation.
 
 Two consequences worth recording while the source is open. CatBoost **refuses**
 Ordered together with a nonsymmetric grow policy rather than silently resolving
