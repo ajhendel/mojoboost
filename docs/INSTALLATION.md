@@ -367,19 +367,20 @@ it. Pickle the estimator when you want those.
 ```python
 MojoTreesRegressor(device="cpu")    # default, dependable, every objective
 MojoTreesRegressor(device="gpu")    # accelerator or an exception, never a fallback
-MojoTreesRegressor(device="auto")   # picks for you, and today always picks the CPU
+MojoTreesRegressor(device="auto")   # picks for you, and picks the CPU unless a rule covers the run
 ```
 
 `device="gpu"` is a request that gets honored or refused. It never quietly
-trains on the CPU while you believe you used the GPU. `device="auto"`
-resolves to the CPU on every machine and every workload right now, but not
-for want of a measurement: one crossover rule is installed, scoped to Metal
-on an Apple M4 for squared error at 1,000,000 rows by 50 features and above,
-where the GPU trains in 3.58s against the CPU's 6.98s. It cannot fire,
-because the capability probe opens no device and so a rule scoped to
-particular hardware can never match the profile it produces.
-[docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md) has the whole policy and the
-gap.
+trains on the CPU while you believe you used the GPU. `device="auto"` picks
+the GPU only where a benchmark says it is faster, which today is one rule:
+Metal on an Apple M4, unweighted squared error, single output, 1,000,000 rows
+by 50 features and above, where the GPU trains in 3.58s against the CPU's
+6.98s. Everything below that keeps the CPU, and below that shape the CPU
+really is the right answer on this hardware: at 250,000 rows the GPU takes
+1.89s against the CPU's 1.66s and at 50,000 it takes 1.63s against 0.564s.
+[docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md) has the whole policy,
+including what the rule is scoped to and why, and what a redistributed wheel
+assumes about the hardware it is running on.
 
 ### 6. Print the diagnostics
 
@@ -615,22 +616,29 @@ behavior on every machine and every workload.
 
 ```python
 model = MojoTreesRegressor(device="auto").fit(X, y)
-model.device_        # "cpu", on an M4 with a working Metal GPU
+model.device_        # "cpu" below the crossover, "gpu" above it
 ```
 
-The crossover table that `auto` consults holds one rule, and no rule matches
-in practice. The rule is scoped to Metal on an Apple M4 for unweighted
-squared error at 1,000,000 rows by 50 features and above, where the GPU has
-been measured at 3.58s against the CPU's 6.98s. What stops it matching is
-that the capability probe opens no device, so the machine is reported as
-unidentified and a rule scoped to particular hardware cannot apply to it.
-`auto` keeps the CPU and says which half of "no rule covered this" applied,
-rather than implying the shape was too small.
+The crossover table that `auto` consults holds one rule. It is scoped to
+Metal on an Apple M4 for unweighted squared error, single output, at
+1,000,000 rows by 50 features and above, where the GPU has been measured at
+3.58s against the CPU's 6.98s. Anything the rule does not cover keeps the
+CPU, and the report says which half of "no rule covered this" applied, rather
+than implying the shape was too small.
 
-Below that shape the CPU really is the right answer on this hardware: at
-250,000 rows the GPU takes 1.89s against the CPU's 1.66s, and at 50,000 it
-takes 1.63s against 0.564s, because the device carries about 1.5 seconds of
-fixed cost per fit.
+Below that shape the CPU really is the right answer on this hardware, and
+that too is measured rather than assumed: at 250,000 rows the GPU takes 1.89s
+against the CPU's 1.66s, and at 50,000 it takes 1.63s against 0.564s, because
+the device carries about 1.5 seconds of fixed cost per fit. The crossover
+itself is somewhere between 250,000 and 1,000,000 rows and has not been
+bracketed, so the rule's floor sits at the top of that interval.
+
+One caveat specific to installed wheels. `auto` identifies the accelerator
+from the one this binary was *compiled for*, because probing costs a device
+open that a decision cannot afford. On a wheel built for an M4 and run on
+different Apple silicon, `auto` will believe it is on an M4. The report says
+so (`profile_source=build-target`, warning `build-target-hardware`);
+`device="cpu"` and `MOJOTREES_DISABLE_GPU=1` both opt out.
 
 Two ways forward, depending on what you want.
 

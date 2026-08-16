@@ -472,7 +472,7 @@ using the instructions above.
 | `RuntimeError: device 'gpu' requested but no accelerator is available` | This build has no GPU path. Availability is fixed when the extension is compiled, not at runtime |
 | `RuntimeError: validation metrics are scored on the CPU` | An `eval_set` with `device="gpu"`. Use `device="cpu"` or `"auto"` |
 | `RuntimeError: sparse input trains on the CPU` | There is no sparse GPU kernel. Use `device="cpu"`, `"auto"`, or densify |
-| `device="auto"` chose the CPU and said nothing | Expected. One crossover rule ships, and it is scoped to hardware the capability probe never identifies, so no rule matches and `auto` keeps the CPU everywhere |
+| `device="auto"` chose the CPU and said nothing | Usually expected. One crossover rule ships, scoped to Metal on an Apple M4 for squared error, single output, at 1,000,000 rows by 50 features and above; everything else keeps the CPU, and below that shape the CPU is the measured winner. Read `select_device(...).explain()`, which names which half of "no rule covered this" applied |
 
 Each case, with the full message and what to do about it, is in
 [docs/INSTALLATION.md](https://github.com/mojotrees/mojotrees/blob/main/docs/INSTALLATION.md#when-something-goes-wrong).

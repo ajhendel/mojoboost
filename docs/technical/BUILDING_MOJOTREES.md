@@ -117,12 +117,15 @@ GPU request should either use the GPU or raise a clear error.
 
 One measured rule now exists, scoped to Metal on an Apple M4 for unweighted
 squared error at 1,000,000 rows by 50 features and above, where the GPU
-trains in 3.58s against the CPU's 6.98s. It does not yet fire through the
-default path, because the capability probe opens no device and a rule scoped
-to particular hardware cannot match a profile that names none, so `auto`
-still chooses the CPU and reports exactly which half of "no rule covered
-this" applied. Below that shape the CPU is genuinely the right answer on this
-hardware, since the device carries about 1.5 seconds of fixed cost per fit.
+trains in 3.58s against the CPU's 6.98s. It fires for any caller that
+declares an objective, which is every entry point except `resolve_device`'s
+four-argument form; the hardware is identified from the accelerator this
+binary was compiled for rather than from a device reading, which is free but
+is a build property and is reported and warned on as one. `auto` chooses the
+CPU everywhere the rule does not cover and reports exactly which half of "no
+rule covered this" applied. Below that shape the CPU is genuinely the right
+answer on this hardware, since the device carries about 1.5 seconds of fixed
+cost per fit.
 
 ## AI-assisted development and integration debt
 
