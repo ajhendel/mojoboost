@@ -437,3 +437,62 @@ The third exists because four of this week's most consequential findings were in
 it: the throttled comparator, the `force_row_wise` pin, the inverted binning pin,
 and the conditions line that could not distinguish two arms differing by 0.75
 seconds.
+
+
+---
+
+# The headline is now END-TO-END, and that has a blocker
+
+Settled 2026-08-16: every published number is **binning plus training**, against
+LightGBM stock+det (their Dataset construction plus their train), speed and
+accuracy side by side, thresholds relative to that comparator, conditions line on
+every row.
+
+**Two consequences, and the second one blocks the window.**
+
+**1. Every number in `session3_2026-08-16/RESULTS.md` is training-only.** The 2.58
+seconds at 1M, the 0.75-second resident-plane result, the 10.8 percent unroll --
+all of them exclude binning on both sides. They are not wrong and they are not
+comparable to an end-to-end figure. They keep their labels and the end-to-end
+headline is a new measurement, not a re-reading of an old one.
+
+**2. The end-to-end headline CANNOT be taken until the inverted binning pin is
+fixed**, and that fix is in the CPU campaign's fallout lane.
+
+`bench/real_data/engines.py` still injects `bin_construct_sample_cnt` from the
+training row count **for LightGBM**, while our own default moved to LightGBM's
+stock 200,000. So we bin a 200,000-row subsample and the comparator is forced to
+bin every row: **it does strictly more binning work than we do.**
+
+That was tolerable while binning was reported separately and held under an
+explicit void. **It is not tolerable once binning is inside the headline**, where
+it would inflate the number in our favour and be invisible. Our binning advantage
+is the largest single ratio this project has measured -- 6.3x at 1M -- and under
+an end-to-end headline it flows directly into the result.
+
+**So the order is: `engines.py` fix lands, then the window opens.** Recorded here
+rather than raised as a conversation, because it is a sequencing fact rather than
+a disagreement.
+
+# Closed with evidence. Do not reopen without a new number.
+
+- **`DeviceGraph` on Metal.** Verified by execution: raises at builder creation;
+  `MetalDeviceGraphBuilder.cpp` absent from a driver set containing the CUDA and
+  HIP equivalents.
+- **Device row-major bins.** Reopens on exactly one condition: the
+  atomic-fraction probe showing the gather under ~10 percent of the histogram
+  phase.
+- **K >= 2 speculation.** A theorem, not a measurement: the children a step
+  creates have no records until that step's own search writes them, and the
+  pre-existing leaves' ranking provably cannot move across a commit.
+- **Feature-blocked layout at 256 bins.** Two lanes, independently.
+- **CPU fallback for wide features.** It would merge per-node histogram cells
+  from a Float64 backend and a fixed-point one, which is not a hybrid split but a
+  histogram with no single definition.
+
+# On fixed point, stated so it stops drifting
+
+**Neither a proven advantage nor a proven handicap on this platform.** XGBoost's
+int64 quantiser is precedent for **determinism**, not validation of cost. Cite it
+as precedent only. The one thing measured here is that the power-of-two scale
+made dequantization exact and *tightened* the overflow bound by 64 units.
