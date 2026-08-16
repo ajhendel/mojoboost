@@ -164,6 +164,10 @@ stay Float64. The narrowing is applied at the objective and **again at every
 read site**, which makes it idempotent and is what keeps the gathered and
 ungathered accumulation paths adding identical Float64s.
 
+This is the default and not the only setting; §1.6 has the measured trade that
+made it a switch, and what `derivative_precision = "float64"` changes. Both
+properties below are properties of the Float32 default.
+
 Two properties follow that a reader should not have to discover from a test.
 
 **Sample-weight scaling is exact only to Float32 precision.** The code forms
@@ -180,6 +184,82 @@ is a Float64 that generally is not Float32-representable. `histogram_sparse`
 and the row-major kernels both had to be corrected for exactly this, and both
 failures presented as a builder disagreeing with the dense reference rather
 than as anything that looked like a precision problem.
+
+### 1.6 It is a measured trade, and therefore a switch: `derivative_precision`
+
+Float32 is not free, and the numbers below are the reason this is a parameter
+rather than a constant. They are the first `bench/real_data` run after the
+narrowing landed, comparing the run before it against the run after it on the
+same scenarios, same seeds, same binning.
+
+**What it bought.** Agreement between this package's own CPU and accelerator
+arms, which is what makes a backend claim checkable at all:
+
+| scenario | metric | before Float32 | after Float32 |
+|---|---|---|---|
+| dense_regression | rmse, CPU vs GPU | 1.6e-04 | **7.9e-09** |
+| dense_regression | mae, CPU vs GPU | 2.0e-04 | 6.2e-09 |
+
+Four orders of magnitude on RMSE. The device carries gradients in Float32 and
+accumulates in Int32 fixed point (§1.4); a CPU path carrying Float64
+derivatives was disagreeing with it for that reason and no other.
+
+**What it cost.** Accuracy on the imbalanced binary scenario, on the CPU arm
+alone. The accelerator arm barely moved, so this is a precision effect and not
+two backends drifting:
+
+| scenario | metric | before Float32 | after Float32 | change |
+|---|---|---|---|---|
+| imbalanced_binary | average_precision, CPU arm | 0.0136 | 0.0123 | **-9.4% relative** |
+| imbalanced_binary | auc, CPU arm | 0.7339 | 0.7279 | -0.006 absolute |
+| imbalanced_binary | average_precision, CPU vs GPU | 0.00497 | **0.0736** | wider |
+| imbalanced_binary | auc, CPU vs GPU | 0.00317 | 0.0054 | wider |
+
+The CPU-vs-GPU columns widen on this scenario while narrowing on
+`dense_regression`, which is the same fact seen twice: the CPU arm moved and
+the accelerator arm did not.
+
+Provenance: **measured**, `bench/real_data`, one run per side, on the
+scenario's synthetic variant at a 0.5 percent positive rate (the real variant,
+`bank_marketing`, sits near an average precision of 0.68 and is not where this
+shows). Two runs are two runs and not a distribution; average precision on a
+rare class is dominated by the ordering of a few hundred rows and is the
+noisiest number in the harness. Read the direction, not the third digit.
+
+**The decision, and it did not change.** Float32 stays the default. It is
+LightGBM's own profile (`typedef float score_t`, `include/LightGBM/meta.h`),
+and on `imbalanced_binary` it puts this package *at* LightGBM's average
+precision and AUC rather than above them, which is the parity the project is
+aiming at. A number that moves toward the comparator is not a regression even
+when it moves down.
+
+**But a measured trade becomes a switch.** `derivative_precision` takes
+`float32` (the default, everything above) or `float64`, and `float64` keeps
+per-row gradients and hessians at full Float64 through the objective and every
+read site. Reach it with `MOJOTREES_DERIVATIVE_PRECISION=float64`, which is
+read once per fit by `histogram.ConstHessianSettings.resolve()` and once per
+round by `boosting.fill_grad_hess`.
+
+**What `float64` buys and what it costs, for a reader deciding.** It buys back
+the accuracy in the second table on a rare-class ranking metric, and it buys
+an exact sample-weight identity (§1.5's first property is a Float32 property
+and does not apply). It costs, in order of size:
+
+- **Agreement with the accelerator**, which is the first table run backwards.
+  A `float64` CPU fit and a device fit are not comparable to the precision
+  §1.4 claims, and `bench/real_data`'s `device_agreement` gate is calibrated
+  for the Float32 default.
+- **Speed.** The gathered `(gradient, hessian)` pair buffer packs two Float32
+  into one Float64 word, so it cannot carry a Float64 derivative and does not
+  run; and the row-blocked private histograms have that buffer as their only
+  row source on the subset arm, so blocking is off in *both* builders (both,
+  because one-sided blocking is what produced a four-ulp leaf-value
+  disagreement between the bagged and whole-dataset paths). A timing taken
+  under `float64` is not a timing of this package's CPU path.
+- **Bit identity with any published number**, all of which are Float32.
+
+What it does not cost: determinism across worker counts, which §1.1 promises
+at both settings and `tests/test_derivative_precision.mojo` checks at both.
 
 ## 2. What contraction is, and why it is the hazard
 

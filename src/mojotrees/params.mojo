@@ -56,6 +56,7 @@ from .growth_policy import parse_grow_policy
 from .tree_parameters_extra import (
     check_extra_option_supported,
     check_feature_pre_filter,
+    parse_derivative_precision,
     parse_monotone_method,
 )
 
@@ -79,7 +80,7 @@ comptime SUPPORTED_KEYS = String(
     " data_sample_strategy, max_bin, alpha, fair_c,"
     " tweedie_variance_power, device, use_missing,"
     " use_quantized_grad, num_grad_quant_bins, quant_train_renew_leaf,"
-    " stochastic_rounding"
+    " stochastic_rounding, derivative_precision"
 )
 
 # Parameters that name a real LightGBM feature this parser does not cover,
@@ -581,6 +582,19 @@ def parse_params(spec: String) raises -> TrainConfig:
         elif key == "stochastic_rounding":
             config.booster.tree.extra.stochastic_rounding = _parse_bool(
                 key, value
+            )
+        # `derivative_precision`, which is not a LightGBM parameter name:
+        # LightGBM fixes the same choice at compile time with
+        # `SCORE_T_USE_DOUBLE`. It is a key rather than a `MOJOTREES_*`
+        # override because it changes a fit's numbers, which is where this
+        # package draws that line. `float32` is the default and is LightGBM's
+        # profile; `float64` parses and then fails validation with a sentence
+        # naming the environment variable that does reach the trainer
+        # (`ExtraTreeParams.check_derivative_precision`), which is the same
+        # refuse-rather-than-ignore path `use_quantized_grad` takes above.
+        elif key == "derivative_precision":
+            config.booster.tree.extra.derivative_precision = (
+                parse_derivative_precision(value)
             )
         elif (
             key == "monotone_penalty"
