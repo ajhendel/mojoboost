@@ -307,13 +307,16 @@ def device_selection():
         "\ndevice='auto' resolves to the CPU unless a crossover rule covers\n"
         "the run, or MOJOTREES_AUTO_MIN_CELLS is set. The crossover table\n"
         "holds one rule, scoped to Metal on an Apple M4 for squared error,\n"
-        "single output, at 1,000,000 rows by 50 features and above, where\n"
-        "the GPU trains in 3.58s against the CPU's 6.98s. Below that the\n"
-        "CPU wins and is chosen: 1.66s against 1.89s at 250,000 rows and\n"
-        "0.564s against 1.63s at 50,000. The hardware is identified from\n"
-        "the accelerator this build was compiled for, which is reported as\n"
-        "profile_source 'build-target'. See docs/DEVICE_SELECTION.md and\n"
-        "docs/GPU_VALIDATION.md."
+        "single output, dense input, 50 or more features, and 250,000 or\n"
+        "more rows (AUTO_GPU_MIN_ROWS). At 1,000,000 x 50 the GPU trains in\n"
+        "3.58s against the CPU's 6.98s. That 250,000-row floor is a\n"
+        "provisional constant set below the measured evidence, not a\n"
+        "measured crossover; at 50,000 x 50 the CPU wins by 2.9x and is\n"
+        "chosen. MOJOTREES_DERIVATIVE_PRECISION=float64 keeps the CPU at\n"
+        "every shape, because the device narrows derivatives to Float32.\n"
+        "The hardware is identified from the accelerator this build was\n"
+        "compiled for, which is reported as profile_source 'build-target'.\n"
+        "See docs/DEVICE_SELECTION.md and docs/GPU_VALIDATION.md."
     )
 
 

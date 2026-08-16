@@ -65,10 +65,12 @@ readbacks per round at about 606 microseconds each. Those round trips cost
 what they cost whatever the row count, which is the 1.5 seconds of fixed
 per-fit cost the table above implies.
 
-One crossover rule now ships from these records, scoped to Metal on an M4 at
-the largest shape. `device="auto"` still resolves to the CPU because that
-rule cannot match a device profile that names no hardware, which is a wiring
-gap rather than a missing measurement.
+One crossover rule ships from these records, scoped to Metal on an M4 for
+squared error. It fires: the hardware is identified from the build target,
+so `device="auto"` selects the accelerator from 250,000 rows by 50 features
+up. That row floor is `AUTO_GPU_MIN_ROWS`, a provisional constant set below
+the largest shape in this table rather than at it, and the reasoning is in
+`src/mojotrees/device_policy.mojo`.
 
 This table still starts empty, and filling it is still worth doing, because
 every number above is one machine. A second data point on different silicon

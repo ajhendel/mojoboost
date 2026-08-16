@@ -74,6 +74,7 @@ from mojotrees.device import (
     resolve_device,
 )
 from mojotrees.device_policy import (
+    AUTO_GPU_MIN_ROWS,
     BLOCK_NO_ACCELERATOR,
     DECISION_AUTO_CPU_BELOW_EVIDENCE,
     DECISION_AUTO_CPU_BLOCKED,
@@ -82,7 +83,6 @@ from mojotrees.device_policy import (
     DeviceRequest,
     M4_TRAINING_EVIDENCE_ID,
     M4_TRAINING_MIN_FEATURES,
-    M4_TRAINING_MIN_ROWS,
     OBJECTIVE_UNSPECIFIED,
     POLICY_VERSION,
     PROFILE_BUILD_TARGET,
@@ -253,7 +253,7 @@ def test_a_contradicting_declaration_removes_identity_rather_than_adding_one(
         # And with the generation gone, the measured shape falls back to the
         # CPU: hardware cannot be misdeclared into a crossover rule.
         var decision = decide_device(
-            _auto(M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
+            _auto(AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
             conflicting,
         )
         assert_equal(decision.selected_device, CPU_DEVICE)
@@ -311,7 +311,7 @@ def test_an_open_context_still_outranks_the_build_target() raises:
     assert_equal(caps.profile_source, PROFILE_REPORTED)
     assert_equal(caps.profile.apple_generation, APPLE_GEN_M4)
     var decision = decide_device(
-        _auto(M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES), caps
+        _auto(AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES), caps
     )
     assert_equal(decision.selected_device, GPU_DEVICE)
     assert_true(decision.validated())
@@ -348,7 +348,7 @@ def test_auto_reaches_the_gpu_at_the_measured_shape() raises:
         return
     var caps = DeviceCapabilities.detect()
     var decision = decide_device(
-        _auto(M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES), caps
+        _auto(AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES), caps
     )
     assert_equal(decision.selected_device, GPU_DEVICE)
     assert_equal(decision.decision_code, DECISION_AUTO_GPU_EVIDENCE)
@@ -367,20 +367,21 @@ def test_auto_reaches_the_gpu_at_the_measured_shape() raises:
     assert_true(warned)
 
 
-def test_auto_keeps_the_cpu_below_the_measured_shape() raises:
-    """The other half, and it is measured rather than merely unclaimed.
+def test_auto_keeps_the_cpu_below_the_row_floor() raises:
+    """The other half of the gate: one row under the floor is the CPU.
 
-    `bench/results/profile_2026-08-15/RESULTS.md`, arms interleaved, median
-    of three: at 250,000 x 50 the CPU is 1.66 s against the GPU's 1.89 s, and
-    at 50,000 x 50 it is 0.564 s against 1.63 s. The GPU loses at both, by
-    2.9x at the smaller one. So these two assertions are not conservatism in
-    the absence of data; they are the data.
+    The floor is `AUTO_GPU_MIN_ROWS`, a provisional constant at 250,000 rows
+    rather than a measured crossover, so this test asserts an *edge* rather
+    than a claim about performance. `AUTO_GPU_MIN_ROWS - 1` is the assertion
+    that carries the weight: it fails the moment the floor stops being a
+    hard comparison against one number, which is what a "roughly" or a
+    fitted expression growing in its place would look like.
 
-    999,999 x 50 is different and is the conservative one. The crossover lies
-    somewhere in (250,000, 1,000,000] rows and nothing inside that interval
-    has been run, so the floor sits at the top of it. It is `min_rows` and not
-    only `min_cells`, which is why one row below the measured shape is
-    outside the rule even though the cell count barely moves.
+    50,000 x 50 is the shape where staying on the CPU is also the measured
+    answer: `bench/results/profile_2026-08-15/RESULTS.md`, arms interleaved,
+    median of three, has the CPU at 0.564 s against the GPU's 1.63 s, a 2.9x
+    loss. That is the near end of the interval the floor is deliberately
+    kept above.
 
     `bench/results/session3_2026-08-16/RESULTS.md` has larger and more recent
     figures at 50,000 and 250,000 and they do not bear on this: both arms of
@@ -392,7 +393,7 @@ def test_auto_keeps_the_cpu_below_the_measured_shape() raises:
     if not _on_the_measured_build():
         return
     var caps = DeviceCapabilities.detect()
-    var shapes: List[Int] = [50_000, 250_000, 999_999]
+    var shapes: List[Int] = [50_000, 100_000, AUTO_GPU_MIN_ROWS - 1]
     for i in range(len(shapes)):
         var decision = decide_device(
             _auto(shapes[i], M4_TRAINING_MIN_FEATURES), caps
@@ -402,10 +403,11 @@ def test_auto_keeps_the_cpu_below_the_measured_shape() raises:
             decision.decision_code, DECISION_AUTO_CPU_BELOW_EVIDENCE
         )
         assert_false(decision.validated())
-    # And the feature floor, at a shape with more than enough cells: a
-    # 5,000,000 x 10 matrix is 50,000,000 cells and a tenth of the measured
-    # feature count, which is a different ratio of per-node launch cost to
-    # per-node work and which the record says nothing about.
+    # And the feature floor, at a shape with far more than enough rows: a
+    # 5,000,000 x 10 matrix clears the row floor twenty times over with a
+    # fifth of the measured feature count, which is a different ratio of
+    # per-node launch cost to per-node work and which the record says
+    # nothing about. The row floor moved; the feature scope did not.
     var narrow = decide_device(_auto(5_000_000, 10), caps)
     assert_equal(narrow.selected_device, CPU_DEVICE)
     assert_false(narrow.validated())
@@ -426,14 +428,14 @@ def test_resolve_device_reaches_the_gpu_only_with_an_objective() raises:
         return
     assert_equal(
         resolve_device(
-            AUTO_DEVICE, M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES, 1
+            AUTO_DEVICE, AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES, 1
         ),
         CPU_DEVICE,
     )
     assert_equal(
         resolve_device(
             AUTO_DEVICE,
-            M4_TRAINING_MIN_ROWS,
+            AUTO_GPU_MIN_ROWS,
             M4_TRAINING_MIN_FEATURES,
             1,
             OBJECTIVE_UNSPECIFIED,
@@ -444,7 +446,7 @@ def test_resolve_device_reaches_the_gpu_only_with_an_objective() raises:
     assert_equal(
         resolve_device(
             AUTO_DEVICE,
-            M4_TRAINING_MIN_ROWS,
+            AUTO_GPU_MIN_ROWS,
             M4_TRAINING_MIN_FEATURES,
             1,
             SQUARED_ERROR,
@@ -455,7 +457,11 @@ def test_resolve_device_reaches_the_gpu_only_with_an_objective() raises:
     # what the objective bought is reachability and not a bypass.
     assert_equal(
         resolve_device(
-            AUTO_DEVICE, 250_000, M4_TRAINING_MIN_FEATURES, 1, SQUARED_ERROR
+            AUTO_DEVICE,
+            AUTO_GPU_MIN_ROWS - 1,
+            M4_TRAINING_MIN_FEATURES,
+            1,
+            SQUARED_ERROR,
         ),
         CPU_DEVICE,
     )
@@ -477,7 +483,7 @@ def test_no_accelerator_keeps_the_cpu_at_the_measured_shape() raises:
     var absent = DeviceCapabilities.unavailable()
     assert_equal(absent.profile_source, PROFILE_NONE)
     var decision = decide_device(
-        _auto(M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES), absent
+        _auto(AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES), absent
     )
     assert_equal(decision.selected_device, CPU_DEVICE)
     assert_equal(decision.decision_code, DECISION_AUTO_CPU_BLOCKED)
@@ -492,7 +498,7 @@ def test_no_accelerator_keeps_the_cpu_at_the_measured_shape() raises:
     assert_equal(
         resolve_device(
             AUTO_DEVICE,
-            M4_TRAINING_MIN_ROWS,
+            AUTO_GPU_MIN_ROWS,
             M4_TRAINING_MIN_FEATURES,
             1,
             SQUARED_ERROR,
@@ -506,8 +512,14 @@ def test_policy_version_records_that_reachability_changed() raises:
     """A version-2 report saying "no rule covered this" and a version-3 one
     saying it mean different things: under version 2 the table was non-empty
     and unreachable. The number is what lets a reader tell them apart, and
-    `profile_source` is what tells them which detector answered."""
-    assert_true(POLICY_VERSION >= 3)
+    `profile_source` is what tells them which detector answered.
+
+    Version 4 is the second such distinction and is about the floor rather
+    than about reachability: from 4 on, a GPU selection between 250,000 and
+    1,000,000 rows rests on `AUTO_GPU_MIN_ROWS`, a provisional constant set
+    below the measured evidence, and a report carrying the number says so.
+    """
+    assert_true(POLICY_VERSION >= 4)
     assert_equal(profile_source_name(PROFILE_BUILD_TARGET), "build-target")
 
 
