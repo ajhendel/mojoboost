@@ -83,28 +83,41 @@ and `histogram_from_host` (fixed-point to Float64 conversion).
 One-way is the whole claim, and in particular it is not a claim that the
 upload is asynchronous. On Metal `enqueue_copy` is a synchronous full-queue
 drain in **both** directions: it commits an empty command buffer, waits for
-it, and then memcpys. That was measured by disassembling the shipped MAX
+it, and then memcpys. That was **measured** by disassembling the shipped MAX
 Metal runtime and is written out with its consequences in
-`docs/GPU_PORTABILITY.md` section 6.1. So `upload_staged` is a host
-synchronization exactly as `download_raw` is, the `stage_gradients` and
-`upload_staged` split above is a split between host conversion work and a
-wait rather than between two enqueues, and any per-round staging (gradients,
-a bag mask, a GOSS row vector, a scale word) is a per-round wait that has to
-be counted as one. What the staged route still buys over `map_to_host` is
-the second direction's bytes and a separately timeable phase, which is why
-it stays.
+`docs/GPU_PORTABILITY.md` section 6.1. So `upload_staged` is a full-queue
+drain exactly as `download_raw` is, the `stage_gradients` and `upload_staged`
+split above is a split between host conversion work and a drain rather than
+between two enqueues, and any per-round staging (gradients, a bag mask, a
+GOSS row vector, a scale word) is a per-round ordering point that has to be
+counted as one. What the staged route still buys over `map_to_host` is the
+second direction's bytes and a separately timeable phase, which is why it
+stays.
 
-Counting the ordinary round's waits under that rule gives three, all of them
+A drain is not a wait, and the difference is the whole of section 6.1.1,
+withdrawn 2026-08-16. `download_raw` is a **round trip**: the host reads a
+histogram and then decides what to enqueue next, so it blocks on unfinished
+device work and costs whatever that work had left. `upload_staged` is not;
+nothing is queued behind it and nothing reads a device answer. Draining a
+queue that holds nothing costs nothing, and the **measured** null is on the
+record: thirteen copies removed per tree elsewhere on this plane bought 0.016
+seconds at 1,000,000 x 50 against a registered prediction of 0.64
+(`bench/results/session3_2026-08-16/RESULTS.md`). Count round trips here to
+predict time; count copies to predict portability risk and staleness.
+
+Counting the ordinary round's drains under that rule gives three, all of them
 on the `upload_gradients` path: the `synchronize` in `stage_gradients`, and
 one copy per derivative plane in `upload_staged`. The gradient and hessian
 planes now share one device allocation and one pinned host arena laid out as
 `[grad | hess]`, so `upload_staged` moves both with a single copy and the
-round pays two waits instead of three; `grad_dev` and `hess_dev` are
+round has two ordering points instead of three; `grad_dev` and `hess_dev` are
 `create_sub_buffer` windows onto that allocation, so nothing that consumes
 them -- kernels, the device objectives, the multiclass scatter -- sees a
-change. The remaining `synchronize` stays on purpose and `stage_gradients`
-says why. `stage_from_device`, which only hybrid leaf scheduling reaches,
-still costs two copies and a synchronize of its own on top.
+change. **Three to two is one fewer copy per round, not a predicted saving**;
+it is one fewer staging lifetime and one fewer place a plane can go stale.
+The remaining `synchronize` stays on purpose and `stage_gradients` says why.
+`stage_from_device`, which only hybrid leaf scheduling reaches, adds two
+copies and a synchronize of its own on top.
 
 Which transfer route the binned matrix takes is resolved once per builder
 through `unified_memory_policy.resolve_from_env`, so `MOJOTREES_GPU_TRANSFER`
@@ -334,13 +347,20 @@ struct GpuHistogramBuilder(Movable):
     # derivatives as `[grad | hess]`, adjacent and in that order, and the two
     # windows onto it that every kernel and every consumer still sees.
     #
-    # Why one allocation. `enqueue_copy` is a host wait on Metal whatever the
-    # byte count is (`docs/GPU_PORTABILITY.md` section 6.1, established by
-    # disassembly), so two plane copies per round cost two waits and one
-    # costs one. The two planes are the same dtype and the same length, so
-    # concatenating them is a plain adjacency: no bitcast, no conversion, no
-    # padding, and the bytes each plane's window receives are exactly the
-    # bytes its separate buffer used to receive.
+    # Why one allocation. `enqueue_copy` is a full-queue drain on Metal
+    # whatever the byte count is (`docs/GPU_PORTABILITY.md` section 6.1,
+    # **measured** by disassembly), so two plane copies per round are two
+    # drains and one is one. The two planes are the same dtype and the same
+    # length, so concatenating them is a plain adjacency: no bitcast, no
+    # conversion, no padding, and the bytes each plane's window receives are
+    # exactly the bytes its separate buffer used to receive.
+    #
+    # Two drains to one is not two waits to one. Section 6.1.1, withdrawn
+    # 2026-08-16, took back the step that priced a drain: nothing is queued
+    # behind these uploads, and draining an empty queue costs nothing. So the
+    # argument for one allocation is one staging lifetime instead of two and
+    # one ordering point instead of two, plus a `[grad | hess]` pair that
+    # cannot arrive half fresh. No time may be predicted from it.
     #
     # Why windows rather than an offset pointer. `grad_dev` and `hess_dev`
     # leave this file as `DeviceBuffer`s (`gpu_objectives_native`'s fills and
@@ -760,19 +780,32 @@ struct GpuHistogramBuilder(Movable):
         Not a numeric option and not a launch shape either: the two arms
         write identical bytes to identical device addresses, and the argument
         for that is at `upload_staged`. The only difference is the number of
-        host waits the round pays, because on Metal `enqueue_copy` is a
-        synchronous full-queue drain whose cost does not scale with the byte
-        count (`docs/GPU_PORTABILITY.md` section 6.1).
+        drains the round issues, because on Metal `enqueue_copy` is a
+        synchronous full-queue drain whose behavior does not scale with the
+        byte count (`docs/GPU_PORTABILITY.md` section 6.1).
 
-        Why fused is the default rather than the requested arm. The usual
-        rule here is that an unmeasured arm has to be asked for. That rule is
-        about arms whose sign is unknown, and this one's is not: section 6.1
-        establishes the wait and instructs a design to count every copy as a
-        synchronization, so removing a copy removes a synchronization by an
-        established fact rather than by a guess, and the bytes that move are
-        the same bytes. The split arm survives so the removal can be
-        **measured** rather than only **derived**, which is the only thing
-        the default costs.
+        **What that difference is worth is not a time.** An earlier version of
+        this docstring called the two copies two host waits and justified the
+        default on the ground that removing a copy removes a synchronization
+        by an established fact. Section 6.1.1 withdrew that inference on
+        2026-08-16: a drain of a queue holding nothing costs nothing, and
+        nothing is queued behind a gradient upload. The nearest **measured**
+        point is the thirteen-copy collapse on the device-resident plane,
+        which bought 0.016 seconds at 1,000,000 x 50 against a registered
+        prediction of 0.64 and did not resolve under M0
+        (`bench/results/session3_2026-08-16/RESULTS.md`). Nothing here
+        predicts that fusing these two is different.
+
+        Why fused is still the default rather than the requested arm. The
+        usual rule is that an unmeasured arm has to be asked for, and that
+        rule is about arms whose sign is unknown. This one's sign is known in
+        the dimension that is left: the bytes that move are the same bytes,
+        and one copy is one staging lifetime, one ordering point, and one
+        place a `[grad | hess]` pair can arrive half fresh, where two are two.
+        It is a hazard and portability default, not a speed default, and no
+        speed claim may be attached to it. The split arm survives so an
+        interleaved A/B can be run if anyone wants it; the **estimate**, from
+        the null above, is that it will not resolve.
 
         Reachable in process, and only in process. `train_gpu` builds its own
         builder and takes its arm knobs as function parameters (`row_unroll`
@@ -927,12 +960,20 @@ struct GpuHistogramBuilder(Movable):
         with no build in between would come back to an arena whose copy is
         still in flight. A watermark (a copy sequence number against the
         sequence a synchronize last drained through) would be a real
-        guarantee and would cut the waits to one per arena-count rounds, but
+        guarantee and would cut the drains to one per arena-count rounds, but
         it buys a wait that is near zero where we can measure it, costs a
         pinned `2 * n_rows` Float32 per extra arena, and fails silently in
         exactly the way a stale host table failed silently in this project
-        this week. The fused upload below removes a wait unconditionally and
-        with no hazard at all, which is the better trade of the two.
+        this week. The fused upload below removes one drain unconditionally
+        and with no hazard at all, which is the better trade of the two.
+
+        Section 6.1.1, on 2026-08-16, strengthened the first reason rather
+        than weakening it: a copy is a drain but a drain is not a wait, and
+        the only **measured** point puts thirteen such copies per tree at
+        0.016 seconds, a null under M0. So the rotation is buying even less
+        than the paragraph above conceded, and the hazard argument in the
+        second reason is now the whole of the case. That argument is about
+        ordering and it stands unchanged.
         """
         if len(grad) != self.n_rows or len(hess) != self.n_rows:
             raise Error("gradient/hessian length must equal n_rows")
@@ -969,11 +1010,21 @@ struct GpuHistogramBuilder(Movable):
         `stage_gh[n_rows : 2 * n_rows]` to `gh_dev[n_rows : 2 * n_rows]`,
         which is exactly what the split arm's two copies write into the two
         windows. Neither arm converts, reorders, or pads anything. What
-        differs is one host wait, because on Metal a copy is a wait whatever
-        its byte count is and under four microseconds of the roughly 458 it
-        costs is actual byte movement (`docs/GPU_PORTABILITY.md` section 6.1,
-        the wait established by disassembly and the split **derived** from
-        it).
+        differs is one drain, because on Metal a copy drains the whole queue
+        whatever its byte count is (`docs/GPU_PORTABILITY.md` section 6.1,
+        **measured** by disassembly).
+
+        **One drain, not one wait, and the ~458 microseconds that used to be
+        written here has been taken off it.** That constant is **derived**
+        from the depthwise A/B and it is the price of a *round trip*; neither
+        of these copies is one, because nothing is queued behind them and no
+        host decision reads a device answer. Section 6.1.1 records the
+        withdrawal and the data: thirteen copies per tree removed elsewhere on
+        this plane **measured** 0.016 seconds against a registered prediction
+        of 0.64, a null under M0
+        (`bench/results/session3_2026-08-16/RESULTS.md`). The fused arm is
+        kept because one copy is one ordering point and one staging lifetime
+        where two are two, not because it is faster.
         """
         if self.fused_upload:
             self.ctx.enqueue_copy(
@@ -1909,9 +1960,14 @@ struct GpuHistogramBuilder(Movable):
         budget and not from the data, both are held in a one-element list so
         that "not open" is a length rather than a sentinel, and both reuse an
         already-open instance when it is deep enough. `DeviceTreeTables` costs
-        eleven buffers and one synchronization to construct, so building one
-        per tree would put a host wait back into every tree that this whole
-        lane exists to take out of every split.
+        eleven device allocations and one synchronization to construct, so
+        building one per tree would put eleven allocations and a drain back
+        into every tree. The allocations are the part that is real work; the
+        drain is an ordering point and, under `docs/GPU_PORTABILITY.md`
+        section 6.1.1, is not by itself a time. Neither is a round trip, so
+        nothing here should be quoted in seconds. Reusing is right on
+        allocation grounds and on the ordinary grounds that per-fit state
+        belongs on a per-fit object.
 
         It lives on the builder rather than on the growth loop for one
         practical reason: the builder is the object a fit already threads

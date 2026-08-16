@@ -59,16 +59,33 @@ it did not have to.
 
 One backend fact the model does not encode, and must not be read as denying.
 On Metal `enqueue_copy` is itself a synchronous full-queue drain in both
-directions, measured by disassembly of the shipped runtime and recorded in
-`docs/GPU_PORTABILITY.md` section 6.1. Two things follow for anyone reading
-this model's output on that backend. A copy is a synchronization whether or
-not the model was told to record one, so a per-round upload is a per-round
-wait and belongs in any count of them. And the second hazard class above,
-the host about to overwrite a staging buffer a copy may still be reading, is
-vacuous there, so an elided check the tracker reports against `RES_STAGE` is
-not a wait anyone could have removed. The model stays written against queue
-ordering rather than against Metal, which is what makes it portable and what
-makes it conservative in the safe direction.
+directions, **measured** by disassembly of the shipped runtime and recorded
+in `docs/GPU_PORTABILITY.md` section 6.1. Two things follow for anyone
+reading this model's output on that backend. A copy is a synchronization
+whether or not the model was told to record one, so a per-round upload is a
+per-round ordering point and belongs in any *hazard* count of them. And the
+second hazard class above, the host about to overwrite a staging buffer a
+copy may still be reading, is vacuous there, so an elided check the tracker
+reports against `RES_STAGE` is not a synchronization anyone could have
+removed. The model stays written against queue ordering rather than against
+Metal, which is what makes it portable and what makes it conservative in the
+safe direction.
+
+A third thing follows, and it is the one this file is most likely to be
+misread on. **What this tracker counts is hazards, not time.** Section 6.1.1,
+withdrawn 2026-08-16, records that draining a queue holding nothing costs
+nothing, and that the count which predicts seconds is the count of *round
+trips*: host code blocking on a device answer it needs before it can decide
+what to enqueue next. Removing thirteen copies per tree from the
+device-resident plane **measured** 0.016 seconds at 1,000,000 x 50 against a
+registered prediction of 0.64, a null under M0
+(`bench/results/session3_2026-08-16/RESULTS.md`). So a required check this
+model reports is a real ordering constraint and an elided one is a real
+redundancy, and neither number converts to a saving. `StagingRing` inherits
+the same correction: on Metal no copy is ever still in flight, so a second
+slot cannot be what avoids a wait, and `MOJOTREES_GPU_STAGING_SLOTS` above 1
+buys nothing on this backend. The ring is correct, cheap and portable and
+should stay; what is wrong is the expected value of turning it up.
 
 Nothing in this file removes a synchronization from histogram_gpu.mojo or
 train_gpu.mojo, and nothing here has been measured. It is the model and the

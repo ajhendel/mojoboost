@@ -2575,11 +2575,19 @@ struct GpuSplitSearcher(Movable):
     The four per-node tables live at fixed offsets inside one pinned
     staging allocation and one device allocation, and `_copy_tables` moves
     the whole thing in a single `enqueue_copy`. On Metal that is the
-    difference between four host waits and one, because a copy there costs a
-    full-queue drain regardless of its size. `set_table_upload_hoisting`
-    puts the four-copy arm back at run time for an interleaved measurement,
-    and `_copy_tables` argues why the two arms leave the device holding
-    identical bytes.
+    difference between four full-queue drains and one, because a copy there
+    drains regardless of its size (**measured** by disassembly,
+    `docs/GPU_PORTABILITY.md` section 6.1). **Four drains is not four waits.**
+    None of the four blocks on a device answer the host needs next, and under
+    section 6.1.1, withdrawn 2026-08-16, that is what separates a copy count
+    from a time: the collapse this is part of **measured** 0.016 seconds at
+    1,000,000 x 50 against a registered prediction of 0.64, a null under M0
+    (`bench/results/session3_2026-08-16/RESULTS.md`). What one copy instead of
+    four earns is three fewer ordering points, one staging lifetime instead of
+    four, and a device that cannot be left holding three fresh tables and one
+    stale one. `set_table_upload_hoisting` puts the four-copy arm back at run
+    time for an interleaved measurement, and `_copy_tables` argues why the two
+    arms leave the device holding identical bytes.
     """
 
     var ctx: DeviceContext
@@ -2640,10 +2648,17 @@ struct GpuSplitSearcher(Movable):
     # staging contract above.
     #
     # One-way, not asynchronous. On Metal `enqueue_copy` is a synchronous
-    # full-queue drain in both directions (measured by disassembly,
-    # `docs/GPU_PORTABILITY.md` section 6.1), so an upload here is a host
-    # synchronization and the copy below has to be counted as a wait, not
-    # as an enqueue. That is why there is one buffer and not four.
+    # full-queue drain in both directions (**measured** by disassembly,
+    # `docs/GPU_PORTABILITY.md` section 6.1), so an upload here is an ordering
+    # point and the copy below has to be counted as a drain, not as an
+    # enqueue. That is why there is one buffer and not four.
+    #
+    # It is a drain and not a wait. Section 6.1.1, withdrawn 2026-08-16, took
+    # back the step that turned each such drain into time: nothing is queued
+    # behind these uploads, and draining a queue that holds nothing costs
+    # nothing. So the reason for one buffer instead of four is the ordering
+    # and staleness argument above, plus one staging lifetime to reason about
+    # instead of four. It is not a predicted saving, and none may be quoted.
     #
     # One pinned buffer holding all four staged tables end to end, in the
     # same order and at the same offsets as `tables_dev`, so the packed
@@ -2930,7 +2945,16 @@ struct GpuSplitSearcher(Movable):
         same bytes in the same four tables before either kernel is enqueued
         (`_copy_tables` argues that region by region) and the same monotone
         vector (`set_monotone` argues that one). What differs is only how
-        many times the host blocks on a queue drain to put them there.
+        many drains it takes to put them there.
+
+        **What differs is not expected to be a time.** Both arms make the same
+        number of round trips, which under `docs/GPU_PORTABILITY.md` section
+        6.1.1 is the count that predicts time; they differ only in copies,
+        which predict portability risk and ordering hazards. The thirteen-copy
+        collapse this knob is part of **measured** 0.016 seconds at
+        1,000,000 x 50 against a registered prediction of 0.64, a null under
+        M0 (`bench/results/session3_2026-08-16/RESULTS.md`). Keep the knob for
+        the A/B and for the staleness argument, not for a predicted win.
 
         Takes effect on the next `_copy_tables`, which is the next
         `enqueue`, `search` or `enqueue_frontier`, and on the next
@@ -3047,26 +3071,43 @@ struct GpuSplitSearcher(Movable):
         """Put the four staged per-node tables on the device: one copy when
         `hoist_tables` is on, four when it is off.
 
-        Why this is where the waits were
-        --------------------------------
+        Why this is one call and not four
+        ---------------------------------
         On Metal `enqueue_copy` is a synchronous full-queue drain in both
-        directions, measured by disassembly and recorded in
-        `docs/GPU_PORTABILITY.md` section 6.1 at roughly 458 microseconds
-        against under 4 microseconds of actual byte movement for these
-        table sizes. The cost is therefore per *call*, not per byte, by two
-        orders of magnitude. Four calls that together move a few tens of
-        kilobytes cost four drains; one call that moves the same bytes
-        costs one. That ratio is what this method is built around, and it is
-        why the packed arm does not bother to skip regions that did not
-        change: not copying a clean region saves bytes, and bytes are not
-        the price.
+        directions, **measured** by disassembly and recorded in
+        `docs/GPU_PORTABILITY.md` section 6.1. Four calls that together move a
+        few tens of kilobytes are four drains; one call that moves the same
+        bytes is one. That is why the packed arm does not bother to skip
+        regions that did not change: not copying a clean region saves bytes,
+        and bytes were never what this was about.
 
-        `grow_tree_device_resident` counts sixteen host waits per tree on
-        the device-resident plane and attributes four of them to this
-        method. The packed arm makes it one, so that count is thirteen. The
-        shipping node-at-a-time and frontier loops call this once per split
-        rather than once per tree, so there the same change is four waits
-        per split down to one.
+        **What four drains are worth was overstated and the overstatement is
+        withdrawn.** An earlier version of this docstring priced each drain at
+        the ~458 microsecond per-synchronization constant and called the four
+        "where the waits were". That constant is **derived**, from the
+        depthwise A/B, and what that A/B removed were per-level *round trips*:
+        host code blocking on a device answer it needs before it can decide
+        what to enqueue next. None of these four is one. Section 6.1.1 records
+        the withdrawal, on 2026-08-16, together with the data that forced it:
+        collapsing thirteen copies per tree on the device-resident plane, four
+        of them this method's, **measured** 0.016 seconds at 1,000,000 x 50
+        against a registered prediction of 0.64
+        (`bench/results/session3_2026-08-16/RESULTS.md`), which is a null under
+        M0. Draining a queue that holds nothing costs nothing.
+
+        `grow_tree_device_resident` counts sixteen copies per tree on the
+        device-resident plane and attributes four of them to this method. The
+        packed arm makes it one, so that count is thirteen. The shipping
+        node-at-a-time and frontier loops call this once per split rather than
+        once per tree, so there the same change is four copies per split down
+        to one. **Read those as hazard and portability counts, not as a wait
+        budget.** What one copy instead of four earns here is three fewer
+        ordering points per call, one staging lifetime instead of four, and a
+        device that can no longer be left holding three fresh tables and one
+        stale one; that last is the argument this method is actually built
+        around, and it is a correctness property rather than a speed one. The
+        four-copy arm is kept as the arm an interleaved A/B holds this
+        against, not because anyone predicts it will lose on a clock.
 
         Why one allocation and not four plus a scatter
         ----------------------------------------------
@@ -3184,8 +3225,10 @@ struct GpuSplitSearcher(Movable):
         each mutator is the auditable form and is what the enumeration above
         would have driven; it was rejected only because packing dominates it
         on this call graph, not because it was wrong. The one place a skip
-        is both provable and worth a wait is the monotone vector, which has
-        no device writer at all, and `set_monotone` takes it.
+        is provable is the monotone vector, which has no device writer at
+        all, and `set_monotone` takes it. What that skip removes is a copy
+        and therefore an ordering point, not a wait; under section 6.1.1 no
+        copy count in this docstring converts to seconds.
 
         Ordering is unchanged. The copy is issued from `_launch` before
         either kernel is enqueued, into the same in-order queue, so the
@@ -3285,11 +3328,14 @@ struct GpuSplitSearcher(Movable):
         Called once per tree by the trainer (`train_gpu.mojo` line 1034) and
         handed the fit's constraint vector, which does not vary by tree.
         `map_to_host` moves the buffer in both directions on every use, so
-        an unconditional map is one or two host waits per tree spent writing
-        the same words that are already there. With `hoist_tables` on, this
-        maps only when the vector it is handed differs from the one this
-        searcher last wrote, which makes it once per fit for every
-        configuration mojotrees supports.
+        an unconditional map is one or two drains per tree spent writing the
+        same words that are already there. With `hoist_tables` on, this maps
+        only when the vector it is handed differs from the one this searcher
+        last wrote, which makes it once per fit for every configuration
+        mojotrees supports. Per tree to per fit is a reduction in ordering
+        points and in places the mirror could go stale; it is **not** a
+        predicted time, because nothing is queued behind those maps and
+        section 6.1.1 no longer permits a copy count to be priced.
 
         Why a mirror here is trustworthy, where it is not for the four
         tables `_copy_tables` carries. The skip is sound exactly when the
@@ -3464,17 +3510,22 @@ struct GpuSplitSearcher(Movable):
         """Enqueue the scan and reduction over `hist`, writing record slot
         `record`.
 
-        It does transfer, and on Metal it therefore waits. `_launch` copies
+        It does transfer, and on Metal it therefore drains. `_launch` copies
         the staged per-node tables across before either kernel is enqueued,
         and `enqueue_copy` on Metal is a synchronous full-queue drain
-        (measured by disassembly, `docs/GPU_PORTABILITY.md` section 6.1). An
-        earlier version of this line said "does not transfer or
+        (**measured** by disassembly, `docs/GPU_PORTABILITY.md` section 6.1).
+        An earlier version of this line said "does not transfer or
         synchronize" and was wrong on both halves. Nothing about the launch
-        changed; what changed is what a wait count may claim.
+        changed; what changed is what a copy count may claim.
 
-        That wait is **one** with `hoist_tables` on, where it was four: the
+        That drain is **one** with `hoist_tables` on, where it was four: the
         four tables share an allocation and cross in one copy. See
         `_copy_tables`.
+
+        It is a drain, not a round trip. No host decision here reads a device
+        answer, so under section 6.1.1 this ordering point predicts no time,
+        and four to one is a hazard and portability improvement rather than a
+        measured saving.
 
         `hist` is a device buffer of `3 * n_features * n_bins` Int32 words in
         `GpuHistogramBuilder`'s `[grad | hess | count]` layout, and `g_scale`
@@ -3638,21 +3689,30 @@ struct GpuSplitSearcher(Movable):
         `download_frontier`, which is one for the level rather than one per
         leaf.
 
-        It does transfer, and on Metal it therefore waits. The tables cross
-        in `_copy_tables` before the launches, and on Metal an
-        `enqueue_copy` is a synchronous full-queue drain in both directions,
-        measured by disassembly and recorded in `docs/GPU_PORTABILITY.md`
-        section 6.1. An earlier version of this line said "does not transfer
-        and does not synchronize", which was wrong on both halves. What this
-        entry point buys is one table crossing for a whole level instead of
-        one per node, which is still the point of it; what it does not buy
-        is a level with no host wait in it at all.
+        **The download per node is the part that is worth time**, because a
+        download is a round trip: the host reads a device answer and then
+        decides what to enqueue next. Removing about thirty of those per tree
+        **measured** 0.75 seconds at 1,000,000 x 50, resolved by a wide margin
+        (`bench/results/session3_2026-08-16/RESULTS.md`). That is the count
+        this entry point should be defended on.
 
-        That crossing is **one** copy with `hoist_tables` on and four with
-        it off. It was four unconditionally before the table-packing lane,
-        and `grow_tree_device_resident`'s per-tree wait count, which
-        attributed four of its sixteen to this call, is therefore thirteen
-        on the packed arm.
+        It does transfer, and on Metal it therefore drains. The tables cross
+        in `_copy_tables` before the launches, and on Metal an `enqueue_copy`
+        is a synchronous full-queue drain in both directions, **measured** by
+        disassembly and recorded in `docs/GPU_PORTABILITY.md` section 6.1. An
+        earlier version of this line said "does not transfer and does not
+        synchronize", which was wrong on both halves; a later one called that
+        drain a host wait, which section 6.1.1 withdrew on 2026-08-16. So a
+        level is not free of ordering points, and it is free of round trips
+        but one.
+
+        That crossing is **one** copy with `hoist_tables` on and four with it
+        off. It was four unconditionally before the table-packing lane, and
+        `grow_tree_device_resident`'s per-tree copy count, which attributed
+        four of its sixteen to this call, is therefore thirteen on the packed
+        arm. That is a hazard and portability count. Four to one bought
+        0.016 seconds across the whole thirteen-copy collapse, a null under
+        M0, and no part of it may be quoted as a saving.
 
         `hist` holds every node's histogram: the builder's single-node
         buffer when the batch has one node, and a multi-slot buffer

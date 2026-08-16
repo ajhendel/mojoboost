@@ -940,6 +940,14 @@ struct GpuSplitSearcherCache(Movable):
     was 100 rebuilds of an object whose contents were about to be
     overwritten node by node anyway.
 
+    The eighteen allocations are the part of that which is unambiguously
+    work. The copies and mappings are drains, and under
+    `docs/GPU_PORTABILITY.md` section 6.1.1 a drain is an ordering point
+    rather than a price: none of them is a round trip, and a queue with
+    nothing in it drains for nothing. Read them here as part of the hazard
+    surface a per-tree rebuild kept re-creating, not as a wait budget the
+    cache recovers.
+
     One of those eighteen is dead weight on this path in particular.
     `hist_dev` is `3 * n_features * n_bins` Int32, about 150 KB at 50
     features and 255 bins, and it is read by exactly two methods,
@@ -1539,14 +1547,24 @@ def _device_search_resident(
     # large and its `histogram` line is small: see the mode note in
     # phase_profile.mojo.
     #
-    # Not the batch's one wait, which is what this comment used to say. The
-    # `enqueue_frontier` above copies four staged tables across first, and on
-    # Metal each of those is itself a full-queue drain (measured by
-    # disassembly, docs/GPU_PORTABILITY.md section 6.1). So the batch costs
-    # four upload waits and this one download wait, and only the download is
-    # charged with `syncs=1` because only the download calls `synchronize`
-    # by name. A wait count taken from this profile is a count of explicit
-    # synchronizations, not of times the host blocked.
+    # It is the batch's one *round trip*, and that is the count that predicts
+    # time (docs/GPU_PORTABILITY.md section 6.1.1): host code reads a device
+    # answer here and then decides what to enqueue next. It is not the batch's
+    # only drain. The `enqueue_frontier` above copies the staged tables across
+    # first, and on Metal each copy is itself a full-queue drain (**measured**
+    # by disassembly, section 6.1), so the batch has those upload drains plus
+    # this download. Only the download is charged with `syncs=1`, because only
+    # the download calls `synchronize` by name.
+    #
+    # Two counts, and this profile carries one of them. `syncs` is a count of
+    # explicit synchronizations and is closest to the round-trip count, which
+    # is the one that predicts seconds. The upload drains belong on the copy
+    # count, which predicts portability risk and ordering hazards and does not
+    # convert to time: removing thirteen such copies per tree **measured**
+    # 0.016 seconds at 1,000,000 x 50 against a registered prediction of 0.64
+    # (bench/results/session3_2026-08-16/RESULTS.md), a null under M0. An
+    # earlier version of this comment called every one of them a wait the
+    # batch paid for; section 6.1.1 withdrew that on 2026-08-16.
     var root_dl_started = profile.clock()
     var root_recs = searcher.download_frontier(1)
     profile.charge(PROF_TRANSFER, n_root, root_dl_started, syncs=1)
@@ -1563,8 +1581,9 @@ def _device_search_resident(
     )
     var n_leaves = 1
     var schedule = GrowthSchedule(params.grow_policy)
-    # A batch is a host wait, so a level wider than the searcher's record
-    # capacity becomes several of them rather than one oversized launch.
+    # A batch ends in a download, so a batch is a round trip: the count that
+    # predicts time. A level wider than the searcher's record capacity
+    # therefore becomes several of them rather than one oversized launch.
     # Two records per split, since both children are searched.
     var per_batch = searcher.max_records // 2
     if per_batch < 1:

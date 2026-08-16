@@ -484,9 +484,18 @@ def _range_add_raw_kernel(
 # device buffers and therefore two `enqueue_copy` calls per tree, and section
 # 6.1 of `docs/GPU_PORTABILITY.md` establishes **by measurement** (disassembly
 # of the shipped Metal runtime) that an `enqueue_copy` on that backend is a
-# synchronous full-queue drain in both directions whose cost is a host wait
-# rather than a function of the byte count. So the second buffer was buying a
-# second wait to carry a few hundred bytes.
+# synchronous full-queue drain in both directions rather than a byte movement
+# whose behavior scales with the count. So the second buffer was a second
+# drain to carry a few hundred bytes.
+#
+# A second drain is not a second wait. Section 6.1.1, withdrawn 2026-08-16,
+# took back the step that priced a drain at the per-synchronization constant:
+# that constant is **derived** and it is the price of a round trip, and
+# neither of these uploads is one. The nearest **measured** point is thirteen
+# copies per tree removed on the device-resident plane for 0.016 seconds at
+# 1,000,000 x 50, a null under M0. So what the second buffer was buying is a
+# second ordering point and a second staging lifetime, which is reason enough
+# to be rid of it and is not a time.
 #
 # Every live leaf has exactly one segment and exactly one node, so the step is
 # a function of the segment and belongs in the segment record. Moving it here
@@ -772,10 +781,12 @@ struct GpuObjectiveState(Movable):
     one-way copy out of this buffer instead.
 
     One-way, not asynchronous. On Metal `enqueue_copy` is a synchronous
-    full-queue drain in both directions, measured by disassembly and
-    recorded in `docs/GPU_PORTABILITY.md` section 6.1, so what this buys
-    over the mapping is the second direction's bytes and not the wait. The
-    wait is still there, once per tree."""
+    full-queue drain in both directions, **measured** by disassembly and
+    recorded in `docs/GPU_PORTABILITY.md` section 6.1, so what this buys over
+    the mapping is the second direction's bytes and not the drain. The drain
+    is still there, once per tree, and under section 6.1.1 it is an ordering
+    point rather than a time: nothing is queued behind it and no host decision
+    reads a device answer through it."""
     var stage_seg: HostBuffer[DType.int32]
     """Pinned staging for `seg_dev`, on the same grounds. Since the step
     moved into the descriptor this is the whole of what
@@ -1127,10 +1138,16 @@ struct GpuObjectiveState(Movable):
         this docstring claimed more. It said the staged copy was
         asynchronous where the mapping blocked. It is not: on Metal
         `enqueue_copy` is a synchronous full-queue drain in both directions,
-        measured by disassembly of the shipped runtime and recorded in
-        `docs/GPU_PORTABILITY.md` section 6.1. So this call still costs one
-        host synchronization per tree, exactly as the mapping did, and a
-        wait budget for a round has to carry it.
+        **measured** by disassembly of the shipped runtime and recorded in
+        `docs/GPU_PORTABILITY.md` section 6.1. So this call still drains once
+        per tree, exactly as the mapping did, and a round's **hazard** budget
+        has to carry it.
+
+        Its **time** budget does not, and section 6.1.1 is why. A drain of a
+        queue holding nothing costs nothing; this upload blocks on no device
+        answer and nothing enqueued is waiting behind it, so it is an ordering
+        point and not a round trip. The two counts are separate and only the
+        round-trip count predicts seconds.
 
         The staging contract is the usual one and is kept for the backend
         where the copy really is asynchronous: the pinned buffer must not be
@@ -1186,10 +1203,14 @@ struct GpuObjectiveState(Movable):
         **by measurement** (disassembly of the shipped Metal runtime, plus a
         second measurement from outside the process in
         `docs/METAL_TIMELINE.md`) that on that backend an `enqueue_copy`
-        drains the whole queue and then memcpys, in both directions, so its
-        cost is a host wait and is very nearly independent of the byte
-        count. Two buffers therefore bought two waits to move a few hundred
-        bytes.
+        drains the whole queue and then memcpys, in both directions, and that
+        the drain is very nearly independent of the byte count. Two buffers
+        therefore meant two drains to move a few hundred bytes. Two drains and
+        not two waits: section 6.1.1, withdrawn 2026-08-16, is explicit that a
+        copy count predicts portability risk and ordering hazards while a
+        round-trip count predicts time, and neither of these is a round trip.
+        The paragraph below already declined to convert this into seconds, and
+        that was the right call.
 
         The step is now carried inside the range descriptor, in the word
         that was padding, as the Float32's own bits reinterpreted as an
