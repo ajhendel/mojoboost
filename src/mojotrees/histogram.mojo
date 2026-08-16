@@ -230,10 +230,20 @@ device path does have a multiply and it is an Int32 one, argued in
 
 from std.math import round
 from std.sys.info import simd_width_of
+from std.time import perf_counter_ns
 
 from .apple_cpu_policy import (
+    ASSUMED_CACHE_LINE_BYTES,
+    BIN_LAYOUT_AUTO,
+    BIN_LAYOUT_FEATURE_MAJOR,
+    BIN_LAYOUT_ROW_MAJOR,
+    ROW_BLOCK_PLANES,
     AccumulationPlan,
+    align_cells_up,
     derive_accumulation_plan_with,
+    env_bin_layout,
+    histogram_line_floats,
+    resolve_bin_layout,
     subtract_ops,
     subtract_ops_for_planes,
 )
@@ -2169,3 +2179,970 @@ def subtract_histogram_into(
         _resolve_const_hessian(const_hessian),
         settings,
     )
+
+
+# ---------------------------------------------------------------------------
+# The row-major accumulation
+# ---------------------------------------------------------------------------
+#
+# The same histogram, read out of `BinnedMatrix.row_bins` instead of
+# `BinnedMatrix.bins`. LightGBM calls this pair `force_row_wise` and
+# `force_col_wise` and picks between them by timing one construction of each
+# at the start of the fit; `choose_bin_layout_timed` below is that probe.
+#
+# **Which builder reads which array, stated here because a GPU reader will
+# look in this file for it.** Every builder in this module except the
+# `_row_major` ones reads `bins`, the feature-major column array, and always
+# has: `build_histogram`, `build_histogram_subset` and all their `_into`
+# forms, the sibling subtraction, and `build_histogram_subset_replica_into`
+# (the hybrid scheduler's host replica). **Every GPU path also reads `bins`**
+# -- the device histogram kernels upload and scatter the column array,
+# `train_gpu`'s resident data plane holds the column array, and nothing on the
+# device is ever handed `row_bins`. A device scatter wants the coalesced
+# column, not the record, so the group-major / feature-blocked device layout
+# question is a *separate* decision from this one and neither constrains the
+# other. Turning `MOJOTREES_CPU_ROW_MAJOR` on cannot change a device result;
+# it costs the fit one extra copy of the bin matrix and nothing else. The
+# byte figure is on `binning.BinnedMatrix`.
+#
+# **These kernels move no bits, and that is the whole correctness claim.** A
+# row-major build visits the same rows in the same order and adds the same
+# Float64 into the same cell as its feature-major twin; only the address the
+# bin id is loaded from changes. Three things make that hold rather than
+# merely be intended:
+#
+# 1. **One plan, two arms.** Both arms are run against the *same*
+#    `AccumulationPlan`, taken from the same `_plan_accumulation` call on the
+#    same arguments. `plan.row_blocks` is the one field that is part of the
+#    value (see `apple_cpu_policy`'s docstring), so the layout choice must
+#    never be allowed to reach it, and here it cannot: the layout is not an
+#    argument to the plan.
+# 2. **Ascending rows inside a block, ascending blocks in the fold.** Both are
+#    preserved verbatim from `_accumulate_subset_blocked_at`.
+# 3. **The group width is free.** The interleave width partitions *features*
+#    across tasks and never reassociates a cell's sum, which is why the
+#    blocked row-major kernel below can put every active feature in one inner
+#    loop -- the thing that makes the layout worth having -- without that
+#    being a numerics change.
+#
+# What the two arms actually differ in is memory traffic, and the argument is
+# in the lane report rather than in a cost function here: LightGBM's entire
+# auto rule is the timed shot, and a cost model nobody measured would be
+# tuning by another name.
+
+comptime FOLD_BIN_CHUNK = 4 * SIMD_LANES
+"""Bins one fold task takes from one feature's slice.
+
+The row-major fold dispatches over `(active slot, bin chunk)` pairs rather
+than over whole slots, which is LightGBM's `HistMerge` shape -- they reduce
+their per-thread buffers with `schedule(static, 1)` over bin ranges.
+
+**Why parallelizing the fold is legal here and does not reassociate
+anything.** A unit owns the output range `[f * n_bins + b0, f * n_bins + b1)`
+and nothing else: no other unit reads it and no other unit writes it. Inside
+the unit, each cell sums its blocks in ascending block order, in a loop the
+task count cannot enter. So the fold's parallel structure decides *which core*
+sums a cell and never *in what order*, and the histogram is identical at every
+`MOJOTREES_NUM_WORKERS`. That is exactly the argument the feature-major fold
+makes for its slot ranges; splitting the bins as well only makes the units
+smaller.
+"""
+
+
+def _row_major_slot_meta(
+    data: BinnedMatrix,
+    features: List[Int],
+    n_active: Int,
+    mut meta: List[Int],
+) raises -> Int:
+    """Per-active-slot constants for the row-major kernels, and the compact
+    cell count.
+
+    Four Ints per slot, interleaved so one cache line carries several slots:
+    the slot's offset into a compact histogram, the byte its feature occupies
+    in a row record, the nibble shift, and the nibble mask. A sentinel slot at
+    the end holds the total, so slot `j`'s width is
+    `meta[4 * (j + 1)] - meta[4 * j]` with no special case for the last one.
+
+    The offsets are LightGBM's `group_bin_boundaries_` idea applied to the
+    private accumulator: a compact histogram over the active features costs
+    `sum_j feature_bins[f_j]` cells instead of `n_active * n_bins`. On a
+    dataset whose features average 40 realized bins out of a 255-bin budget
+    that is a sixth of the storage, which is the difference between a private
+    partial that lives in L2 and one that does not. It never reaches the
+    output, which keeps its `f * n_bins + b` shape.
+
+    One `List[Int]` per build, `4 * (n_active + 1)` entries -- 1.6 KB at 50
+    features. In the same class as the active mask `_zero_excluded` already
+    allocates per call, and three orders of magnitude below the gather buffer
+    the same call reuses.
+    """
+    meta.resize(4 * (n_active + 1), 0)
+    var use_all = len(features) == 0
+    var off = 0
+    for j in range(n_active):
+        var f = j if use_all else features[j]
+        meta[4 * j] = off
+        meta[4 * j + 1] = data.row_byte[f]
+        meta[4 * j + 2] = data.row_shift[f]
+        meta[4 * j + 3] = data.row_mask[f]
+        off += data.feature_bins[f]
+    meta[4 * n_active] = off
+    return off
+
+
+def row_major_line_floats() -> Int:
+    """Float64 slots one private partial is padded to a multiple of.
+
+    Taken from `ASSUMED_CACHE_LINE_BYTES`, a compilation-target fact, rather
+    than from the detected profile: padding to a line that is too *large*
+    costs a few hundred bytes of scratch and padding to one too small costs
+    two cores a contested line on every store, so the conservative direction
+    is up, and the target's line is never smaller than the machine's.
+    """
+    return histogram_line_floats(ASSUMED_CACHE_LINE_BYTES)
+
+
+def row_major_scratch_floats(
+    plan: AccumulationPlan, compact_cells: Int
+) raises -> Int:
+    """Float64 slots the row-major blocked kernel needs in the caller's
+    scratch, gather region included. Zero for an unblocked plan.
+
+    Deliberately *not* `AccumulationPlan.block_scratch_floats`: that sizes the
+    feature-major partials, which are `n_active * n_bins` cells with no
+    padding. These are compact (`compact_cells`) and line-padded, so they are
+    a different number, and a scratch sized from one and indexed by the other
+    is the failure this function exists to make impossible.
+    """
+    if not plan.blocked():
+        return 0
+    var line = row_major_line_floats()
+    var part_off = row_major_part_offset(plan)
+    return part_off + ROW_BLOCK_PLANES * plan.row_blocks * align_cells_up(
+        compact_cells, line
+    )
+
+
+def row_major_part_offset(plan: AccumulationPlan) raises -> Int:
+    """Where the private partials start in the caller's scratch: after the
+    gather region, rounded up to a cache line so block 0's partials do not
+    share a line with the last gathered pair."""
+    var line = row_major_line_floats()
+    if not plan.compact_rows:
+        return 0
+    return align_cells_up(2 * plan.block_rows * plan.row_blocks, line)
+
+
+def build_histogram_subset_row_major(
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    features: List[Int] = [],
+    const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> Histogram:
+    """`build_histogram_subset` over the row-major view of the same data.
+
+    Bit-identical to `build_histogram_subset` on the same arguments. Raises if
+    `data` has no row-major view, because silently reading the other layout
+    would make a benchmark arm indistinguishable from its control -- which is
+    the failure this project has already had twice.
+    """
+    var out = Histogram.zeroed(data.n_features, data.n_bins)
+    var pairs = List[Float64]()
+    build_histogram_subset_row_major_into_scratch(
+        out, pairs, data, grad, hess, rows, 0, len(rows), features,
+        const_hessian, settings,
+    )
+    return out^
+
+
+def build_histogram_subset_row_major_into_scratch(
+    mut out: Histogram,
+    mut pairs: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int] = [],
+    const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """The row-major twin of `build_histogram_subset_into_scratch`.
+
+    Same signature, same scratch contract (`pairs` grows and never shrinks,
+    carries no state between calls beyond its capacity), same output. The
+    scratch it wants for a blocked plan is `row_major_scratch_floats`, which
+    is a different number from the feature-major kernel's; a grower that runs
+    both arms simply keeps the larger, since the buffer is written before it
+    is read.
+    """
+    if len(grad) != data.n_rows or len(hess) != data.n_rows:
+        raise Error("gradient/hessian length must equal n_rows")
+    if not out.matches(data.n_features, data.n_bins):
+        raise Error("output histogram shape must match the data")
+    if row_start < 0 or row_count < 0 or row_start + row_count > len(rows):
+        raise Error("row window out of range")
+    if not data.has_row_major():
+        raise Error(
+            "the row-major builder needs BinnedMatrix.build_row_major();"
+            " set MOJOTREES_CPU_ROW_MAJOR=1 to have fit-time binning build it"
+        )
+    _check_features(features, data.n_features)
+    var const_h = _resolve_const_hessian(const_hessian)
+    if const_h and const_hessian_verify():
+        _check_constant_hessian(hess, data.n_rows)
+
+    _accumulate_subset_row_major(
+        out._grad, out._hess, out._count, pairs,
+        data, grad, hess, rows, row_start, row_count, features, const_h,
+        settings,
+    )
+
+
+def _accumulate_subset_row_major(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    mut pairs: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int],
+    const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """The row-major twin of `_accumulate_subset`, plan for plan.
+
+    The plan comes from the same `_plan_accumulation` call on the same
+    arguments, so `row_blocks`, `block_rows` and `compact_rows` are whatever
+    the feature-major build would have used. Only the kernel differs.
+    """
+    var n_bins = data.n_bins
+    var n_features = data.n_features
+    var n_sub = row_count
+    var use_all = len(features) == 0
+    var n_active = n_features if use_all else len(features)
+    var plan = _plan_accumulation(
+        settings, n_features, n_active, n_bins, n_sub, True
+    )
+
+    _zero_excluded(
+        out_grad, out_hess, out_count,
+        n_features, n_bins, features, plan.excluded_ops, settings,
+    )
+    if n_active <= 0 or n_sub <= 0:
+        # Nothing active: the excluded pass above has already zeroed every
+        # slice this build owns, and an empty row window leaves the active
+        # ones zero too. Handled here rather than inside a kernel so neither
+        # kernel needs an empty case.
+        if n_active > 0:
+            _zero_active_slices(
+                out_grad, out_hess, out_count, n_features, n_bins, features,
+                n_active, plan.active_ops, settings,
+            )
+        return
+
+    if plan.compact_rows:
+        ensure_pair_capacity(pairs, n_sub)
+
+    if not plan.blocked():
+        if plan.compact_rows:
+            _gather_pairs(
+                pairs, grad, hess, rows, row_start, n_sub, plan.gather_ops,
+                settings,
+            )
+        var group = plan.group_width
+        if group >= 16:
+            _accumulate_subset_row_major_at[16](
+                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                rows, row_start, row_count, features, plan.compact_rows,
+                n_active, plan.group_count, plan.active_ops, const_h,
+                settings,
+            )
+        elif group >= 8:
+            _accumulate_subset_row_major_at[8](
+                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                rows, row_start, row_count, features, plan.compact_rows,
+                n_active, plan.group_count, plan.active_ops, const_h,
+                settings,
+            )
+        elif group >= 4:
+            _accumulate_subset_row_major_at[4](
+                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                rows, row_start, row_count, features, plan.compact_rows,
+                n_active, plan.group_count, plan.active_ops, const_h,
+                settings,
+            )
+        elif group >= 2:
+            _accumulate_subset_row_major_at[2](
+                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                rows, row_start, row_count, features, plan.compact_rows,
+                n_active, plan.group_count, plan.active_ops, const_h,
+                settings,
+            )
+        else:
+            _accumulate_subset_row_major_at[1](
+                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                rows, row_start, row_count, features, plan.compact_rows,
+                n_active, plan.group_count, plan.active_ops, const_h,
+                settings,
+            )
+        return
+
+    var meta = List[Int]()
+    var cells = _row_major_slot_meta(data, features, n_active, meta)
+    var part_off = row_major_part_offset(plan)
+    var wanted = row_major_scratch_floats(plan, cells)
+    if len(pairs) < wanted:
+        pairs.resize(wanted, 0.0)
+    if plan.compact_rows:
+        _gather_pairs(
+            pairs, grad, hess, rows, row_start, n_sub, plan.gather_ops,
+            settings,
+        )
+    _accumulate_subset_row_major_blocked(
+        out_grad, out_hess, out_count, pairs, data, grad, hess, rows,
+        row_start, row_count, features, plan, part_off, n_active, cells,
+        meta, const_h, settings,
+    )
+
+
+def _zero_active_slices(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    n_features: Int,
+    n_bins: Int,
+    features: List[Int],
+    n_active: Int,
+    total_ops: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """Zero the active features' slices, for the degenerate empty-window case
+    the kernels are not asked to handle.
+
+    The accumulating kernels fuse their zeroing into the pass that fills the
+    slice, so with no rows to walk there is no pass and the slices would keep
+    whatever the caller's buffer held. `build_histogram_subset_into` documents
+    that every cell of the output is written, and an empty node is exactly the
+    case where a caller recycling a histogram would notice it was not.
+    """
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+    var use_all = len(features) == 0
+    comptime W = SIMD_LANES
+
+    def zero_slots(s_start: Int, s_end: Int) {imm}:
+        for j in range(s_start, s_end):
+            var f = j if use_all else feat_p.unsafe_load(j)
+            var base = f * n_bins
+            var b = 0
+            while b + W <= n_bins:
+                gp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
+                hp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
+                cp.unsafe_store(base + b, SIMD[DType.int, W](0))
+                b += W
+            while b < n_bins:
+                gp.unsafe_store(base + b, 0.0)
+                hp.unsafe_store(base + b, 0.0)
+                cp.unsafe_store(base + b, 0)
+                b += 1
+
+    dispatch_feature_ranges_with(settings, zero_slots, n_active, total_ops)
+
+
+def _accumulate_subset_row_major_at[
+    GROUP: Int
+](
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    pairs: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int],
+    compact: Bool,
+    n_active: Int,
+    n_groups: Int,
+    active_ops: Int,
+    const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """The unblocked row-major accumulation at one interleave width.
+
+    `_accumulate_subset_at` with three loads changed. Where that kernel reads
+    `bins[col[k] + r]`, one byte per (row, feature) from `GROUP` columns
+    `n_rows` apart, this one reads byte `rbyte[k]` of row `r`'s record and
+    shifts out a nibble. The `GROUP` bytes a group needs come from one record,
+    so they are one cache line rather than `GROUP` of them -- which is worth
+    everything on a node whose rows are scattered and nothing on a node whose
+    rows are the whole dataset, since the feature-major columns are then read
+    sequentially and every byte of every line is used.
+
+    The shift and mask are per-feature constants hoisted into SIMD lane
+    arrays exactly as `base` and `col` are, so the row loop pays two integer
+    operations per (row, feature) and no branch. An unpacked feature carries
+    shift 0 and mask 255, so the packed and unpacked cases are one code path.
+
+    Every structural claim `_accumulate_subset_at` makes -- fused zeroing,
+    tail groups, the `compact` pair of row loops, the elided hessian plane and
+    its exact refill from the count -- holds here unchanged, because none of
+    them is about where a bin id was loaded from.
+    """
+    var n_bins = data.n_bins
+    var n_sub = row_count
+    var stride = data.row_stride
+    var use_all = len(features) == 0
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
+    var grad_p = grad.unsafe_ptr()
+    var hess_p = hess.unsafe_ptr()
+    var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
+    var rm_p = data.row_bins.unsafe_ptr()
+    var byte_p = data.row_byte.unsafe_ptr()
+    var shift_p = data.row_shift.unsafe_ptr()
+    var mask_p = data.row_mask.unsafe_ptr()
+    var pairs_p = pairs.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+    comptime W = SIMD_LANES
+
+    def accumulate_groups(g_start: Int, g_end: Int) {imm}:
+        for grp in range(g_start, g_end):
+            var slot0 = grp * GROUP
+            var owned = n_active - slot0
+            if owned > GROUP:
+                owned = GROUP
+            var base = SIMD[DType.int, GROUP](0)
+            var rbyte = SIMD[DType.int, GROUP](0)
+            var rshift = SIMD[DType.int, GROUP](0)
+            var rmask = SIMD[DType.int, GROUP](0)
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var f = (
+                        (slot0 + k) if use_all
+                        else feat_p.unsafe_load(slot0 + k)
+                    )
+                    base[k] = f * n_bins
+                    rbyte[k] = byte_p.unsafe_load(f)
+                    rshift[k] = shift_p.unsafe_load(f)
+                    rmask[k] = mask_p.unsafe_load(f)
+
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var z0 = Int(base[k])
+                    var zb = 0
+                    while zb + W <= n_bins:
+                        gp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
+                        if not const_h:
+                            hp.unsafe_store(
+                                z0 + zb, SIMD[DType.float64, W](0.0)
+                            )
+                        cp.unsafe_store(z0 + zb, SIMD[DType.int, W](0))
+                        zb += W
+                    while zb < n_bins:
+                        gp.unsafe_store(z0 + zb, 0.0)
+                        if not const_h:
+                            hp.unsafe_store(z0 + zb, 0.0)
+                        cp.unsafe_store(z0 + zb, 0)
+                        zb += 1
+
+            if const_h:
+                if compact:
+                    for i_row in range(n_sub):
+                        var rec = rows_p.unsafe_load(i_row) * stride
+                        var g = pairs_p.unsafe_load(2 * i_row)
+                        comptime for k in range(GROUP):
+                            if k < owned:
+                                var raw = Int(
+                                    rm_p.unsafe_load(rec + Int(rbyte[k]))
+                                )
+                                var b = Int(base[k]) + (
+                                    (raw >> Int(rshift[k])) & Int(rmask[k])
+                                )
+                                gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                                cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+                else:
+                    for i_row in range(n_sub):
+                        var r = rows_p.unsafe_load(i_row)
+                        var rec = r * stride
+                        var g = grad_p.unsafe_load(r)
+                        comptime for k in range(GROUP):
+                            if k < owned:
+                                var raw = Int(
+                                    rm_p.unsafe_load(rec + Int(rbyte[k]))
+                                )
+                                var b = Int(base[k]) + (
+                                    (raw >> Int(rshift[k])) & Int(rmask[k])
+                                )
+                                gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                                cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+            elif compact:
+                for i_row in range(n_sub):
+                    var rec = rows_p.unsafe_load(i_row) * stride
+                    var g = pairs_p.unsafe_load(2 * i_row)
+                    var h = pairs_p.unsafe_load(2 * i_row + 1)
+                    comptime for k in range(GROUP):
+                        if k < owned:
+                            var raw = Int(
+                                rm_p.unsafe_load(rec + Int(rbyte[k]))
+                            )
+                            var b = Int(base[k]) + (
+                                (raw >> Int(rshift[k])) & Int(rmask[k])
+                            )
+                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+            else:
+                for i_row in range(n_sub):
+                    var r = rows_p.unsafe_load(i_row)
+                    var rec = r * stride
+                    var g = grad_p.unsafe_load(r)
+                    var h = hess_p.unsafe_load(r)
+                    comptime for k in range(GROUP):
+                        if k < owned:
+                            var raw = Int(
+                                rm_p.unsafe_load(rec + Int(rbyte[k]))
+                            )
+                            var b = Int(base[k]) + (
+                                (raw >> Int(rshift[k])) & Int(rmask[k])
+                            )
+                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+
+            if const_h:
+                comptime for k in range(GROUP):
+                    if k < owned:
+                        var f0 = Int(base[k])
+                        var fb = 0
+                        while fb + W <= n_bins:
+                            hp.unsafe_store(
+                                f0 + fb,
+                                cp.unsafe_load[width=W](f0 + fb).cast[
+                                    DType.float64
+                                ](),
+                            )
+                            fb += W
+                        while fb < n_bins:
+                            hp.unsafe_store(
+                                f0 + fb, Float64(cp.unsafe_load(f0 + fb))
+                            )
+                            fb += 1
+
+    dispatch_feature_ranges_with(
+        settings, accumulate_groups, n_groups, active_ops
+    )
+
+
+def _accumulate_subset_row_major_blocked(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    mut pairs: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int],
+    plan: AccumulationPlan,
+    part_off: Int,
+    n_active: Int,
+    compact_cells: Int,
+    meta: List[Int],
+    const_h: Bool,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """The blocked row-major accumulation. This is LightGBM's row-wise
+    builder, and it is the shape the layout exists for.
+
+    **One axis, not two, and that is the point.** The feature-major blocked
+    kernel dispatches over `(block, group)` pairs because a group must be
+    narrow enough that its histogram slices stay in L1. This one dispatches
+    over **blocks alone**: a block owns a private histogram over *every*
+    active feature and walks its rows once, reading each row's whole record.
+    Three consequences, and only the third is a trade:
+
+    - The node's gradients are read **once**, not once per group. The
+      feature-major kernel re-streams the gather buffer `ceil(n_active /
+      group_width)` times, which at 50 features and width 2 is 25 passes.
+    - A row's record is one cache line and serves all `n_active` features,
+      where the feature-major kernel pays one line per (row, feature) on a
+      node whose rows are scattered.
+    - The private histogram is `sum_j feature_bins[f_j]` cells rather than
+      `group_width * n_bins`, so it is bigger than L1 where the feature-major
+      one was sized to fit. That is the cost, and it is why the compact
+      cumulative offsets above matter rather than being tidiness: they are
+      what keeps the accumulator in L2 instead of past it.
+
+    **Parallelism comes from blocks only, so `plan.row_blocks` is the whole
+    fan-out** for the accumulate pass. The plan is not allowed to grow it for
+    this kernel's benefit -- the block count is part of the value, and a
+    layout that changed it would move bits. A node the plan does not block is
+    therefore not a node for this kernel; `_accumulate_subset_row_major` sends
+    those to the unblocked row-major kernel, which partitions by feature as
+    before.
+
+    **Padding.** Each block's partials are padded up to a cache line
+    (`row_major_line_floats`), which is LightGBM's `num_bin_aligned_`. Without
+    it two blocks' partials share the line at their boundary and two cores
+    contest it on every store. The gather region is padded to a line for the
+    same reason before the partials start.
+
+    **Determinism**, unchanged from the feature-major blocked kernel: a
+    block's rows are walked ascending, a block is never split across tasks,
+    and the fold sums blocks ascending inside each cell. The fold's own
+    parallel split is over disjoint output ranges and cannot reassociate; see
+    `FOLD_BIN_CHUNK`.
+
+    **The elided hessian plane** is exact for the reason
+    `_accumulate_subset_blocked_at` gives: a block's hessian cell under
+    `const_h` would have been `count_b` copies of 1.0, which is exactly
+    `Float64(count_b)`, every partial is an integer below 2^53, and the fold
+    of those is exact. The block count does not depend on `const_h`, so a fit
+    cannot move a bin by turning the specialization off.
+
+    **The tail bins.** A compact slot holds `feature_bins[f]` cells and the
+    output slice holds `n_bins`. The bins above the highest one the feature
+    realizes are written as zero by the fold, which is bit for bit what the
+    feature-major kernel leaves there: no row ever lands in them, so its
+    accumulated gradient is `0.0`, its count is `0`, and its hessian is `0.0`
+    on both the three-plane and the elided path.
+    """
+    var n_bins = data.n_bins
+    var n_sub = row_count
+    var n_blocks = plan.row_blocks
+    var block_rows = plan.block_rows
+    var compact = plan.compact_rows
+    var stride = data.row_stride
+    var use_all = len(features) == 0
+    var aligned = align_cells_up(compact_cells, row_major_line_floats())
+    var plane = n_blocks * aligned
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
+    var grad_p = grad.unsafe_ptr()
+    var hess_p = hess.unsafe_ptr()
+    var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
+    var rm_p = data.row_bins.unsafe_ptr()
+    var meta_p = meta.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+    # ONE pointer into `pairs`: the gather occupies `[0, 2 * n_sub)` and the
+    # partials `[part_off, ...)`, and two mutable pointers with the same
+    # origin in one parallel closure is an aliasing error Mojo refuses.
+    var pp = pairs.unsafe_ptr()
+    comptime W = SIMD_LANES
+
+    def accumulate_blocks(u_start: Int, u_end: Int) {imm}:
+        for blk in range(u_start, u_end):
+            var r0 = blk * block_rows
+            var r1 = r0 + block_rows
+            if r1 > n_sub:
+                r1 = n_sub
+            var b0 = part_off + blk * aligned
+
+            # Zeroing stays fused into the pass that fills the slice. Only the
+            # `compact_cells` in use are zeroed; the line padding beyond them
+            # is never read.
+            var zb = 0
+            while zb + W <= compact_cells:
+                pp.unsafe_store(b0 + zb, SIMD[DType.float64, W](0.0))
+                pp.unsafe_store(plane + b0 + zb, SIMD[DType.float64, W](0.0))
+                if not const_h:
+                    pp.unsafe_store(
+                        2 * plane + b0 + zb, SIMD[DType.float64, W](0.0)
+                    )
+                zb += W
+            while zb < compact_cells:
+                pp.unsafe_store(b0 + zb, 0.0)
+                pp.unsafe_store(plane + b0 + zb, 0.0)
+                if not const_h:
+                    pp.unsafe_store(2 * plane + b0 + zb, 0.0)
+                zb += 1
+
+            if const_h:
+                if compact:
+                    for i_row in range(r0, r1):
+                        var rec = rows_p.unsafe_load(i_row) * stride
+                        var g = pp.unsafe_load(2 * i_row)
+                        for j in range(n_active):
+                            var m = 4 * j
+                            var raw = Int(
+                                rm_p.unsafe_load(
+                                    rec + meta_p.unsafe_load(m + 1)
+                                )
+                            )
+                            var b = (
+                                b0
+                                + meta_p.unsafe_load(m)
+                                + (
+                                    (raw >> meta_p.unsafe_load(m + 2))
+                                    & meta_p.unsafe_load(m + 3)
+                                )
+                            )
+                            pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                            pp.unsafe_store(
+                                plane + b, pp.unsafe_load(plane + b) + 1.0
+                            )
+                else:
+                    for i_row in range(r0, r1):
+                        var r = rows_p.unsafe_load(i_row)
+                        var rec = r * stride
+                        var g = grad_p.unsafe_load(r)
+                        for j in range(n_active):
+                            var m = 4 * j
+                            var raw = Int(
+                                rm_p.unsafe_load(
+                                    rec + meta_p.unsafe_load(m + 1)
+                                )
+                            )
+                            var b = (
+                                b0
+                                + meta_p.unsafe_load(m)
+                                + (
+                                    (raw >> meta_p.unsafe_load(m + 2))
+                                    & meta_p.unsafe_load(m + 3)
+                                )
+                            )
+                            pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                            pp.unsafe_store(
+                                plane + b, pp.unsafe_load(plane + b) + 1.0
+                            )
+            elif compact:
+                for i_row in range(r0, r1):
+                    var rec = rows_p.unsafe_load(i_row) * stride
+                    var g = pp.unsafe_load(2 * i_row)
+                    var h = pp.unsafe_load(2 * i_row + 1)
+                    for j in range(n_active):
+                        var m = 4 * j
+                        var raw = Int(
+                            rm_p.unsafe_load(rec + meta_p.unsafe_load(m + 1))
+                        )
+                        var b = (
+                            b0
+                            + meta_p.unsafe_load(m)
+                            + (
+                                (raw >> meta_p.unsafe_load(m + 2))
+                                & meta_p.unsafe_load(m + 3)
+                            )
+                        )
+                        pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                        pp.unsafe_store(
+                            plane + b, pp.unsafe_load(plane + b) + 1.0
+                        )
+                        pp.unsafe_store(
+                            2 * plane + b, pp.unsafe_load(2 * plane + b) + h
+                        )
+            else:
+                for i_row in range(r0, r1):
+                    var r = rows_p.unsafe_load(i_row)
+                    var rec = r * stride
+                    var g = grad_p.unsafe_load(r)
+                    var h = hess_p.unsafe_load(r)
+                    for j in range(n_active):
+                        var m = 4 * j
+                        var raw = Int(
+                            rm_p.unsafe_load(rec + meta_p.unsafe_load(m + 1))
+                        )
+                        var b = (
+                            b0
+                            + meta_p.unsafe_load(m)
+                            + (
+                                (raw >> meta_p.unsafe_load(m + 2))
+                                & meta_p.unsafe_load(m + 3)
+                            )
+                        )
+                        pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                        pp.unsafe_store(
+                            plane + b, pp.unsafe_load(plane + b) + 1.0
+                        )
+                        pp.unsafe_store(
+                            2 * plane + b, pp.unsafe_load(2 * plane + b) + h
+                        )
+
+    dispatch_feature_ranges_with(
+        settings, accumulate_blocks, n_blocks, plan.block_ops
+    )
+
+    var n_chunks = (n_bins + FOLD_BIN_CHUNK - 1) // FOLD_BIN_CHUNK
+    if n_chunks < 1:
+        n_chunks = 1
+
+    def fold_units(u_start: Int, u_end: Int) {imm}:
+        for u in range(u_start, u_end):
+            var j = u // n_chunks
+            var c = u - j * n_chunks
+            var f = j if use_all else feat_p.unsafe_load(j)
+            var in0 = part_off + meta_p.unsafe_load(4 * j)
+            var width = meta_p.unsafe_load(4 * (j + 1)) - meta_p.unsafe_load(
+                4 * j
+            )
+            var out0 = f * n_bins
+            var lo = c * FOLD_BIN_CHUNK
+            var hi = lo + FOLD_BIN_CHUNK
+            if hi > n_bins:
+                hi = n_bins
+            var lim = width if width < hi else hi
+            var b = lo
+            while b + W <= lim:
+                var sg = pp.unsafe_load[width=W](in0 + b)
+                var sc = pp.unsafe_load[width=W](plane + in0 + b)
+                var sh = SIMD[DType.float64, W](0.0)
+                if not const_h:
+                    sh = pp.unsafe_load[width=W](2 * plane + in0 + b)
+                for blk in range(1, n_blocks):
+                    var off = blk * aligned + in0 + b
+                    sg += pp.unsafe_load[width=W](off)
+                    sc += pp.unsafe_load[width=W](plane + off)
+                    if not const_h:
+                        sh += pp.unsafe_load[width=W](2 * plane + off)
+                gp.unsafe_store(out0 + b, sg)
+                cp.unsafe_store(out0 + b, sc.cast[DType.int]())
+                hp.unsafe_store(out0 + b, sc if const_h else sh)
+                b += W
+            while b < lim:
+                var sg1 = pp.unsafe_load(in0 + b)
+                var sc1 = pp.unsafe_load(plane + in0 + b)
+                var sh1 = Float64(0.0)
+                if not const_h:
+                    sh1 = pp.unsafe_load(2 * plane + in0 + b)
+                for blk in range(1, n_blocks):
+                    var off = blk * aligned + in0 + b
+                    sg1 += pp.unsafe_load(off)
+                    sc1 += pp.unsafe_load(plane + off)
+                    if not const_h:
+                        sh1 += pp.unsafe_load(2 * plane + off)
+                gp.unsafe_store(out0 + b, sg1)
+                cp.unsafe_store(out0 + b, Int(sc1))
+                hp.unsafe_store(out0 + b, sc1 if const_h else sh1)
+                b += 1
+            # The bins this feature never realizes. Zero on both paths, which
+            # is what the feature-major kernel leaves there.
+            while b < hi:
+                gp.unsafe_store(out0 + b, 0.0)
+                hp.unsafe_store(out0 + b, 0.0)
+                cp.unsafe_store(out0 + b, 0)
+                b += 1
+
+    dispatch_feature_ranges_with(
+        settings, fold_units, n_active * n_chunks, plan.fold_ops
+    )
+
+
+def build_histogram_subset_by_layout_into_scratch(
+    mut out: Histogram,
+    mut pairs: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    layout: Int,
+    features: List[Int] = [],
+    const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> Int:
+    """Build one node's histogram in the requested layout, and **return the
+    layout that actually ran**.
+
+    The return value is the observable. A layout that is requested but not
+    available degrades to feature-major (`resolve_bin_layout`), and a caller
+    or a test that only asserted the request would be asserting nothing --
+    this project has already shipped one test comparing two arms that were
+    equal whether or not the optimization fired, and one whose six fixtures
+    all ran below the gate. So the gate reports itself.
+
+    `BIN_LAYOUT_AUTO` runs feature-major here rather than timing anything. The
+    timed choice is a once-per-fit decision (`choose_bin_layout_timed`), which
+    is where LightGBM makes it; timing it per node would spend the measurement
+    on the thing it is trying to speed up.
+    """
+    var chosen = resolve_bin_layout(layout, data.has_row_major())
+    if chosen == BIN_LAYOUT_ROW_MAJOR:
+        build_histogram_subset_row_major_into_scratch(
+            out, pairs, data, grad, hess, rows, row_start, row_count,
+            features, const_hessian, settings,
+        )
+        return BIN_LAYOUT_ROW_MAJOR
+    build_histogram_subset_into_scratch(
+        out, pairs, data, grad, hess, rows, row_start, row_count, features,
+        const_hessian, settings,
+    )
+    return BIN_LAYOUT_FEATURE_MAJOR
+
+
+def choose_bin_layout_timed(
+    mut out: Histogram,
+    mut pairs: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int] = [],
+    const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> Int:
+    """LightGBM's auto rule: build the node once each way, keep the faster.
+
+    Their whole `force_row_wise` / `force_col_wise` decision is one timed
+    construction with each builder at the start of the fit, kept for the
+    remainder of it and printed. This is that probe, and a fit should call it
+    **once**, on its first node, and thread the answer through
+    `build_histogram_subset_by_layout_into_scratch` for every node after.
+
+    `MOJOTREES_CPU_BIN_LAYOUT` is honored first: an explicit arm is an
+    instruction, not a hint, and a benchmark that asked for one layout and
+    silently got the other is a discarded result.
+
+    **`out` holds a correct histogram on return whichever arm won**, because
+    the two arms are bit-identical -- which is what makes a probe that runs
+    both affordable at all. It costs one extra build of one node per fit, of
+    the thousands a fit performs.
+
+    One clock, `perf_counter_ns`, around one build each, on the machine the
+    fit is running on. Two builds are not a benchmark and this function does
+    not pretend otherwise: it is a tie-break with a real bias (the second arm
+    runs with the caches the first one warmed). LightGBM accepts the same
+    bias. It is still strictly better information than a cost model nobody
+    measured, and the arms are exchangeable enough that the bias costs a wrong
+    answer only where the two are close, which is where it does not matter.
+    """
+    if not data.has_row_major():
+        return BIN_LAYOUT_FEATURE_MAJOR
+    var requested = resolve_bin_layout(env_bin_layout(), True)
+    if requested != BIN_LAYOUT_AUTO:
+        return requested
+
+    var t0 = perf_counter_ns()
+    build_histogram_subset_into_scratch(
+        out, pairs, data, grad, hess, rows, row_start, row_count, features,
+        const_hessian, settings,
+    )
+    var t1 = perf_counter_ns()
+    build_histogram_subset_row_major_into_scratch(
+        out, pairs, data, grad, hess, rows, row_start, row_count, features,
+        const_hessian, settings,
+    )
+    var t2 = perf_counter_ns()
+    if (t2 - t1) < (t1 - t0):
+        return BIN_LAYOUT_ROW_MAJOR
+    return BIN_LAYOUT_FEATURE_MAJOR
