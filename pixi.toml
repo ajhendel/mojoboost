@@ -132,6 +132,14 @@ max = ">=26.5.0,<27"
 python = ">=3.11"
 numpy = "*"
 lightgbm = "*"
+# The CatBoost peer arm of bench/real_data. It is a peer column reported
+# beside the comparator and never instead of it: the one comparator is
+# LightGBM at stock defaults plus deterministic=true, and nothing is gated
+# on CatBoost. 1.2 is the floor because below it the resolved parameter list
+# the arm records is not readable back through `get_all_params()`, and a
+# record that states defaults nobody checked is worse than one that states
+# none. See bench/real_data/scenarios.py, CATBOOST_MIN_VERSION.
+catboost = ">=1.2"
 
 [feature.bench.tasks]
 bench-lgbm = "python bench/bench_lightgbm.py"

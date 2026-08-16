@@ -11,6 +11,12 @@ printed by `run.py` before the first cell, stored in `manifest.json` and in
 every row of `records.csv`. Paste it. If a table cannot say which comparator
 produced it, it is not a result yet.
 
+The peer arms travel inside that same block, under `comparator.peers`, and
+they are not a second mechanism for the same reason: a file that states its
+comparator cannot then fail to state what else was in the table. **A peer
+arm is never the comparator.** There is exactly one comparator, `stock+det`,
+and a section headed by a peer arm says so in its own first line.
+
 ## Why this file exists
 
 Four comparator-configuration incidents in three days, three of them caught
@@ -61,6 +67,115 @@ comes out the day mojotrees implements the filter. `enable_bundle` merges
 mutually exclusive sparse features before binning, which is the same kind of
 change, and mojotrees's EFB is not applied by every trainer this harness
 reaches.
+
+## Peer arm: CatBoost
+
+    <paste `comparator.peers.catboost` from the run's manifest.json, or the
+    peer block run.py printed. At minimum: id, label, the parameters
+    CatBoost was passed, the two matched parameters, the determinism block,
+    and `unmatchable`.>
+
+**The headline row above is unchanged and this section does not compete with
+it.** CatBoost is a peer column, reported beside `stock+det` and never
+instead of it. Nothing in `thresholds.json` is measured against it and
+`verify.py`'s differential does not see these rows. A margin quoted from
+this section is a margin against CatBoost and must say so in the sentence
+that carries it, not in a footnote.
+
+Two rows, both against the same CatBoost arm:
+
+| row | mojotrees side | CatBoost side |
+| --- | --- | --- |
+| us in CatBoost mode vs CatBoost defaults | `mojotrees_catboost_mode` | `catboost` |
+| our defaults vs CatBoost defaults | `mojotrees` | `catboost` |
+
+Both at **matched tree count and matched learning rate**. The learning rate
+is not a formality here. CatBoost picks its own from the iteration count and
+the dataset when it is not given one, and the value it picks moves with the
+budget: 0.5 at 2 iterations, 0.4273 at 100 and 0.06573 at 1000, measured at
+20,000 rows by 20 features. A run that left it alone would compare two
+different models.
+
+### Determinism, which is weaker here than on the comparator
+
+**CatBoost has no `deterministic` flag.** LightGBM has one, which is the
+whole reason the comparator is `stock+det`. CatBoost's like-for-like is a
+fixed `thread_count` plus a fixed `random_seed`, and that is weaker: nothing
+in it is a promise by the library, only two inputs held still. **This arm is
+seeded, not guaranteed, and it must be labelled that way wherever it is
+quoted.**
+
+It was checked rather than assumed. On catboost 1.2.10, 20,000 rows by 20
+features, 100 iterations at learning rate 0.1 and a fixed seed, the
+prediction digest was identical across three in-process repeats, across
+three separate processes, and across `thread_count` 1, 2, 4 and 8. That is
+one shape, one loss, one machine, and no missing values or categorical
+features; bit-identity at 20,000 rows is not bit-identity at 1,000,000,
+where the parallel reductions are wider. Every repeat records its own
+prediction digest, so state what **this** run observed and not what that
+note observed.
+
+The precedent for saying it this way is directly above: LightGBM produced
+two distinct prediction digests across three repeats on `sparse_highdim`
+with `deterministic=true` already set and a fixed seed. The honest form is
+to state what the flag does and does not buy, on both arms.
+
+### What each engine's phases contain
+
+The end-to-end headline includes ingestion, and the three libraries put
+ingestion and binning in different places. Paste `comparator.phase_shape`
+and do not summarize it away.
+
+| engine | ingest | binning | train | e2e |
+| --- | --- | --- | --- | --- |
+| mojotrees | transpose | `Dataset.construct()` | boosting | ingest + binning + train |
+| lightgbm | inside binning | `Dataset.construct()`, contains ingestion | boosting | binning + train |
+| catboost | `Pool()`, conversion only | none, it is inside `fit` | `fit()`, contains binning | ingest + train |
+
+**CatBoost's `Pool` does something neither of the others does, and it is
+recorded rather than folded in.** `Pool(X, label=y)` is ingestion only: the
+pool is not quantized when it returns. `Pool.quantize()` is a separate
+public call, and using it to expose a binning number was tried and rejected
+on evidence, because it produces a different model above a few hundred
+thousand rows. At 300,000 rows by 20 features, a raw-pool fit, a
+default-seed quantized fit and a harness-seed quantized fit gave three
+distinct prediction digests and 51 against 50 borders on feature 0. CatBoost
+draws its border-construction sample under the quantization seed, which the
+fit path does not share. So the CatBoost rows carry `binning: null` with
+that reason and their binning cost sits inside `train`. A table that adds a
+CatBoost `binning_s` to a CatBoost `train_s` is adding a number that is not
+there.
+
+### What no parameter closes
+
+Copy `comparator.peers.catboost.unmatchable` in full. The short form, which
+is not a substitute for it: CatBoost grows symmetric trees of depth 6 and
+mojotrees has no symmetric policy, so the CatBoost-mode arm is depthwise at
+depth 6 and is not the same tree. CatBoost subsamples 80 percent of rows per
+tree by default under MVS and the other two do not subsample at all.
+CatBoost perturbs split scores with `random_strength` and scores them with
+`Cosine`. Its `min_data_in_leaf` default is 1 against this harness's shared
+20. Its `nan_mode` is `Min` where the other two learn a direction.
+
+### Cost, before the matrix is scheduled
+
+Copy `comparator.peers.catboost.cost_warnings`. As of this arm's first
+version there is one, and it is about `sparse_highdim`: CatBoost's `rsm`
+default of 1 means it considers every feature at every split, and the smoke
+tier alone took 8.5 seconds of fit on two threads where ingestion took
+0.011. The standard tier is 25 times each dimension. A cell that hits
+`run.py`'s per-run timeout is an infrastructure failure and takes the run's
+exit code with it, so schedule that cell knowing this or leave it out
+deliberately and say which.
+
+### Scenarios with no CatBoost row
+
+Copy `comparator.peers.catboost.scenarios_not_run`. As of this arm's first
+version: `ranking`, because CatBoost has no lambdarank and running YetiRank
+would put a third objective in a column headed by the other two's; and
+`categorical_missing`, because CatBoost refuses `cat_features` on the
+float64 matrix every engine is handed, and converting a copy for CatBoost
+alone would break the data digest that makes the records comparable.
 
 ## Run
 

@@ -418,6 +418,199 @@ class InterleavedArm:
         return train_loss(self.booster, self.X, self.y, self.objective)[1]
 
 
+def _catboost_spec(objective: str) -> dict:
+    """The minimal scenario spec `scenarios.catboost_params` needs.
+
+    Built here rather than restated, for the same reason the comparator is
+    imported whole: the peer arm's parameters have to be the ones
+    `bench/real_data` uses, or this repository is running two CatBoost
+    configurations under one name the way it once ran two LightGBM ones.
+
+    `id` is a label rather than a registered scenario. This file's dataset
+    is `make_data`, which is bench_train.mojo's generator and is not one of
+    the six, so the id says that instead of borrowing a scenario name whose
+    thresholds and caveats do not apply here.
+    """
+    task = "binary" if objective == "binary" else "regression"
+    return {
+        "id": "bench_train_synthetic",
+        "task": task,
+        "objective": task,
+        "params": {},
+    }
+
+
+def catboost_params(objective: str, threads: int, rounds: int) -> dict:
+    """The CatBoost peer arm's parameter dict, at a matched tree count.
+
+    Everything except the round count comes whole from
+    `scenarios.catboost_params`: `CATBOOST_ALIGNMENT`, the matched learning
+    rate, the thread count, and the loss. Nothing is added here and nothing
+    is dropped.
+
+    `iterations` is overridden with the harness's round count for the one
+    reason the whole arm exists: a comparison at different budgets is not a
+    comparison. In the interleaved path the two numbers cannot diverge:
+    `check_alignment` refuses to run unless the mojotrees round count equals
+    `BASE_PARAMS['n_estimators']`, which is the same value
+    `scenarios.catboost_params` puts in, so the override is the identity
+    there and is written out anyway so that a caller which reaches this
+    function directly still gets a matched budget rather than a silently
+    different one.
+
+    CatBoost picks its own learning rate from the iteration count and the
+    dataset when it is not given one, so the rate is pinned by
+    `scenarios.catboost_params` and is not this function's business.
+    """
+    params = scenarios.catboost_params(_catboost_spec(objective), threads)
+    params["iterations"] = int(rounds)
+    return params
+
+
+def catboost_params_summary(params: dict) -> str:
+    """The resolved parameters on one line, with the arm's id leading.
+
+    `arm` leads rather than `comparator`, and that is the point of the
+    difference: a CatBoost number is not a number against the comparator.
+    The comparator is LightGBM at `stock+det` and this line must not be
+    mistaken for one taken against it.
+    """
+    resolved = dict(
+        params,
+        arm=scenarios.catboost_arm_id(),
+        comparator_is_still=scenarios.comparator_id(),
+    )
+    return " ".join(f"{k}={resolved[k]}" for k in sorted(resolved))
+
+
+class CatBoostInterleavedArm:
+    """The CatBoost peer arm, in the shape `InterleavedArm` established.
+
+    Reported beside the LightGBM arm and never instead of it. Same data,
+    same round count, same thread count, same repeat reduction.
+
+    **Its `train` is not the same span of work as the LightGBM arm's, and
+    that is a property of CatBoost rather than of this class.** The
+    LightGBM arm constructs its Dataset in the constructor, so its timed
+    call is boosting only. CatBoost's `Pool` is ingestion only -- it comes
+    back unquantized -- and CatBoost bins inside `fit`, so this arm's timed
+    call is binning plus boosting. Pre-quantizing the pool to move the
+    binning out was tried in the real-data harness and rejected: it
+    produces a different model above a few hundred thousand rows, because
+    CatBoost draws its border-construction sample under a quantization seed
+    the fit path does not share. `phase_shape()` states this and `summary()`
+    carries it, so a reader cannot pick the two `train` numbers up as
+    comparable.
+
+    The comparable quantity across all three arms is end to end: ingestion
+    plus binning plus boosting. `ingest_s` here plus the caller's timed
+    `train` is that total for this arm, in the same way `binning_s` plus the
+    timed `train` is that total for the LightGBM arm.
+
+    Determinism is seeded and not guaranteed. CatBoost has no
+    `deterministic` flag; `scenarios.CATBOOST_DETERMINISM` says what is
+    pinned instead and what was observed.
+    """
+
+    def __init__(
+        self,
+        n_rows: int,
+        n_features: int,
+        objective: str,
+        threads: int,
+        seed: int,
+        **mojo_defaults,
+    ):
+        if objective not in ("reg", "binary"):
+            raise ValueError(
+                "the catboost arm handles 'reg' and 'binary'. Multiclass "
+                "would need the harness's quantile bucketing replicated "
+                "here, and ranking has no CatBoost row at all: CatBoost has "
+                "no lambdarank"
+            )
+        check_alignment(mojo_defaults)
+        import catboost  # deferred: this module's lightgbm arm must import
+        # and run in an environment where catboost is not installed.
+
+        scenarios.check_catboost_version(catboost.__version__)
+        self.catboost = catboost
+        self.version = catboost.__version__
+        self.objective = objective
+        self.rounds = int(mojo_defaults.get("rounds", 100))
+        self.threads = int(threads)
+        self.X, self.y = make_data(n_rows, n_features, objective, seed)
+        self.params = catboost_params(objective, threads, self.rounds)
+        t0 = time.perf_counter()
+        self.pool = catboost.Pool(self.X, label=self.y)
+        # Named ingest_s and not binning_s. It is the conversion into
+        # CatBoost's own layout and nothing else; the pool is unquantized
+        # when this returns.
+        self.ingest_s = time.perf_counter() - t0
+        self.model = None
+
+    def summary(self) -> str:
+        return catboost_params_summary(self.params)
+
+    def phase_shape(self) -> str:
+        """What this arm's timed call contains, on one line, for the
+        result record. Never omitted: two `train` numbers that span
+        different work and carry no note is exactly how a benchmark
+        produces a real number for a question it cannot answer."""
+        shape = scenarios.PHASE_SHAPE["catboost"]
+        return (
+            f"catboost ingest={shape['ingest']}; train={shape['train']}; "
+            f"binning={shape['binning']}; e2e={shape['e2e']}"
+        )
+
+    def resolved_threads(self) -> int:
+        return int(self.params["thread_count"])
+
+    def train(self) -> int:
+        """One fit, which contains CatBoost's binning. Returns the tree
+        count; the caller holds the clock.
+
+        A fresh model per call rather than a refit: CatBoost continues an
+        existing model rather than replacing it, so reusing one would make
+        the second repeat a 200-tree run.
+        """
+        self.model = self.catboost.CatBoost(self.params)
+        self.model.fit(self.pool)
+        return int(self.model.tree_count_)
+
+    def loss(self) -> float:
+        """The training loss of the most recent `train`, outside any timed
+        region, in the same definition `train_loss` uses for LightGBM."""
+        if self.model is None:
+            raise RuntimeError("loss requested before any training run")
+        if self.objective == "binary":
+            p = np.asarray(
+                self.model.predict(self.X, prediction_type="Probability")
+            )[:, 1]
+            p = np.clip(p, 1e-15, 1.0 - 1e-15)
+            return float(
+                -np.mean(
+                    self.y * np.log(p) + (1.0 - self.y) * np.log(1.0 - p)
+                )
+            )
+        pred = self.model.predict(self.X)
+        return float(np.mean((pred - self.y) ** 2))
+
+    def resolved_params(self) -> dict:
+        """What CatBoost itself resolved, read back from the fitted model.
+
+        Worth a method rather than a comment because CatBoost derives
+        defaults from the data. `learning_rate` is the one that matters and
+        this arm pins it; `boosting_type` is chosen from the dataset size
+        and is only knowable this way. `get_all_params()` omits
+        `thread_count`, which is put back here.
+        """
+        if self.model is None:
+            raise RuntimeError("resolved parameters requested before a fit")
+        resolved = dict(self.model.get_all_params())
+        resolved["thread_count"] = self.resolved_threads()
+        return resolved
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=100_000)
