@@ -102,7 +102,7 @@ measure.py            timing, peak memory, model size, digests
 backend_proof.py      what the trainer emitted about which backend it ran on
 envinfo.py            machine, versions, git state, thermal and load conditions
 worker.py             one measured run in its own process, one JSON record out
-run.py                builds the matrix and runs it sequentially
+run.py                builds the matrix and runs it sequentially; exits 2 if any cell produced no result
 thresholds.json       the correctness tolerances, with the reasoning for each
 verify.py             the gate: applies thresholds, exits non-zero on a failure
 report.py             the timings: prints distributions, decides nothing
@@ -125,10 +125,49 @@ digest of the exact bytes it will hand over. `verify.py` fails a scenario
 whose two engines report different digests before it looks at anything else.
 
 **The parameters are aligned deliberately, and the alignment is written
-down.** `scenarios.py` sets `lambda_l2` explicitly because the two defaults
-differ, disables exclusive feature bundling because mojotrees has none,
-disables LightGBM's feature pre-filter because it deletes columns at Dataset
-build time, and leaves the two binning population settings alone.
+down.** There is exactly one comparator, and it is named in every run.
+
+**`stock+det`, which is LightGBM at its own defaults plus
+`deterministic=true`.** Registered as section C9 of
+`bench/results/PROFILE_PROTOCOL.md`. One arm,
+one label, and no other LightGBM configuration is published. `run.py`
+prints the whole configuration before the first cell, writes it into the
+manifest and into `records.json`, and puts its id in a column of every CSV
+row, so a table without it is missing a field rather than missing a
+convention.
+
+`deterministic=true` is the only deviation from pure stock that is not a
+feature-space pin, and the reason it is there is worth stating plainly
+because a reader will ask. Our arm is reproducible across thread counts at
+no cost, so this is the setting that makes the two sides comparable rather
+than one that handicaps either. It does not fully succeed. In the first
+real-data run LightGBM produced two distinct prediction digests across
+three repeats on `sparse_highdim`, with `deterministic=true` already set
+and a fixed seed, while our arm was bit-identical across all three. The
+LightGBM side of the repeat-determinism check is non-gating for exactly
+that reason. LightGBM's own documentation also advises pairing
+`deterministic` with a forced histogram builder; this comparator forces
+neither, because choosing the comparator's algorithm for it is the larger
+distortion, and the repeats that disagreed above were taken with
+`force_row_wise` set anyway.
+
+Beyond that, `scenarios.py` sets `lambda_l2` explicitly because the two
+defaults differ, disables exclusive feature bundling, disables LightGBM's
+feature pre-filter because it deletes columns at Dataset build time, and
+leaves the two binning population settings alone.
+
+The two disabled switches are both feature-space pins and neither is a
+leftover. `feature_pre_filter` deletes features that cannot satisfy
+`min_data_in_leaf` before training starts, which removes them from the
+matrix, from the pool `feature_fraction` samples, and from every feature
+index; mojotrees does not do it, so leaving it on would compare two engines
+fitting different feature spaces. It comes out the day mojotrees implements
+the filter, and a lane is on it. `enable_bundle` merges mutually exclusive
+sparse features before binning, which is the same kind of change.
+mojotrees's EFB is reachable from Python now, so that one is closer to
+coming out than it was, but the ranking trainer refuses an active bundling
+switch by name, so turning it on for both engines would raise on one of the
+six scenarios rather than compare it.
 
 Those two used to be pinned and are not any more, which is worth recording
 because the reasoning that justified the pins is the reasoning that now
@@ -143,10 +182,19 @@ held. mojotrees's binner now defaults to LightGBM's own 3 and 200000, so
 the same pins would move LightGBM *away* from a rule it already shares with
 us and make it do strictly more binning work than the subject does. They are
 inverted rather than merely stale, so they are gone and both engines bin
-stock. `feature_pre_filter` stays pinned off, because that one is still a
-real difference: LightGBM's `NeedFilter` is not implemented here.
+stock.
 
-Each remaining alignment is justified where it is set. Threads are matched by count rather
+Two more settings left with them, for the same kind of reason.
+`force_row_wise=true` chose LightGBM's histogram builder for it; stock
+LightGBM times both on its first iterations and keeps the winner, which is
+both what a user gets and the harder thing to beat. And
+`zero_as_missing`, `min_gain_to_split` and `boost_from_average` were
+restatements of LightGBM's own defaults, so they are recorded in
+`scenarios.LIGHTGBM_STOCK_DEFAULTS` rather than passed.
+
+Every remaining setting is justified where it is set, and
+`selfcheck.check_comparator` fails if the dict grows one that is not.
+Threads are matched by count rather
 than by parameter name: LightGBM reads `num_threads`, mojotrees reads
 `MOJOTREES_NUM_WORKERS`, and the runner sets both from one number before
 either library is imported.
@@ -165,6 +213,28 @@ copied into every record they touch and reprinted under every table.
 LightGBM reads its pairwise ranking sigmoid from a lookup table where
 mojotrees evaluates it, so ranking models diverge from the first pair; the
 ranking thresholds are correspondingly loose and say why.
+
+## Three exit codes, and what each of them is about
+
+`run.py` reports whether the **matrix ran**. It exits 0 when every cell
+that was meant to run produced a result, and **2 when any cell produced no
+result at all**: an engine that would not import, a worker that died, a
+timeout, or a record that came back without an ok status. It prints a
+block naming every failed cell, the distinct causes, and, when the cause is
+the one that has actually happened, the command that fixes it
+(`pixi run build-python`). Exit code 1 is deliberately unused, so a caller
+that reads the number can tell "the matrix did not run" from "the results
+were bad".
+
+That distinction is not a refinement. The first time this harness ran it
+produced 44 cells of which 27 failed, every mojotrees row dying on `cannot
+import name '_mojotrees'` because nothing in the run path builds the
+extension, and the run was read as having happened. A cell with no result
+is an infrastructure failure and it is a different finding from a red
+verdict.
+
+`verify.py` reports whether the **results were good**, and it remains the
+sole judge of that. `run.py` decides nothing about quality.
 
 ## Correctness and performance are separated on purpose
 
@@ -223,12 +293,22 @@ Host-to-device transfer time is not exposed to Python by either engine;
 instrumenting it is a change to the Mojo accelerator sources and is listed
 in the handoff. On the sparse path, mojotrees bins inside `fit`, so binning
 time cannot be separated from training time there, and the estimator keeps
-its Dataset to itself, so the bin counts cannot be read back either. And a
-LightGBM run that forces neither histogram builder has no recoverable
-resolved builder, because 4.7 keeps that choice in the tree learner's share
-state and reports it only in a log line this harness silences. Every one of
-them appears as a null with a reason, which is the only form a missing
+its Dataset to itself, so the bin counts cannot be read back either. And
+the resolved histogram builder is unavailable on **every** LightGBM cell
+now that the comparator forces neither: 4.7 keeps that choice in the tree
+learner's share state and reports it only in a log line this harness
+silences. That is a real loss against the old pinned comparator and it is
+the price of letting LightGBM pick its own algorithm. Every one of them
+appears as a null with a reason, which is the only form a missing
 measurement takes in this harness.
+
+Two measurements got *less* reduced rather than more. Each record now
+carries the per-feature bin counts themselves, not only their total,
+maximum, minimum, mean and digest, because a lane diagnosing an accuracy
+gap had to reconstruct them by arithmetic over the recorded total and the
+list would have answered the question by being read. The digest is still
+taken over the whole vector; the stored list is truncated with a marker
+above 65,536 features, which only the sparse `large` tier reaches.
 
 ## Accelerator mode
 

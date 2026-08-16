@@ -15,10 +15,42 @@ noise; the remaining features are pure noise.
 
 Parameters match on both sides (mojotrees defaults): 100 boosting rounds,
 `num_leaves=31`, `learning_rate=0.1`, `min_data_in_leaf=20`,
-`min_sum_hessian_in_leaf=1e-3`, `lambda_l2=1.0`, `max_bin=255`. LightGBM
-additionally runs with `enable_bundle=false` (mojotrees has no EFB yet) and
-`force_row_wise=true`. The table below records the original single-threaded
-mojotrees baseline. The current implementation parallelizes histogram
+`min_sum_hessian_in_leaf=1e-3`, `lambda_l2=1.0`, `max_bin=255`.
+
+**There is exactly one comparator: `stock+det`, LightGBM at its own
+defaults plus `deterministic=true`.** It is registered as section C9 of
+[`results/PROFILE_PROTOCOL.md`](results/PROFILE_PROTOCOL.md) and it is
+defined in one place, `real_data/scenarios.py`, from which both this
+directory's LightGBM driver and the real-data harness import it whole. No
+other LightGBM configuration is published, and speed and accuracy are
+reported together against it.
+
+`deterministic=true` is the only deviation from pure stock that is not a
+feature-space pin. It is there because our arm is reproducible across
+thread counts at no cost, so it is the setting that makes the two sides
+comparable rather than one that handicaps either. It does not fully
+succeed. In the first real-data run LightGBM produced two distinct
+prediction digests across three repeats on `sparse_highdim` with
+`deterministic=true` already set and a fixed seed, while our arm was
+bit-identical across all three.
+
+Two switches are pinned off, both feature-space differences rather than
+tuning: `feature_pre_filter` (LightGBM deletes columns at Dataset
+construction and mojotrees does not, and a lane is implementing it) and
+`enable_bundle` (mojotrees's EFB is not applied by every trainer these
+benchmarks reach). Everything else is LightGBM's own default, including
+`min_data_in_bin`, `bin_construct_sample_cnt`, and the histogram builder,
+which stock LightGBM picks for itself by timing both.
+
+**Every LightGBM figure in this file predates that comparator.** They were
+taken against a configuration pinned to `min_data_in_bin=1`,
+`bin_construct_sample_cnt` at the row count and `force_row_wise=true`; the
+binning pin in particular made the comparator do strictly more binning work
+than mojotrees did. Read them as history and re-measure before quoting.
+`real_data/results/RESULTS_TEMPLATE.md` carries the banner to mark them
+with.
+
+The table below records the original single-threaded mojotrees baseline. The current implementation parallelizes histogram
 accumulation across features, so new runs should record available CPU cores
 and compare against both 1-thread and machine-wide LightGBM.
 
@@ -527,15 +559,26 @@ timed call and which mojotrees pays no counterpart to. And the parameters now
 come from `real_data/scenarios.py`, which adds the binning alignment the
 standalone script was missing. That alignment was three settings when this
 paragraph was written (`min_data_in_bin=1`, `feature_pre_filter=false` and
-`bin_construct_sample_cnt` at the row count) and is one setting now
-(`feature_pre_filter=false`): mojotrees's binner defaults to LightGBM's own
-`min_data_in_bin=3` and 200000-row sample, so pinning either would make the
-comparator bin differently from the subject rather than the same. Numbers
-recorded under the old pins were measured against a constraint this
-repository imposed. `deterministic` is the one
-entry deliberately not inherited, because it is a reproducibility setting
-whose documented cost would land entirely on the comparator's side of a speed
-comparison.
+`bin_construct_sample_cnt` at the row count) and is two now
+(`feature_pre_filter=false` and `enable_bundle=false`, both feature-space
+pins), because mojotrees's binner defaults to LightGBM's own
+`min_data_in_bin=3`
+and 200000-row sample, so pinning either would make the comparator bin
+differently from the subject rather than the same. Numbers recorded under
+the old pins were measured against a constraint this repository imposed.
+
+`deterministic` used to be the one entry deliberately **not** inherited
+here, on the grounds that its documented cost would land entirely on the
+comparator's side of a speed comparison. That exclusion is gone, and with
+it the situation it created. This repository was running two LightGBM
+configurations under one name, so a speed figure from this driver and an
+accuracy figure from `real_data` were not figures about the same engine.
+`deterministic=true` is now the comparator, on both, for the reason given
+at the top of this file, which is that our arm is reproducible across
+thread counts at no cost, so the flag is what makes the two sides comparable rather than a
+handicap on the comparator. The wall time it costs LightGBM is paid
+deliberately and in the open, and every figure taken before it is not
+comparable with one taken after.
 
 `bench-lgbm` itself now takes `--repeats` and reports minimum, median,
 maximum and spread under the same reduction, so even the separate-process

@@ -14,6 +14,11 @@ true claim about accuracy parity with LightGBM was retracted. The claim was
 correct and the reviewer was reasonable: an accurate claim with no evidence
 in the tree is indistinguishable from an inaccurate one.
 
+`RESULTS_TEMPLATE.md`, beside this file, is what a published table is
+written from. It carries the comparator block, the run block, and the
+"pinned configuration, superseded" banner for figures taken against a
+comparator that has since changed.
+
 ## What is committed
 
 One file per complete run:
@@ -114,6 +119,26 @@ twice over, except for the one scenario a fix landed in.
 
 ## The parity spread, stated as a range
 
+> **Pinned configuration, superseded.** Both runs below were measured
+> against LightGBM pinned to `min_data_in_bin=1`,
+> `bin_construct_sample_cnt` at the training row count, `force_row_wise=true`,
+> `deterministic=true`, `enable_bundle=false` and `feature_pre_filter=false`.
+> That comparator was retired on 2026-08-16 in favor of **`stock+det`**,
+> LightGBM at its own defaults plus `deterministic=true`, registered as
+> section C9 of `bench/results/PROFILE_PROTOCOL.md`.
+>
+> The figures stay, because a measurement whose comparator later changed is
+> still a record of what was true when it was taken. What they now describe
+> is accuracy parity against a LightGBM that was binning on our rule rather
+> than its own: `min_data_in_bin=1` moved it onto a minimum-population rule
+> mojotrees no longer has, and the row-count sample made it fit its edges
+> from every row while mojotrees fit them from 200,000. Both differences are
+> in the binning, which is where an accuracy differential on a quantile
+> histogram is most sensitive, so **a re-run under `stock+det` is the thing
+> to quote and these numbers are not it**.
+>
+> Nothing here was a timing, so none of the speed caveats apply.
+
 The claim these summaries exist to support is accuracy parity with LightGBM.
 From `20260815T023123Z`, the relative difference on each scenario's primary
 metric, this project against LightGBM, both scored by `quality.py` from
@@ -171,6 +196,15 @@ directory were produced from run directories that live on another machine.
 
 ## Before anything from here is quoted
 
+- The table it came from was written from `RESULTS_TEMPLATE.md` and carries
+  its comparator block. The comparator is `stock+det` and every run records
+  the whole configuration in its `manifest.json` and its `records.json`, in
+  the `comparator` column of `records.csv`, and on the console before the
+  first cell. A figure from an older run carries an older comparator and
+  says so under a "pinned configuration, superseded" banner.
+- `run.py` exited 0. It exits 2 when any cell produced no result at all,
+  which is a different finding from a red verdict and is not a statement
+  about quality either way.
 - `verify.py` returned zero on the run. A red verdict means the two engines
   were not compared on the same problem, whatever the timings say. No
   verdict has been recorded for either run summarized here, and running one
