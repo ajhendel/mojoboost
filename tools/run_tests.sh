@@ -189,7 +189,12 @@ test_host_replica
 
 # CPU-safe, but exercises a GPU path when one exists, so a GPU runner should
 # see it too.
-GPU_ALSO="test_interaction"
+# `test_cosine_device_split` is the second entry and is the same shape: its
+# replica-against-host assertions run anywhere, and its last two tests open a
+# device to check that the kernels choose what the host chooses under
+# `score_function=Cosine`. Naming it `test_gpu_*` would have hidden the
+# host-side half from CPU-only CI, which is where most of its content is.
+GPU_ALSO="test_interaction test_cosine_device_split"
 
 # Derive GPU-only status from the file NAME, so the list above cannot drift.
 #
