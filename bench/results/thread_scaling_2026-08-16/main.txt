@@ -1,0 +1,243 @@
+mojotrees cpu thread-scaling bench: 799110 rows x 100 features, reg seed 0
+machine: cores=10 (perf 4, eff 6, logical 10) pool=all tasks_per_core=4 max_auto_tasks=40 f64_lanes=2 neon=yes assumed_line=128 assumed_l1d=65536
+binning_s: 0.184772
+arms: w1_base,w1_noblk,w1_lgbmlike,w1_g16,w1_lgbm,wA_base,wA_noblk,wA_lgbmlike,wA_g16,wA_lgbm
+repeats: 12
+plan w1_base node_rows: 799110 row_blocks: 27 group_width: 8 groups: 13 units: 351
+plan w1_base node_rows: 399555 row_blocks: 27 group_width: 8 groups: 13 units: 351
+plan w1_base node_rows: 99888 row_blocks: 24 group_width: 8 groups: 13 units: 312
+plan w1_base node_rows: 12486 row_blocks: 3 group_width: 8 groups: 13 units: 39
+plan w1_noblk node_rows: 799110 row_blocks: 1 group_width: 4 groups: 25 units: 25
+plan w1_noblk node_rows: 399555 row_blocks: 1 group_width: 4 groups: 25 units: 25
+plan w1_noblk node_rows: 99888 row_blocks: 1 group_width: 4 groups: 25 units: 25
+plan w1_noblk node_rows: 12486 row_blocks: 1 group_width: 4 groups: 25 units: 25
+plan w1_lgbmlike node_rows: 799110 row_blocks: 1 group_width: 1 groups: 100 units: 100
+plan w1_lgbmlike node_rows: 399555 row_blocks: 1 group_width: 1 groups: 100 units: 100
+plan w1_lgbmlike node_rows: 99888 row_blocks: 1 group_width: 1 groups: 100 units: 100
+plan w1_lgbmlike node_rows: 12486 row_blocks: 1 group_width: 1 groups: 100 units: 100
+plan w1_g16 node_rows: 799110 row_blocks: 27 group_width: 16 groups: 7 units: 189
+plan w1_g16 node_rows: 399555 row_blocks: 27 group_width: 16 groups: 7 units: 189
+plan w1_g16 node_rows: 99888 row_blocks: 24 group_width: 16 groups: 7 units: 168
+plan w1_g16 node_rows: 12486 row_blocks: 3 group_width: 16 groups: 7 units: 21
+lightgbm_binning_s: 0.5735003750305623
+lightgbm_params: comparator=stock+det@v2 deterministic=True enable_bundle=False feature_pre_filter=False lambda_l1=0.0 learning_rate=0.1 max_bin=255 max_depth=-1 min_data_in_leaf=20 min_sum_hessian_in_leaf=0.001 num_leaves=31 objective=regression seed=190019 use_missing=True verbosity=-1
+lightgbm_multithreading: col-wise at both thread counts, measured out of band at verbosity 1 on this shape; see the module docstring
+run 1 w1_base train_s: 14.302202
+run 1 w1_noblk train_s: 15.834855
+run 1 w1_lgbmlike train_s: 19.69866
+run 1 w1_g16 train_s: 15.255418
+run 1 w1_lgbm train_s: 13.291697 resolved_num_threads: 1
+run 1 wA_base train_s: 5.952673
+run 1 wA_noblk train_s: 7.296942
+run 1 wA_lgbmlike train_s: 9.361009
+run 1 wA_g16 train_s: 6.649774
+run 1 wA_lgbm train_s: 4.536877 resolved_num_threads: 0
+run 2 w1_base train_s: 14.505461
+run 2 w1_noblk train_s: 15.883925
+run 2 w1_lgbmlike train_s: 19.888818
+run 2 w1_g16 train_s: 15.328596
+run 2 w1_lgbm train_s: 13.33872 resolved_num_threads: 1
+run 2 wA_base train_s: 6.136159
+run 2 wA_noblk train_s: 7.545461
+run 2 wA_lgbmlike train_s: 9.511573
+run 2 wA_g16 train_s: 6.928611
+run 2 wA_lgbm train_s: 4.672321 resolved_num_threads: 0
+run 3 w1_base train_s: 14.766647
+run 3 w1_noblk train_s: 16.162674
+run 3 w1_lgbmlike train_s: 22.139591
+run 3 w1_g16 train_s: 15.813759
+run 3 w1_lgbm train_s: 13.648002 resolved_num_threads: 1
+run 3 wA_base train_s: 6.298725
+run 3 wA_noblk train_s: 7.688489
+run 3 wA_lgbmlike train_s: 10.415963
+run 3 wA_g16 train_s: 7.793475
+run 3 wA_lgbm train_s: 5.514568 resolved_num_threads: 0
+run 4 w1_base train_s: 14.602041
+run 4 w1_noblk train_s: 16.07291
+run 4 w1_lgbmlike train_s: 20.086762
+run 4 w1_g16 train_s: 15.335802
+run 4 w1_lgbm train_s: 13.541824 resolved_num_threads: 1
+run 4 wA_base train_s: 7.020467
+run 4 wA_noblk train_s: 8.498145
+run 4 wA_lgbmlike train_s: 11.079116
+run 4 wA_g16 train_s: 8.15342
+run 4 wA_lgbm train_s: 5.538019 resolved_num_threads: 0
+run 5 w1_base train_s: 14.733559
+run 5 w1_noblk train_s: 16.279887
+run 5 w1_lgbmlike train_s: 20.31245
+run 5 w1_g16 train_s: 15.400229
+run 5 w1_lgbm train_s: 13.556075 resolved_num_threads: 1
+run 5 wA_base train_s: 6.415915
+run 5 wA_noblk train_s: 9.377026
+run 5 wA_lgbmlike train_s: 12.342208
+run 5 wA_g16 train_s: 8.930885
+run 5 wA_lgbm train_s: 6.346735 resolved_num_threads: 0
+run 6 w1_base train_s: 14.723642
+run 6 w1_noblk train_s: 17.453532
+run 6 w1_lgbmlike train_s: 21.133521
+run 6 w1_g16 train_s: 15.419986
+run 6 w1_lgbm train_s: 13.98695 resolved_num_threads: 1
+run 6 wA_base train_s: 8.62577
+run 6 wA_noblk train_s: 10.145224
+run 6 wA_lgbmlike train_s: 13.121376
+run 6 wA_g16 train_s: 9.491035
+run 6 wA_lgbm train_s: 6.565067 resolved_num_threads: 0
+run 7 w1_base train_s: 14.873213
+run 7 w1_noblk train_s: 16.890344
+run 7 w1_lgbmlike train_s: 21.437039
+run 7 w1_g16 train_s: 15.829751
+run 7 w1_lgbm train_s: 14.306503 resolved_num_threads: 1
+run 7 wA_base train_s: 8.97373
+run 7 wA_noblk train_s: 11.342996
+run 7 wA_lgbmlike train_s: 12.856498
+run 7 wA_g16 train_s: 9.018631
+run 7 wA_lgbm train_s: 6.760855 resolved_num_threads: 0
+run 8 w1_base train_s: 14.82299
+run 8 w1_noblk train_s: 16.897468
+run 8 w1_lgbmlike train_s: 20.444395
+run 8 w1_g16 train_s: 15.465317
+run 8 w1_lgbm train_s: 14.200947 resolved_num_threads: 1
+run 8 wA_base train_s: 9.142485
+run 8 wA_noblk train_s: 10.20225
+run 8 wA_lgbmlike train_s: 12.675702
+run 8 wA_g16 train_s: 8.979103
+run 8 wA_lgbm train_s: 6.422398 resolved_num_threads: 0
+run 9 w1_base train_s: 14.681066
+run 9 w1_noblk train_s: 16.770932
+run 9 w1_lgbmlike train_s: 20.879627
+run 9 w1_g16 train_s: 15.325253
+run 9 w1_lgbm train_s: 14.090204 resolved_num_threads: 1
+run 9 wA_base train_s: 8.627707
+run 9 wA_noblk train_s: 9.773591
+run 9 wA_lgbmlike train_s: 12.529456
+run 9 wA_g16 train_s: 8.807712
+run 9 wA_lgbm train_s: 6.413395 resolved_num_threads: 0
+run 10 w1_base train_s: 14.862364
+run 10 w1_noblk train_s: 16.157554
+run 10 w1_lgbmlike train_s: 20.259797
+run 10 w1_g16 train_s: 15.253212
+run 10 w1_lgbm train_s: 14.05747 resolved_num_threads: 1
+run 10 wA_base train_s: 8.473762
+run 10 wA_noblk train_s: 9.796513
+run 10 wA_lgbmlike train_s: 12.654541
+run 10 wA_g16 train_s: 8.777617
+run 10 wA_lgbm train_s: 6.568657 resolved_num_threads: 0
+run 11 w1_base train_s: 14.89867
+run 11 w1_noblk train_s: 15.961694
+run 11 w1_lgbmlike train_s: 20.271576
+run 11 w1_g16 train_s: 15.672421
+run 11 w1_lgbm train_s: 13.740172 resolved_num_threads: 1
+run 11 wA_base train_s: 8.6228
+run 11 wA_noblk train_s: 9.829931
+run 11 wA_lgbmlike train_s: 12.734441
+run 11 wA_g16 train_s: 9.062968
+run 11 wA_lgbm train_s: 6.585929 resolved_num_threads: 0
+run 12 w1_base train_s: 14.607031
+run 12 w1_noblk train_s: 15.975365
+run 12 w1_lgbmlike train_s: 21.190791
+run 12 w1_g16 train_s: 16.807464
+run 12 w1_lgbm train_s: 14.337028 resolved_num_threads: 1
+run 12 wA_base train_s: 9.61078
+run 12 wA_noblk train_s: 10.110554
+run 12 wA_lgbmlike train_s: 13.478002
+run 12 wA_g16 train_s: 9.19694
+run 12 wA_lgbm train_s: 6.949925 resolved_num_threads: 0
+--- determinism ---
+worker_invariance base w1_digest: 222091343700048511 auto_digest: 222091343700048511 verdict: identical
+worker_invariance noblk w1_digest: 222091343700048511 auto_digest: 222091343700048511 verdict: identical
+worker_invariance lgbmlike w1_digest: 222091343700048511 auto_digest: 222091343700048511 verdict: identical
+worker_invariance g16 w1_digest: 222091343700048511 auto_digest: 222091343700048511 verdict: identical
+width_neutrality w1_base vs w1_g16 verdict: identical
+digest w1_base 222091343700048511
+digest w1_noblk 222091343700048511
+digest w1_lgbmlike 222091343700048511
+digest w1_g16 222091343700048511
+digest wA_base 222091343700048511
+digest wA_noblk 222091343700048511
+digest wA_lgbmlike 222091343700048511
+digest wA_g16 222091343700048511
+--- reductions ---
+plateau_drops_first: 4
+w1_base_samples: 14.302202 14.505461 14.766647 14.602041 14.733559 14.723642 14.873213 14.82299 14.681066 14.862364 14.89867 14.607031
+w1_base plateau_median_s: 14.7782745
+w1_base plateau_min_s: 14.607031 plateau_max_s: 14.89867
+w1_base plateau_spread_pct_of_median: 1.9734306599867257
+w1_noblk_samples: 15.834855 15.883925 16.162674 16.07291 16.279887 17.453532 16.890344 16.897468 16.770932 16.157554 15.961694 15.975365
+w1_noblk plateau_median_s: 16.5254095
+w1_noblk plateau_min_s: 15.961694 plateau_max_s: 17.453532
+w1_noblk plateau_spread_pct_of_median: 9.027540285764173
+w1_lgbmlike_samples: 19.69866 19.888818 22.139591 20.086762 20.31245 21.133521 21.437039 20.444395 20.879627 20.259797 20.271576 21.190791
+w1_lgbmlike plateau_median_s: 20.662011
+w1_lgbmlike plateau_min_s: 20.259797 plateau_max_s: 21.437039
+w1_lgbmlike plateau_spread_pct_of_median: 5.697615783865373
+w1_g16_samples: 15.255418 15.328596 15.813759 15.335802 15.400229 15.419986 15.829751 15.465317 15.325253 15.253212 15.672421 16.807464
+w1_g16 plateau_median_s: 15.4426515
+w1_g16 plateau_min_s: 15.253212 plateau_max_s: 16.807464
+w1_g16 plateau_spread_pct_of_median: 10.064670565155213
+w1_lgbm_samples: 13.291697 13.33872 13.648002 13.541824 13.556075 13.98695 14.306503 14.200947 14.090204 14.05747 13.740172 14.337028
+w1_lgbm plateau_median_s: 14.073837000000001
+w1_lgbm plateau_min_s: 13.556075 plateau_max_s: 14.337028
+w1_lgbm plateau_spread_pct_of_median: 5.548970049887605
+wA_base_samples: 5.952673 6.136159 6.298725 7.020467 6.415915 8.62577 8.97373 9.142485 8.627707 8.473762 8.6228 9.61078
+wA_base plateau_median_s: 8.626738499999998
+wA_base plateau_min_s: 6.415915 plateau_max_s: 9.61078
+wA_base plateau_spread_pct_of_median: 37.034448186878514
+wA_noblk_samples: 7.296942 7.545461 7.688489 8.498145 9.377026 10.145224 11.342996 10.20225 9.773591 9.796513 9.829931 10.110554
+wA_noblk plateau_median_s: 9.970242500000001
+wA_noblk plateau_min_s: 9.377026 plateau_max_s: 11.342996
+wA_noblk plateau_spread_pct_of_median: 19.718376960239418
+wA_lgbmlike_samples: 9.361009 9.511573 10.415963 11.079116 12.342208 13.121376 12.856498 12.675702 12.529456 12.654541 12.734441 13.478002
+wA_lgbmlike plateau_median_s: 12.705071499999999
+wA_lgbmlike plateau_min_s: 12.342208 plateau_max_s: 13.478002
+wA_lgbmlike plateau_spread_pct_of_median: 8.939689949796826
+wA_g16_samples: 6.649774 6.928611 7.793475 8.15342 8.930885 9.491035 9.018631 8.979103 8.807712 8.777617 9.062968 9.19694
+wA_g16 plateau_median_s: 8.998867
+wA_g16 plateau_min_s: 8.777617 plateau_max_s: 9.491035
+wA_g16 plateau_spread_pct_of_median: 7.927864696744609
+wA_lgbm_samples: 4.536877 4.672321 5.514568 5.538019 6.346735 6.565067 6.760855 6.422398 6.413395 6.568657 6.585929 6.949925
+wA_lgbm plateau_median_s: 6.566862
+wA_lgbm plateau_min_s: 6.346735 plateau_max_s: 6.949925
+wA_lgbm plateau_spread_pct_of_median: 9.18536128823783
+--- paired ---
+scaling w1_base/wA_base paired_ratios: 2.2964080727378713 1.7069365401581542 1.6574170383998628 1.6213305244690037 1.7016185181068388 1.7539274763676391 1.727822748991047 1.519859054103829
+scaling w1_base/wA_base paired_ratio_median: 1.7042775291324965 paired_ratio_min: 1.519859054103829 paired_ratio_max: 2.2964080727378713 faster_repeats_a_of_counted: 0 of 8
+scaling w1_noblk/wA_noblk paired_ratios: 1.7361460872562364 1.7203693087506 1.4890549198818372 1.6562491607243501 1.7159437099424355 1.6493168538642273 1.6237849482361575 1.5800682138683992
+scaling w1_noblk/wA_noblk paired_ratio_median: 1.6527830072942886 paired_ratio_min: 1.4890549198818372 paired_ratio_max: 1.7361460872562364 faster_repeats_a_of_counted: 0 of 8
+scaling w1_lgbmlike/wA_lgbmlike paired_ratios: 1.6457711618536974 1.6106177431391342 1.6674088853745397 1.6128806909471365 1.6664432198812142 1.600990269026747 1.5918701103566304 1.5722501747662598
+scaling w1_lgbmlike/wA_lgbmlike paired_ratio_median: 1.6117492170431353 paired_ratio_min: 1.5722501747662598 paired_ratio_max: 1.6674088853745397 faster_repeats_a_of_counted: 0 of 8
+scaling w1_g16/wA_g16 paired_ratios: 1.7243788269583584 1.624689614989303 1.7552277058458208 1.7223677019853765 1.73998116650499 1.7377395254315608 1.7292812906323844 1.8275061052915427
+scaling w1_g16/wA_g16 paired_ratio_median: 1.7335104080319725 paired_ratio_min: 1.624689614989303 paired_ratio_max: 1.8275061052915427 faster_repeats_a_of_counted: 0 of 8
+scaling w1_lgbm/wA_lgbm paired_ratios: 2.135913190010297 2.1305113870125014 2.1160789574691363 2.2111596011334083 2.1969961307544597 2.1400828205826548 2.0862921540757573 2.062903988172534
+scaling w1_lgbm/wA_lgbm paired_ratio_median: 2.133212288511399 paired_ratio_min: 2.062903988172534 paired_ratio_max: 2.2111596011334083 faster_repeats_a_of_counted: 0 of 8
+gap_w1 w1_base/w1_lgbm paired_ratios: 1.08686024531437 1.0526699530633912 1.0396120561397848 1.043802923847262 1.0419342402707583 1.0572573869978026 1.0843146650565947 1.018832564182758
+gap_w1 w1_base/w1_lgbm paired_ratio_median: 1.0482364384553264 paired_ratio_min: 1.018832564182758 paired_ratio_max: 1.08686024531437 faster_repeats_a_of_counted: 0 of 8
+gap_auto wA_base/wA_lgbm paired_ratios: 1.010900092724842 1.3138891042543814 1.3273069752272455 1.423531366321427 1.345263624024405 1.2900296057474154 1.3092761856375918 1.3828609661255338
+gap_auto wA_base/wA_lgbm paired_ratio_median: 1.3205980397408135 paired_ratio_min: 1.010900092724842 paired_ratio_max: 1.423531366321427 faster_repeats_a_of_counted: 0 of 8
+gap_w1 w1_noblk/w1_lgbm paired_ratios: 1.2009292512766416 1.2478440260385573 1.1806060502695872 1.1898831817342885 1.1902547330045752 1.1493927427908437 1.1616807999201175 1.1142731255041143
+gap_w1 w1_noblk/w1_lgbm paired_ratio_median: 1.1852446160019379 paired_ratio_min: 1.1142731255041143 paired_ratio_max: 1.2478440260385573 faster_repeats_a_of_counted: 0 of 8
+gap_auto wA_noblk/wA_lgbm paired_ratios: 1.477456676543136 1.5453344192831544 1.677745788069704 1.588542161354684 1.5239340474117062 1.4914027327047217 1.4925655894559446 1.45477167019788
+gap_auto wA_noblk/wA_lgbm paired_ratio_median: 1.5082498184338253 paired_ratio_min: 1.45477167019788 paired_ratio_max: 1.677745788069704 faster_repeats_a_of_counted: 0 of 8
+gap_w1 w1_lgbmlike/w1_lgbm paired_ratios: 1.4984020079558427 1.510945631463614 1.4984122255452643 1.4396501162915403 1.4818541307137922 1.4412121811392802 1.4753509635832798 1.4780462868594524
+gap_w1 w1_lgbmlike/w1_lgbm paired_ratio_median: 1.4799502087866223 paired_ratio_min: 1.4396501162915403 paired_ratio_max: 1.510945631463614 faster_repeats_a_of_counted: 0 of 8
+gap_auto wA_lgbmlike/wA_lgbm paired_ratios: 1.9446546925308839 1.998665969440982 1.9016083025002015 1.9736712050545604 1.9536385954708855 1.926503545549722 1.933583098147581 1.9393017910265218
+gap_auto wA_lgbmlike/wA_lgbm paired_ratio_median: 1.9419782417787028 paired_ratio_min: 1.9016083025002015 paired_ratio_max: 1.998665969440982 faster_repeats_a_of_counted: 0 of 8
+gap_w1 w1_g16/w1_lgbm paired_ratios: 1.1360389345736137 1.1024552171845898 1.1064724202693 1.089034203141523 1.0876530247539353 1.0850609675852054 1.1406277155773596 1.172311583683871
+gap_w1 w1_g16/w1_lgbm paired_ratio_median: 1.1044638187269449 paired_ratio_min: 1.0850609675852054 paired_ratio_max: 1.172311583683871 faster_repeats_a_of_counted: 0 of 8
+gap_auto wA_g16/wA_lgbm paired_ratios: 1.4071621077609195 1.4456874545225509 1.3339482950011499 1.3980919587979443 1.3733306618413492 1.336287920042103 1.376110796214171 1.323314999802156
+gap_auto wA_g16/wA_lgbm paired_ratio_median: 1.37472072902776 paired_ratio_min: 1.323314999802156 paired_ratio_max: 1.4456874545225509 faster_repeats_a_of_counted: 0 of 8
+candidate_auto wA_base/wA_noblk paired_ratios: 0.6842164029405485 0.8502296252896928 0.7911252018426173 0.8961243843269868 0.882757115578092 0.8649773649052476 0.877198425909602 0.9505690786083532
+candidate_auto wA_base/wA_noblk paired_ratio_median: 0.8710878954074248 paired_ratio_min: 0.6842164029405485 paired_ratio_max: 0.9505690786083532 faster_repeats_a_of_counted: 8 of 8
+candidate_w1 w1_base/w1_noblk paired_ratios: 0.9050160483300652 0.843590970584063 0.8805749012571917 0.8772314289927935 0.8753876051730459 0.9198399708272674 0.9334015549978593 0.9143472465261356
+candidate_w1 w1_base/w1_noblk paired_ratio_median: 0.8927954747936284 paired_ratio_min: 0.843590970584063 paired_ratio_max: 0.9334015549978593 faster_repeats_a_of_counted: 8 of 8
+candidate_auto wA_base/wA_lgbmlike paired_ratios: 0.5198352677251915 0.657383036657131 0.6979917859435749 0.7212606449725626 0.6885939022412465 0.6696222328411596 0.6771243433457346 0.7130715665422813
+candidate_auto wA_base/wA_lgbmlike paired_ratio_median: 0.6828591227934906 paired_ratio_min: 0.5198352677251915 paired_ratio_max: 0.7212606449725626 faster_repeats_a_of_counted: 8 of 8
+candidate_w1 w1_base/w1_lgbmlike paired_ratios: 0.7253462285445627 0.6966961160896947 0.6938091123498913 0.7250393078396304 0.7031287484206494 0.7335889890703249 0.7349537105551142 0.6893103235268565
+candidate_w1 w1_base/w1_lgbmlike paired_ratio_median: 0.7140840281301399 paired_ratio_min: 0.6893103235268565 paired_ratio_max: 0.7349537105551142 faster_repeats_a_of_counted: 8 of 8
+candidate_auto wA_base/wA_g16 paired_ratios: 0.7183963291431924 0.9088334412421827 0.9950213064488391 1.0181958041911314 0.9795627967853625 0.9653829735337053 0.9514322460368392 1.0449975752804739
+candidate_auto wA_base/wA_g16 paired_ratio_median: 0.9724728851595339 paired_ratio_min: 0.7183963291431924 paired_ratio_max: 1.0449975752804739 faster_repeats_a_of_counted: 6 of 8
+candidate_w1 w1_base/w1_g16 paired_ratios: 0.9567103839819525 0.9548414635395908 0.9395734020073974 0.9584666127438578 0.9579656531608319 0.9743760199491097 0.9506297718776187 0.8690800111188696
+candidate_w1 w1_base/w1_g16 paired_ratio_median: 0.9557759237607717 paired_ratio_min: 0.8690800111188696 paired_ratio_max: 0.9743760199491097 faster_repeats_a_of_counted: 8 of 8
+--- verdicts ---
+wA_base vs wA_noblk median_delta_s: -1.343504000000003 widest_plateau_spread_s: 3.194865 verdict: indistinguishable ratio: 0.8652486135618063
+wA_base vs wA_lgbmlike median_delta_s: -4.078333000000001 widest_plateau_spread_s: 3.194865 verdict: resolved ratio: 0.6789996026389933
+wA_base vs wA_g16 median_delta_s: -0.3721285000000023 widest_plateau_spread_s: 3.194865 verdict: indistinguishable ratio: 0.9586471830287077
