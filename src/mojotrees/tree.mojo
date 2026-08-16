@@ -1649,6 +1649,14 @@ def _search(
         parent_output=parent_output,
         cegb=cegb,
         settings=settings,
+        # CatBoost's `score_function`. `SCORE_L2` is the field's default and
+        # is `find_best_split`'s, so a fit that does not name the parameter
+        # makes the identical call it made before this argument was passed.
+        # This line and its pair in `_grow_oblivious_levels` are the only two
+        # places in the package that carry the choice into a split search;
+        # everything else that searches splits is refused or declined by
+        # `ExtraTreeParams.is_active()`.
+        score_function=params.extra.score_function,
     )
 
 
@@ -2115,6 +2123,11 @@ def _grow_oblivious_levels(
             node=level_node,
             tree_index=tree_index,
             settings=scratch.settings,
+            # The pair of the line in `_search`: one level's shared split is
+            # elected with the same functional a leaf-wise split is.
+            # `SCORE_L2` is the default on both sides, so the untouched
+            # bundle makes the identical call.
+            score_function=params.extra.score_function,
         )
         # One charge for the level, at the level's row count, over the cells
         # the one dispatch read: the per-node figure times the leaves folded
