@@ -77,6 +77,38 @@ def test_workload_tracks_shape_outputs_and_declared_features():
     }
 
 
+def test_two_classes_is_binary_or_softmax_and_the_objective_decides():
+    """`n_classes == 2` is one output for binary logistic and two for
+    softmax, and the class count alone cannot tell them apart.
+
+    This was invisible until the native `apple-m4-metal-dense-multiclass`
+    crossover rule was installed on 2026-08-16, because nothing read
+    `n_outputs`. That rule is scoped on exactly this field, and the device
+    Python resolves is the one that travels in the params dict, so a
+    `train(params={"objective": "multiclass", "num_class": 2})` fit would
+    have been pinned to the CPU above the crossover with nothing saying so.
+
+    A classifier that counted two labels in `y` is the other case and must
+    stay at one output; it declares binary logistic, not softmax.
+    """
+    softmax = ds.Workload(465_000, 54, objective_code=-1, n_classes=2)
+    assert softmax.n_outputs == 2
+
+    binary = ds.Workload(465_000, 54, objective_code=1, n_classes=2)
+    assert binary.n_outputs == 1
+
+    # Undeclared stays at the count-based answer: an absent objective is not
+    # a declaration of softmax, and the native layer marks such a decision
+    # incomplete rather than assuming one.
+    undeclared = ds.Workload(465_000, 54, n_classes=2)
+    assert undeclared.n_outputs == 1
+
+    # Above two the objective changes nothing, which is what keeps this a
+    # disambiguation rather than a second rule.
+    assert ds.Workload(465_000, 54, objective_code=-1, n_classes=7).n_outputs == 7
+    assert ds.Workload(465_000, 54, n_classes=7).n_outputs == 7
+
+
 @pytest.mark.parametrize("rows, features", [(0, 2), (2, 0)])
 def test_workload_rejects_empty_dimensions(rows, features):
     with pytest.raises(ValueError, match="at least one row and one feature"):

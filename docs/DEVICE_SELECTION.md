@@ -26,28 +26,60 @@ information; a fallback destroys it.
 
 ## What `auto` currently does, and why
 
-**`auto` reaches the GPU.** On Metal on an Apple M4, for squared error,
-single output, dense input, at 50 or more features and 250,000 or more rows,
-`auto` selects the accelerator; everywhere else it keeps the CPU and says
-which half of "no rule covered this" applied.
+**`auto` reaches the GPU.** On Metal on an Apple M4, dense input, at 250,000
+or more rows: for squared error at 50 or more features on a single output,
+and for multiclass at 54 or more features on two or more classes. Everywhere
+else it keeps the CPU and says which half of "no rule covered this" applied.
 
-`crossover_rules()` in `src/mojotrees/device_policy.mojo` holds exactly one
-rule:
+`crossover_rules()` in `src/mojotrees/device_policy.mojo` holds two rules,
+one per output regime. They are disjoint, so no request matches both:
 
 ```text
-profile.api              == metal
-profile.apple_generation == m4
-request.objective        == squared error
-request.n_outputs        <= 1
-request.n_features       >= 50
-request.n_rows           >= AUTO_GPU_MIN_ROWS   (250,000)
+apple-m4-metal-dense-regression
+    profile.api              == metal
+    profile.apple_generation == m4
+    request.objective        == squared error
+    request.n_outputs        <= 1
+    request.n_features       >= 50
+    request.n_rows           >= AUTO_GPU_MIN_ROWS   (250,000)
+
+apple-m4-metal-dense-multiclass
+    profile.api              == metal
+    profile.apple_generation == m4
+    request.n_outputs        >= 2
+    request.n_features       >= 54
+    request.n_rows           >= AUTO_GPU_MIN_ROWS   (250,000)
 ```
 
-There is no cell-count term. `min_cells` was 50,000,000, the product of the
-old 1,000,000-row floor and the 50-feature scope, and gating on rows and on
-their product meant the shipped threshold was something a reader had to
-derive by division. It is 0 now, which does not constrain, and
-`AUTO_GPU_MIN_ROWS` is the one number.
+There is no cell-count term in either. `min_cells` was 50,000,000, the
+product of the old 1,000,000-row floor and the 50-feature scope, and gating
+on rows and on their product meant the shipped threshold was something a
+reader had to derive by division. It is 0 now, which does not constrain, and
+`AUTO_GPU_MIN_ROWS` is the one number for both rules.
+
+**The multiclass rule is scoped by trees per round and not by objective
+code, deliberately.** `n_outputs >= 2` is the exact statement of "this is a
+softmax fit": it is what `train_multiclass_gpu` against `train_multiclass`
+branches on, no single-output objective can present it, and it is declared
+whether or not the caller named an objective. That last part is what makes
+the rule reachable at all -- `model.fit_multiclass`,
+`trainset.train_dataset_multiclass` and `external_memory.train_external_
+multiclass` each pass `n_classes` and no objective, so a rule scoped
+`objective == multiclass` would have been unreachable from every Mojo entry
+point while looking correct in the table. Python's `binding_params` does
+declare the objective, and reaches the same rule.
+
+Its evidence is one record: 465,000 rows by 54 features over 7 classes,
+GPU **15.30 s** against CPU **25.47 s**, medians of three at 0.1 and 7.7
+percent spread (`bench/results/profile_2026-08-15/RESULTS.md`,
+`docs/GPU_VALIDATION.md`). The GPU wins multiclass by 1.63x, and the two
+spreads are nowhere near touching. Before 2026-08-16 there was no rule here,
+so `auto` sent every softmax fit to the CPU at every size, which on this
+hardware is the arm that loses. The class count is bounded below at two and
+**not bounded above**: a class is one more independent tree over the same
+already-uploaded matrix, so a larger class count is more of the work that was
+measured. Capping it at the measured seven would send a ten-class fit to the
+CPU while a seven-class fit of the same shape went to the device.
 
 **The row floor is a provisional constant, deliberately set below its own
 evidence, and that is the one thing to know before changing it.** The
@@ -118,7 +150,13 @@ looked like.
    `trainset.train_dataset`, `external_memory.train_external`, and their
    multiclass counterparts, which pass "unspecified" because a softmax fit's
    per-class objective is not one they see). A caller that leaves it
-   defaulted still gets the CPU at every shape, by design.
+   defaulted still gets the CPU at every shape *for a single output*, by
+   design. Multiclass is the exception and it is not one of these three
+   defects: `apple-m4-metal-dense-multiclass` is scoped by trees per round
+   rather than by objective code, precisely so that the three multiclass
+   entry points reach it while declaring no objective. Trees-per-round is a
+   stronger declaration than the objective code, not a weaker one, so this is
+   not the scope being loosened.
 
 The transcript below is the state before (1) and (2) were fixed. It is kept
 because "the table is empty", "the table has a rule that cannot be reached",
@@ -209,7 +247,7 @@ measurement.
 
 **The table is native, not Python.** It lives in
 `crossover_rules()` in `src/mojotrees/device_policy.mojo`, carries
-`POLICY_VERSION = 2`, and holds one rule. The Python module no longer
+`POLICY_VERSION = 6`, and holds two rules. The Python module no longer
 defines `RULES_VERSION`, `CROSSOVER_RULES`, or a `CrossoverRule` type at
 all: it formats the native decision and adds nothing to it, so a rule that
 existed only in Python would be a rule the Mojo API, the CLI, and the C API
@@ -227,9 +265,10 @@ refuses a rule without it.
 | `evidence_id` | Where the numbers live: a document section, a benchmark file, a commit. Required. |
 | `measured_on` | The device the numbers came from. |
 | `api`, `apple_generation` | Scope. Unset means the rule is not limited that way. |
-| `objective` | The objective that was benchmarked. |
+| `objective` | The objective that was benchmarked. Unset means the rule is not scoped that way, which is how the multiclass rule is written: `n_outputs >= 2` states "softmax fit" exactly and the objective code adds nothing to it. |
 | `min_rows`, `min_features`, `min_cells` | The thresholds themselves. |
-| `max_outputs` | Upper bound on trees per round the measurement covered. |
+| `max_outputs` | Upper bound on trees per round the measurement covered. Zero does not constrain. |
+| `min_outputs` | Lower bound on trees per round. Zero does not constrain. `max_outputs = 1` and `min_outputs = 2` are what make the two shipped rules disjoint. |
 
 A rule matches only when every field that is set matches, so widening a
 rule to hardware nobody measured takes a deliberate edit rather than an

@@ -81,6 +81,8 @@ from mojotrees.device_policy import (
     DECISION_AUTO_GPU_EVIDENCE,
     DeviceCapabilities,
     DeviceRequest,
+    M4_MULTICLASS_EVIDENCE_ID,
+    M4_MULTICLASS_MIN_FEATURES,
     M4_TRAINING_EVIDENCE_ID,
     M4_TRAINING_MIN_FEATURES,
     OBJECTIVE_UNSPECIFIED,
@@ -97,7 +99,11 @@ from mojotrees.device_policy import (
     decide_device,
     profile_source_name,
 )
-from mojotrees.objective_registry import SQUARED_ERROR
+from mojotrees.objective_registry import (
+    BINARY_LOGISTIC,
+    MULTICLASS,
+    SQUARED_ERROR,
+)
 
 comptime _DISABLE_GPU = "MOJOTREES_DISABLE_GPU"
 comptime _AUTO_MIN_CELLS = "MOJOTREES_AUTO_MIN_CELLS"
@@ -138,6 +144,35 @@ def _auto(n_rows: Int, n_features: Int) raises -> DeviceRequest:
         1,
         _MEASURED_BINS,
         SQUARED_ERROR,
+    )
+
+
+# The row count the multiclass record was taken at
+# (`bench/results/profile_2026-08-15/RESULTS.md`, 465,000 x 54 over 7
+# classes). Used as a shape well clear of both rules' floors, never as a
+# threshold: the multiclass rule's floor is `AUTO_GPU_MIN_ROWS` and the test
+# below that asserts the floor uses that constant.
+comptime _MULTICLASS_MEASURED_ROWS = 465_000
+
+
+def _auto_multiclass(
+    n_rows: Int, n_classes: Int, objective: Int
+) raises -> DeviceRequest:
+    """A fully described `auto` softmax request at the multiclass record's
+    feature count and the measured bin count.
+
+    `objective` is a parameter rather than a constant because whether the
+    caller declared one is the thing under test: the three Mojo multiclass
+    entry points send `OBJECTIVE_UNSPECIFIED` and Python sends `MULTICLASS`,
+    and the rule is scoped so that both reach it.
+    """
+    return DeviceRequest(
+        AUTO_DEVICE,
+        n_rows,
+        M4_MULTICLASS_MIN_FEATURES,
+        n_classes,
+        _MEASURED_BINS,
+        objective,
     )
 
 
@@ -465,6 +500,199 @@ def test_resolve_device_reaches_the_gpu_only_with_an_objective() raises:
         ),
         CPU_DEVICE,
     )
+
+
+# --- The multiclass rule ------------------------------------------------
+#
+# `tests/test_gpu_auto_reaches_multiclass.mojo` is the other half of this and
+# the half that costs a training run: it proves an `auto` softmax fit produces
+# the GPU trainer's model bits and not the CPU trainer's. Everything here is
+# policy arithmetic and opens no device, which is why it lives in the CPU set
+# beside the single-output assertions.
+
+
+def test_auto_reaches_the_gpu_for_multiclass_at_the_measured_shape() raises:
+    """The multiclass gate, proved open at the shape the record was taken at.
+
+    Until 2026-08-16 the table held one rule, scoped `max_outputs=1`, so a
+    softmax fit fell through to `DECISION_AUTO_CPU_BELOW_EVIDENCE` at every
+    size on every machine. Measured, that meant `auto` handing multiclass
+    users the arm that loses: 465,000 x 54 over 7 classes is CPU 25.47 s
+    against GPU 15.30 s on this hardware.
+
+    Same construction as the single-output test above and for the same
+    reason: `DeviceCapabilities.detect()`, not a fixture, and three
+    assertions past the device code so that "a rule fired" is separated from
+    "something returned a value meaning GPU".
+    """
+    _clear_env()
+    if not _on_the_measured_build():
+        return
+    var caps = DeviceCapabilities.detect()
+    var decision = decide_device(
+        _auto_multiclass(_MULTICLASS_MEASURED_ROWS, 7, MULTICLASS), caps
+    )
+    assert_equal(decision.selected_device, GPU_DEVICE)
+    assert_equal(decision.decision_code, DECISION_AUTO_GPU_EVIDENCE)
+    assert_true(decision.validated())
+    assert_equal(decision.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
+    assert_true(decision.crossover_citation.find("7 classes") >= 0)
+    # And it is not the single-output rule that fired: the two rules are
+    # disjoint and a report that named the wrong one would be citing a
+    # squared-error measurement for a softmax fit.
+    assert_not_equal(decision.evidence_id, M4_TRAINING_EVIDENCE_ID)
+
+
+def test_multiclass_reaches_the_rule_with_or_without_a_declared_objective(
+) raises:
+    """The scope choice, pinned: trees-per-round is the multiclass scope and
+    the objective code is not.
+
+    This is what makes the rule reachable at all. `model.fit_multiclass`,
+    `trainset.train_dataset_multiclass`, and
+    `external_memory.train_external_multiclass` each call `resolve_device`
+    with `n_classes` as `n_outputs` and no objective, so a rule scoped
+    `objective == MULTICLASS` would have been unreachable from every Mojo
+    entry point while looking correct in the table. Python's
+    `binding_params` does declare `MULTICLASS`. Both spellings must reach the
+    same rule, and this asserts they do.
+
+    It is also the test that fails if somebody "tightens" the rule by adding
+    an objective scope to it.
+    """
+    _clear_env()
+    if not _on_the_measured_build():
+        return
+    var caps = DeviceCapabilities.detect()
+    var declared = decide_device(
+        _auto_multiclass(_MULTICLASS_MEASURED_ROWS, 3, MULTICLASS), caps
+    )
+    var undeclared = decide_device(
+        _auto_multiclass(
+            _MULTICLASS_MEASURED_ROWS, 3, OBJECTIVE_UNSPECIFIED
+        ),
+        caps,
+    )
+    assert_equal(declared.selected_device, GPU_DEVICE)
+    assert_equal(undeclared.selected_device, GPU_DEVICE)
+    assert_equal(declared.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
+    assert_equal(undeclared.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
+
+
+def test_resolve_device_reaches_multiclass_without_an_objective() raises:
+    """The same claim through the function the trainers actually call.
+
+    `resolve_device` is the narrow entry point and the multiclass call sites
+    pass it four arguments. This asserts the rule fires through that exact
+    call, so the test cannot pass while the shipped path stays on the CPU --
+    which is precisely the shape of the single-output defect this file's
+    `test_resolve_device_reaches_the_gpu_only_with_an_objective` records.
+    """
+    _clear_env()
+    if not _on_the_measured_build():
+        return
+    assert_equal(
+        resolve_device(
+            AUTO_DEVICE,
+            _MULTICLASS_MEASURED_ROWS,
+            M4_MULTICLASS_MIN_FEATURES,
+            3,
+        ),
+        GPU_DEVICE,
+    )
+    # Below the floor it is still the CPU, so what the class count bought is
+    # a rule and not a bypass of the row floor.
+    assert_equal(
+        resolve_device(
+            AUTO_DEVICE,
+            AUTO_GPU_MIN_ROWS - 1,
+            M4_MULTICLASS_MIN_FEATURES,
+            3,
+        ),
+        CPU_DEVICE,
+    )
+
+
+def test_multiclass_keeps_the_cpu_below_its_floor_and_feature_scope() raises:
+    """The other side of the multiclass gate, both bounds.
+
+    The row floor is `AUTO_GPU_MIN_ROWS`, shared with the single-output rule
+    and provisional for both; the feature scope is
+    `M4_MULTICLASS_MIN_FEATURES`, which is 54 because that is what was
+    measured and not 50 to match the other rule. One short of either and the
+    run keeps the CPU.
+    """
+    _clear_env()
+    if not _on_the_measured_build():
+        return
+    var caps = DeviceCapabilities.detect()
+    var thin = decide_device(
+        _auto_multiclass(AUTO_GPU_MIN_ROWS - 1, 3, MULTICLASS), caps
+    )
+    assert_equal(thin.selected_device, CPU_DEVICE)
+    assert_equal(thin.decision_code, DECISION_AUTO_CPU_BELOW_EVIDENCE)
+    assert_false(thin.validated())
+    # Far more rows than the floor, one feature short of the scope. The
+    # multiclass record was taken at 54 features and says nothing about 53.
+    var narrow = DeviceRequest(
+        AUTO_DEVICE,
+        _MULTICLASS_MEASURED_ROWS,
+        M4_MULTICLASS_MIN_FEATURES - 1,
+        3,
+        _MEASURED_BINS,
+        MULTICLASS,
+    )
+    var narrow_decision = decide_device(narrow, caps)
+    assert_equal(narrow_decision.selected_device, CPU_DEVICE)
+    assert_false(narrow_decision.validated())
+
+
+def test_the_two_rules_are_disjoint() raises:
+    """Neither rule can be reached by a request the other one covers.
+
+    This is what keeps a multiclass rule from moving a single-output fit's
+    bits. `max_outputs=1` on the single-output rule and `min_outputs=2` on
+    the multiclass one are complementary, so a request matches at most one,
+    and a single-output request at a shape well past both floors must still
+    cite the squared-error record.
+    """
+    _clear_env()
+    if not _on_the_measured_build():
+        return
+    var caps = DeviceCapabilities.detect()
+
+    # Single output, well past both row floors and both feature scopes.
+    var single = decide_device(
+        _auto(_MULTICLASS_MEASURED_ROWS, M4_MULTICLASS_MIN_FEATURES), caps
+    )
+    assert_equal(single.selected_device, GPU_DEVICE)
+    assert_equal(single.evidence_id, M4_TRAINING_EVIDENCE_ID)
+    assert_not_equal(single.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
+
+    # A single-output request declaring an objective the single-output rule
+    # does not cover reaches neither rule, which is the check that the
+    # multiclass rule's unconstrained objective field did not open a hole:
+    # binary logistic at 1 output must stay on the CPU.
+    var logistic = DeviceRequest(
+        AUTO_DEVICE,
+        _MULTICLASS_MEASURED_ROWS,
+        M4_MULTICLASS_MIN_FEATURES,
+        1,
+        _MEASURED_BINS,
+        BINARY_LOGISTIC,
+    )
+    var logistic_decision = decide_device(logistic, caps)
+    assert_equal(logistic_decision.selected_device, CPU_DEVICE)
+    assert_false(logistic_decision.validated())
+
+    # Multiclass at a class count past the measured seven still matches: the
+    # rule bounds the class count below and not above, deliberately, and
+    # `crossover_rules()` says what measurement would close that.
+    var many = decide_device(
+        _auto_multiclass(_MULTICLASS_MEASURED_ROWS, 20, MULTICLASS), caps
+    )
+    assert_equal(many.selected_device, GPU_DEVICE)
+    assert_equal(many.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
 
 
 # --- Degrading on a machine that has no accelerator --------------------
