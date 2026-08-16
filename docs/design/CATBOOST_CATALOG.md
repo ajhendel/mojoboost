@@ -186,6 +186,9 @@ chosen. Building it would be building a gate that cannot open.
 | A23 | `PairLogit` + its automatic pair generation (`error_functions.h::TPairLogitError::CalcDersForQueries`; `catboost/private/libs/pairs/util.cpp::GeneratePairLogitPairs` / `GenerateBruteForce`; `catboost/private/libs/target/data_providers.cpp::GeneratePairs`) -- **verified from source** | Pairwise logistic loss over (winner, loser) pairs inside a group. `p = e^{a_lose} / (e^{a_lose} + e^{a_win})`, `Der1[win] += c p`, `Der1[lose] -= c p`, `Der2[both] += c p (p-1)`. With `max_pairs` unset, pairs are *every* label-distinct pair in the group, weight = group weight, no RNG | Yes -- a new objective, and it is the first mojotrees objective whose hessian is pairwise by construction | Yes. It is also the gradient kernel `YetiRank` reuses | CPU (`catboost_ranking.mojo`) | A22/A23/A24 note. **BUILT, off by default, unreached.** (3) when on. **Carries a constant-hessian exclusion.** Deterministic: default pair generation draws nothing |
 | A24 | `YetiRank` (`catboost/private/libs/algo/yetirank_helpers.cpp`: `UpdatePairsForYetiRank`, `GenerateYetiRankPairsForQuery`, `TYetiRankPairWeightsCalcer::{AddNoise,CalcWeightsClassic}`; defaults in `catboost/private/libs/options/loss_description.cpp::GetYetiRankPermutations` / `GetYetiRankDecay`) -- **verified from source** | A *sampled* pairwise scheme, not a closed form: each round, per group, draw `permutations`=10 noisy rankings of the current scores, and in each ranking charge each adjacent pair `0.15 * decay^k * |rel_i - rel_j|`. Average the pair weights over the 10 draws and feed them to the `PairLogit` gradient | Yes, and it is the only objective in the catalog whose gradients depend on an RNG stream | Yes. It is CatBoost's flagship ranking loss and the one a CatBoost ranking comparison will be run under | CPU (`catboost_ranking.mojo`) | A22/A23/A24 note. **BUILT, off by default, unreached.** (3) when on. **Carries a constant-hessian exclusion.** Deterministic under `(seed, iteration, query, permutation, doc)` keying, across `MOJOTREES_NUM_WORKERS` and machines. CatBoost's own stream is NOT nameable |
 | A25 | `group_id` and the two ranking eval metrics `NDCG`, `PFound` (`catboost/libs/data/objects.cpp::CheckGroupIds`; `catboost/libs/data/target.cpp::CheckGroupWeights`; `catboost/libs/metrics/dcg.cpp` + `catboost/libs/metrics/metric.cpp::TDcgMetric`; `catboost/libs/metrics/pfound.h::TPFoundCalcer` + `metric.cpp::TPFoundMetric`; tie rule in `catboost/libs/metrics/doc_comparator.h`) -- **verified from source**, see the A25 note | The grouping contract (contiguous, *not* sorted; loud failure when violated; weights constant inside a group) and the two metrics a CatBoost ranking run is actually judged by. CatBoost's default `NDCG` is **not** LightGBM's: `type=Base` (raw relevance, not `2^l - 1`), no truncation, and an adversarial tie rule | No (metrics move no bits) | Yes. Without them we cannot score a CatBoost ranking run at all, which is bucket C | CPU (`catboost_ranking.mojo`); `ranking.RankGroups` reused unchanged | A25 note. **BUILT, off by default, unreached.** (3) as a metric selection. Deterministic: no RNG |
+| A26 | `Cox` (`catboost/private/libs/algo_helpers/error_functions.h` `TCoxError`, `.cpp:110-207` `ArgSort`/`CalcCoxApproxSum`/`CalcDersRange`; metric `catboost/libs/metrics/metric.cpp:880-947`) -- **verified from source**, see the A26 note | Cox proportional-hazards partial likelihood. One signed label column: `abs(y)` is the time, `y > 0` is an event and `y <= 0` is right-censored. The risk set is a **suffix of a stable sort by `abs(y)`**, so the derivative of every row depends on every other row and there is **no tie correction at all** | New objective | Yes, and it is the only one of the three whose whole shape our machinery already carries: approx dimension 1, one label column, one grad/hess plane | CPU (`survival.mojo`, new file) | (3) when selected, and it is a **coupled** objective: the hessian is per-row and non-constant, and must be declared. Cox is `IsPlainOnlyModeLoss` in CatBoost, which is CatBoost saying the same thing about ordered boosting |
+| A27 | `SurvivalAft` (`error_functions.h` `TSurvivalAftError`, `.cpp:360-450`; `catboost/private/libs/algo_helpers/survival_aft_utils.{h,cpp}`; `catboost/libs/helpers/distribution_helpers.{h,cpp}`; construction in `BuildError`; metric `metric.cpp:408-444`) -- **verified from source**, see the A27 note | Accelerated failure time. **TWO label columns per row**, a lower and an upper bound, with `-1` the unbounded sentinel; `lower == upper` is an exact event, `upper == -1` right-censored, `lower == -1` left-censored, otherwise interval-censored. `dist` in {`Normal` (default), `Logistic`, `Extreme`}, `scale` default 1 and required positive. Approx dimension is **1** (`approx_dimension.cpp`) | New objective | Yes for the derivatives and the metric; **the input contract is the blocker, not the gradient** | CPU (`survival.mojo`), input path unowned | (3) when selected. Per-row non-constant hessian (clipped into `[1e-16, 15]`), declared. **Needs a two-column target that `List[Float64]` cannot spell** |
+| A28 | `MultiRMSE` (`error_functions.h:191-218` `TMultiRMSEError`; `approx_dimension.cpp`; `online_predictor.cpp` `CalcDeltaNewtonMulti`; `hessian.cpp` `TDiagonalHessian::SolveNewtonEquation`; multi-dim score accumulation `catboost/private/libs/algo/scoring.cpp:741-767`; metric `metric.cpp:474-515`) -- **verified from source**, see the A28 note | Multi-target regression. **T label columns per row**, approx dimension T, diagonal hessian, `der[i] = w*(y[i] - p[i])`, `der2[i] = -w`. **One tree per iteration with a vector leaf value** (`model.h:118`, `LeafValues[leafId * ApproxDimension + dim]`), and the split score is the **sum over dimensions into one accumulator** | New objective **and a new tree shape** | The derivatives and the metric yes. The tree shape is `multiclass_tree_count` again, and this time it is not a cosmetic difference: see the A28 note | CPU (`multi_target.mojo`), tree shape unowned (`tree.mojo`, `histogram.mojo`) | (3) when selected. **The shared tree structure is the entire modeling content of MultiRMSE**; without it the objective degenerates into T independent RMSE fits |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -3827,3 +3830,266 @@ of carrying CatBoost's `NDCG:type=Base;denominator=LogPosition` parameter
 syntax through a registry that has one scalar slot per metric. `PFound` has no
 collision and is registered under CatBoost's own name, `pfound`. The naming
 lane owns the final spelling of the first.
+
+### A26/A27/A28 note: the input contract comes first
+
+Status: **verified from CatBoost source**, `master`, read 2026-08-16 by the
+`survival-multitarget` lane. Files read, all under `catboost/`:
+
+- `private/libs/algo_helpers/error_functions.h` (`IDerCalcer`,
+  `TMultiDerCalcer`, `TMultiRMSEError`, `TSurvivalAftError`, `TCoxError`)
+- `private/libs/algo_helpers/error_functions.cpp` (`ArgSort`,
+  `CalcCoxApproxSum`, `TCoxError::CalcDersRange`,
+  `TCoxError::CalcFirstDerRange`, `TSurvivalAftError::CalcDers`)
+- `private/libs/algo_helpers/survival_aft_utils.h` / `.cpp`
+  (`TDerivativeConstants`, `ECensoredType`, `InverseMonotoneTransform`,
+  `ClipDerivatives`, `GetDerivativeLimits`, `DispatchDerivativeLimits`)
+- `libs/helpers/distribution_helpers.h` / `.cpp` (`TNormalDistribution`,
+  `TLogisticDistribution`, `TExtremeDistribution`)
+- `private/libs/algo/approx_dimension.cpp` (`GetApproxDimension`)
+- `private/libs/algo/tensor_search_helpers.cpp` (`BuildError`: the `dist` and
+  `scale` parsing and their defaults)
+- `private/libs/algo/scoring.cpp` (`CalcScoresForSubCandidate`, the
+  `for (int dim ...) UpdateScores(..., scoreCalcer)` loop)
+- `private/libs/algo_helpers/online_predictor.cpp` (`CalcDeltaNewtonMulti`),
+  `private/libs/algo_helpers/hessian.cpp`
+  (`TDiagonalHessian::SolveNewtonEquation`)
+- `private/libs/options/enum_helpers.cpp` (`MultiRegressionObjectives`,
+  `SurvivalRegressionObjectives`, `MultiTargetObjectives`,
+  `IsPlainOnlyModeLoss`), `private/libs/options/enums.h`
+- `private/libs/target/data_providers.cpp` ("SurvivalAft is compatible only
+  with a single-dimensional model")
+- `libs/metrics/metric.cpp` (`TCoxMetric`, `TSurvivalAftMetric`,
+  `TMultiRMSEMetric`)
+- `libs/model/model.h:118`
+
+**The headline is not a gradient.** `boosting.fill_grad_hess`,
+`boosting.train`, `objective.GradHessFn`, `Booster`, and every Python and C
+entry point in this repo take the label as `List[Float64] target`, one number
+per row. That is a **one-column contract**, and two of these three objectives
+cannot be spelled in it at all:
+
+| objective | label columns | approx dimension | fits `List[Float64]`? |
+|---|---|---|---|
+| `Cox` | 1 (signed) | 1 | **yes** |
+| `SurvivalAft` | **2** (lower, upper) | 1 | no |
+| `MultiRMSE` | **T** | **T** | no |
+
+So the deliverable that matters here is `target_matrix.TargetMatrix`, a flat
+row-major `List[Float64]` of `n_rows * n_targets` with `n_targets` beside it,
+and the honest statement that **nothing reaches it yet**: the Python layer,
+the C API, `bindings/_mojotrees.mojo` and the sklearn wrapper all pass one
+column and none of them is this lane's to widen. A two-bound or vector target
+is a change to the *ingestion* path, and it is a bigger and more valuable
+piece of work than any of the three derivative functions.
+
+CatBoost's own layout is the same shape: `TConstArrayRef<TConstArrayRef<float>>
+target` indexed `[dim][row]`, column-major where ours is row-major. Row-major
+is the deliberate choice: the gradient loop for `MultiRMSE` touches
+`target[r*T + t]` and `raw[r*T + t]` for all `t` at one `r`, which is a
+contiguous run of `T` in both, and it is the same layout
+`train_multiclass` already uses for its `raw[r * n_classes + k]` scores.
+
+#### A26. Cox, and the two things everyone gets wrong about it
+
+**The target encoding.** One column. `ArgSort` (error_functions.cpp:110-127)
+sorts by `std::abs(targets[i])`, and the event test throughout is `y > 0`.
+So `abs(y)` is the time and the *sign* is the event indicator. `y == 0` is
+censored, which means **an event at time 0 cannot be expressed**; our
+`cox_signed_target` refuses `time <= 0` for an event rather than silently
+recoding it as censored.
+
+**How the risk set is formed, and it is not Breslow.** `CalcDersRange` walks
+the rows in sorted order carrying a one-position-lagged `accumulatedSum`, and
+subtracts it from `expPSum` at each event:
+
+```cpp
+accumulatedSum += lastExpP;
+if (y > 0) { expPSum -= accumulatedSum; accumulatedSum = 0;
+             rk += 1.0 / expPSum; sk += 1.0 / (expPSum * expPSum); }
+const double grad = static_cast<double>(y > 0) - expP * rk;
+const double hess = expP * rk - expP * expP * sk;
+ders[ind].Der1 = grad;  ders[ind].Der2 = -hess;
+```
+
+so at sorted position `k` the risk set is exactly `{k, k+1, ..., n-1}` --
+**the suffix of the sort order**, not the set of rows with time `>= t_k`.
+The two differ precisely on ties. Two events at the same time: the first sees
+both, the second does **not** see the first. That is neither Breslow (which
+gives every tied event the full risk set) nor Efron (which averages); it is
+**no tie correction**, with ties broken by `StableSort`, therefore by original
+row index. mojotrees reproduces exactly this, and reproduces it with its own
+stable index merge sort keyed on `(abs(y), row index)` so that the tiebreak is
+a stated rule rather than a property of whatever sort is linked in.
+
+**Consequences that are not details.**
+
+- The hessian `h_k = e^{p_k} r_k - e^{2 p_k} s_k` is **per-row, non-constant,
+  and coupled**: it depends on the approxes of every row that shares a risk
+  set with `k`. `cox_varies_hessian()` is unconditionally `True` and
+  `check_cox_hessian_declaration` refuses a `CONSTANT_HESSIAN` declaration
+  beside it, in the shape of `sampling.check_mvs_hessian_declaration`. It is
+  non-negative -- `h_k = e^{p_k} sum_i (S_i - e^{p_k}) / S_i^2` and
+  `e^{p_k} <= S_i` whenever `k` is in `R_i` -- so the Newton step is safe, but
+  it reaches exactly 0 for the last row and that is a real leaf-denominator
+  case, not a numerical accident.
+- **CatBoost ignores `weights` for Cox.** Both `CalcDersRange` and
+  `CalcFirstDerRange` name the parameter `const float* /*weights*/`. A
+  weighted Cox partial likelihood needs the weights inside `S_i`, which
+  CatBoost never does. mojotrees **refuses** a non-empty `sample_weight` for
+  Cox rather than accepting and dropping it.
+- **`labelOrder` is indexed out of its own bounds when `start != 0`.**
+  `ArgSort` returns a vector of length `count` filled `iota` from `start`, and
+  the caller reads `labelOrder[i]` for `i` in `[start, start + count)`.
+  `CalcFirstDerRange` also reads `getApprox(0)` where its sibling reads
+  `getApprox(start)`. Both are only harmless because Cox is always called with
+  `start == 0` over the whole learn set. It is worth recording as the
+  strongest available evidence that CatBoost itself treats Cox as a
+  whole-dataset objective.
+- Adding a constant to every raw score leaves the partial likelihood
+  unchanged, so Cox has **no meaningful base score**; ours starts at 0, which
+  is CatBoost's `INIT_ZERO` equivalent.
+- The metric (`TCoxMetric::Eval`) is the partial log-likelihood itself,
+  higher-is-better, and it is **not** additive over rows -- CatBoost derives it
+  from `TNonAdditiveSingleTargetMetric` for exactly that reason. It also does
+  **not** subtract the maximum approx before exponentiating where the
+  derivative code does, so it overflows above `|approx| ~ 709`. Ours subtracts
+  the maximum in both places. That is analytically the identical quantity and
+  bit-moving only, class (3).
+
+#### A27. SurvivalAft, and how an interval target is spelled
+
+**The input.** `TSurvivalAftError::CalcDers` reads `target[0]` and
+`target[1]`. The four cases, in CatBoost's own branch order:
+
+| test | `ECensoredType` | meaning |
+|---|---|---|
+| `target[0] == target[1]` | `Uncensored` | exact event at that time |
+| `target[1] == -1` | `RightCensored` | still alive after `target[0]` |
+| `target[0] == -1` | `LeftCensored` | event before `target[1]` |
+| otherwise | `IntervalCensored` | event inside `(lower, upper)` |
+
+`-1` is the sentinel, in **both** columns, and the metric agrees
+(`realTarget` maps `-1` to `+infinity`). Note that the uncensored test comes
+first, so `(-1, -1)` is read as an exact event at time `-1` and
+`log(-1)` follows; `TargetMatrix.check_survival_aft` refuses it.
+
+**The transform.** `InverseMonotoneTransform(approx, target, scale)` is
+`(log(target) - approx) / scale`, so the model predicts `log` of the survival
+time and `exp(approx)` is a time. Every target must be strictly positive; we
+check it, CatBoost does not.
+
+**The derivatives.** With `z = (log t - a) / scale`, `f` the distribution's
+pdf and `F` its cdf, the loss is `-log(f(z) / (scale t))` uncensored and
+`-log(F(z_U) - F(z_L))` otherwise, and CatBoost's two numerator/denominator
+pairs are exactly the first and second derivatives of those:
+
+```
+uncensored:  g = f'(z) / (scale * f(z))
+             h = -(f(z) f''(z) - f'(z)^2) / (scale * f(z))^2
+censored:    P = f(z_U) - f(z_L),  D = F(z_U) - F(z_L),  Q = f'(z_U) - f'(z_L)
+             g = P / (scale * D)
+             h = (P^2 - D Q) / (scale * D)^2
+```
+
+with `f = F = f' = 0` substituted at an unbounded lower end and
+`f = f' = 0, F = 1` at an unbounded upper end. CatBoost stores `Der1 = -g` and
+`Der2 = -h` throughout (its `RMSE` stores `target - approx` against a loss
+whose gradient is `approx - target`), which is why the two minus signs appear
+in `CalcDers` and why the diagonal Newton solve reads
+`negativeDer[d] / (Data[d] - l2)`.
+
+**Then it clips, and the clip is load-bearing.** `TDerivativeConstants`:
+`g` into `[-15, 15]`, `h` into `[1e-16, 15]`. The `1e-16` floor is what makes
+the hessian strictly positive for every row and every distribution, so a leaf
+denominator can never be zero -- and it is also why the hessian is **non-
+constant per row**, declared through `survival_aft_varies_hessian`. The
+`DispatchDerivativeLimits` table is the *second* fallback, reached only when
+the denominator is below `1e-12` **and** the quotient came out NaN or
+infinite; it substitutes a per-(distribution, order, censoring, sign) limit.
+That table is transcribed verbatim in `survival.aft_derivative_limit`,
+including the two entries that look like typos and are reproduced as written:
+`Normal`/`Second`/`RightCensored` returns `(1/scale^2, 1e-16)` with the larger
+value in the `min` slot, and `Extreme`/`Second` returns `(15, 1e-16)` the same
+way. They are used as `targetSign ? min : max`, so the order of the pair is
+the whole meaning and guessing at it would change answers.
+
+**`scale` and `dist`.** `BuildError` accepts exactly two loss params, `dist`
+and `scale`; `dist` defaults to `Normal` and `scale` to `1`, and
+`TSurvivalAftError`'s constructor enforces `scale > 0`. The three
+distributions are transcribed from `distribution_helpers.cpp` -- Normal,
+Logistic, and Extreme (Gumbel-minimum, `F(x) = 1 - exp(-e^x)`).
+
+**Divergences, both deliberate.** CatBoost calls `fast_exp` and `FastLogf`;
+we call `std.math.exp` and `std.math.log`. **Both sides are approximate** and
+this lane makes no accuracy claim in either direction, because Mojo's
+transcendentals are not libm: measured on this toolchain, `exp(log(5.0))` is
+`4.999999998698298` (2.6e-10 relative) and the Normal cdf at 1 is
+`0.841344750494095` against libm's `0.8413447460685429` (5.3e-9 relative).
+Class (3), bit-moving, and it is why the AFT tolerances in
+`tests/test_survival_multitarget.mojo` are 1e-7 rather than 1e-12. And `TSurvivalAftError::CalcDers` takes
+`float /*weight*/` and **drops it**, exactly as Cox does; we multiply both
+derivatives by the row weight, because a weight is a clean multiplier here
+(unlike Cox, where it would have to enter the risk-set sums) and silently
+ignoring an argument the caller passed is the worse failure.
+
+**The eval metric is not the likelihood.** `TSurvivalAftMetric` is the mean
+weighted **distance from the interval in time units**: it exponentiates the
+approx, and adds `min(|e^a - lower|, |e^a - upper|)` whenever `e^a <= lower`
+or `e^a >= upper`, with `-1` read as `+infinity` in both columns so that the
+right- and left-censored cases fall out of the same expression. Lower is
+better, best 0. Anyone reporting "SurvivalAft" as a number is reporting that,
+not a log-likelihood.
+
+#### A28. MultiRMSE, where the tree shape *is* the objective
+
+**The derivatives are trivial and are not the point.** For each of `T`
+dimensions, `der[i] = w * (y[i] - p[i])` and `der2[i] = -w`; the hessian type
+is `Diagonal`, so there is no cross-target term anywhere in the derivative.
+`TMultiRMSEErrorWithMissingValues` is the same function with `NaN` targets
+zeroing both, which is a second registered loss
+(`MultiRMSEWithMissingValues`) and is built here beside it because it costs
+one branch.
+
+**The tree shape is the point, and it is verified.**
+`approx_dimension.cpp` returns `targetDimension` for a multi-target
+objective; `model.h:118` says leaf values are laid out
+`[treeIndex][leafId * ApproxDimension + dimension]`; and `scoring.cpp:751-766`
+loops `for (int dim = 0; dim < approxDimension; ++dim) UpdateScores(stats +
+dim*splitStatsCount, ..., scoreCalcer)` into **one** `scoreCalcer`, whose
+`AddLeaf` does `Scores[splitIdx] += ...`. So:
+
+> CatBoost builds **one tree per iteration** whose structure is chosen by the
+> **sum over targets** of the per-target split score, and gives it a **vector
+> leaf value** solved per target from the diagonal hessian:
+> `value[d] = -sum(der[d]) / (sum(der2[d]) - l2_scaled)`.
+
+This is the same distinction `bench/real_data/scenarios.py`
+`CATBOOST_UNMATCHABLE["multiclass_tree_count"]` already records for
+`MultiClass` -- but for `MultiRMSE` it is not a bookkeeping difference, it is
+**the entire model**. Because the `MultiRMSE` derivative has no cross-target
+coupling, the shared structure is the *only* thing that couples the targets:
+grow one tree per target per round, as our multiclass machinery does, and the
+result is **bit-identical to `T` independent `SQUARED_ERROR` boosters**.
+`train_multi_rmse` in `multi_target.mojo` is that shape, is labelled that way
+in its docstring, and is useful as a multi-output regression API and as the
+consumer that gives `TargetMatrix` a reason to exist -- but it is **not
+CatBoost's `MultiRMSE`** and no comparison should say it is.
+
+Two things are needed from the tree lanes and they are stated as an owed
+interface rather than built here:
+
+1. `histogram.mojo`: `T` gradient planes and `T` hessian planes per node, or
+   one plane set of stride `T`. This is the same request `multiclass-device`
+   makes; the only new part is that the planes must be summable into one score.
+2. `tree.mojo`: a split gain that is `sum over d of gain_d`, not the gain of
+   the summed planes. **These are different numbers** and collapsing them is
+   the easy wrong answer here. `multi_target.multi_target_split_gain` and
+   `multi_target.multi_target_leaf_values` are written and tested against
+   CatBoost's formulas so that whoever owns the grower calls a checked
+   function instead of rederiving it.
+
+**The metric.** `sqrt( sum over d of sum over i of w_i (p - y)^2 / sum over i
+of w_i )`. The denominator is the row-weight sum and is **not** multiplied by
+`T`, so `MultiRMSE` is the root-mean-square *Euclidean norm* of the residual
+vector, not the mean of the per-target RMSEs. At `T = 1` it is exactly RMSE.
