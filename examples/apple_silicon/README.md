@@ -358,7 +358,7 @@ work when they are present.
 | Shown as a placeholder | State |
 | --- | --- |
 | `pip install mojotrees` | Not published. No PyPI release, no downloadable wheel. |
-| `predict(..., device="gpu")` | Not implemented. Prediction is CPU only. |
+| `predict(..., device="gpu")` | Implemented. `predict`, `predict_proba`, and the ranker's `predict` take `device=`, and the device entry points are registered in the extension. Contributions and sparse input have no device path and refuse an explicit `"gpu"`. This row is retired. |
 | `explain_device_choice(X)` | Implemented and re-exported from `mojotrees`. This row is retired. |
 | `device="auto"` choosing the GPU | One measured rule exists and cannot fire, because `DeviceCapabilities.detect()` opens no device and a hardware-scoped rule cannot match an unidentified profile. `MOJOTREES_AUTO_MIN_CELLS` is the escape hatch until a trainer passes the profile it reads. |
 | Early stopping with `device="gpu"` | Raises. Validation is scored on the CPU. |
