@@ -3,12 +3,35 @@
 A parameter string is whitespace separated `key=value` pairs, the same
 shape LightGBM accepts in its config files and in `LGBM_BoosterCreate`:
 
-    objective=binary num_leaves=31 learning_rate=0.05 num_iterations=200
+    objective=binary max_leaves=31 learning_rate=0.05 n_estimators=200
 
 This is the only training surface the C ABI (`capi/`) and the CLI (`cli/`)
 expose, which keeps both of them free of struct layouts that would have to
-change whenever a hyperparameter is added. Keys are LightGBM's names, with
-LightGBM's common aliases accepted.
+change whenever a hyperparameter is added.
+
+Canonical names, and every vendor's spelling
+--------------------------------------------
+Keys are the canonical names of docs/PARAMETER_NAMING.md: one name per
+parameter, always a name some vendor already uses, chosen for being the
+clearest of the four. Every other vendor's spelling for the same parameter
+is accepted as an alias, so a LightGBM, XGBoost, CatBoost or scikit-learn
+configuration ports across without being retyped -- and retyping is where
+two "identical" configurations quietly stop being identical.
+
+The canonical name is what this module's error messages and the package's
+documentation use. It is *not* what the struct fields, the LightGBM model
+files, or `tools/check_parity.py` are named: those keep LightGBM's
+spelling, because that is the wire and a wire does not get renamed for
+readability. `n_estimators` therefore sets `BoosterParams.n_estimators`,
+`max_leaves` sets `TreeParams.num_leaves`, and `min_child_weight` sets
+`TreeParams.min_child_hess`.
+
+**Values are case insensitive.** CatBoost writes `RMSE`, `SymmetricTree`
+and `Bayesian`; XGBoost writes `reg:squarederror`; LightGBM writes
+everything lowercase. All of them arrive here and are folded to ASCII
+lowercase before any comparison (`_lower_ascii`), which is the one place
+that fold happens on this surface. Keys are compared as written: no vendor
+capitalizes a parameter name.
 
 Intentional differences from LightGBM
 
@@ -67,18 +90,23 @@ from .tree_parameters_extra import (
 # module's callers import.
 comptime MULTICLASS = _MULTICLASS
 
-# Every key `parse_params` accepts, primary names only, for error messages.
+# Every key `parse_params` accepts, canonical names only, for error
+# messages. An alias is deliberately absent here: a user who misspelled
+# `colsample_bytre` should be shown the one name to reach for, not four.
 comptime SUPPORTED_KEYS = String(
-    "objective, num_class, num_iterations, learning_rate, num_leaves,"
-    " min_data_in_leaf, min_sum_hessian_in_leaf, lambda_l1, lambda_l2,"
-    " max_depth, grow_policy, feature_fraction, feature_fraction_bynode,"
-    " feature_fraction_bylevel, feature_fraction_seed, min_gain_to_split,"
+    "objective, num_class, n_estimators, learning_rate, max_leaves,"
+    " min_child_samples, min_child_weight, reg_alpha, reg_lambda,"
+    " max_depth, grow_policy, boosting_type, colsample_bytree,"
+    " colsample_bynode, colsample_bylevel, feature_fraction_seed,"
+    " min_split_gain,"
     " max_delta_step, path_smooth, extra_trees, extra_seed, random_strength,"
-    " monotone_penalty, monotone_constraints_method, cegb_tradeoff,"
+    " score_function, monotone_penalty, monotone_constraints_method,"
+    " cegb_tradeoff,"
     " cegb_penalty_split, linear_tree, linear_lambda, enable_bundle,"
     " max_conflict_rate, feature_pre_filter,"
     " data_sample_strategy, max_bin, alpha, fair_c,"
-    " tweedie_variance_power, device, use_missing,"
+    " tweedie_variance_power, device, random_state, n_jobs, verbose,"
+    " use_missing,"
     " use_quantized_grad, num_grad_quant_bins, quant_train_renew_leaf,"
     " stochastic_rounding, leaf_estimation_iterations,"
     " derivative_precision"
@@ -97,18 +125,31 @@ comptime SUPPORTED_KEYS = String(
 # carry `monotone_constraints`. All three are reachable through
 # `TreeParams.extra.penalties` in the Mojo API: the first on `contri`, the
 # other two on `penalties.cegb` (cegb.mojo).
+#
+# Every vendor spelling of a Mojo-API-only parameter is listed too, so that
+# `subsample` and `rsm` and `cat_features` each get the sentence naming the
+# feature they asked for rather than "unknown parameter". A name that is
+# only ever an alias still belongs here: what the user needs to be told is
+# about the parameter, not about the spelling.
 comptime _MOJO_API_ONLY = String(
-    "bagging_fraction bagging_freq bagging_seed pos_bagging_fraction"
-    " neg_bagging_fraction top_rate other_rate boosting boosting_type"
-    " monotone_constraints interaction_constraints"
-    " categorical_feature cat_smooth cat_l2 max_cat_threshold"
-    " max_cat_to_onehot min_data_per_group early_stopping_round"
-    " early_stopping_rounds first_metric_only lambdarank_truncation_level"
+    "bagging_fraction subsample sub_row bagging"
+    " bagging_freq subsample_freq bagging_seed pos_bagging_fraction"
+    " neg_bagging_fraction top_rate other_rate"
+    " monotone_constraints monotonic_cst interaction_constraints"
+    " interaction_cst"
+    " categorical_feature categorical_features cat_features"
+    " cat_smooth cat_l2 max_cat_threshold"
+    " max_cat_to_onehot one_hot_max_size min_data_per_group"
+    " early_stopping_round"
+    " early_stopping_rounds od_wait n_iter_no_change"
+    " first_metric_only lambdarank_truncation_level"
     " label_gain sigmoid eval_at ndcg_eval_at class_weight is_unbalance"
     " unbalance unbalanced_sets scale_pos_weight feature_contri"
     " feature_contrib fc fp feature_penalty cegb_penalty_feature_coupled"
     " cegb_penalty_feature_lazy bootstrap_type bagging_temperature"
-    " bootstrap_seed"
+    " bootstrap_seed min_data_in_bin bin_construct_sample_cnt"
+    " drop_rate rate_drop max_drop skip_drop uniform_drop drop_seed"
+    " xgboost_dart_mode metric eval_metric custom_metric"
 )
 
 
@@ -143,16 +184,58 @@ struct TrainConfig(Copyable, Movable):
         return self.objective == MULTICLASS
 
 
-def objective_from_name(name: String) raises -> Int:
-    """Objective code for a LightGBM objective name, or `MULTICLASS`.
+def _lower_ascii(value: String) -> String:
+    """`value` with A-Z folded to a-z, every other byte untouched.
 
-    Accepts LightGBM's aliases for the objectives mojotrees implements.
-    Names are canonical lowercase, as in `parse_device`.
+    The one place a value string is case folded on this surface. CatBoost
+    writes `RMSE`, `SymmetricTree`, `Bayesian` and `Plain`; XGBoost writes
+    `reg:squarederror`; LightGBM writes lowercase. docs/PARAMETER_NAMING.md
+    makes value strings case insensitive, so every value comparison below
+    happens after this fold and every table entry is written lowercase.
+
+    ASCII only, and deliberately: a parameter value is a vocabulary word
+    from one of four libraries, all of which spell theirs in ASCII, and a
+    Unicode fold would make `objective` depend on a locale table for no
+    reachable gain.
+    """
+    var out = String("")
+    for b in value.as_bytes():
+        var c = Int(b)
+        if c >= 65 and c <= 90:
+            c += 32
+        out = out + chr(c)
+    return out^
+
+
+def objective_from_name(name: String) raises -> Int:
+    """Objective code for an objective name, or `MULTICLASS`.
+
+    Accepts all four vendors' spellings: LightGBM's names and aliases,
+    XGBoost's `reg:`/`binary:`/`multi:`/`count:` loss names, CatBoost's
+    `loss_function` values, and scikit-learn's `HistGradientBoosting*`
+    `loss` values. `name` is folded to lowercase first, so `RMSE`,
+    `rmse` and `Rmse` are one name.
 
     The LightGBM objectives mojotrees does not implement are named
-    explicitly in `_unimplemented_objective_error` rather than falling into
-    the unknown-name message: a user who asks for `multiclassova` has asked
-    for a real thing, and being told it is unknown would be misleading.
+    explicitly in `_raise_if_unimplemented_objective` rather than falling
+    into the unknown-name message: a user who asks for `multiclassova` has
+    asked for a real thing, and being told it is unknown would be
+    misleading.
+    """
+    var lowered = _lower_ascii(name)
+    return _objective_from_lower(lowered)
+
+
+def _objective_from_lower(name: String) raises -> Int:
+    """`objective_from_name` with the case fold already applied.
+
+    Split out so that `parse_params`, which has folded the value once
+    already, does not fold it twice; the table is here and nowhere else.
+
+    Each row is one objective and every vendor's word for it. The vendors,
+    in column order per docs/PARAMETER_NAMING.md, are LightGBM (`objective`),
+    XGBoost (`objective`), CatBoost (`loss_function`) and scikit-learn's
+    `HistGradientBoosting*` (`loss`).
     """
     if (
         name == "regression"
@@ -160,36 +243,88 @@ def objective_from_name(name: String) raises -> Int:
         or name == "l2"
         or name == "mean_squared_error"
         or name == "mse"
+        # XGBoost, and its pre-1.0 spelling; CatBoost; scikit-learn.
+        or name == "reg:squarederror"
+        or name == "reg:linear"
+        or name == "rmse"
+        or name == "squared_error"
     ):
         return SQUARED_ERROR
-    if name == "binary":
+    if (
+        name == "binary"
+        # XGBoost; CatBoost; scikit-learn.
+        or name == "binary:logistic"
+        or name == "logloss"
+        or name == "log_loss"
+    ):
         return BINARY_LOGISTIC
-    if name == "poisson":
+    if name == "poisson" or name == "count:poisson":
         return POISSON
+    # CatBoost spells it `Huber` too, though it carries its delta in the
+    # name (`Huber:delta=1.0`) rather than in a separate parameter; the bare
+    # word is the spelling both libraries share. XGBoost's nearest thing is
+    # `reg:pseudohubererror`, a different curve, refused by name below.
     if name == "huber":
         return HUBER
-    if name == "quantile":
+    if (
+        name == "quantile"
+        or name == "reg:quantileerror"
+        # scikit-learn's HistGradientBoostingRegressor.
+        or name == "quantile_loss"
+    ):
         return QUANTILE
     if (
         name == "mae"
         or name == "regression_l1"
         or name == "l1"
         or name == "mean_absolute_error"
+        # XGBoost; CatBoost; scikit-learn.
+        or name == "reg:absoluteerror"
+        or name == "absolute_error"
     ):
         return L1
-    if name == "gamma":
+    if name == "gamma" or name == "reg:gamma":
         return GAMMA
-    if name == "tweedie":
+    if name == "tweedie" or name == "reg:tweedie":
         return TWEEDIE
-    if name == "mape" or name == "mean_absolute_percentage_error":
+    if (
+        name == "mape"
+        or name == "mean_absolute_percentage_error"
+        # XGBoost 2.x.
+        or name == "reg:absolutepercentageerror"
+    ):
         return MAPE
     if name == "fair":
         return FAIR
-    if name == "cross_entropy" or name == "xentropy":
+    if (
+        name == "cross_entropy"
+        or name == "xentropy"
+        # CatBoost's name for the same loss.
+        or name == "crossentropy"
+    ):
         return CROSS_ENTROPY
-    if name == "multiclass" or name == "softmax":
+    if (
+        name == "multiclass"
+        or name == "softmax"
+        # XGBoost; CatBoost. `multi:softprob` differs from `multi:softmax`
+        # only in what predict returns, which is `predict_proba` here, so
+        # both name the same trainer.
+        or name == "multi:softmax"
+        or name == "multi:softprob"
+    ):
         return MULTICLASS
-    if name == "lambdarank":
+    if name == "reg:pseudohubererror":
+        raise Error(
+            "objective 'reg:pseudohubererror' is XGBoost's smooth"
+            " pseudo-Huber, which is a different curve from LightGBM's"
+            " 'huber' (a quadratic spliced to a line at alpha), not a"
+            " spelling of it; mojotrees implements 'huber'"
+        )
+    # XGBoost's `rank:ndcg` is the same LambdaRank-with-NDCG family and
+    # resolves here. CatBoost's `YetiRank` is not: it is a different pairwise
+    # loss, so it falls through to the unknown-name message rather than being
+    # told it is LambdaRank spelled differently.
+    if name == "lambdarank" or name == "rank:ndcg":
         raise Error(
             "objective 'lambdarank' needs query groups, which a parameter"
             " string cannot carry; use train_ranker in the Mojo API"
@@ -225,6 +360,8 @@ def _raise_if_unimplemented_objective(name: String) raises:
         )
     if name == "multiclassova" or name == "multiclass_ova" or (
         name == "ova" or name == "ovr"
+        # CatBoost's spelling of the same scheme.
+        or name == "multiclassoneversusall"
     ):
         raise Error(
             "objective 'multiclassova' is not implemented; one-vs-rest"
@@ -321,15 +458,30 @@ def params_names_mojo_api_only(spec: String) -> Bool:
         var value = String(token[byte=eq + 1 :])
         if _is_mojo_api_only(key):
             return True
-        if (key == "objective" or key == "application") and (
-            value == "lambdarank" or value == "custom"
+        var lowered = _lower_ascii(value)
+        if (
+            key == "objective"
+            or key == "application"
+            or key == "loss_function"
+            or key == "loss"
+        ) and (
+            lowered == "lambdarank"
+            or lowered == "rank:ndcg"
+            or lowered == "custom"
         ):
             return True
         # `data_sample_strategy=bagging` is accepted; only the GOSS value
         # needs the Mojo API, because selecting it means handing the trainer
         # a `GossParams`.
-        if key == "data_sample_strategy" and value == "goss":
+        if key == "data_sample_strategy" and lowered == "goss":
             return True
+        # Same rule for the three `boosting_type` values that name a real
+        # trainer needing a parameter bundle. `ordered` is deliberately not
+        # here: it is not implemented at all, so it is not a feature reached
+        # the wrong way.
+        if key == "boosting_type" or key == "boosting" or key == "booster":
+            if lowered == "dart" or lowered == "goss" or lowered == "rf":
+                return True
     return False
 
 
@@ -388,6 +540,56 @@ def _check_alpha_key(config: TrainConfig, alpha_key: String) raises:
         "'; it takes '",
         expected,
         "'",
+    )
+
+
+def _check_boosting_type(value: String) raises:
+    """The one `boosting_type` vocabulary: gbdt, dart, goss, rf, plain,
+    ordered. `value` is already lowercased.
+
+    `plain` is CatBoost's word for boosting without its ordered scheme,
+    which is what `gbdt` is, so it resolves to `gbdt` and this surface's
+    default configuration answers it by doing nothing.
+
+    `ordered` is CatBoost's ordered boosting: derivatives for row i taken
+    from a model that never saw row i. It is not implemented anywhere in
+    mojotrees (docs/design/CATBOOST_CATALOG.md, A7), so it parses and is
+    then refused by name -- the user asked for a real thing and being told
+    the value is unknown would be misleading.
+
+    `dart`, `goss` and `rf` are implemented, but selecting one means handing
+    a trainer a `DartParams`, a `GossParams` or the RF loop, which a
+    whitespace-separated string cannot carry, exactly as it cannot carry
+    `bagging_fraction`. They are refused with the Mojo API sentence rather
+    than as unknown values.
+    """
+    if value == "gbdt" or value == "plain" or value == "gbrt" or (
+        value == "traditional" or value == "gbtree"
+    ):
+        return
+    if value == "ordered":
+        raise Error(
+            "boosting_type 'ordered' is not implemented: CatBoost's ordered"
+            " boosting takes each row's derivatives from a model fitted"
+            " without that row, which needs a per-permutation model set"
+            " mojotrees does not build. 'plain' (an alias of 'gbdt') is the"
+            " scheme mojotrees trains"
+        )
+    if value == "dart" or value == "goss" or value == "rf" or (
+        value == "random_forest" or value == "dart_mode"
+    ):
+        raise Error(
+            "boosting_type '",
+            value,
+            "' is supported by the Mojo API only, not by parameter strings:"
+            " it needs a parameter bundle (DartParams, GossParams) or the"
+            " random-forest loop, which a whitespace-separated string cannot"
+            " carry any more than it can carry bagging_fraction",
+        )
+    raise Error(
+        "unknown boosting_type '",
+        value,
+        "'; expected gbdt, dart, goss, rf, plain (= gbdt), or ordered",
     )
 
 
@@ -459,6 +661,14 @@ def parse_params(spec: String) raises -> TrainConfig:
     var config = TrainConfig()
     var saw_num_class = False
     var alpha_key = String("")
+    # `random_state` sets every seed this surface carries, but only the ones
+    # the string did not name outright: an explicit `feature_fraction_seed`
+    # wins over a global seed whichever order they appear in, which is the
+    # rule a reader expects and the one LightGBM's `seed` follows.
+    var random_state = 0
+    var saw_random_state = False
+    var saw_feature_fraction_seed = False
+    var saw_extra_seed = False
 
     for token_slice in spec.split():
         var token = String(token_slice)
@@ -473,64 +683,118 @@ def parse_params(spec: String) raises -> TrainConfig:
             raise Error("empty parameter name in '", token, "'")
         if value.byte_length() == 0:
             raise Error("parameter '", key, "' has an empty value")
+        # docs/PARAMETER_NAMING.md: value strings are case insensitive, keys
+        # are not. Folded once here so that no branch below has to remember
+        # to, and so that a value that is a number or a path is untouched by
+        # anything except an A-Z byte, which neither can contain.
+        var lowered = _lower_ascii(value)
 
-        if key == "objective" or key == "application":
-            config.objective = objective_from_name(value)
-        elif key == "num_class" or key == "num_classes":
+        # `application` is LightGBM's, `loss_function` CatBoost's, `loss`
+        # scikit-learn's.
+        if (
+            key == "objective"
+            or key == "application"
+            or key == "loss_function"
+            or key == "loss"
+        ):
+            config.objective = _objective_from_lower(lowered)
+        elif (
+            key == "num_class"
+            or key == "num_classes"
+            # CatBoost's name for the same count.
+            or key == "classes_count"
+        ):
             config.n_classes = _parse_int(key, value)
             saw_num_class = True
         elif (
-            key == "num_iterations"
+            key == "n_estimators"
+            # LightGBM.
+            or key == "num_iterations"
             or key == "num_iteration"
-            or key == "n_estimators"
             or key == "num_round"
             or key == "num_rounds"
             or key == "num_boost_round"
+            or key == "num_trees"
+            or key == "num_tree"
+            # CatBoost; scikit-learn's HistGradientBoosting*.
+            or key == "iterations"
+            or key == "max_iter"
         ):
             config.booster.n_estimators = _parse_int(key, value)
         elif (
             key == "learning_rate"
             or key == "shrinkage_rate"
+            # XGBoost.
             or key == "eta"
         ):
             config.booster.learning_rate = _parse_f64(key, value)
-        elif key == "num_leaves" or key == "num_leaf":
+        elif (
+            key == "max_leaves"
+            # LightGBM; scikit-learn's HistGradientBoosting*.
+            or key == "num_leaves"
+            or key == "num_leaf"
+            or key == "max_leaf_nodes"
+        ):
             config.booster.tree.num_leaves = _parse_int(key, value)
         elif (
-            key == "min_data_in_leaf"
+            key == "min_child_samples"
+            # LightGBM (and CatBoost, which uses LightGBM's spelling here);
+            # scikit-learn's HistGradientBoosting*.
+            or key == "min_data_in_leaf"
             or key == "min_data"
-            or key == "min_child_samples"
+            or key == "min_samples_leaf"
         ):
             config.booster.tree.min_data_in_leaf = _parse_int(key, value)
         elif (
-            key == "min_sum_hessian_in_leaf"
+            key == "min_child_weight"
+            # LightGBM.
+            or key == "min_sum_hessian_in_leaf"
             or key == "min_sum_hessian"
-            or key == "min_child_weight"
         ):
             config.booster.tree.min_child_hess = _parse_f64(key, value)
-        elif key == "lambda_l1" or key == "reg_alpha":
+        elif key == "reg_alpha" or key == "lambda_l1":
             config.booster.tree.lambda_l1 = _parse_f64(key, value)
-        elif key == "lambda_l2" or key == "reg_lambda" or key == "lambda":
+        elif (
+            key == "reg_lambda"
+            # LightGBM; CatBoost; scikit-learn's HistGradientBoosting*.
+            or key == "lambda_l2"
+            or key == "lambda"
+            or key == "l2_leaf_reg"
+            or key == "l2_regularization"
+        ):
             config.booster.tree.lambda_reg = _parse_f64(key, value)
-        elif key == "max_depth":
+        elif key == "max_depth" or key == "depth":
             config.booster.tree.max_depth = _parse_int(key, value)
         elif key == "grow_policy":
-            # XGBoost's name and spellings; LightGBM has no such switch, so
-            # this is an extension rather than a parity row
-            # (growth_policy.mojo). `depthwise` commits a depth at a time.
-            config.booster.tree.grow_policy = parse_grow_policy(value)
+            # XGBoost's and CatBoost's parameter, with all three vendors'
+            # value spellings and all of them case insensitive
+            # (growth_policy.mojo): `lossguide` grows by best gain anywhere,
+            # `depthwise` commits a depth at a time, `symmetrictree` grows
+            # oblivious trees. LightGBM has no such switch, so this is an
+            # extension rather than a parity row.
+            config.booster.tree.grow_policy = parse_grow_policy(lowered)
+        elif key == "boosting_type" or key == "boosting" or key == "booster":
+            _check_boosting_type(lowered)
         elif (
-            key == "feature_fraction"
+            key == "colsample_bytree"
+            # LightGBM; CatBoost.
+            or key == "feature_fraction"
             or key == "sub_feature"
-            or key == "colsample_bytree"
+            or key == "rsm"
         ):
             config.booster.tree.feature_fraction = _parse_f64(key, value)
-        elif key == "feature_fraction_bynode" or key == "colsample_bynode":
+        elif (
+            key == "colsample_bynode"
+            # LightGBM; scikit-learn's HistGradientBoosting*.
+            or key == "feature_fraction_bynode"
+            or key == "sub_feature_bynode"
+            or key == "max_features"
+        ):
             config.booster.tree.feature_fraction_bynode = _parse_f64(
                 key, value
             )
         elif (
-            key == "feature_fraction_bylevel" or key == "colsample_bylevel"
+            key == "colsample_bylevel" or key == "feature_fraction_bylevel"
         ):
             # XGBoost's name; LightGBM has no per-level fraction at all, so
             # this is an extension rather than a parity row (sampling.mojo).
@@ -539,7 +803,13 @@ def parse_params(spec: String) raises -> TrainConfig:
             )
         elif key == "feature_fraction_seed":
             config.booster.tree.feature_fraction_seed = _parse_int(key, value)
-        elif key == "min_gain_to_split" or key == "min_split_gain":
+            saw_feature_fraction_seed = True
+        elif (
+            key == "min_split_gain"
+            # LightGBM; XGBoost.
+            or key == "min_gain_to_split"
+            or key == "gamma"
+        ):
             config.booster.tree.extra.min_gain_to_split = _parse_f64(
                 key, value
             )
@@ -555,6 +825,128 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.extra.extra_trees = _parse_bool(key, value)
         elif key == "extra_seed":
             config.booster.tree.extra.extra_seed = _parse_int(key, value)
+            saw_extra_seed = True
+        # `random_state` is scikit-learn's word and the canonical one; the
+        # other three are LightGBM's, XGBoost's and CatBoost's. It seeds
+        # every draw this surface can reach, which today is the feature
+        # sampling seed and the extra-trees seed; the bagging, GOSS, dart and
+        # bootstrap seeds belong to samplers a parameter string cannot select
+        # at all, so there is nothing here for them to seed.
+        #
+        # It sets a seed to `random_state` rather than deriving one per
+        # component the way LightGBM's `seed` does. That is a deliberate
+        # divergence and it is stated rather than hidden: LightGBM derives
+        # its per-component seeds by running its own LCG, which mojotrees
+        # does not have and would have to reimplement bit for bit to match,
+        # and mojotrees's draws are splitmix64 and would not reproduce
+        # LightGBM's subsets from a matching seed anyway. What `random_state`
+        # buys is reproducibility of a mojotrees fit, which is what a script
+        # that sets it is asking for.
+        elif (
+            key == "random_state"
+            or key == "seed"
+            or key == "random_seed"
+            or key == "data_random_seed"
+        ):
+            random_state = _parse_int(key, value)
+            saw_random_state = True
+        # scikit-learn's word; LightGBM's, XGBoost's two, and CatBoost's.
+        # There is no worker count on this surface: `parallel.mojo` takes
+        # one from `MOJOTREES_NUM_WORKERS` and from the machine, and a fit
+        # is bit-identical at every worker count by contract. The values
+        # that mean "use the machine" are therefore already satisfied and
+        # are accepted; a specific count is refused by name rather than
+        # accepted and dropped, because the user asked for a thing that
+        # would not happen.
+        elif (
+            key == "n_jobs"
+            or key == "num_threads"
+            or key == "num_thread"
+            or key == "nthread"
+            or key == "thread_count"
+        ):
+            var jobs = _parse_int(key, value)
+            if jobs > 0:
+                raise Error(
+                    "n_jobs=",
+                    jobs,
+                    " cannot be set from a parameter string: the worker"
+                    " count comes from MOJOTREES_NUM_WORKERS and from the"
+                    " machine (parallel.mojo), and a fit is bit-identical"
+                    " at every worker count. Set MOJOTREES_NUM_WORKERS=",
+                    jobs,
+                    " in the environment instead. n_jobs of -1 or 0, which"
+                    " means 'use the machine', is what this surface already"
+                    " does and is accepted",
+                )
+        # scikit-learn's and CatBoost's word; LightGBM and XGBoost spell it
+        # `verbosity`, CatBoost also takes `logging_level`. Nothing on this
+        # surface writes a training log, so silence is what it already does
+        # and a request for silence is honored by doing nothing. A request
+        # for output is refused by name and pointed at the surface that has
+        # one, rather than accepted and quietly producing none.
+        elif key == "verbose" or key == "verbosity":
+            if _parse_int(key, value) > 0:
+                raise Error(
+                    "parameter '",
+                    key,
+                    "' above 0 cannot be honored here: a parameter string"
+                    " reaches the C ABI and the CLI, neither of which writes"
+                    " a training log. The Python estimator's verbose= does,"
+                    " through callback.log_evaluation. A value of 0 or below"
+                    " is what this surface already does and is accepted",
+                )
+        elif key == "logging_level":
+            # CatBoost's spelling of the same switch, with its own vocabulary.
+            if lowered != "silent":
+                raise Error(
+                    "logging_level '",
+                    value,
+                    "' cannot be honored here: a parameter string reaches the"
+                    " C ABI and the CLI, neither of which writes a training"
+                    " log. 'Silent' is what this surface already does and is"
+                    " accepted",
+                )
+        # CatBoost's `score_function`, the split-gain shape. mojotrees
+        # scores every split as `G^2 / (H + lambda)`, which is CatBoost's
+        # `L2` (see the note in tree_parameters_extra.mojo), so naming `L2`
+        # states what already happens and is accepted.
+        #
+        # `Cosine`, CatBoost's own default, is refused rather than accepted
+        # as an equivalent, even though at THIS library's stock settings it
+        # would pick the same split: Cosine's numerator is the L2 sum and at
+        # `lambda_l2 = 0` its denominator collapses onto the same
+        # expression, so it degenerates to `sqrt(L2)` and the argmax cannot
+        # move (docs/design/CATBOOST_CATALOG.md, A10 section 3). That
+        # equivalence is conditional on `lambda_l2 = 0`, which is stock but
+        # is a value a user may change, and it bites under leaf-wise growth,
+        # which is the default. Accepting the name on a condition the user
+        # can silently break is the shape this package refuses.
+        elif key == "score_function":
+            if lowered != "l2":
+                raise Error(
+                    "score_function '",
+                    value,
+                    "' is not implemented; mojotrees scores a split as"
+                    " G^2/(H+lambda), which is CatBoost's 'L2', and that is"
+                    " the only value accepted. 'Cosine' picks the same split"
+                    " at lambda_l2=0, where it degenerates to sqrt(L2), but"
+                    " not above it, so it is not accepted as an alias",
+                )
+        # CatBoost's `max_ctr_complexity`. Refused for any value, its own
+        # default included: CTRs -- ordered target statistics over
+        # categorical combinations -- are the feature construction the name
+        # controls, and mojotrees has none of it (its categorical handling
+        # is LightGBM's category-set split). A number here would ask for
+        # combinations that are never built.
+        elif key == "max_ctr_complexity":
+            raise Error(
+                "max_ctr_complexity is not implemented: it bounds the arity"
+                " of CatBoost's target-statistic (CTR) feature combinations,"
+                " and mojotrees builds none. Its categorical handling is"
+                " LightGBM's category-set split, under max_cat_to_onehot,"
+                " max_cat_threshold, cat_smooth and cat_l2"
+            )
         # CatBoost's `random_strength`, the only name on this surface that is
         # not LightGBM's. 0.0, the default, is LightGBM's behavior exactly. A
         # positive value parses and then fails validation with a sentence
@@ -701,7 +1093,13 @@ def parse_params(spec: String) raises -> TrainConfig:
                     value,
                     "' is supported by the Mojo API only, through GossParams",
                 )
-        elif key == "max_bin":
+        elif (
+            key == "max_bin"
+            # LightGBM's plural; CatBoost; scikit-learn's
+            # HistGradientBoosting*.
+            or key == "max_bins"
+            or key == "border_count"
+        ):
             config.max_bin = _parse_int(key, value)
         elif (
             key == "alpha"
@@ -722,8 +1120,35 @@ def parse_params(spec: String) raises -> TrainConfig:
                 )
             alpha_key = key
             config.alpha = _parse_f64(key, value)
-        elif key == "device" or key == "device_type":
-            config.device = parse_device(value)
+        # `device` is XGBoost 2.x's name and the canonical one; `device_type`
+        # is LightGBM's and `task_type` CatBoost's (whose `CPU`/`GPU` fold to
+        # our own two words). All three take the same vocabulary.
+        elif key == "device" or key == "device_type" or key == "task_type":
+            config.device = parse_device(lowered)
+        # XGBoost's older switch, which names an algorithm and a device at
+        # once. Only the two values that name the histogram algorithm
+        # mojotrees implements resolve; `exact` and `approx` are different
+        # split searches, not spellings of `device`, and are refused by name.
+        elif key == "tree_method":
+            if lowered == "hist" or lowered == "auto":
+                config.device = parse_device(String("cpu"))
+            elif lowered == "gpu_hist":
+                config.device = parse_device(String("gpu"))
+            elif lowered == "exact" or lowered == "approx":
+                raise Error(
+                    "tree_method '",
+                    value,
+                    "' is a different split search, not a spelling of"
+                    " device: mojotrees searches a histogram, which is"
+                    " XGBoost's 'hist'. Use device=cpu or device=gpu",
+                )
+            else:
+                raise Error(
+                    "unknown tree_method '",
+                    value,
+                    "'; expected 'hist', 'gpu_hist', or 'auto'. device=cpu"
+                    " and device=gpu are the canonical spellings",
+                )
         elif key == "use_missing":
             config.use_missing = _parse_bool(key, value)
         elif _is_mojo_api_only(key):
@@ -749,5 +1174,13 @@ def parse_params(spec: String) raises -> TrainConfig:
         config.alpha = objective_default_alpha(config.objective)
     else:
         _check_alpha_key(config, alpha_key)
+    # A global seed fills only the seeds the string did not name, and it
+    # waits until the whole string is read so that the two may appear in
+    # either order.
+    if saw_random_state:
+        if not saw_feature_fraction_seed:
+            config.booster.tree.feature_fraction_seed = random_state
+        if not saw_extra_seed:
+            config.booster.tree.extra.extra_seed = random_state
     _validate(config, saw_num_class)
     return config^
