@@ -2,6 +2,24 @@
 
 > ## SUPERSEDED COMPARATOR. Every speed ratio below is NOT PUBLISHED.
 >
+> **The reason changed the same day; the conclusion did not.** These figures
+> were first marked superseded because the comparator was to become LightGBM
+> plus `use_quantized_grad=true`, which our CPU float path could not match.
+> That comparator is withdrawn. The comparator is now **LightGBM stock
+> defaults plus `deterministic=true`**, labelled `stock+det`, and our float
+> path **is** like-for-like against it.
+>
+> **These numbers are still superseded, for a different and simpler reason:
+> they were taken against the OLD pinned configuration** — LightGBM forced to
+> `force_row_wise`, to `min_data_in_bin=1`, and to bin every row via
+> `bin_construct_sample_cnt = n_rows`. Every one of those pins is being
+> dropped. A ratio against a comparator we required to do more work than it
+> would choose is not a ratio against stock.
+>
+> **What changes going forward:** once the harness lane lands `stock+det`, CPU
+> speed numbers are publishable again, taken fresh. The quantized-gradient
+> lane no longer gates that.
+>
 > **The project now has exactly one comparator: LightGBM at stock defaults
 > plus `use_quantized_grad=true`, with its own defaults for the
 > sub-parameters.** Every mojotrees arm runs with quantized gradients on. The

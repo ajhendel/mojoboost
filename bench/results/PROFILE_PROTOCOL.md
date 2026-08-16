@@ -982,6 +982,34 @@ canary line. Treat it as suspect until someone does.
 
 # C9. One comparator, and what may be published against it
 
+> **AMENDED the same day, before any measurement was taken under it.** The
+> comparator below was first registered as *LightGBM stock plus
+> `use_quantized_grad=true`*, with every mojotrees arm quantized. That is
+> **withdrawn**. The comparator is now **LightGBM stock defaults plus
+> `deterministic=true`**, one arm, labelled **`stock+det`**.
+>
+> The consequence is the opposite of the first version's. Under the quantized
+> comparator our CPU float path was not like-for-like and **no CPU speed
+> number could be published at all**. Under `stock+det` it **is**
+> like-for-like, so CPU speed numbers become publishable as soon as the
+> harness lane lands the arm.
+>
+> `deterministic=true` is the only deviation from pure stock, and it is there
+> because our arm is reproducible across thread counts at no cost, so it is
+> the setting that makes the two sides comparable rather than one that
+> handicaps either. Evidence that it does not fully succeed, which belongs
+> next to the claim rather than in a footnote: in the first real-data run
+> **LightGBM produced two distinct prediction digests across three repeats on
+> `sparse_highdim` with `deterministic=true` already set and a fixed seed**,
+> while our arm was bit-identical across all three.
+>
+> The CPU `use_quantized_grad` lane continues, because LightGBM has the option
+> and we should too, but it **no longer gates publication of anything**.
+>
+> The text below is left as first registered, with this amendment above it,
+> because a protocol that quietly rewrites its own rules is worth less than
+> one that shows where they moved.
+
 Registered 2026-08-16, before any measurement is taken under it. It
 supersedes the comparator every CPU figure in this round was taken against.
 
