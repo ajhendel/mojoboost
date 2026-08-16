@@ -141,9 +141,14 @@ therefore enqueued before the first split has happened:
                        performing it            (gpu_tree_tables)
     per tree, once     download the tables      <- the one round trip
 
-Eleven launches a step rather than ten when the K=1 speculative prebuild is
-armed; the armed schedule is written out under "K=1 speculative prebuild"
-below, and it adds no round trip.
+Those bullets are lines and not launches. The launch census, exact and by
+phase, is the next section; the short version is nine command buffers a step
+where there were ten, because the partition's copy-back and the child build's
+slot zeroing are unordered with respect to each other and now share a launch.
+
+One more line a step when the K=1 speculative prebuild is armed; the armed
+schedule is written out under "K=1 speculative prebuild" below, and it adds no
+round trip.
 
 The step count is `num_leaves - 1`, because a tree of L leaves is L-1 splits.
 The step *after* those is not a split and is not optional: a terminal status
@@ -167,17 +172,79 @@ copy anywhere, so nothing is corrupted and no answer changes; what is spent
 is real work. Making it free means a descriptor-aware search launch, which
 lives in a module this lane does not own.
 
-The queue this stream goes into is 64 deep
-------------------------------------------
-Ten launches a step over thirty steps, plus about six per tree, is on
-the order of 306 command buffers between waits, because on Metal every
-`enqueue_function` becomes its own single-encoder command buffer. The queue
-holds 64 of them: MAX creates it with a bare `newCommandQueue` and never
-sets `maxCommandBufferCount`, which was measured by disassembling the
-shipped runtime and is recorded with its consequences in
-`docs/GPU_PORTABILITY.md` section 6.2. So this loop does not fly; it fills
-the queue and then runs at one in and one out, which is a derived bound from
-that depth and this launch count, and is not a measurement.
+The queue this stream goes into is 64 deep, and the census of what goes in it
+----------------------------------------------------------------------------
+On Metal every `enqueue_function` becomes its own single-encoder command
+buffer. The queue holds 64 of them: MAX creates it with a bare
+`newCommandQueue` and never sets `maxCommandBufferCount`, which was measured
+by disassembling the shipped runtime and is recorded with its consequences in
+`docs/GPU_PORTABILITY.md` section 6.2. The per-launch enqueue cost is
+**measured** flat at 6 to 7 microseconds through a stream of 64 and rising to
+14 to 17 beyond it, a knee exactly where that depth predicts. So this loop
+does not fly: it fills the queue and then runs at one in and one out, and for
+most of every tree it is past the knee and paying roughly double per launch.
+
+**The exact census, counted statically off the source rather than estimated**,
+on the default arms as they now stand: the resident plane on, device
+gradients, squared error, no bagging, the speculation off, the packed table
+reset and the packed download on, scan primitives on, no bin re-layout and no
+gradient quantization. One `enqueue_function` is one command buffer; the
+copies and the `synchronize` are counted separately because they are not.
+
+    phase                          module              before  after
+    --- once per tree --------------------------------------------------
+    root histogram                 gpu_active_rows        2       2
+      zero the root's slot                                1       1
+      accumulate the root                                 1       1
+    reset the tables               gpu_tree_tables        1       1
+    root search                    gpu_split_search       2       2
+      scan slots                                          1       1
+      reduce slots                                        1       1
+    seed the root's value          gpu_tree_tables        1       1
+    the step that ends growth      gpu_tree_tables        1       1
+                                          per tree, once  7       7
+    --- per growth step, x(num_leaves - 1) -----------------------------
+    pick and commit                gpu_tree_tables        1       1
+    stage the two searches         gpu_tree_tables        1       1
+    partition                      gpu_active_rows        3       2
+      flag scan                                           1       1
+      scatter                                             1       1
+      copy back                                           1       0   <- folded
+    build the smaller child        gpu_active_rows        2       2
+      zero the slot                                       1       1   <- + copy back
+      accumulate and subtract                             1       1
+    search both children           gpu_split_search       2       2
+    file the two records           gpu_tree_tables        1       1
+                                          per step       10       9
+    --- the one round trip ---------------------------------------------
+    pack the six tables            gpu_tree_tables        1       1
+      (then one enqueue_copy and one synchronize, which are not launches)
+
+At the default budget of 31 leaves that is 30 growth steps, so
+
+    before   7 + 30 * 10 + 1 = 308 command buffers between waits
+    after    7 + 30 *  9 + 1 = 278
+
+**30 fewer per tree, roughly 3,000 fewer per hundred-tree fit**, all of them
+taken out of the stretch that is past the queue's knee. The docstring used to
+say "on the order of 306"; the real number was 308 and this is the count to
+quote against.
+
+Armed with the K=1 speculation a step is **eighteen** launches rather than ten
+-- the ten above, plus consume, subtract and publish, plus a speculative
+partition of three and a speculative child of two -- and becomes **sixteen**,
+because the speculative pair is the same two entry points against `DESC_SPEC`
+and folds in exactly the same way. (The "eleven launches a step" this file used
+to carry was counting the itemized *lines* of that schedule and not its
+launches; the lines are eleven and the launches are eighteen.) That arm is off
+by default and is not what the census above describes.
+
+The one caveat on the seven: the root histogram is two launches whenever every
+feature is active, which is what `feature_fraction = 1.0` gives and what the
+plane's refusals already assume for everything below the root. A tiled root
+with a narrowed feature set adds its zeroing pass and makes it three. Nothing
+about the per-step figure moves either way, because the descriptor histogram
+always takes the atomic strategy and always zeroes.
 
 That is not fatal and nothing is dropped. What it means for anyone measuring
 this plane is that **enqueue time has to be timed separately from wall
@@ -814,6 +881,39 @@ def speculative_build_enabled() -> Bool:
     Read once per tree, next to the trace and census sinks, for the reason
     stated at `resident_trace_sink`."""
     return getenv(SPECULATION_BUILD_VAR) == "1"
+
+
+comptime PARTITION_FUSION_VAR = "MOJOTREES_GPU_FUSE_PARTITION_TAIL"
+"""`0` unfolds the partition-tail fusion. Anything else, including unset,
+leaves it folded, which is the default.
+
+**An inequality against "0", the spelling this repository reserves for a
+default that does not need arguing** -- and this one does not need arguing for
+a stronger reason than the measured arms have. `MOJOTREES_GPU_TREE_RESIDENT`
+reads this way because three measurements stand behind it;
+`MOJOTREES_GPU_SPECULATION` reads the other way because it trades a third more
+child histogram builds for a better launch shape and nobody has weighed the
+two. This arm trades nothing. It issues one command buffer where the step used
+to issue two, storing the same values to the same addresses under the same
+guard, so there is no direction in which it can lose and nothing for a
+benchmark to resolve. See `GpuActiveRows.set_partition_fusion`.
+
+The off arm exists because a window has to be able to hold the two against each
+other in one process without a rebuild -- this machine drifts two- to
+threefold between time windows and a rebuild would put a different compile and
+a different thermal state on either side of the comparison -- and because it is
+where a run goes that hits a fault in the fused kernel."""
+
+
+def partition_fusion_enabled() -> Bool:
+    """Whether the descriptor partition's copy-back is folded into the
+    descriptor histogram's slot zeroing.
+
+    Read once per tree, next to the trace and census sinks, for the reason
+    stated at `resident_trace_sink`: a variable does not change inside a fit,
+    and reading one inside a loop that is supposed to contain no host work at
+    all is how such a loop quietly becomes slow."""
+    return getenv(PARTITION_FUSION_VAR) != "0"
 
 
 def speculation_census_sink() -> String:
@@ -1664,11 +1764,23 @@ def grow_tree_device_resident(
     var widest = len(searcher.active)
     if widest < 1:
         widest = len(tree_features)
-    # All four read once, before the first launch. See `resident_trace_sink`.
+    # All five read once, before the first launch. See `resident_trace_sink`.
     var trace = resident_trace_sink()
     var trace_steps = trace != "" and resident_trace_steps_requested()
     var census_sink = speculation_census_sink()
     var spec = speculative_build_enabled()
+    # One fewer command buffer per growth step, and the arm that puts it back.
+    # Applied here rather than left to whoever constructed the builder, because
+    # the pairing the fusion depends on -- a descriptor partition followed
+    # immediately by the descriptor histogram that pays its copy-back -- is a
+    # property of the loop below and of nothing else in this package. See
+    # `PARTITION_FUSION_VAR` and `GpuActiveRows.set_partition_fusion`.
+    builder.rows.set_partition_fusion(partition_fusion_enabled())
+    # Where the fold counter stood before this tree, so the trace can report
+    # what this tree folded rather than what the fit has folded so far. Host
+    # arithmetic over one Int; it enqueues nothing and reads no device answer,
+    # so it is not a round trip and does not perturb what it counts.
+    var folds_before = builder.rows.copy_back_folds
     # Four handles onto buffers the builder already owns, taken once.
     #
     # Handles rather than pointers because of a language constraint that has
@@ -1943,6 +2055,15 @@ def grow_tree_device_resident(
             n_root,
             " steps=",
             params.num_leaves - 1,
+            # Fused copy-back-and-zero launches this tree issued, from the
+            # counter `GpuActiveRows.enqueue_desc_histogram` increments when it
+            # actually takes the fused branch. A count of launches enqueued and
+            # not a prediction of how many there should be, which is what makes
+            # it usable as the positive assertion that the arm engaged:
+            # `steps` on the fused arm and zero on the unfused one. The same
+            # tree, node for node, either way.
+            " folds=",
+            builder.rows.copy_back_folds - folds_before,
             "\n",
             snap.describe(),
         ),
