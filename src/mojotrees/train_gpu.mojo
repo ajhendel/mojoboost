@@ -3148,7 +3148,16 @@ def train_gpu(
         # bytes of contiguous moves per split against scattered
         # gather traffic removed, and its own author put break-even
         # near depth 3 with a thin margin on a 31-leaf tree.
-        builder.rows.set_row_compaction(row_compaction)
+        # `or` the environment, not override it. An unconditional set here
+        # made this parameter's default silently DISABLE
+        # `MOJOTREES_GPU_ROW_COMPACTION=1` for every fit through
+        # `train_gpu`, which is exactly how the arm's own test caught it:
+        # "the on arm never reached the compaction; the environment
+        # variable did not select it". A parameter that defaults off must
+        # not out-rank an explicit request.
+        builder.rows.set_row_compaction(
+            row_compaction or builder.rows.row_compaction_requested()
+        )
         # The three hist-latency arms, on the same footing and for the same
         # reason: a launch shape reachable in the call so a benchmark can
         # interleave arms in one process. None can change a model. The index
@@ -3248,7 +3257,16 @@ def train_gpu(
         # bytes of contiguous moves per split against scattered
         # gather traffic removed, and its own author put break-even
         # near depth 3 with a thin margin on a 31-leaf tree.
-        builder.rows.set_row_compaction(row_compaction)
+        # `or` the environment, not override it. An unconditional set here
+        # made this parameter's default silently DISABLE
+        # `MOJOTREES_GPU_ROW_COMPACTION=1` for every fit through
+        # `train_gpu`, which is exactly how the arm's own test caught it:
+        # "the on arm never reached the compaction; the environment
+        # variable did not select it". A parameter that defaults off must
+        # not out-rank an explicit request.
+        builder.rows.set_row_compaction(
+            row_compaction or builder.rows.row_compaction_requested()
+        )
         # The same three arms the session-free overload sets, from the same
         # arguments. A session owns the context, not the geometry, so it
         # cannot change these answers either.
