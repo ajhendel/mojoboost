@@ -27,8 +27,35 @@ What that costs, and what it does not:
   arms alike.
 - **The absolute seconds are contaminated** and are labelled that way. Our
   arm's 21 percent spread at 1M is partly somebody else's compile.
-- The headline will be re-taken in a genuinely quiet window before it goes in
-  any summary table. The GPU session has offered a courtesy pause for it.
+- The headline is re-taken in a genuinely quiet window before it goes in any
+  summary table.
+
+### The stronger statement, from an instrument neither campaign can game
+
+The GPU campaign's regime canary — two fixed probes, no dataset, no training
+code, nothing either campaign can optimize — produced this on its first real
+run, over a single short run:
+
+    drift_cpu_pct: 22.5     regime: shifted
+    drift_gpu_pct: 0.7
+
+The CPU probe went 467 ms to 572 ms between the start and the end of one run.
+The GPU probe did not move.
+
+**So a CPU-versus-CPU comparison on this machine drifts materially inside a
+single run, and every absolute second in this document is a property of the
+window rather than of the code.** That is a stronger claim than "the box was
+busy" and it is measured rather than inferred. It independently reproduces two
+things that were previously only anecdote: this document's finding that our CPU
+arm rose 18 percent while LightGBM's rose 10 across five repeats, and the GPU
+campaign's finding that its device arm held 2.7 percent while LightGBM drifted
+24 percent.
+
+**The consequence, applied throughout this document: ratios are reported as
+results; absolute seconds are reported as context and are not a property of the
+implementation.** The 2.04x at one million rows stands because both arms were
+interleaved inside one process. The 6.000 and the 2.945 that produce it do not
+stand as levels, and no lane should be scored against them.
 
 ## A correction to the harness before any number is read
 
@@ -153,17 +180,32 @@ LightGBM's 3.08x independently reproduces the 3.08x recorded on 2026-08-15 from
 a different window, which is a useful sign that the comparator's scaling is a
 stable property even when its absolute times are not.
 
-Our 2.04x deficit at one million rows factors exactly:
+Our 2.04x deficit at one million rows decomposes as:
 
 - **serial inner loop**: 12.357 / 9.084 = **1.360x behind**
 - **parallel scaling**: 3.084 / 2.059 = **1.498x behind**
 - product: 1.360 x 1.498 = **2.038**, against a measured end-to-end ratio of
   **2.037**
 
-The two terms reproduce the measured ratio to three decimal places. That is
-arithmetic rather than a coincidence — it is what the two measurements mean —
-but it does establish that there is no third term hiding. All of the deficit is
-in those two places.
+**An earlier version of this section claimed the three-decimal agreement
+established "there is no third term hiding". That claim is withdrawn: it is an
+algebraic identity and it establishes nothing.**
+
+Writing `Cs`, `Cp`, `Ls`, `Lp` for our serial, our parallel, LightGBM's serial
+and LightGBM's parallel times, the two terms are `Cs/Ls` and
+`(Ls/Lp) / (Cs/Cp)`, and their product is
+
+    (Cs/Ls) x (Ls/Lp) x (Cp/Cs) = Cp/Lp
+
+identically, for any four numbers whatsoever. It will always reproduce the
+end-to-end ratio, on any machine, for any implementation, whether or not a
+third effect exists. The agreement to three decimals confirms only that the
+four measurements were divided correctly.
+
+The decomposition remains the right way to think about the deficit — it says
+how much of the gap would close if each half were fixed, which is a real and
+useful statement — but it is a re-expression of the same two measurements, not
+independent evidence about them.
 
 **The parallel term is now the larger of the two**, 1.498 against 1.360. On
 2026-08-15's numbers it was the smaller one. Nothing about the code changed;

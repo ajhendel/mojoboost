@@ -1,0 +1,68 @@
+==================================================================
+ARM: CW2 50000 x 50, cpu+lightgbm interleaved, 9 repeats, lgbm 10 threads
+CMD: pixi run -e bench bench-train-gpu 50000 50 reg 9 cpu,lightgbm
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 03:43:30 EDT
+--- box state BEFORE ---
+ 3:43  up 5 days, 18:32, 1 user, load averages: 4.26 11.34 14.92
+top processes by cpu:
+ 14.5 /Applications/Docker.app/Contents/MacOS/com.docker.backend
+ 12.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.3 claude
+other mojo/pixi builds running:
+--- output ---
+✨ Pixi task (bench-train-gpu in bench): mojo run -I src bench/bench_train_gpu.mojo 50000 50 reg 9 cpu,lightgbm
+mojotrees gpu-vs-cpu bench: 50000 rows x 50 features, reg seed 0
+binning_s: 0.048242
+arms: cpu,lightgbm
+repeats: 9
+lightgbm_threads: 10
+lightgbm_binning_s: 0.04597529099555686
+lightgbm_params: bin_construct_sample_cnt=50000 boost_from_average=True enable_bundle=False feature_pre_filter=False force_row_wise=True lambda_l1=0.0 lambda_l2=1.0 learning_rate=0.1 max_bin=255 max_depth=-1 min_data_in_bin=1 min_data_in_leaf=20 min_gain_to_split=0.0 min_sum_hessian_in_leaf=0.001 num_leaves=31 num_threads=10 objective=regression seed=190019 use_missing=True verbose=-1 verbosity=-1 zero_as_missing=False
+run 1 cpu train_s: 0.49293
+run 1 lightgbm train_s: 0.585916
+run 2 cpu train_s: 0.627556
+run 2 lightgbm train_s: 0.704869
+run 3 cpu train_s: 0.568019
+run 3 lightgbm train_s: 0.575765
+run 4 cpu train_s: 0.551853
+run 4 lightgbm train_s: 0.564962
+run 5 cpu train_s: 0.570174
+run 5 lightgbm train_s: 0.596436
+run 6 cpu train_s: 0.542493
+run 6 lightgbm train_s: 0.585914
+run 7 cpu train_s: 0.545378
+run 7 lightgbm train_s: 0.576238
+run 8 cpu train_s: 0.549839
+run 8 lightgbm train_s: 0.569545
+run 9 cpu train_s: 0.547491
+run 9 lightgbm train_s: 0.565181
+cpu_train_s_samples: 0.49293 0.627556 0.568019 0.551853 0.570174 0.542493 0.545378 0.549839 0.547491
+cpu_train_s: 0.49293
+cpu_train_s_median: 0.549839
+cpu_train_s_max: 0.627556
+cpu_spread_pct: 27.3
+cpu_spread_pct_of_median: 24.5
+cpu_n_trees: 100
+cpu_train_loss: 0.0038876942963873263
+lightgbm_train_s_samples: 0.585916 0.704869 0.575765 0.564962 0.596436 0.585914 0.576238 0.569545 0.565181
+lightgbm_train_s: 0.564962
+lightgbm_train_s_median: 0.576238
+lightgbm_train_s_max: 0.704869
+lightgbm_spread_pct: 24.8
+lightgbm_spread_pct_of_median: 24.3
+lightgbm_n_trees: 100
+lightgbm_train_loss: 0.004043745148354513
+lightgbm_speedup_x: 0.8725011593700107
+lightgbm_vs_cpu: indistinguishable delta_pct 14.6 noise_floor_pct 27.3
+json_summary: {"n_rows":50000,"n_features":50,"objective":"reg","n_classes":0,"seed":0,"repeats":9,"binning_s":0.048242,"arms":[{"name":"cpu","samples_s":[0.49293,0.627556,0.568019,0.551853,0.570174,0.542493,0.545378,0.549839,0.547491],"min_s":0.49293,"median_s":0.549839,"max_s":0.627556,"spread_pct_of_min":27.3,"spread_pct_of_median":24.5,"n_trees":100,"train_loss":0.0038876942963873263},{"name":"lightgbm","samples_s":[0.585916,0.704869,0.575765,0.564962,0.596436,0.585914,0.576238,0.569545,0.565181],"min_s":0.564962,"median_s":0.576238,"max_s":0.704869,"spread_pct_of_min":24.8,"spread_pct_of_median":24.3,"n_trees":100,"train_loss":0.004043745148354513}],"comparisons":[{"arm":"lightgbm","baseline":"cpu","speedup_x":0.8725011593700107,"delta_pct":14.6,"noise_floor_pct":27.3,"verdict":"indistinguishable"}],"lightgbm":{"threads":10,"binning_s":0.04597529099555686,"params":"bin_construct_sample_cnt=50000 boost_from_average=True enable_bundle=False feature_pre_filter=False force_row_wise=True lambda_l1=0.0 lambda_l2=1.0 learning_rate=0.1 max_bin=255 max_depth=-1 min_data_in_bin=1 min_data_in_leaf=20 min_gain_to_split=0.0 min_sum_hessian_in_leaf=0.001 num_leaves=31 num_threads=10 objective=regression seed=190019 use_missing=True verbose=-1 verbosity=-1 zero_as_missing=False"}}
+--- box state AFTER ---
+ 3:43  up 5 days, 18:33, 1 user, load averages: 4.47 11.03 14.75
+top processes by cpu:
+  5.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  2.6 claude
+  1.2 claude
+  0.7 /usr/sbin/coreaudiod
+other mojo/pixi builds running:
+finished: 2026-08-16 03:43:46 EDT  exit=0
+
