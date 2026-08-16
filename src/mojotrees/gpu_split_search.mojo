@@ -6330,6 +6330,14 @@ struct GpuSplitSearcher(Movable):
             params.cat.min_data_per_group,
             wide=self.wide_scan,
             primitives=self.use_primitives,
+            # `gain_form` was missing here until 2026-08-16, so this entry
+            # point ran `DEFAULT_GAIN_FORM` whatever `set_gain_form` had been
+            # told -- the sibling `enqueue_frontier` passed it and this one did
+            # not. Spotted by the random-strength lane, which correctly left it
+            # alone because fixing it moves records and needed the gain-form
+            # suite run. Keyword-passed like its neighbours so a future
+            # argument inserted above cannot silently rebind it.
+            gain_form=self.gain_form_code,
             noisy=self.noise_stdev > 0.0,
         )
         return self.download(record)
