@@ -293,8 +293,16 @@ def test_block_count_is_workload_only_at_every_setting() raises:
         assert_equal(a.row_blocks, b.row_blocks)
         assert_equal(a.block_rows, b.block_rows)
         assert_equal(a.block_cells, b.block_cells)
-        # The width is machine-dependent and the block count is not.
-        assert_not_equal(a.group_width, b.group_width)
+        # The width is machine-dependent and the block count is not. Checked
+        # on a node of 60 rows, which is below the smallest block minimum any
+        # swept ratio produces and so blocks 1 way at every arm: with many
+        # blocks the balance rule stops binding and both machines land on the
+        # L1 clamp, which would make this vacuous for the opposite reason.
+        var a1 = _plan(one_core, 50, 255, 60)
+        var b1 = _plan(many, 50, 255, 60)
+        assert_equal(a1.row_blocks, 1)
+        assert_equal(b1.row_blocks, 1)
+        assert_not_equal(a1.group_width, b1.group_width)
 
     # And the schedule variables cannot reach it either. One arm is enough to
     # be worth stating; it is checked at a setting that blocks 24 ways so a

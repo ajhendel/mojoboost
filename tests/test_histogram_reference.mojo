@@ -629,8 +629,14 @@ def test_row_block_count_ignores_the_machine() raises:
     assert_equal(a.block_cells, b.block_cells)
     assert_true(a.row_blocks > 1)
     # And the width is machine-dependent, so this is not vacuously true of
-    # everything the planner returns.
-    assert_not_equal(a.group_width, b.group_width)
+    # everything the planner returns. Asserted on a node too small to block:
+    # once a node blocks, the balance rule has enough `(block, group)` units
+    # on either machine and both land on the L1 clamp, which would make the
+    # check pass for the wrong reason.
+    var a_flat = derive_accumulation_plan(one_core, 50, 50, 255, 3_000, True)
+    var b_flat = derive_accumulation_plan(many, 50, 50, 255, 3_000, True)
+    assert_equal(a_flat.row_blocks, 1)
+    assert_not_equal(a_flat.group_width, b_flat.group_width)
 
 
 def test_row_block_env_override() raises:
