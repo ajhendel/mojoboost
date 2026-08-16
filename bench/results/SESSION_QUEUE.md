@@ -570,3 +570,61 @@ cost exactly the same nine, and if it costs more the margin at d=6 goes negative
 even fused. And the 64-deep queue is **measured** as a knee in enqueue cost, not
 as a cliff -- 68 buffers is not a catastrophe, it is the far side of a knee where
 per-launch enqueue roughly doubles.
+
+---
+
+# Owed by the GPU campaign after `lambda_l2 = 0` merges
+
+Both blocked on the wave-end merge. Registered here before the data.
+
+## 1. The 2x2 that separates two candidate causes of the agreement FAIL
+
+`device_agreement` on `imbalanced_binary` went WARN to FAIL: `max |gpu - cpu| =
+0.231` against a 0.001 limit, `average_precision` 7.4 percent relative against a
+0.5 percent limit. **Two changes landed near it and either could explain it.**
+
+| | lambda_l2 = 1.0 | lambda_l2 = 0.0 |
+|---|---|---|
+| **derivative_precision = f64** | cell A | cell B |
+| **derivative_precision = f32** | cell C | cell D |
+
+Device against host on `imbalanced_binary`, all four cells.
+
+**What each outcome means, registered now so the reading is not chosen after the
+fact:**
+
+- **A ~ C, and B, D both bad** -> the cause is `lambda_l2 = 0`, i.e. the Float32
+  gain near the admission boundary. At `lambda_l2 = 1.0` the divisor `H +
+  lambda_l2` could never fall below 1; at 0.0 it is floored only by
+  `min_sum_hessian_in_leaf = 1e-3`, so a gain bounded by `G^2` becomes bounded by
+  `1000*G^2` and a leaf value by `1000*|G|`. On the device those are **Float32**.
+- **A ~ B, and C, D both bad** -> the cause is the CPU's move to Float32
+  per-row derivatives, and the device is a bystander.
+- **only D bad** -> the two interact and neither alone is the story, which is
+  the outcome that would take longest to find any other way.
+- **all four bad** -> neither change caused it and something else did, which
+  would be the most informative result and the one nobody is expecting.
+
+**No code moves on this until the 2x2 reads.** That is the point of running it.
+
+Standing context that bounds the interpretation: a lane established this week
+that given the **same** histogram, the device replica and the host scan chose the
+identical split **1,200 times out of 1,200**. So this is not a tie-break defect;
+it is how far apart the two summations are, and both candidate causes widen
+exactly that distance.
+
+## 2. Re-run the GAIN_FORM_CROSS accuracy gate on the merged tree
+
+It cleared at **10 pass / 0 fail** on the GPU path -- the first accuracy record
+that path ever had -- but **at `lambda_l2 = 1.0`**.
+
+It is not inherited, for a specific reason rather than caution: the cross form's
+entire advantage lives in the **near-tie regime**, its improvement factor is
+`sqrt(parent_score/gain)`, and `lambda_l2` moves both `parent_score` and `gain`.
+So the change shifts where near-ties occur, which is the one variable this arm is
+sensitive to. A gate that cleared under the old lambda says nothing about the new
+one.
+
+If it fails on the merged tree, the registered consequence stands: the default
+flips to opt-in and the arm stays for the L1-free case where the bound is
+largest.
