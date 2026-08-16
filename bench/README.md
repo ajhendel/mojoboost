@@ -2,6 +2,11 @@
 
 Reproducible mojotrees vs LightGBM comparison on identical synthetic data.
 
+Every `pixi run` command in this file names a task that exists. Which of them
+have ever produced a recorded number is a different question, and it is answered
+per driver in [`results/INSTRUCTION_AUDIT.md`](results/INSTRUCTION_AUDIT.md).
+Several sections below say "no numbers are recorded here yet" and mean it.
+
 Both drivers generate the dataset from the same counter-based splitmix64
 stream, so every feature value and label is bit-identical between the two
 (no files exchanged, no RNG library differences). The target mixes linear,
@@ -169,9 +174,16 @@ pixi run bench-profile                  # 100000 rows x 100 features, 3 reps
 pixi run bench-profile 200000 50 5      # rows, features, reps
 ```
 
-Sweeping `TASKS_PER_CORE` in `src/mojotrees/parallel.mojo` and rerunning this
-is how that constant should be settled; it is currently an unmeasured starting
-value of 4.
+Sweeping the tasks-per-core constant and rerunning this is how it should be
+settled; it is currently an unmeasured starting value of 4. **This no longer
+means editing the source.** `MOJOTREES_CPU_TASKS_PER_CORE` overrides
+`TASKS_PER_CORE` at runtime (`src/mojotrees/apple_cpu_policy.mojo`, and
+`src/mojotrees/parallel.mojo:172` names it for exactly this purpose), so the
+sweep is a loop over the environment variable rather than a rebuild per point,
+which also makes the points comparable on a machine that drifts.
+
+Nobody has run that sweep. The constant is still whatever
+`DEFAULT_TASKS_PER_CORE` says.
 
 **No numbers are recorded here yet.** Every run taken during the work that
 added this driver was on a machine carrying a load average above 8 on 10
@@ -431,8 +443,17 @@ pixi run bench-hist-scaling 20 1000000 50      # reps, then (rows, features)
 
 `MOJOTREES_GPU_HIST_STRATEGY`, `MOJOTREES_GPU_ROW_TILE`, and
 `MOJOTREES_GPU_BLOCK_THREADS` (see `src/mojotrees/gpu_tiling.mojo`) sweep the
-tiling by hand, which is how the defaults in that module were chosen. Pin
-them when comparing runs.
+tiling by hand. Pin them when comparing runs.
+
+**Only one of the three has settled a default.** `MOJOTREES_GPU_HIST_STRATEGY`
+produced the `tiled` against `atomic` table below, which is a **measured**
+result. `MOJOTREES_GPU_ROW_TILE` and `MOJOTREES_GPU_BLOCK_THREADS` have never
+been swept and recorded — the "Not yet measured" note further down says so, and
+`gpu_tiling.mojo` is explicit that `TARGET_BLOCKS_PER_SM = 8` rests on a
+**derived bound** rather than a measurement: a small shared-memory footprint "is
+evidence that 8 blocks are not excluded, not evidence that more than 8 are
+resident". This paragraph used to claim all three knobs were how the module's
+defaults were chosen, which contradicted that note twenty lines away.
 
 The same caveat as above applies with more force here: the tiling is derived
 from the device's own reported capabilities, so numbers from one GPU say
