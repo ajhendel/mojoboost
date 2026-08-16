@@ -69,8 +69,13 @@ from .ordered_boosting import (
     plane_offsets,
 )
 from .sampling import (
+    BootstrapParams,
     ClassBaggingParams,
+    MvsAudit,
+    bootstrap_round,
     has_positive_rows,
+    mvs_auto_lambda_from_gradients,
+    mvs_auto_lambda_from_leaf_values,
     refresh_class_bag,
 )
 from .objective_registry import (
@@ -127,6 +132,7 @@ from .tree_parameters_extra import (
     ExtraTreeParams,
     cap_leaf_output,
     finish_leaf_output,
+    random_score_scale_from_gradients,
     raw_leaf_output,
 )
 from .validation import (
@@ -378,6 +384,66 @@ def _check_class_bagging(
         raise Error(
             "pos_bagging_fraction/neg_bagging_fraction apply to binary"
             " classification only, as in LightGBM"
+        )
+
+
+def _check_bootstrap(
+    bootstrap: BootstrapParams,
+    bagging: BaggingParams,
+    goss: GossParams,
+    class_bagging: ClassBaggingParams,
+    objective: Int,
+) raises:
+    """Validate `bootstrap_type` and reject it beside the other row samplers.
+
+    `BootstrapParams.validate` carries CatBoost's own rules and the one
+    exclusion between MVS and the Bayesian bootstrap. What is added here is the
+    exclusion against the three samplers mojotrees already had, on exactly the
+    reasoning `_check_goss` and `_check_class_bagging` give: each of them owns
+    the row list a tree is grown on, MVS owns it too (it drops its
+    zero-weight rows outright, `sampling.mvs_kept_rows`), and a configuration
+    that would quietly ignore half of itself is reported rather than run.
+
+    Row bagging is the sharpest case and is worth naming rather than lumping
+    in: **it is CatBoost's Bernoulli bootstrap under mojotrees's own name**
+    (`sampling.canonical_bootstrap_type` refuses the spelling `bernoulli` for
+    precisely that reason), so `bagging_fraction` beside `bootstrap_type=MVS`
+    is two values of one CatBoost enum at once. The Bayesian bootstrap keeps
+    every row and could in principle compose with a bag, but CatBoost cannot
+    spell that combination either and nothing here is calibrated against it, so
+    it is refused with the rest instead of being the one untested crossing.
+
+    `objective` is refused for `CUSTOM` alone: `train_custom` never reaches the
+    loops that call `bootstrap_round`, and a callback's derivatives are
+    whatever the caller returns, so the draw's row magnitudes would be scaled
+    by an unknown convention.
+    """
+    bootstrap.validate()
+    if not bootstrap.enabled():
+        return
+    if bagging_enabled(bagging):
+        raise Error(
+            "bootstrap_type and bagging_fraction cannot both be enabled:"
+            " bagging_fraction IS CatBoost's Bernoulli bootstrap under"
+            " mojotrees's name, so this asks for two bootstrap types at once,"
+            " and both own the row list a tree is grown on"
+        )
+    if goss.enabled:
+        raise Error(
+            "bootstrap_type and goss cannot both be enabled; both sample rows"
+            " by gradient magnitude and both own the row list a tree is grown"
+            " on"
+        )
+    if class_bagging.enabled():
+        raise Error(
+            "bootstrap_type and pos_bagging_fraction/neg_bagging_fraction"
+            " cannot both be enabled; both own the row list a tree is grown on"
+        )
+    if objective == CUSTOM:
+        raise Error(
+            "bootstrap_type is not applied to a custom objective: the draw"
+            " scales the callback's own derivatives, whose units and hessian"
+            " convention this loop does not know"
         )
 
 
@@ -2089,6 +2155,103 @@ def _ordered_fit_leaf_values(
         values[node] = v
 
 
+def _tree_leaf_values(
+    tree: Tree, learning_rate: Float64, mut values: List[Float64]
+) raises -> Int:
+    """The leaf values of one tree, in node order, scaled by the learning
+    rate, and how many there are.
+
+    This is what MVS's derived `mvs_reg` reads on every tree after the first:
+    `TMvsSampler::GetLambda` calls `CalculateLastIterMeanLeafValue` on
+    `leafValues.back()`, the previous iteration's entry of
+    `ctx->LearnProgress->LeafValues`.
+
+    **The learning-rate factor is why this is a function rather than a slice.**
+    A CatBoost model's stored leaf values already carry the shrinkage -- a
+    saved model scores by summing them with no separate rate -- whereas a
+    mojotrees `Tree.value` is the bare Newton step and `_add_tree_scores`
+    applies `learning_rate` as it accumulates. The two conventions differ by
+    exactly that factor, and the lambda is the squared *mean norm* of these
+    values, so getting it wrong scales the MVS floor by `learning_rate^2` and
+    quietly changes which rows survive. This is reasoning from the two
+    libraries' storage conventions rather than a line of CatBoost this lane
+    re-read; it is flagged as such in the lane report.
+
+    A leaf is a node with `feature[node] < 0`, the same test the predictor and
+    the renewal use. Single-output trees only, so the stride is 1; the
+    multiclass loops do not call this (see `_boost_rounds_multiclass`, which
+    takes no bootstrap bundle at all).
+    """
+    values.clear()
+    for node in range(len(tree.feature)):
+        if tree.feature[node] < 0:
+            values.append(tree.value[node] * learning_rate)
+    return len(values)
+
+
+def _round_random_score_scale(
+    extra: ExtraTreeParams,
+    grad: List[Float64],
+    n_rows: Int,
+    round: Int,
+    learning_rate: Float64,
+) raises -> Float64:
+    """One tree's `ExtraTreeParams.random_score_scale`, or 0.0 when
+    `random_strength` is off.
+
+    CatBoost's `CalcScoreStDev` is
+    `random_strength * derivativesStDevFromZero * modelSizeDecrease`; the
+    strength is the user's knob and stays on the bundle, and the other two
+    factors are `random_score_scale_from_gradients`, whose `modelLength` is
+    `train.cpp`'s `iteration_index * learning_rate`. `round` is the **absolute**
+    round index, so a continued run (`train_more`) computes the model length
+    an uninterrupted run would have had rather than restarting it at zero.
+
+    At `random_strength == 0`, the default, this returns before it reads a row
+    and the bundle keeps the 0.0 it was constructed with, so not one
+    instruction of this reaches the default arm.
+
+    **The one refusal.** `random_score_scale_from_gradients` can return exactly
+    0.0 -- from an all-zero gradient vector, or from a model length past the
+    point where `exp(log(n) - L)` underflows, which at `learning_rate = 0.1`
+    is somewhere beyond round 7500. In CatBoost that is a well-defined
+    `N(0, 0)` and the noise simply vanishes; here `split.find_best_split`
+    refuses a positive strength beside a non-positive scale, because that pair
+    is also what an unwired caller looks like and it cannot tell the two apart.
+    So a genuine zero is refused here instead, at the round that produced it
+    and with the cause named, rather than reaching a message that says the
+    scale was never computed when it was. Distinguishing "computed and zero"
+    from "never set" is a field on `ExtraTreeParams`, which this lane does not
+    own; the lane report carries the diff.
+    """
+    if not (extra.random_strength > 0.0):
+        return 0.0
+    if n_rows <= 0:
+        raise Error(
+            "random_strength needs at least one row: its scale is the RMS of"
+            " the round's derivatives"
+        )
+    var scale = random_score_scale_from_gradients(
+        grad, n_rows, Float64(round) * learning_rate
+    )
+    if not (scale > 0.0):
+        raise Error(
+            "random_strength's per-tree scale came out as ",
+            scale,
+            " on round ",
+            round,
+            ", and the split search refuses a positive random_strength beside"
+            " a non-positive scale because that is indistinguishable from a"
+            " caller that never computed one. CatBoost's scoreStDev is"
+            " derivativesStDevFromZero * modelSizeDecrease: the first factor"
+            " is zero only when every derivative is exactly zero (the fit has"
+            " converged), and the second underflows to zero once"
+            " round * learning_rate exceeds about 745 + log(n_rows). Lower"
+            " n_estimators or learning_rate, or set random_strength=0",
+        )
+    return scale
+
+
 def _boost_rounds(
     data: BinnedMatrix,
     target: List[Float64],
@@ -2103,6 +2266,7 @@ def _boost_rounds(
     mut raw: List[Float64],
     mut trees: List[Tree],
     class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises:
     """Grow `params.n_estimators` trees, appending them to `trees` and
     keeping `raw` (the raw score of every training row) in step.
@@ -2129,9 +2293,37 @@ def _boost_rounds(
     so a bundled run and an unbundled one differ in cost and not in result.
     Disabled by default, and `prepare_bundling` falls back to the unbundled
     matrix whenever the plan would not pay for itself.
+
+    `bootstrap` is CatBoost's `bootstrap_type` (see sampling.mojo): MVS, which
+    is CatBoost's real CPU default, or the Bayesian bootstrap. Both put a
+    per-row weight on the round's derivatives, which is why the
+    constant-hessian declaration below is withdrawn for them and why
+    `BootstrapParams.check_hessian_declaration` is called on the result. It is
+    exclusive with the three row samplers above (`_check_bootstrap`) and
+    disabled by default, so an untouched bundle takes no draw, allocates no
+    weight vector, and leaves every fit byte for byte the fit it is today.
+
+    `params.tree.extra.random_score_scale` is the one field this loop writes
+    rather than reads. It is CatBoost's `scoreStDev` divided by the user's
+    `random_strength`, a property of the ensemble's current gradients and of
+    how long the model already is, so it is per-tree state and not
+    configuration -- see `_round_random_score_scale` and the local copy below.
     """
     if params.linear.is_active():
         check_linear_tree_unconnected("the binned-only boosting trainers")
+    # `random_score_scale` is per-tree ENSEMBLE STATE, not user configuration:
+    # CatBoost recomputes it before every tree from that round's derivatives
+    # and the model's length. `params` is borrowed, and it must stay borrowed
+    # -- writing the scale back into the caller's `BoosterParams` would make a
+    # fit mutate its own argument, so two identical `train` calls would differ
+    # (the second would start at the first's last scale) and a `BoosterParams`
+    # shared between two fits would carry one fit's gradients into the other.
+    # So the loop keeps its own copy of the tree bundle and hands THAT to the
+    # grower. One `TreeParams` copy per fit, not per tree, and at
+    # `random_strength = 0` -- the default -- the copy is never written and the
+    # grower reads exactly what it read before.
+    var tree_params = params.tree.copy()
+    var noisy = params.tree.extra.random_strength > 0.0
     var bundling = prepare_bundling(data, params.bundling)
     # One CEGB ledger for the whole ensemble, handed to every tree. That
     # lifetime is the mechanism's premise: the model pays for a feature once,
@@ -2213,6 +2405,65 @@ def _boost_rounds(
     var const_hessian = round_has_constant_hessian(
         objective, sample_weight, goss
     )
+    # ---- the bootstrap's constant-hessian exclusion ----
+    #
+    # THE FOURTH EXCLUSION, the one `round_has_constant_hessian` documents and
+    # cannot test for. Both bootstraps multiply the round's derivatives by a
+    # per-row weight (`sampling.apply_bootstrap_weights`, CatBoost's
+    # `CalcWeightedData`), so under an objective whose unweighted hessian is
+    # the literal 1.0 a bootstrapped round stores the DRAW into `hess`. A
+    # histogram builder told to rebuild the hessian plane from the row count
+    # would rebuild a plane of ones over a plane of draws, silently, and every
+    # split of the fit would be chosen from it.
+    #
+    # Withdrawing the declaration is the first line; the second is calling the
+    # sampler's own refusals on the result, which is not belt-and-braces. They
+    # are the assertion that this line ran: `round_has_constant_hessian` grows
+    # arms over time, this loop grows lines between the two, and a future edit
+    # that computes the declaration after this point, or adds an arm that
+    # re-enables it, turns a silently wrong hessian plane into an exception at
+    # fit setup. `mvs_varies_hessian` and `bayesian_bootstrap_varies_hessian`
+    # both test `enabled` alone, deliberately, so a `subsample = 1.0` or
+    # `bagging_temperature = 0` fit pays for the third plane and gets the same
+    # model -- the cheap side of the trade, and the side that cannot go stale
+    # part way through a loop.
+    if bootstrap.varies_hessian():
+        const_hessian = False
+    bootstrap.check_hessian_declaration(const_hessian)
+    # MVS's lambda is derived from the PREVIOUS tree's leaf values on every
+    # tree after the first (`TMvsSampler::GetLambda` reads `leafValues.back()`),
+    # and a continued run is handed raw scores rather than the ensemble that
+    # produced them, so the tree this loop would need does not arrive. Refused
+    # rather than silently restarting the derivation from the gradients, which
+    # would give round `k` of a continued run a different lambda from round `k`
+    # of an uninterrupted one and quietly change which rows survive. An
+    # explicit `mvs_reg` needs no derivation and continues fine, as does the
+    # Bayesian bootstrap, which has no lambda at all.
+    if (
+        round_offset != 0
+        and bootstrap.mvs.enabled
+        and not bootstrap.mvs.reg_is_set
+    ):
+        raise Error(
+            "continued training with bootstrap_type=mvs needs mvs_reg set"
+            " explicitly: the derived value is the squared mean leaf-value"
+            " norm of the tree before, and a continued run resumes from raw"
+            " scores rather than from the ensemble, so the first new round has"
+            " no previous tree to read"
+        )
+    # One buffer for the whole fit, as the gradient buffers are: the draw is
+    # rewritten in place every round. Both stay EMPTY on the default arm --
+    # `bootstrap_round` clears rather than fills them -- which is the
+    # convention `refresh_mvs_bootstrap` states and the reason an unbootstrapped
+    # fit moves no bits here.
+    var boot_w = List[Float64]()
+    var boot_audit = MvsAudit.empty()
+    # The previous tree's leaf values, for MVS's derived lambda. Filled after
+    # each accepted tree and read by the next round; empty on the first round
+    # of a fresh fit, which is the branch `GetLambda` takes when `leafValues`
+    # is empty.
+    var last_leaf_values = List[Float64]()
+    var n_last_leaves = 0
     # ---- ordered boosting state, all empty and untouched when it is off ----
     # `_check_ordered` runs whether or not it is on, because `validate` refuses
     # a malformed bundle a caller built and then disabled, which is a typo
@@ -2221,6 +2472,17 @@ def _boost_rounds(
     _check_ordered(
         ordered, objective, bagging, goss, class_bagging, round_offset
     )
+    # The fourth sampler `_check_ordered` does not take. Same refusal and the
+    # same sentence: MVS drops rows outright and the Bayesian bootstrap
+    # reweights every one of them, and either changes which prefix each fold
+    # was fitted on. `_check_ordered`'s signature is not widened from here
+    # because it is another lane's shape; this is the one place both
+    # configurations are in scope.
+    if ordered.enabled and bootstrap.enabled():
+        raise Error(
+            "boosting_type=ordered is exclusive with bootstrap_type: a dropped"
+            " or reweighted row changes which prefix each fold was fitted on"
+        )
     check_ordered_hessian_declaration(ordered, const_hessian)
     # `ladder[f]` is rung `f`'s body end and `ladder[f + 1]` its tail end;
     # `plane_off[f]` is where rung `f`'s raw-score plane starts in the one flat
@@ -2314,6 +2576,57 @@ def _boost_rounds(
                 ),
             )
         goss_round(bag, grad, hess, goss, round, learning_rate)
+        # ---- CatBoost's `random_strength`, one scale per tree ----
+        #
+        # Before the bootstrap, and that order is CatBoost's rather than a
+        # convenience: `CalcScoreStDev` reads the fold's `WeightedDerivatives`,
+        # and `Bootstrap` writes `SampleWeightedDerivatives` and leaves
+        # `WeightedDerivatives` alone, so the noise scale is a property of the
+        # round's user-weighted derivatives and not of the draw. Reading it
+        # after `bootstrap_round` would scale the noise by the sampler.
+        #
+        # Written onto the loop's own copy of the tree bundle, never onto
+        # `params` -- see `tree_params` above. At the default of
+        # `random_strength = 0` the call returns on its first comparison and
+        # nothing is written.
+        if noisy:
+            tree_params.extra.random_score_scale = _round_random_score_scale(
+                params.tree.extra, grad, n, round, learning_rate
+            )
+        # ---- CatBoost's `bootstrap_type` ----
+        #
+        # `goss_round`'s twin, in `goss_round`'s place: a row sampler that
+        # reads this round's derivatives, rewrites them, and may replace the
+        # row list. The two are mutually exclusive (`_check_bootstrap`) and a
+        # disabled bundle returns without touching `bag`, `grad`, `hess`, or
+        # the buffers.
+        #
+        # The lambda argument is `TMvsSampler::GetLambda`'s branch, made
+        # explicit: the squared mean gradient magnitude while no tree exists,
+        # the squared mean leaf-value norm of the previous tree afterwards.
+        # It is computed here rather than inside the sampler because the
+        # second branch reads the ensemble, which sampling.mojo cannot see.
+        if bootstrap.enabled():
+            var auto_lambda = 0.0
+            if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
+                if n_last_leaves > 0:
+                    auto_lambda = mvs_auto_lambda_from_leaf_values(
+                        last_leaf_values, n_last_leaves, 1
+                    )
+                else:
+                    auto_lambda = mvs_auto_lambda_from_gradients(grad, n, 1)
+            bootstrap_round(
+                bag,
+                grad,
+                hess,
+                boot_w,
+                boot_audit,
+                bootstrap,
+                n,
+                round,
+                auto_lambda,
+                1,
+            )
         # Round-level work belonging to no node, so it is charged at the
         # tree's root row count and files under `root`. The GOSS rescale is
         # inside the same charge because it is the same pass over the same
@@ -2331,7 +2644,10 @@ def _boost_rounds(
             data,
             grad,
             hess,
-            params.tree,
+            # The loop's copy, not the caller's bundle: it is `params.tree` in
+            # every field but `extra.random_score_scale`, which this round just
+            # computed and which is 0.0 on the default arm.
+            tree_params,
             bag,
             round,
             bundling,
@@ -2408,7 +2724,12 @@ def _boost_rounds(
         # the next sample gets its turn.
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
             profile.note_wall(post_started)
-            if bagging_enabled(bagging) or goss.enabled or balanced:
+            if (
+                bagging_enabled(bagging)
+                or goss.enabled
+                or balanced
+                or bootstrap.enabled()
+            ):
                 continue
             break
 
@@ -2494,6 +2815,18 @@ def _boost_rounds(
                             learning_rate
                             * rung_values[leaf_of_row[ord_perm[pbase + q]]]
                         )
+        # MVS's derived lambda for the NEXT round, read off the tree the
+        # ensemble just kept -- `leafValues.back()` in `TMvsSampler::GetLambda`.
+        # Recorded here, after the degenerate-tree test, so a round that was
+        # dropped does not leave its leaf values as the next round's lambda,
+        # which is what `LearnProgress->LeafValues` never receiving them means
+        # in CatBoost. Only when the derivation is actually used: an explicit
+        # `mvs_reg`, the Bayesian bootstrap and the default arm all skip the
+        # walk entirely.
+        if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
+            n_last_leaves = _tree_leaf_values(
+                tree, learning_rate, last_leaf_values
+            )
         trees.append(tree^)
         profile.note_wall(post_started)
 
@@ -2513,6 +2846,7 @@ def train(
     goss: GossParams = GossParams.disabled(),
     init_score: List[Float64] = [],
     class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Booster:
     """Train a boosted ensemble. `target` is the regression target for
     SQUARED_ERROR, HUBER, QUANTILE, and L1, {0, 1} labels for
@@ -2530,6 +2864,14 @@ def train(
     rows are kept at their own rates (see sampling.mojo). It applies to
     BINARY_LOGISTIC alone and is exclusive with the other two samplers.
 
+    `bootstrap` is CatBoost's `bootstrap_type` (see sampling.mojo): MVS at
+    `subsample`, which is CatBoost's own CPU default for these objectives, or
+    the Bayesian bootstrap at `bagging_temperature`. Both weight every row's
+    derivatives per tree; MVS additionally drops its zero-weight rows. It is
+    exclusive with the three samplers above -- `bagging_fraction` is CatBoost's
+    Bernoulli bootstrap under mojotrees's name, so it is a `bootstrap_type`
+    too -- and disabled by default.
+
     A non-empty `init_score` starts boosting from those raw scores instead
     of from the objective's own base score, LightGBM's `init_score`. The
     offset is training state, not model state: the returned ensemble has a
@@ -2542,6 +2884,7 @@ def train(
     check_bagging(bagging)
     _check_goss(goss, bagging)
     _check_class_bagging(class_bagging, bagging, goss, objective)
+    _check_bootstrap(bootstrap, bagging, goss, class_bagging, objective)
     params.tree.monotone.check_features(data.n_features)
     check_column_length(len(init_score), data.n_rows, "init_score")
 
@@ -2571,6 +2914,7 @@ def train(
         raw,
         trees,
         class_bagging,
+        bootstrap,
     )
 
     return Booster(
@@ -2593,6 +2937,7 @@ def train_more(
     goss: GossParams = GossParams.disabled(),
     init_score: List[Float64] = [],
     class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Int:
     """Append `params.n_estimators` more trees to a fitted ensemble and
     return how many were actually added.
@@ -2641,6 +2986,13 @@ def train_more(
     check_bagging(bagging)
     _check_goss(goss, bagging)
     _check_class_bagging(class_bagging, bagging, goss, booster.objective)
+    # The exclusions, and then the one refusal continued training adds:
+    # `_boost_rounds` rejects a derived `mvs_reg` at a nonzero `round_offset`,
+    # because the value is the previous tree's and a continuation resumes from
+    # raw scores rather than from the ensemble.
+    _check_bootstrap(
+        bootstrap, bagging, goss, class_bagging, booster.objective
+    )
     params.tree.monotone.check_features(data.n_features)
     # A `Booster` carries the trees a CEGB ledger produced, not the ledger,
     # so these rounds would start from an empty one and charge every feature
@@ -2682,6 +3034,7 @@ def train_more(
         raw,
         grown,
         class_bagging,
+        bootstrap,
     )
     var added = len(grown)
     for i in range(added):
@@ -2703,6 +3056,7 @@ def train_with_valid(
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
     class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Booster:
     """Train with validation-set early stopping. Stops when the validation
     loss (MSE / log loss / huber / pinball / MAE) has not improved by more
@@ -2714,7 +3068,11 @@ def train_with_valid(
     samples training rows by gradient magnitude instead (see goss.mojo) and
     leaves the validation loss untouched in the same way. `class_bagging`
     (see sampling.mojo) is a third, exclusive training-row sampler and is
-    likewise never applied to the validation rows."""
+    likewise never applied to the validation rows. `bootstrap` is CatBoost's
+    `bootstrap_type`, MVS or the Bayesian bootstrap, and is a fourth: it
+    weights and (under MVS) drops training rows per tree, and the validation
+    loss is computed on unweighted, unsampled rows exactly as it is under the
+    other three."""
     if params.linear.is_active():
         check_linear_tree_unconnected("train_with_valid")
     if len(target) != data.n_rows:
@@ -2730,6 +3088,7 @@ def train_with_valid(
     check_bagging(bagging)
     _check_goss(goss, bagging)
     _check_class_bagging(class_bagging, bagging, goss, objective)
+    _check_bootstrap(bootstrap, bagging, goss, class_bagging, objective)
     params.tree.monotone.check_features(data.n_features)
 
     # Fitted once, from the training matrix alone: the validation matrix is
@@ -2789,6 +3148,22 @@ def train_with_valid(
     var const_hessian = round_has_constant_hessian(
         objective, sample_weight, goss
     )
+    # The fourth exclusion, exactly as `_boost_rounds` makes it and for exactly
+    # the reason stated there: both bootstraps put the drawn weight into `hess`,
+    # so the declaration is withdrawn and then the sampler's own refusals are
+    # called on the result as the assertion that it was.
+    if bootstrap.varies_hessian():
+        const_hessian = False
+    bootstrap.check_hessian_declaration(const_hessian)
+    # The loop's own copy of the tree bundle, written by nothing but
+    # `random_score_scale` below. `params` stays borrowed; see the same block
+    # in `_boost_rounds` for why the scale must not be written back.
+    var tree_params = params.tree.copy()
+    var noisy = params.tree.extra.random_strength > 0.0
+    var boot_w = List[Float64]()
+    var boot_audit = MvsAudit.empty()
+    var last_leaf_values = List[Float64]()
+    var n_last_leaves = 0
     for i in range(params.n_estimators):
         if balanced:
             refresh_class_bag(bag, class_bagging, target, i)
@@ -2800,6 +3175,36 @@ def train_with_valid(
             float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
+        # `random_strength`'s per-tree scale, then the bootstrap, in that
+        # order and for the reason `_boost_rounds` gives: CatBoost's
+        # `CalcScoreStDev` reads the pre-bootstrap `WeightedDerivatives`.
+        # This loop starts at round 0 always -- it has no `round_offset` --
+        # so the model length is `i * learning_rate`.
+        if noisy:
+            tree_params.extra.random_score_scale = _round_random_score_scale(
+                params.tree.extra, grad, n, i, params.learning_rate
+            )
+        if bootstrap.enabled():
+            var auto_lambda = 0.0
+            if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
+                if n_last_leaves > 0:
+                    auto_lambda = mvs_auto_lambda_from_leaf_values(
+                        last_leaf_values, n_last_leaves, 1
+                    )
+                else:
+                    auto_lambda = mvs_auto_lambda_from_gradients(grad, n, 1)
+            bootstrap_round(
+                bag,
+                grad,
+                hess,
+                boot_w,
+                boot_audit,
+                bootstrap,
+                n,
+                i,
+                auto_lambda,
+                1,
+            )
         var tree = grow_tree_leaves(
             leaves,
             ledger,
@@ -2807,7 +3212,7 @@ def train_with_valid(
             data,
             grad,
             hess,
-            params.tree,
+            tree_params,
             bag,
             i,
             bundling,
@@ -2834,10 +3239,21 @@ def train_with_valid(
         # Under any row sampler a degenerate tree indicts the sample, not
         # the run.
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
-            if bagging_enabled(bagging) or goss.enabled or balanced:
+            if (
+                bagging_enabled(bagging)
+                or goss.enabled
+                or balanced
+                or bootstrap.enabled()
+            ):
                 continue
             break
 
+        # MVS's derived lambda for the next round, off the tree the ensemble
+        # kept. After the degenerate-tree test, as in `_boost_rounds`.
+        if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
+            n_last_leaves = _tree_leaf_values(
+                tree, params.learning_rate, last_leaf_values
+            )
         _add_tree_scores(
             raw, tree, leaves, data, params.learning_rate, by_leaf, 1, 0,
             settings,
