@@ -313,11 +313,28 @@ last, and records that it did.
 
 ## M3. The prediction, registered before the data
 
-Removing eleven of sixteen waits per tree in the tables path and three of four
-in the search path is fourteen fewer waits per tree. At the **measured** 458
-microseconds per synchronization over 100 trees that is an **estimated** 0.64
-seconds, taking a 3.17 second leaf-wise fit to roughly 2.5. That estimate is
-recorded here so the measurement can refute it rather than be fitted to it.
+**Corrected before any data was taken, and the error is worth keeping visible.**
+The brief for the tables lane said eleven waits removed. It is ten. Six
+downloads becoming one saves five, not six, and five plus five is ten. The lane
+caught it and refused to carry the estimate that depended on it. An off-by-one
+in a prediction that is about to be compared against a measurement is exactly
+the kind of error that gets absorbed as "close enough" afterwards, so it is
+fixed here rather than in the write-up.
+
+Removing **ten** of sixteen waits per tree in the tables path (five uploads in
+`begin_tree`, five of six downloads in `download_desc_tables`), three of four in
+the search path, and one of two in the raw-score update is **fourteen** fewer
+waits per tree. At the **measured** 458 microseconds per synchronization over
+100 trees that is an **estimated** 0.64 seconds, taking a 3.17 second leaf-wise
+fit to roughly 2.5. The total is unchanged because the two other lanes' shares
+were counted separately; only its composition moved.
+
+That estimate is recorded so the measurement can refute it rather than be fitted
+to it. Its weakest assumption, stated so it can be blamed later: it prices every
+copy at the 458 microseconds derived from the depthwise A/B, where the copies
+were 153 KB histograms. Most of these are a few hundred bytes. If per-copy cost
+turns out to depend on size after all, this estimate is too high and the
+per-synchronization constant needs re-deriving rather than re-applying.
 
 If the collapse lands and the fit does **not** move by at least 0.3 seconds,
 then per-copy cost is not 458 microseconds in this position, and the per-sync

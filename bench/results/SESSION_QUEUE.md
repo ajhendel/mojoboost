@@ -71,11 +71,13 @@ Order matters: the main claim goes first, while the box is coldest.
 Every copy is a host wait on Metal, in both directions, at a **measured** ~458
 microseconds regardless of byte count. What the lanes are removing, per tree:
 
-- five uploads in `DeviceTreeTables.begin_tree`, replaced by a device reset
-  kernel, since every byte it writes is a constant or a function of three
-  scalars (`lane/tables-reset-kernel`)
-- six downloads in `download_desc_tables`, packed toward one; one is genuine
-  and correct, six is not (`lane/tables-reset-kernel`)
+- **LANDED**, five uploads in `DeviceTreeTables.begin_tree`, replaced by
+  `_reset_tables_kernel`, since every byte it writes is a constant or a
+  function of three scalars (`lane/tables-reset-kernel`)
+- **LANDED**, six downloads in `download_desc_tables` packed into one by
+  `_pack_tables_kernel`; the float plane crosses as bits and is bitcast back,
+  and the decode below the fetch is shared by both arms so the snapshot cannot
+  tell which ran (`lane/tables-reset-kernel`)
 - four uploads in `GpuSplitSearcher._copy_tables`, scoped to what actually
   changes; the float parameter block and monotone vector are fit-constant, the
   feature table and allow mask move only when `feature_fraction` is active
@@ -94,10 +96,27 @@ microseconds in this position, and the per-synchronization constant that three
 independent routes agreed on is wrong somewhere. That outcome is more
 informative than the win and must be written up at least as loudly.
 
-Arm names to be filled in from the lane reports. Both lanes were required to
-keep two arms live in one binary rather than behind an environment variable,
-because this machine drifts two to three times between time windows and only
-interleaved arms compare.
+**Arms, as landed.** `lane/tables-reset-kernel` exposes setters
+(`set_reset_on_device`, `set_packed_download`, both defaulting to the device
+form) **and** environment overrides `MOJOTREES_GPU_TABLE_RESET=0` /
+`MOJOTREES_GPU_PACKED_DOWNLOAD=0`. It needed the environment variables because
+`DeviceTreeTables` is constructed inside `GpuHistogramBuilder.open_resident_
+tables`, in a file that lane was not allowed to touch, so nothing between a
+bench and the object exposes the setter.
+
+**Consequence, stated rather than glossed: this A/B is alternating processes,
+not interleaved arms in one process.** That is weaker, and it is the same shape
+as the resident-plane A/B in M2.2, which is precedent rather than justification.
+It is accepted here because the alternative is threading two more arguments
+through `train_gpu` and adding fields to a struct three other lanes are working
+next to. If this measurement lands ambiguous, closing that gap is the first
+thing to try, not more repeats.
+
+```
+MOJOTREES_GPU_TABLE_RESET=0 MOJOTREES_GPU_PACKED_DOWNLOAD=0 \
+  pixi run -e bench bench-train-gpu 1000000 50 reg 5 gpu-device      # off arm
+pixi run -e bench bench-train-gpu 1000000 50 reg 5 gpu-device        # on arm
+```
 
 ### M2.2 The resident plane, re-taken
 
@@ -195,3 +214,14 @@ so far.
   sharing kernels and a split-policy gate that is a lever for one policy and a
   no-op for the other.
 - `main` is unpromoted. All of this is on `perf-round-2`.
+- **`compatibility/api_snapshot.json` is stale and was already stale before this
+  round.** It is missing `MOJOTREES_CONST_HESSIAN`, `MOJOTREES_GPU_TREE_RESIDENT`
+  and its trace variables from earlier lanes, and this round adds
+  `MOJOTREES_GPU_TABLE_RESET` and `MOJOTREES_GPU_PACKED_DOWNLOAD`. Regenerate
+  **once** at merge with `--write` rather than per lane, or every lane conflicts
+  with every other. Then decide whether these knobs get declared in
+  `docs/COMPATIBILITY_POLICY.md`; the undeclared performance knobs from the last
+  two rounds were not, and that is a drift worth settling deliberately.
+- `stage_frontier` still uploads three tables. Untouched on purpose: it stages an
+  arbitrary test-built frontier that no scalar describes, so the reset-kernel
+  trick does not apply to it. It is not on the per-tree path.
