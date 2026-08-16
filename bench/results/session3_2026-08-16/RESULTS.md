@@ -509,3 +509,63 @@ headline within the last twenty-four hours and neither survives.
 - Whether tonight's machine state is thermal, clock, or something else. Nothing
   in this session establishes it and the results are labelled by regime rather
   than corrected for it.
+
+
+---
+
+## The canary's first reading, and it is the most consequential number of the session
+
+Taken 2026-08-16 on the first run of `bench/canary.mojo` after it was wired in.
+Three repeats, one short run, the CPU campaign active on the same box. Two fixed
+probes: a serial single-threaded integer chain and a saturating GPU kernel.
+**Neither probe touches a dataset, the training code, or any knob either campaign
+varies**, so nothing here is a property of anything either of us wrote.
+
+    drift_cpu_pct: 22.5      regime: shifted
+    drift_gpu_pct:  0.7
+
+The CPU probe measured 467 ms at the start of the run and 572 ms at the end. The
+GPU probe held to 0.7 percent across the same interval.
+
+**Measured.** The baselines are not yet recorded so the ratios are null; only the
+start-to-end drift is meaningful, and it is enough.
+
+### What it settles
+
+Three separate findings this week were arguments from arm behavior, each open to
+the objection that the arm's own code explained it:
+
+- ours: the GPU arm held 2.7 percent spread across five runs while LightGBM
+  drifted 2.80 to 3.50
+- the CPU campaign's: their CPU arm rose 18 percent across five repeats while
+  LightGBM rose 10
+- the resident plane measuring 24 percent in one window and 8 percent in another
+
+All three are now explained by one directly measured fact: **on this machine the
+CPU throttles hard and fast and the GPU essentially does not.** It is not a
+property of LightGBM, not of our arms, and not of either campaign's code.
+
+### What it costs us
+
+**A CPU-versus-CPU comparison on this box drifts materially inside a single
+run.** Not between sessions, not between windows -- inside one three-repeat run
+lasting well under a minute.
+
+So absolute seconds from any CPU-heavy arm are not a property of the code, and
+may be reported only as ratios from interleaved arms with the canary line beside
+them. The CPU campaign has accepted this for its own headline and is rewriting
+its results file to lead with the ratio. That is the correct response and it was
+reached on evidence neither campaign could have produced from its own arms.
+
+### And it is the argument for the instrument itself
+
+`PROFILE_PROTOCOL.md` had asked for thermal state since the first session. The
+instruction pointed at a script that measures nothing, and for two days at a
+handoff file that had been deleted. Every regime label in this repository until
+now was inferred from effect, by hand, and one such inference was made and
+retracted the same night.
+
+The canary answers a different question than the protocol asked -- not what state
+the machine reports, but what the machine delivers -- and it answered it on the
+first run, without privileges, in a way that changed what another campaign is
+willing to publish.

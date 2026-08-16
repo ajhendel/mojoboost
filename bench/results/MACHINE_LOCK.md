@@ -66,6 +66,15 @@ narrower form the same night.
   reports when in-flight compiles have drained. **A compile cannot be killed
   mid-flight, so there is a drain interval and it gets reported rather than
   papered over.**
+- **A test suite counts as a compile.** Neither campaign runs a suite during the
+  other's announced timing window, and neither times while running its own. This
+  is not a new lock or a new message, it is the existing rule saying what already
+  followed from it: `tools/run_tests.sh` builds every test file and has run at
+  533 to 874 percent CPU for four to eleven minutes on this machine. It is the
+  single heaviest thing either campaign does, heavier than most lanes, and it was
+  not obviously covered by a rule phrased around "lanes".
+- The same applies to a session's own commits when the other holds the box: the
+  pre-commit hook runs the gate scripts. Small, but free to defer.
 - Every results header records whether the box was verifiably quiet, per M1.
 
 ## The instrument problem, stated plainly
