@@ -98,6 +98,12 @@ from .histogram import (
     build_histogram_subset_by_layout_into_scratch,
     subtract_histogram_into,
 )
+from .oblivious_level import (
+    accumulate_level_stats,
+    copy_level_slot,
+    level_columns_are_whole,
+    level_engine_enabled,
+)
 from .parallel import (
     DispatchSettings,
     plan_row_blocks_with,
@@ -812,6 +818,133 @@ def partition_rows_into(
                 ri += 1
 
     run_row_blocks(blocks, scatter_block)
+
+
+def _oblivious_level_fold(
+    mut fold_docs: List[Int],
+    mut fold_slots: List[Int],
+    mut fold_grad: List[Float64],
+    mut fold_hess: List[Float64],
+    mut slot_of: List[Int],
+    mut keep_left: Bool,
+    docs: List[Int],
+    grad: List[Float64],
+    hess: List[Float64],
+    data: BinnedMatrix,
+    split: SplitInfo,
+    missing_bin: Int,
+    n_slots: Int,
+    settings: DispatchSettings,
+) raises -> Int:
+    """The level's kept side, compacted in ascending row order, and the next
+    level's slot for every document.
+
+    `docs` is the tree's whole document set in ascending row order and never
+    moves; `slot_of[i]` is the slot in `[0, n_slots)` that `docs[i]` sits in
+    at the CURRENT level. On return `slot_of[i]` is its slot at the next
+    level -- `k` for a document that went left and `k + n_slots` for one that
+    went right, which is exactly the next level's ascending-leaf-index order
+    because every left child keeps its parent's leaf index and every right
+    child adds this level's power of two.
+
+    **Which side is kept is a property of the whole level, not of each
+    leaf.** That is CatBoost's rule (`TCalcScoreFold::SetSmallestSideControl`,
+    `calc_score_cache.cpp`: it counts the documents whose new bit is set and
+    keeps the minority, right on a tie) and it is what lets one pass build
+    every leaf's statistics at once. The grower that this replaces chose the
+    smaller child of each leaf independently, which builds fewer rows in
+    total and cannot be done in one pass. **The two therefore round
+    differently**; see the level engine's declaration in
+    `_grow_oblivious_levels`.
+
+    The kept side comes out in ascending row order whatever the block count:
+    block `b` writes at its exclusive prefix and ascends within itself, which
+    is `partition_rows_into`'s argument and its structure. Ascending order is
+    the whole point -- it is what walks a feature-major bin column forwards.
+
+    Answers the fold length and writes `keep_left`.
+    """
+    var n = len(docs)
+    # Two indirect bin loads and a gather of the gradient pair per document,
+    # so a document is charged like four histogram ops rather than one.
+    var blocks = plan_row_blocks_with(settings, n, 4 * n)
+    var docs_p = docs.unsafe_ptr()
+    var bins_p = data.bins.unsafe_ptr().unsafe_offset(
+        split.feature * data.n_rows
+    )
+    var is_cat = split.is_categorical
+    var default_left = split.default_left
+    var threshold = split.bin
+
+    @always_inline
+    def goes_left(bin: Int) {imm} -> Bool:
+        if is_cat:
+            return split.goes_left(bin)
+        if bin == missing_bin:
+            return default_left
+        return bin <= threshold
+
+    var left_counts = List[Int](capacity=blocks.n_blocks)
+    left_counts.resize(blocks.n_blocks, 0)
+    var counts_p = left_counts.unsafe_ptr()
+
+    def count_block(b: Int) {imm}:
+        var c = 0
+        for i in range(blocks.start(b), blocks.end(b)):
+            if goes_left(Int(bins_p.unsafe_load(docs_p.unsafe_load(i)))):
+                c += 1
+        counts_p.unsafe_store(b, c)
+
+    run_row_blocks(blocks, count_block)
+
+    var total_left = 0
+    for b in range(blocks.n_blocks):
+        total_left += left_counts[b]
+    # CatBoost's tie rule, spelled its way round: it keeps the LEFT side only
+    # when the right side is the strict majority, so a level that splits
+    # exactly in half keeps the right.
+    keep_left = (n - total_left) * 2 > n
+
+    # Exclusive prefix sum over the per-block KEPT counts, in place over the
+    # same array the left counts were counted into.
+    var total = 0
+    for b in range(blocks.n_blocks):
+        var c = left_counts[b]
+        if not keep_left:
+            c = (blocks.end(b) - blocks.start(b)) - c
+        left_counts[b] = total
+        total += c
+
+    fold_docs.resize(total, 0)
+    fold_slots.resize(total, 0)
+    fold_grad.resize(total, 0.0)
+    fold_hess.resize(total, 0.0)
+    var fd_p = fold_docs.unsafe_ptr()
+    var fs_p = fold_slots.unsafe_ptr()
+    var fg_p = fold_grad.unsafe_ptr()
+    var fh_p = fold_hess.unsafe_ptr()
+    var slot_p = slot_of.unsafe_ptr()
+    var grad_p = grad.unsafe_ptr()
+    var hess_p = hess.unsafe_ptr()
+    var kept_is_left = keep_left
+
+    def scatter_block(b: Int) {imm}:
+        var w = counts_p.unsafe_load(b)
+        for i in range(blocks.start(b), blocks.end(b)):
+            var d = docs_p.unsafe_load(i)
+            var left = goes_left(Int(bins_p.unsafe_load(d)))
+            var s = slot_p.unsafe_load(i)
+            if left == kept_is_left:
+                fd_p.unsafe_store(w, d)
+                fs_p.unsafe_store(w, s)
+                fg_p.unsafe_store(w, grad_p.unsafe_load(d))
+                fh_p.unsafe_store(w, hess_p.unsafe_load(d))
+                w += 1
+            if not left:
+                slot_p.unsafe_store(i, s + n_slots)
+
+    run_row_blocks(blocks, scatter_block)
+    return total
 
 
 def fill_identity_rows(
@@ -2011,6 +2144,36 @@ def _grow_oblivious_levels(
     var leaf_ix = List[Int](capacity=1)
     leaf_ix.append(0)
 
+    # --- the level engine's per-tree state -------------------------------
+    #
+    # `use_level` is the switch and it is ON by default, so every fit this
+    # engine supports takes it without anyone opting in. It is refused, by
+    # name and here rather than silently, for the one case whose bin ids do
+    # not live in `data.bins`: an EFB-bundled matrix, whose columns are
+    # bundle columns and whose builder is `expand_bundled_histogram`. That
+    # case keeps the leaf-by-leaf builder.
+    var use_level = level_engine_enabled() and not bundling.active
+    # The tree's whole document set, ascending and fixed for the tree, and
+    # the slot each document sits in at the current level. `full_docs` is a
+    # copy of the root's row list because the frontier's own list is moved
+    # into `_LeafState` and then repartitioned per level, while this one must
+    # keep the ascending order the accumulation reads it in.
+    var full_docs = List[Int]()
+    var slot_of = List[Int]()
+    var level_gh = List[Float64]()
+    var level_cnt = List[Int]()
+    var fold_docs = List[Int]()
+    var fold_slots = List[Int]()
+    var fold_grad = List[Float64]()
+    var fold_hess = List[Float64]()
+    var whole_columns = False
+    if use_level:
+        full_docs = frontier[0].rows.copy()
+        slot_of.resize(len(full_docs), 0)
+        whole_columns = level_columns_are_whole(
+            tree_columns, data.n_features
+        )
+
     while level_depth < params.max_depth:
         # The level in ascending LEAF INDEX, which is the cross-backend
         # contract and is not ascending node id (see the docstring).
@@ -2163,6 +2326,64 @@ def _grow_oblivious_levels(
         # Exactly two nodes per leaf of this level, known before the loop.
         tree.reserve_nodes(len(tree.feature) + 2 * len(order))
 
+        # --- THE LEVEL BUILD -------------------------------------------
+        #
+        # One pass over the level's kept documents per drawn column, folding
+        # every leaf of the level into a private `[slot][feature][bin]`
+        # stripe, against the leaf-by-leaf builder's one pass over the whole
+        # bin matrix PER LEAF. See `oblivious_level` for what CatBoost does
+        # and where; this is the call site and the only thing it decides is
+        # which side of the level gets built and which gets subtracted.
+        var keep_left = False
+        var n_fold = 0
+        if use_level:
+            var fold_started = profile.clock()
+            n_fold = _oblivious_level_fold(
+                fold_docs,
+                fold_slots,
+                fold_grad,
+                fold_hess,
+                slot_of,
+                keep_left,
+                full_docs,
+                grad,
+                hess,
+                data,
+                split,
+                split_missing_bin,
+                len(order),
+                scratch.settings,
+            )
+            profile.charge(
+                PROF_PARTITION,
+                len(full_docs),
+                fold_started,
+                dispatches=HOST_PARTITION_DISPATCHES,
+            )
+            var hist_started = profile.clock()
+            accumulate_level_stats(
+                level_gh,
+                level_cnt,
+                data,
+                fold_docs,
+                fold_slots,
+                fold_grad,
+                fold_hess,
+                tree_columns,
+                len(order),
+                scratch.settings,
+            )
+            for _k in range(len(order)):
+                profile.note_node()
+            profile.charge(
+                PROF_HISTOGRAM,
+                n_fold,
+                hist_started,
+                dispatches=HOST_HIST_DISPATCHES,
+                slots_per_row=len(tree_columns),
+                cells=len(order) * hist_cells,
+            )
+
         for k in range(len(order)):
             var i = order[k]
             var parent_node = frontier[i].node
@@ -2189,7 +2410,15 @@ def _grow_oblivious_levels(
                     dispatches=HOST_PARTITION_DISPATCHES,
                 )
 
-            var builds_left = len(left_rows) <= len(right_rows)
+            # Which side was BUILT. Under the level engine that is a
+            # property of the whole level (`_oblivious_level_fold` chose it
+            # by CatBoost's rule); leaf by leaf it is this leaf's smaller
+            # child. The two differ, and where they differ the pair
+            # (built, derived) swaps, so the rounding of the derived
+            # sibling's cells changes. That is the declared divergence.
+            var builds_left = keep_left if use_level else (
+                len(left_rows) <= len(right_rows)
+            )
             var built_rows = len(left_rows) if builds_left else len(right_rows)
             var derived_rows = (
                 len(right_rows) if builds_left else len(left_rows)
@@ -2197,11 +2426,35 @@ def _grow_oblivious_levels(
             var alloc_started = profile.clock()
             var left_hist = scratch.pool.take()
             var right_hist = scratch.pool.take()
+            if use_level:
+                # The level built every leaf's kept child in one pass above.
+                # This is the copy out of the flat buffer, charged with the
+                # buffer handling rather than with the accumulation because
+                # that is what it is: one sequential run of `hist_cells`
+                # cells, no bin matrix read at all.
+                if builds_left:
+                    copy_level_slot(
+                        left_hist,
+                        level_gh,
+                        level_cnt,
+                        k,
+                        tree_columns,
+                        whole_columns,
+                    )
+                else:
+                    copy_level_slot(
+                        right_hist,
+                        level_gh,
+                        level_cnt,
+                        k,
+                        tree_columns,
+                        whole_columns,
+                    )
             profile.charge(
                 PROF_HIST_ALLOC,
                 built_rows,
                 alloc_started,
-                cells=2 * hist_cells,
+                cells=(3 if use_level else 2) * hist_cells,
             )
             # A pooled buffer's contents are undefined. The bundled builders
             # write only the sampled features' slices, and a child with no
@@ -2209,7 +2462,27 @@ def _grow_oblivious_levels(
             # rather than inherit another node's statistics. The derived
             # sibling is fully written by the subtraction either way.
             var hist_started = profile.clock()
-            if builds_left:
+            if use_level:
+                var sub_started = profile.clock()
+                if builds_left:
+                    subtract_histogram_into(
+                        right_hist, level_hists[k], left_hist, const_hessian,
+                        scratch.settings, const_h_env,
+                    )
+                else:
+                    subtract_histogram_into(
+                        left_hist, level_hists[k], right_hist, const_hessian,
+                        scratch.settings, const_h_env,
+                    )
+                profile.note_node()
+                profile.charge(
+                    PROF_SUBTRACT,
+                    derived_rows,
+                    sub_started,
+                    dispatches=HOST_SUBTRACT_DISPATCHES,
+                    cells=hist_cells,
+                )
+            elif builds_left:
                 if built_rows == 0 or bundling.active:
                     left_hist.reset()
                 if built_rows > 0:

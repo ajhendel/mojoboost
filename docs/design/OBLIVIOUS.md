@@ -194,3 +194,102 @@ CatBoost at its defaults (`depth=6`, symmetric trees, `learning_rate` auto,
 CPU-only on macOS), Dataset construction included in end-to-end. Its own
 determinism setting where offered. Reported as a third column, never instead
 of LightGBM `stock+det`.
+
+## Part D. The CPU level engine, 2026-08-16
+
+### D1. The defect, stated before the fix
+
+The CPU grower that shipped grew an oblivious tree with the **leaf-wise
+engine**. `_grow_oblivious_levels` searched the level once, as B2 says it
+should, and then produced the level's statistics leaf by leaf: for each of
+the level's `L` leaves it called the leaf-wise subset builder over that
+leaf's row-id list, and that builder walks every drawn feature's bin column.
+Feature-major bins are `n_rows` bytes a column, so a level of `L` leaves
+streamed the whole `n_features * n_rows` bin matrix `L` times. At depth 6 the
+levels are 1, 2, 4, 8, 16 and 32 leaves wide, so one tree read the bin matrix
+**63 times where it needs to read it 6**.
+
+That is arithmetic over the loop nest, not a measurement, and it is the
+reason the CatBoost-shape arm measured 14.4 s against CatBoost's 3.8 s on the
+same tree shape in `bench/results/COMPARISON_RUN_2026-08-16.md` Block A --
+slower than our own leaf-wise arm at 10.1 s, for a tree that needs strictly
+less work than a leaf-wise one of the same leaf count.
+
+### D2. What CatBoost does, read from source
+
+Verified in the clone, not relayed:
+
+- **Fan-out is over candidate FEATURES.** `CalcBestScore`
+  (`catboost/private/libs/algo/greedy_tensor_search.cpp`) hands one task per
+  feature to `ExecRange`. Each task owns a private
+  `stats[leaf * bucketCount + bin]` array. No atomics, no shared histogram,
+  no cross-thread reduction.
+- **One pass over the documents per feature covers every leaf.**
+  `TStatsIndexer::GetIndex` (`scoring.cpp`) is
+  `BucketCount * LeafIndices[obj] + quantizedValue`, and `UpdateWeighted`
+  loops a document range adding into it.
+- **Level-wide sibling subtraction.**
+  `TCalcScoreFold::SetSmallestSideControl` (`calc_score_cache.cpp`) counts
+  the documents whose new bit is set and keeps the **minority side for the
+  whole level** -- one boolean, not one per leaf -- then
+  `SelectSmallestSplitSide` compacts those documents and sets their index to
+  `srcIndices[i] | (1 << (curDepth - 1))`, which lands every kept document in
+  the second half of the stats array. `CalcStatsKernel` zeroes only that
+  second half, so the first half still holds the previous level's stats, and
+  `FixUpStats` derives the other side by `stats[i].Remove(stats[i + half])`,
+  swapping when the kept side was the left one.
+- The compacted fold is rebuilt from the **full sampled fold** each level
+  (`SelectSmallestSplitSide(curDepth + 1, ctx->SampledDocs, ...)`), not from
+  the previous level's fold, so it is always about half the documents and
+  always in the full fold's ascending order.
+
+### D3. What is built here
+
+`src/mojotrees/oblivious_level.mojo` plus `tree._oblivious_level_fold`.
+Per level:
+
+1. `_oblivious_level_fold` makes one blocked pass over the tree's document
+   set, in **ascending row order**, counting the left side; picks the side to
+   build by CatBoost's rule (keep the minority, right on a tie); and compacts
+   that side into `(doc, slot, gradient, hessian)` arrays, still ascending.
+   It also advances each document's slot to the next level's, which is `k`
+   for a left child and `k + L` for a right one -- exactly the next level's
+   ascending-leaf-index order, because a left child keeps its parent's leaf
+   index and a right child adds this level's power of two.
+2. `accumulate_level_stats` fans out over the drawn columns. Each task zeroes
+   its own column's stripe in every slot and then makes **one pass over the
+   fold**, adding into a flat `[slot][feature][bin]` buffer. Per task the
+   working set is `L * n_bins` cells, 196 KB at 32 leaves and 256 bins.
+3. Each leaf takes its slot out of the flat buffer (`copy_level_slot`, one
+   contiguous run when no feature draw is active) and derives its sibling
+   with the same `subtract_histogram_into` the leaf-wise path uses.
+
+The search, the leaf values, the node ids, the leaf numbering and the
+frontier are untouched. The defect was never in any of them.
+
+**Reachability.** `MOJOTREES_OBLIVIOUS_LEVEL_ENGINE` defaults to ON, so every
+`grow_policy = oblivious` CPU fit takes it without opting in; `0` restores
+the leaf-by-leaf builder so an A/B runs in one process. It is refused, by
+name, for an EFB-bundled matrix, whose bin ids do not live in `data.bins`;
+that case keeps the old builder.
+
+### D4. The divergence, declared rather than discovered
+
+Trees are **not** bit-identical to the ones the leaf-by-leaf builder grew,
+and there are exactly two reasons:
+
+1. **Addend order.** The leaf-wise subset builder folds per-row-block partial
+   sums, so a cell's addends arrive in a block order. The level engine adds
+   strictly in ascending document order inside one feature's task. Same
+   addends, different association, so cells differ in the last bits.
+2. **Which side is derived.** The old path built each leaf's smaller child
+   and subtracted for the larger. The level engine builds the level's
+   minority side and subtracts for the other, so for a leaf whose own smaller
+   child is on the level's majority side the pair (built, derived) swaps and
+   the derived cells round the other way.
+
+Both are ulp-level. Neither changes which candidate wins except on an exact
+tie between two candidates' summed gains, where the loser of the tie can
+change. Determinism is unaffected: every cell is written by one task, in an
+order fixed by the arguments, so the result is identical at every
+`MOJOTREES_NUM_WORKERS` and on every machine.

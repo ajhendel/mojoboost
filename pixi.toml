@@ -106,6 +106,9 @@ bench-sparse = "mojo run -I src bench/bench_sparse.mojo"
 bench-profile = "mojo run -I src bench/bench_profile.mojo"
 bench-custom = "mojo run -I src bench/bench_custom_objective.mojo"
 bench-goss = "mojo run -I src bench/bench_goss.mojo"
+# The oblivious level engine A/B, arms interleaved inside one process because
+# this machine drifts 2-3x across a long window (bench/results/MACHINE_LOCK.md).
+bench-oblivious-level = "mojo run -I src bench/bench_oblivious_level.mojo"
 # What one kernel launch and one host wait cost here. Read this before
 # proposing any GPU change whose whole benefit is fewer launches or fewer
 # synchronizations; see train_gpu.mojo's `_device_search_resident`.
