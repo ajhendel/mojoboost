@@ -1047,3 +1047,76 @@ keep.**
 but not in a speedup, and **their share is unmeasured**, which makes every
 memory-side estimate in this batch an upper bound on wall-clock effect. Two lanes
 that disagreed about the layout agree about this.
+
+---
+
+## The readback probe: the per-trip floor, the transport ranking, and a corrected constant
+
+**Measured**, arms interleaved in one process, box at load 2.14 with two
+campaigns idle-to-light. A ratio from adjacent arms survives a contended window;
+the absolute microseconds are labelled accordingly.
+
+| arm | cmd buffers/trip | per-trip | vs floor |
+|---|---|---|---|
+| `bare_sync` (empty queue, the floor) | 1 | **10.59 us** | 1.0x |
+| `plain_one` (one packed copy, plain pointer) | 2 | **124.85 us** | 10.9x |
+| `kernel_sync` | 2 | 149.29 us | 14.1x |
+| `plain_pair` | 3 | 156.17 us | 13.6x |
+| `pinned_one_sync` | 3 | 175.84 us | 16.6x |
+| **`pinned_pair_sync` (what ships today)** | 4 | **202.14 us** | 19.1x |
+| `map` | 3 | 349.47 us | 30.4x |
+
+**The lane's structural prediction was right without a timing**: `plain_one` wins,
+`map` is worst despite its docs wording. Shipping 202.14 to `plain_one` 124.85 is
+**77 microseconds a trip, 38 percent**, from packing six words into one buffer and
+copying into ordinary heap memory rather than two pinned ones.
+
+### The 458 microsecond constant is superseded, and it was too high
+
+This campaign has priced every host trip at ~458 microseconds, **derived** from
+the depthwise A/B. A trip is now **measured directly at 202 microseconds** on the
+shipping transport.
+
+So the standing per-fit arithmetic changes: 200 trips at 202 microseconds is
+**0.040 seconds**, not the 0.092 the derived constant gave. **The control plane
+is worth less than half what the campaign has been assuming**, and everything
+downstream of that constant -- including the estimated 0.05 second remainder that
+closed the control-plane chapter -- was too pessimistic in the direction of
+overvaluing trip removal.
+
+That does not reopen the chapter; it closes it harder. It also means the
+`trip-count` lane's target of ~10 trips per fit is worth about **0.038 seconds**,
+not 0.09, and it should be judged against that.
+
+### Queue depth: the docstring's claim is supported
+
+Enqueue cost per launch, against stream length:
+
+| launches | enqueue us | | launches | enqueue us |
+|---|---|---|---|---|
+| 1 | 7.00 | | 96 | 9.90 |
+| 16 | 5.94 | | 128 | 10.81 |
+| 32 | 6.97 | | 192 | 14.13 |
+| 48 | 7.19 | | 256 | 14.75 |
+| 64 | 6.59 | | 512 | 16.63 |
+
+**Flat at 6-7 microseconds through 64, then rising to 14-17 beyond it.** The knee
+sits between 64 and 96, which is exactly where a 64-deep queue would put it. So
+`gpu_resident_round`'s claim -- that the plane emits on the order of 306 command
+buffers between waits and therefore runs one-in-one-out -- **is supported**, and
+the cost of being past the depth is roughly a doubling of per-launch enqueue time.
+
+**And it cannot be raised.** No knob exists: zero load sites on both raising
+selectors, no such environment variable, and the compiler lists four
+`DeviceContext` constructor overloads, none taking one.
+
+### Four transports do not exist, each with its reason
+
+`direct` (a `DeviceBuffer` pointer is a GPU virtual address that faults on a host
+load), `spin` (needs one allocation both kernel-writable and host-readable, which
+MAX exposes on neither type), `cpu_callback` (`enqueue_cpu_function` is CPU
+contexts only), and `event` (`eventCreate is not supported on this device`).
+
+The probe prints each unavailable arm **with why**, so a future MAX that closes a
+gap shows up as `unavailable -> ok` with no edit to the harness. That is the right
+shape for a capability probe and it is worth copying.
