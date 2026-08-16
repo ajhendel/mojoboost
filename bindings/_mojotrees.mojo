@@ -312,6 +312,7 @@ from mojotrees.tree import Tree, TreeParams
 # that parser is also `extra_params_check`'s, and this refusal needs the
 # entry point, which only `_parse_params` knows.
 from mojotrees.tree_parameters_extra import (
+    CATBOOST_RANDOM_STRENGTH,
     SCORE_L2,
     parse_score_function,
     score_function_name,
@@ -746,6 +747,7 @@ def _parse_params(
     auto_lr_rows: Int = 0,
     auto_lr_objective: Int = _CUSTOM_OBJECTIVE,
     catboost_defaults_objective: Int = _NO_CATBOOST_DEFAULTS,
+    ctr_ok: Bool = False,
 ) raises -> BoosterParams:
     """The `BoosterParams` a fit runs under, from the params mapping.
 
@@ -941,6 +943,29 @@ def _parse_params(
       arguments with two sentinels is the only shape in which a forgotten call
       site declines rather than resolves the wrong loss.
 
+    - `ctr_ok`: CatBoost's ordered target statistics
+      (src/mojotrees/ctr_columns.mojo, catalog A19/A36). The odd one out here,
+      because what it declares is not which round loop runs but **which
+      BINNING runs**: a CTR column is built from the label and a fixed
+      permutation while the matrix is binned, and the only type in this
+      package that binds a bundle to a matrix is `trainset.Dataset`. So the
+      entry points that may pass True are the ones that can hand the bundle to
+      a `Dataset`, and that is exactly one: `fit`, on its plain fork, which
+      reroutes through `trainset.Dataset` + `trainset.train_dataset` when the
+      bundle is active and takes the untouched `model.fit` call when it is
+      not. Its dart/rf and linear forks are refused by name below.
+
+      Every other entry point is False, and the reason is uniform rather than
+      per-trainer: `model.fit`, `model.fit_multiclass`, `fit_csc`,
+      `fit_ranker`, `fit_custom`, the three `*_with_metrics` fits and
+      `distributed_train_local` all bin a raw matrix through `binning.fit_bins`
+      and take no `SimpleCtrConfig`. The `train_dataset*` and `booster_update*`
+      entry points are False for the opposite reason -- their dataset was
+      binned before they were called, so its bundle is already decided and a
+      `ctr` key in the train params would be a second answer arriving too late.
+      `Dataset(params={"ctr": ...})` is where those set it, and that door is
+      unchanged.
+
       **A mode default is only ever applied where the value can be honored.**
       `leaf_estimation_iterations` resolves through
       `boosting.catboost_leaf_estimation_iterations`, so the objectives whose
@@ -948,9 +973,26 @@ def _parse_params(
       only reach it at the three call sites that also pass
       `leaf_estimation_ok`; `boost_from_average` resolves through
       `auto_learning_rate.catboost_boost_from_average_default`, whose False
-      answers only reach the same three. Everywhere else the value stays at the
+      answers only reach the same three; `random_strength` resolves to
+      `tree_parameters_extra.CATBOOST_RANDOM_STRENGTH` and reaches only the
+      three call sites that pass `random_strength_ok`, which is a NARROWER set
+      again, because the per-tree scale it multiplies is computed by two round
+      loops and not by five. Everywhere else the value stays at the
       LightGBM default this package has always had, and an EXPLICIT request is
-      refused by name below. That is the difference between a default and a
+      refused by name below.
+
+      **All three are supplied with CatBoost's own `SetDefault` semantics**
+      (`option.h:27-33`: assign the value, do not raise `IsSetFlag`). That is
+      what lets `l2_leaf_reg = 3` and a per-objective
+      `leaf_estimation_iterations` be supplied by CatBoost mode WITHOUT
+      closing the automatic-learning-rate gate they are two of the four keys
+      of (`options_helper.cpp:276-281`). The provenance flags this function
+      reads -- `leaf_estimation_iterations_set`, `boost_from_average_set`,
+      `random_strength_set`, and `auto_learning_rate_l2_set` further down --
+      are all written by the estimator from `is not None` tests on what the
+      CALLER passed, and no mode default writes any of them. Without that rule
+      the mode would advertise a derived learning rate and ship the constant,
+      which was live in this repository until 2026-08-16. That is the difference between a default and a
       request, and it is the same line `auto_lr_ok` / `auto_lr_required` draw:
       an inherited mode default an entry point cannot honor declines in
       silence, because that is what CatBoost itself does when its own table has
@@ -1001,6 +1043,33 @@ def _parse_params(
         extra.leaf_estimation_iterations = (
             catboost_leaf_estimation_iterations(catboost_defaults_objective)
         )
+    # CatBoost's `random_strength`, the third parameter with a CatBoost-mode
+    # default and the third to be resolved HERE rather than in the estimator,
+    # for the reason the two above it are: the mode default is only applied
+    # where the value can be honored, and whether it can is a property of the
+    # routing, which is what `random_strength_ok` carries.
+    #
+    # CatBoost ships 1.0 and mojotrees ships 0.0 (LightGBM's behavior, since
+    # LightGBM has no such parameter), so the estimator sends both the value
+    # and whether anybody typed it. A caller who types 0.0 has turned the
+    # noise off and keeps it off in either mode; a caller who types nothing
+    # gets 1.0 under `symmetrictree` and 0.0 under `lossguide`.
+    #
+    # Gated on `random_strength_ok` so that a CatBoost-mode fit which landed
+    # on a loop that computes no per-tree scale keeps 0.0 and TRAINS, rather
+    # than inheriting a 1.0 that `ExtraTreeParams.check_random_strength` would
+    # then refuse. An inherited default an entry point cannot honor declines;
+    # only a value the caller typed is refused, and a typed one still is,
+    # below and in `check_scalars`.
+    var strength_named = Int(py=params["random_strength_set"]) != 0
+    if (
+        catboost_defaults
+        and not strength_named
+        and random_strength_ok
+        and catboost_defaults_objective != _NO_CATBOOST_DEFAULTS
+    ):
+        extra.random_strength = CATBOOST_RANDOM_STRENGTH
+
     if extra.leaf_estimation_active() and not leaf_estimation_ok:
         raise Error(
             "leaf_estimation_iterations > 1 is not implemented by ",
@@ -1010,6 +1079,39 @@ def _parse_params(
             " train_gpu.train_gpu_with_valid, which this estimator reaches"
             " through a dense, single-output fit without a custom objective."
             " 1 is LightGBM's behavior and mojotrees's, and is the default",
+        )
+
+    # CatBoost's ordered target statistics, catalog A19/A36. The verdict is
+    # taken HERE, beside the other four, so the whole enumeration is one table
+    # and a new entry point inherits a refusal rather than a silent drop.
+    #
+    # Unlike the four above, this one is not a field on `BoosterParams`: a CTR
+    # bundle is a property of the BINNING, so it is applied where the dataset
+    # is built and this function only decides whether the entry point about to
+    # bin can carry one. `_parse_ctr` turns the same key into the bundle.
+    #
+    # The mode default is resolved in the estimator rather than here, and that
+    # is the one difference from `leaf_estimation_iterations`: `ctr` crosses
+    # the wire as a RULE NAME and not as a number, so "auto" arriving from a
+    # CatBoost-mode default and "auto" typed by a caller are the same six
+    # bytes. What keeps that honest is that both are refused identically --
+    # there is no value of this key an entry point may honor halfway -- so the
+    # provenance a mode default would need is not read by anything.
+    var ctr_rule = String(py=params.get("ctr", PythonObject("off")))
+    if ctr_rule != "off" and not ctr_ok:
+        raise Error(
+            "ctr='",
+            ctr_rule,
+            "' is not honored by ",
+            who,
+            ": ordered target statistics are built while the dataset is"
+            " binned, from the label and a fixed permutation, and this entry"
+            " point bins without a ctr_columns.SimpleCtrConfig. The routes"
+            " that carry one are a dense single-output fit, and"
+            " mojotrees.Dataset(params={'ctr': ...}) followed by"
+            " mojotrees.train(params, dataset). ctr='off' is what every fit"
+            " made before this parameter existed did and is the default under"
+            " every grow policy but symmetrictree",
         )
 
     # LightGBM's and CatBoost's `boost_from_average`, and the one parameter
@@ -1572,6 +1674,20 @@ def _parse_ctr(params: PythonObject) raises -> SimpleCtrConfig:
       those columns cost histogram width without recovering anything the
       category table already holds.
 
+    - `"on"`, the estimator's spelling of `"catboost"`. One rule, two words,
+      because `Dataset(params={"ctr": ...})` shipped with `"catboost"` and the
+      estimator parameter reads as a switch. Resolved here rather than in
+      Python so that both surfaces reach one resolver.
+
+    `one_hot_max_size` is CatBoost's fork between one-hot and CTR: a
+    categorical column with at most that many levels is one-hot and every
+    wider one is replaced by its CTR columns. It is read only by the
+    `"catboost"` / `"on"` rule -- `"auto"` selects its source columns by
+    whether the category table overflowed, which is a different question and
+    reads a different number -- so it is applied only there, and a bundle that
+    does not read it keeps `ctr_columns.CTR_ONE_HOT_MAX_SIZE` rather than
+    recording a cutoff nothing consulted.
+
     Anything else raises here rather than resolving to a default, so a typo is
     an error and not a silently different model.
     """
@@ -1580,10 +1696,29 @@ def _parse_ctr(params: PythonObject) raises -> SimpleCtrConfig:
         return SimpleCtrConfig.auto()
     if name == "off":
         return SimpleCtrConfig.disabled()
-    if name == "catboost":
-        return SimpleCtrConfig.catboost_defaults()
+    if name == "catboost" or name == "on":
+        var out = SimpleCtrConfig.catboost_defaults()
+        # `.get`, not a subscript: `Dataset` sends this key and the estimator
+        # sends this key, but a direct caller of `dataset_create` predating
+        # both does not, and a KeyError there would be a regression in a door
+        # that was working. The fallback is the bundle's own default, which is
+        # CatBoost's 2.
+        var cutoff = Int(
+            py=params.get(
+                "one_hot_max_size", PythonObject(out.one_hot_max_size)
+            )
+        )
+        if cutoff < 0:
+            raise Error(
+                "one_hot_max_size must be nonnegative; got ", cutoff
+            )
+        out.one_hot_max_size = cutoff
+        return out^
     raise Error(
-        "ctr must be 'auto', 'off' or 'catboost'; got '", name, "'"
+        "ctr must be 'off', 'auto', or 'on' (spelled 'catboost' on the"
+        " Dataset door); got '",
+        name,
+        "'",
     )
 
 
@@ -1662,10 +1797,20 @@ def fit(
         auto_lr_rows=nr,
         auto_lr_objective=Int(py=objective),
         # CatBoost mode's per-objective defaults for
-        # `leaf_estimation_iterations` and `boost_from_average`. The same
-        # code `auto_lr_objective` gets, declared separately because the two
-        # sentinels mean different things; see `_parse_params`.
+        # `leaf_estimation_iterations`, `boost_from_average` and
+        # `random_strength`. The same code `auto_lr_objective` gets, declared
+        # separately because the two sentinels mean different things; see
+        # `_parse_params`.
         catboost_defaults_objective=Int(py=objective),
+        # CatBoost's ordered target statistics. True for this entry point's
+        # PLAIN fork, which reroutes through `trainset.Dataset` +
+        # `trainset.train_dataset` when the bundle is active; the dart/rf and
+        # linear forks are refused by name a few statements below, beside
+        # `ordered`'s and `random_strength`'s and for the same reason --
+        # `alternate_boosting.fit_boosting` and
+        # `custom_metric.fit_with_metrics` take raw matrices and bin them
+        # themselves, with no place to put a bundle.
+        ctr_ok=True,
     )
     var weights = _parse_weights(params, nr)
     # CatBoost's `bootstrap_type`, with the flag that says whether the user
@@ -1782,6 +1927,28 @@ def fit(
             " the label mean under a parameter that asked for zero. Set"
             " boost_from_average=true, or drop linear_tree"
         )
+    # `ctr`'s two CPU forks, exactly beside `ordered`'s, `random_strength`'s
+    # and `leaf_estimation_iterations`'s, and settled the same way.
+    # `ctr_ok=True` above is right for this entry point's PLAIN fork, which
+    # reroutes through `trainset.Dataset`; these two branches leave it, and
+    # both bin a raw matrix through `fit_bins` with nowhere to put a bundle.
+    if _parse_ctr(params).is_active() and (
+        boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF
+    ):
+        raise Error(
+            "ctr cannot be combined with boosting='dart' or boosting='rf':"
+            " alternate_boosting.fit_boosting bins the raw matrix itself and"
+            " takes no ctr_columns.SimpleCtrConfig, so the CTR columns would"
+            " never be built. Set ctr='off', or train boosting='gbdt'"
+        )
+    if _parse_ctr(params).is_active() and bp.linear.is_active():
+        raise Error(
+            "ctr cannot be combined with linear_tree: linear leaves are"
+            " fitted by custom_metric.fit_with_metrics, which bins the raw"
+            " matrix itself and takes no ctr_columns.SimpleCtrConfig, so the"
+            " CTR columns would never be built. Set ctr='off', or drop"
+            " linear_tree"
+        )
     if boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF:
         # dart and rf run through alternate_boosting's dispatcher, which
         # bins with the same fit_bins and returns the same Model; it is CPU
@@ -1877,6 +2044,59 @@ def fit(
     # unchanged and read there. A defaulted bundle is dropped here, because
     # deferring it would let a default raise.
     var bootstrap = boot_req.resolve_or_defer(device == CPU_DEVICE)
+    # CatBoost's ordered target statistics, catalog A19/A36, and the ONE
+    # reroute in this function.
+    #
+    # `model.fit` takes no `SimpleCtrConfig` and never will: the bundle is a
+    # property of the binning and `model.fit` bins through `fit_bins`
+    # directly, while the type that binds a bundle to a matrix is
+    # `trainset.Dataset`. So a fit that asked for CTR columns builds the
+    # dataset the mechanism already lives on and trains it through
+    # `trainset.train_dataset`, which is the same trainer `model.fit` would
+    # have reached -- `boosting.train` on the dense CPU arm and
+    # `train_gpu.train_gpu` on the device one -- with the CTR columns present
+    # in the binned matrix.
+    #
+    # **A fit that did not ask takes the untouched call below and nothing
+    # about it moves.** The reroute is guarded on `is_active()`, which is
+    # false for `ctr='off'`, the default under every grow policy but
+    # `symmetrictree`; `_parse_params` has already refused an active bundle
+    # for every entry point that is not this one.
+    var ctr = _parse_ctr(params)
+    if ctr.is_active():
+        # `keep_raw=False`: nothing here calls `subset`, and the raw copy
+        # would be a second `n_rows * n_features` buffer for a fit that has
+        # the caller's matrix borrowed already.
+        #
+        # No group and no init_score: `fit` reads neither, so passing empty
+        # lists is what this entry point already means, not a capability
+        # dropped on the way through.
+        var ctr_dataset = Dataset(
+            features,
+            nr,
+            nf,
+            target.copy(),
+            weights.copy(),
+            List[Int](),
+            List[Float64](),
+            List[String](),
+            _parse_categorical(params),
+            Int(py=params["max_bin"]),
+            _parse_use_missing(params),
+            False,
+            ctr^,
+        )
+        var ctr_model = mojo_train_dataset(
+            ctr_dataset,
+            Int(py=objective),
+            bp,
+            Float64(py=params["alpha"]),
+            device,
+            _parse_bagging(params),
+            _parse_goss(params),
+            bootstrap,
+        )
+        return PythonObject(alloc=ctr_model^)
     var model = mojo_fit(
         features,
         nr,
@@ -3954,22 +4174,65 @@ def categorical_features_multiclass(
     return _categorical_list(m[].mapper.cats)
 
 
+def _importance_tree_width(trees: List[Tree], nf: Int) -> Int:
+    """The width `importance.*_importance` has to be run at for these trees.
+
+    `nf` for every ensemble whose splits all land inside the caller's feature
+    count, which is every ensemble this package produced before CTR columns
+    could be reached from Python.
+
+    **A CTR fit splits past it, legitimately.** Ordered target statistics
+    append numeric columns to the binned matrix
+    (`ctr_columns.build_ctr_train_columns`) and the trees split on them, so a
+    tree can carry a feature id up to `mapper.n_total_features() - 1` while
+    the caller's matrix is `mapper.n_features` wide. `split_importance` and
+    `gain_importance` refuse a split past the width they are handed, and that
+    refusal is right: a short buffer would otherwise be written past or a
+    split silently dropped.
+
+    So the width is taken from the TREES rather than from the mapper. That
+    keeps this function correct for a model loaded from a file, whose mapper
+    is reconstructed, and it needs no accessor that does not exist; the
+    quantity actually wanted is "the largest id anybody splits on", and that
+    is what this reads. One pass over the split arrays, only when the trees
+    are already in memory, and it returns `nf` unchanged for the common case
+    so nothing about an ordinary fit moves.
+    """
+    var width = nf
+    for t in range(len(trees)):
+        for i in range(len(trees[t].feature)):
+            var f = trees[t].feature[i]
+            if f >= width:
+                width = f + 1
+    return width
+
+
 def _write_importance(
     trees: List[Tree], nf: Int, kind: Int, out_addr: Int
 ) raises:
     """Per-feature importance into a preallocated float64 buffer of length
-    `nf`. `kind` is 0 for split counts and 1 for total gain."""
+    `nf`. `kind` is 0 for split counts and 1 for total gain.
+
+    The buffer is the CALLER's width and the computation is the TREES' width,
+    and on a CTR model those differ. Only the first `nf` entries are stored,
+    so the caller gets importances for the columns it passed and the derived
+    CTR columns are not reported. They are deliberately not folded back onto
+    their source column either: a CTR column is a statistic of the TARGET
+    keyed by that column, so the two carry different information and a sum
+    would be a number that is neither.
+    """
     if kind != 0 and kind != 1:
         raise Error("importance kind must be 0 (split) or 1 (gain)")
+    var width = _importance_tree_width(trees, nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=out_addr
     )
     if kind == 0:
-        var counts = split_importance(trees, nf)
+        var counts = split_importance(trees, width)
         for f in range(nf):
             out.unsafe_store(f, Float64(counts[f]))
     else:
-        var gains = gain_importance(trees, nf)
+        var gains = gain_importance(trees, width)
         for f in range(nf):
             out.unsafe_store(f, gains[f])
 

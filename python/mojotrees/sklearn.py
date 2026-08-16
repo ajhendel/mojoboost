@@ -79,6 +79,101 @@ Three independent literals carried the old value; `tools/check_parity.py`
 now asserts every stock default across all of them.
 """
 
+# ---------------------------------------------------------------------------
+# CatBoost mode's defaults, and the rule they are supplied under.
+#
+# `grow_policy='symmetrictree'` mirrors CatBoost exactly and every other grow
+# policy mirrors LightGBM. The constants below are CatBoost's own, and they are
+# applied with **`SetDefault` semantics**: they supply a value and they do NOT
+# count as the user having named the key.
+#
+# That distinction is CatBoost's, not an invention here.
+# `NCatboostOptions::TOption::SetDefault` (`option.h:27-33`) writes
+# `DefaultValue`, mirrors it into `Value` when the option is not already
+# user-set, and never touches `IsSetFlag`; `Set` (`option.h:39-43`) and
+# `operator=` (`option.h:118-121`) both raise it. CatBoost's per-loss
+# resolution supplies exactly these three through `SetDefault` --
+# `catboost_options.cpp:302` (`L2Reg`), `:305` (`LeavesEstimationMethod`),
+# `:319` (`LeavesEstimationIterations`) -- which is why CatBoost's own
+# `l2_leaf_reg = 3` leaves the automatic-learning-rate gate open
+# (`options_helper.cpp:276-281`) while a user's `l2_leaf_reg=3` closes it, at
+# the same number.
+#
+# So a mode default here never sets the `*_named` provenance a user's value
+# sets, and `_auto_learning_rate_knobs` reads provenance and never a value.
+# Without that rule this mode would advertise an automatic rate and ship a
+# constant, which is the defect these constants exist to avoid rather than to
+# introduce.
+# ---------------------------------------------------------------------------
+
+#: CatBoost's `learning_rate` when its derivation does not fire.
+#:
+#: `LearningRate("learning_rate", 0.03)`,
+#: `catboost/private/libs/options/boosting_options.cpp:10`. It is the ONLY
+#: initializer for that option -- no other CatBoost code path calls
+#: `LearningRate.SetDefault` -- so it is unconditional across task type,
+#: objective and iteration count. Under `grow_policy='symmetrictree'` an unset
+#: `learning_rate` resolves to this and the derivation replaces it when the
+#: gate is open; under `lossguide` an unset rate resolves to `_LEARNING_RATE`,
+#: LightGBM's 0.1, and there is no derivation to replace it.
+_CATBOOST_LEARNING_RATE = 0.03
+
+#: CatBoost's `l2_leaf_reg`, `oblivious_tree_options.cpp:15`, supplied to CatBoost's
+#: own runs through `SetDefault` at `catboost_options.cpp:302`.
+#:
+#: Our `lambda_l2` is LightGBM's spelling of the same coefficient, so the mode
+#: default lands on the same member; `_LAMBDA_L2` (0.0) stays the value an
+#: unset `lambda_l2` resolves to under `lossguide`.
+_CATBOOST_L2_LEAF_REG = 3.0
+
+#: CatBoost's `random_strength`, the score-noise multiplier
+#: (`RandomStrength("random_strength", 1.0)`,
+#: `catboost/private/libs/options/oblivious_tree_options.cpp:17`; catalog A3
+#: owns the mechanism). LightGBM has no such parameter and mojotrees's stock
+#: value is 0.0, which is LightGBM's behavior exactly.
+#:
+#: Unlike the two above, this one is resolved on the NATIVE side rather than
+#: here, because whether it can be honored depends on the entry point: the
+#: per-tree scale it multiplies is computed by exactly two round loops. See
+#: `random_strength_set` in `_params` and `random_strength_ok` in
+#: `bindings/_mojotrees.mojo`. The constant lives here so the value and its
+#: citation stay in one place.
+_CATBOOST_RANDOM_STRENGTH = 1.0
+
+#: CatBoost's `depth`, `oblivious_tree_options.cpp:12`, and the one mode default
+#: that is load-bearing rather than merely faithful.
+#:
+#: A symmetric tree is bounded by its depth alone, so `growth_policy` refuses
+#: an unbounded one; our stock `max_depth` is -1. Without this constant the
+#: default CatBoost-mode configuration -- `MojoTreesRegressor(
+#: grow_policy='symmetrictree')` and nothing else -- raised on every fit, which
+#: is what a shipped default must not do.
+_CATBOOST_DEPTH = 6
+
+#: CatBoost mode's `ctr` rule when the caller names none.
+#:
+#: `"auto"`, not `"on"`: `"on"` is CatBoost's own source rule
+#: (`one_hot_max_size`, four numeric columns for nearly every categorical
+#: column) and `"auto"` gives CTR columns only to the categorical columns that
+#: overflowed their category table. Under `lossguide` the default is `"off"`,
+#: because a CTR is CatBoost's mechanism and `lossguide` mirrors LightGBM,
+#: which has none.
+_CATBOOST_CTR = "auto"
+
+#: `ctr` spellings the estimator accepts and the rule name each resolves to.
+#:
+#: The values on the right are `_mojotrees._parse_ctr`'s vocabulary and the
+#: same one `Dataset(params={"ctr": ...})` already takes, so this parameter
+#: reaches the existing door rather than opening a second one. `"on"` is the
+#: estimator's word for CatBoost's own source rule, spelled `"catboost"` on
+#: the Dataset door; both spellings are accepted here.
+_CTR_RULES = {
+    "off": "off",
+    "auto": "auto",
+    "on": "catboost",
+    "catboost": "catboost",
+}
+
 from ._fit_args import (
     _BOOSTING_TYPES,
     _DEVICES,
@@ -427,11 +522,37 @@ class _Base(_ParamsMixin):
     reaches the numerical scan, so the two functionals would end up inside
     one argmax.
 
+    `ctr` is CatBoost's ordered target statistics (catalog A19/A36):
+    `'off'`, `'auto'` or `'on'`. A categorical column that overflows its
+    category table loses levels into one unreachable bin, which is the one
+    place this library loses resolution LightGBM keeps, and a target
+    statistic is how that resolution comes back. `'auto'` builds CTR columns
+    for exactly those overflowing columns; `'on'` is CatBoost's own source
+    rule, `unique_values > one_hot_max_size`, which gives nearly every
+    categorical column four numeric columns. The cutoff is
+    `one_hot_max_size`, this estimator's `max_cat_to_onehot` under CatBoost's
+    spelling, so the CTR fork and the one-hot fork read the same number.
+
+    **The default is the mode's.** `'auto'` under
+    `grow_policy='symmetrictree'`, because a CTR is how CatBoost handles a
+    categorical column at all; `'off'` under `lossguide` and `depthwise`,
+    because those mirror LightGBM and LightGBM has no CTR. `ctr='off'` is
+    what every fit made before this parameter existed did, on either policy.
+
+    It is honored by the dense single-output `fit` and refused by name
+    everywhere else: the bundle is a property of the BINNING, so it is
+    applied where the dataset is built, and the entry points that bin
+    without one (the sparse, multiclass, ranking, custom-objective,
+    custom-metric and continued-training fits) say so rather than dropping
+    it. The other door onto the same mechanism is unchanged:
+    `Dataset(params={"ctr": ...})`, whose spellings this parameter resolves
+    onto.
+
     **Not wired, and refused by name with the missing piece.**
-    `max_ctr_complexity`: the CTR modules are implemented and the model file
-    now carries a `ctr` section, but no binding entry point enables a CTR
-    bundle, so no fit reachable from Python builds a CTR column. Not
-    accepted and ignored.
+    `max_ctr_complexity` above 1: the projection enumeration exists
+    (`src/mojotrees/ctr_combinations.mojo`) but no grow loop drives it, so a
+    combination would never be built. 1 is what CatBoost itself resolves to
+    for any fit under 200 iterations, and it is the arity `ctr=` runs at.
 
     `random_strength` left that list. The claim above used to be that its
     per-tree scale "is computed by a function with no callers", and that was
@@ -695,6 +816,12 @@ class _Base(_ParamsMixin):
         # CatBoost-mode fit pins its own rate without leaving CatBoost mode.
         auto_learning_rate=None,
         score_function=None,
+        # Ordered target statistics, catalog A19/A36: `'auto'`, `'off'` or
+        # `'on'`. `None` means the grow policy's default, which is `'auto'`
+        # under `symmetrictree` and `'off'` under every other policy, because
+        # a CTR is CatBoost's mechanism for a categorical column and
+        # `lossguide` mirrors LightGBM, which has none.
+        ctr=None,
         max_ctr_complexity=None,
         device="cpu",
         device_type=None,
@@ -832,6 +959,7 @@ class _Base(_ParamsMixin):
         self.boost_from_average = boost_from_average
         self.auto_learning_rate = auto_learning_rate
         self.score_function = score_function
+        self.ctr = ctr
         self.max_ctr_complexity = max_ctr_complexity
         self.device = device
         self.device_type = device_type
@@ -1605,22 +1733,25 @@ class _Base(_ParamsMixin):
                     "what CatBoost itself resolves to for any fit under 200 "
                     "iterations."
                 )
-            # 1 is built and reaches a design matrix, and this still refuses,
-            # because the blocker moved rather than cleared. The fitted CTR
-            # tables are MODEL STATE -- built from the target -- and the model
-            # format has no section for them, so a CTR fit that produced a
-            # model would write a file that loads with empty tables, keeps
-            # every tree referencing its CTR columns, and bins them as if the
-            # feature were absent. Refusing here beats producing a model that
-            # loads and scores wrong.
-            raise ValueError(
-                "max_ctr_complexity=1 is built but no Python fit enables it: "
-                "an enabled CTR bundle is refused at the trainer boundary "
-                "(ctr.check_ctr_model_support) and at every model writer "
-                "(serialize.check_ctr_serializable), because the fitted CTR "
-                "tables are model state and the model format carries no "
-                "section for them. Follow catalog A29."
-            )
+            # 1 no longer refuses, and both halves of the old reason are
+            # gone rather than relaxed. `serialize.mojo`'s v5 `ctr` section
+            # carries the fitted tables, so a CTR model saves and loads and
+            # scores (`ctr.check_ctr_model_support`,
+            # `ctr_columns.check_ctr_serializable`); and `ctr=` below is the
+            # switch that was missing, so a Python fit can now enable the
+            # bundle this parameter bounds the arity of.
+            #
+            # `max_ctr_complexity` is the ARITY and not the switch. A value of
+            # 1 beside `ctr='off'` still builds nothing, which is what
+            # CatBoost's own parameter means too.
+            if self.ctr is None or str(self.ctr).strip().lower() == "off":
+                raise ValueError(
+                    "max_ctr_complexity=1 bounds the arity of a CTR bundle "
+                    "and does not turn one on. Set ctr='on' (CatBoost's own "
+                    "source rule) or ctr='auto' (CTR columns only for the "
+                    "categorical columns that overflowed their category "
+                    "table), or drop max_ctr_complexity."
+                )
         # `bootstrap_type` and `bagging_temperature` used to be refused here
         # and are not any more: both travel on the wire and reach
         # `boosting.train`'s `bootstrap` argument through `_resolve_bootstrap`
@@ -2005,6 +2136,69 @@ class _Base(_ParamsMixin):
             f"'symmetric'), got {self.grow_policy!r}"
         )
 
+    def _learning_rate_named(self):
+        """Whether the caller named the learning rate under any spelling.
+
+        Provenance, not a value: every one of the three members defaults to
+        `None`, so "named" is exactly "not None" and `learning_rate=0.03` in
+        CatBoost mode is a caller's statement even though it is also what the
+        mode would have supplied. That is `TOption::NotSet()`
+        (`option.h:80-86`), which reads a flag written on assignment and never
+        compares against a default.
+        """
+        return (
+            self.learning_rate is not None
+            or self.eta is not None
+            or self.shrinkage_rate is not None
+        )
+
+    def _l2_named(self):
+        """Whether the caller named `l2_leaf_reg` under any spelling.
+
+        CatBoost's second live gate key (`options_helper.cpp:280`). The mode
+        default supplies 3.0 without going through any of these members, which
+        is how CatBoost's own 3 leaves the gate open and a caller's 3 closes
+        it.
+        """
+        return (
+            self.lambda_l2 is not None
+            or self.reg_lambda is not None
+            or self.l2_leaf_reg is not None
+            or self.l2_regularization is not None
+        )
+
+    def _resolve_ctr(self, catboost_mode):
+        """The `ctr` rule name a fit goes out with.
+
+        Ordered target statistics, catalog A19/A36. `"off"`, `"auto"` and
+        `"on"` from the caller; `"catboost"` is accepted as the Dataset door's
+        spelling of `"on"`. The value returned is
+        `_mojotrees._parse_ctr`'s vocabulary and is the same rule name
+        `Dataset(params={"ctr": ...})` takes, so this parameter reaches the
+        existing mechanism instead of opening a second one.
+
+        The default is the mode's: `"auto"` under `symmetrictree`, because a
+        CTR is how CatBoost handles a categorical column at all, and `"off"`
+        under `lossguide` and `depthwise`, because those mirror LightGBM and
+        LightGBM has no CTR. `ctr="off"` is the behavior of every fit made
+        before this parameter existed, on either policy.
+        """
+        asked = self.ctr
+        if asked is None:
+            asked = _CATBOOST_CTR if catboost_mode else "off"
+        if not isinstance(asked, str):
+            raise ValueError(
+                "ctr must be 'auto', 'off' or 'on'; got " f"{self.ctr!r}"
+            )
+        rule = _CTR_RULES.get(asked.strip().lower())
+        if rule is None:
+            raise ValueError(
+                "ctr must be 'auto', 'off' or 'on' (the Dataset door's "
+                "'catboost' is accepted as a spelling of 'on'); got "
+                f"{self.ctr!r}"
+            )
+        return rule
+
     def _auto_learning_rate_knobs(self, grow_policy, boosting):
         """The four `auto_learning_rate_*` keys a fit goes out with.
 
@@ -2072,18 +2266,11 @@ class _Base(_ParamsMixin):
             required = wanted
         # Provenance, one name at a time. Each of these is `None` in the
         # constructor when it is not named, so "named" is exactly "not None"
-        # and no value is compared with anything.
-        rate_named = (
-            self.learning_rate is not None
-            or self.eta is not None
-            or self.shrinkage_rate is not None
-        )
-        l2_named = (
-            self.lambda_l2 is not None
-            or self.reg_lambda is not None
-            or self.l2_leaf_reg is not None
-            or self.l2_regularization is not None
-        )
+        # and no value is compared with anything. The first two live on their
+        # own methods because `_params` reads them too, to decide which stock
+        # default an unset key resolves to; one definition, two readers.
+        rate_named = self._learning_rate_named()
+        l2_named = self._l2_named()
         leaf_iters_named = self.leaf_estimation_iterations is not None
         if required:
             # The same three contradictions `params.mojo` refuses on the
@@ -2130,7 +2317,73 @@ class _Base(_ParamsMixin):
             "auto_learning_rate_required": int(enabled and required),
             "auto_learning_rate_l2_set": int(l2_named),
             "auto_learning_rate_leaf_iters_set": int(leaf_iters_named),
+            # The resolved record. NOT a wire key -- the native side reads
+            # neither of these -- and it travels in this dict only because
+            # this is the one function that knows every input to the answer.
+            # `_params` lifts both onto the estimator.
+            "auto_learning_rate_note": self._auto_lr_note(
+                grow_policy,
+                wanted,
+                rate_named,
+                boosting,
+                l2_named,
+                leaf_iters_named,
+            ),
+            "auto_learning_rate_mode": grow_policy,
         }
+
+    @staticmethod
+    def _auto_lr_note(
+        grow_policy, wanted, rate_named, boosting, l2_named, leaf_iters_named
+    ):
+        """Why this fit does or does not derive CatBoost's learning rate.
+
+        **The reason this function exists is that a silent stop-deriving is
+        worse than a loud one.** Under `grow_policy='symmetrictree'` the mode
+        advertises an automatic rate; when one of CatBoost's gate keys is
+        named the derivation does not happen, and before this the run reported
+        nothing at all and shipped a constant under a heading that said
+        otherwise. An auto rate that quietly is not auto is the defect class
+        this whole sequence exists to end.
+
+        The vocabulary is `auto_learning_rate.auto_lr_skipped_note`'s, kept in
+        step by hand because a Python fit never builds an
+        `AutoLearningRateParams` and cannot import Mojo:
+
+        - `auto_lr_off:<policy>` -- the grow policy does not want it and the
+          caller did not ask. `lossguide` and `depthwise` mirror LightGBM,
+          which has no such feature. Not a skip; nothing was ever wanted.
+        - `auto_lr_skipped:<key>` -- it was wanted and a NAMED key stopped it.
+          The keys are CatBoost's own spellings and they are tested in the
+          order `UpdateLearningRate` tests them
+          (`options_helper.cpp:277-280`), so a caller who closed two is told
+          the one CatBoost's short-circuit would have stopped at.
+        - `auto_lr_skipped:boosting_type=rf` -- a forest trains at 1.0
+          whatever it was given, so there is nothing for a rate to do. Not one
+          of CatBoost's four; named in full for that reason.
+        - `auto_lr_gate_open` -- the gate is open and the derivation was
+          handed to the native resolver. It is deliberately NOT a promise that
+          a rate was derived: `NeedToUpdate` (`options_helper.cpp:246-249`)
+          may still find no coefficient row for the (target type, task type,
+          use_best_model, boost_from_average) key, and CatBoost keeps its
+          constant in silence when it does. Reproducing that answer here would
+          mean a second copy of the coefficient table in Python, which is a
+          worse defect than the one it would report.
+        """
+        if not wanted:
+            return "auto_lr_off:" + str(grow_policy)
+        if rate_named:
+            return "auto_lr_skipped:learning_rate"
+        if boosting == "rf":
+            return "auto_lr_skipped:boosting_type=rf"
+        # mojotrees has no `leaf_estimation_method` (Newton only, catalog A6),
+        # so CatBoost's second gate key cannot be named here and is absent
+        # from this chain rather than tested and always false.
+        if leaf_iters_named:
+            return "auto_lr_skipped:leaf_estimation_iterations"
+        if l2_named:
+            return "auto_lr_skipped:l2_leaf_reg"
+        return "auto_lr_gate_open"
 
     def _params(
         self,
@@ -2142,6 +2395,16 @@ class _Base(_ParamsMixin):
         categorical=None,
         contri_addr=0,
     ):
+        # THE MODE, FIRST, because two stock defaults below depend on it and
+        # nothing it reads depends on them. `_resolve_grow_policy` reads
+        # `self.grow_policy` alone, so it is safe this early, and it has to be
+        # this early: `learning_rate` and `lambda_l2` resolve to CatBoost's
+        # numbers under `symmetrictree` and to LightGBM's under every other
+        # policy, and a resolution that ran before the mode was known would
+        # have to be redone afterwards, which is how a mode default drifts
+        # from the value it is documented to be.
+        grow_policy = self._resolve_grow_policy()
+        catboost_mode = grow_policy == "symmetrictree"
         # Every canonical name of docs/PARAMETER_NAMING.md and every other
         # vendor's spelling of it, resolved onto the LightGBM-spelled member
         # that holds the stock default and is what the native layer is sent.
@@ -2158,18 +2421,53 @@ class _Base(_ParamsMixin):
         n_estimators = self._resolve_alias(
             "n_estimators", "max_iter", 100, n_estimators
         )
+        # The stock value an UNSET rate resolves to, and the first of the two
+        # mode defaults. 0.03 is CatBoost's constant
+        # (`boosting_options.cpp:10`) and 0.1 is LightGBM's; which one an
+        # unset rate lands on is the whole difference between the two modes,
+        # and it is supplied here with `SetDefault` semantics -- the
+        # provenance `_auto_learning_rate_knobs` reads is `self.learning_rate
+        # is not None`, which this does not touch.
+        #
+        # It matters on exactly the runs where the derivation does not fire:
+        # a named `l2_leaf_reg`, or a loss with no coefficient row. CatBoost
+        # ships 0.03 on those, so CatBoost mode does too, instead of falling
+        # back to a LightGBM number under a CatBoost heading.
+        rate_default = _CATBOOST_LEARNING_RATE if catboost_mode else _LEARNING_RATE
         learning_rate_set = self._resolve_alias(
-            "learning_rate", "eta", _LEARNING_RATE
+            "learning_rate", "eta", rate_default
         )
         learning_rate_set = self._resolve_alias(
-            "learning_rate", "shrinkage_rate", _LEARNING_RATE,
+            "learning_rate", "shrinkage_rate", rate_default,
             learning_rate_set,
         )
         num_leaves = self._resolve_alias("num_leaves", "max_leaves", 31)
         num_leaves = self._resolve_alias(
             "num_leaves", "max_leaf_nodes", 31, num_leaves
         )
+        # The third mode default, and the one without which CatBoost mode does
+        # not fit at all. A symmetric tree is bounded by its depth and by
+        # nothing else -- `num_leaves` does not bind, because a level splits
+        # entirely or not at all -- so `growth_policy` refuses an unbounded
+        # one, and our stock `max_depth` is -1, unbounded. Before this, the
+        # default CatBoost-mode configuration raised on every fit.
+        #
+        # This one is resolved from the VALUE and not from provenance, and the
+        # difference is worth stating because every other default in this layer
+        # goes the other way. `max_depth`'s signature default is -1 rather than
+        # `None`, so a caller who types -1 is indistinguishable from one who
+        # types nothing. That is acceptable here and nowhere else: -1 is not a
+        # depth, it is the absence of a bound, and the absence of a bound is
+        # the one thing a symmetric tree cannot have. So both readings want the
+        # same answer -- supply a bound -- and the answer is CatBoost's own
+        # `depth` default of 6 (`oblivious_tree_options.cpp:12`).
+        #
+        # It is safe for the gate too, which is the property that matters:
+        # `max_depth` is not one of CatBoost's four gate keys, so supplying it
+        # cannot stop the learning rate being derived however it is read.
         max_depth = self._resolve_alias("max_depth", "depth", -1)
+        if catboost_mode and int(max_depth) < 0:
+            max_depth = _CATBOOST_DEPTH
         min_data_in_leaf = self._resolve_alias(
             "min_data_in_leaf", "min_child_samples", 20
         )
@@ -2183,12 +2481,28 @@ class _Base(_ParamsMixin):
             "min_child_hess", "min_sum_hessian_in_leaf", 1e-3, min_child_hess
         )
         lambda_l1 = self._resolve_alias("lambda_l1", "reg_alpha", _LAMBDA_L1)
-        lambda_l2 = self._resolve_alias("lambda_l2", "reg_lambda", _LAMBDA_L2)
+        # The second mode default, and the one that made the contradiction
+        # visible. CatBoost supplies `l2_leaf_reg = 3` to every run through
+        # `SetDefault` (`catboost_options.cpp:302`), which leaves its
+        # automatic-learning-rate gate open; a value a caller types goes
+        # through `operator=`, raises `IsSetFlag`, and closes it
+        # (`option.h:118-121`, `options_helper.cpp:280`). Supplying 3.0 here
+        # reproduces the first half exactly, because the provenance
+        # `_auto_learning_rate_knobs` reads is `self.lambda_l2 is not None`
+        # and the four alias members beside it -- none of which this line
+        # writes.
+        #
+        # Before this, a CatBoost-mode arm that wanted CatBoost's regularizer
+        # had to type it, which closed the gate and pinned the rate. That is
+        # what "the mode advertises an auto rate and quietly ships a constant"
+        # meant, and it is why this is a layer and not a table entry.
+        l2_default = _CATBOOST_L2_LEAF_REG if catboost_mode else _LAMBDA_L2
+        lambda_l2 = self._resolve_alias("lambda_l2", "reg_lambda", l2_default)
         lambda_l2 = self._resolve_alias(
-            "lambda_l2", "l2_leaf_reg", _LAMBDA_L2, lambda_l2
+            "lambda_l2", "l2_leaf_reg", l2_default, lambda_l2
         )
         lambda_l2 = self._resolve_alias(
-            "lambda_l2", "l2_regularization", _LAMBDA_L2, lambda_l2
+            "lambda_l2", "l2_regularization", l2_default, lambda_l2
         )
         max_bin = self._resolve_alias("max_bin", "max_bins", 255)
         max_bin = self._resolve_alias("max_bin", "border_count", 255, max_bin)
@@ -2345,14 +2659,42 @@ class _Base(_ParamsMixin):
             raise ValueError("colsample_bytree must be in (0, 1]")
         if not 0.0 < float(feature_fraction_bynode) <= 1.0:
             raise ValueError("colsample_bynode must be in (0, 1]")
-        grow_policy = self._resolve_grow_policy()
-        # After `boosting` and `grow_policy` are both resolved, because the
-        # mode default reads the grow policy and the forest refusal reads
-        # the boosting strategy. Before the dict is built, so that a
-        # contradiction raises rather than travelling.
+        # After `boosting` is resolved, because the forest refusal reads the
+        # boosting strategy; `grow_policy` was resolved at the top of this
+        # method, because two stock defaults depend on it. Before the dict is
+        # built, so that a contradiction raises rather than travelling.
         auto_learning_rate_knobs = self._auto_learning_rate_knobs(
             grow_policy, boosting
         )
+        # The resolved record, lifted off the wire dict onto the estimator.
+        # `auto_learning_rate_note` and `auto_learning_rate_mode` are read by
+        # nothing native; they exist so that a fit which resolved to NOT
+        # deriving says which key did it, by name, instead of reporting
+        # nothing and training at a constant.
+        self.auto_learning_rate_note_ = auto_learning_rate_knobs.pop(
+            "auto_learning_rate_note"
+        )
+        self.grow_policy_ = auto_learning_rate_knobs.pop(
+            "auto_learning_rate_mode"
+        )
+        # The values CatBoost mode supplied that the caller did not name, at
+        # the numbers they resolved to. `random_strength` and
+        # `leaf_estimation_iterations` are absent on purpose: both are
+        # resolved on the native side, where the entry point's routing is
+        # known, so a record written here would be a guess.
+        self.mode_defaults_ = {}
+        if catboost_mode:
+            if not auto_learning_rate_knobs["auto_learning_rate_l2_set"]:
+                self.mode_defaults_["l2_leaf_reg"] = float(l2_default)
+            if not self._learning_rate_named():
+                self.mode_defaults_["learning_rate"] = float(rate_default)
+            if int(max_depth) == _CATBOOST_DEPTH and self.depth is None:
+                self.mode_defaults_["depth"] = int(max_depth)
+        ctr_rule = self._resolve_ctr(catboost_mode)
+        # Recorded so a fitted estimator can say what it asked for. It is the
+        # rule REQUESTED and not the columns built: `'auto'` plans nothing on
+        # a dataset whose categorical columns all fit their tables.
+        self.ctr_ = ctr_rule
         if int(max_cat_to_onehot) < 0:
             raise ValueError("max_cat_to_onehot must be nonnegative")
         if int(self.max_cat_threshold) < 1:
@@ -2560,6 +2902,33 @@ class _Base(_ParamsMixin):
             # and a loss function refuse it by name there.
             **auto_learning_rate_knobs,
             "random_strength": float(self.random_strength or 0.0),
+            # Provenance, for the same reason `leaf_estimation_iterations`
+            # sends it: CatBoost mode supplies `random_strength = 1` and 0.0
+            # is our stock value, so a caller who types 0.0 has turned the
+            # noise off and a caller who types nothing has not decided. The
+            # native side applies the mode default, not this side, because
+            # whether it can be honored is a property of the entry point --
+            # the per-tree scale it multiplies is computed by exactly two
+            # round loops -- and an inherited default an entry point cannot
+            # honor must decline rather than refuse.
+            "random_strength_set": int(self.random_strength is not None),
+            # Ordered target statistics, catalog A19/A36. A rule name in
+            # `_parse_ctr`'s vocabulary, which is the same vocabulary
+            # `Dataset(params={"ctr": ...})` takes, so this reaches the
+            # existing mechanism rather than a second one. `"off"` on every
+            # policy but `symmetrictree`, and `"off"` is what every fit made
+            # before this key existed did.
+            "ctr": ctr_rule,
+            # CatBoost's `one_hot_max_size`, which is already this
+            # estimator's `max_cat_to_onehot` under its CatBoost spelling
+            # (the alias is resolved above). It is CatBoost's own fork
+            # between one-hot and CTR -- a column at or under the cutoff is
+            # one-hot and every wider column is replaced by its CTR columns
+            # (catalog A16/A36) -- so the CTR bundle reads the SAME number
+            # the categorical split search reads. One parameter, one meaning,
+            # two consumers; a separate `ctr_one_hot_max_size` would be the
+            # second door this item exists to avoid.
+            "one_hot_max_size": int(max_cat_to_onehot),
             # The seed that noise stream is keyed from. Through
             # `_resolve_seeds` like every other per-component seed, so
             # `random_state` reaches it by the same rule: an explicitly named
@@ -2967,11 +3336,20 @@ class _Base(_ParamsMixin):
         # `callback.RESETTABLE` is a native vocabulary and keeps LightGBM's
         # names, as every wire does; the values are resolved from the
         # canonical user-facing names the same way `_params` resolves them.
+        # The two mode-dependent stock defaults, resolved exactly as `_params`
+        # resolves them. They have to agree: a callback that read 0.1 and 0.0
+        # while the fit ran at CatBoost's 0.03 and 3.0 would be reporting a
+        # configuration nothing trained under, and a callback that RESET one
+        # of them would move the fit off the mode default without being asked
+        # to.
+        catboost_mode = self._resolve_grow_policy() == "symmetrictree"
+        rate_default = _CATBOOST_LEARNING_RATE if catboost_mode else _LEARNING_RATE
+        l2_default = _CATBOOST_L2_LEAF_REG if catboost_mode else _LAMBDA_L2
         learning_rate = self._resolve_alias(
-            "learning_rate", "eta", _LEARNING_RATE
+            "learning_rate", "eta", rate_default
         )
         learning_rate = self._resolve_alias(
-            "learning_rate", "shrinkage_rate", _LEARNING_RATE, learning_rate
+            "learning_rate", "shrinkage_rate", rate_default, learning_rate
         )
         num_leaves = self._resolve_alias("num_leaves", "max_leaves", 31)
         num_leaves = self._resolve_alias(
@@ -2989,12 +3367,12 @@ class _Base(_ParamsMixin):
         min_child_hess = self._resolve_alias(
             "min_child_hess", "min_sum_hessian_in_leaf", 1e-3, min_child_hess
         )
-        lambda_l2 = self._resolve_alias("lambda_l2", "reg_lambda", _LAMBDA_L2)
+        lambda_l2 = self._resolve_alias("lambda_l2", "reg_lambda", l2_default)
         lambda_l2 = self._resolve_alias(
-            "lambda_l2", "l2_leaf_reg", _LAMBDA_L2, lambda_l2
+            "lambda_l2", "l2_leaf_reg", l2_default, lambda_l2
         )
         lambda_l2 = self._resolve_alias(
-            "lambda_l2", "l2_regularization", _LAMBDA_L2, lambda_l2
+            "lambda_l2", "l2_regularization", l2_default, lambda_l2
         )
         feature_fraction = self._resolve_alias(
             "feature_fraction", "colsample_bytree", 1.0
@@ -3912,6 +4290,13 @@ class _Base(_ParamsMixin):
         return int(_mojotrees.num_iterations(self._model))
 
     def _raw_importance(self, importance_type):
+        # `n_features_in_` is the CALLER's width and stays the caller's width.
+        # On a CTR fit the trees split past it, on the derived columns the
+        # caller never passed; `_write_importance` in bindings/_mojotrees.mojo
+        # runs the computation at the trees' own width and stores only the
+        # first `n_features_in_` entries, so this buffer is the right size on
+        # either kind of model and `feature_importances_` keeps lining up with
+        # the columns that were handed to `fit`.
         out = _out_buffer(self.n_features_in_)
         query = (
             _mojotrees.feature_importance_multiclass
