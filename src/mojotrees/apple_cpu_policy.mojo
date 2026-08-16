@@ -259,9 +259,18 @@ comptime DEFAULT_FEATURE_GROUP = MAX_FEATURE_GROUP
 L1 estimate, the core count, and the active feature count are what actually
 choose, which is the point of deriving a width instead of naming one."""
 
-# Groups per dispatch core the resolved width must leave, when the feature
+# Dispatch units per core the resolved width must leave, when the feature
 # count allows it. The balance rule, and the reason width is not chosen from
 # memory traffic alone.
+#
+# **A unit is a `(block, group)` pair.** It was a group, back when the feature
+# partition was the only axis; row blocking made the accumulation dispatch over
+# `row_blocks * group_count` units and the rule was not revisited, so it went
+# on demanding `TASK_BALANCE_FACTOR * cores` *groups* from an axis that no
+# longer had to supply them alone. On 50 features and 14 cores that demanded 28
+# groups from 50 features and returned width 1: no interleaving at all, on the
+# default path, and worse on a bigger machine than on a smaller one. The rule
+# now divides the demand by the block count first.
 #
 # The arithmetic. `T` equal-cost tasks over `C` cores under a barrier finish
 # in `ceil(T / C)` rounds, so utilization is `T / (C * ceil(T / C))`. That is
@@ -275,11 +284,17 @@ choose, which is the point of deriving a width instead of naming one."""
 # Why 2 and not 4. The floor is a guarantee, not the typical case, and at the
 # shape this lane exists for it is not what binds: 50 features on 10 cores at
 # width 2 is 25 groups, 3 rounds, 25/30 = 83%. Raising the factor to 4 would
-# demand 40 groups and force width 1 on that same shape, which is to say it
-# would revert the lane on the only shape it was written for. 3 would demand
-# 30 groups and force width 1 as well. 2 is therefore the largest factor that
-# leaves any interleave at all at 50 features on this machine, and that is the
-# whole of its derivation: it is a boundary, not an optimum.
+# demand 40 units and force width 1 on an unblocked node of that shape, which
+# is to say it would revert the lane on the only shape it was written for. 3
+# would demand 30 and force width 1 as well. 2 is therefore the largest factor
+# that leaves any interleave at all at 50 features on one block, and that is
+# the whole of its derivation: it is a boundary, not an optimum.
+#
+# That derivation is now much less load-bearing than it was. Once the demand is
+# counted in `(block, group)` units, a node that blocks 49 ways satisfies even
+# a factor of 4 at the widest rung, so the factor stops choosing the width on
+# any node large enough to block and the L1 estimate chooses instead. It still
+# decides on nodes too small to block, which is most nodes deep in a tree.
 #
 # It is unmeasured in both directions. Two things it does not model: cores here
 # are not equal (a task on an efficiency core sets the pace of its round, so
@@ -1155,21 +1170,27 @@ struct ResolvedCpuPolicy(Copyable, Movable):
             1,
         )
 
-    def feature_group_for(self, n_bins: Int, n_active: Int) raises -> Int:
+    def feature_group_for(
+        self, n_bins: Int, n_active: Int, row_blocks: Int = 1
+    ) raises -> Int:
         """`plan_feature_group` against the resolved knobs.
 
-        Takes `n_active` because the width is no longer a property of the
-        cache estimate alone: the balance rule bounds it by how many groups
-        the dispatch can still spread over the cores.
+        Takes `n_active` and `row_blocks` because the width is not a property
+        of the cache estimate alone: the balance rule bounds it by how many
+        `(block, group)` units the dispatch can still spread over the cores,
+        and both numbers are needed to count one.
         """
         if not self.resolved:
-            return plan_feature_group(CpuProfile.detect(), n_bins, n_active)
+            return plan_feature_group(
+                CpuProfile.detect(), n_bins, n_active, row_blocks
+            )
         return _plan_group(
             self.profile.l1d_bytes,
             self.dispatch_cores(),
             self.feature_group,
             n_bins,
             n_active,
+            row_blocks,
         )
 
     def describe(self) -> String:
@@ -1219,18 +1240,38 @@ def _cache_group(l1d_bytes: Int, n_bins: Int) -> Int:
     return feature_group_floor(budget // slice_bytes)
 
 
-def _schedule_group(cores: Int, n_active: Int) -> Int:
-    """The balance clamp over raw integers; see `schedule_feature_group`."""
+def _schedule_group(cores: Int, n_active: Int, row_blocks: Int = 1) -> Int:
+    """The balance clamp over raw integers; see `schedule_feature_group`.
+
+    `row_blocks` is the second axis of the decomposition. The dispatch unit is
+    a `(block, group)` pair, so the units this clamp is protecting number
+    `row_blocks * ceil(n_active / width)` and not `ceil(n_active / width)`.
+    Counting groups alone was correct only while the feature partition was the
+    only axis; it is the default when a caller has no block count to hand in,
+    and 1 reproduces the group-only arithmetic exactly.
+    """
     if cores < 1:
         return 1
-    var wanted_groups = TASK_BALANCE_FACTOR * cores
+    var blocks = row_blocks if row_blocks > 1 else 1
+    var wanted_units = TASK_BALANCE_FACTOR * cores
+    if wanted_units < 1:
+        wanted_units = 1
+    # Groups per block still needed to reach `wanted_units` units in total.
+    # Ceiling, so a block count that does not divide the demand still buys the
+    # whole demand rather than one unit short of it.
+    var wanted_groups = (wanted_units + blocks - 1) // blocks
     if wanted_groups < 1:
         wanted_groups = 1
     return feature_group_floor(n_active // wanted_groups)
 
 
 def _plan_group(
-    l1d_bytes: Int, cores: Int, requested: Int, n_bins: Int, n_active: Int
+    l1d_bytes: Int,
+    cores: Int,
+    requested: Int,
+    n_bins: Int,
+    n_active: Int,
+    row_blocks: Int = 1,
 ) raises -> Int:
     """The one copy of the width rule, with every input already read.
 
@@ -1247,7 +1288,7 @@ def _plan_group(
     var by_cache = _cache_group(l1d_bytes, n_bins)
     if by_cache < group:
         group = by_cache
-    var by_schedule = _schedule_group(cores, n_active)
+    var by_schedule = _schedule_group(cores, n_active, row_blocks)
     if by_schedule < group:
         group = by_schedule
     var by_active = feature_group_floor(n_active)
@@ -1303,38 +1344,56 @@ def dispatch_utilization_percent(n_tasks: Int, cores: Int) -> Int:
     return (100 * n_tasks) // (cores * rounds)
 
 
-def schedule_feature_group(profile: CpuProfile, n_active: Int) -> Int:
-    """The widest rung that still leaves `TASK_BALANCE_FACTOR` groups per core.
+def schedule_feature_group(
+    profile: CpuProfile, n_active: Int, row_blocks: Int = 1
+) -> Int:
+    """The widest rung that still leaves `TASK_BALANCE_FACTOR` units per core.
 
-    A group is the dispatch unit, so `n_active` features at width N offer
-    `feature_group_count(n_active, N)` units of parallelism and no more.
-    Widening divides the task count by the same factor it divides the gradient
-    traffic by, and under a barrier that is a real and predictable loss, so the
-    width is bounded by what the schedule can still balance.
+    **A unit is a `(block, group)` pair, not a group.** `histogram.
+    _accumulate_blocked_at` dispatches over `row_blocks * group_count` of them
+    and indexes them as `block * group_count + group`, so a node cut into `B`
+    blocks offers `B * ceil(n_active / width)` units of parallelism. This rule
+    counted groups alone, which was right when the feature partition was the
+    only axis and became wrong the moment row blocking landed: it was refusing
+    a width to protect a task count the other axis had already multiplied.
 
-    Worked, on the shape this lane exists for: 50 active features on a 10-core
-    profile. The rule asks for `2 * 10 = 20` groups, `50 // 20 = 2`, and 2 is a
-    rung, so the width is 2 and the dispatch is 25 groups in 3 rounds at 83%
-    utilization. Width 4 would have been 13 groups in 2 rounds at 65%, and
-    width 8 seven groups in one round at 70%. The rungs unlock at
-    `n_active >= width * TASK_BALANCE_FACTOR * cores`, which on this machine is
-    40 features for width 2, 80 for width 4, 160 for width 8, and 320 for 16.
+    Worked, on the shape this lane exists for: 50 active features, 255 bins, a
+    node of 200,000 rows, on a 14-core profile. The demand is `2 * 14 = 28`
+    units. Blocked 49 ways the rule needs `ceil(28 / 49) = 1` group per block,
+    `50 // 1 = 50`, floored to the rung 16 -- so this clamp stops binding
+    entirely and the L1 estimate (4 at 255 bins) decides. Counting groups
+    alone the same shape asked for 28 groups, `50 // 28 = 1`, and returned
+    width **1**: no interleaving at all, and the gradient stream walked 50
+    times per block instead of 13.
+
+    With `row_blocks` at its default of 1 this is the old arithmetic to the
+    integer: `2 * 10 = 20` groups wanted, `50 // 20 = 2`, width 2, 25 groups in
+    3 rounds at 83% utilization. That is the right answer for an unblocked
+    node and it is still the answer given.
 
     `dispatch_cores()` and not `max_auto_tasks()`: the 4x over-decomposition is
     itself a balance device against unequal cores, and counting it here as well
-    would demand 400 groups and cap the width at 1 on every shape this project
+    would demand 400 units and cap the width at 1 on every shape this project
     cares about. The two floors are for the same problem and applying both
     would double-charge for it.
 
-    Fewer features than `TASK_BALANCE_FACTOR * cores` gives 1, which is what
-    the dispatch already did on such a shape and gives up nothing measurable:
+    Fewer features than the per-block group demand gives 1, which is what the
+    dispatch already did on such a shape and gives up nothing measurable:
     there was never a wide group for a task to hold.
+
+    None of this moves a bit. The width decides how many features share one
+    walk of the rows; it never changes which Float64 are added into a cell or
+    in what order, and the private-histogram layout is indexed by absolute
+    active slot rather than by position within a group. The block count is the
+    part of this decomposition that *is* a value, and it is derived by
+    `plan_row_block_count` from the workload alone -- this function reads it
+    and cannot influence it.
     """
-    return _schedule_group(profile.dispatch_cores(), n_active)
+    return _schedule_group(profile.dispatch_cores(), n_active, row_blocks)
 
 
 def plan_feature_group(
-    profile: CpuProfile, n_bins: Int, n_active: Int
+    profile: CpuProfile, n_bins: Int, n_active: Int, row_blocks: Int = 1
 ) raises -> Int:
     """How many features one accumulation inner loop interleaves.
 
@@ -1348,10 +1407,16 @@ def plan_feature_group(
     Otherwise the width is the narrowest of what the cache estimate allows,
     what the balance rule leaves schedulable, and what `n_active` features can
     fill, floored to a rung throughout. The three are independent bounds and
-    which one binds depends on the shape: at 255 bins and 50 features on ten
-    cores the balance rule binds at 2 while the cache estimate would have
-    allowed 4, and at 32 bins the cache estimate allows 16 while the balance
-    rule still says 2.
+    which one binds depends on the shape. `row_blocks` is how many blocks the
+    node will be cut into, because the balance rule counts `(block, group)`
+    units; at its default of 1 the bound is the group-only one it always was.
+
+    At 255 bins and 50 features on ten cores with one block the balance rule
+    binds at 2 while the cache estimate would have allowed 4; at 49 blocks --
+    what a 200,000-row node plans at those bins -- the balance rule stops
+    binding and the cache estimate's 4 is the answer. At 32 bins the cache
+    estimate allows 16, so the balance rule or the active-feature floor
+    decides.
 
     Whatever it returns, the result is bit-identical: the width changes how
     many features share one walk of the rows, never the order in which any one
@@ -1363,6 +1428,7 @@ def plan_feature_group(
         env_feature_group(),
         n_bins,
         n_active,
+        row_blocks,
     )
 
 
@@ -1605,6 +1671,15 @@ def _derive_plan(
     block count is a summation order rather than a schedule (see
     `plan_row_block_count`). `row_block_amortize` is a workload rule and not a
     machine fact, which is the whole reason it was allowed in here.
+
+    The dependency between the two axes runs **one way, and only one way**:
+    the settled block count is an input to the width, and the width is not an
+    input to anything the block count reads. That direction is what keeps the
+    determinism argument intact. The width is machine-dependent (it reads
+    `dispatch_cores`) and moves nothing but the schedule; the block count is
+    machine-independent and is part of the value. Were the arrow reversed, a
+    core count would reach a summation order and the histogram would stop
+    being the same on two machines.
     """
     var active = n_active if n_active > 0 else 0
     var rows = n_rows_touched if n_rows_touched > 0 else 0
@@ -1618,13 +1693,12 @@ def _derive_plan(
         and active >= COMPACT_MIN_FEATURES
         and rows >= compact_min_rows
     )
-    var group = _plan_group(
-        l1d_bytes, dispatch_cores, feature_group, bins, active
-    )
-
-    # The requested block count first, then the geometry, then a recount from
-    # the chunk so no block comes out empty. The recount can only lower the
-    # count, and it can lower it to 1, which is the unblocked path again.
+    # The block count comes first, because the width depends on it and it does
+    # not depend on the width. The requested count, then the geometry, then a
+    # recount from the chunk so no block comes out empty. The recount can only
+    # lower the count, and it can lower it to 1, which is the unblocked path
+    # again -- so the width is planned against the *settled* count, never the
+    # provisional one.
     var blocks = plan_row_block_count_at(
         row_block_amortize, row_blocks, rows, bins, active, rows_are_indirect
     )
@@ -1636,6 +1710,10 @@ def _derive_plan(
         blocks = 1
         chunk = rows
         cells = 0
+
+    var group = _plan_group(
+        l1d_bytes, dispatch_cores, feature_group, bins, active, blocks
+    )
 
     return AccumulationPlan(
         group,
@@ -1729,16 +1807,25 @@ def describe_cpu_policy(profile: CpuProfile, plan: AccumulationPlan) -> String:
     does not carry. It is the number that makes a wide group's cost visible
     next to its benefit; a benchmark header that prints only the width is
     reporting half of the trade.
+
+    It is priced over `row_blocks * group_count`, which is what
+    `histogram._accumulate_blocked_at` actually dispatches
+    (`dispatch_feature_ranges_with(..., n_blocks * n_groups, ...)`). Printing
+    `group_count` alone under-reported a blocked build by the block count and
+    would have made a wider group look like a scheduling loss it is not.
     """
     var cores = profile.dispatch_cores()
+    var units = plan.row_blocks * plan.group_count
     return String(
         profile.describe(),
         " | ",
         plan.describe(),
+        " units=",
+        units,
         " rounds=",
-        dispatch_rounds(plan.group_count, cores),
+        dispatch_rounds(units, cores),
         " utilization=",
-        dispatch_utilization_percent(plan.group_count, cores),
+        dispatch_utilization_percent(units, cores),
         "%",
     )
 

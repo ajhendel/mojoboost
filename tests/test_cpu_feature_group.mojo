@@ -281,16 +281,22 @@ def test_derived_width_is_always_a_rung() raises:
 
 
 def test_the_balance_rule_binds_before_the_cache_estimate() raises:
-    """The width this lane actually ships, pinned with both of the bounds that
+    """The width on an **unblocked** node, pinned with both of the bounds that
     could have chosen it, so a later edit to `ASSUMED_L1D_BYTES`,
     `L1_GROUP_DIVISOR` or `TASK_BALANCE_FACTOR` has to come here and say so.
 
     At 255 bins a feature's slice is 255 * 24 = 6120 bytes, the assumed budget
     is 65536 / 2 = 32768, five slices fit, and the widest rung at or below
     five is 4. The balance rule is narrower: ten cores at
-    `TASK_BALANCE_FACTOR` 2 want 20 groups, `50 // 20 = 2`, so the width is 2
-    and not the 4 the cache estimate would have allowed. That is the
-    correction that keeps a byte count from choosing alone.
+    `TASK_BALANCE_FACTOR` 2 want 20 dispatch units, and on one block those
+    units can only be groups, so `50 // 20 = 2` and the width is 2 rather than
+    the 4 the cache estimate would have allowed. That is the correction that
+    keeps a byte count from choosing alone.
+
+    Every call below leaves `row_blocks` at its default of 1, which is the
+    only shape on which the balance rule still binds first.
+    `test_the_balance_rule_counts_block_group_units` is the blocked case, and
+    on it this bound stops binding entirely.
     """
     _reset_env()
     var machine = CpuProfile.synthetic(10, 4)
@@ -313,6 +319,96 @@ def test_the_balance_rule_binds_before_the_cache_estimate() raises:
     # At 255 bins the cache estimate takes over above width 4, so a very wide
     # matrix stops at 4 however many features it has.
     assert_equal(plan_feature_group(machine, 255, 320), 4)
+
+
+def test_the_balance_rule_counts_block_group_units() raises:
+    """The clamp counts `(block, group)` pairs, which is what the kernel
+    dispatches over, and not feature groups alone.
+
+    `histogram._accumulate_blocked_at` runs `row_blocks * group_count` units
+    and indexes them `block * group_count + group`. Counting groups alone made
+    the width *fall* as the machine got bigger while the second axis stood
+    idle: at 50 features on 14 cores the old rule wanted 28 groups out of 50
+    features, `50 // 28 = 1`, so the shipped width was **1** and the gradient
+    stream was walked 50 times per block. Every number below is arithmetic on
+    the constants, not a measurement.
+
+    The three shapes that matter, all at 50 features and 255 bins, where the
+    L1 estimate allows 4:
+
+    - 1,000,000 rows blocks 54 ways (245 by the 4,080-row minimum, capped by
+      the 16 MB scratch budget at `16777216 / (50 * 255 * 3 * 8) = 54`).
+      `ceil(28 / 54) = 1` group per block, `50 // 1 = 50`, floored to the top
+      rung 16 -- so the balance rule stops binding and the **L1 clamp of 4
+      governs**.
+    - 250,000 rows blocks 54 ways too, for the same ceiling, so it is the same
+      answer: **L1 clamp, width 4**.
+    - 8,000 rows does not block at all (4,080 is the minimum, so one block),
+      and there the balance rule still governs and still returns 1. Most nodes
+      deep in a tree are this shape and this change does not touch them.
+
+    Nothing here moves a bit; `test_blocked_bits_identical_across_feature_
+    group_widths` in `test_histogram_reference.mojo` is the guard on that.
+    """
+    _reset_env()
+    var m14 = CpuProfile.synthetic(14, 14)
+    var m10 = CpuProfile.synthetic(10, 10)
+
+    # One block is the old arithmetic to the integer, on both machines.
+    assert_equal(schedule_feature_group(m14, 50), 1)
+    assert_equal(schedule_feature_group(m10, 50), 2)
+    assert_equal(plan_feature_group(m14, 255, 50), 1)
+
+    # 54 blocks covers the demand with one group each, so the schedule bound
+    # goes to the top of the ladder and the L1 estimate decides.
+    assert_equal(schedule_feature_group(m14, 50, 54), MAX_FEATURE_GROUP)
+    assert_equal(schedule_feature_group(m10, 50, 54), MAX_FEATURE_GROUP)
+    assert_equal(plan_feature_group(m14, 255, 50, 54), 4)
+
+    # And through the planner, which is what the histogram actually calls.
+    var p1m = derive_accumulation_plan(m14, 50, 50, 255, 1_000_000, True)
+    assert_equal(p1m.row_blocks, 54)
+    assert_equal(p1m.group_width, 4)
+    assert_equal(p1m.group_count, feature_group_count(50, 4))
+    var p250k = derive_accumulation_plan(m14, 50, 50, 255, 250_000, True)
+    assert_equal(p250k.row_blocks, 54)
+    assert_equal(p250k.group_width, 4)
+
+    # A node too small to block keeps the old answer, which is the right one:
+    # with one block there really are only `ceil(50 / width)` units.
+    var small = derive_accumulation_plan(m14, 50, 50, 255, 8_000, True)
+    assert_equal(small.row_blocks, 1)
+    assert_equal(small.group_width, 1)
+
+    # Narrow data, so the clamp direction is visible in the other regime. Ten
+    # features block 64 ways at a million rows (`MAX_ROW_BLOCKS`), so the
+    # schedule bound is `50 // 1` again; what is left is the L1 estimate at
+    # 255 bins (4) and the active-feature floor at 32 bins, where L1 allows 16
+    # and ten features floor to 8.
+    var narrow255 = derive_accumulation_plan(m14, 10, 10, 255, 1_000_000, True)
+    assert_equal(narrow255.row_blocks, 64)
+    assert_equal(cache_feature_group(m14, 255), 4)
+    assert_equal(narrow255.group_width, 4)
+    var narrow32 = derive_accumulation_plan(m14, 10, 10, 32, 1_000_000, True)
+    assert_equal(narrow32.row_blocks, 64)
+    assert_equal(cache_feature_group(m14, 32), 16)
+    assert_equal(feature_group_floor(10), 8)
+    assert_equal(narrow32.group_width, 8)
+
+    # Monotone in the block count: more blocks lowers the per-block demand, so
+    # it may widen the interleave and can never narrow it. A rule that was not
+    # monotone here would make a bigger node plan a narrower walk.
+    var prev = 0
+    for blocks in range(1, 65):
+        var w = schedule_feature_group(m14, 50, blocks)
+        assert_true(w >= prev)
+        prev = w
+    assert_equal(prev, MAX_FEATURE_GROUP)
+
+    # An explicit width still bypasses all of it, blocked or not.
+    _set_group(2)
+    assert_equal(plan_feature_group(m14, 255, 50, 54), 2)
+    _reset_env()
 
 
 def test_utilization_is_the_number_the_byte_table_cannot_see() raises:
