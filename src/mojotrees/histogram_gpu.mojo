@@ -94,6 +94,18 @@ be counted as one. What the staged route still buys over `map_to_host` is
 the second direction's bytes and a separately timeable phase, which is why
 it stays.
 
+Counting the ordinary round's waits under that rule gives three, all of them
+on the `upload_gradients` path: the `synchronize` in `stage_gradients`, and
+one copy per derivative plane in `upload_staged`. The gradient and hessian
+planes now share one device allocation and one pinned host arena laid out as
+`[grad | hess]`, so `upload_staged` moves both with a single copy and the
+round pays two waits instead of three; `grad_dev` and `hess_dev` are
+`create_sub_buffer` windows onto that allocation, so nothing that consumes
+them -- kernels, the device objectives, the multiclass scatter -- sees a
+change. The remaining `synchronize` stays on purpose and `stage_gradients`
+says why. `stage_from_device`, which only hybrid leaf scheduling reaches,
+still costs two copies and a synchronize of its own on top.
+
 Which transfer route the binned matrix takes is resolved once per builder
 through `unified_memory_policy.resolve_from_env`, so `MOJOTREES_GPU_TRANSFER`
 is answered by the one route policy in the package rather than ignored here.
@@ -318,6 +330,31 @@ struct GpuHistogramBuilder(Movable):
     # The device-resident active-row permutation and its per-leaf ranges;
     # every histogram and every partition works through it.
     var rows: GpuActiveRows
+    # One `2 * n_rows` Float32 device allocation holding this round's
+    # derivatives as `[grad | hess]`, adjacent and in that order, and the two
+    # windows onto it that every kernel and every consumer still sees.
+    #
+    # Why one allocation. `enqueue_copy` is a host wait on Metal whatever the
+    # byte count is (`docs/GPU_PORTABILITY.md` section 6.1, established by
+    # disassembly), so two plane copies per round cost two waits and one
+    # costs one. The two planes are the same dtype and the same length, so
+    # concatenating them is a plain adjacency: no bitcast, no conversion, no
+    # padding, and the bytes each plane's window receives are exactly the
+    # bytes its separate buffer used to receive.
+    #
+    # Why windows rather than an offset pointer. `grad_dev` and `hess_dev`
+    # leave this file as `DeviceBuffer`s (`gpu_objectives_native`'s fills and
+    # reductions, `gpu_multiclass_batch.scatter_slot`) and as raw pointers
+    # (the range histogram kernels, `gpu_categorical`). A `create_sub_buffer`
+    # window is a `DeviceBuffer`, so both kinds of call site keep the exact
+    # signature and the exact argument they had, and no file outside this one
+    # changes. An offset pointer would have served the second kind only.
+    # Offsets are counted in elements, not bytes.
+    #
+    # Why the parent is a field. Holding `gh_dev` for the life of the builder
+    # makes the parent allocation's lifetime the builder's, so nothing here
+    # depends on whether a window keeps its parent alive on its own.
+    var gh_dev: DeviceBuffer[DType.float32]
     var grad_dev: DeviceBuffer[DType.float32]
     var hess_dev: DeviceBuffer[DType.float32]
     # The feature ids builds accumulate, device side; the first `n_active`
@@ -329,8 +366,17 @@ struct GpuHistogramBuilder(Movable):
     # slot. One element when the resolved strategy needs no partial buffer.
     var part_dev: DeviceBuffer[DType.int32]
     var part_capacity: Int
-    var stage_g: HostBuffer[DType.float32]
-    var stage_h: HostBuffer[DType.float32]
+    # The host side of the same adjacency: `2 * n_rows` pinned Float32 with
+    # the gradient plane at 0 and the hessian plane at `n_rows`, so one copy
+    # of the whole arena is one copy of both planes and the fused upload has
+    # a contiguous source. Nothing outside this file reads it; the two halves
+    # are taken as `unsafe_ptr()` and `unsafe_ptr().unsafe_offset(n_rows)` at
+    # the four sites that need them.
+    var stage_gh: HostBuffer[DType.float32]
+    # Whether `upload_staged` issues one copy of the whole `[grad | hess]`
+    # arena or the two per-plane copies that shipped. See
+    # `set_fused_gradient_upload`.
+    var fused_upload: Bool
     var host_out: HostBuffer[DType.int32]
     var n_rows: Int
     var n_features: Int
@@ -358,7 +404,7 @@ struct GpuHistogramBuilder(Movable):
     var h_scale: Float64
     var has_gradients: Bool
     # Whether the Float32 gradients the kernels read this round are also
-    # sitting in `stage_g` / `stage_h` on the host: True after
+    # sitting in the `stage_gh` arena on the host: True after
     # `stage_gradients` (the host produced them) or `stage_from_device` (the
     # device produced them and the host read them back), False after a
     # device fill until one of those runs. A host replica build
@@ -452,6 +498,10 @@ struct GpuHistogramBuilder(Movable):
         _ = session.request_buffer(
             SLOT_BINS, data.n_rows * data.n_features, 1
         )
+        # Two ledger entries, one allocation: the gradient and hessian planes
+        # are windows onto a single `2 * n_rows` buffer (see `gh_dev`). The
+        # bytes each role is charged are unchanged, which is what these
+        # entries are for; the allocation count they imply is now one high.
         _ = session.request_buffer(SLOT_GRAD, data.n_rows, 4)
         _ = session.request_buffer(SLOT_HESS, data.n_rows, 4)
         _ = session.request_buffer(SLOT_FEAT, data.n_features, 4)
@@ -594,6 +644,10 @@ struct GpuHistogramBuilder(Movable):
         self.round_epoch = 0
         self.feat_epoch = 0
         self.batch_feat_stamp = -1
+        # One copy per round rather than two. Both arms write the same bytes
+        # to the same device addresses, so this is not a numeric option; the
+        # argument for the default is in `set_fused_gradient_upload`.
+        self.fused_upload = True
         self.active = List[Int](capacity=data.n_features)
         for f in range(data.n_features):
             self.active.append(f)
@@ -601,11 +655,18 @@ struct GpuHistogramBuilder(Movable):
         var n_cells = data.n_rows * data.n_features
         var hist_size = data.n_features * data.n_bins
         self.bins_dev = self.ctx.enqueue_create_buffer[DType.uint8](n_cells)
-        self.grad_dev = self.ctx.enqueue_create_buffer[DType.float32](
-            data.n_rows
+        # One derivative allocation, two windows onto it. The windows are
+        # taken once here and never retaken: a window is a value, the parent
+        # never moves or reallocates, and the buffer this builder hands to a
+        # kernel has to be the same buffer for the life of the fit.
+        self.gh_dev = self.ctx.enqueue_create_buffer[DType.float32](
+            2 * data.n_rows
         )
-        self.hess_dev = self.ctx.enqueue_create_buffer[DType.float32](
-            data.n_rows
+        self.grad_dev = self.gh_dev.create_sub_buffer[DType.float32](
+            0, data.n_rows
+        )
+        self.hess_dev = self.gh_dev.create_sub_buffer[DType.float32](
+            data.n_rows, data.n_rows
         )
         self.out_dev = self.ctx.enqueue_create_buffer[DType.int32](
             3 * hist_size
@@ -621,11 +682,8 @@ struct GpuHistogramBuilder(Movable):
             part_size = 1
         self.part_dev = self.ctx.enqueue_create_buffer[DType.int32](part_size)
 
-        self.stage_g = self.ctx.enqueue_create_host_buffer[DType.float32](
-            data.n_rows
-        )
-        self.stage_h = self.ctx.enqueue_create_host_buffer[DType.float32](
-            data.n_rows
+        self.stage_gh = self.ctx.enqueue_create_host_buffer[DType.float32](
+            2 * data.n_rows
         )
         self.host_out = self.ctx.enqueue_create_host_buffer[DType.int32](
             3 * hist_size
@@ -694,6 +752,42 @@ struct GpuHistogramBuilder(Movable):
     def row_unroll(self) -> Bool:
         """The row-walk arm `set_row_unroll` last chose."""
         return self.rows.row_unroll
+
+    def set_fused_gradient_upload(mut self, on: Bool):
+        """Whether `upload_staged` moves this round's two derivative planes
+        with one copy of their shared allocation or with one copy each.
+
+        Not a numeric option and not a launch shape either: the two arms
+        write identical bytes to identical device addresses, and the argument
+        for that is at `upload_staged`. The only difference is the number of
+        host waits the round pays, because on Metal `enqueue_copy` is a
+        synchronous full-queue drain whose cost does not scale with the byte
+        count (`docs/GPU_PORTABILITY.md` section 6.1).
+
+        Why fused is the default rather than the requested arm. The usual
+        rule here is that an unmeasured arm has to be asked for. That rule is
+        about arms whose sign is unknown, and this one's is not: section 6.1
+        establishes the wait and instructs a design to count every copy as a
+        synchronization, so removing a copy removes a synchronization by an
+        established fact rather than by a guess, and the bytes that move are
+        the same bytes. The split arm survives so the removal can be
+        **measured** rather than only **derived**, which is the only thing
+        the default costs.
+
+        Reachable in process, and only in process. `train_gpu` builds its own
+        builder and takes its arm knobs as function parameters (`row_unroll`
+        is the pattern), so an end-to-end interleaved comparison needs either
+        such a parameter in `train_gpu.mojo` or an environment variable read
+        in this constructor. Both were out of this lane's file budget -- the
+        second because a new `MOJOTREES_*` literal under `src/` moves
+        `compatibility/api_snapshot.json`, which is a gate artifact and a
+        third file. Neither is more than a line; see the lane report.
+        """
+        self.fused_upload = on
+
+    def fused_gradient_upload(self) -> Bool:
+        """The upload arm `set_fused_gradient_upload` last chose."""
+        return self.fused_upload
 
     def set_constant_hessian(mut self, on: Bool):
         """Declare that this round's objective guarantees a per-row hessian
@@ -796,12 +890,50 @@ struct GpuHistogramBuilder(Movable):
         mut self, grad: List[Float64], hess: List[Float64]
     ) raises:
         """Convert this round's gradients and hessians into the device's
-        Float32 in pinned host memory. Host work only, no transfer.
+        Float32 in pinned host memory, laid out as one `[grad | hess]` arena.
+        Host work only, no transfer.
 
         The device's copy is stale from here until `upload_staged`, and the
         scales below already describe the new values, so builds are refused
-        in between rather than mixing one round's scale with another's
-        data."""
+        in between rather than mixing one round's scale with another's data.
+
+        Why the synchronize below is still here
+        ---------------------------------------
+        It guards a host-write hazard: the previous round's upload reads this
+        arena, and this method is about to overwrite it. Rotating two or more
+        arenas would retire the hazard structurally instead of by waiting,
+        and was considered and declined, for two reasons that both have to
+        fail before it is worth doing.
+
+        First, on the one backend where the cost of a wait is established, it
+        is the cheap one of this round's three. `enqueue_copy` on Metal
+        commits an empty command buffer and waits for it before it memcpys
+        (`docs/GPU_PORTABILITY.md` section 6.1), so the upload that read this
+        arena had already completed before it returned, and this synchronize
+        has nothing of its own to wait for. What it drains is whatever the
+        previous round left enqueued, and the previous round's last device
+        operation is a copy on every path in this file -- `download_raw`,
+        `readback_range`, the device split search's own readbacks -- each of
+        which drained the queue on the way out. The wait removed would
+        therefore be **estimated** near zero on Metal, and **unestablished**
+        on CUDA and HIP, where nothing in this repository has shown what MAX
+        does with an asynchronous copy family.
+
+        Second, on a backend where copies really are asynchronous this
+        synchronize is the entire guarantee, and a rotation's replacement
+        guarantee has to be named rather than assumed. "Two rounds have
+        passed" is not one: nothing in this class's contract forces a drain
+        between two `upload_gradients` calls, so a caller that uploads twice
+        with no build in between would come back to an arena whose copy is
+        still in flight. A watermark (a copy sequence number against the
+        sequence a synchronize last drained through) would be a real
+        guarantee and would cut the waits to one per arena-count rounds, but
+        it buys a wait that is near zero where we can measure it, costs a
+        pinned `2 * n_rows` Float32 per extra arena, and fails silently in
+        exactly the way a stale host table failed silently in this project
+        this week. The fused upload below removes a wait unconditionally and
+        with no hazard at all, which is the better trade of the two.
+        """
         if len(grad) != self.n_rows or len(hess) != self.n_rows:
             raise Error("gradient/hessian length must equal n_rows")
         self.has_gradients = False
@@ -812,12 +944,12 @@ struct GpuHistogramBuilder(Movable):
         self.h_scale = Float64(h_scale)
         self.round_epoch += 1
 
-        # Any copy still reading the staging buffers has to finish before
-        # they are overwritten.
+        # Any copy still reading the staging arena has to finish before it is
+        # overwritten. See the docstring for why this stays.
         self.ctx.synchronize()
 
-        var dst_g = self.stage_g.unsafe_ptr()
-        var dst_h = self.stage_h.unsafe_ptr()
+        var dst_g = self.stage_gh.unsafe_ptr()
+        var dst_h = dst_g.unsafe_offset(self.n_rows)
         var src_g = grad.unsafe_ptr()
         var src_h = hess.unsafe_ptr()
         for r in range(self.n_rows):
@@ -826,12 +958,33 @@ struct GpuHistogramBuilder(Movable):
         self.gradients_host = True
 
     def upload_staged(mut self) raises:
-        """Copy the staged gradients and hessians to the device."""
+        """Copy the staged gradients and hessians to the device: one copy of
+        the whole `[grad | hess]` arena, or the two per-plane copies that
+        shipped, per `fused_upload`.
+
+        The two arms are byte for byte the same upload. The host arena and
+        the device allocation carry the same two planes at the same two
+        offsets in the same order, so the fused arm's single copy writes
+        `stage_gh[0 : n_rows]` to `gh_dev[0 : n_rows]` and
+        `stage_gh[n_rows : 2 * n_rows]` to `gh_dev[n_rows : 2 * n_rows]`,
+        which is exactly what the split arm's two copies write into the two
+        windows. Neither arm converts, reorders, or pads anything. What
+        differs is one host wait, because on Metal a copy is a wait whatever
+        its byte count is and under four microseconds of the roughly 458 it
+        costs is actual byte movement (`docs/GPU_PORTABILITY.md` section 6.1,
+        the wait established by disassembly and the split **derived** from
+        it).
+        """
+        if self.fused_upload:
+            self.ctx.enqueue_copy(
+                dst_buf=self.gh_dev, src_ptr=self.stage_gh.unsafe_ptr()
+            )
+            self.has_gradients = True
+            return
+        var stage = self.stage_gh.unsafe_ptr()
+        self.ctx.enqueue_copy(dst_buf=self.grad_dev, src_ptr=stage)
         self.ctx.enqueue_copy(
-            dst_buf=self.grad_dev, src_ptr=self.stage_g.unsafe_ptr()
-        )
-        self.ctx.enqueue_copy(
-            dst_buf=self.hess_dev, src_ptr=self.stage_h.unsafe_ptr()
+            dst_buf=self.hess_dev, src_ptr=stage.unsafe_offset(self.n_rows)
         )
         self.has_gradients = True
 
@@ -865,11 +1018,17 @@ struct GpuHistogramBuilder(Movable):
             raise Error("no gradients to read back this round")
         if self.gradients_host:
             return
+        # Two copies and a synchronize, deliberately left as they were. The
+        # planes are now adjacent in both directions, so this is one
+        # `dst_ptr=stage_gh, src_buf=gh_dev` away from costing one wait
+        # instead of two, exactly as `upload_staged` is; it is not fused here
+        # because this path is hybrid-leaf-scheduling only and no arm of it
+        # has been measured, and a second unmeasured arm in the same commit
+        # would make the first one harder to attribute.
+        var stage = self.stage_gh.unsafe_ptr()
+        self.ctx.enqueue_copy(dst_ptr=stage, src_buf=self.grad_dev)
         self.ctx.enqueue_copy(
-            dst_ptr=self.stage_g.unsafe_ptr(), src_buf=self.grad_dev
-        )
-        self.ctx.enqueue_copy(
-            dst_ptr=self.stage_h.unsafe_ptr(), src_buf=self.hess_dev
+            dst_ptr=stage.unsafe_offset(self.n_rows), src_buf=self.hess_dev
         )
         self.ctx.synchronize()
         self.gradients_host = True
@@ -1364,11 +1523,13 @@ struct GpuHistogramBuilder(Movable):
             or data.n_bins != self.n_bins
         ):
             raise Error("binned matrix does not match this builder")
-        var grad_span = Span(
-            unsafe_ptr=self.stage_g.unsafe_ptr(), length=self.n_rows
-        )
+        # The two halves of the one staging arena. Same values the two
+        # separate staging buffers held: `stage_gradients` writes the same
+        # Float32 to the same indices of each plane, only adjacently.
+        var stage = self.stage_gh.unsafe_ptr()
+        var grad_span = Span(unsafe_ptr=stage, length=self.n_rows)
         var hess_span = Span(
-            unsafe_ptr=self.stage_h.unsafe_ptr(), length=self.n_rows
+            unsafe_ptr=stage.unsafe_offset(self.n_rows), length=self.n_rows
         )
         build_histogram_subset_replica_into(
             out,
