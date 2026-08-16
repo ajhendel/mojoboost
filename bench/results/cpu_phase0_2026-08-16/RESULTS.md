@@ -20,6 +20,11 @@
 > speed numbers are publishable again, taken fresh. The quantized-gradient
 > lane no longer gates that.
 >
+> ---
+>
+> *Everything below this line is the ORIGINAL registration, kept as history
+> and no longer in force.*
+>
 > The project's comparator is now **LightGBM at stock defaults plus
 > `use_quantized_grad=true`**, against mojotrees arms that also run quantized
 > gradients. The CPU has no such option yet, so every CPU-versus-LightGBM
