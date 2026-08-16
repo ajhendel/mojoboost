@@ -5,11 +5,17 @@ Every executable instruction in `PROFILE_PROTOCOL.md`, `MACHINE_LOCK.md`,
 evidence the verdict rests on.
 
 Written 2026-08-16 on `lane/instruction-audit`, branched from `perf-round-2` at
-`cbff73b`. No benchmark, timing run, or training run was taken: another
-orchestrator holds `/tmp/mojotrees-bench.lock` in `mode: timing` for the whole
-window this was written in. Everything labelled **verified by execution** below
-is a non-timing execution — a self-check, a `--help`, a grep, a gate, a plan
-print, or reading a live file.
+`cbff73b`. No benchmark, timing run, or training run was taken. Everything
+labelled **verified by execution** below is a non-timing execution — a
+self-check, a `--help`, a grep, a gate, a plan print, or reading a live file.
+
+For most of the window this was written in, another orchestrator held
+`/tmp/mojotrees-bench.lock` in `mode: timing` for the CPU round's Phase 0; the
+lock is quoted in section 3 and section 6 as it stood then, and it had been
+released by the time this was committed. Nothing here was timed either way, so
+the release changes no verdict — but the two sections describe a file that is
+no longer on disk, and saying so is cheaper than letting the next reader
+discover it.
 
 ## Why this file exists
 
