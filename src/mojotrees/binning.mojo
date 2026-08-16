@@ -167,6 +167,40 @@ Two consequences, both of them LightGBM's too, and both real:
 Categorical features are unaffected: `categorical.fit_categorical_spec` fits
 its tables from the full column, so a sampled fit cannot lose a category.
 
+feature_pre_filter
+------------------
+LightGBM's, and off here rather than on. At `True`, `fit_bins` counts each
+feature's bins on the same sample it fit the edges from and drops the features
+that have no usable split at all: `need_filter` is `NeedFilter` from
+`src/io/bin.cpp` and `filter_count` is the `filter_cnt` of
+`src/io/dataset_loader.cpp`, which is `min_data_in_leaf` **scaled to the
+sample** and truncated (`min_data_in_leaf * total_sample_size / num_data`, so 4
+at the stock 20, 200,000 and 1,000,000, not 20). The survivors are
+`BinMapper.usable`, which is LightGBM's `used_features`, and `transform`
+carries the list onto the `BinnedMatrix` because a grower is handed the matrix
+and nothing else.
+
+Dropping is not skipping. LightGBM removes the feature from the Dataset, so it
+is gone from the pool `feature_fraction` samples and the fraction is taken of
+what is left (`src/treelearner/col_sampler.hpp`), which changes the trees and
+not only their cost. `sampling.select_tree_features` takes the pool for exactly
+that reason. What is *not* renumbered is the matrix: every column is still
+binned and every feature keeps its id, so a dropped feature reads 0 in an
+importance vector rather than vanishing from it, which is also what LightGBM
+does (`GBDT::FeatureImportance` sizes its result by `num_total_features`).
+
+Three things here are not LightGBM's, and the parity contract says so:
+
+- The default. LightGBM's is `true`; this is `False`, because `False` has to
+  remain the fit that preceded the option.
+- At `False` mojotrees keeps one-bin features, which LightGBM drops from
+  `used_features` whatever the flag says. So `False` is "keep everything",
+  not LightGBM's `false`.
+- All features filtered raises here. LightGBM warns and continues.
+
+`sparse.fit_bins_csc` and `external_memory` build their own mappers and do not
+take the flag, so a prefiltered fit is the dense path only.
+
 Missing values
 --------------
 `NaN` is the missing marker for numerical features. A feature whose training
@@ -321,6 +355,95 @@ The name and the default are carried over; the stream is not (see the module
 docstring). Fixed, never derived from a clock or a global, so the sampled fit
 that is now the default is the same fit on every machine and at every
 `MOJOTREES_NUM_WORKERS`."""
+
+comptime DEFAULT_MIN_DATA_IN_LEAF = 20
+"""LightGBM's `min_data_in_leaf` default, repeated here because `filter_count`
+scales it and this module cannot import the grower's parameter bundle without
+closing the `efb -> binning -> tree_parameters_extra` cycle. A caller who sets
+`min_data_in_leaf` must pass the same number to `fit_bins`, exactly as a
+LightGBM user must reconstruct the Dataset after changing it."""
+
+
+def filter_count(
+    min_data_in_leaf: Int, total_sample_size: Int, num_data: Int
+) raises -> Int:
+    """LightGBM's `filter_cnt`, the row count the prefilter tests against.
+
+    Verified against `src/io/dataset_loader.cpp`, which computes it twice
+    with the same expression (`DatasetLoader::ConstructBinMappersFromTextData`
+    and `DatasetLoader::CostructFromSampleData`):
+
+        const data_size_t filter_cnt = static_cast<data_size_t>(
+          static_cast<double>(config_.min_data_in_leaf * total_sample_size)
+          / num_dist_data);
+
+    So it is `min_data_in_leaf` scaled from the whole dataset down to the
+    bin-construction sample, truncated toward zero, and *not* `min_data_in_leaf`
+    itself. The multiplication is integer and only the division is floating
+    point, which is reproduced here rather than approximated: at
+    `min_data_in_leaf=20`, a 200,000-row sample and 1,000,000 rows it is 4, and
+    at `total_sample_size == num_data` -- every fit that reads every row, which
+    is every fit below `bin_construct_sample_cnt` rows -- it is exactly
+    `min_data_in_leaf`.
+
+    A zero or negative `num_data` has no scaling to do and is refused rather
+    than divided by.
+    """
+    if num_data < 1:
+        raise Error("num_data must be positive")
+    if total_sample_size < 0:
+        raise Error("total_sample_size must be nonnegative")
+    if min_data_in_leaf < 0:
+        raise Error("min_data_in_leaf must be nonnegative")
+    return Int(
+        Float64(min_data_in_leaf * total_sample_size) / Float64(num_data)
+    )
+
+
+def need_filter(
+    cnt_in_bin: List[Int],
+    total_cnt: Int,
+    filter_cnt: Int,
+    categorical: Bool = False,
+) -> Bool:
+    """LightGBM's `NeedFilter` from `src/io/bin.cpp`, transcribed.
+
+    True when the feature has no usable split at all: no prefix of its bins
+    leaves at least `filter_cnt` rows on both sides. LightGBM's loop stops one
+    short of the last bin, so the last bin's population never enters a prefix
+    and a reserved missing bin (which numerical binning puts last) only ever
+    contributes to `total_cnt`.
+
+    Categorical features take LightGBM's other branch: a categorical split is
+    one category against the rest rather than a prefix, so with more than two
+    bins there is always some partition to try and the answer is False without
+    looking. With at most two bins the single bin (not the prefix) is tested,
+    which for two bins is the same arithmetic.
+
+    Note that the prefix sums are non-decreasing, so `total_cnt - sum_left` is
+    non-increasing: the first prefix to reach `filter_cnt` is also the one with
+    the most rows left on the right, and no later prefix can succeed where it
+    failed. The loop is kept in LightGBM's shape anyway, because the bin counts
+    are at most 256 numbers and a transcription is worth more here than the
+    early exit.
+    """
+    var n = len(cnt_in_bin)
+    if n < 2:
+        return True
+    if not categorical:
+        var sum_left = 0
+        for i in range(n - 1):
+            sum_left += cnt_in_bin[i]
+            if sum_left >= filter_cnt and total_cnt - sum_left >= filter_cnt:
+                return False
+        return True
+    if n > 2:
+        return False
+    for i in range(n - 1):
+        var sum_left = cnt_in_bin[i]
+        if sum_left >= filter_cnt and total_cnt - sum_left >= filter_cnt:
+            return False
+    return True
 
 
 def _avoid_inf(x: Float64) -> Float64:
@@ -1092,6 +1215,14 @@ def _sized_missing_bins(var table: List[Int], n_features: Int) -> List[Int]:
     return no_missing_bins(n_features)
 
 
+def all_features(n_features: Int) -> List[Int]:
+    """`[0, 1, ..., n_features - 1]`, the unfiltered feature pool."""
+    var out = List[Int](capacity=n_features)
+    for f in range(n_features):
+        out.append(f)
+    return out^
+
+
 struct BinnedMatrix(Copyable, Movable):
     """Column-major binned feature matrix.
 
@@ -1100,6 +1231,14 @@ struct BinnedMatrix(Copyable, Movable):
     category partitions rather than ordinal thresholds; an empty spec means
     every feature is numerical. `missing_bin[f]` is the bin reserved for
     missing values of feature f, or -1 when that feature reserves none.
+
+    `usable` is the ascending pool a tree may split on, LightGBM's
+    `used_features`. It is every feature unless the matrix came from a mapper
+    fit with `feature_pre_filter=True`, and it rides on the matrix rather than
+    on the mapper alone because a grower is handed the matrix and nothing else
+    -- the same reason `map_forced_splits` exists. The columns are *not*
+    renumbered: a filtered feature keeps its id, its column, and its slot in an
+    importance vector.
     """
 
     var bins: List[UInt8]
@@ -1108,6 +1247,7 @@ struct BinnedMatrix(Copyable, Movable):
     var n_bins: Int
     var cats: CategoricalSpec
     var missing_bin: List[Int]
+    var usable: List[Int]
 
     def __init__(
         out self,
@@ -1122,6 +1262,7 @@ struct BinnedMatrix(Copyable, Movable):
         self.n_bins = n_bins
         self.cats = CategoricalSpec.none()
         self.missing_bin = no_missing_bins(n_features)
+        self.usable = all_features(n_features)
 
     def __init__(
         out self,
@@ -1131,15 +1272,22 @@ struct BinnedMatrix(Copyable, Movable):
         n_bins: Int,
         var cats: CategoricalSpec,
         var missing_bin: List[Int] = [],
+        var usable: List[Int] = [],
     ):
         """A `missing_bin` table of the wrong length (the empty default
-        included) means no feature reserves a missing bin."""
+        included) means no feature reserves a missing bin. An empty `usable`
+        (the default) means nothing was prefiltered, so every feature is
+        usable."""
         self.bins = bins^
         self.n_rows = n_rows
         self.n_features = n_features
         self.n_bins = n_bins
         self.cats = cats^
         self.missing_bin = _sized_missing_bins(missing_bin^, n_features)
+        if len(usable) > 0:
+            self.usable = usable^
+        else:
+            self.usable = all_features(n_features)
 
     def bin_at(self, row: Int, feature: Int) -> Int:
         return Int(self.bins[feature * self.n_rows + row])
@@ -1147,6 +1295,13 @@ struct BinnedMatrix(Copyable, Movable):
     def is_missing(self, row: Int, feature: Int) -> Bool:
         """Whether (row, feature) holds a missing value."""
         return self.bin_at(row, feature) == self.missing_bin[feature]
+
+    def usable_features(self) -> List[Int]:
+        """The pool `feature_fraction` draws from, ascending. Pass it to
+        `sampling.select_tree_features`; it is every feature unless the fit
+        prefiltered, and passing every feature is the same draw as passing
+        nothing."""
+        return self.usable.copy()
 
 
 struct BinMapper(Copyable, Movable):
@@ -1163,6 +1318,17 @@ struct BinMapper(Copyable, Movable):
     A numerical feature with `missing_bin[f] >= 0` reserves that bin for
     missing values, so its k edges give ordinary bins 0..k and a missing bin
     at k + 1. `missing_bin[f] = -1` means no reservation.
+
+    `usable` is the ascending list of feature ids a tree may split on, which is
+    every feature unless `fit_bins` ran with `feature_pre_filter=True`. It is
+    LightGBM's `used_features`: `Dataset::Construct` builds exactly this list
+    (`src/io/dataset.cpp`, from `!BinMapper::is_trivial()`) and it is the pool
+    `feature_fraction` samples from. It is *not* a renumbering. The matrix keeps
+    every column and every feature keeps its own id, so a filtered feature is
+    still binned, still predicted through, and still occupies its own slot in an
+    importance vector -- which is what LightGBM does too, because
+    `GBDT::FeatureImportance` sizes its result by `max_feature_idx_ + 1 =
+    num_total_features` rather than by the used count.
     """
 
     var edges: List[Float64]
@@ -1171,6 +1337,7 @@ struct BinMapper(Copyable, Movable):
     var n_bins: Int
     var cats: CategoricalSpec
     var missing_bin: List[Int]
+    var usable: List[Int]
 
     def __init__(
         out self,
@@ -1185,6 +1352,7 @@ struct BinMapper(Copyable, Movable):
         self.n_bins = n_bins
         self.cats = CategoricalSpec.all_numerical(n_features)
         self.missing_bin = no_missing_bins(n_features)
+        self.usable = all_features(n_features)
 
     def __init__(
         out self,
@@ -1194,15 +1362,36 @@ struct BinMapper(Copyable, Movable):
         n_bins: Int,
         var cats: CategoricalSpec,
         var missing_bin: List[Int] = [],
+        var usable: List[Int] = [],
     ):
         """A `missing_bin` table of the wrong length (the empty default
-        included) means no feature reserves a missing bin."""
+        included) means no feature reserves a missing bin. An empty `usable`
+        (the default) means no feature was prefiltered, so every feature is
+        usable."""
         self.edges = edges^
         self.edge_offsets = edge_offsets^
         self.n_features = n_features
         self.n_bins = n_bins
         self.cats = cats^
         self.missing_bin = _sized_missing_bins(missing_bin^, n_features)
+        if len(usable) > 0:
+            self.usable = usable^
+        else:
+            self.usable = all_features(n_features)
+
+    def usable_features(self) -> List[Int]:
+        """The pool `feature_fraction` draws from, ascending. Every feature
+        unless the fit prefiltered."""
+        return self.usable.copy()
+
+    def is_usable(self, feature: Int) -> Bool:
+        """Whether `feature` survived the prefilter. Linear in the usable
+        count, which is what keeps the representation a plain ascending list
+        rather than a second per-feature table."""
+        for i in range(len(self.usable)):
+            if self.usable[i] == feature:
+                return True
+        return False
 
     def has_missing(self) -> Bool:
         """Whether any feature reserves a missing bin."""
@@ -1238,6 +1427,14 @@ struct BinMapper(Copyable, Movable):
             return False
         for i in range(len(self.missing_bin)):
             if self.missing_bin[i] != other.missing_bin[i]:
+                return False
+        # A prefiltered mapper and an unfiltered one bin every value the same
+        # way but do not offer the same features to a tree, so `train_more`
+        # must not accept one for the other.
+        if len(self.usable) != len(other.usable):
+            return False
+        for i in range(len(self.usable)):
+            if self.usable[i] != other.usable[i]:
                 return False
         for f in range(self.n_features):
             if self.cats.is_cat(f) != other.cats.is_cat(f):
@@ -1386,6 +1583,7 @@ struct BinMapper(Copyable, Movable):
             self.n_bins,
             self.cats.copy(),
             self.missing_bin.copy(),
+            self.usable.copy(),
         )
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
@@ -1410,6 +1608,8 @@ def fit_bins[
     min_data_in_bin: Int = DEFAULT_MIN_DATA_IN_BIN,
     bin_construct_sample_cnt: Int = DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT,
     data_random_seed: Int = DEFAULT_DATA_RANDOM_SEED,
+    feature_pre_filter: Bool = False,
+    min_data_in_leaf: Int = DEFAULT_MIN_DATA_IN_LEAF,
 ) raises -> BinMapper:
     """Fit quantile (equal-frequency) bin edges on a column-major feature
     matrix. Edges are midpoints between distinct values at quantile
@@ -1433,6 +1633,29 @@ def fit_bins[
     existed. Passing `min_data_in_bin=1, bin_construct_sample_cnt=0` restores
     that fit exactly, and a test says so. The module docstring states what
     each honors and what it does not.
+
+    `feature_pre_filter` is LightGBM's, and `min_data_in_leaf` is the number it
+    scales (see `filter_count`); it has no other use here, so a caller who
+    leaves the filter off never has to keep the two in step. At `True` the fit
+    additionally counts each feature's bins on the same sample it fit the edges
+    from, runs `need_filter` on those counts, and returns a `BinMapper` whose
+    `usable` list omits every feature LightGBM's `Dataset::Construct` would
+    have left out of `used_features` -- the trivial ones (one bin) and the
+    filtered ones. **Off is the exact fit this function has always produced**:
+    no counting pass runs, no allocation is made for it, and `usable` is every
+    feature.
+
+    Two divergences from LightGBM, both deliberate and both on the record:
+
+    - LightGBM drops a one-bin feature from `used_features` whatever
+      `feature_pre_filter` says. mojotrees drops nothing at `False`, because
+      `False` has to stay bit-identical to the fit that preceded this argument
+      and dropping constant columns from the `feature_fraction` pool is not a
+      bit-identical change. So mojotrees's `False` is "keep everything", not
+      LightGBM's `false`.
+    - LightGBM warns and continues when every feature is trivial. There is
+      nowhere to warn to here and a fit with no usable feature has no tree to
+      grow, so this raises instead.
     """
     if max_bins < 2 or max_bins > MAX_BINS:
         raise Error("max_bins must be in [2, ", MAX_BINS, "]")
@@ -1444,6 +1667,8 @@ def fit_bins[
         raise Error("min_data_in_bin must be positive")
     if bin_construct_sample_cnt < 0:
         raise Error("bin_construct_sample_cnt must be non-negative")
+    if feature_pre_filter and min_data_in_leaf < 0:
+        raise Error("min_data_in_leaf must be nonnegative")
 
     var cats = fit_categorical_spec(
         features, n_rows, n_features, categorical_features, max_bins
@@ -1477,6 +1702,18 @@ def fit_bins[
     var n_sample = len(sample) if sampled else n_rows
     var sample_p = sample.unsafe_ptr()
 
+    # LightGBM's prefilter state. `filter_cnt` is drawn once, from the same two
+    # sizes for every feature, so it cannot depend on which task fit a column.
+    # Both buffers are unallocated when the filter is off, which is what keeps
+    # that path allocation-for-allocation the path it was.
+    var n_flags = n_features if feature_pre_filter else 0
+    var filter_cnt = 0
+    if feature_pre_filter:
+        filter_cnt = filter_count(min_data_in_leaf, n_sample, n_rows)
+    var trivial = List[Int](capacity=n_flags)
+    trivial.resize(n_flags, 0)
+    var trivial_p = trivial.unsafe_ptr()
+
     def do_range(f_start: Int, f_end: Int) {imm}:
         # One set of scratch buffers per task rather than per feature: each is
         # emptied and refilled between features, keeping the capacity it
@@ -1505,10 +1742,43 @@ def fit_bins[
         var dist_hits = List[Int]()
         var dist_vals = List[Float64]()
         var level_counts = List[Int]()
+        # Per-bin populations, refilled per feature and only when the prefilter
+        # asked for them.
+        var cnt_in_bin = List[Int]()
         for f in range(f_start, f_end):
             # Categorical columns never enter quantile binning.
             if spec.is_cat(f):
                 counts_p.unsafe_store(f, 0)
+                if feature_pre_filter:
+                    # mojotrees's categorical layout is LightGBM's: bin 0 is
+                    # the unknown/missing dummy and the i-th kept code is bin
+                    # i + 1, so the counts line up bin for bin with the vector
+                    # `NeedFilter` was written against.
+                    var nb = spec.n_categories(f) + 1
+                    cnt_in_bin.clear()
+                    cnt_in_bin.resize(nb, 0)
+                    var cbase = f * n_rows
+                    if sampled:
+                        for i in range(n_sample):
+                            var r = sample_p.unsafe_load(i)
+                            var b = spec.bin_of(
+                                f, feat_p.unsafe_load(cbase + r)
+                            )
+                            if b >= 0 and b < nb:
+                                cnt_in_bin[b] += 1
+                    else:
+                        for r in range(n_rows):
+                            var b = spec.bin_of(
+                                f, feat_p.unsafe_load(cbase + r)
+                            )
+                            if b >= 0 and b < nb:
+                                cnt_in_bin[b] += 1
+                    trivial_p.unsafe_store(
+                        f,
+                        1 if need_filter(
+                            cnt_in_bin, n_sample, filter_cnt, True
+                        ) else 0,
+                    )
                 continue
             # NaN is dropped before any ordering, so it never takes part in a
             # quantile comparison, and a column that has any gives up one bin
@@ -1655,6 +1925,39 @@ def fit_bins[
             # k edges give ordinary bins 0..k, so the missing bin is k + 1.
             missing_p.unsafe_store(f, n_out + 1 if reserve else -1)
 
+            if feature_pre_filter:
+                # LightGBM builds `cnt_in_bin` from the distinct values it
+                # already counted; the edges are the same edges either way, so
+                # counting the sample through them gives the same vector. The
+                # reserved missing bin goes last, which is where LightGBM puts
+                # its NaN bin, and `need_filter`'s prefix loop stops one short
+                # of the last bin, so a missing-heavy column is not rescued by
+                # its own missing rows.
+                var nb = n_out + 2 if reserve else n_out + 1
+                cnt_in_bin.clear()
+                cnt_in_bin.resize(nb, 0)
+                for i in range(n_valid):
+                    var v = col[i]
+                    # The bin `bin_value` lands on: the number of edges
+                    # strictly below `v`.
+                    var lo = 0
+                    var hi = n_out
+                    while lo < hi:
+                        var mid = (lo + hi) // 2
+                        if v <= edge_buf[mid]:
+                            hi = mid
+                        else:
+                            lo = mid + 1
+                    cnt_in_bin[lo] += 1
+                if reserve:
+                    cnt_in_bin[nb - 1] = n_sample - n_valid
+                trivial_p.unsafe_store(
+                    f,
+                    1 if need_filter(
+                        cnt_in_bin, n_sample, filter_cnt, False
+                    ) else 0,
+                )
+
     # A feature costs a copy of its column plus resolving order statistics in
     # it, so the estimate carries a comparison count rather than the row count
     # alone. It stays the sort's estimate: it decides only how the work is
@@ -1672,8 +1975,34 @@ def fit_bins[
         for i in range(counts[f]):
             edges.append(scratch[base + i])
         offsets.append(len(edges))
+
+    # `used_features` (src/io/dataset.cpp): the ascending ids that survived,
+    # built serially in feature order from per-feature flags each task wrote
+    # only into its own slots, so the list is the same at every worker count.
+    var usable = List[Int]()
+    if feature_pre_filter:
+        for f in range(n_features):
+            if trivial[f] == 0:
+                usable.append(f)
+        if len(usable) == 0:
+            raise Error(
+                "feature_pre_filter dropped every feature: none of them has a"
+                " bin boundary leaving at least ",
+                filter_cnt,
+                " rows on both sides (min_data_in_leaf=",
+                min_data_in_leaf,
+                " scaled to a ",
+                n_sample,
+                "-row sample of ",
+                n_rows,
+                " rows). Lower min_data_in_leaf or min_data_in_bin, or turn"
+                " the filter off. LightGBM warns and continues here; there is"
+                " nothing to warn to and no tree to grow",
+            )
+    else:
+        usable = all_features(n_features)
     return BinMapper(
-        edges^, offsets^, n_features, max_bins, cats^, missing_bin^
+        edges^, offsets^, n_features, max_bins, cats^, missing_bin^, usable^
     )
 
 
