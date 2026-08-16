@@ -76,9 +76,19 @@ def main() raises:
         var serial_s = _timed_builds(data, grad, hess, reps)
 
         _ = setenv("MOJOTREES_NUM_WORKERS", "0")
+        # BOTH grains, not one. `MOJOTREES_PARALLEL_MIN_OPS` used to set the
+        # crossover and the per-task floor together, because they were one
+        # variable; the arm that produced this harness's cited "1.2 to 1.6x at
+        # 65,536 ops" was therefore a full-width fan-out of roughly 1,638-op
+        # tasks. Since the two grains were separated, setting only the
+        # crossover leaves the per-task floor at its default, `by_grain`
+        # collapses to 1, and the "parallel" arm measures a two-task fan-out
+        # that cannot reproduce the number this file exists to justify.
         _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "1")
+        _ = setenv("MOJOTREES_PARALLEL_MIN_TASK_OPS", "1")
         var parallel_s = _timed_builds(data, grad, hess, reps)
         _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "")
+        _ = setenv("MOJOTREES_PARALLEL_MIN_TASK_OPS", "")
 
         print(n_rows, "|", ops, "|", serial_s, "|", parallel_s, "|", serial_s / parallel_s)
         n_rows *= 2

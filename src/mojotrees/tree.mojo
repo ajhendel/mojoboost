@@ -84,7 +84,11 @@ from .histogram import (
     build_histogram_subset_into_scratch,
     subtract_histogram_into,
 )
-from .parallel import DispatchSettings, plan_row_blocks, run_row_blocks
+from .parallel import (
+    DispatchSettings,
+    plan_row_blocks_with,
+    run_row_blocks,
+)
 from .phase_profile import (
     HOST_HIST_DISPATCHES,
     HOST_PARTITION_DISPATCHES,
@@ -650,6 +654,7 @@ def partition_rows_into(
     rows: List[Int],
     split: SplitInfo,
     missing_bin: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """Route each of `rows` to the left or right child of `split`.
 
@@ -670,7 +675,13 @@ def partition_rows_into(
     # Each row is touched twice, and each touch is an indirect load of a bin
     # through a row id, so a row costs roughly three histogram ops rather than
     # one; the estimate is scaled up to match.
-    var blocks = plan_row_blocks(n, 3 * n)
+    # The last hot per-node dispatch that was still reading the environment.
+    # Every other one in the grower takes the fit-scoped snapshot; this one
+    # called the live `plan_row_blocks`, so a fit paid one `getenv` sweep --
+    # and, above the crossover, a whole `CpuProfile.detect()` -- per split.
+    # Unresolved settings fall through to the live path, so the default keeps
+    # every caller outside the grower working unchanged.
+    var blocks = plan_row_blocks_with(settings, n, 3 * n)
     var rows_p = rows.unsafe_ptr()
     var bins_p = data.bins.unsafe_ptr().unsafe_offset(
         split.feature * data.n_rows
@@ -1766,6 +1777,7 @@ def grow_tree_leaves_profiled(
             frontier[best_i].rows,
             split,
             split_missing_bin,
+            scratch.settings,
         )
         profile.charge(
             PROF_PARTITION,
