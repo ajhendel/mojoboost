@@ -150,7 +150,8 @@ produces wrong numbers rather than an error.
 |---|---|---|
 | `exports_by_module` | dict[str, list[str]] | The `from .mod import ...` blocks of `src/mojotrees/__init__.mojo`. Names sorted within a module; module keys sorted by the JSON writer |
 | `export_count` | int | Total names. A scalar that moves when any module's list does, so a truncated parse is visible |
-| `objective_codes` | dict[str, int] | `comptime NAME = <int>` in `src/mojotrees/boosting.mojo` and `params.mojo` for the objective constants |
+| `objective_codes` | dict[str, int] | `comptime NAME = <int>` in `src/mojotrees/objective_registry.mojo`, `boosting.mojo` and `params.mojo`. Integers only: a `comptime` bound to a float (`DEFAULT_FAIR_C = 1.0`) is not a code and is not recorded, which it used to be, truncated |
+| `objective_names` | dict | The names those integers round-trip under, parsed from `objective_registry.mojo` the way the metric names are. `canonical` is code constant -> the name `objective_canonical_name` reports; `aliases` is spelling -> constant from `objective_code_from_name`, the fit gate; `reserved_aliases` is spelling -> constant from `_reserved_objective_code`, identity only; `unimplemented` is spelling -> primary spelling from `objective_unimplemented_canonical`. A name moving between `aliases` and `reserved_aliases` is a fit that starts or stops being possible |
 
 ### 4.2 `c_abi`
 
@@ -275,9 +276,15 @@ about the tree rather than facts about the file.
 | I9 | Every `deprecations.toml` entry in state `removed` names something absent from the snapshot, and every entry in state `soft` or `deprecated` names something present | The register and the tree cannot disagree about existence |
 | I10 | No `deprecations.toml` entry has a `remove_in` that violates the overlap floor against its `since` | Deprecation policy section 1 |
 | I11 | The union of `mojo.exports_by_module` values equals `check_parity.mojo_export_names()` | Two parsers over one file must agree, or one of them is dropping a module |
+| I12 | Every name in `objective_names.canonical` resolves, through `aliases` or `reserved_aliases`, back to the constant that reports it | A code whose own canonical name does not resolve is a saved model whose loss field cannot be read back by name |
+| I13 | No two constants in `objective_names.canonical` share a value in `objective_codes` | An objective code is a number in a serialized model, so two objectives sharing one is a model that loads as the wrong loss, applies the wrong inverse link, and raises nothing. This has happened once: 13 and 14 were assigned twice in one round |
+| I14 | Every objective code has an entry in `python.inspection.objective_names` | `inspection.py` is the pure-Python model parser and carries its own code -> name table. Existence only, not spelling: code 5 is `mae` in the registry and `regression_l1` there on purpose. A code the parser cannot name at all is reported as `objective_16` |
 
 I5 and I11 are the two that catch a whole class of bug rather than one
-bug.
+bug. I13 is the one that catches a bug that already happened: the
+constant set it compares is derived from `objective_names.canonical`
+rather than written down, because the whole failure was that each lane
+could see only its own numbers.
 
 **I4 and I5 are violated on the tree as read**, which is findings F1 and
 F2 in [DRIFT_REPORT.md](DRIFT_REPORT.md). So the first

@@ -69,6 +69,18 @@ grouped. Nothing outside this module should answer any of them for itself.
   `objective_name_status`, `objective_is_known`, `objective_is_builtin`,
   `objective_task`, `objective_alias_names`, `all_objective_codes`,
   and the same five for metrics.
+- The reserved half of identity, which is the *file format* half:
+  `objective_reserved`, `objective_reserved_trainer`,
+  `reserved_objective_code_from_name`, `reserved_objective_alias_names`,
+  `all_reserved_objective_codes`, `any_objective_code_from_name`,
+  `all_assigned_objective_codes`, `check_objective_codes_distinct`.
+  Two resolvers, and the split is load-bearing rather than a convenience.
+  `objective_code_from_name` is the *fit gate*: a name it resolves is a name
+  a trainer will be handed, so the seven reserved codes must not resolve
+  there and do not. `any_objective_code_from_name` is *identity*: a code in
+  a saved model needs a name that maps back to it, or the number and the
+  name are two facts nothing reconciles. Never call the second one where the
+  question is whether a fit may proceed.
 - Prediction: `objective_link`, `metric_transform`.
 - Parameters: `objective_param`, `objective_param_name`,
   `objective_default_param`, `objective_param_domain`,
@@ -214,6 +226,31 @@ comptime METRIC_AVERAGE_PRECISION = _METRIC_AVERAGE_PRECISION
 comptime METRIC_MAP = _METRIC_MAP
 comptime N_BUILTIN_METRICS = _N_BUILTIN_METRICS
 
+# WARNING, and it is the objective collision about to happen again one code
+# space over. `N_BUILTIN_METRICS` is 21, so the next built-in metric assigned
+# in metrics.mojo takes 21 -- and `catboost_ranking.mojo:137` has already
+# staged `METRIC_PFOUND = 21` and `:138` `METRIC_NDCG_CATBOOST = 22`, in a
+# module the registry cannot see and nothing imports. That is the exact
+# setup that produced the 13/14 objective collision: codes staged where the
+# next assignment cannot see them.
+#
+# It is not a collision today. 21 and 22 are free, `metric_is_builtin`
+# rejects both, and no metric table reaches either. It becomes one the moment
+# anybody adds a metric without reading catboost_ranking.mojo, and a metric
+# code crosses the Python boundary as an integer.
+#
+# Deliberately NOT fixed here. Reserving 21 and 22 means moving
+# `N_BUILTIN_METRICS`, which is the bound `metric_is_builtin`,
+# `metric_codes_for_task` and `registry_metrics` all walk, so it is a change
+# to the metric table rather than a comment on it. The metric-space lane
+# owns that. What this note buys is that the next assignment can see them.
+#
+# Neither PFound nor CatBoost's NDCG belongs in the OBJECTIVE code space:
+# they are eval metrics, they score a model rather than train one, and an
+# objective code is what `serialize.save_model` writes into the loss field.
+# A metric occupying an objective code would be a format mistake, not a
+# naming one. Checked at head: no objective code is assigned to a metric.
+
 # ---------------------------------------------------------------------------
 # Objective codes
 # ---------------------------------------------------------------------------
@@ -296,6 +333,14 @@ comptime MULTICLASS = -1
 # trained by `boosting.train` and does not hold one tree per round.
 comptime MULTI_RMSE = -2
 comptime MULTI_RMSE_WITH_MISSING = -3
+
+# Not an objective: what `_reserved_objective_code` returns for a name that
+# is not one of the reserved spellings. It is deliberately far outside the
+# assigned space (which runs -3..17) so that a caller which forgets to test
+# for it gets a code no query answers rather than a plausible one, and it is
+# frozen in `compatibility/api_snapshot.json` beside the codes so that the
+# assigned space can never be extended onto it by accident.
+comptime NO_OBJECTIVE_CODE = -1000
 
 # --- the seven codes above are RESERVED, not reachable --------------------
 #
@@ -470,6 +515,16 @@ is no single positive class to lift."""
 comptime KNOWN_OBJECTIVE_NAMES = String(
     "regression, binary, multiclass, poisson, huber, quantile, mae, gamma,"
     " tweedie, mape, fair, cross_entropy, lambdarank, or custom"
+)
+
+# The seven reserved objectives by their primary spelling, for the message
+# `reserved_objective_code_from_name` raises with. Deliberately a separate
+# list from `KNOWN_OBJECTIVE_NAMES`: these resolve to a code through the
+# identity resolver and to nothing at all through the fit gate, and a single
+# list would blur the one distinction the reserved codes exist to draw.
+comptime RESERVED_OBJECTIVE_NAMES = String(
+    "query_rmse, pair_logit, yeti_rank, cox, survival_aft, multi_rmse, or"
+    " multi_rmse_with_missing"
 )
 
 # Metric names per task, sorted, as the Python error messages print them.
@@ -752,6 +807,15 @@ def objective_unimplemented_canonical(name: String) -> String:
     # for a real thing and here is what is missing" path, and resolving them
     # to a code instead would hand a trainer a number it cannot fit. Both
     # spellings, because a ported CatBoost script writes theirs.
+    #
+    # `multi_rmse_with_missing` was the seventh and it was absent: the code
+    # -3 had a canonical name that `objective_canonical_name` reported and
+    # that no name function accepted, so `objective_name_status` called it
+    # NAME_UNKNOWN and the Python estimator's message for it was the
+    # unknown-name one. A code whose own canonical name does not resolve is
+    # the round trip broken in the direction nothing was checking, which is
+    # why `check_objective_codes_distinct` and the round-trip test below now
+    # walk the whole assigned space rather than a hand-typed list.
     if name == "queryrmse" or name == "query_rmse":
         return String("query_rmse")
     if name == "pairlogit" or name == "pair_logit":
@@ -764,6 +828,12 @@ def objective_unimplemented_canonical(name: String) -> String:
         return String("survival_aft")
     if name == "multirmse" or name == "multi_rmse":
         return String("multi_rmse")
+    if (
+        name == "multirmsewithmissingvalues"
+        or name == "multirmsewithmissing"
+        or name == "multi_rmse_with_missing"
+    ):
+        return String("multi_rmse_with_missing")
     return String("")
 
 
@@ -839,6 +909,18 @@ def objective_unimplemented_reason(name: String) -> String:
             " nothing imports. Reaching it needs a binding entry point that"
             " returns a MultiTargetBooster, which no Python model type wraps"
         )
+    if (
+        name == "multirmsewithmissingvalues"
+        or name == "multirmsewithmissing"
+        or name == "multi_rmse_with_missing"
+    ):
+        return String(
+            "the per-plane loss and its round loop are implemented in"
+            " src/mojotrees/multi_target.mojo (train_multi_rmse with"
+            " with_missing_values=True), which nothing imports. Reaching it"
+            " needs a binding entry point that returns a MultiTargetBooster,"
+            " which no Python model type wraps"
+        )
     return String("")
 
 
@@ -912,6 +994,130 @@ def objective_code_from_name(name: String) raises -> Int:
     raise Error(
         "unknown objective '", name, "'; expected ", KNOWN_OBJECTIVE_NAMES
     )
+
+
+@always_inline
+def _reserved_objective_code(name: String) -> Int:
+    """The code a reserved objective spelling denotes, or
+    `NO_OBJECTIVE_CODE` when `name` is not one of them. Never raises and
+    never routes anything: it is the identity half only.
+
+    Every spelling `objective_unimplemented_canonical` accepts for a
+    reserved code appears here, and the round-trip test asserts the two
+    chains list the same names. Two spellings each, because a ported
+    CatBoost script writes `QueryRMSE` (lowercased by the caller, as
+    everywhere in this module) and a mojotrees model file writes
+    `query_rmse`.
+    """
+    if name == "queryrmse" or name == "query_rmse":
+        return QUERY_RMSE
+    if name == "pairlogit" or name == "pair_logit":
+        return PAIR_LOGIT
+    if name == "yetirank" or name == "yeti_rank":
+        return YETI_RANK
+    if name == "cox":
+        return COX
+    if name == "survivalaft" or name == "survival_aft" or name == "aft":
+        return SURVIVAL_AFT
+    if name == "multirmse" or name == "multi_rmse":
+        return MULTI_RMSE
+    if (
+        name == "multirmsewithmissingvalues"
+        or name == "multirmsewithmissing"
+        or name == "multi_rmse_with_missing"
+    ):
+        return MULTI_RMSE_WITH_MISSING
+    return NO_OBJECTIVE_CODE
+
+
+def reserved_objective_code_from_name(name: String) raises -> Int:
+    """The code a reserved objective spelling denotes, raising for anything
+    else.
+
+    This is the function `objective_code_from_name` deliberately is not, and
+    the split is the point. `objective_code_from_name` is the *fit gate*: a
+    name that resolves there is a name a trainer will be handed, so the seven
+    reserved codes must not resolve there and do not. But a code that is in
+    the model file format needs a name that maps back to it, or the number
+    and the name it round-trips under are two facts nothing reconciles. That
+    is this function, and it is what `check_objective_codes_distinct` and the
+    snapshot's I12 both close the loop through.
+
+    Callers: identity only. Nothing that decides whether a fit may proceed
+    may call this, which `objective_reserved` and `objective_is_known`
+    already say and `objective_reserved_trainer` already explains.
+    """
+    var code = _reserved_objective_code(name)
+    if code == NO_OBJECTIVE_CODE:
+        raise Error(
+            "'",
+            name,
+            "' is not a reserved objective name; the reserved spellings are ",
+            RESERVED_OBJECTIVE_NAMES,
+        )
+    return code
+
+
+def any_objective_code_from_name(name: String) raises -> Int:
+    """The code for any *assigned* objective spelling, connected or
+    reserved. The one resolver that is total over `all_assigned_objective_
+    codes`, which is what makes the round trip name -> code -> name -> code
+    checkable at all.
+
+    A LightGBM objective mojotrees has not implemented (`multiclassova`,
+    `rank_xendcg`, `cross_entropy_lambda`) still raises here with its own
+    reason: those have no code to resolve to, which is a different thing from
+    having a code no trainer reaches.
+
+    Not the fit gate. `objective_code_from_name` is, and this one wraps it
+    rather than replacing it, so a caller that wants the narrow answer keeps
+    getting the narrow answer and its error text is unchanged.
+    """
+    var reserved = _reserved_objective_code(name)
+    if reserved != NO_OBJECTIVE_CODE:
+        return reserved
+    return objective_code_from_name(name)
+
+
+def check_objective_codes_distinct() raises:
+    """Refuse a code space in which one integer names two objectives.
+
+    An objective code is a number in a serialized model:
+    `serialize.save_model` writes it and `load_model` reads it back, so two
+    objectives sharing one is not a merge conflict, it is a model that loads
+    as the wrong loss with the wrong inverse link and raises nothing. This
+    has already happened once, in the round that assigned 13 and 14 twice,
+    and what caught it was a lane's own unit test rather than any gate.
+
+    It walks `all_assigned_objective_codes` rather than a written-out list,
+    which is the difference between a check that catches the *next*
+    assignment and one that catches the last. A new code is added in exactly
+    one place, the `comptime` block at the top of this file, and then to that
+    list; a hand-typed list here would be a third place and the third place
+    is where the drift lives.
+
+    A compile-time `constrained[...]` would be better and is not available:
+    the assigned space is a runtime `List[Int]`, and the only comptime
+    formulation is a pairwise chain typed out by hand, which is exactly the
+    hand-typed list this function exists to avoid. The test file
+    tests/test_objective_code_space.mojo is therefore the gate, and
+    invariant I13 in tools/api_snapshot.py is the second one, derived from
+    the source text rather than from a compiled call.
+    """
+    var codes = all_assigned_objective_codes()
+    for i in range(len(codes)):
+        for j in range(i + 1, len(codes)):
+            if codes[i] == codes[j]:
+                raise Error(
+                    "objective code ",
+                    codes[i],
+                    " is assigned twice, at positions ",
+                    i,
+                    " and ",
+                    j,
+                    " of all_assigned_objective_codes(); a code is a number"
+                    " in a serialized model and cannot name two losses",
+                )
 
 
 def objective_name_status(name: String) -> Int:
@@ -1895,9 +2101,35 @@ comptime OBJECTIVE_ALIAS_NAMES = String(
     " multiclass softmax lambdarank custom"
 )
 
+# Every spelling `objective_unimplemented_canonical` accepts, in two groups
+# that are one list because Python reads it as one: the LightGBM objectives
+# mojotrees does not implement, and then the reserved codes, whose trainers
+# ARE implemented and whose refusal names the module and the function.
+#
+# The second group was missing and that was a Python-facing hole, not a
+# cosmetic one: `registry_objective_unimplemented` in objective_bindings.mojo
+# walks this list and `_unimplemented_objectives` in python/mojotrees/
+# _fit_args.py turns it into the dict the estimators quote, so
+# `objective="Cox"` reached a user as a bare unknown-name message while the
+# registry already knew the name, the reason, and the entry point.
 comptime UNIMPLEMENTED_OBJECTIVE_ALIAS_NAMES = String(
     "cross_entropy_lambda xentlambda multiclassova multiclass_ova ova ovr"
     " rank_xendcg xendcg"
+    " queryrmse query_rmse pairlogit pair_logit yetirank yeti_rank cox"
+    " survivalaft survival_aft aft multirmse multi_rmse"
+    " multirmsewithmissingvalues multirmsewithmissing"
+    " multi_rmse_with_missing"
+)
+
+# Every spelling `_reserved_objective_code` resolves. A strict subset of the
+# list above, and the round-trip test asserts exactly that: a reserved name
+# that stopped reporting its reason, or a reason with no code behind it,
+# would be one list moving without the other.
+comptime RESERVED_OBJECTIVE_ALIAS_NAMES = String(
+    "queryrmse query_rmse pairlogit pair_logit yetirank yeti_rank cox"
+    " survivalaft survival_aft aft multirmse multi_rmse"
+    " multirmsewithmissingvalues multirmsewithmissing"
+    " multi_rmse_with_missing"
 )
 
 comptime METRIC_ALIAS_NAMES = String(
@@ -1924,9 +2156,17 @@ def objective_alias_names() -> List[String]:
 
 
 def unimplemented_objective_alias_names() -> List[String]:
-    """Every spelling of a LightGBM objective mojotrees reports by name as
-    not implemented."""
+    """Every spelling `objective_unimplemented_canonical` and
+    `objective_unimplemented_reason` answer for: the LightGBM objectives
+    mojotrees does not implement, and the reserved codes whose trainer is
+    merged and unreached. Both refuse a fit; only the second group has a
+    code, and `reserved_objective_alias_names` is that subset."""
     return _split_names(UNIMPLEMENTED_OBJECTIVE_ALIAS_NAMES)
+
+
+def reserved_objective_alias_names() -> List[String]:
+    """Every spelling `reserved_objective_code_from_name` resolves."""
+    return _split_names(RESERVED_OBJECTIVE_ALIAS_NAMES)
 
 
 def metric_alias_names() -> List[String]:
@@ -1935,9 +2175,18 @@ def metric_alias_names() -> List[String]:
 
 
 def all_objective_codes() -> List[Int]:
-    """Every objective code, built-ins first and then the three with their
-    own trainers. Metric codes need no such list: they are 0 through
-    `N_BUILTIN_METRICS - 1`."""
+    """Every objective code a fit can be routed to: the built-ins first and
+    then the three with their own trainers. Metric codes need no such list:
+    they are 0 through `N_BUILTIN_METRICS - 1`.
+
+    The seven RESERVED codes are deliberately not here, and the reason is a
+    caller rather than a principle: `registry_objectives` in
+    bindings/objective_bindings.mojo walks this list and builds an
+    `objective_spec` per entry, and `objective_spec` raises for a code
+    `objective_is_known` rejects. This list is "what a trainer can be handed"
+    and it stays that. `all_assigned_objective_codes` is the whole number
+    space, which is the list a *format* question walks.
+    """
     var out = List[Int]()
     out.append(SQUARED_ERROR)
     out.append(BINARY_LOGISTIC)
@@ -1953,6 +2202,40 @@ def all_objective_codes() -> List[Int]:
     out.append(MULTICLASS)
     out.append(LAMBDARANK)
     out.append(CUSTOM)
+    return out^
+
+
+def all_reserved_objective_codes() -> List[Int]:
+    """Every code that is assigned and serializable and that no trainer this
+    package connects can be handed. `objective_reserved` is the predicate
+    over the same seven; this is the enumeration, for the callers that have
+    to walk the space rather than test one member of it."""
+    var out = List[Int]()
+    out.append(QUERY_RMSE)
+    out.append(PAIR_LOGIT)
+    out.append(YETI_RANK)
+    out.append(COX)
+    out.append(SURVIVAL_AFT)
+    out.append(MULTI_RMSE)
+    out.append(MULTI_RMSE_WITH_MISSING)
+    return out^
+
+
+def all_assigned_objective_codes() -> List[Int]:
+    """Every objective code that means something, connected or reserved.
+
+    This is the list a *file format* question walks, and it is a different
+    question from the one `all_objective_codes` answers. A serialized model
+    carries a code, `load_model` reads it back, and the code it reads may be
+    one no trainer in this build reaches; what may never happen is that the
+    integer means two things. `check_objective_codes_distinct` walks this,
+    the round-trip test walks this, and `compatibility/api_snapshot.json`
+    freezes the same twenty-one numbers.
+    """
+    var out = all_objective_codes()
+    var reserved = all_reserved_objective_codes()
+    for i in range(len(reserved)):
+        out.append(reserved[i])
     return out^
 
 
