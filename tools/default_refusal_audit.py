@@ -736,6 +736,38 @@ def unmasked_by_removing(default_set, parameter):
     return device_rows, unrouted
 
 
+def _tree_state():
+    """What this answer was computed from, in one line, for the reassuring
+    answers only. Reads the WORKING TREE, so an uncommitted edit in a shared
+    checkout is part of the answer whether or not the reader expects it."""
+    import subprocess
+
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT, capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--", "src", "bindings", "python"],
+            cwd=ROOT, capture_output=True, text=True, timeout=5,
+        ).stdout.strip().splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return "  (tree state unavailable; this answer was read from the working tree)"
+    if not dirty:
+        return f"  Read from the working tree at {head}, clean."
+    # Split rather than slice a fixed offset. Porcelain's status field is two
+    # characters plus a space, but the first version sliced [3:] and printed
+    # "rc/mojotrees/device_policy.mojo" for a real path. A line whose entire
+    # job is to be trusted cannot be one character wrong.
+    files = ", ".join(sorted(line.split()[-1] for line in dirty)[:4])
+    return (
+        f"  Read from the working tree at {head}, with {len(dirty)} "
+        f"UNCOMMITTED source file(s): {files}.\n"
+        "  A reassuring answer computed over uncommitted work is the failure "
+        "this line exists for."
+    )
+
+
 def _read_source(rel):
     try:
         return open(os.path.join(ROOT, rel), errors="ignore").read()
@@ -789,6 +821,16 @@ def main(argv=None):
             )
         elif not device_rows:
             print("  nothing: the set walks into no device refusal without it")
+        # Print the tree state whenever the answer is reassuring, and only
+        # then. "Safely masked" and "nothing" are the two answers a reader
+        # acts on by NOT looking further, so they are the two that must carry
+        # what they were computed from. This function has already reported a
+        # cliff as guarded because another session's 76 uncommitted lines were
+        # sitting in the shared checkout; under-reporting nags until somebody
+        # looks, and over-reporting sends them away satisfied.
+        if not unrouted:
+            print()
+            print(_tree_state())
         return 1 if unrouted else 0
 
     params, rows = audit(args.set)
