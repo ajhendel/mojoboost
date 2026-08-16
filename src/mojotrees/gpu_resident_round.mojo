@@ -28,39 +28,85 @@ is the removal of that round trip. Compute of every kind was 22.9% of a
 round, which is the ceiling on what any kernel-level change could have been
 worth.
 
-**No speedup is claimed and none was measured.** What is claimed is a count,
-and the count has been corrected twice: once downward in ambition and once
-back down in size. The loop below contains exactly one `synchronize` per tree
-against the shipping loop's `num_leaves`, which is what was originally
-reported. But on Metal every `enqueue_copy` is itself a full-queue drain in
-both directions, so the honest per-tree figure was sixteen host waits and not
-one: nine uploads before the first split, six downloads and the `synchronize`
-at the end.
+The number that matters is round trips
+--------------------------------------
+The figure this module is built on, and the one to quote, is the count of
+**round trips**, meaning points where host code reads a device answer and then
+decides what to enqueue next. This plane makes one per tree. The shipping loop
+makes one per split, which is `num_leaves` and is 31 at the default budget.
 
-That figure is now **three**, on the default arms, because thirteen of those
-copies were not carrying anything a copy had to carry. The tables reset is a
-kernel that takes three scalars rather than five staged uploads
-(`gpu_tree_tables.DeviceTreeTables.set_reset_on_device`); the download is one
-copy of one device-side concatenation rather than six (`set_packed_download`);
-and the searcher's four staged tables are now `create_sub_buffer` windows onto
-one parent allocation, so one copy writes all four
-(`gpu_split_search.GpuSplitSearcher.set_table_upload_hoisting`). What is left
-is that one upload, the one download, and the `synchronize`, which is free on
-Metal since the copy before it already drained.
+That count is now backed by a clock. **Measured**
+(`bench/results/session3_2026-08-16/RESULTS.md`, 1,000,000 x 50, median of
+five in-process repeats, alternating processes): this plane against the
+shipping loop is worth **0.75 seconds in the fast regime**, 24% of the fit,
+resolved by a wide margin against arm spreads under 0.02. Removing about thirty
+round trips per tree is what bought it. In a slow window both arms rose about
+65% and the delta fell to 0.35, or 8%, so the effect size itself moves with
+machine state: the direction is regime-independent and a single figure for the
+size is not.
+
+The other number is copies, and it is not a time
+------------------------------------------------
+On Metal every `enqueue_copy` is itself a full-queue drain in both directions,
+**measured** by disassembly (`docs/GPU_PORTABILITY.md` section 6.1). During
+the 2026-08-15 round that mechanism was turned into a **cost** model here:
+every copy is a wait, so the honest per-tree figure was called sixteen host
+waits rather than one, and removing copies was argued as removing waits.
+
+**That cost model was refuted on 2026-08-16 and section 6.1.1 records the
+withdrawal.** Draining a queue that holds nothing costs nothing. The copy
+count went from sixteen to **three** on the default arms, thirteen fewer per
+tree and roughly 1,300 fewer per fit, and the **measured** effect of all
+thirteen was **0.016 seconds** against a registered prediction of 0.64, which
+is not resolved under M0 and sits inside the arm's own spread. It is a null.
+
+So the copy count is kept, and it is kept as what it honestly is: a
+**portability and hazard count**, not a time estimate. It says how many places
+a stale byte could hide, how many buffers must stay alive, and how much would
+have to be rethought on a backend where a copy is genuinely asynchronous. It
+does not predict seconds. Count round trips for that.
+
+The thirteen, and why none of it is reverted
+--------------------------------------------
+The tables reset is a kernel that takes three scalars rather than five staged
+uploads (`gpu_tree_tables.DeviceTreeTables.set_reset_on_device`); the download
+is one copy of one device-side concatenation rather than six
+(`set_packed_download`); and the searcher's four staged tables are now
+`create_sub_buffer` windows onto one parent allocation, so one copy writes all
+four (`gpu_split_search.GpuSplitSearcher.set_table_upload_hoisting`). What is
+left is one upload, one download, and the `synchronize`, which waits on
+nothing because the copy before it already drained.
 `grow_tree_device_resident` itemizes all three. Every replacement has a second
 arm reachable at run time, because this machine's timings drift several-fold
 across time windows and only interleaved arms compare.
+
+**The collapse from sixteen waits per tree to three is correct, it is tested,
+and it is worth an unmeasurable amount of time. It is not reverted and should
+not be.** It makes staleness structurally impossible in the searcher's tables
+rather than merely unlikely, it removes real work, and it is the right shape.
+What it is not is a speed result, and every place it was argued as one has
+been relabelled rather than deleted.
 
 Two lanes produced that thirteen and neither could see the other, so each
 reported a correct intermediate figure against its own baseline: sixteen to
 six, and separately four to one giving thirteen. Composed it is three. Written
 out because that is the arithmetic a multi-lane round gets wrong.
 
-What survives all of this intact is the count of *round trips*, meaning
-points where host code reads a device answer before it can decide what to
-enqueue next: this plane makes one per tree and the shipping loop makes one
-per split. Whether any of it is worth anything is a measurement nobody has
-taken.
+The control plane is finished. Do not spend another lane on it.
+--------------------------------------------------------------
+The three that remain are one upload, one download and one `synchronize`,
+which together are a single round trip per tree, so roughly 100 per fit at a
+hundred-tree default. **Estimated** at the derived ~458 microseconds per round
+trip, that whole remaining budget is at most about **0.05 seconds**. M0 cannot
+resolve 0.05 seconds on this machine: the arm spreads in the session above run
+from 0.02 in a quiet window to several tenths in a slow one, and the machine
+drifts two- to threefold between windows.
+
+So there is nothing left here to win, and the next reader should not re-derive
+an ambition from the fact that a count went from sixteen to three. **No
+further lane should be spent on this control plane.** Whatever is next is in
+the kernels, in the data layout, or in what the host does between trees, and
+it has to be argued against a round-trip budget that is already spent.
 
 The shape of the loop
 ---------------------
@@ -188,9 +234,12 @@ Reaches this plane, and how far each one has been checked:
 - **bagging.** A sampled tree differs only in which rows the root owns, and
   `GpuHistogramBuilder.begin_tree` already stages the bag; every window below
   is arithmetic on `[0, n_active)` and does not care how that prefix was
-  chosen. It costs one extra host synchronization per tree, inside
-  `GpuActiveRows.begin_tree`, which drains the queue before it refills the row
-  staging buffer. **Run and checked** against `_device_search_resident` in
+  chosen. It adds one drain per tree, inside `GpuActiveRows.begin_tree`, which
+  empties the queue before it refills the row staging buffer. That is an
+  ordering point and one more copy on the portability count; it is not a round
+  trip, since no host decision reads a device answer there, so nothing here
+  predicts that it costs time. **Run and checked** against
+  `_device_search_resident` in
   `tests/test_gpu_tree_resident.mojo`, tree for tree with no tolerance.
 - **GOSS.** The same argument as bagging and the same code path, but nothing
   has run it. GOSS also rescales the sampled rows' gradients before upload,
@@ -218,8 +267,12 @@ descriptors rather than of restructuring the loop. Second, the loop body
 below is a straight sequence of enqueues with no host state carried between
 iterations at all: there is nothing in it that would have to be replicated
 per batch member, because there is nothing in it. What is *not* built is any
-of the batching itself, and it should not be built before the one-wait loop
-has been measured.
+of the batching itself. The precondition that gated it, that the one-round-trip
+loop be measured first, is now satisfied: it is worth 0.75 seconds and the
+control plane is spent. So batching is no longer blocked on this module, and
+it is also no longer a control-plane argument. It has to be argued on
+occupancy, which is a kernel question and is measured with a kernel
+instrument.
 
 Numerics
 --------
@@ -720,14 +773,34 @@ def grow_tree_device_resident(
     feature set and an empty allow mask, and `resident_round_supported`
     answered `RESIDENT_OK`.
 
-    Host synchronizations, counted statically rather than measured, which is
-    all this lane is allowed to do. **Every copy counts, in both directions**,
-    because on Metal `enqueue_copy` is a synchronous full-queue drain in both
-    directions, measured by disassembly and recorded in
-    `docs/GPU_PORTABILITY.md` section 6.1. An earlier version of this list
-    counted only the `synchronize` at the end and said "one"; that was a count
-    of one kind of wait, not a count of the waits, and section 6.1 rule 1 says
-    so in as many words.
+    **Round trips, which is the count that predicts time. One per tree.** A
+    round trip is host code that reads a device answer and then decides what
+    to enqueue next, and there is exactly one such point in this function: the
+    download at the end. That is the property this plane was built for, and it
+    is the figure to quote. The shipping loop makes one per split, which is
+    `num_leaves` and is 31 at the default budget.
+
+    **Measured**: this plane against the shipping loop is worth **0.75
+    seconds** at 1,000,000 x 50, median of five in-process repeats,
+    alternating processes, resolved by a wide margin
+    (`bench/results/session3_2026-08-16/RESULTS.md`). That is the fast regime,
+    where it is 24% of the fit. In a slow window both arms rose about 65% and
+    the delta fell to 0.35, or 8%, so the effect size itself moves with machine
+    state. The direction holds in every pair taken; the size does not, and no
+    single figure may be quoted for it.
+
+    **Copies, which is a portability and hazard count and is not a time.**
+    Counted statically off the source. On Metal `enqueue_copy` is a
+    synchronous full-queue drain in both directions, **measured** by
+    disassembly (`docs/GPU_PORTABILITY.md` section 6.1), so each copy below is
+    a real ordering point and a real place a stale byte could hide. An earlier
+    version of this list read that mechanism as a cost, called each copy a
+    host wait, and totalled sixteen waits per tree. **That reading was refuted
+    on 2026-08-16** and the withdrawal is recorded in section 6.1.1: removing
+    thirteen of these per tree, roughly 1,300 per fit, **measured** 0.016
+    seconds against a registered prediction of 0.64, which is a null under M0.
+    Draining a queue that holds nothing costs nothing. The list below is
+    therefore kept in full and read as a hazard inventory, not a wait budget.
 
     Per tree, inside this function, on Metal, on the default arms:
 
@@ -766,21 +839,40 @@ def grow_tree_device_resident(
       about them.
     - **one download plus one `synchronize`** in `download_desc_tables`. It
       used to be six downloads: a kernel now concatenates the six tables into
-      one device buffer and one copy brings the concatenation home, which is
-      the same round trip made of one wait instead of six.
+      one device buffer and one copy brings the concatenation home. It was one
+      round trip before and it is one round trip now; what changed is that the
+      round trip is made of one copy instead of six.
       `set_packed_download(False)`, or `MOJOTREES_GPU_PACKED_DOWNLOAD=0`, is
-      the six-copy arm. The `synchronize` is
-      free on Metal, since the copy before it already drained, and it stays
-      because it is what keeps this correct on a backend where a copy really
-      is asynchronous.
+      the six-copy arm. The `synchronize` waits on nothing, since the copy
+      before it already drained, and it stays because it is what keeps this
+      correct on a backend where a copy really is asynchronous.
 
-    **Three**, then, of which one is an upload, one a download and one the
-    trailing `synchronize`, where it was sixteen of which nine were uploads.
-    All thirteen removed were copies of bytes that either the device could
-    have written itself or that were already sitting next to each other in
-    device memory; not one of them was removed by moving less data, and the
-    data moved is very nearly unchanged. That is the whole shape of this
-    round: on Metal the cost is the drain, not the bytes.
+    **Three copies**, then, of which one is an upload, one a download and one
+    the trailing `synchronize`, where it was sixteen of which nine were
+    uploads. All thirteen removed were copies of bytes that either the device
+    could have written itself or that were already sitting next to each other
+    in device memory; not one of them was removed by moving less data, and the
+    data moved is very nearly unchanged.
+
+    **The collapse from sixteen to three is correct, it is tested, and it is
+    worth an unmeasurable amount of time.** It is not reverted and should not
+    be. It makes staleness structurally impossible in the searcher's tables
+    rather than merely unlikely, it removes real work, and it is the right
+    shape. It is simply not a speed result. What this round actually
+    established is narrower and more useful than what it set out to
+    establish: on Metal the cost is neither the bytes nor the drain, it is the
+    round trip, and thirteen of these thirteen were draining a queue that held
+    nothing.
+
+    **Nothing is left here to win, and no further lane should be spent on this
+    control plane.** The three that remain are a single round trip per tree,
+    so roughly 100 per fit at a hundred-tree default. **Estimated** at the
+    derived ~458 microseconds per round trip, the entire remaining budget is
+    at most about 0.05 seconds, which M0 cannot resolve on this machine: arm
+    spreads run from 0.02 in a quiet window to several tenths in a slow one,
+    and the machine drifts two- to threefold between windows. A reader who
+    sees sixteen go to three should not read an ambition into the next
+    reduction. There is not one.
 
     Two lanes produced that thirteen and neither could see the other, so the
     two intermediate figures each lane reported are both correct against the
@@ -793,32 +885,36 @@ def grow_tree_device_resident(
     Outside this function and not in the three: the monotone vector's
     `map_to_host` went from once per tree to once per fit, and the raw-score
     update's two copies became one. **None of that is a measurement**: it is a
-    static count read off the source. That a copy is a wait at all is
-    measured in `docs/GPU_PORTABILITY.md` section 6.1, and what one wait
-    costs is measured in `docs/METAL_TIMELINE.md:550` at 606 microseconds for
-    one blocking readback, of which 3.7 microseconds is bytes moving. Neither
-    was re-measured here, and what ten fewer waits are worth in this loop is
-    unmeasured.
+    static count read off the source, and under 6.1.1 a copy count is not a
+    time. That a copy drains at all is **measured** in
+    `docs/GPU_PORTABILITY.md` section 6.1 by disassembly. What one *round
+    trip* costs is **measured** in `docs/METAL_TIMELINE.md:550` at 606
+    microseconds for one blocking readback, of which 3.7 microseconds is bytes
+    moving; that readback was a round trip, and the number does not transfer
+    to a copy that nothing was waiting behind. What these particular copy
+    removals are worth in this loop is **unmeasured** and is expected to be
+    nothing, by the same argument the 0.016 second null establishes.
 
-    The one figure that is genuinely one, and always was, is the number of
-    *round trips*, in the sense of host code that reads a device answer and
-    then decides what to enqueue next: there is one such point per tree and
-    it is the download at the end. That is the property the plane was built
-    for.
-
-    Outside this function and unchanged by it: **two** inside
-    `GpuActiveRows.begin_tree` when the tree is bagged, its explicit
+    Outside this function and unchanged by it, on the copy count: **two**
+    inside `GpuActiveRows.begin_tree` when the tree is bagged, its explicit
     `synchronize` and the bag upload; and whatever the caller's round does,
     which is the gradient upload (two drains, one per plane, every round), a
     GOSS row and scale upload where that is on, and a custom objective's host
-    callback.
+    callback. Of those, only the custom objective's callback is a round trip,
+    because it is the only one where the host reads a device answer before it
+    can decide what to enqueue next. The rest are ordering points.
 
     The shipping loop's count for comparison, at the same leaf budget: one
     `synchronize` per split from `download_frontier` plus one for the root,
     which is `num_leaves` in total and 31 at the default budget, and on top of
-    that its own copies, four staged tables per search among them. Comparing
-    31 against 6 is comparing two static counts read off the source, and
-    neither is a measurement of anything.
+    that its own copies, four staged tables per search among them. Each of
+    those 31 is a **round trip**, not merely a copy: the host downloads the
+    frontier and then decides the next split from what it read. That is why
+    this comparison is the one that moved a clock. Both counts are still
+    static counts read off the source, but the difference between them has
+    since been **measured** end to end at 0.75 seconds, and the count and the
+    measurement agree about which direction is faster and about roughly thirty
+    round trips per tree being what changed.
 
     Equivalence to the shipping loop, which outranks the count entirely. The
     claim is that this grows the same tree `_device_search_resident` grows,
