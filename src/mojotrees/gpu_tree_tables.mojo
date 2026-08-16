@@ -834,6 +834,88 @@ struct TreeTablesSnapshot(Copyable, Movable):
                 " L leaves holds 2L-1 nodes"
             )
 
+    def trace_line(self) -> String:
+        """The counters as one line of `key=value` pairs.
+
+        This exists because a device-owned growth loop has no per-split host
+        view at all. On the shipping loop a wrong tree can be bisected by
+        printing the frontier after each download, since there is a download
+        after each split. Here there is one download per tree, so the only
+        thing a reader can inspect without changing what runs is what that
+        one download brought home, and this is it.
+
+        The format is deliberately flat, single-line, and stable: a test
+        parses it by counting substrings rather than by understanding it, so
+        a passing assertion about `status=budget_spent` is an assertion about
+        a word a device counter produced. Anything added later goes on the
+        end, so an existing reader keeps working.
+        """
+        return String(
+            "status=",
+            tree_status_name(self.status),
+            " commits=",
+            self.commits,
+            " leaves=",
+            self.n_live,
+            " nodes=",
+            self.next_node,
+            " pick=",
+            self.pick,
+            " pick_node=",
+            self.pick_node,
+        )
+
+    def describe(self) -> String:
+        """The frontier, the slot pool and the commit log, as indented text.
+
+        Several lines rather than one, and indented, so that it reads under a
+        `trace_line` above it. Everything printed is an exact integer that a
+        device kernel wrote; nothing here recomputes or interprets, because a
+        trace that computed anything would be a second implementation of the
+        thing being debugged.
+
+        Deliberately *not* including `trace_line`, even though a caller almost
+        always wants both. A trace is counted as well as read: a test asserts
+        on how many records carry `status=budget_spent`, and a status printed
+        twice per record would be counted twice. The caller writes the summary
+        line and then this.
+
+        The frontier is printed in slot order, which is load bearing rather
+        than cosmetic: slot order is the pick kernel's tie-breaking rule, so
+        a reader comparing two traces is comparing the order decisions were
+        made in and not merely the set of leaves.
+        """
+        var out = String("")
+        for i in range(len(self.leaves)):
+            var leaf = self.leaves[i].copy()
+            out += String(
+                "  leaf slot=",
+                i,
+                " node=",
+                leaf.node,
+                " rows=[",
+                leaf.row_begin,
+                ",",
+                leaf.row_end(),
+                ") count=",
+                leaf.row_count,
+                " depth=",
+                leaf.depth,
+                " hist_slot=",
+                leaf.hist_slot,
+                " record=",
+                leaf.record,
+                "\n",
+            )
+        out += String("  slot_owner=")
+        for i in range(len(self.slot_owner)):
+            out += String(" ", self.slot_owner[i])
+        out += String("\n  commit_order=")
+        for k in range(len(self.commit_order)):
+            out += String(" ", self.commit_order[k])
+        out += String("\n")
+        return out^
+
 
 # --- The kernel -----------------------------------------------------------
 
