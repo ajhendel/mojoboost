@@ -101,7 +101,25 @@ DUMP_FORMAT_VERSION = 1
 #: so a dump built from one reports `has_split_gain: False`. The native
 #: dump reports the format the model would serialize to and reads nothing,
 #: so this does not bound it.
-SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3, 4)
+#:
+#: **v5 is here because the sections are, not because the number was
+#: raised.** A v5 file is one carrying any of three optional sections, and
+#: this parser handles two of them: `ctr` (`_parse_ctr`, the fitted ordered
+#: target statistics) and `usable` (`_parse_usable`, the split-search pool).
+#: The third, `linear` (linear leaves), is **refused by name** in
+#: `parse_model_string` -- reconstructing linear leaves here would be a
+#: second implementation of `src/mojotrees/linear_tree.mojo`, and skipping
+#: the section would report a linear model as a constant-leaf one, which is
+#: the mis-parse the old blanket refusal existed to prevent. So the number
+#: covers exactly what the parser genuinely reads, and what it does not read
+#: says so by name.
+#:
+#: Parsing a section is not the same as describing it. `parse_model_string`
+#: returns a v5 CTR model's tables; `dump_model`'s fallback then refuses that
+#: model, because the dump schema is sized by `mapper.n_features` and a CTR
+#: tree splits past it. That refusal mirrors `ctr.check_ctr_model_support`
+#: in the Mojo dump, so both sides of `dump_model` say the same thing.
+SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3, 4, 5)
 
 #: Whether this build can edit a fitted model in place. Mirrors
 #: `MODEL_EDITING_SUPPORTED` in src/mojotrees/model_editing.mojo (re-exported
@@ -1004,8 +1022,26 @@ def parse_model_string(text):
     out["mapper"] = _parse_mapper(reader, version)
     n_features = out["mapper"]["n_features"]
     out["categorical"] = _parse_categorical(reader, n_features)
+    # The two v5 sections this parser reads, in the order
+    # `save_model` writes them: `ctr` and then `usable`, both between the
+    # categorical tables and the monotone vector.
+    out["ctr"] = _parse_ctr(reader, version)
+    out["usable"] = _parse_usable(reader, version, n_features)
     out["monotone"] = _parse_monotone(reader, n_features)
     out["trees"] = _parse_trees(reader, version)
+    # The one v5 section this parser does not read, refused by name. It is
+    # last in the file, so reaching here with it unread means it is next.
+    if reader.peek() == _LINEAR_SECTION_TAG:
+        raise ValueError(
+            "this model carries the v5 'linear' section (linear leaves) and "
+            "the pure-Python fallback parser does not read it: rebuilding a "
+            "linear leaf's features, coefficients and centering here would "
+            "be a second implementation of "
+            "src/mojotrees/linear_tree.mojo, and skipping the section would "
+            "describe a linear model as a constant-leaf one. Use the native "
+            "dump, which reads it (src/mojotrees/model_dump.mojo, "
+            "_attach_linear)"
+        )
     return out
 
 
@@ -1110,6 +1146,239 @@ def _parse_categorical(reader, n_features):
     if offsets[0] != 0 or offsets[n_features] != n_codes:
         raise ValueError("corrupt categorical offsets")
     return {"is_categorical": flags, "codes": codes, "offsets": offsets}
+
+
+#: The `ctr` section's own revision, carried in the section rather than in
+#: the file version. `CTR_SECTION_REVISION` in src/mojotrees/serialize.mojo,
+#: and the two must move together: the section is unreadable at a revision
+#: this parser does not know, so it refuses one rather than guessing.
+_CTR_SECTION_REVISION = 2
+
+#: The three v5 section tags, spelled here so the refusals below can name
+#: them. `_LINEAR_SECTION_TAG` is `LINEAR_SECTION_TAG` in
+#: src/mojotrees/linear_tree.mojo.
+_CTR_SECTION_TAG = "ctr"
+_USABLE_SECTION_TAG = "usable"
+_LINEAR_SECTION_TAG = "linear"
+
+#: A CTR bucket is a bin index stored in a byte, the same ceiling
+#: `MAX_BINS` puts on the mapper. `_read_ctr` in
+#: src/mojotrees/serialize.mojo checks it there for the same reason.
+_MAX_BINS = 256
+
+
+def _parse_ctr(reader, version):
+    """The optional v5 `ctr` section: the fitted ordered target statistics.
+
+    Absent -- every file before v5, and every v5 file whose mapper carries no
+    fitted tables -- means `None`, which is what `CtrTables.none()` is on the
+    Mojo side.
+
+    A mirror of `_read_ctr` in src/mojotrees/serialize.mojo, field for field
+    and check for check, including the ones that are not about reading: the
+    slot tables and the per-slot bucket counts state the same thing twice,
+    and a file where they disagree would map a raw value through one and size
+    its statistics with the other, which scores wrong instead of failing.
+
+    Three of `CtrColumn`'s fields are not in the file (`shift`, `norm`,
+    `scale`), and neither is `predict_lut`; the Mojo reader recomputes them.
+    This parser does not, because it does not score -- it reports what the
+    file holds. What it must not do is silently skip the section, which would
+    leave the reader positioned on the middle of the CTR arrays and read them
+    as the monotone vector.
+    """
+    if version < 5 or reader.peek() != _CTR_SECTION_TAG:
+        return None
+    reader.expect(_CTR_SECTION_TAG)
+    revision = reader.next_int()
+    if revision != _CTR_SECTION_REVISION:
+        raise ValueError(
+            f"unsupported ctr section revision {revision}; this parser "
+            f"reads revision {_CTR_SECTION_REVISION}"
+        )
+    n_base_features = reader.next_int()
+    n_classes = reader.next_int()
+    prior_denom = reader.next_f64()
+    n_slots = reader.next_int()
+    n_columns = reader.next_int()
+    n_class = reader.next_int()
+    n_mean = reader.next_int()
+    n_counter = reader.next_int()
+    if n_base_features < 1 or n_classes < 1:
+        raise ValueError("corrupt ctr section: nonpositive header count")
+    if n_slots < 1 or n_columns < 1:
+        raise ValueError(
+            "corrupt ctr section: an active section carries at least one "
+            "slot and one column"
+        )
+    if n_class < 0 or n_mean < 0 or n_counter < 0:
+        raise ValueError("corrupt ctr section: negative table length")
+
+    source_features = reader.ints(n_slots)
+    for s, feature in enumerate(source_features):
+        if feature < 0 or feature >= n_base_features:
+            raise ValueError("corrupt ctr section: source feature out of range")
+        if s > 0 and feature <= source_features[s - 1]:
+            raise ValueError(
+                "corrupt ctr section: source features are not ascending"
+            )
+    slot_buckets = reader.ints(n_slots)
+    if any(b < 1 for b in slot_buckets):
+        raise ValueError("corrupt ctr section: nonpositive bucket count")
+
+    slot_code_offsets = reader.ints(n_slots + 1)
+    if slot_code_offsets[0] != 0:
+        raise ValueError("corrupt ctr section: code offsets must start at 0")
+    for s in range(n_slots):
+        lo = slot_code_offsets[s]
+        hi = slot_code_offsets[s + 1]
+        if hi < lo:
+            raise ValueError(
+                "corrupt ctr section: code offsets are not ascending"
+            )
+        if hi - lo + 1 != slot_buckets[s]:
+            raise ValueError(
+                f"corrupt ctr section: slot {s} carries {hi - lo} category "
+                f"codes but claims {slot_buckets[s]} buckets; a bucket is "
+                "one code plus the reserved bucket 0"
+            )
+    slot_codes = reader.ints(slot_code_offsets[n_slots])
+    for s in range(n_slots):
+        lo = slot_code_offsets[s]
+        hi = slot_code_offsets[s + 1]
+        for i in range(lo + 1, hi):
+            if slot_codes[i] <= slot_codes[i - 1]:
+                raise ValueError(
+                    "corrupt ctr section: category codes are not strictly "
+                    "ascending"
+                )
+        if lo < hi and slot_codes[lo] < 0:
+            raise ValueError("corrupt ctr section: negative category code")
+
+    counter_denominator = reader.ints(n_slots)
+
+    columns = []
+    for _ in range(n_columns):
+        slot = reader.next_int()
+        if slot < 0 or slot >= n_slots:
+            raise ValueError("corrupt ctr section: column slot out of range")
+        source = reader.next_int()
+        if source != source_features[slot]:
+            raise ValueError(
+                "corrupt ctr section: a column's source feature disagrees "
+                "with its slot"
+            )
+        ctr_type = reader.next_int()
+        target_border_idx = reader.next_int()
+        prior_index = reader.next_int()
+        prior = reader.next_f64()
+        border_count = reader.next_int()
+        if border_count < 1 or border_count >= _MAX_BINS:
+            raise ValueError(
+                f"corrupt ctr section: ctr_border_count must be in "
+                f"[1, {_MAX_BINS - 1}]; a ctr bucket is stored in a byte"
+            )
+        columns.append(
+            {
+                "slot": slot,
+                "source_feature": source,
+                "ctr_type": ctr_type,
+                "target_border_idx": target_border_idx,
+                "prior_index": prior_index,
+                "prior": prior,
+                "ctr_border_count": border_count,
+            }
+        )
+
+    class_offsets = reader.ints(n_slots + 1)
+    _check_ctr_offsets(class_offsets, n_class, "class")
+    class_table = reader.ints(n_class)
+    mean_offsets = reader.ints(n_slots + 1)
+    _check_ctr_offsets(mean_offsets, n_mean, "mean")
+    mean_sums = reader.floats(n_mean)
+    mean_counts = reader.ints(n_mean)
+    counter_offsets = reader.ints(n_slots + 1)
+    _check_ctr_offsets(counter_offsets, n_counter, "counter")
+    counter_counts = reader.ints(n_counter)
+
+    return {
+        "revision": revision,
+        "n_base_features": n_base_features,
+        "n_classes": n_classes,
+        "prior_denom": prior_denom,
+        "source_features": source_features,
+        "slot_buckets": slot_buckets,
+        "slot_code_offsets": slot_code_offsets,
+        "slot_codes": slot_codes,
+        "counter_denominator": counter_denominator,
+        "columns": columns,
+        "class_offsets": class_offsets,
+        "class_table": class_table,
+        "mean_offsets": mean_offsets,
+        "mean_sums": mean_sums,
+        "mean_counts": mean_counts,
+        "counter_offsets": counter_offsets,
+        "counter_counts": counter_counts,
+    }
+
+
+def _check_ctr_offsets(offsets, total, name):
+    """One slot-offset array as `_check_ctr_offsets` in
+    src/mojotrees/serialize.mojo checks it: starts at zero, never goes
+    backwards, and ends exactly at the array it indexes."""
+    if not offsets or offsets[0] != 0:
+        raise ValueError(f"corrupt ctr section: {name} offsets do not start at 0")
+    for i in range(1, len(offsets)):
+        if offsets[i] < offsets[i - 1]:
+            raise ValueError(
+                f"corrupt ctr section: {name} offsets are not ascending"
+            )
+    if offsets[-1] != total:
+        raise ValueError(
+            f"corrupt ctr section: {name} offsets end at {offsets[-1]}, not "
+            f"at the {total} entries they index"
+        )
+
+
+def _parse_usable(reader, version, n_features):
+    """The optional v5 `usable` section: the ascending pool a tree's split
+    search may draw from, LightGBM's `used_features`.
+
+    Absent -- every file before v5, and every v5 file whose pool was never
+    narrowed -- means every feature, which is what
+    `binning.all_features(n_features)` is and what the Mojo reader
+    substitutes.
+
+    Two things narrow it and both are training-time:
+    `fit_bins(feature_pre_filter=True)` and CatBoost-mode CTR replacement
+    through `BinMapper.drop_usable`. Nothing on the inference path reads it,
+    so it does not enter the dump schema; it is parsed because the section is
+    in the byte stream between `ctr` and `monotone` and a parser that skipped
+    it would read its feature ids as the monotone vector.
+    """
+    if version < 5 or reader.peek() != _USABLE_SECTION_TAG:
+        return list(range(n_features))
+    reader.expect(_USABLE_SECTION_TAG)
+    n = reader.next_int()
+    if n < 0 or n > n_features:
+        raise ValueError(
+            f"corrupt usable section: {n} entries for a mapper with "
+            f"{n_features} features"
+        )
+    pool = reader.ints(n)
+    previous = -1
+    for feature in pool:
+        if feature < 0 or feature >= n_features:
+            raise ValueError(
+                "corrupt usable section: feature id out of range"
+            )
+        if feature <= previous:
+            raise ValueError(
+                "corrupt usable section: feature ids are not strictly "
+                "ascending"
+            )
+        previous = feature
+    return pool
 
 
 def _parse_monotone(reader, n_features):
@@ -1241,6 +1510,23 @@ def _dump_from_text(model, feature_names=None):
     """The documented schema, rebuilt from the model text."""
     text, carried_names = _model_text(model)
     raw = parse_model_string(text)
+    # Parsing the `ctr` section is not describing it. Every field of this
+    # schema is sized by `mapper.n_features`, which counts base features
+    # only, while a CTR tree splits on ids up to `n_total_features() - 1`:
+    # `_feature_infos` would describe none of those columns and `node_at`
+    # would index `infos` past its end. The Mojo dump refuses the same model
+    # for the same reason (`ctr.check_ctr_model_support`, catalog A19), and
+    # the two sides of `dump_model` have to agree about what a v5 file can be
+    # turned into.
+    if raw["ctr"] is not None:
+        raise ValueError(
+            "a model carrying ctr columns cannot be described by this "
+            "schema: it is sized by mapper.n_features, which counts base "
+            "features only, while a ctr tree splits on ids up to "
+            "n_total_features() - 1 (catalog A19). The model itself saves, "
+            "loads and predicts, and parse_model_string returns its fitted "
+            "tables; this is the dump schema's gap"
+        )
     source = "model_to_string"
     # The text is the first source asked, because from v4 on it carries the
     # gains itself. The hook is what gives a model written in an older
@@ -1305,8 +1591,10 @@ def _dump_from_text(model, feature_names=None):
         "monotone_constraints": raw["monotone"],
         "has_split_gain": gains is not None,
         "has_node_count": has_count,
-        # The text fallback reads v1 through v4, which have no linear
-        # section; a linear (v5) model is dumped natively.
+        # False is a fact here rather than an assumption. The text fallback
+        # reads v1 through v5, and `parse_model_string` refuses the `linear`
+        # section by name, so any model that reaches this line has constant
+        # leaves. A linear model is dumped natively.
         "linear_tree": False,
         "tree_info": trees,
     }

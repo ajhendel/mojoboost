@@ -237,13 +237,19 @@ A30's own refusal is unaffected and still correct. Comment-only; whoever owns
 
 ## Part 4. What NOT to change, listed so it is not changed by accident
 
-- `python/mojotrees/inspection.py:104`,
-  `SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3, 4)`. This bounds the **Python
-  fallback parser**, which is a hand-written reader of the text format. It
-  cannot read a v5 file today and could not before this lane either (linear
-  trees already wrote v5), so its refusal is correct as it stands. Raising it
-  to include 5 without teaching that parser the `linear` and `ctr` sections
-  would turn a clean refusal into a mis-parse. Leave it.
+- ~~`python/mojotrees/inspection.py:104`,
+  `SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3, 4)`.~~ **SUPERSEDED.** The
+  reasoning above stands and became the specification: the tuple now reads
+  `(1, 2, 3, 4, 5)` because the parser was taught the sections, not because
+  the number was raised. `_parse_ctr` reads the `ctr` section and
+  `_parse_usable` reads the v5 `usable` section (the split-search pool,
+  `serialize._write_usable`); the `linear` section is **refused by name** in
+  `parse_model_string`, since rebuilding linear leaves there would duplicate
+  `linear_tree.mojo` and skipping it would describe a linear model as a
+  constant-leaf one. `dump_model`'s text fallback separately refuses a CTR
+  model by name, mirroring `ctr.check_ctr_model_support`, because the dump
+  schema is still sized by `mapper.n_features`. Parsing a section and
+  describing it are two claims and only the first was made.
 - `src/mojotrees/model_dump.mojo:93`, `MODEL_FORMAT_VERSION = 4`. It is the
   **base** version, not the maximum: a model with neither v5 section still
   writes v4, and `linear_model_format_version` raises it to 5 when the linear

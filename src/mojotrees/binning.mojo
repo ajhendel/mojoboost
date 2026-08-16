@@ -2801,12 +2801,13 @@ struct BinMapper(Copyable, Movable):
         copies `self.usable` and then has its CTR ids appended, and without
         this it would offer a column the training matrix did not.
 
-        `usable` is not written by `serialize`, so a mapper read back from a
-        file has the default pool again. That is inert rather than wrong:
-        nothing on the inference path consults `usable`, which is the pool
-        `sampling.select_tree_features` draws from and is read at fit time
-        only. Stated here rather than discovered, because the natural reading
-        of "model state" would have expected it to survive.
+        `usable` IS written by `serialize` -- the v5 `usable` section,
+        `_write_usable` / `_read_usable` -- so a mapper read back from a file
+        has the pool the fit left it with, and `BinMapper.matches` therefore
+        holds across a save and a load of a CatBoost-mode model. It did not
+        always: the section was added after the reset was found to turn
+        `save -> load -> update_dataset` into a refusal whose stated reason
+        ("binned differently") was not the real one.
         """
         var out = List[Int](capacity=len(self.usable))
         for i in range(len(self.usable)):

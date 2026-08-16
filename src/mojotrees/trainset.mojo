@@ -631,8 +631,9 @@ def _build_ctr[
     )
     # The same removal on the mapper, so a validation set or a prediction
     # batch transformed later is offered the same pool the trees were grown
-    # on. See `BinMapper.drop_usable` for what a serialize round trip does
-    # with it and why that is inert.
+    # on. The narrowing survives a save and a load: `serialize`'s v5 `usable`
+    # section carries it, which is what makes `BinMapper.matches` -- and so
+    # `update_dataset` on a model read back from disk -- agree with the fit.
     if len(replaced) > 0:
         mapper.drop_usable(replaced)
 
