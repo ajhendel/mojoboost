@@ -173,6 +173,41 @@ rather than here because it is keyed on an objective code and this module must
 not import the objective registry. They are a record of what CatBoost does,
 for a caller that asks for CatBoost's settings by name; nothing in this
 package reads them, and **this default does not move because of them**.
+
+The native default staying 1 is not the same statement as "no fit ever runs at
+10". `bindings/_mojotrees.mojo` resolves an unset `leaf_estimation_iterations`
+through `boosting.catboost_leaf_estimation_iterations` when the fit is in
+CatBoost mode (`grow_policy='symmetrictree'`), which is the standing rule --
+CatBoost mode mirrors CatBoost, `lossguide` mirrors LightGBM. That resolution
+happens at the boundary, where the objective code is known and the entry
+point's routing has already been settled; this constant is what every other
+surface, and every CatBoost-mode fit whose objective CatBoost also leaves at
+one step, still gets.
+"""
+
+comptime DEFAULT_BOOST_FROM_AVERAGE = True
+"""Whether boosting starts from the objective's optimal constant.
+
+**True, and true is what every fit in this repository has always done.**
+`boosting._base_score` computes the link of the weighted label mean (or the
+label percentile for `L1`, `QUANTILE` and `MAPE`, or the per-class log prior
+for `MULTICLASS`) and seeds every row's raw score with it, unconditionally.
+Naming that behavior does not change it: this default is LightGBM's own
+(`include/LightGBM/config.h:948-950`, `bool boost_from_average = true`, read
+from source at `bdf3704`), and a fit that leaves the parameter alone is
+bit-identical to the same fit before the parameter existed.
+
+CatBoost's static default is the opposite -- `false`
+(`catboost/private/libs/options/boosting_options.cpp:17`) -- raised to `true`
+for exactly seven losses by `AdjustBoostFromAverageDefaultValue`
+(`catboost/libs/train_lib/options_helper.cpp:353-374`, read from source at
+`58c7bb8`): `RMSE`, `MAE`, `Quantile`, `MAPE`, `MultiQuantile`, `MultiRMSE`
+and `MultiRMSEWithMissingValues`. `Logloss`, `CrossEntropy` and `MultiClass`
+keep `false`. That per-loss table is
+`auto_learning_rate.catboost_boost_from_average_default`, which lives there
+rather than here for the reason `catboost_leaf_estimation_iterations` lives in
+`boosting.mojo`: it is keyed on an objective code and this module must not
+import the objective registry.
 """
 
 comptime MONOTONE_BASIC = 0
@@ -1597,6 +1632,35 @@ struct ExtraTreeParams(Copyable, Movable):
     # so puts every path that does not read it out of reach.
     var score_function: Int
 
+    # LightGBM's `boost_from_average` (`include/LightGBM/config.h:948-950`,
+    # default `true`), which is also CatBoost's `boost_from_average`
+    # (`catboost/private/libs/options/boosting_options.cpp:17`, static default
+    # `false`, raised to `true` per loss by `AdjustBoostFromAverageDefaultValue`
+    # at `catboost/libs/train_lib/options_helper.cpp:353-374`).
+    #
+    # **This is a NAME for behavior that already existed, not a new
+    # mechanism.** `boosting._base_score` has always computed the optimal
+    # constant for the objective -- the link of the weighted label mean, or the
+    # label percentile for the renewing objectives -- and every trainer has
+    # always seeded its raw scores from it, with no way to ask for anything
+    # else short of a per-row `init_score`. `True` is therefore what every fit
+    # in this package has done since the beginning, which is LightGBM's default
+    # and is why turning the name on moves not one bit.
+    #
+    # `False` starts every row at 0.0 instead. That is CatBoost's resolved
+    # value for `Logloss`, `CrossEntropy` and `MultiClass`, and it is the
+    # difference the CatBoost-mode arm needs: on a Logloss cell CatBoost starts
+    # from zero and we started from the prior log-odds.
+    #
+    # The per-objective rule lives in
+    # `objective_registry.objective_init_kind`, which already names the five
+    # starting points this package uses; `False` is that registry's `INIT_ZERO`
+    # forced onto an objective whose kind is something else, rather than a
+    # sixth kind. `boost_from_average_disabled()` below is the test, so a fit
+    # that leaves this alone takes the identical path it took before the field
+    # existed.
+    var boost_from_average: Bool
+
     def __init__(out self):
         self.min_gain_to_split = 0.0
         self.max_delta_step = 0.0
@@ -1617,6 +1681,7 @@ struct ExtraTreeParams(Copyable, Movable):
         self.leaf_estimation_iterations = DEFAULT_LEAF_ESTIMATION_ITERATIONS
         self.derivative_precision = DERIV_PRECISION_FLOAT32
         self.score_function = SCORE_L2
+        self.boost_from_average = DEFAULT_BOOST_FROM_AVERAGE
 
     @staticmethod
     def default() -> ExtraTreeParams:
@@ -1756,6 +1821,22 @@ struct ExtraTreeParams(Copyable, Movable):
         to the first value that could round differently from the histogram's.
         """
         return self.leaf_estimation_iterations > 1
+
+    def boost_from_average_disabled(self) -> Bool:
+        """Whether boosting must start from 0.0 rather than from the
+        objective's optimal constant.
+
+        False at the default of True, where `boosting._base_score` is called
+        exactly as it always was and no comparison this field takes part in can
+        move a number. The test is phrased as "disabled" rather than as the
+        field itself so that the *active* direction is the one that costs
+        something, which is the shape `leaf_estimation_active` and
+        `is_active()` already take on this bundle: a fit that never names the
+        parameter is on the same instruction path it was on before the field
+        existed, and the trainers that cannot honor `False` test one Bool to
+        refuse it by name.
+        """
+        return not self.boost_from_average
 
     def needs_leaf_finish(self) -> Bool:
         """Whether `finish_leaf_output` would move a leaf's value.

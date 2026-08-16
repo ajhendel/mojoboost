@@ -349,6 +349,46 @@ class _Base(_ParamsMixin):
     loss is exactly the quadratic one Newton step already minimizes.
     `boosting_type="ordered"` and its five knobs are described above.
 
+    Left unset under `grow_policy="symmetrictree"` it resolves **per
+    objective as CatBoost does** rather than to 1: `Logloss` and
+    `CrossEntropy` to 10, `RMSE` and `MultiClass` to 1, read from
+    `GetEstimationMethodDefaults` in
+    `catboost/private/libs/options/catboost_options.cpp`. Under `lossguide`
+    it stays at 1, which is LightGBM's behavior. That is the standing rule
+    again, and it is the reason the parameter existing was not the same thing
+    as the parameter being reachable: until 2026-08-16 only a plain
+    `estimator.fit()` accepted it, while `mojotrees.train(params, Dataset)`
+    -- which the benchmark suite trains through -- refused it by name, so
+    every CatBoost-mode Logloss comparison had CatBoost taking ten Newton
+    steps and mojotrees taking one.
+
+    `random_strength_seed` is the seed the per-split score noise is drawn
+    from. It is a seed like `bagging_seed` and follows `random_state` by the
+    same rule, and it exists because until 2026-08-16 it did not: the noise
+    stream ran from a native constant no matter what a caller passed for
+    `random_state`, which made a `random_strength > 0` fit reproducible only
+    by accident. The draw is keyed by (seed, tree, node, feature, bin) and by
+    nothing else, so it is the same value at every `MOJOTREES_NUM_WORKERS`
+    and on either device.
+
+    `boost_from_average` is **LightGBM's** parameter as much as CatBoost's,
+    so both halves of the standing rule apply to it, and it names behavior
+    this package always had rather than adding any: `boosting._base_score`
+    has seeded every fit from the objective's optimal constant since the
+    beginning. `True` is therefore both LightGBM's default
+    (`include/LightGBM/config.h:948`) and a no-op, and `lossguide` keeps it.
+    `False` starts every row at 0.0; it is honored by the dense
+    single-output CPU and GPU round loops and refused by name everywhere
+    else, including continued training, whose starting point was decided by
+    the original fit. Under `grow_policy="symmetrictree"` an unset value
+    resolves per objective as CatBoost resolves it
+    (`AdjustBoostFromAverageDefaultValue`, `options_helper.cpp:353-374`): on
+    for `RMSE`, `MAE`, `Quantile` and `MAPE`, off for `Logloss`,
+    `CrossEntropy` and `MultiClass`. Note that this is a place where the two
+    engines genuinely disagree and an earlier reading that all three arms
+    agreed came from LightGBM's default alone: on a Logloss cell CatBoost
+    starts from zero and both other engines start from the prior log-odds.
+
     `score_function` selects the functional a split candidate is scored by:
     `"L2"` (the default) is `G**2 / (H + reg_lambda)`, which is what every
     fit here has always maximized, and `"Cosine"` is CatBoost's own default,
@@ -600,9 +640,37 @@ class _Base(_ParamsMixin):
         od_wait=None,
         n_iter_no_change=None,
         random_strength=None,
+        # CatBoost's seed for the per-split score noise
+        # (`ExtraTreeParams.random_strength_seed`,
+        # `tree_parameters_extra.DEFAULT_RANDOM_STRENGTH_SEED`, which is 0).
+        # A real default rather than `None`, because it is a seed and
+        # `_SEEDS` below is the mechanism that lets `random_state` fill it:
+        # that loop overrides a seed only while it still equals its stock
+        # default, so the stock default has to be a number here.
+        #
+        # Until this parameter existed the split-score noise ran from the
+        # native constant no matter what the caller passed for
+        # `random_state`, while every other draw in the fit followed it.
+        random_strength_seed=0,
         bootstrap_type=None,
         bagging_temperature=None,
         leaf_estimation_iterations=None,
+        # LightGBM's and CatBoost's `boost_from_average`. Three states, and
+        # `None` is not "off": it is "whatever the grow policy implies",
+        # which under `lossguide` and `depthwise` is LightGBM's own default
+        # of True (`include/LightGBM/config.h:948`) and is what every fit
+        # this package has ever made already did, and under
+        # `symmetrictree` is CatBoost's PER-OBJECTIVE resolution -- True for
+        # RMSE, MAE, Quantile and MAPE, False for Logloss, CrossEntropy and
+        # MultiClass (`options_helper.cpp:353-374`). `True` and `False`
+        # override it either way.
+        #
+        # The per-objective half is resolved natively, in `_parse_params`,
+        # for the reason the learning rate's derivation is: the table is
+        # `auto_learning_rate.catboost_boost_from_average_default` and a
+        # Python copy of it would be a second table to keep true. What
+        # crosses the boundary is the value plus whether anybody typed it.
+        boost_from_average=None,
         # CatBoost's automatic learning rate (catalog A12/A38). Three states,
         # and `None` is not "off": it is "whatever the grow policy implies",
         # which is ON under `grow_policy='symmetrictree'` and OFF under every
@@ -742,9 +810,11 @@ class _Base(_ParamsMixin):
         self.od_wait = od_wait
         self.n_iter_no_change = n_iter_no_change
         self.random_strength = random_strength
+        self.random_strength_seed = random_strength_seed
         self.bootstrap_type = bootstrap_type
         self.bagging_temperature = bagging_temperature
         self.leaf_estimation_iterations = leaf_estimation_iterations
+        self.boost_from_average = boost_from_average
         self.auto_learning_rate = auto_learning_rate
         self.score_function = score_function
         self.max_ctr_complexity = max_ctr_complexity
@@ -1385,6 +1455,23 @@ class _Base(_ParamsMixin):
         # it is a parameter at all is that the permutation is then
         # reproducible by name.
         "ordered_seed": 0,
+        # `tree_parameters_extra.DEFAULT_RANDOM_STRENGTH_SEED`, which is 0.
+        # CatBoost's per-split score noise comes off its single `random_seed`
+        # too, so 0 here is the same "CatBoost-inherited seeds are all 0"
+        # family as `ordered_seed` and `bootstrap_seed`; the streams are kept
+        # apart by their domain constants
+        # (`tree_parameters_extra._RANDOM_SCORE_DOMAIN`) and not by distinct
+        # seed numbers.
+        #
+        # **Added 2026-08-16, and its absence was a reproducibility hole
+        # rather than a wrong number.** The draw was always deterministic --
+        # keyed by (seed, tree, node, feature, bin) and by nothing else -- but
+        # the seed was unreachable from Python, so `random_state` fanned out
+        # to six draws and not to the seventh. With `random_strength`
+        # reachable and CatBoost mode about to carry a positive strength by
+        # default, that is the difference between a seeded fit and a fit that
+        # repeats only because nothing asked it not to.
+        "random_strength_seed": 0,
     }
 
     def _resolve_seeds(self):
@@ -2365,6 +2452,38 @@ class _Base(_ParamsMixin):
                 if self.leaf_estimation_iterations is None
                 else int(self.leaf_estimation_iterations)
             ),
+            # Provenance, not a value. `_parse_params` resolves an UNSET
+            # count through `boosting.catboost_leaf_estimation_iterations`
+            # when the fit is in CatBoost mode, and "unset" cannot be
+            # recovered from the 1 above: a caller who types 1 has decided
+            # something and a caller who types nothing has not. That is
+            # CatBoost's own gate, which reads `TOption::NotSet()` rather
+            # than comparing against a default (`option.h:80-85`).
+            "leaf_estimation_iterations_set": int(
+                self.leaf_estimation_iterations is not None
+            ),
+            # LightGBM's and CatBoost's `boost_from_average`, sent as a
+            # value plus its provenance for the same reason. The value
+            # itself is True when unset, which is LightGBM's default
+            # (config.h:948) and is what `boosting._base_score` has always
+            # done, so a fit that never names it makes the identical call it
+            # made before this key existed; the native side replaces it with
+            # CatBoost's per-objective answer only when the mode default
+            # applies and the entry point can honor it.
+            "boost_from_average": int(
+                True
+                if self.boost_from_average is None
+                else bool(self.boost_from_average)
+            ),
+            "boost_from_average_set": int(
+                self.boost_from_average is not None
+            ),
+            # Whether the two keys above may take a CatBoost per-objective
+            # default. `symmetrictree` is CatBoost mode and mirrors CatBoost;
+            # `lossguide` and `depthwise` mirror LightGBM, which resolves
+            # neither parameter per loss. One key for both, because it is one
+            # fact about the fit and two copies of it could disagree.
+            "catboost_mode_defaults": int(grow_policy == "symmetrictree"),
             # CatBoost's `score_function`: which functional a split candidate
             # is scored by (`split.SCORE_L2` / `split.SCORE_COSINE`).
             # Lowercased here and nowhere else -- the native
@@ -2408,6 +2527,13 @@ class _Base(_ParamsMixin):
             # and a loss function refuse it by name there.
             **auto_learning_rate_knobs,
             "random_strength": float(self.random_strength or 0.0),
+            # The seed that noise stream is keyed from. Through
+            # `_resolve_seeds` like every other per-component seed, so
+            # `random_state` reaches it by the same rule: an explicitly named
+            # seed wins, an unnamed one follows the global. Inert whenever
+            # `random_strength` is 0, which is the default, so this key costs
+            # an unnoised fit nothing.
+            "random_strength_seed": int(seeds["random_strength_seed"]),
             "max_delta_step": float(self.max_delta_step),
             "path_smooth": float(self.path_smooth),
             # int, not bool: the binding reads it as an integer.

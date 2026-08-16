@@ -306,6 +306,7 @@ from .boosting import (
     _estimate_leaf_values,
     _fill_grad_hess,
     _mean_loss,
+    _refuse_boost_from_average,
     _refuse_leaf_estimation,
     _renew_leaf_values,
     _check_goss,
@@ -3136,7 +3137,17 @@ def _train_gpu_rounds[
         raise Error("GPU training requires an accelerator")
     else:
         var n = data.n_rows
-        var base_score = _base_score(target, objective, sample_weight, alpha)
+        # `boost_from_average`, threaded here for the reason
+        # `boosting.train` threads it: the device loop starts from the same
+        # constant the host loop does, so the parameter has to reach both or
+        # a CatBoost-mode fit would mean two different things by device.
+        var base_score = _base_score(
+            target,
+            objective,
+            sample_weight,
+            alpha,
+            params.tree.extra.boost_from_average,
+        )
 
         var signs = params.tree.monotone.active_signs()
         var renews = objective_renews_leaves(objective)
@@ -3757,6 +3768,14 @@ def _train_custom_gpu_rounds[
         # re-differentiated at a shifted score, which is a call shape
         # `GradHessFn` does not have. Refused by name rather than ignored.
         _refuse_leaf_estimation(params.tree.extra, "train_custom_gpu")
+        # `boost_from_average` does not apply to a custom objective at all:
+        # the framework does not know a callback's link, which is why
+        # `objective_registry.objective_init_kind` gives CUSTOM `INIT_CALLER`
+        # and the caller passes `base_score` outright. LightGBM draws the same
+        # line, guarding `GBDT::BoostFromAverage` on
+        # `objective_function_ != nullptr` (gbdt.cpp:331). Refused rather than
+        # ignored, so a false says so instead of appearing to work.
+        _refuse_boost_from_average(params.tree.extra, "train_custom_gpu")
         var n = data.n_rows
         var raw = List[Float64](capacity=n)
         for _ in range(n):
@@ -4081,6 +4100,16 @@ def _train_multiclass_gpu_rounds[
         # do not have. CatBoost defaults `MultiClass` to 1 Newton iteration
         # anyway (`boosting.catboost_leaf_estimation_iterations`).
         _refuse_leaf_estimation(
+            params.tree.extra, "the multiclass GPU trainers"
+        )
+        # `boost_from_average=false`, refused here for a reason that is not
+        # the one above. The multiclass loops seed every row with the per-class
+        # log priors and no multiclass trainer in this package takes a zero
+        # start, so there is nothing to thread the value into. CatBoost does
+        # not support the pair either: `MultiClass` is absent from the
+        # `CB_ENSURE` list at `catboost_options.cpp:703-711`, so asking
+        # CatBoost for it raises rather than resolving.
+        _refuse_boost_from_average(
             params.tree.extra, "the multiclass GPU trainers"
         )
         var n = data.n_rows
@@ -4664,7 +4693,16 @@ def _train_gpu_valid_rounds[
         raise Error("GPU training requires an accelerator")
     else:
         var n = data.n_rows
-        var base_score = _base_score(target, objective, sample_weight, alpha)
+        # `boost_from_average`, threaded for the reason `train_gpu` threads
+        # it. `scorer.start` below takes the same number, so the validation
+        # stream starts where the training stream does.
+        var base_score = _base_score(
+            target,
+            objective,
+            sample_weight,
+            alpha,
+            params.tree.extra.boost_from_average,
+        )
         var raw = List[Float64](capacity=n)
         for _ in range(n):
             raw.append(base_score)

@@ -185,7 +185,29 @@ FEATURES = (
         trainer_refusals=("_refuse_leaf_estimation",),
         note=(
             "train_gpu implements it (_check_leaf_estimation_config plus "
-            "GpuLeafEstimator); the sparse and custom trainers refuse it"
+            "GpuLeafEstimator); the sparse and custom trainers refuse it. "
+            "Three call sites declare leaf_estimation_ok as of 2026-08-16 "
+            "(fit, train_dataset on its dense arms, booster_update), each "
+            "chosen by which round loop it reaches; the rest inherit the "
+            "False default and refuse by name. Same caveat as "
+            "random_strength: this tool reads the flag, not the routing "
+            "behind it"
+        ),
+    ),
+    Feature(
+        name="boost_from_average",
+        policy_guard=None,
+        policy_block=None,
+        workload_kwarg=None,
+        ok_flag="boost_from_average_ok",
+        trainer_refusals=("_refuse_boost_from_average",),
+        note=(
+            "only false is refusable; true is boosting._base_score's "
+            "unconditional behavior and LightGBM's default. Two call sites "
+            "declare it (fit, train_dataset on its dense arms). It tracks "
+            "leaf_estimation_ok everywhere except booster_update, whose "
+            "trainer reads the iteration count but never calls "
+            "boosting._base_score"
         ),
     ),
     Feature(

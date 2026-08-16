@@ -470,6 +470,14 @@ gradient kernel and no base score the framework can pick."""
 # a caller can answer "what does this model boost from" without running a
 # trainer, and so a custom objective can be pointed at the matching rule
 # (`matching_base_score` in objective.mojo).
+#
+# `boost_from_average=false` (`ExtraTreeParams.boost_from_average`) forces an
+# objective onto `INIT_ZERO` rather than adding a sixth rule: the parameter is
+# an off switch on the rule this table names, not a different starting point.
+# So this table stays the answer to "what does this objective boost from at
+# the defaults", and the parameter is the one thing that can override it. The
+# two objectives already on `INIT_ZERO` are unaffected by it, and `INIT_CALLER`
+# is out of its reach for the reason stated below.
 comptime INIT_LINK_MEAN = 0
 """The link of the weighted label mean: the mean itself under the identity
 link, its logit under the sigmoid, its logarithm under exp."""

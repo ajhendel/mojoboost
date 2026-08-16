@@ -356,8 +356,27 @@ ACKNOWLEDGED = {
     ),
     ("leaf_estimation_iterations", "bindings/_mojotrees.mojo"): (
         "RESOLVED",
-        ":786 fires on 'not leaf_estimation_ok', and every construction site "
-        "in this file passes leaf_estimation_ok=True (:1192)",
+        "the refusal fires on 'not leaf_estimation_ok'. Three of the fifteen "
+        "_parse_params call sites pass True as of 2026-08-16, chosen by which "
+        "trainer the entry point routes to: fit (plain fork), train_dataset "
+        "(dense arms; the sparse arm has no such trainer) and booster_update "
+        "(boosting.train_more). Before that date only fit passed it, which is "
+        "why bench/real_data -- which trains through train_dataset -- ran "
+        "every CatBoost-mode Logloss cell at one Newton step against "
+        "CatBoost's ten. The earlier note here claimed every construction "
+        "site passed True; that was never so",
+    ),
+    ("boost_from_average", "bindings/_mojotrees.mojo"): (
+        "RESOLVED",
+        "only false is refusable: true is what boosting._base_score has "
+        "always done and is LightGBM's default (config.h:948). "
+        "boost_from_average_ok is True at fit and train_dataset (dense arms) "
+        "and nowhere else. It is a SEPARATE flag from leaf_estimation_ok, "
+        "which it otherwise tracks, because booster_update reaches "
+        "boosting.train_more: that loop reads leaf_estimation_iterations but "
+        "starts from the model's stored base score and never calls "
+        "boosting._base_score, so sharing one flag would have accepted a "
+        "false and ignored it",
     ),
     ("boosting_type", "src/mojotrees/params.mojo"): (
         "RESOLVED",

@@ -157,6 +157,7 @@ from mojotrees.auto_learning_rate import (
     AUTO_LR_TASK_CPU,
     AUTO_LR_TASK_GPU,
     AutoLearningRateParams,
+    catboost_boost_from_average_default,
     resolve_learning_rate,
 )
 from mojotrees.objective_registry import (
@@ -171,6 +172,7 @@ from mojotrees.boosting import (
     BoosterParams,
     IterationRange,
     _softmax_inplace,
+    catboost_leaf_estimation_iterations,
 )
 from mojotrees.callback import (
     BEFORE_ITERATION,
@@ -694,6 +696,17 @@ def _parse_monotone(
 # Shared because it is one reason and not three: what disqualifies them is
 # the eval set itself, which is the only thing all three have in common and
 # is exactly the input CatBoost's `use_best_model` is resolved from.
+comptime _NO_CATBOOST_DEFAULTS = -1
+"""`_parse_params`'s "this entry point resolves no CatBoost-mode default".
+
+Negative because every objective code in `objective_registry` is nonnegative,
+so no loss can ever collide with it and no call site can mean it by accident.
+It is a distinct sentinel from `auto_lr_objective`'s `CUSTOM` default on
+purpose: `CUSTOM` is a real objective that `fit_custom` really passes, so it
+cannot also carry "nothing was declared here" without the two meanings landing
+on one number.
+"""
+
 comptime _AUTO_LR_EVAL_SET_REASON = (
     "an eval_set is what makes CatBoost's use_best_model resolvable"
     " (UpdateUseBestModel, options_helper.cpp:100-113, which forces it false"
@@ -725,12 +738,14 @@ def _parse_params(
     entry: String = "",
     ordered_ok: Bool = False,
     leaf_estimation_ok: Bool = False,
+    boost_from_average_ok: Bool = False,
     score_function_ok: Bool = False,
     random_strength_ok: Bool = False,
     auto_lr_ok: Bool = False,
     auto_lr_reason: String = "",
     auto_lr_rows: Int = 0,
     auto_lr_objective: Int = _CUSTOM_OBJECTIVE,
+    catboost_defaults_objective: Int = _NO_CATBOOST_DEFAULTS,
 ) raises -> BoosterParams:
     """The `BoosterParams` a fit runs under, from the params mapping.
 
@@ -774,10 +789,93 @@ def _parse_params(
     - `leaf_estimation_ok`: CatBoost's `leaf_estimation_iterations`. Honored
       by `boosting.train`, `boosting.train_more`, `boosting.train_with_valid`,
       `train_gpu.train_gpu` and `train_gpu.train_gpu_with_valid`, and by
-      nothing else, so **`fit` alone** passes True. `fit_with_metrics` does
-      not, and the near miss is worth recording: it routes to
-      `custom_metric.fit_with_metrics`, which is a different round loop from
-      `boosting.train_with_valid` and reads the field nowhere.
+      nothing else. `fit_with_metrics` does not qualify, and the near miss is
+      worth recording: it routes to `custom_metric.fit_with_metrics`, which is
+      a different round loop from `boosting.train_with_valid` and reads the
+      field nowhere.
+
+      **This flag was True at `fit` alone until 2026-08-16, and that was the
+      same defect `random_strength_ok` had before it**: `bench/real_data`
+      trains through `mojotrees.train(params, Dataset)`, which is
+      `train_dataset` below, so on every CatBoost-mode Logloss cell CatBoost
+      took ten Newton steps per leaf and we took one -- while a comparison
+      table transcribed from an RMSE fit, where CatBoost also takes one,
+      reported the two engines as agreeing. The flag now follows the routing at
+      all fifteen call sites, and the verdicts are:
+
+      - `fit` -- True. Its plain fork reaches `boosting.train` or
+        `train_gpu.train_gpu`. Its other two forks are refused by name below,
+        beside `ordered`'s and `random_strength`'s: `alternate_boosting.
+        fit_boosting` (dart and rf) and `custom_metric.fit_with_metrics`
+        (`linear_tree`) run their own round loops and read the field nowhere.
+      - `train_dataset` -- True on the dense arms only (`not is_sparse`).
+        `trainset.train_dataset` forks three ways and two of them qualify:
+        the dense CPU arm is `boosting.train` and the GPU arm is
+        `train_gpu.train_gpu`. The sparse arm is `boosting_sparse.
+        train_sparse`, which does not implement the extra steps, so the fork
+        is settled here rather than left to the trainer. Note this is a
+        WIDER condition than `random_strength_ok`'s `scale_is_computed` two
+        lines above it, and the difference is real: the per-tree noise scale
+        is computed by the dense CPU loops alone, while the extra Newton
+        steps are implemented on the device too.
+      - `booster_update` -- True, unconditional. `trainset.update_dataset`
+        refuses a sparse dataset by name, takes no device argument, and calls
+        `boosting.train_more`, which is `_boost_rounds` with a round offset
+        and reads the field at `boosting.mojo:2345`. Unconditional rather
+        than a sparse test for the reason its `random_strength_ok=True` is:
+        a sparse continued fit should get `update_dataset`'s own message
+        about continued training, not a message about leaf estimation.
+      - `fit_with_metrics`, `fit_multiclass_with_metrics`,
+        `fit_ranker_with_metrics` -- False. All three land in
+        `custom_metric`'s round loops, none of which reads the field.
+      - `fit_multiclass`, `train_dataset_multiclass`,
+        `booster_update_multiclass` -- False. `boosting.train_multiclass`,
+        `train_multiclass_gpu` and `boosting_sparse.train_multiclass_sparse`
+        read the field nowhere. Nothing is lost by this: CatBoost resolves
+        MultiClass to **1** as well (`catboost_options.cpp:106-112`; the 10
+        in that block is the Gradient slot and is not the default), so the
+        refusal fires only on a value CatBoost would not have chosen either.
+      - `fit_csc`, `fit_multiclass_csc` -- False. `boosting_sparse` and
+        `train_gpu_sparse` do not implement it; `train_gpu_sparse` already
+        refuses it itself at `train_gpu_sparse.mojo:242`.
+      - `fit_ranker`, `train_dataset_ranker` -- False. `ranking.train_ranker`
+        reads the field nowhere. CatBoost resolves `LambdaMart` to 1
+        (`catboost_options.cpp:199-205`), so again the refusal fires only
+        above CatBoost's own value.
+      - `fit_custom` -- False. A callback objective is a pair of derivative
+        buffers; there is no loss to re-evaluate a leaf's rows at, which is
+        what an extra Newton step is. `train_gpu` refuses the same pair at
+        `train_gpu.mojo:3759`.
+      - `distributed_train_local` -- False. `distributed_strategies` grows
+        and shrinks its own trees and never calls
+        `boosting._estimate_leaf_values`.
+    - `boost_from_average_ok`: LightGBM's and CatBoost's
+      `boost_from_average`. Only `False` is refusable, because `True` is what
+      every trainer in this package does and has always done
+      (`boosting._base_score`, called unconditionally by all fourteen of its
+      callers before 2026-08-16). So this flag decides who may start from
+      **zero**, and the honoring trainers are the four that thread the value
+      into that call: `boosting.train`, `boosting.train_with_valid`,
+      `train_gpu.train_gpu` and `train_gpu.train_gpu_with_valid`.
+
+      **Its verdicts are the same as `leaf_estimation_ok`'s except at
+      `booster_update`, and that exception is the reason it is a second flag
+      rather than a reuse of the first.** `trainset.update_dataset` reaches
+      `boosting.train_more`, which reads
+      `leaf_estimation_iterations` and so may honor it, but which starts from
+      the base score already stored on the model and never calls
+      `boosting._base_score` at all. A `False` accepted there would be
+      accepted and ignored, which is exactly the defect the rest of this
+      docstring exists to prevent, so `booster_update` passes
+      `leaf_estimation_ok=True` and `boost_from_average_ok` at its default.
+      That leaves True at two call sites: `fit` (plain fork; its dart, rf and
+      linear forks are refused by name below) and `train_dataset` on its
+      dense arms.
+
+      A continued fit therefore takes the ORIGINAL fit's starting point,
+      which is the only coherent answer -- half an ensemble cannot start
+      somewhere else -- and naming the parameter on an update says so instead
+      of appearing to work.
     - `score_function_ok`: CatBoost's `score_function`
       (src/mojotrees/split.mojo, `SCORE_COSINE`). Honored by every trainer
       that elects a split through `tree._search` or
@@ -832,6 +930,31 @@ def _parse_params(
       per-call-site argument rather than a table here because the reason
       differs by entry point and a shared message would have to be vague
       enough to be true of all six.
+    - `catboost_defaults_objective` is the objective code the CatBoost-mode
+      per-objective defaults are resolved for, and `_NO_CATBOOST_DEFAULTS`
+      means "this entry point resolves none". It is a separate argument from
+      `auto_lr_objective`, which carries the same number at eight call sites,
+      and the duplication is deliberate: `auto_lr_objective` defaults to
+      `CUSTOM`, which is a legitimate value for it (`fit_custom` really does
+      have a custom objective), so a mode-default resolver reusing it would
+      silently resolve five entry points as CUSTOM instead of declining. Two
+      arguments with two sentinels is the only shape in which a forgotten call
+      site declines rather than resolves the wrong loss.
+
+      **A mode default is only ever applied where the value can be honored.**
+      `leaf_estimation_iterations` resolves through
+      `boosting.catboost_leaf_estimation_iterations`, so the objectives whose
+      CatBoost value is above 1 (`Logloss` 10, `CrossEntropy` 10, `Poisson` 10)
+      only reach it at the three call sites that also pass
+      `leaf_estimation_ok`; `boost_from_average` resolves through
+      `auto_learning_rate.catboost_boost_from_average_default`, whose False
+      answers only reach the same three. Everywhere else the value stays at the
+      LightGBM default this package has always had, and an EXPLICIT request is
+      refused by name below. That is the difference between a default and a
+      request, and it is the same line `auto_lr_ok` / `auto_lr_required` draw:
+      an inherited mode default an entry point cannot honor declines in
+      silence, because that is what CatBoost itself does when its own table has
+      no row; a value the caller typed is refused.
     """
     var who = entry.copy()
     if who.byte_length() == 0:
@@ -848,9 +971,36 @@ def _parse_params(
     # surface for exactly the reason handled here, that a string reaches
     # trainers that do not implement it.
     var extra = extra_params_from_mapping(params, n_features)
+    # CatBoost mode resolves this per objective; `lossguide` does not resolve
+    # it at all. `catboost_defaults` is 1 when the estimator's grow policy is
+    # `symmetrictree` AND the caller did not name a value, which is the same
+    # "unset is provenance, not a value" rule `auto_learning_rate` already
+    # keeps: CatBoost's own gate reads `TOption::NotSet()` and not a
+    # comparison against the default (`option.h:80-85`), so a caller who types
+    # 1 has typed something and a caller who types nothing has not.
+    var catboost_defaults = Int(py=params["catboost_mode_defaults"]) != 0
+    var leaf_iters_named = (
+        Int(py=params["leaf_estimation_iterations_set"]) != 0
+    )
     extra.leaf_estimation_iterations = Int(
         py=params["leaf_estimation_iterations"]
     )
+    if (
+        catboost_defaults
+        and not leaf_iters_named
+        and leaf_estimation_ok
+        and catboost_defaults_objective != _NO_CATBOOST_DEFAULTS
+    ):
+        # The mode default. Gated on `leaf_estimation_ok` as well as on the
+        # mode, so a CatBoost-mode fit that landed on an entry point which
+        # cannot take the extra steps keeps 1 and trains, rather than
+        # resolving a 10 this function would then have to refuse. An inherited
+        # default that an entry point cannot honor declines; only a value the
+        # caller typed is refused. That is `auto_lr_required`'s rule, applied
+        # to the second parameter that has a mode default.
+        extra.leaf_estimation_iterations = (
+            catboost_leaf_estimation_iterations(catboost_defaults_objective)
+        )
     if extra.leaf_estimation_active() and not leaf_estimation_ok:
         raise Error(
             "leaf_estimation_iterations > 1 is not implemented by ",
@@ -861,6 +1011,74 @@ def _parse_params(
             " through a dense, single-output fit without a custom objective."
             " 1 is LightGBM's behavior and mojotrees's, and is the default",
         )
+
+    # LightGBM's and CatBoost's `boost_from_average`, and the one parameter
+    # here that NAMES behavior this package already had rather than reaching
+    # something that was unreachable. `boosting._base_score` has always seeded
+    # every row from the objective's optimal constant, so `true` -- LightGBM's
+    # default (`config.h:948`) and the default under `lossguide` -- is
+    # bit-identical to every fit made before this key existed. `false` starts
+    # from 0.0 and is what CatBoost resolves for `Logloss`, `CrossEntropy` and
+    # `MultiClass`.
+    #
+    # The mode default is resolved here rather than in the estimator for the
+    # reason the leaf count is: the per-loss table is
+    # `auto_learning_rate.catboost_boost_from_average_default`, transcribed
+    # from `options_helper.cpp:353-374` with the objective codes this package
+    # uses, and a Python copy of it would be a second table to keep true.
+    var bfa_named = Int(py=params["boost_from_average_set"]) != 0
+    extra.boost_from_average = Int(py=params["boost_from_average"]) != 0
+    if (
+        catboost_defaults
+        and not bfa_named
+        and boost_from_average_ok
+        and catboost_defaults_objective != _NO_CATBOOST_DEFAULTS
+    ):
+        extra.boost_from_average = catboost_boost_from_average_default(
+            catboost_defaults_objective
+        )
+    if extra.boost_from_average_disabled() and not boost_from_average_ok:
+        raise Error(
+            "boost_from_average=false is not honored by ",
+            who,
+            ": the trainers that thread it into boosting._base_score are"
+            " boosting.train, boosting.train_with_valid, train_gpu.train_gpu"
+            " and train_gpu.train_gpu_with_valid, which this estimator"
+            " reaches through a dense, single-output fit. Every other round"
+            " loop seeds its raw scores from the objective's optimal constant"
+            " unconditionally -- the multiclass loops from the per-class log"
+            " priors, the ranking loops from zero already -- so accepting"
+            " false here would start from the label mean under a parameter"
+            " that asked for zero. true is LightGBM's default"
+            " (include/LightGBM/config.h:948) and is mojotrees's behavior on"
+            " every trainer. For a per-row offset instead, pass init_score",
+        )
+
+    # CatBoost's `random_strength_seed`, the seed the per-split score noise is
+    # keyed from. Parsed here beside the strength rather than in
+    # `extra_params_from_mapping`, because the two are one mechanism and the
+    # refusal below reads both.
+    #
+    # Until this line, `ExtraTreeParams.random_strength_seed` took
+    # `DEFAULT_RANDOM_STRENGTH_SEED` on every fit that came through Python
+    # while `random_state` fanned out to six other seeds, so a user who seeded
+    # a run seeded everything about it EXCEPT the split-score noise. That is a
+    # reproducibility hole rather than a wrong number -- the draw was always
+    # deterministic, it just could not be moved -- and with `random_strength`
+    # reachable it is the difference between a seeded fit and a fit that
+    # repeats only because nothing asked it not to. `sklearn._SEEDS` now
+    # carries the name, so `random_state` reaches it by the same rule as
+    # `bagging_seed` and the rest: an explicitly named seed wins, an unnamed
+    # one follows the global.
+    #
+    # No reachability flag. The draw is keyed by (seed, tree, node, feature,
+    # bin) and by nothing else (`tree_parameters_extra.random_score_stream`),
+    # the device backend keys it identically
+    # (`gpu_split_search.gpu_random_score_stream`, same domain constant), and
+    # the seed is inert whenever `random_strength` is 0. So the entry points
+    # that may carry a seed are exactly the entry points that may carry a
+    # strength, and `random_strength_ok` right below already decides that.
+    extra.random_strength_seed = Int(py=params["random_strength_seed"])
     # CatBoost's `random_strength`. The noise and its per-tree scale are both
     # implemented; the dense CPU round loops compute the scale onto their own
     # copy of the bundle before growth, which is why the strength can arrive
@@ -1391,6 +1609,12 @@ def fit(
         # trainer.
         random_strength_ok=device == CPU_DEVICE,
         leaf_estimation_ok=True,
+        # Same fork, same shape: the plain CPU and GPU forks both thread
+        # `boost_from_average` into `boosting._base_score`, and the dart, rf
+        # and linear forks are refused by name a few statements below,
+        # because they are selected by `boosting` and `bp.linear` and neither
+        # is known until this call has returned.
+        boost_from_average_ok=True,
         score_function_ok=True,
         # CatBoost's automatic learning rate. Unconditional here, and the
         # fork does not have to be settled the way `ordered_ok`'s does: the
@@ -1403,6 +1627,11 @@ def fit(
         auto_lr_ok=True,
         auto_lr_rows=nr,
         auto_lr_objective=Int(py=objective),
+        # CatBoost mode's per-objective defaults for
+        # `leaf_estimation_iterations` and `boost_from_average`. The same
+        # code `auto_lr_objective` gets, declared separately because the two
+        # sentinels mean different things; see `_parse_params`.
+        catboost_defaults_objective=Int(py=objective),
     )
     var weights = _parse_weights(params, nr)
     # CatBoost's `bootstrap_type`. This entry point is the ONLY one in this
@@ -1459,6 +1688,62 @@ def fit(
             " round loop never calls boosting._round_random_score_scale, so"
             " the per-tree scale CatBoost's noise is drawn at would be zero."
             " Set random_strength=0, or drop linear_tree"
+        )
+    # `leaf_estimation_iterations`'s and `boost_from_average`'s two CPU forks,
+    # exactly beside `ordered`'s and `random_strength`'s and settled the same
+    # way. `leaf_estimation_ok=True` above is right for this entry point's
+    # PLAIN fork, which reaches `boosting.train` or `train_gpu.train_gpu`;
+    # these two branches leave it, and until they were named here a
+    # `boosting='dart'` fit with `leaf_estimation_iterations=5` was accepted
+    # and silently took one Newton step per leaf. That is precisely the
+    # accept-and-ignore this file exists to remove, and the flag being True at
+    # the entry point rather than per fork is how it hid.
+    #
+    # Both parameters are refused together because both forks miss both: the
+    # dart and rf loops live in `alternate_boosting`, the linear loop in
+    # `custom_metric`, and none of the three reads
+    # `TreeParams.extra.leaf_estimation_iterations` or threads
+    # `boost_from_average` into `boosting._base_score`.
+    if bp.tree.extra.leaf_estimation_active() and (
+        boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF
+    ):
+        raise Error(
+            "leaf_estimation_iterations > 1 cannot be combined with"
+            " boosting='dart' or boosting='rf': those run"
+            " alternate_boosting's own round loops, which never call"
+            " boosting._estimate_leaf_values, so every leaf would take the"
+            " single Newton step the grower wrote. Only the plain gbdt fork"
+            " of this entry point reaches boosting.train. Set"
+            " leaf_estimation_iterations=1, or train boosting='gbdt'"
+        )
+    if bp.tree.extra.leaf_estimation_active() and bp.linear.is_active():
+        raise Error(
+            "leaf_estimation_iterations > 1 cannot be combined with"
+            " linear_tree: linear leaves are fitted by"
+            " custom_metric.fit_with_metrics, whose round loop never calls"
+            " boosting._estimate_leaf_values, and a linear leaf is a fitted"
+            " model rather than a constant, so an extra Newton step on it is"
+            " not the same operation. Set leaf_estimation_iterations=1, or"
+            " drop linear_tree"
+        )
+    if bp.tree.extra.boost_from_average_disabled() and (
+        boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF
+    ):
+        raise Error(
+            "boost_from_average=false cannot be combined with"
+            " boosting='dart' or boosting='rf': alternate_boosting's round"
+            " loops call boosting._base_score without threading the"
+            " parameter, so the fit would start from the label mean under a"
+            " parameter that asked for zero. Set boost_from_average=true, or"
+            " train boosting='gbdt'"
+        )
+    if bp.tree.extra.boost_from_average_disabled() and bp.linear.is_active():
+        raise Error(
+            "boost_from_average=false cannot be combined with linear_tree:"
+            " custom_metric.fit_with_metrics calls boosting._base_score"
+            " without threading the parameter, so the fit would start from"
+            " the label mean under a parameter that asked for zero. Set"
+            " boost_from_average=true, or drop linear_tree"
         )
     if boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF:
         # dart and rf run through alternate_boosting's dispatcher, which
@@ -3891,6 +4176,31 @@ def train_dataset(
             entry=String("a Dataset fit"),
             score_function_ok=True,
             random_strength_ok=scale_is_computed,
+            # CatBoost's `leaf_estimation_iterations` and, on the same flag,
+            # `boost_from_average`. **`not is_sparse`, which is WIDER than
+            # `scale_is_computed` right above, and the difference is the
+            # device.** `trainset.train_dataset` forks three ways: the dense
+            # CPU arm is `boosting.train` and the GPU arm is
+            # `train_gpu.train_gpu`, and both implement the extra Newton steps
+            # and both thread `boost_from_average` into
+            # `boosting._base_score`. Only the sparse arm
+            # (`boosting_sparse.train_sparse`) implements neither, so only it
+            # is refused. The per-tree noise scale one line up is narrower
+            # because it is computed by the dense CPU round loops alone.
+            #
+            # This is the entry point the whole item is for.
+            # `mojotrees.train(params, Dataset)` is what `bench/real_data`
+            # trains through, so until this argument existed every
+            # CatBoost-mode Logloss cell had CatBoost taking ten Newton steps
+            # per leaf and mojotrees taking one, under a parity table that had
+            # been transcribed from an RMSE fit where both take one.
+            leaf_estimation_ok=not d[].is_sparse,
+            # The same condition and the same three-way fork:
+            # `boosting.train` and `train_gpu.train_gpu` both thread the value
+            # into `boosting._base_score`, `boosting_sparse.train_sparse` does
+            # not.
+            boost_from_average_ok=not d[].is_sparse,
+            catboost_defaults_objective=Int(py=params["objective"]),
             # Honored, and this is the entry point that makes the capability
             # worth having: `mojotrees.train(params, Dataset)` is what
             # `bench/real_data` trains through, and a CatBoost-mode arm whose
@@ -4014,6 +4324,30 @@ def booster_update(
             # `update_dataset`'s own message about continued training instead
             # of a message about random_strength, which is not its problem.
             random_strength_ok=True,
+            # CatBoost's `leaf_estimation_iterations`. Unconditional for the
+            # reason `random_strength_ok` is unconditional here:
+            # `trainset.update_dataset` refuses a sparse dataset by name,
+            # takes no device argument, and calls `boosting.train_more`, which
+            # is `_boost_rounds` with a round offset and reads the field at
+            # boosting.mojo:2345. A sparse continued fit should hear about
+            # continued training, not about leaf estimation.
+            leaf_estimation_ok=True,
+            # No `catboost_defaults_objective`. Continued training resolves no
+            # mode default, and the reason is the one
+            # `_AUTO_LR_CONTINUED_REASON` gives for the learning rate: the
+            # trees already in the model were grown under whatever this
+            # resolved on the first fit, and resolving it again here could
+            # append ten-step leaves to a one-step ensemble without either
+            # half being wrong on its own.
+            #
+            # And no `boost_from_average_ok`, which is the one place its
+            # verdict parts company with `leaf_estimation_ok`'s.
+            # `boosting.train_more` reads `leaf_estimation_iterations`, so the
+            # extra steps are honest here; it starts from the base score
+            # already stored on the model and never calls
+            # `boosting._base_score`, so a `false` would be accepted and
+            # ignored. Left at its refusing default, so a continued fit that
+            # names the parameter hears that the original fit decided it.
             auto_lr_reason=String(_AUTO_LR_CONTINUED_REASON),
         ),
         Float64(py=params["alpha"]),

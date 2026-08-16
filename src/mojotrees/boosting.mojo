@@ -129,6 +129,7 @@ from .tree import (
     node_bounds,
 )
 from .tree_parameters_extra import (
+    DEFAULT_BOOST_FROM_AVERAGE,
     ExtraTreeParams,
     cap_leaf_output,
     finish_leaf_output,
@@ -487,7 +488,22 @@ def _base_score(
     objective: Int,
     weights: List[Float64],
     alpha: Float64,
+    boost_from_average: Bool = DEFAULT_BOOST_FROM_AVERAGE,
 ) raises -> Float64:
+    # `boost_from_average=False` starts every row at 0.0 instead of at the
+    # optimal constant. It returns before a label is read, which is what makes
+    # it an off switch on the existing mechanism rather than a second one: the
+    # True branch below is byte for byte the function this was before the
+    # argument existed, and the argument defaults to True, so every caller that
+    # does not pass it computes what it always computed.
+    #
+    # The defaulted argument is deliberate and is not an accept-and-ignore: a
+    # trainer that has not been given the flag cannot silently start from zero,
+    # because zero is only reachable by passing False. The entry points whose
+    # trainers do not thread it refuse `False` by name through
+    # `_refuse_boost_from_average` instead.
+    if not boost_from_average:
+        return 0.0
     # QUANTILE, L1, and MAPE boost from the target percentile, LightGBM
     # style; every other objective boosts from the (weighted) mean. MAPE
     # takes the median under its own label weights, the same weights its
@@ -1099,14 +1115,38 @@ def catboost_leaf_estimation_iterations(objective: Int) -> Int:
     """What CatBoost would default `leaf_estimation_iterations` to for the
     CatBoost loss that corresponds to `objective`, on **CPU**.
 
-    **A record, not a default.** Nothing in this package reads this function.
-    `ExtraTreeParams.leaf_estimation_iterations` defaults to 1 for every
-    objective, which is LightGBM's behavior and this project's; this is here so
-    that a caller who asks for CatBoost's settings by name has one place to
-    read them from and so that the numbers are checked rather than remembered.
+    **A record that is now also a resolver.** `ExtraTreeParams.
+    leaf_estimation_iterations` still defaults to 1 for every objective, which
+    is LightGBM's behavior and this project's, and every surface except one
+    still gets that 1. The exception is `bindings/_mojotrees.mojo`, which calls
+    this function to resolve an UNSET `leaf_estimation_iterations` when the fit
+    is in CatBoost mode (`grow_policy='symmetrictree'`) and the entry point's
+    routing reaches a trainer that implements the extra steps. That is the
+    standing rule -- CatBoost mode mirrors CatBoost, `lossguide` mirrors
+    LightGBM -- and it is why the numbers below have to be right rather than
+    merely recorded.
 
-    Verified from source, `github.com/catboost/catboost` at `master`, read
-    2026-08-16. The table is `GetEstimationMethodDefaults` in
+    **The value below is the OPTION default and CatBoost can still stomp it
+    from the data.** `UpdateLeavesEstimationIterations`
+    (`catboost/libs/train_lib/options_helper.cpp:290-303`, called at `:429`)
+    resets the count to 1, for every loss, when the user did not set it AND the
+    run has fewer than 200 iterations (`IsSmallIterationCount`,
+    `catboost_options.h:88-90`) AND the pool has fewer than 20 features.
+    `SetDefault` does not raise the `IsSetFlag` (`option.h:28-33`), so an
+    option-resolved 10 is still "not set" as far as that later pass is
+    concerned. So a 100-round CatBoost Logloss fit on a 12-feature pool takes
+    ONE Newton step, not ten, and a table that reports 10 for Logloss without
+    this paragraph will disagree with a live `get_all_params()` on exactly the
+    small cells a benchmark suite is quickest to build. This function does not
+    apply that stomp: it is keyed on an objective and knows neither the round
+    count nor the feature count, and the caller in the binding has both.
+
+    Verified from source, `github.com/catboost/catboost` at commit
+    `58c7bb8be2fbd12f85aae268dd1f5cf3cb211e74`, read 2026-08-16. Note that
+    CatBoost's own Python docstring (`python-package/catboost/core.py:4958`,
+    "If None, then leaf_estimation_iterations=1") is stale and contradicts the
+    C++ below; the C++ is what runs. The table is
+    `GetEstimationMethodDefaults` in
     `catboost/private/libs/options/catboost_options.cpp`, and the value that
     takes effect is the one belonging to the loss's default
     `leaf_estimation_method`: that function sets `defaultNewtonIterations`
@@ -1118,15 +1158,24 @@ def catboost_leaf_estimation_iterations(objective: Int) -> Int:
     steps for logloss and for multiclass" comes from, and it is **half wrong**:
 
     - `Logloss`, `CrossEntropy`, `MultiLogloss`, `MultiCrossEntropy` really do
-      default to **10**. Their block sets `defaultNewtonIterations = 10`,
-      `defaultGradientIterations = 40`, method `Newton`.
+      default to **10**. Their block, `catboost_options.cpp:157-165`, sets
+      `defaultNewtonIterations = 10`, `defaultGradientIterations = 40`, method
+      `Newton`.
     - `MultiClass` and `MultiClassOneVsAll` default to **1**, not 10. Their
-      block sets `defaultEstimationMethod = Newton`,
-      `defaultNewtonIterations = 1`, `defaultGradientIterations = 10`. The 10
-      is the Gradient slot and is unreachable unless the caller passes
+      block, `catboost_options.cpp:106-112`, sets
+      `defaultEstimationMethod = Newton`, `defaultNewtonIterations = 1`,
+      `defaultGradientIterations = 10`. The 10 is the Gradient slot and is
+      unreachable unless the caller passes
       `leaf_estimation_method="Gradient"`. CatBoost's own documentation says
       "Multiclassification mode -- One Newton iteration", which agrees with
       the source; the folklore does not.
+    - `RMSE` defaults to **1**, at `catboost_options.cpp:59-64`: method
+      `Newton`, both slots 1, so the method selection cannot change it.
+
+    The selection itself is `SetLeavesEstimationDefault` at
+    `catboost_options.cpp:273`, and the switch that reads the method is at
+    `:315-336`. The static option default before any of this runs is 1
+    (`private/libs/options/oblivious_tree_options.cpp:13`).
 
     The rest of the table, for the losses that have a mojotrees counterpart:
 
@@ -1179,6 +1228,37 @@ def _refuse_leaf_estimation(
         "; it is implemented by boosting.train, boosting.train_more and"
         " boosting.train_with_valid, through"
         " TreeParams.extra.leaf_estimation_iterations",
+    )
+
+
+def _refuse_boost_from_average(
+    extra: ExtraTreeParams, trainer: StringSlice
+) raises:
+    """What a trainer that does not thread `boost_from_average` into its
+    `_base_score` call calls, so a fit asking to start from zero says which
+    entry point would have ignored it instead of training from the label mean
+    under a parameter that said otherwise. Returns on the first comparison at
+    the default of True, which is every fit that does not name the parameter.
+
+    Only `False` is refusable. `True` is what every trainer in this package
+    does and has always done, so there is no trainer for which it is a request
+    that cannot be met; the asymmetry is the point, and it is why this takes
+    the bundle rather than a Bool, so the test and the default live in one
+    place (`ExtraTreeParams.boost_from_average_disabled`).
+    """
+    if not extra.boost_from_average_disabled():
+        return
+    raise Error(
+        "boost_from_average=false is not implemented by ",
+        trainer,
+        "; the trainers that thread it into boosting._base_score are"
+        " boosting.train, boosting.train_with_valid, train_gpu.train_gpu and"
+        " train_gpu.train_gpu_with_valid, which a dense, single-output fit"
+        " reaches. Every other round loop in this package seeds its raw"
+        " scores from the objective's optimal constant unconditionally, so"
+        " accepting false here would start from the label mean under a"
+        " parameter that asked for zero. true is LightGBM's default"
+        " (config.h:948) and mojotrees's behavior since the beginning",
     )
 
 
@@ -2907,7 +2987,23 @@ def train(
         for r in range(n):
             raw.append(init_score[r])
     else:
-        base_score = _base_score(target, objective, sample_weight, alpha)
+        # `boost_from_average`. The `init_score` branch above is the reason
+        # this is threaded here and not folded into `_base_score`'s callers
+        # blindly: a per-row `init_score` ALREADY overrides the optimal
+        # constant, so the two mechanisms meet on this `if` and the answer is
+        # that the offset wins. That is both engines' rule -- LightGBM guards
+        # `GBDT::BoostFromAverage` on `!train_score_updater_->has_init_score()`
+        # (gbdt.cpp:328) and CatBoost forces `boost_from_average` to false when
+        # a baseline column is present (options_helper.cpp:371-373) -- so an
+        # `init_score` beside `boost_from_average=false` is not a contradiction
+        # to refuse, it is the same request made twice.
+        base_score = _base_score(
+            target,
+            objective,
+            sample_weight,
+            alpha,
+            params.tree.extra.boost_from_average,
+        )
         for _ in range(n):
             raw.append(base_score)
 
@@ -3114,7 +3210,16 @@ def train_with_valid(
         params.tree.extra.penalties.cegb, data.n_features, data.n_rows
     )
     var n = data.n_rows
-    var base_score = _base_score(target, objective, sample_weight, alpha)
+    # `boost_from_average`, threaded for the reason `train` threads it. This
+    # loop has no `init_score` branch, so the parameter is the only thing that
+    # can move the start.
+    var base_score = _base_score(
+        target,
+        objective,
+        sample_weight,
+        alpha,
+        params.tree.extra.boost_from_average,
+    )
     var raw = List[Float64](capacity=n)
     for _ in range(n):
         raw.append(base_score)

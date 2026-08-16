@@ -120,6 +120,7 @@ comptime SUPPORTED_KEYS = String(
     " use_missing,"
     " use_quantized_grad, num_grad_quant_bins, quant_train_renew_leaf,"
     " stochastic_rounding, leaf_estimation_iterations,"
+    " boost_from_average,"
     " derivative_precision, auto_learning_rate,"
     " permutation_count, fold_len_multiplier, fold_permutation_block,"
     " ordered_seed"
@@ -1131,6 +1132,45 @@ def parse_params(spec: String) raises -> TrainConfig:
         # build, and a split search cannot reconstruct it from a histogram.
         elif key == "random_strength":
             config.booster.tree.extra.random_strength = _parse_f64(key, value)
+        # LightGBM's `boost_from_average`, which unlike the two CatBoost names
+        # around it really is a name off this surface's own vocabulary
+        # (`include/LightGBM/config.h:948`, default `true`).
+        #
+        # `true` is accepted and is a no-op: `boosting._base_score` has always
+        # computed the objective's optimal constant on every trainer this
+        # string can reach, so a configuration that spells the default out
+        # ports across unchanged and changes nothing, which is the property
+        # this surface exists to have.
+        #
+        # `false` parses and is then refused, by the same
+        # refuse-rather-than-ignore rule `leaf_estimation_iterations` takes
+        # above and for the identical reason: a parameter string is the entry
+        # point for `cli/`, for the sparse, custom-objective, multiclass and
+        # ranking fits, and for the sklearn wrapper, while only the dense
+        # single-output round loops thread the value into
+        # `boosting._base_score`. A `false` accepted here would be honored by
+        # some fits and dropped by most. The estimator route named in the
+        # message is exact: it settles the routing per entry point, which a
+        # string cannot.
+        elif key == "boost_from_average":
+            var bfa = _parse_bool(key, value)
+            if not bfa:
+                raise Error(
+                    "boost_from_average=false cannot be set from a parameter"
+                    " string: this string reaches the sparse,"
+                    " custom-objective, multiclass and ranking trainers, none"
+                    " of which thread the value into boosting._base_score, so"
+                    " it would be honored by some fits and dropped by others."
+                    " Set it on the estimator instead"
+                    " (boost_from_average=False), which settles the routing"
+                    " per entry point, or from the Mojo API on"
+                    " TreeParams.extra.boost_from_average, which"
+                    " boosting.train, boosting.train_with_valid,"
+                    " train_gpu.train_gpu and train_gpu.train_gpu_with_valid"
+                    " honor and every other trainer refuses by name. true is"
+                    " LightGBM's default and is accepted"
+                )
+            config.booster.tree.extra.boost_from_average = bfa
         # CatBoost's `leaf_estimation_iterations`, the second name here that
         # is not LightGBM's. 1, the default, is LightGBM's behavior exactly:
         # one Newton step per leaf. It parses and is range-checked, so a
