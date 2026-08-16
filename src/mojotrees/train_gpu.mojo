@@ -3020,6 +3020,7 @@ def train_gpu(
     objective_source: Int = OBJECTIVE_SOURCE_AUTO,
     split_search: Int = SPLIT_SEARCH_AUTO,
     row_unroll: Bool = True,
+    row_compaction: Bool = False,
     narrow_index: Bool = False,
     pair_alignment: Bool = True,
     min_tiles: Int = 0,
@@ -3142,6 +3143,12 @@ def train_gpu(
             round_has_constant_hessian(objective, sample_weight, goss)
         )
         builder.set_row_unroll(row_unroll)
+        # A trade, not a strictly-less-work change, so it defaults
+        # OFF and the window decides: compaction adds 4*L*(nf+8)
+        # bytes of contiguous moves per split against scattered
+        # gather traffic removed, and its own author put break-even
+        # near depth 3 with a thin margin on a 31-leaf tree.
+        builder.rows.set_row_compaction(row_compaction)
         # The three hist-latency arms, on the same footing and for the same
         # reason: a launch shape reachable in the call so a benchmark can
         # interleave arms in one process. None can change a model. The index
@@ -3187,6 +3194,7 @@ def train_gpu(
     objective_source: Int = OBJECTIVE_SOURCE_AUTO,
     split_search: Int = SPLIT_SEARCH_AUTO,
     row_unroll: Bool = True,
+    row_compaction: Bool = False,
     narrow_index: Bool = False,
     pair_alignment: Bool = True,
     min_tiles: Int = 0,
@@ -3235,6 +3243,12 @@ def train_gpu(
         # A launch shape, not a number: see the session-free overload. A
         # session owns the context, so it cannot change this answer either.
         builder.set_row_unroll(row_unroll)
+        # A trade, not a strictly-less-work change, so it defaults
+        # OFF and the window decides: compaction adds 4*L*(nf+8)
+        # bytes of contiguous moves per split against scattered
+        # gather traffic removed, and its own author put break-even
+        # near depth 3 with a thin margin on a 31-leaf tree.
+        builder.rows.set_row_compaction(row_compaction)
         # The same three arms the session-free overload sets, from the same
         # arguments. A session owns the context, not the geometry, so it
         # cannot change these answers either.
