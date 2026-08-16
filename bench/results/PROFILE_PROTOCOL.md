@@ -32,9 +32,31 @@ that must be read in full before each use is one that gets skimmed.
 
 ## The comparator rule
 
-`scenarios.LIGHTGBM_ALIGNMENT` pins `force_row_wise = True`, and that pin stays:
-on auto, LightGBM spends its first iterations timing both builders and that
-one-off lands inside the measured region, which would flatter us.
+**CORRECTED 2026-08-16. `scenarios.LIGHTGBM_ALIGNMENT` does NOT pin
+`force_row_wise`, and has not since the comparator became `stock+det`.** Its
+five keys are `deterministic`, `feature_pre_filter`, `enable_bundle`,
+`verbosity` and `seed`. The sentence that stood here said the pin was in place
+"and that pin stays", and it was false for as long as the current comparator has
+existed.
+
+**It was load-bearing rather than cosmetic.** A reader following it believed
+LightGBM ran row-wise in every comparison. **It runs COL-WISE on the shape this
+harness measures**, established by running it at `verbosity=1` for two rounds
+at both thread counts and reading its own line: `Auto-choosing col-wise
+multi-threading`. So the private-buffer-and-merge builder that a lane was
+briefed to match **never runs in this comparison at all**, and a whole lane was
+scoped against a builder LightGBM does not select here.
+
+Nobody could have caught it from the record. `engines.py::_histogram_builder`
+records a null, because LightGBM reports its choice only in a log line that
+`verbosity: -1` silences, and `verbosity: -1` is in the alignment for good
+reasons. **The one fact that would have falsified this paragraph is suppressed
+by the configuration the paragraph describes.**
+
+The original reasoning for a pin is still worth keeping, because it is why one
+was once wanted: on auto, LightGBM spends its first iterations timing both
+builders and that one-off lands inside the measured region, which would flatter
+us. That cost is real and is now simply paid, unpinned, by both sides.
 
 But a pin we chose is not a fair comparator. **The rule is LightGBM's better
 pinned builder at each shape**, measured once per shape and recorded beside the
