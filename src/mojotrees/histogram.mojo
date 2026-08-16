@@ -188,6 +188,22 @@ n_rows`, which is worse.
 A node too small for a block to amortize its own private histogram still never
 blocks -- `apple_cpu_policy.row_block_min_rows` is the floor and its derivation
 is there -- so small and tiny nodes keep the accumulation, and the bytes, they
+
+**And so does the CPU quantized path, which is now built on this same
+decomposition.** `quantized_gradient.build_histogram_subset_quantized_into_scratch`
+is the row-blocked kernel above over interleaved Int64 cells: the same
+`plan_row_block_count`, the same contiguous ascending blocks, the same private
+partials, the same ascending fold. Integer addition is associative, so on that
+path the fold is **exact** rather than merely deterministic, and every
+paragraph above that had to argue the block count is a *value* stops applying:
+`MOJOTREES_CPU_ROW_BLOCKS` cannot move a quantized cell at any setting, so it
+is a pure scheduling A/B there and an answer-changing knob only here. It also
+means the full-dataset builder and the subset builder, which sum the same rows
+in two orders and so differ by a few ulp in Float64, agree bit for bit once
+both are quantized. That kernel lives in `quantized_gradient.mojo` and not in
+this file only because this file is on the wrong side of the import edge --
+`quantized_gradient` imports `Histogram` from here, so the reverse import
+would be a cycle.
 already had.
 
 The LightGBM cell, and the per-row derivative

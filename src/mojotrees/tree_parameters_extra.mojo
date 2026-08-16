@@ -133,6 +133,17 @@ comptime DEFAULT_EXTRA_SEED = 6
 
 # monotone_constraints_method codes. Only `basic` is implemented; the other
 # two are named so they can be rejected as the real features they are.
+comptime DEFAULT_NUM_GRAD_QUANT_BINS = 4
+"""LightGBM's `num_grad_quant_bins` default, read off
+`include/LightGBM/config.h` (LightGBM 4.7.0.99).
+
+Restated here rather than imported from `quantized_gradient.mojo`, which
+already imports `raw_leaf_output` from this module: the edge goes one way and
+a second one would be a cycle. The two constants are asserted equal in
+`tests/test_cpu_quantized_grad.mojo`, which is the mechanism that keeps a
+restatement from drifting.
+"""
+
 comptime MONOTONE_BASIC = 0
 comptime MONOTONE_INTERMEDIATE = 1
 comptime MONOTONE_ADVANCED = 2
@@ -1098,6 +1109,21 @@ struct ExtraTreeParams(Copyable, Movable):
     var penalties: FeaturePenalties
     var forced: ForcedSplits
 
+    # LightGBM's quantized-training family, verbatim: the four names and the
+    # four defaults of `include/LightGBM/config.h` (LightGBM 4.7.0.99), no
+    # more and no fewer. The scale rule, the rounding seed, and the
+    # accumulator width are NOT here, because LightGBM has no parameters for
+    # them and this surface is exactly LightGBM's; they live on
+    # `quantized_gradient.QuantGradParams` and are set from
+    # `MOJOTREES_*` environment overrides. `quantized_gradient.cpu_quant_params`
+    # is the one function that turns these four into that bundle, and it is
+    # in that module rather than here because this module must not import it
+    # (it imports `raw_leaf_output` from here, so the edge only goes one way).
+    var use_quantized_grad: Bool
+    var num_grad_quant_bins: Int
+    var quant_train_renew_leaf: Bool
+    var stochastic_rounding: Bool
+
     def __init__(out self):
         self.min_gain_to_split = 0.0
         self.max_delta_step = 0.0
@@ -1108,6 +1134,10 @@ struct ExtraTreeParams(Copyable, Movable):
         self.monotone_method = MONOTONE_BASIC
         self.penalties = FeaturePenalties()
         self.forced = ForcedSplits.none()
+        self.use_quantized_grad = False
+        self.num_grad_quant_bins = DEFAULT_NUM_GRAD_QUANT_BINS
+        self.quant_train_renew_leaf = False
+        self.stochastic_rounding = True
 
     @staticmethod
     def default() -> ExtraTreeParams:
@@ -1124,6 +1154,7 @@ struct ExtraTreeParams(Copyable, Movable):
             or self.monotone_penalty > 0.0
             or self.penalties.is_active()
             or not self.forced.is_empty()
+            or self.use_quantized_grad
         )
 
     def needs_leaf_finish(self) -> Bool:
@@ -1189,6 +1220,7 @@ struct ExtraTreeParams(Copyable, Movable):
             self.monotone_penalty < 0.0
         ):
             raise Error("monotone_penalty must be a finite nonnegative number")
+        self.check_quantized_grad()
         if self.monotone_method != MONOTONE_BASIC:
             raise Error(
                 "monotone_constraints_method '",
@@ -1214,6 +1246,53 @@ struct ExtraTreeParams(Copyable, Movable):
                 " handed a BinnedMatrix, which has no bin edges. Map them"
                 " once with binning.map_forced_splits(mapper, forced) and put"
                 " the result on ExtraTreeParams.forced"
+            )
+
+    def check_quantized_grad(self) raises:
+        """Range-check LightGBM's quantized-training family, and refuse an
+        enabled one by name rather than ignoring it.
+
+        Runs whether or not `use_quantized_grad` is set, so a nonsense bin
+        count is reported when it is set and not when it is first used, which
+        is the rule `QuantGradParams.validate` states and this mirrors.
+
+        `num_grad_quant_bins` must be even. LightGBM computes
+        `num_grad_quant_bins_ / 2` in integer arithmetic
+        (`gradient_discretizer.cpp`), so an odd count silently truncates and
+        the positive and negative halves of the gradient lattice stop
+        matching. That is the difference mojotrees takes: an asymmetric
+        gradient lattice is a bug in every reported case, not a
+        configuration.
+
+        **`use_quantized_grad=true` is refused, with a sentence.** The CPU
+        integer histogram exists (`quantized_gradient.
+        build_histogram_subset_quantized_into_scratch`) but no trainer calls
+        it: `boosting.mojo` and `tree.mojo` are untouched, and
+        `quantized_gradient.CONNECTED` is still False. Accepting the key and
+        training a float model would be exactly the silent-downgrade failure
+        the package refuses everywhere else, so this says so where the
+        parameter was set. The wiring that lifts the refusal is the ordered
+        patch set in `handoffs/remaining_06_quantized_gradients.md`.
+        """
+        if self.num_grad_quant_bins < 2 or self.num_grad_quant_bins > 1048576:
+            raise Error(
+                "num_grad_quant_bins must be between 2 and 1048576, got ",
+                self.num_grad_quant_bins,
+            )
+        if self.num_grad_quant_bins % 2 != 0:
+            raise Error(
+                "num_grad_quant_bins must be even so the gradient lattice is"
+                " symmetric about zero, got ",
+                self.num_grad_quant_bins,
+            )
+        if self.use_quantized_grad:
+            raise Error(
+                "use_quantized_grad is recognized but no trainer is wired to"
+                " the quantized histogram in this build, so setting it would"
+                " train a float model that silently ignored it. The CPU"
+                " integer accumulation exists and is reachable directly"
+                " through"
+                " quantized_gradient.build_histogram_subset_quantized_into_scratch"
             )
 
     def check(
