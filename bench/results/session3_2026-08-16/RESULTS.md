@@ -1286,3 +1286,69 @@ step k into `_pick_and_commit_kernel` at step k+1, both `grid_dim=1`.
 new: the descriptor decides *at run time* whether the partition happened, so a
 host-side buffer swap cannot be conditioned on it and a dead step would swap in
 stale scratch.
+
+---
+
+## gradient-staging: Int16 pairs, and it corrected the scope of its own bound
+
+Bytes fetched per (row, feature) visit, `4/G + W/G + 1`, where `W` is staged
+derivative bytes per row:
+
+| objective class | Float32 | Int32 (shipped) | **Int16 (new)** |
+|---|---|---|---|
+| constant hessian -- unweighted squared error, L1, Huber, quantile | 4 | 4 | **2** |
+| general hessian -- logistic, poisson, tweedie, weighted, multiclass | 8 | 8 | **4** |
+
+Totals at the default `G=1`: **9 to 7 bytes per visit** on the constant-hessian
+path, **13 to 9** on the general one. Against a gather measured at 56.7 percent
+of the phase, that is the first change this wave aimed at the right component.
+
+It confirmed item 1 rather than assuming it: **`CELIDE` was already live**, and
+makes the load a scalar `gq[2r]` rather than a `width=2` pair, so the headline
+objective was already fetching 4 bytes per row and not 8.
+
+### The bound is per ROUND, not per node, and my brief said per node
+
+I briefed this as LightGBM's per-leaf `HIST_BITS` rule with a per-node scale. The
+lane established the scope correctly and it is **narrower than I specified**: the
+buffer is staged **once per round** and every node of the tree gathers it, so a
+per-node bound would license nothing for the other nodes. The bound is per row,
+over every row of the round: `-32768 <= Int32(round(x*scale)) <= 32767`.
+
+**And it is a different bound from the one that killed packing before.**
+`ACCURACY_BUDGET` section 5 prices int16 **accumulators**, which need LightGBM's
+max-abs clamp and cost 4.31 percent worse held-out logloss at magnitude-sum
+2^14. This narrows a **stored value**, and costs **zero accuracy** under its
+bound. Two different bounds on two different objects; conflating them is what
+produced both earlier wrong verdicts on packing.
+
+Under `2^30/sum|g|` the condition reads `max|g|/sum|g| <= 3.05e-5`, so it **fails
+small and holds large** -- the useful direction, and the reason the arm is
+opt-in rather than refused.
+
+### The check fires before the histogram, not after
+
+`_quantize_grad_hess_i16_kernel` compares each row's own integer as it stores it
+and atomically counts failures into **two** per-plane device words; the check
+raises **before** the histogram is enqueued. Two counters rather than one because
+the hessian word is never gathered on a constant-hessian round, so refusing on it
+would reject exactly the class this serves best -- and the test carries that
+negative control.
+
+The raise names the plane, the failing count, the row total and the scale, and
+points at turning the arm **off** rather than at a smaller scale -- because a
+smaller scale is what section 5 measured at 4.31 percent worse logloss. A good
+error message that declines to suggest the tempting wrong fix.
+
+**Bits do not move**, and the default is **off**: every other arm in that file
+defaults on because it is exact whatever the data; this one is exact only under a
+data-dependent bound, and an arm that can refuse a fit should not refuse one by
+default.
+
+### No pointer plumbing changed
+
+The Int16 layout uses the first `4*n_rows` bytes of the existing Int32 `gq_dev`
+allocation, so eight `enqueue_function` argument lists and both kernel signatures
+are untouched, and the arm rides on the existing `use_quant` whose domain simply
+widened. The bin gather is **byte-for-byte unchanged**, which is what keeps this
+mergeable beside the concurrent `ellpack-bins` lane in the same loop.
