@@ -36,27 +36,37 @@ and absent from the model.
 
 So before any boundary is computed, a column is asked how many distinct
 values it has. If there are no more of them than the feature has ordinary
-bins, it gets an edge between every adjacent pair and the boundaries are not
-consulted at all: one bin per level, whatever each level's population, and
-the rest of the budget left unspent. That is LightGBM's `GreedyFindBin` in
-the `num_distinct_values <= max_bin` case at `min_data_in_bin` of 1, which is
-this binner's default (see `min_data_in_bin` below, and
+bins, the boundaries are not consulted at all and the levels are walked in
+order, cutting once a bin has accumulated `min_data_in_bin` rows. That is
+LightGBM's `GreedyFindBin` in the `num_distinct_values <= max_bin` case. At
+`min_data_in_bin` of 1 it is one bin per level whatever each level's
+population; at the default of 3, which is LightGBM's, levels holding one or
+two rows merge into their neighbour and levels holding three or more still
+each take a bin of their own (see `min_data_in_bin` below, and
 docs/LIGHTGBM_PARITY.md).
 
 `collect_distinct` answers the question for the dense fit and
 `distinct_levels_sorted` for the sparse one, which has sorted its stored
 values already. The two are required to agree, because a sparse matrix and
 its dense form must bin identically, and they are tested against each other.
+**They do not agree at the default any more**: `sparse.fit_bins_csc` takes
+neither `min_data_in_bin` nor `bin_construct_sample_cnt`, so it still fits at
+1 and at every row. That is a live gap, not a design, and it is recorded in
+docs/LIGHTGBM_PARITY.md.
 
 A column with more levels than bins is refused within its first few hundred
 rows, so an ordinary continuous column pays a few hundred probes to ask and
 then takes the quantile path exactly as before, edges unchanged bit for bit.
-Measured at 250,000 x 100 continuous, four workers, that costs 0.0276 s
+Measured at 250,000 x 100 continuous, four workers, that cost 0.0276 s
 against 0.0270 s without asking, which is inside the run-to-run spread. On a
-column that does have few levels it is not a cost at all: 250,000 x 100 with
-twenty levels each fits in 0.0100 s through the levels against 0.0924 s
-through the boundaries, because the boundary path pays for a bucket table
-and a second pass to resolve its ties and this one is a single scan.
+column that does have few levels the levels path was much the cheaper of the
+two when it was measured, because the boundary path pays for a bucket table
+and a second pass to resolve its ties and this one is a single scan. **Those
+low-cardinality numbers were taken at `min_data_in_bin` of 1 and no longer
+describe the default.** The scan now also counts each level (`counts` out of
+`collect_distinct`), which is one L1 increment per row and no second pass, so
+the advantage should survive; the size of it has to be re-measured before it
+is quoted again, and this module quotes no ratio for it.
 
 Full parity is still a further step, and stops at the same place it did.
 Past the bin budget LightGBM keeps counting, and spends the counts: a value
@@ -83,24 +93,56 @@ any description of it. It enters in two places and this binner honors both:
   LightGBM's per-level greedy inside that budget, which is the same gap the
   paragraph above names.
 
-The default is 1, not LightGBM's 3, and 1 is the value at which **both
-branches are the code they were before this option existed**: at 1 every
-level's count already clears the accumulator, so the levels path cuts between
-every adjacent pair, and `total_cnt / 1` never binds because the quantile
-branch is only reached when there are more distinct values than bins. Both
-are guarded on `min_data_in_bin <= 1` so that the default runs the same
-instructions rather than the same arithmetic.
+The default is LightGBM's 3. 1 is still reachable and is the value at which
+**both branches are the code they were before this option existed**: at 1
+every level's count already clears the accumulator, so the levels path cuts
+between every adjacent pair, and `total_cnt / 1` never binds because the
+quantile branch is only reached when there are more distinct values than
+bins. Both are guarded on `min_data_in_bin <= 1` so that setting runs the
+same instructions rather than the same arithmetic, and
+`tests/test_binning.mojo` proves a fit at 1 with `bin_construct_sample_cnt=0`
+is edge for edge the fit this module produced before either option existed.
 
-Counting the levels costs a pass over the column with a search of at most
-`log2(256)` steps per value, and it is paid only by a low-cardinality column
-under a `min_data_in_bin` above 1. Nothing pays it by default.
+What 3 does to the number of bins, as a bound rather than a measurement. Let
+a column have `L` levels holding `N` rows between them. At 1 it gets `L`
+bins. At 3 every closed bin except possibly the last holds at least 3 rows,
+and no closed bin can absorb more than 3 levels (three levels hold at least
+three rows), so
+
+    ceil(L / 3)  <=  bins  <=  min(L, floor(N / 3) + 1)
+
+and the merge reaches **only levels holding one or two rows**: a level of 3
+or more closes its bin on its own. A column of 20 levels in 250,000 rows is
+untouched. A column of 136 singleton levels in 900 rows goes from 136 bins to
+about 46. Sparse and near-unique integer columns move; ordinary
+low-cardinality ones do not.
+
+Counting the levels is not a pass any more. `collect_distinct` returns a
+count per level from the scan it was already doing, at one L1 increment per
+row, because at a default of 3 a separate `count_levels` pass would be paid
+by every low-cardinality column rather than by the few that asked for the
+option. `count_levels` remains as the independent reference the fused counts
+are tested against.
 
 Fitting from a sample
 ---------------------
 `bin_construct_sample_cnt` fits the edges from a subsample of the rows rather
-than from all of them, which is what LightGBM does (its own default is
-200,000). 0, the default here, means every row and is the path this module
-has always taken. A positive value at or above `n_rows` also means every row.
+than from all of them, which is what LightGBM does. The default is LightGBM's
+200,000. 0 means every row, which is what this module used to default to; a
+positive value at or above `n_rows` also means every row, so nothing below
+200,000 rows is sampled at all.
+
+What the sample does and does not save, as arithmetic rather than a claim.
+The matrix is column-major and the sample is a set of *rows*, so a sampled
+column is a strided gather, not a shorter read. With a sampling rate `p` and
+eight doubles to a 64-byte line, the fraction of lines a column still has to
+touch is `1 - (1 - p)^8`: at 200,000 of 1,000,000 rows that is 83 percent of
+the bytes for 20 percent of the values, and at 200,000 of 10,000,000 it is 15
+percent of the bytes for 2 percent of the values. So the saving is in the
+per-value work -- the `isnan` test, the distinct probe, and the rank
+selection or sort that follows -- and only becomes a saving in memory traffic
+well below a fifth. The gather also costs an indirection per value and
+defeats the unit-stride prefetch the full read gets.
 
 The sample is a set of row indices drawn **once per fit**, before any feature
 is touched, and every feature is fit from the same rows -- LightGBM samples
@@ -253,25 +295,32 @@ comptime MAX_EDGE = 1e300
 # the two disagree silently, by a whole leaf rather than by a rounding step.
 comptime MAX_BINS = 256
 
-comptime DEFAULT_MIN_DATA_IN_BIN = 1
-"""`fit_bins`'s minimum population for a numerical bin.
+comptime DEFAULT_MIN_DATA_IN_BIN = 3
+"""`fit_bins`'s minimum population for a numerical bin. LightGBM's default.
 
-LightGBM's own default is 3. This one is 1, which is the value at which the
-levels path cuts between every adjacent level and the quantile budget is
-never capped -- that is, the binning this module has always produced. Raising
-it is a model change and is therefore the caller's to ask for; see the module
-docstring."""
+This was 1 until the stock-defaults decision, and 1 is still the value at
+which the levels path cuts between every adjacent level and the quantile
+budget is never capped. It is reachable, and `tests/test_binning.mojo` proves
+that a fit at `min_data_in_bin=1` with `bin_construct_sample_cnt=0` is edge
+for edge the fit this module produced before either option existed. What
+changed is which of the two a caller who says nothing gets: mojotrees's
+defaults are LightGBM's, because a default is what a user actually
+experiences and a comparison between two libraries at their own defaults is
+the only one a user can act on."""
 
-comptime DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT = 0
-"""Rows `fit_bins` fits its edges from, 0 meaning every row.
+comptime DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT = 200_000
+"""Rows `fit_bins` fits its edges from. LightGBM's default; 0 means every row.
 
-LightGBM's own default is 200,000. This one is 0, which is the full-column
-fit this module has always performed."""
+Was 0. See `DEFAULT_MIN_DATA_IN_BIN` for why it is LightGBM's number now.
+Below 200,000 rows this is the full-column fit either way, because a sample
+that would cover the matrix is not drawn at all."""
 
 comptime DEFAULT_DATA_RANDOM_SEED = 1
 """LightGBM's `data_random_seed`, which seeds its bin-construction sample.
 The name and the default are carried over; the stream is not (see the module
-docstring)."""
+docstring). Fixed, never derived from a clock or a global, so the sampled fit
+that is now the default is the same fit on every machine and at every
+`MOJOTREES_NUM_WORKERS`."""
 
 
 def _avoid_inf(x: Float64) -> Float64:
@@ -578,11 +627,34 @@ def collect_distinct(
     limit: Int,
     mut table: List[UInt64],
     mut slots: List[Int],
+    mut hits: List[Int],
     mut out: List[Float64],
+    mut counts: List[Int],
 ) -> Bool:
-    """The ascending distinct values of `col[0, n_valid)` when there are at
-    most `limit` of them; `False`, with `out` empty, as soon as there is one
-    more.
+    """The ascending distinct values of `col[0, n_valid)`, and how many rows
+    each holds, when there are at most `limit` of them; `False`, with `out`
+    and `counts` empty, as soon as there is one more.
+
+    Counting here rather than in a second pass
+    ------------------------------------------
+    `min_data_in_bin` needs a count per level, and its default is now 3, so
+    the levels branch needs those counts on every low-cardinality column
+    rather than on the few that asked for the option. `count_levels` answers
+    the same question in a separate pass, at a binary search over the level
+    table per row; this loop already visits every row and already knows which
+    slot the row's level lives in, so the count is one L1 increment on a line
+    the probe just touched.
+
+    The arithmetic, which is why this is not a tidiness change. At 250,000
+    rows and 100 columns of 20 levels the scan does 25e6 probes. A separate
+    counting pass would add 25e6 x ceil(log2(20)) = 1.25e8 dependent,
+    branchy comparisons and a second streaming read of every column; the
+    fused increment adds 25e6 L1 read-modify-writes and no second read.
+    Neither number is measured, and the orchestrator has the clock.
+
+    `hits` is per *slot* and `counts` is per *level*, ascending with `out`.
+    `hits` is caller-owned scratch for the same reason `table` is: it is
+    cleared by the slots that were recorded rather than by its length.
 
     This is what lets a column with few enough levels get a bin per level
     instead of a bin per quantile boundary, which is LightGBM's
@@ -608,15 +680,20 @@ def collect_distinct(
     feature.
     """
     out.clear()
+    counts.clear()
     if limit < 1 or limit > MAX_BINS or n_valid < 1:
         return False
-    if len(table) != DISTINCT_SLOTS:
+    if len(table) != DISTINCT_SLOTS or len(hits) != DISTINCT_SLOTS:
         table.clear()
         table.resize(DISTINCT_SLOTS, _KEY_EMPTY)
+        hits.clear()
+        hits.resize(DISTINCT_SLOTS, 0)
         slots.clear()
     var tp = table.unsafe_ptr()
+    var hp = hits.unsafe_ptr()
     for i in range(len(slots)):
         tp.unsafe_store(slots[i], _KEY_EMPTY)
+        hp.unsafe_store(slots[i], 0)
     slots.clear()
 
     var cp = col.unsafe_ptr()
@@ -626,7 +703,9 @@ def collect_distinct(
         if v == 0.0:
             # `-0.0` and `0.0` are one value to every comparison an edge is
             # built from, so they have to be one level here too; their bit
-            # patterns differ, so the key alone would make them two.
+            # patterns differ, so the key alone would make them two. The
+            # count follows the normalization, so both signs land on one
+            # level and in one counter.
             v = 0.0
         var k = order_key(v)
         # Fibonacci scramble, then take the top bits: the low bits of a key
@@ -635,12 +714,14 @@ def collect_distinct(
         while True:
             var cur = tp.unsafe_load(s)
             if cur == k:
+                hp.unsafe_store(s, hp.unsafe_load(s) + 1)
                 break
             if cur == _KEY_EMPTY:
                 if len(out) >= limit:
                     full = True
                     break
                 tp.unsafe_store(s, k)
+                hp.unsafe_store(s, 1)
                 slots.append(s)
                 out.append(v)
                 break
@@ -653,6 +734,17 @@ def collect_distinct(
     # At most `limit` values, so this is a sort of a few hundred at the very
     # most, once per column.
     sort(out)
+    # The table is still populated, so each sorted level finds its own
+    # counter by the probe that put it there. `limit` probes at the very
+    # most, and every key is present, so the walk terminates.
+    counts.resize(len(out), 0)
+    var np = counts.unsafe_ptr()
+    for j in range(len(out)):
+        var k = order_key(out[j])
+        var s = Int((k * UInt64(0x9E37_79B9_7F4A_7C15)) >> DISTINCT_SHIFT)
+        while tp.unsafe_load(s) != k:
+            s = (s + 1) & (DISTINCT_SLOTS - 1)
+        np.unsafe_store(j, hp.unsafe_load(s))
     return True
 
 
@@ -701,10 +793,16 @@ def count_levels(
     `levels` is what `collect_distinct` returned for this same column, so it
     is ascending and every value in the column is one of its entries; the
     search below therefore always lands inside the array and the counts sum
-    to `n_valid`. This is the one thing `min_data_in_bin` needs that
-    `collect_distinct` does not already produce, and it is computed here
-    rather than inside that scan so that a fit at the default
-    `min_data_in_bin` of 1 pays nothing for an option it is not using.
+    to `n_valid`.
+
+    **`fit_bins` does not call this.** `collect_distinct` counts as it scans
+    (see its docstring for why a second pass was not affordable once
+    `min_data_in_bin` defaulted to 3). What this is now is the independent
+    reference those fused counts are checked against: it answers the same
+    question by a different mechanism -- a binary search over the level table
+    instead of a hash slot -- and `tests/test_binning.mojo` requires the two
+    to agree count for count. Deleting it would leave the fused counter
+    checked only against itself.
 
     `-0.0` needs no normalizing on the way in: it compares equal to `0.0`,
     which is the entry `collect_distinct` stored, so the search converges on
@@ -1329,11 +1427,12 @@ def fit_bins[
 
     `min_data_in_bin` is LightGBM's minimum population for a numerical bin
     and `bin_construct_sample_cnt` fits the edges from a subsample of the
-    rows, seeded by `data_random_seed`. Both change which bins exist, so both
-    default to the values at which this function is the function it was
-    before they existed -- 1 and 0, meaning no minimum and every row -- rather
-    than to LightGBM's defaults of 3 and 200,000. The module docstring states
-    what each honors and what it does not.
+    rows, seeded by `data_random_seed`. Both change which bins exist, and
+    both now default to **LightGBM's** values, 3 and 200,000, rather than to
+    the 1 and 0 at which this function is the function it was before they
+    existed. Passing `min_data_in_bin=1, bin_construct_sample_cnt=0` restores
+    that fit exactly, and a test says so. The module docstring states what
+    each honors and what it does not.
     """
     if max_bins < 2 or max_bins > MAX_BINS:
         raise Error("max_bins must be in [2, ", MAX_BINS, "]")
@@ -1386,7 +1485,11 @@ def fit_bins[
         # column it saw before, in the same order, so the edges are unchanged.
         # `bucket_counts` and `bucket_keys` are the rank-selection tables and
         # stay empty (and unallocated) on a task that never takes that path.
-        var col = List[Float64](capacity=n_rows)
+        # `n_sample` values at most, which is the sample when one was drawn
+        # and `n_rows` when it was not. At the stock 200,000 against a
+        # 1,000,000-row fit that is 1.6 MB reserved per task instead of 8 MB,
+        # and the difference is first-touched memory, not just address space.
+        var col = List[Float64](capacity=n_sample)
         var idxs = List[Int]()
         var ranks = List[Int]()
         var vals = List[Float64]()
@@ -1399,6 +1502,7 @@ def fit_bins[
         var bucket_keys = List[UInt64]()
         var dist_table = List[UInt64]()
         var dist_slots = List[Int]()
+        var dist_hits = List[Int]()
         var dist_vals = List[Float64]()
         var level_counts = List[Int]()
         for f in range(f_start, f_end):
@@ -1436,7 +1540,14 @@ def fit_bins[
             below.clear()
             above.clear()
             if collect_distinct(
-                col, n_valid, n_ordinary, dist_table, dist_slots, dist_vals
+                col,
+                n_valid,
+                n_ordinary,
+                dist_table,
+                dist_slots,
+                dist_hits,
+                dist_vals,
+                level_counts,
             ):
                 # Few enough levels that every one of them can have its own
                 # bin, so cut between each adjacent pair and let the budget
@@ -1456,8 +1567,8 @@ def fit_bins[
                     # accumulator has reached the minimum, resetting it at
                     # each cut. Adjacent levels merge until they hold enough
                     # rows between them; the final bin keeps whatever is left,
-                    # because nothing merges backwards.
-                    count_levels(col, n_valid, dist_vals, level_counts)
+                    # because nothing merges backwards. `level_counts` came
+                    # out of the scan above, not out of a second pass.
                     var acc = 0
                     for j in range(len(dist_vals) - 1):
                         acc += level_counts[j]

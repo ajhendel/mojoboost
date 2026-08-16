@@ -23,6 +23,9 @@ become false and a deferred row cannot quietly stay false:
 10. every trainer that returns a booster passes the monotone constraints it
     trained under into it, rather than letting them fall back to the
     "no constraints" default
+11. the binning defaults are LightGBM's stock values and `fit_bins` still
+    defaults to them, and `feature_pre_filter=true` is still refused rather
+    than accepted without the feature deletion it names
 
 Check 9 exists because check 7 has a blind spot: it only looks at rows that
 say `deferred` or `unsupported`, so a `partial` row can keep claiming a
@@ -1374,6 +1377,108 @@ def monotone_passthrough(problems):
         )
 
 
+#: The binning defaults that must be LightGBM's, as
+#: `(constant, value, the LightGBM parameter it is)`. mojotrees's defaults
+#: are LightGBM's stock defaults, so that a comparison between the two
+#: libraries at their own defaults is the comparison a user can act on.
+#: Drifting one back is a silent model change on every fit that says
+#: nothing, which is exactly the class of difference a reader cannot see.
+STOCK_BINNING_DEFAULTS = (
+    ("DEFAULT_MIN_DATA_IN_BIN", 3, "min_data_in_bin"),
+    ("DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT", 200_000, "bin_construct_sample_cnt"),
+    ("DEFAULT_DATA_RANDOM_SEED", 1, "data_random_seed"),
+)
+
+
+def stock_defaults(problems):
+    """The binning defaults are LightGBM's, and `fit_bins` still uses them.
+
+    Two things, because either alone can be true while the package binns
+    something else. The constants are checked against the numbers above, and
+    `fit_bins`'s signature is checked to default to the *constants* rather
+    than to a literal, so a signature that drifted back to `= 1` would fail
+    here even with the constant left correct.
+
+    `feature_pre_filter` is deliberately not in the table. It is not a
+    default on this side at all: LightGBM's `true` is a Dataset construction
+    step that deletes features, and until mojotrees implements the deletion
+    the honest state is that `check_feature_pre_filter` still refuses `true`.
+    That refusal is asserted here, so that flipping the flag without
+    implementing the filter fails the gate rather than quietly making the two
+    libraries fit different feature spaces.
+    """
+    binning = ROOT / "src" / "mojotrees" / "binning.mojo"
+    if not binning.is_file():
+        fail(problems, "stock defaults: src/mojotrees/binning.mojo is missing")
+        return
+    text = binning.read_text()
+    for name, want, lgbm in STOCK_BINNING_DEFAULTS:
+        m = re.search(
+            r"^comptime\s+" + name + r"\s*=\s*([0-9_]+)\s*$", text, re.M
+        )
+        if not m:
+            fail(
+                problems,
+                f"stock defaults: {name} is not defined in binning.mojo as a "
+                "plain integer comptime, so this gate cannot read it",
+            )
+            continue
+        got = int(m.group(1).replace("_", ""))
+        if got != want:
+            fail(
+                problems,
+                f"stock defaults: {name} is {got}, and LightGBM's {lgbm} is "
+                f"{want}. mojotrees's defaults are LightGBM's; change this "
+                "back or argue the divergence in docs/LIGHTGBM_PARITY.md and "
+                "in STOCK_BINNING_DEFAULTS here, in one commit",
+            )
+    sig = re.search(r"^def fit_bins\[", text, re.M)
+    if not sig:
+        fail(problems, "stock defaults: fit_bins is not where this expects it")
+    else:
+        head = text[sig.start() : sig.start() + 1200]
+        for arg, name in (
+            ("min_data_in_bin", "DEFAULT_MIN_DATA_IN_BIN"),
+            ("bin_construct_sample_cnt", "DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT"),
+            ("data_random_seed", "DEFAULT_DATA_RANDOM_SEED"),
+        ):
+            if not re.search(
+                r"\b" + arg + r"\s*:\s*Int\s*=\s*" + name + r"\b", head
+            ):
+                fail(
+                    problems,
+                    f"stock defaults: fit_bins does not default {arg} to "
+                    f"{name}, so the constant above is not what a caller who "
+                    "says nothing gets",
+                )
+
+    extra = ROOT / "src" / "mojotrees" / "tree_parameters_extra.mojo"
+    if not extra.is_file():
+        fail(problems, "stock defaults: tree_parameters_extra.mojo is missing")
+        return
+    checker = extra.read_text()
+    body = re.search(
+        r"^def check_feature_pre_filter\(.*?(?=^def |^struct |\Z)",
+        checker,
+        re.M | re.S,
+    )
+    if not body:
+        fail(
+            problems,
+            "stock defaults: check_feature_pre_filter is gone; if "
+            "feature_pre_filter=true is implemented now, say so in the "
+            "contract and update this gate in the same commit",
+        )
+    elif "raise Error(" not in body.group(0):
+        fail(
+            problems,
+            "stock defaults: check_feature_pre_filter no longer refuses "
+            "feature_pre_filter=true. Accepting it without dropping the "
+            "features LightGBM drops makes the two libraries fit different "
+            "feature spaces, which is the same error EFB is held back for",
+        )
+
+
 def unwired_tests(text, problems):
     """Cited Mojo suites that no pixi task runs.
 
@@ -1435,6 +1540,7 @@ def main():
     stale_deferred(text, problems)
     unwired_tests(text, problems)
     monotone_passthrough(problems)
+    stock_defaults(problems)
 
     header, level_rows = levels_table(text)
     print(f"  {len(supported)} rows marked supported")
