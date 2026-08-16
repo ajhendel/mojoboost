@@ -525,6 +525,194 @@ would print a number under a label it had not earned; `train_multiclass_gpu`
 in particular takes no `row_unroll` argument, so both arms of the pair would
 be the same run.
 
+### The K1 hist-latency arms, one pair at a time
+
+Three more launch shapes landed on the GPU histogram path and were
+unreachable from any benchmark, which on this machine is the same as not
+having landed: only interleaved arms in one process resolve anything here,
+so a knob that a rebuild is the only way to move is a knob nobody can
+measure. They are now `bench_train_gpu.mojo` arms, wired as **three
+independent pairs** rather than as one combined arm, because three changes
+timed together cannot be attributed to any one of them.
+
+**No numbers below are measurements of these arms.** Nothing in this section
+has been timed. The only thing run was a smoke pass at 2,000 x 8 in which
+all nine arms executed and every one of them reported the same training loss
+to the last digit and the same tree count, which is the "cannot change a
+model" claim holding and is not a measurement of speed. Every arm prints
+`<arm>_train_s_samples`, `<arm>_spread_pct_of_median` and
+`<arm>_train_loss`, and the loss is what a reader checks first: all of these
+are launch shapes, accumulation is fixed-point Int32, integer addition is
+associative and commutative, so a pair whose losses differ has found a bug
+and not a speedup.
+
+Every run also prints one `arm_conditions:` line per arm before the loop,
+carrying the trainer, split strategy, grow policy and all four launch shapes
+with the tile request resolved to the `rows_per_tile` actually passed. The
+same string is in each arm's object in `json_summary` as `conditions`. An
+arm name is a label; this line is the record.
+
+#### Pair alignment, on against off
+
+```sh
+pixi run bench-train-gpu 1000000 50 binary 5 pair-align-on,pair-align-off
+```
+
+**`binary`, not `reg`, and this is a constraint and not a preference.** The
+width-2 load this knob annotates exists only where the histogram row loop
+carries a live hessian plane. Squared error guarantees a constant hessian,
+so an unweighted non-GOSS `reg` round elides that plane, gathers a single
+word per row, and reads `pair_alignment` nowhere at all; both halves of the
+pair would be the same run. Logistic curvature is `p(1-p)`, so `binary`
+rounds carry the plane and the pair load. `bench_train_gpu.mojo` refuses the
+`reg` combination rather than printing two identical runs under two labels.
+`MOJOTREES_CONST_HESSIAN=0` also makes the arm live on `reg`, at the cost of
+measuring a three-plane configuration the library does not ship.
+
+The knob is on by default on an *observation* of the emitted LLVM IR — the
+unannotated spelling emits `align 4` for a `<2 x i32>` load — and not on any
+device measurement. This pair is what would turn that into one.
+
+#### Index width, Int32 against Int
+
+```sh
+pixi run bench-train-gpu 1000000 50 reg 5 narrow-index-off,narrow-index-on
+```
+
+The control is written first so it is the baseline every comparison line is
+computed against, and it is the OFF arm because off is what the trainer
+defaults to. Unlike the other two knobs this one is exact only **under a
+bound on the dataset shape**: `n_features * n_rows` and `2 * n_rows` must
+both fit a signed 32-bit integer. The bound is not tight against anything
+this library runs — at 1,000,000 rows it admits 2,147 features — and a shape
+outside it is refused before any data is generated rather than run.
+
+The honest prior is that this is a null. The row loop issues three shared
+atomics and one scattered global gather per (row, feature), against which
+one index add either way is noise, and the wide form's expensive term is
+loop-invariant so a compiler that hoists it has already paid it once per
+slot. That is exactly why it needs a measurement and did not get an
+on-by-default.
+
+#### Row tiles, 1 against 2 against 4 against 8
+
+```sh
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-1
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-2
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-4
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-8
+```
+
+All four in one process, which is the better run if the box will hold still
+for it, since every arm is then in the same thermal window as every other:
+
+```sh
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-1,row-tiles-2,row-tiles-4,row-tiles-8
+```
+
+**Which direction is which.** `N` in `row-tiles-N` is the tile count at the
+**root**: the arm sets a fixed tile length of `ceil(n_rows / N)`, so a node
+holding `m` rows gets `ceil(m / length)` tiles and a node shorter than one
+tile gets one. Larger N is more and shorter tiles. That is the direction an
+earlier experiment went, and it went badly: a device-wide floor of 80 tiles
+*measured* 22 percent slower at 50 features and 36 percent slower at 100
+across a whole fit and was reverted (`gpu_tiling.row_tile_floor`). Smaller N
+is fewer and longer tiles and **has never been tested in either benchmark**.
+If per-tile zero-and-flush traffic is what dominated that loss, `row-tiles-1`
+is the arm most likely to win, and it is the one the earlier round could not
+express. The benchmark prints a `row_tiles_legend:` line saying all of this,
+so the direction is readable off the output without opening the source.
+
+**The control passes zeros, and is not `row-tiles-2`.** Zero on both
+`min_tiles` and `rows_per_tile` is byte for byte the geometry the trainer
+produced before those parameters existed. At 1,000,000 x 50 on the 10-core
+M4 that resolves to two tiles at the root (`ceil(target_blocks / n_slots)` =
+`ceil(80 / 50)`), which is *derived* and machine-specific, and it is still
+not the same rule as `row-tiles-2`: the default fixes a tile **count** per
+node so the length shrinks with the node, and these arms fix a tile
+**length** so the count shrinks with the node. The two agree at the root and
+diverge immediately below it, so the control has to be an arm of its own.
+
+**One parameter carries the whole sweep.** `min_tiles` is zero on every arm.
+It is a floor with `ceil(target_blocks / n_slots)` still underneath it, so it
+cannot express one tile at all on the shape being tested, and a sweep whose
+two ends came from two different mechanisms could not attribute what it
+found to the tile count.
+
+**Why `MOJOTREES_GPU_TREE_RESIDENT=0`.** The device-owned growth plane is the
+default and builds every non-root histogram through
+`gpu_active_rows.enqueue_desc_child`, which derives its tiling *without* the
+tile requests. Under it a tile arm would reach the root node and nothing
+else, which is worse to time than an arm that reaches nothing: the delta
+would be real and would be attributed to a geometry most of the tree never
+saw. `=0` forces the host-driven split loop, which honors the requests at
+every node. `bench_train_gpu.mojo` refuses a `gpu` or `gpu-device` tile arm
+while the plane is on rather than producing that pair. **This is a gap in
+`src/`, not a property of the experiment**: `enqueue_desc_child` should take
+the two requests the way `range_tiling` does, and until it does the tile
+question cannot be asked of the default growth plane.
+
+`gpu-host` never routes to the resident plane, so its tile arms need no
+environment variable and are not refused:
+
+```sh
+pixi run bench-train-gpu 1000000 50 reg 5 gpu-host-tiles-default,gpu-host-tiles-1
+```
+
+That is the further-from-default recipe of the two, though, because it also
+moves the split search off the device; prefer the `=0` form, which keeps
+device split search and moves only the tree plane.
+
+#### Composing with the strategy, the grow policy and each other
+
+Every arm above runs under `SPLIT_SEARCH_AUTO`, so each pair holds every
+condition but its own knob constant. Where the strategy or the grow policy
+needs pinning too, the same knobs are composable suffixes on any GPU arm, in
+any order:
+
+```sh
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    gpu-device-tiles-default,gpu-device-tiles-1
+pixi run bench-train-gpu 1000000 50 reg 5 \
+    gpu-device-depth-nonarrow,gpu-device-depth-narrow
+pixi run bench-train-gpu 1000000 50 binary 5 \
+    gpu-device-palign,gpu-device-nopalign
+```
+
+The suffixes are `-unroll` / `-nounroll`, `-narrow` / `-nonarrow`,
+`-palign` / `-nopalign`, and `-tiles-default` / `-tiles-1` / `-tiles-2` /
+`-tiles-4` / `-tiles-8`. A suffix naming the trainer's own default prints
+under the plain arm's name — `gpu-host-tiles-default` reports as `gpu-host`
+— which is the rule `-unroll` already follows: an arm that declares the
+default is the same configuration as the plain arm and must not enter the
+record under a second key. The `arm_conditions:` line still spells out every
+knob for both.
+
+#### What is refused rather than run
+
+A knob that reaches no kernel would still print a number under a label,
+which is the failure this whole file is built to prevent. All of these raise
+before any data is generated:
+
+| Combination | Why |
+| --- | --- |
+| any launch-shape arm under `MOJOTREES_GPU_HIST_SPECIALIZATION=batched` | the batched kernels in `gpu_leaf_batching.mojo` carry their own row loop and tile arithmetic and read none of the four fields |
+| any launch-shape arm on `multi` / `multi:N` | `train_multiclass_gpu` takes none of the four arguments |
+| `narrow-index-*` outside the Int32 shape bound | the wide arm is the only correct one there, so there is no pair |
+| `pair-align-*` on a constant-hessian objective, `reg` included | no width-2 pair load exists to annotate |
+| `row-tiles-*` on `gpu` or `gpu-device` while the resident plane is on | the arm would reach the root node and nothing else |
+| `cpu-*` or `lightgbm-*` with any of the four suffixes | neither trainer has a GPU histogram launch shape |
+
+The last row extends a refusal that was already here for `cpu-nounroll` and
+`lightgbm-depth`, and the batched row extends it to the row-walk pair as
+well: `row-unroll-on` / `row-unroll-off` under a batched specialization were
+two identical runs under two labels until this lane, and are now refused.
+
 ## GPU histogram scaling and phase breakdown
 
 `bench_histogram_scaling.mojo` is the driver for the histogram kernel
