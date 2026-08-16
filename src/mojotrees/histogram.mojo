@@ -560,10 +560,85 @@ def _check_constant_hessian(hess: List[Float64], n_rows: Int) raises:
             )
 
 
-def _resolve_const_hessian(declared: Bool) -> Bool:
+@fieldwise_init
+struct ConstHessianSettings(Copyable, Movable):
+    """The two constant-hessian environment answers, read once.
+
+    `parallel.DispatchSettings` does this for the seven variables the dispatch
+    rule reads, and states the argument: a value that is the same for the
+    length of a fit should be read once for the length of a fit. These two are
+    the same shape of question and were left out of it. `_resolve_const_hessian`
+    calls `const_hessian_allowed()`, and a build that resolves to on then calls
+    `const_hessian_verify()`, so a squared-error fit -- where the declaration
+    is on -- pays two `getenv` calls and the two `String` allocations that name
+    them on **every** histogram build and **every** sibling subtraction, which
+    is twice per node, ignoring the snapshot the same call already carries.
+
+    Snapshot semantics are `DispatchSettings`'s, deliberately: `unresolved()`
+    is the sentinel every defaulted parameter constructs, and it reads the
+    environment live exactly as the call did before this type existed. There
+    is no cache and no global, so nothing goes stale; a holder invalidates by
+    resolving again.
+
+    Where it should live: on `DispatchSettings` itself, resolved once per fit
+    with the rest. It is a separate type only because `parallel.mojo` belongs
+    to another owner this round, and a per-tree resolve was reachable without
+    it. See the report for the field this would fold into.
+    """
+
+    var allowed: Bool
+    """`const_hessian_allowed()`, i.e. `MOJOTREES_CONST_HESSIAN != 0`."""
+
+    var verify: Bool
+    """`const_hessian_verify()`, i.e. `MOJOTREES_CONST_HESSIAN_VERIFY != 0`."""
+
+    var resolved: Bool
+    """False for `unresolved()`, which sends every reader back to the live
+    environment read. The two fields above are then not consulted at all."""
+
+    @staticmethod
+    def resolve() -> ConstHessianSettings:
+        """One read of each of the two variables."""
+        return ConstHessianSettings(
+            const_hessian_allowed(), const_hessian_verify(), True
+        )
+
+    @staticmethod
+    def unresolved() -> ConstHessianSettings:
+        """The sentinel: no `getenv`, three integer stores. `allowed` is set
+        to the default the live read would return so that a misuse that
+        ignored `resolved` would still fail safe, but no reader ignores it."""
+        return ConstHessianSettings(True, False, False)
+
+
+def _resolve_const_hessian(
+    declared: Bool,
+    env: ConstHessianSettings = ConstHessianSettings.unresolved(),
+) -> Bool:
     """The specialization's on/off decision for one build: the caller's
-    declaration, ANDed with the environment's permission."""
-    return declared and const_hessian_allowed()
+    declaration, ANDed with the environment's permission.
+
+    With a resolved `env` the permission comes from the snapshot and this
+    reads no environment variable; with the sentinel it reads it live, which
+    is what every call site did before the parameter existed. The answer is
+    the same either way for a fit that did not `setenv` mid-run, and a fit
+    that did is exactly what a snapshot is defined not to observe."""
+    if not declared:
+        return False
+    if env.resolved:
+        return env.allowed
+    return const_hessian_allowed()
+
+
+def _resolve_const_hessian_verify(
+    env: ConstHessianSettings = ConstHessianSettings.unresolved(),
+) -> Bool:
+    """`const_hessian_verify()` under the same snapshot rule. Only ever
+    asked when the specialization resolved to on, which is why it sits
+    behind the `and` at every call site."""
+    if env.resolved:
+        return env.verify
+    return const_hessian_verify()
 
 
 @fieldwise_init
@@ -725,7 +800,14 @@ def _zeroed_int(size: Int) -> List[Int]:
 
 
 def _check_features(features: List[Int], n_features: Int) raises:
-    """Feature ids must be in range; an empty list means every feature."""
+    """Feature ids must be in range; an empty list means every feature.
+
+    Range **only**. This does not check that the ids are distinct or
+    ascending, and a repeated id is accepted here: `[0, 0, 0]` against three
+    features passes. Nothing downstream is unsound for it -- the accumulation
+    would simply do feature 0 three times -- but it means `len(features) ==
+    n_features` alone does not establish that the list covers every feature,
+    which is why `_zero_excluded` proves the covering separately."""
     for i in range(len(features)):
         if features[i] < 0 or features[i] >= n_features:
             raise Error("feature index out of range")
@@ -773,6 +855,28 @@ def _zero_excluded(
     """
     if len(features) == 0 or n_features <= 0 or n_bins <= 0:
         return
+
+    # Nothing is excluded when the list already names every feature, and the
+    # grower reaches here with exactly that list on the default path: at
+    # `feature_fraction = 1.0` the tree's set is `[0, n_features)`, so the
+    # mask below is allocated, filled, dispatched over, and zeroes nothing.
+    #
+    # `len(features) == n_features` is not on its own enough to conclude that:
+    # `_check_features` checks range only and accepts repeats (see its
+    # docstring), so `[0, 0, 0]` against three features would pass a length
+    # test while excluding two features. Strictly ascending is what settles
+    # it -- with every id range-checked by the caller, `n_features` strictly
+    # ascending ids inside `[0, n_features)` can only be `features[i] == i`.
+    # A complete but unordered list falls through and does the work, which is
+    # correct, just not shortened.
+    if len(features) == n_features:
+        var covers_every_feature = True
+        for i in range(1, n_features):
+            if features[i] <= features[i - 1]:
+                covers_every_feature = False
+                break
+        if covers_every_feature:
+            return
 
     # Mojo's scalar pointer API cannot load `Bool`. A byte preserves the
     # compact active mask and keeps the parallel zeroing pass unchanged.
@@ -842,6 +946,7 @@ def build_histogram_into(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """`build_histogram` into a caller-owned buffer, every cell of which is
     written: the accumulation pass zeroes each slice before filling it, so a
@@ -855,10 +960,14 @@ def build_histogram_into(
     before the parameter existed, and produces the same histogram cell for
     cell either way -- a snapshot changes only how many tasks the work is cut
     into, and every dispatch shape here keeps each feature's summation inside
-    one task."""
+    one task.
+
+    `const_hessian_env` is the same idea for the two constant-hessian
+    variables; see `ConstHessianSettings`."""
     var scratch = List[Float64]()
     build_histogram_into_scratch(
-        out, scratch, data, grad, hess, features, const_hessian, settings
+        out, scratch, data, grad, hess, features, const_hessian, settings,
+        const_hessian_env,
     )
 
 
@@ -871,6 +980,7 @@ def build_histogram_into_scratch(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """`build_histogram_into` with a caller-owned scratch buffer, the twin of
     `build_histogram_subset_into_scratch`.
@@ -891,8 +1001,8 @@ def build_histogram_into_scratch(
     if not out.matches(data.n_features, data.n_bins):
         raise Error("output histogram shape must match the data")
     _check_features(features, data.n_features)
-    var const_h = _resolve_const_hessian(const_hessian)
-    if const_h and const_hessian_verify():
+    var const_h = _resolve_const_hessian(const_hessian, const_hessian_env)
+    if const_h and _resolve_const_hessian_verify(const_hessian_env):
         _check_constant_hessian(hess, data.n_rows)
 
     # The three output buffers are passed as separate `mut` lists rather than
@@ -1358,6 +1468,7 @@ def build_histogram_subset_into_scratch(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """`build_histogram_subset_into` with a caller-owned scratch buffer.
 
@@ -1391,6 +1502,14 @@ def build_histogram_subset_into_scratch(
     was fixed when the fit started. Passing one reads nothing. It cannot move
     a cell: the gather is elementwise over ascending disjoint blocks and the
     accumulation keeps each feature inside one task at every task count.
+
+    `const_hessian_env` is the same argument for the two constant-hessian
+    variables, and this is likewise the call that matters most for it: the
+    declaration is on for every squared-error round, so without a snapshot
+    this function reads `MOJOTREES_CONST_HESSIAN` and
+    `MOJOTREES_CONST_HESSIAN_VERIFY` once per node, allocating a `String` for
+    each name, to re-derive a decision the fit made before its first tree. See
+    `ConstHessianSettings`.
     """
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
@@ -1399,8 +1518,8 @@ def build_histogram_subset_into_scratch(
     if row_start < 0 or row_count < 0 or row_start + row_count > len(rows):
         raise Error("row window out of range")
     _check_features(features, data.n_features)
-    var const_h = _resolve_const_hessian(const_hessian)
-    if const_h and const_hessian_verify():
+    var const_h = _resolve_const_hessian(const_hessian, const_hessian_env)
+    if const_h and _resolve_const_hessian_verify(const_hessian_env):
         _check_constant_hessian(hess, data.n_rows)
 
     _accumulate_subset(
@@ -2555,10 +2674,16 @@ def subtract_histogram_into(
     child: Histogram,
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """`subtract_histogram` into a caller-owned buffer. Every element is
     written, so unlike the accumulating builders this one needs no zeroing
     pass at all.
+
+    `const_hessian_env` is the fit's constant-hessian snapshot; the sentinel
+    reads the environment live, once per subtraction, exactly as before. The
+    grower reaches this once per split, which is the other half of the two
+    reads per node `ConstHessianSettings` exists to remove.
 
     `const_hessian` declares that **both operands** were built under the
     constant-hessian specialization, so each holds `Float64(count)` in its
@@ -2598,7 +2723,7 @@ def subtract_histogram_into(
         child._hess,
         child._count,
         parent.n_features * parent.n_bins,
-        _resolve_const_hessian(const_hessian),
+        _resolve_const_hessian(const_hessian, const_hessian_env),
         settings,
     )
 

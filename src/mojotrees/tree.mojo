@@ -20,15 +20,22 @@ Growth also carries each frontier leaf's branch feature set, the features
 split on between the root and that leaf. When feature interaction
 constraints are configured, the branch set determines which features the
 leaf may split on; see interaction.mojo for the rule. With no constraints
-the branch sets stay empty and the allow masks stay empty, so the
-unconstrained path is unchanged.
+the allow mask is empty for every branch, so the branch set is never read;
+growth then leaves the branch sets empty too rather than building a list per
+split that nothing consumes, and the unconstrained path allocates nothing
+for interaction constraints at all.
 
 Feature subsampling (see sampling.mojo) draws one feature set per tree from
 `tree_index` and the seed, then optionally a set per depth and a set per
 node, in that order. Only the tree's set is ever accumulated into histograms,
 so excluded features cost nothing and sibling subtraction stays exact; the
 per-depth and per-node sets narrow the split search on top of that. Both
-inner fractions default to 1.0, which passes the tree's set through untouched.
+inner fractions default to 1.0, which passes the tree's set through
+untouched -- and when the tree's set is every feature (the default
+`feature_fraction`), a node's set is left empty instead of copied, since the
+empty list already means "every feature" to the split scan, the CEGB costing
+and the profile's cell count. That is the same selection with no per-node
+list allocation; a node draws only when some fraction actually narrows it.
 
 Exclusive feature bundling (see efb.mojo) is a histogram layout and nothing
 more. `grow_tree` optionally takes a `BundledMatrix`, and then each node's
@@ -79,6 +86,7 @@ from .efb import (
     expand_bundled_histogram,
 )
 from .histogram import (
+    ConstHessianSettings,
     Histogram,
     build_histogram_into,
     build_histogram_subset_into_scratch,
@@ -354,6 +362,33 @@ struct Tree(Copyable, Movable):
                     "); feature contributions need every node's training row"
                     " count",
                 )
+
+    def reserve_nodes(mut self, n_nodes: Int):
+        """Size the ten per-node arrays for a tree of at most `n_nodes` nodes.
+
+        `_add_node` appends to ten separately allocated `List`s, each of which
+        doubles on its own schedule, so a grower that does not call this pays
+        ten independent geometric reallocation sequences per tree: for a
+        31-leaf tree that is ten lists times six doublings, and every doubling
+        copies what is already there. A grower knows its node budget before it
+        starts -- a tree with `num_leaves` leaves has exactly
+        `2 * num_leaves - 1` nodes at most -- so one reservation per tree
+        replaces all of it.
+
+        Reserve only; it never shrinks, never resizes, and leaves the tree's
+        length and contents alone, so calling it changes no value anywhere."""
+        if n_nodes <= 0:
+            return
+        self.feature.reserve(n_nodes)
+        self.threshold_bin.reserve(n_nodes)
+        self.left.reserve(n_nodes)
+        self.right.reserve(n_nodes)
+        self.value.reserve(n_nodes)
+        self.split_gain.reserve(n_nodes)
+        self.default_left.reserve(n_nodes)
+        self.missing_bin.reserve(n_nodes)
+        self.cat_offset.reserve(n_nodes)
+        self.count.reserve(n_nodes)
 
     def _add_node(mut self, value: Float64, count: Float64) -> Int:
         """Append a leaf holding `value`, covered by `count` training rows.
@@ -1419,6 +1454,19 @@ def _leaf_value(
     )
 
 
+def _scan_cells(features: List[Int], n_features: Int, n_bins: Int) -> Int:
+    """The cells one node's split scan reads, for `PhaseProfile.charge`.
+
+    A node's feature list is empty exactly when it did not draw one, and an
+    empty list means every feature to the scan -- the same convention
+    `find_best_split` and `prepare_cegb_node` use. A drawn list is never
+    empty (`sampling.selection_count` floors at 2), so the two cases cannot
+    be confused. Resolving it here keeps the charge equal to what the scan
+    actually reads instead of charging zero for an undrawn node."""
+    var n_active = len(features) if len(features) > 0 else n_features
+    return n_active * n_bins
+
+
 def _search(
     hist: Histogram,
     n_rows: Int,
@@ -1550,6 +1598,7 @@ def _hist_full(
     columns: List[Int],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """Accumulate every row into `hist`, which is always per feature.
 
@@ -1578,11 +1627,13 @@ def _hist_full(
     """
     if not bundled.active:
         build_histogram_into(
-            hist, data, grad, hess, features, const_hessian, settings
+            hist, data, grad, hess, features, const_hessian, settings,
+            const_hessian_env,
         )
         return
     build_histogram_into(
-        scratch, bundled.data, grad, hess, columns, const_hessian, settings
+        scratch, bundled.data, grad, hess, columns, const_hessian, settings,
+        const_hessian_env,
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -1602,6 +1653,7 @@ def _hist_subset(
     columns: List[Int],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """`_hist_full` for a row subset. Row ids index the original matrix and the
     bundled one identically, because bundling rearranges columns and never
@@ -1625,12 +1677,12 @@ def _hist_subset(
     if not bundled.active:
         build_histogram_subset_into_scratch(
             hist, pairs, data, grad, hess, rows, start, count, features,
-            const_hessian, settings,
+            const_hessian, settings, const_hessian_env,
         )
         return
     build_histogram_subset_into_scratch(
         scratch, pairs, bundled.data, grad, hess, rows, start, count, columns,
-        const_hessian, settings,
+        const_hessian, settings, const_hessian_env,
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -1821,9 +1873,24 @@ def grow_tree_leaves_profiled(
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
     const_hessian: Bool = False,
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises -> Tree:
     """Grow one tree, leaf-wise by default or depth-wise under
     `params.grow_policy == GROW_DEPTHWISE`.
+
+    `const_hessian_env` is the fit's constant-hessian snapshot
+    (`histogram.ConstHessianSettings`), the counterpart of the dispatch
+    snapshot `scratch.settings` carries. It is threaded into every histogram
+    build and every sibling subtraction below, so a resolved value makes a
+    whole tree of nodes read `MOJOTREES_CONST_HESSIAN` and
+    `MOJOTREES_CONST_HESSIAN_VERIFY` exactly zero times. The default sentinel
+    is resolved **once here**, at the top of the tree, rather than being
+    passed down as the sentinel: an unwired caller then pays two `getenv`
+    calls per tree instead of two per node, which is the behaviour every
+    caller that has not been wired gets and is already a strict improvement on
+    the per-node reads. A boosting loop that holds one across the fit passes
+    it and pays them once per fit; `parallel.DispatchSettings` states the same
+    staging argument for its own `resolved` flag.
 
     `profile` is the phase and node-size attribution instrument
     (phase_profile.mojo), and it is off unless `MOJOTREES_PHASE_PROFILE` says
@@ -2014,6 +2081,21 @@ def grow_tree_leaves_profiled(
     # Empty unless a feature is actually constrained, which keeps split search
     # on its unconstrained path and the fit bit-identical.
     var signs = params.monotone.active_signs()
+    # Whether any node's branch feature set is ever read. It is read only by
+    # `InteractionConstraints.allowed_features`, which answers "every feature"
+    # -- the empty mask -- for any branch when no groups are configured, so
+    # with no constraints the sets stay empty and no branch list is built.
+    var constrained = not params.constraints.is_empty()
+    # The two constant-hessian environment answers, resolved at most once for
+    # this tree instead of once per histogram build and once per subtraction.
+    # A squared-error round declares a constant hessian, so without this every
+    # node pays two `getenv` calls and two `String` allocations to re-derive a
+    # decision that was fixed before the fit started; see
+    # `histogram.ConstHessianSettings`. A caller that carries one across the
+    # fit passes it and nothing here reads the environment at all.
+    var const_h_env = const_hessian_env.copy()
+    if not const_h_env.resolved:
+        const_h_env = ConstHessianSettings.resolve()
     var tree_features = select_tree_features(
         data.n_features,
         params.feature_fraction,
@@ -2032,10 +2114,40 @@ def grow_tree_leaves_profiled(
     # Leaf-value totals must come from a feature the histograms accumulated,
     # which under bundling means one whose slice the expansion wrote.
     var value_feature = tree_features[0]
+    # Whether any node needs a feature draw of its own at all.
+    #
+    # With both inner fractions at 1.0 -- the default -- `select_split_features`
+    # copies `tree_features` twice, once for the level draw and once for the
+    # node draw, and hands back a list the caller is already holding. When the
+    # tree's own set is *every* feature, the empty list means exactly that same
+    # set to all three consumers downstream (`_search` and so `find_best_split`,
+    # `prepare_cegb_node`, and the profile's cell count, which is resolved
+    # through `_scan_cells`), so the two copies are removed by not making them.
+    #
+    # No bit moves: `find_best_split` reads feature `i_feature` directly under
+    # its `use_all` arm and reads `features[i_feature]`, which is `i_feature`
+    # for an ascending complete list, otherwise; the scan order, the active
+    # count and the tie-breaking are the same either way. `select_tree_features`
+    # returns an ascending list without repeats, so `len(tree_features) ==
+    # data.n_features` is exactly "the tree may split on every feature".
+    #
+    # `check_feature_fractions` above has already validated all three fractions
+    # for this tree, so skipping the per-node re-validation cannot let a bad
+    # value through.
+    var per_node_draw = (
+        params.feature_fraction_bylevel < 1.0
+        or params.feature_fraction_bynode < 1.0
+        or len(tree_features) != data.n_features
+    )
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
         List[Float64](), List[Float64](), 0,
     )
+    # A leaf-wise tree stops at `num_leaves` leaves, and a binary tree with L
+    # leaves has 2L - 1 nodes, so this is an exact upper bound on what
+    # `_add_node` will append. One reservation per tree in place of ten
+    # independent doubling sequences; see `Tree.reserve_nodes`.
+    tree.reserve_nodes(2 * params.num_leaves - 1)
 
     # The tree's own root row count is the denominator every node size class
     # in this tree is taken against (phase_profile.mojo). Under bagging or
@@ -2100,6 +2212,7 @@ def grow_tree_leaves_profiled(
         _hist_full(
             root_hist, bundle_scratch, data, bundling, grad, hess,
             tree_features, tree_columns, const_hessian, scratch.settings,
+            const_h_env,
         )
         profile.note_node()
         profile.charge(
@@ -2127,7 +2240,7 @@ def grow_tree_leaves_profiled(
         _hist_subset(
             root_hist, bundle_scratch, scratch.pairs, data, bundling, grad,
             hess, bag, 0, len(bag), tree_features, tree_columns,
-            const_hessian, scratch.settings,
+            const_hessian, scratch.settings, const_h_env,
         )
         profile.note_node()
         profile.charge(
@@ -2167,15 +2280,17 @@ def grow_tree_leaves_profiled(
     # more would walk rows for features that are never scanned, and costing
     # fewer makes `CegbNodeCosts.delta_of` raise for a feature the scan asks
     # about.
-    var root_features = select_split_features(
-        tree_features,
-        params.feature_fraction_bylevel,
-        params.feature_fraction_bynode,
-        params.feature_fraction_seed,
-        tree_index,
-        0,
-        0,
-    )
+    var root_features = List[Int]()
+    if per_node_draw:
+        root_features = select_split_features(
+            tree_features,
+            params.feature_fraction_bylevel,
+            params.feature_fraction_bynode,
+            params.feature_fraction_seed,
+            tree_index,
+            0,
+            0,
+        )
     var root_costs = prepare_cegb_node(
         cegb_config,
         ledger,
@@ -2204,15 +2319,16 @@ def grow_tree_leaves_profiled(
         settings=scratch.settings,
     )
     # The scan reads one bin at a time over the node's own feature draw, so
-    # its cells are `len(root_features) * n_bins` and not the buffer's full
+    # its cells are that draw's width times `n_bins` and not the buffer's full
     # shape. That distinction is the whole reason `cells` is recorded per
-    # charge rather than derived from the dataset.
+    # charge rather than derived from the dataset. `_scan_cells` resolves the
+    # undrawn case, where the empty list means every feature.
     profile.charge(
         PROF_SPLIT_SEARCH,
         len(root_rows),
         root_search_started,
         dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
-        cells=len(root_features) * data.n_bins,
+        cells=_scan_cells(root_features, data.n_features, data.n_bins),
     )
 
     var frontier = List[_LeafState]()
@@ -2379,6 +2495,7 @@ def grow_tree_leaves_profiled(
                 left_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, left_rows, 0, len(left_rows), tree_features,
                 tree_columns, const_hessian, scratch.settings,
+                const_h_env,
             )
             profile.note_node()
             profile.charge(
@@ -2392,7 +2509,7 @@ def grow_tree_leaves_profiled(
             var sub_started = profile.clock()
             subtract_histogram_into(
                 right_hist, parent_hist, left_hist, const_hessian,
-                scratch.settings,
+                scratch.settings, const_h_env,
             )
             # Filed at the *derived* child's size: it is that child's
             # histogram that comes out, and the point of the trick is that a
@@ -2412,6 +2529,7 @@ def grow_tree_leaves_profiled(
                 right_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, right_rows, 0, len(right_rows), tree_features,
                 tree_columns, const_hessian, scratch.settings,
+                const_h_env,
             )
             profile.note_node()
             profile.charge(
@@ -2425,7 +2543,7 @@ def grow_tree_leaves_profiled(
             var sub_started = profile.clock()
             subtract_histogram_into(
                 left_hist, parent_hist, right_hist, const_hessian,
-                scratch.settings,
+                scratch.settings, const_h_env,
             )
             profile.note_node()
             profile.charge(
@@ -2524,20 +2642,32 @@ def grow_tree_leaves_profiled(
 
         # Both children inherit the same branch feature set, so they share one
         # allow mask, and both sit one edge below the leaf that was split.
-        var branch = extend_branch(frontier[best_i].branch, split.feature)
+        #
+        # The branch set exists only to be read by
+        # `InteractionConstraints.allowed_features`, which returns the empty
+        # mask for every branch when no groups are configured. With no
+        # constraints the set is therefore never read, and extending it would
+        # copy a list per split for a value nothing consumes -- so it is left
+        # empty, which is what the module docstring says the unconstrained
+        # path does.
+        var branch = List[Int]()
+        if constrained:
+            branch = extend_branch(frontier[best_i].branch, split.feature)
         var allowed = params.constraints.allowed_features(branch)
         var child_depth = frontier[best_i].depth + 1
         # Each child draws its own per-node feature set from its node id, out
         # of the set its depth drew from the tree's.
-        var left_features = select_split_features(
-            tree_features,
-            params.feature_fraction_bylevel,
-            params.feature_fraction_bynode,
-            params.feature_fraction_seed,
-            tree_index,
-            child_depth,
-            left_node,
-        )
+        var left_features = List[Int]()
+        if per_node_draw:
+            left_features = select_split_features(
+                tree_features,
+                params.feature_fraction_bylevel,
+                params.feature_fraction_bynode,
+                params.feature_fraction_seed,
+                tree_index,
+                child_depth,
+                left_node,
+            )
         var left_costs = prepare_cegb_node(
             cegb_config,
             ledger,
@@ -2571,17 +2701,19 @@ def grow_tree_leaves_profiled(
             len(left_rows),
             left_search_started,
             dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
-            cells=len(left_features) * data.n_bins,
+            cells=_scan_cells(left_features, data.n_features, data.n_bins),
         )
-        var right_features = select_split_features(
-            tree_features,
-            params.feature_fraction_bylevel,
-            params.feature_fraction_bynode,
-            params.feature_fraction_seed,
-            tree_index,
-            child_depth,
-            right_node,
-        )
+        var right_features = List[Int]()
+        if per_node_draw:
+            right_features = select_split_features(
+                tree_features,
+                params.feature_fraction_bylevel,
+                params.feature_fraction_bynode,
+                params.feature_fraction_seed,
+                tree_index,
+                child_depth,
+                right_node,
+            )
         var right_costs = prepare_cegb_node(
             cegb_config,
             ledger,
@@ -2615,7 +2747,7 @@ def grow_tree_leaves_profiled(
             len(right_rows),
             right_search_started,
             dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
-            cells=len(right_features) * data.n_bins,
+            cells=_scan_cells(right_features, data.n_features, data.n_bins),
         )
 
         frontier[best_i] = _LeafState(
