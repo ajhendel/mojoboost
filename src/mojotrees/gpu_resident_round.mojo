@@ -610,13 +610,18 @@ from .gpu_active_rows import (
     STEP_WORDS,
     LeafRange,
 )
+from .growth_policy import GROW_OBLIVIOUS
+from .gpu_leaf_batching import OBLIVIOUS_MAX_ITEMS
 from .gpu_split_search import (
     GpuSplitParams,
     GpuSplitSearcher,
+    OBLIVIOUS_MAX_LEAVES,
     SplitNodeRequest,
+    _launch_oblivious_search,
     _launch_search,
 )
 from .gpu_tree_tables import (
+    OBLIVIOUS_PLAN_ITEMS,
     TREE_BUDGET_SPENT,
     TREE_NO_CANDIDATE,
     TREE_RESIDENT_OK,
@@ -1439,24 +1444,30 @@ what `gpu_split_search.OBLIVIOUS_MAX_LEAVES` reserves per-leaf scan state
 for, and the two limits agreeing is not a coincidence."""
 
 comptime OBLIVIOUS_LEVEL_HISTOGRAM = 2
-"""No descriptor-driven whole-level histogram build is **wired**, so a level
-costs two launches per leaf instead of two per level and a depth-6 tree is 176
-command buffers rather than 62.
+"""The histogram pool this builder holds cannot build a whole level in one
+batch, so a level would cost more command buffers than the census allows.
 
-The primitive is no longer missing. `GpuLeafBatcher.stage_device_plan` and
-`enqueue_device_plan_batch_fused` build any number of children in two
-launches from a plan `gpu_tree_tables._pick_and_commit_kernel` writes on the
-device, at zero extra command buffers, and
-`oblivious_launch_census(6, batch_max_items=64)` is 62 -- under the knee by
-two. What is missing is one edit in `histogram_gpu.mojo`: the growth loop
-calls `GpuHistogramBuilder.enqueue_desc_child`, which is the one-child-per-
-launch-pair path, and nothing yet calls the batched one in its place.
+**This refusal used to be unconditional and is now a sizing test**, which is
+the whole of what the wiring lane changed about it. The primitive was already
+built: `GpuLeafBatcher.stage_device_plan` and `enqueue_device_plan_batch_fused`
+build any number of children in two launches from a plan a commit kernel writes
+on the device, at zero extra command buffers, and the second pays the
+descriptor partition's deferred copy-back inside the zeroing pass it launches
+anyway. What was missing was the growth loop calling it, and
+`GpuHistogramBuilder.enqueue_desc_level_children` is that call.
 
-**And one sizing precondition, which is not a preference.** A depth-6 level
-offers 64 children and `gpu_leaf_batching.DEFAULT_MAX_ITEMS` is 32, so a
-batcher at the default bound needs two batches for the last level and the tree
-lands at exactly 64 -- on the knee rather than under it. The batcher this mode
-uses must be constructed with `max_items >= 64`."""
+What survives is the **sizing precondition, which is not a preference.** A
+depth-6 level offers 64 children and `gpu_leaf_batching.DEFAULT_MAX_ITEMS` is
+32, so a batcher at the default bound needs two batches for the last level and
+`oblivious_launch_census(6, batch_max_items=32)` is exactly 64 -- on the knee
+rather than under it, where the same census at 64 items is 62. So a builder
+whose batcher was opened for the leaf-wise plane refuses here rather than
+growing a tree whose queue-depth argument does not hold.
+`GpuHistogramBuilder.open_resident` takes the bound as a parameter and
+`gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS` is the value this mode passes.
+
+**Depth 5 tops out at 32 children**, so this refusal cannot fire below depth 6
+and a lane that validated only at depth 5 would never have seen it."""
 
 comptime OBLIVIOUS_ROW_RANGES = 3
 """The one-partition-per-level arm leaves host row-range state the host table
@@ -1487,9 +1498,15 @@ lines of host bookkeeping and no kernel.
 window without requiring containment, keeps `split`'s orphan guard, and is not
 a hole in the poison -- it reads nothing out, it clears nothing, and
 `end_descriptor_partition` still lifts the refusal only after checking every
-window against the device's own frontier and running the tiling invariant. So
-this refusal is a schedule that does not exist rather than a table that cannot
-express one."""
+window against the device's own frontier and running the tiling invariant.
+
+**CLOSED, and this code is never returned.** `_publish_level_row_ranges` is the
+schedule that calls the setter: it empties every node, gives each live leaf the
+window the device came home holding, and then hands `end_descriptor_partition`
+the device's own frontier to check the whole table against. The constant stays
+so that a trace or a log written before the closure still names the same thing
+when it is read back, and so the codes below do not shift under a reader who has
+one memorized."""
 
 comptime OBLIVIOUS_CATEGORICAL = 4
 """The dataset has a categorical feature. The cross-leaf scan skips those (see
@@ -1497,14 +1514,64 @@ comptime OBLIVIOUS_CATEGORICAL = 4
 set than the CPU grower's cannot meet a no-tolerance node-identity gate."""
 
 comptime OBLIVIOUS_NO_CPU_PEER = 5
-"""There is no CPU oblivious grower to be node-identical to yet.
+"""There is no CPU oblivious grower to be node-identical to.
 
 Not a technical refusal and deliberately in the same list as the technical
-ones. This mode's gate is bit-level agreement with `grow_policy = oblivious` on
-the CPU, `growth_policy.mojo` still holds only `GROW_LEAFWISE` and
-`GROW_DEPTHWISE`, and a device mode shipped before its comparator exists is a
-mode whose accuracy claim rests on nothing. `OBLIVIOUS_LEAF_INDEX_RULE` is the
-half of the agreement this side can state on its own."""
+ones: a device mode shipped before its comparator exists is a mode whose
+accuracy claim rests on nothing.
+
+**CLOSED, and this code is never returned.** `growth_policy.GROW_OBLIVIOUS`,
+`split.find_best_split_shared` and `tree._grow_oblivious_levels` are the
+comparator, and they implement this side's `OBLIVIOUS_LEAF_INDEX_RULE` rather
+than a numbering of their own. Retained for the reason `OBLIVIOUS_ROW_RANGES`
+is."""
+
+comptime OBLIVIOUS_TABLES = 6
+"""A parameter this plane cannot express: monotone constraints,
+`feature_fraction_bynode`, interaction constraints, `feature_fraction_bylevel`,
+or anything in `TreeParams.extra`.
+
+`gpu_tree_tables.tree_resident_supported` is the same list for the leaf-wise
+plane and cannot be reused directly, because its fourth test refuses every
+`grow_policy` that is not leaf-wise -- which is this one. So the four refusals
+that are genuinely about what a device table can hold are asked here, and the
+one that is about the growth order is not. Each of them refuses for exactly the
+reason it refuses there, and `tree_resident_reason_name` still names them.
+
+The CPU grower refuses more than this under the mode (`tree._check_oblivious`
+adds forced splits, `extra_trees` and the CEGB penalties), and all three of
+those live inside `TreeParams.extra`, so this one code covers them."""
+
+comptime OBLIVIOUS_SPECULATION = 7
+"""The K=1 speculative prebuild is armed, and it must not combine with a
+batched level build.
+
+This is a refusal rather than a silent precedence, because the two are
+individually correct and their combination is not.
+`gpu_tree_tables._pick_runner_up_kernel` publishes a *live* leaf -- the leaf the
+next step is most likely to pick -- and the speculative build deliberately does
+not fold in its sibling subtraction, because that leaf's own histogram is what
+the next pick reads on a miss. A plan that builds both children of a leaf
+overwrites exactly that histogram. On a miss the tree then reduces over a slot
+holding a child's statistics under a parent's name, which is a wrong tree that
+every invariant check passes.
+
+It is also moot on the merits: the speculation predicts which single leaf a
+leaf-wise pick will take next, and an oblivious level takes every leaf. There
+is nothing to speculate about."""
+
+comptime OBLIVIOUS_RECORDS = 8
+"""The searcher holds fewer records than the widest level needs.
+
+A level search reads one record per leaf plus the one level record the
+cross-feature reduction folds into, so the requirement is
+`(1 << max_depth) + 1`. At CatBoost's default depth that is 65, where the
+leaf-wise plane's default budget of 31 leaves asks for 33 -- so a searcher sized
+from `num_leaves` is too small for an oblivious tree and the sizing has to ask
+`oblivious_leaf_budget` instead. `train_gpu._search_record_slots` is where that
+happens, and it is the same predicate the routing asks, for the reason stated
+there: a capacity decision made from a different question than the routing
+decision refuses the plane on the grounds that it was not given room for it."""
 
 
 def oblivious_reason_name(reason: Int) -> String:
@@ -1513,73 +1580,125 @@ def oblivious_reason_name(reason: Int) -> String:
     if reason == OBLIVIOUS_DEPTH:
         return String("max_depth outside 1..6")
     if reason == OBLIVIOUS_LEVEL_HISTOGRAM:
-        return String("no descriptor-driven whole-level histogram build")
+        return String("the histogram batcher cannot hold a whole level")
     if reason == OBLIVIOUS_ROW_RANGES:
         return String("the host row-range table cannot express a level")
     if reason == OBLIVIOUS_CATEGORICAL:
         return String("categorical features")
     if reason == OBLIVIOUS_NO_CPU_PEER:
         return String("no CPU oblivious grower to compare against")
+    if reason == OBLIVIOUS_TABLES:
+        return String("tree tables refuse this configuration")
+    if reason == OBLIVIOUS_SPECULATION:
+        return String("the K=1 speculative prebuild is armed")
+    if reason == OBLIVIOUS_RECORDS:
+        return String("searcher record capacity too small for a level")
     return String("unknown")
+
+
+def oblivious_leaf_budget(params: TreeParams) -> Int:
+    """Leaves an oblivious tree of this depth will have: `1 << max_depth`.
+
+    **`num_leaves` is ignored under this mode and this function is where that
+    is said in arithmetic rather than in prose.** A level splits entirely or not
+    at all, so a leaf budget cannot be met exactly, and every table this plane
+    sizes -- the slot pool, the tree tables, the searcher's records, the plan --
+    is sized from here and never from `params.num_leaves`. CatBoost resolves the
+    same collision by overwriting `max_leaves` with `1 << depth` and raising on
+    a conflicting value; `TreeParams` cannot tell a defaulted `num_leaves` from
+    an explicit one, so this package ignores it and says so, in
+    `tree._check_oblivious` on the host and here on the device.
+
+    Clamped to nothing and unclamped by nothing: `oblivious_device_supported`
+    refuses a depth outside `[1, 6]` before anything asks this, so the answer is
+    between 2 and 64."""
+    if params.max_depth < 1:
+        return 0
+    return 1 << params.max_depth
 
 
 def oblivious_device_supported(
     params: TreeParams, builder: GpuHistogramBuilder
 ) raises -> Int:
-    """Whether the device could grow an oblivious tree, and why not.
+    """Whether the device can grow this fit's oblivious trees, and why not
+    when it cannot.
 
-    It cannot, today, and this returns the reason in the order a reader wants
-    it: the shape refusal first, then the two structural ones the census found,
-    then the data refusal, then the comparator.
+    A predicate rather than a raise, for the same reason
+    `resident_round_supported` is one: the caller has a correct path either way,
+    because the CPU grower implements the same mode.
 
-    This is a predicate and not a raise for the same reason
-    `resident_round_supported` is: the caller has a correct path either way.
-    The difference is that every refusal below is currently unconditional, so
-    the function's honest summary is that the mode is **not reachable** and the
-    two refusals worth lifting are named rather than described.
+    **Every refusal below is now conditional, which was not true of this
+    function before the wiring lane.** It used to end by returning
+    `OBLIVIOUS_LEVEL_HISTOGRAM` unconditionally, and its honest summary was that
+    the mode was unreachable. The order is the order a reader wants the reason
+    in: the two that are properties of the request, then the two that are
+    properties of the data and the parameters, then the two that are properties
+    of what this builder happens to have open.
+
+    `builder` is asked one question -- whether its batcher can hold a whole
+    level -- and it is asked last among the shape tests, because a caller that
+    reaches this with a leaf-wise builder should be told about the batcher
+    rather than about the depth.
     """
+    if params.grow_policy != GROW_OBLIVIOUS:
+        return OBLIVIOUS_TABLES
     if params.max_depth < 1 or params.max_depth > 6:
         return OBLIVIOUS_DEPTH
     if builder.cats.any_categorical():
         return OBLIVIOUS_CATEGORICAL
-    return OBLIVIOUS_LEVEL_HISTOGRAM
+    if (
+        params.monotone.is_active()
+        or params.feature_fraction_bynode != 1.0
+        or params.constraints.n_groups() > 0
+        or params.extra.is_active()
+        or params.feature_fraction_bylevel != 1.0
+    ):
+        return OBLIVIOUS_TABLES
+    if speculative_build_enabled():
+        return OBLIVIOUS_SPECULATION
+    if not builder.oblivious_level_fits(oblivious_leaf_budget(params)):
+        return OBLIVIOUS_LEVEL_HISTOGRAM
+    return OBLIVIOUS_OK
+
+
+def oblivious_records_needed(params: TreeParams) -> Int:
+    """Record slots a searcher must hold for a level search: one per leaf of
+    the widest level, plus the level record the reduction folds into.
+
+    The level record must sit outside the leaf records it reads, which
+    `GpuSplitSearcher.enqueue_oblivious_level` refuses on and
+    `_launch_oblivious_search` relies on: the scan reads the leaf records while
+    writing the level record's per-feature slots."""
+    return oblivious_leaf_budget(params) + 1
 
 
 def oblivious_open_blockers() -> List[Int]:
-    """Every standing reason this mode is not reachable, largest first.
+    """Every standing reason this mode is not reachable, and there are none.
 
-    `oblivious_device_supported` answers for one configuration and can only
-    return one reason, so the two blockers that hold for *every* configuration
-    would otherwise be visible only in a comment. They are the list a reader
-    wants -- "what would it take" -- rather than the answer to "can this fit
-    take it", and they are in cost order:
+    It held three, and each of them is closed by something a test now runs
+    rather than by an argument:
 
-    1. `OBLIVIOUS_LEVEL_HISTOGRAM`, which is the census. Until a level's
-       children can be built by a descriptor-driven launch, a depth-6 tree is
-       176 command buffers and not 62, and the queue-depth argument that opened
-       this round does not hold. `GpuLeafBatcher.enqueue_batch` is the shape
-       that closes it; what it needed was a device-written `BatchItemPlan`, and
-       it now has one. What is left is the wiring: `enqueue_desc_child` in
-       `histogram_gpu.mojo` is still what the growth loop calls.
-    2. `OBLIVIOUS_ROW_RANGES`, which is host bookkeeping and is small: a direct
-       window setter on `LeafRangeTable`, because a level partitioned in one
-       pass leaves children that are not inside their parents.
-       `LeafRangeTable.set_window` is that setter and it is built; what is
-       missing is the level schedule that would call it.
-    3. `OBLIVIOUS_NO_CPU_PEER`, which is not this lane's to close. The gate for
-       the mode is node-identity with the CPU oblivious grower and there is not
-       one yet.
+    1. `OBLIVIOUS_LEVEL_HISTOGRAM`, the census. A level's children are built by
+       `GpuHistogramBuilder.enqueue_desc_level_children`, which is
+       `GpuLeafBatcher.enqueue_device_plan_batch_fused` over a plan
+       `gpu_tree_tables._commit_level_kernel` wrote on the device: two launches
+       for the whole level, and the partition's deferred copy-back carried
+       inside the zeroing pass so the partition stays at two. What survives
+       under that code is the sizing test, not the wiring gap.
+    2. `OBLIVIOUS_ROW_RANGES`, the host bookkeeping. `_publish_level_row_ranges`
+       replays the device's own frontier onto the host table through
+       `LeafRangeTable.set_window` and clears the poison through
+       `end_descriptor_partition`, which checks every window against that
+       frontier before it lifts.
+    3. `OBLIVIOUS_NO_CPU_PEER`, the comparator. `tree._grow_oblivious_levels`
+       exists and implements this file's `OBLIVIOUS_LEAF_INDEX_RULE`.
 
-    The cross-leaf reduction is deliberately **not** on this list. It is built,
-    it is fused into the search launch at no extra command buffer, and
-    `tests/test_gpu_oblivious_device.mojo` checks it against a host replica bit
-    for bit at the full 64-leaf width of a depth-6 level.
+    The function stays rather than being deleted, and returning an empty list is
+    the point: "what would it take" is a question a reader will ask again, and
+    an empty answer that something asserts is stronger than a deleted function
+    nobody can ask.
     """
-    return [
-        OBLIVIOUS_LEVEL_HISTOGRAM,
-        OBLIVIOUS_ROW_RANGES,
-        OBLIVIOUS_NO_CPU_PEER,
-    ]
+    return List[Int]()
 
 
 def resident_round_refusal_detail(params: TreeParams) raises -> String:
@@ -2536,4 +2655,553 @@ def grow_tree_device_resident(
                 "\n",
             ),
         )
+    return tree_from_snapshot(snap)
+
+
+# --- grow_policy = oblivious: the level schedule ---------------------------
+
+
+comptime OBLIVIOUS_TRACE_MARK = "plane=device-oblivious"
+"""The token `grow_tree_device_oblivious` writes once per tree it grows.
+
+Deliberately **not** `plane=device-resident`. That token is what
+`tests/test_gpu_tree_resident.mojo` counts to prove the leaf-wise plane ran, and
+a second plane writing it would turn that file's positive control into a test
+that passes when either plane executes. Two planes, two marks, and each file
+counts its own."""
+
+
+comptime OBLIVIOUS_LEVEL_LAUNCHES = 6
+"""Command buffers one level of the schedule below costs, apart from its
+children.
+
+    stage the level's leaf search records   gpu_tree_tables   1
+    search the level                        gpu_split_search  2
+    commit the level                        gpu_tree_tables   1
+    partition the whole prefix              gpu_active_rows   2
+                                                              6
+
+One fewer than the leaf-wise counterpart `oblivious_launch_census` models,
+because there is no per-child record to file: the level's decision is written
+straight into the level record by the cross-feature reduction, and the commit
+reads it there. The leaf-wise loop's `enqueue_desc_copy_records` exists to
+reconcile a search that writes consecutive scratch records with two children
+whose frontier slots are not consecutive, and a level has neither problem --
+record index, frontier slot, leaf index and pool slot are all the same number
+(`gpu_tree_tables._stage_level_search_kernel`).
+
+The partition is 2 and not 3 because `GpuActiveRows.enqueue_partition_desc`
+defers its copy-back and the level's batched build pays it inside the zeroing
+pass it launches anyway. That is the whole margin; see
+`gpu_leaf_batching._batch_copy_back_zero_kernel`."""
+
+
+def oblivious_schedule_launches(
+    max_depth: Int, batch_max_items: Int = OBLIVIOUS_MAX_ITEMS
+) -> Int:
+    """Command buffers **the schedule below actually enqueues** between waits,
+    counted statically off `grow_tree_device_oblivious`.
+
+    `oblivious_launch_census` is the model this round was opened on and it is
+    kept exactly as it was, because it is the registered prediction and a
+    prediction edited after the fact is not one. This is the built thing, and
+    the two differ in one term:
+
+        depth 6, max_items = 64:  census 62,  schedule 56
+        depth 6, max_items = 32:  census 64,  schedule 58
+
+    The six-launch gap is `OBLIVIOUS_LEVEL_LAUNCHES` being 6 where the census
+    assumed 7, once per level. The census was not wrong about anything it
+    counted; it counted the leaf-wise phase list, and a level does not need the
+    record-filing phase.
+
+    **The sizing precondition survives the gap and is not weakened by it.** At
+    `max_items = 32` this schedule is 58 rather than 62, which is under the
+    knee -- so on this schedule the default bound would not by itself break the
+    queue-depth argument. It is still refused (`OBLIVIOUS_LEVEL_HISTOGRAM`), for
+    two reasons that are about not spending the margin rather than about having
+    already spent it: the two extra command buffers buy nothing at all, and the
+    census the mode was admitted on is the 62/64 pair, so a build that quietly
+    runs at a bound the census calls the knee is a build whose registered
+    argument no longer describes it.
+
+    What is deliberately not counted here, exactly as the census does not count
+    it: the last level's children. Those histograms are built and never
+    searched, because a leaf at `max_depth` is never split. Skipping them would
+    be worth two launches and is **not** taken, because the batched build is
+    also what pays the partition's deferred copy-back, and a schedule that
+    skipped it would have to pay that debt in a launch of its own -- the same
+    two buffers, moved. Recorded so nobody re-derives the saving.
+    """
+    if max_depth < 1:
+        return 0
+    var total = 7 + max_depth * OBLIVIOUS_LEVEL_LAUNCHES + 1
+    for l in range(max_depth):
+        var children = 1 << (l + 1)
+        if batch_max_items < 1:
+            total += 2 * children
+        else:
+            total += 2 * (
+                (children + batch_max_items - 1) // batch_max_items
+            )
+    return total
+
+
+def _publish_level_row_ranges(
+    mut builder: GpuHistogramBuilder, snap: TreeTablesSnapshot
+) raises:
+    """Replay an oblivious tree's finished frontier onto the host row-range
+    table, and clear the descriptor partition's poison.
+
+    `_publish_row_ranges` is the leaf-wise counterpart and it **cannot be used
+    here**, which is `OBLIVIOUS_ROW_RANGES` and is worth restating at the code
+    that works around it. That function replays `LeafRangeTable.split` in commit
+    order, and `split` hands a parent's window to two children as a prefix and a
+    suffix of one block. An oblivious level does not partition that way: one
+    stable partition of the whole prefix sends every leaf's left-going rows to
+    the front and every leaf's right-going rows to the back, so a parent's rows
+    end up in two blocks that are not adjacent and there is no `n_left` that
+    describes it. `split` would not raise on such a level -- it would silently
+    write a different partition, and the failure mode of a wrong row-range table
+    is not a wrong tree, it is correct trees and wrong scores from round two
+    onward, because `GpuHistogramBuilder.update_raw_device` reads exactly this
+    table. That shipped once and is why this is not optional.
+
+    So the replay is direct rather than derived. `LeafRangeTable.set_window`
+    writes one node's window without requiring containment, and what it is
+    handed is the device's **own frontier**: the row window every live leaf came
+    home holding, straight out of the snapshot.  Every other node is emptied
+    first, which is always permitted and is what a level replay does to the
+    parents it has just replaced.
+
+    **Nothing here is a weaker proof than the leaf-wise replay's.** The setter
+    does not clear the poison and cannot; `end_descriptor_partition` still does,
+    and still only after checking the node count, every live leaf's window
+    against the device frontier, that no non-live node owns rows, and the tiling
+    invariant. What changes is where the windows come from, not what is checked
+    about them. The one thing it cannot prove is the one the leaf-wise replay
+    cannot either: that the counts the commit derived from the histogram agree
+    with the rows `_scatter_kernel` actually routed. Both numbers come from the
+    same count plane.
+
+    The commit-log check is made first and for the same reason it is there:
+    every commit creates exactly two nodes, so a log accounting for fewer nodes
+    than the tree holds is a log the kernel stopped appending to.
+
+    Host bookkeeping only. It enqueues nothing, transfers nothing, and waits for
+    nothing.
+    """
+    if 2 * len(snap.commit_order) + 1 != snap.next_node:
+        raise Error(
+            "the device commit log holds ",
+            len(snap.commit_order),
+            " commits, which account for ",
+            2 * len(snap.commit_order) + 1,
+            " nodes, but the oblivious tree ended with ",
+            snap.next_node,
+            "; replaying a log that does not account for the whole tree would"
+            " leave the host row-range table describing a different tree from"
+            " the one the device grew",
+        )
+    # Every node emptied first, live leaves included, so the loop below writes
+    # onto a table with no window to orphan. Emptying is always allowed
+    # (`set_window`), and it is what a level replay does to the parents it has
+    # just replaced.
+    for n in range(snap.next_node):
+        builder.rows.ranges.set_window(n, 0, 0)
+    var leaf_nodes = List[Int](capacity=len(snap.leaves))
+    var leaf_windows = List[LeafRange](capacity=len(snap.leaves))
+    for i in range(len(snap.leaves)):
+        var leaf = snap.leaves[i].copy()
+        if leaf.node < 0 or leaf.node >= snap.next_node:
+            raise Error(
+                "the device frontier names a leaf outside the tree it grew"
+            )
+        builder.rows.ranges.set_window(
+            leaf.node, leaf.row_begin, leaf.row_end()
+        )
+        leaf_nodes.append(leaf.node)
+        leaf_windows.append(LeafRange(leaf.row_begin, leaf.row_end()))
+    builder.rows.ranges.end_descriptor_partition(
+        snap.next_node, leaf_nodes, leaf_windows
+    )
+
+
+def grow_tree_device_oblivious(
+    mut builder: GpuHistogramBuilder,
+    mut searcher: GpuSplitSearcher,
+    split_params: GpuSplitParams,
+    params: TreeParams,
+    tree_features: List[Int],
+    n_root: Int,
+) raises -> Tree:
+    """Grow one symmetric (CatBoost `SymmetricTree`) tree with the device
+    owning the frontier, the tree and the slot pool, and the host waiting once.
+
+    Preconditions the caller has already met, in the order it met them:
+    gradients uploaded, `builder.set_features(tree_features)` called,
+    `builder.begin_tree(bag)` called so the root owns `[0, n_root)`,
+    `builder.open_resident(oblivious_leaf_budget(params), OBLIVIOUS_MAX_ITEMS)`
+    answered True, `builder.open_resident_tables(oblivious_leaf_budget(params))`
+    answered True, the searcher reset for this tree so that every record slot
+    carries the tree's feature set and an empty allow mask, and
+    `oblivious_device_supported` answered `OBLIVIOUS_OK`.
+
+    **`num_leaves` is ignored and every table above is sized from
+    `1 << max_depth`.** A level splits entirely or not at all, so a leaf budget
+    cannot be met exactly; `oblivious_leaf_budget` is the one place that
+    arithmetic lives and `tree._check_oblivious` says the same thing on the
+    host. A caller that sizes from `params.num_leaves` gets `OBLIVIOUS_RECORDS`
+    or a declined pool, not a truncated tree.
+
+    The schedule, per level
+    -----------------------
+    Six launches plus the level's children, which is
+    `OBLIVIOUS_LEVEL_LAUNCHES` and `oblivious_schedule_launches`:
+
+        stage the level's leaf search records   1
+        search the level                        2   scan + cross-feature reduce
+        commit the level                        1
+        partition the whole prefix              2   scan + scatter
+        build every child of the level          2   one batch, copy-back fused
+
+    so a whole tree is `7 + 6 * max_depth + 1 + 2 * max_depth` at
+    `max_items >= 64`, which is **56** at CatBoost's default depth of 6 against
+    a queue that is 64 deep. The leaf-wise plane at its default budget is 278.
+
+    Three of those five phases are the same launches the leaf-wise plane makes,
+    aimed at a level instead of at a split, and that is the load-bearing claim
+    of the whole lane:
+
+    - **The search is two launches for a level exactly as it is for a node**,
+      because `gpu_split_search._scan_slot_oblivious_kernel` puts the sum over
+      the level's leaves in the innermost loop of the scan that already runs.
+      The sum is serial in ascending leaf-record order rather than a block
+      collective, because Float32 addition is not associative and this mode's
+      accuracy gate has no tolerance in it.
+    - **The partition is one partition for the whole level**, because at every
+      level the live leaves tile `[0, n_active)` and an oblivious level applies
+      the same routing rule to all of them. `enqueue_partition_desc` needs no
+      change at all: the commit writes a descriptor naming the whole prefix and
+      the existing kernels do the rest.
+    - **The children are one batch for the whole level.** The commit writes the
+      plan on the device, in the launch it was already making, and the batch
+      carries the partition's deferred copy-back in its zeroing pass. Without
+      that fusion the partition would be three launches, six more per tree, and
+      the census would land the wrong side of the knee.
+
+    Round trips: **one per tree**, the download at the end, exactly as the
+    leaf-wise plane. Nothing in the loop below reads a device answer.
+
+    What is enqueued past the end of growth
+    ---------------------------------------
+    Every level is enqueued whether or not growth has already stopped, for the
+    same reason the leaf-wise loop enqueues every step: asking the host how many
+    levels there will be is the round trip this plane exists to remove. A
+    stopped tree's commits return on `CTR_STATUS` before they read a record, so
+    nothing after the stop can commit. Its *searches* still run, over records
+    the frontier no longer fills; `_stage_level_search_kernel` points those at
+    slot 0 so the reads are in bounds and the answers are read by nothing.
+
+    The last launch is a commit that cannot commit, and it is not optional. A
+    committing level writes `TREE_RUNNING`, because from inside the kernel that
+    is what has just happened, so a tree that spends its whole depth budget
+    would otherwise come home saying growth is still in progress. Handed
+    `level_depth == max_depth` this launch writes `TREE_BUDGET_SPENT` and
+    nothing else. It is the same shape, and the same argument, as the extra
+    `enqueue_desc_step` below the leaf-wise loop.
+
+    The last level's children are built and never searched, which is two
+    launches of real work spent on histograms nothing reads. It is deliberate:
+    that batch is also what pays the partition's deferred copy-back, so skipping
+    it would move the cost rather than remove it. See
+    `oblivious_schedule_launches`.
+
+    Not instrumented, traceable
+    ---------------------------
+    `PhaseProfile` is not threaded through this loop, for the reason
+    `grow_tree_device_resident` states: an instrument that adds two
+    synchronizations per level would measure itself. `OBLIVIOUS_TRACE_MARK` is
+    written once per tree to the resident trace sink, and that is what a test
+    asserts on to prove this function ran at all -- which matters more than it
+    sounds, because a caller that refuses this mode falls back to a CPU grower
+    that produces a structurally identical tree, and a comparison between the
+    two can agree perfectly while this function never executed.
+    """
+    if n_root < 0:
+        raise Error("the root row count must be nonnegative")
+    if len(tree_features) < 1:
+        raise Error("a tree needs at least one active feature")
+    if not builder.desc_tables_open():
+        raise Error("open_resident_tables has not run on this builder")
+    if params.max_depth < 1 or params.max_depth > 6:
+        raise Error(
+            "grow_policy=oblivious on the device is implemented for max_depth"
+            " in [1, 6]; see OBLIVIOUS_DEPTH"
+        )
+    if speculative_build_enabled():
+        raise Error(
+            "the K=1 speculative prebuild and a batched level build must not"
+            " combine: the runner-up kernel publishes a leaf that is still"
+            " live, and a plan that builds both of its children overwrites the"
+            " histogram the next pick reads on a miss. See"
+            " OBLIVIOUS_SPECULATION"
+        )
+    var budget = oblivious_leaf_budget(params)
+    # The level record sits outside the leaf records it reads, because the scan
+    # reads the leaf records while writing the level record's per-feature slots
+    # (`GpuSplitSearcher.enqueue_oblivious_level` refuses the overlap).
+    var leaf_base = 0
+    var level_record = searcher.max_records - 1
+    if searcher.max_records < oblivious_records_needed(params):
+        raise Error(
+            String(
+                "an oblivious tree of depth ",
+                params.max_depth,
+                " needs ",
+                oblivious_records_needed(params),
+                " search records and this searcher holds ",
+                searcher.max_records,
+                "; see OBLIVIOUS_RECORDS",
+            )
+        )
+    if budget > OBLIVIOUS_MAX_LEAVES:
+        raise Error(
+            "an oblivious level is bounded by OBLIVIOUS_MAX_LEAVES leaves"
+        )
+
+    var slot_cells = 3 * builder.n_features * builder.n_bins
+    var widest = len(searcher.active)
+    if widest < 1:
+        widest = len(tree_features)
+    var trace = resident_trace_sink()
+    var trace_steps = trace != "" and resident_trace_steps_requested()
+    # Not optional here, where it is merely the default on the leaf-wise plane:
+    # the level's batched build is the only thing that pays the partition's
+    # copy-back, and it pays it by fusion. With the fusion off the partition
+    # would launch its own copy-back and the batch would then be told there is
+    # no debt, which `mark_copy_back_fused` refuses rather than absorbs.
+    builder.rows.set_partition_fusion(True)
+    var folds_before = builder.rows.copy_back_folds
+    var row_bound = n_root if n_root > 0 else 1
+
+    # --- Per-tree staging, all of it, before any growth --------------------
+    #
+    # The plan's geometry first, because staging it is two copies and a copy on
+    # Metal drains the queue; doing it here means the drain happens before
+    # anything is in flight rather than in the middle of the tree. Every item is
+    # staged dead, so a batch enqueued before the commit that fills it zeroes
+    # nothing and accumulates nothing.
+    #
+    # `budget` items and not the first level's two: every level fills or kills
+    # the same staged width, because an item some earlier and narrower level
+    # filled still names a histogram slot that is now another leaf's.
+    _ = builder.stage_desc_level_plan(budget, row_bound)
+
+    # The root's histogram, into pool slot 0. Slot 0 because the level commit
+    # pins slot index to leaf index and the root is leaf index 0.
+    builder.enqueue_leaf(0, resident_slot=0)
+
+    # The tables, reset to a one-leaf frontier owning every active row. Before
+    # the root value is seeded, since the reset zeroes the node table.
+    builder.enqueue_desc_begin_tree(n_root)
+
+    # The searcher's per-record tables. Every record carries this tree's
+    # fixed-point scales, and every record's histogram base starts at slot 0;
+    # the level's own bases are written on the device from the frontier before
+    # each search. One copy for all of it, and it is the only upload here.
+    for r in range(searcher.max_records):
+        searcher._stage_params(
+            split_params,
+            builder.g_scale,
+            builder.h_scale,
+            OutputBounds.unbounded(),
+            r,
+        )
+        searcher._stage_hist_base(r, Int32(0))
+    searcher._copy_tables()
+
+    # --- Growth, one level at a time ---------------------------------------
+    for level in range(params.max_depth):
+        var n_leaves = 1 << level
+        # Point this level's leaf records at this level's pool slots. Reads the
+        # device frontier, so it is right on a level the host never saw.
+        builder.enqueue_desc_stage_level_search(
+            searcher.node_dev, slot_cells, leaf_base, budget
+        )
+        # The level search: the cross-leaf scan and the ordinary cross-feature
+        # reduction, two launches, into `level_record`.
+        # `_launch_oblivious_search` directly rather than
+        # `enqueue_oblivious_level`, for the reason `_launch_child_search`
+        # bypasses `enqueue_frontier`: the per-record histogram base was written
+        # on the device a launch ago and copying the host's stale mirror over it
+        # would aim the scan at the previous level's slots.
+        _launch_oblivious_search(
+            searcher.ctx,
+            builder.batcher[0].out_dev,
+            searcher.node_dev,
+            searcher.feat_dev,
+            searcher.allow_dev,
+            searcher.missing_dev,
+            searcher.catn_dev,
+            searcher.mono_dev,
+            searcher.fparam_dev,
+            searcher.slot_i_dev,
+            searcher.slot_f_dev,
+            searcher.rec_i_dev,
+            searcher.rec_f_dev,
+            searcher.n_bins,
+            searcher.n_features * searcher.n_bins,
+            searcher.n_features,
+            widest,
+            level_record,
+            leaf_base,
+            n_leaves,
+            split_params.min_data_in_leaf,
+            searcher.constrained,
+            False,
+            searcher.use_primitives,
+            searcher.gain_form_code,
+        )
+        if level == 0:
+            # The root's own Newton value. Level 0's record is a level of one
+            # leaf, so its `FREC_PARENT_VALUE` is the root's totals and nothing
+            # else; the leaf-wise plane seeds the same word from record 0.
+            builder.enqueue_desc_seed_root(searcher.rec_f_dev, level_record)
+        # Apply the level's split to every leaf of the level: node ids, child
+        # values, windows, slot pool, frontier, plan, step descriptor.
+        builder.enqueue_desc_level(
+            searcher.rec_i_dev,
+            searcher.rec_f_dev,
+            searcher.fparam_dev,
+            level_record,
+            level,
+            params.max_depth,
+            searcher.gain_form_code,
+        )
+        # One stable partition of the whole prefix by the level's one rule,
+        # which produces the entire next level. Two launches; the copy-back is
+        # deferred to the batch below.
+        builder.enqueue_desc_partition(row_bound)
+        # Every child of the level, each from its own rows, in two launches,
+        # with the deferred copy-back paid inside the first of them.
+        builder.enqueue_desc_level_children()
+        if trace_steps:
+            var mid = builder.download_desc_tables()
+            _resident_trace_emit(
+                trace,
+                String(
+                    "mojotrees.oblivious level=",
+                    level,
+                    " leaves=",
+                    n_leaves,
+                    " ",
+                    mid.trace_line(),
+                    "\n",
+                    mid.describe(),
+                ),
+            )
+
+    # --- The launch that ends growth rather than performing it -------------
+    #
+    # `level_depth == max_depth` is a depth the commit cannot take, so this
+    # writes `TREE_BUDGET_SPENT` and nothing else. See the docstring; it is the
+    # same argument as the leaf-wise loop's trailing `enqueue_desc_step`.
+    builder.enqueue_desc_level(
+        searcher.rec_i_dev,
+        searcher.rec_f_dev,
+        searcher.fparam_dev,
+        level_record,
+        params.max_depth,
+        params.max_depth,
+        searcher.gain_form_code,
+    )
+
+    # --- The one round trip ------------------------------------------------
+    var snap = builder.download_desc_tables()
+    _resident_trace_emit(
+        trace,
+        String(
+            "mojotrees.oblivious ",
+            OBLIVIOUS_TRACE_MARK,
+            " ",
+            snap.trace_line(),
+            " depth=",
+            params.max_depth,
+            " budget=",
+            budget,
+            " root_rows=",
+            n_root,
+            " levels=",
+            params.max_depth,
+            " folds=",
+            builder.rows.copy_back_folds - folds_before,
+            "\n",
+            snap.describe(),
+        ),
+    )
+    snap.check_invariants()
+    if not _growth_finished_normally(snap.status):
+        raise Error(
+            String(
+                "the device-owned oblivious tree stopped abnormally: ",
+                tree_status_name(snap.status),
+                "; ",
+                snap.trace_line(),
+                ". Set ",
+                RESIDENT_TRACE_VAR,
+                " to a path and ",
+                RESIDENT_TRACE_STEPS_VAR,
+                "=1 for the frontier at every level.",
+            )
+        )
+    # Four numbers the schedule knows and the tables cannot check for
+    # themselves. The middle two are the shape of the mode: a symmetric tree's
+    # leaf count is a power of two and is bounded by its depth and by nothing
+    # else -- which is what "num_leaves does not bind" reads like when it is
+    # written as an assertion instead of as prose.
+    if snap.commits != snap.n_live - 1:
+        raise Error(
+            String(
+                "the device-owned oblivious tree committed ",
+                snap.commits,
+                " splits but holds ",
+                snap.n_live,
+                " leaves; a tree of L leaves is L-1 splits",
+            )
+        )
+    if snap.n_live > budget:
+        raise Error(
+            String(
+                "the device-owned oblivious tree grew ",
+                snap.n_live,
+                " leaves against a depth budget of ",
+                budget,
+            )
+        )
+    var power = 1
+    while power < snap.n_live:
+        power *= 2
+    if power != snap.n_live:
+        raise Error(
+            String(
+                "the device-owned oblivious tree holds ",
+                snap.n_live,
+                " leaves, which is not a power of two; every level of a"
+                " symmetric tree splits entirely or not at all",
+            )
+        )
+    if snap.status == TREE_BUDGET_SPENT and snap.n_live != budget:
+        raise Error(
+            String(
+                "the device-owned oblivious tree reports a spent depth budget"
+                " at ",
+                snap.n_live,
+                " leaves of ",
+                budget,
+            )
+        )
+    # The host state the rest of the trainer reads back out of the builder.
+    # Not optional and not cosmetic; see `_publish_level_row_ranges`.
+    _publish_level_row_ranges(builder, snap)
     return tree_from_snapshot(snap)

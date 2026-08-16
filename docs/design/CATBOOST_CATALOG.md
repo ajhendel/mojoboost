@@ -31,9 +31,9 @@ reported beside LightGBM `stock+det`; never instead of it.
 | A1 | Per-level physical row reordering (`MakeSplit`: "segmented sort; segmented gather for each stats + indices; update part offsets and sizes") | After each level's split, rows are physically sorted so every leaf's rows are contiguous; gathers coalesce | No (order-preserving version) | Yes, GPU, if the histogram kernel is gather-bound | GPU | (2) trade: a sort per split vs coalesced reads; behind a switch, A/B after the decomposition probe |
 | A2 | Small-leaf-first with sibling subtraction (`if (firstLeaf.Size < secondLeaf.Size)`; `SubstractHistograms`) | Build the smaller child, derive the larger | — | Already ours, both backends | — | — |
 | A3 | `random_strength` (`scoreStDev = RandomStrength * derivativesStDevFromZero * modelSizeDecrease`; `SetBestScore(randSeed + taskIdx, ...)`) | Seeded noise added to candidate scores before argmax; a regularizer LightGBM lacks | Only when > 0 | Yes, all growth modes, default 0 | CPU (`split.mojo`), GPU search kernel for parity | (3) when on; deterministic under the seed and across workers |
-| A4 | Bayesian bootstrap / `bootstrap_type` (**verified from source**, see A4 note) | Row weighting instead of row dropping: every row kept, each given weight `(-log(U + 1e-100)) ** bagging_temperature`, redrawn once per tree | Only when on | Yes for CatBoost mode (their default sampler). Built in `sampling.mojo`, off by default. **Device cost, checked:** per-row weights disable the constant-hessian plane (`round_has_constant_hessian`), so the device accumulates three planes and the Int16 gradient-staging arm loses its better half (staged bytes per visit 7 -> 9 at the default group, not 9 -> 7). Not free on the device even with no device code written. | CPU (`sampling.mojo`) | (3) when on; **carries a constant-hessian exclusion**, see the note |
+| A4 | Bayesian bootstrap / `bootstrap_type` (**verified from source**, see A4 note) | Row weighting instead of row dropping: every row kept, each given weight `(-log(U + 1e-100)) ** bagging_temperature`, redrawn once per tree | Only when on | Yes for CatBoost mode (their default sampler). Built in `sampling.mojo`, off by default. **Device cost, checked:** per-row weights disable the constant-hessian plane (`round_has_constant_hessian`), so the device accumulates three planes and the Int16 gradient-staging arm loses its better half (staged bytes per visit 7 -> 9 at the default group, not 9 -> 7). Not free on the device even before any device code was written. **Device plane now live** (weight-plane-device lane): `GpuObjectiveState.refresh_weights` rewrites the per-row weight plane once per tree and `GpuHistogramBuilder.refresh_objective_weights` refuses one beside a constant-hessian declaration. The weight is applied in the gradient kernel, where the CPU applies it, so the histogram accumulation gains no multiply and no fetch. Unreached: no trainer constructs a `BayesianBootstrapParams` yet. | CPU (`sampling.mojo`), device plane in `gpu_objectives_native.mojo` | (3) when on; **carries a constant-hessian exclusion**, see the note |
 | A5 | Ordered target statistics for categoricals (CTRs; "verify" against `catboost/private/libs/algo/` CTR code) | For each of several random permutations, a categorical value in row i is replaced by (sum of targets of earlier rows with that category + prior) / (count + 1); plus counters and pairwise combinations; test time uses all rows | Yes (feature values change) | Yes; it is CatBoost's real accuracy edge on high-cardinality columns and independent of tree shape | CPU (`binning.mojo`, categorical, dataset) | (3); design section B2 first, then lanes |
-| A6 | `leaf_estimation_iterations` (`gradient_walker.h::FastGradientWalker`; defaults in `catboost_options.cpp::GetEstimationMethodDefaults`) -- **verified from source** | Re-estimate leaf values 1..k times, derivatives recomputed at the current leaf value each pass | Only when > 1 | Built on the CPU, opt-in, default 1. **DEVICE: not cheap, structural** (GPU orchestrator, 2026-08-16): each extra iteration needs per-leaf grad/hess sums after the previous raw-score update, so a second reduction per leaf per iteration inside the tree (more launches, against the oblivious command-buffer budget) or leaf estimation moved out of the device round (more host trips). **Correction:** an earlier version of this row said CatBoost defaults to 10 for logloss AND multiclass. Logloss is 10; **multiclass is 1**. The 10 in that block is the unreachable Gradient slot while the default method is Newton, and CatBoost's own docs agree. | CPU built; device design decision before any device lane | (3) when > 1; see A6 notes |
+| A6 | `leaf_estimation_iterations` (`gradient_walker.h::FastGradientWalker`; defaults in `catboost_options.cpp::GetEstimationMethodDefaults`) -- **verified from source** | Re-estimate leaf values 1..k times, derivatives recomputed at the current leaf value each pass | Only when > 1 | Built on the CPU and now on the device, opt-in, default 1. **DEVICE: built 2026-08-16**, the first of the two shapes the earlier survey named -- a per-iteration device reduction inside the tree, launches accepted, host kept out of the loop (`gpu_objectives_native.GpuLeafEstimator`). `3 * (k - 1)` launches per tree plus one round trip; at `k = 3` that is 278 -> 284 leaf-wise and 62 -> 68 oblivious, which crosses the 64-command-buffer knee and is why the same six launches cost proportionally more on the oblivious schedule. The earlier "structural, decide before any device lane" deferral is discharged, not still open. **Correction:** an earlier version of this row said CatBoost defaults to 10 for logloss AND multiclass. Logloss is 10; **multiclass is 1**. The 10 in that block is the unreachable Gradient slot while the default method is Newton, and CatBoost's own docs agree. | CPU built; device built | (3) when > 1; see A6 notes |
 | A7 | Ordered boosting (`BodyTailArr`, tail derivatives only) | Derivatives for row i from a model that never saw i | Yes | No for now; large machinery, matters most on small data | — | design note only |
 | A8 | Symmetric (oblivious) trees (`numScoreBlocks = 1` for `SymmetricTree`; leaf index = split-condition bits; depth default 6) | One split per level for all leaves | New mode | Yes, opt-in `grow_policy=oblivious`, both backends | CPU search+schedule; GPU cross-leaf reduce + level partition | Part B. **CPU half BUILT.** Shape/numbering/aggregation **verified from source**; the per-leaf min-child rule is **NOT verified, it is ours** (see below) |
 
@@ -323,6 +323,166 @@ problem more exactly rather than changing which problem it is. **The
 per-objective CatBoost numbers above are recorded in
 `boosting.catboost_leaf_estimation_iterations` and read by nothing; our
 default stays 1 for every objective, which is LightGBM stock.**
+
+**What mojotrees built on the device**, 2026-08-16. `train_gpu`,
+`train_gpu_with_valid` and their session entry points now honor the parameter
+too, on both of `_train_gpu_rounds`'s arms. The host-objective arm's raw
+scores are a `List[Float64]`, so that arm calls
+`boosting._estimate_leaf_values` itself: same fold, same order, same bits as
+the CPU trainer. The device-objective arm's raw scores live on the device and
+is where the new code is.
+
+*Which of the two shapes.* The earlier survey named two and deferred the
+choice: a per-iteration device reduction inside the tree (more launches), or
+leaf estimation lifted out of the device round (more host trips). The first
+was taken. `docs/GPU_PORTABILITY.md` section 6.1.1 separates the two costs --
+a launch or copy count predicts ordering hazard, a *round-trip* count predicts
+seconds -- and the second shape converts a fixed launch cost into `k - 1`
+round trips per tree, which at a hundred rounds and `k = 10` is nine hundred
+waits on a plane whose whole design is one wait per tree.
+
+*What it costs.* `GpuLeafEstimator.estimate` enqueues three launches per extra
+iteration, independent of the leaf count: shift the raw scores by each leaf's
+current value, run `_grad_hess_kernel` (the round's own derivative kernel,
+unmodified, so the objectives and the weight multiplier keep one definition on
+this backend) over the shifted scores, then one threadgroup per leaf to reduce
+that leaf's `G` and `H` and take the step in place. Plus one device-to-host
+copy and one synchronization per tree, which is unavoidable in either shape
+because `Tree.value` is a host list; the point is that it is one and not
+`k - 1`. At `k = 3` a leaf-wise tree goes from 278 launches to 284 (+2.2%,
+entirely inside the 14-17 microsecond regime) and a depth-6 oblivious tree
+from 62 to 68 (+9.7%, and it **crosses** the 64-command-buffer knee where the
+per-launch cost roughly doubles). Added launches therefore cost proportionally
+more on the oblivious schedule, and the crossing is the reason rather than the
+count.
+
+*What moves between iterations, and what does not.* The structure is fixed and
+**no histogram is rebuilt**. Row membership is the leaf ranges the grower left
+in the active-row permutation and does not move. What moves is two numbers per
+leaf, `G` and `H`, and only because the point they are evaluated at moved --
+`raw[r] + v`, with `v` the value the leaf currently holds, unshrunk, exactly
+as on the host and exactly as in CatBoost's own walker.
+
+*Agreement.* Node-identical to `boosting._estimate_leaf_values` to Float32,
+not to the bit: the device sums a leaf's rows in Float32 in a strided
+threadgroup reduction where the host sums them in Float64 sequentially in
+ascending row index. That is the trade this plane already makes everywhere.
+`tests/test_gpu_leaf_estimation.mojo` asserts it on one tree handed to both
+implementations, and asserts the `k = 1` path is bit-identical to a fit with
+the parameter absent on both arms.
+
+*What the GPU trainers refuse rather than ignore.* The multiclass GPU
+trainers (class `k`'s softmax derivative reads every class's raw score,
+including trees this round has not grown yet -- and CatBoost defaults
+`MultiClass` to 1 anyway) and `train_custom_gpu` (a `GradHessFn` is called
+once per round over the whole row set; there is no per-leaf, shifted-score
+call shape to ask it for). The renewing objectives and GOSS are refused by
+the same `boosting._check_leaf_estimation_config` the CPU trainer calls.
+
+## A9, MultiRMSE (multi-target regression), device derivative plane
+
+Status, 2026-08-16 (`lane/multitarget-device`): the **device derivative plane
+and its per-output fixed-point scales are built and tested**; nothing above
+them exists on either backend, and the path is **unreachable from any
+user-facing API by construction**. Read the reachability paragraph at the
+bottom of this section before quoting the first sentence.
+
+**Tree shape, and why it is not CatBoost's.** CatBoost's MultiRMSE grows one
+tree whose leaves hold a vector of `ApproxDimension` values and whose split is
+scored against a gain summed over dimensions. mojotrees grows **K trees per
+round, one scalar-leaf tree per output**, and this lane implements that shape.
+It is the only shape the rest of the codebase can express: `tree.Tree.value`
+is a `List[Float64]` indexed by node id and `Tree.predict_row` returns one
+`Float64`, so a leaf cannot hold a vector without a new field on `Tree` and a
+second dimension through every serializer, dumper and predictor that reads it.
+It is also the shape mojotrees already uses for its one existing multi-output
+trainer: `objective_is_multi_output` *defines* multi-output as "whether one
+boosting iteration grows more than one tree", and
+`boosting._boost_rounds_multiclass` grows `trees[round * n_classes + k]`. A
+device path emitting vector-leaf trees would have no host model to put them
+in. **This is a divergence from CatBoost and is recorded as one**, not a
+parity claim.
+
+**What the other shape would cost, since it was not built.** Two things, in
+two files this lane does not own. (1) A gain summed over outputs in
+`gpu_split_search.mojo`: a candidate would score `sum_j gain(G_j, H_j)` across
+`n_outputs` histogram planes at one split point instead of one plane, which
+changes the reduction the split kernel performs and the argmax it feeds. The
+histogram *accumulation* needs nothing -- it already builds one plane per
+slot. (2) A vector leaf value in `tree.mojo` and `model.mojo`. Neither is
+refused as a runtime error, because neither is reachable: no type here can
+hold a vector leaf, so no caller can ask for one.
+
+**Derivatives.** Uncoupled, and that is the whole reason this was cheap.
+Softmax couples its outputs -- class `k`'s gradient reads a denominator summed
+over every class, so a round needs a probability pass before any class's
+gradient exists. MultiRMSE does not: output `j`'s gradient is
+`w * (raw[r, j] - y[r, j])` and reads nothing of output `j'`. So `prob_dev`,
+`refresh_softmax` and the probability pass all disappear, and
+`_multi_grad_hess_kernel` is a pure per-(row, output) map that writes the same
+class-major plane `grad[slot * n_rows + r]` the batched softmax kernel writes.
+Everything downstream is the multiclass machinery **unchanged**:
+`GpuClassBatch.magnitude_sums`, `set_scales`, `scatter_slot` and every batched
+histogram kernel take a multi-target round without one line changed, and
+`update_raw(k=j)` advances output `j`'s slot exactly as it advances class
+`k`'s. The one new method in `gpu_multiclass_batch.mojo` is
+`fill_multi_output_gradients`, which is the launch and nothing else.
+
+**One scale per output, never one shared.** The fixed-point scale is per round
+and derived from gradient magnitudes, and with K outputs there are K magnitude
+profiles. `GpuClassBatch.set_scales` already answers this per slot and the
+multi-target path inherits the answer unchanged. This hazard is *sharper* here
+than under softmax: softmax classes share a probability simplex and so cannot
+differ by orders of magnitude, while a vector target routinely puts one output
+in units of 1 beside another in units of 1000. A shared scale would size the
+small output's lattice by the large output's magnitudes and quantize its
+gradients toward zero, silently -- the fit would converge on the large output
+and barely move on the small one.
+`tests/test_gpu_multitarget.mojo` fixes three outputs three orders of
+magnitude apart for exactly this, and asserts each slot's scale **equals**
+what the scalar device path derives for that output alone. Equal-scale outputs
+would pass a shared-scale implementation and would also hide an output-index
+error entirely, since swapping two identically-scaled planes changes nothing
+observable.
+
+**Weights.** Per-row, not per (row, output): a sample weight weights the
+observation and every output of it, which is what lets one weight plane serve
+every output slot of a launch. A weighted multi-target round therefore stages
+both derivative planes per output rather than the gradient alone, 9 bytes per
+(row, feature) visit at the default feature group where an unweighted one is
+on 7. That is the A4 arithmetic applied per output, by construction, and not a
+regression.
+
+**Bits do not move for a single-output fit.** The `multi_output` constructor
+parameter defaults False and every scalar statement computes what it computed
+before it existed. `git diff -U0` on `gpu_objectives_native.mojo` deletes
+exactly twelve lines: one import, four docstring lines, one error *message*,
+and six constructor statements, each of the six replaced by an expression
+equal to it at `multi_output == False` --
+`_check_weight_vector(..., n_rows)` for `(..., len(target))`,
+`self.n_rows = n_rows` for `= len(target)`, `target_dev` sized `len(target)`
+for `self.n_rows`, the upload loop over `range(len(target))` for
+`range(self.n_rows)`, and `and not multi_output` appended to the two
+`n_classes > 1` tests. **No kernel body is touched at all** -- not
+`_grad_hess_kernel`, not `_abs_sum_kernel`, not the softmax or raw-update
+kernels. Empirically, `tests/test_gpu_objectives_native.mojo` passes 16/16
+unchanged.
+
+**REACHABILITY: none, and this is the entry that says so.** Walked end to end
+rather than checked at its entry point. `python/mojotrees/sklearn.py` has no
+multi-target objective name and no estimator that accepts a 2-D `y` -- not an
+allow-list gap, a missing estimator class. `params.mojo` has no `num_targets`
+key and `_validate` refuses `num_class` for every objective but `multiclass`,
+so a multi-target fit cannot be spelled in a parameter string.
+`trainset.Dataset` holds one `List[Float64]` label column, so a target matrix
+cannot be expressed at the dataset level. No multi-target objective code
+exists in `objective_registry`. Nothing calls `fill_multi_grad_hess` but the
+test. Making it reachable is four further pieces of work, none of them in
+these files: a label matrix on `Dataset`, a `num_targets` parameter, a
+`train_multi_target` round loop shaped like `_boost_rounds_multiclass`, and a
+multi-output estimator on the Python side. Until then a user asking for
+MultiRMSE gets a name error from sklearn.py, which is a refusal; the failure
+mode to avoid is the opposite one, an accepted parameter with no reader.
 
 ### A12 note: automatic `learning_rate` from the data, verified from source
 

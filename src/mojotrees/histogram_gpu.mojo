@@ -219,7 +219,10 @@ from .gpu_objectives_native import (
     DEFAULT_MAX_NODES,
     SCALE_WINDOW_MAX,
     GpuObjectiveState,
+    GpuRankingState,
 )
+from .ranking import RankGroups
+from .ranking_pairwise import check_rank_kind, describe_rank_kind
 from .parallel import _env_int, dispatch_rows
 from .quantized_gradient import (
     DEFAULT_SCALE_SHAPE,
@@ -1626,6 +1629,49 @@ struct GpuHistogramBuilder(Movable):
             self.ctx, target, sample_weight, n_classes, max_nodes
         )
 
+    def refresh_objective_weights(
+        mut self, mut state: GpuObjectiveState, weights: List[Float64]
+    ) raises:
+        """Upload this tree's per-row weights into `state`'s weight plane, on
+        this builder's context, and refuse the one combination that would make
+        the upload produce a wrong histogram.
+
+        The upload itself is `GpuObjectiveState.refresh_weights`; what this
+        adds is the builder's half of the contract, which the state cannot
+        see. A per-row weight multiplies both derivatives, so under squared
+        error, L1, huber and quantile the hessian *is* the weight (the CPU
+        stores exactly `w` there, `boosting._fill_grad_hess_into`). A builder
+        holding `set_constant_hessian(True)` rebuilds the hessian plane from
+        the row count instead of accumulating it, and against a weighted
+        round it would rebuild the wrong plane silently, in the histogram,
+        with nothing downstream able to tell. So it is refused here.
+
+        This is the same rule as `boosting.round_has_constant_hessian` (which
+        ends in `objective_has_constant_hessian(objective, len(sample_weight)
+        > 0)`, false for every objective under a non-empty weight vector) and
+        `sampling.check_bayesian_bootstrap_hessian_declaration`, reached from
+        the third side. Those two are host predicates evaluated once per fit;
+        this is the device state, and a declaration once made is held for the
+        whole fit and cannot be withdrawn mid-loop, so the ordering a caller
+        must follow is: decide the declaration, then set it, then refresh
+        weights -- never a refresh into a builder already declared constant.
+
+        Only the objective plane is touched. The histogram kernels take no
+        weight argument and none is added: the weight is applied per row in
+        the gradient kernel, before quantization, exactly as on the CPU. See
+        the gpu_objectives_native.mojo module docstring for that argument and
+        for what the refused declaration costs the Int16 staging arm (9 bytes
+        per (row, feature) visit against 7).
+        """
+        if self.constant_hessian():
+            raise Error(
+                "a constant-hessian declaration is in force: a per-row weight"
+                " makes the hessian the weight, so the plane cannot be"
+                " rebuilt from the row count. Clear the declaration before"
+                " refreshing weights"
+            )
+        state.refresh_weights(self.ctx, weights)
+
     def fill_gradients_device(
         mut self,
         mut state: GpuObjectiveState,
@@ -1655,6 +1701,86 @@ struct GpuHistogramBuilder(Movable):
         """
         state.fill_grad_hess(
             self.ctx, objective, alpha, self.grad_dev, self.hess_dev
+        )
+        self._refresh_scales(state)
+        self.has_gradients = True
+        self.gradients_host = False
+        self.round_epoch += 1
+
+    def ranking_state(mut self, groups: RankGroups) raises -> GpuRankingState:
+        """A device ranking state on this builder's context, so its gradients
+        land in this builder's buffers. See gpu_objectives_native.mojo, and
+        ranking_pairwise.mojo for what the objectives are.
+
+        The query boundaries are uploaded here, once per fit. A pairwise fit
+        then calls `GpuRankingState.refresh_pairs` -- once for PairLogit,
+        once per round for YetiRank.
+        """
+        return GpuRankingState(self.ctx, groups)
+
+    def fill_rank_gradients_device(
+        mut self,
+        mut ranking: GpuRankingState,
+        mut state: GpuObjectiveState,
+        kind: Int,
+        round_index: Int = 0,
+    ) raises:
+        """This round's ranking gradients, computed on the device straight
+        into the histogram buffers. The ranking twin of
+        `fill_gradients_device`, and it shares that method's scale derivation
+        rather than repeating it, so a ranking round and a regression round
+        quantize by the same rule at the same cadence.
+
+        What the builder adds to `GpuRankingState.fill_grad_hess`
+        --------------------------------------------------------
+        One refusal the state cannot make for itself, and it is the same
+        refusal `refresh_objective_weights` makes from the other side. A
+        builder holding `set_constant_hessian(True)` rebuilds the hessian plane
+        from the row count instead of accumulating it, and **no ranking
+        objective may be accumulated that way**:
+
+        - PairLogit and YetiRank have `hess_r = sum over the row's pairs of
+          w rho (1 - rho)`, which varies per row, on every round, at every raw
+          score. It is never the constant.
+        - QueryRMSE has `hess_r = w_r`, so it is exactly
+          `histogram.CONSTANT_HESSIAN` when the fit is unweighted and is the
+          weight when it is not -- the same shape squared error has, and
+          `objective_has_constant_hessian` refuses the declaration for squared
+          error under weights for exactly this reason. The unweighted case
+          would qualify, and it is still refused here, because
+          `objective_has_constant_hessian` is histogram.mojo's statement of
+          which objectives qualify and this lane does not extend it. A
+          declaration this path accepted without that function's agreement
+          would be a second answer to the same question.
+
+        So every ranking round on this path stages both derivative planes. Per
+        `GpuActiveRows.staged_gradient_bytes_per_row` that is 4 bytes per row
+        rather than 2, and at the default feature group of one each (row,
+        feature) visit fetches 4 bytes of row index plus the staged derivative
+        plus 1 bin byte: **9 bytes per visit where an unweighted squared-error
+        round is on 7.** That is the arithmetic of the declaration, by
+        construction, and it is not a regression in anything measured here. The
+        gpu_objectives_native.mojo and ranking_pairwise.mojo module docstrings
+        state the same sum from the objective's side.
+        """
+        check_rank_kind(kind)
+        if self.constant_hessian():
+            raise Error(
+                "a constant-hessian declaration is in force and objective '",
+                describe_rank_kind(kind),
+                "' does not guarantee a per-row hessian of 1: its hessian is"
+                " the row weight (QueryRMSE) or a per-round sum over the"
+                " row's pairs (PairLogit, YetiRank). Clear the declaration"
+                " before filling ranking gradients, or train with"
+                " device='cpu'",
+            )
+        ranking.fill_grad_hess(
+            self.ctx,
+            state,
+            kind,
+            self.grad_dev,
+            self.hess_dev,
+            round_index,
         )
         self._refresh_scales(state)
         self.has_gradients = True
@@ -2360,9 +2486,50 @@ struct GpuHistogramBuilder(Movable):
             >= want_slots
         )
 
-    def open_resident(mut self, want_slots: Int) raises -> Bool:
+    def oblivious_level_fits(self, n_children: Int) raises -> Bool:
+        """Whether an open batcher can build a whole level of `n_children` in
+        one batch, and hold a slot for every one of them.
+
+        Two questions and both have to answer yes, because an oblivious level
+        builds every child from its own rows: `max_items` bounds how many item
+        rows one batch covers, and the pool bounds how many histograms can be
+        live at once. The widest level of a depth-`d` tree has `1 << d` children
+        and that is also the tree's leaf count, so the two bounds are asked
+        against the same number.
+
+        A builder with no batcher open answers False rather than guessing at the
+        budget: this is asked by `gpu_resident_round.oblivious_device_supported`
+        *after* `open_resident` has run, so "not open" here means the pool
+        declined, and a mode whose census depends on the batch width should not
+        be routed to on the strength of an allocation nobody made.
+
+        The item bound is the one that is easy to get wrong and expensive to get
+        wrong quietly; see `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`.
+        """
+        if n_children < 2:
+            return False
+        if len(self.batcher) == 0:
+            return False
+        return (
+            self.batcher[0].max_items >= n_children
+            and self.batcher[0].pool.capacity >= n_children
+        )
+
+    def open_resident(
+        mut self, want_slots: Int, max_items: Int = DEFAULT_MAX_ITEMS
+    ) raises -> Bool:
         """Allocate a slot pool deep enough to hold `want_slots` leaves at
         once, and report whether the resident path is available afterwards.
+
+        `max_items` is the widest batch the pool's batcher will ever be asked to
+        build, and it is a parameter rather than a constant because
+        `grow_policy = oblivious` needs it to be 64 and the default is 32. That
+        is not a preference: a depth-6 level's last generation has 64 children,
+        at the default bound it needs two batches, and
+        `gpu_resident_round.oblivious_launch_census(6, batch_max_items=32)` lands
+        the tree at exactly 64 command buffers -- on the queue-depth knee rather
+        than under it. See `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`. The leaf-wise
+        plane passes the default and is unchanged.
 
         All or nothing, and deliberately so. A leaf-wise frontier holds a
         slot per live leaf for the whole tree, so a pool one slot short does
@@ -2410,7 +2577,16 @@ struct GpuHistogramBuilder(Movable):
         if not self.resident_frontier_fits(want_slots):
             return False
         if len(self.batcher) > 0:
-            return self.batcher[0].pool.capacity >= want_slots
+            # Both dimensions, and the item bound is not decoration: a batcher
+            # opened for the leaf-wise plane holds 32 items and an oblivious
+            # tree would silently split its widest level into two batches,
+            # which is the one thing the census cannot absorb. A shallower
+            # request reuses; a wider one declines, exactly as a deeper slot
+            # request does.
+            return (
+                self.batcher[0].pool.capacity >= want_slots
+                and self.batcher[0].max_items >= max_items
+            )
         require_histogram_launchable(
             self.contract,
             self.caps,
@@ -2428,7 +2604,7 @@ struct GpuHistogramBuilder(Movable):
                 self.n_bins,
                 want_slots,
                 self.part_capacity,
-                DEFAULT_MAX_ITEMS,
+                max_items,
                 1,
             )
         )
@@ -2754,6 +2930,151 @@ struct GpuHistogramBuilder(Movable):
             left_record,
             right_record,
         )
+
+    # --- The oblivious level seam -----------------------------------------
+    #
+    # Four more forwarders, and they are the whole of `enqueue_desc_child`'s
+    # replacement under `grow_policy = oblivious`. The single-child build is
+    # two launches per parent; these are two launches per *level*, which is the
+    # difference between 176 command buffers on a depth-6 tree and 62. They sit
+    # here for the same language reason the six above do: each one needs the
+    # tree tables in `resident_tables`, the slot pool in `batcher`, and the row
+    # state in `rows` at once, and a caller outside cannot hold a mutable
+    # borrow of one field while passing a pointer derived from another.
+
+    def stage_desc_level_plan(
+        mut self, n_items: Int, max_rows: Int
+    ) raises -> Int:
+        """Fix the host half of the level plan for this tree, once.
+
+        Forwards to `GpuLeafBatcher.stage_device_plan`, which stages every item
+        dead and returns the packed tile count the batch's grid uses. Called
+        once per tree, before the first level commit, and not again: the
+        geometry is a function of the row bound, the feature width and the item
+        count, and none of the three moves inside a tree.
+
+        `n_items` is the widest level's child count, `1 << max_depth`, and not
+        the first level's. Every level fills or kills the same width; see
+        `gpu_tree_tables._kill_level_plan` for why the killing has to cover the
+        whole staged width and not just the level's own prefix.
+        """
+        if not self.has_gradients:
+            raise Error("call upload_gradients before staging a level plan")
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        return self.batcher[0].stage_device_plan(
+            n_items,
+            max_rows,
+            len(self.active),
+            self.caps,
+            Float32(self.g_scale),
+            Float32(self.h_scale),
+        )
+
+    def enqueue_desc_level(
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        mut fparams: DeviceBuffer[DType.float32],
+        level_record: Int,
+        level_depth: Int,
+        max_depth: Int,
+        gain_form: Int,
+    ) raises:
+        """Commit one oblivious level, writing the descriptor its partition
+        routes by and the plan its batched build accumulates from.
+
+        One launch. `gpu_tree_tables._commit_level_kernel` is the rule.
+        """
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        var pool = self.batcher[0].out_dev.copy()
+        var plan_items = self.batcher[0].plan_items
+        if plan_items < 2:
+            raise Error(
+                "no device-written plan is staged; call"
+                " stage_desc_level_plan before committing a level"
+            )
+        self.resident_tables[0].enqueue_level(
+            rec_i,
+            rec_f,
+            fparams,
+            pool.unsafe_ptr(),
+            self.rows.step_dev.unsafe_ptr(),
+            self.batcher[0].items_dev.unsafe_ptr(),
+            True,
+            level_record,
+            self.n_bins,
+            self.n_features * self.n_bins,
+            level_depth,
+            max_depth,
+            plan_items,
+            gain_form,
+        )
+
+    def enqueue_desc_stage_level_search(
+        mut self,
+        mut node_tbl: DeviceBuffer[DType.int32],
+        slot_cells: Int,
+        leaf_base: Int,
+        max_leaves: Int,
+    ) raises:
+        """Point the level's leaf search records at the level's pool slots."""
+        if len(self.resident_tables) == 0:
+            raise Error("no device tree tables are open")
+        self.resident_tables[0].enqueue_stage_level_search(
+            node_tbl, slot_cells, leaf_base, max_leaves
+        )
+
+    def enqueue_desc_level_children(mut self) raises:
+        """Build every child of the level from its own rows. **Two launches,
+        whatever the level holds**, and they also pay the partition's deferred
+        copy-back.
+
+        This is the call `enqueue_desc_child` is replaced by, and the two are
+        alternatives rather than stages: that one builds the smaller child of one
+        parent and derives the larger by subtraction, which is two launches per
+        parent and 126 per depth-6 tree; this one accumulates all `2^(l+1)`
+        children of a level directly from the windows the level commit wrote,
+        which is two launches per level and 12 per tree. Both accumulate the same
+        per-`(row, feature)` quantized value into the same bin of the same slot
+        in fixed-point Int32, so they are bit-identical where they overlap; see
+        the plan-writing block of `gpu_tree_tables._pick_and_commit_kernel`.
+
+        The copy-back is carried inside the zeroing pass the batch has to launch
+        anyway (`gpu_leaf_batching._batch_copy_back_zero_kernel`), and paying it
+        anywhere else would cost a third partition launch per level -- six per
+        depth-6 tree, which is exactly the margin between 62 command buffers and
+        68. `GpuActiveRows.mark_copy_back_fused` is the bookkeeping half and is
+        called after the launch, never before: four refusals on that struct read
+        the flag this clears.
+
+        No `max_rows` argument, and that is not an omission. The batch's grid
+        comes from the geometry `stage_desc_level_plan` fixed for the tree, so
+        there is no per-level bound left for a caller to get wrong.
+        """
+        if not self.has_gradients:
+            raise Error(
+                "call upload_gradients before enqueue_desc_level_children"
+            )
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        var blocks = self.rows.copy_back_debt_blocks()
+        var rows_ptr = self.rows.rows_dev.copy()
+        var scratch_ptr = self.rows.scratch_dev.copy()
+        var desc_ptr = self.rows.step_dev.copy()
+        self.batcher[0].enqueue_device_plan_batch_fused(
+            self.bins_dev.unsafe_ptr(),
+            rows_ptr.unsafe_ptr(),
+            scratch_ptr.unsafe_ptr(),
+            desc_ptr.unsafe_ptr(),
+            self.grad_dev.unsafe_ptr(),
+            self.hess_dev.unsafe_ptr(),
+            blocks,
+        )
+        self.rows.mark_copy_back_fused()
 
     def download_desc_tables(mut self) raises -> TreeTablesSnapshot:
         """Bring the whole device tree state home.

@@ -26,33 +26,63 @@ information; a fallback destroys it.
 
 ## What `auto` currently does, and why
 
-**`auto` still resolves to the CPU on every machine and every workload in
-practice, but the reason has changed and it is no longer "there is no
-evidence".**
+**`auto` reaches the GPU.** On Metal on an Apple M4, for squared error,
+single output, dense input, at 50 or more features and 250,000 or more rows,
+`auto` selects the accelerator; everywhere else it keeps the CPU and says
+which half of "no rule covered this" applied.
 
-The crossover table is no longer empty. `crossover_rules()` in
-`src/mojotrees/device_policy.mojo` holds exactly one rule, and it is the
-smallest claim the records support:
+`crossover_rules()` in `src/mojotrees/device_policy.mojo` holds exactly one
+rule:
 
 ```text
 profile.api              == metal
 profile.apple_generation == m4
 request.objective        == squared error
 request.n_outputs        <= 1
-request.n_rows           >= 1,000,000
 request.n_features       >= 50
-request.cells()          >= 50,000,000
+request.n_rows           >= AUTO_GPU_MIN_ROWS   (250,000)
 ```
 
-Its evidence is two interleaved CPU against GPU records at exactly that
-shape, `bench/results/apple_m4_large_scaling_2026-08-14.md` and the
-2026-08-15 section of `docs/GPU_VALIDATION.md`. Since then a third round has
-measured the same shape at CPU 6.98s against GPU 3.58s, so the GPU is 1.85x
-the CPU there, and at 250,000 and 50,000 rows the GPU loses to our own CPU
-(1.89 against 1.66, and 1.63 against 0.564). The rule's floor is the
-measured point rather than a fraction of it, because nothing smaller has
-been measured end to end and extrapolating down is precisely what this
-policy exists to refuse.
+There is no cell-count term. `min_cells` was 50,000,000, the product of the
+old 1,000,000-row floor and the 50-feature scope, and gating on rows and on
+their product meant the shipped threshold was something a reader had to
+derive by division. It is 0 now, which does not constrain, and
+`AUTO_GPU_MIN_ROWS` is the one number.
+
+**The row floor is a provisional constant, deliberately set below its own
+evidence, and that is the one thing to know before changing it.** The
+hardware, objective and output scopes rest on two interleaved CPU-against-GPU
+records at 1,000,000 x 50 (`bench/results/apple_m4_large_scaling_2026-08-14.md`
+and the 2026-08-15 section of `docs/GPU_VALIDATION.md`, GPU 2.6x to 2.8x the
+CPU). The floor does not. It was lowered from 1,000,000 to 250,000 on
+2026-08-16 as a stated trade:
+
+- end to end against LightGBM stock+det at 1,000,000 x 50, our GPU arm is
+  1.18x ahead and our CPU arm is 1.75x behind, so which backend `auto`
+  reaches is a 2.1x swing decided by dispatch, and an `auto` that
+  under-reaches hands a user the losing arm silently and forever;
+- at 250,000 x 50 the GPU measured 1.89 s against our own CPU's 1.66 s
+  (`bench/results/profile_2026-08-15/RESULTS.md`), a 14 percent loss on a
+  machine the same protocol records drifting by a factor of two between
+  windows;
+- at 50,000 x 50 the loss is 2.9x, which is why the floor is at 250,000 and
+  not lower.
+
+The crossover point itself is unmeasured and lies somewhere in (50,000,
+1,000,000] rows at 50 features. Measuring it is scheduled for the end of the
+current feature work, and it comes in as an edit to `AUTO_GPU_MIN_ROWS` plus
+a `POLICY_VERSION` bump.
+
+**`MOJOTREES_DERIVATIVE_PRECISION=float64` sends `auto` to the CPU at every
+shape, and no threshold is involved.** The GPU gradient upload narrows every
+per-row derivative to Float32 (`gpu_gradient_stream.stage_gradients`), so the
+accelerator cannot produce the Float64 answer at any size. Precision is a
+capability, so it enters as `BLOCK_DERIVATIVE_PRECISION` and `decide_device`
+reads the blocks before it reads the crossover table: the shape is never
+compared. `device='gpu'` under the same setting raises instead, and the
+asymmetry is deliberate. A caller who named a backend is told it cannot
+honor the request; a caller who asked us to pick is given the backend that
+can.
 
 **Why `auto` could not pick the GPU at all until 2026-08-16, on the very
 machine the rule was measured on.** Three things stopped it, each sufficient
@@ -83,12 +113,12 @@ looked like.
    `resolve_device` declares no objective unless one is passed. This one is
    deliberate and is not being closed by weakening the scope: a caller that
    did not say what it is training has not earned a claim measured on
-   something else. `resolve_device` now takes an optional `objective`, and
-   until the six trainer entry points that hold one start passing it, a
-   defaulted `fit(device='auto')` still gets the CPU. `resolve_device_full`,
-   `decide_device`, `decide_device_report`, and the Python
-   `device_selection.select_device` all take an objective and all reach the
-   rule today.
+   something else. `resolve_device` takes an optional `objective`, and the
+   six trainer entry points that hold one now pass it (`model.fit`,
+   `trainset.train_dataset`, `external_memory.train_external`, and their
+   multiclass counterparts, which pass "unspecified" because a softmax fit's
+   per-class objective is not one they see). A caller that leaves it
+   defaulted still gets the CPU at every shape, by design.
 
 The transcript below is the state before (1) and (2) were fixed. It is kept
 because "the table is empty", "the table has a rule that cannot be reached",
@@ -125,7 +155,9 @@ shape the one rule was measured at, and the rule still did not match,
 because the profile named no hardware. That the report said which half is
 what made the gap findable at all: it never implied the shape was too small.
 Under policy version 3 the same request names the hardware and matches, and
-a report that still says "does not cover" now means the shape.
+a report that still says "does not cover" now means the shape. Under version
+4 the shape it means is `AUTO_GPU_MIN_ROWS`, 250,000 rows, rather than the
+1,000,000 above.
 
 ## Hard blocks and soft uncertainty
 
@@ -147,6 +179,7 @@ raises on it and `"auto"` takes the CPU:
 | More rows than the kernels can index | `workload-limit` | `MAX_ROWS` in `src/mojotrees/histogram_gpu.mojo` |
 | `max_bin` outside [2, 256] | `workload-limit` | `MAX_BINS` there and the binner |
 | The memory estimate does not fit the budget | `insufficient-memory` | the estimate below |
+| `MOJOTREES_DERIVATIVE_PRECISION=float64` | `derivative-precision` | `stage_gradients` in `src/mojotrees/gpu_gradient_stream.mojo` narrows every derivative to Float32 |
 
 **Soft uncertainty** is a workload nobody has measured or documented as
 covered, most often an objective outside the set `device.mojo` names

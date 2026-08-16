@@ -116,6 +116,7 @@ test_gpu_objectives
 test_gpu_objectives_native
 test_gpu_portability
 test_gpu_predict
+test_gpu_ranking_device
 test_gpu_row_compaction
 test_gpu_random_score_noise
 test_gpu_runtime

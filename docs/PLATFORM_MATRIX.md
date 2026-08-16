@@ -191,7 +191,7 @@ The consequences, in order of how much trouble they cause:
   `profile_source=build-target` and warned on as `build-target-hardware`, and it
   is a stronger error than a wrong availability answer because it can select a
   backend rather than merely fail one. It only becomes reachable at all above
-  the crossover rule's floor (1,000,000 rows by 50 features, Metal, M4, squared
+  the crossover rule's floor (250,000 rows by 50 features, Metal, M4, squared
   error, single output), or the moment `MOJOTREES_AUTO_MIN_CELLS` is set on a
   redistributed build. `MOJOTREES_DISABLE_GPU=1` is the way to pin such a build
   to the CPU, and `device="cpu"` is the per-call way; a caller that opens a
@@ -338,7 +338,7 @@ mistake is, loudly, rather than somewhere convenient and quietly.
 | `device="gpu"` with no accelerator in the build | Raises. It never falls back to the CPU silently | `src/mojotrees/device.mojo` |
 | `device="gpu"` on a redistributed build whose host has no usable device | Raises when the device is opened, later than the resolve | `has_accelerator()` is compile time |
 | `device="gpu"` for multiclass | Trains on the device. `fit_multiclass` dispatches on the resolved device and `gpu_supports_outputs` admits every output count; on an M4 the GPU wins multiclass by 1.63x | `device.mojo`, `fit_multiclass` |
-| `device="auto"` anywhere | Chooses the GPU where the one installed rule covers the run (Metal on an M4, squared error, single output, 1,000,000 x 50 and above) and the CPU everywhere else, saying which half of "no rule covered this" applied. The hardware is identified from the build target, not from a reading | `crossover_rules()`, `PROFILE_BUILD_TARGET` |
+| `device="auto"` anywhere | Chooses the GPU where the one installed rule covers the run (Metal on an M4, squared error, single output, dense, 50 or more features, `AUTO_GPU_MIN_ROWS` = 250,000 rows and above) and the CPU everywhere else, saying which half of "no rule covered this" applied. `MOJOTREES_DERIVATIVE_PRECISION=float64` keeps the CPU at every shape, because the device narrows every derivative to Float32. The hardware is identified from the build target, not from a reading | `crossover_rules()`, `AUTO_GPU_MIN_ROWS`, `PROFILE_BUILD_TARGET` |
 | GPU tests on a machine with no accelerator | Print `skipped: no accelerator` and pass. A pass that says `skipped` is not a validation | test suites |
 | A wheel whose tag no target declares | `validate_artifact.py` rule R1 fails the release | release check |
 

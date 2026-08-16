@@ -76,17 +76,24 @@ Three requested devices, and what each one means
 
 Where `auto` reaches the GPU, and where it still does not
 ---------------------------------------------------------
-`crossover_rules()` holds exactly one rule, and it is as narrow as the two
-records behind it. Both measure end-to-end training on an Apple M4 over
+`crossover_rules()` holds exactly one rule. Its *scope* is as narrow as the
+two records behind it. Both measure end-to-end training on an Apple M4 over
 Metal at 1,000,000 rows by 50 dense features, 255 bins, 31 leaves, 100
 rounds, squared error, in interleaved CPU/GPU arms:
 `bench/results/apple_m4_large_scaling_2026-08-14.md` (GPU 4.289-4.382 s
 against CPU 11.094-11.706 s over three seeds) and the 2026-08-15 section of
 `docs/GPU_VALIDATION.md` (GPU 4.10 s against CPU 11.36 s over five
-repeats). So the rule fires from that shape up, on that device, for that
-objective, and nowhere else. Every other backend, every other Apple
-generation, every other objective, every smaller shape, and multiclass all
-keep returning "no rule covered this", because nothing here measured them.
+repeats). So the rule fires on that device, for that objective, at 50 or
+more features, and nowhere else. Every other backend, every other Apple
+generation, every other objective, and multiclass all keep returning "no
+rule covered this", because nothing here measured them.
+
+Its *row floor* is a different kind of thing and is labelled as one:
+`AUTO_GPU_MIN_ROWS` is a plain provisional constant at 250,000 rows, set
+below the smallest shape the GPU has been measured to win, on a stated
+trade rather than on a measurement. Read the comment on that constant
+before changing it; the measured crossover is scheduled work and this is
+the placeholder standing in for it.
 
 That the table was empty for longer than the evidence warranted was a bug,
 not conservatism: `auto` selected the CPU at every size on every machine,
@@ -225,6 +232,14 @@ from .apple_gpu_policy import (
 # `CUSTOM` stays because `_collect_blocks` refuses it by name and gives a
 # reason specific to it.
 from .boosting import CUSTOM
+
+# The derivative-precision rule, imported rather than restated.
+# `MOJOTREES_DERIVATIVE_PRECISION` has one home and it is histogram.mojo;
+# this module reads its answer into `DeviceCapabilities` so that
+# `decide_device` can stay pure. Safe to import: histogram.mojo reaches only
+# binning, objective_registry, apple_cpu_policy and parallel, none of which
+# come back here, and `boosting` (already imported above) reaches it anyway.
+from .histogram import derivative_precision_narrows
 from .initialization import SessionState, warmup_level_name
 
 # The one table of objective facts. Imported rather than restated: this
@@ -338,7 +353,14 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # table was non-empty and unreachable, so a version-2 report saying "no rule
 # covered this" and a version-3 report saying the same thing mean different
 # things, which is precisely what this number is for.
-comptime POLICY_VERSION = 3
+# 4: the row floor moved down, from the measured 1,000,000 to a provisional
+# 250,000 (`AUTO_GPU_MIN_ROWS`), and the 50,000,000-cell term was removed so
+# that one named constant decides. No rule was added and no scope widened.
+# This is the first version whose threshold is set ahead of its evidence
+# rather than at it, and `crossover_rules()` states the trade and what would
+# reverse it; a version-4 GPU selection between 250,000 and 1,000,000 rows is
+# a provisional selection and a report carrying this number says so.
+comptime POLICY_VERSION = 4
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -415,6 +437,7 @@ comptime BLOCK_ROW_LIMIT = 8
 comptime BLOCK_BIN_LIMIT = 9
 comptime BLOCK_OUTPUT_LIMIT = 10
 comptime BLOCK_MEMORY_BUDGET = 11
+comptime BLOCK_DERIVATIVE_PRECISION = 12
 
 
 def block_reason_name(code: Int) -> String:
@@ -440,6 +463,8 @@ def block_reason_name(code: Int) -> String:
         return String("output-limit")
     if code == BLOCK_MEMORY_BUDGET:
         return String("memory-budget")
+    if code == BLOCK_DERIVATIVE_PRECISION:
+        return String("derivative-precision")
     return String("unknown-block")
 
 
@@ -672,6 +697,30 @@ def gpu_available() -> Bool:
     if not build_has_accelerator():
         return False
     return not gpu_disabled_by_env()
+
+
+def env_derivative_precision_is_float64() -> Bool:
+    """Whether this process asked for Float64 per-row derivatives, through
+    `MOJOTREES_DERIVATIVE_PRECISION=float64`.
+
+    The one read of that variable on this side of the boundary, and it is
+    not a second copy of the rule: `histogram.derivative_precision_narrows`
+    is the rule, and this is its negation folded into `DeviceCapabilities`
+    so that `decide_device` stays pure. A typo in the value is diagnosed by
+    `histogram.check_derivative_precision`, which every entry point that can
+    raise already calls; anything unrecognized here means the Float32
+    default, which is the setting the GPU path implements, so a typo can
+    only ever leave the device reachable, never make it unreachable.
+
+    Why the device policy cares at all. `gpu_gradient_stream.stage_gradients`
+    narrows every per-row derivative to Float32 as it uploads, and the GPU
+    histogram runs whatever else is configured, so the accelerator has never
+    been able to honor a Float64 derivative request. Until 2026-08-16 it
+    accepted the flag and produced the Float32 answer anyway, reported as
+    success. The growers now refuse it, which is correct for `device='gpu'`;
+    this function is what lets `auto` route around it instead.
+    """
+    return not derivative_precision_narrows()
 
 
 def env_auto_min_cells() -> Int:
@@ -938,6 +987,11 @@ struct DeviceCapabilities(Copyable, Movable):
       Fields rather than constants so a build that widens one can say so.
     - `auto_min_cells`: the `MOJOTREES_AUTO_MIN_CELLS` value in effect.
       Negative means the heuristic is off.
+    - `derivative_precision_float64`: this process asked for Float64 per-row
+      derivatives (`MOJOTREES_DERIVATIVE_PRECISION=float64`), which no GPU
+      grower can honor. A *capability* rather than a preference, which is
+      why it lands here beside the kernel limits and not near the crossover
+      rules: it blocks, and a block is consulted before any threshold.
     - `session`: how much of the one-time startup cost this process has
       already paid, from initialization.mojo. Reported and warned on, never
       selected on: see `SessionState`.
@@ -960,6 +1014,7 @@ struct DeviceCapabilities(Copyable, Movable):
     var min_bins: Int
     var max_bins: Int
     var auto_min_cells: Int
+    var derivative_precision_float64: Bool
     var session: SessionState
     var transfer: SessionMemoryPlan
 
@@ -976,6 +1031,7 @@ struct DeviceCapabilities(Copyable, Movable):
         max_rows: Int = MAX_GPU_ROWS,
         min_bins: Int = MIN_GPU_BINS,
         max_bins: Int = MAX_GPU_BINS,
+        derivative_precision_float64: Bool = False,
     ):
         self.gpu_available = gpu_available
         self.built_with_accelerator = built_with_accelerator
@@ -986,6 +1042,11 @@ struct DeviceCapabilities(Copyable, Movable):
         self.min_bins = min_bins
         self.max_bins = max_bins
         self.auto_min_cells = auto_min_cells
+        # Defaults False rather than reading the environment here, because
+        # every other environment read on this struct happens in the named
+        # constructors below and a fixture built by hand must stay a value
+        # the caller wrote down. `detect` and `from_profile` fill it in.
+        self.derivative_precision_float64 = derivative_precision_float64
         self.session = session^
         self.transfer = transfer^
 
@@ -1071,6 +1132,7 @@ struct DeviceCapabilities(Copyable, Movable):
             env_auto_min_cells(),
             session^,
             transfer^,
+            derivative_precision_float64=env_derivative_precision_is_float64(),
         )
 
     @staticmethod
@@ -1105,6 +1167,7 @@ struct DeviceCapabilities(Copyable, Movable):
             env_auto_min_cells(),
             session^,
             transfer^,
+            derivative_precision_float64=env_derivative_precision_is_float64(),
         )
 
     @staticmethod
@@ -1279,10 +1342,11 @@ def estimate_gpu_memory(
 # this machine's noise, and this one is not.
 #
 # The same 2026-08-14 record has 5,000,000 x 50 at 17.162 s against 56.902
-# s, 3.32x, so the advantage grows with rows rather than closing. Nothing
-# below 1,000,000 rows has been measured CPU against GPU end to end, which
-# is why the floor is the measured point and not an extrapolation down
-# toward one.
+# s, 3.32x, so the advantage grows with rows rather than closing. These two
+# records are what scope the rule to Metal, to an M4, to squared error, and
+# to single output. They are NOT what sets the row floor: the floor is
+# `AUTO_GPU_MIN_ROWS`, which sits below every shape either record covers and
+# carries its own reasoning.
 comptime M4_TRAINING_RULE_NAME = String("apple-m4-metal-dense-regression")
 comptime M4_TRAINING_EVIDENCE_ID = String(
     "bench/results/apple_m4_large_scaling_2026-08-14.md +"
@@ -1294,14 +1358,64 @@ comptime M4_TRAINING_MEASURED_ON = String(
     " squared error, single output"
 )
 
-# The thresholds themselves. `M4_TRAINING_MIN_CELLS` is the product of the
-# two above and so constrains nothing on its own; it is stated because
-# cells is the size measure `MOJOTREES_AUTO_MIN_CELLS` and
-# `CrossoverInputs` are written in, and a reader comparing this rule
-# against those should not have to multiply.
-comptime M4_TRAINING_MIN_ROWS = 1_000_000
+# THE THRESHOLD, AND IT IS A PLAIN PROVISIONAL CONSTANT.
+#
+# `AUTO_GPU_MIN_ROWS` is the row count at or above which `auto` selects the
+# GPU. One number, written down, with nothing computed into it: not a fitted
+# crossover, not a work estimate, not a function of features or bins or
+# leaves or core count, and not the cell product that used to sit beside it.
+# A reader who wants to know where `auto` switches reads this line and is
+# finished.
+#
+# IT IS PROVISIONAL AND IT IS AHEAD OF ITS EVIDENCE. The real crossover is a
+# measurement nobody has taken and it is scheduled for the end of the current
+# feature work, not for this lane; `crossover_rules()` below states exactly
+# what would move this number and in which direction. Two things are true at
+# once and both belong on the record:
+#
+#   - end to end against LightGBM stock+det at 1,000,000 x 50 the GPU arm is
+#     1.18x ahead and the CPU arm is 1.75x behind, so which backend `auto`
+#     reaches is worth more than any kernel in either campaign, and a user
+#     who asked for `auto` and silently got the losing arm is the failure
+#     this constant exists to end;
+#   - `bench/results/profile_2026-08-15/RESULTS.md` measured 250,000 x 50 as
+#     a GPU *loss* against our own CPU (1.89 s against 1.66 s, training only,
+#     binning excluded). This constant is set at that shape anyway,
+#     deliberately, and the reasoning is written out in `crossover_rules()`
+#     under WHY THE FLOOR SITS BELOW ITS OWN EVIDENCE. If that trade turns
+#     out to be wrong the fix is to raise this one number.
+#
+# HOW THIS RELATES TO THE CELLS MACHINERY, AND WHICH ONE WINS. There are two
+# other size measures in this module and neither of them decides this any
+# more:
+#
+#   - `M4_TRAINING_MIN_CELLS`, which was 50,000,000 and was the product of
+#     1,000,000 rows and 50 features. It is DELETED. A rule that gated on
+#     rows and on cells gated twice on the same fact and made the shipped
+#     threshold a thing you had to derive by division; at 250,000 x 50 the
+#     cell product is 12,500,000, so leaving it installed would have kept
+#     `auto` on the CPU while this constant said otherwise. The rule's
+#     `min_cells` field survives on `CrossoverEvidence` because a future
+#     rule measured on cells may want it, and is passed 0 (does not
+#     constrain) by the one installed rule.
+#   - `MOJOTREES_AUTO_MIN_CELLS` / `AUTO_MIN_CELLS`, the operator override.
+#     It is disabled by default and is not a shipped threshold; it exists so
+#     a crossover benchmark can reach the GPU on hardware no rule covers.
+#     When it *is* set it outranks this constant, because `decide_device`
+#     tests it before it consults the rule table, and the decision it
+#     produces says so (`DECISION_AUTO_GPU_ENV_THRESHOLD` plus
+#     `WARN_ENV_THRESHOLD_UNVALIDATED`). So: the env knob wins when set,
+#     this constant wins otherwise, and the cell product decides nothing at
+#     all.
+comptime AUTO_GPU_MIN_ROWS = 250_000
+
+# The rest of the rule's scope, which is not the threshold. `min_features`
+# is the feature count the record was taken at and stays a scope bound
+# rather than a second threshold: a 5,000,000 x 10 matrix is a different
+# ratio of per-node launch cost to per-node work and the record says nothing
+# about it. `max_outputs` keeps multiclass out, which grows one tree per
+# class per round through a different trainer.
 comptime M4_TRAINING_MIN_FEATURES = 50
-comptime M4_TRAINING_MIN_CELLS = 50_000_000
 comptime M4_TRAINING_MAX_OUTPUTS = 1
 
 
@@ -1405,7 +1519,7 @@ struct CrossoverEvidence(Copyable, Movable):
 def crossover_rules() raises -> List[CrossoverEvidence]:
     """The benchmark-derived crossover rules, in priority order.
 
-    One rule, and it is the smallest claim the records support.
+    One rule, and its shape scope is one provisional constant.
 
     The rule, as arithmetic. `auto` selects the GPU when *all* of:
 
@@ -1413,27 +1527,54 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
         profile.apple_generation == m4
         request.objective       == squared error
         request.n_outputs       <= 1
-        request.n_rows          >= 1,000,000
+        request.n_rows          >= AUTO_GPU_MIN_ROWS   (250,000)
         request.n_features      >= 50
-        request.cells()         >= 50,000,000
 
-    and the GPU path is otherwise unblocked and the input is dense. Every
-    other (device, workload) pair falls through to
-    `DECISION_AUTO_CPU_BELOW_EVIDENCE` and keeps the CPU.
+    and the GPU path is otherwise unblocked and the input is dense. There is
+    no cell-count term: `min_cells` is passed 0 and the comment on
+    `AUTO_GPU_MIN_ROWS` says why. Every other (device, workload) pair falls
+    through to `DECISION_AUTO_CPU_BELOW_EVIDENCE` and keeps the CPU.
 
-    The evidence is the two Apple M4 records named in
-    `M4_TRAINING_EVIDENCE_ID` and quoted above this function: interleaved
-    CPU/GPU arms at exactly that shape, a day apart, GPU 2.6x to 2.8x the
-    CPU both times, and 3.3x at five million rows. The floor is the
-    measured point, not a fraction of it, because nothing smaller has been
-    measured CPU against GPU end to end. Extrapolating down would be the
-    thing this module exists to refuse: below a million rows the GPU's
-    fixed per-round and per-node costs are a growing fraction of a tree
-    (the regime the deleted hybrid leaf scheduler addressed, and lost),
-    so the crossover is somewhere below here and its location is a
-    measurement nobody has taken.
+    The evidence for the *hardware and objective* scope is the two Apple M4
+    records named in `M4_TRAINING_EVIDENCE_ID` and quoted above this
+    function: interleaved CPU/GPU arms at 1,000,000 x 50, a day apart, GPU
+    2.6x to 2.8x the CPU both times, and 3.3x at five million rows.
 
-    Why every scope field is set, and what stays "no evidence":
+    WHY THE FLOOR SITS BELOW ITS OWN EVIDENCE, WHICH IS THE ONE THING TO
+    READ HERE BEFORE CHANGING IT. Until 2026-08-16 this floor was
+    1,000,000 rows, the measured point, on the standing principle that a
+    threshold placed inside an unmeasured interval is a guess with a number
+    on it. It was lowered to 250,000 anyway, and the reasoning is a trade
+    rather than a measurement:
+
+    - The two backends now sit on opposite sides of the comparator. At
+      1,000,000 x 50 against LightGBM stock+det, end to end, the GPU arm is
+      1.18x ahead and the CPU arm is 1.75x behind. Which backend `auto`
+      reaches is therefore a 2.1x swing decided by dispatch, larger than
+      anything either performance campaign has open, and the cost of getting
+      it wrong is asymmetric: an `auto` that under-reaches hands a user the
+      losing arm silently and forever, while an `auto` that over-reaches
+      costs them a measurable but bounded amount on one shape.
+    - At 250,000 x 50 that bounded amount is known and it is small. Our GPU
+      measured 1.89 s against our CPU's 1.66 s
+      (`bench/results/profile_2026-08-15/RESULTS.md`, training only, binning
+      excluded, medians of three, arms interleaved): a 14 percent loss, on a
+      machine the same protocol records drifting by a factor of two between
+      windows. At 50,000 x 50 the loss is 2.9x, which is not small, and that
+      is why the floor is at 250,000 and not lower.
+    - The number is a constant on purpose. It is not fitted, and no
+      expression should grow here in its place. When the crossover is
+      measured, this line changes and `POLICY_VERSION` is bumped.
+
+    So the honest statement of the floor's status is: the hardware scope,
+    the objective scope, and the output scope rest on measurement; the row
+    floor is a deliberate provisional setting that is 250,000 rows below the
+    smallest shape at which the GPU has been measured to win, taken because
+    the loss it risks is smaller than the loss it prevents. It is scheduled
+    to be replaced by a measured crossover at the end of the current feature
+    work.
+
+    Why every other scope field is set, and what stays "no evidence":
 
     - `api` and `apple_generation`. Metal on an M4 is the only device this
       code has ever run on (docs/GPU_VALIDATION.md, whose CUDA and HIP rows
@@ -1449,67 +1590,65 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
       back to the host every round. Unmeasured, so declined.
     - `max_outputs`. Multiclass grows one tree per class per round through
       a different trainer. Unmeasured, so declined.
-    - `min_rows` and `min_features` together, rather than cells alone. A
-      5,000,000 x 10 matrix has the same cell count as the measured shape
-      and a tenth of its features, which is a different ratio of per-node
-      launch cost to per-node work. The record has nothing to say about it.
+    - `min_features`, and no cell term beside it. A 5,000,000 x 10 matrix
+      would clear any cell floor the measured shape clears while carrying a
+      tenth of its features, which is a different ratio of per-node launch
+      cost to per-node work. The record has nothing to say about it, so the
+      feature count is bounded directly and the product is not bounded at
+      all.
 
-    What would falsify the threshold. Any of these, and the rule is wrong
-    and should be narrowed or withdrawn rather than patched:
-
-    - an interleaved CPU/GPU pair at 1,000,000 x 50 on an M4 where the GPU
-      is not faster, run in one window on an idle machine;
-    - the same at 5,000,000 x 50, where the record claims a larger margin;
-    - a bin count or leaf budget far from the measured 255 and 31 that
-      reverses the sign. Neither is in the rule, because neither was swept,
-      and that is a gap in the evidence rather than a claim of invariance.
-
-    WHERE THE CROSSOVER ACTUALLY SITS, which is the question this rule's
-    floor answers and which has since been measured on both sides. From
-    `bench/results/profile_2026-08-15/RESULTS.md`, taken under the
-    pre-registered rules in `bench/results/PROFILE_PROTOCOL.md`, arms
-    interleaved, median of three, seconds of training with binning excluded,
-    100 rounds, 31 leaves, 255 bins, squared error (MEASURED, and reproduced
-    at five repeats for the top two shapes in
-    `bench/results/sweep2_2026-08-15/RESULTS.md`):
+    WHAT THE MEASUREMENTS ACTUALLY SAY, in full, so that the trade above is
+    checkable. From `bench/results/profile_2026-08-15/RESULTS.md`, taken
+    under the pre-registered rules in
+    `bench/results/PROFILE_PROTOCOL.md`, arms interleaved, median of three,
+    seconds of training with binning excluded, 100 rounds, 31 leaves, 255
+    bins, squared error (MEASURED, and reproduced at five repeats for the top
+    two shapes in `bench/results/sweep2_2026-08-15/RESULTS.md`):
 
         shape             our CPU   our GPU
         1,000,000 x 50       6.98      3.58     GPU 1.85x
-          250,000 x 50       1.66      1.89     CPU wins
-           50,000 x 50      0.564      1.63     CPU wins by 2.9x
+          250,000 x 50       1.66      1.89     CPU by 14 percent
+           50,000 x 50      0.564      1.63     CPU by 2.9x
 
-    So the floor is not merely the smallest shape anybody ran. 250,000 x 50
-    is a measured *loss* for the GPU and 50,000 x 50 is a large one, which is
-    the device's roughly 1.5 s of fixed cost per fit showing up as a growing
-    fraction of a smaller tree. `auto` therefore selects the GPU at
-    1,000,000 x 50 and the CPU at 250,000 and at 50,000, and both halves of
-    that are now backed by a measurement rather than by the absence of one.
+    The floor now sits at the middle row, which is a shape where the GPU
+    lost. It does not sit at the bottom row, where it lost by 2.9x: the
+    device's roughly 1.5 s of fixed cost per fit is a growing fraction of a
+    smaller tree, and at 50,000 rows that fraction is most of the fit. The
+    crossover point itself is still unmeasured and lies somewhere in
+    (50,000, 1,000,000] rows at 50 features.
 
-    What is still unmeasured is the crossover point itself: it lies somewhere
-    in (250,000, 1,000,000] rows at 50 features, and nothing in that interval
-    has been run. The floor sits at the top of the interval, which is the
-    conservative end, because a floor placed inside an unmeasured interval is
-    a guess with a number on it.
+    `bench/results/session3_2026-08-16/RESULTS.md` does not move any of
+    this. Its 250,000 and 50,000 figures (1.126 s and 0.789 s) are GPU
+    against GPU, the resident plane against the shipping device loop with
+    the device split search forced on both arms, and that file's own
+    same-night correction withdraws the inference that was drawn from them
+    about a gate. Its 1,000,000 x 50 GPU arm at 2.584 s in a fast window
+    corroborates this rule's direction. It also measured this machine
+    drifting by a factor of two between windows on the GPU and 2.2 on the
+    CPU, with a verdict flipping from "indistinguishable" to "resolved" on
+    identical code, which is why the 14 percent figure at 250,000 is treated
+    as within the noise of this box rather than as a settled loss.
 
-    `bench/results/session3_2026-08-16/RESULTS.md` is the most recent round
-    and it does not move any of this, deliberately. Its 250,000 and 50,000
-    figures (1.126 s and 0.789 s) are GPU against GPU, the resident plane
-    against the shipping device loop with the device split search forced on
-    both arms, and that file's own same-night correction withdraws the
-    inference that was drawn from them about a gate. Its 1,000,000 x 50 GPU
-    arm at 2.584 s in a fast window corroborates this rule's direction at
-    exactly its floor. It also measured this machine drifting by a factor of
-    two between windows on the GPU and 2.2 on the CPU, with a verdict
-    flipping from "indistinguishable" to "resolved" on identical code, which
-    is the standing reason a threshold is not installed from a single window
-    at a shape where the margin is small.
+    WHAT WOULD FALSIFY THE RULE, split by which half it hits. The scope and
+    the floor fail differently and should be fixed differently:
 
-    The measurement that would move the floor down is an interleaved
-    CPU-arm-against-GPU-arm pair inside (250,000, 1,000,000] rows at 50
-    features on an idle M4, medians of five, in a single window. It comes
-    down by that and a `POLICY_VERSION` bump, the way it went in.
+    - the scope. An interleaved CPU/GPU pair at 1,000,000 x 50 on an M4
+      where the GPU is not faster, run in one window on an idle machine; the
+      same at 5,000,000 x 50, where the record claims a larger margin; or a
+      bin count or leaf budget far from the measured 255 and 31 that
+      reverses the sign. Any of these and the rule is wrong and should be
+      narrowed or withdrawn rather than patched.
+    - the floor. An interleaved pair anywhere in [250,000, 1,000,000) rows
+      at 50 features, medians of five, in a single window, showing the GPU
+      losing by more than this box's window-to-window drift. That does not
+      withdraw the rule; it raises `AUTO_GPU_MIN_ROWS` to the smallest shape
+      the GPU still wins, which is the measurement scheduled for the end of
+      the current feature work.
 
-    Do not add a rule from reasoning. Add one from a recorded sweep, cite
+    Either way it moves by an edit to one constant and a `POLICY_VERSION`
+    bump, the way it went in.
+
+    Do not add a *rule* from reasoning. Add one from a recorded sweep, cite
     it in `evidence_id`, name the device in `measured_on`, and bump
     `POLICY_VERSION`.
     """
@@ -1522,9 +1661,13 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
             API_METAL,
             APPLE_GEN_M4,
             SQUARED_ERROR,
-            M4_TRAINING_MIN_ROWS,
+            AUTO_GPU_MIN_ROWS,
             M4_TRAINING_MIN_FEATURES,
-            M4_TRAINING_MIN_CELLS,
+            # min_cells: 0, which does not constrain. The threshold is
+            # `AUTO_GPU_MIN_ROWS` and only `AUTO_GPU_MIN_ROWS`; see the
+            # comment on it for why the 50,000,000-cell gate was removed
+            # rather than lowered alongside the row floor.
+            0,
             M4_TRAINING_MAX_OUTPUTS,
         )
     )
@@ -1563,6 +1706,34 @@ def _collect_blocks(
                 String("no accelerator is available to this build"),
             )
         return blocks^
+
+    if caps.derivative_precision_float64:
+        # Precision is a capability, not a preference, so it sits here with
+        # the kernel limits and above every shape question. `stage_gradients`
+        # in gpu_gradient_stream.mojo narrows each per-row derivative with a
+        # literal `Float32(g)` on upload and the device histogram runs
+        # whatever else is configured, so no GPU grower has ever produced the
+        # Float64 answer this setting asks for. Until 2026-08-16 it produced
+        # the Float32 one and reported success.
+        #
+        # Being a block rather than a rule scope is what gives the two device
+        # requests their different answers, and both are deliberate: an
+        # explicit `device='gpu'` raises this message, because a backend the
+        # user named cannot honor what they asked for and a silent downgrade
+        # is the defect itself; `device='auto'` selects the CPU with
+        # `DECISION_AUTO_CPU_BLOCKED`, because a user who asked us to pick
+        # asked for the backend that *can* honor it. Forwarding instead
+        # would have the host compute Float64 derivatives for the device to
+        # narrow, which is worse than either.
+        blocks.add(
+            BLOCK_DERIVATIVE_PRECISION,
+            String(
+                "MOJOTREES_DERIVATIVE_PRECISION=float64 asks for Float64"
+                " per-row derivatives, and the GPU gradient upload narrows"
+                " every derivative to Float32, so no accelerator path can"
+                " produce that answer"
+            ),
+        )
 
     # An impossible shape is not a block. `estimate_gpu_memory` raises for
     # it before this function is reached, because a workload with no rows
@@ -2081,6 +2252,11 @@ struct DeviceDecision(Copyable, Movable):
         out += String(
             "auto_min_cells=", self.capabilities.auto_min_cells, "\n"
         )
+        out += String(
+            "derivative_precision_float64=",
+            _bool_text(self.capabilities.derivative_precision_float64),
+            "\n",
+        )
 
         out += String(
             "session_context_open=",
@@ -2443,6 +2619,26 @@ def resolve_device(
     what it is training has not earned a claim measured on something else. It
     does mean that a caller which leaves this defaulted can never reach the
     GPU on evidence, whatever the shape and whatever the hardware.
+
+    WHAT `auto` DOES UNDER `MOJOTREES_DERIVATIVE_PRECISION=float64`, WHICH IS
+    NOT A THRESHOLD COMPARISON. It returns `CPU_DEVICE`, at every shape, on
+    every machine, including shapes far above `AUTO_GPU_MIN_ROWS`. The GPU
+    gradient upload narrows every per-row derivative to Float32
+    (`gpu_gradient_stream.stage_gradients`), so a Float64 request is
+    something the accelerator cannot do rather than something it does
+    slowly. Precision is a capability, so it enters through
+    `_collect_blocks`, and `decide_device` consults the blocks before it
+    consults the crossover table: the shape is never compared and the
+    250,000-row floor never comes into it. A reader looking for the
+    threshold that produced this answer will not find one, and that is
+    correct.
+
+    `device='gpu'` under the same setting raises instead, and the asymmetry
+    is the point. A caller who named a backend is told it cannot honor the
+    request; a caller who asked us to pick is given the backend that can.
+    Softening the explicit refusal into a fallback would restore the defect
+    this block exists for, which was an accepted flag and a silently
+    Float32 answer.
 
     Every caller in the tree leaves it defaulted today, and each of them is
     holding the objective when it does. `model.fit` takes `objective` as a

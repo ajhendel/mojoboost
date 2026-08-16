@@ -3,17 +3,19 @@
 The GPU trainer in train_gpu.mojo computes every round's derivatives on the
 host (`_fill_grad_hess` over Float64 lists) and then uploads `2 * n_rows`
 Float32 to the device. That upload is pure overhead: the labels never change,
-the sample weights never change, and the raw scores are the only thing that
-moves between rounds, by an amount the device already knows (each row's leaf
-and that leaf's value). This module keeps all three device-resident so a
+the user's sample weights never change, and the raw scores are the only thing
+that moves between rounds, by an amount the device already knows (each row's
+leaf and that leaf's value). This module keeps all three device-resident so a
 boosting round costs no per-row host-to-device traffic at all.
 
 What lives here:
 
   `GpuObjectiveState`   the per-session device buffers: target (or class
                         label), sample weight, raw scores, and softmax
-                        probabilities. Uploaded once at construction, never
-                        again.
+                        probabilities. Uploaded once at construction. The
+                        weight plane is the one exception, because CatBoost's
+                        Bayesian bootstrap redraws it per tree; see
+                        `refresh_weights`.
   gradient kernels      one thread per row, one straight-line body per
                         objective, writing into gradient/hessian buffers the
                         caller owns (in practice `GpuHistogramBuilder`'s, so
@@ -32,7 +34,23 @@ What lives here:
 Objectives covered: squared error, binary logistic, cross entropy, poisson,
 gamma, tweedie, huber, quantile, L1, MAPE, fair, and softmax multiclass.
 Every one of those has a closed-form per-row derivative in the raw score,
-which is exactly the interface a one-thread-per-row kernel can serve. CUSTOM
+which is exactly the interface a one-thread-per-row kernel can serve.
+
+CatBoost's ranking objectives -- QueryRMSE, PairLogit, YetiRank -- are also
+covered, at the bottom of this file, and they are a different interface rather
+than three more arms of `_grad_hess_kernel`: a row's ranking gradient is a
+function of the *other rows in its query group*, so neither the kernel shape
+nor the state is the same. `GpuRankingState` holds their two planes, and
+`ranking_pairwise.mojo` -- which imports nothing from `max.gpu.*` and is
+therefore reachable from a CPU-only build -- holds the derivative definitions,
+the group and pair conventions, the refusals, and the fixed-point arithmetic a
+ranking gradient profile implies. Nothing in this paragraph's subject touches
+`_grad_hess_kernel`, `_softmax_prob_kernel`, `_softmax_class_kernel`, the four
+raw-score update kernels, `_abs_sum_kernel`, or `GpuObjectiveState`: the
+ranking path is new symbols beside them, which is what keeps every
+non-ranking fit bit-identical.
+
+CUSTOM
 is the exception and stays on the host by construction: the callback is
 Python or Mojo code over host-side `List[Float64]`, there is no device image
 of it, and `train_custom_gpu`'s contract (one call per round over the whole
@@ -67,9 +85,173 @@ Sample weights follow the built-in convention exactly: the kernel multiplies
 both derivatives by the row weight in the same operand order as
 `_fill_grad_hess_into`, so a zero-weight row produces a zero gradient and a
 zero hessian and is invisible to every histogram, on either backend.
+
+Where the weight is applied, and why it is not in the histogram
+--------------------------------------------------------------
+A weight is a per-row multiplier on the gradient and on the hessian, and it
+could be applied in either of two places. The CPU applies it in the objective,
+before anything is quantized: `boosting._fill_grad_hess_into` loads
+`w = weights[r]` as the first statement of every objective's row body and
+stores `w * (...)` into `grad` and `hess`. Nothing downstream of that carries a
+weight at all -- `histogram.build_histogram` takes `grad`, `hess`, the bins and
+the constant-hessian flag, and there is no weight argument anywhere in the
+histogram API on either backend.
+
+The device matches that exactly. `_grad_hess_kernel` and
+`_softmax_grad_hess_kernel` apply the weight, and the histogram accumulation is
+untouched: no weight plane is fetched per (row, feature) visit and no multiply
+is added to the hottest loop in the codebase. The alternative -- carrying the
+weight into the accumulation -- would put the two backends on different
+arithmetic (a weighted product formed once per row against one formed once per
+visit) and buy nothing, since the row's weight is loop-invariant across its
+features.
+
+The corollary for the host-gradient path: `GpuHistogramBuilder.stage_gradients`
+needs nothing added to it. The Float64 gradients it stages already have the
+weight multiplied in by `_fill_grad_hess_into`, so a weighted fit on that path
+was already correct and is unchanged by anything here.
+
+What a weighted fit costs the staging arm
+-----------------------------------------
+`boosting.round_has_constant_hessian` ends in
+`objective_has_constant_hessian(objective, len(sample_weight) > 0)`, so a
+non-empty weight vector refuses the constant-hessian declaration for every
+objective. That is a definition rather than a conservatism: under squared
+error, L1, huber and quantile the CPU stores the bare weight as the hessian
+(`hp.unsafe_store(r, derivative[NARROW](w))`), so the hessian *is* the weight
+and a builder told to rebuild that plane from the row count would rebuild the
+wrong plane.
+
+Priced on the Int16 gradient-staging arm, per
+`GpuActiveRows.staged_gradient_bytes_per_row`, that costs the better half of
+the arm. A constant-hessian round stages the gradient alone, 2 bytes per row;
+a weighted round stages both planes, 4. At the default feature group of one,
+each (row, feature) visit fetches 4 bytes of row index plus the staged
+derivative plus 1 bin byte, so a weighted fit is on **9 bytes per visit where
+an unweighted one is on 7**. Every fit under a per-row weight -- a user's
+`sample_weight`, a class weight folded into it, or a Bayesian bootstrap draw
+-- is on the 9-byte width by construction. That is the arithmetic of the
+declaration and not a regression in anything measured here.
+
+That arithmetic is not special to the single-output case and is *not*
+relaxed by a multi-target fit. A weighted multi-target round stages both
+derivative planes per output for the same reason a weighted scalar round
+stages both: under squared error the CPU stores the bare weight as the
+hessian, so the hessian is the weight and cannot be rebuilt from a row count.
+Nine bytes per (row, feature) visit at the default feature group, per output,
+by construction.
+
+Multi-target fits (CatBoost's MultiRMSE), and the tree shape they take
+---------------------------------------------------------------------
+A multi-target fit predicts a vector rather than a scalar. Two tree shapes
+can carry that, and they are different trees, not different derivative
+formulas:
+
+  K trees per round   one scalar-leaf tree per output, each grown on its own
+                      output's derivatives, the vector assembled by summing
+                      K independent traversals. `objective_is_multi_output`
+                      in objective_registry.mojo already *defines*
+                      multi-output this way ("whether one boosting iteration
+                      grows more than one tree").
+  one vector tree     one tree whose split is scored against a gain summed
+                      over outputs and whose leaf holds one value per output.
+                      This is CatBoost's shape for MultiRMSE.
+
+**mojotrees takes the first, and this module implements the first.** That is
+not a preference; it is the only shape the rest of the codebase can express.
+`tree.Tree.value` is a `List[Float64]` indexed by node id and
+`Tree.predict_row` returns one `Float64`, so a leaf cannot hold a vector
+without a new field on `Tree`; and softmax multiclass, the one multi-output
+trainer that exists, already grows K trees per round
+(`boosting._boost_rounds_multiclass`, `trees[round * n_classes + k]`). A
+device path that grew vector-leaf trees would have no host model to put them
+in. What is NOT here, and what the other shape would cost, is written out
+under `fill_multi_grad_hess`.
+
+Given that shape, MultiRMSE is the *easier* of the two multi-output
+derivative problems, and deliberately so. Softmax couples the outputs: a
+round needs a probability pass over the whole row before any class's gradient
+exists, because class `k`'s gradient reads a denominator summed over every
+class. MultiRMSE does not couple them at all -- output `j`'s gradient is
+`w * (raw[r, j] - y[r, j])` and reads nothing of output `j'` -- so the
+probability pass, `prob_dev`, and `refresh_softmax` all disappear and the
+derivative kernel is a pure per-(row, output) map. Everything downstream is
+the multiclass machinery unchanged: `_multi_grad_hess_kernel` writes the same
+class-major plane `grad[slot * n_rows + r]` that `_batch_softmax_grad_kernel`
+writes, so `GpuClassBatch.magnitude_sums`, `set_scales`, `scatter_slot` and
+every batched histogram kernel take a multi-target round without one line
+changed, and `update_raw(k=j)` advances output `j`'s slot of the row-major
+raw scores exactly as it advances class `k`'s.
+
+One fixed-point scale per output, never one shared
+--------------------------------------------------
+With K outputs there are K gradient-magnitude profiles, and a multi-target
+fit is the case where they genuinely differ: an output in units of 1 beside
+an output in units of 1000 produces magnitude sums three orders of magnitude
+apart on the very first round. `GpuClassBatch.set_scales` already answers
+this per slot -- `device_fixed_scale(mags[c].grad)` for each `c`, from that
+slot's own reduction -- and the multi-target path inherits that answer
+unchanged, which is the whole reason the derivative kernel writes into the
+batch's plane layout rather than a layout of its own. A shared scale would
+size the small output's lattice by the large output's magnitudes and quantize
+every one of its gradients toward zero, and it would do so silently: the fit
+would converge on the large output and barely move on the small one.
+`tests/test_gpu_multitarget.mojo` fixes outputs three orders of magnitude
+apart for exactly this reason. Equal-scale outputs would pass a shared-scale
+implementation, and they would hide an output-index error entirely, because
+swapping two identically-scaled planes changes nothing observable.
+
+REACHABILITY: the multi-target path is UNREACHABLE from any user-facing API
+---------------------------------------------------------------------------
+Stated here rather than left to be discovered, because this project has
+already shipped two features that were complete, correct, tested and not
+callable (CatBoost mode and `grow_policy=oblivious`, both invisible until
+somebody walked a path end to end instead of checking its entry point). A
+feature nobody can call is as absent as one nobody wrote, and it passes every
+Mojo test either way. So, walked end to end as of this lane:
+
+  `python/mojotrees/sklearn.py`   `MTRegressor._OBJECTIVES` has no
+                                  multi-target name and no estimator accepts
+                                  a 2-D `y`. Not an allow-list gap: a
+                                  multi-target estimator is a new class, not
+                                  a new dictionary entry.
+  `params.mojo`                   No `num_targets` key. `num_class` parses,
+                                  and `_validate` **refuses** it for every
+                                  objective but `multiclass`, so a
+                                  multi-target fit cannot even be spelled in
+                                  a parameter string.
+  `trainset.Dataset`              One `List[Float64]` label column. A target
+                                  matrix cannot be expressed at the dataset
+                                  level at all.
+  `objective_registry`            No multi-target objective code exists.
+                                  `objective_is_multi_output` is True for
+                                  `MULTICLASS` alone.
+  trainers                        Nothing calls `fill_multi_grad_hess`. It is
+                                  reached only by
+                                  `tests/test_gpu_multitarget.mojo`.
+
+What is built here is therefore the **device derivative plane and its
+per-output scale**, tested against the scalar device path bit for bit, and
+nothing above it. Making it reachable is four further pieces of work, none of
+them in this file and none of them this lane's: a label matrix on `Dataset`,
+a `num_targets` parameter, a `train_multi_target` round loop shaped like
+`_boost_rounds_multiclass`, and a `MTMultiOutputRegressor` on the Python
+side. Until all four land, a user asking for MultiRMSE gets a name error from
+sklearn.py, which is a refusal -- the failure mode to avoid is the opposite
+one, an accepted parameter with no reader.
+
+**Every ranking round is on the 9-byte width too, and unconditionally.**
+PairLogit and YetiRank have a hessian that is a per-round sum over each row's
+pairs, so they can never be declared constant. QueryRMSE's hessian is the row
+weight, so a weighted one cannot either, and an unweighted one -- whose hessian
+really is exactly 1.0 -- is refused anyway, because
+`histogram.objective_has_constant_hessian` is the one statement of which
+objectives qualify and this lane does not extend it.
+`GpuHistogramBuilder.fill_rank_gradients_device` is where that is refused and
+argued. Again: arithmetic of the declaration, not a regression.
 """
 
-from std.gpu import block_idx, global_idx, thread_idx
+from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import exp, isfinite
 from std.memory import bitcast, stack_allocation
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
@@ -87,13 +269,28 @@ from .boosting import (
     MAPE,
     POISSON,
     QUANTILE,
+    SQUARED_ERROR,
     TWEEDIE,
     _POISSON_MAX_DELTA_STEP,
 )
 from .gpu_active_rows import GpuActiveRows
 from .gpu_tiling import derive_block_threads, query_device_caps
+from .monotone import NO_BOUND, OutputBounds
 from .objective_registry import objective_gradients_on_device
 from .quantized_gradient import fixed_point_scale
+from .ranking import RankGroups, check_groups
+from .ranking_pairwise import (
+    RANK_PAIR_LOGIT,
+    RANK_QUERY_RMSE,
+    RANK_YETI_RANK,
+    PairAdjacency,
+    check_rank_kind,
+    check_rank_sample_weight,
+    check_yeti_rank_pairs,
+    describe_rank_kind,
+    rank_kind_is_pairwise,
+    rank_kind_regenerates_pairs,
+)
 
 # Clamp on every `exp` argument. exp(60) is 1.1e26, four orders of magnitude
 # inside the Float32 maximum, so the poisson hessian's extra
@@ -160,6 +357,36 @@ def supports_device_objective(objective: Int) -> Bool:
     `fill_softmax_grad_hess` rather than by `_grad_hess_kernel`.
     """
     return objective_gradients_on_device(objective)
+
+
+def supports_multi_output_objective(objective: Int) -> Bool:
+    """Whether `objective` has a per-output device kernel for a multi-target
+    fit.
+
+    True for `SQUARED_ERROR` alone, which under a vector target is CatBoost's
+    MultiRMSE: the loss is separable over outputs and each output's
+    derivative is the scalar squared-error derivative at that output's raw
+    score. Every other code is False, and `fill_multi_grad_hess` **refuses**
+    it by name rather than falling through to a per-output squared error,
+    which is the failure mode this predicate exists to make impossible.
+
+    Deliberately not routed through `objective_gradients_on_device` the way
+    `supports_device_objective` is. That table answers "does this objective
+    have a closed-form per-row derivative these kernels implement", and every
+    one of its eleven codes does; the question here is the different one of
+    "is this objective *separable over a vector target*", which poisson,
+    gamma, tweedie and the rest are not -- not because their derivative is
+    hard, but because CatBoost defines no multi-target form of them and
+    mojotrees has no multi-target label to feed one. Answering the second
+    question out of the first table would silently accept ten codes nothing
+    has defined.
+
+    CatBoost's other multi-target losses (MultiLogloss, MultiCrossEntropy,
+    MultiQuantile) are absent from **both** backends, so a refusal here has
+    no `device='cpu'` fallback to point at and the error message does not
+    pretend otherwise.
+    """
+    return objective == SQUARED_ERROR
 
 
 def device_fixed_scale(total: Float64) raises -> Float32:
@@ -302,6 +529,62 @@ def _grad_hess_kernel(
         # rejects before the launch, so nothing else arrives here.
         grad[unsafe_offset=r] = w * (raw_r - y)
         hess[unsafe_offset=r] = w
+
+
+def _multi_grad_hess_kernel(
+    raw: MutPointer[Float32, MutAnyOrigin],
+    target: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+    n_outputs: Int32,
+    j_begin: Int32,
+    j_count: Int32,
+    weighted: Int32,
+):
+    """MultiRMSE derivatives for a contiguous run of outputs, in one launch.
+    `grid.x` tiles the rows and `grid.y` indexes the output slot, so the whole
+    (row, output-in-batch) plane is one launch.
+
+    The arithmetic per (row, output) is character for character the squared
+    error arm of `_grad_hess_kernel` -- `grad = w * (raw_r - y)`, `hess = w`,
+    in that operand order -- and there is no second definition of it: a
+    multi-target fit's `j`-th output is a scalar squared-error fit against
+    `y[:, j]`, and the only thing that differs is where the two operands live.
+
+    Only the addressing differs, and it differs on both sides, exactly as
+    `gpu_multiclass_batch._batch_softmax_grad_kernel`'s does. The reads are
+    row-major (`raw[r * n_outputs + j]`, `target[r * n_outputs + j]`, the
+    layout every consumer of a score reduces over outputs within a row in,
+    and the layout `update_raw` and `gpu_predict` already contract for) and
+    the write is class-major (`grad[slot * n_rows + r]`, the layout the
+    histogram kernels and the magnitude reduction need). This kernel is the
+    transpose, and it is the only one in a multi-target round.
+
+    No coupling term appears anywhere: output `j` reads index
+    `r * n_outputs + j` of two planes and nothing else. That is the whole
+    difference from the softmax kernel, which reads a probability whose
+    denominator summed over every class.
+    """
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var nr = Int(n_rows)
+    if r >= nr:
+        return
+    var slot = Int(block_idx.y)
+    if slot >= Int(j_count):
+        return
+    var j = Int(j_begin) + slot
+
+    var w = Float32(1.0)
+    if weighted != 0:
+        w = weight[unsafe_offset=r][0]
+    var i = r * Int(n_outputs) + j
+    var raw_r = raw[unsafe_offset=i][0]
+    var y = target[unsafe_offset=i][0]
+    var out = slot * nr + r
+    grad[unsafe_offset=out] = w * (raw_r - y)
+    hess[unsafe_offset=out] = w
 
 
 def _softmax_prob_kernel(
@@ -738,6 +1021,23 @@ def sum_abs_partials[partials_origin: MutOrigin, //](
     return GradMagnitudes(g_total, h_total)
 
 
+def _check_weight_vector(weights: List[Float64], n_rows: Int) raises:
+    """The one definition of a valid per-row weight vector on this side: one
+    finite, nonnegative entry per row.
+
+    Shared by the constructor and by `refresh_weights` so a bootstrap draw
+    cannot reach the device through a weaker check than a user's
+    `sample_weight` does. Nonnegative rather than positive because zero is a
+    meaningful weight -- it is how a row is excluded -- and the kernels carry
+    it through to an exactly zero gradient and hessian.
+    """
+    if len(weights) != n_rows:
+        raise Error("sample_weight length must equal the target length")
+    for r in range(n_rows):
+        if not isfinite(weights[r]) or weights[r] < 0.0:
+            raise Error("sample_weight must be finite and nonnegative")
+
+
 struct GpuObjectiveState(Movable):
     """Device-resident labels, weights, and raw scores for one training run.
 
@@ -753,15 +1053,30 @@ struct GpuObjectiveState(Movable):
     """
 
     var target_dev: DeviceBuffer[DType.float32]
-    """The regression target, or the integer class label for softmax."""
+    """The regression target, or the integer class label for softmax, or --
+    under `multi_output` -- the row-major target matrix
+    `y[r * n_outputs + j]`.
+
+    The one field whose length is not always `n_rows`: it is
+    `n_rows * n_classes` on a multi-target state and `n_rows` everywhere
+    else, which is why the constructor sizes it from `len(target)` rather
+    than from `self.n_rows`."""
     var weight_dev: DeviceBuffer[DType.float32]
     """Sample weights, or a one-element placeholder when unweighted:
-    zero-length device buffers are not portable."""
+    zero-length device buffers are not portable.
+
+    The one plane here that a caller may rewrite after construction, because
+    CatBoost's Bayesian bootstrap draws a fresh per-row weight every tree and
+    the round's effective weight is that draw times the user's own
+    `sample_weight` (`sampling.refresh_bayesian_bootstrap`). See
+    `refresh_weights`, which is also what grows this buffer from the
+    placeholder on a fit that started unweighted."""
     var raw_dev: DeviceBuffer[DType.float32]
     """Row-major raw scores, `raw[r * n_classes + k]`."""
     var prob_dev: DeviceBuffer[DType.float32]
     """Softmax probabilities in the same layout, or a placeholder when
-    `n_classes == 1`."""
+    `n_classes == 1` and on a `multi_output` state, whose outputs are
+    uncoupled and so have nothing to normalize over."""
     var value_dev: DeviceBuffer[DType.float32]
     """The current tree's node values, the lookup table the per-leaf range
     kernel reads. It is the only kernel that still applies the learning rate
@@ -810,6 +1125,18 @@ struct GpuObjectiveState(Movable):
     reader of `step_dev` and it still writes through a `map_to_host`
     mapping, which is a per-tree bidirectional transfer this lane counted
     and deliberately did not touch."""
+    var stage_weight: HostBuffer[DType.float32]
+    """Pinned staging for `weight_dev`, on the same grounds as `stage_value`,
+    and allocated by the first `refresh_weights` rather than at construction:
+    an unbootstrapped fit never refreshes its weights and must not pay
+    `4 * n_rows` of pinned memory for a buffer it will not write.
+
+    A one-element placeholder until then. `weight_stage_rows` is what says
+    which of the two it currently is."""
+    var weight_stage_rows: Int
+    """Rows `stage_weight` is sized for: 0 while it is the placeholder,
+    `n_rows` once `refresh_weights` has grown it. One number rather than a
+    second flag, so the buffer and the claim about it cannot disagree."""
     var part_pending: Int
     """How many magnitude reductions have been enqueued into `host_part` and
     not yet folded.
@@ -833,6 +1160,19 @@ struct GpuObjectiveState(Movable):
     var weighted: Bool
     var block_threads: Int
     var has_raw: Bool
+    var multi_output: Bool
+    """Whether this state carries a vector target (MultiRMSE) rather than a
+    scalar target or a class label.
+
+    A separate flag from `n_classes > 1` and not derivable from it, because
+    the two multi-output states have the *same* `n_classes` shape and
+    opposite meanings: on a softmax state `n_classes` counts coupled classes,
+    `target` is one label column, and `prob_dev` is live; on a multi-target
+    state `n_classes` counts uncoupled outputs, `target` is an
+    `n_rows * n_classes` matrix, and there is no probability plane at all.
+    Every method that can only serve one of the two tests this flag and
+    raises, rather than inferring an answer from the class count and
+    computing the wrong thing."""
 
     def __init__(
         out self,
@@ -841,13 +1181,28 @@ struct GpuObjectiveState(Movable):
         sample_weight: List[Float64] = [],
         n_classes: Int = 1,
         max_nodes: Int = DEFAULT_MAX_NODES,
+        multi_output: Bool = False,
     ) raises:
         """Upload the labels and weights, which never change again, and
         allocate the raw-score and scratch buffers.
 
         For softmax, `target` holds the class labels as whole numbers and
-        `n_classes` is the class count; for every other objective
-        `n_classes` is 1 and `target` is the regression target.
+        `n_classes` is the class count; for every other single-output
+        objective `n_classes` is 1 and `target` is the regression target.
+
+        Under `multi_output` (MultiRMSE), `n_classes` is the output count and
+        `target` is the row-major target matrix, `n_rows * n_classes` long,
+        with row `r`'s output `j` at `target[r * n_classes + j]` -- the same
+        layout `raw_dev` already carries, so the derivative kernel reads both
+        planes at one index. `n_rows` is then derived from the two rather
+        than being `len(target)`.
+
+        **The default is `False` and the `False` path is unchanged.** Every
+        statement below that a single-output or softmax state executes
+        computes what it computed before this parameter existed: `n_rows` is
+        `len(target)`, `target_dev` is `len(target)` == `n_rows` long,
+        `prob_dev` is live exactly when `n_classes > 1`, and the class-label
+        validation runs on exactly the states it ran on.
         """
         if len(target) < 1:
             raise Error("device objectives require at least one row")
@@ -855,15 +1210,28 @@ struct GpuObjectiveState(Movable):
             raise Error("n_classes must be positive")
         if max_nodes < 1:
             raise Error("max_nodes must be positive")
-        if len(sample_weight) > 0 and len(sample_weight) != len(target):
-            raise Error("sample_weight length must equal the target length")
+        if multi_output:
+            if n_classes < 2:
+                raise Error(
+                    "a multi-output state needs at least two outputs; a"
+                    " one-output fit is a scalar fit and belongs on the"
+                    " ordinary single-output state"
+                )
+            if len(target) % n_classes != 0:
+                raise Error(
+                    "multi-output target length must be n_rows * n_outputs"
+                )
+        var n_rows = len(target) // n_classes if multi_output else len(target)
+        if len(sample_weight) > 0:
+            # One weight per ROW, not per (row, output): a sample weight
+            # weights the observation, and every one of its outputs with it,
+            # which is what lets the one weight plane serve every output slot
+            # of a launch.
+            _check_weight_vector(sample_weight, n_rows)
         for r in range(len(target)):
             if not isfinite(target[r]):
                 raise Error("target must be finite")
-        for r in range(len(sample_weight)):
-            if not isfinite(sample_weight[r]) or sample_weight[r] < 0.0:
-                raise Error("sample_weight must be finite and nonnegative")
-        if n_classes > 1:
+        if n_classes > 1 and not multi_output:
             for r in range(len(target)):
                 var label = Int(target[r])
                 if Float64(label) != target[r] or label < 0 or (
@@ -874,21 +1242,26 @@ struct GpuObjectiveState(Movable):
                         " 0..n_classes-1"
                     )
 
-        self.n_rows = len(target)
+        self.n_rows = n_rows
         self.n_classes = n_classes
         self.max_nodes = max_nodes
         self.weighted = len(sample_weight) > 0
         self.has_raw = False
+        self.multi_output = multi_output
         self.block_threads = derive_block_threads(query_device_caps(ctx))
 
         var n_scores = self.n_rows * n_classes
-        self.target_dev = ctx.enqueue_create_buffer[DType.float32](self.n_rows)
+        self.target_dev = ctx.enqueue_create_buffer[DType.float32](len(target))
         self.weight_dev = ctx.enqueue_create_buffer[DType.float32](
             self.n_rows if self.weighted else 1
         )
         self.raw_dev = ctx.enqueue_create_buffer[DType.float32](n_scores)
+        # No probability plane on a multi-target state: MultiRMSE outputs are
+        # uncoupled, so nothing ever reduces over them and the
+        # `4 * n_rows * n_outputs` a softmax state spends here would be a
+        # buffer with no reader.
         self.prob_dev = ctx.enqueue_create_buffer[DType.float32](
-            n_scores if n_classes > 1 else 1
+            n_scores if (n_classes > 1 and not multi_output) else 1
         )
         self.value_dev = ctx.enqueue_create_buffer[DType.float32](max_nodes)
         self.seg_dev = ctx.enqueue_create_buffer[DType.int32](
@@ -916,6 +1289,9 @@ struct GpuObjectiveState(Movable):
         self.stage_seg = ctx.enqueue_create_host_buffer[DType.int32](
             max_nodes * SEG_WORDS
         )
+        # Placeholder until a caller refreshes the weights; see the field.
+        self.stage_weight = ctx.enqueue_create_host_buffer[DType.float32](1)
+        self.weight_stage_rows = 0
 
         # One-time uploads. Both buffers are written through the mapping
         # rather than staged, because this runs once per session and the
@@ -923,7 +1299,7 @@ struct GpuObjectiveState(Movable):
         # ones that had to be cheap.
         with self.target_dev.map_to_host() as host:
             var dst = host.unsafe_ptr()
-            for r in range(self.n_rows):
+            for r in range(len(target)):
                 dst.unsafe_store(r, Float32(target[r]))
         if self.weighted:
             with self.weight_dev.map_to_host() as host:
@@ -983,6 +1359,96 @@ struct GpuObjectiveState(Movable):
                 dst.unsafe_store(i, Float32(raw[i]))
         self.has_raw = True
 
+    def refresh_weights(
+        mut self, ctx: DeviceContext, weights: List[Float64]
+    ) raises:
+        """Replace the device-resident per-row weights, for the one sampler
+        whose weights are not fixed for the whole fit.
+
+        CatBoost's Bayesian bootstrap draws a fresh weight per row per tree,
+        and the round's *effective* weight is that draw times the user's own
+        `sample_weight` -- `sampling.refresh_bayesian_bootstrap` is where the
+        product is formed, and it is formed on the host, in Float64, because
+        the draw is a `splitmix64` stream the device has no image of. What
+        crosses to the device is the finished product, one Float32 per row,
+        once per tree. (MVS is refused by name in
+        `sampling.canonical_bootstrap_type` and produces no weights to carry;
+        when it does, it produces them the same way and arrives here
+        unchanged.)
+
+        Where the weight lands, and where it deliberately does not
+        ----------------------------------------------------------
+        Into the *objective*, which is where the CPU puts it. The plane this
+        writes is read only by `_grad_hess_kernel` and
+        `_softmax_grad_hess_kernel`, which multiply both derivatives by it
+        exactly as `boosting._fill_grad_hess_into` does, before anything is
+        quantized. The histogram accumulation never sees a weight on either
+        backend and gains no multiply and no fetch from this. The module
+        docstring argues why that is the only defensible half of the choice.
+
+        Cost and cadence
+        ----------------
+        `4 * n_rows` host to device per tree, plus one drain. That is the
+        same shape and the same cadence as `_stage_values`, and a third of
+        the traffic a host-gradient round already pays; it is not on the
+        default path at all, because nothing calls this unless a bootstrap is
+        configured.
+
+        The drain is the difference from `_stage_values`, which argues it can
+        skip one because the round's magnitude reduction synchronizes before
+        the staging arena is rewritten. This cannot borrow that argument:
+        `GpuHistogramBuilder.set_scale_refresh` can defer that reduction by up
+        to `SCALE_WINDOW_MAX` rounds, so on a windowed fit there is no
+        guaranteed drain between two calls here and the pinned buffer could be
+        rewritten under a copy still reading it. On Metal the hazard is
+        unreachable anyway (`enqueue_copy` is itself a synchronous full-queue
+        drain, `docs/GPU_PORTABILITY.md` section 6.1), so this costs an
+        ordering point and not a wait there; on a backend whose copies are
+        genuinely asynchronous it is the whole guarantee. The same trade
+        `stage_gradients` makes, for the same reason, and the alternative is
+        the silent staleness this project has already been bitten by.
+
+        Growing the plane
+        -----------------
+        A fit with no `sample_weight` constructed a one-element placeholder,
+        so the first call here allocates the real `n_rows` buffer and its
+        pinned staging and flips `weighted`. That happens once per fit, under
+        the same synchronize, and every later call is the copy alone.
+
+        An empty vector is refused rather than read as "go back to
+        unweighted". `refresh_bayesian_bootstrap` returns an empty list only
+        when the bundle is disabled, which is a fit that should not be
+        calling this per tree at all, and silently un-weighting a round would
+        be a wrong model rather than an error.
+        """
+        if len(weights) == 0:
+            raise Error(
+                "refresh_weights needs one weight per row; an empty vector is"
+                " the unweighted convention and there is nothing to refresh"
+            )
+        _check_weight_vector(weights, self.n_rows)
+
+        # Two hazards, one drain: a kernel still holding the placeholder
+        # buffer that the growth below drops, and a copy still reading the
+        # staging arena that the fill below overwrites. See the docstring.
+        ctx.synchronize()
+
+        if not self.weighted:
+            self.weight_dev = ctx.enqueue_create_buffer[DType.float32](
+                self.n_rows
+            )
+        if self.weight_stage_rows != self.n_rows:
+            self.stage_weight = ctx.enqueue_create_host_buffer[DType.float32](
+                self.n_rows
+            )
+            self.weight_stage_rows = self.n_rows
+
+        var dst = self.stage_weight.unsafe_ptr()
+        for r in range(self.n_rows):
+            dst.unsafe_store(r, Float32(weights[r]))
+        ctx.enqueue_copy(dst_buf=self.weight_dev, src_ptr=dst)
+        self.weighted = True
+
     def fill_grad_hess(
         mut self,
         ctx: DeviceContext,
@@ -1006,6 +1472,12 @@ struct GpuObjectiveState(Movable):
             )
         if not supports_device_objective(objective):
             raise Error("unknown objective code ", objective)
+        if self.multi_output:
+            raise Error(
+                "multi-output state: use fill_multi_grad_hess, which reads"
+                " one output's column of the target matrix; this call would"
+                " read the matrix as if it were a scalar target"
+            )
         if self.n_classes != 1:
             raise Error(
                 "multiclass state: use refresh_softmax and"
@@ -1035,6 +1507,12 @@ struct GpuObjectiveState(Movable):
         is where the host trainer computes them too."""
         if self.n_classes < 2:
             raise Error("refresh_softmax requires n_classes >= 2")
+        if self.multi_output:
+            raise Error(
+                "a multi-output state has no softmax coupling: MultiRMSE"
+                " outputs are independent and there is no probability plane"
+                " to refresh; use fill_multi_grad_hess"
+            )
         if not self.has_raw:
             raise Error("call init_raw before computing probabilities")
         ctx.enqueue_function[_softmax_prob_kernel](
@@ -1058,6 +1536,11 @@ struct GpuObjectiveState(Movable):
         of the round, exactly as on the host."""
         if self.n_classes < 2:
             raise Error("fill_softmax_grad_hess requires n_classes >= 2")
+        if self.multi_output:
+            raise Error(
+                "a multi-output state carries a vector target, not class"
+                " labels; use fill_multi_grad_hess"
+            )
         if k < 0 or k >= self.n_classes:
             raise Error("class index out of range")
         if not self.has_raw:
@@ -1073,6 +1556,100 @@ struct GpuObjectiveState(Movable):
             Int32(k),
             Int32(1) if self.weighted else Int32(0),
             grid_dim=self._row_blocks(),
+            block_dim=self.block_threads,
+        )
+
+    def fill_multi_grad_hess(
+        mut self,
+        ctx: DeviceContext,
+        objective: Int,
+        j_begin: Int,
+        j_count: Int,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        mut hess_dev: DeviceBuffer[DType.float32],
+    ) raises:
+        """Write outputs `j_begin .. j_begin+j_count-1` of a MultiRMSE round
+        into `grad_dev` and `hess_dev`, class-major, in one launch.
+
+        Slot `c` of the destination carries output `j_begin + c` at
+        `[c * n_rows .. (c+1) * n_rows)`, so the buffers must hold at least
+        `j_count * n_rows` Float32 each. That is exactly
+        `GpuClassBatch.grad_dev`'s layout and exactly what
+        `GpuClassBatch.magnitude_sums`, `set_scales` and `scatter_slot`
+        consume, which is why a multi-target round gets its per-output
+        fixed-point scales out of the multiclass batch machinery without a
+        line of new reduction or scaling code.
+
+        Slot-to-output is `j_begin + c` and nothing reorders it, the same
+        contract `gpu_output_planes` fixes for classes, so results collected
+        by ascending slot are results in ascending output order.
+
+        What this does not do, and what the other tree shape would cost
+        ------------------------------------------------------------------
+        This serves the **K-trees-per-round** shape: output `j`'s plane is a
+        scalar gradient/hessian pair per row, and a grower consumes it as an
+        ordinary single-output tree, exactly as a class tree is grown. It
+        does not serve the vector-leaf shape, and it cannot be made to from
+        here. That shape needs two things this lane did not write and does
+        not own:
+
+        1. **A gain summed over outputs**, in `gpu_split_search.mojo`. A
+           candidate would have to score `sum_j gain(G_j, H_j)` over
+           `n_outputs` histogram planes at one split point instead of over
+           one, which changes the reduction the split kernel performs and
+           the argmax it feeds -- not the histogram accumulation, which
+           already builds one plane per slot. A concurrent lane owns that
+           expression.
+        2. **A vector leaf value**, in `tree.mojo` and `model.mojo`.
+           `Tree.value` is `List[Float64]` indexed by node id and
+           `Tree.predict_row` returns one `Float64`; a vector leaf needs a
+           second dimension on both, and every serializer, dumper and
+           predictor that reads them. The CPU campaign owns those files.
+
+        Neither is refused here as a runtime error, because neither is
+        reachable: no caller can ask for a vector leaf, since no type in
+        this codebase can hold one.
+        """
+        if not self.multi_output:
+            raise Error(
+                "fill_multi_grad_hess requires a multi-output state"
+                " (GpuObjectiveState(..., multi_output=True)); this state"
+                " carries a scalar target or class labels"
+            )
+        if objective == CUSTOM:
+            raise Error(
+                "custom objectives have no device kernel, multi-target or"
+                " otherwise; the callback is host code over host lists"
+            )
+        if not supports_multi_output_objective(objective):
+            raise Error(
+                "objective code ",
+                objective,
+                " has no multi-target device kernel; only squared error"
+                " (CatBoost MultiRMSE) is separable over a vector target"
+                " here. The other CatBoost multi-target losses"
+                " (MultiLogloss, MultiCrossEntropy, MultiQuantile) are"
+                " implemented on neither backend, so there is no"
+                " device='cpu' fallback for them to fall back to",
+            )
+        if not self.has_raw:
+            raise Error("call init_raw before filling gradients")
+        if j_count < 1:
+            raise Error("output batch size must be positive")
+        if j_begin < 0 or j_begin + j_count > self.n_classes:
+            raise Error("output batch is outside the output range")
+        ctx.enqueue_function[_multi_grad_hess_kernel](
+            self.raw_dev.unsafe_ptr(),
+            self.target_dev.unsafe_ptr(),
+            self.weight_dev.unsafe_ptr(),
+            grad_dev.unsafe_ptr(),
+            hess_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            Int32(self.n_classes),
+            Int32(j_begin),
+            Int32(j_count),
+            Int32(1) if self.weighted else Int32(0),
+            grid_dim=(self._row_blocks(), j_count),
             block_dim=self.block_threads,
         )
 
@@ -1581,3 +2158,1106 @@ struct GpuObjectiveState(Movable):
         for r in range(self.n_rows):
             g.append(Float64(src.unsafe_load(r)))
         return g^
+
+
+# ---------------------------------------------------------------------------
+# CatBoost's `leaf_estimation_iterations` on the device-resident plane.
+# ---------------------------------------------------------------------------
+#
+# One device-side leaf record, in Int32 words. `EST_START` is where this leaf's
+# rows begin in the flattened thread index space (the running sum of the
+# preceding leaves' counts), `EST_BEGIN` is where they begin in the active-row
+# permutation, and `EST_COUNT` is how many there are. The fourth word is unused
+# and keeps the stride a power of two, exactly as `SEG_WORDS` does.
+#
+# The count is carried here and is not carried in `SEG_WORDS`, because the two
+# tables answer different questions. `_range_table_add_raw_kernel` maps a
+# *thread* to a leaf, so it needs only the running start and finds its row from
+# the difference; `_leaf_newton_kernel` maps a *block* to a leaf and then
+# sweeps that leaf's rows, so it needs the leaf's own extent. Reusing `seg_dev`
+# would mean either recovering the count by differencing the next descriptor
+# (which has no next at the last leaf) or making the two kernels' layouts
+# co-vary for no gain.
+comptime EST_WORDS = 4
+comptime EST_START = 0
+comptime EST_BEGIN = 1
+comptime EST_COUNT = 2
+
+# The Float32 plane parallel to it: the leaf's current value, and the closed
+# monotone interval that value must stay inside. `EST_V` is the only word the
+# device writes; the bounds are read-only for the whole tree. Fourth word
+# padding again, for the same alignment reason.
+comptime EST_VALS = 4
+comptime EST_V = 0
+comptime EST_LO = 1
+comptime EST_HI = 2
+
+
+def _leaf_shift_raw_kernel(
+    rows: MutPointer[Int32, MutAnyOrigin],
+    raw: MutPointer[Float32, MutAnyOrigin],
+    shifted: MutPointer[Float32, MutAnyOrigin],
+    segs: MutPointer[Int32, MutAnyOrigin],
+    vals: MutPointer[Float32, MutAnyOrigin],
+    n_segments: Int32,
+    total: Int32,
+):
+    """`shifted[r] = raw[r] + v[leaf(r)]` for every row of every live leaf.
+
+    The score an extra Newton step differentiates at is the score the row
+    would sit at if the tree stopped here, which is its current raw score plus
+    the value its leaf currently holds. This kernel materializes that point so
+    that `_grad_hess_kernel` -- the *same* kernel the round's own derivatives
+    come from, argument for argument -- can be run over it unchanged. That
+    reuse is the whole reason this arm is three launches per iteration rather
+    than one: a fused kernel would have to restate every objective's
+    derivative and its weight multiplier, and a second definition of the
+    objectives is precisely what `supports_device_objective`'s docstring says
+    this module has already paid for once.
+
+    **The shift is `v`, not `learning_rate * v`.** The ensemble adds
+    `learning_rate * v` to each row, so evaluating here at `raw[r] + v` asks
+    what the best *full* step for this leaf is and lets the raw-score update
+    shrink that answer once, at the end. It is the same division of labour the
+    host implementation makes and states at length
+    (`boosting._estimate_leaf_values`), and it is CatBoost's: its walker
+    carries no rate and `NormalizeLeafValues` multiplies the accumulated leaf
+    value by the rate once, after the last iteration.
+
+    Thread `t` finds its leaf by the same binary search
+    `_range_table_add_raw_kernel` uses, over the same strictly ascending
+    `EST_START` column. Ranges are pairwise disjoint, so each row is written
+    by exactly one thread. Rows in no range -- out of bag -- are never written
+    and keep the zero `GpuLeafEstimator` put there once at construction;
+    nothing reads them, and the zero is there so that `_grad_hess_kernel`'s
+    full-grid sweep never differentiates uninitialized memory.
+    """
+    var t = Int(global_idx.x)
+    if t >= Int(total):
+        return
+    var lo = 0
+    var hi = Int(n_segments) - 1
+    while lo < hi:
+        var mid = (lo + hi + 1) // 2
+        if Int(segs[unsafe_offset = mid * EST_WORDS + EST_START][0]) <= t:
+            lo = mid
+        else:
+            hi = mid - 1
+    var base = lo * EST_WORDS
+    var j = t - Int(segs[unsafe_offset = base + EST_START][0])
+    var slot = Int(segs[unsafe_offset = base + EST_BEGIN][0]) + j
+    var r = Int(rows[unsafe_offset=slot][0])
+    shifted[unsafe_offset=r] = (
+        raw[unsafe_offset=r][0]
+        + vals[unsafe_offset = lo * EST_VALS + EST_V][0]
+    )
+
+
+def _leaf_newton_kernel(
+    rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    segs: MutPointer[Int32, MutAnyOrigin],
+    vals: MutPointer[Float32, MutAnyOrigin],
+    lambda_l1: Float32,
+    lambda_l2: Float32,
+    max_delta_step: Float32,
+):
+    """One threadgroup per live leaf: sum that leaf's gradients and hessians
+    and take one more Newton step, in place, without the host seeing either
+    number.
+
+    This is the launch that makes the iteration a *device* iteration. The
+    dependency an extra Newton step introduces is genuine -- iteration `k`'s
+    sums are taken at the scores iteration `k - 1` wrote -- and it is resolved
+    here, inside the device queue, rather than by handing the sums to the host
+    and taking the value back. A block owns one leaf and no other block reads
+    or writes that leaf's record, so the step needs no cross-block
+    communication and no second launch: thread 0 of the block writes the new
+    value straight back into `EST_V`, where the next iteration's shift kernel
+    reads it.
+
+    What is recomputed and what is not
+    ----------------------------------
+    **The histogram is not rebuilt and the tree's structure does not move.**
+    Nothing here reads a bin, a threshold, or a feature. What moves between
+    iterations is exactly two numbers per leaf, `G` and `H`, and they move
+    only because the point they are evaluated at moved. The row membership is
+    the one the grower left in the active-row permutation and is fixed for the
+    whole call.
+
+    The fold order
+    --------------
+    Thread `t` accumulates rows `t, t + SUM_THREADS, t + 2 * SUM_THREADS, ...`
+    of its leaf's slice, then the threadgroup folds those 256 partials in a
+    fixed binary tree. Both the stride and the tree are compile-time constants
+    and the slice is the grower's, so the sum is the same Float32 for a given
+    leaf whatever the device schedules -- deterministic run to run, in the
+    sense the module docstring already claims for `_abs_sum_kernel`.
+
+    It is **not** the host's fold. `boosting._estimate_leaf_values` sums the
+    same rows sequentially in ascending row order in Float64. This is a
+    strided Float32 tree reduction, so the two agree to Float32 and not to the
+    bit, which is the same trade every other number on this plane already
+    makes and is stated in the module docstring. Agreement with the host
+    implementation is asserted in `tests/test_gpu_leaf_estimation.mojo` rather
+    than argued here.
+
+    The guard, the cap and the clamp
+    --------------------------------
+    A non-positive `H + lambda_l2` leaves the value alone. On the host that is
+    a `break` out of the iteration loop; here it is a skip, and the two end at
+    the same value because a skipped iteration changes nothing the next
+    iteration reads, so every later iteration skips too.
+
+    `max_delta_step` and the monotone interval are re-applied after every
+    step, not only after the last, because both are projections onto a fixed
+    set: applying one to an already-projected value is the identity, so this
+    costs nothing and keeps the value the *next* iteration differentiates at
+    inside the cap and inside the constraint the tree was grown under.
+    `path_smooth` is not a projection and is refused beside this parameter in
+    `ExtraTreeParams.check_leaf_estimation`, which is why no smoothing appears
+    here.
+
+    No fused multiply-add is at stake in the step. `-T(G) / (H + lambda_l2)`
+    is a divide and the accumulation `v + step` adds its quotient, so there is
+    no multiply for the device compiler to contract into the following add --
+    unlike `learning_rate * value[node]` in `_range_table_add_raw_kernel`,
+    whose contraction cost that lane a bit and is documented there. The
+    reduction loop is a chain of plain adds for the same reason.
+    """
+    var tid = thread_idx.x
+    var seg = Int(block_idx.x)
+    var sg = stack_allocation[
+        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var sh = stack_allocation[
+        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+
+    var base = seg * EST_WORDS
+    var begin = Int(segs[unsafe_offset = base + EST_BEGIN][0])
+    var count = Int(segs[unsafe_offset = base + EST_COUNT][0])
+
+    var acc_g = Float32(0.0)
+    var acc_h = Float32(0.0)
+    var j = tid
+    while j < count:
+        var r = Int(rows[unsafe_offset = begin + j][0])
+        acc_g += grad[unsafe_offset=r][0]
+        acc_h += hess[unsafe_offset=r][0]
+        j += SUM_THREADS
+    sg[unsafe_offset=tid] = acc_g
+    sh[unsafe_offset=tid] = acc_h
+    barrier()
+
+    # Uniform trip count across the threadgroup, so every thread reaches every
+    # barrier, exactly as in `_abs_sum_kernel`.
+    var active = SUM_THREADS // 2
+    while active > 0:
+        if tid < active:
+            sg[unsafe_offset=tid] = (
+                sg[unsafe_offset=tid][0] + sg[unsafe_offset = tid + active][0]
+            )
+            sh[unsafe_offset=tid] = (
+                sh[unsafe_offset=tid][0] + sh[unsafe_offset = tid + active][0]
+            )
+        barrier()
+        active //= 2
+
+    if tid == 0:
+        var vbase = seg * EST_VALS
+        var g_sum = sg[unsafe_offset=0][0]
+        var h_sum = sh[unsafe_offset=0][0]
+        var denom = h_sum + lambda_l2
+        if denom > 0.0:
+            # `gain.soft_threshold_l1`, arm for arm. `g_sum == 0` reaches the
+            # `mag <= 0` arm whenever `lambda_l1 > 0`, so the sign test below
+            # is never asked about a zero.
+            var s = g_sum
+            if lambda_l1 > 0.0:
+                var mag = abs(g_sum) - lambda_l1
+                if mag <= 0.0:
+                    s = 0.0
+                elif g_sum > 0.0:
+                    s = mag
+                else:
+                    s = -mag
+            var v = vals[unsafe_offset = vbase + EST_V][0] + (-s / denom)
+            # `tree_parameters_extra.cap_leaf_output`.
+            if max_delta_step > 0.0:
+                if v > max_delta_step:
+                    v = max_delta_step
+                elif v < -max_delta_step:
+                    v = -max_delta_step
+            # `monotone.OutputBounds.clamp`.
+            var b_lo = vals[unsafe_offset = vbase + EST_LO][0]
+            var b_hi = vals[unsafe_offset = vbase + EST_HI][0]
+            if v < b_lo:
+                v = b_lo
+            elif v > b_hi:
+                v = b_hi
+            vals[unsafe_offset = vbase + EST_V] = v
+
+
+struct GpuLeafEstimator(Movable):
+    """CatBoost's `leaf_estimation_iterations` for the device-resident round.
+
+    After a tree's structure is fixed, re-estimate each leaf's value `k` times
+    instead of once, each iteration recomputing that leaf's gradient and
+    hessian sums against the raw scores the previous iteration produced. The
+    host implementation is `boosting._estimate_leaf_values` and is the
+    definition; this is the same iteration on the plane where the raw scores
+    live on the device, node-identical to that implementation to Float32.
+
+    Which shape this is, and why
+    ----------------------------
+    Two shapes were available. This is the **per-iteration device reduction
+    inside the tree**: the launches go into the schedule and the host stays
+    out of the loop. The alternative -- lifting leaf estimation out of the
+    device round, downloading the raw scores, iterating on the host and
+    uploading the values -- was rejected because it converts a fixed launch
+    cost into `k - 1` *round trips* per tree, and section 6.1.1 of
+    `docs/GPU_PORTABILITY.md` is explicit that a round-trip count predicts
+    seconds while a launch or copy count predicts ordering hazard. A hundred
+    rounds at `k = 10` would be nine hundred waits on a plane whose entire
+    design is one wait per tree.
+
+    What it costs, counted in source
+    --------------------------------
+    Three launches per extra iteration, independent of the leaf count, plus
+    one device-to-host copy and one synchronization per tree:
+
+      shift    `_leaf_shift_raw_kernel`, one thread per live row
+      grads    `_grad_hess_kernel`, the round's own derivative kernel,
+               unmodified, over the shifted scores
+      step     `_leaf_newton_kernel`, one threadgroup per live leaf
+
+    So `k` iterations add `3 * (k - 1)` launches to a tree's schedule. The
+    campaign's measured enqueue cost is flat at 6-7 microseconds through 64
+    command buffers and 14-17 beyond, and the two schedules sit on opposite
+    sides of that knee, so the same six launches are not the same cost:
+
+    - **Leaf-wise**, a tree already issues 278 launches, well past the knee.
+      `k = 3` takes it to 284, a 2.2% increase entirely inside the expensive
+      regime: about 84-102 microseconds of enqueue per tree.
+    - **Oblivious**, a depth-6 tree issues 62, inside the flat regime. `k = 3`
+      takes it to 68, a 9.7% increase, and it **crosses the knee**: six
+      launches that would each have cost 6-7 microseconds instead push the
+      schedule past 64 buffers. Proportionally the added launches cost more on
+      the oblivious schedule, and the crossing is the reason, not the count.
+
+    The one round trip per tree is unavoidable in either shape: `Tree.value`
+    is a host list and the ensemble is scored from it, so the finished values
+    have to come home. What this shape buys is that it is **one** and not
+    `k - 1`.
+
+    Memory
+    ------
+    Three `n_rows` Float32 planes -- the shifted scores and the derivative
+    pair -- so 12 MB at a million rows, allocated only when a fit actually
+    sets the parameter above 1. The derivative planes are the estimator's own
+    rather than the histogram builder's: the builder's hold the round's
+    gradients, and although nothing reads them after the tree is grown,
+    borrowing them would make this feature's correctness depend on that
+    remaining true.
+
+    Construct once per fit, alongside `GpuObjectiveState`, and call `estimate`
+    once per tree between growth and the raw-score update.
+    """
+
+    var shift_dev: DeviceBuffer[DType.float32]
+    """`raw[r] + v[leaf(r)]`, the point this iteration differentiates at."""
+    var grad_dev: DeviceBuffer[DType.float32]
+    var hess_dev: DeviceBuffer[DType.float32]
+    var seg_dev: DeviceBuffer[DType.int32]
+    """`EST_WORDS` Int32 per live leaf, staged once per tree."""
+    var val_dev: DeviceBuffer[DType.float32]
+    """`EST_VALS` Float32 per live leaf: the value the iteration carries, and
+    the monotone interval it stays inside."""
+    var stage_seg: HostBuffer[DType.int32]
+    var stage_val: HostBuffer[DType.float32]
+    """Pinned staging for `val_dev`, **and** the destination of the one
+    readback. Both directions can share it because the queue is in order: the
+    upload copy has retired before the last iteration's kernels run, and the
+    readback is enqueued behind all of them."""
+
+    var n_rows: Int
+    var max_nodes: Int
+    var block_threads: Int
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        n_rows: Int,
+        max_nodes: Int = DEFAULT_MAX_NODES,
+    ) raises:
+        if n_rows < 1:
+            raise Error("leaf estimation requires at least one row")
+        if max_nodes < 1:
+            raise Error("max_nodes must be positive")
+        self.n_rows = n_rows
+        self.max_nodes = max_nodes
+        self.block_threads = derive_block_threads(query_device_caps(ctx))
+        self.shift_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        self.grad_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        self.hess_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        self.seg_dev = ctx.enqueue_create_buffer[DType.int32](
+            max_nodes * EST_WORDS
+        )
+        self.val_dev = ctx.enqueue_create_buffer[DType.float32](
+            max_nodes * EST_VALS
+        )
+        self.stage_seg = ctx.enqueue_create_host_buffer[DType.int32](
+            max_nodes * EST_WORDS
+        )
+        self.stage_val = ctx.enqueue_create_host_buffer[DType.float32](
+            max_nodes * EST_VALS
+        )
+        # Once per fit, not once per tree. `_grad_hess_kernel` sweeps the whole
+        # grid, so it differentiates rows the shift kernel never wrote --
+        # out-of-bag rows, under a sampler. Their derivatives are read by
+        # nothing, since no leaf owns them, but an allocation's contents are
+        # not defined and a NaN sitting in a buffer is the kind of thing that
+        # is harmless until it is not. Zero is a point every device objective
+        # is finite at.
+        with self.shift_dev.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            for r in range(n_rows):
+                dst.unsafe_store(r, Float32(0.0))
+
+    def estimate(
+        mut self,
+        ctx: DeviceContext,
+        mut state: GpuObjectiveState,
+        mut rows: GpuActiveRows,
+        mut values: List[Float64],
+        is_leaf: List[Bool],
+        bounds: List[OutputBounds],
+        objective: Int,
+        alpha: Float64,
+        iterations: Int,
+        lambda_l1: Float64,
+        lambda_l2: Float64,
+        max_delta_step: Float64,
+    ) raises:
+        """Take `iterations - 1` extra Newton steps on every live leaf of the
+        tree `values` belongs to, and write the results back into `values`.
+
+        Call after growth and before the next `begin_tree`, which is what
+        resets the ranges this reads, and before the raw-score update, which
+        is what consumes the values this writes.
+
+        `values` is the tree's node-value array, **finished**: capped and
+        clamped, exactly as the grower left it and exactly as
+        `update_raw_ranges` will consume it. That is the value whose
+        derivatives the first extra iteration evaluates, because it is the
+        value the leaf actually holds. `is_leaf` and `bounds` are parallel to
+        it: `is_leaf[node]` is `tree.feature[node] < 0`, and `bounds` is
+        `tree.node_bounds`'s output, or empty when no monotone constraint is
+        active.
+
+        **`iterations <= 1` returns before it stages a word, and that early
+        return is the bit-identity guarantee.** It mirrors, statement for
+        statement, the early return `boosting._estimate_leaf_values` opens
+        with: iteration 1 is never recomputed here either, so the value the
+        grower wrote from the histogram's own sums is the value the tree
+        keeps, and the default path enqueues nothing, copies nothing and waits
+        on nothing.
+
+        Order of operations, per tree
+        -----------------------------
+        1. Flatten the live leaf ranges into ascending-node-order records on
+           the host, one per leaf with a live range, each carrying the leaf's
+           current value and its monotone interval. Internal nodes are skipped
+           twice over: their ranges are empty once their children own their
+           rows, and `is_leaf` is checked as well, so a range a grower failed
+           to clear cannot be mistaken for a leaf.
+        2. Upload both planes. Two copies, once, not once per iteration.
+        3. For each of the `iterations - 1` extra steps: shift, differentiate,
+           reduce-and-step. Nothing crosses to the host inside this loop.
+        4. Read the value plane back, once, and write it into `values`.
+
+        The membership does not move between steps and neither does the
+        structure. Only `G` and `H` move, and only because the point they are
+        taken at moved.
+        """
+        if iterations <= 1:
+            return
+        if state.n_classes != 1:
+            raise Error(
+                "leaf estimation iterations are single-output only; the"
+                " multiclass trainers refuse the setting by name, and a"
+                " multi-target state reaches this refusal through the same"
+                " test because its outputs are separate trees with separate"
+                " leaf values"
+            )
+        if state.n_rows != self.n_rows:
+            raise Error(
+                "objective state and leaf estimator disagree on n_rows"
+            )
+        if not state.has_raw:
+            raise Error("call init_raw before estimating leaf values")
+        if objective == CUSTOM or not supports_device_objective(objective):
+            raise Error(
+                "leaf estimation iterations need a device objective kernel;"
+                " custom objectives stay on the host path"
+            )
+        if not isfinite(alpha):
+            raise Error("alpha must be finite")
+        if not isfinite(lambda_l1) or not isfinite(lambda_l2):
+            raise Error("regularization must be finite")
+        if not isfinite(max_delta_step):
+            raise Error("max_delta_step must be finite")
+        if len(values) > self.max_nodes:
+            raise Error(
+                "tree has more nodes than the leaf-estimation table holds;"
+                " construct with a larger max_nodes"
+            )
+        for i in range(len(values)):
+            if not isfinite(values[i]):
+                raise Error("node values must be finite")
+
+        var dseg = self.stage_seg.unsafe_ptr()
+        var dval = self.stage_val.unsafe_ptr()
+        var nodes = List[Int]()
+        var n_segments = 0
+        var total = 0
+        for node in range(rows.ranges.n_nodes()):
+            if node >= len(values):
+                break
+            if node < len(is_leaf) and not is_leaf[node]:
+                continue
+            var window = rows.ranges.get(node)
+            var n = window.count()
+            if n <= 0:
+                continue
+            var base = n_segments * EST_WORDS
+            dseg.unsafe_store(base + EST_START, Int32(total))
+            dseg.unsafe_store(base + EST_BEGIN, Int32(window.begin))
+            dseg.unsafe_store(base + EST_COUNT, Int32(n))
+            dseg.unsafe_store(base + EST_WORDS - 1, Int32(0))
+            var vbase = n_segments * EST_VALS
+            dval.unsafe_store(vbase + EST_V, Float32(values[node]))
+            # An inactive bound is `Float64.MAX_FINITE`, which is not a finite
+            # Float32; it is staged as the Float32 maximum instead, so the
+            # comparison in the kernel is against a real number and the clamp
+            # is the identity either way.
+            var b_lo = -Float32.MAX_FINITE
+            var b_hi = Float32.MAX_FINITE
+            if node < len(bounds):
+                if bounds[node].lo > -NO_BOUND:
+                    b_lo = Float32(bounds[node].lo)
+                if bounds[node].hi < NO_BOUND:
+                    b_hi = Float32(bounds[node].hi)
+            dval.unsafe_store(vbase + EST_LO, b_lo)
+            dval.unsafe_store(vbase + EST_HI, b_hi)
+            dval.unsafe_store(vbase + EST_VALS - 1, Float32(0.0))
+            nodes.append(node)
+            n_segments += 1
+            total += n
+        if n_segments == 0:
+            return
+
+        ctx.enqueue_copy(dst_buf=self.seg_dev, src_ptr=dseg)
+        ctx.enqueue_copy(dst_buf=self.val_dev, src_ptr=dval)
+
+        var l1 = Float32(lambda_l1)
+        var l2 = Float32(lambda_l2)
+        var cap = Float32(max_delta_step)
+        var shift_blocks = (
+            total + self.block_threads - 1
+        ) // self.block_threads
+        var row_blocks = (
+            self.n_rows + self.block_threads - 1
+        ) // self.block_threads
+        for _ in range(iterations - 1):
+            ctx.enqueue_function[_leaf_shift_raw_kernel](
+                rows.rows_dev.unsafe_ptr(),
+                state.raw_dev.unsafe_ptr(),
+                self.shift_dev.unsafe_ptr(),
+                self.seg_dev.unsafe_ptr(),
+                self.val_dev.unsafe_ptr(),
+                Int32(n_segments),
+                Int32(total),
+                grid_dim=shift_blocks,
+                block_dim=self.block_threads,
+            )
+            # The round's own derivative kernel, over the shifted scores and
+            # the state's own labels and weights. Not a copy of it and not a
+            # variant of it: the same function, so the weight multiplier and
+            # every objective arm keep one definition on this backend.
+            ctx.enqueue_function[_grad_hess_kernel](
+                self.shift_dev.unsafe_ptr(),
+                state.target_dev.unsafe_ptr(),
+                state.weight_dev.unsafe_ptr(),
+                self.grad_dev.unsafe_ptr(),
+                self.hess_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                Int32(objective),
+                Float32(alpha),
+                Int32(1) if state.weighted else Int32(0),
+                grid_dim=row_blocks,
+                block_dim=self.block_threads,
+            )
+            ctx.enqueue_function[_leaf_newton_kernel](
+                rows.rows_dev.unsafe_ptr(),
+                self.grad_dev.unsafe_ptr(),
+                self.hess_dev.unsafe_ptr(),
+                self.seg_dev.unsafe_ptr(),
+                self.val_dev.unsafe_ptr(),
+                l1,
+                l2,
+                cap,
+                grid_dim=n_segments,
+                block_dim=SUM_THREADS,
+            )
+
+        # The tree's one round trip. `Tree.value` is a host list and the
+        # ensemble is scored from it, so the finished values have to come
+        # home; what this shape buys is that they come home once and not once
+        # per iteration.
+        ctx.enqueue_copy(
+            dst_ptr=self.stage_val.unsafe_ptr(), src_buf=self.val_dev
+        )
+        ctx.synchronize()
+        var src = self.stage_val.unsafe_ptr()
+        for s in range(n_segments):
+            values[nodes[s]] = Float64(src.unsafe_load(s * EST_VALS + EST_V))
+
+
+# ---------------------------------------------------------------------------
+# CatBoost's group-and-pair ranking objectives on the device-resident plane.
+# ---------------------------------------------------------------------------
+#
+# QueryRMSE, PairLogit, and YetiRank. `ranking_pairwise.mojo` is the definition
+# -- the derivative formulas in CatBoost's own sign convention, the group and
+# pair conventions and where they were read from, the refusals, the weighting
+# rule, and the fixed-point arithmetic a ranking gradient profile implies. This
+# section is those derivatives on the plane where the raw scores already live,
+# and it restates none of that reasoning; it records only what is true of the
+# device shape.
+#
+# WHAT THE GROUPING PLANE IS, AND WHAT IT IS NOT
+# ----------------------------------------------
+# It is the `n_groups + 1` boundary array `ranking.RankGroups.starts`, uploaded
+# once per fit, and **it is not a per-row group id**. Rows of a group are
+# contiguous -- that is `RankGroups`'s invariant, and `groups_from_query_ids`
+# refuses data that violates it -- so a group is a window and a kernel block
+# owns one. No row ever looks its own group up: `_query_rmse_kernel` is indexed
+# by group, and the pairwise kernel is indexed by row and never needs the group
+# at all, because the pairs were already validated to lie inside one.
+#
+# A per-row id would have been `4 * n_rows` bytes of upload plus one gather per
+# row per round, to answer a question the row's position already answers. The
+# only shape in which it would have been necessary is unsorted rows, which is
+# the convention the CPU does not have.
+#
+# WHY THE PAIR PLANE IS AN ADJACENCY AND NOT A PAIR LIST
+# ------------------------------------------------------
+# **Metal has no floating-point atomic add.** A one-thread-per-pair kernel
+# writes into `grad[i]` and `grad[j]` from as many threads as the row appears
+# in pairs, which needs an atomic this backend does not have and which would be
+# non-deterministic on the backends that do. So the host expands the pair list
+# into the per-row CSR `ranking_pairwise.PairAdjacency` and the kernel is one
+# thread per row over its own slice: no atomic, no contention, and a fold order
+# fixed by the host rather than by the scheduler. Each pair is read twice,
+# which is the price.
+#
+# One device word pair per entry, `PAIR_WORDS` Int32 apiece: the other
+# endpoint, and the pair's weight as a Float32 whose *sign* carries whether
+# this row was the winner, travelling as its own bit pattern. Same
+# reinterpretation `SEG_STEP` uses and for the same reason -- two buffers are
+# two `enqueue_copy` calls and on Metal a copy is a full-queue drain whatever
+# its byte count (`docs/GPU_PORTABILITY.md` section 6.1, **measured**). A
+# `bitcast` between two 32-bit types alters no value in either direction.
+comptime PAIR_WORDS = 2
+comptime PAIR_OTHER = 0
+comptime PAIR_WEIGHT = 1
+
+
+def _query_rmse_kernel(
+    raw: MutPointer[Float32, MutAnyOrigin],
+    target: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    starts: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    weighted: Int32,
+):
+    """One threadgroup per query group: the group's weighted mean residual,
+    then every row's derivative against it.
+
+    `ranking_pairwise.query_rmse_grad_hess` is the definition and carries the
+    CatBoost correspondence. Here:
+
+        r_i    = target_i - raw_i
+        avg    = sum_i w_i r_i / sum_i w_i        (0 when sum_i w_i is 0)
+        grad_i = w_i * (avg - r_i)
+        hess_i = w_i
+
+    The block sweeps its group twice -- once to reduce, once to write -- rather
+    than caching the residuals, because a group has no bounded size and shared
+    memory does. Both sweeps are `SUM_THREADS`-strided over the same window in
+    the same direction, so the second reads exactly what the first summed.
+
+    **The reduction is inside the block and the barriers are unconditional.**
+    Every thread of the block runs the same fixed `SUM_THREADS`-wide tree
+    whatever the group's size, so every thread reaches every barrier, and the
+    fold order is a compile-time constant. That makes the sum the same Float32
+    for a given group whatever the device schedules -- deterministic run to
+    run, in the sense `_abs_sum_kernel` already claims. It is **not** the
+    host's fold: the reference sums sequentially in ascending row order in
+    Float64, so the two agree to Float32 and not to the bit, which is the trade
+    every number on this plane makes.
+
+    A group of one is not a special case here and gets no branch. Its single
+    thread sums `w_0` and `w_0 r_0`, `avg` comes out exactly `r_0`, and the
+    write produces `w_0 * (r_0 - r_0)`, an exact zero in Float32 because it is
+    a subtraction of a value from itself. A group whose weights sum to zero
+    takes the `sum_w > 0` branch to `avg = 0` and then writes `0 * (...)`,
+    which is zero rather than the NaN a division would have produced.
+
+    The shape is chosen for correctness and not for occupancy, and that is
+    worth saying rather than leaving to be discovered: a group of ten leaves
+    246 of 256 threads idle in both sweeps. A thread-per-group or
+    subgroup-per-group variant is the obvious answer for many small groups and
+    is **not measured here** -- this is an accuracy lane and it publishes no
+    timing.
+    """
+    var tid = Int(thread_idx.x)
+    var q = Int(block_idx.x)
+    var sw = stack_allocation[
+        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var sr = stack_allocation[
+        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+
+    var start = Int(starts[unsafe_offset=q][0])
+    var stop = Int(starts[unsafe_offset = q + 1][0])
+
+    var acc_w = Float32(0.0)
+    var acc_r = Float32(0.0)
+    var i = start + tid
+    while i < stop:
+        var w = Float32(1.0)
+        if weighted != 0:
+            w = weight[unsafe_offset=i][0]
+        acc_w += w
+        acc_r += w * (target[unsafe_offset=i][0] - raw[unsafe_offset=i][0])
+        i += SUM_THREADS
+    sw[unsafe_offset=tid] = acc_w
+    sr[unsafe_offset=tid] = acc_r
+    barrier()
+
+    var active = SUM_THREADS // 2
+    while active > 0:
+        if tid < active:
+            sw[unsafe_offset=tid] = (
+                sw[unsafe_offset=tid][0] + sw[unsafe_offset = tid + active][0]
+            )
+            sr[unsafe_offset=tid] = (
+                sr[unsafe_offset=tid][0] + sr[unsafe_offset = tid + active][0]
+            )
+        barrier()
+        active //= 2
+
+    # The last iteration's barrier is what publishes slot 0 to every thread,
+    # so no further synchronization is needed before this read.
+    var sum_w = sw[unsafe_offset=0][0]
+    var sum_wr = sr[unsafe_offset=0][0]
+    var avg = Float32(0.0)
+    if sum_w > 0.0:
+        avg = sum_wr / sum_w
+
+    var j = start + tid
+    while j < stop:
+        var w = Float32(1.0)
+        if weighted != 0:
+            w = weight[unsafe_offset=j][0]
+        var resid = target[unsafe_offset=j][0] - raw[unsafe_offset=j][0]
+        grad[unsafe_offset=j] = w * (avg - resid)
+        hess[unsafe_offset=j] = w
+        j += SUM_THREADS
+
+
+def _pair_logit_kernel(
+    raw: MutPointer[Float32, MutAnyOrigin],
+    offsets: MutPointer[Int32, MutAnyOrigin],
+    entries: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+):
+    """One thread per row: the row's pairwise-logit derivatives, summed over
+    the pairs it takes part in.
+
+    `ranking_pairwise.pairwise_grad_hess` is the definition and carries the
+    CatBoost correspondence, and it is the same expression for PairLogit and
+    for YetiRank because it is the same expression in CatBoost. Per entry,
+    with `d` the winner-minus-loser raw score difference and `w` the pair's
+    weight:
+
+        rho     = 1 / (1 + exp(d))
+        grad   -= w * rho                  if this row is the winner
+        grad   += w * rho                  if this row is the loser
+        hess   += w * rho * (1 - rho)      either way
+
+    `rho` is `_dev_sigmoid(-d)`, which is `ranking._pair_sigmoid(d, 1.0)`
+    branch for branch: at `d > 0` both evaluate `e = exp(-d); e / (1 + e)`, at
+    `d < 0` both evaluate `e = exp(d); 1 / (1 + e)`, and at `d == 0` both reach
+    the first arm and return exactly `1/2`. That is why the host reference
+    imports the CPU's function instead of restating it and why this kernel
+    calls the module's existing sigmoid instead of adding a second one: the
+    overflow guard has one definition per backend and the two are the same
+    expression.
+
+    **No atomic, and no thread writes a row another thread writes.** The
+    accumulators are registers, the slice is the row's own, and the two stores
+    at the end are the only writes. That is the whole reason the pair plane is
+    an adjacency; the block comment above gives it.
+
+    A row with an empty slice -- every row of a singleton group, and any row no
+    pair mentions -- exits the loop having touched nothing and stores exactly
+    zero into both planes. There is no division in this kernel, so there is
+    nothing a degenerate group could divide by.
+
+    The trip count is the row's pair count and varies across a threadgroup, so
+    this kernel diverges where `_grad_hess_kernel` does not. It is the shape
+    the absence of a float atomic leaves, and the alternative is not a faster
+    kernel, it is a wrong one.
+    """
+    var r = global_idx.x
+    if r >= Int(n_rows):
+        return
+    var lo = Int(offsets[unsafe_offset=r][0])
+    var hi = Int(offsets[unsafe_offset = r + 1][0])
+    var raw_r = raw[unsafe_offset=r][0]
+    var g = Float32(0.0)
+    var h = Float32(0.0)
+    for e in range(lo, hi):
+        var base = e * PAIR_WORDS
+        var o = Int(entries[unsafe_offset = base + PAIR_OTHER][0])
+        var sw = bitcast[DType.float32, 1](
+            entries[unsafe_offset = base + PAIR_WEIGHT][0]
+        )
+        var raw_o = raw[unsafe_offset=o][0]
+        var w = abs(sw)
+        var d = (raw_r - raw_o) if sw > 0.0 else (raw_o - raw_r)
+        var rho = _dev_sigmoid(-d)
+        var contrib = w * rho
+        if sw > 0.0:
+            g -= contrib
+        else:
+            g += contrib
+        h += w * rho * (1.0 - rho)
+    grad[unsafe_offset=r] = g
+    hess[unsafe_offset=r] = h
+
+
+struct GpuRankingState(Movable):
+    """Device-resident query boundaries and pair adjacency for one ranking fit.
+
+    Construct once per fit from the same `DeviceContext` as the
+    `GpuObjectiveState` whose labels, weights and raw scores it reads, and
+    beside it; `fill_grad_hess` takes that state rather than duplicating any of
+    it, which is the arrangement `GpuLeafEstimator` already has.
+
+    Two planes, with different lifetimes, and the difference is the whole of
+    what separates the three objectives on this side:
+
+    - The **group boundaries** are a property of the *dataset*. Uploaded once,
+      in the constructor, and never again. Rows of a group are contiguous
+      (`ranking.RankGroups`), so this is an `n_groups + 1` boundary array and
+      not a per-row column; the block comment above argues why that is not
+      merely smaller but structurally different.
+    - The **pair adjacency** is a property of the *pair set*. For PairLogit
+      that is the fit's, uploaded once; for YetiRank it is the round's, and
+      `refresh_pairs` is the per-round upload, the twin of
+      `GpuObjectiveState.refresh_weights` and for the same kind of reason.
+
+    QueryRMSE reads only the first plane, and this state allocates the second
+    at one word until something needs it, so a QueryRMSE fit pays no pair
+    memory at all.
+
+    What this state deliberately does not hold: the raw scores, the labels, the
+    weights, and the gradient buffers. All four belong to `GpuObjectiveState`
+    and `GpuHistogramBuilder` and are read through them, so a ranking round
+    writes into exactly the buffers the histogram kernels read, with nothing
+    crossing the boundary, on the same terms as every other device objective.
+    """
+
+    var starts_dev: DeviceBuffer[DType.int32]
+    """`n_groups + 1` ascending row boundaries. The grouping plane."""
+    var off_dev: DeviceBuffer[DType.int32]
+    """`n_rows + 1` CSR offsets into `pair_dev`, or a placeholder."""
+    var pair_dev: DeviceBuffer[DType.int32]
+    """`PAIR_WORDS` Int32 per adjacency entry, or a placeholder."""
+    var stage_off: HostBuffer[DType.int32]
+    var stage_pair: HostBuffer[DType.int32]
+    """Pinned staging for the two pair planes, on the same grounds as
+    `GpuObjectiveState.stage_value`: `map_to_host` copies in both directions on
+    every use, so a per-round upload goes through a one-way copy instead.
+    Allocated by the first `refresh_pairs`, never at construction, so a
+    QueryRMSE fit pays nothing for a buffer it will not write."""
+
+    var n_rows: Int
+    var n_groups: Int
+    var pair_capacity: Int
+    """Adjacency entries `pair_dev` and `stage_pair` are sized for. Zero while
+    they are placeholders. One number rather than a second flag, so the buffer
+    and the claim about it cannot disagree."""
+    var n_entries: Int
+    """Entries currently staged. Zero when no pair set has been uploaded."""
+    var pairs_round: Int
+    """The round index the staged pairs were generated for, or -1 when none
+    have been. Read only by `_check_pair_plane`, which is what makes a YetiRank
+    round that forgot to redraw an error instead of a model trained against an
+    ordering it has already left behind."""
+    var has_pairs: Bool
+    var block_threads: Int
+
+    def __init__(out self, ctx: DeviceContext, groups: RankGroups) raises:
+        """Upload the query boundaries, which never change again.
+
+        `groups` is validated by `ranking.check_groups` -- the CPU's validator,
+        not a second one -- so a boundary array that does not start at zero,
+        does not ascend strictly, or does not end at `n_rows` is refused here
+        rather than producing a block that sweeps the wrong window.
+        """
+        check_groups(groups, groups.n_rows)
+        if groups.n_rows < 1:
+            raise Error("ranking objectives require at least one row")
+        self.n_rows = groups.n_rows
+        self.n_groups = groups.n_queries()
+        self.block_threads = derive_block_threads(query_device_caps(ctx))
+        self.pair_capacity = 0
+        self.n_entries = 0
+        self.pairs_round = -1
+        self.has_pairs = False
+
+        self.starts_dev = ctx.enqueue_create_buffer[DType.int32](
+            self.n_groups + 1
+        )
+        # Placeholders: zero-length device buffers are not portable, and a
+        # QueryRMSE fit never grows these.
+        self.off_dev = ctx.enqueue_create_buffer[DType.int32](1)
+        self.pair_dev = ctx.enqueue_create_buffer[DType.int32](1)
+        self.stage_off = ctx.enqueue_create_host_buffer[DType.int32](1)
+        self.stage_pair = ctx.enqueue_create_host_buffer[DType.int32](1)
+
+        # One-time upload, written through the mapping rather than staged, on
+        # the same grounds as `GpuObjectiveState`'s label upload: it runs once
+        # per session and the mapping is the shorter path.
+        with self.starts_dev.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            for q in range(self.n_groups + 1):
+                dst.unsafe_store(q, Int32(groups.starts[q]))
+
+    def _row_blocks(self) -> Int:
+        return (self.n_rows + self.block_threads - 1) // self.block_threads
+
+    def refresh_pairs(
+        mut self,
+        ctx: DeviceContext,
+        adjacency: PairAdjacency,
+        round_index: Int = 0,
+    ) raises:
+        """Replace the device-resident pair adjacency.
+
+        Called once per fit for PairLogit, whose pairs the caller supplies and
+        which do not move, and once per *round* for YetiRank, whose pairs are
+        redrawn against the current scores. `round_index` records which round
+        the staged pairs belong to; `fill_grad_hess` refuses a YetiRank round
+        whose pairs carry a different one, which is the difference between
+        training YetiRank and training PairLogit on a stale draw.
+
+        Cost and cadence
+        ----------------
+        Two `enqueue_copy` calls -- the offsets and the interleaved entries --
+        plus one drain, per upload. Two rather than three because the entry's
+        weight travels inside the entry record as a reinterpreted Float32; the
+        block comment above `PAIR_WORDS` argues that choice. On the PairLogit
+        path this happens once for the whole fit. On the YetiRank path it is
+        per round, at `4 * (n_rows + 1) + 8 * entries` bytes.
+
+        The drain is the same trade `refresh_weights` makes and is argued
+        there: on Metal `enqueue_copy` is itself a synchronous full-queue drain
+        (`docs/GPU_PORTABILITY.md` section 6.1), so the explicit synchronize
+        costs an ordering point rather than a wait there, and on a backend
+        whose copies are genuinely asynchronous it is the whole guarantee that
+        a kernel still reading the old planes has finished before the buffers
+        are dropped and the staging arena is rewritten.
+
+        Validation
+        ----------
+        Every field is checked against the row count and against the buffer it
+        will index, because a malformed adjacency does not crash a kernel, it
+        produces a plausible wrong gradient: an offset that does not ascend
+        gives a row a negative trip count and silently drops its pairs, and an
+        endpoint out of range reads another row's raw score. Weights must be
+        finite and nonzero, because zero is the one value the sign encoding
+        cannot carry a direction for; `pair_adjacency` drops zero-weight pairs
+        rather than emitting them, so an adjacency built by that function
+        always passes.
+        """
+        if adjacency.n_rows != self.n_rows:
+            raise Error(
+                "pair adjacency and query boundaries disagree on the row count"
+            )
+        if len(adjacency.offsets) != self.n_rows + 1:
+            raise Error("pair adjacency offsets must have n_rows + 1 entries")
+        if adjacency.offsets[0] != 0:
+            raise Error("pair adjacency offsets must start at 0")
+        var total = len(adjacency.other)
+        if len(adjacency.signed_weight) != total:
+            raise Error(
+                "pair adjacency index and weight planes must have equal length"
+            )
+        if adjacency.offsets[self.n_rows] != total:
+            raise Error("pair adjacency offsets must end at the entry count")
+        for r in range(self.n_rows):
+            if adjacency.offsets[r + 1] < adjacency.offsets[r]:
+                raise Error("pair adjacency offsets must be nondecreasing")
+        for e in range(total):
+            var o = adjacency.other[e]
+            if o < 0 or o >= self.n_rows:
+                raise Error("pair adjacency endpoint out of range")
+            var w = adjacency.signed_weight[e]
+            if not isfinite(w) or w == 0.0:
+                raise Error(
+                    "pair weights must be finite and nonzero; the sign carries"
+                    " which endpoint won and zero has no sign"
+                )
+
+        # Two hazards, one drain: a kernel still holding a placeholder buffer
+        # the growth below drops, and a copy still reading the staging arena
+        # the fill below overwrites. See the docstring.
+        ctx.synchronize()
+
+        if self.pair_capacity == 0:
+            self.off_dev = ctx.enqueue_create_buffer[DType.int32](
+                self.n_rows + 1
+            )
+            self.stage_off = ctx.enqueue_create_host_buffer[DType.int32](
+                self.n_rows + 1
+            )
+        var want = total if total > 0 else 1
+        if want > self.pair_capacity:
+            self.pair_dev = ctx.enqueue_create_buffer[DType.int32](
+                want * PAIR_WORDS
+            )
+            self.stage_pair = ctx.enqueue_create_host_buffer[DType.int32](
+                want * PAIR_WORDS
+            )
+            self.pair_capacity = want
+
+        var doff = self.stage_off.unsafe_ptr()
+        for r in range(self.n_rows + 1):
+            doff.unsafe_store(r, Int32(adjacency.offsets[r]))
+        var dpair = self.stage_pair.unsafe_ptr()
+        for e in range(total):
+            var base = e * PAIR_WORDS
+            dpair.unsafe_store(base + PAIR_OTHER, Int32(adjacency.other[e]))
+            dpair.unsafe_store(
+                base + PAIR_WEIGHT,
+                bitcast[DType.int32, 1](Float32(adjacency.signed_weight[e])),
+            )
+        ctx.enqueue_copy(dst_buf=self.off_dev, src_ptr=doff)
+        if total > 0:
+            ctx.enqueue_copy(dst_buf=self.pair_dev, src_ptr=dpair)
+        self.n_entries = total
+        self.pairs_round = round_index
+        self.has_pairs = True
+
+    def _check_pair_plane(self, kind: Int, round_index: Int) raises:
+        """The two refusals a pairwise round can hit, stated once so the
+        YetiRank arm and the PairLogit arm cannot drift apart on them."""
+        if not rank_kind_is_pairwise(kind):
+            return
+        if not self.has_pairs:
+            raise Error(
+                "objective '",
+                describe_rank_kind(kind),
+                "' is a pairwise loss and no pair plane has been uploaded;"
+                " call refresh_pairs, or train with device='cpu'",
+            )
+        if rank_kind_regenerates_pairs(kind):
+            check_yeti_rank_pairs(kind, self.pairs_round == round_index)
+
+    def fill_grad_hess(
+        mut self,
+        ctx: DeviceContext,
+        mut state: GpuObjectiveState,
+        kind: Int,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        mut hess_dev: DeviceBuffer[DType.float32],
+        round_index: Int = 0,
+    ) raises:
+        """Write this round's ranking gradients and hessians into `grad_dev`
+        and `hess_dev`, which must be device buffers of at least `n_rows`
+        Float32 belonging to the same context.
+
+        In the trainer those are the histogram builder's own buffers, so the
+        values the histogram kernels read are the ones these kernels wrote and
+        nothing per-row crosses to the host, exactly as
+        `GpuObjectiveState.fill_grad_hess` arranges for the built-in
+        objectives.
+
+        Every refusal is here and every one names a reason
+        --------------------------------------------------
+        An unknown kind, a multiclass state, a row-count disagreement,
+        uninitialized raw scores, a per-row `sample_weight` on a pairwise kind
+        (the weight belongs on the pair -- `check_rank_sample_weight`), a
+        pairwise kind with no pair plane, and a YetiRank round whose pairs were
+        drawn for a different round. None of them is a silent fallback and none
+        of them quietly computes something adjacent: this file's standing rule,
+        after `leaf_estimation_iterations` was ignored without comment by every
+        GPU entry point for months, is that a device which cannot honour a
+        configuration says so and names `device='cpu'`.
+
+        What this does *not* refuse is a group whose rows carry no signal -- a
+        singleton group, a perfectly ordered group, a group of zero-weight
+        rows. Those are not unsupported configurations, they are configurations
+        whose correct gradient is zero, and both kernels produce an exact zero
+        for them without a branch. `ranking_pairwise` works each one through.
+        """
+        check_rank_kind(kind)
+        if state.n_classes != 1:
+            raise Error(
+                "ranking objectives are single-output; a multiclass objective"
+                " state cannot serve one. Use device='cpu' for a multi-output"
+                " ranking loss"
+            )
+        if state.n_rows != self.n_rows:
+            raise Error("objective state and ranking state disagree on n_rows")
+        if not state.has_raw:
+            raise Error("call init_raw before filling ranking gradients")
+        check_rank_sample_weight(kind, state.weighted)
+        self._check_pair_plane(kind, round_index)
+
+        if kind == RANK_QUERY_RMSE:
+            ctx.enqueue_function[_query_rmse_kernel](
+                state.raw_dev.unsafe_ptr(),
+                state.target_dev.unsafe_ptr(),
+                state.weight_dev.unsafe_ptr(),
+                self.starts_dev.unsafe_ptr(),
+                grad_dev.unsafe_ptr(),
+                hess_dev.unsafe_ptr(),
+                Int32(1) if state.weighted else Int32(0),
+                grid_dim=self.n_groups,
+                block_dim=SUM_THREADS,
+            )
+            return
+
+        ctx.enqueue_function[_pair_logit_kernel](
+            state.raw_dev.unsafe_ptr(),
+            self.off_dev.unsafe_ptr(),
+            self.pair_dev.unsafe_ptr(),
+            grad_dev.unsafe_ptr(),
+            hess_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            grid_dim=self._row_blocks(),
+            block_dim=self.block_threads,
+        )
