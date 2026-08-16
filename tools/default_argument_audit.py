@@ -218,7 +218,7 @@ def audit(min_callers):
 
 
 def _producers(param):
-    """Declarations elsewhere in `src/` that look like they EXIST TO FEED this
+    r"""Declarations elsewhere in `src/` that look like they EXIST TO FEED this
     parameter, and this is the heuristic that makes the tool worth running.
 
     Raw count is a weak signal: plenty of optional parameters are optional on
@@ -255,6 +255,40 @@ def _producers(param):
     door is more useful than one that only finds orphans, and the docstring
     should promise the weaker thing it does rather than the stronger thing the
     heading implies.
+
+    **THREE CONFIRMED BLIND SPOTS in the sibling filters, recorded because
+    each was found only by somebody noticing a known instance was absent.**
+
+    1. **A `GPU_` or `CPU_` infix.** An environment-variable pass matched
+       `MOJOTREES_<NAME>` against parameter `<name>` and missed
+       `MOJOTREES_GPU_ROW_COMPACTION` against `row_compaction`. Handling the
+       infix took its count from 2 to 11.
+
+    2. **The struct-field declaration form, and this one is mine.** The pass
+       that produced the seventeen-variable table in
+       `docs/COMPATIBILITY_POLICY.md` section 9.5.1 collected parameters with
+       `^\s*(\w+)\s*:\s*\w`. That matches a function parameter,
+       `name: Type = default`, and returns **None** for a struct field,
+       `var name: Type`, because it captures `var`. So
+       `tree_parameters_extra.mojo:1774`'s `var derivative_precision: Int`
+       was invisible, and `MOJOTREES_DERIVATIVE_PRECISION` is absent from a
+       table whose stated purpose is to list exactly that pairing. **The
+       seventeen was a lower bound and the section already said it was an
+       upper one.**
+
+    3. **A comment line counted as a Python door.** A pass asking whether a
+       knob is reachable from Python matched the name anywhere in
+       `python/mojotrees/`, so a knob mentioned only in a docstring or a
+       comment read as exposed. That direction is the dangerous one: it
+       reports a gap as closed.
+
+    **All three are name-matching failures and all three under-report except
+    the third**, which over-reports. None was detectable from its own output:
+    each was caught because a person already knew of an instance and noticed
+    it missing. **A count from any of these passes is a floor, not a total**,
+    and the tally moves with the notation you happened to search for -- a
+    fourth copy of a tree count was found spelled "Five hundred trees",
+    invisible to a grep for digits.
 
     **A second warning, from a sibling filter that reported its own blind spot
     as a result.** A name-matching pass over environment variables first
