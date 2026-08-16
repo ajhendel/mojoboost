@@ -301,9 +301,12 @@ from .boosting import (
     _base_score,
     _check_objective,
     _check_sample_weight,
+    _check_leaf_estimation_config,
     _clamp_prob,
+    _estimate_leaf_values,
     _fill_grad_hess,
     _mean_loss,
+    _refuse_leaf_estimation,
     _renew_leaf_values,
     _check_goss,
     _fill_softmax_grad_hess,
@@ -323,7 +326,7 @@ from .gpu_fused_round import (
     round_eligibility_reason,
 )
 from .gpu_multiclass_batch import GpuClassBatch, MulticlassRoundGuard
-from .gpu_objectives_native import GpuObjectiveState
+from .gpu_objectives_native import GpuLeafEstimator, GpuObjectiveState
 from .gpu_output_planes import BatchEligibility
 from .gpu_predict import (
     DEVICE_METRIC_L1,
@@ -406,7 +409,7 @@ from .growth_policy import (
     LeafCandidate,
     check_grow_policy,
 )
-from .tree import Tree, TreeParams, _leaf_value, _search
+from .tree import Tree, TreeParams, _leaf_value, _search, node_bounds
 
 
 struct _GpuLeafState(Movable):
@@ -2783,6 +2786,15 @@ def _train_gpu_rounds[
         var renews = objective_renews_leaves(objective)
         var renew_w = renewal_weights(objective, target, sample_weight)
         var renew_a = renewal_alpha(objective, alpha)
+        # CatBoost's extra Newton steps. Read and checked once per fit, not
+        # once per tree, exactly as `boosting._boost_rounds` does it: nothing
+        # the check reads moves inside the loop, and at the default of 1 both
+        # the count and the check are one integer comparison. The check
+        # refuses the renewing objectives and GOSS, which are the two
+        # configurations where a second step would be minimizing a different
+        # quantity than the first; both arms below reach it.
+        var leaf_iters = params.tree.extra.leaf_estimation_iterations
+        _check_leaf_estimation_config(params.tree.extra, objective, goss)
         var trees = List[Tree]()
         # One profile for the whole fit rather than one per tree, so a
         # hundred rounds produce one table to diff instead of a hundred
@@ -2819,6 +2831,18 @@ def _train_gpu_rounds[
             if route_all_rows and bagging_enabled(bagging):
                 router.append(
                     GpuTreeRouter(
+                        builder.ctx, n, 2 * params.tree.num_leaves
+                    )
+                )
+            # One estimator per fit, and only when a fit actually asked for
+            # extra Newton steps: it owns three `n_rows` Float32 planes, which
+            # is 12 MB at a million rows and is not worth allocating for the
+            # default. Empty is the shipped path, and an empty list issues
+            # nothing.
+            var estimator = List[GpuLeafEstimator]()
+            if params.tree.extra.leaf_estimation_active():
+                estimator.append(
+                    GpuLeafEstimator(
                         builder.ctx, n, 2 * params.tree.num_leaves
                     )
                 )
@@ -2888,6 +2912,51 @@ def _train_gpu_rounds[
                     _renew_leaf_values(
                         tree, data, target, raw, renew_w, renew_a, dev_bag,
                         signs, params.tree.extra,
+                    )
+                if len(estimator) > 0:
+                    # CatBoost's extra Newton steps, on the device, from the
+                    # leaf ranges the grower left behind. The structure is
+                    # fixed and no histogram is rebuilt: what moves is each
+                    # leaf's `G` and `H`, and only because the point they are
+                    # taken at moved. Placed before the degenerate-tree test
+                    # below so that test sees the value the ensemble is about
+                    # to carry, which is where `boosting._boost_rounds` places
+                    # it too. Exclusive with renewal, which
+                    # `_check_leaf_estimation_config` refuses above rather
+                    # than ordering against.
+                    var est_started = profile.clock()
+                    var is_leaf = List[Bool](capacity=len(tree.feature))
+                    for node in range(len(tree.feature)):
+                        is_leaf.append(tree.feature[node] < 0)
+                    # Read off the tree *before* its value list is handed over
+                    # mutably: `node_bounds` reads `tree.value`, and the two
+                    # borrows cannot overlap.
+                    var est_bounds = node_bounds(tree, signs)
+                    estimator[0].estimate(
+                        builder.ctx,
+                        state,
+                        builder.rows,
+                        tree.value,
+                        is_leaf,
+                        est_bounds,
+                        objective,
+                        alpha,
+                        leaf_iters,
+                        params.tree.lambda_l1,
+                        params.tree.lambda_reg,
+                        params.tree.extra.max_delta_step,
+                    )
+                    # Charged to the gradient phase because that is what the
+                    # extra iterations overwhelmingly are: `leaf_iters - 1`
+                    # more full-row derivative passes through the round's own
+                    # kernel. `syncs=1` is the one readback per tree, which is
+                    # a genuine round trip and would otherwise be invisible to
+                    # the instrument that exists to find them.
+                    profile.charge(
+                        PROF_GRAD_FILL,
+                        n * (leaf_iters - 1),
+                        est_started,
+                        syncs=1,
                     )
                 if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
                     life.end_round()
@@ -2974,6 +3043,17 @@ def _train_gpu_rounds[
                     tree, data, target, raw, renew_w, renew_a, bag, signs,
                     params.tree.extra,
                 )
+            # The host arm's raw scores are the same `List[Float64]` the CPU
+            # trainer carries, so this arm takes the CPU implementation
+            # itself rather than a second one: same fold, same order, same
+            # bits. Honoring the parameter on only one of this function's two
+            # arms would be worse than not honoring it at all, which is the
+            # rule `params.parse_params` states for this name.
+            _estimate_leaf_values(
+                tree, data, target, raw, objective, sample_weight, alpha,
+                leaf_iters, params.tree.lambda_l1, params.tree.lambda_reg,
+                params.tree.extra.max_delta_step, bag, signs,
+            )
 
             # A single-leaf tree with a near-zero value means the objective
             # has converged; further rounds cannot make progress. Under
@@ -3315,6 +3395,12 @@ def _train_custom_gpu_rounds[
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
     else:
+        # A custom objective has no second derivative this trainer can
+        # recompute: the callback is asked once per round for the whole row
+        # set, and `boosting._estimate_leaf_values` needs a *leaf's* rows
+        # re-differentiated at a shifted score, which is a call shape
+        # `GradHessFn` does not have. Refused by name rather than ignored.
+        _refuse_leaf_estimation(params.tree.extra, "train_custom_gpu")
         var n = data.n_rows
         var raw = List[Float64](capacity=n)
         for _ in range(n):
@@ -3630,6 +3716,15 @@ def _train_multiclass_gpu_rounds[
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
     else:
+        # The same refusal `boosting._boost_rounds_multiclass` makes, for the
+        # same reason: class k's softmax derivative reads every class's raw
+        # score, so re-estimating class k's leaves would have to hold this
+        # round's not-yet-grown trees for classes k+1.. fixed at a value they
+        # do not have. CatBoost defaults `MultiClass` to 1 Newton iteration
+        # anyway (`boosting.catboost_leaf_estimation_iterations`).
+        _refuse_leaf_estimation(
+            params.tree.extra, "the multiclass GPU trainers"
+        )
         var n = data.n_rows
         var trees = List[Tree]()
         # One searcher for the fit, not one per tree. Its shape comes from
@@ -4219,6 +4314,11 @@ def _train_gpu_valid_rounds[
         var renews = objective_renews_leaves(objective)
         var renew_w = renewal_weights(objective, target, sample_weight)
         var renew_a = renewal_alpha(objective, alpha)
+        # The same once-per-fit check and the same count `_train_gpu_rounds`
+        # makes. This loop's raw scores are host-side throughout, so the extra
+        # Newton steps are the CPU implementation itself.
+        var leaf_iters = params.tree.extra.leaf_estimation_iterations
+        _check_leaf_estimation_config(params.tree.extra, objective, goss)
         var trees = List[Tree]()
         # One searcher for the fit, not one per tree. Its shape comes from
         # the builder and the tree budget, neither of which moves between the
@@ -4253,6 +4353,15 @@ def _train_gpu_valid_rounds[
                     tree, data, target, raw, renew_w, renew_a, bag, signs,
                     params.tree.extra,
                 )
+            # The same extra Newton steps, in the same place and with the same
+            # arguments; a no-op at the default of 1, and taken before the
+            # scorer folds the tree in so early stopping judges the values the
+            # ensemble will carry.
+            _estimate_leaf_values(
+                tree, data, target, raw, objective, sample_weight, alpha,
+                leaf_iters, params.tree.lambda_l1, params.tree.lambda_reg,
+                params.tree.extra.max_delta_step, bag, signs,
+            )
 
             # Under bagging or GOSS a degenerate tree indicts the sample, not
             # the run.
