@@ -127,10 +127,6 @@
       "MOJOTREES_GPU_VERIFY_ROWS",
       "MOJOTREES_GPU_WARMUP",
       "MOJOTREES_HIST_CACHE_BYTES",
-      "MOJOTREES_HYBRID_COSTS",
-      "MOJOTREES_HYBRID_GUARD_TRANSFER",
-      "MOJOTREES_HYBRID_LEAVES",
-      "MOJOTREES_HYBRID_TRACE",
       "MOJOTREES_LEAF_SCORE_UPDATE",
       "MOJOTREES_MACOS_DEPLOYMENT_TARGET",
       "MOJOTREES_NUM_WORKERS",
@@ -171,10 +167,6 @@
       "MOJOTREES_GPU_TREE_RESIDENT",
       "MOJOTREES_GPU_VALID_SCORING",
       "MOJOTREES_GPU_WARMUP",
-      "MOJOTREES_HYBRID_COSTS",
-      "MOJOTREES_HYBRID_GUARD_TRANSFER",
-      "MOJOTREES_HYBRID_LEAVES",
-      "MOJOTREES_HYBRID_TRACE",
       "MOJOTREES_LEAF_SCORE_UPDATE",
       "MOJOTREES_PHASE_PROFILE",
       "MOJOTREES_STARTUP_TRACE"
@@ -232,10 +224,6 @@
       "MOJOTREES_GPU_VERIFY_ROWS",
       "MOJOTREES_GPU_WARMUP",
       "MOJOTREES_HIST_CACHE_BYTES",
-      "MOJOTREES_HYBRID_COSTS",
-      "MOJOTREES_HYBRID_GUARD_TRANSFER",
-      "MOJOTREES_HYBRID_LEAVES",
-      "MOJOTREES_HYBRID_TRACE",
       "MOJOTREES_LEAF_SCORE_UPDATE",
       "MOJOTREES_MACOS_DEPLOYMENT_TARGET",
       "MOJOTREES_PARALLEL_MIN_TASK_OPS",
@@ -262,7 +250,7 @@
   },
   "mojo": {
     "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
-    "export_count": 612,
+    "export_count": 598,
     "export_source": "src/mojotrees/__init__.mojo",
     "exports_by_module": {
       "alternate_boosting": [
@@ -607,22 +595,6 @@
         "build_histogram_sparse",
         "build_histogram_sparse_node",
         "build_histogram_sparse_subset"
-      ],
-      "hybrid_leaf_scheduler": [
-        "HybridContext",
-        "HybridCosts",
-        "LeafWork",
-        "Placement",
-        "REPLICA_REFUTED",
-        "REPLICA_UNTESTED",
-        "REPLICA_VERIFIED",
-        "SplitPlan",
-        "decline_name",
-        "decline_reason",
-        "env_hybrid_costs",
-        "env_hybrid_mode",
-        "place_leaf",
-        "plan_split"
       ],
       "importance": [
         "gain_importance",
