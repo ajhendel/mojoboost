@@ -819,6 +819,33 @@ def dispatch_regions[FuncType: def (Int, Int, Int) -> None](
     """Run `func(region, start, end)` over contiguous ranges covering every
     region's units, under one fan-out.
 
+    **THIS HAS NO CALLER, DELIBERATELY, AND THAT IS DECLARED HERE RATHER THAN
+    LEFT TO BE DISCOVERED.** It is a receiving half. This repository found
+    three built-tested-never-wired mechanisms in a single night --
+    `DispatchSettings`, `gpu_gradient_stream.HostGradientStage`, and eight
+    functions in `apple_cpu_policy` -- each of which passed its tests because
+    the tests called it directly while no production call site existed, and
+    each of which had its benefit claimed in a commit message. This one says
+    so instead.
+
+    The named cross-lane edit that wires it is `split.find_best_split_pair`:
+    hoist the per-node state `scan_feature` closes over into a context struct,
+    and replace the two per-child `dispatch_features_with` calls with one
+    `dispatch_regions_with` over both children, leaving both serial ascending
+    folds unchanged. That is bit-identical by construction -- same per-feature
+    scan, same fold order, same strict `>` tie-break.
+
+    Why it is worth wiring, as a derived bound rather than a measurement: the
+    split search fans out once per node at width 10 regardless of node size,
+    which is 6,001 fan-outs per fit behind the smallest per-node work in the
+    round. Fusing a split's two children halves that count, for a derived 44
+    percent of the split-search phase, which is itself at most 27 percent of
+    the parallel round.
+
+    **If that edit is not sequenced, delete this rather than leave it.** An
+    unwired receiving half that nobody has committed to wiring is exactly the
+    pathology described above.
+
     `sizes[r]` is how many units region `r` holds; a region of zero or fewer
     units is skipped and still occupies its index, so a caller may pass a
     fixed-length vector with an inactive region zeroed rather than renumbering
