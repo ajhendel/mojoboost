@@ -187,21 +187,76 @@ the program.** The in-run instrument existed the whole time and cost two runs.
    on its own — 5.13 s against LightGBM's 2.92 — which is consistent with C2's
    registered arithmetic that neither half suffices alone.
 
-2. **Three phases are actively SLOWER in parallel than serial**, at every size
-   for `subtract` (0.76x to 0.82x) and at small and tiny for `partition` (0.78x,
-   0.80x). This is dispatch overhead exceeding the work — the grain floor is
-   letting through fan-outs that cannot pay for themselves. Small in absolute
-   terms (about 8 ms of subtract plus 3 ms of partition per fit) but it is a
-   pure loss with a cheap fix, and it is the clearest evidence that the grain
-   rule is wrong at the bottom rather than merely suboptimal.
+2. **Three phases measure SLOWER in parallel than serial** — `subtract` at
+   every size (0.76x to 0.82x) and `partition` at small and tiny (0.78x,
+   0.80x).
 
-3. **`split_search` scales at 1.22x and nothing else.** The profile-fidelity
-   lane derived why, before this was measured: `split_scan_ops(50, 256,
-   two_sided) = 217,600`, and `217,600 // 65,536 = 3`, so the scan fans out
-   **three ways regardless of node size**, leaving 7 of 10 cores idle on every
-   one of 6,100 nodes. A **derived bound** that this measurement confirms: it is
-   3.0 percent of the auto round, so fixing it entirely is worth about 0.14 s.
-   Small, but it is the most obviously wrong number in the table.
+   **RETRACTED, same day, before any lane acted on it.** The first version of
+   this bullet read that as "dispatch overhead exceeding the work — the grain
+   floor is letting through fan-outs that cannot pay for themselves", and
+   proposed raising those crossovers.
+
+   That is refuted by exact arithmetic on the planner, done by the grain-floor
+   lane. `subtract_ops(50 * 255) = 38,250`, or 25,500 under constant hessian.
+   The partition passes `3n`, and its `small` class tops out at 15,625 rows so
+   `3n = 46,875`. **Both are below the 65,536 crossover, so `plan_tasks`
+   returns 1 and both run serial — in the auto arm and in the one-worker arm
+   alike.** Since the wiring glue they also go through `plan_tasks_with` on a
+   resolved snapshot, so the two arms execute an identical instruction stream
+   with no `getenv` and no core detection in either.
+
+   **There is no fan-out under either phase to remove, so there is nothing for
+   a grain-floor change to fix.** A ratio of 0.76x between two arms running
+   identical code is not a property of the code. It is whole-machine state —
+   clock and cache residency — misattributed to a phase, because the ratio was
+   taken across two *whole fits* rather than with the arms interleaved. Given
+   the regime canary measures 22.5 percent CPU drift inside a single short run,
+   an 11 ms artifact across two fits is entirely unremarkable.
+
+   **The instructive part is what this says about the method, not the phase.**
+   A per-phase serial-versus-auto ratio taken from two separate whole-fit runs
+   inherits the drift of the whole machine between them. It is trustworthy for
+   the large effects in the table above, where the signal is 2x, and it is
+   worthless below about 1.2x. Every ratio in the histogram row survives that;
+   the subtract row does not, and neither does `split_search` at root (1.04x).
+
+   The genuine planner defect runs in the **opposite** direction and is
+   described below.
+
+3. **`split_search` scales at 1.22x and nothing else, and this one is a real
+   defect with a real cause.** The profile-fidelity lane derived it before it
+   was measured: `split_scan_ops(50, 255, two_sided) = 216,750`, and
+   `216,750 // 65,536 = 3`, so the scan fanned out **three ways regardless of
+   node size**, leaving 7 of 10 cores idle on every one of 6,100 nodes.
+
+   The grain-floor lane found the general form. `DEFAULT_MIN_TASK_OPS` was
+   **aliased to `PARALLEL_MIN_OPS`**, so `by_grain = total_ops // 65,536`
+   collapsed the task count for every caller whose total sits between 1 and 40
+   grains — the entire small and medium tail, plus the split scan at every
+   size. `MIN_TASKS_ABOVE_GRAIN = 2` was already an admission that the grain
+   permits no legal split between one grain and two; it just capped the
+   admission at two.
+
+   **So the planner is wrong in one direction, not two: too few tasks, never
+   too many.** The crossover that decides serial-versus-parallel is not
+   implicated by anything in this profile, because the three phases it would
+   have had to mis-admit were never admitted at all.
+
+   Fixed on this branch: the task count now floors at `dispatch_cores` once the
+   crossover is cleared, with `max_auto_tasks` still binding last. Split scan
+   goes 3 to 10 tasks, gradient fill 3 to 10 at 1M rows, partition at medium
+   nodes 2 to 10. **The root and medium histogram are unchanged, and not by
+   luck** — both already had more whole grains than the 25 accumulation groups
+   the dispatch has to hand out, so the floor has nothing to raise. That is
+   asserted as literal integers in the test, so a change to the estimator
+   breaks the test rather than silently invalidating the argument.
+
+   **Derived bound, and it is a ceiling rather than a prediction:** the split
+   scan cannot improve by more than 10/3 = 3.33x, it is 3.0 percent of the auto
+   round, and it is followed by a serial ascending fold over all 50 features
+   that does not parallelize at all. So the whole prize here is well under
+   0.14 s. Small. It is in the round because it was free once the rule was
+   understood, not because it was worth a lane on its own.
 
 4. **`hist_alloc` is 0.005 percent of the serial round.** The booster-scoped
    `_HistPool` from round 2 works, and **histogram allocation is not the
@@ -221,5 +276,16 @@ the program.** The in-run instrument existed the whole time and cost two runs.
 - **L1's case is weaker than written** and its brief must be corrected before
   it starts: allocation is measured as negligible, so it stands on row-id
   traffic and on the partition's own lists.
-- **A new cheap lane exists**: fix the grain floor so that `subtract` and
-  small-node `partition` stop fanning out into a loss.
+- **The grain-floor lane ran and inverted its own premise**, which is the right
+  outcome for a lane launched off a misread. It was sent to stop `subtract` and
+  small-node `partition` fanning out into a loss; it proved neither fans out at
+  all, declined to change the crossover, and fixed the opposite defect instead.
+  Its report is the reason the two retractions above exist.
+
+- **The score-update lane's prize is unmeasured and unmeasurable from here.**
+  It made `_add_by_leaf` cut inside leaves rather than between them, which
+  removes an imbalance whose size depends on the largest leaf's row share `p`.
+  At 31 leaves over 30 tasks the old floor was 1.94x even for perfectly even
+  leaves. Nothing in this profile sizes the score update as a share of the
+  round, so nothing here says what that is worth. `PROF_SCORE_UPDATE` is where
+  it would be settled.
