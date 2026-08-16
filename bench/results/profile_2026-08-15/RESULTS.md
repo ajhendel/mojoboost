@@ -203,10 +203,20 @@ spread, so batching seven classes into one launch buys nothing at this shape.
 That matters beyond multiclass: classes in a round are independent trees over
 one shared uploaded matrix, which is structurally the same problem as
 independent fits, so this is the first measured point on the multi-fit
-batching idea and it points against it. The idea was ranked highly on
-reasoning; the reasoning was that batching amortizes per-dispatch cost, and
-the Metal timeline has since shown that per-dispatch cost is not what the
-round is spending its time on. The two results agree.
+batching idea.
+
+**It is not a refutation, and an earlier version of this paragraph overstated
+it as one.** Batching amortizes per-dispatch cost, and the Metal timeline has
+since shown that per-dispatch cost is not what this round spends its time on,
+so a null result here was predictable rather than informative. The condition
+under which batching should help has not been created yet: once the per-split
+host wait is gone, the residual cost on the small-leaf tail is a latency-bound
+kernel that under-fills the GPU, and batching independent trees is exactly
+what fills it. That cost is currently hidden behind the wait.
+
+So the correct record is **retest after the device-owned tree lands, at
+250,000 rows and below**, not "dead". Filing it as refuted would have thrown
+away an idea on evidence that could not have supported it either way.
 
 Against LightGBM, using its own recorded covertype figures of 6.7 to 6.9
 seconds, we are roughly **2.2x behind** on multiclass rather than the 10x that
