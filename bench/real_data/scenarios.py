@@ -15,28 +15,44 @@ The alignment, and why each entry is here:
 - `enable_bundle = false` for LightGBM. Exclusive feature bundling merges
   sparse features before binning. mojotrees has no EFB, so leaving it on
   compares two different feature spaces.
-- `feature_pre_filter = false` for LightGBM. On by default, it deletes
-  features that cannot satisfy `min_data_in_leaf` at Dataset construction
-  time. That is a data change, not a training change, and mojotrees does
-  not do it.
-- `bin_construct_sample_cnt` raised to the training row count. LightGBM
-  builds bin edges from a 200000-row subsample by default; mojotrees bins
-  from every row. Left alone this is the largest single source of split
-  divergence on anything above 200000 rows, and it also makes LightGBM's
-  binning time look better than a like-for-like measurement would.
+- `feature_pre_filter = false` for LightGBM. **The last binning pin, and
+  the only one left.** On by default, it deletes features that cannot
+  satisfy `min_data_in_leaf` at Dataset construction time, which removes
+  them from the matrix, from the pool `feature_fraction` samples, and from
+  every feature index. That is a data change, not a training change, and
+  mojotrees does not do it, so leaving it on compares two different feature
+  spaces -- the same reason `enable_bundle` is pinned. It comes out the day
+  mojotrees implements the filter and not before.
+- `bin_construct_sample_cnt` is **not** pinned any more. mojotrees's own
+  default is LightGBM's 200000 as of the stock-defaults change, so both
+  libraries now fit their edges from a 200000-row subsample and neither is
+  binning rows the other is not. They do not draw the *same* 200000 rows
+  (different streams, see the `bin_construct_sample_cnt` row of
+  docs/LIGHTGBM_PARITY.md), so above 200000 rows the two fit different
+  edges from equally sized samples; that is a real and stated difference
+  and it is not fixable by a parameter.
+
+  **This pin is not in this module.** It is injected per call by the engine
+  adapters, `bench/real_data/engines.py` (two sites: the LightGBM Dataset
+  path and the LightGBM estimator path, both spelling
+  `bin_construct_sample_cnt` from the row count), and by
+  `bench/bench_lightgbm.py`. Removing it there is what makes the paragraph
+  above true; until it is removed, LightGBM is binning every row while
+  mojotrees bins 200000, which is the pin inverted rather than dropped.
+  `bench/real_data/selfcheck.py` passes its own count and is a self-check,
+  not a measurement, so it may keep one.
 - `zero_as_missing = false`. Both engines' default, restated because the
   sparse scenario is exactly where the other setting would be tempting.
   A stored zero and an absent entry are both the value zero on both sides.
-- `min_data_in_bin = 1`, against LightGBM's default of 3. mojotrees's
-  numerical binner has no minimum-population rule at all, which is
-  `min_data_in_bin = 1` (`src/mojotrees/binning.mojo`, and the
-  `min_data_in_bin` row of `docs/LIGHTGBM_PARITY.md`). At LightGBM's
-  default the two engines bin low-cardinality columns differently:
-  LightGBM merges levels that mojotrees keeps apart, which leaves
-  mojotrees with more bins and therefore more histogram work per node on
-  exactly those columns. Setting it to 1 moves LightGBM onto our rule,
-  so it makes the timing comparison stricter against us rather than
-  laxer, which is the direction an alignment is allowed to move in.
+- `min_data_in_bin` is **not** pinned any more either. It used to be
+  forced to 1 because mojotrees had no minimum-population rule; mojotrees
+  now defaults to LightGBM's 3 and honors it in both branches of
+  `GreedyFindBin` (`src/mojotrees/binning.mojo`, and the `min_data_in_bin`
+  row of `docs/LIGHTGBM_PARITY.md`), so both libraries merge the same rare
+  levels and there is nothing left to remove. Note the direction this
+  moved in: the old pin made the timing comparison stricter against us,
+  and dropping it makes it laxer, so a binning or histogram number taken
+  before this change is not comparable with one taken after it.
 - `force_row_wise = true` for LightGBM. Without it LightGBM spends the
   first iterations timing both histogram strategies, which lands in the
   training measurement as a one-off cost that has nothing to do with the
@@ -72,6 +88,12 @@ BASE_PARAMS = {
 
 #: LightGBM-only parameters that exist to remove a difference, not to tune.
 #: Every one is justified in the module docstring.
+#:
+#: Two entries left here when mojotrees's binning defaults became LightGBM's
+#: stock defaults: `min_data_in_bin`, because both sides are 3 now, and
+#: `bin_construct_sample_cnt`, which was never in this dict but was injected
+#: per call by the engine adapters. Only `feature_pre_filter` remains of the
+#: binning pins, and only because the filter is not implemented on our side.
 LIGHTGBM_ALIGNMENT = {
     "enable_bundle": False,
     "feature_pre_filter": False,
@@ -81,12 +103,6 @@ LIGHTGBM_ALIGNMENT = {
     "verbosity": -1,
     "seed": 190019,
     "min_gain_to_split": 0.0,
-    # 1, not LightGBM's default of 3: mojotrees's numerical binner has no
-    # minimum-population rule, so 3 would have LightGBM merging levels we
-    # keep. The merge is in LightGBM's favor on speed, so correcting it
-    # costs us and the comparison gets harder, not easier. See the
-    # docstring.
-    "min_data_in_bin": 1,
     "boost_from_average": True,
 }
 

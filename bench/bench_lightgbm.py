@@ -188,9 +188,13 @@ def lgbm_params(objective: str, threads: int, n_rows: int) -> dict:
         if key in SPEED_EXCLUDED_ALIGNMENT:
             continue
         params[key] = value
-    # LightGBM bins from a 200000-row subsample by default and mojotrees
-    # bins from every row, so the sample count has to follow the row count.
-    params["bin_construct_sample_cnt"] = int(n_rows)
+    # `bin_construct_sample_cnt` is deliberately NOT set. It used to be
+    # raised to the row count because LightGBM sampled 200000 rows and
+    # mojotrees binned every one of them; mojotrees's default is LightGBM's
+    # 200000 now, so both engines sample and setting it would pin LightGBM
+    # to a fit mojotrees is not doing. Every binning number recorded under
+    # the old pin was measured against a constraint this repository imposed
+    # and does not describe the stock comparison.
     if threads > 0:
         params["num_threads"] = int(threads)
     return params

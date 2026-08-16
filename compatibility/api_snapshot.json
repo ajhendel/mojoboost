@@ -1047,6 +1047,7 @@
       "linear_lambda",
       "enable_bundle",
       "max_conflict_rate",
+      "feature_pre_filter",
       "data_sample_strategy",
       "max_bin",
       "alpha",
