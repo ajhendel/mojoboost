@@ -712,8 +712,12 @@ def test_device_cpu_and_auto():
     cpu = MojoTreesRegressor(n_estimators=20, device="cpu").fit(X, y)
     assert cpu.device_ == "cpu"
 
-    # auto resolves to the CPU today (the size heuristic ships disabled),
-    # so it must be bit-identical to an explicit cpu fit.
+    # 400 rows is far below `AUTO_GPU_MIN_ROWS` (250,000) and 4 features is
+    # below the rule's feature scope, so `auto` keeps the CPU here and must
+    # be bit-identical to an explicit cpu fit. It is the shape that makes
+    # this true, not the absence of a reachable rule: `auto` does select the
+    # GPU above the floor, which `tests/test_gpu_auto_reaches_gpu.mojo`
+    # proves by the model it produces.
     auto = MojoTreesRegressor(n_estimators=20, device="auto").fit(X, y)
     assert auto.device_ == "cpu", f"auto chose {auto.device_}"
     assert all(

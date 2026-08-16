@@ -40,6 +40,7 @@ from mojotrees.device import (
     AUTO_DEVICE,
     CPU_DEVICE,
     GPU_DEVICE,
+    NO_DEVICE,
     device_name,
     env_auto_min_cells,
     gpu_available,
@@ -47,14 +48,18 @@ from mojotrees.device import (
     resolve_device,
 )
 from mojotrees.device_policy import (
+    AUTO_GPU_MIN_ROWS,
     AUTO_MIN_CELLS,
+    BLOCK_DERIVATIVE_PRECISION,
     CrossoverEvidence,
     DECISION_AUTO_CPU_BELOW_ENV_THRESHOLD,
     DECISION_AUTO_CPU_BELOW_EVIDENCE,
+    DECISION_AUTO_CPU_BLOCKED,
     DECISION_AUTO_GPU_ENV_THRESHOLD,
     DECISION_AUTO_GPU_EVIDENCE,
     DECISION_EXPLICIT_CPU,
     DECISION_EXPLICIT_GPU,
+    DECISION_GPU_REFUSED,
     DeviceCapabilities,
     DeviceRequest,
     EVIDENCE_ENV,
@@ -62,9 +67,7 @@ from mojotrees.device_policy import (
     M4_TRAINING_EVIDENCE_ID,
     M4_TRAINING_MAX_OUTPUTS,
     M4_TRAINING_MEASURED_ON,
-    M4_TRAINING_MIN_CELLS,
     M4_TRAINING_MIN_FEATURES,
-    M4_TRAINING_MIN_ROWS,
     M4_TRAINING_RULE_NAME,
     OBJECTIVE_UNSPECIFIED,
     POLICY_VERSION,
@@ -224,6 +227,7 @@ def _caps_for(
     var profile: GpuProfile,
     profile_source: Int = PROFILE_REPORTED,
     auto_min_cells: Int = AUTO_MIN_CELLS,
+    derivative_precision_float64: Bool = False,
 ) raises -> DeviceCapabilities:
     """A machine with a working accelerator and this profile.
 
@@ -243,6 +247,7 @@ def _caps_for(
         auto_min_cells,
         SessionState.cold(),
         SessionMemoryPlan.staged(),
+        derivative_precision_float64=derivative_precision_float64,
     )
 
 
@@ -292,12 +297,19 @@ def test_crossover_rules_carry_their_evidence() raises:
     assert_equal(rule.apple_generation, APPLE_GEN_M4)
     assert_equal(rule.objective, SQUARED_ERROR)
     assert_equal(rule.max_outputs, M4_TRAINING_MAX_OUTPUTS)
-    # The thresholds are the measured point itself, not an extrapolation
-    # below it.
-    assert_equal(rule.min_rows, M4_TRAINING_MIN_ROWS)
+    # The row floor is the one named constant and nothing else. There is no
+    # cell term: `min_cells` was 50,000,000 (the product of the old
+    # 1,000,000-row floor and the 50-feature scope) and gated on the same
+    # fact twice, so a reader had to divide to find the shipped threshold.
+    # It is 0 now, which does not constrain, and `AUTO_GPU_MIN_ROWS` is the
+    # only number a reader has to find. A cell term coming back without this
+    # test being edited means the threshold has two homes again.
+    assert_equal(rule.min_rows, AUTO_GPU_MIN_ROWS)
     assert_equal(rule.min_features, M4_TRAINING_MIN_FEATURES)
-    assert_equal(rule.min_cells, M4_TRAINING_MIN_CELLS)
-    assert_equal(rule.min_rows * rule.min_features, rule.min_cells)
+    assert_equal(rule.min_cells, 0)
+    # And the constant is what this release ships, spelled out rather than
+    # referred to, so that lowering it silently is a test edit.
+    assert_equal(AUTO_GPU_MIN_ROWS, 250_000)
     # The citation names both the record and the device.
     assert_true(rule.cite().find(M4_TRAINING_EVIDENCE_ID) >= 0)
     assert_true(rule.cite().find("Apple M4") >= 0)
@@ -309,10 +321,18 @@ def test_crossover_rules_carry_their_evidence() raises:
         )
 
 
-def test_auto_selects_gpu_on_the_measured_m4_shape() raises:
+def test_auto_selects_gpu_at_and_above_the_row_floor() raises:
+    """At `AUTO_GPU_MIN_ROWS` and above, `auto` selects the GPU.
+
+    The floor is at 250,000 rows and the two records behind the rule were
+    taken at 1,000,000, so this test's lower shape is deliberately *below*
+    the measured evidence: that is what `AUTO_GPU_MIN_ROWS` being a
+    provisional constant means, and the constant's own comment carries the
+    trade. Both shapes are asserted so that raising the floor back to the
+    measured point cannot pass this file unedited."""
     var caps = _caps_for(apple_m4_observed())
     var decision = decide_device(
-        _request(AUTO_DEVICE, M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
+        _request(AUTO_DEVICE, AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
         caps,
     )
     assert_equal(decision.selected_device, GPU_DEVICE)
@@ -335,7 +355,7 @@ def test_a_selected_gpu_says_what_measured_it() raises:
     """The decision has to be findable, not just correct."""
     var caps = _caps_for(apple_m4_observed())
     var decision = decide_device(
-        _request(AUTO_DEVICE, M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
+        _request(AUTO_DEVICE, AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
         caps,
     )
 
@@ -378,13 +398,14 @@ def _declines(request: DeviceRequest, caps: DeviceCapabilities) raises:
 def test_auto_declines_beside_the_measured_shape() raises:
     var caps = _caps_for(apple_m4_observed())
 
-    # One row and one feature short of the measured point. Nothing below
-    # 1,000,000 x 50 has been measured CPU against GPU end to end, so the
-    # answer there is the safe backend and not an interpolation.
+    # One row and one feature short of the floor. The floor is
+    # `AUTO_GPU_MIN_ROWS`, a provisional constant rather than a measured
+    # crossover, but it is still a hard edge: one row under it is the CPU,
+    # and a caller cannot get the GPU by rounding.
     _declines(
         _request(
             AUTO_DEVICE,
-            M4_TRAINING_MIN_ROWS - 1,
+            AUTO_GPU_MIN_ROWS - 1,
             M4_TRAINING_MIN_FEATURES,
         ),
         caps,
@@ -392,7 +413,7 @@ def test_auto_declines_beside_the_measured_shape() raises:
     _declines(
         _request(
             AUTO_DEVICE,
-            M4_TRAINING_MIN_ROWS,
+            AUTO_GPU_MIN_ROWS,
             M4_TRAINING_MIN_FEATURES - 1,
         ),
         caps,
@@ -405,7 +426,7 @@ def test_auto_declines_beside_the_measured_shape() raises:
     _declines(
         _request(
             AUTO_DEVICE,
-            M4_TRAINING_MIN_ROWS,
+            AUTO_GPU_MIN_ROWS,
             M4_TRAINING_MIN_FEATURES,
             3,
         ),
@@ -415,7 +436,7 @@ def test_auto_declines_beside_the_measured_shape() raises:
     _declines(
         _request(
             AUTO_DEVICE,
-            M4_TRAINING_MIN_ROWS,
+            AUTO_GPU_MIN_ROWS,
             M4_TRAINING_MIN_FEATURES,
             1,
             BINARY_LOGISTIC,
@@ -425,7 +446,7 @@ def test_auto_declines_beside_the_measured_shape() raises:
     _declines(
         _request(
             AUTO_DEVICE,
-            M4_TRAINING_MIN_ROWS,
+            AUTO_GPU_MIN_ROWS,
             M4_TRAINING_MIN_FEATURES,
             1,
             OBJECTIVE_UNSPECIFIED,
@@ -452,7 +473,7 @@ def test_unmeasured_hardware_still_gets_no_rule() raises:
     # things went wrong.
     var blind = decide_device(
         _request(
-            AUTO_DEVICE, M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES
+            AUTO_DEVICE, AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES
         ),
         _caps_for(GpuProfile.generic(), PROFILE_FALLBACK),
     )
@@ -472,7 +493,7 @@ def test_unmeasured_hardware_still_gets_no_rule() raises:
     # five-argument call that does reach the GPU here.
     assert_equal(
         resolve_device(
-            AUTO_DEVICE, M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES, 1
+            AUTO_DEVICE, AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES, 1
         ),
         CPU_DEVICE,
     )
@@ -492,7 +513,7 @@ def test_the_rule_leaves_explicit_requests_alone() raises:
 
     # Explicit cpu on the shape the rule does cover: still the CPU.
     var pinned = decide_device(
-        _request(CPU_DEVICE, M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
+        _request(CPU_DEVICE, AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
         caps,
     )
     assert_equal(pinned.selected_device, CPU_DEVICE)
@@ -510,13 +531,98 @@ def test_the_rule_leaves_explicit_requests_alone() raises:
     assert_false(by_env.validated())
 
     var held = decide_device(
-        _request(AUTO_DEVICE, M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
+        _request(AUTO_DEVICE, AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES),
         _caps_for(
-            apple_m4_observed(), auto_min_cells=M4_TRAINING_MIN_CELLS + 1
+            apple_m4_observed(),
+            auto_min_cells=AUTO_GPU_MIN_ROWS * M4_TRAINING_MIN_FEATURES + 1,
         ),
     )
     assert_equal(held.selected_device, CPU_DEVICE)
     assert_equal(held.decision_code, DECISION_AUTO_CPU_BELOW_ENV_THRESHOLD)
+
+
+def test_float64_derivatives_route_auto_to_the_cpu() raises:
+    """`MOJOTREES_DERIVATIVE_PRECISION=float64` sends `auto` to the CPU, and
+    it does so for a reason that is not the shape.
+
+    The shape here is 5,000,000 x 50, twenty times `AUTO_GPU_MIN_ROWS` and
+    five times the largest shape any record covers, so "the CPU because it
+    is small" is not available as an explanation: the same request with the
+    flag off selects the GPU, asserted immediately below the first
+    assertion so that the two answers sit side by side. What changed is the
+    capability, not the workload.
+
+    Why it is a block and not a rule scope. `gpu_gradient_stream`'s upload
+    narrows every per-row derivative to Float32, so the accelerator cannot
+    produce the Float64 answer at any size; precision outranks the crossover
+    rather than being weighed against it, and `decide_device` reads the
+    blocks before it reads the table. `DECISION_AUTO_CPU_BLOCKED` rather
+    than `DECISION_AUTO_CPU_BELOW_EVIDENCE` is what says which of those two
+    happened, and asserting on it is what stops this test from passing for
+    the wrong reason.
+    """
+    var caps = _caps_for(
+        apple_m4_observed(), derivative_precision_float64=True
+    )
+    var big = _request(AUTO_DEVICE, 5_000_000, M4_TRAINING_MIN_FEATURES)
+    var decision = decide_device(big, caps)
+    assert_equal(decision.selected_device, CPU_DEVICE)
+    assert_equal(decision.decision_code, DECISION_AUTO_CPU_BLOCKED)
+    assert_false(decision.validated())
+    assert_equal(
+        decision.blocking_reasons.codes[0], BLOCK_DERIVATIVE_PRECISION
+    )
+
+    # The control, at the identical shape: with the flag off this request
+    # reaches the GPU. Without this line the test above would pass on any
+    # build where `auto` never reaches the GPU at all.
+    var permitted = decide_device(
+        _request(AUTO_DEVICE, 5_000_000, M4_TRAINING_MIN_FEATURES),
+        _caps_for(apple_m4_observed()),
+    )
+    assert_equal(permitted.selected_device, GPU_DEVICE)
+    assert_equal(permitted.decision_code, DECISION_AUTO_GPU_EVIDENCE)
+
+    # And it holds below the floor too, where the CPU was the answer
+    # anyway: the reason has to be the precision either way, because a
+    # report that named the shape would send the reader to the wrong knob.
+    var small = decide_device(_request(AUTO_DEVICE, 1_000, 4), caps)
+    assert_equal(small.selected_device, CPU_DEVICE)
+    assert_equal(small.decision_code, DECISION_AUTO_CPU_BLOCKED)
+    assert_equal(small.blocking_reasons.codes[0], BLOCK_DERIVATIVE_PRECISION)
+
+
+def test_float64_derivatives_still_refuse_an_explicit_gpu() raises:
+    """The other half of the asymmetry, and it must not soften.
+
+    A caller who wrote `device='gpu'` named a backend, and that backend
+    cannot honor a Float64 derivative request. Telling them so is the whole
+    correction: the defect being fixed is that the flag was accepted and the
+    Float32 answer returned. `auto` is the only request that may be routed,
+    because `auto` is the only one that asked us to choose.
+    """
+    var caps = _caps_for(
+        apple_m4_observed(), derivative_precision_float64=True
+    )
+    var decision = decide_device(
+        _request(GPU_DEVICE, 5_000_000, M4_TRAINING_MIN_FEATURES), caps
+    )
+    assert_true(decision.blocked)
+    assert_equal(decision.selected_device, NO_DEVICE)
+    assert_equal(decision.decision_code, DECISION_GPU_REFUSED)
+    assert_equal(
+        decision.blocking_reasons.codes[0], BLOCK_DERIVATIVE_PRECISION
+    )
+    assert_true(decision.message.find("float64") >= 0)
+    with assert_raises():
+        decision.raise_if_blocked()
+
+    # An explicit `cpu` is unaffected: it was always going to honor it.
+    var pinned = decide_device(
+        _request(CPU_DEVICE, 5_000_000, M4_TRAINING_MIN_FEATURES), caps
+    )
+    assert_equal(pinned.selected_device, CPU_DEVICE)
+    assert_false(pinned.blocked)
 
 
 def test_sparse_input_keeps_the_cpu_under_auto() raises:
@@ -525,7 +631,7 @@ def test_sparse_input_keeps_the_cpu_under_auto() raises:
     # at the measured shape must not inherit it.
     var request = DeviceRequest(
         AUTO_DEVICE,
-        M4_TRAINING_MIN_ROWS,
+        AUTO_GPU_MIN_ROWS,
         M4_TRAINING_MIN_FEATURES,
         1,
         _MEASURED_BINS,

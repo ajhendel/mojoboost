@@ -47,6 +47,14 @@ Where `auto` reaches the GPU, what `MOJOTREES_AUTO_MIN_CELLS` and
 are properties of the build rather than of the running machine are all
 documented in device_policy.mojo, where the rules that implement them live.
 
+The short form of the first of those, because it is what changes what an
+unspecified fit does: `auto` selects the GPU from `AUTO_GPU_MIN_ROWS` rows
+up (250,000, a plain provisional constant) on Metal on an M4, for squared
+error, single output, dense input, at 50 or more features, and keeps the CPU
+everywhere else. That floor is set below the smallest shape the GPU has been
+measured to win; device_policy.mojo's `crossover_rules()` states the trade
+and what would move it.
+
 One thing worth knowing before importing `resolve_device` from here rather
 than reading that module: it takes the shape and, since 2026-08-16, an
 optional `objective`, and every installed crossover rule is scoped to the

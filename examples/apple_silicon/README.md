@@ -145,15 +145,24 @@ Estimators take `device="cpu"`, `device="gpu"`, or `device="auto"`, and
 `device_type` is accepted as the LightGBM spelling of the same parameter.
 Fitting records the backend that ran on `device_`.
 
-`auto` resolves to the CPU today, and the reason is worth getting right
-because it is no longer "there is no evidence". One crossover rule is
-installed, scoped to Metal on an M4 for unweighted squared error at
-1,000,000 rows by 50 features and above, on the records quoted at the top of
-this file. What stops it firing is that `DeviceCapabilities.detect()` opens
-no device, so the machine is reported as unidentified and a rule scoped to
-an Apple generation cannot match it. `auto` therefore warns and keeps the
-CPU, even on the M4 the rule was measured on. That is a wiring gap and it is
-written down rather than hidden.
+`auto` reaches the GPU. One crossover rule is installed, scoped to Metal on
+an M4 for unweighted squared error, single output, dense input, at 50 or
+more features, and it fires from `AUTO_GPU_MIN_ROWS` = 250,000 rows up.
+Everything else keeps the CPU, and the report names which half of "no rule
+covered this" applied.
+
+Two things about that floor are worth knowing. It is a plain constant, not a
+fitted crossover, and it is set below the 1,000,000-row shape the records at
+the top of this file were taken at: end to end the GPU arm is ahead of
+LightGBM there while the CPU arm is behind, so reaching the accelerator is
+worth more than the margin it gives up at 250,000. The real crossover is a
+measurement still to be taken.
+
+`MOJOTREES_DERIVATIVE_PRECISION=float64` sends `auto` to the CPU at every
+shape, threshold or no threshold. The GPU gradient upload narrows every
+per-row derivative to Float32, so the accelerator cannot produce that answer
+at any size; `device="gpu"` under the same setting raises rather than
+downgrading quietly.
 
 `MOJOTREES_AUTO_MIN_CELLS` is the escape hatch: a number of cells
 (`n_rows * n_features`) at or above which `auto` should pick the GPU. `0`
@@ -367,7 +376,7 @@ work when they are present.
 | `pip install mojotrees` | Not published. No PyPI release, no downloadable wheel. |
 | `predict(..., device="gpu")` | Implemented. `predict`, `predict_proba`, and the ranker's `predict` take `device=`, and the device entry points are registered in the extension. Contributions and sparse input have no device path and refuse an explicit `"gpu"`. This row is retired. |
 | `explain_device_choice(X)` | Implemented and re-exported from `mojotrees`. This row is retired. |
-| `device="auto"` choosing the GPU from `fit` | One measured rule exists and, since 2026-08-16, fires: the hardware is identified from the build target and the architecture string a Metal device reports now parses. What still holds `fit` on the CPU is that every rule is objective-scoped and `resolve_device`'s four-argument form declares no objective. `resolve_device_full` and `decide_device_report` reach it; `MOJOTREES_AUTO_MIN_CELLS` remains the escape hatch for hardware no rule covers. |
+| `device="auto"` choosing the GPU from `fit` | Implemented. The hardware is identified from the build target, the architecture string a Metal device reports parses, and the trainer entry points pass the objective they hold, so `fit(device="auto")` selects the accelerator from 250,000 rows by 50 features up on Metal on an M4 for squared error. `MOJOTREES_AUTO_MIN_CELLS` remains the escape hatch for hardware no rule covers. This row is retired. |
 | Early stopping with `device="gpu"` | Raises. Validation is scored on the CPU. |
 | Sparse input on the GPU from Python | The estimators keep the CPU. `train_gpu_sparse` exists and is reachable from the Mojo API; its crossover is unmeasured, so `auto` keeps the CPU there too. |
 | Any Apple GPU speedup claim beyond one M4 | Measured on exactly one machine, and `TIMINGS.md` is empty for every other. On that machine the GPU is 1.85x our CPU at 1,000,000 x 50 and slower than it below about a million rows. |
