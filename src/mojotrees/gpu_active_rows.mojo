@@ -199,7 +199,7 @@ module offers a grower.
 """
 
 from std.atomic import Atomic
-from std.gpu import block_dim, block_idx, global_idx, thread_idx
+from std.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
 from std.math import round
 from std.memory import stack_allocation
 from std.sys import has_accelerator
@@ -216,6 +216,7 @@ from .gpu_histogram_specializations import MAX_BINS
 from .gpu_tiling import (
     HIST_FEATURE_GROUP_LADDER,
     HIST_FEATURE_GROUP_MAX,
+    STRATEGY_ATOMIC,
     STRATEGY_TILED,
     DeviceCaps,
     HistogramTiling,
@@ -226,11 +227,145 @@ from .gpu_tiling import (
     histogram_shared_bytes,
     is_feature_group_width,
 )
+from .gpu_split_search import CAT_WORDS, CAT_WORD_BITS
 from .parallel import _env_int
 from .split import SplitInfo
 
 # Row indices and leaf ids cross into the kernels as Int32.
 comptime MAX_ROWS = Int(Int32.MAX)
+
+
+# --- The step descriptor --------------------------------------------------
+#
+# One committed growth step, written by the device and read by the device.
+#
+# Why this table exists at all. Every kernel below takes the split it is
+# routing by, and the window it is routing, as *launch arguments*: the host
+# knows both because the host chose the split. A device-owned tree
+# (`gpu_tree_tables.mojo`) moves that choice onto the device, and then the
+# host does not know either one and cannot pass them without reading them
+# back first. A blocking readback on an Apple M4 was measured at 606
+# microseconds against 3.7 microseconds of actual byte movement
+# (`docs/METAL_TIMELINE.md`), and there are 31 of them in a default 31-leaf
+# tree, so the readback is the cost and removing it is the point.
+#
+# The descriptor is therefore the seam. The commit kernel in
+# `gpu_tree_tables.mojo` writes it as the last act of a commit, and the
+# partition and histogram
+# kernels here read the same words instead of taking them as arguments. It
+# is a flat Int32 row, in the same style as the split records in
+# `gpu_split_search.mojo`, because a flat row is what a kernel can index
+# without knowing anything about the layout of the tables it came from.
+#
+# The layout lives *here*, in the consumer, and not in the producer, purely
+# to keep the import graph a tree: `gpu_tree_tables` already imports this
+# module's neighbours, and nothing in this file may import
+# `gpu_tree_tables` without creating a cycle through
+# `histogram_gpu -> gpu_active_rows`.
+#
+# **Everything is written on every commit and nothing is left over from the
+# step before.** A step that commits nothing writes `STEP_LIVE = 0` and
+# leaves the rest at whatever it held, so `STEP_LIVE` is the only word a
+# reader may consult before it has checked `STEP_LIVE`. Every kernel here
+# that takes a descriptor returns immediately when it is zero, which is what
+# makes a whole tree's worth of steps safe to enqueue up front: the steps
+# past the end of growth run, read one word, and do nothing.
+
+comptime STEP_LIVE = 0
+"""1 when the step this descriptor describes committed a split, 0 otherwise.
+The guard every descriptor-driven kernel checks first."""
+
+comptime STEP_ROW_BEGIN = 1
+"""Start of the split leaf's window into the active-row permutation. The
+partition rewrites exactly `[STEP_ROW_BEGIN, STEP_ROW_BEGIN + STEP_ROW_COUNT)`
+and nothing else, which is what leaves every other leaf's window intact."""
+
+comptime STEP_ROW_COUNT = 2
+"""Rows in that window."""
+
+comptime STEP_FEATURE = 3
+comptime STEP_THRESHOLD = 4
+comptime STEP_MISSING_BIN = 5
+comptime STEP_DEFAULT_LEFT = 6
+comptime STEP_IS_CAT = 7
+"""The five words of `RowRouting`, in the same meanings: the split feature,
+the inclusive threshold bin (-1 on a categorical split), the feature's
+missing bin (-1 when it reserves none), the direction missing rows take, and
+whether the node routes by category set instead of by threshold."""
+
+comptime STEP_BUILT_BEGIN = 8
+comptime STEP_BUILT_COUNT = 9
+"""The window of the child whose histogram is *accumulated* rather than
+derived, which is the smaller of the two under
+`gpu_frontier.subtraction_builds_left`. Written by the commit because it is
+`begin`/`begin + n_left` arithmetic the commit has already done, and reading
+it here saves the histogram kernel from having to know which child won that
+comparison."""
+
+comptime STEP_BUILT_SLOT = 10
+"""The resident pool slot the accumulated child's histogram is written
+into."""
+
+comptime STEP_SUB_SLOT = 11
+"""The pool slot the accumulation is also subtracted from, which is the
+parent's slot and therefore the derived sibling's slot after the commit
+reassigns it. The device mirror of `enqueue_resident_leaf_subtracting`'s
+`parent_slot`."""
+
+comptime STEP_LEFT_SLOT = 12
+comptime STEP_RIGHT_SLOT = 13
+"""The pool slots the two children's histograms end up in, whichever of them
+was built and whichever was derived. What the next search reads."""
+
+comptime STEP_LEFT_REC = 14
+comptime STEP_RIGHT_REC = 15
+"""The split-record slots the two children's records must end up in, which
+are the frontier slots' own record indices. The search itself writes a fixed
+pair of scratch records, because a launch's record range is a host-side
+constant; a device kernel then copies those two into these two. See
+`gpu_tree_tables._copy_records_kernel`."""
+
+comptime STEP_CAT0 = 16
+"""First of `CAT_WORDS` category-set words, in the split record's own 16-bit
+packing. Copied out of the record without reinterpretation, and unpacked
+into the four UInt64 the routing rule wants by `_step_cat_word` below."""
+
+comptime STEP_WORDS = STEP_CAT0 + CAT_WORDS
+
+
+@always_inline
+def _step_cat_word(
+    desc: MutPointer[Int32, MutAnyOrigin], w: Int
+) -> UInt64:
+    """UInt64 word `w` of the descriptor's category set.
+
+    `_row_goes_left` wants the set as four UInt64; a split record carries it
+    as sixteen Int32 holding sixteen bits each, and the tree table stores the
+    record's words verbatim so that no bit is reinterpreted between the
+    search that chose the set and the partition that routes by it. This is
+    the one place the two spellings meet, and it is a reassembly rather than
+    a reinterpretation: bit `b` of the set is bit `b % CAT_WORD_BITS` of Int32
+    word `b // CAT_WORD_BITS`, and bit `b` of UInt64 word `w` is bit `b - 64 *
+    w`, so four consecutive Int32 words make one UInt64 word in ascending
+    order.
+
+    The mask against 0xFFFF is not decoration. A 16-bit field held in an
+    Int32 is sign-extended by the widening conversion whenever bit 15 is set,
+    which would set every bit above it in the UInt64 and put categories into
+    the set that the search never chose. That is a fault a small fixture
+    would miss, because bit 15 of word 0 is category 15 and most category
+    sets are sparse and low.
+    """
+    var out = UInt64(0)
+    comptime WORDS_PER_U64 = 64 // CAT_WORD_BITS
+    for k in range(WORDS_PER_U64):
+        var idx = w * WORDS_PER_U64 + k
+        if idx < CAT_WORDS:
+            var v = UInt64(
+                UInt32(Int32(desc[unsafe_offset = STEP_CAT0 + idx][0]))
+            ) & UInt64(0xFFFF)
+            out |= v << UInt64(k * CAT_WORD_BITS)
+    return out
 
 # The scan kernels keep one Int32 per thread in shared memory, so the block
 # size they can be launched with is bounded by this allocation rather than by
@@ -402,6 +537,43 @@ def _zero_int32_kernel(
         buf[unsafe_offset=i] = Int32(0)
 
 
+def _zero_slot_desc_kernel(
+    pool: MutPointer[Int32, MutAnyOrigin],
+    cells: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+):
+    """Zero the resident pool slot the step descriptor names, and only that
+    one.
+
+    The atomic histogram strategy folds its threadgroup partials into the
+    output with `Atomic.fetch_add`, so it accumulates onto whatever the
+    destination already held and the destination has to start at zero. On the
+    host-driven path `enqueue_range_histogram` zeroes it with
+    `_zero_int32_kernel` over a pointer the host has already offset to the
+    right slot. Here the slot is a device value, so the offset is computed
+    inside the kernel from `STEP_BUILT_SLOT` instead.
+
+    Guarded on `STEP_LIVE` for a reason that is worth spelling out, because
+    getting it wrong would be silent and destructive rather than merely
+    wrong: on a step that committed nothing the descriptor's slot word is
+    whatever it was left at, and zeroing an arbitrary slot would erase a live
+    leaf's histogram, which would then be searched and would produce a
+    plausible split with no rows behind it. A dead step must touch nothing at
+    all, and this is the kernel where that mattered most.
+
+    Grid-strided, so the caller sizes the grid to the pool's slot width once
+    and never to a per-step quantity.
+    """
+    if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+        return
+    var base = Int(desc[unsafe_offset=STEP_BUILT_SLOT][0]) * Int(cells)
+    var stride = Int(block_dim.x) * Int(grid_dim.x)
+    var i = Int(global_idx.x)
+    while i < Int(cells):
+        pool[unsafe_offset = base + i] = Int32(0)
+        i += stride
+
+
 def _flag_scan_kernel(
     bins: MutPointer[UInt8, MutAnyOrigin],
     rows: MutPointer[Int32, MutAnyOrigin],
@@ -420,6 +592,8 @@ def _flag_scan_kernel(
     cat2: UInt64,
     cat3: UInt64,
     tiles: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+    use_desc: Int32,
 ):
     """Stage one of the stable partition: flag each row of the range and scan
     the flags within each threadgroup.
@@ -468,13 +642,74 @@ def _flag_scan_kernel(
     primitive instantiation exists for, and because a benchmark wanting both
     arms in one process needs both to be present. It produces the identical
     offsets and block sums.
+
+    The descriptor arm
+    ------------------
+    With `use_desc`, the window and the routing rule are read out of `desc`
+    (see "The step descriptor" at the head of this module) instead of out of
+    the launch arguments, and the launch arguments for those eight values are
+    ignored. That is the whole of what a device-owned tree needs from this
+    kernel: the split it routes by was chosen by a kernel rather than by the
+    host, so it lives in device memory rather than in a register the host
+    filled.
+
+    Nothing else changes, and in particular the *geometry* does not. A
+    descriptor-driven launch cannot size its grid to a range length it does
+    not know, so it is launched at a grid that covers the whole active
+    prefix, which is an upper bound on any window. That is safe because the
+    permutation this partition computes is a function of the routing flags
+    and of each row's position in the range and of nothing else; the argument
+    is written out in `_scatter_kernel`, which is where the destination
+    arithmetic lives. Cutting a short range into more chunks than it needs
+    therefore produces the same permutation as cutting it into few. What an
+    over-provisioned grid costs is threadgroups that own nothing, and the
+    early return below is what keeps that cost to a launch slot.
+
+    Whether the extra threadgroups are cheap enough to pay for the readback
+    they remove is UNMEASURED: no benchmark of this arm has been run.
     """
     var tid = thread_idx.x
     var nthreads = block_dim.x
     var n = Int(count)
-    var col = Int(feature) * Int(n_rows)
+    var row_begin = Int(begin)
+    var feat = feature
+    var thr = threshold_bin
+    var miss = missing_bin
+    var dleft = default_left
+    var iscat = is_categorical
+    var c0 = cat0
+    var c1 = cat1
+    var c2 = cat2
+    var c3 = cat3
+    if Int(use_desc) != 0:
+        if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+            return
+        row_begin = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+        n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+        feat = desc[unsafe_offset=STEP_FEATURE][0]
+        thr = desc[unsafe_offset=STEP_THRESHOLD][0]
+        miss = desc[unsafe_offset=STEP_MISSING_BIN][0]
+        dleft = desc[unsafe_offset=STEP_DEFAULT_LEFT][0]
+        iscat = desc[unsafe_offset=STEP_IS_CAT][0]
+        c0 = _step_cat_word(desc, 0)
+        c1 = _step_cat_word(desc, 1)
+        c2 = _step_cat_word(desc, 2)
+        c3 = _step_cat_word(desc, 3)
+    var col = Int(feat) * Int(n_rows)
     var chunk = Int(tiles) * nthreads
     var base = Int(block_idx.x) * chunk
+
+    # A block whose whole chunk lies past the end of the range. `base`, `n`
+    # and `tiles` are block-uniform, so the entire threadgroup returns
+    # together and no thread is left waiting at a barrier the others skipped.
+    # The zero it writes is exactly what the tile loop below would have
+    # accumulated, so this is an early exit and not a behavior change; the
+    # host-argument arm reaches it only on a grid that was already
+    # over-provisioned, which `_partition_grid` does not produce.
+    if base >= n:
+        if tid == 0:
+            block_sums[unsafe_offset = Int(block_idx.x)] = Int32(0)
+        return
 
     var s = stack_allocation[
         SCAN_MAX_THREADS,
@@ -488,18 +723,10 @@ def _flag_scan_kernel(
 
         var flag = Int32(0)
         if j < n:
-            var row = rows[unsafe_offset = Int(begin) + j][0]
+            var row = rows[unsafe_offset = row_begin + j][0]
             var bin = Int32(bins[unsafe_offset = col + Int(row)])
             if _row_goes_left(
-                bin,
-                threshold_bin,
-                missing_bin,
-                default_left,
-                is_categorical,
-                cat0,
-                cat1,
-                cat2,
-                cat3,
+                bin, thr, miss, dleft, iscat, c0, c1, c2, c3
             ):
                 flag = Int32(1)
         s[unsafe_offset=tid] = flag
@@ -555,6 +782,8 @@ def _flag_scan_prim_kernel[block_size: Int](
     cat2: UInt64,
     cat3: UInt64,
     tiles: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+    use_desc: Int32,
 ):
     """Stage one, scanned with `block.prefix_sum` instead of by hand.
 
@@ -606,12 +835,51 @@ def _flag_scan_prim_kernel[block_size: Int](
     its own scratch on exit. `tiles` is a uniform argument, so every thread
     of the block runs the same number of iterations and reaches every
     collective.
+
+    `desc` and `use_desc` are the descriptor arm, identical in meaning to
+    `_flag_scan_kernel`'s: read that kernel's docstring for what the arm is
+    for and why an over-provisioned grid computes the same permutation. The
+    early return matters more here than there, because this arm's collectives
+    are called once per tile whether or not the tile owns any element, so an
+    empty block that ran the loop would pay `tiles` prefix sums and `tiles`
+    broadcasts to sum a column of zeros.
     """
     var tid = thread_idx.x
     var n = Int(count)
-    var col = Int(feature) * Int(n_rows)
+    var row_begin = Int(begin)
+    var feat = feature
+    var thr = threshold_bin
+    var miss = missing_bin
+    var dleft = default_left
+    var iscat = is_categorical
+    var c0 = cat0
+    var c1 = cat1
+    var c2 = cat2
+    var c3 = cat3
+    if Int(use_desc) != 0:
+        if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+            return
+        row_begin = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+        n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+        feat = desc[unsafe_offset=STEP_FEATURE][0]
+        thr = desc[unsafe_offset=STEP_THRESHOLD][0]
+        miss = desc[unsafe_offset=STEP_MISSING_BIN][0]
+        dleft = desc[unsafe_offset=STEP_DEFAULT_LEFT][0]
+        iscat = desc[unsafe_offset=STEP_IS_CAT][0]
+        c0 = _step_cat_word(desc, 0)
+        c1 = _step_cat_word(desc, 1)
+        c2 = _step_cat_word(desc, 2)
+        c3 = _step_cat_word(desc, 3)
+    var col = Int(feat) * Int(n_rows)
     var chunk = Int(tiles) * block_size
     var base = Int(block_idx.x) * chunk
+
+    # Block-uniform, so the whole threadgroup leaves together and no
+    # collective is reached by part of a block. See `_flag_scan_kernel`.
+    if base >= n:
+        if tid == 0:
+            block_sums[unsafe_offset = Int(block_idx.x)] = Int32(0)
+        return
 
     var carry = Int32(0)
     for t in range(Int(tiles)):
@@ -619,18 +887,10 @@ def _flag_scan_prim_kernel[block_size: Int](
 
         var flag = Int32(0)
         if j < n:
-            var row = rows[unsafe_offset = Int(begin) + j][0]
+            var row = rows[unsafe_offset = row_begin + j][0]
             var bin = Int32(bins[unsafe_offset = col + Int(row)])
             if _row_goes_left(
-                bin,
-                threshold_bin,
-                missing_bin,
-                default_left,
-                is_categorical,
-                cat0,
-                cat1,
-                cat2,
-                cat3,
+                bin, thr, miss, dleft, iscat, c0, c1, c2, c3
             ):
                 flag = Int32(1)
 
@@ -662,6 +922,8 @@ def _scatter_kernel(
     count: Int32,
     tiles: Int32,
     n_blocks: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+    use_desc: Int32,
 ):
     """Stage two: scan the block sums at the head of the block, then write
     each row of this block's chunk to its compacted slot.
@@ -720,11 +982,24 @@ def _scatter_kernel(
     This is the fallback arm; `_scatter_prim_kernel` is the default and
     differs only in scanning with `block.prefix_sum` and `block.broadcast`
     instead of in shared memory by hand.
+
+    `desc` and `use_desc` are the descriptor arm: only the window moves,
+    since this stage reads the routing decision out of the packed offsets and
+    never touches a bin. A dead step leaves the permutation untouched, which
+    is what makes a tree's worth of steps safe to enqueue before growth has
+    decided how many of them there will be.
     """
     var tid = thread_idx.x
     var nthreads = block_dim.x
     var nb = Int(n_blocks)
     var me = Int(block_idx.x)
+    var n = Int(count)
+    var b = Int(begin)
+    if Int(use_desc) != 0:
+        if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+            return
+        b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+        n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
 
     var s = stack_allocation[
         SCAN_MAX_THREADS,
@@ -771,8 +1046,6 @@ def _scatter_kernel(
     if me == 0 and tid == 0:
         total[unsafe_offset=0] = carry
 
-    var n = Int(count)
-    var b = Int(begin)
     var chunk = Int(tiles) * nthreads
     var first = me * chunk
     for t in range(Int(tiles)):
@@ -799,6 +1072,8 @@ def _scatter_prim_kernel[block_size: Int](
     count: Int32,
     tiles: Int32,
     n_blocks: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+    use_desc: Int32,
 ):
     """Stage two on the primitive arm: the same head scan and the same
     scatter, with `block.prefix_sum` and `block.broadcast` in place of the
@@ -819,10 +1094,21 @@ def _scatter_prim_kernel[block_size: Int](
     `block.broadcast`, and `me - base` is block-uniform inside the guarded
     branch, so the collective is reached by the whole threadgroup with the
     same source lane.
+
+    `desc` and `use_desc` are the descriptor arm, as in `_scatter_kernel`:
+    only the window moves, and a dead step returns before any collective, so
+    the whole threadgroup leaves together.
     """
     var tid = thread_idx.x
     var nb = Int(n_blocks)
     var me = Int(block_idx.x)
+    var n = Int(count)
+    var b = Int(begin)
+    if Int(use_desc) != 0:
+        if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+            return
+        b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+        n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
 
     var carry = Int32(0)
     var mine = Int32(0)
@@ -851,8 +1137,6 @@ def _scatter_prim_kernel[block_size: Int](
     if me == 0 and tid == 0:
         total[unsafe_offset=0] = carry
 
-    var n = Int(count)
-    var b = Int(begin)
     var chunk = Int(tiles) * block_size
     var first = me * chunk
     for t in range(Int(tiles)):
@@ -874,6 +1158,8 @@ def _copy_back_kernel(
     scratch: MutPointer[Int32, MutAnyOrigin],
     begin: Int32,
     count: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+    use_desc: Int32,
 ):
     """Stage three: fold the compacted range back over the parent's slots.
 
@@ -886,6 +1172,19 @@ def _copy_back_kernel(
     It has no cross-block dependency of any kind, so there is nothing for a
     bounded block count to buy it, and giving it the uncapped grid keeps its
     shape exactly what it was before this lane.
+
+    The loop is grid-strided rather than a single guarded store. On the
+    host-argument arm that is the same thing: the grid is `ceil(count /
+    threads)` blocks, so the stride is at least `count` and every thread runs
+    exactly one iteration, which is the store this kernel has always made.
+    What it buys is the descriptor arm, which cannot size a grid to a count
+    it does not know and would otherwise have to launch
+    `ceil(n_active / threads)` blocks to cover the largest window a step
+    might pick. With a stride it can launch the capped grid the other two
+    stages use and let each thread walk. No element is visited twice either
+    way, because the destinations are distinct positions of one range.
+
+    `desc` and `use_desc` are the descriptor arm; see `_flag_scan_kernel`.
 
     Why this launch is still here
     -----------------------------
@@ -935,10 +1234,19 @@ def _copy_back_kernel(
     the copy stays, and the design is written down here rather than
     half-built.
     """
-    var j = global_idx.x
-    if j < Int(count):
-        var i = Int(begin) + j
+    var n = Int(count)
+    var b = Int(begin)
+    if Int(use_desc) != 0:
+        if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+            return
+        b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+        n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+    var stride = Int(block_dim.x) * Int(grid_dim.x)
+    var j = Int(global_idx.x)
+    while j < n:
+        var i = b + j
         rows[unsafe_offset=i] = scratch[unsafe_offset=i][0]
+        j += stride
 
 
 def _quantize_grad_hess_kernel(
@@ -1007,6 +1315,8 @@ def _range_hist_atomic_kernel[
     do_sub: Int32,
     use_quant: Int32,
     const_hess: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+    use_desc: Int32,
 ):
     """One node's histogram over a compacted row range, accumulated in
     threadgroup memory and folded into the output with global atomics.
@@ -1125,6 +1435,34 @@ def _range_hist_atomic_kernel[
     change to that module's contract and is not this lane's; the download in
     `histogram_gpu.histogram_from_host` therefore still moves three planes as
     well.
+
+    The descriptor arm
+    ------------------
+    With `use_desc`, four values move from launch arguments into device
+    memory: the row window this build reads (`STEP_BUILT_BEGIN`,
+    `STEP_BUILT_COUNT`), the resident pool slot it writes
+    (`STEP_BUILT_SLOT`), and the slot it subtracts itself from
+    (`STEP_SUB_SLOT`). `out_hist` is then the *base* of the pool rather than a
+    pointer the host has already offset, and `sub_offset` is derived here as
+    `(sub_slot - built_slot) * 3 * hist_size` instead of being passed in.
+    Which of the two children was chosen to be built and which derived was
+    decided by the commit kernel and is already baked into those four words.
+
+    Nothing about the accumulation moves. The same rows are gathered, the
+    same fixed-point products are formed, the same shared atomics run and the
+    same global atomics flush. The only floating-point operations in this
+    kernel are the two per-row quantizing products, which are untouched, so a
+    histogram built on this arm is the one the host-argument arm would have
+    built, bin for bin. That is a structural statement and not a tolerance.
+
+    The empty-tile early return below is what makes an over-provisioned grid
+    affordable. A descriptor-driven launch does not know the row count, so it
+    is launched with `grid.y` sized for the whole active prefix; a block whose
+    tile begins past the end of the range would otherwise zero its shared
+    planes, gather nothing, and then walk every bin of the flush finding
+    nothing to add. `block_idx.y` and the count are block-uniform, so the
+    whole threadgroup leaves together, and the result is unchanged on both
+    arms because such a block contributes nothing either way.
     """
     var slot0 = GROUP * Int(block_idx.x)
     var owned = Int(n_slots) - slot0
@@ -1135,6 +1473,30 @@ def _range_hist_atomic_kernel[
     var nr = Int(n_rows)
     var hs = Int(hist_size)
     var n = Int(count)
+    var row_begin = Int(begin)
+    # Where this build's own slot starts inside `out_hist`, in Int32 words.
+    # Zero on the host-argument arm, because there the host offset the
+    # pointer before the launch.
+    var out_base = 0
+    var sub_off = Int(sub_offset)
+    if Int(use_desc) != 0:
+        if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+            return
+        row_begin = Int(desc[unsafe_offset=STEP_BUILT_BEGIN][0])
+        n = Int(desc[unsafe_offset=STEP_BUILT_COUNT][0])
+        var cells = 3 * hs
+        var built_slot = Int(desc[unsafe_offset=STEP_BUILT_SLOT][0])
+        var from_slot = Int(desc[unsafe_offset=STEP_SUB_SLOT][0])
+        out_base = built_slot * cells
+        sub_off = (from_slot - built_slot) * cells
+
+    # Empty tiles cost a launch slot and nothing else. See the docstring.
+    var tile_begin = Int(block_idx.y) * Int(rows_per_tile)
+    if tile_begin >= n:
+        return
+    var tile_end = tile_begin + Int(rows_per_tile)
+    if tile_end > n:
+        tile_end = n
 
     var sg = stack_allocation[
         GROUP * BIN_CAP,
@@ -1183,11 +1545,6 @@ def _range_hist_atomic_kernel[
             fid[unsafe_offset=k] = f
             col[unsafe_offset=k] = f * nr
 
-    var tile_begin = block_idx.y * Int(rows_per_tile)
-    var tile_end = tile_begin + Int(rows_per_tile)
-    if tile_end > n:
-        tile_end = n
-
     if celide:
         # Two atomics per (row, feature). The hessian is neither read nor
         # accumulated: it is the same Int32 for every row, so the count plane
@@ -1195,7 +1552,7 @@ def _range_hist_atomic_kernel[
         if Int(use_quant) != 0:
             var j = tile_begin + tid
             while j < tile_end:
-                var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+                var r = Int(rows[unsafe_offset = row_begin + j][0])
                 var gqv = gq[unsafe_offset = 2 * r][0]
                 comptime for k in range(GROUP):
                     if k < owned:
@@ -1208,7 +1565,7 @@ def _range_hist_atomic_kernel[
         else:
             var j = tile_begin + tid
             while j < tile_end:
-                var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+                var r = Int(rows[unsafe_offset = row_begin + j][0])
                 var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
                 comptime for k in range(GROUP):
                     if k < owned:
@@ -1221,7 +1578,7 @@ def _range_hist_atomic_kernel[
     elif Int(use_quant) != 0:
         var j = tile_begin + tid
         while j < tile_end:
-            var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+            var r = Int(rows[unsafe_offset = row_begin + j][0])
             var gqv = gq[unsafe_offset = 2 * r][0]
             var hqv = gq[unsafe_offset = 2 * r + 1][0]
             comptime for k in range(GROUP):
@@ -1236,7 +1593,7 @@ def _range_hist_atomic_kernel[
     else:
         var j = tile_begin + tid
         while j < tile_end:
-            var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+            var r = Int(rows[unsafe_offset = row_begin + j][0])
             var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
             var hqv = Int32(round(hess[unsafe_offset=r][0] * h_scale))
             comptime for k in range(GROUP):
@@ -1267,15 +1624,16 @@ def _range_hist_atomic_kernel[
                     var vh = (
                         hq_const * vc if celide else sh[unsafe_offset=s][0]
                     )
-                    _ = Atomic.fetch_add(out_hist.unsafe_offset(base + c), vg)
+                    var go = out_base + base + c
+                    _ = Atomic.fetch_add(out_hist.unsafe_offset(go), vg)
                     _ = Atomic.fetch_add(
-                        out_hist.unsafe_offset(hs + base + c), vh
+                        out_hist.unsafe_offset(hs + go), vh
                     )
                     _ = Atomic.fetch_add(
-                        out_hist.unsafe_offset(2 * hs + base + c), vc
+                        out_hist.unsafe_offset(2 * hs + go), vc
                     )
                     if sub:
-                        var so = Int(sub_offset) + base + c
+                        var so = out_base + sub_off + base + c
                         _ = Atomic.fetch_add(out_hist.unsafe_offset(so), -vg)
                         _ = Atomic.fetch_add(
                             out_hist.unsafe_offset(hs + so), -vh
@@ -1858,6 +2216,21 @@ struct GpuActiveRows(Movable):
     var block_sums_dev: DeviceBuffer[DType.int32]
     # One Int32: the range's total left count, written by the scatter.
     var total_dev: DeviceBuffer[DType.int32]
+    # The step descriptor (see "The step descriptor"), `STEP_WORDS` Int32.
+    #
+    # It lives here rather than with the tree tables that write it for two
+    # reasons. The kernels that read it are all in this file, so the buffer
+    # sits with its readers; and every host-driven launch has to pass
+    # *something* for the descriptor argument, which must be a real pointer
+    # and must not be any other buffer that launch already passes, because a
+    # kernel launch may not be handed the same buffer twice mutably. Reusing
+    # one of the partition's own buffers as the inert stand-in is what the
+    # first draft did and the compiler correctly refused it.
+    #
+    # Nothing here writes it. `gpu_tree_tables.DeviceTreeTables.enqueue_step`
+    # takes this pointer and its commit kernel fills it, which is the whole
+    # of the coupling between that module and this one.
+    var step_dev: DeviceBuffer[DType.int32]
     var host_total: HostBuffer[DType.int32]
     var host_rows: HostBuffer[DType.int32]
     var stage_rows: HostBuffer[DType.int32]
@@ -1967,6 +2340,7 @@ struct GpuActiveRows(Movable):
             max_blocks
         )
         self.total_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
+        self.step_dev = self.ctx.enqueue_create_buffer[DType.int32](STEP_WORDS)
         self.host_total = self.ctx.enqueue_create_host_buffer[DType.int32](1)
         self.host_rows = self.ctx.enqueue_create_host_buffer[DType.int32](
             n_rows
@@ -2360,6 +2734,15 @@ struct GpuActiveRows(Movable):
                 cat[2],
                 cat[3],
                 Int32(tiles),
+                # Inert descriptor. The host chose this split and passed
+                # it as arguments, so `use_desc` is zero and the kernel
+                # never dereferences this pointer; a real buffer rather
+                # than a null keeps the argument well typed everywhere,
+                # and it must be a buffer this launch does not already
+                # pass, which is why it is `step_dev` and not one of the
+                # partition's own.
+                self.step_dev.unsafe_ptr(),
+                Int32(0),
                 grid_dim=blocks,
                 block_dim=threads,
             )
@@ -2376,6 +2759,15 @@ struct GpuActiveRows(Movable):
                 Int32(n),
                 Int32(tiles),
                 Int32(blocks),
+                # Inert descriptor. The host chose this split and passed
+                # it as arguments, so `use_desc` is zero and the kernel
+                # never dereferences this pointer; a real buffer rather
+                # than a null keeps the argument well typed everywhere,
+                # and it must be a buffer this launch does not already
+                # pass, which is why it is `step_dev` and not one of the
+                # partition's own.
+                self.step_dev.unsafe_ptr(),
+                Int32(0),
                 grid_dim=blocks,
                 block_dim=threads,
             )
@@ -2384,6 +2776,9 @@ struct GpuActiveRows(Movable):
             self.scratch_dev.unsafe_ptr(),
             Int32(window.begin),
             Int32(n),
+            # Inert descriptor; see the flag pass above.
+            self.step_dev.unsafe_ptr(),
+            Int32(0),
             grid_dim=copy_blocks,
             block_dim=threads,
         )
@@ -2398,6 +2793,7 @@ struct GpuActiveRows(Movable):
         n: Int,
         blocks: Int,
         tiles: Int,
+        use_desc: Int32 = Int32(0),
     ) raises:
         """The flag pass and the scatter, on the primitive arm, at one
         compile-time threadgroup width.
@@ -2436,6 +2832,8 @@ struct GpuActiveRows(Movable):
             cat[2],
             cat[3],
             Int32(tiles),
+            self.step_dev.unsafe_ptr(),
+            use_desc,
             grid_dim=blocks,
             block_dim=width,
         )
@@ -2449,9 +2847,296 @@ struct GpuActiveRows(Movable):
             Int32(n),
             Int32(tiles),
             Int32(blocks),
+            self.step_dev.unsafe_ptr(),
+            use_desc,
             grid_dim=blocks,
             block_dim=width,
         )
+
+    def enqueue_partition_desc[
+        bins_origin: MutOrigin, //
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        max_count: Int,
+    ) raises:
+        """Enqueue the partition of whatever window the step descriptor names.
+
+        The device-owned counterpart of `enqueue_partition`. It launches the
+        same three kernels in the same order on the same arm; what it does not
+        do is know which leaf is being split, which split is being applied, or
+        how many rows are involved, because on this path a kernel chose all
+        three and the host has not read them back. `max_count` is the only
+        number the host still supplies and it is an upper bound rather than a
+        length: the active row count, which no window can exceed because the
+        live windows tile `[0, n_active)`.
+
+        Why an upper bound is enough. The geometry a partition is launched at
+        never reaches the permutation. `_scatter_kernel` derives each row's
+        destination from the routing flags and from the row's position in the
+        range, and from nothing else; the chunking appears only in how the
+        prefix is accumulated, and an integer prefix is the same number
+        however it is summed. So a grid sized for a longer range than the one
+        it finds produces exactly the permutation the exactly-sized grid would
+        have produced, and the surplus threadgroups return at their first
+        bounds check. That argument is written out at greater length in
+        `_flag_scan_kernel` and `_scatter_kernel`.
+
+        What the surplus costs is UNMEASURED. It is bounded above by the
+        capped block count times the tile count that covers `max_count`, and
+        every one of those blocks that owns nothing exits before it reads a
+        row; whether that is cheaper than the host round trip it replaces is
+        exactly the thing a benchmark would have to answer and no benchmark
+        has been run.
+
+        Nothing is downloaded and nothing synchronizes, which is the point.
+        `total_dev` is still written by the scatter and is still the range's
+        left count, but the device-owned path does not read it: the commit
+        kernel already took both children's counts off the parent histogram's
+        integer count plane, exactly as the host path takes them off the
+        record. It stays written so that `MOJOTREES_GPU_VERIFY_ROWS` remains
+        meaningful for anyone who wants to check the two against each other.
+        """
+        if max_count < 1:
+            raise Error("a descriptor partition needs a positive row bound")
+        if max_count > self.n_rows:
+            raise Error("the row bound exceeds the row buffer")
+        var threads = self.block_threads
+        var grid = _partition_grid(
+            max_count, threads, self.partition_block_cap
+        )
+        var blocks = grid[0]
+        var tiles = grid[1]
+
+        # The routing arguments are placeholders: `use_desc` is 1, so every
+        # kernel below reads the split out of `step_dev` and ignores them. A
+        # window of `[0, max_count)` is passed for the same reason, and is
+        # deliberately the widest legal one rather than an empty one, so that
+        # a wiring mistake that left `use_desc` at zero would partition a real
+        # range and be caught by a row check rather than silently do nothing.
+        var window = LeafRange(0, max_count)
+        var routing = RowRouting.numerical(0, 0, -1, False)
+
+        var scanned = False
+        comptime if has_accelerator():
+            if self.scan_primitives:
+                scanned = True
+                if threads == 128:
+                    self._enqueue_scan_primitives[128](
+                        bins, window, routing, max_count, blocks, tiles,
+                        Int32(1),
+                    )
+                elif threads == 256:
+                    self._enqueue_scan_primitives[256](
+                        bins, window, routing, max_count, blocks, tiles,
+                        Int32(1),
+                    )
+                elif threads == 512:
+                    self._enqueue_scan_primitives[512](
+                        bins, window, routing, max_count, blocks, tiles,
+                        Int32(1),
+                    )
+                elif threads == 1024:
+                    self._enqueue_scan_primitives[1024](
+                        bins, window, routing, max_count, blocks, tiles,
+                        Int32(1),
+                    )
+                else:
+                    scanned = False
+
+        if not scanned:
+            self.ctx.enqueue_function[_flag_scan_kernel](
+                bins,
+                self.rows_dev.unsafe_ptr(),
+                self.offsets_dev.unsafe_ptr(),
+                self.block_sums_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                Int32(0),
+                Int32(max_count),
+                Int32(0),
+                Int32(0),
+                Int32(-1),
+                Int32(0),
+                Int32(0),
+                UInt64(0),
+                UInt64(0),
+                UInt64(0),
+                UInt64(0),
+                Int32(tiles),
+                self.step_dev.unsafe_ptr(),
+                Int32(1),
+                grid_dim=blocks,
+                block_dim=threads,
+            )
+            self.ctx.enqueue_function[_scatter_kernel](
+                self.rows_dev.unsafe_ptr(),
+                self.scratch_dev.unsafe_ptr(),
+                self.offsets_dev.unsafe_ptr(),
+                self.block_sums_dev.unsafe_ptr(),
+                self.total_dev.unsafe_ptr(),
+                Int32(0),
+                Int32(max_count),
+                Int32(tiles),
+                Int32(blocks),
+                self.step_dev.unsafe_ptr(),
+                Int32(1),
+                grid_dim=blocks,
+                block_dim=threads,
+            )
+        # The copy back runs on the capped grid here, not on the uncapped
+        # `ceil(count / threads)` one the host arm gives it, because a count
+        # this launch does not know cannot size a grid. It is grid-strided, so
+        # the same threads walk the range instead of one thread owning one
+        # element; see `_copy_back_kernel`.
+        self.ctx.enqueue_function[_copy_back_kernel](
+            self.rows_dev.unsafe_ptr(),
+            self.scratch_dev.unsafe_ptr(),
+            Int32(0),
+            Int32(max_count),
+            self.step_dev.unsafe_ptr(),
+            Int32(1),
+            grid_dim=blocks,
+            block_dim=threads,
+        )
+
+    def enqueue_desc_histogram[
+        bins_origin: MutOrigin,
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin,
+        feat_origin: MutOrigin,
+        pool_origin: MutOrigin, //
+    ](
+        mut self,
+        pool_slots: Int,
+        max_rows: Int,
+        bins: MutPointer[UInt8, bins_origin],
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+        feat_ids: MutPointer[Int32, feat_origin],
+        pool: MutPointer[Int32, pool_origin],
+        n_slots: Int,
+        g_scale: Float32,
+        h_scale: Float32,
+        caps: DeviceCaps,
+    ) raises:
+        """Accumulate the built child's histogram into the pool slot the step
+        descriptor names, subtracting it from the sibling's slot as it goes.
+
+        The device-owned counterpart of `enqueue_range_histogram`, narrowed to
+        exactly the one shape a device-owned tree needs: one node, into a
+        resident pool slot, with the sibling subtraction folded in.
+
+        **The atomic strategy, always, and this is a decision rather than an
+        oversight.** The tiled strategy's partial buffer and its reduction are
+        both sized by `n_tiles`, and `n_tiles` is derived from the node's row
+        count, which on this path the host does not know. Deriving it from the
+        active row count instead would give a shallow node a reduction over
+        thousands of empty tiles, which is a cost that grows exactly where the
+        tree spends most of its splits. The atomic strategy has no such term:
+        its only row-derived quantity is the grid's second dimension, and a
+        block whose tile is empty returns at its first comparison
+        (`_range_hist_atomic_kernel`).
+
+        The two strategies produce the same histogram, which is what makes
+        this a launch decision and not a numeric one. Accumulation is
+        fixed-point Int32 in both, integer addition is associative and
+        commutative, and each strategy adds the same per-(row, feature)
+        quantized value into the same bin; only the order of the additions
+        differs, and the order of integer additions cannot change a sum. That
+        is the same argument `_range_hist_atomic_kernel` makes for its own
+        forty instantiations agreeing with each other.
+
+        **What is not claimed.** That the atomic strategy is as fast here as
+        the strategy the host arm would have chosen. It may well not be on a
+        large first split, where the tiled path exists precisely because
+        atomics contend. No benchmark of this arm has been run and none is
+        reported.
+
+        `max_rows` is an upper bound on the built child's row count, and the
+        active row count is the bound a caller has. The built child is the
+        smaller of the two by `subtraction_builds_left`, so `n_active / 2`
+        would also bound it; the looser bound is used because a bound that
+        depends on which child won a comparison is a bound that has to be
+        re-derived if that comparison ever changes.
+        """
+        if n_slots < 1 or n_slots > self.n_features:
+            raise Error("active feature count out of range")
+        if pool_slots < 1:
+            raise Error("the resident pool must hold at least one slot")
+        if max_rows < 1:
+            raise Error("a descriptor histogram needs a positive row bound")
+
+        var hist_size = self.n_features * self.n_bins
+        var cells = 3 * hist_size
+        var tiling = derive_tiling(
+            caps,
+            max_rows,
+            n_slots,
+            self.n_bins,
+            STRATEGY_ATOMIC,
+            self.part_capacity_unused(),
+        )
+        var threads = tiling.block_threads
+
+        # The atomic flush is `Atomic.fetch_add` onto whatever the slot
+        # already holds, so the slot has to start at zero. Only the one slot
+        # the descriptor names is cleared, and only when the step is live;
+        # clearing a slot on a dead step would erase a live leaf's histogram.
+        var zero_blocks = (cells + threads - 1) // threads
+        if zero_blocks > pool_slots * 4:
+            zero_blocks = pool_slots * 4
+        if zero_blocks < 1:
+            zero_blocks = 1
+        self.ctx.enqueue_function[_zero_slot_desc_kernel](
+            pool,
+            Int32(cells),
+            self.step_dev.unsafe_ptr(),
+            grid_dim=zero_blocks,
+            block_dim=threads,
+        )
+
+        var use_quant = Int32(0)
+        if self.quantized_gradients:
+            self._ensure_quantized(grad, hess, g_scale, h_scale)
+            use_quant = Int32(1)
+        var const_hess = Int32(1) if self.constant_hessian else Int32(0)
+
+        self._enqueue_atomic_family(
+            bins,
+            grad,
+            hess,
+            feat_ids,
+            pool,
+            n_slots,
+            hist_size,
+            tiling.rows_per_tile,
+            # Window, destination slot and subtraction offset all come out of
+            # the descriptor, so these three are placeholders the kernel
+            # overwrites. The subtraction is always on: a device-owned split
+            # always derives one child from the parent's slot.
+            0,
+            max_rows,
+            g_scale,
+            h_scale,
+            0,
+            Int32(1),
+            use_quant,
+            const_hess,
+            tiling.n_tiles,
+            threads,
+            Int32(1),
+        )
+
+    def part_capacity_unused(self) -> Int:
+        """Zero, the "no preallocated partial buffer" value `derive_tiling`
+        takes.
+
+        The atomic strategy allocates no partials, so the capacity a caller
+        would pass to cap the tiled strategy's buffer has nothing to cap. It
+        is a named method rather than a bare literal so that the reason is
+        attached to the argument at the one call site that passes it.
+        """
+        return 0
 
     def download_left_count(mut self) raises -> Int:
         """The left count of the last enqueued partition. Synchronizes."""
@@ -2813,6 +3498,10 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 tiling.n_tiles,
                 threads,
+                # No descriptor: this arm's window and destination came
+                # from the host, so the kernel is told to ignore the
+                # descriptor buffer it is handed. See `step_dev`.
+                Int32(0),
             )
 
     def _launch_group(self, n_slots: Int) -> Int:
@@ -3102,6 +3791,7 @@ struct GpuActiveRows(Movable):
         const_hess: Int32,
         n_tiles: Int,
         threads: Int,
+        use_desc: Int32,
     ) raises:
         """The atomic twin of `_enqueue_partial_family`, same static tree."""
         var group = self._launch_group(n_slots)
@@ -3125,6 +3815,7 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 n_tiles,
                 threads,
+                use_desc,
             )
         elif group >= 8:
             self._enqueue_atomic_at[8](
@@ -3146,6 +3837,7 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 n_tiles,
                 threads,
+                use_desc,
             )
         elif group >= 4:
             self._enqueue_atomic_at[4](
@@ -3167,6 +3859,7 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 n_tiles,
                 threads,
+                use_desc,
             )
         elif group >= 2:
             self._enqueue_atomic_at[2](
@@ -3188,6 +3881,7 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 n_tiles,
                 threads,
+                use_desc,
             )
         else:
             self._enqueue_atomic_at[1](
@@ -3209,6 +3903,7 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 n_tiles,
                 threads,
+                use_desc,
             )
 
     def _enqueue_atomic_at[
@@ -3238,6 +3933,7 @@ struct GpuActiveRows(Movable):
         const_hess: Int32,
         n_tiles: Int,
         threads: Int,
+        use_desc: Int32,
     ) raises:
         """The atomic launch at one group width, over the four bin
         capacities."""
@@ -3264,6 +3960,8 @@ struct GpuActiveRows(Movable):
                 do_sub,
                 use_quant,
                 const_hess,
+                self.step_dev.unsafe_ptr(),
+                use_desc,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -3289,6 +3987,8 @@ struct GpuActiveRows(Movable):
                 do_sub,
                 use_quant,
                 const_hess,
+                self.step_dev.unsafe_ptr(),
+                use_desc,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -3314,6 +4014,8 @@ struct GpuActiveRows(Movable):
                 do_sub,
                 use_quant,
                 const_hess,
+                self.step_dev.unsafe_ptr(),
+                use_desc,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -3339,6 +4041,8 @@ struct GpuActiveRows(Movable):
                 do_sub,
                 use_quant,
                 const_hess,
+                self.step_dev.unsafe_ptr(),
+                use_desc,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )

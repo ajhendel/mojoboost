@@ -256,7 +256,33 @@ from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.primitives import block
 
-from .categorical import CatBitset, cat_add, cat_empty
+from .categorical import (
+    CAT_BITSET_WORDS,
+    CatBitset,
+    cat_add,
+    cat_empty,
+)
+from .gpu_active_rows import (
+    STEP_BUILT_BEGIN,
+    STEP_BUILT_COUNT,
+    STEP_BUILT_SLOT,
+    STEP_CAT0,
+    STEP_DEFAULT_LEFT,
+    STEP_FEATURE,
+    STEP_IS_CAT,
+    STEP_LEFT_REC,
+    STEP_LEFT_SLOT,
+    STEP_LIVE,
+    STEP_MISSING_BIN,
+    STEP_RIGHT_REC,
+    STEP_RIGHT_SLOT,
+    STEP_ROW_BEGIN,
+    STEP_ROW_COUNT,
+    STEP_SUB_SLOT,
+    STEP_THRESHOLD,
+    STEP_WORDS,
+)
+from .gpu_split_search import NODE_HIST_BASE, NODE_WORDS
 from .growth_policy import GROW_LEAFWISE
 from .gpu_split_search import (
     CAT_WORD_BITS,
@@ -266,6 +292,7 @@ from .gpu_split_search import (
     FLAG_FOUND,
     FREC_GAIN,
     FREC_LEFT_VALUE,
+    FREC_PARENT_VALUE,
     FREC_RIGHT_VALUE,
     IREC_BIN,
     IREC_CAT0,
@@ -278,7 +305,7 @@ from .gpu_split_search import (
     SPLIT_IWORDS,
 )
 from .split import SplitInfo
-from .tree import TreeParams
+from .tree import Tree, TreeParams
 
 
 # --- The gate -------------------------------------------------------------
@@ -722,6 +749,14 @@ struct TreeTablesSnapshot(Copyable, Movable):
     """Histogram pool: slot index to owning node id, or -1 for free. The
     device mirror of `gpu_leaf_batching.HistogramSlotPool.owner`."""
 
+    var commit_order: List[Int]
+    """Node ids in the order they were split, one entry per commit. Only
+    `tree_from_snapshot` reads it, and only to append categorical sets into
+    the flat pool in the order the host grower would have appended them; see
+    `_pick_and_commit_kernel`. Empty on a tree with no categorical split, in
+    the sense that nothing consults it, not in the sense that it is unfilled.
+    """
+
     var n_live: Int
     var next_node: Int
     var pick: Int
@@ -733,6 +768,7 @@ struct TreeTablesSnapshot(Copyable, Movable):
         self.leaves = List[DeviceLeafRow]()
         self.nodes = List[DeviceNodeRow]()
         self.slot_owner = List[Int]()
+        self.commit_order = List[Int]()
         self.n_live = 0
         self.next_node = 0
         self.pick = -1
@@ -811,6 +847,8 @@ def _pick_and_commit_kernel(
     missing: MutPointer[Int32, MutAnyOrigin],
     rec_i: MutPointer[Int32, MutAnyOrigin],
     rec_f: MutPointer[Float32, MutAnyOrigin],
+    step: MutPointer[Int32, MutAnyOrigin],
+    order: MutPointer[Int32, MutAnyOrigin],
     num_leaves: Int32,
     max_depth: Int32,
     min_data_in_leaf: Int32,
@@ -856,6 +894,31 @@ def _pick_and_commit_kernel(
     No floating-point arithmetic occurs anywhere in this kernel. Gains are
     compared; leaf values and the split gain are copied out of the record.
     See the contraction note in the module docstring.
+
+    Two outputs beyond the tables, both added by the wiring lane:
+
+    `step` is the step descriptor (`gpu_active_rows`'s `STEP_*` layout), the
+    flat row the row partition and the child histogram read instead of taking
+    their arguments from the host. It is the whole of what makes a
+    device-owned tree possible: without it the host would have to read the
+    commit back before it could enqueue the work the commit implies, which is
+    the round trip this lane exists to remove. **Every exit writes
+    `STEP_LIVE`**, and the three that commit nothing write it as zero, so a
+    step enqueued past the end of growth reads one word and does nothing.
+    That is what lets a whole tree's launches be enqueued before growth has
+    decided how many splits there will be.
+
+    `order` is the commit log: `order[k]` is the node id split by the k-th
+    commit. It exists for one narrow reason and it is worth stating, because
+    the reason is not obvious. The host tree stores a categorical node's
+    category set in a flat side pool addressed by an offset, and
+    `Tree._set_split` appends to that pool in *commit* order, while a reader
+    decoding the device node table would naturally walk it in *node id*
+    order. Under leaf-wise growth those two orders differ (the root splits
+    into 1 and 2, then 2 may split before 1), so a decode that ignored the
+    log would build a tree whose `cat_offset` values differed from the host's
+    even though every routing decision was identical. The log costs one Int32
+    per commit and removes that discrepancy entirely.
     """
     var tid = Int(thread_idx.x)
     var n_live = Int(ctr[unsafe_offset=CTR_N_LIVE][0])
@@ -866,6 +929,7 @@ def _pick_and_commit_kernel(
             ctr[unsafe_offset=CTR_PICK] = Int32(-1)
             ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
             ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_BUDGET_SPENT)
+            step[unsafe_offset=STEP_LIVE] = Int32(0)
         return
 
     # Phase 2: this thread's best over its strided share of the frontier.
@@ -923,6 +987,7 @@ def _pick_and_commit_kernel(
         ctr[unsafe_offset=CTR_PICK] = Int32(-1)
         ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
         ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_NO_CANDIDATE)
+        step[unsafe_offset=STEP_LIVE] = Int32(0)
         return
 
     var slot = Int(best)
@@ -957,6 +1022,7 @@ def _pick_and_commit_kernel(
         ctr[unsafe_offset=CTR_PICK] = Int32(-1)
         ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
         ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_OVERFLOW)
+        step[unsafe_offset=STEP_LIVE] = Int32(0)
         return
 
     # The histogram slot pool, device side. `acquire` takes the lowest free
@@ -975,6 +1041,7 @@ def _pick_and_commit_kernel(
         ctr[unsafe_offset=CTR_PICK] = Int32(-1)
         ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
         ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_POOL_FULL)
+        step[unsafe_offset=STEP_LIVE] = Int32(0)
         return
 
     # `Tree._set_split` on the parent, field for field.
@@ -1086,14 +1153,205 @@ def _pick_and_commit_kernel(
     front[unsafe_offset = no + FRONT_HIST_SLOT] = Int32(right_slot)
     front[unsafe_offset = no + FRONT_RECORD] = Int32(n_live)
 
+    # The step descriptor. Written last, after every table this commit
+    # touches, so that a reader of `STEP_LIVE` on the same queue is reading a
+    # descriptor whose tables are already consistent with it. The queue is in
+    # order and this is one thread, so that ordering is the program order
+    # above and needs no fence.
+    #
+    # Every word is written on every commit. Nothing is inherited from the
+    # step before, which matters because a step that commits nothing leaves
+    # the row untouched apart from `STEP_LIVE`, and a reader that skipped the
+    # liveness check would then act on a stale split.
+    step[unsafe_offset=STEP_LIVE] = Int32(1)
+    step[unsafe_offset=STEP_ROW_BEGIN] = Int32(begin)
+    step[unsafe_offset=STEP_ROW_COUNT] = n_left + n_right
+    step[unsafe_offset=STEP_FEATURE] = feature
+    step[unsafe_offset=STEP_IS_CAT] = Int32(1) if is_cat else Int32(0)
+    if is_cat:
+        # A categorical node routes only by its set, so the three numerical
+        # routing words are the neutral values `_row_goes_left` ignores: no
+        # threshold can match, no bin equals -1, and no row takes a default
+        # direction.
+        step[unsafe_offset=STEP_THRESHOLD] = Int32(-1)
+        step[unsafe_offset=STEP_MISSING_BIN] = Int32(-1)
+        step[unsafe_offset=STEP_DEFAULT_LEFT] = Int32(0)
+    else:
+        step[unsafe_offset=STEP_THRESHOLD] = rec_i[
+            unsafe_offset = ri + IREC_BIN
+        ][0]
+        step[unsafe_offset=STEP_MISSING_BIN] = missing[
+            unsafe_offset = Int(feature)
+        ][0]
+        var sdl = Int32(0)
+        if (flags & Int32(FLAG_DEFAULT_LEFT)) != Int32(0):
+            sdl = Int32(1)
+        step[unsafe_offset=STEP_DEFAULT_LEFT] = sdl
+    for w in range(CAT_WORDS):
+        # Copied whether or not the split is categorical, because a stale
+        # category set behind a `STEP_IS_CAT` of zero is exactly the kind of
+        # thing that becomes a fault the day a reader stops checking the flag.
+        step[unsafe_offset = STEP_CAT0 + w] = rec_i[
+            unsafe_offset = ri + IREC_CAT0 + w
+        ][0]
+    # The built child is the one accumulated from its own rows; the derived
+    # one is subtracted out of the parent's slot. `build_left` was decided
+    # above by the same `n_left <= n_right` integer comparison every other
+    # grower in this package uses.
+    if build_left:
+        step[unsafe_offset=STEP_BUILT_BEGIN] = Int32(begin)
+        step[unsafe_offset=STEP_BUILT_COUNT] = n_left
+    else:
+        step[unsafe_offset=STEP_BUILT_BEGIN] = Int32(begin) + n_left
+        step[unsafe_offset=STEP_BUILT_COUNT] = n_right
+    step[unsafe_offset=STEP_BUILT_SLOT] = Int32(built_slot)
+    step[unsafe_offset=STEP_SUB_SLOT] = Int32(parent_slot)
+    step[unsafe_offset=STEP_LEFT_SLOT] = Int32(left_slot)
+    step[unsafe_offset=STEP_RIGHT_SLOT] = Int32(right_slot)
+    # The record slots the children's searches must end up in, which are the
+    # frontier's own record indices: the left child kept the parent's and the
+    # right child took `n_live`.
+    step[unsafe_offset=STEP_LEFT_REC] = Int32(rec)
+    step[unsafe_offset=STEP_RIGHT_REC] = Int32(n_live)
+
+    var commits = Int(ctr[unsafe_offset=CTR_COMMITS][0])
+    if commits < Int(leaf_capacity):
+        order[unsafe_offset=commits] = Int32(parent)
     ctr[unsafe_offset=CTR_NEXT_NODE] = Int32(next_node + 2)
     ctr[unsafe_offset=CTR_N_LIVE] = Int32(n_live + 1)
     ctr[unsafe_offset=CTR_PICK] = Int32(slot)
     ctr[unsafe_offset=CTR_PICK_NODE] = Int32(parent)
     ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_RUNNING)
-    ctr[unsafe_offset=CTR_COMMITS] = ctr[unsafe_offset=CTR_COMMITS][0] + Int32(
-        1
-    )
+    ctr[unsafe_offset=CTR_COMMITS] = Int32(commits + 1)
+
+
+def _seed_root_value_kernel(
+    node_f: MutPointer[Float32, MutAnyOrigin],
+    rec_f: MutPointer[Float32, MutAnyOrigin],
+    record: Int32,
+):
+    """Copy the root's Newton value out of its search record into node 0.
+
+    One thread, one Float32, and it exists only because of *when* the root's
+    value is known. `Tree._add_node` creates the root with a value of 0.0 and
+    the grower overwrites it with `root_rec.parent_value` after the root's
+    search comes home; on the host path that overwrite is free, because the
+    record is already on the host. On a device-owned tree the record never
+    comes to the host, so the copy has to happen where the record is.
+
+    `begin_tree` still takes a `root_value` argument for callers that have
+    one (the test file builds trees with no search behind them at all). This
+    kernel is what a caller uses when it does not, and it is a copy with no
+    arithmetic, so the value node 0 ends up holding is bit for bit the Float32
+    the search wrote.
+    """
+    node_f[unsafe_offset = TN_VALUE] = rec_f[
+        unsafe_offset = Int(record) * SPLIT_FWORDS + FREC_PARENT_VALUE
+    ][0]
+
+
+def _stage_child_search_kernel(
+    node_tbl: MutPointer[Int32, MutAnyOrigin],
+    step: MutPointer[Int32, MutAnyOrigin],
+    slot_cells: Int32,
+    left_record: Int32,
+    right_record: Int32,
+):
+    """Point the two scratch search records at the children's histogram slots.
+
+    The split searcher reads a per-record table whose only per-node word that
+    varies within one tree, once monotone intervals and per-node feature
+    draws are refused, is `NODE_HIST_BASE`: where in the resident pool that
+    record's histogram starts. Everything else in that table
+    (`NODE_SLOTS`, the feature list, the allow mask, the float parameter
+    block) is a property of the tree and is staged once by the host before
+    the first split.
+
+    So this kernel is the whole of holdout three's device half: two Int32
+    writes that say "search these two slots", derived from the commit that
+    just happened. Without it the host would have to know the slots, and the
+    slots are chosen by the commit kernel from a device-resident pool.
+
+    `left_record` and `right_record` are the two *scratch* record slots the
+    search launch writes, which are host constants because a launch's record
+    range is a host-side argument. They are not the frontier's record slots;
+    `_copy_records_kernel` moves the answers into those afterwards.
+
+    A dead step writes nothing, so the searcher's table keeps whatever it
+    last held and the search that follows re-searches the previous step's
+    slots into scratch records nothing will read. That is wasted work on a
+    tree that stopped early and it is deliberately preferred to a branchier
+    alternative: the copy that would have propagated those records is guarded
+    by the same liveness word, so nothing stale can reach the frontier.
+    """
+    if step[unsafe_offset=STEP_LIVE][0] == Int32(0):
+        return
+    node_tbl[
+        unsafe_offset = Int(left_record) * NODE_WORDS + NODE_HIST_BASE
+    ] = step[unsafe_offset=STEP_LEFT_SLOT][0] * slot_cells
+    node_tbl[
+        unsafe_offset = Int(right_record) * NODE_WORDS + NODE_HIST_BASE
+    ] = step[unsafe_offset=STEP_RIGHT_SLOT][0] * slot_cells
+
+
+def _copy_records_kernel(
+    rec_i: MutPointer[Int32, MutAnyOrigin],
+    rec_f: MutPointer[Float32, MutAnyOrigin],
+    step: MutPointer[Int32, MutAnyOrigin],
+    left_record: Int32,
+    right_record: Int32,
+):
+    """Move the two scratch search records into the frontier slots that own
+    them.
+
+    A search launch writes a *consecutive* range of record slots, because
+    `record_base` and `n_records` are host arguments. The two children of a
+    committed split do not occupy consecutive frontier slots: the left child
+    keeps the parent's slot, which can be anywhere, and the right child is
+    appended at the end. Reconciling those two facts without a host round
+    trip is what this kernel is for. The search always writes one fixed pair
+    of scratch records, and this copies each into the record slot its
+    frontier leaf reads, which the commit recorded as `STEP_LEFT_REC` and
+    `STEP_RIGHT_REC`.
+
+    A record is `SPLIT_IWORDS` Int32 and `SPLIT_FWORDS` Float32, thirty-four
+    words in all, so the copy is small enough for one narrow threadgroup and
+    is written as a strided walk rather than as two serial loops on thread
+    zero.
+
+    Every word is copied, and none is interpreted. In particular no float is
+    read as a float: they are moved by assignment, so nothing here can round,
+    contract, or reorder anything. That is the same discipline the commit
+    kernel keeps and for the same reason (`docs/NUMERICS.md`).
+
+    A dead step copies nothing, which is what leaves the frontier holding the
+    records it already had when growth has stopped.
+    """
+    if step[unsafe_offset=STEP_LIVE][0] == Int32(0):
+        return
+    var dst_l = Int(step[unsafe_offset=STEP_LEFT_REC][0])
+    var dst_r = Int(step[unsafe_offset=STEP_RIGHT_REC][0])
+    var src_l = Int(left_record)
+    var src_r = Int(right_record)
+    var tid = Int(thread_idx.x)
+    var w = tid
+    while w < SPLIT_IWORDS:
+        rec_i[unsafe_offset = dst_l * SPLIT_IWORDS + w] = rec_i[
+            unsafe_offset = src_l * SPLIT_IWORDS + w
+        ][0]
+        rec_i[unsafe_offset = dst_r * SPLIT_IWORDS + w] = rec_i[
+            unsafe_offset = src_r * SPLIT_IWORDS + w
+        ][0]
+        w += PICK_THREADS
+    w = tid
+    while w < SPLIT_FWORDS:
+        rec_f[unsafe_offset = dst_l * SPLIT_FWORDS + w] = rec_f[
+            unsafe_offset = src_l * SPLIT_FWORDS + w
+        ][0]
+        rec_f[unsafe_offset = dst_r * SPLIT_FWORDS + w] = rec_f[
+            unsafe_offset = src_r * SPLIT_FWORDS + w
+        ][0]
+        w += PICK_THREADS
 
 
 # --- Host-side owner ------------------------------------------------------
@@ -1132,6 +1390,19 @@ struct DeviceTreeTables(Movable):
     var ctr_dev: DeviceBuffer[DType.int32]
     var slot_dev: DeviceBuffer[DType.int32]
     var missing_dev: DeviceBuffer[DType.int32]
+    # `order[k]` is the node id split by the k-th commit. Read once per tree
+    # by `download`, and used by `tree_from_snapshot` to append categorical
+    # sets in the order the host tree would have appended them. See
+    # `_pick_and_commit_kernel` for why that order is not the node id order.
+    var order_dev: DeviceBuffer[DType.int32]
+    # A step descriptor of this struct's own, used only by the `enqueue_step`
+    # overload that is handed none. The wiring path passes the descriptor
+    # buffer that `GpuActiveRows` owns, because that is the buffer the
+    # partition and histogram kernels are launched against; this one exists so
+    # that a caller exercising the commit kernel on its own -- which is what
+    # the test file does -- does not have to construct a `GpuActiveRows` to
+    # get a pointer. Eight words. It is never read by any other kernel.
+    var step_scratch: DeviceBuffer[DType.int32]
 
     # Pinned staging, so a reset and a download are ordinary asynchronous
     # copies rather than `map_to_host` mappings, each of which blocks until
@@ -1157,6 +1428,7 @@ struct DeviceTreeTables(Movable):
     var host_node_f: HostBuffer[DType.float32]
     var host_ctr: HostBuffer[DType.int32]
     var host_slot: HostBuffer[DType.int32]
+    var host_order: HostBuffer[DType.int32]
 
     def __init__(
         out self,
@@ -1212,6 +1484,12 @@ struct DeviceTreeTables(Movable):
         self.missing_dev = self.ctx.enqueue_create_buffer[DType.int32](
             n_features
         )
+        self.order_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            self.leaf_capacity
+        )
+        self.step_scratch = self.ctx.enqueue_create_buffer[DType.int32](
+            STEP_WORDS
+        )
 
         self.stage_front = self.ctx.enqueue_create_host_buffer[DType.int32](
             self.leaf_capacity * FRONT_WORDS
@@ -1243,6 +1521,9 @@ struct DeviceTreeTables(Movable):
         self.host_slot = self.ctx.enqueue_create_host_buffer[DType.int32](
             self.pool_capacity
         )
+        self.host_order = self.ctx.enqueue_create_host_buffer[DType.int32](
+            self.leaf_capacity
+        )
 
         # The per-feature missing-bin table, uploaded once. -1 is the "this
         # feature has no missing bin" value every other routing site in the
@@ -1260,7 +1541,11 @@ struct DeviceTreeTables(Movable):
         self.ctx.synchronize()
 
     def begin_tree(
-        mut self, n_active: Int, root_slot: Int = 0, root_value: Float32 = 0.0
+        mut self,
+        n_active: Int,
+        root_slot: Int = 0,
+        root_value: Float32 = 0.0,
+        wait: Bool = True,
     ) raises:
         """Reset to a one-leaf frontier whose root owns `[0, n_active)`.
 
@@ -1288,6 +1573,18 @@ struct DeviceTreeTables(Movable):
         earlier form shared one staging buffer and had to drain between
         copies, which is both five times the waits and, when a drain was
         omitted, a frontier row silently overwritten by node-table words.
+
+        `wait` is the one synchronization this call makes, and a device-owned
+        growth loop passes False to remove it. That is safe under exactly one
+        condition, which is worth stating rather than assuming: the staging
+        buffers must not be refilled before the copies reading them have
+        finished, and the only thing that refills them is the *next*
+        `begin_tree`. A caller that downloads the tree at the end of every
+        tree therefore already has a synchronization between any two
+        `begin_tree` calls, and the wait here is redundant for it. A caller
+        that does not must leave `wait` alone. It defaults to True so every
+        existing caller, the test file included, keeps the behavior it was
+        written against.
         """
         if n_active < 0:
             raise Error("active row count must be nonnegative")
@@ -1355,7 +1652,8 @@ struct DeviceTreeTables(Movable):
         self.ctx.enqueue_copy(
             dst_buf=self.slot_dev, src_ptr=self.stage_slot.unsafe_ptr()
         )
-        self.ctx.synchronize()
+        if wait:
+            self.ctx.synchronize()
 
     def stage_frontier(
         mut self, leaves: List[DeviceLeafRow], next_node: Int
@@ -1449,6 +1747,77 @@ struct DeviceTreeTables(Movable):
         max_depth: Int,
         min_data_in_leaf: Int,
     ) raises:
+        """One pick-and-commit step, writing the descriptor into this
+        struct's own scratch buffer.
+
+        The overload for a caller that only wants the commit: it exercises
+        the same kernel and leaves the same tables, and the descriptor it
+        writes goes somewhere nothing else reads. A device-owned growth loop
+        uses the other overload and hands in the descriptor buffer the row
+        partition and the child histogram are launched against, since a
+        descriptor no kernel reads would leave those two with nothing to
+        route by.
+
+        The launch is written out rather than delegated to the other
+        overload, and that is a language constraint rather than a taste:
+        passing `self.step_scratch.unsafe_ptr()` to a method that also takes
+        `self` mutably is an aliasing the compiler correctly refuses. Inside
+        one method body the two are disjoint borrows and the launch is fine,
+        which is why every other launch in this file reads the same way.
+        """
+        self._check_step_args(num_leaves, min_data_in_leaf)
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_pick_and_commit_kernel](
+                self.front_dev.unsafe_ptr(),
+                self.node_i_dev.unsafe_ptr(),
+                self.node_f_dev.unsafe_ptr(),
+                self.ctr_dev.unsafe_ptr(),
+                self.slot_dev.unsafe_ptr(),
+                self.missing_dev.unsafe_ptr(),
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                self.step_scratch.unsafe_ptr(),
+                self.order_dev.unsafe_ptr(),
+                Int32(num_leaves),
+                Int32(max_depth),
+                Int32(min_data_in_leaf),
+                Int32(self.pool_capacity),
+                Int32(self.leaf_capacity),
+                Int32(self.node_capacity),
+                grid_dim=1,
+                block_dim=PICK_THREADS,
+            )
+
+    def _check_step_args(
+        self, num_leaves: Int, min_data_in_leaf: Int
+    ) raises:
+        """The preconditions both `enqueue_step` overloads share."""
+        if num_leaves < 2:
+            raise Error("a leaf budget of at least two is required")
+        if num_leaves > self.leaf_capacity:
+            raise Error(
+                "the leaf budget exceeds the capacity these tables were"
+                " sized for"
+            )
+        if min_data_in_leaf < 0:
+            raise Error("min_data_in_leaf must be nonnegative")
+
+    def enqueue_step[
+        step_origin: MutOrigin, //
+    ](
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        step: MutPointer[Int32, step_origin],
+        num_leaves: Int,
+        max_depth: Int,
+        min_data_in_leaf: Int,
+    ) raises:
         """Enqueue one pick-and-commit step. Does not transfer and does not
         synchronize.
 
@@ -1469,16 +1838,14 @@ struct DeviceTreeTables(Movable):
         `num_leaves - 1` of these, all of which can sit in the queue behind
         the histogram and search work they depend on, where today each of
         them is a host round trip.
+
+        `step` is the descriptor buffer the row partition and the child
+        histogram will be launched against, which on the wired path is the one
+        `GpuActiveRows` owns. Handing it in rather than owning it here is what
+        keeps the coupling between the two modules to a single flat row of
+        Int32 with a layout stated in one place.
         """
-        if num_leaves < 2:
-            raise Error("a leaf budget of at least two is required")
-        if num_leaves > self.leaf_capacity:
-            raise Error(
-                "the leaf budget exceeds the capacity these tables were"
-                " sized for"
-            )
-        if min_data_in_leaf < 0:
-            raise Error("min_data_in_leaf must be nonnegative")
+        self._check_step_args(num_leaves, min_data_in_leaf)
         comptime if not has_accelerator():
             raise Error(
                 "the device tree tables need an accelerator; this binary was"
@@ -1494,12 +1861,114 @@ struct DeviceTreeTables(Movable):
                 self.missing_dev.unsafe_ptr(),
                 rec_i.unsafe_ptr(),
                 rec_f.unsafe_ptr(),
+                step,
+                self.order_dev.unsafe_ptr(),
                 Int32(num_leaves),
                 Int32(max_depth),
                 Int32(min_data_in_leaf),
                 Int32(self.pool_capacity),
                 Int32(self.leaf_capacity),
                 Int32(self.node_capacity),
+                grid_dim=1,
+                block_dim=PICK_THREADS,
+            )
+
+    def enqueue_seed_root_value(
+        mut self, mut rec_f: DeviceBuffer[DType.float32], record: Int = 0
+    ) raises:
+        """Copy the root's own Newton value out of record `record`. One
+        launch, one thread, no transfer and no synchronization.
+
+        The device-owned equivalent of `_device_search_resident`'s
+        `tree.value[root] = root_rec.parent_value`, which is the one thing the
+        host does with the root's record besides deciding whether the root can
+        split at all. See `_seed_root_value_kernel`.
+        """
+        if record < 0:
+            raise Error("record index must be nonnegative")
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_seed_root_value_kernel](
+                self.node_f_dev.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                Int32(record),
+                grid_dim=1,
+                block_dim=1,
+            )
+
+    def enqueue_stage_child_search[
+        step_origin: MutOrigin, //
+    ](
+        mut self,
+        mut node_tbl: DeviceBuffer[DType.int32],
+        step: MutPointer[Int32, step_origin],
+        slot_cells: Int,
+        left_record: Int,
+        right_record: Int,
+    ) raises:
+        """Point the searcher's two scratch records at the children's slots.
+
+        `node_tbl` is `GpuSplitSearcher.node_dev` and `slot_cells` is
+        `3 * n_features * n_bins`, the resident pool's slot stride, which is
+        the same unit `enqueue_frontier` multiplies a `hist_slot` by. This is
+        the only write to that table inside a tree on the device-owned path:
+        everything else in it is staged once by the host before the first
+        split, which is what the module docstring's third holdout is about.
+        """
+        if slot_cells < 1:
+            raise Error("the pool slot stride must be positive")
+        if left_record < 0 or right_record < 0:
+            raise Error("record indices must be nonnegative")
+        if left_record == right_record:
+            raise Error("the two scratch records must differ")
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_stage_child_search_kernel](
+                node_tbl.unsafe_ptr(),
+                step,
+                Int32(slot_cells),
+                Int32(left_record),
+                Int32(right_record),
+                grid_dim=1,
+                block_dim=1,
+            )
+
+    def enqueue_copy_records[
+        step_origin: MutOrigin, //
+    ](
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        step: MutPointer[Int32, step_origin],
+        left_record: Int,
+        right_record: Int,
+    ) raises:
+        """Move the two scratch records into the frontier slots that own them.
+        See `_copy_records_kernel` for why the indirection exists at all."""
+        if left_record < 0 or right_record < 0:
+            raise Error("record indices must be nonnegative")
+        if left_record == right_record:
+            raise Error("the two scratch records must differ")
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_copy_records_kernel](
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                step,
+                Int32(left_record),
+                Int32(right_record),
                 grid_dim=1,
                 block_dim=PICK_THREADS,
             )
@@ -1525,6 +1994,9 @@ struct DeviceTreeTables(Movable):
         )
         self.ctx.enqueue_copy(
             dst_ptr=self.host_slot.unsafe_ptr(), src_buf=self.slot_dev
+        )
+        self.ctx.enqueue_copy(
+            dst_ptr=self.host_order.unsafe_ptr(), src_buf=self.order_dev
         )
         self.ctx.synchronize()
 
@@ -1575,4 +2047,144 @@ struct DeviceTreeTables(Movable):
         var s = self.host_slot.unsafe_ptr()
         for i in range(self.pool_capacity):
             out.slot_owner.append(Int(s.unsafe_load(i)))
+
+        var o = self.host_order.unsafe_ptr()
+        var n_commits = out.commits
+        if n_commits > self.leaf_capacity:
+            n_commits = self.leaf_capacity
+        for k in range(n_commits):
+            out.commit_order.append(Int(o.unsafe_load(k)))
         return out^
+
+
+# --- Decoding a snapshot into the tree the host would have grown -----------
+
+
+def tree_from_snapshot(snap: TreeTablesSnapshot) raises -> Tree:
+    """The `Tree` the host grower would have built from the same commits.
+
+    This is the one place a device-owned tree becomes an ordinary model, and
+    it is a transcription rather than a construction: every field below is
+    read out of a node row that a device kernel wrote, and nothing is
+    recomputed. Written as an argument, field by field, because it is the
+    only part of the device-owned path that a reader can check against
+    `tree.Tree` directly.
+
+        Tree field        device source                    why it is equal
+        ----------        -------------                    ---------------
+        feature           TN_FEATURE                       `_set_split` writes
+                                                           `split.feature`;
+                                                           the commit kernel
+                                                           writes the record's
+                                                           feature, which is
+                                                           what `to_split_info`
+                                                           puts in `split`.
+        threshold_bin     TN_THRESHOLD                     both -1 on a leaf
+                                                           and on a categorical
+                                                           node, both the
+                                                           record's bin
+                                                           otherwise.
+        left / right      TN_LEFT / TN_RIGHT               both assign the two
+                                                           ids consecutively,
+                                                           left first.
+        value             TN_VALUE widened                 the host stores the
+                                                           record's Float32
+                                                           child value in a
+                                                           Float64 field, which
+                                                           is a widening and so
+                                                           is exact; the same
+                                                           Float32 widened here
+                                                           is the same Float64.
+        split_gain        TN_SPLIT_GAIN widened            same argument.
+        default_left      TN_DEFAULT_LEFT                  same flag bit.
+        missing_bin       TN_MISSING_BIN                   both read the same
+                                                           per-feature table
+                                                           at the split
+                                                           feature, and both
+                                                           force -1 on a
+                                                           categorical node.
+        count             TN_COUNT widened                 the host writes
+                                                           `Float64(n_left)`
+                                                           from the record's
+                                                           integer count; this
+                                                           widens the same
+                                                           integer.
+        cat_offset /      TN_CAT0.. in commit order        see below.
+        cat_bitset
+
+    **Why the commit order matters.** `Tree._set_split` appends a categorical
+    node's 256-bit set to a flat pool and records the offset, so the offsets
+    a tree carries depend on the order its nodes were split, which under
+    leaf-wise growth is not the order of their ids. Walking the node table in
+    id order would therefore produce a tree that routed identically and whose
+    `cat_offset` array differed, which is a difference a structural comparison
+    would report and a prediction comparison would not. `snap.commit_order`
+    is the device's log of that order and this walks it.
+
+    **What is not checked here.** That the snapshot is internally consistent;
+    `TreeTablesSnapshot.check_invariants` is that check and it is the
+    caller's to run. This function assumes a well-formed snapshot and will
+    build a nonsense tree from a malformed one rather than raising, which is
+    the same contract the host grower has with its own frontier.
+    """
+    var n_nodes = snap.next_node
+    if n_nodes < 1:
+        raise Error("a tree snapshot holds at least the root")
+    if n_nodes > len(snap.nodes):
+        raise Error("the snapshot's node table is shorter than its counter")
+
+    var feature = List[Int](capacity=n_nodes)
+    var threshold_bin = List[Int](capacity=n_nodes)
+    var left = List[Int](capacity=n_nodes)
+    var right = List[Int](capacity=n_nodes)
+    var value = List[Float64](capacity=n_nodes)
+    var split_gain = List[Float64](capacity=n_nodes)
+    var default_left = List[Bool](capacity=n_nodes)
+    var missing_bin = List[Int](capacity=n_nodes)
+    var cat_offset = List[Int](capacity=n_nodes)
+    var count = List[Float64](capacity=n_nodes)
+    var cat_bitset = List[UInt64]()
+
+    for n in range(n_nodes):
+        var row = snap.nodes[n].copy()
+        feature.append(row.feature)
+        threshold_bin.append(row.threshold_bin)
+        left.append(row.left)
+        right.append(row.right)
+        value.append(Float64(row.value))
+        split_gain.append(Float64(row.split_gain))
+        default_left.append(row.default_left)
+        missing_bin.append(row.missing_bin)
+        count.append(Float64(row.count))
+        cat_offset.append(-1)
+
+    # The category pool, in commit order, exactly as `Tree._set_split` fills
+    # it. A node that is not categorical contributes nothing and keeps the
+    # -1 written above, which is what the whole array holds for a model with
+    # no categorical features.
+    for k in range(len(snap.commit_order)):
+        var node = snap.commit_order[k]
+        if node < 0 or node >= n_nodes:
+            raise Error("the commit log names a node outside the tree")
+        var row = snap.nodes[node].copy()
+        if not row.is_categorical:
+            continue
+        cat_offset[node] = len(cat_bitset)
+        var bits = row.cat_bitset()
+        for w in range(CAT_BITSET_WORDS):
+            cat_bitset.append(bits[w])
+
+    return Tree(
+        feature^,
+        threshold_bin^,
+        left^,
+        right^,
+        value^,
+        split_gain^,
+        snap.n_live,
+        default_left^,
+        missing_bin^,
+        cat_offset^,
+        cat_bitset^,
+        count^,
+    )
