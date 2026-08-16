@@ -40,9 +40,8 @@ bins, it gets an edge between every adjacent pair and the boundaries are not
 consulted at all: one bin per level, whatever each level's population, and
 the rest of the budget left unspent. That is LightGBM's `GreedyFindBin` in
 the `num_distinct_values <= max_bin` case at `min_data_in_bin` of 1, which is
-the minimum-population rule this binner has for numerical features (see
-docs/LIGHTGBM_PARITY.md; LightGBM's default of 3 would merge some of those
-levels back together).
+this binner's default (see `min_data_in_bin` below, and
+docs/LIGHTGBM_PARITY.md).
 
 `collect_distinct` answers the question for the dense fit and
 `distinct_levels_sorted` for the sparse one, which has sorted its stored
@@ -63,11 +62,68 @@ Full parity is still a further step, and stops at the same place it did.
 Past the bin budget LightGBM keeps counting, and spends the counts: a value
 populous enough to deserve a bin of its own takes one (`is_big_count_value`),
 and the target bin size is recomputed from what budget is left as it goes.
-This binner uses quantile boundaries there. Doing it LightGBM's way needs
-distinct values with counts for every column, which LightGBM affords by
-binning a sample of at most `bin_construct_sample_cnt` rows rather than all
-of them; that sampling is deferred here, so the counts would have to come off
-the full column.
+This binner uses quantile boundaries there, capped as LightGBM caps them (see
+`min_data_in_bin` below), and does not implement the big-count rule.
+
+min_data_in_bin
+---------------
+LightGBM's minimum population for a numerical bin, verified against
+`GreedyFindBin` in `src/io/bin.cpp` on LightGBM master rather than against
+any description of it. It enters in two places and this binner honors both:
+
+- In the `num_distinct_values <= max_bin` branch, LightGBM walks the levels
+  in order accumulating their counts and cuts only once the accumulator has
+  reached `min_data_in_bin`, resetting it at each cut. So adjacent levels are
+  merged until they hold enough rows between them, and the last bin may hold
+  fewer (nothing merges backwards). The levels path here does exactly that.
+- In the other branch, LightGBM first shrinks the budget itself:
+  `max_bin = max(1, min(max_bin, total_cnt / min_data_in_bin))`. The quantile
+  path here applies the same cap to `n_ordinary`, which puts at least
+  `min_data_in_bin` values in the average bin. What it does *not* do is
+  LightGBM's per-level greedy inside that budget, which is the same gap the
+  paragraph above names.
+
+The default is 1, not LightGBM's 3, and 1 is the value at which **both
+branches are the code they were before this option existed**: at 1 every
+level's count already clears the accumulator, so the levels path cuts between
+every adjacent pair, and `total_cnt / 1` never binds because the quantile
+branch is only reached when there are more distinct values than bins. Both
+are guarded on `min_data_in_bin <= 1` so that the default runs the same
+instructions rather than the same arithmetic.
+
+Counting the levels costs a pass over the column with a search of at most
+`log2(256)` steps per value, and it is paid only by a low-cardinality column
+under a `min_data_in_bin` above 1. Nothing pays it by default.
+
+Fitting from a sample
+---------------------
+`bin_construct_sample_cnt` fits the edges from a subsample of the rows rather
+than from all of them, which is what LightGBM does (its own default is
+200,000). 0, the default here, means every row and is the path this module
+has always taken. A positive value at or above `n_rows` also means every row.
+
+The sample is a set of row indices drawn **once per fit**, before any feature
+is touched, and every feature is fit from the same rows -- LightGBM samples
+rows, not values. It is drawn by Knuth's selection sampling with a
+counter-based splitmix64 draw per row (`rng.uniform(seed * GOLDEN + r)`), so
+the draw for row r does not depend on how many rows were selected before it,
+the result is exactly `bin_construct_sample_cnt` indices in ascending order,
+and it is identical at every worker count and on every machine on this
+toolchain. It does not reproduce LightGBM's own indices: LightGBM draws from
+a 32-bit LCG in `include/LightGBM/utils/random.h` seeded by
+`data_random_seed`, and matching that stream is a separate promise this
+module does not make.
+
+Two consequences, both of them LightGBM's too, and both real:
+
+- A level that no sampled row carries is not a level the fit can see, so a
+  rare value can lose the bin it would have had. That is the whole trade.
+- Missingness is decided from the sample as well: a column whose only `NaN`s
+  fall outside the sample reserves no missing bin, and `transform` then bins
+  those `NaN`s as 0.0 (the `missing_type = None` rule below).
+
+Categorical features are unaffected: `categorical.fit_categorical_spec` fits
+its tables from the full column, so a sampled fit cannot lose a category.
 
 Missing values
 --------------
@@ -172,6 +228,7 @@ from .parallel import (
     dispatch_feature_rows,
     dispatch_features,
 )
+from .rng import GOLDEN, uniform
 from .tree_parameters_extra import ForcedSplits
 
 
@@ -195,6 +252,26 @@ comptime MAX_EDGE = 1e300
 # narrows to `UInt8` while `BinMapper.bin_value` returns an `Int`: above it
 # the two disagree silently, by a whole leaf rather than by a rounding step.
 comptime MAX_BINS = 256
+
+comptime DEFAULT_MIN_DATA_IN_BIN = 1
+"""`fit_bins`'s minimum population for a numerical bin.
+
+LightGBM's own default is 3. This one is 1, which is the value at which the
+levels path cuts between every adjacent level and the quantile budget is
+never capped -- that is, the binning this module has always produced. Raising
+it is a model change and is therefore the caller's to ask for; see the module
+docstring."""
+
+comptime DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT = 0
+"""Rows `fit_bins` fits its edges from, 0 meaning every row.
+
+LightGBM's own default is 200,000. This one is 0, which is the full-column
+fit this module has always performed."""
+
+comptime DEFAULT_DATA_RANDOM_SEED = 1
+"""LightGBM's `data_random_seed`, which seeds its bin-construction sample.
+The name and the default are carried over; the stream is not (see the module
+docstring)."""
 
 
 def _avoid_inf(x: Float64) -> Float64:
@@ -611,6 +688,97 @@ def distinct_levels_sorted(
             return False
         out.append(v)
     return True
+
+
+def count_levels(
+    col: List[Float64],
+    n_valid: Int,
+    levels: List[Float64],
+    mut counts: List[Int],
+):
+    """`counts[j]` = how many of `col[0, n_valid)` equal `levels[j]`.
+
+    `levels` is what `collect_distinct` returned for this same column, so it
+    is ascending and every value in the column is one of its entries; the
+    search below therefore always lands inside the array and the counts sum
+    to `n_valid`. This is the one thing `min_data_in_bin` needs that
+    `collect_distinct` does not already produce, and it is computed here
+    rather than inside that scan so that a fit at the default
+    `min_data_in_bin` of 1 pays nothing for an option it is not using.
+
+    `-0.0` needs no normalizing on the way in: it compares equal to `0.0`,
+    which is the entry `collect_distinct` stored, so the search converges on
+    the same slot for both signs.
+
+    Non-raising, because the dense fitter calls this from inside a worker
+    closure that cannot raise.
+    """
+    counts.clear()
+    var m = len(levels)
+    if m <= 0 or n_valid <= 0:
+        return
+    counts.resize(m, 0)
+    var lp = levels.unsafe_ptr()
+    var np = counts.unsafe_ptr()
+    var vp = col.unsafe_ptr()
+    for i in range(n_valid):
+        var v = vp.unsafe_load(i)
+        # First index whose level is not below `v`, which is `v`'s own level.
+        # At most `log2(MAX_BINS)` steps over a table that fits in L1.
+        var left = 0
+        var right = m
+        while left < right:
+            var mid = (left + right) // 2
+            if lp.unsafe_load(mid) < v:
+                left = mid + 1
+            else:
+                right = mid
+        if left < m:
+            np.unsafe_store(left, np.unsafe_load(left) + 1)
+
+
+def bin_construct_sample_rows(
+    n_rows: Int, sample_cnt: Int, seed: Int
+) raises -> List[Int]:
+    """The rows a sampled edge fit reads, ascending, or empty for "every row".
+
+    Knuth's selection sampling: row r of the `left` still to be considered is
+    taken when `uniform < need / left`, which selects exactly `sample_cnt`
+    rows in one pass and in ascending order. The `need >= left` shortcut at
+    the end is what makes "exactly" true rather than "in expectation".
+
+    Determinism, which is the property this has to have. The draw for row r is
+    `uniform(seed * GOLDEN + r)`, a counter-based splitmix64 draw that depends
+    on r alone: it does not read a clock, a global, or a running RNG state, so
+    it is the same draw however many rows were selected before it. The loop is
+    serial and runs once per fit, before any feature is dispatched, so the
+    sample is identical at every `MOJOTREES_NUM_WORKERS`. `splitmix64` is
+    64-bit integer arithmetic and the comparison is one multiply and one
+    compare on `Float64`, with no accumulation for a compiler to reassociate,
+    so it is the same set of rows on every machine on this toolchain.
+
+    An empty result means every row, which is the caller's fast path: it is
+    returned both for `sample_cnt <= 0` and for a sample that would cover the
+    matrix anyway.
+    """
+    var out = List[Int]()
+    if n_rows < 1 or sample_cnt <= 0 or sample_cnt >= n_rows:
+        return out^
+    out.reserve(sample_cnt)
+    var base = UInt64(seed) * GOLDEN
+    var need = sample_cnt
+    for r in range(n_rows):
+        if need <= 0:
+            break
+        var left = n_rows - r
+        if need >= left:
+            out.append(r)
+            need -= 1
+            continue
+        if uniform(base + UInt64(r)) * Float64(left) < Float64(need):
+            out.append(r)
+            need -= 1
+    return out^
 
 
 def _bucket_shift(span: UInt64) -> UInt64:
@@ -1141,6 +1309,9 @@ def fit_bins[
     max_bins: Int = 255,
     categorical_features: List[Int] = [],
     use_missing: Bool = True,
+    min_data_in_bin: Int = DEFAULT_MIN_DATA_IN_BIN,
+    bin_construct_sample_cnt: Int = DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT,
+    data_random_seed: Int = DEFAULT_DATA_RANDOM_SEED,
 ) raises -> BinMapper:
     """Fit quantile (equal-frequency) bin edges on a column-major feature
     matrix. Edges are midpoints between distinct values at quantile
@@ -1154,13 +1325,26 @@ def fit_bins[
     any `NaN` reserves its highest bin for missing values and fits its edges
     over the remaining `max_bins - 1` bins from the non-missing values alone,
     so `NaN` never enters a quantile comparison. `use_missing=False` reserves
-    nothing and bins `NaN` as 0.0, matching LightGBM's `use_missing=false`."""
+    nothing and bins `NaN` as 0.0, matching LightGBM's `use_missing=false`.
+
+    `min_data_in_bin` is LightGBM's minimum population for a numerical bin
+    and `bin_construct_sample_cnt` fits the edges from a subsample of the
+    rows, seeded by `data_random_seed`. Both change which bins exist, so both
+    default to the values at which this function is the function it was
+    before they existed -- 1 and 0, meaning no minimum and every row -- rather
+    than to LightGBM's defaults of 3 and 200,000. The module docstring states
+    what each honors and what it does not.
+    """
     if max_bins < 2 or max_bins > MAX_BINS:
         raise Error("max_bins must be in [2, ", MAX_BINS, "]")
     if n_rows < 1:
         raise Error("n_rows must be positive")
     if len(features) != n_rows * n_features:
         raise Error("features length must equal n_rows * n_features")
+    if min_data_in_bin < 1:
+        raise Error("min_data_in_bin must be positive")
+    if bin_construct_sample_cnt < 0:
+        raise Error("bin_construct_sample_cnt must be non-negative")
 
     var cats = fit_categorical_spec(
         features, n_rows, n_features, categorical_features, max_bins
@@ -1182,6 +1366,17 @@ def fit_bins[
     var feat_p = features.unsafe_ptr()
     var select_min_rows = env_select_min_rows()
     ref spec = cats
+
+    # Drawn once, before any feature is dispatched, so every feature is fit
+    # from the same rows and the sample cannot depend on the worker count.
+    # Empty means every row, which is the default and keeps the column loop
+    # below the loop it has always been.
+    var sample = bin_construct_sample_rows(
+        n_rows, bin_construct_sample_cnt, data_random_seed
+    )
+    var sampled = len(sample) > 0
+    var n_sample = len(sample) if sampled else n_rows
+    var sample_p = sample.unsafe_ptr()
 
     def do_range(f_start: Int, f_end: Int) {imm}:
         # One set of scratch buffers per task rather than per feature: each is
@@ -1205,6 +1400,7 @@ def fit_bins[
         var dist_table = List[UInt64]()
         var dist_slots = List[Int]()
         var dist_vals = List[Float64]()
+        var level_counts = List[Int]()
         for f in range(f_start, f_end):
             # Categorical columns never enter quantile binning.
             if spec.is_cat(f):
@@ -1215,12 +1411,26 @@ def fit_bins[
             # to hold its missing values.
             col.clear()
             var base = f * n_rows
-            for r in range(n_rows):
-                var v = feat_p.unsafe_load(base + r)
-                if not isnan(v):
-                    col.append(v)
+            if sampled:
+                # The same rows for every feature, in ascending order, so a
+                # sampled fit differs from a full one only in which values it
+                # sees and never in the order it sees them.
+                for i in range(n_sample):
+                    var v = feat_p.unsafe_load(
+                        base + sample_p.unsafe_load(i)
+                    )
+                    if not isnan(v):
+                        col.append(v)
+            else:
+                for r in range(n_rows):
+                    var v = feat_p.unsafe_load(base + r)
+                    if not isnan(v):
+                        col.append(v)
             var n_valid = len(col)
-            var reserve = use_missing and n_valid < n_rows
+            # Missingness is decided from what was read, which is the whole
+            # column unless a sample was drawn. `n_sample == n_rows` when it
+            # was not, so this is the test it has always been.
+            var reserve = use_missing and n_valid < n_sample
             var n_ordinary = max_bins - 1 if reserve else max_bins
 
             below.clear()
@@ -1236,11 +1446,40 @@ def fit_bins[
                 # so it used to be swallowed by its neighbour however far
                 # away that neighbour was. This is LightGBM's rule for the
                 # same case.
-                for j in range(len(dist_vals) - 1):
-                    below.append(dist_vals[j])
-                    above.append(dist_vals[j + 1])
+                if min_data_in_bin <= 1:
+                    for j in range(len(dist_vals) - 1):
+                        below.append(dist_vals[j])
+                        above.append(dist_vals[j + 1])
+                else:
+                    # LightGBM's `GreedyFindBin` in the same branch: walk the
+                    # levels accumulating their counts and cut only once the
+                    # accumulator has reached the minimum, resetting it at
+                    # each cut. Adjacent levels merge until they hold enough
+                    # rows between them; the final bin keeps whatever is left,
+                    # because nothing merges backwards.
+                    count_levels(col, n_valid, dist_vals, level_counts)
+                    var acc = 0
+                    for j in range(len(dist_vals) - 1):
+                        acc += level_counts[j]
+                        if acc >= min_data_in_bin:
+                            below.append(dist_vals[j])
+                            above.append(dist_vals[j + 1])
+                            acc = 0
             else:
-                quantile_boundary_indices(n_valid, n_ordinary, idxs)
+                # LightGBM's other branch shrinks the budget before it cuts:
+                # `max_bin = max(1, min(max_bin, total_cnt / min_data_in_bin))`.
+                # At the default of 1 the cap cannot bind here -- this branch
+                # is reached only when the column has more distinct values
+                # than ordinary bins, so `n_valid > n_ordinary` -- and the
+                # guard keeps the default on the same instructions anyway.
+                var n_ord = n_ordinary
+                if min_data_in_bin > 1:
+                    var cap = n_valid // min_data_in_bin
+                    if cap < 1:
+                        cap = 1
+                    if cap < n_ord:
+                        n_ord = cap
+                quantile_boundary_indices(n_valid, n_ord, idxs)
                 if n_valid >= select_min_rows:
                     # The ranks the boundaries ask about, ascending and
                     # unique. `idxs` is non-decreasing, so appending `idx - 1`

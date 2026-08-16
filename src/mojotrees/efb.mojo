@@ -63,6 +63,32 @@ What the dense path does not do
   `use_bundling` verdict decide only whether an *already requested* bundling
   is worth applying; when the verdict is negative the trainer falls back to
   the unbundled matrix, which is the same fit.
+
+  LightGBM defaults `enable_bundle` to true and this module does not, and the
+  reason is that **turning it on is not free on a dense matrix**. Asking for
+  bundling and being told no still costs three complete serial passes over
+  the binned matrix before the verdict exists: `dense_default_bins` (a read
+  and a tally increment per cell), `dense_bin_counts` (a read and a compare),
+  and `count_nondefault_dense` (a read and a compare). That is 3 * n_features
+  * n_rows cell visits, none of them dispatched to a worker -- 150,000,000
+  visits over 150 MB of `List[UInt8]` at 1,000,000 x 50. This is arithmetic
+  over counts, not a timing.
+
+  And on dense continuous data the verdict is always no, so those passes buy
+  nothing. A column binned to 255 equal-frequency bins has no mode worth the
+  name: its most frequent bin holds about `n_rows / 255` rows, so it is
+  non-default on about 99.6 percent of them, against the 95 percent
+  `EfbParams.max_nondefault_rate` allows. Every feature is therefore
+  ineligible, every bundle is a singleton, `n_bundles == n_features`, and
+  `use_bundling` is False. A feature only becomes eligible when some single
+  bin holds at least 5 percent of the rows, which is the sparse and
+  one-hot case bundling is for.
+
+  Flipping the default would therefore charge every dense user three passes
+  to reach an answer of "no". If it is ever flipped, the eligibility test has
+  to come first and cheaply -- `count_nondefault_dense` alone, or a cheaper
+  mode estimate -- so that a dense matrix pays one pass and stops, and the
+  two remaining passes are paid only by a matrix that might use them.
 - The sparse, GPU, distributed, ranking, custom-objective, and custom-metric
   trainers do not honor the switch. They are not in this lane's ownership;
   `check_bundling_honored` is the one-line refusal they need so that an
