@@ -1681,6 +1681,150 @@ def _quantize_grad_hess_kernel(
         )
 
 
+# --- The packed Int16 staging arm ----------------------------------------
+#
+# What the histogram gather actually costs, which is the number this arm is
+# aimed at. Per (row, feature) visit at `GROUP` owned slots, the loop reads
+# the row index once per row (4 bytes), the staged derivative once per row,
+# and one bin byte per visit -- so the derivative's share of the per-visit
+# traffic is its width divided by `GROUP`. At the default `GROUP = 1` that
+# share is the whole of it, and halving the staged width halves it.
+#
+# Nothing about the accumulation changes. `Int32(Int16(q)) == q` for every
+# `q` in `[-32768, 32767]`, sign extension being exact, so the shared plane
+# receives the identical integer and the histogram is bit-identical to the
+# Int32 arm's. `quantized_gradient.check_int16_staging` is the bound written
+# out, its scope argued, and the reason it is not section 5 of
+# `docs/design/ACCURACY_BUDGET.md`.
+
+comptime QUANT_SOURCE_FLOAT = 0
+"""`use_quant`: the two Float32 planes, rounded in the row loop."""
+comptime QUANT_SOURCE_INT32 = 1
+"""`use_quant`: the interleaved Int32 pairs, the shipped default."""
+comptime QUANT_SOURCE_PACKED16 = 2
+"""`use_quant`: the same allocation reinterpreted as interleaved Int16 pairs.
+Selected by `GpuActiveRows.set_packed_gradients`; refused at staging time,
+never at the launch, because the bound is a property of the round's values
+and not of its shape."""
+
+comptime STAGE16_MAX = Int32(32767)
+comptime STAGE16_MIN = Int32(-32768)
+"""The signed 16-bit range, as the device compares against it. Named rather
+than spelled inline so the kernel's condition and
+`quantized_gradient.INT16_LIMIT` are visibly the same bound."""
+
+comptime STAGE16_FLAG_WORDS = 2
+comptime STAGE16_FLAG_GRAD = 0
+comptime STAGE16_FLAG_HESS = 1
+"""One counter per plane. Two rather than one because the hessian word is not
+read at all on a constant-hessian round, so a hessian that did not fit is not
+a reason to refuse that round; `_ensure_quantized` reads the gradient counter
+always and the hessian counter only when the plane will be gathered."""
+
+
+def _quantize_grad_hess_i16_kernel(
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    gq16: MutPointer[Int16, MutAnyOrigin],
+    flag: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    g_scale: Float32,
+    h_scale: Float32,
+):
+    """`_quantize_grad_hess_kernel` at half the width, plus the overflow
+    counters that make the narrowing checkable rather than assumed.
+
+    **The value is formed identically.** `Int32(round(x * scale))` is
+    reproduced here character for character from the Int32 kernel, for the
+    same contraction reason `docs/NUMERICS.md` section 5.6 records and the
+    same reason the Float32 arm of `_hist_rows_step` reproduces it: the
+    multiply is consumed by `round`, so there is no add for it to fuse into,
+    and that argument survives only while the expression does. The narrowing
+    is applied *after* that integer exists, so the two kernels agree on the
+    integer and disagree only on how many bytes it is stored in.
+
+    **The check is on the integer, not on a magnitude.** A host check would
+    need `max_r |g_r|`, which nothing on the device path reduces today --
+    `_abs_sum_kernel` reduces the sum, and adding a second reduction would
+    have to reach `GpuHistogramBuilder._refresh_scales` to be read, in a file
+    this lane may not edit. Comparing the value each thread has already
+    computed costs two compares per row on a pass that runs once per tree and
+    needs no reduction at all. `quantized_gradient.check_int16_staging` is the
+    same inequality in the form a host test can call.
+
+    **The counter is a count and not a flag** so the message can say how many
+    rows failed, which is the difference between "your scale is one row's
+    outlier away" and "this shape does not fit". The atomic executes only on
+    a row that fails, so a passing round pays the compare and nothing else.
+
+    **Both words are always written.** The hessian word is dead on a
+    constant-hessian round, and writing it anyway is what keeps one layout,
+    one kernel and one cache key; a layout that depended on `constant_hessian`
+    would be stale the moment a caller flipped it between trees without a
+    refill, which is a wrong histogram no fixture catches. Its overflow is
+    counted separately so that the dead word cannot refuse a round that never
+    reads it.
+    """
+    var r = global_idx.x
+    if r < Int(n_rows):
+        var qg = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+        var qh = Int32(round(hess[unsafe_offset=r][0] * h_scale))
+        if qg > STAGE16_MAX or qg < STAGE16_MIN:
+            _ = Atomic.fetch_add(
+                flag.unsafe_offset(STAGE16_FLAG_GRAD), Int32(1)
+            )
+        if qh > STAGE16_MAX or qh < STAGE16_MIN:
+            _ = Atomic.fetch_add(
+                flag.unsafe_offset(STAGE16_FLAG_HESS), Int32(1)
+            )
+        gq16[unsafe_offset = 2 * r] = qg.cast[DType.int16]()
+        gq16[unsafe_offset = 2 * r + 1] = qh.cast[DType.int16]()
+
+
+def _raise_stage16(
+    plane: String, n_over: Int, n_rows: Int, scale: Float64
+) raises:
+    """The refusal `GpuActiveRows._check_stage16_bound` issues, with the
+    numbers a caller needs to decide what to do rather than only the fact.
+
+    Three of them. The **count** separates "one outlier row" from "this shape
+    does not fit", which are different problems with different answers. The
+    **row total** is what the bound moves with -- under the shipped
+    `2^30 / sum|g|` scale a row carries about `1/n` of the magnitude, so the
+    bound tightens as `n` falls and a fit that failed at fifty thousand rows
+    will not pass by retrying. The **scale** is there because it is the other
+    factor in the product and because a caller who has moved
+    `GpuHistogramBuilder.set_scale_refresh`'s headroom has moved exactly it.
+
+    The remedy named is the Int32 buffer and not a smaller scale, deliberately.
+    Shrinking the scale until every row fits sixteen bits is the
+    magnitude-sum-at-`2^14` move that `docs/design/ACCURACY_BUDGET.md`
+    section 5 measures at 4.31 percent worse held-out logloss with the same
+    sign on all six seeds, outside this project's own three percent tolerance.
+    It is the obvious-looking fix and it is the worst option on the table, so
+    the message does not offer it.
+    """
+    raise Error(
+        String(
+            "the packed Int16 gradient staging arm lost ",
+            String(n_over),
+            " of ",
+            String(n_rows),
+            " rows on the ",
+            plane,
+            " plane: their quantized values do not fit a signed 16-bit word"
+            " at the scale in force (",
+            String(scale),
+            "). This bound is per row over the whole round and it tightens as"
+            " the row count falls, so the remedy is the Int32 staged buffer"
+            " (GpuActiveRows.set_packed_gradients(False), which is the"
+            " default), not a smaller scale -- narrowing the scale to fit is"
+            " the arm docs/design/ACCURACY_BUDGET.md section 5 measures"
+            " outside the project's own accuracy tolerance.",
+        )
+    )
+
+
 # --- The row walk, shared by both accumulation strategies ----------------
 #
 # Rows one thread keeps in flight at once inside the histogram row loop.
@@ -2017,6 +2161,7 @@ def _hist_rows_step[
     h_scale: Float32,
     narrow: Bool,
     aligned: Bool,
+    packed: Bool,
     rstride: Int,
     probe_mode: Int,
 ):
@@ -2092,6 +2237,50 @@ def _hist_rows_step[
     begins at byte `8r` of that base, so the address is 8-byte aligned for
     every row. That is a **derived bound** from the allocator contract, not
     a measurement, which is why the weaker annotation stays reachable.
+
+    **`packed` halves the bytes that load fetches, and is the one arm here
+    whose exactness rests on a bound rather than on associativity.** It reads
+    the same allocation reinterpreted as interleaved *Int16* pairs, which
+    `_quantize_grad_hess_i16_kernel` wrote: two bytes per plane per row
+    instead of four, so the elided arm's scalar load is 2 bytes rather than 4
+    and the pairing arm's `width=2` load is 4 bytes rather than 8. Nothing
+    else moves. The value assigned to `gv` is `Int32(gq16[2r])`, and sign
+    extension of a 16-bit two's-complement word to 32 bits is exact, so
+    whenever the stored word is the same integer the Int32 buffer would have
+    held, this arm adds the identical integer to the identical shared cell.
+    The accumulators stay Int32 in threadgroup memory, Int32 in the global
+    planes, and Int32 through sibling subtraction: **this arm narrows a
+    value, never an accumulator**, which is why it is not the candidate
+    `docs/design/ACCURACY_BUDGET.md` section 5 prices and does not pay that
+    candidate's two percent of effective sample size.
+
+    **The bound, its scope, and where it is checked.** The stored word is the
+    same integer only while every row of the round satisfies
+    `-32768 <= Int32(round(x * scale)) <= 32767`. That is a **per-row bound
+    over every row of the round**, not a per-node bound: the staged buffer is
+    built once per round and read by every node of the tree, so a bound
+    established on one node's rows would license nothing for the others. It
+    is checked, not assumed, and not here -- a kernel cannot raise. Each row's
+    own integer is compared against the range by
+    `_quantize_grad_hess_i16_kernel` on the pass that stores it, failures are
+    counted into a device word, and `GpuActiveRows._ensure_quantized` reads
+    that word and **raises** before the histogram that would have read the
+    truncated buffer is enqueued. So a violation ends the fit with a message
+    naming the plane and the count, and no wrong histogram is ever built --
+    which is a stronger position than `histogram_gpu._check_window_bound`, a
+    check of the same family that can only report after the fact.
+    `quantized_gradient.check_int16_staging` is the same inequality in the
+    form a host test can call.
+
+    **Why `packed` carries no `aligned` twin.** `aligned` exists because a
+    `width=2` load of Int32 is 8 bytes at an address whose 8-byte alignment
+    had to be argued from the allocator contract, and the weaker annotation
+    stays reachable so the two spellings can be held as arms. The Int16 pair
+    is 4 bytes at byte `4r` of the same base, so `alignment=4` is the pair's
+    own natural alignment and is not a claim about anything: there is no
+    second spelling to hold it against. `narrow` does apply and both of its
+    spellings are written, because the index `2r` it narrows is formed the
+    same way at either width.
 
     **The index arms.** `narrow` selects the width of the two index
     computations in this loop that a bound can narrow. The shared-plane
@@ -2393,8 +2582,29 @@ def _hist_rows_step[
     # once per `U` rows against `U * GROUP * 3` shared atomics is not
     # measurable; four times the instantiations is.
     comptime if QUANT:
+        # The packed arm's view of the very same allocation. A pointer
+        # reinterpretation costs nothing and is hoisted out of the loop by
+        # any optimizer; it is spelled once here rather than inside each of
+        # the four `packed` branches so there is one place the width changes.
+        # `gq16` is dereferenced only under `packed`, which is set only when
+        # `_ensure_quantized` filled the buffer through
+        # `_quantize_grad_hess_i16_kernel` and its bound check passed.
+        var gq16 = gq.unsafe_bitcast[Int16]()
         comptime if CELIDE:
-            if narrow:
+            if packed:
+                if narrow:
+                    comptime for u in range(U):
+                        gv[unsafe_offset=u] = gq16[
+                            unsafe_offset = Int(
+                                Int32(2) * rr[unsafe_offset=u][0]
+                            )
+                        ][0].cast[DType.int32]()
+                else:
+                    comptime for u in range(U):
+                        gv[unsafe_offset=u] = gq16[
+                            unsafe_offset = 2 * Int(rr[unsafe_offset=u][0])
+                        ][0].cast[DType.int32]()
+            elif narrow:
                 comptime for u in range(U):
                     gv[unsafe_offset=u] = gq[
                         unsafe_offset = Int(Int32(2) * rr[unsafe_offset=u][0])
@@ -2405,7 +2615,28 @@ def _hist_rows_step[
                         unsafe_offset = 2 * Int(rr[unsafe_offset=u][0])
                     ][0]
         else:
-            if narrow:
+            if packed:
+                # Four bytes for the pair where the Int32 arm reads eight,
+                # at the pair's own alignment. `alignment=4` and not the
+                # default for the reason the docstring's alignment paragraph
+                # gives: the unannotated `width=2` load is emitted at the
+                # element alignment, which a backend is free to split back
+                # into two scalar loads and which would give the packing back.
+                if narrow:
+                    comptime for u in range(U):
+                        var pair16 = gq16.unsafe_load[width=2, alignment=4](
+                            Int(Int32(2) * rr[unsafe_offset=u][0])
+                        )
+                        gv[unsafe_offset=u] = pair16[0].cast[DType.int32]()
+                        hv[unsafe_offset=u] = pair16[1].cast[DType.int32]()
+                else:
+                    comptime for u in range(U):
+                        var pair16 = gq16.unsafe_load[width=2, alignment=4](
+                            2 * Int(rr[unsafe_offset=u][0])
+                        )
+                        gv[unsafe_offset=u] = pair16[0].cast[DType.int32]()
+                        hv[unsafe_offset=u] = pair16[1].cast[DType.int32]()
+            elif narrow:
                 if aligned:
                     comptime for u in range(U):
                         var pair = gq.unsafe_load[width=2, alignment=8](
@@ -2559,6 +2790,7 @@ def _hist_accumulate_rows[
     unrolled: Bool,
     narrow: Bool,
     aligned: Bool,
+    packed: Bool,
     rstride: Int,
     probe_mode: Int,
 ):
@@ -2751,6 +2983,7 @@ def _hist_accumulate_rows[
             h_scale,
             narrow,
             aligned,
+            packed,
             rstride,
             probe_mode,
         )
@@ -2781,6 +3014,7 @@ def _hist_accumulate_rows[
             h_scale,
             narrow,
             aligned,
+            packed,
             rstride,
             probe_mode,
         )
@@ -2830,6 +3064,7 @@ def _hist_accumulate_dispatch[
     unrolled: Bool,
     narrow: Bool,
     aligned: Bool,
+    packed: Bool,
     rstride: Int,
     probe_mode: Int,
 ):
@@ -2881,6 +3116,7 @@ def _hist_accumulate_dispatch[
                 unrolled,
                 narrow,
                 aligned,
+                packed,
                 rstride,
                 probe_mode,
             )
@@ -2907,6 +3143,7 @@ def _hist_accumulate_dispatch[
                 unrolled,
                 narrow,
                 aligned,
+                packed,
                 rstride,
                 probe_mode,
             )
@@ -2933,6 +3170,7 @@ def _hist_accumulate_dispatch[
             unrolled,
             narrow,
             aligned,
+            packed,
             rstride,
             probe_mode,
         )
@@ -2959,6 +3197,7 @@ def _hist_accumulate_dispatch[
             unrolled,
             narrow,
             aligned,
+            packed,
             rstride,
             probe_mode,
         )
@@ -3306,6 +3545,7 @@ def _range_hist_atomic_kernel[
         Int(row_unroll) != 0,
         Int(narrow_index) != 0,
         Int(pair_align) != 0,
+        Int(use_quant) == QUANT_SOURCE_PACKED16,
         rstride,
         probe_mode,
     )
@@ -3533,6 +3773,7 @@ def _range_hist_partial_kernel[
         Int(row_unroll) != 0,
         Int(narrow_index) != 0,
         Int(pair_align) != 0,
+        Int(use_quant) == QUANT_SOURCE_PACKED16,
         rstride,
         probe_mode,
     )
@@ -4353,6 +4594,34 @@ struct GpuActiveRows(Movable):
     var quant_valid: Bool
     var quant_g_scale: Float32
     var quant_h_scale: Float32
+    # --- gradient-staging lane ---
+    # Whether that buffer is filled and read as interleaved *Int16* pairs
+    # rather than Int32 ones. One allocation serves both: the Int16 layout
+    # uses the first `4 * n_rows` bytes of the same `2 * n_rows` Int32
+    # allocation, so no pointer anywhere else in this file changes and the
+    # eight `enqueue_function` argument lists are untouched. The allocation is
+    # not shrunk; what halves is the traffic the histogram gather issues, and
+    # that is the whole of the claim.
+    #
+    # `packed_gradients` is what the caller asked for and `quant_packed` is
+    # which layout the buffer currently holds, kept apart so `_ensure_quantized`
+    # rebuilds when an A/B moves the arm between repeats in one process rather
+    # than handing the next histogram a buffer of the other width.
+    #
+    # Off by default, and the polarity is not timidity. Every other arm in this
+    # file that defaults on is exact whatever the data; this one is exact only
+    # while every row's quantized value fits sixteen bits, a bound that fails
+    # on small fits (see `_quantize_grad_hess_i16_kernel`), and an arm that can
+    # refuse a fit does not get to refuse it by default.
+    var packed_gradients: Bool
+    var quant_packed: Bool
+    # The two per-plane overflow counters `_quantize_grad_hess_i16_kernel`
+    # raises, their host mirror, and a zeroed source to reset them from. Eight
+    # bytes each; allocated unconditionally because a `DeviceBuffer` field
+    # cannot be conditionally absent, and never touched on the Int32 arm.
+    var stage16_flag_dev: DeviceBuffer[DType.int32]
+    var stage16_flag_host: HostBuffer[DType.int32]
+    var stage16_zero: HostBuffer[DType.int32]
     # scan-primitives lane: whether the two scan stages run on
     # `block.prefix_sum` (the default) or on the hand-rolled Hillis-Steele
     # kernels. A launch-shape knob and nothing else, because the two arms
@@ -4634,6 +4903,25 @@ struct GpuActiveRows(Movable):
         self.quant_valid = False
         self.quant_g_scale = 0.0
         self.quant_h_scale = 0.0
+        # The packed Int16 staging arm, off. `MOJOTREES_GPU_PACKED_GRADS=1` or
+        # `set_packed_gradients(True)` turns it on; see the field for why this
+        # is the one staging arm that does not default on.
+        self.packed_gradients = (
+            _env_int("MOJOTREES_GPU_PACKED_GRADS", 0) != 0
+        )
+        self.quant_packed = False
+        self.stage16_flag_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            STAGE16_FLAG_WORDS
+        )
+        self.stage16_flag_host = self.ctx.enqueue_create_host_buffer[
+            DType.int32
+        ](STAGE16_FLAG_WORDS)
+        self.stage16_zero = self.ctx.enqueue_create_host_buffer[DType.int32](
+            STAGE16_FLAG_WORDS
+        )
+        var z16 = self.stage16_zero.unsafe_ptr()
+        for i in range(STAGE16_FLAG_WORDS):
+            z16.unsafe_store(i, Int32(0))
         # The primitive scan arm is the default: it computes the same
         # permutation with strictly less work, so it does not need a
         # measurement to justify being on. `MOJOTREES_GPU_SCAN_PRIMITIVES=0`
@@ -4787,6 +5075,71 @@ struct GpuActiveRows(Movable):
         """
         self.quantized_gradients = on
         self.quant_valid = False
+
+    def set_packed_gradients(mut self, on: Bool):
+        """Whether the pre-quantized buffer is staged and gathered as
+        interleaved **Int16** pairs instead of Int32 ones.
+
+        Halves the bytes the histogram's per-row derivative fetch issues: two
+        bytes per plane per row instead of four, which at the default one
+        feature slot per threadgroup is half of the loop's per-visit traffic
+        that is not the bin byte. It does not touch the accumulators, which
+        stay Int32 in threadgroup memory, Int32 in the global planes and Int32
+        through sibling subtraction, so it is not the packed-accumulator
+        candidate `docs/design/ACCURACY_BUDGET.md` section 5 prices and it
+        costs none of that candidate's accuracy.
+
+        **Exact under a bound, and the bound is checked.** Sign extension of a
+        16-bit word is exact, so the shared plane receives the identical
+        integer whenever the stored word is the integer the Int32 arm would
+        have stored -- that is, whenever every row of the round satisfies
+        `-32768 <= Int32(round(x * scale)) <= 32767`. That is a per-row bound
+        over the whole round, because the buffer is staged once per round and
+        every node of the tree reads it. `_quantize_grad_hess_i16_kernel`
+        compares each row's own integer against the range as it stores it and
+        counts the failures; `_ensure_quantized` reads the counters and raises
+        before the histogram that would have read a truncated buffer is
+        enqueued. Nothing is clamped and nothing is silently widened.
+
+        **Which is why this is off by default.** Under the shipped
+        `2^30 / sum|g|` scale the bound is `max|g| / sum|g| <= 3.05e-5`, so it
+        holds at large row counts and fails at small ones. That is the useful
+        direction -- the gather it cuts is the largest component of the
+        histogram phase only at the large shapes -- but an arm that can refuse
+        a fit is an arm a caller opts into. `MOJOTREES_GPU_PACKED_GRADS=1` is
+        the other way in, and both exist so an interleaved A/B can hold the
+        two widths in one process, which is the only comparison this machine's
+        drifting timings admit.
+
+        Requires the quantized source: it is a narrower spelling of that
+        buffer, not a third one, so it is ignored while
+        `set_quantized_gradients(False)` is in force. Takes effect on the next
+        `enqueue_range_histogram`, which restages the buffer at the new width.
+        """
+        self.packed_gradients = on
+        self.quant_valid = False
+
+    def packed_gradients_on(self) -> Bool:
+        """Whether the next histogram will gather Int16 pairs. The conjunction
+        of both staging arms, because the packed arm is a width of the
+        quantized buffer and not an alternative to it."""
+        return self.packed_gradients and self.quantized_gradients
+
+    def staged_gradient_bytes_per_row(self) -> Int:
+        """Bytes of staged derivative one row occupies in the buffer the
+        histogram gathers, at the arms currently set.
+
+        The number this lane is measured on, published rather than recomputed
+        by each reader, and checkable without a clock. Per (row, feature)
+        visit the row loop fetches this many bytes divided by the feature
+        group, plus four for the row index divided by the feature group, plus
+        one bin byte. Four on the Float32 arm because a constant-hessian round
+        gathers only the gradient plane and eight because a general one
+        gathers both; four or eight likewise on the Int32 quantized arm, the
+        pair being one load either way; two or four packed.
+        """
+        var wide = 4 if self.packed_gradients_on() else 8
+        return wide // 2 if self.constant_hessian else wide
 
     def set_row_unroll(mut self, on: Bool):
         """Whether the histogram row loop keeps `HIST_ROW_UNROLL` rows in
@@ -6181,10 +6534,17 @@ struct GpuActiveRows(Movable):
                 block_dim=threads,
             )
 
-        var use_quant = Int32(0)
+        var use_quant = Int32(QUANT_SOURCE_FLOAT)
         if self.quantized_gradients:
             self._ensure_quantized(grad, hess, g_scale, h_scale)
-            use_quant = Int32(1)
+            # Which *width* of the quantized buffer, read from the staging
+            # state rather than from the request, so the kernel is told the
+            # layout the buffer actually holds. `_ensure_quantized` has just
+            # made those agree, and reading the request here instead would be
+            # the one spelling that could disagree with it.
+            use_quant = Int32(
+                QUANT_SOURCE_PACKED16
+            ) if self.quant_packed else Int32(QUANT_SOURCE_INT32)
         # The device-owned growth plane builds every non-root histogram
         # through this entry point, so the re-layout has to be reachable from
         # here as well as from the host-driven one; omitting it would leave
@@ -6554,10 +6914,17 @@ struct GpuActiveRows(Movable):
         # that reads it by the queue. Every strategy and every group width
         # reads the same buffer now, so this sits above the dispatch rather
         # than inside one arm of it.
-        var use_quant = Int32(0)
+        var use_quant = Int32(QUANT_SOURCE_FLOAT)
         if self.quantized_gradients:
             self._ensure_quantized(grad, hess, g_scale, h_scale)
-            use_quant = Int32(1)
+            # Which *width* of the quantized buffer, read from the staging
+            # state rather than from the request, so the kernel is told the
+            # layout the buffer actually holds. `_ensure_quantized` has just
+            # made those agree, and reading the request here instead would be
+            # the one spelling that could disagree with it.
+            use_quant = Int32(
+                QUANT_SOURCE_PACKED16
+            ) if self.quant_packed else Int32(QUANT_SOURCE_INT32)
 
         # The bin re-layout, if one was asked for, on the same footing and in
         # the same place: one enqueued pass ordered before the histogram that
@@ -7339,28 +7706,115 @@ struct GpuActiveRows(Movable):
         """Rebuild the interleaved quantized gradient buffer unless it was
         built for this tree at these scales already. One streaming launch
         over `n_rows`, ordered before the histogram that reads it by the
-        queue."""
+        queue.
+
+        **The width is part of the cache key.** `quant_packed` records which
+        layout the buffer currently holds, so an A/B that moves
+        `set_packed_gradients` between repeats in one process restages rather
+        than handing the next histogram a buffer of the other width. The
+        setter also drops `quant_valid`, which makes this belt and braces; it
+        is here because the two states are not the same thing and a later
+        edit that changed one would otherwise not have to think about it.
+
+        **What the packed arm costs, stated so it is not discovered.** One
+        eight-byte upload to zero the counters, and one `synchronize` to read
+        them back. That is one host wait per *rebuild*, and a rebuild happens
+        when `begin_tree` invalidates the buffer or the round's scales move,
+        so it is one wait per tree and not one per node. It buys the right to
+        raise **before** the histogram is enqueued rather than after it has
+        run, which is the difference between refusing a fit and reporting on
+        a corrupt one; `histogram_gpu._check_window_bound`, the check of the
+        same family that cannot get ahead of its own data, has to settle for
+        the latter and says so.
+
+        Nothing on the Int32 arm waits, and nothing on it was moved.
+        """
         if (
             self.quant_valid
+            and self.quant_packed == self.packed_gradients
             and self.quant_g_scale == g_scale
             and self.quant_h_scale == h_scale
         ):
             return
         var threads = self.block_threads
         var blocks = (self.n_rows + threads - 1) // threads
-        self.ctx.enqueue_function[_quantize_grad_hess_kernel](
-            grad,
-            hess,
-            self.gq_dev.unsafe_ptr(),
-            Int32(self.n_rows),
-            g_scale,
-            h_scale,
-            grid_dim=blocks,
-            block_dim=threads,
-        )
+        if self.packed_gradients:
+            # Zero the counters from a host source rather than from a kernel:
+            # eight bytes on the same queue, ordered before the launch that
+            # increments them, and one fewer launch than a zeroing kernel.
+            self.ctx.enqueue_copy(
+                dst_buf=self.stage16_flag_dev,
+                src_ptr=self.stage16_zero.unsafe_ptr(),
+            )
+            self.ctx.enqueue_function[_quantize_grad_hess_i16_kernel](
+                grad,
+                hess,
+                self.gq_dev.unsafe_ptr().unsafe_bitcast[Int16](),
+                self.stage16_flag_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                g_scale,
+                h_scale,
+                grid_dim=blocks,
+                block_dim=threads,
+            )
+            self._check_stage16_bound(g_scale, h_scale)
+        else:
+            self.ctx.enqueue_function[_quantize_grad_hess_kernel](
+                grad,
+                hess,
+                self.gq_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                g_scale,
+                h_scale,
+                grid_dim=blocks,
+                block_dim=threads,
+            )
         self.quant_valid = True
+        self.quant_packed = self.packed_gradients
         self.quant_g_scale = g_scale
         self.quant_h_scale = h_scale
+
+    def _check_stage16_bound(
+        mut self, g_scale: Float32, h_scale: Float32
+    ) raises:
+        """Read the two overflow counters the Int16 staging pass wrote and
+        refuse the fit if either plane that will be gathered lost a row.
+
+        The bound this enforces is
+        `-32768 <= Int32(round(x * scale)) <= 32767`, **per row, over every
+        row of the round**, which is the scope the representation needs: one
+        buffer is staged per round and every node of the tree gathers it, so
+        a bound holding for one node's rows would license nothing for the
+        others. `quantized_gradient.check_int16_staging` is the same
+        inequality written against a magnitude, for a host test; the device
+        evaluates it against the integer it has just formed, which needs no
+        reduction and cannot disagree with the value it stored.
+
+        **The hessian counter is consulted only when the hessian is read.** On
+        a constant-hessian round `_hist_rows_step` never gathers the second
+        word, so a hessian that did not fit is a dead byte and not a wrong
+        histogram. Refusing on it would reject rounds this arm serves exactly.
+        The gradient counter is consulted always, because there is no arm on
+        which the gradient word is unread.
+
+        Raising and not clamping, for the reason
+        `histogram_gpu._check_window_bound` gives at greater length: a clamped
+        row is a gradient the fit never had, on one plane, for one round, and
+        no fixture tells it from a data change. The whole value of this arm is
+        that it is bit-identical or it is nothing.
+        """
+        self.ctx.enqueue_copy(
+            dst_ptr=self.stage16_flag_host.unsafe_ptr(),
+            src_buf=self.stage16_flag_dev,
+        )
+        self.ctx.synchronize()
+        var flags = self.stage16_flag_host.unsafe_ptr()
+        var n_g = Int(flags.unsafe_load(STAGE16_FLAG_GRAD))
+        var n_h = Int(flags.unsafe_load(STAGE16_FLAG_HESS))
+        if n_g > 0:
+            _raise_stage16("gradient", n_g, self.n_rows, Float64(g_scale))
+        if n_h > 0 and not self.constant_hessian:
+            _raise_stage16("hessian", n_h, self.n_rows, Float64(h_scale))
 
     def download_rows(mut self) raises -> List[Int32]:
         """The whole active-row buffer, host side. Synchronizes, and is for

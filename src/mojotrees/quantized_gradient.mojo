@@ -1114,6 +1114,121 @@ def fixed_point_scale(total: Float64) raises -> Float32:
     return fixed_point_scale_shaped(total, DEFAULT_SCALE_SHAPE)
 
 
+# ---------------------------------------------------------------------------
+# The Int16 *staging* bound
+# ---------------------------------------------------------------------------
+#
+# WHAT THIS IS NOT. It is not section 5 of `docs/design/ACCURACY_BUDGET.md`.
+# That section prices an int16 *accumulator*: a threadgroup histogram cell
+# holding the partial sum of many rows, whose bound is
+# `sum over the tile's rows in one bin`, which the shipped magnitude-sum scale
+# blows through at three to three hundred rows per tile and which therefore
+# cannot be had without LightGBM's max-abs per-row clamp and the two percent
+# of effective sample size that clamp costs. None of that applies here.
+#
+# WHAT THIS IS. The bound on one *stored value*. `_quantize_grad_hess_kernel`
+# already writes each row's `Int32(round(g_r * s))` once per round into a
+# buffer the histogram kernels gather per (row, feature) visit. If every one
+# of those integers happens to fit sixteen bits, the buffer can hold them as
+# Int16 and the gather reads half as many bytes for **the identical integers**:
+# `Int32(Int16(q)) == q` whenever `-32768 <= q <= 32767`, sign extension being
+# exact, and every accumulator downstream -- threadgroup Int32, global Int32,
+# the sibling subtraction -- is untouched. So this is exact by construction
+# given the bound, and it costs no accuracy at all, which is what separates it
+# from candidate 2 of the budget.
+#
+# THE SCOPE, STATED PLAINLY BECAUSE THIS REPOSITORY HAS PAID FOR GETTING IT
+# WRONG TWICE. The bound is **per row, over every row of the round**, at the
+# round's scale. It is not a per-node bound and it must not be argued as one:
+# the staged buffer is built once per round and read by every node of the
+# tree, so a bound that held only for one node's rows would not license the
+# representation the other nodes read. A per-row bound over the whole round is
+# strictly stronger than any per-node bound, and it is the one the check
+# enforces.
+#
+# WHEN IT HOLDS. Under the shipped magnitude-sum scale `s = 2^30 / sum|g|`,
+# `q_r = g_r * 2^30 / sum|g|`, so the bound is
+#
+#     max_r |g_r| / sum_r |g_r| <= 32767 / 2^30 = 3.05e-5
+#
+# A row carries about `1/n` of the total magnitude, so the condition is
+# roughly `n >= 32767 * max|g| / mean|g|`: it fails on small fits and holds on
+# large ones. That is the opposite of the usual direction and it is the useful
+# direction, because the gather this saves is 57 percent of a histogram phase
+# only at the large shapes. It is also why the arm is off by default and why
+# a violation raises instead of quietly widening.
+
+
+def int16_staging_fits(max_abs: Float64, scale: Float64) raises -> Bool:
+    """Whether every row of a round whose largest derivative magnitude is
+    `max_abs` quantizes, at `scale`, into a signed 16-bit word.
+
+    The inequality is `max_abs * scale <= 32767`, which is the per-row form of
+    the block comment above. Stated on the *maximum* rather than the sum
+    because that is the quantity the representation constrains; the sum is
+    what `fixed_point_scale_pow2` constrains and the two are different bounds
+    on different objects.
+
+    No slack term, unlike `histogram_gpu._check_window_bound`. That check
+    compares a Float64 product against `2^30` and needs `2^-24` of room
+    because the scale's own derivation admits an ulp past the round number.
+    Here the comparison is against 32,767, the product is more than fifteen
+    orders of magnitude below the point where a Float64 ulp reaches one
+    lattice unit, and the device makes the same decision by comparing the
+    *integer* it just formed. Adding slack would only let through a value the
+    device would then reject.
+
+    Raises rather than returning `False` on a non-finite input, because a
+    non-finite magnitude is not a bound that failed, it is a round that
+    should never have derived a scale at all.
+    """
+    if not isfinite(max_abs) or max_abs < 0.0:
+        raise Error(
+            "an Int16 staging bound needs a finite non-negative magnitude"
+        )
+    if not isfinite(scale) or scale <= 0.0:
+        raise Error("quantization scales must be finite and positive")
+    return max_abs * scale <= Float64(INT16_LIMIT)
+
+
+def check_int16_staging(
+    max_abs: Float64, scale: Float64, plane: String
+) raises:
+    """`int16_staging_fits`, as a refusal.
+
+    The host twin of the device check in
+    `gpu_active_rows._quantize_grad_hess_i16_kernel`, which evaluates the same
+    inequality per row on the integer it has just formed rather than on a
+    maximum it would have to reduce. Both are here so that the rule has one
+    written definition and so that it is testable without a device.
+
+    Raising is the only correct answer and a clamp is not. A clamped row is a
+    gradient the fit never had, silently, for one round, on one plane, in a
+    way no fixture distinguishes from a data change; the whole point of this
+    arm is that it is bit-identical or it is nothing.
+    """
+    if not int16_staging_fits(max_abs, scale):
+        raise Error(
+            String(
+                "the packed Int16 gradient staging arm needs every row's",
+                " quantized ",
+                plane,
+                " to fit a signed 16-bit word: the largest magnitude ",
+                String(max_abs),
+                " times the scale in force ",
+                String(scale),
+                " is ",
+                String(max_abs * scale),
+                ", past the ",
+                String(INT16_LIMIT),
+                " the Int16 staged buffer holds. This bound tightens as the"
+                " row count falls, so the remedy is the Int32 buffer"
+                " (GpuActiveRows.set_packed_gradients(False), the default),"
+                " not a different scale.",
+            )
+        )
+
+
 @fieldwise_init
 struct QuantScales(Copyable, Movable):
     """One round's (or one class's) lattice.
