@@ -296,6 +296,53 @@ the program.** The in-run instrument existed the whole time and cost two runs.
    remaining case is the partition's own row lists (inside `partition`'s 14
    percent) and halving row-id traffic with Int32, not histogram allocation.
 
+## The golden fixture does not cover either bit-moving change in this round
+
+Three lanes independently reported that `tests/test_golden_bits.mojo` passes
+**untouched** through their work, and each was right for a different reason.
+Verified directly rather than taken on report:
+
+- **Five of the six fixtures never call `fit_bins` at all.** They use
+  `bin_equal_width(x, n_rows, n_features, 32)`. The binning defaults change —
+  `bin_construct_sample_cnt` to 200,000 and `min_data_in_bin` to 3 — cannot
+  reach them by construction.
+- **The sixth, `misscat`, does call `fit_bins`**, at `max_bins=32` with
+  categorical features and missing values. It is 200 rows. The sample cap only
+  engages above 200,000 rows, and `min_data_in_bin=3` merges only levels
+  holding one or two rows, which continuous uniforms into 32 bins do not
+  produce.
+- **Row-block private histograms need 8,160 rows to engage** at 255 bins. The
+  fixtures are 150 to 200 rows. Not one of them blocks.
+
+So this round made **two deliberate bit-moving changes and the contract
+fixture saw neither of them.**
+
+**This is not a complaint about the lanes; it is a finding about the
+fixture.** The golden test is the artifact this project treats as its
+bit-identity contract, and the honest statement of what it currently protects
+is: eight-tree boosters over 150 to 200 rows of uniform noise at 32 bins,
+five of them on equal-width bins that no production path uses.
+
+It is a real regression net for the tree grower, the objectives, the split
+scan and the score update, all of which it exercises. It is **not** a net for
+the binner, for anything that engages above a few hundred rows, or for any
+decomposition whose threshold sits above its fixture sizes. A change can move
+bits on every real dataset a user has and leave it green.
+
+Two consequences, neither of them acted on in this round:
+
+1. **The wave's single golden regeneration is expected to be a no-op**, and if
+   it is, that fact should be recorded rather than read as "no bits moved".
+   Bits moved. The fixture cannot see them.
+2. **The fixture needs at least one fixture above the thresholds the code now
+   has** — above 8,160 rows for the block path and above 200,000 for the
+   sample cap — or those paths ship with no bit contract at all. That is a
+   lane, and it belongs to whoever owns the fixture next.
+
+This is the same species as the three built-tested-never-wired findings and
+the two gate-blind tests: a check that passes for a reason unrelated to the
+thing it is believed to check.
+
 ## Consequences for the round's plan
 
 - **L3 (row-block private histograms) is rehabilitated and is the strongest
