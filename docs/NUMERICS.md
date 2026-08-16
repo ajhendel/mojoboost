@@ -100,11 +100,33 @@ source unless somebody writes it down.
 
 ## 3. What Mojo 1.0.0 exposes, measured
 
-The Modular documentation and the docs MCP are both unreliable for this project.
-A lane in this same round found `docs.modular.com/gpu/block-and-warp.md` listing
-warp primitives that do not exist in this release, and the docs MCP reporting a
-module that does exist as not found. Everything in this section was therefore
-taken out of the compiler, not out of the documentation.
+The Modular documentation and the docs MCP are both unreliable for this project,
+and so, it turns out, is a hasty probe. Everything in this section was taken out
+of the compiler rather than out of the documentation, and one paragraph of it
+had to be taken out of the compiler twice.
+
+The correction is worth keeping because it is the more instructive half. A lane
+in this round reported that `docs.modular.com/gpu/block-and-warp.md` lists warp
+primitives that do not exist in this release. It had checked
+`max.gpu.primitives.warp`, which indeed does not exist, and concluded that the
+warp collectives were absent from the toolchain. **They are not.**
+`std.gpu.primitives.warp` exists and exports the full set: `sum`, `max`, `min`,
+`prefix_sum`, `shuffle_down`, `shuffle_up`, `shuffle_xor`, `shuffle_idx` and
+`broadcast`, all of which compile. The docs page was right about the primitives
+and wrong only about the namespace.
+
+That mistake propagated for most of a day and reached several pieces of work as
+"there are no warp primitives in Mojo 1.0", which is a much stronger and much
+falser claim than the one that was actually verified. The lesson is narrow and
+worth stating: a negative result from a probe bounds only what the probe
+tested. `max.` not having a module is not evidence that `std.` does not, and an
+absence should be reported with the namespace attached.
+
+Separately, `max.gpu.host.device_graph.DeviceGraph` exists as a type. It is not
+constructible from a `DeviceContext` directly, so it is presumably obtained from
+a capture API that has not been located, and whether it is backed on Metal is
+unverified. If it is, it captures exactly the fixed data-independent command
+sequence a device-resident tree emits, which would make it worth finding.
 
 ### 3.1 There is a contraction control, and it works
 
