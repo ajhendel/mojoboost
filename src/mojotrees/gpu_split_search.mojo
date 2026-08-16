@@ -136,6 +136,21 @@ property the GPU backend already guarantees, but is not bit-identical to the
 host scan. Equivalence tests against the CPU trainer must stay
 tolerance-based.
 
+One rule here is CatBoost's, and it is the one rule that must not be
+tolerance-based
+--------------------------------------------------------------------------
+`random_strength` adds a seeded normal to every candidate's gain, and the
+whole point of it is that the host and the device pick the **same** split
+under the same seed: a stochastic split rule whose two backends disagree is
+worse than no stochastic split rule, because the disagreement is invisible
+and looks like noise by design. The draw's key is 64-bit integer arithmetic
+and is identical on both backends; the normal it feeds is Float64
+transcendental arithmetic and cannot be, so it is drawn once on the host and
+uploaded as a plane the kernels read. Default 0, at which not one instruction
+of it executes. The section headed `random_strength` below carries the
+argument, the cost, and what would break if the draw were moved onto the
+device.
+
 Layout
 ------
 The search runs as two kernels and never allocates per node:
@@ -246,7 +261,7 @@ an interleaved benchmark resolves it and not before.
 """
 
 from std.gpu import block_idx, thread_idx
-from std.math import fma, sqrt
+from std.math import fma, log, sqrt
 from std.memory import stack_allocation
 from std.os import getenv
 from std.sys import has_accelerator
@@ -280,6 +295,7 @@ from .monotone import (
     MONOTONE_INCREASING,
     OutputBounds,
 )
+from .rng import GOLDEN, splitmix64, uniform
 from .split import SplitInfo
 
 # The widest histogram the GPU backend accepts (`histogram_gpu.MAX_BINS`).
@@ -946,6 +962,338 @@ def gpu_split_gain(
     )
 
 
+# --- random_strength: seeded noise on a candidate's gain ------------------
+#
+# CatBoost's one regularizer LightGBM has no equivalent of, on the device
+# side. The rule, the formula, and the CatBoost source it was read from are
+# `tree_parameters_extra.mojo`'s; this section owns only the part that has to
+# survive the crossing to a Float32 accelerator, and the whole reason it is
+# written the way it is:
+#
+#     the device and the host must pick the SAME split under the same seed.
+#
+# That is the feature. A stochastic split rule whose two backends disagree is
+# worse than no stochastic split rule at all, because the disagreement is
+# invisible and looks like noise by design. So the question this section
+# answers is not "how do I draw a normal on a GPU" but "which half of the
+# draw can be made bit-identical on both backends, and where does the other
+# half have to live".
+#
+# WHAT IS BIT-IDENTICAL, AND WHAT CANNOT BE
+# -----------------------------------------
+# The draw is two stages:
+#
+#   A. key -> counter.  (seed, tree, node, feature, bin) folded through
+#      splitmix64. Pure 64-bit integer arithmetic: exact and associative,
+#      no rounding, no libm, no FMA to contract. This reproduces bit for bit
+#      on the host, on Metal, on CUDA, at any `MOJOTREES_NUM_WORKERS`, and
+#      `gpu_random_score_stream` below is the one definition of it.
+#      `random_score_key_probe` runs it on the device and hands the words
+#      back so a test can compare them to the host's, which
+#      `tests/test_gpu_random_score_noise.mojo` does.
+#
+#   B. counter -> N(0, 1).  Marsaglia's polar method: `log`, `sqrt`, and a
+#      rejection test, all in Float64. **This one cannot cross.** Apple GPUs
+#      have no Float64 at all, and even where Float64 exists `log` is not a
+#      correctly rounded operation, so a device evaluation of stage B is a
+#      different number from the host's. The rejection test is what makes
+#      that fatal rather than merely imprecise: `s = u*u + v*v` is accepted
+#      only when `0 < s < 1`, so a pair that lands within an ulp of 1.0 can
+#      be accepted on one backend and rejected on the other, and a rejected
+#      pair advances the counter. The two backends then walk off onto
+#      completely different draws, not draws a few ulps apart. Squeezing the
+#      test into exact integers does not save it either: the host's own
+#      comparison is against the *rounded* Float64 `s`, so an exact test is
+#      the wrong test, not a better one.
+#
+# THEREFORE: STAGE B RUNS ON THE HOST, ONCE, AND THE DEVICE READS THE ANSWER
+# --------------------------------------------------------------------------
+# `random_score_plane` evaluates both stages on the host for one node's
+# (feature, bin) candidates and returns one Float32 per candidate:
+# `Float32(stdev * normal)`, a single rounding of exactly the Float64 number
+# `split.find_best_split` adds. `GpuSplitSearcher.stage_random_score` uploads
+# that plane and the scan kernels add `plane[slot, bin]` to the candidate's
+# gain. The two backends therefore add *the same number*, and the only
+# remaining difference between a noised device gain and a noised host gain is
+# the Float32-versus-Float64 difference the gain itself already had. The
+# noise introduces no new class of divergence, which is the strongest
+# statement available on a device with no Float64.
+#
+# What that costs, stated plainly because it is not free: one Float32 per
+# (feature, bin) candidate crossing host to device per node, which is one
+# third of the histogram this module exists to stop moving, plus one host
+# `log` and `sqrt` per candidate. It is paid only when `random_strength` is
+# non-zero, which is never in LightGBM mode; at the default the buffer is not
+# allocated, no plane is built, no byte crosses, and the kernels take the
+# same instructions they took before this section existed.
+#
+# WHICH GAIN, AND WHICH SCORE FUNCTION
+# ------------------------------------
+# The noise is added to `gpu_split_gain`'s value: LightGBM's second-order
+# gain `G^2/(H+lambda)`, which is CatBoost's `score_function=L2` shape, not
+# CatBoost's default `Cosine`. CatBoost scales one `scoreStDev` by a
+# derivative RMS, which is dimensionally a gradient and therefore pairs with
+# `Cosine`; against a second-order gain (gradient^2/hessian) the same number
+# is a different size, so the useful range of `random_strength` here is not
+# the range CatBoost documents. That is CatBoost's own behavior under
+# `score_function=L2` and it is the pairing `tree_parameters_extra.mojo`
+# chose; this module reproduces the host's choice rather than making a
+# second one. If a `Cosine` variant lands on the host, it lands here as
+# another `gpu_split_gain` arm and the noise term below does not move.
+#
+# The noise is **independent of the gain form.** It is added to whatever
+# `gpu_split_gain` returned, so `GAIN_FORM_CROSS` and
+# `GAIN_FORM_SUBTRACTIVE` get the identical Float32 addend; the two arms'
+# noised gains differ by exactly the amount their un-noised gains already
+# differed by, and neither arm's noise had to be recalibrated. In particular
+# the cross form's refusal of itself under `lambda_l1 != 0` (see
+# `gpu_resolve_gain_form`) changes which gain the noise lands on and changes
+# nothing about the noise.
+
+comptime RANDOM_SCORE_DOMAIN = UInt64(0x52414E4453434F52)
+"""Domain separator folded into the seed, ASCII "RANDSCOR", so this stream
+can never coincide with `tree_parameters_extra.extra_split_stream`'s even
+when both seeds are equal. Must equal
+`tree_parameters_extra._RANDOM_SCORE_DOMAIN`."""
+
+comptime RANDOM_SCORE_POLAR_MAX_TRIES = 64
+"""Marsaglia's polar method rejects a pair outside the unit disc, which is
+`1 - pi/4` of the plane. Sixty-four rejections in a row has probability about
+3e-43; the bound exists so the loop is provably finite. Must equal
+`tree_parameters_extra._POLAR_MAX_TRIES`."""
+
+
+@always_inline
+def gpu_random_score_stream(
+    seed: Int, tree_index: Int, node: Int, feature: Int, bin: Int
+) -> UInt64:
+    """The counter key for one candidate's noise draw, keyed by
+    (seed, tree, node, feature, bin) and by nothing else.
+
+    **This is stage A, and it is the function that has to be identical on
+    both backends.** It is pure 64-bit integer arithmetic, so it is: there is
+    no rounding in it, no library call, and no multiply-add for a compiler to
+    contract. It reads no counter that advances with evaluation order, so a
+    candidate's key is the same value whether its feature was scanned first
+    or last, whether it ran on its own threadgroup or shared one, on one host
+    thread or on sixty-four device lanes.
+
+    Byte for byte the construction `tree_parameters_extra.random_score_stream`
+    uses, and it must stay that way: sign bits masked off so a negative seed
+    is accepted, `node + 1` / `feature + 1` / `bin + 1` so that the lowest
+    index is not the identity element of the xor, and the bin mixed in last.
+    `tests/test_random_score_noise.mojo` pins the words this returns, which is
+    what would catch either copy drifting; the one-line assertion that ties it
+    directly to the host's copy is written out there and becomes live the
+    moment the two branches meet.
+    """
+    var h = splitmix64(
+        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ RANDOM_SCORE_DOMAIN
+    )
+    h = splitmix64(h ^ UInt64(tree_index & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64((node + 1) & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64((feature + 1) & 0x7FFFFFFFFFFFFFFF))
+    return splitmix64(h ^ UInt64((bin + 1) & 0x7FFFFFFFFFFFFFFF))
+
+
+def host_standard_normal(stream: UInt64) -> Float64:
+    """Stage B: a standard normal from one counter key, by Marsaglia's polar
+    method. **Host only**, and deliberately so; see the section header.
+
+    Byte for byte `tree_parameters_extra.standard_normal`, including the
+    order of operations, because the number this returns is the number the
+    host scan adds and any difference between the two copies is a
+    backend disagreement wearing a rounding's clothes.
+
+    On FMA, which this repository has been bitten by twice: `u * u + v * v`
+    is a multiply-add and a compiler is free to contract it, and binding
+    either product to a named local does not stop it. Nothing here depends on
+    it *not* being contracted -- what it depends on is that this expression
+    and `tree_parameters_extra.standard_normal`'s are the same source text
+    compiled by the same toolchain, so they contract the same way or not at
+    all. That is why this function is a copy rather than a rewrite, why the
+    tests do not pin literal draw values (they would be pinning a contraction
+    decision, and the standing rule is deterministic on a given toolchain,
+    not identical to the past), and why the literals that *are* pinned are
+    stage A's, which has no floating-point in it to contract.
+    """
+    var i = 0
+    while i < RANDOM_SCORE_POLAR_MAX_TRIES:
+        var base = stream + GOLDEN * UInt64(2 * i)
+        var u = 2.0 * uniform(base) - 1.0
+        var v = 2.0 * uniform(base + GOLDEN) - 1.0
+        var s = u * u + v * v
+        if s > 0.0 and s < 1.0:
+            return u * sqrt(-2.0 * log(s) / s)
+        i += 1
+    return 0.0
+
+
+@always_inline
+def host_random_score_noise(
+    stdev: Float64,
+    seed: Int,
+    tree_index: Int,
+    node: Int,
+    feature: Int,
+    bin: Int,
+) -> Float32:
+    """The number a candidate's gain is shifted by, as the device consumes
+    it: `Float32(stdev * normal)`.
+
+    `stdev` is CatBoost's `scoreStDev`, which on the host bundle is
+    `ExtraTreeParams.random_score_stdev()` = `random_strength *
+    random_score_scale`. The rounding to Float32 happens once, here, on the
+    exact Float64 product the host scan adds; the device then adds that
+    rounded value and the host adds the unrounded one, which is a difference
+    of at most one Float32 ulp of the noise and is inside the Float32
+    difference the gain already carries.
+
+    At or below zero -- the default, and every LightGBM-mode fit -- this is
+    exactly 0.0 and no stream is touched.
+    """
+    if not (stdev > 0.0) or stdev > Float64.MAX_FINITE:
+        return Float32(0.0)
+    return Float32(
+        stdev
+        * host_standard_normal(
+            gpu_random_score_stream(seed, tree_index, node, feature, bin)
+        )
+    )
+
+
+def random_score_plane(
+    stdev: Float64,
+    seed: Int,
+    tree_index: Int,
+    node: Int,
+    features: List[Int],
+    n_bins: Int,
+) raises -> List[Float32]:
+    """One node's noise plane, `len(features) * n_bins` Float32 in
+    (slot-major, bin-minor) order, which is the layout the scan kernels
+    index.
+
+    Keyed by the *global* feature id, not by the slot: reordering or
+    narrowing a node's feature set permutes this plane and changes no value
+    in it, which is what makes a per-node feature draw
+    (`feature_fraction_bynode`) leave the noise alone.
+
+    `node` is the node id and is required: a grower that does not pass its
+    node ids would draw every node of a tree from the same stream, which is
+    the refusal `ExtraTreeParams.needs_node_identity` states on the host, and
+    a default of 0 standing in for a node id is exactly the failure it exists
+    to prevent.
+
+    THE ONE LINE THAT MOVES WHEN THE HOST LANE MERGES. The body calls
+    `host_random_score_noise`, this module's copy of the host's draw. When
+    `tree_parameters_extra.random_score_noise` is on the same branch, that
+    call becomes a call to it and this module stops holding a second copy of
+    stage B. Nothing else changes: the key is already the same construction,
+    the layout is this function's, and the plane is the same numbers.
+    """
+    if n_bins < 1:
+        raise Error("a noise plane needs at least one bin")
+    if node < 0:
+        raise Error(
+            "random_strength keys its draw by node id, which must be"
+            " nonnegative; a grower that cannot supply one cannot use it"
+        )
+    var out = List[Float32](capacity=len(features) * n_bins)
+    for slot in range(len(features)):
+        var f = features[slot]
+        for b in range(n_bins):
+            out.append(
+                host_random_score_noise(stdev, seed, tree_index, node, f, b)
+            )
+    return out^
+
+
+def _random_score_key_kernel(
+    args: MutPointer[Int32, MutAnyOrigin],
+    keys: MutPointer[Int32, MutAnyOrigin],
+    n: Int32,
+):
+    """Run `gpu_random_score_stream` on the device and hand the 64-bit words
+    back as (low, high) Int32 pairs.
+
+    Two Int32 halves rather than a UInt64 buffer so the readback is the same
+    four-byte element every other buffer in this module moves, and so the
+    comparison a test makes is over words no float ever touched."""
+    var i = Int(block_idx.x)
+    if i >= Int(n):
+        return
+    var b = i * 5
+    var key = gpu_random_score_stream(
+        Int(args[unsafe_offset=b][0]),
+        Int(args[unsafe_offset = b + 1][0]),
+        Int(args[unsafe_offset = b + 2][0]),
+        Int(args[unsafe_offset = b + 3][0]),
+        Int(args[unsafe_offset = b + 4][0]),
+    )
+    keys[unsafe_offset = 2 * i] = (key & UInt64(0xFFFFFFFF)).cast[
+        DType.int32
+    ]()
+    keys[unsafe_offset = 2 * i + 1] = (
+        (key >> UInt64(32)) & UInt64(0xFFFFFFFF)
+    ).cast[DType.int32]()
+
+
+def random_score_key_probe(queries: List[Int]) raises -> List[UInt64]:
+    """Evaluate stage A on the accelerator for a list of
+    (seed, tree, node, feature, bin) tuples, flattened five ints to a tuple.
+
+    This exists for one assertion and it is the assertion this lane was
+    written to make: the device's key and the host's key are the same 64-bit
+    word, bit for bit, for every tuple. Everything downstream of the key --
+    the normal, the standard deviation, the gain it lands on -- is either
+    host-computed or already covered by this module's Float32 contract, so if
+    this holds and the plane is uploaded, the two backends noise the same
+    candidate by the same amount.
+
+    `tests/test_gpu_random_score_noise.mojo` is the caller. It is not on any
+    training path and allocates its own context.
+    """
+    if len(queries) % 5 != 0:
+        raise Error(
+            "random_score_key_probe takes five ints per query"
+            " (seed, tree, node, feature, bin), got ",
+            len(queries),
+        )
+    var n = len(queries) // 5
+    if n == 0:
+        return List[UInt64]()
+    comptime if not has_accelerator():
+        raise Error(
+            "random_score_key_probe needs an accelerator; this binary was"
+            " built without one"
+        )
+    else:
+        var ctx = DeviceContext()
+        var args = ctx.enqueue_create_buffer[DType.int32](len(queries))
+        var out = ctx.enqueue_create_buffer[DType.int32](2 * n)
+        with args.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            for i in range(len(queries)):
+                dst.unsafe_store(i, Int32(queries[i]))
+        ctx.enqueue_function[_random_score_key_kernel](
+            args.unsafe_ptr(),
+            out.unsafe_ptr(),
+            Int32(n),
+            grid_dim=n,
+            block_dim=1,
+        )
+        ctx.synchronize()
+        var words = List[UInt64](capacity=n)
+        with out.map_to_host() as host:
+            var src = host.unsafe_ptr()
+            for i in range(n):
+                var lo = UInt64(Int(src[unsafe_offset = 2 * i][0]) & 0xFFFFFFFF)
+                var hi = UInt64(Int(src[unsafe_offset = 2 * i + 1][0]) & 0xFFFFFFFF)
+                words.append(lo | (hi << UInt64(32)))
+        return words^
+
+
 # --- Collective primitives, and the switch that holds both arms -----------
 #
 # Mojo's `gpu.primitives.block` collectives (`sum`, `max`, `min`,
@@ -1076,6 +1424,7 @@ def _scan_slot_kernel(
     cat_n: MutPointer[Int32, MutAnyOrigin],
     mono: MutPointer[Int32, MutAnyOrigin],
     fparams: MutPointer[Float32, MutAnyOrigin],
+    noise: MutPointer[Float32, MutAnyOrigin],
     out_i: MutPointer[Int32, MutAnyOrigin],
     out_f: MutPointer[Float32, MutAnyOrigin],
     n_bins: Int32,
@@ -1088,6 +1437,7 @@ def _scan_slot_kernel(
     cat_max_threshold: Int32,
     cat_min_group: Int32,
     gain_form: Int32,
+    noisy: Int32,
 ):
     """One threadgroup per (node, active feature slot): scan that feature's
     candidates for that node and write its best one as a per-slot record.
@@ -1131,6 +1481,12 @@ def _scan_slot_kernel(
     var io = (table + slot) * SPLIT_IWORDS
     var fo = (table + slot) * SPLIT_FWORDS
     var pf = record * PF_WORDS
+    # This slot's row of the noise plane, one Float32 per bin, in the same
+    # (record, slot) cell order every other per-slot table uses. Read only
+    # when `noisy`; at the default the pointer is a one-element placeholder
+    # and no lane touches it. See the `random_strength` section above for why
+    # the value is uploaded rather than drawn here.
+    var noise_base = (table + slot) * nb
 
     for i in range(SPLIT_IWORDS):
         out_i[unsafe_offset = io + i] = Int32(0)
@@ -1402,6 +1758,17 @@ def _scan_slot_kernel(
             left_h += hist[unsafe_offset = hs + base + b][0]
             left_c += hist[unsafe_offset = 2 * hs + base + b][0]
 
+            # This threshold's `random_strength` shift, read once and shared
+            # by the two routing directions below, because the noise belongs
+            # to the threshold and not to the direction. Sharing it is what
+            # keeps LightGBM's rule intact: an exact tie between the two
+            # directions still keeps `default_left`, since equal gains stay
+            # equal after the same number is added to both. `split.mojo`
+            # takes one draw per bin for the same reason.
+            var bin_noise = Float32(0.0)
+            if noisy != Int32(0):
+                bin_noise = noise[unsafe_offset = noise_base + b][0]
+
             # Missing to the left, scored first so an exact tie keeps
             # default_left, as in LightGBM and as on the host.
             if missing_bin >= 0:
@@ -1437,6 +1804,8 @@ def _scan_slot_kernel(
                         cross_offset,
                         form,
                     )
+                    if noisy != Int32(0):
+                        gain += bin_noise
                     if gain > best_gain:
                         runner_gain = best_gain
                         best_gain = gain
@@ -1483,6 +1852,8 @@ def _scan_slot_kernel(
                     cross_offset,
                     form,
                 )
+                if noisy != Int32(0):
+                    gain += bin_noise
                 if gain > best_gain:
                     runner_gain = best_gain
                     best_gain = gain
@@ -1579,6 +1950,7 @@ def _scan_slot_wide_kernel(
     missing: MutPointer[Int32, MutAnyOrigin],
     mono: MutPointer[Int32, MutAnyOrigin],
     fparams: MutPointer[Float32, MutAnyOrigin],
+    noise: MutPointer[Float32, MutAnyOrigin],
     out_i: MutPointer[Int32, MutAnyOrigin],
     out_f: MutPointer[Float32, MutAnyOrigin],
     n_bins: Int32,
@@ -1588,6 +1960,7 @@ def _scan_slot_wide_kernel(
     min_data_in_leaf: Int32,
     constrained: Int32,
     gain_form: Int32,
+    noisy: Int32,
 ):
     """`_scan_slot_kernel`'s ordinal scan, spread over a threadgroup instead
     of run on one thread, and it writes the same per-slot record.
@@ -1704,6 +2077,12 @@ def _scan_slot_wide_kernel(
     var io = (table + slot) * SPLIT_IWORDS
     var fo = (table + slot) * SPLIT_FWORDS
     var pf = record * PF_WORDS
+    # This slot's row of the noise plane, one Float32 per bin, in the same
+    # (record, slot) cell order every other per-slot table uses. Read only
+    # when `noisy`; at the default the pointer is a one-element placeholder
+    # and no lane touches it. See the `random_strength` section above for why
+    # the value is uploaded rather than drawn here.
+    var noise_base = (table + slot) * nb
 
     var pg = Int32(0)
     var ph = Int32(0)
@@ -1842,6 +2221,16 @@ def _scan_slot_wide_kernel(
         left_h += hist[unsafe_offset = hs + base + b][0]
         left_c += hist[unsafe_offset = 2 * hs + base + b][0]
 
+        # This threshold's `random_strength` shift, read once and shared by
+        # the two routing directions; see `_scan_slot_kernel`. Keyed by bin
+        # and not by scan position, which is the whole reason a wide scan can
+        # carry it at all: a thread that starts in the middle of the bin
+        # range reads the same number for its bins that a serial walk would
+        # have reached them with.
+        var bin_noise = Float32(0.0)
+        if noisy != Int32(0):
+            bin_noise = noise[unsafe_offset = noise_base + b][0]
+
         # Missing to the left, scored first so an exact tie keeps
         # default_left, as in LightGBM and as on the host.
         if missing_bin >= 0:
@@ -1875,6 +2264,8 @@ def _scan_slot_wide_kernel(
                     cross_offset,
                     form,
                 )
+                if noisy != Int32(0):
+                    gain += bin_noise
                 if gain > best_gain:
                     runner_gain = best_gain
                     best_gain = gain
@@ -1911,6 +2302,8 @@ def _scan_slot_wide_kernel(
                 cross_offset,
                 form,
             )
+            if noisy != Int32(0):
+                gain += bin_noise
             if gain > best_gain:
                 runner_gain = best_gain
                 best_gain = gain
@@ -2004,6 +2397,7 @@ def _scan_slot_wide_primitive_kernel(
     missing: MutPointer[Int32, MutAnyOrigin],
     mono: MutPointer[Int32, MutAnyOrigin],
     fparams: MutPointer[Float32, MutAnyOrigin],
+    noise: MutPointer[Float32, MutAnyOrigin],
     out_i: MutPointer[Int32, MutAnyOrigin],
     out_f: MutPointer[Float32, MutAnyOrigin],
     n_bins: Int32,
@@ -2013,6 +2407,7 @@ def _scan_slot_wide_primitive_kernel(
     min_data_in_leaf: Int32,
     constrained: Int32,
     gain_form: Int32,
+    noisy: Int32,
 ):
     """`_scan_slot_wide_kernel` with its four hand-rolled reductions written
     as `gpu.primitives.block` collectives, and returning its record bit for
@@ -2086,6 +2481,12 @@ def _scan_slot_wide_primitive_kernel(
     var io = (table + slot) * SPLIT_IWORDS
     var fo = (table + slot) * SPLIT_FWORDS
     var pf = record * PF_WORDS
+    # This slot's row of the noise plane, one Float32 per bin, in the same
+    # (record, slot) cell order every other per-slot table uses. Read only
+    # when `noisy`; at the default the pointer is a one-element placeholder
+    # and no lane touches it. See the `random_strength` section above for why
+    # the value is uploaded rather than drawn here.
+    var noise_base = (table + slot) * nb
 
     var pg = Int32(0)
     var ph = Int32(0)
@@ -2204,6 +2605,16 @@ def _scan_slot_wide_primitive_kernel(
         left_h += hist[unsafe_offset = hs + base + b][0]
         left_c += hist[unsafe_offset = 2 * hs + base + b][0]
 
+        # This threshold's `random_strength` shift, read once and shared by
+        # the two routing directions; see `_scan_slot_kernel`. Keyed by bin
+        # and not by scan position, which is the whole reason a wide scan can
+        # carry it at all: a thread that starts in the middle of the bin
+        # range reads the same number for its bins that a serial walk would
+        # have reached them with.
+        var bin_noise = Float32(0.0)
+        if noisy != Int32(0):
+            bin_noise = noise[unsafe_offset = noise_base + b][0]
+
         # Missing to the left, scored first so an exact tie keeps
         # default_left, as in LightGBM and as on the host.
         if missing_bin >= 0:
@@ -2237,6 +2648,8 @@ def _scan_slot_wide_primitive_kernel(
                     cross_offset,
                     form,
                 )
+                if noisy != Int32(0):
+                    gain += bin_noise
                 if gain > best_gain:
                     runner_gain = best_gain
                     best_gain = gain
@@ -2273,6 +2686,8 @@ def _scan_slot_wide_primitive_kernel(
                 cross_offset,
                 form,
             )
+            if noisy != Int32(0):
+                gain += bin_noise
             if gain > best_gain:
                 runner_gain = best_gain
                 best_gain = gain
@@ -3103,6 +3518,16 @@ struct SplitNodeRequest(Copyable, Movable):
     var bounds: OutputBounds
     """The node's monotone output interval, which is the one float
     parameter that differs between the leaves of one tree."""
+    var node: Int
+    """This leaf's node id in the tree being grown, or -1 for "not supplied".
+
+    Read by exactly one rule, `random_strength`, whose draw is keyed by
+    (seed, tree, **node**, feature, bin); every other rule on a frontier
+    request is a property of the histogram or of the feature set and does not
+    care which node it belongs to. -1 is the default and is fine while the
+    noise is off; with it on, a batch carrying -1 is refused rather than
+    drawing every node of the tree from one stream, which is the refusal
+    `ExtraTreeParams.needs_node_identity` makes on the host."""
 
     def __init__(
         out self,
@@ -3110,11 +3535,13 @@ struct SplitNodeRequest(Copyable, Movable):
         var features: List[Int] = [],
         var allowed: List[Bool] = [],
         var bounds: OutputBounds = OutputBounds.unbounded(),
+        node: Int = -1,
     ):
         self.hist_slot = hist_slot
         self.features = features^
         self.allowed = allowed^
         self.bounds = bounds^
+        self.node = node
 
 
 def _launch_search(
@@ -3145,6 +3572,89 @@ def _launch_search(
     wide: Bool = False,
     primitives: Bool = True,
     gain_form: Int = DEFAULT_GAIN_FORM,
+) raises:
+    """The launch without a noise plane, which is every caller that does not
+    stage one.
+
+    An overload rather than a defaulted argument because the plane is a
+    `DeviceBuffer` and there is no null one to default to. A one-element
+    window onto `fparam` stands in for the plane and is never dereferenced:
+    `noisy` is zero, every read of that pointer is behind it, and the window
+    is the same Float32 element type so nothing is reinterpreted even in
+    principle. A window rather than a fresh buffer because this is a
+    per-launch path and it must not allocate.
+
+    **`gpu_resident_round`'s device-resident loop lands here, so
+    `random_strength` does not reach that path.** That is a wiring gap and
+    not a semantic one: the resident loop already holds the searcher, so it
+    would pass `searcher.noise_dev` and `searcher.noise_stdev > 0.0` to the
+    overload below and stage a plane per node the way `enqueue` does. It is
+    left alone here because that file belongs to another lane this round.
+    """
+    var unread = fparam.create_sub_buffer[DType.float32](0, 1)
+    _launch_search(
+        ctx,
+        hist,
+        node,
+        feat,
+        allow,
+        missing,
+        catn,
+        mono,
+        fparam,
+        unread,
+        slot_i,
+        slot_f,
+        rec_i,
+        rec_f,
+        n_bins,
+        hist_size,
+        feat_stride,
+        widest_slots,
+        record_base,
+        n_records,
+        min_data_in_leaf,
+        constrained,
+        cat_onehot_max,
+        cat_max_threshold,
+        cat_min_group,
+        wide,
+        primitives,
+        gain_form,
+        False,
+    )
+
+
+def _launch_search(
+    mut ctx: DeviceContext,
+    mut hist: DeviceBuffer[DType.int32],
+    mut node: DeviceBuffer[DType.int32],
+    mut feat: DeviceBuffer[DType.int32],
+    mut allow: DeviceBuffer[DType.int32],
+    mut missing: DeviceBuffer[DType.int32],
+    mut catn: DeviceBuffer[DType.int32],
+    mut mono: DeviceBuffer[DType.int32],
+    mut fparam: DeviceBuffer[DType.float32],
+    mut noise: DeviceBuffer[DType.float32],
+    mut slot_i: DeviceBuffer[DType.int32],
+    mut slot_f: DeviceBuffer[DType.float32],
+    mut rec_i: DeviceBuffer[DType.int32],
+    mut rec_f: DeviceBuffer[DType.float32],
+    n_bins: Int,
+    hist_size: Int,
+    feat_stride: Int,
+    widest_slots: Int,
+    record_base: Int,
+    n_records: Int,
+    min_data_in_leaf: Int,
+    constrained: Bool,
+    cat_onehot_max: Int,
+    cat_max_threshold: Int,
+    cat_min_group: Int,
+    wide: Bool = False,
+    primitives: Bool = True,
+    gain_form: Int = DEFAULT_GAIN_FORM,
+    noisy: Bool = False,
 ) raises:
     """Enqueue the two kernels of one search, over `n_records` consecutive
     nodes starting at `record_base`.
@@ -3186,7 +3696,13 @@ def _launch_search(
     second instantiation, for the same reason `primitives` does: the arms
     have to be alternated inside one process. Unlike `primitives` and
     `wide`, **this one changes records.** See
-    `GpuSplitSearcher.set_gain_form`."""
+    `GpuSplitSearcher.set_gain_form`.
+
+    `noisy` is `random_strength`, and it is the second arm here that changes
+    records. `noise` is the per-(record, slot, bin) plane the host filled
+    from `random_score_plane`; when `noisy` is False it is a one-element
+    placeholder no kernel reads, and every kernel takes the instruction
+    sequence it took before the parameter existed."""
     # The whole dispatch sits behind a compile-time accelerator test, so a
     # CPU-only extension build never instantiates any of these kernels and
     # never asks the backend for a GPU architecture it was not built with.
@@ -3207,6 +3723,7 @@ def _launch_search(
                 missing.unsafe_ptr(),
                 mono.unsafe_ptr(),
                 fparam.unsafe_ptr(),
+                noise.unsafe_ptr(),
                 slot_i.unsafe_ptr(),
                 slot_f.unsafe_ptr(),
                 Int32(n_bins),
@@ -3216,6 +3733,7 @@ def _launch_search(
                 Int32(min_data_in_leaf),
                 Int32(1) if constrained else Int32(0),
                 Int32(gain_form),
+                Int32(1) if noisy else Int32(0),
                 grid_dim=(widest_slots, n_records),
                 block_dim=WIDE_SCAN_THREADS,
             )
@@ -3228,6 +3746,7 @@ def _launch_search(
                 missing.unsafe_ptr(),
                 mono.unsafe_ptr(),
                 fparam.unsafe_ptr(),
+                noise.unsafe_ptr(),
                 slot_i.unsafe_ptr(),
                 slot_f.unsafe_ptr(),
                 Int32(n_bins),
@@ -3237,6 +3756,7 @@ def _launch_search(
                 Int32(min_data_in_leaf),
                 Int32(1) if constrained else Int32(0),
                 Int32(gain_form),
+                Int32(1) if noisy else Int32(0),
                 grid_dim=(widest_slots, n_records),
                 block_dim=WIDE_SCAN_THREADS,
             )
@@ -3250,6 +3770,7 @@ def _launch_search(
                 catn.unsafe_ptr(),
                 mono.unsafe_ptr(),
                 fparam.unsafe_ptr(),
+                noise.unsafe_ptr(),
                 slot_i.unsafe_ptr(),
                 slot_f.unsafe_ptr(),
                 Int32(n_bins),
@@ -3262,6 +3783,7 @@ def _launch_search(
                 Int32(cat_max_threshold),
                 Int32(cat_min_group),
                 Int32(gain_form),
+                Int32(1) if noisy else Int32(0),
                 grid_dim=(widest_slots, n_records),
                 block_dim=1,
             )
@@ -3523,6 +4045,46 @@ struct GpuSplitSearcher(Movable):
     `GAIN_FORM_CROSS` or `GAIN_FORM_SUBTRACTIVE`, read once at construction
     from `MOJOTREES_GPU_SPLIT_GAIN_FORM` and settable afterwards. **The one
     arm on this searcher that changes a record**; see `set_gain_form`."""
+    var noise_stdev: Float64
+    """CatBoost's `scoreStDev`: `random_strength * random_score_scale`, or
+    0.0 for "off", which is the default and every LightGBM-mode fit.
+
+    A run-time field and not an environment variable, deliberately: both arms
+    have to be reachable in one binary and one process, and the parameter is
+    a per-tree quantity (the scale is the ensemble's derivative RMS times the
+    model-size decay, which changes every iteration) rather than a session
+    constant an environment variable could carry. See `set_random_score`."""
+    var noise_seed: Int
+    """`random_strength_seed`, the seed the noise stream is keyed from."""
+    var noise_tree: Int
+    """The tree index the noise stream is keyed from. One of the five key
+    components, and the reason two trees of one fit do not reuse a draw."""
+    var noise_node: List[Int]
+    """The node id each record's staged plane was drawn for, or -1 for "no
+    plane staged". A launch with `noise_stdev > 0` and a -1 here is refused
+    rather than run: a default 0 standing in for a node id would draw every
+    node of the tree from the same stream, which is exactly what
+    `ExtraTreeParams.needs_node_identity` refuses on the host."""
+    var noise_dev: DeviceBuffer[DType.float32]
+    """The noise plane, `max_records * n_features * n_bins` Float32 in
+    (record, slot, bin) order -- the same cell order `feat_dev` and
+    `allow_dev` use, one row of `n_bins` per cell.
+
+    A one-element placeholder until `_ensure_noise` sizes it, as `hist_dev`
+    is, because a zero-length device buffer is not portable and because a
+    LightGBM-mode fit must not pay for a buffer it never reads."""
+    var noise_owned: Bool
+    """Whether `noise_dev` has been sized. See `_ensure_noise`."""
+    var noise_stage: List[Float32]
+    """Host mirror of `noise_dev`, staged per record and copied per launch.
+
+    Ordinary heap memory rather than a pinned `HostBuffer`, and it is a field
+    rather than a local for the reason section 6.5.1 of
+    `docs/GPU_PORTABILITY.md` gives: a staging buffer that is overwritten
+    before the copy it feeds has completed is a live race, so the staging
+    must outlive the launch. It does, and the next round's staging is
+    separated from this one by the same `enqueue`/`download` ordering
+    contract the per-node tables already rely on."""
 
     def __init__(
         out self,
@@ -3613,11 +4175,28 @@ struct GpuSplitSearcher(Movable):
         for _ in range(max_records):
             self.active_len.append(n_features)
 
+        # `random_strength` starts off, which is LightGBM's behavior and this
+        # module's default: no buffer, no plane, no arithmetic. Every field
+        # here is inert until `set_random_score` is called with a positive
+        # standard deviation.
+        self.noise_stdev = 0.0
+        self.noise_seed = 0
+        self.noise_tree = 0
+        self.noise_node = List[Int](capacity=max_records)
+        for _ in range(max_records):
+            self.noise_node.append(-1)
+        self.noise_stage = List[Float32]()
+
         var table_cells = max_records * n_features
         # A placeholder until `_ensure_hist` sizes it, because a
         # zero-length device buffer is not portable. See the field.
         self.hist_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
         self.hist_owned = False
+        # The same placeholder pattern, and the same reason, for the noise
+        # plane; `_ensure_noise` sizes it the first time a positive
+        # `random_strength` is set.
+        self.noise_dev = self.ctx.enqueue_create_buffer[DType.float32](1)
+        self.noise_owned = False
         # The four per-node tables in one allocation, in the order
         # `_feat_off` fixes: node, features, allow mask, float parameters.
         # The float region is counted in Int32 words because a Float32 is
@@ -3930,6 +4509,155 @@ struct GpuSplitSearcher(Movable):
         """The gain arm `set_gain_form` last chose."""
         return self.gain_form_code
 
+    def set_random_score(
+        mut self, stdev: Float64, seed: Int = 0, tree_index: Int = 0
+    ) raises:
+        """Turn CatBoost's `random_strength` on for the trees that follow,
+        with standard deviation `stdev` keyed from `seed` and `tree_index`.
+
+        `stdev` is CatBoost's `scoreStDev` in full: `random_strength *
+        derivativesStDevFromZero * modelSizeDecrease`, which on the host
+        bundle is `ExtraTreeParams.random_score_stdev()`. It is not a session
+        constant -- the last two factors are properties of the ensemble at
+        this iteration -- so it is set per tree, from whoever owns the
+        gradient vector, exactly as
+        `tree_parameters_extra.random_score_scale_from_gradients` describes.
+        Zero or negative turns the noise off, which is the default state, and
+        is the value LightGBM mode always passes.
+
+        **This is the second arm on this searcher that changes a record**,
+        the first being `set_gain_form`. It changes it on purpose and by a
+        seeded amount, which is the difference between a regularizer and a
+        defect, and it is the reason the plane is host-computed: see the
+        `random_strength` section at the top of this module for why stage B
+        of the draw cannot cross to a Float32 device and what would break if
+        it were made to.
+
+        Refused with a categorical feature, matching `find_best_split`: a
+        categorical candidate is a category set chosen by a partition search,
+        so only that search's winner would be noised while every numerical
+        feature had every candidate noised. That is a different regularizer
+        with the same name, and half-applying it is worse than refusing it.
+
+        Takes effect on the next `stage_random_score`; a record whose plane
+        has not been staged since is refused at launch rather than searched
+        without its noise.
+        """
+        if stdev != stdev or stdev > Float64.MAX_FINITE:
+            raise Error(
+                "random_strength needs a finite noise standard deviation"
+            )
+        if not (stdev > 0.0):
+            self.noise_stdev = 0.0
+            self.noise_seed = seed
+            self.noise_tree = tree_index
+            for r in range(self.max_records):
+                self.noise_node[r] = -1
+            return
+        for f in range(self.n_features):
+            if self.cat_n[f] >= 2:
+                raise Error(
+                    "random_strength is implemented for numerical thresholds"
+                    " only; this searcher was constructed with a categorical"
+                    " feature, whose candidates are category partitions and"
+                    " cannot each be noised from the threshold scan"
+                )
+        self._ensure_noise()
+        self.noise_stdev = stdev
+        self.noise_seed = seed
+        self.noise_tree = tree_index
+        # A new tree or a new standard deviation invalidates every staged
+        # plane: the draw is keyed by the tree index and scaled by the
+        # deviation, so a plane held over would be the previous tree's noise.
+        for r in range(self.max_records):
+            self.noise_node[r] = -1
+
+    def random_score_stdev(self) -> Float64:
+        """The noise standard deviation `set_random_score` last chose. 0.0
+        when `random_strength` is off, which is the default."""
+        return self.noise_stdev
+
+    def _ensure_noise(mut self) raises:
+        """Size the noise plane, once, on the first positive
+        `random_strength`. A LightGBM-mode searcher never reaches this and
+        therefore never allocates it."""
+        if self.noise_owned:
+            return
+        var cells = self.max_records * self.n_features * self.n_bins
+        self.noise_dev = self.ctx.enqueue_create_buffer[DType.float32](cells)
+        self.noise_stage = List[Float32](capacity=cells)
+        for _ in range(cells):
+            self.noise_stage.append(Float32(0.0))
+        self.noise_owned = True
+
+    def stage_random_score(mut self, record: Int, node: Int) raises:
+        """Draw record `record`'s noise plane for node `node` and stage it.
+
+        Called once per node, after `set_features` has fixed that record's
+        active set and before the `enqueue` or `enqueue_frontier` that
+        searches it. The draw is keyed by
+        (`seed`, `tree_index`, `node`, global feature id, bin), so restaging
+        the same node reproduces the same plane bit for bit, and a node whose
+        feature set was narrowed or reordered gets the same numbers in the
+        permuted positions.
+
+        Stages only; the copy happens at launch, which is what keeps the host
+        mirror alive across the transfer (see `noise_stage`).
+        """
+        self._check_record(record)
+        if not (self.noise_stdev > 0.0):
+            raise Error(
+                "stage_random_score needs a positive noise standard"
+                " deviation; call set_random_score first"
+            )
+        if node < 0:
+            raise Error(
+                "random_strength keys its draw by node id, which must be"
+                " nonnegative"
+            )
+        var slots = self.active_len[record]
+        var plane = random_score_plane(
+            self.noise_stdev,
+            self.noise_seed,
+            self.noise_tree,
+            node,
+            self._record_features(record),
+            self.n_bins,
+        )
+        var base = record * self.n_features * self.n_bins
+        for i in range(slots * self.n_bins):
+            self.noise_stage[base + i] = plane[i]
+        self.noise_node[record] = node
+
+    def _record_features(self, record: Int) -> List[Int]:
+        """Record `record`'s active feature ids, read back out of the staged
+        feature table so the plane is keyed by exactly the features the scan
+        will walk, in exactly the order it will walk them."""
+        var src = self.stage_tables.unsafe_ptr().unsafe_offset(
+            self._feat_off()
+        )
+        var slots = self.active_len[record]
+        var out = List[Int](capacity=slots)
+        for slot in range(slots):
+            out.append(Int(src[unsafe_offset = record * self.n_features + slot][0]))
+        return out^
+
+    def _check_noise_staged(self, record_base: Int, n_records: Int) raises:
+        """Refuse a launch whose noise plane was never drawn for one of its
+        records. The alternative is a node searched against another node's
+        noise, or against zeros, and neither announces itself."""
+        if not (self.noise_stdev > 0.0):
+            return
+        for r in range(record_base, record_base + n_records):
+            if self.noise_node[r] < 0:
+                raise Error(
+                    "random_strength is on but record ",
+                    r,
+                    " has no noise plane staged for it; call"
+                    " stage_random_score(record, node) after set_features"
+                    " and before the search",
+                )
+
     def _feat_off(self) -> Int:
         """First Int32 word of the feature table inside the packed tables.
 
@@ -3984,6 +4712,22 @@ struct GpuSplitSearcher(Movable):
         # interleaves two settings of it, and a run whose arm cannot be read
         # off its own output proves nothing about either.
         var back = String(" readback=", self.describe_readback())
+        # And `random_strength`, for the reason the gain arm is here: it is
+        # the other arm that changes what the records say, and a stochastic
+        # split rule that does not print itself is a result nobody can
+        # attribute. Off is the default and prints as "off", not as nothing,
+        # so a line that lacks the field is an old line rather than a quiet
+        # one.
+        var noise = String(" noise=off")
+        if self.noise_stdev > 0.0:
+            noise = String(
+                " noise=stdev:",
+                self.noise_stdev,
+                " seed:",
+                self.noise_seed,
+                " tree:",
+                self.noise_tree,
+            )
         if self.wide_scan:
             return String(
                 "scan=wide threads=",
@@ -3992,8 +4736,11 @@ struct GpuSplitSearcher(Movable):
                 tables,
                 gain,
                 back,
+                noise,
             )
-        return String("scan=serial threads=1", reduction, tables, gain, back)
+        return String(
+            "scan=serial threads=1", reduction, tables, gain, back, noise
+        )
 
     def _check_record(self, record: Int) raises:
         if record < 0 or record >= self.max_records:
@@ -4452,7 +5199,9 @@ struct GpuSplitSearcher(Movable):
         """Copy the staged tables and launch the two kernels over
         `n_records` consecutive record slots. The one place either entry
         point reaches the device."""
+        self._check_noise_staged(record_base, n_records)
         self._copy_tables()
+        self._copy_noise(record_base, n_records)
         _launch_search(
             self.ctx,
             hist,
@@ -4463,6 +5212,7 @@ struct GpuSplitSearcher(Movable):
             self.catn_dev,
             self.mono_dev,
             self.fparam_dev,
+            self.noise_dev,
             self.slot_i_dev,
             self.slot_f_dev,
             self.rec_i_dev,
@@ -4481,6 +5231,32 @@ struct GpuSplitSearcher(Movable):
             self.wide_scan,
             self.use_primitives,
             self.gain_form_code,
+            self.noise_stdev > 0.0,
+        )
+
+    def _copy_noise(mut self, record_base: Int, n_records: Int) raises:
+        """Upload the staged noise rows for `[record_base, record_base +
+        n_records)`, and nothing else.
+
+        One copy per launch, over exactly the records the launch searches, so
+        a node-at-a-time loop moves one node's plane and a frontier moves the
+        frontier's. It is a real transfer -- `n_features * n_bins` Float32 a
+        node, a third of the histogram this module exists to stop moving --
+        and it is the price of the two backends adding the same number; see
+        the `random_strength` section at the top of this module. Nothing is
+        copied, and this function returns immediately, when the noise is off.
+        """
+        if not (self.noise_stdev > 0.0):
+            return
+        var stride = self.n_features * self.n_bins
+        var window = self.noise_dev.create_sub_buffer[DType.float32](
+            record_base * stride, n_records * stride
+        )
+        self.ctx.enqueue_copy(
+            dst_buf=window,
+            src_ptr=self.noise_stage.unsafe_ptr().unsafe_offset(
+                record_base * stride
+            ),
         )
 
     def enqueue(
@@ -4492,9 +5268,14 @@ struct GpuSplitSearcher(Movable):
         bounds: OutputBounds = OutputBounds.unbounded(),
         record: Int = 0,
         hist_slot: Int = 0,
+        node: Int = -1,
     ) raises:
         """Enqueue the scan and reduction over `hist`, writing record slot
         `record`.
+
+        `node` is this leaf's node id, read by `random_strength` alone, which
+        keys its draw by it; -1, the default, is correct whenever the noise is
+        off and refused when it is on. See `set_random_score`.
 
         It does transfer, and on Metal it therefore drains. `_launch` copies
         the staged per-node tables across before either kernel is enqueued,
@@ -4535,6 +5316,8 @@ struct GpuSplitSearcher(Movable):
         self._stage_hist_base(
             record, Int32(hist_slot * 3 * self.n_features * self.n_bins)
         )
+        if self.noise_stdev > 0.0:
+            self.stage_random_score(record, node)
         self._launch(hist, params, record, 1, self.active_len[record])
 
     def enqueue_pick_best(
@@ -4688,10 +5471,17 @@ struct GpuSplitSearcher(Movable):
         h_scale: Float64,
         bounds: OutputBounds = OutputBounds.unbounded(),
         record: Int = 0,
+        node: Int = -1,
     ) raises -> GpuSplitRecord:
         """Search the histogram staged by `upload_histogram` and return its
-        record."""
+        record.
+
+        `node` is this leaf's node id and is read by `random_strength` alone,
+        which keys its draw by it; -1, the default, is correct whenever the
+        noise is off and refused when it is on. See `set_random_score`."""
         self._check_record(record)
+        if self.noise_stdev > 0.0:
+            self.stage_random_score(record, node)
         # Ordinarily a no-op, since `upload_histogram` has run and sized the
         # buffer; it is here so that this method never launches against the
         # placeholder, whatever order a caller uses.
@@ -4714,6 +5504,7 @@ struct GpuSplitSearcher(Movable):
         # _the_serial_wide_scan` reaches the wide kernel through `search`
         # and had therefore been comparing the serial scan against itself.
         self._copy_tables()
+        self._copy_noise(record, 1)
         _launch_search(
             self.ctx,
             self.hist_dev,
@@ -4724,6 +5515,7 @@ struct GpuSplitSearcher(Movable):
             self.catn_dev,
             self.mono_dev,
             self.fparam_dev,
+            self.noise_dev,
             self.slot_i_dev,
             self.slot_f_dev,
             self.rec_i_dev,
@@ -4741,6 +5533,7 @@ struct GpuSplitSearcher(Movable):
             params.cat.min_data_per_group,
             wide=self.wide_scan,
             primitives=self.use_primitives,
+            noisy=self.noise_stdev > 0.0,
         )
         return self.download(record)
 
@@ -4822,6 +5615,10 @@ struct GpuSplitSearcher(Movable):
                 params, g_scale, h_scale, nodes[i].bounds, i
             )
             self._stage_hist_base(i, Int32(nodes[i].hist_slot * slot_cells))
+            # After the feature set, because the plane is keyed by the global
+            # ids of exactly the features this record will scan.
+            if self.noise_stdev > 0.0:
+                self.stage_random_score(i, nodes[i].node)
             if self.active_len[i] > widest:
                 widest = self.active_len[i]
         self._launch(hist, params, 0, len(nodes), widest)
@@ -4924,6 +5721,7 @@ def reference_search(
     cats: CategoricalSpec = CategoricalSpec.none(),
     bounds: OutputBounds = OutputBounds.unbounded(),
     gain_form: Int = DEFAULT_GAIN_FORM,
+    noise: List[Float32] = [],
 ) raises -> GpuSplitRecord:
     """The kernels' arithmetic, run on the host over the same fixed-point
     histogram.
@@ -4942,6 +5740,17 @@ def reference_search(
     the two forms on one histogram without a device; passing a different one
     by accident is how a host/device comparison fails for a reason that is
     not about either of them.
+
+    `noise` is one node's `random_strength` plane, `len(features) * n_bins`
+    Float32 in the order `random_score_plane` builds it -- the same buffer,
+    element for element, that `GpuSplitSearcher.stage_random_score` uploads.
+    Empty is the default and is a strict no-op: not a zero added, no
+    arithmetic executed, and the same record the replica returned before this
+    parameter existed. Categorical features are refused with it, matching
+    `split.find_best_split`: a categorical candidate is a category *set*
+    chosen by a partition search, so only that search's winner would be
+    noised while every numerical feature had every candidate noised, which is
+    a different regularizer wearing the same name.
     """
     if len(hist) != 3 * n_features * n_bins:
         raise Error("histogram must hold 3 * n_features * n_bins Int32 words")
@@ -4971,6 +5780,26 @@ def reference_search(
         active = List[Int](capacity=n_features)
         for f in range(n_features):
             active.append(f)
+
+    var noisy = len(noise) > 0
+    if noisy:
+        if len(noise) != len(active) * n_bins:
+            raise Error(
+                "a random_strength noise plane must hold one Float32 per"
+                " (active feature, bin): expected ",
+                len(active) * n_bins,
+                ", got ",
+                len(noise),
+            )
+        for slot in range(len(active)):
+            var cf = active[slot]
+            if cats.is_cat(cf) and cats.n_categories(cf) >= 2:
+                raise Error(
+                    "random_strength is implemented for numerical thresholds"
+                    " only; a categorical feature is searched as category"
+                    " partitions, and only that search's winner would reach"
+                    " a per-candidate draw"
+                )
 
     var out = GpuSplitRecord()
     var best_slot = -1
@@ -5208,6 +6037,12 @@ def reference_search(
                 left_h += hist[hs + base + b]
                 left_c += hist[2 * hs + base + b]
 
+                # One `random_strength` shift per threshold, shared by the
+                # two routing directions; see `_scan_slot_kernel`.
+                var bin_noise = Float32(0.0)
+                if noisy:
+                    bin_noise = noise[slot * n_bins + b]
+
                 if missing_bin >= 0:
                     var dl_g = left_g + miss_g
                     var dl_h = left_h + miss_h
@@ -5241,6 +6076,8 @@ def reference_search(
                             cross_offset,
                             form,
                         )
+                        if noisy:
+                            gain += bin_noise
                         if gain > gain_here:
                             runner_here = gain_here
                             gain_here = gain
@@ -5286,6 +6123,8 @@ def reference_search(
                         cross_offset,
                         form,
                     )
+                    if noisy:
+                        gain += bin_noise
                     if gain > gain_here:
                         runner_here = gain_here
                         gain_here = gain
