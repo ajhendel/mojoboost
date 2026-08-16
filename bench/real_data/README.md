@@ -29,13 +29,16 @@ answer. `backend_proof.py` exists because of it.
 
 ### What a GPU run of this harness does and does not produce
 
-Three of the six scenarios declare `devices=["cpu", "gpu"]`
-(`dense_regression`, `imbalanced_binary`, `multiclass`). The other three
-declare the CPU only, because `ranking` and `categorical_missing` and
-`sparse_highdim` have no accelerator path the harness is willing to compare.
-A `--device gpu` run therefore records those three as **skipped, with the
-reason attached**, which is a different record from a failure and must not be
-read as one.
+Three of the eight scenarios declare `devices=["cpu", "gpu"]`
+(`dense_regression`, `imbalanced_binary`, `multiclass`). The other five
+declare the CPU only: `ranking`, `categorical_missing`,
+`high_cardinality_categorical` and `sparse_highdim` have no accelerator path
+the harness is willing to compare, and `ordered_boosting_small` is pinned to
+a row count chosen for CatBoost's boosting-scheme threshold, which sits below
+the size at which this library sends work to the accelerator at all. A
+`--device gpu` run therefore records those five as **skipped, with the reason
+attached**, which is a different record from a failure and must not be read
+as one.
 
 Two corrections follow, because both readings have circulated. "The GPU
 errored on four of six scenarios" is wrong twice over: the scenarios without
@@ -45,7 +48,7 @@ came from a package rename that had not propagated, and they hit **all six**
 scenarios on **both** backends. An error that lands on the CPU arm too is
 evidence about the harness environment, not about the accelerator.
 
-## The six scenarios
+## The eight scenarios
 
 | id | shape | real dataset | generator |
 | --- | --- | --- | --- |
@@ -54,10 +57,31 @@ evidence about the harness environment, not about the accelerator.
 | `multiclass` | softmax, one tree per class per round | Covertype | skewed-prior softmax |
 | `ranking` | LambdaRank on graded relevance | MSLR-WEB10K (manual) | graded queries of varying length |
 | `categorical_missing` | integer categories and real holes | Adult | high-cardinality effects, missing not at random |
+| `high_cardinality_categorical` | 1,000,000 rows, five cardinalities, one interaction | none yet | level counts pinned to rows per level |
+| `ordered_boosting_small` | 50,000 rows, where CatBoost's default is `Ordered` | none | the dense recipe at a higher noise level |
 | `sparse_highdim` | CSC, features outnumber rows | RCV1 | power-law column density |
 
 Two more datasets sit in a `large` tier that is never in the default run:
 HIGGS for row scaling and news20 for feature scaling.
+
+The last two are the newest and are the ones that make a comparison possible
+rather than adding a shape to it, so what each is for is worth stating.
+`high_cardinality_categorical` is the shape ordered target statistics and CTR
+feature combinations exist for, and before it landed no scenario in this
+suite exercised any of that machinery, so none of it could reach a published
+number however well it worked. `ordered_boosting_small` is pinned to a row
+count chosen so that CatBoost runs its own `Ordered` default rather than
+`Plain`; that row count is an assumption and `scenarios.ORDERED_BOOSTING_ROWS`
+records exactly how much of it is verified, which is none of it.
+
+Neither has a real dataset. For the first that is a gap and not a
+preference: the real reading of the shape is a click log, and registering one
+is a `sources.json` entry, a loader, a licence check and a multi-gigabyte
+fetch. A ninth scenario, `text_features`, is **specified and not built** and
+is deliberately outside `SCENARIOS`: `scenarios.TEXT_SCENARIO_PENDING` holds
+the design and names the three things the input contract has to settle before
+it can be registered, and `selfcheck.check_pending_scenarios` fails if it is
+registered before they are.
 
 ## Running it
 
@@ -95,7 +119,7 @@ checksums.lock.json   digests fetch.py --pin observed. Written by a fetch, never
 fetch.py              download, verify against the lock, or record a new pin
 loaders.py            pinned files into arrays, with the shape checked against the registry
 generators.py         deterministic data for every scenario, so the suite runs offline
-scenarios.py          the six scenarios and the parameter alignment between the engines
+scenarios.py          the eight scenarios and the parameter alignment between the engines
 engines.py            one adapter per library, same phases measured on both
 quality.py            one implementation of every metric, applied to both engines
 measure.py            timing, peak memory, model size, digests
@@ -167,7 +191,7 @@ sparse features before binning, which is the same kind of change.
 mojotrees's EFB is reachable from Python now, so that one is closer to
 coming out than it was, but the ranking trainer refuses an active bundling
 switch by name, so turning it on for both engines would raise on one of the
-six scenarios rather than compare it.
+eight scenarios rather than compare it.
 
 Those two used to be pinned and are not any more, which is worth recording
 because the reasoning that justified the pins is the reasoning that now

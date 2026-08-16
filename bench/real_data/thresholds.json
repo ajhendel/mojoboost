@@ -188,6 +188,42 @@
         "min": 0.70,
         "rationale": "Signal is concentrated in a few hundred of tens of thousands of columns. A model that missed them lands near 0.5, and 0.70 separates that clearly from a model that found them."
       }
+    },
+    "high_cardinality_categorical": {
+      "primary_metric": "auc",
+      "differential": {
+        "kind": "absolute",
+        "max_worse": 0.05,
+        "implausible_better": 0.02,
+        "rationale": "The widest gate in this file and the most asymmetric, and both properties are deliberate. mojotrees keeps at most max_bin - 1 = 254 categories per column and lumps every other code into a bin that can never join a split set (src/mojotrees/categorical.mojo, 'Capacity'); LightGBM's max_bin is a FLOOR on a categorical column's bin count and it keeps admitting categories until it has both covered 99 percent of the rows and spent max_bin bins. On this scenario's standard tier that is 254 bins against roughly 100,000 on one column and 254 against 20,000 on another. That is a known structural deficit on our side, sized before any run, and a gate tight enough to fail on it would fail on the first run for a reason nobody needed a benchmark to learn. 0.05 absolute AUC bounds it loosely enough to still catch a broken model.",
+        "why_asymmetric": "implausible_better is 0.02 against a max_worse of 0.05, which is the only inverted pair in this file. mojotrees is structurally handicapped on this scenario by the capacity ceiling above, so a LARGE win is stronger evidence that the two engines were not given the same problem than it is anywhere else. Small wins remain plausible and are not caught: mojotrees uses exact row counts where LightGBM estimates a bin's count from its Hessian sum, and mojotrees drops no rare category where LightGBM drops everything under min_data_in_bin.",
+        "exit_condition": "this number comes down to the dense case's band the day a mojotrees categorical column stops being capped at 254 levels. An ordered target statistic does that by turning the column into one numeric feature of 255 bins, which is the whole reason that mechanism is being built, so a tightening here is the measurable form of that lane landing. Loosening it further needs a commit that says why.",
+        "known_risk": "no mojotrees-versus-LightGBM differential has ever been recorded on this scenario, at any tier, because it did not exist before 2026-08-16. 0.05 is derived from the capacity gap above and from nothing measured. If the first run comes in wildly outside it, the number to question is this one and the place to question it is a commit, not the morning it goes red."
+      },
+      "secondary": {"average_precision": {"kind": "relative", "max_worse": 0.10}},
+      "baseline": {
+        "kind": "absolute_floor",
+        "metric": "auc",
+        "min": 0.70,
+        "rationale": "The generator puts most of the signal in five categorical columns and a double-centered two-column interaction, at a 10 percent positive rate. A constant model scores 0.5. 0.70 separates a model that found the categorical structure from one that treated the codes as ordinal numbers, which is the failure this scenario is built to expose, and it does not assert that either engine fitted it well.",
+        "why_this_number": "measured rather than guessed, and measured without training anything. On 2026-08-16 a cat_smooth-smoothed per-level target mean, fitted on the training split and scored on the held-out split at 200,000 rows with the cardinality ladder divided by five, reaches 0.8165 AUC from the five categorical columns alone, against 0.6338 from the numeric terms alone. A boosted model with both should sit above that, so 0.70 is a floor with real margin under it rather than a floor sitting on top of the achievable value. See scenarios.HIGH_CARDINALITY_LEVELS for the per-column readings."
+      }
+    },
+    "ordered_boosting_small": {
+      "primary_metric": "rmse",
+      "differential": {
+        "kind": "relative",
+        "max_worse": 0.03,
+        "implausible_better": 0.10,
+        "rationale": "The same data recipe as dense_regression at the same objective and the same bin count, so the same reasoning and the same numbers apply: what is left between mojotrees and LightGBM is split-search tie breaking and floating-point summation order. This gate is against the COMPARATOR and is unaffected by anything CatBoost resolves; the ordered-boosting question this scenario exists for lives in a peer column, and nothing in this file is measured against a peer column."
+      },
+      "secondary": {"mae": {"kind": "relative", "max_worse": 0.05}},
+      "baseline": {
+        "kind": "relative_improvement",
+        "metric": "rmse",
+        "min": 0.15,
+        "rationale": "dense_regression's floor, for dense_regression's reason: a model that cannot beat the training mean did not fit, and two engines agreeing on a non-model would otherwise pass the differential check. This scenario runs the generator at a higher noise level (0.60 against 0.30) so that a 100-tree model at 50,000 rows genuinely overfits, which lowers the achievable improvement; 0.15 was already loosened once against measured data and is not lowered again here on an argument. If the noise level turns out to put it out of reach, the fix is a commit that says so."
+      }
     }
   },
   "performance": {
