@@ -18,8 +18,12 @@ The engine LIBRARIES are deliberately not imported. `engines.py` itself is,
 so that the peer-arm check can prove the CatBoost-mode arm goes through its
 own translator rather than being the plain arm under another name, but every
 `import lightgbm` and `import catboost` in that module is inside a method
-and none of them runs here. This needs nothing but the standard library and
-numpy, in any environment, in well under a second.
+and none of them runs here. This needs the standard library, **numpy and pandas** (the categorical
+fixture builds a mixed float-and-integer frame, which numpy has no dtype
+for), in well under a second. **pandas is why "any environment" is no longer
+true**, and it is declared under `[feature.bench.dependencies]` in
+`pixi.toml`: run this as `pixi run -e bench python bench/real_data/selfcheck.py`
+rather than with whatever `python3` is on PATH.
 """
 
 import json
@@ -1387,6 +1391,28 @@ def main():
         for failure in FAILURES:
             print(f"FAIL {failure}")
         print(f"\n{len(FAILURES)} problems")
+        # An import failure here is far more often the WRONG INTERPRETER than
+        # a missing dependency, and the two look identical in the message.
+        # This file is designed to run anywhere in under a second, which makes
+        # `python3 bench/real_data/selfcheck.py` the natural thing to type --
+        # and that interpreter lacks pandas, which the categorical fixture
+        # needs. So the tool that is supposed to run anywhere fails in a way
+        # that reads as "the repository is broken" rather than "you used the
+        # wrong python". Two people lost time to it on 2026-08-16, one of them
+        # reporting it upward as a pre-existing environment gap after checking
+        # carefully that it was not their own change.
+        #
+        # The message that will be acted on should carry what it was computed
+        # from, so say which interpreter this was.
+        if any("No module named" in str(f) for f in FAILURES):
+            print()
+            print(f"  Interpreter: {sys.executable}")
+            print(f"  Version:     {sys.version.split()[0]}")
+            print(
+                "  A missing module here is usually the wrong interpreter.\n"
+                "  The bench environment is the one that has the dependencies:\n"
+                "      pixi run -e bench python bench/real_data/selfcheck.py"
+            )
         return 1
     print("harness self-check passed. Nothing was trained and nothing was downloaded.")
     return 0
