@@ -18,6 +18,10 @@ trained model:
                   pinned against the CPU reference instead)
   weights         weighted derivatives, including zero-weight rows, which must
                   produce an exactly zero gradient and hessian
+  weight refresh  `refresh_weights`, the per-tree weight plane a Bayesian
+                  bootstrap needs: growing it from the unweighted placeholder,
+                  redrawing it over a live one, and the builder's refusal to
+                  accept one beside a constant-hessian declaration
   softmax         multiclass probabilities and per-class derivatives against
                   `_softmax_inplace` + `_fill_softmax_grad_hess`
   raw update      `raw[r] += lr * value[leaf[r]]` from a device leaf array,
@@ -62,11 +66,13 @@ from mojotrees.boosting import (
     _softmax_inplace,
     fill_grad_hess,
 )
+from mojotrees.binning import BinnedMatrix
 from mojotrees.gpu_objectives_native import (
     GpuObjectiveState,
     device_fixed_scale,
     supports_device_objective,
 )
+from mojotrees.histogram_gpu import GpuHistogramBuilder
 from support import _uniform
 
 
@@ -338,6 +344,327 @@ def test_device_grad_hess_weights() raises:
                     got[n + r], hess[r], 1e-5, 1e-6,
                     String("weighted hess objective ", objective, " row ", r),
                 )
+
+
+def _weights_redrawn(n: Int) -> List[Float64]:
+    """A second per-row weight vector, the shape the next tree of a Bayesian
+    bootstrap hands over: a different draw on every row, and its zero rows in
+    different places than `_weights` puts them."""
+    var w = List[Float64](capacity=n)
+    for r in range(n):
+        if r % 5 == 2:
+            w.append(0.0)
+        else:
+            w.append(_f32(0.1 + 2.5 * _uniform(UInt64(r) * 29 + 13)))
+    return w^
+
+
+def _assert_weights_can_fail(w: List[Float64]) raises:
+    """The trap every weighted test here has to avoid.
+
+    A vector of all ones is arithmetically identical to no weights at all, so
+    it passes an implementation whose weight plane is never uploaded, never
+    read, or read at the wrong row. These assertions say the vector is not
+    that one: it has a zero row, rows below one and rows above one, and so a
+    kernel that ignored the plane has to disagree on most rows rather than
+    on none.
+    """
+    var zeros = 0
+    var below = 0
+    var above = 0
+    for r in range(len(w)):
+        if w[r] == 0.0:
+            zeros += 1
+        elif w[r] < 1.0:
+            below += 1
+        elif w[r] > 1.0:
+            above += 1
+    assert_true(zeros > 0, "the weights must include a zero-weight row")
+    assert_true(below > 0, "the weights must include a row weighted below 1")
+    assert_true(above > 0, "the weights must include a row weighted above 1")
+
+
+def _binned(n_rows: Int, n_features: Int, n_bins: Int) raises -> BinnedMatrix:
+    """A column-major binned matrix of pseudorandom bins, the fixture the
+    other GPU histogram tests use. Its values do not matter here: the builder
+    is only needed for the half of the weight contract that lives on it."""
+    var bins = List[UInt8](capacity=n_rows * n_features)
+    for f in range(n_features):
+        for r in range(n_rows):
+            var v = _uniform(UInt64(f * n_rows + r) + 0x0DF1A5E3)
+            bins.append(UInt8(Int(v * Float64(n_bins)) % n_bins))
+    return BinnedMatrix(bins^, n_rows, n_features, n_bins)
+
+
+def test_device_refresh_weights_grows_an_unweighted_plane() raises:
+    """A fit that started unweighted holds a one-element placeholder where
+    the weight plane goes, so the first `refresh_weights` has to grow it.
+
+    Both halves are asserted on one state and one set of raw scores. Before
+    the refresh the derivatives must be exactly the unweighted ones, which is
+    the claim that an unweighted fit takes the path it took before this
+    method existed. After it they must be the weighted ones, and must differ
+    from the unweighted ones on most rows -- see `_assert_weights_can_fail`
+    for why that last assertion is the one an all-ones vector would not make.
+    """
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n = 512
+        var objective = SQUARED_ERROR
+        var alpha = _alpha_for(objective)
+        var target = _target_for(objective, n)
+        var raw = _raw_for(objective, target)
+        var weights = _weights(n, True)
+        _assert_weights_can_fail(weights)
+
+        var ctx = DeviceContext()
+        var empty = List[Float64]()
+        var state = GpuObjectiveState(ctx, target)
+        state.set_raw(ctx, raw)
+        var grad_dev = ctx.enqueue_create_buffer[DType.float32](n)
+        var hess_dev = ctx.enqueue_create_buffer[DType.float32](n)
+
+        state.fill_grad_hess(ctx, objective, alpha, grad_dev, hess_dev)
+        var plain = state.download_grad_hess(ctx, grad_dev, hess_dev)
+        var g0 = List[Float64]()
+        var h0 = List[Float64]()
+        fill_grad_hess(raw, target, objective, empty, alpha, g0, h0)
+        for r in range(n):
+            _assert_close(
+                plain[r], g0[r], 1e-5, 1e-6, String("plain grad row ", r)
+            )
+            _assert_close(
+                plain[n + r], h0[r], 1e-5, 1e-6, String("plain hess row ", r)
+            )
+
+        state.refresh_weights(ctx, weights)
+        state.fill_grad_hess(ctx, objective, alpha, grad_dev, hess_dev)
+        var got = state.download_grad_hess(ctx, grad_dev, hess_dev)
+        var g1 = List[Float64]()
+        var h1 = List[Float64]()
+        fill_grad_hess(raw, target, objective, weights, alpha, g1, h1)
+
+        var moved = 0
+        for r in range(n):
+            _assert_close(
+                got[r], g1[r], 1e-5, 1e-6, String("refreshed grad row ", r)
+            )
+            _assert_close(
+                got[n + r], h1[r], 1e-5, 1e-6,
+                String("refreshed hess row ", r),
+            )
+            if weights[r] == 0.0:
+                # Excluded exactly, not approximately: a zero-weight row is
+                # invisible to every histogram on both backends.
+                assert_equal(got[r], 0.0)
+                assert_equal(got[n + r], 0.0)
+            elif abs(got[r] - plain[r]) > 1e-6:
+                moved += 1
+        assert_true(
+            moved > n // 2,
+            "the refreshed weights must move the derivatives on most rows",
+        )
+
+
+def test_device_refresh_weights_redraws_a_live_plane() raises:
+    """The Bayesian bootstrap's own shape: a state constructed with the
+    user's `sample_weight` and then handed a different product vector every
+    tree.
+
+    The second refresh is the one that matters. Its answer has to be the
+    *second* vector's, not the first vector's still sitting on the device,
+    which is the failure a single refresh could not distinguish. Run over
+    every device objective, because the weight enters each arm separately
+    (MAPE folds it into the label weight, the constant-hessian four store it
+    as the hessian outright).
+    """
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n = 256
+        var first = _weights(n, True)
+        var second = _weights_redrawn(n)
+        _assert_weights_can_fail(first)
+        _assert_weights_can_fail(second)
+        var differ = 0
+        for r in range(n):
+            if first[r] != second[r]:
+                differ += 1
+        assert_true(differ > n // 2, "the two draws must actually differ")
+
+        var ctx = DeviceContext()
+        var objectives = _all_objectives()
+        for i in range(len(objectives)):
+            var objective = objectives[i]
+            var alpha = _alpha_for(objective)
+            var target = _target_for(objective, n)
+            var raw = _raw_for(objective, target)
+
+            var state = GpuObjectiveState(ctx, target, first)
+            state.set_raw(ctx, raw)
+            var grad_dev = ctx.enqueue_create_buffer[DType.float32](n)
+            var hess_dev = ctx.enqueue_create_buffer[DType.float32](n)
+
+            state.fill_grad_hess(ctx, objective, alpha, grad_dev, hess_dev)
+            var got_first = state.download_grad_hess(ctx, grad_dev, hess_dev)
+            var g0 = List[Float64]()
+            var h0 = List[Float64]()
+            fill_grad_hess(raw, target, objective, first, alpha, g0, h0)
+
+            state.refresh_weights(ctx, second)
+            state.fill_grad_hess(ctx, objective, alpha, grad_dev, hess_dev)
+            var got_second = state.download_grad_hess(ctx, grad_dev, hess_dev)
+            var g1 = List[Float64]()
+            var h1 = List[Float64]()
+            fill_grad_hess(raw, target, objective, second, alpha, g1, h1)
+
+            for r in range(n):
+                _assert_close(
+                    got_first[r], g0[r], 1e-5, 1e-6,
+                    String("draw 1 grad objective ", objective, " row ", r),
+                )
+                _assert_close(
+                    got_first[n + r], h0[r], 1e-5, 1e-6,
+                    String("draw 1 hess objective ", objective, " row ", r),
+                )
+                _assert_close(
+                    got_second[r], g1[r], 1e-5, 1e-6,
+                    String("draw 2 grad objective ", objective, " row ", r),
+                )
+                _assert_close(
+                    got_second[n + r], h1[r], 1e-5, 1e-6,
+                    String("draw 2 hess objective ", objective, " row ", r),
+                )
+                if second[r] == 0.0:
+                    assert_equal(got_second[r], 0.0)
+                    assert_equal(got_second[n + r], 0.0)
+
+
+def test_device_refresh_weights_contract() raises:
+    """The refusals, and that a refused call leaves the plane as it was.
+
+    Every check runs before anything is allocated or written, so a state that
+    rejected a bad vector is still the state it was and its next fill is
+    still correct. That is asserted rather than assumed.
+    """
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n = 64
+        var objective = SQUARED_ERROR
+        var alpha = _alpha_for(objective)
+        var target = _target_for(objective, n)
+        var raw = _raw_for(objective, target)
+        var weights = _weights(n, True)
+
+        var ctx = DeviceContext()
+        var state = GpuObjectiveState(ctx, target, weights)
+        state.set_raw(ctx, raw)
+        var grad_dev = ctx.enqueue_create_buffer[DType.float32](n)
+        var hess_dev = ctx.enqueue_create_buffer[DType.float32](n)
+
+        # Empty is the unweighted convention, not an instruction to unweight
+        # a live plane, so it is refused rather than silently obeyed.
+        var empty = List[Float64]()
+        with assert_raises():
+            state.refresh_weights(ctx, empty)
+        # A vector that is not one entry per row.
+        with assert_raises():
+            state.refresh_weights(ctx, [1.0, 1.0])
+        # Negative and non-finite entries, the same rule the constructor
+        # applies to `sample_weight`.
+        var negative = weights.copy()
+        negative[0] = -1.0
+        with assert_raises():
+            state.refresh_weights(ctx, negative)
+        var infinite = weights.copy()
+        var inf = 1.0 / 0.0
+        infinite[1] = inf
+        with assert_raises():
+            state.refresh_weights(ctx, infinite)
+        var nan = weights.copy()
+        nan[2] = inf - inf
+        with assert_raises():
+            state.refresh_weights(ctx, nan)
+
+        # The plane the constructor uploaded is untouched by all of that.
+        state.fill_grad_hess(ctx, objective, alpha, grad_dev, hess_dev)
+        var got = state.download_grad_hess(ctx, grad_dev, hess_dev)
+        var g = List[Float64]()
+        var h = List[Float64]()
+        fill_grad_hess(raw, target, objective, weights, alpha, g, h)
+        for r in range(n):
+            _assert_close(
+                got[r], g[r], 1e-5, 1e-6,
+                String("grad after refused refresh row ", r),
+            )
+            _assert_close(
+                got[n + r], h[r], 1e-5, 1e-6,
+                String("hess after refused refresh row ", r),
+            )
+
+
+def test_builder_refuses_weights_under_constant_hessian() raises:
+    """The builder's half of the contract.
+
+    A per-row weight multiplies both derivatives, so under squared error the
+    hessian *is* the weight. A builder holding a constant-hessian declaration
+    rebuilds that plane from the row count instead of accumulating it, and
+    against a weighted round it would rebuild the wrong plane with nothing
+    downstream able to tell. `refresh_objective_weights` refuses that pairing
+    instead, and accepts the refresh once the declaration is cleared -- and
+    the accepted one has to reach the kernel, which is what the comparison at
+    the end establishes.
+
+    The refusal is asserted only when the declaration was actually adopted:
+    `MOJOTREES_CONST_HESSIAN=0` refuses it outright, and `constant_hessian`
+    reports what was adopted rather than what was asked for.
+    """
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n = 128
+        var objective = SQUARED_ERROR
+        var alpha = _alpha_for(objective)
+        var target = _target_for(objective, n)
+        var raw = _raw_for(objective, target)
+        var weights = _weights(n, True)
+        _assert_weights_can_fail(weights)
+
+        var data = _binned(n, 4, 16)
+        var builder = GpuHistogramBuilder(data)
+        var state = builder.objective_state(target)
+        state.set_raw(builder.ctx, raw)
+
+        builder.set_constant_hessian(True)
+        if builder.constant_hessian():
+            with assert_raises():
+                builder.refresh_objective_weights(state, weights)
+
+        builder.set_constant_hessian(False)
+        builder.refresh_objective_weights(state, weights)
+        state.fill_grad_hess(
+            builder.ctx, objective, alpha, builder.grad_dev, builder.hess_dev
+        )
+        var got = state.download_grad_hess(
+            builder.ctx, builder.grad_dev, builder.hess_dev
+        )
+        var g = List[Float64]()
+        var h = List[Float64]()
+        fill_grad_hess(raw, target, objective, weights, alpha, g, h)
+        for r in range(n):
+            _assert_close(
+                got[r], g[r], 1e-5, 1e-6,
+                String("builder-refreshed grad row ", r),
+            )
+            _assert_close(
+                got[n + r], h[r], 1e-5, 1e-6,
+                String("builder-refreshed hess row ", r),
+            )
+            if weights[r] == 0.0:
+                assert_equal(got[r], 0.0)
+                assert_equal(got[n + r], 0.0)
 
 
 def test_device_gradient_finite_difference() raises:

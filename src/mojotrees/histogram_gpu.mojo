@@ -1626,6 +1626,49 @@ struct GpuHistogramBuilder(Movable):
             self.ctx, target, sample_weight, n_classes, max_nodes
         )
 
+    def refresh_objective_weights(
+        mut self, mut state: GpuObjectiveState, weights: List[Float64]
+    ) raises:
+        """Upload this tree's per-row weights into `state`'s weight plane, on
+        this builder's context, and refuse the one combination that would make
+        the upload produce a wrong histogram.
+
+        The upload itself is `GpuObjectiveState.refresh_weights`; what this
+        adds is the builder's half of the contract, which the state cannot
+        see. A per-row weight multiplies both derivatives, so under squared
+        error, L1, huber and quantile the hessian *is* the weight (the CPU
+        stores exactly `w` there, `boosting._fill_grad_hess_into`). A builder
+        holding `set_constant_hessian(True)` rebuilds the hessian plane from
+        the row count instead of accumulating it, and against a weighted
+        round it would rebuild the wrong plane silently, in the histogram,
+        with nothing downstream able to tell. So it is refused here.
+
+        This is the same rule as `boosting.round_has_constant_hessian` (which
+        ends in `objective_has_constant_hessian(objective, len(sample_weight)
+        > 0)`, false for every objective under a non-empty weight vector) and
+        `sampling.check_bayesian_bootstrap_hessian_declaration`, reached from
+        the third side. Those two are host predicates evaluated once per fit;
+        this is the device state, and a declaration once made is held for the
+        whole fit and cannot be withdrawn mid-loop, so the ordering a caller
+        must follow is: decide the declaration, then set it, then refresh
+        weights -- never a refresh into a builder already declared constant.
+
+        Only the objective plane is touched. The histogram kernels take no
+        weight argument and none is added: the weight is applied per row in
+        the gradient kernel, before quantization, exactly as on the CPU. See
+        the gpu_objectives_native.mojo module docstring for that argument and
+        for what the refused declaration costs the Int16 staging arm (9 bytes
+        per (row, feature) visit against 7).
+        """
+        if self.constant_hessian():
+            raise Error(
+                "a constant-hessian declaration is in force: a per-row weight"
+                " makes the hessian the weight, so the plane cannot be"
+                " rebuilt from the row count. Clear the declaration before"
+                " refreshing weights"
+            )
+        state.refresh_weights(self.ctx, weights)
+
     def fill_gradients_device(
         mut self,
         mut state: GpuObjectiveState,
