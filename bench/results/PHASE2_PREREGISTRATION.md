@@ -235,7 +235,8 @@ assumption.
 
 1. the device-owned tree plane is the default GPU plane,
 2. the CPU backend's **serial** performance is within 1.2x of LightGBM's, and
-3. a CPU fixed-point option exists at all -- **deferred, and not this round**
+3. the CPU quantized-gradient option exists -- the CPU campaign's
+   `use_quantized_grad` lane, built to LightGBM's scheme
 
 Condition 3 was added on 2026-08-16 when the numeric policy settled: the CPU
 default precision is now LightGBM's (Float32 per-row gradients, Float64 histogram

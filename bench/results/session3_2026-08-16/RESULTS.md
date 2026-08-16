@@ -778,3 +778,64 @@ is therefore gated on the real-data accuracy run against
 `bench/real_data/thresholds.json`, which is also the GPU path's first accuracy
 record of any kind. If that run does not clear the thresholds, the default flips
 to opt-in and the arm stays for the L1-free case where the bound is largest.
+
+---
+
+## The GPU path's first accuracy record, and GAIN_FORM_CROSS clears
+
+`bench/real_data/run.py --device gpu --tier smoke`, verified with `verify.py`:
+
+**10 pass, 0 fail, 3 warn, 15 skip.** Baselines cleared on all three GPU-capable
+scenarios: `dense_regression` RMSE 9.10211 against a 10.8525 baseline (improvement
+0.1613, needs 0.15); `imbalanced_binary` AUC 0.950526 against a 0.65 floor;
+`multiclass` multi_logloss 0.356234 against 1.20635 (improvement 0.7047, needs
+0.1). Data pinning verified against `checksums.lock.json` on all three.
+
+**This is the first accuracy record the GPU path has ever had.** Three of six
+scenarios are covered: `categorical_missing`, `ranking` and `sparse_highdim`
+declare no GPU support, and the LightGBM cells skip because LightGBM runs on the
+CPU in this harness, so a cpu-vs-gpu row is labelled a mojotrees-internal
+comparison rather than a differential.
+
+### GAIN_FORM_CROSS is accuracy-neutral here, and the default stands
+
+Cross against subtractive, device search forced, produced **bit-identical
+training loss** (0.004108700157832688). That is the expected outcome, not a
+plumbing failure: the lane's own test established that both arms **select the
+same split** on ordinary data and differ by at most 1.96 units of
+`eps32*(parent_score + gain)`. The two forms diverge only in the near-tie regime,
+which ordinary data rarely enters.
+
+So the change is an accuracy improvement **where near-ties occur** and a no-op
+elsewhere, and it costs nothing measurable in either direction on real data. The
+default stands, gated as registered.
+
+### Two failed attempts at that A/B, and the second one is the fifth instance
+
+Recorded because the failures are more instructive than the result.
+
+**Attempt one had no environment variable set at all** -- I ran the same arm
+twice under two labels and got identical numbers, which is precisely the
+degenerate A/B this project has caught in three other places this week.
+
+**Attempt two set the variable but ran below the split gate.** At 20,000 x 20 the
+normalized split work is 400,000 against a 50,000,000 threshold, so the **host
+scan** runs and the device gain form is never reached. The real-data smoke tier
+is small for the same reason. So the A/B compared the host path against itself,
+twice, and would have reported "no effect" about code that never executed.
+
+**That is the fifth instance of the same failure in this repository**, after the
+vacuous resident-plane test, the tile arms reaching one node in sixty-one, the
+device-capability fixtures asserting a value no detection path could produce, and
+the S1 inference drawn from an arm that bypassed the gate it was about. The
+standing rule -- *a test for a gated path must prove the gate opened* -- applies
+to **measurements** exactly as it applies to tests, and it is now written that
+way rather than left to be inferred.
+
+### One gap worth closing
+
+The harness's `conditions` line reports `row_unroll`, `narrow_index`,
+`pair_alignment`, `min_tiles` and `rows_per_tile`, but **not the gain form and
+not the scale shape** -- the two arms in this wave that change numerics rather
+than launch shape. A results file that names the launch shape and omits the
+arithmetic is the wrong way round. Not fixed here; `bench/` has a live lane.
