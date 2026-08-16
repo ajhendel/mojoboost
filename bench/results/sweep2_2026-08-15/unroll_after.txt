@@ -1,0 +1,3 @@
+cpu_train_s_median: 8.414655
+gpu_train_s_median: 3.786354
+gpu_spread_pct: 18.6
