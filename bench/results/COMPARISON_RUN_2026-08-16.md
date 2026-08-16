@@ -108,18 +108,65 @@ disagreement is **1.06 (Block B) against 1.04e-05 (Block A)** -- still five
 orders of magnitude, so the effect survives normalization and is not an
 artifact of comparing a target near 2000 with one near 0.3.
 
-**What this does and does not say about the decision row.** Block A's own
-device-agreement check passed at 3.19e-06 and is direct evidence about Block A.
-But synthetic data here is drawn well-conditioned, so a scale-dependent defect
-would be invisible in it by construction. **The decision row's GPU number is
-therefore not shown to be wrong and not shown to be right**, and that is the
-honest state of it until the cause is separated. Two candidates worth
-separating first, both cheap: whether the divergence tracks the column with the
-largest magnitude range, which would point at the fixed-point histogram's scale
-rather than at any kernel; and that it spreads across all rows rather than
-concentrating, which the table above already establishes and which argues
-against a binning-boundary explanation. If it is the fixed-point scale, it is a
-correctness bound on every GPU number in this artifact.
+**RESOLVED, 2026-08-16, by a three-arm interleaved window. The divergence is
+NOT path-linked.** The paragraph that stood here said the decision row's GPU
+number was "not shown to be wrong and not shown to be right". That is now
+superseded by a measurement.
+
+The same shape was run three ways in one window -- CPU, GPU under AUTO (which
+the split-policy threshold sends to the host scan), and GPU forced onto the
+resident device plane:
+
+| comparison | max | median | rows differing |
+| --- | --- | --- | --- |
+| GPU AUTO vs CPU | 9.6719 | 0.4601 | 100.00% |
+| GPU forced device vs CPU | 9.6719 | 0.4601 | 100.00% |
+| **GPU AUTO vs GPU forced device** | **0.0000** | **0.0000** | **0.00%** |
+
+**Two entirely different code paths -- one issuing 15,100 dispatches with 3,100
+host histogram downloads, the other a resident plane issuing 100 transfers --
+produce bit-identical predictions, and both miss the CPU by exactly the same
+amount.** So the divergence lives in what they share: the fixed-point Int32
+histogram under the same scales. It is not the split search, not the launch
+structure, and not the near-tie resolution the WARN was recorded under.
+
+**What that means for the decision row.** The mechanism is shared by every GPU
+fit, so it is present in Block A too -- and Block A's own check measures it
+there at 3.19e-06. The same mechanism therefore produces 1.04e-05 relative
+error on well-conditioned synthetic data and 1.06 relative on 90 correlated
+audio features. **Block A's GPU number stands, and its risk is characterized
+rather than unbounded**, which is a stronger statement than the one it replaces.
+The open question is no longer "is the decision row valid" but "what data
+conditions amplify fixed-point histogram error by five orders", and that is a
+bounded question about one component.
+
+Incidentally, two device paths agreeing to the bit across entirely different
+launch structures is a strong correctness signal for both.
+
+## A cross-unit exposure that applies to every table above
+
+Round-interleaving protects a comparison when the arms share hardware: drift
+lands on all of them and surfaces as spread. **It does not protect a CPU arm
+against a GPU arm**, because two units do not respond to a thermal window the
+same way. This is why the protocol reports `canary_cpu_ratio` and
+`canary_gpu_ratio` separately and never averages them -- Session III measured
+the CPU degrading 2.2x in a window where the GPU degraded 1.5x.
+
+This run's canary moved the CPU +7.7 percent and the GPU +2.1 percent, a
+**differential of about 5.6 percent between the two units**. Every
+mojotrees-GPU-against-LightGBM comparison here is cross-unit and carries it:
+
+- **Block A's headline, 1.31x, survives comfortably**: a 5.6 percent
+  differential against a 31 percent margin.
+- **Block B's loss, 1.30x, likewise survives** and is not an artifact.
+- **A margin near or below ~10 percent in a cross-unit comparison in this
+  window would not be resolvable at all**, and one was found the same day: a
+  follow-up window measured the forced device plane at 2.251 s against
+  LightGBM's 2.510 s on this dataset -- 1.115x with disjoint ranges -- in a
+  window whose canary moved the CPU +7.5 percent and the GPU -4.5 percent, in
+  opposite directions, for a combined ~12 percent against an 11.5 percent
+  margin. **That result is not reported as a win here, because the correction
+  dissolves it rather than shrinking it.** It remains unestablished.
 
 ## Block C -- high-cardinality categorical, 799,110 train rows x 15 features
 
