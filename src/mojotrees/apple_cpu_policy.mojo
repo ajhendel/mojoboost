@@ -1515,3 +1515,120 @@ def describe_cpu_policy(profile: CpuProfile, plan: AccumulationPlan) -> String:
         dispatch_utilization_percent(plan.group_count, cores),
         "%",
     )
+
+
+# ---------------------------------------------------------------------------
+# Bin layout: which copy of the binned matrix an accumulation reads
+# ---------------------------------------------------------------------------
+#
+# `BinnedMatrix` can carry two views of the same bytes. The feature-major one
+# is the original, `bins[f * n_rows + r]`, one contiguous column per feature.
+# The row-major one is `binning.BinnedMatrix.build_row_major`'s record array,
+# one contiguous fixed-width record per row holding every feature's bin, with
+# features of at most 16 bins packed two to a byte. LightGBM calls the second
+# a `MultiValBin` and selects between them with `force_row_wise` /
+# `force_col_wise`.
+#
+# **Nothing in this section moves a bit.** The two layouts hold the same bin
+# ids and an accumulation over either visits the same rows in the same order
+# and adds the same Float64 into the same cell, so the histogram is identical
+# to the bit. In particular the layout choice must never reach
+# `plan_row_block_count`: the block count *is* part of the value (see this
+# module's docstring), so the two arms are run against **one** plan and differ
+# only in which array their inner loop loads from.
+#
+# How the choice is made is deliberately not arithmetic here. LightGBM's
+# entire auto rule is one timed histogram construction with each builder at
+# the start of the fit, keeping the faster for the whole fit and printing
+# which it chose; `histogram.choose_bin_layout_timed` is that probe. A cost
+# model over traffic was drafted for this decision and is recorded in the
+# lane report rather than in code, because a model nobody measured would be
+# tuning by another name -- and because the timed shot is strictly better
+# information than the model on the machine that is actually running.
+
+comptime BIN_LAYOUT_FEATURE_MAJOR = 0
+"""Accumulate from `bins[f * n_rows + r]`, the column-major matrix."""
+
+comptime BIN_LAYOUT_ROW_MAJOR = 1
+"""Accumulate from `row_bins[r * row_stride + row_byte[f]]`, the record
+array."""
+
+comptime BIN_LAYOUT_AUTO = 2
+"""Unresolved: the caller should time both and keep the faster. Never
+returned by `resolve_bin_layout` when the row-major view is unavailable."""
+
+
+def bin_layout_name(layout: Int) -> String:
+    """The name a benchmark header or a trace line prints for a layout."""
+    if layout == BIN_LAYOUT_ROW_MAJOR:
+        return String("row")
+    if layout == BIN_LAYOUT_AUTO:
+        return String("auto")
+    return String("feature")
+
+
+def env_bin_layout() raises -> Int:
+    """`MOJOTREES_CPU_BIN_LAYOUT`: `auto` (default), `feature`, or `row`.
+
+    Scheduling-only, like every variable in this file but
+    `MOJOTREES_CPU_ROW_BLOCKS`: it selects which array the inner loop loads
+    from and cannot change a cell. `feature` is the off switch for the whole
+    row-major path and reproduces the accumulation that shipped, which is what
+    a bisection wants.
+
+    Raises on an unrecognized value rather than silently meaning `auto`,
+    because a benchmark arm that quietly ran the other layout is exactly the
+    result this campaign has already had to throw away twice.
+    """
+    var s = getenv("MOJOTREES_CPU_BIN_LAYOUT")
+    if s.byte_length() == 0 or s == "auto":
+        return BIN_LAYOUT_AUTO
+    if s == "feature" or s == "col" or s == "0":
+        return BIN_LAYOUT_FEATURE_MAJOR
+    if s == "row" or s == "1":
+        return BIN_LAYOUT_ROW_MAJOR
+    raise Error(
+        'MOJOTREES_CPU_BIN_LAYOUT must be "auto", "feature" or "row". Got "',
+        s,
+        '"',
+    )
+
+
+def resolve_bin_layout(requested: Int, row_major_available: Bool) -> Int:
+    """The layout a build should run, given the request and what exists.
+
+    Availability wins over the request in one direction only: without a
+    row-major view there is nothing to read, so `row` degrades to
+    `feature` rather than raising -- a matrix that was binned before the view
+    was ever asked for is a normal thing for a caller to hold, and refusing to
+    build its histogram would be a worse answer than building it the way it
+    was always built. `auto` with no view available resolves the same way, so
+    the timed probe is only ever reached with both arms runnable.
+    """
+    if not row_major_available:
+        return BIN_LAYOUT_FEATURE_MAJOR
+    if requested == BIN_LAYOUT_ROW_MAJOR:
+        return BIN_LAYOUT_ROW_MAJOR
+    if requested == BIN_LAYOUT_FEATURE_MAJOR:
+        return BIN_LAYOUT_FEATURE_MAJOR
+    return BIN_LAYOUT_AUTO
+
+
+def histogram_line_floats(cache_line_bytes: Int) -> Int:
+    """Float64 slots in one cache line, never below 1.
+
+    The padding unit for a per-block private histogram. LightGBM pads the same
+    buffers to `num_bin_aligned_` for the same reason: two blocks whose
+    partials share a line make two cores fight over it on every store, and
+    `n_bins * ROW_BLOCK_PLANE_BYTES` is 2,040 bytes at 255 bins, which is not
+    a multiple of a 128-byte line.
+    """
+    var n = cache_line_bytes // ROW_BLOCK_PLANE_BYTES
+    return n if n > 0 else 1
+
+
+def align_cells_up(cells: Int, unit: Int) -> Int:
+    """`cells` rounded up to a multiple of `unit`, for the padding above."""
+    if unit <= 1 or cells <= 0:
+        return cells if cells > 0 else 0
+    return ((cells + unit - 1) // unit) * unit
