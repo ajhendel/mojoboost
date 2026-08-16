@@ -34,7 +34,7 @@ reported beside LightGBM `stock+det`; never instead of it.
 | A4 | Bayesian bootstrap / `bootstrap_type` (**verified from source**, see A4 note) | Row weighting instead of row dropping: every row kept, each given weight `(-log(U + 1e-100)) ** bagging_temperature`, redrawn once per tree | Only when on | Yes for CatBoost mode (their default sampler). Built in `sampling.mojo`, off by default. **Device cost, checked:** per-row weights disable the constant-hessian plane (`round_has_constant_hessian`), so the device accumulates three planes and the Int16 gradient-staging arm loses its better half (staged bytes per visit 7 -> 9 at the default group, not 9 -> 7). Not free on the device even with no device code written. | CPU (`sampling.mojo`) | (3) when on; **carries a constant-hessian exclusion**, see the note |
 | A5 | Ordered target statistics for categoricals (CTRs; "verify" against `catboost/private/libs/algo/` CTR code) | For each of several random permutations, a categorical value in row i is replaced by (sum of targets of earlier rows with that category + prior) / (count + 1); plus counters and pairwise combinations; test time uses all rows | Yes (feature values change) | Yes; it is CatBoost's real accuracy edge on high-cardinality columns and independent of tree shape | CPU (`binning.mojo`, categorical, dataset) | (3); design section B2 first, then lanes |
 | A6 | `leaf_estimation_iterations` (`gradient_walker.h::FastGradientWalker`; defaults in `catboost_options.cpp::GetEstimationMethodDefaults`) -- **verified from source** | Re-estimate leaf values 1..k times, derivatives recomputed at the current leaf value each pass | Only when > 1 | Built on the CPU, opt-in, default 1. **DEVICE: not cheap, structural** (GPU orchestrator, 2026-08-16): each extra iteration needs per-leaf grad/hess sums after the previous raw-score update, so a second reduction per leaf per iteration inside the tree (more launches, against the oblivious command-buffer budget) or leaf estimation moved out of the device round (more host trips). **Correction:** an earlier version of this row said CatBoost defaults to 10 for logloss AND multiclass. Logloss is 10; **multiclass is 1**. The 10 in that block is the unreachable Gradient slot while the default method is Newton, and CatBoost's own docs agree. | CPU built; device design decision before any device lane | (3) when > 1; see A6 notes |
-| A7 | Ordered boosting (`BodyTailArr`, tail derivatives only) | Derivatives for row i from a model that never saw i | Yes | No for now; large machinery, matters most on small data | — | design note only |
+| A7 | Ordered boosting, `boosting_type=Ordered` (`fold.h::TFold::TBodyTail`, `fold.cpp::BuildDynamicFold`, `train.cpp::TrainOneIteration`) -- **verified from source**, see the A7 note | Derivatives for row i from a model that never saw i: a geometric ladder of prefixes of a permuted row order, each rung fitted on its own body and scored over its own tail | Yes | **BUILT**, `ordered_boosting.mojo` + the `_boost_rounds` round loop, opt-in `BoosterParams.ordered`, default off, single-output dense CPU trainer only. **Two corrections to what this row used to say.** (1) "Matters most on small data" was inferred from CatBoost's default and the default is not what it is usually said to be -- **on the CPU CatBoost's default is Plain at every row count**; the 50000 threshold is a GPU rule and it turns Ordered OFF. (2) The memory is much smaller than "K planes": the rungs are nested prefixes, so the planes total **under 3n** and are **2.64n at 1e6**, not 14n | CPU (`ordered_boosting.mojo`, `boosting.mojo`) | (2) trade behind a switch; deterministic under the seed, across `MOJOTREES_NUM_WORKERS` and across machines. **Carries no constant-hessian exclusion**, and that is a checked claim: see `ordered_varies_hessian` |
 | A8 | Symmetric (oblivious) trees (`numScoreBlocks = 1` for `SymmetricTree`; leaf index = split-condition bits; depth default 6) | One split per level for all leaves | New mode | Yes, opt-in `grow_policy=oblivious`, both backends | CPU search+schedule; GPU cross-leaf reduce + level partition | Part B. **CPU half BUILT.** Shape/numbering/aggregation **verified from source**; the per-leaf min-child rule is **NOT verified, it is ours** (see below) |
 
 ## A8, verified from source
@@ -177,6 +177,7 @@ chosen. Building it would be building a gate that cannot open.
 | A14 | Model shrinkage: `model_shrink_rate`, `model_shrink_mode` (**verified from source**, see the A13/A14 note) | At the top of every iteration after the first, every accumulated raw score is multiplied by `1 - rate * learning_rate` (Constant) or `1 - rate / iteration` (Decreasing); the products are folded back into the leaf values of the already-grown trees at the end of the fit | Only when on | Yes, `langevin.mojo`, off by default. Built as a deferred fold (strictly less work than CatBoost's per-round rescale of the model, and exact) | CPU (`langevin.mojo`) | (1) as built, off; (3) when on. Refused beside continued training and beside `init_score`, both of which CatBoost also refuses |
 | A15 | `feature_border_type` / `border_count` (`library/cpp/grid_creator/binarization.cpp`, `catboost/libs/data/quantization.cpp`) | CatBoost's float quantization: seven border-selection algorithms, `GreedyLogSum` by default, bounded by `border_count` thresholds | New mode; bit-moving on the arm that selects it, exact on the arm that does not | Yes, opt-in `border_type`, default stays the LightGBM/mojotrees quantile fit | CPU (`binning.mojo`) | A15 note. **BUILT**, five of seven types, `binning.fit_bins(border_type=...)` |
 | A16 | `one_hot_max_size` (`catboost/private/libs/options/cat_feature_options.cpp`, `catboost/private/libs/algo/greedy_tensor_search.cpp`) | CatBoost's categorical one-hot threshold, default 2, `<=` on the count of real categories seen on learn | New mode; bit-moving only when set | Yes, opt-in `CategoricalParams.one_hot_max_size`, default off | CPU (`categorical.mojo`) | A16 note. **BUILT**. It also settles the owed `max_cat_to_onehot` off-by-one, see A12 |
+| A17 | The learn-permutation layer: `permutation_count`, `fold_permutation_block`, `has_time` (`learn_context.cpp::IsPermutationNeeded` / `CountLearningFolds` / `TFoldsCreationParams`, `objects_grouping.cpp::NCB::Shuffle`, `defaults_helper.h::DefaultFoldPermutationBlockSize`) -- **verified from source**, see the A17 note | The permutations themselves, separately from what consumes them. CatBoost builds `max(1, permutation_count - 1)` **learning** permutations plus one **averaging** fold, each a permutation of *blocks* of `min(256, n/1000 + 1)` consecutive rows. **Both A5 (CTRs) and A7 (ordered boosting) read this same layer**, and `IsPermutationNeeded` is what decides whether either gets a shuffle at all | Yes when either consumer is on | Built as part of A7 (`ordered_boosting.ordered_permutation`, `default_permutation_block_size`, `permutation_choice`). **A5's lane should consume it rather than draw its own**: two independent permutation layers keyed by two seeds is two answers to one question | CPU (`ordered_boosting.mojo`); A5's lane is the second consumer | A17 note. Deterministic under the seed and worker-independent, which CatBoost's own `CreateShuffledIndices` is not |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -1792,3 +1793,297 @@ CatBoost's *boundary* and not CatBoost's *other side*. A fit with
 `one_hot_max_size = 2` is CatBoost-shaped in which features get one-hot and
 LightGBM-shaped in what the rest get. Anyone reading a comparison against
 CatBoost has to hold both halves.
+
+### A7 note: ordered boosting, verified from source
+
+Status: **verified from CatBoost source**, `master` (the checkout at
+`58c7bb8b`), read 2026-08-16. Built on the CPU, opt-in, default off. Nothing
+in this note is measured; there is no timing in this lane at all.
+
+Files read, and what each settles:
+
+- `catboost/private/libs/algo/fold.h:33-66` -- `TFold::TBodyTail`: the
+  `BodyQueryFinish` / `TailQueryFinish` / `BodyFinish` / `TailFinish` /
+  `BodySumWeight` quintuple, and the three per-rung planes `Approx`,
+  `WeightedDerivatives`, `SampleWeightedDerivatives`, each `[dim][]`.
+  `:215` -- `TVector<TBodyTail> BodyTailArr` is the ladder.
+- `catboost/private/libs/algo/fold.cpp:35-41` -- `SelectMinBatchSize`
+  (`n > 500 ? min(100, n/50) : 1`) and `SelectTailSize`
+  (`ceil(oldSize * multiplier)`).
+- `catboost/private/libs/algo/fold.cpp:150-198` -- `BuildDynamicFold`'s
+  ladder loop, and the allocation of all three planes at `bt.TailFinish`.
+- `catboost/private/libs/algo/fold.cpp:43-96` -- `InitPermutationData`.
+- `catboost/private/libs/algo/learn_context.cpp:38-50, :53-103, :492-592` --
+  `IsPermutationNeeded`, `CountLearningFolds`, `TFoldsCreationParams`, and the
+  loop that builds `Folds` **plus a separate `AveragingFold`**.
+- `catboost/private/libs/algo/train.cpp:206-243` -- `TrainOneIteration`: one
+  fold taken at random per tree, one `CalcWeightedDerivatives` per rung.
+- `catboost/private/libs/algo/train.cpp:302-382` -- `CalcLeafValues` for the
+  model, then `UpdateLearningFold` for every fold.
+- `catboost/private/libs/algo/tensor_search_helpers.cpp:568-660` --
+  `CalcWeightedDerivatives`: derivatives over `[0, bt.TailFinish)` computed
+  from `bt.Approx`, that rung's own scores.
+- `catboost/private/libs/algo/approx_calcer.cpp:706-830` --
+  `CalcApproxDeltaSimple`: `CalcLeafDersSimple(..., bt.BodyFinish, ...)` fits,
+  `UpdateApproxDeltas(..., bt.TailFinish, ...)` applies.
+- `catboost/private/libs/algo/approx_calcer.cpp:1101-1159` --
+  `CalcApproxForLeafStruct`, one delta plane per rung.
+- `catboost/private/libs/algo/approx_calcer.cpp` `CalcLeafValues` -- **the
+  model's** leaf values, read off `ctx->LearnProgress->AveragingFold`.
+- `catboost/private/libs/algo/scoring.cpp:735-770` -- the split score is
+  SUMMED over every rung, each rung scaling `l2` by its own
+  `BodySumWeight / BodyFinish`.
+- `catboost/private/libs/algo/calc_score_cache.cpp:274-295` -- the scoring
+  copy holds `bodyFinish` derivatives per rung and `tailFinish` sampled ones.
+- `catboost/private/libs/options/boosting_options.cpp:9-27, :64-78` -- the
+  option surface, its defaults, and `Validate`.
+- `catboost/private/libs/options/catboost_options.cpp:778-816, :1040-1044` --
+  where Ordered is installed as a default and where `has_time` forces
+  `PermutationCount = 1`.
+- `catboost/private/libs/options/defaults_helper.h:7-42` --
+  `DefaultFoldPermutationBlockSize` and `UpdateBoostingTypeOption`.
+
+#### 1. What a body is, what a tail is, and how the ladder grows
+
+`BuildDynamicFold` grows a geometric ladder of prefixes of the permuted row
+order. Writing `b_0 < b_1 < ... < b_K = n`:
+
+    b_0     = SelectMinBatchSize(n) = (n > 500 ? min(100, n / 50) : 1)
+    b_{f+1} = min(ceil(b_f * fold_len_multiplier), n)
+
+Rung `f` has **body** `[0, b_f)` and **tail** `[0, b_{f+1})`. There are `K`
+rungs and CatBoost's loop condition (`while (BodyTailArr.empty() ||
+leftPartLen < learnSampleCount)`) guarantees at least one.
+
+- The **body** is what rung `f`'s leaf values are fitted on
+  (`CalcLeafDersSimple(..., bt.BodyFinish, ...)`).
+- The **tail** is what rung `f`'s raw-score plane covers and what its delta is
+  applied over (`UpdateApproxDeltas(..., bt.TailFinish, ...)`).
+- Therefore a row at permuted position `q` in `[b_f, b_{f+1})` is inside rung
+  `f`'s tail and outside rung `f`'s body: **rung `f`'s model has never been
+  fitted on it**, and `CalcWeightedDerivatives` evaluating that row against
+  `bt.Approx` is the derivative-from-a-model-that-has-not-seen-it that the
+  mechanism is named for.
+- The first `b_0` positions are a **leak that CatBoost accepts**: they are
+  inside every rung's body. That is the price of keeping `K` models rather
+  than `n`.
+- `UpdateSize` additionally rounds a body up to a query boundary when the data
+  has group info. mojotrees has no query grouping on this path and does not
+  carry that clause.
+
+#### 2. The permutation count rule, with the citations the device needs
+
+    LearningFoldCount = isPermutationNeeded ? max(1, permutation_count - 1) : 1
+
+`CountLearningFolds`, `learn_context.cpp:48-50`, called at `:81-83`.
+`permutation_count` defaults to **4** (`boosting_options.cpp:14`), so **three
+learning permutations at CatBoost's defaults**, plus one more permutation for
+the `AveragingFold` built at `learn_context.cpp:575-589` -- four permuted
+orders in total, three of which carry ladders.
+
+`isPermutationNeeded` is `IsPermutationNeeded(hasTime, hasCtrs,
+isOrderedBoosting, isAveragingFold=false)`, `learn_context.cpp:38-46`:
+
+    if (hasTime)  return false;
+    if (hasCtrs)  return true;
+    return isOrderedBoosting && !isAveragingFold;
+
+and `hasTime` is `HasTimeFlag || objects order == Ordered`
+(`learn_context.cpp:68-69`). Separately, `has_time` also forces
+`BoostingOptions->PermutationCount = 1` outright
+(`catboost_options.cpp:1042-1044`). So under `has_time` there is exactly one
+learning fold and its permutation is the identity
+(`InitPermutationData`'s `else` branch fills `iota`).
+
+`fold_permutation_block_size` does **not** change the count; it changes what a
+permutation *is*. `NCB::Shuffle` (`objects_grouping.cpp`) permutes **blocks**
+of `permuteBlockSize` consecutive rows and keeps rows inside a block in their
+original relative order. The default is
+`DefaultFoldPermutationBlockSize(n) = min(256, n / 1000 + 1)`
+(`defaults_helper.h:9-11`), and `!isLearnFoldPermuted` sets it to
+`learnSampleCount` -- one block, identity (`learn_context.cpp:93-95`).
+
+**The fold (rung) count is not constant and depends on `n`:**
+
+    K = the number of steps from b_0 to n at ratio m = fold_len_multiplier
+      = ceil(log_m(n / b_0)) + 1,   b_0 = SelectMinBatchSize(n)
+
+At `n = 1e6` with the defaults (`b_0 = 100`, `m = 2`) that is **14 rungs**.
+It grows logarithmically, and it is computable from `n` alone before the first
+tree, so a device can size buffers once at fit time.
+
+#### 3. Memory: a derived bound, and why it is not `K * n`
+
+The rungs are **nested prefixes**, not disjoint blocks. Plane `f` has length
+`b_{f+1}`, so with `b_{K-1} < n`:
+
+    sum_{f=0}^{K-1} b_{f+1}  =  n + sum_{f=1}^{K-1} b_f
+                             <  n + n * m / (m - 1)
+                             =  n * (2m - 1) / (m - 1)     = 3n at m = 2
+
+A strict `3n`, independent of `K`. The exact count at `n = 1e6` with the
+defaults is **2 638 200 entries, or 2.64n** -- not 14n.
+`ordered_boosting.ordered_plane_entries` computes it. Derived, not measured.
+
+In bytes, per permutation, at `n = 1e6`: 21.1 MB of `Float64` on the host;
+10.6 MB on a device staging derivatives at Int16 and 21.1 MB at Int32. At
+CatBoost's three learning permutations that is 31.7 MB / 63.3 MB.
+
+CatBoost is worse than this by a factor of three, because `BuildDynamicFold`
+allocates `Approx`, `WeightedDerivatives` **and** `SampleWeightedDerivatives`
+at `TailFinish` per rung per dimension. Ours keeps one plane per rung (the raw
+score) and recomputes derivatives into a shared scratch buffer, because a
+derivative is cheaper to recompute than to store `2.64n` of.
+
+#### 4. What we built, and the three places it diverges
+
+`src/mojotrees/ordered_boosting.mojo` (new) and the round loop in
+`src/mojotrees/boosting.mojo`. `BoosterParams.ordered`, default disabled,
+appended last so every positional caller is unaffected. Honored by the dense
+single-output CPU `train` only; `train_with_valid`, the multiclass trainers
+and continued training refuse it by name rather than ignore it.
+
+Per round: pick a permutation from `(seed, round)`; read each row's raw score
+off the tightest rung that never saw it; fill gradients from those scores;
+grow the tree; **refit the leaf values on the plain scores over every row**;
+update `raw`; then advance every rung of every permutation.
+
+Three divergences, all deliberate:
+
+1. **One gradient per row, not a sum over rungs.** CatBoost sums the split
+   score over every rung's body (`scoring.cpp:746`), so a row in an early
+   position contributes to `K - f` of the `K` summands and an early row is
+   weighted far more heavily than a late one. We give each row exactly one
+   gradient, from the tightest model that has not seen it, which is the
+   CatBoost paper's Algorithm 1 with the same ladder as its approximation.
+   Strictly less work -- one histogram pass instead of `K` -- and it removes a
+   position-dependent row weight that nothing in the paper asks for. It is a
+   **(2) trade behind a switch**, and it is the largest divergence here.
+2. **The permutation is counter-keyed, not Fisher-Yates.** See the A17 note.
+3. **We keep one permutation by default, not three.** CatBoost's rule is
+   `max(1, permutation_count - 1) = 3`; `permutation_count=3` reproduces it
+   and costs exactly three times the planes. One permutation is the mechanism;
+   three is variance reduction on top of it.
+
+And one thing that is **not** a divergence and is worth stating because it is
+the half of the mechanism most summaries drop: **ordered boosting decides the
+tree's structure, not the values the model carries.**
+`train.cpp::TrainOneIteration` searches the structure on a ladder fold and
+then calls `CalcLeafValues`, which reads the `AveragingFold` -- a plain,
+single-rung fold over every row. `UpdateLearningFold` advances the ladder
+folds' own approxes and those never reach the model. We do the same.
+
+#### 5. Hessian declaration
+
+`ordered_varies_hessian` is **False**, always, and it is a checked claim.
+Ordered boosting changes the *point* at which derivatives are evaluated; it
+installs no per-row weight and no multiplier. For the objectives whose
+unweighted hessian is the literal 1.0 the value written is still exactly 1.0
+at any raw score, so `boosting.round_has_constant_hessian` stays correct
+without knowing the bundle exists and the two-plane histogram path stays
+admissible. This is the opposite answer from A4 and A11, and the distinction
+is exactly theirs: a *weight* that multiplies the derivative is a hessian, a
+*different evaluation point* is not.
+`check_ordered_hessian_declaration` is installed anyway and is called by the
+round loop, on the same reasoning as `check_langevin_hessian_declaration`.
+
+#### 6. What CatBoost's auto rule actually is
+
+**The widely repeated "Ordered below 50 000 rows on CPU, Plain above" is not
+in the source.** `ordered_boosting.catboost_auto_is_ordered` is the corrected
+rule and `tests/test_ordered_boosting.mojo` pins it:
+
+- `boosting_options.cpp:16` constructs `BoostingType("boosting_type",
+  EBoostingType::Plain)`. **On the CPU that is the value a fit keeps, at every
+  row count.**
+- `catboost_options.cpp:802-806` is the only place Ordered is installed as a
+  default and its condition includes `TaskType == ETaskType::GPU`.
+- The same block excludes the multiclass-only metrics and
+  `RMSEWithUncertainty` / `MultiLogloss` / `MultiCrossEntropy`.
+  `docs/en/references/training-parameters/common.md` agrees:
+  "Any number of objects, MultiClass or MultiClassOneVsAll mode: Plain."
+- `defaults_helper.h:33-42::UpdateBoostingTypeOption` then hard-sets Plain
+  when `learnSampleCount >= 50000 || IterationCount < 500`. **The iteration
+  clause is real and is usually omitted.** `TOption::SetDefault` does not
+  raise `IsSetFlag` (`option.h:28-31, 80-85`), so this later test still sees
+  `NotSet()` and wins over the GPU default above.
+
+So 50000 is a real number, but it is a threshold for turning Ordered **off**
+on the GPU, not for turning it on at all on the CPU. Any comparison that
+claims "CatBoost defaults to ordered boosting on small data" on a CPU run is
+comparing against a Plain fit.
+
+### A17 note: the learn-permutation layer, verified from source
+
+Status: **verified from CatBoost source**, `master`, read 2026-08-16. Built as
+part of A7. Files: `learn_context.cpp:38-50, :53-103`,
+`objects_grouping.cpp::NCB::Shuffle`, `fold.cpp::InitPermutationData`,
+`defaults_helper.h:7-11`, `boosting_options.cpp:9-27`.
+
+The permutations are a layer that two mechanisms consume, not a private detail
+of either. A7 (ordered boosting) reads them for the fold ladder; **A5 (ordered
+target statistics / CTRs) reads the same ones** -- `IsPermutationNeeded`
+returns true on `hasCtrs` alone, with no reference to the boosting type, and
+`TFold::InitOnlineCtrs` computes the CTRs *inside* the fold that owns the
+permutation. A5's lane should consume `ordered_boosting.ordered_permutation`
+rather than draw its own: two permutation layers keyed by two seeds is two
+answers to one question, and the CTR values and the ordered gradients would
+then disagree about what "earlier" means for the same row.
+
+#### What a permutation is
+
+`NCB::Shuffle`'s trivial-grouping arm, `permuteBlockSize != 1`:
+
+    blocksCount = ceil(n / permuteBlockSize)
+    blockedPermute = CreateShuffledIndices(blocksCount, rand)
+    emit each block's rows in ORIGINAL order, blocks in shuffled order
+
+So it is a permutation of **blocks**, and rows inside a block keep their
+original relative order. The short final block is placed wherever its draw
+sends it and `currentIdx` advances by its actual width, so permuted positions
+are **not** aligned to the block size in general.
+
+`DefaultFoldPermutationBlockSize(n) = min(256, n / 1000 + 1)`: block size 1
+below 1000 rows (a plain row permutation), the 256 cap from 255 000 rows up.
+
+#### Determinism, and where we deliberately diverge
+
+CatBoost's `CreateShuffledIndices` is a sequential Fisher-Yates over one
+running generator, so a block's destination depends on every draw taken before
+it, and the permutation drawn at a given point in a run depends on how many
+draws the run has already made.
+
+Ours is counter-based, in the same family as `sampling._mvs_stream` and
+`langevin._langevin_row_stream` but a different **shape**, and the difference
+is worth being explicit about:
+
+- MVS and Langevin give each row an *independent* draw, so "row `r` reads
+  `stream + r`, nothing advances" is the whole scheme.
+- A permutation cannot be built that way: the draws have to be turned into a
+  global total order. So each **block** gets an independent 64-bit key
+  (`block_key(stream, b) = splitmix64(stream ^ (b * GOLDEN))`, a pure function
+  of `(seed, permutation index, block index)`) and the blocks are sorted by
+  `(key, block index)` with a bottom-up merge sort. A stable merge over a
+  total order has exactly one answer, at any worker count, on any machine, and
+  no comparison's result depends on how the range was cut.
+- Two domain constants, for the reason `langevin.mojo` gives for having two:
+  the permutation stream and the per-round permutation-choice stream are both
+  keyed by a small integer against the same seed, so without separation
+  permutation 3's keys and round 3's choice would come off one counter run.
+- Key collisions: 64-bit keys over at most a few tens of thousands of blocks,
+  so under `m^2 / 2^65`, about `5e-11` at `m = 40000`. The tie-break makes the
+  *result* exact regardless, at a negligible bias toward low block indices
+  among colliding pairs.
+
+One property this buys that CatBoost's does not have, and which
+`test_permutation_does_not_depend_on_how_the_sort_is_cut` pins: a block's key
+does not depend on how many blocks there are, so changing `n` by less than a
+block leaves every full block's relative order unchanged.
+
+The per-round *choice* of permutation is the same shape:
+`permutation_choice(seed, round, count)` is a function of `(seed, round)`
+alone, where CatBoost's is `Folds[Rand.GenRand() % foldCount]`
+(`train.cpp:208`) off the sequential learn-progress generator. Ours is what
+makes a continued run draw what an uninterrupted run would have drawn, the
+same reason every other seeded decision in `_boost_rounds` reads the absolute
+round index.
