@@ -34,7 +34,23 @@ What lives here:
 Objectives covered: squared error, binary logistic, cross entropy, poisson,
 gamma, tweedie, huber, quantile, L1, MAPE, fair, and softmax multiclass.
 Every one of those has a closed-form per-row derivative in the raw score,
-which is exactly the interface a one-thread-per-row kernel can serve. CUSTOM
+which is exactly the interface a one-thread-per-row kernel can serve.
+
+CatBoost's ranking objectives -- QueryRMSE, PairLogit, YetiRank -- are also
+covered, at the bottom of this file, and they are a different interface rather
+than three more arms of `_grad_hess_kernel`: a row's ranking gradient is a
+function of the *other rows in its query group*, so neither the kernel shape
+nor the state is the same. `GpuRankingState` holds their two planes, and
+`ranking_pairwise.mojo` -- which imports nothing from `max.gpu.*` and is
+therefore reachable from a CPU-only build -- holds the derivative definitions,
+the group and pair conventions, the refusals, and the fixed-point arithmetic a
+ranking gradient profile implies. Nothing in this paragraph's subject touches
+`_grad_hess_kernel`, `_softmax_prob_kernel`, `_softmax_class_kernel`, the four
+raw-score update kernels, `_abs_sum_kernel`, or `GpuObjectiveState`: the
+ranking path is new symbols beside them, which is what keeps every
+non-ranking fit bit-identical.
+
+CUSTOM
 is the exception and stays on the host by construction: the callback is
 Python or Mojo code over host-side `List[Float64]`, there is no device image
 of it, and `train_custom_gpu`'s contract (one call per round over the whole
@@ -223,6 +239,16 @@ a `num_targets` parameter, a `train_multi_target` round loop shaped like
 side. Until all four land, a user asking for MultiRMSE gets a name error from
 sklearn.py, which is a refusal -- the failure mode to avoid is the opposite
 one, an accepted parameter with no reader.
+
+**Every ranking round is on the 9-byte width too, and unconditionally.**
+PairLogit and YetiRank have a hessian that is a per-round sum over each row's
+pairs, so they can never be declared constant. QueryRMSE's hessian is the row
+weight, so a weighted one cannot either, and an unweighted one -- whose hessian
+really is exactly 1.0 -- is refused anyway, because
+`histogram.objective_has_constant_hessian` is the one statement of which
+objectives qualify and this lane does not extend it.
+`GpuHistogramBuilder.fill_rank_gradients_device` is where that is refused and
+argued. Again: arithmetic of the declaration, not a regression.
 """
 
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
@@ -252,6 +278,19 @@ from .gpu_tiling import derive_block_threads, query_device_caps
 from .monotone import NO_BOUND, OutputBounds
 from .objective_registry import objective_gradients_on_device
 from .quantized_gradient import fixed_point_scale
+from .ranking import RankGroups, check_groups
+from .ranking_pairwise import (
+    RANK_PAIR_LOGIT,
+    RANK_QUERY_RMSE,
+    RANK_YETI_RANK,
+    PairAdjacency,
+    check_rank_kind,
+    check_rank_sample_weight,
+    check_yeti_rank_pairs,
+    describe_rank_kind,
+    rank_kind_is_pairwise,
+    rank_kind_regenerates_pairs,
+)
 
 # Clamp on every `exp` argument. exp(60) is 1.1e26, four orders of magnitude
 # inside the Float32 maximum, so the poisson hessian's extra
@@ -2685,3 +2724,540 @@ struct GpuLeafEstimator(Movable):
         var src = self.stage_val.unsafe_ptr()
         for s in range(n_segments):
             values[nodes[s]] = Float64(src.unsafe_load(s * EST_VALS + EST_V))
+
+
+# ---------------------------------------------------------------------------
+# CatBoost's group-and-pair ranking objectives on the device-resident plane.
+# ---------------------------------------------------------------------------
+#
+# QueryRMSE, PairLogit, and YetiRank. `ranking_pairwise.mojo` is the definition
+# -- the derivative formulas in CatBoost's own sign convention, the group and
+# pair conventions and where they were read from, the refusals, the weighting
+# rule, and the fixed-point arithmetic a ranking gradient profile implies. This
+# section is those derivatives on the plane where the raw scores already live,
+# and it restates none of that reasoning; it records only what is true of the
+# device shape.
+#
+# WHAT THE GROUPING PLANE IS, AND WHAT IT IS NOT
+# ----------------------------------------------
+# It is the `n_groups + 1` boundary array `ranking.RankGroups.starts`, uploaded
+# once per fit, and **it is not a per-row group id**. Rows of a group are
+# contiguous -- that is `RankGroups`'s invariant, and `groups_from_query_ids`
+# refuses data that violates it -- so a group is a window and a kernel block
+# owns one. No row ever looks its own group up: `_query_rmse_kernel` is indexed
+# by group, and the pairwise kernel is indexed by row and never needs the group
+# at all, because the pairs were already validated to lie inside one.
+#
+# A per-row id would have been `4 * n_rows` bytes of upload plus one gather per
+# row per round, to answer a question the row's position already answers. The
+# only shape in which it would have been necessary is unsorted rows, which is
+# the convention the CPU does not have.
+#
+# WHY THE PAIR PLANE IS AN ADJACENCY AND NOT A PAIR LIST
+# ------------------------------------------------------
+# **Metal has no floating-point atomic add.** A one-thread-per-pair kernel
+# writes into `grad[i]` and `grad[j]` from as many threads as the row appears
+# in pairs, which needs an atomic this backend does not have and which would be
+# non-deterministic on the backends that do. So the host expands the pair list
+# into the per-row CSR `ranking_pairwise.PairAdjacency` and the kernel is one
+# thread per row over its own slice: no atomic, no contention, and a fold order
+# fixed by the host rather than by the scheduler. Each pair is read twice,
+# which is the price.
+#
+# One device word pair per entry, `PAIR_WORDS` Int32 apiece: the other
+# endpoint, and the pair's weight as a Float32 whose *sign* carries whether
+# this row was the winner, travelling as its own bit pattern. Same
+# reinterpretation `SEG_STEP` uses and for the same reason -- two buffers are
+# two `enqueue_copy` calls and on Metal a copy is a full-queue drain whatever
+# its byte count (`docs/GPU_PORTABILITY.md` section 6.1, **measured**). A
+# `bitcast` between two 32-bit types alters no value in either direction.
+comptime PAIR_WORDS = 2
+comptime PAIR_OTHER = 0
+comptime PAIR_WEIGHT = 1
+
+
+def _query_rmse_kernel(
+    raw: MutPointer[Float32, MutAnyOrigin],
+    target: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    starts: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    weighted: Int32,
+):
+    """One threadgroup per query group: the group's weighted mean residual,
+    then every row's derivative against it.
+
+    `ranking_pairwise.query_rmse_grad_hess` is the definition and carries the
+    CatBoost correspondence. Here:
+
+        r_i    = target_i - raw_i
+        avg    = sum_i w_i r_i / sum_i w_i        (0 when sum_i w_i is 0)
+        grad_i = w_i * (avg - r_i)
+        hess_i = w_i
+
+    The block sweeps its group twice -- once to reduce, once to write -- rather
+    than caching the residuals, because a group has no bounded size and shared
+    memory does. Both sweeps are `SUM_THREADS`-strided over the same window in
+    the same direction, so the second reads exactly what the first summed.
+
+    **The reduction is inside the block and the barriers are unconditional.**
+    Every thread of the block runs the same fixed `SUM_THREADS`-wide tree
+    whatever the group's size, so every thread reaches every barrier, and the
+    fold order is a compile-time constant. That makes the sum the same Float32
+    for a given group whatever the device schedules -- deterministic run to
+    run, in the sense `_abs_sum_kernel` already claims. It is **not** the
+    host's fold: the reference sums sequentially in ascending row order in
+    Float64, so the two agree to Float32 and not to the bit, which is the trade
+    every number on this plane makes.
+
+    A group of one is not a special case here and gets no branch. Its single
+    thread sums `w_0` and `w_0 r_0`, `avg` comes out exactly `r_0`, and the
+    write produces `w_0 * (r_0 - r_0)`, an exact zero in Float32 because it is
+    a subtraction of a value from itself. A group whose weights sum to zero
+    takes the `sum_w > 0` branch to `avg = 0` and then writes `0 * (...)`,
+    which is zero rather than the NaN a division would have produced.
+
+    The shape is chosen for correctness and not for occupancy, and that is
+    worth saying rather than leaving to be discovered: a group of ten leaves
+    246 of 256 threads idle in both sweeps. A thread-per-group or
+    subgroup-per-group variant is the obvious answer for many small groups and
+    is **not measured here** -- this is an accuracy lane and it publishes no
+    timing.
+    """
+    var tid = Int(thread_idx.x)
+    var q = Int(block_idx.x)
+    var sw = stack_allocation[
+        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var sr = stack_allocation[
+        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+
+    var start = Int(starts[unsafe_offset=q][0])
+    var stop = Int(starts[unsafe_offset = q + 1][0])
+
+    var acc_w = Float32(0.0)
+    var acc_r = Float32(0.0)
+    var i = start + tid
+    while i < stop:
+        var w = Float32(1.0)
+        if weighted != 0:
+            w = weight[unsafe_offset=i][0]
+        acc_w += w
+        acc_r += w * (target[unsafe_offset=i][0] - raw[unsafe_offset=i][0])
+        i += SUM_THREADS
+    sw[unsafe_offset=tid] = acc_w
+    sr[unsafe_offset=tid] = acc_r
+    barrier()
+
+    var active = SUM_THREADS // 2
+    while active > 0:
+        if tid < active:
+            sw[unsafe_offset=tid] = (
+                sw[unsafe_offset=tid][0] + sw[unsafe_offset = tid + active][0]
+            )
+            sr[unsafe_offset=tid] = (
+                sr[unsafe_offset=tid][0] + sr[unsafe_offset = tid + active][0]
+            )
+        barrier()
+        active //= 2
+
+    # The last iteration's barrier is what publishes slot 0 to every thread,
+    # so no further synchronization is needed before this read.
+    var sum_w = sw[unsafe_offset=0][0]
+    var sum_wr = sr[unsafe_offset=0][0]
+    var avg = Float32(0.0)
+    if sum_w > 0.0:
+        avg = sum_wr / sum_w
+
+    var j = start + tid
+    while j < stop:
+        var w = Float32(1.0)
+        if weighted != 0:
+            w = weight[unsafe_offset=j][0]
+        var resid = target[unsafe_offset=j][0] - raw[unsafe_offset=j][0]
+        grad[unsafe_offset=j] = w * (avg - resid)
+        hess[unsafe_offset=j] = w
+        j += SUM_THREADS
+
+
+def _pair_logit_kernel(
+    raw: MutPointer[Float32, MutAnyOrigin],
+    offsets: MutPointer[Int32, MutAnyOrigin],
+    entries: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+):
+    """One thread per row: the row's pairwise-logit derivatives, summed over
+    the pairs it takes part in.
+
+    `ranking_pairwise.pairwise_grad_hess` is the definition and carries the
+    CatBoost correspondence, and it is the same expression for PairLogit and
+    for YetiRank because it is the same expression in CatBoost. Per entry,
+    with `d` the winner-minus-loser raw score difference and `w` the pair's
+    weight:
+
+        rho     = 1 / (1 + exp(d))
+        grad   -= w * rho                  if this row is the winner
+        grad   += w * rho                  if this row is the loser
+        hess   += w * rho * (1 - rho)      either way
+
+    `rho` is `_dev_sigmoid(-d)`, which is `ranking._pair_sigmoid(d, 1.0)`
+    branch for branch: at `d > 0` both evaluate `e = exp(-d); e / (1 + e)`, at
+    `d < 0` both evaluate `e = exp(d); 1 / (1 + e)`, and at `d == 0` both reach
+    the first arm and return exactly `1/2`. That is why the host reference
+    imports the CPU's function instead of restating it and why this kernel
+    calls the module's existing sigmoid instead of adding a second one: the
+    overflow guard has one definition per backend and the two are the same
+    expression.
+
+    **No atomic, and no thread writes a row another thread writes.** The
+    accumulators are registers, the slice is the row's own, and the two stores
+    at the end are the only writes. That is the whole reason the pair plane is
+    an adjacency; the block comment above gives it.
+
+    A row with an empty slice -- every row of a singleton group, and any row no
+    pair mentions -- exits the loop having touched nothing and stores exactly
+    zero into both planes. There is no division in this kernel, so there is
+    nothing a degenerate group could divide by.
+
+    The trip count is the row's pair count and varies across a threadgroup, so
+    this kernel diverges where `_grad_hess_kernel` does not. It is the shape
+    the absence of a float atomic leaves, and the alternative is not a faster
+    kernel, it is a wrong one.
+    """
+    var r = global_idx.x
+    if r >= Int(n_rows):
+        return
+    var lo = Int(offsets[unsafe_offset=r][0])
+    var hi = Int(offsets[unsafe_offset = r + 1][0])
+    var raw_r = raw[unsafe_offset=r][0]
+    var g = Float32(0.0)
+    var h = Float32(0.0)
+    for e in range(lo, hi):
+        var base = e * PAIR_WORDS
+        var o = Int(entries[unsafe_offset = base + PAIR_OTHER][0])
+        var sw = bitcast[DType.float32, 1](
+            entries[unsafe_offset = base + PAIR_WEIGHT][0]
+        )
+        var raw_o = raw[unsafe_offset=o][0]
+        var w = abs(sw)
+        var d = (raw_r - raw_o) if sw > 0.0 else (raw_o - raw_r)
+        var rho = _dev_sigmoid(-d)
+        var contrib = w * rho
+        if sw > 0.0:
+            g -= contrib
+        else:
+            g += contrib
+        h += w * rho * (1.0 - rho)
+    grad[unsafe_offset=r] = g
+    hess[unsafe_offset=r] = h
+
+
+struct GpuRankingState(Movable):
+    """Device-resident query boundaries and pair adjacency for one ranking fit.
+
+    Construct once per fit from the same `DeviceContext` as the
+    `GpuObjectiveState` whose labels, weights and raw scores it reads, and
+    beside it; `fill_grad_hess` takes that state rather than duplicating any of
+    it, which is the arrangement `GpuLeafEstimator` already has.
+
+    Two planes, with different lifetimes, and the difference is the whole of
+    what separates the three objectives on this side:
+
+    - The **group boundaries** are a property of the *dataset*. Uploaded once,
+      in the constructor, and never again. Rows of a group are contiguous
+      (`ranking.RankGroups`), so this is an `n_groups + 1` boundary array and
+      not a per-row column; the block comment above argues why that is not
+      merely smaller but structurally different.
+    - The **pair adjacency** is a property of the *pair set*. For PairLogit
+      that is the fit's, uploaded once; for YetiRank it is the round's, and
+      `refresh_pairs` is the per-round upload, the twin of
+      `GpuObjectiveState.refresh_weights` and for the same kind of reason.
+
+    QueryRMSE reads only the first plane, and this state allocates the second
+    at one word until something needs it, so a QueryRMSE fit pays no pair
+    memory at all.
+
+    What this state deliberately does not hold: the raw scores, the labels, the
+    weights, and the gradient buffers. All four belong to `GpuObjectiveState`
+    and `GpuHistogramBuilder` and are read through them, so a ranking round
+    writes into exactly the buffers the histogram kernels read, with nothing
+    crossing the boundary, on the same terms as every other device objective.
+    """
+
+    var starts_dev: DeviceBuffer[DType.int32]
+    """`n_groups + 1` ascending row boundaries. The grouping plane."""
+    var off_dev: DeviceBuffer[DType.int32]
+    """`n_rows + 1` CSR offsets into `pair_dev`, or a placeholder."""
+    var pair_dev: DeviceBuffer[DType.int32]
+    """`PAIR_WORDS` Int32 per adjacency entry, or a placeholder."""
+    var stage_off: HostBuffer[DType.int32]
+    var stage_pair: HostBuffer[DType.int32]
+    """Pinned staging for the two pair planes, on the same grounds as
+    `GpuObjectiveState.stage_value`: `map_to_host` copies in both directions on
+    every use, so a per-round upload goes through a one-way copy instead.
+    Allocated by the first `refresh_pairs`, never at construction, so a
+    QueryRMSE fit pays nothing for a buffer it will not write."""
+
+    var n_rows: Int
+    var n_groups: Int
+    var pair_capacity: Int
+    """Adjacency entries `pair_dev` and `stage_pair` are sized for. Zero while
+    they are placeholders. One number rather than a second flag, so the buffer
+    and the claim about it cannot disagree."""
+    var n_entries: Int
+    """Entries currently staged. Zero when no pair set has been uploaded."""
+    var pairs_round: Int
+    """The round index the staged pairs were generated for, or -1 when none
+    have been. Read only by `_check_pair_plane`, which is what makes a YetiRank
+    round that forgot to redraw an error instead of a model trained against an
+    ordering it has already left behind."""
+    var has_pairs: Bool
+    var block_threads: Int
+
+    def __init__(out self, ctx: DeviceContext, groups: RankGroups) raises:
+        """Upload the query boundaries, which never change again.
+
+        `groups` is validated by `ranking.check_groups` -- the CPU's validator,
+        not a second one -- so a boundary array that does not start at zero,
+        does not ascend strictly, or does not end at `n_rows` is refused here
+        rather than producing a block that sweeps the wrong window.
+        """
+        check_groups(groups, groups.n_rows)
+        if groups.n_rows < 1:
+            raise Error("ranking objectives require at least one row")
+        self.n_rows = groups.n_rows
+        self.n_groups = groups.n_queries()
+        self.block_threads = derive_block_threads(query_device_caps(ctx))
+        self.pair_capacity = 0
+        self.n_entries = 0
+        self.pairs_round = -1
+        self.has_pairs = False
+
+        self.starts_dev = ctx.enqueue_create_buffer[DType.int32](
+            self.n_groups + 1
+        )
+        # Placeholders: zero-length device buffers are not portable, and a
+        # QueryRMSE fit never grows these.
+        self.off_dev = ctx.enqueue_create_buffer[DType.int32](1)
+        self.pair_dev = ctx.enqueue_create_buffer[DType.int32](1)
+        self.stage_off = ctx.enqueue_create_host_buffer[DType.int32](1)
+        self.stage_pair = ctx.enqueue_create_host_buffer[DType.int32](1)
+
+        # One-time upload, written through the mapping rather than staged, on
+        # the same grounds as `GpuObjectiveState`'s label upload: it runs once
+        # per session and the mapping is the shorter path.
+        with self.starts_dev.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            for q in range(self.n_groups + 1):
+                dst.unsafe_store(q, Int32(groups.starts[q]))
+
+    def _row_blocks(self) -> Int:
+        return (self.n_rows + self.block_threads - 1) // self.block_threads
+
+    def refresh_pairs(
+        mut self,
+        ctx: DeviceContext,
+        adjacency: PairAdjacency,
+        round_index: Int = 0,
+    ) raises:
+        """Replace the device-resident pair adjacency.
+
+        Called once per fit for PairLogit, whose pairs the caller supplies and
+        which do not move, and once per *round* for YetiRank, whose pairs are
+        redrawn against the current scores. `round_index` records which round
+        the staged pairs belong to; `fill_grad_hess` refuses a YetiRank round
+        whose pairs carry a different one, which is the difference between
+        training YetiRank and training PairLogit on a stale draw.
+
+        Cost and cadence
+        ----------------
+        Two `enqueue_copy` calls -- the offsets and the interleaved entries --
+        plus one drain, per upload. Two rather than three because the entry's
+        weight travels inside the entry record as a reinterpreted Float32; the
+        block comment above `PAIR_WORDS` argues that choice. On the PairLogit
+        path this happens once for the whole fit. On the YetiRank path it is
+        per round, at `4 * (n_rows + 1) + 8 * entries` bytes.
+
+        The drain is the same trade `refresh_weights` makes and is argued
+        there: on Metal `enqueue_copy` is itself a synchronous full-queue drain
+        (`docs/GPU_PORTABILITY.md` section 6.1), so the explicit synchronize
+        costs an ordering point rather than a wait there, and on a backend
+        whose copies are genuinely asynchronous it is the whole guarantee that
+        a kernel still reading the old planes has finished before the buffers
+        are dropped and the staging arena is rewritten.
+
+        Validation
+        ----------
+        Every field is checked against the row count and against the buffer it
+        will index, because a malformed adjacency does not crash a kernel, it
+        produces a plausible wrong gradient: an offset that does not ascend
+        gives a row a negative trip count and silently drops its pairs, and an
+        endpoint out of range reads another row's raw score. Weights must be
+        finite and nonzero, because zero is the one value the sign encoding
+        cannot carry a direction for; `pair_adjacency` drops zero-weight pairs
+        rather than emitting them, so an adjacency built by that function
+        always passes.
+        """
+        if adjacency.n_rows != self.n_rows:
+            raise Error(
+                "pair adjacency and query boundaries disagree on the row count"
+            )
+        if len(adjacency.offsets) != self.n_rows + 1:
+            raise Error("pair adjacency offsets must have n_rows + 1 entries")
+        if adjacency.offsets[0] != 0:
+            raise Error("pair adjacency offsets must start at 0")
+        var total = len(adjacency.other)
+        if len(adjacency.signed_weight) != total:
+            raise Error(
+                "pair adjacency index and weight planes must have equal length"
+            )
+        if adjacency.offsets[self.n_rows] != total:
+            raise Error("pair adjacency offsets must end at the entry count")
+        for r in range(self.n_rows):
+            if adjacency.offsets[r + 1] < adjacency.offsets[r]:
+                raise Error("pair adjacency offsets must be nondecreasing")
+        for e in range(total):
+            var o = adjacency.other[e]
+            if o < 0 or o >= self.n_rows:
+                raise Error("pair adjacency endpoint out of range")
+            var w = adjacency.signed_weight[e]
+            if not isfinite(w) or w == 0.0:
+                raise Error(
+                    "pair weights must be finite and nonzero; the sign carries"
+                    " which endpoint won and zero has no sign"
+                )
+
+        # Two hazards, one drain: a kernel still holding a placeholder buffer
+        # the growth below drops, and a copy still reading the staging arena
+        # the fill below overwrites. See the docstring.
+        ctx.synchronize()
+
+        if self.pair_capacity == 0:
+            self.off_dev = ctx.enqueue_create_buffer[DType.int32](
+                self.n_rows + 1
+            )
+            self.stage_off = ctx.enqueue_create_host_buffer[DType.int32](
+                self.n_rows + 1
+            )
+        var want = total if total > 0 else 1
+        if want > self.pair_capacity:
+            self.pair_dev = ctx.enqueue_create_buffer[DType.int32](
+                want * PAIR_WORDS
+            )
+            self.stage_pair = ctx.enqueue_create_host_buffer[DType.int32](
+                want * PAIR_WORDS
+            )
+            self.pair_capacity = want
+
+        var doff = self.stage_off.unsafe_ptr()
+        for r in range(self.n_rows + 1):
+            doff.unsafe_store(r, Int32(adjacency.offsets[r]))
+        var dpair = self.stage_pair.unsafe_ptr()
+        for e in range(total):
+            var base = e * PAIR_WORDS
+            dpair.unsafe_store(base + PAIR_OTHER, Int32(adjacency.other[e]))
+            dpair.unsafe_store(
+                base + PAIR_WEIGHT,
+                bitcast[DType.int32, 1](Float32(adjacency.signed_weight[e])),
+            )
+        ctx.enqueue_copy(dst_buf=self.off_dev, src_ptr=doff)
+        if total > 0:
+            ctx.enqueue_copy(dst_buf=self.pair_dev, src_ptr=dpair)
+        self.n_entries = total
+        self.pairs_round = round_index
+        self.has_pairs = True
+
+    def _check_pair_plane(self, kind: Int, round_index: Int) raises:
+        """The two refusals a pairwise round can hit, stated once so the
+        YetiRank arm and the PairLogit arm cannot drift apart on them."""
+        if not rank_kind_is_pairwise(kind):
+            return
+        if not self.has_pairs:
+            raise Error(
+                "objective '",
+                describe_rank_kind(kind),
+                "' is a pairwise loss and no pair plane has been uploaded;"
+                " call refresh_pairs, or train with device='cpu'",
+            )
+        if rank_kind_regenerates_pairs(kind):
+            check_yeti_rank_pairs(kind, self.pairs_round == round_index)
+
+    def fill_grad_hess(
+        mut self,
+        ctx: DeviceContext,
+        mut state: GpuObjectiveState,
+        kind: Int,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        mut hess_dev: DeviceBuffer[DType.float32],
+        round_index: Int = 0,
+    ) raises:
+        """Write this round's ranking gradients and hessians into `grad_dev`
+        and `hess_dev`, which must be device buffers of at least `n_rows`
+        Float32 belonging to the same context.
+
+        In the trainer those are the histogram builder's own buffers, so the
+        values the histogram kernels read are the ones these kernels wrote and
+        nothing per-row crosses to the host, exactly as
+        `GpuObjectiveState.fill_grad_hess` arranges for the built-in
+        objectives.
+
+        Every refusal is here and every one names a reason
+        --------------------------------------------------
+        An unknown kind, a multiclass state, a row-count disagreement,
+        uninitialized raw scores, a per-row `sample_weight` on a pairwise kind
+        (the weight belongs on the pair -- `check_rank_sample_weight`), a
+        pairwise kind with no pair plane, and a YetiRank round whose pairs were
+        drawn for a different round. None of them is a silent fallback and none
+        of them quietly computes something adjacent: this file's standing rule,
+        after `leaf_estimation_iterations` was ignored without comment by every
+        GPU entry point for months, is that a device which cannot honour a
+        configuration says so and names `device='cpu'`.
+
+        What this does *not* refuse is a group whose rows carry no signal -- a
+        singleton group, a perfectly ordered group, a group of zero-weight
+        rows. Those are not unsupported configurations, they are configurations
+        whose correct gradient is zero, and both kernels produce an exact zero
+        for them without a branch. `ranking_pairwise` works each one through.
+        """
+        check_rank_kind(kind)
+        if state.n_classes != 1:
+            raise Error(
+                "ranking objectives are single-output; a multiclass objective"
+                " state cannot serve one. Use device='cpu' for a multi-output"
+                " ranking loss"
+            )
+        if state.n_rows != self.n_rows:
+            raise Error("objective state and ranking state disagree on n_rows")
+        if not state.has_raw:
+            raise Error("call init_raw before filling ranking gradients")
+        check_rank_sample_weight(kind, state.weighted)
+        self._check_pair_plane(kind, round_index)
+
+        if kind == RANK_QUERY_RMSE:
+            ctx.enqueue_function[_query_rmse_kernel](
+                state.raw_dev.unsafe_ptr(),
+                state.target_dev.unsafe_ptr(),
+                state.weight_dev.unsafe_ptr(),
+                self.starts_dev.unsafe_ptr(),
+                grad_dev.unsafe_ptr(),
+                hess_dev.unsafe_ptr(),
+                Int32(1) if state.weighted else Int32(0),
+                grid_dim=self.n_groups,
+                block_dim=SUM_THREADS,
+            )
+            return
+
+        ctx.enqueue_function[_pair_logit_kernel](
+            state.raw_dev.unsafe_ptr(),
+            self.off_dev.unsafe_ptr(),
+            self.pair_dev.unsafe_ptr(),
+            grad_dev.unsafe_ptr(),
+            hess_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            grid_dim=self._row_blocks(),
+            block_dim=self.block_threads,
+        )

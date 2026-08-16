@@ -219,7 +219,10 @@ from .gpu_objectives_native import (
     DEFAULT_MAX_NODES,
     SCALE_WINDOW_MAX,
     GpuObjectiveState,
+    GpuRankingState,
 )
+from .ranking import RankGroups
+from .ranking_pairwise import check_rank_kind, describe_rank_kind
 from .parallel import _env_int, dispatch_rows
 from .quantized_gradient import (
     DEFAULT_SCALE_SHAPE,
@@ -1698,6 +1701,86 @@ struct GpuHistogramBuilder(Movable):
         """
         state.fill_grad_hess(
             self.ctx, objective, alpha, self.grad_dev, self.hess_dev
+        )
+        self._refresh_scales(state)
+        self.has_gradients = True
+        self.gradients_host = False
+        self.round_epoch += 1
+
+    def ranking_state(mut self, groups: RankGroups) raises -> GpuRankingState:
+        """A device ranking state on this builder's context, so its gradients
+        land in this builder's buffers. See gpu_objectives_native.mojo, and
+        ranking_pairwise.mojo for what the objectives are.
+
+        The query boundaries are uploaded here, once per fit. A pairwise fit
+        then calls `GpuRankingState.refresh_pairs` -- once for PairLogit,
+        once per round for YetiRank.
+        """
+        return GpuRankingState(self.ctx, groups)
+
+    def fill_rank_gradients_device(
+        mut self,
+        mut ranking: GpuRankingState,
+        mut state: GpuObjectiveState,
+        kind: Int,
+        round_index: Int = 0,
+    ) raises:
+        """This round's ranking gradients, computed on the device straight
+        into the histogram buffers. The ranking twin of
+        `fill_gradients_device`, and it shares that method's scale derivation
+        rather than repeating it, so a ranking round and a regression round
+        quantize by the same rule at the same cadence.
+
+        What the builder adds to `GpuRankingState.fill_grad_hess`
+        --------------------------------------------------------
+        One refusal the state cannot make for itself, and it is the same
+        refusal `refresh_objective_weights` makes from the other side. A
+        builder holding `set_constant_hessian(True)` rebuilds the hessian plane
+        from the row count instead of accumulating it, and **no ranking
+        objective may be accumulated that way**:
+
+        - PairLogit and YetiRank have `hess_r = sum over the row's pairs of
+          w rho (1 - rho)`, which varies per row, on every round, at every raw
+          score. It is never the constant.
+        - QueryRMSE has `hess_r = w_r`, so it is exactly
+          `histogram.CONSTANT_HESSIAN` when the fit is unweighted and is the
+          weight when it is not -- the same shape squared error has, and
+          `objective_has_constant_hessian` refuses the declaration for squared
+          error under weights for exactly this reason. The unweighted case
+          would qualify, and it is still refused here, because
+          `objective_has_constant_hessian` is histogram.mojo's statement of
+          which objectives qualify and this lane does not extend it. A
+          declaration this path accepted without that function's agreement
+          would be a second answer to the same question.
+
+        So every ranking round on this path stages both derivative planes. Per
+        `GpuActiveRows.staged_gradient_bytes_per_row` that is 4 bytes per row
+        rather than 2, and at the default feature group of one each (row,
+        feature) visit fetches 4 bytes of row index plus the staged derivative
+        plus 1 bin byte: **9 bytes per visit where an unweighted squared-error
+        round is on 7.** That is the arithmetic of the declaration, by
+        construction, and it is not a regression in anything measured here. The
+        gpu_objectives_native.mojo and ranking_pairwise.mojo module docstrings
+        state the same sum from the objective's side.
+        """
+        check_rank_kind(kind)
+        if self.constant_hessian():
+            raise Error(
+                "a constant-hessian declaration is in force and objective '",
+                describe_rank_kind(kind),
+                "' does not guarantee a per-row hessian of 1: its hessian is"
+                " the row weight (QueryRMSE) or a per-round sum over the"
+                " row's pairs (PairLogit, YetiRank). Clear the declaration"
+                " before filling ranking gradients, or train with"
+                " device='cpu'",
+            )
+        ranking.fill_grad_hess(
+            self.ctx,
+            state,
+            kind,
+            self.grad_dev,
+            self.hess_dev,
+            round_index,
         )
         self._refresh_scales(state)
         self.has_gradients = True
