@@ -1262,13 +1262,18 @@ struct Dataset(Copyable, Movable, Writable):
                 return True
         return False
 
-    def matches_binning(self, other: Dataset) -> Bool:
+    def matches_binning(self, other: Dataset) raises -> Bool:
         """Whether two datasets bin every value the same way, so that a bin
         index means the same thing in both.
 
         The mapper's own equality (see `BinMapper.matches`), plus the
         representation: a dense and a sparse dataset that bin identically
         still hold different matrix types, and no trainer reads both.
+
+        Raising because `BinMapper.matches` raises: it compares CTR tables,
+        and the comparison is fallible. Five of the six callers of
+        `BinMapper.matches` already declared `raises` and this one did not,
+        which is what broke the package build.
         """
         if self.is_sparse != other.is_sparse:
             return False
