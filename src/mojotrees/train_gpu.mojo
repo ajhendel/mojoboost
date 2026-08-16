@@ -336,7 +336,14 @@ from .gpu_resident_round import (
     RESIDENT_NO_POOL,
     RESIDENT_OK,
     RESIDENT_TABLES,
+    OBLIVIOUS_OK,
+    OBLIVIOUS_RECORDS,
+    grow_tree_device_oblivious,
     grow_tree_device_resident,
+    oblivious_device_supported,
+    oblivious_leaf_budget,
+    oblivious_reason_name,
+    oblivious_records_needed,
     resident_round_enabled,
     resident_round_reason_name,
     resident_round_record_slots,
@@ -402,10 +409,12 @@ from .sampling import (
 from .split import SplitInfo
 from .growth_policy import (
     GROW_DEPTHWISE,
+    GROW_OBLIVIOUS,
     GrowthSchedule,
     LeafCandidate,
     check_grow_policy,
 )
+from .gpu_leaf_batching import OBLIVIOUS_MAX_ITEMS
 from .tree import Tree, TreeParams, _leaf_value, _search
 
 
@@ -828,6 +837,30 @@ def _search_record_slots(params: TreeParams, n_features: Int) -> Int:
     instead (`GrowthSchedule.plan_level`), so it buys room for one, bounded
     by both ceilings above and never below the two a single split needs.
     """
+    if params.grow_policy == GROW_OBLIVIOUS:
+        # `grow_policy = oblivious` searches a whole *level* in one launch
+        # pair, so it needs one record per leaf of the widest level plus the
+        # one level record the cross-feature reduction folds into --
+        # `oblivious_records_needed`, which is `(1 << max_depth) + 1` and is 65
+        # at CatBoost's default depth.
+        #
+        # **Sized from the depth and not from `num_leaves`, which does not bind
+        # under this mode.** At the default budget of 31 leaves the leaf-wise
+        # arithmetic below would ask for 33 records, the plane would refuse with
+        # `OBLIVIOUS_RECORDS`, and the fit would fall back for a reason that was
+        # created here rather than found. That is the exact shape of mistake
+        # the leaf-wise branch's own comment warns about: a capacity decision
+        # made from a different question than the routing decision.
+        var want = oblivious_records_needed(params)
+        if want > MAX_LEVEL_RECORDS:
+            want = MAX_LEVEL_RECORDS
+        var ob_width = n_features if n_features > 0 else 1
+        var ob_by_cells = MAX_LEVEL_TABLE_CELLS // ob_width
+        if want > ob_by_cells:
+            want = ob_by_cells
+        if want < 2:
+            want = 2
+        return want
     if params.grow_policy != GROW_DEPTHWISE:
         # The device-owned growth plane (gpu_resident_round.mojo) reduces
         # over the whole frontier on the device, so every live leaf needs a
@@ -1201,6 +1234,34 @@ struct GpuSplitSearcherCache(Movable):
         self.searchers[0].set_features(tree_features)
 
 
+def _oblivious_route_reason(
+    params: TreeParams,
+    builder: GpuHistogramBuilder,
+    opened: Bool,
+    searcher_records: Int,
+) raises -> Int:
+    """Why an oblivious fit cannot take the level schedule, or `OBLIVIOUS_OK`.
+
+    Three questions in the order a reader wants them answered: did the pool and
+    the tables open at all, does the configuration fit the plane, and is the
+    searcher wide enough for the widest level. The first comes back as a
+    `RESIDENT_*` code because it is the pool's answer and not this mode's, which
+    is why the caller names the two code spaces apart when it reports.
+
+    A free function rather than three lines at the call site so that the
+    "resident pool declined" case has one spelling; it is also the only place
+    that knows both code spaces.
+    """
+    if not opened:
+        return RESIDENT_NO_POOL
+    var why = oblivious_device_supported(params, builder)
+    if why != OBLIVIOUS_OK:
+        return why
+    if searcher_records < oblivious_records_needed(params):
+        return OBLIVIOUS_RECORDS
+    return OBLIVIOUS_OK
+
+
 def _grow_tree_gpu_device_search(
     mut profile: PhaseProfile,
     mut builder: GpuHistogramBuilder,
@@ -1278,6 +1339,60 @@ def _grow_tree_gpu_device_search(
 
     builder.begin_tree(bag)
     var n_root = len(bag) if len(bag) > 0 else builder.n_rows
+    if params.grow_policy == GROW_OBLIVIOUS:
+        # CatBoost's `SymmetricTree`, on the device: one split per level
+        # applied to every leaf of that level. It is reached here, through the
+        # ordinary per-tree dispatch and the ordinary `grow_policy` parameter,
+        # rather than behind a switch of its own -- a parallel switch is how the
+        # CPU half of this mode came to be built, tested and uncallable.
+        #
+        # **Every table is sized from `1 << max_depth` and not from
+        # `num_leaves`.** A level splits entirely or not at all, so a leaf
+        # budget cannot be met exactly; `oblivious_leaf_budget` is the one place
+        # that arithmetic lives and `tree._check_oblivious` says the same thing
+        # on the host.
+        var budget = oblivious_leaf_budget(params)
+        var opened = (
+            not resident_frontier_disabled()
+            and budget >= 2
+            and builder.open_resident(budget, OBLIVIOUS_MAX_ITEMS)
+            and builder.open_resident_tables(budget)
+        )
+        var why = _oblivious_route_reason(
+            params, builder, opened, cache.searchers[0].max_records
+        )
+        if why != OBLIVIOUS_OK:
+            # A named raise rather than a fallback, because there is nothing on
+            # this backend to fall back *to*: no other GPU grower implements a
+            # symmetric tree. The CPU grower does, so the message names it.
+            raise Error(
+                String(
+                    "grow_policy=oblivious cannot be grown on this device: ",
+                    oblivious_reason_name(why)
+                    if opened
+                    else resident_round_reason_name(why),
+                    ". The CPU backend grows the same tree; pass"
+                    " device='cpu', or use max_depth in [1, 6] with no"
+                    " categorical feature, no monotone or interaction"
+                    " constraint, and no extra tree parameters",
+                )
+            )
+        profile.begin_tree(n_root, builder.n_rows)
+        var oblivious_started = profile.clock()
+        var symmetric = grow_tree_device_oblivious(
+            builder,
+            cache.searchers[0],
+            split_params,
+            params,
+            tree_features,
+            n_root,
+        )
+        # Counted, not timed, exactly as the leaf-wise plane's bracket is: one
+        # round trip per tree, `download_desc_tables` at the end, and no clock
+        # inside a loop whose whole claim is that it does not wait.
+        profile.charge(PROF_TRANSFER, n_root, 0, syncs=1)
+        profile.end_tree(oblivious_started)
+        return symmetric^
     if (
         not resident_frontier_disabled()
         and params.min_data_in_leaf >= 1
@@ -2305,6 +2420,22 @@ def grow_tree_gpu_profiled(
     var decision = split_search_decision_for(builder, params, split_search)
     if split_trace_enabled():
         print("split_trace tree", tree_index, decision.describe())
+    if params.grow_policy == GROW_OBLIVIOUS:
+        # `grow_policy = oblivious` has exactly one GPU grower -- the level
+        # schedule in `gpu_resident_round.mojo` -- and it lives behind the
+        # device-search entry point below. There is no host-scan arm to weigh
+        # it against on this backend: the grower under `decision.uses_device()
+        # == False` builds its frontier with `GrowthSchedule`, and a symmetric
+        # tree is not a frontier order at all (`growth_policy.mojo`), so that
+        # arm raises rather than growing a different tree.
+        #
+        # So the AUTO crossover has nothing to decide here and is not consulted
+        # for this policy. It is still *resolved* above, and printed under
+        # `split_trace`, because the reason a fit took a path is worth having in
+        # the record even when the path was not in question.
+        return _grow_tree_gpu_device_search(
+            profile, builder, cache, params, bag, tree_index
+        )
     if decision.uses_device():
         return _grow_tree_gpu_device_search(
             profile, builder, cache, params, bag, tree_index

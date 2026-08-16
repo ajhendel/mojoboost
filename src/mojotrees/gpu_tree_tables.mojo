@@ -262,11 +262,13 @@ entry point in this package is guarded, with the whole body behind
 """
 
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.memory import bitcast
+from std.memory import bitcast, stack_allocation
 from std.os import getenv
 from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+from max.gpu.memory import AddressSpace
 from max.gpu.primitives import block
+from max.gpu.sync import barrier
 
 from .categorical import (
     CAT_BITSET_WORDS,
@@ -321,8 +323,17 @@ from .gpu_split_search import (
     IREC_LEFT_COUNT,
     IREC_RIGHT_COUNT,
     MAX_SPLIT_BINS,
+    OBLIVIOUS_MAX_LEAVES,
+    PF_G_INV,
+    PF_H_INV,
+    PF_LAMBDA_L1,
+    PF_LAMBDA_L2,
+    PF_WORDS,
     SPLIT_FWORDS,
     SPLIT_IWORDS,
+    gpu_leaf_value,
+    gpu_resolve_gain_form,
+    gpu_right_sum,
 )
 from .split import SplitInfo
 from .tree import Tree, TreeParams
@@ -1443,6 +1454,565 @@ def _pick_and_commit_kernel(
     ctr[unsafe_offset=CTR_COMMITS] = Int32(commits + 1)
 
 
+# --- grow_policy = oblivious: the level commit ----------------------------
+#
+# The kernel below is `_pick_and_commit_kernel`'s rule with the *pick* taken
+# out of it and the *commit* widened from one parent to a whole level. Both
+# halves of that sentence are load bearing:
+#
+# - There is no pick. An oblivious level's split is decided by one search over
+#   the whole level (`gpu_split_search._scan_slot_oblivious_kernel` folded by
+#   `_reduce_slots_kernel` into one record), so by the time this runs the
+#   decision is a single record and the reduction the leaf-wise kernel spends
+#   its first two phases on has already happened, one launch earlier, fused
+#   into the scan. What is left is the commit.
+#
+# - The commit applies that one split to every leaf of the level, in ascending
+#   leaf index, left child before right, which is
+#   `gpu_resident_round.OBLIVIOUS_LEAF_INDEX_RULE` and is the half of the
+#   cross-backend contract that decides node *ids*.
+#
+# It is a separate kernel rather than an arm of `_pick_and_commit_kernel`, and
+# that is a deliberate reading of "bits move only in the new mode": every path
+# that exists today keeps the kernel it had, byte for byte, and no leaf-wise
+# launch grows a branch it can never take.
+
+comptime HIST_PLANES = 3
+"""Planes in one resident histogram slot: gradient, hessian, count, in that
+order and each `n_features * n_bins` Int32 long.
+
+The same number `gpu_leaf_batching.N_PLANES` is and the same stride
+`3 * n_features * n_bins` that every `hist_slot` in this package is multiplied
+by. Named here because the level commit is the only kernel in this file that
+indexes a histogram, and a bare 3 next to a bare 2 is exactly the kind of
+constant that gets read as an off-by-one."""
+
+comptime OBLIVIOUS_LEVEL_LEAVES = OBLIVIOUS_MAX_LEAVES
+"""Leaves in one level this commit will apply a split to, which is `2 ** 6`.
+
+The same bound `gpu_split_search.OBLIVIOUS_MAX_LEAVES` puts on the cross-leaf
+scan, imported rather than restated so the two cannot drift: a level this
+kernel would commit and that kernel would not search is a level whose split
+came from a truncated sum."""
+
+comptime OBLIVIOUS_PLAN_ITEMS = 2 * OBLIVIOUS_MAX_LEAVES
+"""Item rows a level commit may fill in a batched-histogram plan.
+
+A level of `L` parents makes `2L` children and every one of them is built from
+its own rows, so the plan is twice as wide as the level. The widest level a
+depth-6 tree commits is `L = 32`, giving 64 items -- which is exactly
+`gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`, and that agreement is the sizing
+precondition of the whole census rather than a coincidence. The constant here
+is `2 * 64` because it bounds the *scratch* plan a caller may hand this struct
+without a batcher, and a caller that hands in a real batcher's `items_dev` is
+bounded by that batcher's own `max_items`."""
+
+
+@always_inline
+def _kill_level_plan(
+    plan: MutPointer[Int32, MutAnyOrigin], write_plan: Int32, n_items: Int
+):
+    """Mark every item of a level's plan dead.
+
+    `_kill_plan`'s reasoning at a level's width, and it kills the whole staged
+    width rather than the level's own `2L`: a batch is launched over the item
+    count `stage_device_plan` fixed for the tree, so an item this level does not
+    use is an item some *earlier, narrower* level filled and whose `ITEM_OUT`
+    still names a histogram slot that is now some other leaf's. Killing only the
+    prefix would leave `_batch_zero_kernel` erasing a live leaf's histogram --
+    the exact failure `ITEM_DEAD` exists to prevent, arriving from the other
+    direction."""
+    if write_plan != Int32(0):
+        for i in range(n_items):
+            _write_plan_item(plan, i, Int32(0), Int32(ITEM_DEAD), Int32(0))
+
+
+def _commit_level_kernel(
+    front: MutPointer[Int32, MutAnyOrigin],
+    node_i: MutPointer[Int32, MutAnyOrigin],
+    node_f: MutPointer[Float32, MutAnyOrigin],
+    ctr: MutPointer[Int32, MutAnyOrigin],
+    slot_owner: MutPointer[Int32, MutAnyOrigin],
+    missing: MutPointer[Int32, MutAnyOrigin],
+    rec_i: MutPointer[Int32, MutAnyOrigin],
+    rec_f: MutPointer[Float32, MutAnyOrigin],
+    hist: MutPointer[Int32, MutAnyOrigin],
+    fparams: MutPointer[Float32, MutAnyOrigin],
+    step: MutPointer[Int32, MutAnyOrigin],
+    order: MutPointer[Int32, MutAnyOrigin],
+    plan: MutPointer[Int32, MutAnyOrigin],
+    write_plan: Int32,
+    level_record: Int32,
+    n_bins: Int32,
+    hist_size: Int32,
+    level_depth: Int32,
+    max_depth: Int32,
+    plan_items: Int32,
+    pool_capacity: Int32,
+    leaf_capacity: Int32,
+    node_capacity: Int32,
+    gain_form: Int32,
+):
+    """One oblivious level, committed entirely on the device.
+
+    Launched as a single threadgroup of `PICK_THREADS` threads over a grid of
+    one block, exactly as `_pick_and_commit_kernel` is, and for a reason that is
+    now even more direct: `PICK_THREADS` is 64 and so is
+    `OBLIVIOUS_LEVEL_LEAVES`, so the level's per-leaf work is one thread per
+    leaf and the block is neither too small nor too large by construction.
+
+    The three phases, in order:
+
+    **Stop.** Growth ends when the depth budget is spent, when the level search
+    found nothing, or when a previous level already stopped. All three are
+    uniform across the block -- every thread reads the same words -- so the
+    early return is uniform and no thread reaches the barrier that the others
+    skip. `level_depth >= max_depth` is what makes the schedule's tail launch a
+    *terminal status* rather than a step that quietly does nothing, which is the
+    same job `_growth_finished_normally` needs done and the same shape the
+    leaf-wise loop's extra `enqueue_desc_step` has.
+
+    A stopped tree stays stopped. The commit reads `CTR_STATUS` first, so once
+    a level writes `TREE_NO_CANDIDATE` every later level's commit returns
+    without reading a record. That matters here in a way it does not in the
+    leaf-wise loop: after a stop the frontier stops growing while the host
+    schedule keeps enqueueing searches sized for the level the tree *would*
+    have reached, so those searches read leaf records the frontier no longer
+    fills. They are in bounds -- the schedule reserves records for the widest
+    level of the tree and the tables are zeroed at `begin_tree` -- and their
+    answers are read by nothing, because this test is the first thing every
+    later commit makes.
+
+    **Per-leaf statistics, one thread per leaf.** Thread `l` walks leaf `l`'s
+    own histogram slice for the winning feature and produces that leaf's own
+    left and right counts and gradient/hessian sums. This is the arithmetic a
+    leaf-wise commit gets for free off the record and an oblivious one cannot:
+    the level record's `IREC_LEFT_COUNT` is a sum over the leaves that found the
+    candidate *legal*, which is the right number for scoring the level and the
+    wrong number for any one leaf's window. Each leaf's rows are its own.
+
+    The left/right test is `gpu_active_rows._row_goes_left` written over bins
+    instead of over rows -- the missing bin takes the level's default direction
+    and every other bin takes the inclusive threshold -- so the count this
+    derives is by construction the count `_scatter_kernel` will route, and not
+    a second derivation that has to be argued equal to it.
+
+    **The commit, on one thread.** Serial and deliberately so. It assigns
+    `2L` node ids in ascending leaf index with the left child before the right,
+    writes the same split onto all `L` parents, writes both children of each as
+    leaves with their own counts and their own Newton values, lays the level's
+    `2L` windows out over the prefix, moves the slot pool, rewrites the
+    frontier, fills the plan, and publishes one step descriptor. None of that
+    reduces over anything, so a parallel form would buy nothing and would have
+    to agree with this one about an order that *is* the answer.
+
+    **Why one partition of the whole prefix produces the whole level, and why
+    the windows below are the ones it writes.** At every level the live leaves
+    tile `[0, n_active)` in ascending leaf index -- the invariant this kernel
+    both assumes and re-establishes. One stable partition of that prefix by the
+    level's single routing rule therefore leaves every leaf's left-going rows in
+    the front block, in ascending leaf order, and every leaf's right-going rows
+    in the back block, in ascending leaf order. The new leaf indices are `j` for
+    the left child of `j` and `j + L` for its right child
+    (`OBLIVIOUS_LEAF_INDEX_RULE`, CatBoost's numbering), so the physical order
+    after the partition *is* ascending new leaf index and the invariant holds
+    again. The two cursors below are the exclusive prefix sums of the left and
+    right counts, which is the whole of that argument written as arithmetic.
+
+    That is also why `gpu_active_rows.LeafRangeTable.split` cannot replay this
+    tree and `set_window` exists: a parent's rows end up in two blocks that are
+    not adjacent.
+
+    **Slot index equals leaf index**, so the pool assignment is a function of
+    the tree and not of an allocation order. A leaf-wise commit scans `slot_owner`
+    upward for the lowest free slot because its frontier slots and its pool slots
+    have no relationship; here they do, and pinning them removes an ordering
+    from the answer rather than merely simplifying the code. The pool is sized at
+    `1 << max_depth`, so the widest level's `2L = 1 << max_depth` children fit
+    exactly.
+
+    **The parent's own histogram is read here and destroyed afterwards**, and
+    the order is what makes that safe: this commit runs before the partition and
+    before the batched build, so every leaf's slice is still the slice its own
+    search read. The batch that follows zeroes each destination slot before it
+    accumulates, so nothing inherits.
+
+    **Every parent of the level carries the level's summed gain** in
+    `TN_SPLIT_GAIN`, which is not an approximation of a per-node gain but the
+    quantity that was actually maximized; `tree._grow_oblivious_levels` writes
+    the same number onto the same nodes through `Tree._set_split`, so this is one
+    of the cross-backend agreements a node-for-node comparison checks.
+
+    No floating-point comparison decides anything here. The gain is tested
+    against zero, the counts are exact Int32, and the leaf values are the same
+    `gpu_leaf_value` a leaf-wise commit copies out of the record -- computed
+    here instead of copied, because there is no per-leaf record to copy from.
+    """
+    var tid = Int(thread_idx.x)
+    var status = Int(ctr[unsafe_offset=CTR_STATUS][0])
+    var n_live = Int(ctr[unsafe_offset=CTR_N_LIVE][0])
+    var ri = Int(level_record) * SPLIT_IWORDS
+    var rf = Int(level_record) * SPLIT_FWORDS
+    var flags = rec_i[unsafe_offset = ri + IREC_FLAGS][0]
+    var gain = rec_f[unsafe_offset = rf + FREC_GAIN][0]
+
+    # Phase 1: has growth ended, or is this the launch that ends it?
+    var depth_spent = Int(level_depth) >= Int(max_depth)
+    var no_candidate = (flags & Int32(FLAG_FOUND)) == Int32(0) or gain <= (
+        Float32(0.0)
+    )
+    if status != TREE_RUNNING or depth_spent or no_candidate:
+        if tid == 0:
+            ctr[unsafe_offset=CTR_PICK] = Int32(-1)
+            ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
+            step[unsafe_offset=STEP_LIVE] = Int32(0)
+            _kill_level_plan(plan, write_plan, Int(plan_items))
+            if status == TREE_RUNNING:
+                if depth_spent:
+                    ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_BUDGET_SPENT)
+                else:
+                    ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_NO_CANDIDATE)
+        return
+
+    # The capacities, all of them uniform and all of them checked before a
+    # single table is written, so an undersized table reports rather than
+    # corrupts. Unreachable when the caller sized every table from
+    # `1 << max_depth`, which `gpu_resident_round.oblivious_leaf_budget` is.
+    var next_node = Int(ctr[unsafe_offset=CTR_NEXT_NODE][0])
+    var commits = Int(ctr[unsafe_offset=CTR_COMMITS][0])
+    var pool_short = 2 * n_live > Int(pool_capacity)
+    var over = (
+        n_live > OBLIVIOUS_LEVEL_LEAVES
+        or 2 * n_live > Int(leaf_capacity)
+        or next_node + 2 * n_live > Int(node_capacity)
+        or commits + n_live > Int(leaf_capacity)
+        or (write_plan != Int32(0) and 2 * n_live > Int(plan_items))
+    )
+    if pool_short or over:
+        if tid == 0:
+            ctr[unsafe_offset=CTR_PICK] = Int32(-1)
+            ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
+            if pool_short:
+                ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_POOL_FULL)
+            else:
+                ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_OVERFLOW)
+            step[unsafe_offset=STEP_LIVE] = Int32(0)
+            _kill_level_plan(plan, write_plan, Int(plan_items))
+        return
+
+    # Phase 2: each leaf's own split statistics, one thread per leaf.
+    var feature = rec_i[unsafe_offset = ri + IREC_FEATURE][0]
+    var threshold = rec_i[unsafe_offset = ri + IREC_BIN][0]
+    var default_left = (flags & Int32(FLAG_DEFAULT_LEFT)) != Int32(0)
+    var missing_bin = missing[unsafe_offset = Int(feature)][0]
+    var nb = Int(n_bins)
+    var hs = Int(hist_size)
+    var pf = Int(level_record) * PF_WORDS
+    var g_inv = fparams[unsafe_offset = pf + PF_G_INV][0]
+    var h_inv = fparams[unsafe_offset = pf + PF_H_INV][0]
+    var lambda_l1 = fparams[unsafe_offset = pf + PF_LAMBDA_L1][0]
+    var lambda_l2 = fparams[unsafe_offset = pf + PF_LAMBDA_L2][0]
+    var form = gpu_resolve_gain_form(gain_form, lambda_l1)
+
+    var s_parent = stack_allocation[
+        OBLIVIOUS_LEVEL_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var s_begin = stack_allocation[
+        OBLIVIOUS_LEVEL_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var s_nleft = stack_allocation[
+        OBLIVIOUS_LEVEL_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var s_nright = stack_allocation[
+        OBLIVIOUS_LEVEL_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var s_lval = stack_allocation[
+        OBLIVIOUS_LEVEL_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var s_rval = stack_allocation[
+        OBLIVIOUS_LEVEL_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    if tid < n_live:
+        var fo = tid * FRONT_WORDS
+        s_parent[unsafe_offset=tid] = front[unsafe_offset = fo + FRONT_NODE][0]
+        s_begin[unsafe_offset=tid] = front[
+            unsafe_offset = fo + FRONT_ROW_BEGIN
+        ][0]
+        var slot = Int(front[unsafe_offset = fo + FRONT_HIST_SLOT][0])
+        var base = slot * HIST_PLANES * hs + Int(feature) * nb
+        var lg = Int32(0)
+        var lh = Int32(0)
+        var lc = Int32(0)
+        var tg = Int32(0)
+        var th = Int32(0)
+        var tc = Int32(0)
+        for b in range(nb):
+            var g = hist[unsafe_offset = base + b][0]
+            var h = hist[unsafe_offset = hs + base + b][0]
+            var c = hist[unsafe_offset = 2 * hs + base + b][0]
+            tg += g
+            th += h
+            tc += c
+            # `_row_goes_left` over bins: the missing bin takes the level's
+            # default direction, every other bin takes the inclusive
+            # threshold. A feature with no missing bin has -1 here, which no
+            # bin id equals.
+            var goes_left: Bool
+            if Int32(b) == missing_bin:
+                goes_left = default_left
+            else:
+                goes_left = Int32(b) <= threshold
+            if goes_left:
+                lg += g
+                lh += h
+                lc += c
+        s_nleft[unsafe_offset=tid] = lc
+        s_nright[unsafe_offset=tid] = tc - lc
+        var lgf = lg.cast[DType.float32]() * g_inv
+        var lhf = lh.cast[DType.float32]() * h_inv
+        var tgf = tg.cast[DType.float32]() * g_inv
+        var thf = th.cast[DType.float32]() * h_inv
+        var rgf = gpu_right_sum(tgf, lgf, tg, lg, g_inv, form)
+        var rhf = gpu_right_sum(thf, lhf, th, lh, h_inv, form)
+        s_lval[unsafe_offset=tid] = gpu_leaf_value(
+            lgf, lhf, lambda_l1, lambda_l2
+        )
+        s_rval[unsafe_offset=tid] = gpu_leaf_value(
+            rgf, rhf, lambda_l1, lambda_l2
+        )
+    barrier()
+
+    if tid != 0:
+        return
+
+    # Phase 3: the commit, on one thread.
+    var origin = Int(s_begin[unsafe_offset=0][0])
+    var total_left = 0
+    var total_rows = 0
+    for j in range(n_live):
+        total_left += Int(s_nleft[unsafe_offset=j][0])
+        total_rows += Int(s_nleft[unsafe_offset=j][0]) + Int(
+            s_nright[unsafe_offset=j][0]
+        )
+    # The two block cursors: all of the level's left children first, in
+    # ascending leaf index, then all of its right children. See the docstring.
+    var left_cursor = origin
+    var right_cursor = origin + total_left
+
+    for j in range(n_live):
+        var parent = Int(s_parent[unsafe_offset=j][0])
+        var left_node = next_node + 2 * j
+        var right_node = left_node + 1
+        var n_left = s_nleft[unsafe_offset=j][0]
+        var n_right = s_nright[unsafe_offset=j][0]
+
+        # `Tree._set_split` on the parent, field for field. Numerical only:
+        # the level search refuses a dataset with a categorical feature, so
+        # nothing here can be a category set.
+        var po = parent * TN_IWORDS
+        node_i[unsafe_offset = po + TN_FEATURE] = feature
+        node_i[unsafe_offset = po + TN_THRESHOLD] = threshold
+        node_i[unsafe_offset = po + TN_LEFT] = Int32(left_node)
+        node_i[unsafe_offset = po + TN_RIGHT] = Int32(right_node)
+        node_i[unsafe_offset = po + TN_DEFAULT_LEFT] = (
+            Int32(1) if default_left else Int32(0)
+        )
+        node_i[unsafe_offset = po + TN_MISSING_BIN] = missing_bin
+        node_i[unsafe_offset = po + TN_IS_CATEGORICAL] = Int32(0)
+        node_f[unsafe_offset = parent * TN_FWORDS + TN_SPLIT_GAIN] = gain
+
+        # The two `Tree._add_node` calls, left then right.
+        var lo = left_node * TN_IWORDS
+        var ro = right_node * TN_IWORDS
+        for w in range(TN_IWORDS):
+            node_i[unsafe_offset = lo + w] = Int32(0)
+            node_i[unsafe_offset = ro + w] = Int32(0)
+        node_i[unsafe_offset = lo + TN_FEATURE] = Int32(-1)
+        node_i[unsafe_offset = lo + TN_THRESHOLD] = Int32(-1)
+        node_i[unsafe_offset = lo + TN_LEFT] = Int32(-1)
+        node_i[unsafe_offset = lo + TN_RIGHT] = Int32(-1)
+        node_i[unsafe_offset = lo + TN_MISSING_BIN] = Int32(-1)
+        node_i[unsafe_offset = lo + TN_COUNT] = n_left
+        node_i[unsafe_offset = ro + TN_FEATURE] = Int32(-1)
+        node_i[unsafe_offset = ro + TN_THRESHOLD] = Int32(-1)
+        node_i[unsafe_offset = ro + TN_LEFT] = Int32(-1)
+        node_i[unsafe_offset = ro + TN_RIGHT] = Int32(-1)
+        node_i[unsafe_offset = ro + TN_MISSING_BIN] = Int32(-1)
+        node_i[unsafe_offset = ro + TN_COUNT] = n_right
+        node_f[unsafe_offset = left_node * TN_FWORDS + TN_VALUE] = s_lval[
+            unsafe_offset=j
+        ][0]
+        node_f[
+            unsafe_offset = left_node * TN_FWORDS + TN_SPLIT_GAIN
+        ] = Float32(0.0)
+        node_f[unsafe_offset = right_node * TN_FWORDS + TN_VALUE] = s_rval[
+            unsafe_offset=j
+        ][0]
+        node_f[
+            unsafe_offset = right_node * TN_FWORDS + TN_SPLIT_GAIN
+        ] = Float32(0.0)
+
+        # The windows, and with them the frontier. The left child takes leaf
+        # index `j` and the right child `j + L`, which is where each of them
+        # lands in the partitioned prefix and is also which pool slot each of
+        # them owns.
+        var left_begin = left_cursor
+        left_cursor += Int(n_left)
+        var right_begin = right_cursor
+        right_cursor += Int(n_right)
+
+        var lfo = j * FRONT_WORDS
+        front[unsafe_offset = lfo + FRONT_NODE] = Int32(left_node)
+        front[unsafe_offset = lfo + FRONT_ROW_BEGIN] = Int32(left_begin)
+        front[unsafe_offset = lfo + FRONT_ROW_COUNT] = n_left
+        front[unsafe_offset = lfo + FRONT_DEPTH] = level_depth + Int32(1)
+        front[unsafe_offset = lfo + FRONT_HIST_SLOT] = Int32(j)
+        front[unsafe_offset = lfo + FRONT_RECORD] = Int32(j)
+
+        var rfo = (j + n_live) * FRONT_WORDS
+        front[unsafe_offset = rfo + FRONT_NODE] = Int32(right_node)
+        front[unsafe_offset = rfo + FRONT_ROW_BEGIN] = Int32(right_begin)
+        front[unsafe_offset = rfo + FRONT_ROW_COUNT] = n_right
+        front[unsafe_offset = rfo + FRONT_DEPTH] = level_depth + Int32(1)
+        front[unsafe_offset = rfo + FRONT_HIST_SLOT] = Int32(j + n_live)
+        front[unsafe_offset = rfo + FRONT_RECORD] = Int32(j + n_live)
+
+        slot_owner[unsafe_offset=j] = Int32(left_node)
+        slot_owner[unsafe_offset = j + n_live] = Int32(right_node)
+
+        # The commit log, in the order `Tree._set_split` is called on the host:
+        # over the level's leaves in ascending leaf index.
+        order[unsafe_offset = commits + j] = Int32(parent)
+
+        if write_plan != Int32(0):
+            _write_plan_item(
+                plan, j, Int32(left_begin), n_left, Int32(j)
+            )
+            _write_plan_item(
+                plan,
+                j + n_live,
+                Int32(right_begin),
+                n_right,
+                Int32(j + n_live),
+            )
+
+    # Slots past this level's children belong to nobody. Written every level
+    # rather than only when the level narrows, because `check_invariants`
+    # compares the pool against the frontier and a stale owner is exactly the
+    # disagreement it looks for.
+    for s in range(2 * n_live, Int(pool_capacity)):
+        slot_owner[unsafe_offset=s] = Int32(-1)
+    # Items past this level's children build nothing. See `_kill_level_plan`.
+    if write_plan != Int32(0):
+        for i in range(2 * n_live, Int(plan_items)):
+            _write_plan_item(plan, i, Int32(0), Int32(ITEM_DEAD), Int32(0))
+
+    # The step descriptor. Written last, after every table this commit touched,
+    # for the reason `_pick_and_commit_kernel` gives: a reader of `STEP_LIVE` on
+    # the same queue then sees tables already consistent with it.
+    #
+    # The window is the **whole level**, which is the one thing about this
+    # descriptor that differs in kind from a leaf-wise one, and it is what makes
+    # `GpuActiveRows.enqueue_partition_desc` produce an entire level in one
+    # stable partition with no change at all.
+    step[unsafe_offset=STEP_LIVE] = Int32(1)
+    step[unsafe_offset=STEP_ROW_BEGIN] = Int32(origin)
+    step[unsafe_offset=STEP_ROW_COUNT] = Int32(total_rows)
+    step[unsafe_offset=STEP_FEATURE] = feature
+    step[unsafe_offset=STEP_THRESHOLD] = threshold
+    step[unsafe_offset=STEP_MISSING_BIN] = missing_bin
+    step[unsafe_offset=STEP_DEFAULT_LEFT] = (
+        Int32(1) if default_left else Int32(0)
+    )
+    step[unsafe_offset=STEP_IS_CAT] = Int32(0)
+    for w in range(CAT_WORDS):
+        step[unsafe_offset = STEP_CAT0 + w] = Int32(0)
+    # The single-child build's words. This schedule does not launch
+    # `enqueue_desc_child` -- the level's children come from one batch -- and a
+    # zero count is what makes that unambiguous: a caller who wired the
+    # single-child path in here by mistake would accumulate nothing and be
+    # caught by an empty histogram, rather than silently rebuild one leaf of the
+    # level over the whole prefix.
+    step[unsafe_offset=STEP_BUILT_BEGIN] = Int32(origin)
+    step[unsafe_offset=STEP_BUILT_COUNT] = Int32(0)
+    step[unsafe_offset=STEP_BUILT_SLOT] = Int32(0)
+    step[unsafe_offset=STEP_SUB_SLOT] = Int32(0)
+    step[unsafe_offset=STEP_LEFT_SLOT] = Int32(0)
+    step[unsafe_offset=STEP_RIGHT_SLOT] = Int32(0)
+    step[unsafe_offset=STEP_LEFT_REC] = Int32(0)
+    step[unsafe_offset=STEP_RIGHT_REC] = Int32(0)
+
+    ctr[unsafe_offset=CTR_NEXT_NODE] = Int32(next_node + 2 * n_live)
+    ctr[unsafe_offset=CTR_N_LIVE] = Int32(2 * n_live)
+    ctr[unsafe_offset=CTR_COMMITS] = Int32(commits + n_live)
+    # There is no pick. `CTR_PICK_NODE` carries the level's lowest node id,
+    # which is leaf index 0's parent and is the same key
+    # `tree._grow_oblivious_levels` uses for the level; `CTR_PICK` is -1
+    # because no frontier slot was selected over any other.
+    ctr[unsafe_offset=CTR_PICK] = Int32(-1)
+    ctr[unsafe_offset=CTR_PICK_NODE] = s_parent[unsafe_offset=0][0]
+    ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_RUNNING)
+
+
+def _stage_level_search_kernel(
+    node_tbl: MutPointer[Int32, MutAnyOrigin],
+    front: MutPointer[Int32, MutAnyOrigin],
+    ctr: MutPointer[Int32, MutAnyOrigin],
+    slot_cells: Int32,
+    leaf_base: Int32,
+    max_leaves: Int32,
+):
+    """Point the level's leaf search records at the level's histogram slots.
+
+    `_stage_child_search_kernel` for a whole level: one Int32 write per live
+    leaf instead of two per split. `gpu_split_search._scan_slot_oblivious_kernel`
+    reads records `[leaf_base, leaf_base + n_leaves)` for exactly one word each,
+    `NODE_HIST_BASE`, and reads everything else it needs -- the feature list, the
+    allow mask, the monotone vector, the float parameter block -- from the level
+    record; under this plane's refusals all four are tree-level and are staged
+    once by the host.
+
+    **Record index equals frontier slot equals leaf index equals pool slot.**
+    The level commit pins all four together, so this kernel is a copy rather
+    than a mapping, and the order the scan sums in is the order the frontier is
+    in without anything having to sort it. That is
+    `gpu_resident_round.OBLIVIOUS_LEAF_INDEX_RULE` reduced to an identity.
+
+    Records past `n_live` are written too, up to `max_leaves`, and pointed at
+    slot 0. They are the records a level search reads after growth has stopped:
+    the host schedule keeps enqueueing searches sized for the level the tree
+    would have reached, and a record left holding a previous tree's base would
+    aim that search at a slot outside the pool. Pointing them at slot 0 makes
+    those reads in-bounds and meaningless, which is what they should be -- the
+    commit that follows returns on `CTR_STATUS` before it reads any record.
+
+    One thread. The work is at most 64 stores and a launch of one block of one
+    thread is what the leaf-wise counterpart already costs."""
+    if thread_idx.x != 0:
+        return
+    var n_live = Int(ctr[unsafe_offset=CTR_N_LIVE][0])
+    for i in range(Int(max_leaves)):
+        var slot = Int32(0)
+        if i < n_live:
+            slot = front[unsafe_offset = i * FRONT_WORDS + FRONT_HIST_SLOT][0]
+        node_tbl[
+            unsafe_offset = (Int(leaf_base) + i) * NODE_WORDS + NODE_HIST_BASE
+        ] = slot * slot_cells
+
+
 def _pick_runner_up_kernel(
     front: MutPointer[Int32, MutAnyOrigin],
     ctr: MutPointer[Int32, MutAnyOrigin],
@@ -2281,8 +2851,14 @@ struct DeviceTreeTables(Movable):
         self.step_scratch = self.ctx.enqueue_create_buffer[DType.int32](
             STEP_WORDS
         )
+        # Wide enough for a level commit as well as a leaf-wise one. A level of
+        # `L` parents fills `2L` item rows and the widest level a depth-6 tree
+        # commits is `L = 32`, so this is `OBLIVIOUS_PLAN_ITEMS` and not
+        # `PLAN_ITEMS`. Two hundred and fifty-six Int32; the buffer is never
+        # read by any other kernel and exists so that the overloads which write
+        # no plan still have a legal pointer to hand one.
         self.plan_scratch = self.ctx.enqueue_create_buffer[DType.int32](
-            PLAN_ITEMS * ITEM_WORDS
+            OBLIVIOUS_PLAN_ITEMS * ITEM_WORDS
         )
 
         self.stage_front = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -2914,6 +3490,141 @@ struct DeviceTreeTables(Movable):
                 Int32(self.node_capacity),
                 grid_dim=1,
                 block_dim=PICK_THREADS,
+            )
+
+    def enqueue_level[
+        step_origin: MutOrigin,
+        plan_origin: MutOrigin,
+        hist_origin: MutOrigin, //
+    ](
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        mut fparams: DeviceBuffer[DType.float32],
+        hist: MutPointer[Int32, hist_origin],
+        step: MutPointer[Int32, step_origin],
+        plan: MutPointer[Int32, plan_origin],
+        write_plan: Bool,
+        level_record: Int,
+        n_bins: Int,
+        hist_size: Int,
+        level_depth: Int,
+        max_depth: Int,
+        plan_items: Int,
+        gain_form: Int,
+    ) raises:
+        """Commit one oblivious level: one launch, one block.
+
+        The level's split is already decided -- it is the single record at
+        `level_record` that `gpu_split_search`'s cross-leaf scan and the ordinary
+        cross-feature reduction wrote one launch earlier -- so this applies it to
+        every leaf of the level and publishes everything the rest of the level's
+        schedule reads: the step descriptor its partition routes by, the plan its
+        batched build accumulates from, and the frontier its next search covers.
+
+        `hist` is the resident histogram pool (`GpuLeafBatcher.out_dev`), read
+        here and only here inside this file. A level commit cannot get its
+        per-leaf row counts and child values off the record the way a leaf-wise
+        commit does, because the record's are the level's aggregates; see
+        `_commit_level_kernel`.
+
+        `plan_items` is the item count the batcher was staged for, which is the
+        width every level of this tree kills or fills. Handing in a narrower
+        number than the batcher's would leave items live that the batch still
+        launches over.
+
+        **A caller uses this or `enqueue_step`/`enqueue_step_with_plan`, never
+        both on one tree.** They are two growth policies, not two shapes of one.
+        """
+        if level_record < 0:
+            raise Error("the level record index must be nonnegative")
+        if n_bins < 1 or hist_size < n_bins:
+            raise Error("a level commit needs a positive histogram geometry")
+        if max_depth < 1:
+            raise Error("an oblivious tree needs a positive max_depth")
+        if level_depth < 0:
+            raise Error("a level depth must be nonnegative")
+        if write_plan and (
+            plan_items < 2 or plan_items > OBLIVIOUS_PLAN_ITEMS
+        ):
+            raise Error(
+                "a level plan holds between two items and"
+                " OBLIVIOUS_PLAN_ITEMS"
+            )
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_commit_level_kernel](
+                self.front_dev.unsafe_ptr(),
+                self.node_i_dev.unsafe_ptr(),
+                self.node_f_dev.unsafe_ptr(),
+                self.ctr_dev.unsafe_ptr(),
+                self.slot_dev.unsafe_ptr(),
+                self.missing_dev.unsafe_ptr(),
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                hist,
+                fparams.unsafe_ptr(),
+                step,
+                self.order_dev.unsafe_ptr(),
+                plan,
+                Int32(1) if write_plan else Int32(0),
+                Int32(level_record),
+                Int32(n_bins),
+                Int32(hist_size),
+                Int32(level_depth),
+                Int32(max_depth),
+                Int32(plan_items),
+                Int32(self.pool_capacity),
+                Int32(self.leaf_capacity),
+                Int32(self.node_capacity),
+                Int32(gain_form),
+                grid_dim=1,
+                block_dim=PICK_THREADS,
+            )
+
+    def enqueue_stage_level_search(
+        mut self,
+        mut node_tbl: DeviceBuffer[DType.int32],
+        slot_cells: Int,
+        leaf_base: Int,
+        max_leaves: Int,
+    ) raises:
+        """Point the level's leaf search records at the level's slots.
+
+        `enqueue_stage_child_search` for a whole level. `node_tbl` is
+        `GpuSplitSearcher.node_dev` and `slot_cells` is
+        `3 * n_features * n_bins`; `leaf_base` is the first record the level's
+        leaves occupy and `max_leaves` is the widest level this tree will reach,
+        so the records a stopped tree's search still covers are written too. See
+        `_stage_level_search_kernel`.
+        """
+        if slot_cells < 1:
+            raise Error("the pool slot stride must be positive")
+        if leaf_base < 0:
+            raise Error("the leaf record base must be nonnegative")
+        if max_leaves < 1 or max_leaves > OBLIVIOUS_LEVEL_LEAVES:
+            raise Error(
+                "a level holds between one leaf and OBLIVIOUS_LEVEL_LEAVES"
+            )
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_stage_level_search_kernel](
+                node_tbl.unsafe_ptr(),
+                self.front_dev.unsafe_ptr(),
+                self.ctr_dev.unsafe_ptr(),
+                Int32(slot_cells),
+                Int32(leaf_base),
+                Int32(max_leaves),
+                grid_dim=1,
+                block_dim=1,
             )
 
     def enqueue_runner_up(

@@ -7402,6 +7402,49 @@ struct GpuActiveRows(Movable):
         """
         return self.copy_back_debt
 
+    def copy_back_debt_blocks(self) -> Int:
+        """Blocks the outstanding copy-back was enqueued against, or zero when
+        nothing is owed.
+
+        The number a batched build has to launch at least as wide as, so that
+        the fused grid covers what `_copy_back_kernel`'s own would have covered.
+        Zero when there is no debt, which is the value
+        `GpuLeafBatcher.enqueue_device_plan_batch_fused` reads as "size the grid
+        from the zeroing alone"; the copy-back half of that kernel is guarded on
+        `STEP_LIVE` and stores nothing when the step is dead, so a zero here and
+        a dead step agree.
+        """
+        return self.copy_back_blocks if self.copy_back_debt else 0
+
+    def mark_copy_back_fused(mut self) raises:
+        """Record that a batched build has paid the deferred copy-back.
+
+        The bookkeeping half of `GpuLeafBatcher.enqueue_device_plan_batch_fused`,
+        which carries the partition's deferred row copy-back inside the zeroing
+        pass it launches anyway. That kernel lives in a module that cannot reach
+        this flag -- `gpu_leaf_batching` does not own a `GpuActiveRows` -- so the
+        schedule that enqueues it marks the debt paid here, in the same place.
+
+        `enqueue_desc_histogram` clears the same flag for the single-child path,
+        and it clears it *after* enqueueing the fused kernel. This does the same,
+        and it is the caller's obligation to call it in that order: four refusals
+        on this struct read `copy_back_debt`, and clearing it before the launch
+        that pays it would open a window in which they all pass wrongly.
+
+        Refuses when nothing is owed, because a schedule that thinks it paid a
+        debt it never incurred is a schedule whose partition ran with the fusion
+        off, and the batched build it just enqueued was then sized against a
+        stale `copy_back_blocks`.
+        """
+        if not self.copy_back_debt:
+            raise Error(
+                "no descriptor partition copy-back is outstanding, so nothing"
+                " was fused; a batched level build must follow the"
+                " enqueue_partition_desc that deferred one"
+            )
+        self.copy_back_debt = False
+        self.copy_back_folds += 1
+
     def _refuse_copy_back_debt(self, what: String) raises:
         """Refuse an operation that would observe the row buffer, or start a
         new tree, while the partition's copy-back has not been paid.
