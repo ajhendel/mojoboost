@@ -2618,6 +2618,10 @@ def grow_tree_leaves_profiled(
         _check_oblivious(params, data)
     params.constraints.check_features(data.n_features)
     params.monotone.check_features(data.n_features)
+    # CatBoost's one-hot threshold, refused here rather than at the first
+    # categorical node. Off by default, so this cannot fire on a fit that
+    # never set it.
+    params.cat.check_one_hot()
     check_feature_fractions(
         params.feature_fraction,
         params.feature_fraction_bynode,
