@@ -100,15 +100,28 @@ which candidates exist (`extra_trees`, forced splits), and what a leaf emits
 highest-gain leaf anywhere in the tree, and a rejected candidate simply makes
 its leaf offer no split, exactly as the depth limit does today.
 
+One rule here is CatBoost's, not LightGBM's
+-------------------------------------------
+`random_strength` (0.0) is CatBoost's score-noise regularizer, which
+LightGBM has no equivalent of. At its default it takes no draw and changes
+no bit, so the bundle's contract is unchanged; above 0 it adds a seeded
+normal to every (feature, bin) candidate's gain before the search folds
+them. The section below it in this file carries the CatBoost source it was
+read from and the two places that source corrects the usual summary of the
+formula.
+
 Randomness stays counter-based
 ------------------------------
 `extra_trees` draws from a counter-based splitmix64 stream keyed by
-(seed, tree index, node id, feature), the same construction `sampling.mojo`
-uses for feature subsampling and for the same reason: a draw must not depend
-on how many draws happened before it, so a tree is reproducible whatever the
-thread count or the training history. This costs LightGBM-identical streams
-for a given seed, which `sampling.mojo` already documents as an intentional
-difference.
+(seed, tree index, node id, feature), and `random_strength` from one keyed by
+(seed, tree index, node id, feature, bin): the same construction
+`sampling.mojo` uses for feature subsampling and for the same reason: a draw
+must not depend on how many draws happened before it, so a tree is
+reproducible whatever the thread count or the training history. This costs
+LightGBM-identical streams for a given seed, and CatBoost-identical ones --
+CatBoost seeds one RNG per candidate task and walks it in evaluation order,
+which is exactly the dependence this construction refuses. `sampling.mojo`
+already documents that trade against LightGBM.
 
 Linear trees are a subsystem, not a tree control
 ------------------------------------------------
@@ -121,10 +134,12 @@ leaves from the raw matrix, `Booster.linear` carries the sidecar, and
 untouched, which is why nothing in this module knows about it.
 """
 
+from std.math import exp, log, sqrt
+
 from .cegb import CegbConfig
 from .gain import leaf_score, soft_threshold_l1
 from .monotone import MONOTONE_FREE, output_score
-from .rng import splitmix64, uniform
+from .rng import GOLDEN, splitmix64, uniform
 
 # LightGBM's extra_seed default. The other seeds already live with the
 # features that use them (`sampling.DEFAULT_FEATURE_FRACTION_SEED`,
@@ -483,6 +498,240 @@ def extra_threshold_index(
     """
     return extra_candidate_index(
         n_candidates, extra_split_stream(seed, tree_index, node, feature)
+    )
+
+
+# ---------------------------------------------------------------------------
+# random_strength: seeded noise on a candidate's gain (CatBoost)
+# ---------------------------------------------------------------------------
+#
+# The one CatBoost regularizer LightGBM has no equivalent of. Read from
+# CatBoost `master` (fetched 2026-08-16), not from the paper or the docs:
+#
+#   catboost/private/libs/algo/greedy_tensor_search.cpp
+#       CalcScoreStDev = RandomStrength
+#                      * derivativesStDevFromZero
+#                      * (RandomScoreType == NormalWithModelSizeDecrease
+#                         ? CalcDerivativesStDevFromZeroMultiplier(n, L)
+#                         : 1.0)
+#       CalcDerivativesStDevFromZeroPlainBoosting(fold)
+#           = sqrt(sum over dims and rows of d^2 / rows)
+#       CalcDerivativesStDevFromZeroMultiplier(n, L)
+#           modelLeft = exp(log(n) - L);  return modelLeft / (1 + modelLeft)
+#   catboost/private/libs/algo/train.cpp
+#       modelLength L = iteration_index * learning_rate
+#   catboost/private/libs/algo/rand_score.h
+#       TRandomScore::GetInstance = Val + NormalDistribution(rand, 0, StDev)
+#   catboost/private/libs/algo/tensor_search_helpers.cpp
+#       SetBestScore: every candidate bin is noised, then the argmax over
+#       bins is taken on the *noised* values
+#
+# Two things the source corrects about the short summary of this formula:
+#
+# 1. `derivativesStDevFromZero` is not a standard deviation. No mean is
+#    subtracted: it is the root-mean-square of the per-row weighted
+#    derivatives about zero, taken over the whole learn set, once per tree.
+#    It is a property of the ensemble's current residuals, not of the node
+#    being split, and it cannot be recovered from a node histogram (a
+#    histogram carries sums of g, never sums of g squared).
+# 2. the "model-size decrease" is not a size. It is
+#    n / (n + exp(L)) written as modelLeft / (1 + modelLeft): a factor that
+#    starts at n/(n+1), effectively 1, on the first tree and decays toward 0
+#    once iteration * learning_rate passes log(n). The noise fades as the
+#    model grows, which is the point of the term. It applies only under
+#    CatBoost's default `random_score_type=NormalWithModelSizeDecrease`; the
+#    `Gumbel` type drops it and changes the distribution, and is not
+#    implemented here.
+#
+# Units, which the summary does not mention and which matter. CatBoost's
+# default CPU score function is `Cosine`, whose value is
+# sum(leafOut * sumDelta) / sqrt(sum(leafOut^2 * sumWeight)), dimensionally a
+# gradient, so noise scaled by a gradient RMS is dimensionally consistent
+# with it. mojotrees's gain is the second-order gain, dimensionally
+# gradient^2 / hessian, which is CatBoost's `score_function=L2` shape. The
+# scaling below is applied to that gain unchanged, which is CatBoost's own
+# behavior under `score_function=L2` -- CatBoost applies one scoreStDev to
+# whichever score function is configured -- but it is not the pairing
+# CatBoost ships by default, and the useful range of `random_strength` on a
+# gain is therefore not the useful range CatBoost documents.
+#
+# Where the draw is keyed, and why it is not CatBoost's keying. CatBoost
+# seeds one RNG per candidate *task* (`SetBestScore(randSeed + taskIdx, ...)`)
+# and walks it in bin order inside that task, so its draw depends on how the
+# candidate list was blocked. mojotrees keys every draw by
+# (seed, tree, node, feature, bin) instead, exactly as `extra_trees` above
+# keys by (seed, tree, node, feature): a draw must not depend on how many
+# draws happened before it, or the answer would move with
+# MOJOTREES_NUM_WORKERS. That is a deliberate divergence from CatBoost's
+# stream and it costs CatBoost-identical noise for a given seed, which is the
+# same trade `sampling.mojo` already documents against LightGBM.
+
+# CatBoost's `random_seed` default, which is what its noise stream is keyed
+# from. Not a parameter-string key here: the string surface is LightGBM's,
+# and `random_strength` is the only name added to it.
+comptime DEFAULT_RANDOM_STRENGTH_SEED = 0
+
+# Domain separator folded into the seed so this stream can never coincide
+# with `extra_split_stream`'s even when both seeds are equal. ASCII
+# "RANDSCOR".
+comptime _RANDOM_SCORE_DOMAIN = UInt64(0x52414E4453434F52)
+
+# Marsaglia's polar method rejects a draw outside the unit disc, which is
+# 1 - pi/4 of the plane. Sixty-four rejections in a row has probability about
+# 3e-43; the bound exists so the loop is provably finite, not because it is
+# expected to be reached.
+comptime _POLAR_MAX_TRIES = 64
+
+
+def derivatives_stdev_from_zero(
+    gradients: List[Float64], n_rows: Int
+) raises -> Float64:
+    """CatBoost's `CalcDerivativesStDevFromZeroPlainBoosting`: the RMS of the
+    weighted derivatives about zero.
+
+    `gradients` is the ensemble's current gradient vector and `n_rows` the
+    number of rows *per output dimension*, so a multiclass caller passes the
+    flat `n_rows * n_class` vector and the row count. That matches CatBoost,
+    which sums the squares over every dimension and divides by the row count
+    of one dimension rather than by the total length.
+
+    Plain boosting only. CatBoost's ordered-boosting variant takes the same
+    RMS over each fold's tail segment instead; mojotrees has no ordered
+    boosting, so there is nothing here to select between.
+    """
+    if n_rows <= 0:
+        raise Error(
+            "derivatives_stdev_from_zero needs a positive row count, got ",
+            n_rows,
+        )
+    if len(gradients) % n_rows != 0:
+        raise Error(
+            "the gradient vector must be a whole number of output dimensions"
+            " of ",
+            n_rows,
+            " rows, got ",
+            len(gradients),
+        )
+    var sum2 = 0.0
+    for i in range(len(gradients)):
+        sum2 += gradients[i] * gradients[i]
+    return sqrt(sum2 / Float64(n_rows))
+
+
+def model_size_decrease(
+    learn_sample_count: Int, model_length: Float64
+) raises -> Float64:
+    """CatBoost's `CalcDerivativesStDevFromZeroMultiplier`.
+
+    `model_length` is CatBoost's `modelLength`, which `train.cpp` computes as
+    `iteration_index * learning_rate` -- the boosted length of the model so
+    far, not a node count and not a byte count. The factor is
+    `exp(log(n) - L) / (1 + exp(log(n) - L))`, written here exactly as
+    CatBoost writes it rather than as the algebraically equal
+    `n / (n + exp(L))`, so the same two roundings happen in the same order.
+
+    An overflow of the exponential is the L -> -infinity limit of the same
+    expression and returns 1.0 rather than a NaN.
+    """
+    if learn_sample_count <= 0:
+        raise Error(
+            "model_size_decrease needs a positive learn sample count, got ",
+            learn_sample_count,
+        )
+    if not _is_finite(model_length):
+        raise Error("model_size_decrease needs a finite model length")
+    var model_left = exp(log(Float64(learn_sample_count)) - model_length)
+    if not _is_finite(model_left):
+        return 1.0
+    return model_left / (1.0 + model_left)
+
+
+def random_score_scale_from_gradients(
+    gradients: List[Float64], n_rows: Int, model_length: Float64
+) raises -> Float64:
+    """The per-tree scale `ExtraTreeParams.random_score_scale` wants:
+    `derivatives_stdev_from_zero * model_size_decrease`.
+
+    This is everything in CatBoost's `CalcScoreStDev` except the
+    `random_strength` multiplier itself, which stays on the parameter bundle
+    because it is the user's knob and this is the ensemble's state. One call
+    per tree, before growth, from whichever trainer owns the gradient vector.
+    """
+    return derivatives_stdev_from_zero(gradients, n_rows) * (
+        model_size_decrease(n_rows, model_length)
+    )
+
+
+def random_score_stream(
+    seed: Int, tree_index: Int, node: Int, feature: Int, bin: Int
+) -> UInt64:
+    """The counter key for one candidate's noise draw.
+
+    Keyed by (seed, tree, node, feature, bin) and by nothing else. It reads
+    no counter that advances with evaluation order, so the draw for a
+    candidate is the same value whether that candidate was the first scored
+    in the node or the last, whether its feature ran on its own task or
+    shared one, and at any `MOJOTREES_NUM_WORKERS`. Sign bits are masked off
+    so negative seeds are accepted, as in `extra_split_stream`.
+
+    The bin is mixed in last, and `bin + 1` rather than `bin` so that the
+    lowest bin is not the identity element of the xor.
+    """
+    var h = splitmix64(
+        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _RANDOM_SCORE_DOMAIN
+    )
+    h = splitmix64(h ^ UInt64(tree_index & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64((node + 1) & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64((feature + 1) & 0x7FFFFFFFFFFFFFFF))
+    return splitmix64(h ^ UInt64((bin + 1) & 0x7FFFFFFFFFFFFFFF))
+
+
+def standard_normal(stream: UInt64) -> Float64:
+    """A standard normal draw from one counter key, by Marsaglia's polar
+    method.
+
+    Polar rather than Box-Muller because Box-Muller needs a cosine and this
+    needs only `log` and `sqrt`, which the package already depends on
+    elsewhere; one fewer libm function on a path whose bits have to reproduce
+    across the x86-64 and ARM64 CI legs.
+
+    Rejection does not make this stream-dependent. A rejected pair advances a
+    counter derived from `stream` alone, so the accepted pair for a given key
+    is a function of that key and the number of rejections it takes is a
+    property of the key rather than of the evaluation order.
+    """
+    var i = 0
+    while i < _POLAR_MAX_TRIES:
+        var base = stream + GOLDEN * UInt64(2 * i)
+        var u = 2.0 * uniform(base) - 1.0
+        var v = 2.0 * uniform(base + GOLDEN) - 1.0
+        var s = u * u + v * v
+        if s > 0.0 and s < 1.0:
+            return u * sqrt(-2.0 * log(s) / s)
+        i += 1
+    return 0.0
+
+
+@always_inline
+def random_score_noise(
+    stdev: Float64,
+    seed: Int,
+    tree_index: Int,
+    node: Int,
+    feature: Int,
+    bin: Int,
+) -> Float64:
+    """The noise added to one (feature, bin) candidate's gain: a draw from
+    N(0, `stdev`), keyed as `random_score_stream` describes.
+
+    `stdev` is `ExtraTreeParams.random_score_stdev()`, which is
+    `random_strength * random_score_scale`. At or below zero this is exactly
+    0.0 and no stream is touched, which is the default path.
+    """
+    if not (stdev > 0.0) or not _is_finite(stdev):
+        return 0.0
+    return stdev * standard_normal(
+        random_score_stream(seed, tree_index, node, feature, bin)
     )
 
 
@@ -1109,6 +1358,25 @@ struct ExtraTreeParams(Copyable, Movable):
     var penalties: FeaturePenalties
     var forced: ForcedSplits
 
+    # CatBoost's `random_strength`, the one rule on this bundle that is not
+    # LightGBM's. `random_strength` is the user's knob and defaults to 0,
+    # which is exactly LightGBM's behavior: no draw is taken, no gain is
+    # touched, and `is_active` stays False for it.
+    #
+    # `random_score_scale` is the rest of CatBoost's `CalcScoreStDev` --
+    # `derivatives_stdev_from_zero * model_size_decrease` -- and is a
+    # property of the ensemble at this iteration rather than of the tree
+    # controls, so it is supplied per tree by whoever owns the gradient
+    # vector (`random_score_scale_from_gradients`). A split search is handed
+    # a histogram, and no histogram carries the sum of squared gradients this
+    # needs, so it cannot be reconstructed there. 0.0 means "not supplied",
+    # and `check_scalars` refuses a positive `random_strength` beside it
+    # rather than training a model whose regularizer silently scaled to
+    # nothing.
+    var random_strength: Float64
+    var random_score_scale: Float64
+    var random_strength_seed: Int
+
     # LightGBM's quantized-training family, verbatim: the four names and the
     # four defaults of `include/LightGBM/config.h` (LightGBM 4.7.0.99), no
     # more and no fewer. The scale rule, the rounding seed, and the
@@ -1134,6 +1402,9 @@ struct ExtraTreeParams(Copyable, Movable):
         self.monotone_method = MONOTONE_BASIC
         self.penalties = FeaturePenalties()
         self.forced = ForcedSplits.none()
+        self.random_strength = 0.0
+        self.random_score_scale = 0.0
+        self.random_strength_seed = DEFAULT_RANDOM_STRENGTH_SEED
         self.use_quantized_grad = False
         self.num_grad_quant_bins = DEFAULT_NUM_GRAD_QUANT_BINS
         self.quant_train_renew_leaf = False
@@ -1154,8 +1425,15 @@ struct ExtraTreeParams(Copyable, Movable):
             or self.monotone_penalty > 0.0
             or self.penalties.is_active()
             or not self.forced.is_empty()
+            or self.random_strength > 0.0
             or self.use_quantized_grad
         )
+
+    def random_score_stdev(self) -> Float64:
+        """CatBoost's `scoreStDev`: the standard deviation of the noise added
+        to one candidate's gain. 0.0 at the default, where no draw is taken.
+        """
+        return self.random_strength * self.random_score_scale
 
     def needs_leaf_finish(self) -> Bool:
         """Whether `finish_leaf_output` would move a leaf's value.
@@ -1172,13 +1450,14 @@ struct ExtraTreeParams(Copyable, Movable):
     def needs_node_identity(self) -> Bool:
         """Whether an active rule reads the node id and the tree index.
 
-        Only `extra_trees` does: its threshold draw is keyed by
-        (seed, tree index, node id, feature). A grower that does not pass its
-        node ids would draw every node's threshold from the same stream, so
-        `tree._search` refuses this too rather than let a caller's default 0
-        stand in for a node id.
+        Two rules do. `extra_trees` keys its threshold draw by
+        (seed, tree index, node id, feature), and `random_strength` keys its
+        per-candidate noise by (seed, tree index, node id, feature, bin). A
+        grower that does not pass its node ids would draw every node from the
+        same stream, so `tree._search` refuses both rather than let a
+        caller's default 0 stand in for a node id.
         """
-        return self.extra_trees
+        return self.extra_trees or self.random_strength > 0.0
 
     def needs_grower_support(self) -> Bool:
         """Whether this bundle can only be honored by a grower that opts in.
@@ -1220,6 +1499,7 @@ struct ExtraTreeParams(Copyable, Movable):
             self.monotone_penalty < 0.0
         ):
             raise Error("monotone_penalty must be a finite nonnegative number")
+        self.check_random_strength()
         self.check_quantized_grad()
         if self.monotone_method != MONOTONE_BASIC:
             raise Error(
@@ -1246,6 +1526,55 @@ struct ExtraTreeParams(Copyable, Movable):
                 " handed a BinnedMatrix, which has no bin edges. Map them"
                 " once with binning.map_forced_splits(mapper, forced) and put"
                 " the result on ExtraTreeParams.forced"
+            )
+
+    def check_random_strength(self) raises:
+        """Range-check `random_strength`, and refuse a positive value whose
+        per-tree scale nobody supplied.
+
+        Runs whether or not `random_strength` is set, so a nonsense value is
+        reported when it is set rather than when it is first used, which is
+        the rule `check_quantized_grad` states and this mirrors.
+
+        The refusal is the same shape as that one and for the same reason.
+        CatBoost's noise is `random_strength * derivativesStDevFromZero *
+        modelSizeDecrease`, and the last two factors are properties of the
+        ensemble at this iteration: the RMS of the current gradients over the
+        whole learn set, and `iteration * learning_rate`. A split search sees
+        a node histogram, which carries sums of gradients and never sums of
+        squared gradients, so it cannot compute them and must be handed the
+        product. Nothing in this build hands it over yet -- `boosting.fit`
+        and the metric-path trainers are untouched -- so a `random_strength`
+        set from a parameter string would scale to zero and train an
+        unregularized model that reported success. Accepting it and doing
+        nothing is the silent downgrade this package refuses everywhere else.
+
+        A Mojo-API caller that computes the scale itself with
+        `random_score_scale_from_gradients(grad, n_rows, iteration *
+        learning_rate)` and puts it on `random_score_scale` passes this
+        check, and the draw is live for `tree.grow_tree` from there.
+        """
+        if not _is_finite(self.random_strength) or self.random_strength < 0.0:
+            raise Error(
+                "random_strength must be a finite nonnegative number"
+            )
+        if not _is_finite(self.random_score_scale) or (
+            self.random_score_scale < 0.0
+        ):
+            raise Error(
+                "random_score_scale must be a finite nonnegative number"
+            )
+        if self.random_strength > 0.0 and self.random_score_scale <= 0.0:
+            raise Error(
+                "random_strength is recognized but no trainer computes its"
+                " per-tree scale in this build, so setting it alone would"
+                " train an unregularized model that ignored it. The scale is"
+                " CatBoost's derivativesStDevFromZero * modelSizeDecrease;"
+                " compute it with"
+                " tree_parameters_extra.random_score_scale_from_gradients("
+                "grad, n_rows, iteration * learning_rate) and set it on"
+                " ExtraTreeParams.random_score_scale, which makes the draw"
+                " live for tree.grow_tree"
             )
 
     def check_quantized_grad(self) raises:

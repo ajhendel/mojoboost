@@ -92,6 +92,26 @@ caller's feature list is ascending (`find_best_split` requires that it be). A
 parallel max carrying the feature index and resolving ties toward the lower
 index would answer the same, and would be a second rule to keep in step with
 the first.
+
+Noise on a candidate's gain
+---------------------------
+`random_strength` (CatBoost's, see tree_parameters_extra.mojo) adds a seeded
+normal to each candidate's gain. Its placement is chosen so that none of the
+paragraph above changes. The draw belongs to a (feature, bin) candidate and
+is keyed by (seed, tree index, node id, feature, bin) and by nothing else, so
+it is decided inside the feature's own task, before that feature's best is
+written to its slot, and the fold still sees one number per feature and folds
+them in ascending order under the same strict `>`. Nothing about the noise
+reads a counter that advances with evaluation order, so the same tree comes
+out at every task count. At the default of 0 no draw is taken, no arithmetic
+is added, and the scan takes exactly the path it took before the parameter
+existed.
+
+The two candidates at one threshold -- missing rows left and missing rows
+right -- share a single draw, because the noise belongs to the threshold and
+not to the routing direction. Sharing it keeps the LightGBM rule above
+intact: an exact tie between the two directions still keeps `default_left`,
+because equal gains stay equal after the same number is added to both.
 """
 
 from .apple_cpu_policy import split_scan_ops
@@ -130,6 +150,7 @@ from .tree_parameters_extra import (
     extra_threshold_index,
     finish_leaf_output,
     passes_min_gain,
+    random_score_noise,
 )
 
 
@@ -407,6 +428,14 @@ def find_best_split(
       candidates are scored at the finished outputs (see `_split_gain`).
       `parent_output` is this node's own value, which is what its children
       smooth toward, and `n_rows` its row count.
+    - `random_strength` adds a seeded normal to every candidate's gain before
+      that gain is compared to anything, keyed by (`random_strength_seed`,
+      `tree_index`, `node`, feature, bin). Its standard deviation is
+      `random_strength * random_score_scale`, and a positive strength with no
+      scale is refused rather than silently scaled to nothing. It is refused
+      on a matrix with a categorical feature, for the reason `extra_trees`
+      is. At the default of 0 not a single instruction of arithmetic is
+      added, which is what makes it a no-op rather than a small one.
 
     `n_rows` is the node's row count, used by the per-split CEGB cost and, at
     0, taken from the histogram's own totals. `depth` is the node's depth in
@@ -484,6 +513,41 @@ def find_best_split(
             " categorical feature is searched as category partitions, whose"
             " random draw is a separate rule"
         )
+
+    # `random_strength`: CatBoost's seeded noise on a candidate's gain. The
+    # standard deviation is `random_strength * random_score_scale`, and the
+    # scale is the ensemble's, not the node's, so a caller that set the
+    # strength without it is refused here as well as at `check_scalars`:
+    # this function is reachable directly and a caller who came in that way
+    # would otherwise get an unregularized answer that looked regularized.
+    var noise_stdev = extra.random_score_stdev()
+    var noisy = extra.random_strength > 0.0
+    if noisy and not (noise_stdev > 0.0):
+        raise Error(
+            "random_strength is set but ExtraTreeParams.random_score_scale"
+            " is not. The scale is CatBoost's derivativesStDevFromZero *"
+            " modelSizeDecrease, which is a property of the ensemble's"
+            " current gradients and cannot be read from a node histogram."
+            " Compute it once per tree with"
+            " tree_parameters_extra.random_score_scale_from_gradients(grad,"
+            " n_rows, iteration * learning_rate)"
+        )
+    if noisy and cats.any_categorical():
+        # A categorical feature's candidates are category *sets*, searched
+        # inside `find_best_categorical_split`, and only that search's winner
+        # reaches this function. Noising the winner would noise one candidate
+        # per feature while every numerical feature had every candidate
+        # noised, which is a different regularizer wearing the same name. The
+        # combination is refused rather than half-applied; making it work
+        # means the draw moving into the partition search, which is
+        # categorical.mojo's.
+        raise Error(
+            "random_strength is implemented for numerical thresholds only; a"
+            " categorical feature is searched as category partitions, and"
+            " only that search's winner reaches here, so its candidates"
+            " cannot each be noised from this function"
+        )
+    var noise_seed = extra.random_strength_seed
 
     comptime W = SIMD_LANES
     var grad_p = hist._grad.unsafe_ptr()
@@ -666,6 +730,16 @@ def find_best_split(
             if draw_one and b != pick:
                 continue
 
+            # This threshold's noise draw, taken once and shared by the two
+            # routing directions below. Keyed by (seed, tree, node, feature,
+            # bin), so it does not depend on this scan having reached bin `b`
+            # by walking bins 0..b-1, nor on which task this feature ran on.
+            var noise = 0.0
+            if noisy:
+                noise = random_score_noise(
+                    noise_stdev, noise_seed, tree_index, node, f, b
+                )
+
             # Missing to the left, scored first so an exact tie keeps
             # default_left, as in LightGBM. With no missing rows in this node
             # the two candidates coincide, and the left default is recorded
@@ -701,6 +775,8 @@ def find_best_split(
                         total_c - dl_left_c,
                         parent_output,
                     )
+                    if noisy:
+                        gain += noise
                     if gain > f_gain:
                         f_gain = gain
                         f_bin = b
@@ -737,6 +813,8 @@ def find_best_split(
                         total_c - left_c,
                         parent_output,
                     )
+                    if noisy:
+                        gain += noise
                     if gain > f_gain:
                         f_gain = gain
                         f_bin = b
