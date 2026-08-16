@@ -20,6 +20,28 @@ session; the authoritative list is this file.
 
 ---
 
+> **Annotation, 2026-08-16. Session III has since run, and the cost model this
+> queue was written against was refuted.** Results are in
+> `session3_2026-08-16/RESULTS.md`; the withdrawal is
+> `docs/GPU_PORTABILITY.md` section 6.1.1.
+>
+> **Nothing below this line has been edited.** The predictions are left exactly
+> as they were registered, because a registered prediction that was refuted is
+> the evidence that the process worked, and rewriting it to look right in
+> hindsight destroys the only thing registering it was for.
+>
+> What was refuted, in one line: the queue prices every `enqueue_copy` at the
+> ~458 microsecond per-synchronization constant. **Measured**, removing thirteen
+> copies per tree bought 0.016 seconds against a registered prediction of 0.64,
+> a null under M0; removing about thirty *round trips* per tree bought 0.75
+> seconds, resolved. The mechanism is untouched: a copy really does drain the
+> queue on Metal. What is withdrawn is the price. Count round trips to predict
+> time; count copies to predict portability risk and ordering hazards.
+>
+> Read every "wait" below as "drain" and every wait-count projection as void.
+
+---
+
 ## Session II leftovers: the one decision Sweep II could not close
 
 ### S1. Does the tree-resident plane become the default GPU plane?
@@ -65,6 +87,14 @@ restated there.
 Order matters: the main claim goes first, while the box is coldest.
 
 ### M2.1 The upload collapse, ON against OFF
+
+> **Annotation, 2026-08-16. RAN, and REFUTED.** 1,000,000 x 50, alternating
+> processes, five pairs, medians 2.489 ON against 2.505 OFF: **0.016 seconds**
+> against the 0.64 registered below. Not resolved under M0; the gap sits inside
+> the ON arm's own 0.039 spread. The registered falsification two paragraphs
+> down fired exactly as written, which is the outcome it said was more
+> informative than the win. Full table in `session3_2026-08-16/RESULTS.md`,
+> withdrawal in `docs/GPU_PORTABILITY.md` section 6.1.1. Text below unedited.
 
 **Blocked on merge.** Five lanes are out; two of them are this item.
 
@@ -257,6 +287,15 @@ so far.
   trick does not apply to it. It is not on the per-tree path.
 
 ### The copies that are still there, found by lanes and deliberately not taken
+
+> **Annotation, 2026-08-16.** This list is still worth having, and its reason
+> has changed. It was written as a list of unclaimed waits; after M2.1 it is a
+> list of unclaimed **hazards** and portability items. Every entry below that
+> says "wait" means "drain", and none of them should be picked up expecting a
+> clock to move. The one item here that would be a *round trip* is none of them.
+> Pick these up to reduce the places a stale byte can hide and the work a
+> non-Metal backend will need, not to make a fit faster. See
+> `docs/GPU_PORTABILITY.md` section 6.1.1. Text below unedited.
 
 Listed so the next round starts from a list rather than from another audit. None
 of these is on the default 1M leaf-wise path, which is why none was taken.

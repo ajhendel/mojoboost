@@ -6,13 +6,21 @@ WHY THIS FILE EXISTS
 per tree: a Float32 plane of per-node steps and an Int32 table of range
 descriptors. Section 6.1 of `docs/GPU_PORTABILITY.md` establishes **by
 measurement** that on Metal an `enqueue_copy` drains the whole queue in both
-directions, so its cost is a host wait rather than a function of the byte
-count, and two buffers of a few hundred bytes each were therefore buying two
-waits. The step now rides inside the descriptor, in the word that was
-padding, as the Float32's own bit pattern reinterpreted as an Int32. That is
-one `enqueue_copy` per tree instead of two, **counted in source**; what it is
-worth in seconds is a measurement this file does not attempt and does not
-estimate.
+directions rather than moving bytes in proportion to their count, so two
+buffers of a few hundred bytes each were two drains. The step now rides
+inside the descriptor, in the word that was padding, as the Float32's own bit
+pattern reinterpreted as an Int32. That is one `enqueue_copy` per tree instead
+of two, **counted in source**.
+
+What that is worth in seconds is a measurement this file does not attempt and
+does not estimate, and section 6.1.1 has since made the same point from the
+other side. It withdrew, on 2026-08-16, the model that turned a drain into a
+per-copy price: neither of these uploads is a round trip, and draining a queue
+that holds nothing costs nothing. Removing thirteen comparable copies per tree
+elsewhere **measured** 0.016 seconds at 1,000,000 x 50 against a registered
+prediction of 0.64, a null under M0. So one copy instead of two is a hazard
+and portability improvement, and this file exists to check the only thing that
+could have gone wrong with it, which is a value.
 
 The only thing that could have gone wrong is a changed value, and there are
 exactly two ways for that to happen. This file closes both.

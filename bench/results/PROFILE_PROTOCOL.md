@@ -313,6 +313,30 @@ last, and records that it did.
 
 ## M3. The prediction, registered before the data
 
+> **Annotation, 2026-08-16. This prediction was measured and refuted. It is
+> left exactly as registered.** The measurement is 0.016 seconds against the
+> 0.64 below, a null under M0 (`session3_2026-08-16/RESULTS.md`); the
+> withdrawal of the model it rests on is `docs/GPU_PORTABILITY.md` section
+> 6.1.1. The falsification condition M3 states in its last paragraph fired as
+> written.
+>
+> Worth recording precisely, because M3 did name its own weakest assumption and
+> was half right about it. It predicted the failure mode as *per-copy cost
+> depending on size after all*. That is not what happened. Byte count is
+> irrelevant, as this document assumed; what is wrong is applying a
+> per-synchronization constant to a copy at all. The 458 microseconds is
+> **derived** from the depthwise A/B, and what that A/B removed were per-level
+> **round trips** — host code blocking on a device answer it needs before it
+> can decide what to enqueue next. A copy that drains a queue holding nothing
+> is not a round trip and costs nothing. The constant remains correct for round
+> trips: removing about thirty per tree **measured** 0.75 seconds in the same
+> session, resolved.
+>
+> The rule for the next registration: count round trips to predict time, count
+> copies to predict portability risk and ordering hazards, and never quote a
+> copy count times a per-synchronization constant as a predicted saving. Text
+> below unedited.
+
 **Corrected before any data was taken, and the error is worth keeping visible.**
 The brief for the tables lane said eleven waits removed. It is ten. Six
 downloads becoming one saves five, not six, and five plus five is ten. The lane

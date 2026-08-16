@@ -783,6 +783,17 @@ struct SyncContract(Copyable, Movable):
     would report an overlap that is not there. On `map_write` there is no
     staging slot to rotate at all, since the host writes through the device
     buffer's own mapping.
+
+    **True here is a statement about the dependency model and not a promise of
+    overlap on Metal.** `docs/GPU_PORTABILITY.md` section 6.1 establishes, by
+    disassembly, that `enqueue_copy` on Metal drains the whole queue before it
+    memcpys, so on that backend no copy is ever still in flight and a slot is
+    free the instant the copy returns. Section 6.1.1, 2026-08-16, draws the
+    consequence: a second slot cannot be the thing that avoids a wait there,
+    and `MOJOTREES_GPU_STAGING_SLOTS` above 1 buys nothing on Metal. The flag
+    is still right, because it is written against queue ordering rather than
+    against one backend, and it is what keeps the ring correct where the copy
+    really is asynchronous. What it does not do is predict a saving here.
     """
 
 

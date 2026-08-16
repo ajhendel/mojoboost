@@ -183,10 +183,16 @@ integer parse would turn a typo into a default:
 
   Two Metal-specific corrections to that picture, both measured by
   disassembly and written out in `docs/GPU_PORTABILITY.md` section 6. First,
-  the download is not the only phase that waits: `enqueue_copy` is a
+  the download is not the only phase that drains: `enqueue_copy` is a
   synchronous full-queue drain in *both* directions, so every upload charged
-  to `PROF_TRANSFER` is a wait too, and an `async` profile on Metal is
-  already partly fenced by its own uploads. Second, a launch stream longer
+  to `PROF_TRANSFER` fences too, and an `async` profile on Metal is already
+  partly fenced by its own uploads. That is a statement about *ordering*, not
+  about cost: section 6.1.1 records that a drain of a queue holding nothing
+  costs nothing, and that the download is a **round trip** where the uploads
+  are not. So an upload's fencing effect is what shifts device time into
+  whichever phase's clock closes over it; it is not itself a charge, and a
+  `PROF_TRANSFER` total should not be read as a count of copies times a
+  per-copy price. Second, a launch stream longer
   than 64 command buffers backpressures inside `objc_msgSend`, which this
   profiler counts as enqueue time with no attribution, so a rising enqueue
   clock on a long unwaited stream is the host blocking and not the device

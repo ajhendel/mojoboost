@@ -13,8 +13,19 @@ The host compute inside one of those round trips is small. Measured
 separately, the host spends roughly 15 to 20 microseconds per split deciding
 which leaf to split and writing the node, against a measured wait cost of
 about 126 microseconds for the synchronization itself. The cost is therefore
-not the deciding, it is the draining: every decision empties the device
-queue, blocks, and then refills a pipeline that was already full.
+not the deciding, it is the round trip: every decision empties the device
+queue, blocks on an answer it needs before it can enqueue anything else, and
+then refills a pipeline that was already full.
+
+**That is the half of the transfer model that survived 2026-08-16.** Removing
+about thirty round trips per tree **measured** 0.75 seconds at 1,000,000 x 50,
+resolved by a wide margin. Removing thirteen *copies* per tree, on the same
+plane in the same session, measured 0.016 and did not resolve
+(`bench/results/session3_2026-08-16/RESULTS.md`, and
+`docs/GPU_PORTABILITY.md` section 6.1.1 for the withdrawal). A copy that
+drains a queue holding nothing costs nothing. Read every copy count in this
+module as a portability and hazard number; read the round-trip counts as the
+ones that predict time.
 
 The end state that removes it is a device that picks the leaf and commits the
 split itself, so the host waits once per tree instead of once per split. This
@@ -1327,13 +1338,27 @@ def _reset_tables_kernel(
     count rather than a compute one. Every byte the host used to stage for
     this reset is a constant or a function of three scalars, and on Metal an
     `enqueue_copy` is a synchronous full-queue drain in both directions
-    whatever it carries (measured by disassembly of the shipped runtime,
-    `docs/GPU_PORTABILITY.md` section 6.1), so five staged tables cost five
-    host waits to move a few kilobytes that the device could have written
-    from three numbers. This kernel is those three numbers arriving as launch
+    whatever it carries (**measured** by disassembly of the shipped runtime,
+    `docs/GPU_PORTABILITY.md` section 6.1), so five staged tables were five
+    drains to move a few kilobytes that the device could have written from
+    three numbers. This kernel is those three numbers arriving as launch
     arguments instead. It is the same move `_seed_root_value_kernel` and
     `_stage_child_search_kernel` already make for `TN_VALUE` and for
     `NODE_HIST_BASE`, applied to the whole reset.
+
+    **What that is worth is a hazard count and not a time.** Section 6.1.1
+    withdrew, on 2026-08-16, the cost model that turned the drain into a
+    price: removing thirteen copies per tree from this plane, of which these
+    five were a part, **measured** 0.016 seconds at 1,000,000 x 50 against a
+    registered prediction of 0.64, which is a null under M0
+    (`bench/results/session3_2026-08-16/RESULTS.md`). Draining a queue that
+    holds nothing costs nothing, and nothing was queued behind these five.
+    What five copies fewer per tree does buy is real and is not a stopwatch
+    number: five fewer staging buffers whose lifetime has to be argued, five
+    fewer places a stale byte can hide, and five fewer copies to rethink on a
+    backend where a copy is genuinely asynchronous. The kernel is correct and
+    is the right shape; it is not a speed result and should not be cited as
+    one.
 
     **Every word has exactly one writer and no barrier is used.** That is the
     property that lets this run on a grid of any width, and it is worth
@@ -1592,14 +1617,25 @@ def _pack_tables_kernel(
 ):
     """Gather all six downloadable tables into one contiguous Int32 buffer.
 
-    The download is the one genuine round trip a device-owned tree makes, so
-    one host wait for it is correct. Six was not: `download` issued one
-    `enqueue_copy` per table, and on Metal each of those is a synchronous
-    full-queue drain in both directions costing about the same whatever it
-    carries (`docs/GPU_PORTABILITY.md` section 6.1). Six drains to bring home
-    a few kilobytes that are already in device memory next to each other is a
-    layout problem, and this kernel is the layout: the device concatenates,
-    the host copies once and takes the buffer apart.
+    The download is the one genuine round trip a device-owned tree makes, and
+    that count is unchanged by this kernel: it was one round trip when it was
+    six copies and it is one round trip now. What changed is the copy count.
+    `download` issued one `enqueue_copy` per table, and on Metal each of those
+    is a synchronous full-queue drain in both directions whatever it carries
+    (**measured** by disassembly, `docs/GPU_PORTABILITY.md` section 6.1). Six
+    drains to bring home a few kilobytes that are already in device memory
+    next to each other is a layout problem, and this kernel is the layout: the
+    device concatenates, the host copies once and takes the buffer apart.
+
+    **Six to one is not a time saving and was never measured as one.** Under
+    section 6.1.1, withdrawn 2026-08-16, a copy count predicts portability
+    risk and ordering hazards; a round-trip count predicts time, and the
+    round-trip count here did not move. Five of these six drains found a queue
+    that the sixth was going to drain anyway, and draining a queue that holds
+    nothing costs nothing. What this kernel earns is five fewer ordering
+    points, five fewer staging buffers to keep alive, and one arrival instead
+    of six for the decode to be wrong about. Those are the arguments it should
+    be defended on.
 
     **The float plane travels as its bits.** `node_f` is Float32 and the
     packed buffer is Int32, so its words are moved with `std.memory.bitcast`,
@@ -1609,8 +1645,10 @@ def _pack_tables_kernel(
     this module where a float and an integer share a buffer, and it is
     deliberately confined to a transport: nothing between the two bitcasts
     reads the words as either type. The alternative that keeps the planes
-    apart is two copies rather than one, which is two drains rather than one
-    and buys nothing, since a bitcast pair cannot change a bit.
+    apart is two copies rather than one, which is one more ordering point and
+    one more buffer to keep alive for no gain, since a bitcast pair cannot
+    change a bit. That is a hazard argument, not a timing one; nothing here
+    claims a second copy would cost measurable time.
 
     Every offset is a launch argument rather than a formula repeated here,
     because the host has to take the buffer apart at exactly the boundaries
@@ -1741,12 +1779,13 @@ struct DeviceTreeTables(Movable):
     # argument for that used to be that an enqueued copy reads its source
     # asynchronously, so a shared buffer would force a `synchronize` between
     # every pair of copies before the host could refill it, and a
-    # `begin_tree` writing five tables would cost five drains instead of
+    # `begin_tree` writing five tables would force five drains instead of
     # one. On Metal that argument does not hold: `enqueue_copy` is itself a
-    # synchronous full-queue drain in both directions (measured by
+    # synchronous full-queue drain in both directions (**measured** by
     # disassembly of the shipped runtime, `docs/GPU_PORTABILITY.md` section
     # 6.1), so five copies are five drains whatever memory they read, and a
-    # shared buffer would have added no wait that was not already there.
+    # shared buffer would have added no ordering point that was not already
+    # there.
     #
     # The separate buffers stay, for two reasons that survive. They are what
     # makes this correct on a backend where the copy really is asynchronous,
@@ -1757,6 +1796,17 @@ struct DeviceTreeTables(Movable):
     # Until someone does, treat the separate buffers as free and portable
     # rather than as a wait that was removed. A design that wants fewer
     # drains has to stage fewer times, not stage into more places.
+    #
+    # And under section 6.1.1, withdrawn 2026-08-16, "fewer drains" is not a
+    # request for speed. A drain of a queue holding nothing costs nothing;
+    # removing thirteen such copies per tree from this plane **measured**
+    # 0.016 seconds at 1,000,000 x 50 against a registered prediction of 0.64
+    # (`bench/results/session3_2026-08-16/RESULTS.md`), a null under M0.
+    # Staging fewer times is worth doing because it removes ordering points,
+    # buffer lifetimes and places a stale byte can hide, which is exactly what
+    # the paragraph above already argues these separate buffers on. It is not
+    # worth doing for the clock. Rule 5 of 6.1.1 says the same thing from the
+    # other side: never argue a new pinned staging buffer on Metal grounds.
     #
     # The tables-reset lane took that last sentence literally, and these five
     # buffers are consequently **no longer on the default path**. `begin_tree`
@@ -1948,12 +1998,28 @@ struct DeviceTreeTables(Movable):
         calls. On Metal those five copies are five synchronous full-queue
         drains (**measured** by disassembling the shipped runtime,
         `docs/GPU_PORTABILITY.md` section 6.1), so the arms differ by five
-        host waits per tree and by nothing else. What one such wait costs is
-        **measured** separately and elsewhere: `docs/METAL_TIMELINE.md:550`
-        puts one blocking readback at 606 microseconds at the median, of
-        which 3.7 microseconds is the GPU moving bytes. That figure was taken
-        on a readback in a different loop and is quoted as the order of the
-        cost, not as this call's cost, which nobody has measured.
+        drains per tree and by nothing else.
+
+        **Five drains is not five waits, and this arm is not a speed knob.**
+        An earlier version of this docstring priced each of those drains at
+        the 606 microsecond median blocking readback of
+        `docs/METAL_TIMELINE.md:550`. That figure is **measured**, it is
+        correct, and it is the price of a *round trip*: host code blocking on
+        a device answer it needs before it can decide what to enqueue next.
+        None of these five is one. Section 6.1.1 records the withdrawal, on
+        2026-08-16, of the inference that carried the number across:
+        collapsing thirteen copies per tree on this plane, these five among
+        them, **measured** 0.016 seconds at 1,000,000 x 50 against a
+        registered prediction of 0.64, a null under M0
+        (`bench/results/session3_2026-08-16/RESULTS.md`). Draining a queue
+        that holds nothing costs nothing.
+
+        So flip this expecting a different hazard surface, not a different
+        clock. On removes five staging buffers from the per-tree path, five
+        ordering points, and five places a stale byte could hide; it also
+        removes real host work that is too small for M0 to see. Off is kept
+        because it is the arm an interleaved A/B holds this against, not
+        because anyone expects it to lose.
 
         Reachable at run time rather than through a second build, and that is
         the point rather than a convenience: this machine's device timings
@@ -1989,10 +2055,16 @@ struct DeviceTreeTables(Movable):
         concatenates the six tables into one Int32 buffer, one
         `enqueue_copy` carries it, and the host scatters it back into the
         same six pinned buffers the other arm copies into. Off is the shape
-        this module shipped before it. On Metal the arms differ by five host
-        waits per tree, for the reason `set_reset_on_device` states, and by
-        one device launch and one host scatter of a few thousand words in the
-        other direction.
+        this module shipped before it. On Metal the arms differ by five drains
+        per tree, for the reason `set_reset_on_device` states, and by one
+        device launch and one host scatter of a few thousand words in the
+        other direction. **Both arms make the same one round trip**, which is
+        the count that predicts time under section 6.1.1, so neither arm is
+        expected to measure faster and the collapse was priced at 0.016
+        seconds for all thirteen copies it was part of
+        (`bench/results/session3_2026-08-16/RESULTS.md`, **measured**, a null
+        under M0). What On buys is five fewer ordering points and one arrival
+        for the decode to be wrong about instead of six.
 
         **It cannot change a snapshot.** Both arms end with the same six host
         buffers holding the same words and then fall into the same decode,
@@ -2097,10 +2169,14 @@ struct DeviceTreeTables(Movable):
         rather than written through a `map_to_host` mapping, because a
         mapping blocks until the device is idle and a copy does not. Each of
         the five tables has its own staging buffer, so all five copies are
-        enqueued before anything waits. On Metal that is five host waits and
-        not one, because `enqueue_copy` there is a synchronous full-queue
-        drain in both directions (`docs/GPU_PORTABILITY.md` section 6.1);
-        removing those five is what the device arm is for.
+        enqueued before anything waits. On Metal that is five drains and not
+        one, because `enqueue_copy` there is a synchronous full-queue drain in
+        both directions (**measured**, `docs/GPU_PORTABILITY.md` section 6.1);
+        removing those five is what the device arm is for. **Five ordering
+        points, not five waits**: none of the five blocks on a device answer
+        the host needs, and under section 6.1.1 that is the difference between
+        a copy count and a time. See `set_reset_on_device` for the measurement
+        that forced the distinction.
 
         The two argument checks above stay on the host in both arms. A kernel
         cannot raise, so a negative row count or an out-of-range root slot has
@@ -2519,8 +2595,11 @@ struct DeviceTreeTables(Movable):
     def _fetch_six(mut self) raises:
         """Bring the six tables home in six copies, the shape this module
         shipped with. One `enqueue_copy` per table into its own pinned
-        buffer, which on Metal is six full-queue drains and not one; see
-        `set_packed_download`."""
+        buffer, which on Metal is six full-queue drains and not one. Six
+        drains, one round trip: the round-trip count is the same as the packed
+        arm's and it is the count that predicts time, so this arm is slower
+        only in ordering points and buffer lifetimes. See
+        `set_packed_download` and `docs/GPU_PORTABILITY.md` section 6.1.1."""
         self.ctx.enqueue_copy(
             dst_ptr=self.host_front.unsafe_ptr(), src_buf=self.front_dev
         )
@@ -2625,11 +2704,21 @@ struct DeviceTreeTables(Movable):
 
         The round trip is one in both arms and is not what
         `set_packed_download` moves; what it moves is the number of *copies*
-        that round trip is made of, which on Metal is the number of host
-        waits, since a copy there drains the queue. Six became one. The
-        `synchronize` afterwards stays in both arms even though it is free on
-        Metal, because it is what keeps this correct on a backend where a
-        copy really is asynchronous.
+        that round trip is made of, which on Metal is the number of drains,
+        since a copy there drains the queue. Six became one.
+
+        **Round trips are the count that predicts time and it did not move
+        here.** Section 6.1.1, withdrawn 2026-08-16, took back the reading
+        that made each of those six copies a host wait worth the
+        per-synchronization constant: five of the six drained a queue that the
+        sixth would have drained anyway, and draining a queue that holds
+        nothing costs nothing. The collapse this arm is part of **measured**
+        0.016 seconds at 1,000,000 x 50 against a registered prediction of
+        0.64, a null under M0. It is kept for the copy count, which predicts
+        portability risk and where a stale byte can hide, and not for the
+        clock. The `synchronize` afterwards stays in both arms even though it
+        waits on nothing on Metal, because it is what keeps this correct on a
+        backend where a copy really is asynchronous.
 
         Everything below the fetch is common to both arms deliberately: the
         packed arm ends by scattering into the same six pinned buffers the
