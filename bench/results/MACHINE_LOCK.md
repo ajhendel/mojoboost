@@ -197,6 +197,40 @@ Do not silently publish. Two options, in order of preference:
 2. **Label it.** "Box not verifiably quiet" in the header, and no promotion of
    the number to a summary table until retaken.
 
+## Identifiers get read back before they are sent, and here is the mechanism
+
+Both orchestrators fabricated a commit SHA on 2026-08-16, within an hour of each
+other, and one of them did it in the message immediately after warning the other
+about it. That makes it a process fault rather than a slip, and the mechanism is
+specific enough to fix:
+
+**Composing a message in the same step that produces the commit.** The SHA is
+predicted from what the commit is about to be rather than read from what it
+turned out to be. It looks right, it is the right length, and it is wrong.
+
+The rule: **produce the commit, read the identifier back, then send.** Never in
+one step. `git cat-file -t <sha>` and, for a merge,
+`git merge-base --is-ancestor <branch> HEAD` cost nothing and settle it.
+
+This generalizes past SHAs. Every fabricated number this week -- the "0.4s ideal
+roofline", the "3.2 us/row" slope, both of which existed in no file and no commit
+-- came from the same act of stating a value in the same breath as the reasoning
+that motivated it, rather than reading it from the thing it describes.
+
+## A merge that is not only a merge cannot be bisected through
+
+Recorded because it will be met by whoever rebases. On `cpu-round-1`, commit
+`201218f` is simultaneously the `perf-round-2` merge, an orphan-module deletion
+and the `device='auto'` patches. The conflicted merge could not be committed
+while the pre-commit gate refused a stale generated artifact, so `MERGE_HEAD`
+stayed live and the next commit folded everything together.
+
+The message names all three, so nothing is hidden. But a reviewer expecting a
+clean merge commit will not find one, and **a bisect landing on that commit gets
+three changes at once**. Not worth rewriting history on a shared branch; worth
+knowing before rebasing onto it, and worth avoiding next time by committing the
+merge alone before anything else touches the tree.
+
 ## Cost
 
 None in throughput. Timing windows are minutes; lanes run for hours. The lock
