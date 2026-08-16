@@ -296,7 +296,20 @@ from .monotone import (
     OutputBounds,
 )
 from .rng import GOLDEN, splitmix64, uniform
-from .split import SplitInfo
+
+# `SCORE_L2` and `SCORE_COSINE` are re-exported by `split.mojo` and defined
+# beside the `ExtraTreeParams.score_function` field that carries the choice.
+# They are imported here rather than restated because a device kernel that
+# spelled its own copy of the two codes could drift from the host's, and the
+# whole contract of this module is that the two searches disagree in loop
+# structure and never in what a parameter means.
+from .split import SCORE_COSINE, SCORE_L2, SplitInfo, check_score_function
+
+# `score_function_name` is the one of the four that `split.mojo` does not
+# re-export, so it is taken from the module that defines all four. That
+# module imports only `cegb`, `gain`, `monotone` and `rng`, so this edge adds
+# no cycle; it is the same edge `split.mojo` itself has.
+from .tree_parameters_extra import score_function_name
 
 # The widest histogram the GPU backend accepts (`histogram_gpu.MAX_BINS`).
 comptime MAX_SPLIT_BINS = 256
@@ -894,6 +907,210 @@ def gpu_cat_gain(
         + gpu_leaf_score(right_g, right_h, lambda_l1, child_l2)
         - parent_score
     )
+
+
+# --- score_function = Cosine ----------------------------------------------
+#
+# CatBoost's `score_function=Cosine`, `sum(-out * G) / sqrt(sum(out^2 * H))`
+# over the children minus the same functional of the unsplit node, in the
+# device's Float32. The specification is the CPU path and nothing here is an
+# independent derivation: `split._cosine_out`, `split._cosine_unsplit`,
+# `split._cosine_pair` and `split._cosine_score` are the four functions these
+# four mirror, term for term and in the same order, and the CatBoost source
+# each was read from is cited there rather than restated here.
+#
+# WHY THIS IS A SECOND FUNCTIONAL AND NOT A RELABELLING OF THE L2 KERNEL
+# ----------------------------------------------------------------------
+# Because the argmax coincidence is per parent and this module's answer is
+# not consumed per parent. Substituting the free Newton step makes Cosine's
+# numerator and denominator the same expression at `lambda_l2 = 0`, so the
+# score collapses to `sqrt` of the L2 score and `sqrt` is strictly
+# increasing -- within one node. The stock `grow_policy` is `lossguide`,
+# which is a leaf-wise queue over candidates from *different* parents, and
+# `sqrt(a) - sqrt(p)` does not order like `a - p` across two different `p`.
+# The record this module returns carries `FREC_GAIN` into exactly that
+# queue. So the identity is true, is stated at `split._cosine_pair`, and is
+# not available here; scoring Cosine by relabelling the L2 kernel would be
+# wrong at the default growth policy and wrong in a way no single-node test
+# can see.
+#
+# WHAT IS AND IS NOT THE SAME NUMBER AS THE CPU'S
+# ------------------------------------------------
+# The candidate set, the admission guards, the scan order, the tie rule and
+# the accumulation order are the same; see `gpu_cosine_gain`. The
+# arithmetic is not, and the divergence is entirely the one this module
+# already had before Cosine existed -- Float32 against the host's Float64,
+# over a fixed-point histogram against the host's exact Float64 sums -- plus
+# exactly one new elementary operation, the Float32 square root. That one
+# is named because it is the only part of Cosine with no counterpart in the
+# L2 gain and therefore the only part whose divergence this section
+# introduces rather than inherits.
+
+comptime GPU_COSINE_DEN_FLOOR = Float32(1.17549435082228750797e-38)
+"""CatBoost's denominator seed, in the largest form Float32 can carry it.
+
+`split._COSINE_DEN_FLOOR` is 1e-100, which is CatBoost's own
+(`score_calcers.h`, `Scores.resize(splitsCount, {0, 1e-100})`). **1e-100 is
+not representable in Float32 and rounds to zero**, so transcribing the
+constant would silently delete the guard rather than port it, and the guard
+is load-bearing: it is what turns the `0/0` a zero-gradient candidate
+produces into `0`. `_cosine_out` returns 0.0 for a child of non-positive
+weight and a child whose thresholded gradient is exactly zero gives a zero
+numerator too, so `num` and `den` reach the ratio as `0` and `0` together.
+
+The smallest positive normal Float32 is used instead. It is a divide-by-zero
+guard and not a regularizer in either precision: adding it to any `den` a
+`min_child_hess` of even 1e-9 admits is exactly a no-op under Float32
+rounding, because such a `den` exceeds it by more than 2^24. The seed's
+*value* therefore does not enter any candidate's score in either backend,
+only its being nonzero does, and that property is what has been ported.
+`min_child_hess` is what actually keeps H off the floor, on both sides."""
+
+
+@always_inline
+def gpu_cosine_out(g: Float32, h: Float32, lambda_l2: Float32) -> Float32:
+    """`split._cosine_out` in Float32: CatBoost's `leafApprox` in our sign
+    convention, with CatBoost's `CalcAverage` zero-weight guard kept.
+
+    A child of non-positive weight emits zero and contributes nothing to
+    either accumulator, rather than dividing by `lambda_l2` alone. That is
+    why the Cosine branch has no divide-by-zero at `lambda_l2 = 0` where the
+    L2 branch would produce an infinity, and the guard is the host's, not a
+    device concession."""
+    if not (h > Float32(0.0)):
+        return Float32(0.0)
+    return -g / (h + lambda_l2)
+
+
+@always_inline
+def gpu_cosine_score(num: Float32, den: Float32) -> Float32:
+    """`split._cosine_score` in Float32: `Scores[i][0] / sqrt(Scores[i][1])`
+    with the denominator seed folded in.
+
+    One function for the same reason the host keeps one: the seed cannot then
+    be applied twice or forgotten at one of the call sites.
+
+    **This is the square root, and it is the one operation in the Cosine gain
+    with no counterpart in the L2 gain.** IEEE-754 makes `sqrt` correctly
+    rounded, so on any backend that honors the standard this is the same
+    number the host replica computes; a backend compiling with a relaxed
+    `sqrt` is the one place a device record could differ from the replica's
+    by a last bit, and that possibility is stated at `gpu_cosine_gain`
+    rather than assumed away."""
+    return num / sqrt(den + GPU_COSINE_DEN_FLOOR)
+
+
+@always_inline
+def gpu_cosine_parent(
+    total_g: Float32,
+    total_h: Float32,
+    lambda_l1: Float32,
+    lambda_l2: Float32,
+) -> Float32:
+    """`split._cosine_unsplit` scored, which is the node constant the Cosine
+    gain subtracts: CatBoost's `CalcScoreWithoutSplit`, the same calcer run
+    over the node's own totals with an empty second child.
+
+    Hoisted per node by every kernel, exactly as `parent_score` is, and for
+    the same reason: it is constant across a node's candidates -- every
+    feature's bins total to the same sums -- so subtracting it sets the zero
+    point the `> best_gain` test measures from and does nothing else. The
+    gradient arrives *un*-thresholded and is thresholded here, which is what
+    `find_best_split` does when it passes `parent_g` to `_cosine_unsplit`."""
+    var t = gpu_soft_threshold_l1(total_g, lambda_l1)
+    var out = gpu_cosine_out(t, total_h, lambda_l2)
+    return gpu_cosine_score(-out * t, out * out * total_h)
+
+
+@always_inline
+def gpu_cosine_gain(
+    left_g: Float32,
+    left_h: Float32,
+    right_g: Float32,
+    right_h: Float32,
+    lambda_l2: Float32,
+    parent_cos: Float32,
+    sign: Int32,
+    bound_lo: Float32,
+    bound_hi: Float32,
+    constrained: Bool,
+) -> Float32:
+    """One candidate's Cosine gain: `split._cosine_pair` folded into
+    `split._cosine_score` and the node's unsplit score subtracted, which is
+    the two lines `find_best_split` writes at each of its two scoring sites.
+
+    `left_g` and `right_g` arrive already soft-thresholded, as they do at
+    `gpu_split_gain`, and as `tl` and `tr` do on the host.
+
+    A MONOTONE REJECTION IS 0.0 AND NOT A SENTINEL
+    ----------------------------------------------
+    The host carries it out of band, as `_CosineTerms.ok`, because 0.0 is a
+    legitimate *numerator* there and cannot double as a rejection. By the
+    time the value is a gain that ambiguity is gone: `find_best_split` writes
+    `gain = 0.0` and overwrites it only when `ok`, so a rejected candidate
+    scores exactly 0.0 and loses to a `best_gain` that starts at 0.0 under a
+    strict `>`. Returning 0.0 here is therefore the host's rule and not a
+    device shortcut, and it is the same rule `gpu_split_gain`'s constrained
+    branch already follows for L2.
+
+    Note what is subtracted and what is not: a rejection returns 0.0 flat,
+    **not** `-parent_cos`. The two happen to be indistinguishable to the
+    caller today -- `parent_cos` is `|G| / sqrt(H)` and therefore never
+    negative, so `-parent_cos` is never positive and loses to a `best_gain`
+    that starts at 0.0 exactly as 0.0 does. It is written the host's way
+    anyway, because the equivalence rests on a sign argument about a
+    quantity computed elsewhere and the host's spelling rests on nothing.
+
+    WHAT IS THE SAME AS THE HOST, EXACTLY
+    -------------------------------------
+    The addend order in both accumulators is left child then right child,
+    fixed here as it is fixed in `_cosine_pair`, so neither value moves with
+    a worker count or a launch shape. The clamp is applied before the
+    accumulators are built, so they are built from the output the leaf will
+    actually emit, which is what CatBoost's monotone branch does. The two
+    parameters `_cosine_pair` takes that this does not -- `finish` and its
+    `max_delta_step` / `path_smooth` / parent-output arguments -- are refused
+    for the whole device search by `device_search_eligibility`'s
+    `SEARCH_EXTRA_PARAMS`, so there is no configuration in which the host
+    applies them and this does not.
+
+    WHAT IS NOT THE SAME, EXACTLY
+    -----------------------------
+    Three things, and they are worth separating because only one of them is
+    new.
+
+    1. Float32 against Float64. Every operation below is a Float32 operation
+       and the host's is a Float64 one. Inherited: this is what every gain in
+       this module already is.
+    2. A fixed-point histogram against exact Float64 sums. The device's
+       `left_g` was dequantized from an Int32 accumulation. Inherited, and it
+       is the accumulation this module already had; `gpu_right_sum` is where
+       its one avoidable cast lives and Cosine changes nothing about it.
+    3. The square root, at `gpu_cosine_score`. **New**, and the only new one.
+       It is correctly rounded under IEEE-754 and so agrees between the host
+       replica and a conforming device; a backend that compiles `sqrt` in a
+       relaxed mode would differ from the replica in the last bit, which no
+       L2 record could ever do because no L2 record takes a root.
+
+    The two accumulator adds are written as explicit `fma` for the reason
+    `gpu_cross_gain` gives: a product feeding an add is the contractable
+    shape (`docs/NUMERICS.md` section 6), unfused is not expressible and a
+    named local does not block contraction, and this expression is evaluated
+    both in the kernels and in `reference_search` on the host -- which is
+    exactly the pair that must not diverge. That pins one rounding where the
+    host's `+=` spelling leaves two, which is a divergence *in association*
+    from the host and is recorded as one. It is strictly smaller than
+    difference 1 above, which is already present in every term."""
+    var left_out = gpu_cosine_out(left_g, left_h, lambda_l2)
+    var right_out = gpu_cosine_out(right_g, right_h, lambda_l2)
+    if constrained:
+        left_out = gpu_clamp(left_out, bound_lo, bound_hi)
+        right_out = gpu_clamp(right_out, bound_lo, bound_hi)
+        if gpu_violates(sign, left_out, right_out):
+            return Float32(0.0)
+    var num = fma(-right_out, right_g, -left_out * left_g)
+    var den = fma(right_out * right_out, right_h, left_out * left_out * left_h)
+    return gpu_cosine_score(num, den) - parent_cos
 
 
 @always_inline
@@ -2796,11 +3013,141 @@ comptime OBLIVIOUS_MAX_LEAVES = 64
 therefore CatBoost's default depth exactly.
 
 A bound rather than a preference: the per-leaf scan state below lives in a
-threadgroup allocation sized at compile time, and at twelve words a leaf that
-is 3,072 bytes, the same reservation `WIDE_SCAN_SHARED_BYTES` already makes
-and therefore no new device floor. Depth 7 would double it and also lands at
-71 command buffers per tree, over the queue's knee whatever this kernel does,
-so the two limits agree about where to stop."""
+threadgroup allocation sized at compile time, and at fifteen words a leaf that
+is 3,840 bytes, against the 3,072 `WIDE_SCAN_SHARED_BYTES` already reserves.
+Depth 7 would double it and also lands at 71 command buffers per tree, over
+the queue's knee whatever this kernel does, so the two limits agree about
+where to stop.
+
+Thirteen of the fifteen words are the L2 scan's and were there before Cosine.
+The two Cosine adds -- `un_num` and `un_den`, a leaf's unsplit accumulator
+terms -- are reserved unconditionally rather than behind the selector, because
+a threadgroup allocation is sized at compile time and a kernel argument is not
+a compile-time value. They are written only under `SCORE_COSINE`; an L2 level
+pays 512 bytes of address space and no instruction."""
+
+
+# --- score_function = Cosine, across a level -------------------------------
+#
+# `gpu_cosine_gain` above scores ONE node: it folds a candidate's two
+# accumulator terms and takes the square root on the spot. A level cannot use
+# it. CatBoost keeps `numScoreBlocks = 1` for `SymmetricTree`
+# (`catboost/cuda/methods/greedy_subsets_searcher/greedy_search_helper.cpp`)
+# precisely because the two accumulators are summed across every leaf of the
+# level and ONE ratio is taken per candidate, so a level's score is
+#
+#     sum_l num_l / sqrt(sum_l den_l)   minus the same over the unsplit leaves
+#
+# and NOT `sum_l (num_l / sqrt(den_l))`. Gain is additive across leaves; a
+# ratio is not. That is the whole of why `_scan_slot_oblivious_kernel`'s leaf
+# loop cannot simply call `gpu_cosine_gain` where it calls `gpu_split_gain`,
+# and it is why the two functions below exist: they return the TERMS, and the
+# root is taken once, after the leaf loop closes.
+#
+# `split.find_best_split_shared` is the specification and these mirror its
+# `den_left` / `den_right` planes statement for statement -- the same
+# accumulation order (leaves ascending, innermost), the same substitution for
+# an illegal leaf, the same single subtraction of the level's unsplit score at
+# the end. What differs from the host is what already differed before Cosine
+# and one thing more, both named at `gpu_cosine_gain`: Float32 over a
+# fixed-point histogram rather than Float64 over exact sums (inherited), and
+# the square root (new to Cosine, correctly rounded under IEEE-754).
+
+
+@always_inline
+def gpu_cosine_unsplit(
+    total_g: Float32,
+    total_h: Float32,
+    lambda_l1: Float32,
+    lambda_l2: Float32,
+) -> SIMD[DType.float32, 2]:
+    """`split._cosine_unsplit`'s two terms, `(num, den)`, in Float32.
+
+    CatBoost's `CalcScoreWithoutSplit` (`leafwise_scoring.cpp`): the same
+    calcer run over a leaf's own totals with an empty second child. The
+    gradient arrives *un*-thresholded and is thresholded here, which is what
+    `find_best_split_shared` does when it passes `parent_g` to
+    `_cosine_unsplit`.
+
+    This is the same arithmetic `gpu_cosine_parent` performs, stopped one step
+    earlier. `gpu_cosine_parent` scores a node on the spot because a node's
+    unsplit score is what a node's gain subtracts; a level's is the score of
+    the SUM of these terms over its leaves, so the level needs them unscored
+    and cannot reuse that function. Two entry points on one expression rather
+    than one entry point that returns the wrong shape to one of its callers.
+
+    The terms are needed twice and are computed once per leaf: they are the
+    level's zero point, accumulated over the leaves into the constant the
+    level's gain subtracts, AND they are what a leaf contributes at a
+    candidate it cannot take. `find_best_split_shared` computes `pt` once per
+    leaf and uses it for both, and the kernel caches it per leaf for the same
+    reason."""
+    var t = gpu_soft_threshold_l1(total_g, lambda_l1)
+    var out = gpu_cosine_out(t, total_h, lambda_l2)
+    return SIMD[DType.float32, 2](-out * t, out * out * total_h)
+
+
+@always_inline
+def gpu_cosine_level_terms(
+    left_g: Float32,
+    left_h: Float32,
+    right_g: Float32,
+    right_h: Float32,
+    lambda_l2: Float32,
+    sign: Int32,
+    bound_lo: Float32,
+    bound_hi: Float32,
+    constrained: Bool,
+    unsplit: SIMD[DType.float32, 2],
+) -> SIMD[DType.float32, 2]:
+    """One leaf's contribution to a level's two Cosine accumulators:
+    `split._cosine_pair`, with the caller's `ok`-handling folded in.
+
+    `left_g` and `right_g` arrive already soft-thresholded, as they do at
+    `gpu_split_gain` and as `tl` and `tr` do on the host.
+
+    THE ILLEGAL-LEAF SUBSTITUTION IS AN ARGUMENT, NOT A PARAMETER
+    -------------------------------------------------------------
+    The host carries the monotone rejection out of band as `_CosineTerms.ok`
+    and lets each caller decide: `find_best_split` drops the candidate, and
+    `find_best_split_shared` writes `cn = ct.num if ct.ok else pt.num`. Under
+    a level there is exactly one right answer and it is the second, so this
+    takes the leaf's unsplit terms as an argument and returns them rather than
+    returning a flag a caller could get wrong. **This is where the L2 arm and
+    the Cosine arm genuinely differ**: the L2 arm adds `0.0` for a leaf that
+    cannot take the candidate, and 0.0 is a legitimate *numerator* here, so
+    the ratio's only way to say "this leaf stays as it is" is to add its
+    unsplit terms to both accumulators. The two are arithmetically the same
+    rule -- `sum over legal of (child - parent)` is identically
+    `(sum over legal of child + sum over illegal of parent) - sum over all of
+    parent` -- and the ratio admits only the second spelling.
+
+    The kernel applies the same substitution at the `min_data_in_leaf` /
+    `min_child_hess` rejection, which does not reach this function at all: it
+    is tested before the terms are formed, exactly as the host tests it before
+    calling `_cosine_pair`.
+
+    The clamp is applied before the accumulators are built, so they are built
+    from the output the leaf will actually emit, which is what CatBoost's
+    monotone branch does and what `_cosine_pair` does.
+
+    The two accumulator adds are written as explicit `fma` for the reason
+    `gpu_cosine_gain` gives, and they are the same two expressions it writes,
+    so the per-node and the per-level arms round a candidate's terms
+    identically. That pins one rounding where the host's `+=` spelling leaves
+    two, which is a divergence in association from the host and is recorded as
+    one; it is strictly smaller than the Float32-against-Float64 difference
+    already present in every term."""
+    var left_out = gpu_cosine_out(left_g, left_h, lambda_l2)
+    var right_out = gpu_cosine_out(right_g, right_h, lambda_l2)
+    if constrained:
+        left_out = gpu_clamp(left_out, bound_lo, bound_hi)
+        right_out = gpu_clamp(right_out, bound_lo, bound_hi)
+        if gpu_violates(sign, left_out, right_out):
+            return unsplit
+    var num = fma(-right_out, right_g, -left_out * left_g)
+    var den = fma(right_out * right_out, right_h, left_out * left_out * left_h)
+    return SIMD[DType.float32, 2](num, den)
 
 
 def _scan_slot_oblivious_kernel(
@@ -2823,6 +3170,7 @@ def _scan_slot_oblivious_kernel(
     min_data_in_leaf: Int32,
     constrained: Int32,
     gain_form: Int32,
+    score_function: Int32,
 ):
     """One threadgroup per active feature slot: scan that feature's candidates
     for a whole oblivious *level* and write the level's best one as a per-slot
@@ -2875,7 +3223,55 @@ def _scan_slot_oblivious_kernel(
     leaf's own sums, because that is where they mean anything: an oblivious
     split is one split but it makes 2^d children and each has to be a legal
     leaf on its own. A leaf that fails adds `0.0` and the candidate stays
-    available to the rest of the level.
+    available to the rest of the level. Under `SCORE_COSINE` "contributes
+    nothing" is spelled differently and means the same thing; see below.
+
+    **`score_function` selects which functional the level maximizes, and it
+    changes the shape of the accumulation and not only its arithmetic.**
+    `SCORE_L2` is every line this kernel had before the parameter existed:
+    one accumulator, `total += gpu_split_gain(...)` over the leaves. A
+    `SCORE_COSINE` level cannot be written that way, because CatBoost's
+    Cosine score is a ratio and a level's ratio is not the sum of its leaves'
+    ratios. CatBoost keeps `numScoreBlocks = 1` for `SymmetricTree`
+    (`greedy_search_helper.cpp`) for exactly this reason: the two accumulators
+    are summed across every leaf of the level and ONE square root is taken per
+    candidate. So the Cosine arm carries `cos_num` and `cos_den` where the L2
+    arm carries `total`, folds the leaves into both in the same ascending
+    order, and calls `gpu_cosine_score` once, after the leaf loop closes --
+    which is `split.find_best_split_shared`'s `den_left` / `den_right` planes,
+    kernel-side. Two accumulators instead of one is the whole cost; the leaf
+    loop is the same loop, in the same launch, and the launch count per level
+    is unchanged at two.
+
+    **Under Cosine an illegal leaf contributes its UNSPLIT terms, not zero,
+    and that is the same rule rather than a different one.** `0.0` is a
+    legitimate numerator once the sum is a ratio, so it cannot double as "this
+    leaf stays as it is". The identity is
+    `sum over legal of (child - parent) == (sum over legal of child + sum over
+    illegal of parent) - sum over all of parent`, and the ratio admits only
+    the second spelling. `find_best_split_shared` substitutes `pt.num` /
+    `pt.den` at exactly the two sites this kernel substitutes `un_num[l]` /
+    `un_den[l]`: the minimum-rejection, and the monotone rejection inside
+    `gpu_cosine_level_terms`.
+
+    **The level's unsplit score is subtracted once, at the end.** It is
+    accumulated leaf by leaf in the setup loop below, in the same ascending
+    order, and is constant across this feature's candidates -- every feature's
+    bins total to the same per-leaf sums -- so subtracting it sets the zero
+    point the `> best_gain` test measures from and does nothing else. Exactly
+    what `level_parent` is in `find_best_split_shared`.
+
+    **The top-threshold rule still needs no branch under Cosine**, which is
+    not obvious and is the case worth checking. A candidate every leaf refuses
+    accumulates precisely the level's own unsplit terms, in precisely the
+    order `level_parent` was accumulated in, so it scores `level_parent -
+    level_parent` -- an exact `0.0` in Float32, not a near one -- and `0.0`
+    never beats a `best_gain` that starts at `0.0` under a strict `>`. The
+    same holds at both minimums zero, where a full-left candidate's left child
+    IS the parent and its right child is empty: `gpu_cosine_out` returns 0 for
+    a child of non-positive weight, so the pair's terms reduce to the unsplit
+    terms term for term. The L2 arm's argument for the same property is two
+    paragraphs down and is the same argument in a different functional.
 
     **This is OUR rule, not CatBoost's, and the distinction was established
     2026-08-16 rather than assumed.** An earlier draft of this docstring called
@@ -3012,6 +3408,20 @@ def _scan_slot_oblivious_kernel(
         Scalar[DType.float32],
         address_space = AddressSpace.SHARED,
     ]()
+    # Cosine's two per-leaf words: the leaf's unsplit accumulator terms, which
+    # are both the level's zero point and what the leaf contributes at a
+    # candidate it cannot take. Written only under `SCORE_COSINE`; see
+    # `gpu_cosine_unsplit` and `OBLIVIOUS_MAX_LEAVES`.
+    var un_num = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var un_den = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
 
     var g_inv = fparams[unsafe_offset = pf + PF_G_INV][0]
     var h_inv = fparams[unsafe_offset = pf + PF_H_INV][0]
@@ -3021,6 +3431,17 @@ def _scan_slot_oblivious_kernel(
     var bound_lo = fparams[unsafe_offset = pf + PF_BOUND_LO][0]
     var bound_hi = fparams[unsafe_offset = pf + PF_BOUND_HI][0]
     var form = gpu_resolve_gain_form(gain_form, lambda_l1)
+    # The functional, read once per slot into a value the whole scan holds
+    # constant, for the reason `_scan_slot_kernel` gives for reading it once
+    # per node: an L2 level must leave this kernel on exactly the instruction
+    # sequence it took before the parameter existed, and the square root is
+    # the one operation an L2 scan has never had to issue.
+    var cosine = score_function == Int32(SCORE_COSINE)
+    # The level's own unsplit accumulators, folded over the leaves below in the
+    # same ascending order every other cross-leaf sum here uses. The single
+    # score of them is the constant every candidate of this feature subtracts.
+    var p_num = Float32(0.0)
+    var p_den = Float32(0.0)
 
     # The level's totals, summed over leaves in ascending record order for the
     # same reason the score is. `IREC_TOTAL_COUNT` and the two total sums are
@@ -3059,6 +3480,16 @@ def _scan_slot_oblivious_kernel(
         cross_off[unsafe_offset=l] = gpu_cross_offset(
             tgf, thf, lambda_l1, lambda_l2, lambda_l2, ns
         )
+        # This leaf's unsplit terms, computed once and used twice, which is
+        # what `find_best_split_shared` does with its `pt`: they accumulate
+        # into the level's zero point here, and they are what this leaf
+        # contributes at a candidate it cannot take.
+        if cosine:
+            var ut = gpu_cosine_unsplit(tgf, thf, lambda_l1, lambda_l2)
+            un_num[unsafe_offset=l] = ut[0]
+            un_den[unsafe_offset=l] = ut[1]
+            p_num += ut[0]
+            p_den += ut[1]
         level_g += tgf
         level_h += thf
         level_c += tc
@@ -3094,6 +3525,14 @@ def _scan_slot_oblivious_kernel(
             mis_g[unsafe_offset=l] = Int32(0)
             mis_h[unsafe_offset=l] = Int32(0)
             mis_c[unsafe_offset=l] = Int32(0)
+
+    # ONE ratio for the whole level, which is CatBoost's `numScoreBlocks = 1`,
+    # taken here over the accumulators the leaf loop folded and subtracted from
+    # every candidate below. `find_best_split_shared` computes `level_parent`
+    # at exactly this point and for exactly this reason.
+    var level_parent = Float32(0.0)
+    if cosine:
+        level_parent = gpu_cosine_score(p_num, p_den)
 
     var best_gain = Float32(0.0)
     var runner_gain = Float32(0.0)
@@ -3144,6 +3583,12 @@ def _scan_slot_oblivious_kernel(
                 if not any_missing:
                     continue
             var total = Float32(0.0)
+            # Cosine's two cross-leaf accumulators, which stand where `total`
+            # stands on the L2 arm. `split.find_best_split_shared`'s
+            # `acc_left`/`den_left` pair, per candidate rather than per bin
+            # because this kernel scores one candidate at a time.
+            var cos_num = Float32(0.0)
+            var cos_den = Float32(0.0)
             var cand_c = Int32(0)
             var cand_gf = Float32(0.0)
             var cand_hf = Float32(0.0)
@@ -3166,31 +3611,62 @@ def _scan_slot_oblivious_kernel(
                 var rgf = gpu_right_sum(tgf, lgf, tg, lg, g_inv, form)
                 # This leaf's own legality. A leaf that fails adds nothing and
                 # does not disqualify the candidate for the rest of the level.
+                # "Nothing" is `0.0` under L2 and the leaf's unsplit terms
+                # under Cosine, which is the same rule in the two functionals'
+                # own spellings; see the docstring.
                 if (
                     lc < min_data_in_leaf
                     or tc - lc < min_data_in_leaf
                     or lhf < min_child_hess
                     or rhf < min_child_hess
                 ):
+                    if cosine:
+                        cos_num += un_num[unsafe_offset=l][0]
+                        cos_den += un_den[unsafe_offset=l][0]
                     continue
-                total += gpu_split_gain(
-                    gpu_soft_threshold_l1(lgf, lambda_l1),
-                    lhf,
-                    gpu_soft_threshold_l1(rgf, lambda_l1),
-                    rhf,
-                    lambda_l2,
-                    par_score[unsafe_offset=l][0],
-                    sign,
-                    bound_lo,
-                    bound_hi,
-                    is_constrained,
-                    node_ss[unsafe_offset=l][0],
-                    cross_off[unsafe_offset=l][0],
-                    form,
-                )
+                if cosine:
+                    var ct = gpu_cosine_level_terms(
+                        gpu_soft_threshold_l1(lgf, lambda_l1),
+                        lhf,
+                        gpu_soft_threshold_l1(rgf, lambda_l1),
+                        rhf,
+                        lambda_l2,
+                        sign,
+                        bound_lo,
+                        bound_hi,
+                        is_constrained,
+                        SIMD[DType.float32, 2](
+                            un_num[unsafe_offset=l][0],
+                            un_den[unsafe_offset=l][0],
+                        ),
+                    )
+                    cos_num += ct[0]
+                    cos_den += ct[1]
+                else:
+                    total += gpu_split_gain(
+                        gpu_soft_threshold_l1(lgf, lambda_l1),
+                        lhf,
+                        gpu_soft_threshold_l1(rgf, lambda_l1),
+                        rhf,
+                        lambda_l2,
+                        par_score[unsafe_offset=l][0],
+                        sign,
+                        bound_lo,
+                        bound_hi,
+                        is_constrained,
+                        node_ss[unsafe_offset=l][0],
+                        cross_off[unsafe_offset=l][0],
+                        form,
+                    )
                 cand_c += lc
                 cand_gf += lgf
                 cand_hf += lhf
+            # The one square root of the level, after the leaf loop has closed
+            # over both accumulators. This is the line the L2 arm does not have
+            # and the reason a level's Cosine score is not a sum of per-leaf
+            # Cosine gains.
+            if cosine:
+                total = gpu_cosine_score(cos_num, cos_den) - level_parent
             if total > best_gain:
                 runner_gain = best_gain
                 best_gain = total
@@ -4298,6 +4774,7 @@ def _launch_oblivious_search(
     has_categorical: Bool,
     primitives: Bool = True,
     gain_form: Int = DEFAULT_GAIN_FORM,
+    score_function: Int = SCORE_L2,
 ) raises:
     """Enqueue the two kernels of one oblivious *level* search: the cross-leaf
     scan and the ordinary cross-feature reduction over the single record the
@@ -4330,7 +4807,34 @@ def _launch_oblivious_search(
     candidate set than the CPU grower searches, and the accuracy gate for this
     mode is node-identity with no tolerance. A refusal at the launch is a
     reachable, named failure; a quietly narrower search is a wrong tree that
-    looks right."""
+    looks right.
+
+    `score_function` does NOT refuse, and the fact that it once did is the
+    point of the parameter. **A level's Cosine score is a ratio of two
+    cross-leaf accumulators with a single square root taken at the end, not a
+    sum of per-leaf ratios**, and a leaf loop that could only do `total +=
+    gain` therefore had nothing to add. `_scan_slot_oblivious_kernel` now
+    carries the two accumulators and takes the one root, and it carries the
+    illegal-leaf substitution -- unsplit terms rather than `0.0` -- that
+    `split.find_best_split_shared` carries, which is the one place the two
+    functionals genuinely differ rather than merely rounding differently. So
+    the refusal is retired because the thing it stood in for is written, which
+    is the only reason a refusal in this package may be retired.
+
+    Range-checked with the host's own `check_score_function`, which refuses an
+    unknown code rather than resolving it to `SCORE_L2`. That direction is
+    load-bearing: a third selector added later and not taught to this kernel
+    must fail here, because the alternative is that it silently receives an L2
+    answer under its own label.
+
+    The launch count is unchanged and that is a precondition rather than a
+    happy result. The Cosine accumulation is the same leaf loop of the same
+    scan kernel with a second accumulator beside the first, so a level still
+    costs two command buffers and `oblivious_launch_census(6)` is still 62.
+    Five hundred trees of six levels is the shape this mode will be run at; a
+    correct kernel that cost a launch per leaf per level would be 500 * 126
+    extra command buffers and would have to be rewritten before it could
+    ship."""
     comptime if not has_accelerator():
         raise Error(
             "the device split search needs an accelerator; this binary was"
@@ -4351,6 +4855,7 @@ def _launch_oblivious_search(
                     " 64-buffer queue knee whatever this kernel does",
                 )
             )
+        check_score_function(score_function)
         if has_categorical:
             raise Error(
                 "the oblivious cross-leaf scan does not search category"
@@ -4379,6 +4884,7 @@ def _launch_oblivious_search(
             Int32(min_data_in_leaf),
             Int32(1) if constrained else Int32(0),
             Int32(gain_form),
+            Int32(score_function),
             grid_dim=widest_slots,
             block_dim=1,
         )
@@ -5791,6 +6297,7 @@ struct GpuSplitSearcher(Movable):
         leaf_slots: List[Int],
         level_record: Int = 0,
         leaf_base: Int = 1,
+        score_function: Int = SCORE_L2,
     ) raises -> GpuSplitRecord:
         """Search the level staged by `upload_level_histogram` and return the
         level's record: one (feature, bin, missing direction) chosen by the
@@ -5798,7 +6305,15 @@ struct GpuSplitSearcher(Movable):
 
         The standalone counterpart of `search`, and it spells the field
         borrows out at the free-function boundary for the same aliasing reason
-        that method does."""
+        that method does.
+
+        `score_function` is an explicit argument here and not a searcher
+        field, which is the one place this differs from `gain_form`. It is
+        deliberate and it is temporary: `lane/cosine-device` owns the searcher
+        field and the per-node kernels that read it, and a field on this
+        searcher that only the level scan honored would answer Cosine for a
+        level and L2 for a node without saying so. Named at the call, nothing
+        is silent; when the two lanes meet, the default becomes the field."""
         self._check_record(level_record)
         if len(leaf_slots) < 1:
             raise Error("an oblivious level holds at least one leaf")
@@ -5853,6 +6368,7 @@ struct GpuSplitSearcher(Movable):
             has_cat,
             self.use_primitives,
             self.gain_form_code,
+            score_function,
         )
         return self.download(level_record)
 
@@ -6028,10 +6544,14 @@ struct GpuSplitSearcher(Movable):
         leaf_slots: List[Int],
         level_record: Int,
         leaf_base: Int,
+        score_function: Int = SCORE_L2,
     ) raises:
         """Enqueue one oblivious level's search: the cross-leaf scan over the
         level's leaves and the ordinary cross-feature reduction into
         `level_record`.
+
+        `score_function` is an explicit argument rather than a searcher field
+        for the reason `search_oblivious_level` gives.
 
         `leaf_slots[i]` is the histogram pool slot leaf `i` of the level owns,
         in the leaf-index order the level's frontier holds them, and this
@@ -6115,6 +6635,7 @@ struct GpuSplitSearcher(Movable):
             has_cat,
             self.use_primitives,
             self.gain_form_code,
+            score_function,
         )
 
     def enqueue_pick_best(
