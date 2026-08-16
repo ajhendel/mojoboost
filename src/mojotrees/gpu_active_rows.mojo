@@ -1749,6 +1749,7 @@ def _hist_rows_step[
     gv: _LocalI32,
     hv: _LocalI32,
     bv: _LocalI32,
+    sink: _LocalI32,
     owned: Int,
     nb: Int,
     row_begin: Int,
@@ -1759,6 +1760,7 @@ def _hist_rows_step[
     narrow: Bool,
     aligned: Bool,
     rstride: Int,
+    probe: Bool,
 ):
     """Accumulate `U` rows of one thread's stride into the shared planes.
 
@@ -1931,6 +1933,69 @@ def _hist_rows_step[
     registered by its own author as an expected null against three shared
     atomics and a scattered gather. A fourth address arm to measure a null
     inside an arm is not a trade worth the code.
+
+    **The `probe` arm builds a histogram that is wrong on purpose.** It is
+    not an optimization, it is not selectable by any shipping path, and it
+    must never be read as one. What it does is skip the three
+    `Atomic.fetch_add` calls at the bottom of this function and nothing else,
+    accumulating instead into a per-thread `sink` that
+    `_hist_accumulate_rows` writes to threadgroup memory once at the end of
+    the walk. The only thing it exists to produce is a ratio: what share of
+    this loop's cost the three shared atomics per (row, feature) are, against
+    everything that feeds them. `GpuActiveRows.set_histogram_atomic_probe`
+    is the only way to reach it and says what the number does and does not
+    license.
+
+    What the probe keeps, and this is the whole difficulty of building one:
+
+    - stage one, the row index load out of `rows`;
+    - stage two, the quantized gradient pair load out of `gq` (or the two
+      Float32 plane gathers and their `Int32(round(x * scale))`);
+    - stage three, the bin byte gather out of `bins`, at whichever of the
+      three address forms `narrow` and `rstride` select;
+    - the shared-cell index `lift + bv[u]`, formed exactly as the atomic arm
+      forms it.
+
+    What it drops: the three shared atomics, and with them all threadgroup
+    contention and the atomic unit's own latency. It also drops the third
+    atomic's constant `+1`, which is not a load and not an address, so
+    nothing data-dependent leaves with it.
+
+    What it adds, and it is not nothing: one XOR and one or two integer adds
+    per (row, feature) to fold `s`, `gv` and `hv` into the sink. Those are
+    ALU operations against the atomics they replace, so the probe arm is not
+    a floor of "the loop without atomics" but a floor plus a few cheap
+    instructions. That is the direction the error runs and it is the safe
+    direction: it makes the atomics' measured share an **underestimate**.
+
+    **Why the sink is shaped this way.** A compiler deletes work whose result
+    is unused, so a probe that skipped the atomics and wrote nothing would
+    measure an empty loop and report a flattering number. The sink is
+    `acc = (acc ^ s) + gv (+ hv)` rather than a plain sum for one specific
+    reason: `lift` is loop-invariant, so a sum of `lift + bv[u]` over `u`
+    would let the compiler hoist `U * lift` out and drop the per-visit add
+    that forms the shared-cell index. XOR does not distribute over the add,
+    so the address arithmetic has to happen where the atomic arm makes it
+    happen.
+
+    **How the non-elimination was established, and it was not by assertion.**
+    A reduced replica of this loop -- the same three loads, the same
+    `lift + bin` index, the same XOR-and-add sink, one terminal store -- was
+    compiled to optimized target assembly with `mojo build --emit asm` and
+    read. With the terminal store present the loop survives whole, and every
+    load in it is visible: `ldrsw` for the row index, `ldrb` for the bin
+    byte, `ldp w, w` for the 8-byte gradient pair as the one paired load the
+    alignment argument above claims, `add w, w, w` for `lift + bin`, then the
+    `eor`/`add` sink chain and `str` at the exit. With the terminal store
+    deleted and nothing else changed, the entire function compiles to a
+    single `ret`: no loop, no loads, no arithmetic. That negative control is
+    what gives the positive one teeth -- it shows the check can fail -- and
+    it is the same standard by which the `align 4` fact above was
+    established. The replica is host arm64 rather than Metal, because this
+    repository has no dump path for a Metal kernel that is compiled at
+    launch; dead-code elimination of a value with no reachable use is an
+    LLVM middle-end transform common to both, and the claim is scoped to
+    that.
     """
     # Stage one: the row indices, in the width the permutation holds them.
     # Int32 on both arms: `rows` is an Int32 buffer and `MAX_ROWS` is
@@ -2068,16 +2133,30 @@ def _hist_rows_step[
                             ]
                         )
                     )
-            comptime for u in range(U):
-                var s = Int(lift + bv[unsafe_offset=u][0])
-                _ = Atomic.fetch_add(
-                    sg.unsafe_offset(s), gv[unsafe_offset=u][0]
-                )
-                comptime if not CELIDE:
+            if probe:
+                # The probe arm. Everything above this line has already run;
+                # what is skipped is exactly the three atomics below it. The
+                # index `s` is formed here in the same expression the atomic
+                # arm forms it in, and the XOR is what stops the compiler
+                # hoisting `lift` out of it. See the docstring.
+                comptime for u in range(U):
+                    var s = lift + bv[unsafe_offset=u][0]
+                    var acc = sink[unsafe_offset=0][0]
+                    acc = (acc ^ s) + gv[unsafe_offset=u][0]
+                    comptime if not CELIDE:
+                        acc += hv[unsafe_offset=u][0]
+                    sink[unsafe_offset=0] = acc
+            else:
+                comptime for u in range(U):
+                    var s = Int(lift + bv[unsafe_offset=u][0])
                     _ = Atomic.fetch_add(
-                        sh.unsafe_offset(s), hv[unsafe_offset=u][0]
+                        sg.unsafe_offset(s), gv[unsafe_offset=u][0]
                     )
-                _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+                    comptime if not CELIDE:
+                        _ = Atomic.fetch_add(
+                            sh.unsafe_offset(s), hv[unsafe_offset=u][0]
+                        )
+                    _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
 
 
 @always_inline
@@ -2106,6 +2185,7 @@ def _hist_accumulate_rows[
     narrow: Bool,
     aligned: Bool,
     rstride: Int,
+    probe: Bool,
 ):
     """One thread's whole walk over its share of one tile.
 
@@ -2161,6 +2241,24 @@ def _hist_accumulate_rows[
     residency on this backend is bounded by things this project cannot query.
     If the unroll loses, that is how it loses, and `set_row_unroll(False)` is
     the arm that shows it.
+
+    **`probe`, and it produces a wrong histogram on purpose.** Passed
+    straight through to `_hist_rows_step`, which is where it is argued. The
+    one part of it that lives here is the sink itself: one Int32 per thread,
+    zeroed before the walk and written to threadgroup memory once after it,
+    which is what keeps the gather and the address arithmetic from being
+    deleted as work whose result nobody reads.
+
+    The store is unconditional and every thread makes it, to the same two
+    cells. That races, and the value left there is whichever thread wrote
+    last; both facts are deliberate. A store guarded by `tid == 0` would let
+    a compiler sink the whole loop into the guard and leave the probe timing
+    one thread's work instead of the block's, and an atomic store would put
+    back a shared atomic this arm exists to remove. A racy garbage cell is
+    the right answer in a kernel whose entire output is already garbage, and
+    it is two plain threadgroup stores per thread per tile against the
+    millions of atomics they stand in for. Why two, and why one of them is
+    `sc`, is at the store itself.
     """
     var tid = Int(thread_idx.x)
     var stride = Int(block_dim.x)
@@ -2214,6 +2312,13 @@ def _hist_accumulate_rows[
     var hv = stack_allocation[UNROLL, Scalar[DType.int32]]()
     var bv = stack_allocation[UNROLL, Scalar[DType.int32]]()
 
+    # The probe arm's per-thread sink. Allocated on both arms because a
+    # `stack_allocation` under a runtime `if` is not a thing this loop can
+    # have, and it costs one Int32 of stack the compiler promotes to a
+    # register; the atomic arm never reads or writes it.
+    var sink = stack_allocation[1, Scalar[DType.int32]]()
+    sink[unsafe_offset=0] = 0
+
     var j = tile_begin + tid
     # `limit` is where the last full group of `UNROLL` rows can start. Left
     # at `j` when the unroll is off or unavailable, which skips the main
@@ -2237,6 +2342,7 @@ def _hist_accumulate_rows[
             gv,
             hv,
             bv,
+            sink,
             owned,
             nb,
             row_begin,
@@ -2247,6 +2353,7 @@ def _hist_accumulate_rows[
             narrow,
             aligned,
             rstride,
+            probe,
         )
         j += UNROLL * stride
     while j < tile_end:
@@ -2264,6 +2371,7 @@ def _hist_accumulate_rows[
             gv,
             hv,
             bv,
+            sink,
             owned,
             nb,
             row_begin,
@@ -2274,8 +2382,25 @@ def _hist_accumulate_rows[
             narrow,
             aligned,
             rstride,
+            probe,
         )
         j += stride
+
+    # The sink's one visible effect, and the only reason the probe arm's
+    # loads survive optimization. Unconditional, racing, and garbage; see the
+    # docstring for why each of those three is the right choice here.
+    #
+    # Two cells rather than one, and the second is the load-bearing one. The
+    # atomic kernel's flush reads `sg[s]` only under `if sc[s] != 0`, so a
+    # sink written to `sg` alone is a store whose value a sufficiently clever
+    # compiler could try to prove unread. Writing `sc[0]` as well puts the
+    # sink into the condition that guards three global atomics, which is a
+    # use no analysis can discharge, and it makes the probe's wrongness
+    # visible in the output rather than silent: bin 0 of the first owned slot
+    # comes out as whatever the race left there.
+    if probe:
+        sg[unsafe_offset=0] = sink[unsafe_offset=0][0]
+        sc[unsafe_offset=0] = sink[unsafe_offset=0][0]
 
 
 @always_inline
@@ -2306,6 +2431,7 @@ def _hist_accumulate_dispatch[
     narrow: Bool,
     aligned: Bool,
     rstride: Int,
+    probe: Bool,
 ):
     """Resolve the two comptime-worthy runtime flags into one of four arms,
     once, above the row loop.
@@ -2316,11 +2442,17 @@ def _hist_accumulate_dispatch[
     each of the two kernels.
 
     Only `celide` and `quant` become comptime parameters. `unrolled`,
-    `narrow`, and `aligned` stay runtime values and are passed through,
-    because each one that became a parameter would double a row-loop body
-    that is already inlined twice into forty kernel instantiations. Where
-    they are consumed, and why each is cheap as a branch, is argued at
-    `_hist_accumulate_rows` and `_hist_rows_step`."""
+    `narrow`, `aligned`, and `probe` stay runtime values and are passed
+    through, because each one that became a parameter would double a row-loop
+    body that is already inlined twice into forty kernel instantiations.
+    Where they are consumed, and why each is cheap as a branch, is argued at
+    `_hist_accumulate_rows` and `_hist_rows_step`.
+
+    `probe` is the odd one and is not a launch shape: it is the only flag
+    here that changes the answer, and it changes it to a wrong one on
+    purpose. `GpuActiveRows.set_histogram_atomic_probe` is the only way it
+    can be turned on, it is off by default, and two of this struct's
+    histogram entry points refuse to launch while it is set."""
     if celide:
         if quant:
             _hist_accumulate_rows[GROUP, UNROLL, True, True](
@@ -2346,6 +2478,7 @@ def _hist_accumulate_dispatch[
                 narrow,
                 aligned,
                 rstride,
+                probe,
             )
         else:
             _hist_accumulate_rows[GROUP, UNROLL, True, False](
@@ -2371,6 +2504,7 @@ def _hist_accumulate_dispatch[
                 narrow,
                 aligned,
                 rstride,
+                probe,
             )
     elif quant:
         _hist_accumulate_rows[GROUP, UNROLL, False, True](
@@ -2396,6 +2530,7 @@ def _hist_accumulate_dispatch[
             narrow,
             aligned,
             rstride,
+            probe,
         )
     else:
         _hist_accumulate_rows[GROUP, UNROLL, False, False](
@@ -2421,6 +2556,7 @@ def _hist_accumulate_dispatch[
             narrow,
             aligned,
             rstride,
+            probe,
         )
 
 
@@ -2454,6 +2590,7 @@ def _range_hist_atomic_kernel[
     pair_align: Int32,
     bins_blocked: MutPointer[UInt8, MutAnyOrigin],
     bin_row_stride: Int32,
+    hist_probe: Int32,
 ):
     """One node's histogram over a compacted row range, accumulated in
     threadgroup memory and folded into the output with global atomics.
@@ -2743,6 +2880,7 @@ def _range_hist_atomic_kernel[
         Int(narrow_index) != 0,
         Int(pair_align) != 0,
         rstride,
+        Int(hist_probe) != 0,
     )
     barrier()
 
@@ -2808,6 +2946,7 @@ def _range_hist_partial_kernel[
     pair_align: Int32,
     bins_blocked: MutPointer[UInt8, MutAnyOrigin],
     bin_row_stride: Int32,
+    hist_probe: Int32,
 ):
     """The tiled twin of `_range_hist_atomic_kernel`: the same threadgroup
     accumulation, written to a per-(tile, slot) partial slot instead of folded
@@ -2950,6 +3089,7 @@ def _range_hist_partial_kernel[
         Int(narrow_index) != 0,
         Int(pair_align) != 0,
         rstride,
+        Int(hist_probe) != 0,
     )
     barrier()
 
@@ -3806,6 +3946,19 @@ struct GpuActiveRows(Movable):
     # true alignment can only remove work, never add it. Off is reachable so
     # the two can be interleaved in one process.
     var pair_alignment: Bool
+    # --- atomic-fraction lane ---
+    # Whether the histogram row loop SKIPS its three shared atomics and
+    # writes a per-thread sink instead. **A histogram built with this set is
+    # wrong.** It is not an optimization, it is not an arm anything may ship
+    # on, and the only thing it produces is a ratio.
+    #
+    # Off by default and reachable only through
+    # `set_histogram_atomic_probe`, which takes a second, non-defaulted
+    # acknowledgment argument and refuses without it. `enqueue_desc_histogram`
+    # and any subtracting `enqueue_range_histogram` refuse to launch while it
+    # is set, which between them is every histogram the device-resident
+    # growth plane builds and every non-root node the host plane builds.
+    var hist_atomic_probe: Bool
     # Row-tile requests, overriding what `gpu_tiling` would otherwise take
     # from the environment. Zero means "no request", which is what
     # `MOJOTREES_GPU_MIN_TILES` and `MOJOTREES_GPU_ROW_TILE` unset already
@@ -3990,6 +4143,10 @@ struct GpuActiveRows(Movable):
         # `partition_block_cap` gives. See both fields.
         self.narrow_index = False
         self.pair_alignment = True
+        # The atomics probe is off, and "off" here is not a default anyone
+        # should read as adjustable: on, this instance builds histograms that
+        # are wrong. See `set_histogram_atomic_probe`.
+        self.hist_atomic_probe = False
         self.min_tiles_request = 0
         self.rows_per_tile_request = 0
         # No bin re-layout until one is asked for. The placeholder is one
@@ -4187,6 +4344,79 @@ struct GpuActiveRows(Movable):
         Takes effect on the next `enqueue_range_histogram`.
         """
         self.pair_alignment = on
+
+    def set_histogram_atomic_probe(
+        mut self, on: Bool, acknowledge_wrong_histogram: Bool
+    ) raises:
+        """**The histogram this produces is wrong on purpose.** Turn the row
+        loop's three shared atomics off and accumulate a per-thread sink
+        instead.
+
+        This is an instrument, not an arm. Nothing may ship on it, nothing
+        may train on it, and no result taken from a fit that had it set means
+        anything. Its entire output is one ratio: what share of the histogram
+        phase the three `Atomic.fetch_add` calls per (row, feature) are,
+        against the row-side loads, the quantized gradient load, the bin
+        gather and the shared-cell address arithmetic that feed them --
+        every one of which the probe still performs. `_hist_rows_step` lists
+        what is kept and what is dropped, item by item, and how the kept work
+        was shown not to have been optimized away.
+
+        **Why the question is worth an instrument.** Two lanes in this
+        campaign independently revised memory-side estimates downward and
+        named the same reason: the three shared atomics are untouched by any
+        layout or address change, so they bound every such estimate from
+        above, and nobody has measured their share. A layout lane's 1.10x is
+        an upper bound on wall clock only while the atomics' share is
+        unknown. This method makes it known.
+
+        **Which way the number errs.** It is a **lower bound** on what
+        removing atomic contention could buy, and an upper bound on nothing.
+        Three reasons, all in the same direction:
+
+        1. The probe keeps the shared-cell index `lift + bin`, which a real
+           atomics change (per-node rescaling to pack two counters into one
+           word, or threadgroup privatization) would also keep. So the probe
+           does not credit itself with work such a change would not remove
+           either.
+        2. The probe pays for its own sink: one XOR and one or two integer
+           adds per (row, feature). Those land in the residual, so the
+           residual is larger than a true atomic-free loop's and the atomics'
+           share comes out smaller.
+        3. Removing the atomics also removes the shared-plane zeroing and the
+           flush's dependence on them, and the probe removes neither.
+
+        What it therefore licenses: if the fraction is large, the next kernel
+        lane goes at the atomics and the layout estimates should be read as
+        the small numbers they are. If the fraction is small, no atomics
+        change can be worth its risk and the next lane goes at addresses.
+        What it does not license: quoting `1 / (1 - fraction)` as a speedup.
+        Nothing here builds an atomic-free histogram that is correct, so
+        nothing here has measured what one would cost.
+
+        **The refusals, and why they are shaped like this.** The
+        acknowledgment argument has no default, so no existing call site can
+        acquire this flag by recompiling and no new one can acquire it
+        without writing the words down. Beyond that, two entry points refuse
+        outright while it is set: `enqueue_desc_histogram`, which is every
+        histogram the device-resident growth plane builds, and any
+        `enqueue_range_histogram` that folds a sibling subtraction, which is
+        every non-root node the host plane builds. Between them, a fit cannot
+        get past its root with this on. That is the closest thing to "refuses
+        to run under any configuration that would produce a model" this
+        struct can enforce from inside itself, and it is stated as a bound
+        rather than a guarantee: a caller determined to build one root
+        histogram and call it a model is not something a flag can stop.
+
+        Takes effect on the next histogram launch.
+        """
+        if on and not acknowledge_wrong_histogram:
+            raise Error(
+                "the histogram atomics probe builds a WRONG histogram by"
+                " design; pass acknowledge_wrong_histogram=True to say so in"
+                " the call, and never on a fit whose model anyone will read"
+            )
+        self.hist_atomic_probe = on
 
     def set_row_tiling(
         mut self, min_tiles: Int = 0, rows_per_tile: Int = 0
@@ -5106,6 +5336,18 @@ struct GpuActiveRows(Movable):
             raise Error("the resident pool must hold at least one slot")
         if max_rows < 1:
             raise Error("a descriptor histogram needs a positive row bound")
+        # This entry point is the device-resident growth plane: every
+        # histogram of every non-root node of every tree comes through here.
+        # A probe histogram reaching it would grow a whole tree out of
+        # garbage, and a subtraction chain would then carry the garbage into
+        # siblings that never ran the probe at all. See
+        # `set_histogram_atomic_probe`.
+        if self.hist_atomic_probe:
+            raise Error(
+                "the histogram atomics probe builds a wrong histogram and"
+                " must never reach the device-resident growth plane; turn it"
+                " off with set_histogram_atomic_probe(False, True)"
+            )
 
         # Which descriptor this build reads, and -- the same decision, not a
         # second one -- whether it folds the sibling subtraction in. A
@@ -5493,6 +5735,17 @@ struct GpuActiveRows(Movable):
             raise Error(
                 "a fused subtraction must name a slot other than the build's"
             )
+        # A fused sibling subtraction means a tree is being grown: this node
+        # is a child and its sibling is about to be derived from it. A probe
+        # histogram there would corrupt a sibling that never ran the probe,
+        # which is worse than a wrong node -- it is a wrong node that looks
+        # like a correct one. See `set_histogram_atomic_probe`.
+        if subtract and self.hist_atomic_probe:
+            raise Error(
+                "the histogram atomics probe builds a wrong histogram and"
+                " must never feed a sibling subtraction; it is reachable"
+                " only on a from-scratch build of one node's rows"
+            )
         var window = self.ranges.get(node)
         var hist_size = self.n_features * self.n_bins
         var threads = tiling.block_threads
@@ -5786,6 +6039,11 @@ struct GpuActiveRows(Movable):
             else Int32(0)
         )
         var palign = Int32(1) if self.pair_alignment else Int32(0)
+        # The atomics probe. Off unless `set_histogram_atomic_probe` was
+        # called with its acknowledgment, which no shipping path does; read
+        # from the field here on the same footing as the arms above, and the
+        # only one of them that changes what the launch computes.
+        var probe = Int32(1) if self.hist_atomic_probe else Int32(0)
         # The bin layout arm. `blocked_row_stride` is 1 unless
         # `set_blocked_layout` put the `[block][row][G]` buffer on the device
         # and `_ensure_blocked` filled it, and the second pointer is the
@@ -5825,6 +6083,7 @@ struct GpuActiveRows(Movable):
                 palign,
                 blocked_ptr,
                 rstride,
+                probe,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5852,6 +6111,7 @@ struct GpuActiveRows(Movable):
                 palign,
                 blocked_ptr,
                 rstride,
+                probe,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5879,6 +6139,7 @@ struct GpuActiveRows(Movable):
                 palign,
                 blocked_ptr,
                 rstride,
+                probe,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5906,6 +6167,7 @@ struct GpuActiveRows(Movable):
                 palign,
                 blocked_ptr,
                 rstride,
+                probe,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -6098,6 +6360,11 @@ struct GpuActiveRows(Movable):
             else Int32(0)
         )
         var palign = Int32(1) if self.pair_alignment else Int32(0)
+        # The atomics probe. Off unless `set_histogram_atomic_probe` was
+        # called with its acknowledgment, which no shipping path does; read
+        # from the field here on the same footing as the arms above, and the
+        # only one of them that changes what the launch computes.
+        var probe = Int32(1) if self.hist_atomic_probe else Int32(0)
         # The bin layout arm. `blocked_row_stride` is 1 unless
         # `set_blocked_layout` put the `[block][row][G]` buffer on the device
         # and `_ensure_blocked` filled it, and the second pointer is the
@@ -6149,6 +6416,7 @@ struct GpuActiveRows(Movable):
                 palign,
                 blocked_ptr,
                 rstride,
+                probe,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -6181,6 +6449,7 @@ struct GpuActiveRows(Movable):
                 palign,
                 blocked_ptr,
                 rstride,
+                probe,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -6213,6 +6482,7 @@ struct GpuActiveRows(Movable):
                 palign,
                 blocked_ptr,
                 rstride,
+                probe,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -6245,6 +6515,7 @@ struct GpuActiveRows(Movable):
                 palign,
                 blocked_ptr,
                 rstride,
+                probe,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
