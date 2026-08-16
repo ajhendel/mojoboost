@@ -250,7 +250,8 @@ entry point in this package is guarded, with the whole body behind
 `comptime if not has_accelerator()`.
 """
 
-from std.gpu import thread_idx
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.memory import bitcast
 from std.os import getenv
 from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
@@ -1307,6 +1308,144 @@ def _pick_and_commit_kernel(
     ctr[unsafe_offset=CTR_COMMITS] = Int32(commits + 1)
 
 
+def _reset_tables_kernel(
+    front: MutPointer[Int32, MutAnyOrigin],
+    node_i: MutPointer[Int32, MutAnyOrigin],
+    node_f: MutPointer[Float32, MutAnyOrigin],
+    ctr: MutPointer[Int32, MutAnyOrigin],
+    slot_owner: MutPointer[Int32, MutAnyOrigin],
+    n_active: Int32,
+    root_slot: Int32,
+    root_value: Float32,
+    leaf_capacity: Int32,
+    node_capacity: Int32,
+    pool_capacity: Int32,
+):
+    """Write the one-leaf frontier of a fresh tree into all five tables.
+
+    The device half of `begin_tree`, and the reason it exists is a transfer
+    count rather than a compute one. Every byte the host used to stage for
+    this reset is a constant or a function of three scalars, and on Metal an
+    `enqueue_copy` is a synchronous full-queue drain in both directions
+    whatever it carries (measured by disassembly of the shipped runtime,
+    `docs/GPU_PORTABILITY.md` section 6.1), so five staged tables cost five
+    host waits to move a few kilobytes that the device could have written
+    from three numbers. This kernel is those three numbers arriving as launch
+    arguments instead. It is the same move `_seed_root_value_kernel` and
+    `_stage_child_search_kernel` already make for `TN_VALUE` and for
+    `NODE_HIST_BASE`, applied to the whole reset.
+
+    **Every word has exactly one writer and no barrier is used.** That is the
+    property that lets this run on a grid of any width, and it is worth
+    stating because the obvious form of this kernel does not have it: zero
+    the tables with every thread, barrier, then let thread 0 write the
+    handful of nonzero words. A barrier synchronizes one threadgroup and not
+    a grid, so that form is only correct on a single block, and a single
+    block is a needless constraint on a kernel whose whole job is stores.
+    Instead each strided loop below decides the *final* value of the word it
+    owns, including the nonzero ones, so a thread never overwrites another
+    thread's answer and the grid needs no ordering at all. The counter block
+    is written whole by the one thread that owns it, since no loop covers it.
+
+    The fields, in the order `begin_tree`'s host path writes them, because
+    the two must agree word for word:
+
+    - `front`: zeros everywhere, then slot 0's row is the root, which is node
+      0 at depth 0 owning `[0, n_active)` out of pool slot `root_slot` and
+      reading record 0. Only two of its six words are nonzero, and the other
+      four are the zero the loop already writes, so they are named in
+      comments rather than stored twice.
+    - `node_i`: every node as `Tree._add_node` leaves one, which is all words
+      zero except the five `-1` sentinels at `TN_FEATURE`, `TN_THRESHOLD`,
+      `TN_LEFT`, `TN_RIGHT` and `TN_MISSING_BIN`. Node 0 additionally carries
+      `TN_COUNT = n_active`.
+    - `node_f`: zeroed, with node 0's `TN_VALUE` set to `root_value`.
+    - `ctr`: one live leaf, one node, no pick, running, no commits.
+    - `slot_owner`: `-1` everywhere except `root_slot`, which node 0 holds.
+
+    `root_value` is carried through rather than dropped, and the honest note
+    is that **every caller in this repository passes zero**: the resident
+    plane leaves it at its default and then overwrites node 0's value with
+    `_seed_root_value_kernel` once the root's search record exists, and the
+    test file passes an explicit `Float32(0.0)`. So the argument is redundant
+    today in the sense that removing it would change no in-tree behavior. It
+    stays because `begin_tree` takes it, and the host arm and the device arm
+    have to be word-for-word identical for arguments a caller *may* pass, not
+    merely for the ones callers happen to pass now. It costs one Float32 in
+    the launch record and no store beyond the one the zero fill would have
+    made anyway.
+
+    No floating-point arithmetic occurs here: `root_value` is stored, and
+    every other float written is a literal zero. See the contraction note in
+    the module docstring for why that is worth saying out loud.
+    """
+    var gid = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+
+    # The frontier. `FRONT_NODE`, `FRONT_ROW_BEGIN`, `FRONT_DEPTH` and
+    # `FRONT_RECORD` of slot 0 are all zero for a root, which is what the
+    # fill already writes; the record-slot-equals-frontier-slot identity
+    # starts at record 0 here and the commit preserves it.
+    var i = gid
+    var n_front = Int(leaf_capacity) * FRONT_WORDS
+    while i < n_front:
+        var v = Int32(0)
+        if i == FRONT_ROW_COUNT:
+            v = n_active
+        elif i == FRONT_HIST_SLOT:
+            v = root_slot
+        front[unsafe_offset=i] = v
+        i += stride
+
+    # The node table, one thread per node so that the sixteen words of a row
+    # are written by the thread that owns the row.
+    var n = gid
+    while n < Int(node_capacity):
+        var o = n * TN_IWORDS
+        for w in range(TN_IWORDS):
+            node_i[unsafe_offset = o + w] = Int32(0)
+        node_i[unsafe_offset = o + TN_FEATURE] = Int32(-1)
+        node_i[unsafe_offset = o + TN_THRESHOLD] = Int32(-1)
+        node_i[unsafe_offset = o + TN_LEFT] = Int32(-1)
+        node_i[unsafe_offset = o + TN_RIGHT] = Int32(-1)
+        node_i[unsafe_offset = o + TN_MISSING_BIN] = Int32(-1)
+        if n == 0:
+            node_i[unsafe_offset = o + TN_COUNT] = n_active
+        n += stride
+
+    # The float plane. `TN_VALUE` is word 0 of node 0's row and therefore
+    # index 0 of the flat plane, which is the one word that is not zero.
+    var k = gid
+    var n_nodef = Int(node_capacity) * TN_FWORDS
+    while k < n_nodef:
+        var fv = Float32(0.0)
+        if k == TN_VALUE:
+            fv = root_value
+        node_f[unsafe_offset=k] = fv
+        k += stride
+
+    # The slot pool: free is -1, and the root's slot is owned by node 0.
+    var s = gid
+    while s < Int(pool_capacity):
+        var owner = Int32(-1)
+        if s == Int(root_slot):
+            owner = Int32(0)
+        slot_owner[unsafe_offset=s] = owner
+        s += stride
+
+    # The counters, whole, on the one thread that owns them. No loop above
+    # covers this buffer, so there is no other writer to race with.
+    if gid == 0:
+        for w in range(CTR_WORDS):
+            ctr[unsafe_offset=w] = Int32(0)
+        ctr[unsafe_offset=CTR_N_LIVE] = Int32(1)
+        ctr[unsafe_offset=CTR_NEXT_NODE] = Int32(1)
+        ctr[unsafe_offset=CTR_PICK] = Int32(-1)
+        ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
+        ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_RUNNING)
+        # `CTR_COMMITS` is zero, which the fill above already wrote.
+
+
 def _seed_root_value_kernel(
     node_f: MutPointer[Float32, MutAnyOrigin],
     rec_f: MutPointer[Float32, MutAnyOrigin],
@@ -1436,6 +1575,95 @@ def _copy_records_kernel(
         w += PICK_THREADS
 
 
+def _pack_tables_kernel(
+    pack: MutPointer[Int32, MutAnyOrigin],
+    front: MutPointer[Int32, MutAnyOrigin],
+    node_i: MutPointer[Int32, MutAnyOrigin],
+    node_f: MutPointer[Float32, MutAnyOrigin],
+    ctr: MutPointer[Int32, MutAnyOrigin],
+    slot_owner: MutPointer[Int32, MutAnyOrigin],
+    order: MutPointer[Int32, MutAnyOrigin],
+    off_node_i: Int32,
+    off_node_f: Int32,
+    off_ctr: Int32,
+    off_slot: Int32,
+    off_order: Int32,
+    n_words: Int32,
+):
+    """Gather all six downloadable tables into one contiguous Int32 buffer.
+
+    The download is the one genuine round trip a device-owned tree makes, so
+    one host wait for it is correct. Six was not: `download` issued one
+    `enqueue_copy` per table, and on Metal each of those is a synchronous
+    full-queue drain in both directions costing about the same whatever it
+    carries (`docs/GPU_PORTABILITY.md` section 6.1). Six drains to bring home
+    a few kilobytes that are already in device memory next to each other is a
+    layout problem, and this kernel is the layout: the device concatenates,
+    the host copies once and takes the buffer apart.
+
+    **The float plane travels as its bits.** `node_f` is Float32 and the
+    packed buffer is Int32, so its words are moved with `std.memory.bitcast`,
+    which is a reinterpretation and not a conversion: no value is rounded,
+    widened, or normalized, and the host reverses it with the inverse
+    `bitcast` before the ordinary decode reads it. That is the one place in
+    this module where a float and an integer share a buffer, and it is
+    deliberately confined to a transport: nothing between the two bitcasts
+    reads the words as either type. The alternative that keeps the planes
+    apart is two copies rather than one, which is two drains rather than one
+    and buys nothing, since a bitcast pair cannot change a bit.
+
+    Every offset is a launch argument rather than a formula repeated here,
+    because the host has to take the buffer apart at exactly the boundaries
+    the device wrote it at, and two prefix sums in two languages is the kind
+    of duplicate that agrees until someone adds a table. `DeviceTreeTables`
+    computes them once in its constructor and both sides read those numbers.
+
+    The region lengths are the differences between consecutive offsets, so
+    `n_words` is the total and the last region runs to it.
+    """
+    var gid = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+
+    var i = gid
+    while i < Int(off_node_i):
+        pack[unsafe_offset=i] = front[unsafe_offset=i][0]
+        i += stride
+
+    var n_node_i = Int(off_node_f) - Int(off_node_i)
+    var j = gid
+    while j < n_node_i:
+        pack[unsafe_offset = Int(off_node_i) + j] = node_i[unsafe_offset=j][0]
+        j += stride
+
+    var n_node_f = Int(off_ctr) - Int(off_node_f)
+    var k = gid
+    while k < n_node_f:
+        pack[unsafe_offset = Int(off_node_f) + k] = bitcast[DType.int32, 1](
+            node_f[unsafe_offset=k][0]
+        )
+        k += stride
+
+    var n_ctr = Int(off_slot) - Int(off_ctr)
+    var c = gid
+    while c < n_ctr:
+        pack[unsafe_offset = Int(off_ctr) + c] = ctr[unsafe_offset=c][0]
+        c += stride
+
+    var n_slot = Int(off_order) - Int(off_slot)
+    var s = gid
+    while s < n_slot:
+        pack[unsafe_offset = Int(off_slot) + s] = slot_owner[
+            unsafe_offset=s
+        ][0]
+        s += stride
+
+    var n_order = Int(n_words) - Int(off_order)
+    var o = gid
+    while o < n_order:
+        pack[unsafe_offset = Int(off_order) + o] = order[unsafe_offset=o][0]
+        o += stride
+
+
 # --- Host-side owner ------------------------------------------------------
 
 
@@ -1454,10 +1682,22 @@ struct DeviceTreeTables(Movable):
     that safe without a fence. The private-context constructor exists so the
     tables are exercisable on their own, which is what the test file uses.
 
-    Nothing here reads an environment variable. `tree_resident_requested` is
-    the gate and it is the caller's to consult; a struct that silently did
-    nothing when a variable was unset would be much harder to test than one
-    that always works and is simply never constructed.
+    Nothing here reads an environment variable to decide **whether to work**.
+    `tree_resident_requested` is the gate and it is the caller's to consult; a
+    struct that silently did nothing when a variable was unset would be much
+    harder to test than one that always works and is simply never
+    constructed. Two variables do choose between arms that produce identical
+    tables, `MOJOTREES_GPU_TABLE_RESET` and `MOJOTREES_GPU_PACKED_DOWNLOAD`,
+    and they are read once in the constructor to seed a field that
+    `set_reset_on_device` and `set_packed_download` then override. That is
+    the shape `GpuActiveRows.set_constant_hessian` uses and it is here for the
+    same reason it is there: the in-process setter is what a benchmark needs,
+    because only interleaved arms compare on this machine, and the variable is
+    what a caller who cannot reach the setter needs. Nothing between this
+    struct and a benchmark exposes it today: it is constructed inside
+    `GpuHistogramBuilder.open_resident_tables`, which is reached from the
+    trainer, so without the variable the other arm would require an edit to a
+    module this lane does not own.
     """
 
     var ctx: DeviceContext
@@ -1465,6 +1705,12 @@ struct DeviceTreeTables(Movable):
     var node_capacity: Int
     var pool_capacity: Int
     var n_features: Int
+
+    var reset_on_device: Bool
+    """Which arm `begin_tree` takes. See `set_reset_on_device`."""
+
+    var packed_download: Bool
+    """Which arm `download` takes. See `set_packed_download`."""
 
     var front_dev: DeviceBuffer[DType.int32]
     var node_i_dev: DeviceBuffer[DType.int32]
@@ -1511,6 +1757,15 @@ struct DeviceTreeTables(Movable):
     # Until someone does, treat the separate buffers as free and portable
     # rather than as a wait that was removed. A design that wants fewer
     # drains has to stage fewer times, not stage into more places.
+    #
+    # The tables-reset lane took that last sentence literally, and these five
+    # buffers are consequently **no longer on the default path**. `begin_tree`
+    # now writes the reset with a kernel from three scalars and stages
+    # nothing; `set_reset_on_device(False)` is what puts these back, and it is
+    # the arm a benchmark holds against the kernel. `stage_frontier` still
+    # uses `stage_front`, `stage_slot` and `stage_ctr` unconditionally, since
+    # it uploads an arbitrary frontier a test invented rather than one a
+    # scalar describes, so none of these allocations became dead.
     var stage_front: HostBuffer[DType.int32]
     var stage_node_i: HostBuffer[DType.int32]
     var stage_node_f: HostBuffer[DType.float32]
@@ -1522,6 +1777,27 @@ struct DeviceTreeTables(Movable):
     var host_ctr: HostBuffer[DType.int32]
     var host_slot: HostBuffer[DType.int32]
     var host_order: HostBuffer[DType.int32]
+
+    # The packed download: one device buffer holding all six tables end to
+    # end, and one pinned host buffer to receive it. The six host buffers
+    # above stay, and stay the only thing the decode reads: the packed arm
+    # scatters this buffer back into them on the host and then runs exactly
+    # the decode the six-copy arm runs, so a snapshot cannot depend on which
+    # arm produced it. See `_fetch_packed`.
+    var pack_dev: DeviceBuffer[DType.int32]
+    var host_pack: HostBuffer[DType.int32]
+
+    # Where each table starts in the packed buffer. Computed once here and
+    # handed to the kernel as launch arguments, so the concatenation and the
+    # host's disassembly of it read the same numbers rather than two copies
+    # of the same prefix sum. `pack_words` is the total and the last region
+    # runs to it.
+    var pack_off_node_i: Int
+    var pack_off_node_f: Int
+    var pack_off_ctr: Int
+    var pack_off_slot: Int
+    var pack_off_order: Int
+    var pack_words: Int
 
     def __init__(
         out self,
@@ -1560,6 +1836,28 @@ struct DeviceTreeTables(Movable):
         # `GpuHistogramBuilder.open_resident` already sizes its pool for.
         self.pool_capacity = num_leaves
         self.n_features = n_features
+        # Both arms default to the device form, and each variable can only
+        # move it back to the pre-lane form, which is the one direction that
+        # is always safe: an unset variable, and a variable set to anything
+        # unrecognized, land on the default. Spelled as an equality against
+        # "0" for the reason `MOJOTREES_GPU_SPLIT_RESIDENT` is. See
+        # `set_reset_on_device` and `set_packed_download`.
+        self.reset_on_device = getenv("MOJOTREES_GPU_TABLE_RESET") != "0"
+        self.packed_download = getenv("MOJOTREES_GPU_PACKED_DOWNLOAD") != "0"
+
+        # The packed download's layout. One prefix sum, here, over the same
+        # six regions in the same order `_pack_tables_kernel` writes them and
+        # `_fetch_packed` reads them.
+        self.pack_off_node_i = self.leaf_capacity * FRONT_WORDS
+        self.pack_off_node_f = (
+            self.pack_off_node_i + self.node_capacity * TN_IWORDS
+        )
+        self.pack_off_ctr = (
+            self.pack_off_node_f + self.node_capacity * TN_FWORDS
+        )
+        self.pack_off_slot = self.pack_off_ctr + CTR_WORDS
+        self.pack_off_order = self.pack_off_slot + self.pool_capacity
+        self.pack_words = self.pack_off_order + self.leaf_capacity
 
         self.front_dev = self.ctx.enqueue_create_buffer[DType.int32](
             self.leaf_capacity * FRONT_WORDS
@@ -1617,6 +1915,12 @@ struct DeviceTreeTables(Movable):
         self.host_order = self.ctx.enqueue_create_host_buffer[DType.int32](
             self.leaf_capacity
         )
+        self.pack_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            self.pack_words
+        )
+        self.host_pack = self.ctx.enqueue_create_host_buffer[DType.int32](
+            self.pack_words
+        )
 
         # The per-feature missing-bin table, uploaded once. -1 is the "this
         # feature has no missing bin" value every other routing site in the
@@ -1632,6 +1936,128 @@ struct DeviceTreeTables(Movable):
             dst_buf=self.missing_dev, src_ptr=stage_missing.unsafe_ptr()
         )
         self.ctx.synchronize()
+
+    def set_reset_on_device(mut self, on: Bool):
+        """Whether `begin_tree` resets the five tables with a kernel or with
+        five staged uploads.
+
+        On is the device arm added by the tables-reset lane: one launch that
+        writes the frontier, both node planes, the counters and the slot pool
+        from three scalars. Off is the shape this module shipped before it,
+        which stages every word on the host and issues five `enqueue_copy`
+        calls. On Metal those five copies are five synchronous full-queue
+        drains (**measured** by disassembling the shipped runtime,
+        `docs/GPU_PORTABILITY.md` section 6.1), so the arms differ by five
+        host waits per tree and by nothing else. What one such wait costs is
+        **measured** separately and elsewhere: `docs/METAL_TIMELINE.md:550`
+        puts one blocking readback at 606 microseconds at the median, of
+        which 3.7 microseconds is the GPU moving bytes. That figure was taken
+        on a readback in a different loop and is quoted as the order of the
+        cost, not as this call's cost, which nobody has measured.
+
+        Reachable at run time rather than through a second build, and that is
+        the point rather than a convenience: this machine's device timings
+        drift several-fold between time windows, so only interleaved arms
+        compare, and an environment-only knob would have forced a two-build
+        comparison. It is the same argument `GpuActiveRows.set_row_unroll`
+        makes for the same reason.
+
+        **It cannot change a table.** Both arms write the same words to the
+        same offsets; `_reset_tables_kernel` enumerates them field by field
+        against the staging loops below. What the device arm does not do is
+        touch the pinned staging buffers, so a caller that flips this on has
+        no staging lifetime to protect and `wait` becomes a courtesy rather
+        than a requirement; see `begin_tree`.
+
+        `MOJOTREES_GPU_TABLE_RESET=0` seeds the field to the staging arm at
+        construction, for a caller that cannot reach this setter; the setter
+        wins over it, because it runs later. The variable exists only because
+        nothing between a benchmark and these tables exposes them today, and
+        an A/B that reads its arm from the environment can run one arm under
+        the other's label, which has happened once in this repository. Prefer
+        the setter.
+
+        Takes effect on the next `begin_tree`.
+        """
+        self.reset_on_device = on
+
+    def set_packed_download(mut self, on: Bool):
+        """Whether `download` brings the six tables home in one copy or in
+        six.
+
+        On is the device arm added by the tables-reset lane: a kernel
+        concatenates the six tables into one Int32 buffer, one
+        `enqueue_copy` carries it, and the host scatters it back into the
+        same six pinned buffers the other arm copies into. Off is the shape
+        this module shipped before it. On Metal the arms differ by five host
+        waits per tree, for the reason `set_reset_on_device` states, and by
+        one device launch and one host scatter of a few thousand words in the
+        other direction.
+
+        **It cannot change a snapshot.** Both arms end with the same six host
+        buffers holding the same words and then fall into the same decode,
+        which is the body of `download` below the fetch and is the only
+        reader of the table layout on this side. The float plane
+        crosses the packed buffer as its bits and is bitcast back before the
+        decode sees it, which is a reinterpretation in each direction and so
+        is exact; see `_pack_tables_kernel`.
+
+        `MOJOTREES_GPU_PACKED_DOWNLOAD=0` seeds the field to the six-copy arm
+        at construction, with the same standing and the same caveat
+        `set_reset_on_device` gives its variable.
+
+        Takes effect on the next `download`.
+        """
+        self.packed_download = on
+
+    def _enqueue_reset(
+        mut self, n_active: Int, root_slot: Int, root_value: Float32
+    ) raises:
+        """Launch the device reset. Enqueues only: no transfer, no wait.
+
+        The grid is sized from the widest of the four strided regions, since
+        every loop in the kernel is grid-strided and a thread that finds its
+        region already covered simply does not enter it. One block would also
+        be correct and is what the reduction kernels in this file use; a
+        proportional grid is used instead because this kernel has no
+        collective in it, so nothing constrains it to one threadgroup, and
+        the tables at a large leaf budget are tens of thousands of words.
+
+        `PICK_THREADS` as the block width for no reason beyond consistency
+        with the rest of the file: this kernel has no `block.max` and no
+        `block.min`, so the width is not load bearing here.
+        """
+        var widest = self.leaf_capacity * FRONT_WORDS
+        if self.node_capacity > widest:
+            widest = self.node_capacity
+        if self.node_capacity * TN_FWORDS > widest:
+            widest = self.node_capacity * TN_FWORDS
+        if self.pool_capacity > widest:
+            widest = self.pool_capacity
+        var blocks = (widest + PICK_THREADS - 1) // PICK_THREADS
+        if blocks < 1:
+            blocks = 1
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_reset_tables_kernel](
+                self.front_dev.unsafe_ptr(),
+                self.node_i_dev.unsafe_ptr(),
+                self.node_f_dev.unsafe_ptr(),
+                self.ctr_dev.unsafe_ptr(),
+                self.slot_dev.unsafe_ptr(),
+                Int32(n_active),
+                Int32(root_slot),
+                root_value,
+                Int32(self.leaf_capacity),
+                Int32(self.node_capacity),
+                Int32(self.pool_capacity),
+                grid_dim=blocks,
+                block_dim=PICK_THREADS,
+            )
 
     def begin_tree(
         mut self,
@@ -1658,31 +2084,55 @@ struct DeviceTreeTables(Movable):
         keeps this module from having to know which record slot the root
         used.
 
-        Everything is staged into pinned memory and copied rather than
-        written through a `map_to_host` mapping, because a mapping blocks
-        until the device is idle and a copy does not. Each of the five tables
-        has its own staging buffer, so all five copies are enqueued before
-        anything waits and the whole reset costs one synchronization. The
-        earlier form shared one staging buffer and had to drain between
-        copies, which is both five times the waits and, when a drain was
-        omitted, a frontier row silently overwritten by node-table words.
+        **Two arms, chosen by `set_reset_on_device`, writing the same words.**
+        The default arm is one kernel launch: every byte this reset writes is
+        a constant or a function of `n_active`, `root_slot` and `root_value`,
+        so the three scalars go across as launch arguments and the device
+        fills the tables. It transfers nothing and therefore waits for
+        nothing. `_reset_tables_kernel` enumerates the fields against the
+        staging loops below, which are the other arm.
 
-        `wait` is the one synchronization this call makes, and a device-owned
-        growth loop passes False to remove it. That is safe under exactly one
-        condition, which is worth stating rather than assuming: the staging
-        buffers must not be refilled before the copies reading them have
-        finished, and the only thing that refills them is the *next*
-        `begin_tree`. A caller that downloads the tree at the end of every
-        tree therefore already has a synchronization between any two
-        `begin_tree` calls, and the wait here is redundant for it. A caller
-        that does not must leave `wait` alone. It defaults to True so every
-        existing caller, the test file included, keeps the behavior it was
-        written against.
+        The other arm, `set_reset_on_device(False)`, is what this module
+        shipped before: everything is staged into pinned memory and copied
+        rather than written through a `map_to_host` mapping, because a
+        mapping blocks until the device is idle and a copy does not. Each of
+        the five tables has its own staging buffer, so all five copies are
+        enqueued before anything waits. On Metal that is five host waits and
+        not one, because `enqueue_copy` there is a synchronous full-queue
+        drain in both directions (`docs/GPU_PORTABILITY.md` section 6.1);
+        removing those five is what the device arm is for.
+
+        The two argument checks above stay on the host in both arms. A kernel
+        cannot raise, so a negative row count or an out-of-range root slot has
+        to be refused before the launch or not at all, and "not at all" would
+        mean a frontier pointing at a pool slot that does not exist.
+
+        `wait` means the same thing in both arms -- the reset has landed on
+        the device when this returns -- but it protects something only in the
+        staging arm, and a device-owned growth loop passes False to remove it.
+        In the staging arm that is safe under exactly one condition, which is
+        worth stating rather than assuming: the staging buffers must not be
+        refilled before the copies reading them have finished, and the only
+        thing that refills them is the *next* `begin_tree`. A caller that
+        downloads the tree at the end of every tree therefore already has a
+        synchronization between any two `begin_tree` calls, and the wait here
+        is redundant for it. A caller that does not must leave `wait` alone.
+        In the device arm there is no staging buffer and therefore no
+        lifetime to protect: the launch is ordered against everything else on
+        the same in-order queue, so `wait=False` is unconditionally safe
+        there. It defaults to True so every existing caller, the test file
+        included, keeps the behavior it was written against.
         """
         if n_active < 0:
             raise Error("active row count must be nonnegative")
         if root_slot < 0 or root_slot >= self.pool_capacity:
             raise Error("root histogram slot out of range")
+
+        if self.reset_on_device:
+            self._enqueue_reset(n_active, root_slot, root_value)
+            if wait:
+                self.ctx.synchronize()
+            return
 
         var fi = self.stage_front.unsafe_ptr()
         for i in range(self.leaf_capacity * FRONT_WORDS):
@@ -2066,13 +2516,11 @@ struct DeviceTreeTables(Movable):
                 block_dim=PICK_THREADS,
             )
 
-    def download(mut self) raises -> TreeTablesSnapshot:
-        """Copy every table home and decode it. One host synchronization.
-
-        A wired caller would do this once per tree. A test does it once per
-        step, which is the opposite of the point and is exactly why the
-        measurement in the module docstring cannot be taken from a test run.
-        """
+    def _fetch_six(mut self) raises:
+        """Bring the six tables home in six copies, the shape this module
+        shipped with. One `enqueue_copy` per table into its own pinned
+        buffer, which on Metal is six full-queue drains and not one; see
+        `set_packed_download`."""
         self.ctx.enqueue_copy(
             dst_ptr=self.host_front.unsafe_ptr(), src_buf=self.front_dev
         )
@@ -2091,7 +2539,108 @@ struct DeviceTreeTables(Movable):
         self.ctx.enqueue_copy(
             dst_ptr=self.host_order.unsafe_ptr(), src_buf=self.order_dev
         )
-        self.ctx.synchronize()
+
+    def _fetch_packed(mut self) raises:
+        """Concatenate the six tables on the device, copy once, and scatter
+        the result back into the same six pinned buffers `_fetch_six` fills.
+
+        The scatter is what keeps the two arms honest. It would be faster to
+        decode straight out of the packed buffer, and it would also be a
+        second reader of the table layout: two decoders that agree until
+        someone adds a word to a row. Instead the packed arm's only extra
+        work on the host is a word-for-word copy into the buffers the one
+        decoder already reads, which is a few thousand stores against a drain
+        whose order is a **measured** hundreds of microseconds
+        (`docs/METAL_TIMELINE.md:550`). Neither side of that comparison was
+        measured here. The float plane is bitcast back in this loop, which is
+        the exact inverse of the bitcast the kernel made and so restores the
+        same bits.
+
+        The launch is enqueued before the copy and on the same in-order
+        queue, so the copy reads a buffer the kernel has finished writing
+        with no fence of its own.
+        """
+        var blocks = (self.pack_words + PICK_THREADS - 1) // PICK_THREADS
+        if blocks < 1:
+            blocks = 1
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_pack_tables_kernel](
+                self.pack_dev.unsafe_ptr(),
+                self.front_dev.unsafe_ptr(),
+                self.node_i_dev.unsafe_ptr(),
+                self.node_f_dev.unsafe_ptr(),
+                self.ctr_dev.unsafe_ptr(),
+                self.slot_dev.unsafe_ptr(),
+                self.order_dev.unsafe_ptr(),
+                Int32(self.pack_off_node_i),
+                Int32(self.pack_off_node_f),
+                Int32(self.pack_off_ctr),
+                Int32(self.pack_off_slot),
+                Int32(self.pack_off_order),
+                Int32(self.pack_words),
+                grid_dim=blocks,
+                block_dim=PICK_THREADS,
+            )
+            self.ctx.enqueue_copy(
+                dst_ptr=self.host_pack.unsafe_ptr(), src_buf=self.pack_dev
+            )
+            self.ctx.synchronize()
+
+            var p = self.host_pack.unsafe_ptr()
+            var f = self.host_front.unsafe_ptr()
+            for i in range(self.pack_off_node_i):
+                f.unsafe_store(i, p.unsafe_load(i))
+            var ni = self.host_node_i.unsafe_ptr()
+            for i in range(self.node_capacity * TN_IWORDS):
+                ni.unsafe_store(i, p.unsafe_load(self.pack_off_node_i + i))
+            var nf = self.host_node_f.unsafe_ptr()
+            for i in range(self.node_capacity * TN_FWORDS):
+                nf.unsafe_store(
+                    i,
+                    bitcast[DType.float32, 1](
+                        p.unsafe_load(self.pack_off_node_f + i)
+                    ),
+                )
+            var c = self.host_ctr.unsafe_ptr()
+            for i in range(CTR_WORDS):
+                c.unsafe_store(i, p.unsafe_load(self.pack_off_ctr + i))
+            var s = self.host_slot.unsafe_ptr()
+            for i in range(self.pool_capacity):
+                s.unsafe_store(i, p.unsafe_load(self.pack_off_slot + i))
+            var o = self.host_order.unsafe_ptr()
+            for i in range(self.leaf_capacity):
+                o.unsafe_store(i, p.unsafe_load(self.pack_off_order + i))
+
+    def download(mut self) raises -> TreeTablesSnapshot:
+        """Copy every table home and decode it. One host round trip.
+
+        A wired caller would do this once per tree. A test does it once per
+        step, which is the opposite of the point and is exactly why the
+        measurement in the module docstring cannot be taken from a test run.
+
+        The round trip is one in both arms and is not what
+        `set_packed_download` moves; what it moves is the number of *copies*
+        that round trip is made of, which on Metal is the number of host
+        waits, since a copy there drains the queue. Six became one. The
+        `synchronize` afterwards stays in both arms even though it is free on
+        Metal, because it is what keeps this correct on a backend where a
+        copy really is asynchronous.
+
+        Everything below the fetch is common to both arms deliberately: the
+        packed arm ends by scattering into the same six pinned buffers the
+        six-copy arm copies into, so the decode has one implementation and a
+        snapshot cannot depend on which arm produced it.
+        """
+        if self.packed_download:
+            self._fetch_packed()
+        else:
+            self._fetch_six()
+            self.ctx.synchronize()
 
         var out = TreeTablesSnapshot()
         var c = self.host_ctr.unsafe_ptr()
