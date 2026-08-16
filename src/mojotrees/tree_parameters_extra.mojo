@@ -159,6 +159,22 @@ a second one would be a cycle. The two constants are asserted equal in
 restatement from drifting.
 """
 
+comptime DEFAULT_LEAF_ESTIMATION_ITERATIONS = 1
+"""How many Newton steps a leaf's value is the result of.
+
+**This project's default is 1 and stays 1**, which is LightGBM's behavior and
+the behavior every fit in this repository has ever had: a leaf emits
+`-T(G) / (H + lambda_l2)` evaluated once, at the raw scores the tree was grown
+from.
+
+CatBoost defaults some objectives to more than one step. Those numbers are
+recorded in `boosting.catboost_leaf_estimation_iterations`, which lives there
+rather than here because it is keyed on an objective code and this module must
+not import the objective registry. They are a record of what CatBoost does,
+for a caller that asks for CatBoost's settings by name; nothing in this
+package reads them, and **this default does not move because of them**.
+"""
+
 comptime MONOTONE_BASIC = 0
 comptime MONOTONE_INTERMEDIATE = 1
 comptime MONOTONE_ADVANCED = 2
@@ -1392,6 +1408,16 @@ struct ExtraTreeParams(Copyable, Movable):
     var quant_train_renew_leaf: Bool
     var stochastic_rounding: Bool
 
+    # CatBoost's `leaf_estimation_iterations`, the second name on this bundle
+    # that is CatBoost's rather than LightGBM's. **Default 1, and 1 is
+    # LightGBM's and this project's behavior**: one Newton step per leaf, taken
+    # at the raw scores the tree was grown from, which is exactly what the
+    # grower already wrote into `Tree.value`. Above 1 the trainer re-evaluates
+    # the leaf's rows at the value the leaf currently holds and takes another
+    # step (`boosting._estimate_leaf_values`); iteration 1 is never recomputed,
+    # so 1 and "absent" are the same code path and the same bits.
+    var leaf_estimation_iterations: Int
+
     def __init__(out self):
         self.min_gain_to_split = 0.0
         self.max_delta_step = 0.0
@@ -1409,14 +1435,32 @@ struct ExtraTreeParams(Copyable, Movable):
         self.num_grad_quant_bins = DEFAULT_NUM_GRAD_QUANT_BINS
         self.quant_train_renew_leaf = False
         self.stochastic_rounding = True
+        self.leaf_estimation_iterations = DEFAULT_LEAF_ESTIMATION_ITERATIONS
 
     @staticmethod
     def default() -> ExtraTreeParams:
         return ExtraTreeParams()
 
     def is_active(self) -> Bool:
-        """Whether anything here would change a fit. False for the defaults,
-        so a grower can test this once per tree and take its existing path."""
+        """Whether anything here would change a **split search**. False for the
+        defaults, so a grower can test this once per tree and take its existing
+        path.
+
+        `leaf_estimation_iterations` is deliberately **not** in this test, and
+        that is the one exclusion. Every consumer of this predicate is a split
+        search or a search-eligibility gate -- `split.find_best_split` gates its
+        per-feature cost pass on it, `train_gpu._check_device_search_supported`
+        refuses the device scan on it, `gpu_tree_tables` refuses the resident
+        tree on it -- and extra Newton steps happen *after* the structure is
+        fixed, from the trainer, touching no candidate and no gain. Folding it
+        in here would send a `leaf_estimation_iterations > 1` fit down
+        `split._feature_gain`'s active path, where `passes_min_gain` rejects a
+        gain of exactly 0.0 that the inactive path lets through: a split
+        decision moved for a reason that has nothing to do with leaf values.
+        `leaf_estimation_active` below is the test for this one, and
+        `boosting._check_leaf_estimation_supported` is what keeps a trainer
+        that does not implement it from ignoring it.
+        """
         return (
             self.min_gain_to_split > 0.0
             or self.max_delta_step > 0.0
@@ -1434,6 +1478,17 @@ struct ExtraTreeParams(Copyable, Movable):
         to one candidate's gain. 0.0 at the default, where no draw is taken.
         """
         return self.random_strength * self.random_score_scale
+
+    def leaf_estimation_active(self) -> Bool:
+        """Whether any leaf value is the result of more than one Newton step.
+
+        False at the default of 1, where `boosting._estimate_leaf_values`
+        returns before it reads a row and the leaf keeps exactly the value the
+        grower wrote. That early return is the whole of the "1 moves nothing"
+        guarantee: iteration 1 is never recomputed, so there is no second route
+        to the first value that could round differently from the histogram's.
+        """
+        return self.leaf_estimation_iterations > 1
 
     def needs_leaf_finish(self) -> Bool:
         """Whether `finish_leaf_output` would move a leaf's value.
@@ -1501,6 +1556,7 @@ struct ExtraTreeParams(Copyable, Movable):
             raise Error("monotone_penalty must be a finite nonnegative number")
         self.check_random_strength()
         self.check_quantized_grad()
+        self.check_leaf_estimation()
         if self.monotone_method != MONOTONE_BASIC:
             raise Error(
                 "monotone_constraints_method '",
@@ -1575,6 +1631,50 @@ struct ExtraTreeParams(Copyable, Movable):
                 "grad, n_rows, iteration * learning_rate) and set it on"
                 " ExtraTreeParams.random_score_scale, which makes the draw"
                 " live for tree.grow_tree"
+            )
+
+    def check_leaf_estimation(self) raises:
+        """Range-check `leaf_estimation_iterations`, and refuse the one
+        combination whose repetition is not idempotent.
+
+        Runs whether or not the value is above 1, so a nonsense count is
+        reported where it was set rather than where it is first used, which is
+        the rule the two checks above state and this mirrors.
+
+        **`path_smooth` is refused beside it.** The tree stores the *finished*
+        leaf value -- capped, smoothed, and clamped -- and an extra iteration
+        has to start from the value the leaf actually holds, because that is
+        the value whose derivatives it is about to evaluate. The cap and the
+        monotone clamp survive that: both are projections onto a fixed set, so
+        applying either to an already-projected value is the identity, and
+        re-applying them per iteration keeps every intermediate leaf value
+        inside the cap and inside its monotone interval. Path smoothing is not
+        a projection. It is the affine contraction
+        `v -> v*w/(w+1) + parent/(w+1)` with `w/(w+1) < 1`, so applying it once
+        per iteration drives the leaf geometrically toward its parent's output
+        and `leaf_estimation_iterations=10` would return a leaf that is mostly
+        its parent, for reasons that have nothing to do with the loss. There is
+        no correct place to put it either: smoothing only the last iteration
+        would evaluate every earlier derivative at a value the model will never
+        hold. So the combination is reported instead of picking one of two
+        wrong answers.
+        """
+        if self.leaf_estimation_iterations < 1:
+            raise Error(
+                "leaf_estimation_iterations must be at least 1 (1 is the"
+                " default and is one Newton step per leaf, which is"
+                " LightGBM's behavior), got ",
+                self.leaf_estimation_iterations,
+            )
+        if self.leaf_estimation_active() and self.path_smooth > 0.0:
+            raise Error(
+                "leaf_estimation_iterations > 1 and path_smooth > 0 cannot"
+                " both be set. A leaf carries its finished value, so each"
+                " extra iteration would smooth an already smoothed value and"
+                " the leaf would converge to its parent's output rather than"
+                " to the loss minimizer. max_delta_step and the monotone"
+                " clamp do compose, because both are projections and applying"
+                " one twice is applying it once"
             )
 
     def check_quantized_grad(self) raises:

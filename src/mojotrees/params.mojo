@@ -79,7 +79,7 @@ comptime SUPPORTED_KEYS = String(
     " data_sample_strategy, max_bin, alpha, fair_c,"
     " tweedie_variance_power, device, use_missing,"
     " use_quantized_grad, num_grad_quant_bins, quant_train_renew_leaf,"
-    " stochastic_rounding"
+    " stochastic_rounding, leaf_estimation_iterations"
 )
 
 # Parameters that name a real LightGBM feature this parser does not cover,
@@ -558,6 +558,39 @@ def parse_params(spec: String) raises -> TrainConfig:
         # build, and a split search cannot reconstruct it from a histogram.
         elif key == "random_strength":
             config.booster.tree.extra.random_strength = _parse_f64(key, value)
+        # CatBoost's `leaf_estimation_iterations`, the second name here that
+        # is not LightGBM's. 1, the default, is LightGBM's behavior exactly:
+        # one Newton step per leaf. It parses and is range-checked, so a
+        # configuration that spells out the setting mojotrees matches ports
+        # across unchanged.
+        #
+        # A value above 1 parses and is then refused, by the same
+        # refuse-rather-than-ignore rule `random_strength` and
+        # `use_quantized_grad` take, for a reason particular to this surface:
+        # a parameter string is the entry point for `cli/`, for every
+        # `bindings/_mojotrees.mojo` fit including the sparse, custom,
+        # multiclass, ranking and GPU ones, and for the sklearn wrapper, while
+        # `boosting._estimate_leaf_values` is reached only from the dense
+        # single-output CPU trainers. A string accepted here would therefore
+        # be honored by some fits and silently dropped by most, which is worse
+        # than either. The Mojo API route named in the message is exact and is
+        # not refused.
+        elif key == "leaf_estimation_iterations":
+            var iters = _parse_int(key, value)
+            if iters > 1:
+                raise Error(
+                    "leaf_estimation_iterations > 1 cannot be set from a"
+                    " parameter string: this string reaches the sparse,"
+                    " custom-objective, multiclass, ranking and GPU trainers,"
+                    " none of which implement extra Newton steps, so it would"
+                    " be honored by some fits and dropped by others. Set it"
+                    " from the Mojo API instead, on"
+                    " TreeParams.extra.leaf_estimation_iterations, which"
+                    " boosting.train, boosting.train_more and"
+                    " boosting.train_with_valid honor and every other trainer"
+                    " refuses by name"
+                )
+            config.booster.tree.extra.leaf_estimation_iterations = iters
         # LightGBM's quantized-training family. The four names and no others:
         # LightGBM has no scale-rule, seed, or accumulator-width parameter,
         # and this surface is exactly LightGBM's, so mojotrees's three extra
