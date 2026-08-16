@@ -977,6 +977,7 @@ def _hist_full(
     hess: List[Float64],
     features: List[Int],
     columns: List[Int],
+    const_hessian: Bool = False,
 ) raises:
     """Accumulate every row into `hist`, which is always per feature.
 
@@ -986,11 +987,29 @@ def _hist_full(
     bundling -- and the result is expanded back into per-feature shape. The
     two matrices are spelled out rather than selected through a reference,
     because a `BinnedMatrix` chosen by a conditional would be copied.
+
+    `const_hessian` is the caller's declaration that every entry of `hess` is
+    exactly `histogram.CONSTANT_HESSIAN`, which is a property of the objective
+    and never of the array; `histogram.objective_has_constant_hessian` is the
+    predicate that answers it and this grower does not evaluate it, because
+    the two things that falsify it -- sample weights and GOSS -- are visible
+    at the trainer and not here. It is passed straight through to the builder,
+    which produces a bit-identical histogram either way, so it changes how much
+    memory traffic the accumulation costs and nothing a consumer can read.
+
+    It reaches the builder on both arms, bundled and not. The bundled arm is
+    the one worth stating explicitly: the elision happens inside the
+    accumulation over the bundled matrix and the hessian plane is refilled from
+    the count before the builder returns, so `scratch` holds three complete
+    planes by the time `_expand_bundled` reads it and the expansion sees
+    exactly what it would have seen on the three-plane path.
     """
     if not bundled.active:
-        build_histogram_into(hist, data, grad, hess, features)
+        build_histogram_into(hist, data, grad, hess, features, const_hessian)
         return
-    build_histogram_into(scratch, bundled.data, grad, hess, columns)
+    build_histogram_into(
+        scratch, bundled.data, grad, hess, columns, const_hessian
+    )
     _expand_bundled(hist, scratch, bundled, features)
 
 
@@ -1007,6 +1026,7 @@ def _hist_subset(
     count: Int,
     features: List[Int],
     columns: List[Int],
+    const_hessian: Bool = False,
 ) raises:
     """`_hist_full` for a row subset. Row ids index the original matrix and the
     bundled one identically, because bundling rearranges columns and never
@@ -1020,14 +1040,22 @@ def _hist_subset(
     pass writes `[0, 2 * count)` before the accumulation pass reads any of it,
     and `ensure_pair_capacity` only ever grows the buffer. So the histogram
     that comes out is the one the allocating form produces, cell for cell.
+
+    `const_hessian` carries the same declaration `_hist_full` documents, with
+    the same guarantee: the builder produces a bit-identical histogram whether
+    it is set or not, and setting it wrongly produces a wrong hessian plane, so
+    it has to come from the objective at the trainer rather than be guessed
+    anywhere on this path.
     """
     if not bundled.active:
         build_histogram_subset_into_scratch(
-            hist, pairs, data, grad, hess, rows, start, count, features
+            hist, pairs, data, grad, hess, rows, start, count, features,
+            const_hessian,
         )
         return
     build_histogram_subset_into_scratch(
-        scratch, pairs, bundled.data, grad, hess, rows, start, count, columns
+        scratch, pairs, bundled.data, grad, hess, rows, start, count, columns,
+        const_hessian,
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -1040,6 +1068,7 @@ def grow_tree(
     bag: List[Int] = [],
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
+    const_hessian: Bool = False,
 ) raises -> Tree:
     """Grow one tree with no CEGB ledger: `grow_tree_with_cegb` with an inert
     one.
@@ -1056,10 +1085,14 @@ def grow_tree(
 
     A `mut` argument cannot be defaulted, which is why this is a second entry
     point rather than a defaulted parameter.
+
+    `const_hessian` is forwarded unchanged; see `grow_tree_leaves_profiled`,
+    which is where the whole family's declaration is documented.
     """
     var ledger = CegbLedger.none()
     return grow_tree_with_cegb(
-        data, grad, hess, params, ledger, bag, tree_index, bundling
+        data, grad, hess, params, ledger, bag, tree_index, bundling,
+        const_hessian,
     )
 
 
@@ -1072,6 +1105,7 @@ def grow_tree_with_cegb(
     bag: List[Int] = [],
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
+    const_hessian: Bool = False,
 ) raises -> Tree:
     """`grow_tree_leaves_profiled` with a profile, a leaf membership, and a
     scratch of its own, the profile reported per tree.
@@ -1107,7 +1141,8 @@ def grow_tree_with_cegb(
     """
     var profile = PhaseProfile.from_env(SCOPE_TREE, String("grow_tree"))
     var tree = grow_tree_profiled(
-        profile, data, grad, hess, params, ledger, bag, tree_index, bundling
+        profile, data, grad, hess, params, ledger, bag, tree_index, bundling,
+        const_hessian,
     )
     profile.print_report()
     return tree^
@@ -1123,6 +1158,7 @@ def grow_tree_profiled(
     bag: List[Int] = [],
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
+    const_hessian: Bool = False,
 ) raises -> Tree:
     """`grow_tree_leaves_profiled` with a caller-owned profile, and a leaf
     membership and scratch of its own.
@@ -1132,6 +1168,8 @@ def grow_tree_profiled(
     The membership is grown either way and dropped when this returns; the
     scratch is one pool construction and one gather buffer per call, which is
     what growth did before the scratch was threaded at all.
+
+    `const_hessian` is forwarded unchanged; see `grow_tree_leaves_profiled`.
     """
     var leaves = LeafMembership()
     var scratch = GrowScratch(data.n_features, data.n_bins)
@@ -1147,6 +1185,7 @@ def grow_tree_profiled(
         bag,
         tree_index,
         bundling,
+        const_hessian,
     )
 
 
@@ -1161,6 +1200,7 @@ def grow_tree_leaves(
     bag: List[Int] = [],
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
+    const_hessian: Bool = False,
 ) raises -> Tree:
     """`grow_tree_leaves_profiled` with a profile of its own, reported per
     tree.
@@ -1171,6 +1211,8 @@ def grow_tree_leaves(
     the profile is off, this costs one `getenv` and one bucket allocation per
     tree, and prints nothing; with it set, one `scope=tree` block is printed
     per tree.
+
+    `const_hessian` is forwarded unchanged; see `grow_tree_leaves_profiled`.
     """
     var profile = PhaseProfile.from_env(SCOPE_TREE, String("grow_tree"))
     var tree = grow_tree_leaves_profiled(
@@ -1185,6 +1227,7 @@ def grow_tree_leaves(
         bag,
         tree_index,
         bundling,
+        const_hessian,
     )
     profile.print_report()
     return tree^
@@ -1202,6 +1245,7 @@ def grow_tree_leaves_profiled(
     bag: List[Int] = [],
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
+    const_hessian: Bool = False,
 ) raises -> Tree:
     """Grow one tree, leaf-wise by default or depth-wise under
     `params.grow_policy == GROW_DEPTHWISE`.
@@ -1306,6 +1350,50 @@ def grow_tree_leaves_profiled(
     child search) is the same code either way, so a depth-wise tree enforces
     every constraint exactly as a leaf-wise one does. Forced splits still go
     first in both modes.
+
+    `const_hessian` is the caller's declaration that every entry of `hess` is
+    exactly `histogram.CONSTANT_HESSIAN`, which lets the histogram builders
+    accumulate two planes instead of three and reconstruct the hessian plane
+    from the count (see histogram.mojo's module docstring for the exactness
+    argument). It is threaded from here to every builder this grower calls and
+    to both sibling subtractions, and it is a *declaration*, not an inference:
+
+    - The predicate that answers it is
+      `histogram.objective_has_constant_hessian(objective, weighted)`, and this
+      grower is handed neither an objective code nor a weight vector, which is
+      exactly why it cannot evaluate it. It is `boosting._boost_rounds` and
+      `boosting.train_with_valid` that do, next to where they decide whether to
+      pass weights.
+    - GOSS is the case that makes the argument rather than the weights. A GOSS
+      round rescales the sampled small-gradient rows' hessians
+      (`goss.apply_goss_scaling`) and leaves the objective code untouched, so a
+      squared-error GOSS round has two hessian values and a predicate reading
+      only the objective would say the wrong thing. The trainer excludes it.
+    - Declaring it for a `hess` that is not constant produces a wrong hessian
+      plane silently, with no error and no diagnostic other than
+      `MOJOTREES_CONST_HESSIAN_VERIFY=1`.
+
+    Its default is False, so every grower call in this package that does not
+    pass it is on the path that shipped. When it is true and correct the tree
+    that comes out is byte for byte the tree the three-plane path grows, which
+    is the only claim this argument makes: it is an accounting change in the
+    accumulation loop and not an approximation.
+
+    Passing it to `subtract_histogram_into` is a separate declaration about
+    *two finished histograms* rather than about a row's hessian, and it is
+    sound here for an inductive reason worth writing down. Under a true
+    declaration every histogram this grower produces holds `Float64(count)` in
+    its hessian plane: a directly built one does by the builder's own
+    reconstruction, a bundled one does because `efb.expand_bundled_histogram`
+    only copies cells and recovers a default bin by subtracting exact integers
+    held in Float64, and a derived sibling does because the elided subtraction
+    writes `Float64(parent_count - child_count)`. The root establishes the
+    property and every node below inherits it, so both operands of every
+    subtraction here satisfy what `subtract_histogram_into` asks. Note also
+    that the two arms of that function agree even when the declaration is only
+    passed to one of them, because `Float64(a) - Float64(b)` and
+    `Float64(a - b)` are the same Float64 for integers below 2^53; the elision
+    there is a traffic decision and cannot move a bit on its own.
     """
     check_grow_policy(params.grow_policy)
     params.constraints.check_features(data.n_features)
@@ -1438,7 +1526,7 @@ def grow_tree_leaves_profiled(
         var root_hist_started = profile.clock()
         _hist_full(
             root_hist, bundle_scratch, data, bundling, grad, hess,
-            tree_features, tree_columns,
+            tree_features, tree_columns, const_hessian,
         )
         profile.note_node()
         profile.charge(
@@ -1466,6 +1554,7 @@ def grow_tree_leaves_profiled(
         _hist_subset(
             root_hist, bundle_scratch, scratch.pairs, data, bundling, grad,
             hess, bag, 0, len(bag), tree_features, tree_columns,
+            const_hessian,
         )
         profile.note_node()
         profile.charge(
@@ -1714,7 +1803,7 @@ def grow_tree_leaves_profiled(
             _hist_subset(
                 left_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, left_rows, 0, len(left_rows), tree_features,
-                tree_columns,
+                tree_columns, const_hessian,
             )
             profile.note_node()
             profile.charge(
@@ -1726,7 +1815,9 @@ def grow_tree_leaves_profiled(
                 cells=hist_cells,
             )
             var sub_started = profile.clock()
-            subtract_histogram_into(right_hist, parent_hist, left_hist)
+            subtract_histogram_into(
+                right_hist, parent_hist, left_hist, const_hessian
+            )
             # Filed at the *derived* child's size: it is that child's
             # histogram that comes out, and the point of the trick is that a
             # large sibling costs a per-cell subtraction instead of a per-row
@@ -1744,7 +1835,7 @@ def grow_tree_leaves_profiled(
             _hist_subset(
                 right_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, right_rows, 0, len(right_rows), tree_features,
-                tree_columns,
+                tree_columns, const_hessian,
             )
             profile.note_node()
             profile.charge(
@@ -1756,7 +1847,9 @@ def grow_tree_leaves_profiled(
                 cells=hist_cells,
             )
             var sub_started = profile.clock()
-            subtract_histogram_into(left_hist, parent_hist, right_hist)
+            subtract_histogram_into(
+                left_hist, parent_hist, right_hist, const_hessian
+            )
             profile.note_node()
             profile.charge(
                 PROF_SUBTRACT,

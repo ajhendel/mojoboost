@@ -123,6 +123,7 @@ from .boosting import (
     objective_renews_leaves,
     renewal_alpha,
     renewal_weights,
+    round_has_constant_hessian,
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .gpu_frontier import subtraction_builds_left
@@ -2909,6 +2910,25 @@ def train_gpu(
             objective, 1, objective_source, bagging, goss, routes_all
         )
         var builder = GpuHistogramBuilder(data)
+        # This fit's constant-hessian declaration, made once, next to where
+        # the trainer decides whether to pass weights. It holds for every
+        # round because the three things it reads do: the objective code, the
+        # weight vector, and the GOSS configuration are all arguments to this
+        # function and none of them moves inside `_train_gpu_rounds`.
+        #
+        # It is correct on both of that loop's arms. On the host-gradient arm
+        # `_fill_grad_hess` writes the constant, which is what the predicate
+        # was read off. On the device-gradient arm the derivative kernel in
+        # `gpu_objectives_native.mojo` writes `w` into `hess` in the same four
+        # objective arms and `w` is the Float32 literal 1.0 when the state
+        # carries no weights, so the two arms agree on the value as well as on
+        # the objective. Bagging restricts which rows are accumulated and does
+        # not touch a hessian, so it is not an exclusion; GOSS is, and
+        # `round_has_constant_hessian` refuses it whether or not this run
+        # would have reached the device round.
+        builder.set_constant_hessian(
+            round_has_constant_hessian(objective, sample_weight, goss)
+        )
         var life = NoLifecycle()
         return _train_gpu_rounds(
             builder,
@@ -2972,6 +2992,12 @@ def train_gpu(
         # pays the one-time costs and every later one does not.
         var fit = session.begin_fit()
         var builder = GpuHistogramBuilder(session, data)
+        # The same declaration the session-free overload makes, from the same
+        # predicate over the same three arguments. A session owns the context
+        # and not the round's numbers, so it cannot change the answer.
+        builder.set_constant_hessian(
+            round_has_constant_hessian(objective, sample_weight, goss)
+        )
         # `MOJOTREES_HYBRID_LEAVES` against this run's real facts. Reports
         # the workload-aware split resolution rather than treating AUTO as
         # the historical host default.
@@ -3098,6 +3124,14 @@ def train_custom_gpu[F: GradHessFn](
         _check_sample_weight(sample_weight, data.n_rows)
 
         var builder = GpuHistogramBuilder(data)
+        # No constant-hessian declaration on a custom objective, and the
+        # builder's default of False is what leaves the three-plane path in
+        # force. The hessians here are whatever `grad_hess` returns, from a
+        # callback this package cannot read, and `_apply_sample_weight`
+        # multiplies them by the row weight afterwards on top of that. Neither
+        # is something a predicate over an objective code could rule on, which
+        # is exactly why `objective_has_constant_hessian` returns False for
+        # `CUSTOM` and why nothing here tries to be cleverer than that.
         var life = NoLifecycle()
         return _train_custom_gpu_rounds(
             builder,
@@ -3134,6 +3168,9 @@ def train_custom_gpu[F: GradHessFn](
 
         var fit = session.begin_fit()
         var builder = GpuHistogramBuilder(session, data)
+        # No constant-hessian declaration, for the reason the session-free
+        # overload gives: a custom objective's hessians come from a caller's
+        # callback and no predicate here can rule on them.
         # A custom objective evaluates on the host, so this run's gradients
         # are host resident by construction.
         session.note_hybrid(
@@ -3575,6 +3612,15 @@ def train_multiclass_gpu(
             _SOFTMAX_OBJECTIVE, n_classes, objective_source, bagging, goss
         )
         var builder = GpuHistogramBuilder(data)
+        # No constant-hessian declaration on a softmax run, at any class
+        # count. `boosting._fill_softmax_grad_hess` and the device kernels it
+        # mirrors write `(k / (k - 1)) * p * (1 - p)`, floored, which is a
+        # function of that row's class probability, so the hessian plane is
+        # genuinely per row. `_SOFTMAX_OBJECTIVE` binds `SQUARED_ERROR` as a
+        # placeholder for the device-round eligibility question, and handing
+        # that placeholder to the predicate would read it as a regression
+        # objective and declare a guarantee no softmax round makes; nothing
+        # here does.
         var life = NoLifecycle()
         return _train_multiclass_gpu_rounds(
             builder,
@@ -3625,6 +3671,9 @@ def train_multiclass_gpu(
         )
         var fit = session.begin_fit()
         var builder = GpuHistogramBuilder(session, data)
+        # No constant-hessian declaration, for the reason the session-free
+        # overload gives: a softmax hessian varies with the row's class
+        # probability.
         session.note_hybrid(
             resolve_split_search_for(builder, params.tree, split_search)
             == SPLIT_SEARCH_DEVICE,
@@ -4050,6 +4099,16 @@ def train_gpu_with_valid(
         params.tree.monotone.check_features(data.n_features)
 
         var builder = GpuHistogramBuilder(data)
+        # The same declaration `train_gpu` makes, over the same three inputs.
+        # `_train_gpu_valid_rounds` has one arm and it is the host-gradient
+        # one, so the hessians this covers are exactly the ones
+        # `_fill_grad_hess` writes. The validation matrix is scored and never
+        # accumulated into a histogram, so neither its rows nor its labels
+        # bear on this; early stopping truncates the ensemble afterwards and
+        # likewise changes nothing about how a tree was grown.
+        builder.set_constant_hessian(
+            round_has_constant_hessian(objective, sample_weight, goss)
+        )
         if resolve_valid_scoring(valid_scoring) == VALID_SCORE_DEVICE:
             # On the builder's own context, so the validation kernels queue
             # behind the round's training kernels rather than racing them

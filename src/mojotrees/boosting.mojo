@@ -79,6 +79,7 @@ from .objective_registry import (
     objective_renews_leaves,
 )
 from .cegb import CegbLedger, check_cegb_continued_training
+from .histogram import objective_has_constant_hessian
 from .linear_tree import (
     LinearEnsemble,
     LinearParams,
@@ -604,6 +605,75 @@ def _fill_grad_hess(
     mut hess: List[Float64],
 ) raises:
     fill_grad_hess(raw, target, objective, weights, alpha, grad, hess)
+
+
+def round_has_constant_hessian(
+    objective: Int,
+    sample_weight: List[Float64],
+    goss: GossParams,
+) raises -> Bool:
+    """Whether a single-output round configured this way puts exactly
+    `histogram.CONSTANT_HESSIAN` into every entry of `hess`, so a histogram
+    builder may be told to stop accumulating that plane.
+
+    This is the trainers' binding of
+    `histogram.objective_has_constant_hessian`, and the reason it exists as a
+    function rather than as an expression repeated at each round loop is that
+    it is a **safety predicate**: an overinclusive answer produces a silently
+    wrong hessian plane in the histograms a fit's splits are chosen from, with
+    no exception raised and no metric moved far enough to notice. One
+    definition, used by the CPU trainers here and by the GPU trainers in
+    `train_gpu.mojo`, is one thing to review and one thing to change if an
+    objective's derivatives ever move.
+
+    Three exclusions, in the order they bite:
+
+    - **Sample weights.** `_fill_grad_hess_into` ends the row body of every
+      constant-hessian arm with `hp.unsafe_store(r, w)`, where `w` is
+      `weights[r]` when the fit is weighted, so the hessian *is* the weight and
+      a weighted fit has a per-row hessian by construction. The device kernel
+      in `gpu_objectives_native.mojo` writes the same `w` in the same arms, so
+      this holds on both backends. `len(sample_weight) > 0` is the whole test
+      at this level because a class weight, `scale_pos_weight`, and
+      `is_unbalance` are all expanded into an ordinary per-row `sample_weight`
+      by `class_weight.mojo` before any trainer here is called; nothing reaches
+      these loops as a weight that is not in this list.
+    - **GOSS.** `goss.apply_goss_scaling` multiplies the sampled small-gradient
+      rows' hessians by the amplification factor and leaves the top rows at
+      1.0, so a GOSS round holds two distinct hessian values under an objective
+      whose code says otherwise. That is invisible to
+      `objective_has_constant_hessian`, which sees only the objective, and it is
+      the reason the declaration has to be made here. `goss.enabled` is used
+      rather than `goss.active(round, learning_rate)`: a configured GOSS run has
+      warmup rounds during which nothing is rescaled and the hessians really
+      are constant, but the declaration these trainers make is held for a whole
+      fit (on the GPU it is builder state set once), so a run that will rescale
+      on any round must be excluded on all of them. That costs the
+      specialization on the warmup rounds of a GOSS fit and buys a declaration
+      that cannot go stale part way through a loop.
+    - Every objective whose curvature depends on the raw score or the label,
+      which `objective_has_constant_hessian` itself rejects. MAPE is the one
+      worth naming, because it is the near miss: it is L1 scaled by
+      `1 / max(1, |y|)`, so it stores a *label-dependent* hessian even
+      unweighted, and it is excluded there for exactly that reason.
+
+    Row bagging is deliberately **not** an exclusion, and that is the one
+    judgment in this function rather than a transcription. A bag restricts
+    which rows are accumulated; it does not touch `hess`, so every row a bagged
+    histogram visits still carries 1.0 and the reconstruction from the count is
+    the same integer it would have been. Balanced class bagging
+    (`sampling.refresh_class_bag`) is a different draw of the same kind and is
+    likewise not an exclusion. If either sampler ever grew a per-row weight,
+    this reasoning would fail and this is where it would have to be revisited.
+
+    A custom objective is excluded by `objective_has_constant_hessian`
+    returning False for `CUSTOM`, but no trainer should rely on that alone: the
+    callback's hessians are whatever the caller returns, and
+    `train_custom`/`train_custom_gpu` never call this at all.
+    """
+    if goss.enabled:
+        return False
+    return objective_has_constant_hessian(objective, len(sample_weight) > 0)
 
 
 def _mean_loss(
@@ -1317,6 +1387,18 @@ def _boost_rounds(
     var scratch = GrowScratch(data.n_features, data.n_bins)
     var leaves = LeafMembership()
     var by_leaf = _leaf_score_update_enabled()
+    # Whether every entry of `hess` below is exactly 1.0 on every round, which
+    # is what lets the histogram builders accumulate two planes instead of
+    # three and rebuild the hessian plane from the count (histogram.mojo).
+    # Evaluated once rather than per round because nothing it reads moves
+    # inside the loop: the objective, the weight vector, and the GOSS
+    # configuration are fixed for the whole fit.
+    # `round_has_constant_hessian` carries the exclusions, including why row
+    # bagging is not one of them. The trees are byte for byte the trees this
+    # loop grew before the declaration existed.
+    var const_hessian = round_has_constant_hessian(
+        objective, sample_weight, goss
+    )
     for i in range(params.n_estimators):
         var round = round_offset + i
         # The round's wall clock is taken in two brackets, before the tree and
@@ -1354,6 +1436,7 @@ def _boost_rounds(
             bag,
             round,
             bundling,
+            const_hessian,
         )
         var post_started = profile.clock()
         if renews:
@@ -1655,6 +1738,13 @@ def train_with_valid(
     var scratch = GrowScratch(data.n_features, data.n_bins)
     var leaves = LeafMembership()
     var by_leaf = _leaf_score_update_enabled()
+    # The same declaration `_boost_rounds` makes, from the same predicate and
+    # the same three inputs. Early stopping changes how many of these trees
+    # survive and nothing about how any one of them is grown, so it has no
+    # bearing on it.
+    var const_hessian = round_has_constant_hessian(
+        objective, sample_weight, goss
+    )
     for i in range(params.n_estimators):
         if balanced:
             refresh_class_bag(bag, class_bagging, target, i)
@@ -1675,6 +1765,7 @@ def train_with_valid(
             bag,
             i,
             bundling,
+            const_hessian,
         )
         if renews:
             _renew_leaf_values(
@@ -2048,6 +2139,15 @@ def _boost_rounds_multiclass(
             apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
+            #
+            # No constant-hessian declaration here, and its absence is
+            # deliberate rather than an omission. `_fill_softmax_grad_hess`
+            # writes `(k / (k - 1)) * p * (1 - p)`, floored, which varies
+            # per row with that row's class probability, so a softmax
+            # hessian is not constant at any class count and is not
+            # constant on the first round either, where every probability
+            # is equal but the value is not 1.0. The GOSS rescale on the
+            # line above would break the guarantee a second time.
             var tree = grow_tree_leaves(
                 leaves,
                 ledger,
@@ -2367,6 +2467,15 @@ def train_multiclass_with_valid(
             apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
+            #
+            # No constant-hessian declaration here, and its absence is
+            # deliberate rather than an omission. `_fill_softmax_grad_hess`
+            # writes `(k / (k - 1)) * p * (1 - p)`, floored, which varies
+            # per row with that row's class probability, so a softmax
+            # hessian is not constant at any class count and is not
+            # constant on the first round either, where every probability
+            # is equal but the value is not 1.0. The GOSS rescale on the
+            # line above would break the guarantee a second time.
             var tree = grow_tree_leaves(
                 leaves,
                 ledger,

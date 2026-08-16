@@ -133,6 +133,18 @@ the hessian plane entirely and the plane is refilled from the count at the end
 of the pass, so the assembled `Histogram` still presents `grad`, `hess` and
 `count` and no consumer changes.
 
+The declaration is made in exactly one place per backend, and both go through
+`boosting.round_has_constant_hessian`, which is where the exclusions this
+predicate cannot see (GOSS above all) are applied. On the CPU it travels as
+the `const_hessian` argument of `tree.grow_tree_leaves_profiled` and its
+sibling entry points, down through `tree._hist_full` and `tree._hist_subset`
+to the builders here and to the sibling subtraction. On the device it is
+builder state, set once per fit with
+`GpuHistogramBuilder.set_constant_hessian`. Every other trainer in the
+package -- multiclass, custom objectives, DART, random forest, the sparse and
+distributed paths -- leaves the argument at its default of False and runs the
+three-plane path that shipped.
+
 Exactness on this backend, which is the whole argument for shipping it. A cell
 that received `count` rows accumulated `1.0 + 1.0 + ... + 1.0`, count times, in
 Float64. Every partial sum of that series is one of the integers 1, 2, ...,
@@ -239,10 +251,17 @@ def objective_has_constant_hessian(objective: Int, weighted: Bool) -> Bool:
       callable and from query groups. Neither is a code this function can
       reason about, so both return False.
 
-    Nothing in this package calls this yet. It is the predicate a trainer
-    should evaluate once per round, next to where it decides whether to pass
-    weights, and hand to the builders below; see the module-level note on
-    what is and is not wired.
+    Who calls this. `boosting.round_has_constant_hessian` is the single
+    binding of it, and it adds the one exclusion this function cannot make
+    (GOSS) before answering. Every trainer that declares the specialization
+    goes through that function: `boosting._boost_rounds` and
+    `boosting.train_with_valid` on the CPU, and the `train_gpu` and
+    `train_gpu_with_valid` entry points in `train_gpu.mojo` on the device.
+    The multiclass and custom-objective trainers on both backends do not
+    call it at all, and their builders keep the three-plane path.
+
+    Calling this directly, at a site that is not one of those, means taking
+    on the exclusions in the list above by hand. Prefer the binding.
     """
     if weighted:
         return False
