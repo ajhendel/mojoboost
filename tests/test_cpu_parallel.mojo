@@ -49,6 +49,7 @@ from mojotrees.histogram import (
     subtract_histogram,
     subtract_histogram_into,
 )
+from mojotrees.apple_cpu_policy import cpu_profile
 from mojotrees.parallel import (
     PARALLEL_MIN_OPS,
     TASKS_PER_CORE,
@@ -136,10 +137,17 @@ def test_plan_tasks_respects_grain_and_cap() raises:
     assert_equal(plan_tasks(1_000_000, PARALLEL_MIN_OPS - 1), 1)
     # A single item is never worth a task.
     assert_equal(plan_tasks(1, 1_000_000_000), 1)
-    # Exactly two grains of work buys exactly two tasks, however many cores
-    # are present: this is the rule that stopped cheap elementwise stages
-    # fanning out to one task per core.
-    assert_equal(plan_tasks(1_000_000, 2 * PARALLEL_MIN_OPS), 2)
+    # Exactly two grains of work buys two tasks by the grain alone, but a loop
+    # that has cleared the crossover is fanned out over at least one task per
+    # core: having paid for the barrier, running on two cores out of ten is
+    # eight idle cores. The grain still binds above the core count, and the
+    # per-core ceiling still binds above that. See "The core floor" in
+    # parallel.mojo, and test_cpu_dispatch.mojo for the per-caller table.
+    var two_grains = plan_tasks(1_000_000, 2 * PARALLEL_MIN_OPS)
+    var cores = cpu_profile().dispatch_cores()
+    assert_true(two_grains >= 2)
+    assert_equal(two_grains, cores if cores > 2 else 2)
+    assert_true(two_grains <= TASKS_PER_CORE * cores)
     # Plenty of work: capped by cores, never exceeding the item count.
     var big = plan_tasks(1_000_000, 10_000 * PARALLEL_MIN_OPS)
     assert_true(big > 1)

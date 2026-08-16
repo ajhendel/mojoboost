@@ -123,6 +123,58 @@ rebuild. Lowering it is the single knob that decides how much of an
 asymmetric machine a mid-sized loop reaches, and bench/bench_profile.mojo on
 an idle machine is what would settle it.
 
+The core floor, and why the grain alone leaves cores idle
+---------------------------------------------------------
+`MIN_TASKS_ABOVE_GRAIN = 2` was the admission that the per-task grain and the
+crossover cannot both be `PARALLEL_MIN_OPS`: for any total between one grain
+and two, the grain permits no legal split, so a floor had to be bolted on.
+Two was the smallest floor that is actually parallel. It is not the right
+floor, and the reason is arithmetic on the numbers this module already holds.
+
+A loop that clears the crossover has been declared worth a fan-out. A
+`sync_parallelize` is one wake of the pool and one barrier at the end, and
+that cost is paid in full the moment the loop is declared parallel at all --
+it does not shrink because the work was handed to three tasks instead of ten.
+So having paid it, a task count below the core count leaves cores idle for
+the whole of the barrier it already bought. The split scan is the worked
+example: `split_scan_ops(50, 255, two_sided)` is 216,750, and
+`216,750 // 65,536` is 3, so a fifty-feature node fans three ways at every
+node size in a fit, on any machine, leaving seven of ten cores idle behind a
+barrier that was paid for regardless. Nothing about the node's size enters
+that number, which is what makes it a defect in the rule rather than a
+mis-tuning of it.
+
+The floor is therefore `dispatch_cores`, not 2: once the crossover is
+cleared, use the machine that was woken, and go past one task per core only
+when the grain independently says each of those tasks still holds a full
+grain of work. `MIN_TASKS_ABOVE_GRAIN` survives as the floor under the floor,
+for a machine that reports one core.
+
+What bounds this from above -- the reason it is one task per core and not
+`max_auto_tasks` -- is that nothing has measured the marginal cost of a task,
+so the smallest defensible step past "not enough tasks to fill the machine"
+is "exactly enough". What bounds it from below is the one measurement this
+module does hold, and it is worth writing down because it is easy to lose:
+bench/bench_threshold.mojo forces its parallel arm with
+`MOJOTREES_PARALLEL_MIN_OPS=1` alone. Under the single-grain rule that read
+*both* questions from that variable, so the arm that established the
+crossover was a `max_auto_tasks`-way fan-out -- at the crossover row, 65,536
+ops over 40 tasks, about 1,638 ops each -- and it beat the serial path by
+1.2-1.6x on Apple M4, AMD Zen4 and Neoverse-N2. A task of 1,638 ops paid for
+its scheduling event on all three. The floor here gives a loop sitting
+exactly at the crossover `PARALLEL_MIN_OPS / dispatch_cores` ops per task,
+which at ten cores is 6,554, four times larger than the task size that was
+measured to win. Two caveats on leaning on that: the shape measured was
+histogram accumulation over independent features, not a row-block split, and
+since the two grains were separated that harness no longer reproduces the arm
+it recorded (it now forces a two-task fan-out), so the number cannot be
+re-taken without also setting `MOJOTREES_PARALLEL_MIN_TASK_OPS=1`.
+
+This floor cannot make any loop parallel that was serial before it: the
+crossover is untouched and is tested first. It cannot lower any task count
+either, since it only ever raises `by_grain`. What it can do is over-fan a
+loop that has just cleared the crossover, and that is the risk it carries.
+
 Who carries the snapshot
 ------------------------
 `DispatchSettings.resolve()` is called once per fit, in each CPU trainer in
@@ -175,13 +227,13 @@ comptime PARALLEL_MIN_OPS = 1 << 16
 # quantity in its own right.
 comptime DEFAULT_MIN_TASK_OPS = PARALLEL_MIN_OPS
 
-# Tasks a loop gets when it has cleared the crossover but does not hold a
-# whole per-task grain per task. One is not an option: a one-task fan-out
-# runs the same work on the same core as the serial path and pays a
-# scheduling event for the privilege, so a rule that answers 1 here has
-# decided nothing. Two is the smallest answer that is actually parallel, and
-# the crossover measurement is evidence for exactly this size, having found a
-# fanned-out loop of `PARALLEL_MIN_OPS` beating the serial path.
+# Floor under the core floor. A loop that has cleared the crossover is fanned
+# out over at least `dispatch_cores` tasks (see "The core floor" in the module
+# docstring); this is what that floor falls back to on a machine that reports
+# one core, and it is the reason a fan-out is never one task. One is not an
+# option: a one-task fan-out runs the same work on the same core as the serial
+# path and pays a scheduling event for the privilege, so a rule that answers 1
+# here has decided nothing.
 comptime MIN_TASKS_ABOVE_GRAIN = 2
 
 # Denominator of the elementwise per-row cost weight (see
@@ -348,20 +400,39 @@ struct DispatchSettings(Copyable, Movable):
 
 
 @always_inline
-def _cap_tasks(total_ops: Int, min_task_ops: Int, max_auto: Int) -> Int:
+def _cap_tasks(
+    total_ops: Int, min_task_ops: Int, dispatch_cores: Int, max_auto: Int
+) -> Int:
     """Task count for a loop that has already cleared the crossover.
 
     The one copy of the fan-out rule, so the resolved and the unresolved
-    entry points cannot drift. No task holds less than `min_task_ops`, the
-    machine's ceiling is never exceeded, and the answer is never 1, because
-    the caller has already decided this loop is worth parallelizing and one
-    task does not parallelize it.
+    entry points cannot drift. Three bounds, in this order:
+
+    - the grain, `total_ops // min_task_ops`, which is how many tasks may hold
+      a full per-task grain of work;
+    - the core floor, `dispatch_cores`, raising that answer when the grain
+      would leave cores idle behind a barrier the loop has already been
+      declared worth paying (see "The core floor" in the module docstring),
+      and never below `MIN_TASKS_ABOVE_GRAIN` so a one-core machine still gets
+      something that is actually parallel;
+    - the machine's ceiling, `max_auto`, which binds last and binds
+      absolutely, so a policy that has capped the fan-out is never overridden
+      by the floor.
+
+    Monotone in `total_ops` and monotone in the machine, and it never returns
+    1: the caller has already decided this loop is worth parallelizing and one
+    task does not parallelize it. It is a scheduling decision only -- every
+    dispatch shape in this module is documented to give the same values at
+    every task count -- so this can be retuned without moving an output.
     """
     var by_grain = max_auto
     if min_task_ops > 0:
         by_grain = total_ops // min_task_ops
-    if by_grain < MIN_TASKS_ABOVE_GRAIN:
-        by_grain = MIN_TASKS_ABOVE_GRAIN
+    var floor = dispatch_cores
+    if floor < MIN_TASKS_ABOVE_GRAIN:
+        floor = MIN_TASKS_ABOVE_GRAIN
+    if by_grain < floor:
+        by_grain = floor
     return by_grain if by_grain < max_auto else max_auto
 
 
@@ -393,6 +464,7 @@ def plan_tasks_with(
         n_tasks = _cap_tasks(
             total_ops,
             settings.min_task_ops,
+            settings.policy.dispatch_cores(),
             settings.policy.max_auto_tasks(),
         )
     if n_tasks < 1:
@@ -421,10 +493,16 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
     the whole-loop crossover the loop stays serial. Above it the task count is
     capped so that no task holds less than the per-task floor: fanning 100k
     cheap ops across 40 workers costs far more in scheduling than the 2.5k ops
-    each one would run. Having cleared the crossover the answer is never 1,
-    because a one-task fan-out is the serial path plus a scheduling event. An
-    explicit `MOJOTREES_NUM_WORKERS` bypasses all of it, so tests can force
-    the parallel path at any size.
+    each one would run.
+
+    Having cleared the crossover the answer is at least one task per core, and
+    so is never 1: a one-task fan-out is the serial path plus a scheduling
+    event, and a three-task fan-out on ten cores is seven idle cores behind a
+    barrier that has already been paid for. That floor is "The core floor" in
+    the module docstring, and it is the reason the grain alone -- which for
+    the split scan answers 3 at every node size in a fit -- is not the whole
+    rule. An explicit `MOJOTREES_NUM_WORKERS` bypasses all of it, so tests can
+    force the parallel path at any size.
 
     The per-core ceiling comes from `apple_cpu_policy`, which decides how many
     cores to count on a machine whose cores are not all the same speed. Its
@@ -446,10 +524,16 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
         var grain = env_parallel_min_ops()
         if total_ops < grain:
             return 1
+        # One detection, two questions asked of it. `cpu_profile()` is
+        # `CpuProfile.detect()` and re-reads the machine every call, so binding
+        # it here is what keeps the live path at the one detection it has
+        # always made rather than two.
+        var profile = cpu_profile()
         n_tasks = _cap_tasks(
             total_ops,
             env_parallel_min_task_ops(),
-            cpu_profile().max_auto_tasks(),
+            profile.dispatch_cores(),
+            profile.max_auto_tasks(),
         )
     if n_tasks < 1:
         n_tasks = 1
