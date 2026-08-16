@@ -66,12 +66,20 @@ identical.
 
 Parameter names
 ---------------
-`canonical_sampling_param` maps every LightGBM, XGBoost, and scikit-learn
-spelling of a row or feature sampling parameter onto the mojotrees name,
-including `colsample_bytree` and `colsample_bynode`, which the parity audit
-records as spellings mojotrees does not yet accept. The table here is meant
-to be the single place those aliases are written down, so the Python layer,
-the CLI, and the C API resolve through it instead of each keeping a list.
+`canonical_sampling_param` maps every LightGBM, XGBoost, scikit-learn and
+CatBoost spelling of a row or feature sampling parameter onto the canonical
+name of docs/PARAMETER_NAMING.md -- `subsample`, `subsample_freq`,
+`colsample_bytree`, `colsample_bynode`, `colsample_bylevel`. The table here
+is the single place those aliases are written down, so the Python layer, the
+CLI, and the C API resolve through it instead of each keeping a list.
+
+One row-share number, one key. `bagging_fraction`, `sub_row`, `bagging` and
+`subsample` all name the share of rows a round keeps, and so does the
+`subsample` that CatBoost's Bernoulli and MVS bootstraps read, so all of
+them resolve to `subsample`. Which sampler consumes it is decided by
+`bootstrap_type` and by `data_sample_strategy`, not by the spelling; the
+Bayesian bootstrap is the one that reads no share at all, because it weights
+every row rather than selecting any.
 
 Class-conditional row bagging
 -----------------------------
@@ -406,17 +414,18 @@ def select_split_features(
 
 
 def sampling_param_names() -> List[String]:
-    """Every sampling parameter mojotrees names, in mojotrees's spelling.
-    `canonical_sampling_param` maps into this list and nowhere else."""
+    """Every sampling parameter mojotrees names, in its canonical spelling
+    (docs/PARAMETER_NAMING.md). `canonical_sampling_param` maps into this
+    list and nowhere else."""
     return [
-        String("bagging_fraction"),
-        String("bagging_freq"),
+        String("subsample"),
+        String("subsample_freq"),
         String("bagging_seed"),
         String("pos_bagging_fraction"),
         String("neg_bagging_fraction"),
-        String("feature_fraction"),
-        String("feature_fraction_bylevel"),
-        String("feature_fraction_bynode"),
+        String("colsample_bytree"),
+        String("colsample_bylevel"),
+        String("colsample_bynode"),
         String("feature_fraction_seed"),
         String("top_rate"),
         String("other_rate"),
@@ -424,27 +433,55 @@ def sampling_param_names() -> List[String]:
         String("bootstrap_type"),
         String("bagging_temperature"),
         String("bootstrap_seed"),
+        String("mvs_reg"),
     ]
 
 
 def canonical_sampling_param(name: String) raises -> String:
-    """The mojotrees name for one sampling parameter spelling.
+    """The canonical name for one sampling parameter spelling.
 
-    Accepts LightGBM's own aliases, the scikit-learn spellings LightGBM's
-    Python API accepts, and XGBoost's `colsample_bylevel` for the per-level
-    fraction mojotrees adds. Raises on anything else rather than passing an
-    unrecognized name through, so a misspelled parameter cannot be silently
-    ignored by the caller that resolves through here.
+    The canonical names are docs/PARAMETER_NAMING.md's: `subsample`,
+    `subsample_freq`, `colsample_bytree`, `colsample_bynode`. Every other
+    vendor's spelling of the same parameter -- LightGBM's own aliases, the
+    scikit-learn spellings LightGBM's Python API accepts, XGBoost's
+    `colsample_bylevel`, CatBoost's `rsm` -- resolves onto it. Raises on
+    anything else rather than passing an unrecognized name through, so a
+    misspelled parameter cannot be silently ignored by the caller that
+    resolves through here.
+
+    The names that stay LightGBM's are the ones no other vendor has a word
+    for: `pos_bagging_fraction`, `neg_bagging_fraction`, `top_rate`,
+    `other_rate`, `data_sample_strategy`, and the three seeds. The names
+    that stay CatBoost's are the ones only CatBoost has: `bootstrap_type`,
+    `bagging_temperature`, `mvs_reg`.
+
+    **`subsample` is one key, and which sampler reads it depends on
+    `bootstrap_type`.** LightGBM's `bagging_fraction`, CatBoost's Bernoulli
+    `subsample` and CatBoost's MVS `subsample` are all the same number --
+    the share of rows a round keeps -- so they resolve to one name and not
+    to two. That is CatBoost's own shape: it has exactly one `subsample`
+    option, Bernoulli, MVS and Poisson all read it, and Bayesian refuses it
+    because it weights every row instead of selecting any. A key of its own
+    for MVS would have made `subsample=0.8` mean one thing under one
+    bootstrap and nothing under another, which is the collision this table
+    exists to prevent rather than an instance of it.
+
+    `mvs_reg` does get its own name, because it is a second number and not
+    the same one: it is MVS's regularizer, CatBoost has a word for it, and
+    no other sampler has anything it could collide with. MVS's seed does
+    not, for the same reason in reverse -- it is the existing
+    `bootstrap_seed`, which every bootstrap here already draws from.
     """
     if (
-        name == "bagging_fraction"
+        name == "subsample"
+        # LightGBM.
+        or name == "bagging_fraction"
         or name == "sub_row"
-        or name == "subsample"
         or name == "bagging"
     ):
-        return "bagging_fraction"
-    if name == "bagging_freq" or name == "subsample_freq":
-        return "bagging_freq"
+        return "subsample"
+    if name == "subsample_freq" or name == "bagging_freq":
+        return "subsample_freq"
     if name == "bagging_seed" or name == "bagging_fraction_seed":
         return "bagging_seed"
     if (
@@ -462,20 +499,25 @@ def canonical_sampling_param(name: String) raises -> String:
     ):
         return "neg_bagging_fraction"
     if (
-        name == "feature_fraction"
+        name == "colsample_bytree"
+        # LightGBM; CatBoost, whose `rsm` is the same per-tree share and is
+        # opaque enough that it is the alias rather than the canonical name.
+        or name == "feature_fraction"
         or name == "sub_feature"
-        or name == "colsample_bytree"
+        or name == "rsm"
     ):
-        return "feature_fraction"
+        return "colsample_bytree"
     # XGBoost's name; LightGBM has no per-level fraction at all.
-    if name == "feature_fraction_bylevel" or name == "colsample_bylevel":
-        return "feature_fraction_bylevel"
+    if name == "colsample_bylevel" or name == "feature_fraction_bylevel":
+        return "colsample_bylevel"
     if (
-        name == "feature_fraction_bynode"
+        name == "colsample_bynode"
+        # LightGBM; scikit-learn's HistGradientBoosting*.
+        or name == "feature_fraction_bynode"
         or name == "sub_feature_bynode"
-        or name == "colsample_bynode"
+        or name == "max_features"
     ):
-        return "feature_fraction_bynode"
+        return "colsample_bynode"
     if name == "feature_fraction_seed":
         return "feature_fraction_seed"
     if name == "top_rate":
@@ -484,15 +526,17 @@ def canonical_sampling_param(name: String) raises -> String:
         return "other_rate"
     if name == "data_sample_strategy":
         return "data_sample_strategy"
-    # CatBoost's names; LightGBM has no weighting bootstrap at all. `subsample`
-    # is deliberately absent: CatBoost spells row bagging that way, and it
-    # already resolves to `bagging_fraction` above, which is the sampler it is.
+    # CatBoost's names; LightGBM has no weighting bootstrap at all.
+    # `subsample` is deliberately not among them: CatBoost spells row bagging
+    # that way, and it is already the canonical name of that sampler above.
     if name == "bootstrap_type":
         return "bootstrap_type"
     if name == "bagging_temperature":
         return "bagging_temperature"
     if name == "bootstrap_seed":
         return "bootstrap_seed"
+    if name == "mvs_reg":
+        return "mvs_reg"
     raise Error(String("unknown sampling parameter ", name))
 
 
@@ -925,24 +969,33 @@ def refresh_bayesian_bootstrap(
 def canonical_bootstrap_type(value: String) raises -> String:
     """The `bootstrap_type` value one spelling selects.
 
-    Only CatBoost's `No` and `Bayesian` are implemented. `Bernoulli` is
+    `bootstrap_type` is CatBoost's parameter and keeps CatBoost's name
+    (docs/PARAMETER_NAMING.md); no other vendor has one. Values are
+    canonical lowercase here, as in `device_policy.parse_device`: CatBoost
+    writes `Bayesian` and `MVS`, and the surface the user types at folds
+    the case before calling in (`params._lower_ascii`, and `.lower()` on the
+    Python side).
+
+    CatBoost's `No`, `Bayesian` and `MVS` are implemented. `Bernoulli` is
     refused by name rather than as an unknown value because mojotrees already
-    has it under another name -- it is row bagging, `bagging_fraction` with
-    `bagging_freq`, which is the same draw CatBoost's `subsample` makes -- and
-    telling a user that a real bootstrap type is unknown would be misleading.
-    `MVS` and `Poisson` are refused the same way; CatBoost itself refuses
+    has it under another name -- it is row bagging, `subsample` with
+    `subsample_freq`, which is the same draw CatBoost's `subsample` makes --
+    and telling a user that a real bootstrap type is unknown would be
+    misleading. `Poisson` is refused the same way; CatBoost itself refuses
     Poisson on the CPU.
     """
     if value == "no" or value == "none":
         return "no"
     if value == "bayesian":
         return "bayesian"
+    if value == "mvs":
+        return "mvs"
     if value == "bernoulli":
         raise Error(
             "bootstrap_type 'bernoulli' is row bagging under another name;"
-            " use bagging_fraction with bagging_freq"
+            " use subsample with subsample_freq"
         )
-    if value == "mvs" or value == "poisson":
+    if value == "poisson":
         raise Error(
             String("bootstrap_type '", value, "' is not implemented")
         )
