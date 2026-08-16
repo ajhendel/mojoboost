@@ -2421,6 +2421,77 @@ def _accumulate_subset_at[
     )
 
 
+# ---------------------------------------------------------------------------
+# The serial kernel arms
+# ---------------------------------------------------------------------------
+#
+# `_accumulate_blocked_at`'s inner scatter is the loop the whole CPU fit is
+# made of, and until this round nothing had been done to it beyond the
+# prefetch. Four things were changed, and they are held as arms rather than
+# folded into one commit because a bundle that is faster tells you that the
+# bundle is faster and nothing else. The arms are **cumulative**, so each
+# adjacent pair isolates one change:
+#
+# | arm      | cell stride | cell write   | inactive lane |
+# |----------|-------------|--------------|---------------|
+# | `base`   | runtime     | two scalars  | branch        |
+# | `stride` | comptime    | two scalars  | branch        |
+# | `packed` | comptime    | one 16-byte  | branch        |
+# | `full`   | comptime    | one 16-byte  | none, when the group is full |
+#
+# **Every arm computes the same Float64 sums in the same order**, which is why
+# they can be arms at all. The stride is the same number either way; the
+# packed write is one SIMD add over two independent lanes where the scalar
+# write was two adds of the same two lanes; and the branch removal only
+# deletes a test whose answer is already known for the whole unit. The bench
+# checks that rather than asserting it: `bench/bench_serial_kernel.mojo`
+# prints a bitwise model digest per arm and refuses to call any of them equal
+# without it.
+#
+# `full` is the default. The others exist so the decomposition can be re-taken.
+comptime SERIAL_KERNEL_BASE = 0
+comptime SERIAL_KERNEL_STRIDE = 1
+comptime SERIAL_KERNEL_PACKED = 2
+comptime SERIAL_KERNEL_FULL = 3
+
+
+def serial_kernel_arm() -> Int:
+    """Which scatter `_accumulate_blocked_at` runs, from
+    `MOJOTREES_CPU_SERIAL_KERNEL`.
+
+    Read once per accumulation -- that is, once per node histogram build, on
+    the order of six thousand times in a hundred-tree fit -- and never inside
+    the row loop. At roughly two hundred nanoseconds a read that is about two
+    milliseconds against a fit measured in seconds, and it is the *same* two
+    milliseconds on every arm including `base`, so it cannot tilt a
+    comparison between them. It is deliberately not carried in
+    `DispatchSettings`: that would add a field to `ResolvedCpuPolicy` and
+    touch every construction of it, in files other lanes are in.
+
+    An unrecognized value is the default rather than an error, because this
+    variable is a measurement knob and a benchmark that dies three hours into
+    a window on a typo is worse than one that runs the shipped kernel.
+    """
+    var s = getenv("MOJOTREES_CPU_SERIAL_KERNEL")
+    if s == "base":
+        return SERIAL_KERNEL_BASE
+    if s == "stride":
+        return SERIAL_KERNEL_STRIDE
+    if s == "packed":
+        return SERIAL_KERNEL_PACKED
+    return SERIAL_KERNEL_FULL
+
+
+def serial_kernel_arm_name(arm: Int) -> String:
+    if arm == SERIAL_KERNEL_BASE:
+        return String("base")
+    if arm == SERIAL_KERNEL_STRIDE:
+        return String("stride")
+    if arm == SERIAL_KERNEL_PACKED:
+        return String("packed")
+    return String("full")
+
+
 def _accumulate_blocked_at[
     GROUP: Int, INDIRECT: Bool
 ](
@@ -2523,19 +2594,62 @@ def _accumulate_blocked_at[
     the specialization off would otherwise fold a different number of
     partials and move a bin. Only the addressing narrows.
 
-    **The prefetch.** `DenseBin::ConstructHistogramInner` runs its loop in two
-    parts: while more than `pf_offset = 64 / sizeof(VAL_T)` rows remain it
-    issues `PREFETCH_T0(data_.data() + data_indices[i + pf_offset])` before
-    each accumulate, then finishes without one. `SCATTER_PREFETCH` is that
-    hint and `PREFETCH_ROW_DISTANCE` is that distance. It is issued only on
-    the `INDIRECT` arm, because it is the row-id indirection that stalls: on
-    the sequential arm the binned column is a unit-stride stream and the
-    hardware prefetcher already owns it. There is **no unroll** -- LightGBM's
-    loop is scalar and this one is too.
+    **The prefetch.** `DenseBin::ConstructHistogramInner`
+    (`src/io/dense_bin.hpp:109-130`) runs its loop in two parts: while more
+    than `pf_offset = 64 / sizeof(VAL_T)` rows remain it issues
+    `PREFETCH_T0(data_.data() + data_indices[i + pf_offset])` before each
+    accumulate, then finishes without one. `SCATTER_PREFETCH` is that hint
+    and `PREFETCH_ROW_DISTANCE` is that distance. It is issued only on the
+    `INDIRECT` arm, because it is the row-id indirection that stalls: on the
+    sequential arm the binned column is a unit-stride stream and the hardware
+    prefetcher already owns it.
 
     None of the prefetch moves a bit. It is a hint with no architectural
     effect, and the two loop halves perform the same additions in the same
     order.
+
+    **"LightGBM's loop is scalar and this one is too" was half a reading of
+    one of LightGBM's two kernels, and it is withdrawn.** LightGBM has two
+    dense construction kernels and they have different shapes.
+
+    - `DenseBin::ConstructHistogramInner` is feature-major, one feature per
+      call, and there its row loop really is scalar with no unroll: the only
+      thing between `i` and `i + 1` is the prefetch. That is the kernel the
+      old sentence described, and about that kernel it was right.
+    - `MultiValDenseBin::ConstructHistogramInner`
+      (`src/io/multi_val_dense_bin.hpp:59-103`) is row-major, and its body is
+      `for (int j = 0; j < num_feature_; ++j) { bin = data_ptr[j]; ti = (bin +
+      offsets_[j]) << 1; grad[ti] += gradient; hess[ti] += hessian; }`. One
+      row's derivatives are loaded once into registers and then scattered
+      across **every** feature. That is an unroll over features in all but
+      name, and it is the shape this kernel's `comptime for k in range(GROUP)`
+      already has -- so the part of the sentence that mattered was already
+      false about our own code when it was written.
+
+    Two further things LightGBM does that the sentence obscured, both now
+    taken here:
+
+    - **The 16-byte cell is written as one word, not two.** The Int
+      histogram kernels (`ConstructHistogramIntInner`, `dense_bin.hpp:175-221`
+      and `multi_val_dense_bin.hpp:128-174`) pack gradient and hessian into a
+      single `PACKED_HIST_T` (`int64_t`, `int32_t` or `int16_t`) and do
+      `out_ptr[ti] += gradient_packed`: **one** add per cell. Those kernels
+      are reached only under `use_quantized_grad`, which is off by default, so
+      LightGBM's default fit does take the two-add Float64 path -- but the
+      one-write cell is LightGBM's own idea and not an invention here. The
+      `PACKED` arm is the Float64 spelling of it: one 16-byte load, one
+      two-lane add, one 16-byte store, which is the same two additions of the
+      same two Float64 and therefore the same bits.
+    - **There is no runtime branch inside the loop at all.** `USE_INDICES`,
+      `USE_PREFETCH`, `ORDERED`, `USE_HESSIAN`, `IS_4BIT` and `HIST_BITS` are
+      every one of them template parameters, resolved before the loop exists.
+      This kernel had `if k < owned` inside its unrolled body, once per
+      feature per row, testing a value that is fixed for the whole dispatch
+      unit. At 100 features and width 8 the answer is "yes" for twelve of the
+      thirteen groups. `FULL` is the specialization that deletes the test on
+      those twelve, and it deletes nothing else.
+
+    Both are arms; see `serial_kernel_arm`.
 
     A tail group owning fewer than `GROUP` features and the SIMD-lane slot
     arrays are as in `_accumulate_subset_at`.
@@ -2572,9 +2686,262 @@ def _accumulate_blocked_at[
     # only says how many of them are addressed.
     var region = block_cells * ROW_BLOCK_CELL_FLOATS
     comptime W = SIMD_LANES
+    # Once per node histogram build, never inside the row loop. See
+    # `serial_kernel_arm`.
+    var arm = serial_kernel_arm()
 
     def accumulate_units(u_start: Int, u_end: Int) {imm}:
-        var g32 = pp.unsafe_bitcast[Float32]()
+        # The Float32 view of the gather is taken inside each nested scatter
+        # from `pp` rather than once out here, for the reason `pp`'s own
+        # comment above gives: two pointers carrying the same origin into one
+        # closure is an aliasing error Mojo refuses to compile, and a nested
+        # parametric scatter captures both. The bitcast emits nothing.
+
+        # One dispatch unit's rows.
+        #
+        # Flat rather than a row-visit called from a row loop, and that is a
+        # language constraint rather than a preference: a nested parametric
+        # closure that captures another nested closure is two mutable
+        # captures of one origin and Mojo refuses to compile it. The k-loop
+        # is therefore written out in each of the three row loops.
+        #
+        # The parameters:
+        #
+        # - `STRIDE` is the private cell's float count, 2 under a constant
+        #   hessian and 3 otherwise, and it is a *parameter* here where the
+        #   `base` arm keeps it a variable. The multiply that turns a bin id
+        #   into a cell offset is on every feature of every row, and a shift
+        #   is not an integer multiply.
+        # - `PACKED` writes the cell as one 16-byte word instead of two
+        #   scalar read-modify-writes. Two independent SIMD lanes, so the two
+        #   Float64 that land are the two the scalar spelling landed.
+        # - `FULL` says every lane of the unrolled group is active, which
+        #   deletes the per-lane test. It is chosen per dispatch unit.
+        # - `G` is `GROUP`, passed explicitly because a nested definition
+        #   cannot take the enclosing function's parameter as a SIMD width.
+        #
+        # `pair` is the row's contribution and it is where the two objectives
+        # merge. Under `STRIDE == 2` the second slot counts rows, as it does
+        # in LightGBM's `!USE_HESSIAN` arm, so the pair is `(g, 1.0)`;
+        # otherwise it is `(g, h)` and the count is the third slot. The
+        # `base` arm wrote the same two Float64 with two stores.
+        #
+        # The alignment on the packed load is stated and not defaulted.
+        # `part_off` is the node's row count, which is odd about half the
+        # time, so a private cell is 8-byte aligned and not 16-byte aligned;
+        # `alignment=8` is what the address actually has. An overstated
+        # alignment here would be undefined behavior, and an understated one
+        # invites a backend to split the vector back into the two scalar
+        # loads it was written to replace.
+        #
+        # Two halves on the indirect arm exactly as LightGBM has them: the
+        # first issues the prefetch and the second is the tail that has
+        # nothing left to prefetch. Same additions, same order, same halves
+        # as the `base` arm below.
+        def scatter[STRIDE: Int, FULL: Bool, PACKED: Bool, G: Int](
+            base: SIMD[DType.int, G],
+            col: SIMD[DType.int, G],
+            owned_n: Int,
+            r0: Int,
+            r1: Int,
+        ) {imm}:
+            var g32 = pp.unsafe_bitcast[Float32]()
+            var i_row = r0
+            comptime if INDIRECT:
+                var pf_end = r1 - PREFETCH_ROW_DISTANCE
+                while i_row < pf_end:
+                    var r = rows_p.unsafe_load(i_row)
+                    var pair = SIMD[DType.float64, 2](
+                        Float64(g32.unsafe_load(2 * i_row)), 1.0
+                    )
+                    comptime if STRIDE == 3:
+                        var gh = g32.unsafe_load[width=2](2 * i_row)
+                        pair = SIMD[DType.float64, 2](
+                            Float64(gh[0]), Float64(gh[1])
+                        )
+                    var rf = rows_p.unsafe_load(i_row + PREFETCH_ROW_DISTANCE)
+                    comptime for k in range(G):
+                        if FULL or k < owned_n:
+                            prefetch[SCATTER_PREFETCH](
+                                bins_all_p.unsafe_offset(Int(col[k]) + rf)
+                            )
+                            var b = Int(base[k]) + STRIDE * Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            comptime if PACKED:
+                                pp.unsafe_store(
+                                    b,
+                                    pp.unsafe_load[width=2, alignment=8](b)
+                                    + pair,
+                                )
+                            else:
+                                pp.unsafe_store(
+                                    b, pp.unsafe_load(b) + pair[0]
+                                )
+                                pp.unsafe_store(
+                                    b + 1, pp.unsafe_load(b + 1) + pair[1]
+                                )
+                            comptime if STRIDE == 3:
+                                pp.unsafe_store(
+                                    b + 2, pp.unsafe_load(b + 2) + 1.0
+                                )
+                    i_row += 1
+                while i_row < r1:
+                    var r = rows_p.unsafe_load(i_row)
+                    var pair = SIMD[DType.float64, 2](
+                        Float64(g32.unsafe_load(2 * i_row)), 1.0
+                    )
+                    comptime if STRIDE == 3:
+                        var gh = g32.unsafe_load[width=2](2 * i_row)
+                        pair = SIMD[DType.float64, 2](
+                            Float64(gh[0]), Float64(gh[1])
+                        )
+                    comptime for k in range(G):
+                        if FULL or k < owned_n:
+                            var b = Int(base[k]) + STRIDE * Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            comptime if PACKED:
+                                pp.unsafe_store(
+                                    b,
+                                    pp.unsafe_load[width=2, alignment=8](b)
+                                    + pair,
+                                )
+                            else:
+                                pp.unsafe_store(
+                                    b, pp.unsafe_load(b) + pair[0]
+                                )
+                                pp.unsafe_store(
+                                    b + 1, pp.unsafe_load(b + 1) + pair[1]
+                                )
+                            comptime if STRIDE == 3:
+                                pp.unsafe_store(
+                                    b + 2, pp.unsafe_load(b + 2) + 1.0
+                                )
+                    i_row += 1
+            else:
+                # `score_t` and not `derivative[NARROW]`, on purpose: this
+                # kernel carries no `NARROW` parameter because it runs only
+                # under `float32`. Blocking is off under `float64`
+                # (`_accumulate_full` and `_accumulate_subset` both say why),
+                # so the narrowing here is unconditional because the setting
+                # that would switch it cannot reach this code.
+                while i_row < r1:
+                    var pair = SIMD[DType.float64, 2](
+                        score_t(grad_p.unsafe_load(i_row)), 1.0
+                    )
+                    comptime if STRIDE == 3:
+                        pair[1] = score_t(hess_p.unsafe_load(i_row))
+                    comptime for k in range(G):
+                        if FULL or k < owned_n:
+                            var b = Int(base[k]) + STRIDE * Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + i_row)
+                            )
+                            comptime if PACKED:
+                                pp.unsafe_store(
+                                    b,
+                                    pp.unsafe_load[width=2, alignment=8](b)
+                                    + pair,
+                                )
+                            else:
+                                pp.unsafe_store(
+                                    b, pp.unsafe_load(b) + pair[0]
+                                )
+                                pp.unsafe_store(
+                                    b + 1, pp.unsafe_load(b + 1) + pair[1]
+                                )
+                            comptime if STRIDE == 3:
+                                pp.unsafe_store(
+                                    b + 2, pp.unsafe_load(b + 2) + 1.0
+                                )
+                    i_row += 1
+
+
+        # The `base` arm: the scatter exactly as it shipped, kept whole so
+        # that the decomposition can be re-taken rather than trusted. Runtime
+        # stride, two scalar stores per cell, one test per lane per row.
+        # `CH` is a parameter only because the shipped kernel already hoisted
+        # `const_h` out of the row loop; keeping it runtime here would price
+        # the baseline for a branch it never had.
+        def scatter_base[CH: Bool, G: Int](
+            base: SIMD[DType.int, G],
+            col: SIMD[DType.int, G],
+            owned_n: Int,
+            r0: Int,
+            r1: Int,
+            stride_rt: Int,
+        ) {imm}:
+            var g32 = pp.unsafe_bitcast[Float32]()
+            var pf_end = r1 - PREFETCH_ROW_DISTANCE
+            var i_row = r0
+            comptime if INDIRECT:
+                while i_row < pf_end:
+                    var r = rows_p.unsafe_load(i_row)
+                    var g: Float64
+                    var h = 1.0
+                    comptime if CH:
+                        g = Float64(g32.unsafe_load(2 * i_row))
+                    else:
+                        var gh = g32.unsafe_load[width=2](2 * i_row)
+                        g = Float64(gh[0])
+                        h = Float64(gh[1])
+                    var rf = rows_p.unsafe_load(i_row + PREFETCH_ROW_DISTANCE)
+                    comptime for k in range(G):
+                        if k < owned_n:
+                            prefetch[SCATTER_PREFETCH](
+                                bins_all_p.unsafe_offset(Int(col[k]) + rf)
+                            )
+                            var b = Int(base[k]) + stride_rt * Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                            pp.unsafe_store(b + 1, pp.unsafe_load(b + 1) + h)
+                            comptime if not CH:
+                                pp.unsafe_store(
+                                    b + 2, pp.unsafe_load(b + 2) + 1.0
+                                )
+                    i_row += 1
+                while i_row < r1:
+                    var r = rows_p.unsafe_load(i_row)
+                    var g: Float64
+                    var h = 1.0
+                    comptime if CH:
+                        g = Float64(g32.unsafe_load(2 * i_row))
+                    else:
+                        var gh = g32.unsafe_load[width=2](2 * i_row)
+                        g = Float64(gh[0])
+                        h = Float64(gh[1])
+                    comptime for k in range(G):
+                        if k < owned_n:
+                            var b = Int(base[k]) + stride_rt * Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                            pp.unsafe_store(b + 1, pp.unsafe_load(b + 1) + h)
+                            comptime if not CH:
+                                pp.unsafe_store(
+                                    b + 2, pp.unsafe_load(b + 2) + 1.0
+                                )
+                    i_row += 1
+            else:
+                while i_row < r1:
+                    var g = score_t(grad_p.unsafe_load(i_row))
+                    var h = 1.0
+                    comptime if not CH:
+                        h = score_t(hess_p.unsafe_load(i_row))
+                    comptime for k in range(G):
+                        if k < owned_n:
+                            var b = Int(base[k]) + stride_rt * Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + i_row)
+                            )
+                            pp.unsafe_store(b, pp.unsafe_load(b) + g)
+                            pp.unsafe_store(b + 1, pp.unsafe_load(b + 1) + h)
+                            comptime if not CH:
+                                pp.unsafe_store(
+                                    b + 2, pp.unsafe_load(b + 2) + 1.0
+                                )
+                    i_row += 1
+
         for u in range(u_start, u_end):
             var blk = u // n_groups
             var grp = u - blk * n_groups
@@ -2623,132 +2990,36 @@ def _accumulate_blocked_at[
                         pp.unsafe_store(z0 + zb, 0.0)
                         zb += 1
 
-            # The scatter. Two halves on the indirect arm, as LightGBM has
-            # them: the first issues the prefetch and the second is the tail
-            # that has nothing left to prefetch. Same additions, same order.
-            var pf_end = r1 - PREFETCH_ROW_DISTANCE
-            var i_row = r0
+            # The scatter, dispatched to the arm this build is running.
+            # The test is per dispatch unit -- there are 351 of them at the
+            # shape this round measures -- and not per row.
+            #
+            # `full` is `owned == GROUP`. At 100 active features and width 8
+            # that is true for twelve of the thirteen groups, so the branchy
+            # spelling below is reached by the tail group only.
+            var full = owned == GROUP
             if const_h:
-                comptime if INDIRECT:
-                    while i_row < pf_end:
-                        var r = rows_p.unsafe_load(i_row)
-                        var g = Float64(g32.unsafe_load(2 * i_row))
-                        var rf = rows_p.unsafe_load(
-                            i_row + PREFETCH_ROW_DISTANCE
-                        )
-                        comptime for k in range(GROUP):
-                            if k < owned:
-                                prefetch[SCATTER_PREFETCH](
-                                    bins_all_p.unsafe_offset(Int(col[k]) + rf)
-                                )
-                                var b = Int(base[k]) + stride * Int(
-                                    bins_all_p.unsafe_load(Int(col[k]) + r)
-                                )
-                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
-                                pp.unsafe_store(
-                                    b + 1, pp.unsafe_load(b + 1) + 1.0
-                                )
-                        i_row += 1
-                    while i_row < r1:
-                        var r = rows_p.unsafe_load(i_row)
-                        var g = Float64(g32.unsafe_load(2 * i_row))
-                        comptime for k in range(GROUP):
-                            if k < owned:
-                                var b = Int(base[k]) + stride * Int(
-                                    bins_all_p.unsafe_load(Int(col[k]) + r)
-                                )
-                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
-                                pp.unsafe_store(
-                                    b + 1, pp.unsafe_load(b + 1) + 1.0
-                                )
-                        i_row += 1
+                if arm == SERIAL_KERNEL_BASE:
+                    scatter_base[True, GROUP](base, col, owned, r0, r1, stride)
+                elif arm == SERIAL_KERNEL_STRIDE:
+                    scatter[2, False, False, GROUP](base, col, owned, r0, r1)
+                elif arm == SERIAL_KERNEL_PACKED:
+                    scatter[2, False, True, GROUP](base, col, owned, r0, r1)
+                elif full:
+                    scatter[2, True, True, GROUP](base, col, owned, r0, r1)
                 else:
-                    # `score_t` and not `derivative[NARROW]`, on purpose:
-                    # this kernel carries no `NARROW` parameter because it
-                    # runs only under `float32`. Blocking is off under
-                    # `float64` (`_accumulate_full` and `_accumulate_subset`
-                    # both say why), so the narrowing here is unconditional
-                    # because the setting that would switch it cannot reach
-                    # this code.
-                    while i_row < r1:
-                        var g = score_t(grad_p.unsafe_load(i_row))
-                        comptime for k in range(GROUP):
-                            if k < owned:
-                                var b = Int(base[k]) + stride * Int(
-                                    bins_all_p.unsafe_load(
-                                        Int(col[k]) + i_row
-                                    )
-                                )
-                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
-                                pp.unsafe_store(
-                                    b + 1, pp.unsafe_load(b + 1) + 1.0
-                                )
-                        i_row += 1
+                    scatter[2, False, True, GROUP](base, col, owned, r0, r1)
             else:
-                comptime if INDIRECT:
-                    while i_row < pf_end:
-                        var r = rows_p.unsafe_load(i_row)
-                        var gh = g32.unsafe_load[width=2](2 * i_row)
-                        var g = Float64(gh[0])
-                        var h = Float64(gh[1])
-                        var rf = rows_p.unsafe_load(
-                            i_row + PREFETCH_ROW_DISTANCE
-                        )
-                        comptime for k in range(GROUP):
-                            if k < owned:
-                                prefetch[SCATTER_PREFETCH](
-                                    bins_all_p.unsafe_offset(Int(col[k]) + rf)
-                                )
-                                var b = Int(base[k]) + stride * Int(
-                                    bins_all_p.unsafe_load(Int(col[k]) + r)
-                                )
-                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
-                                pp.unsafe_store(
-                                    b + 1, pp.unsafe_load(b + 1) + h
-                                )
-                                pp.unsafe_store(
-                                    b + 2, pp.unsafe_load(b + 2) + 1.0
-                                )
-                        i_row += 1
-                    while i_row < r1:
-                        var r = rows_p.unsafe_load(i_row)
-                        var gh = g32.unsafe_load[width=2](2 * i_row)
-                        var g = Float64(gh[0])
-                        var h = Float64(gh[1])
-                        comptime for k in range(GROUP):
-                            if k < owned:
-                                var b = Int(base[k]) + stride * Int(
-                                    bins_all_p.unsafe_load(Int(col[k]) + r)
-                                )
-                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
-                                pp.unsafe_store(
-                                    b + 1, pp.unsafe_load(b + 1) + h
-                                )
-                                pp.unsafe_store(
-                                    b + 2, pp.unsafe_load(b + 2) + 1.0
-                                )
-                        i_row += 1
+                if arm == SERIAL_KERNEL_BASE:
+                    scatter_base[False, GROUP](base, col, owned, r0, r1, stride)
+                elif arm == SERIAL_KERNEL_STRIDE:
+                    scatter[3, False, False, GROUP](base, col, owned, r0, r1)
+                elif arm == SERIAL_KERNEL_PACKED:
+                    scatter[3, False, True, GROUP](base, col, owned, r0, r1)
+                elif full:
+                    scatter[3, True, True, GROUP](base, col, owned, r0, r1)
                 else:
-                    # Unconditional for the reason the `const_h` arm above
-                    # gives: this kernel is `float32`-only.
-                    while i_row < r1:
-                        var g = score_t(grad_p.unsafe_load(i_row))
-                        var h = score_t(hess_p.unsafe_load(i_row))
-                        comptime for k in range(GROUP):
-                            if k < owned:
-                                var b = Int(base[k]) + stride * Int(
-                                    bins_all_p.unsafe_load(
-                                        Int(col[k]) + i_row
-                                    )
-                                )
-                                pp.unsafe_store(b, pp.unsafe_load(b) + g)
-                                pp.unsafe_store(
-                                    b + 1, pp.unsafe_load(b + 1) + h
-                                )
-                                pp.unsafe_store(
-                                    b + 2, pp.unsafe_load(b + 2) + 1.0
-                                )
-                        i_row += 1
+                    scatter[3, False, True, GROUP](base, col, owned, r0, r1)
 
     dispatch_feature_ranges_with(
         settings, accumulate_units, n_blocks * n_groups, plan.block_ops
