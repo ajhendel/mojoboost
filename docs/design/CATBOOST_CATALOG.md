@@ -1993,6 +1993,34 @@ silently ignored.
 the pair generator but is trained through CatBoost's pairwise scoring path
 (`pairwise_scoring.cpp`), not through leafwise `PairLogit` derivatives.
 
+#### Three further YetiRank facts from `catboost_options.cpp`, verified
+
+`SetNotSpecifiedOptionsToDefaults` and `GetEstimationMethodDefaults` say
+things about a `YetiRank` fit that a comparison harness has to honor or the
+comparison is against a differently-configured CatBoost:
+
+1. **The default eval metric is `PFound`**, not NDCG:
+   `lossDescription.Load(LossDescriptionToJson("PFound")); MetricOptions->
+   ObjectiveMetric.Set(lossDescription);` in the `YetiRank` /
+   `YetiRankPairwise` case. `PairLogit`'s objective metric is `PairLogit`
+   itself; mojotrees implements neither `QueryRMSE` nor `PairLogit` as a
+   *metric*, so the registry diff points those two at `ndcg_catboost` and
+   records the divergence rather than inventing a metric.
+2. **`l2_leaf_reg` defaults to 0 under `YetiRank`**, not to CatBoost's usual
+   3 (`defaultL2Reg = 0`). A harness that leaves `l2_leaf_reg` at 3 while
+   CatBoost silently used 0 is comparing two different regularizations.
+3. **Leaf estimation is Newton with exactly one iteration**
+   (`defaultEstimationMethod = ELeavesEstimation::Newton`,
+   `defaultNewtonIterations = 1`), and CatBoost *refuses* to let you change
+   it: "At the moment, in the YetiRank mode, changing the
+   leaf_estimation_method parameter is prohibited." Backtracking is likewise
+   forced off. So catalog A6 (`leaf_estimation_iterations`) has no bearing on
+   a YetiRank comparison.
+
+CatBoost also records that `YetiRank` "cannot be used as a metric"
+(`IsSkipInMetricsParamsExport`), which is why there is no YetiRank eval
+metric to implement.
+
 #### Why `YetiRank` is not aliased to `lambdarank`
 
 Recorded by the naming lane and restated here because it is the mistake a
