@@ -575,15 +575,35 @@ def test_a_categorical_matrix_is_refused_rather_than_half_noised() raises:
 
 def test_the_parameter_string_carries_the_name() raises:
     """`random_strength` is the one name on the parameter surface that is
-    CatBoost's rather than LightGBM's. Zero parses and is inert; a positive
-    value parses and is then refused by name, which is the path
-    `use_quantized_grad` takes and for the same reason."""
+    CatBoost's rather than LightGBM's. Zero parses and is inert. A positive
+    value now PARSES on the CPU, and this test used to assert the opposite.
+
+    The refusal was retired when the dense CPU round loops began computing
+    the per-tree scale: `params.mojo` passes
+    `scale_computed_per_tree=(config.device == CPU_DEVICE)`, and
+    `check_random_strength` raises only when that is False. The assertion
+    below was left behind asserting a refusal that no longer exists, and it
+    failed for some hours before anyone ran this file.
+
+    That is worth stating rather than quietly correcting. **A test is a
+    written claim about behavior, and retiring the behavior does not retire
+    the claim.** Nothing in this repository checks whether an assertion still
+    describes the code, which is the same shape as a parity contract citing a
+    divergence that has been fixed.
+
+    A negative value is still refused, because that is a range error rather
+    than a reachability one, and it is the assertion that proves this test is
+    still discriminating rather than merely passing."""
     var zero = parse_params("objective=regression random_strength=0")
     assert_equal(_bits(zero.booster.tree.extra.random_strength), _bits(0.0))
     assert_false(zero.booster.tree.extra.is_active())
 
-    with assert_raises():
-        _ = parse_params("objective=regression random_strength=1.5")
+    var positive = parse_params("objective=regression random_strength=1.5")
+    assert_equal(
+        _bits(positive.booster.tree.extra.random_strength), _bits(1.5)
+    )
+    assert_true(positive.booster.tree.extra.is_active())
+
     with assert_raises():
         _ = parse_params("objective=regression random_strength=-1")
 
