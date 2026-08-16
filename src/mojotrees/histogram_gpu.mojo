@@ -767,6 +767,67 @@ struct GpuHistogramBuilder(Movable):
         """The row-walk arm `set_row_unroll` last chose."""
         return self.rows.row_unroll
 
+    def set_narrow_index(mut self, on: Bool) raises:
+        """Whether the histogram row loop forms its two data-dependent
+        indices in Int32 rather than in Int.
+
+        A forwarder for the reason `set_row_unroll`'s docstring gives:
+        `train_gpu` builds its own builder, so an end-to-end interleaved A/B
+        has no other way to reach the arm.
+
+        Off by default and refused outright on a dataset whose shape does not
+        admit it, which `GpuActiveRows.narrow_index_supported` states as a
+        bound and `GpuActiveRows.set_narrow_index` enforces. Under that bound
+        the two arms address the same bytes and accumulate the same integers,
+        so the histogram is identical; above it the narrow arm would wrap an
+        index, which is why it raises rather than degrading.
+        """
+        self.rows.set_narrow_index(on)
+
+    def narrow_index(self) -> Bool:
+        """The index-width arm `set_narrow_index` last chose."""
+        return self.rows.narrow_index
+
+    def set_pair_alignment(mut self, on: Bool):
+        """Whether the width-2 load of the quantized gradient pair states the
+        8-byte alignment its address actually has.
+
+        A forwarder, for the same reason the others here are. On by default:
+        the unannotated spelling emits `align 4` for a `<2 x i32>` load, and
+        an under-aligned vector load is one a backend may split back into the
+        two scalar loads that width-2 spelling exists to replace. Both read
+        the same eight bytes, so this cannot change a histogram.
+        """
+        self.rows.set_pair_alignment(on)
+
+    def pair_alignment(self) -> Bool:
+        """The pair-load arm `set_pair_alignment` last chose."""
+        return self.rows.pair_alignment
+
+    def set_row_tiling(
+        mut self, min_tiles: Int = 0, rows_per_tile: Int = 0
+    ) raises:
+        """Request a row-tile floor, a rows-per-tile length, or neither, for
+        every node this builder's device-resident path plans from here on.
+
+        Zero on both, the default, is the geometry this builder always
+        produced. A forwarder for the reason the others here are, and this one
+        matters more than most: the row-tile floor has to be re-measured
+        against the unrolled row walk, and the earlier measurement that made
+        it opt-in was taken across processes through an environment variable.
+
+        Affects only `GpuActiveRows.range_tiling`, which is the per-node
+        geometry the device-resident path derives. The whole-dataset
+        `self.tiling` this builder resolved in its constructor is not
+        re-derived, because it is a property of the dataset rather than of a
+        node and nothing here changes the dataset.
+
+        Cannot change a histogram: tiling is a launch geometry and
+        accumulation is fixed-point Int32, so two geometries over the same
+        rows sum the same bins in a different order to the same value.
+        """
+        self.rows.set_row_tiling(min_tiles, rows_per_tile)
+
     def set_fused_gradient_upload(mut self, on: Bool):
         """Whether `upload_staged` moves this round's two derivative planes
         with one copy of their shared allocation or with one copy each.
