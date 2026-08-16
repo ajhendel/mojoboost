@@ -198,6 +198,8 @@ def _assert_same_tree(a: Tree, b: Tree) raises:
         assert_equal(Int(a.default_left[i]), Int(b.default_left[i]))
         assert_equal(a.missing_bin[i], b.missing_bin[i])
         assert_equal(a.cat_offset[i], b.cat_offset[i])
+        # `Tree.count` is the per-node row count, not a `Histogram` plane.
+        # It keeps direct indexing; only `Histogram` gained accessors.
         assert_equal(_bits(a.count[i]), _bits(b.count[i]))
     assert_equal(len(a.cat_bitset), len(b.cat_bitset))
     for i in range(len(a.cat_bitset)):

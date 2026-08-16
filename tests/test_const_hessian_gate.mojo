@@ -183,8 +183,8 @@ def _assert_untouched_planes_agree(a: Histogram, b: Histogram) raises:
     assert_equal(a.n_features, b.n_features)
     assert_equal(a.n_bins, b.n_bins)
     for i in range(a.n_features * a.n_bins):
-        assert_equal(_bits(a.grad[i]), _bits(b.grad[i]))
-        assert_equal(a.count[i], b.count[i])
+        assert_equal(_bits(a.grad_at(i)), _bits(b.grad_at(i)))
+        assert_equal(a.count_at(i), b.count_at(i))
 
 
 def _assert_reconstructed_from_count(h: Histogram) raises:
@@ -195,7 +195,7 @@ def _assert_reconstructed_from_count(h: Histogram) raises:
     A divergence with some third value in it would be a defect, not the
     elision, and this is what tells the two apart."""
     for i in range(h.n_features * h.n_bins):
-        assert_equal(_bits(h.hess[i]), _bits(Float64(h.count[i])))
+        assert_equal(_bits(h.hess_at(i)), _bits(Float64(h.count_at(i))))
 
 
 def _assert_honest_is_double_the_count(h: Histogram) raises:
@@ -205,13 +205,13 @@ def _assert_honest_is_double_the_count(h: Histogram) raises:
     rounding occurs anywhere in the series. Integer doubling then conversion,
     so the reference itself contains no floating multiply."""
     for i in range(h.n_features * h.n_bins):
-        assert_equal(_bits(h.hess[i]), _bits(Float64(2 * h.count[i])))
+        assert_equal(_bits(h.hess_at(i)), _bits(Float64(2 * h.count_at(i))))
 
 
 def _count_diverging_cells(a: Histogram, b: Histogram) -> Int:
     var n = 0
     for i in range(a.n_features * a.n_bins):
-        if _bits(a.hess[i]) != _bits(b.hess[i]):
+        if _bits(a.hess_at(i)) != _bits(b.hess_at(i)):
             n += 1
     return n
 
@@ -219,7 +219,7 @@ def _count_diverging_cells(a: Histogram, b: Histogram) -> Int:
 def _occupied_cells(h: Histogram) -> Int:
     var n = 0
     for i in range(h.n_features * h.n_bins):
-        if h.count[i] > 0:
+        if h.count_at(i) > 0:
             n += 1
     return n
 
@@ -239,7 +239,7 @@ def test_every_cell_of_the_fixture_is_occupied() raises:
     assert_equal(_occupied_cells(hist), _N_FEATURES * _N_BINS)
     var total = 0
     for i in range(_N_FEATURES * _N_BINS):
-        total += hist.count[i]
+        total += hist.count_at(i)
     assert_equal(total, _N_FEATURES * _N_ROWS)
     _reset_env()
 
@@ -332,18 +332,18 @@ def test_a_feature_subset_elides_only_the_selected_slices() raises:
         for b in range(_N_BINS):
             var i = f * _N_BINS + b
             if selected:
-                assert_true(two.count[i] > 0)
-                assert_equal(_bits(two.hess[i]), _bits(Float64(two.count[i])))
+                assert_true(two.count_at(i) > 0)
+                assert_equal(_bits(two.hess_at(i)), _bits(Float64(two.count_at(i))))
                 assert_equal(
-                    _bits(three.hess[i]), _bits(Float64(2 * three.count[i]))
+                    _bits(three.hess_at(i)), _bits(Float64(2 * three.count_at(i)))
                 )
-                if _bits(three.hess[i]) != _bits(two.hess[i]):
+                if _bits(three.hess_at(i)) != _bits(two.hess_at(i)):
                     diverged += 1
             else:
-                assert_equal(two.count[i], 0)
-                assert_equal(_bits(two.grad[i]), _bits(0.0))
-                assert_equal(_bits(two.hess[i]), _bits(0.0))
-                assert_equal(_bits(three.hess[i]), _bits(0.0))
+                assert_equal(two.count_at(i), 0)
+                assert_equal(_bits(two.grad_at(i)), _bits(0.0))
+                assert_equal(_bits(two.hess_at(i)), _bits(0.0))
+                assert_equal(_bits(three.hess_at(i)), _bits(0.0))
     assert_equal(diverged, 3 * _N_BINS)
     _reset_env()
 
@@ -370,7 +370,7 @@ def _subset_diverges(compact_min_rows: String, group: String) raises:
 
     var total = 0
     for i in range(_N_FEATURES * _N_BINS):
-        total += two.count[i]
+        total += two.count_at(i)
     assert_equal(total, _N_FEATURES * len(rows))
 
 
@@ -424,10 +424,10 @@ def test_sibling_subtraction_takes_the_hessian_from_the_counts() raises:
     _assert_reconstructed_from_count(two)
     var expected_diverging = 0
     for i in range(_N_FEATURES * _N_BINS):
-        var sibling_count = parent.count[i] - child.count[i]
-        assert_equal(two.count[i], sibling_count)
-        assert_equal(_bits(two.hess[i]), _bits(Float64(sibling_count)))
-        assert_equal(_bits(three.hess[i]), _bits(Float64(2 * sibling_count)))
+        var sibling_count = parent.count_at(i) - child.count_at(i)
+        assert_equal(two.count_at(i), sibling_count)
+        assert_equal(_bits(two.hess_at(i)), _bits(Float64(sibling_count)))
+        assert_equal(_bits(three.hess_at(i)), _bits(Float64(2 * sibling_count)))
         if sibling_count > 0:
             expected_diverging += 1
     assert_true(expected_diverging > 0)
@@ -535,13 +535,13 @@ def test_the_elided_plane_is_identical_at_every_worker_count() raises:
         var sub = build_histogram_subset(data, grad, hess, rows, [], True)
         var three = build_histogram(data, grad, hess, [], False)
         for j in range(_N_FEATURES * _N_BINS):
-            assert_equal(_bits(full.grad[j]), _bits(base_full.grad[j]))
-            assert_equal(_bits(full.hess[j]), _bits(base_full.hess[j]))
-            assert_equal(full.count[j], base_full.count[j])
-            assert_equal(_bits(sub.grad[j]), _bits(base_sub.grad[j]))
-            assert_equal(_bits(sub.hess[j]), _bits(base_sub.hess[j]))
-            assert_equal(sub.count[j], base_sub.count[j])
-            assert_equal(_bits(three.hess[j]), _bits(base_three.hess[j]))
+            assert_equal(_bits(full.grad_at(j)), _bits(base_full.grad_at(j)))
+            assert_equal(_bits(full.hess_at(j)), _bits(base_full.hess_at(j)))
+            assert_equal(full.count_at(j), base_full.count_at(j))
+            assert_equal(_bits(sub.grad_at(j)), _bits(base_sub.grad_at(j)))
+            assert_equal(_bits(sub.hess_at(j)), _bits(base_sub.hess_at(j)))
+            assert_equal(sub.count_at(j), base_sub.count_at(j))
+            assert_equal(_bits(three.hess_at(j)), _bits(base_three.hess_at(j)))
         assert_equal(
             _count_diverging_cells(three, full), _N_FEATURES * _N_BINS
         )
