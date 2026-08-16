@@ -160,7 +160,7 @@ an empty child contributes either zero (it failed a minimum) or exactly 0.0
 so a level in which every leaf had an empty child sums to 0.0 and is never
 chosen. Building it would be building a gate that cannot open.
 | A9 | `Depthwise`, `Lossguide` (priority queue by gain, `MaxLeaves`) | Their versions of ours | — | Already ours | — | — |
-| A10 | Score functions (`Cosine` default on CPU symmetric trees, `L2`, pairwise) | Split scoring alternatives | Only if changed | No; keep LightGBM's gain | — | — |
+| A10 | `score_function` (`Cosine` is the CPU default for **every** grow policy, `L2`, and the GPU-only `SolarL2`/`NewtonL2`/`NewtonCosine`/`LOOL2`/`SatL2`) -- **verified from source**, see the A10 note | Split scoring alternatives. Cosine is a RATIO of two cross-leaf accumulators, not a sum | Only when set to Cosine | Built on the CPU, opt-in, default `SCORE_L2` (= today's LightGBM gain). **Headline finding: at `lambda_l2 = 0` Cosine is provably a no-op on the argmax** -- it degenerates to `sqrt` of the L2 sum. Its entire difference from L2 is a function of `lambda_l2`, which mojotrees stock now sets to 0 | CPU (`split.mojo`) | (3) when set to Cosine; see the A10 note |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -303,3 +303,255 @@ problem more exactly rather than changing which problem it is. **The
 per-objective CatBoost numbers above are recorded in
 `boosting.catboost_leaf_estimation_iterations` and read by nothing; our
 default stays 1 for every objective, which is LightGBM stock.**
+
+### A10 note: `score_function`, verified from source
+
+Status: **verified from CatBoost source**, `master`, read 2026-08-16 by
+`lane/score-function`. Every claim below cites the file it came from; the two
+paragraphs headed "OURS" are our decisions and cite nothing, because there is
+nothing to cite.
+
+Files read:
+
+- `catboost/private/libs/algo/score_calcers.h` -- `IPointwiseScoreCalcer`,
+  `TCosineScoreCalcer`, `TL2ScoreCalcer`, `MakePointwiseScoreCalcer`.
+- `catboost/private/libs/algo/score_calcers.cpp` -- `AddLeafPlain` /
+  `AddLeafOrdered` for both calcers.
+- `catboost/libs/helpers/short_vector_ops.h` --
+  `NSimdOps::UpdateScoreBinKernelPlain` / `...Ordered`, which is what
+  `TCosineScoreCalcer::AddLeafPlain` actually runs.
+- `catboost/private/libs/algo_helpers/online_predictor.h` -- `CalcAverage`,
+  `ScaleL2Reg`.
+- `catboost/private/libs/algo/calc_score_cache.h` -- `TBucketStats`.
+- `catboost/private/libs/options/oblivious_tree_options.cpp` -- the default
+  and the CPU restriction.
+- `catboost/private/libs/options/catboost_options.cpp` -- the Lossguide
+  default override and its enclosing scope.
+- `catboost/private/libs/options/enums.h` -- `EScoreFunction`.
+- `catboost/private/libs/algo/scoring.cpp` -- `CalculateNonPairwiseScore`
+  (where the regularizer is scaled and set), `UpdateScores` (the monotone
+  branch).
+- `catboost/private/libs/algo/leafwise_scoring.cpp` --
+  `CalcScoresForOneCandidate` dispatch and `CalcScoreWithoutSplit`.
+- `catboost/private/libs/algo/greedy_tensor_search.cpp` --
+  `SelectBestCandidate`, `GreedyTensorSearchOblivious`'s
+  `scoreBeforeSplit`, `CalcBestScoreAndCandidate`.
+
+#### 1. What Cosine computes
+
+`TCosineScoreCalcer` keeps **two** accumulators per candidate, initialized
+`{0, 1e-100}` (`score_calcers.h`, `SetSplitsCount`), and its final value is
+
+```
+score[i] = Scores[i][0] / sqrt(Scores[i][1])
+```
+
+Each child of each leaf contributes through `AddLeaf`:
+
+```
+Scores[i][0] += leafApprox * leafStats.SumWeightedDelta
+Scores[i][1] += leafApprox * leafApprox * leafStats.SumWeight
+```
+
+with `leafApprox = CalcAverage(SumWeightedDelta, SumWeight, scaledL2) =
+SumWeightedDelta / (SumWeight + scaledL2)`, and **0 when `SumWeight <= 0`**
+(`online_predictor.h`: `count > 0 ? 1./(count + reg) : 0`). `TL2ScoreCalcer`
+keeps only the first accumulator and returns it directly. So Cosine's
+numerator IS the L2 score, and the whole difference is the division by
+`sqrt` of a second accumulator.
+
+Written as a cosine, which is where the name comes from: with `d` the vector
+of per-child steps and `g` the vector of per-child derivative sums, the
+numerator is `<d, g>` and the denominator is `||d||_W`, so the score is
+`<d, g> / ||d||_W` -- the projection of the proposed step onto the gradient,
+which is the cosine of the angle between them up to the constant `||g||`.
+
+#### 2. How it differs from L2, exactly, and where `lambda` lives
+
+Translated into mojotrees terms (our leaf output is `out = -G/(H + lambda)`,
+so CatBoost's `SumWeightedDelta = -G` and their `SumWeight` sits where our
+`H` sits):
+
+```
+num = sum_c   -out_c * G_c        =  sum_c  G_c^2 / (H_c + lambda)
+den = sum_c  out_c^2 * H_c        =  sum_c  G_c^2 * H_c / (H_c + lambda)^2
+cosine = num / sqrt(den)          L2 = num
+```
+
+**Set `lambda = 0` and `num` and `den` become the same expression.** Then
+`cosine = num / sqrt(num) = sqrt(num) = sqrt(L2)`, and `sqrt` is strictly
+increasing on the non-negative reals, so **the two score functions have
+exactly the same argmax.** This holds for any number of children, so it holds
+for the depth-wise search and for the oblivious level search alike.
+
+Equivalently, and this is the cleaner statement: for a *single* child,
+`num_c / sqrt(den_c) = |G_c| / sqrt(H_c)`, in which `lambda` has cancelled
+completely. **Cosine is L2 with the regularizer left in the leaf-value
+estimate and taken back out of the score normalization.** That is the whole
+mechanism.
+
+#### 3. The `lambda_l2 = 0` consequence, which is the point of this row
+
+`bench/results/LANE_RULES.md` asks whether a ratio score function has a
+denominator that `lambda` was damping. It does, and the answer runs the
+opposite way from the failure that shape usually produces:
+
+- **mojotrees stock is now `lambda_l2 = 0`. At that value Cosine cannot
+  change which split is chosen.** It is not a small effect at stock, it is
+  the zero effect, provably and not empirically.
+- The `gain > 0` admission test is unaffected too: `num > parent_num` if and
+  only if `sqrt(num) > sqrt(parent_num)`, so a candidate admitted under L2 is
+  admitted under Cosine and vice versa.
+- Cosine is therefore reachable as a *difference* only through one of:
+  `lambda_l2 > 0`; a leaf-wise (`num_leaves`-bounded) priority queue, where
+  gains from **different parents** are compared and `sqrt(a) - sqrt(p)` does
+  reorder against `a - p` even at `lambda_l2 = 0`; a non-zero
+  `min_gain_to_split`, `feature_contri`, CEGB cost or `random_strength`,
+  each of which is an absolute amount or a multiplier applied to a gain whose
+  units Cosine has changed.
+- The denominator's own small-value hazard is the reverse of the usual one:
+  `den -> 0` forces `num -> 0` through the same `SumWeight <= 0` guard, and
+  where our L2 gain blows up like `G^2/H` as `H -> 0`, Cosine blows up like
+  `|G|/sqrt(H)`, which is *less* singular. The `1e-100` seed on the
+  denominator is a divide-by-zero guard, not a regularizer; `min_child_hess`
+  is what actually keeps `H` off the floor and it is unchanged.
+
+#### 4. The CPU default really is Cosine, and the grow-policy story
+
+`oblivious_tree_options.cpp:22` -- `ScoreFunction("score_function",
+EScoreFunction::Cosine)`. That is the constructor default and it is not
+conditioned on anything.
+
+`oblivious_tree_options.cpp:143` -- `CB_ENSURE(TaskType == GPU ||
+EqualToOneOf(ScoreFunction, Cosine, L2), "Only Cosine and L2 score functions
+are supported for CPU.")`. So on CPU the enum has exactly two reachable
+values, and `MakePointwiseScoreCalcer` and
+`leafwise_scoring.cpp:530-551` both refuse anything else by name.
+
+**Per grow policy, on CPU:**
+
+| grow policy | score function used | where |
+|---|---|---|
+| `SymmetricTree` (default) | `score_function`, i.e. **Cosine** by default | `greedy_tensor_search.cpp:685` builds the calcer from `ObliviousTreeOptions->ScoreFunction`; `numScoreBlocks = 1`, so one num/den pair is accumulated across **every leaf of the level** and one ratio is taken per candidate |
+| `Depthwise` | `score_function`, i.e. **Cosine** by default | `leafwise_scoring.cpp:530`, one num/den pair per (leaf, candidate) |
+| `Lossguide` | `score_function`, i.e. **Cosine** by default | same call site |
+
+**The claim that Lossguide defaults to `NewtonL2` is GPU-only.** The
+`ScoreFunction.SetDefault(NewtonL2 / L2)` block at
+`catboost_options.cpp:980-991` sits inside `if (TaskType ==
+ETaskType::GPU) {` opened at line 949. On CPU that block is not reached, and
+`NewtonL2` would be refused by the `CB_ENSURE` above anyway. There is no
+per-policy and no per-loss score-function default on CPU.
+
+#### 5. The parent term, which is not what a reader expects
+
+CatBoost never subtracts a per-candidate parent score inside the calcer.
+`SelectBestCandidate` (`greedy_tensor_search.cpp:955`) computes
+`gain = score - scoreBeforeSplit` and then multiplies by the per-feature
+weight. Under `SymmetricTree`, `scoreBeforeSplit` starts at `0.0` for the
+root level and is then set to the previous level's winning **score**
+(line 1214) -- which is precisely the current level's cross-leaf unsplit
+score, because the current level's leaves are exactly the children the
+previous split made. Under `Depthwise`/`Lossguide` it is
+`CalcScoreWithoutSplit` (`leafwise_scoring.cpp:555`), which runs the same
+calcer over the leaf's own totals with an empty second child.
+
+Two consequences:
+
+1. With no feature weights set (the default) `scoreBeforeSplit` is a constant
+   across the candidates of one level, so it cancels out of the argmax
+   entirely. It matters only for the `bestScore == MINIMAL_SCORE` stop, for
+   `feature_weights` / `penalties_coefficient`, and for the leaf-wise queue.
+2. **Under Lossguide it does NOT cancel**, because gains from different
+   parents are compared against each other. That is the one place where
+   Cosine changes the tree even at `lambda_l2 = 0`.
+
+#### 6. What mojotrees built
+
+`split.SCORE_L2` (= 0, the default) and `split.SCORE_COSINE` (= 1), as a new
+trailing `score_function` parameter on `split.find_best_split` and
+`split.find_best_split_shared`.
+
+**The default path is byte-for-byte the path it was.** Nothing was deleted
+from `_split_gain`, which is untouched; the Cosine arithmetic lives in three
+new `@always_inline` helpers (`_cosine_out`, `_cosine_unsplit`,
+`_cosine_pair`) that the default never calls, behind one `if cosine:` on a
+value that is loop-invariant for the whole node. The two extra accumulator
+planes the oblivious path needs are allocated with length 0 when Cosine is
+off. The golden fixtures are untouched and no bit moves at the default.
+
+Faithful to source: the two-accumulator shape, the `num += -out * G` /
+`den += out^2 * H` contributions, the `H <= 0 -> out = 0` guard, the `1e-100`
+denominator seed, the use of the *finished and clamped* child output as
+`leafApprox` when `max_delta_step` / `path_smooth` / monotone constraints are
+active (`scoring.cpp:711-720` calls `AddLeaf` with the monotonized leaf
+value), and the parent term computed by the same calcer over the node's own
+totals.
+
+Deliberate divergences, each recorded here rather than smoothed over:
+
+- **No mean-weight rescale of `lambda`.** CatBoost uses
+  `scaledL2Regularizer = l2_leaf_reg * (sumAllWeights / docCount)`
+  (`scoring.cpp:749`, `ScaleL2Reg`). Ours is the raw `lambda_l2`, as A6 already
+  records for leaf estimation. Under Cosine this is a *bigger* divergence than
+  under L2, because Cosine's entire difference from L2 is a function of
+  `lambda`; a mojotrees Cosine run at `lambda_l2 = 3` is not a CatBoost
+  `l2_leaf_reg = 3` run unless the mean sample weight is 1.
+- **L1 composes.** CatBoost has no `lambda_l1` in the split score. Ours feeds
+  the same soft-thresholded `T(G)` into Cosine that it feeds into L2, so the
+  two score functions differ only in the ratio and not in the input.
+- **Ordered boosting's `AddLeafOrdered` is not implemented.** It computes
+  `leafApprox` from `(SumDelta, Count)` while still accumulating against
+  `(SumWeightedDelta, SumWeight)`, so under ordered boosting Cosine is *not*
+  `sqrt(L2)` even at `lambda = 0`. mojotrees has no ordered boosting (A7), so
+  the plain kernel is the only one that applies.
+- **Addend order is ours.** `UpdateScoreBinKernelPlain` accumulates the true
+  (right) child before the false (left) one and seeds the denominator before
+  either. We seed the denominator, then add left, then add right, and in the
+  oblivious path fold leaves in ascending `hists` order. Fixed by the loops,
+  not by the scheduler, so the value is identical at every
+  `MOJOTREES_NUM_WORKERS`.
+- **Monotone constraints.** CatBoost *projects* leaf values by isotonic
+  regression and scores the projection; mojotrees clamps to the node's
+  interval and *rejects* a violating candidate. That divergence predates this
+  lane. Under Cosine a rejected or illegal leaf of an oblivious level
+  contributes its **unsplit** `num`/`den` terms, which is the exact
+  generalization of what the L2 path already does (a leaf contributing `0.0`
+  to a sum of `child - parent` differences is arithmetically identical to a
+  leaf contributing its parent terms to both accumulators). See below.
+- **Categorical features are refused under Cosine.** A categorical
+  candidate's set search (`categorical.mojo`) scores partitions with the L2
+  gain internally and only its winner reaches `find_best_split`; rescoring
+  that winner under Cosine would mix two score functions inside one argmax.
+  Refused by name rather than half-applied, exactly as `random_strength` and
+  `extra_trees` are.
+
+**OURS, not verified, and not verifiable:** the rule that an illegal leaf of
+an oblivious level contributes its unsplit terms. CatBoost's `SymmetricTree`
+has no `min_data_in_leaf` and no `min_child_hess` (see the A8 note), so it
+never had to define the case. The rule is chosen because it is the unique
+generalization that reduces to the existing L2 behavior: under L2,
+`sum over legal leaves of (child_score - parent_score)` equals
+`(sum over legal of child_score + sum over illegal of parent_score) - sum over
+all of parent_score`, identically. Cosine's ratio makes the second spelling
+the only one that can be written, and it is the one that agrees with L2 term
+for term.
+
+**OURS, and worth a lane of its own:** with Cosine available,
+`random_strength`'s noise is finally dimensionally consistent with the score
+it is added to. `tree_parameters_extra.mojo` already records that mojotrees
+scales the noise by a gradient RMS (CatBoost's `derivativesStDevFromZero`)
+and adds it to a gain of units `gradient^2 / hessian`, which is CatBoost's
+`score_function=L2` pairing and not the one CatBoost ships. Cosine's value has
+units of a gradient. `score_function=cosine` plus `random_strength > 0` is the
+first configuration in which mojotrees reproduces CatBoost's *actual* default
+regularizer, and A3's useful range of `random_strength` is the documented one
+only in that pairing.
+
+#### 7. Supersedes
+
+The A8 note's Correction 2 says Cosine "is NOT this and NOT implemented
+here", and `split.find_best_split_shared`'s docstring said the same. Both
+were true when written. Cosine is now implemented, opt-in, default off; the
+rest of Correction 2 (that our per-leaf-gain sum and CatBoost's `TL2ScoreCalcer`
+sum have the same argmax) is unaffected and still holds.
