@@ -383,8 +383,14 @@ def _reject_infinite(Xa, name):
     a parallel read with no allocation. The numpy fallback is tiled rather
     than whole-array for the reason `_INF_TILE` gives.
     """
+    # Before the native branch: an empty array's `ctypes.data` is not
+    # required to be a valid address, and the boundary refuses a null one.
+    if Xa.size == 0:
+        return
     native = _native()
-    scan = None if native is None else getattr(native, "buffer_has_infinite", None)
+    scan = (
+        None if native is None else getattr(native, "buffer_has_infinite", None)
+    )
     if (
         scan is not None
         and Xa.dtype == np.dtype(np.float64)
@@ -393,8 +399,6 @@ def _reject_infinite(Xa, name):
     ):
         if scan(addr(Xa), int(Xa.size)):
             raise ValueError(_INF_MESSAGE.format(name))
-        return
-    if Xa.size == 0:
         return
     per_row = max(1, int(Xa.size // Xa.shape[0]))
     step = max(1, _INF_TILE // per_row)
