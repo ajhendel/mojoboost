@@ -515,8 +515,15 @@ _LAZY_SUBMODULES = (
     "dask",
     "device_selection",
     "diagnostics",
+    # `features` and `onnx_export` are the Python halves of four native
+    # modules no entry point reached until 2026-08-16 (catalog A31). Lazy
+    # like `lgbm_model_io` and for the same reason: they export nothing at
+    # top level, so a text or embedding transform and an ONNX export are
+    # asked for by name.
+    "features",
     "inspection",
     "lgbm_model_io",
+    "onnx_export",
 )
 
 #: Top-level names that live in a lazy submodule, and the submodule each

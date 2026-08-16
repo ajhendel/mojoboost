@@ -74,7 +74,14 @@ because nothing has measured a reason to change that.
 
 from std.math import exp, log
 
-from .text_processing import TextBag
+from .text_processing import (
+    DictionaryParams,
+    TextBag,
+    TokenizerParams,
+    build_dictionary,
+    default_dictionaries,
+    digitize,
+)
 
 
 # `TBagOfWordsEstimator`: `TopTokensCount("top_tokens_count", 2000)`.
@@ -618,3 +625,189 @@ def text_column_memory_bound_bytes(
     and the answer is a packed representation rather than more memory.
     """
     return n_features * n_rows * 8
+
+
+# ---------------------------------------------------------------------------
+# The pipeline, for a caller who wants the whole thing
+# ---------------------------------------------------------------------------
+#
+# Everything above this line takes a `List[TextBag]`, and a `TextBag` is a
+# thing only `text_processing` can build. That is why both modules were
+# unreachable: there was no function anywhere that took the documents a user
+# actually has and returned the numeric columns the binner actually wants.
+# This section is that function, and catalog A31 records it.
+#
+# Read the leakage paragraph in the A18 note before enabling `naive_bayes` or
+# `bm25`. Both read the target, both are computed strictly before-write over
+# the caller's permutation, and the permutation is still not built here.
+
+
+@fieldwise_init
+struct TextFeatureSpec(Copyable, Movable):
+    """Which of the three estimators run over one text column.
+
+    All three off by default, like every other CatBoost mechanism in this
+    package. CatBoost's own default is `BoW` always plus `NaiveBayes` for a
+    classification pool, which `catboost_defaults` spells out; asking for it
+    by name is the difference between a comparison and an accident.
+    """
+
+    var bow: Bool
+    var top_tokens_count: Int
+    var naive_bayes: Bool
+    var bm25: Bool
+
+    @staticmethod
+    def default() -> Self:
+        return Self(False, DEFAULT_TOP_TOKENS_COUNT, False, False)
+
+    @staticmethod
+    def catboost_defaults() -> Self:
+        """`TTextProcessingOptions::SetDefault`: `BoW` plus `NaiveBayes`.
+        BM25 stays off, because nothing in CatBoost turns it on either."""
+        return Self(True, DEFAULT_TOP_TOKENS_COUNT, True, False)
+
+    def any_enabled(self) -> Bool:
+        return self.bow or self.naive_bayes or self.bm25
+
+    def target_aware(self) -> Bool:
+        """Whether this spec reads the target, and therefore whether the
+        permutation and the class labels are load-bearing rather than
+        ignored."""
+        return self.naive_bayes or self.bm25
+
+
+struct TextColumns(Copyable, Movable):
+    """The generated columns for one text column, COLUMN-MAJOR:
+    `values[f * n_rows + r]`, which is the layout `binning.fit_bins` reads.
+
+    `n_features` is carried rather than derived because it depends on the
+    fitted dictionary size, which a caller cannot know before the fit and
+    therefore cannot use to size a buffer in advance. That is the whole
+    reason the boundary above this is an open/write pair and not one call.
+    """
+
+    var n_rows: Int
+    var n_features: Int
+    var values: List[Float64]
+
+    def __init__(
+        out self, n_rows: Int, n_features: Int, var values: List[Float64]
+    ) raises:
+        if n_rows < 0:
+            raise Error("TextColumns: n_rows must not be negative")
+        if n_features < 0:
+            raise Error("TextColumns: n_features must not be negative")
+        if len(values) != n_rows * n_features:
+            raise Error(
+                "TextColumns: expected n_rows * n_features values, got a"
+                " different count"
+            )
+        self.n_rows = n_rows
+        self.n_features = n_features
+        self.values = values^
+
+    def memory_bound_bytes(self) -> Int:
+        return text_column_memory_bound_bytes(self.n_rows, self.n_features)
+
+
+def text_column_features(
+    docs: List[String],
+    classes: List[Int],
+    num_classes: Int,
+    permutation: List[Int],
+    tokenizer: TokenizerParams,
+    dictionaries: List[DictionaryParams],
+    spec: TextFeatureSpec,
+) raises -> TextColumns:
+    """Every enabled estimator's columns for one raw text column.
+
+    The order is CatBoost's: dictionary by dictionary in the order given
+    (`default_dictionaries()` is bigram then unigram, and that order is not
+    cosmetic because it fixes which columns land where), and within one
+    dictionary `BoW`, then `NaiveBayes`, then `BM25`. The columns are
+    ordinary floats from here on and go straight into the existing binning
+    path, which is CatBoost's design and the reason this lane wrote no
+    trainer.
+
+    A spec with nothing enabled RAISES rather than returning zero columns,
+    the same rule `embedding.compute_online_features` states: a caller who
+    generated no features asked the wrong question and should hear about it.
+
+    `classes` and `permutation` are read only when the spec is target-aware.
+    A `BoW`-only caller may pass empty lists for both, and that is the one
+    configuration with no leakage question in it at all.
+    """
+    if not spec.any_enabled():
+        raise Error(
+            "text_column_features: no estimator is enabled; this refuses"
+            " rather than returning zero columns"
+        )
+    if len(dictionaries) == 0:
+        raise Error(
+            "text_column_features: no dictionary was given; the untouched"
+            " CatBoost default is text_processing.default_dictionaries()"
+        )
+    var n_rows = len(docs)
+    if spec.target_aware():
+        check_classification_target(classes, num_classes)
+        if len(classes) != n_rows:
+            raise Error(
+                "text_column_features: the document count and the class count"
+                " differ"
+            )
+        check_permutation(permutation, n_rows)
+
+    var values = List[Float64]()
+    var n_features = 0
+    for d in range(len(dictionaries)):
+        var dictionary = build_dictionary(
+            docs, tokenizer, dictionaries[d].copy()
+        )
+        var bags = digitize(docs, tokenizer, dictionary)
+        if spec.bow:
+            var count = bow_feature_count(
+                dictionary.size(), spec.top_tokens_count
+            )
+            var cols = bow_features(
+                bags, dictionary.size(), spec.top_tokens_count
+            )
+            for i in range(len(cols)):
+                values.append(cols[i])
+            n_features += count
+        if spec.naive_bayes:
+            var cols = naive_bayes_online_features(
+                bags, classes, num_classes, permutation
+            )
+            for i in range(len(cols)):
+                values.append(cols[i])
+            n_features += len(cols) // n_rows if n_rows > 0 else 0
+        if spec.bm25:
+            var cols = bm25_online_features(
+                bags, classes, num_classes, permutation
+            )
+            for i in range(len(cols)):
+                values.append(cols[i])
+            n_features += len(cols) // n_rows if n_rows > 0 else 0
+    return TextColumns(n_rows, n_features, values^)
+
+
+def text_column_features_default_dictionaries(
+    docs: List[String],
+    classes: List[Int],
+    num_classes: Int,
+    permutation: List[Int],
+    spec: TextFeatureSpec,
+) raises -> TextColumns:
+    """`text_column_features` at CatBoost's untouched tokenizer and its two
+    default dictionaries. The one-argument form a caller who has not read
+    `text_processing` should be using."""
+    return text_column_features(
+        docs,
+        classes,
+        num_classes,
+        permutation,
+        TokenizerParams(),
+        default_dictionaries(),
+        spec,
+    )

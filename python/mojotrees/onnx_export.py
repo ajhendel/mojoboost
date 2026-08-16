@@ -31,6 +31,11 @@ __all__ = [
     "read_plan",
     "plan_to_model_proto",
     "convert_plan_file",
+    "export_refusals",
+    "plan_text",
+    "plan_from_model",
+    "to_model_proto",
+    "save_model_onnx",
 ]
 
 PLAN_MAGIC = "mojotrees-onnx-plan"
@@ -306,3 +311,98 @@ def convert_plan_file(plan_path: str | Path, onnx_path: str | Path) -> None:
     model = plan_to_model_proto(plan)
     onnx.checker.check_model(model)
     Path(onnx_path).write_bytes(model.SerializeToString())
+
+
+# ---------------------------------------------------------------------------
+# The entry points, which are what made any of the above reachable
+# ---------------------------------------------------------------------------
+#
+# Everything before this line reads a plan FILE. Until 2026-08-16 nothing in
+# the package could write one: `src/mojotrees/onnx_export.mojo` was compiled,
+# tested and bound by nothing, so a user holding a fitted model had no way to
+# reach `onnx_plan` at all and this module was a reader with no writer. The
+# four `_mojotrees` entry points below are the writer. See catalog A31.
+
+
+def _native():
+    from . import _compat  # noqa: PLC0415
+
+    return _compat.import_extension()
+
+
+def _handle_of(model):
+    """`(native handle, is_multiclass)` for a fitted `Booster` or estimator.
+
+    A `Booster` carries the handle as `_handle` and a scikit-learn estimator
+    as `_model`; both are the same native object and neither is public, which
+    is why this reaches for them here rather than asking every caller to.
+    """
+    from . import _eval  # noqa: PLC0415
+
+    handle = getattr(model, "_handle", None)
+    if handle is not None:
+        return handle, getattr(model, "_task", None) == _eval.MULTICLASS
+    booster = getattr(model, "booster_", None)
+    if booster is not None and getattr(booster, "_handle", None) is not None:
+        return booster._handle, booster._task == _eval.MULTICLASS
+    handle = getattr(model, "_model", None)
+    if handle is None:
+        raise TypeError(
+            "expected a fitted mojotrees Booster or estimator; this one holds "
+            "no model"
+        )
+    return handle, bool(getattr(model, "_n_classes", 0))
+
+
+def export_refusals(model, *, raw_score=False):
+    """Every reason `model` cannot be exported exactly, as a list of
+    sentences. An empty list is the only thing that permits an export.
+
+    All of them rather than the first, which is the native function's rule:
+    a caller who has to fix three things learns about three things.
+    """
+    handle, multiclass = _handle_of(model)
+    native = _native()
+    if multiclass:
+        return list(native.onnx_export_refusals_multiclass(handle, int(bool(raw_score))))
+    return list(native.onnx_export_refusals(handle, int(bool(raw_score))))
+
+
+def plan_text(model, *, raw_score=False):
+    """The export plan for a fitted model, as the token stream `read_plan`
+    parses. Raises with every refusal named when the model holds something
+    `ai.onnx.ml` opset 3 cannot reproduce."""
+    handle, multiclass = _handle_of(model)
+    native = _native()
+    if multiclass:
+        return native.onnx_plan_text_multiclass(handle, int(bool(raw_score)))
+    return native.onnx_plan_text(handle, int(bool(raw_score)))
+
+
+def plan_from_model(model, *, raw_score=False):
+    """The plan as an `OnnxPlan`, without a file in between."""
+    return read_plan(plan_text(model, raw_score=raw_score))
+
+
+def to_model_proto(model, *, raw_score=False, name="mojotrees"):
+    """A fitted mojotrees model as an ONNX `ModelProto`.
+
+    Needs the optional `onnx` package. Every threshold, leaf weight and NaN
+    direction in the result was decided in Mojo; this function transcribes.
+    """
+    return plan_to_model_proto(
+        plan_from_model(model, raw_score=raw_score), name=name
+    )
+
+
+def save_model_onnx(model, path, *, raw_score=False, name="mojotrees"):
+    """Write a fitted model to `path` as a checked ONNX file.
+
+    Named `save_model_onnx` and not `save_model` on purpose: `save_model` is
+    the mojotrees model format, which round-trips a fit bit-identically, and
+    an ONNX file does not and never will. Two names for two artifacts.
+    """
+    onnx, _, _ = _require_onnx()
+    proto = to_model_proto(model, raw_score=raw_score, name=name)
+    onnx.checker.check_model(proto)
+    Path(path).write_bytes(proto.SerializeToString())

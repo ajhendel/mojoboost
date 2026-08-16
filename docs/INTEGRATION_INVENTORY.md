@@ -54,17 +54,22 @@ it, not a second opinion.
 |---|---|---|---|
 | `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference the CPU/GPU equivalence test compares against. Test-only by design |
 | `catboost_ranking` | PENDING | cpu_round_2 | CatBoost ranking objectives and eval metrics (QueryRMSE, PairLogit, YetiRank, NDCG, PFound). No trainer selects them |
-| `embedding` | PENDING | cpu_round_2 | CatBoost's LDA and KNN embedding feature estimators. Catalog A20. Needs a raw embedding column the ingestion path does not accept |
 | `gpu_vendor_policy` | EXPERIMENTAL | consolidation_K2 | CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / gpu_amd_policy twins (f23bd1b). Reached only from its test until a discrete-GPU trainer consults it; that is the same status the twins had. handoffs/migration_20_device_policy.md |
-| `langevin` | PENDING | cpu_round_2 | Stochastic Gradient Langevin Boosting and model shrinkage (langevin, diffusion_temperature, model_shrink_rate). The boosting loop does not draw the noise or apply the shrinkage |
-| `multi_target` | PENDING | cpu_round_2 | CatBoost's MultiRMSE and MultiRMSEWithMissingValues. Blocked with survival on the same thing target_matrix names |
-| `onnx_export` | PENDING | cpu_round_2 | ONNX export of the tree ensemble, arithmetic and refusals. No binding registers it, so no Python caller can export |
-| `survival` | PENDING | cpu_round_2 | CatBoost's Cox and SurvivalAft objectives. Both need the multi-column label contract target_matrix describes |
-| `target_matrix` | PENDING | cpu_round_2 | The multi-column label contract, and by its own docstring the finding rather than the fix: every training entry point takes a single target column. This is the head of the chain that reaches multi_target and survival, so one connecting edge closes three |
-| `text_features` | PENDING | cpu_round_2 | CatBoost's text_features: the BoW, NaiveBayes and BM25 estimators. Host-side feature generation nothing calls |
-| `text_processing` | PENDING | cpu_round_2 | The tokenizer, dictionary and digitizer behind text_features. Reached only from that module, itself unreached, so it is the tail of a two-module chain and not a separate decision |
+| `langevin` | PENDING | cpu_round_2 | Stochastic Gradient Langevin Boosting and model shrinkage (langevin, diffusion_temperature, model_shrink_rate). The boosting loop does not draw the noise or apply the shrinkage: BoosterParams carries neither LangevinParams nor ModelShrinkParams, and the leaf-sum draw has no call site in tree.mojo. Since 2026-08-16 all four parameter names EXIST on the estimator and are refused there by name (sklearn._check_langevin), so this is asked-and-refused rather than unaskable. Wiring it is a trainer change |
+| `survival` | PENDING | cpu_round_2 | CatBoost's Cox and SurvivalAft objectives. The multi-column label contract they were blocked on now HAS a Python wire -- _mojotrees.multi_rmse_fit takes n_targets columns and builds a TargetMatrix -- so the blocker moved: survival.mojo has no fit_* entry point of its own and nothing selects its objective codes |
 
-*Dated note, 2026-08-16.* Eleven of the thirteen rows above landed in a single
+*Dated note, 2026-08-16, revised the same day.* The table above held eleven
+rows this morning and holds five now. `lane/reachability-rest` connected six
+of them through one new binding sibling
+(`bindings/catboost_reach_bindings.mojo`), and two of those six were reached
+transitively rather than directly: `target_matrix` through `multi_target`,
+`text_processing` through `text_features`. So two edges closed four modules,
+which is the shape of this list and not a coincidence. Catalog A31 traces
+every path and states what each connected module still refuses. `langevin`
+and `survival` stayed, with their reasons rewritten to say what is now true
+rather than what was true this morning.
+
+Eleven of the thirteen rows this table once held landed in a single
 round and were recorded in one pass, which is itself the finding. The list went
 from two orphans to five and then to eleven inside about half an hour of
 wall clock while lanes merged, and nothing failed, because the CI job that runs
