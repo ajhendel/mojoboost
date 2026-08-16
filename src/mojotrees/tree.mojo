@@ -2816,11 +2816,19 @@ def grow_tree_leaves_profiled(
     const_h_env = const_h_env.widened(
         params.extra.wants_float64_derivatives()
     )
+    # `usable` is the pool the fraction draws from, and every caller of
+    # `select_tree_features` took its `[]` default, so the parameter existed
+    # and no fit ever passed one. `BinnedMatrix.usable_features` says it is
+    # every feature unless the fit prefiltered and that passing every feature
+    # is the same draw as passing nothing, so this changes no fit today; what
+    # it changes is that a prefilter can now reach the sampler at all.
+    # `feature_pre_filter` was half-wired for exactly this reason.
     var tree_features = select_tree_features(
         data.n_features,
         params.feature_fraction,
         params.feature_fraction_seed,
         tree_index,
+        data.usable_features(),
     )
     # The histogram columns the tree's feature sample requires: the features
     # themselves without bundling, the bundles they sit in with it. A bundle
