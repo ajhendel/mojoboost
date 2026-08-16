@@ -87,6 +87,25 @@ The 458 microsecond constant, derived from the depthwise A/B where what was
 removed were per-level round trips, applies to round trips. It was extended to
 copies by analogy, by me, and the extension is refuted.
 
+### And the "three independent confirmations" was two errors agreeing
+
+This project stated, repeatedly and including to Andrew, that the per-split wait
+had been confirmed by three routes sharing no inputs: a curve fit giving a 1.42
+second intercept, a counter times a per-event cost giving 3,100 x 458 us = 1.42
+seconds, and the resident plane predicting 0.69 seconds and measuring 0.57.
+
+The first two are sound and remain so. **The third was a coincidence.** The 0.57
+seconds it measured came from removing about thirty *round trips* per tree. The
+model that predicted 0.69 was counting fifteen *copies and syncs*. Both numbers
+were near 0.6 and the agreement was read as confirmation of the model. It was
+two different quantities landing close together, and it made a wrong cost model
+look corroborated at exactly the moment it should have been questioned.
+
+That is why the collapse prediction was then wrong by a factor of forty rather
+than being caught early: the erroneous model had apparently just passed a test.
+A prediction that agrees with a measurement for the wrong reason is worse than
+one that fails, because it buys the model credit it has not earned.
+
 **None of the collapse work is reverted.** It is correct, it is tested, it makes
 staleness structurally impossible in the searcher's tables, and it removes real
 if unmeasurable work. It is simply not a speed result, and the parts of it that
