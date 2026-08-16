@@ -679,3 +679,102 @@ step including dead ones, where it cannot possibly be consumed. `dead=0` at ever
 shape above, so it does not bite here -- but a fit that stops early on
 `min_gain_to_split` would pay it, which is why `dead` is reported beside `builds`
 rather than folded into it.
+
+---
+
+## Candidates 5 and 6: the lane found a bug in the specification it was implementing
+
+### The retracted claim stays retracted, and a different change is the real win
+
+This project once relayed, enthusiastically, that dropping `- parent_score` from
+the gain was a free accuracy win. **That is still wrong.** Rounding is monotone,
+so subtracting a common constant preserves order, and in the near-tie regime
+Sterbenz applies (`P/2 <= left_score + right_score <= 2P`), making the
+subtraction exactly representable. A null, and no rewrite of it shipped.
+
+**The cross form is a different change and it is real.** The bits are lost one
+step earlier, in forming `left_score + right_score`, whose rounding error is
+`eps` of its own magnitude, roughly `eps * parent_score` -- an absolute floor
+that does not shrink as the gain shrinks. The cross form never forms that sum.
+
+**Derived bound:** shipped resolves to `eps*P`, cross to `eps*sqrt(P*gain)`, an
+improvement factor of `sqrt(parent_score/gain)`. Modelled in standalone NumPy,
+**not in mojotrees**, percent of near-tie pairs ranked correctly:
+
+| parent/gain | shipped resolves | cross resolves | ratio | bound predicts |
+|---|---|---|---|---|
+| 1 | 1e-6 | 1e-6 | 1 | 1 |
+| 30 | 1e-5 | 3e-6 | 3.3 | 5.5 |
+| 300 | 1e-4 | 1e-5 | 10 | 17 |
+| 2900 | 1e-3 | 1e-4 | 10 | 54 |
+
+Where it lives: one-sided gradients, late logistic and softmax rounds, nearly
+pure leaves. **Where it does not: below a parent/gain ratio of 1 it buys nothing
+and is about 30 percent worse on the median.** Said at the site rather than
+buried.
+
+Incidental and worth keeping: a form that cannot resolve a gap does not
+coin-flip. The shipped form *ties* the candidates and the scan keeps its
+incumbent, which is why it scores 19 percent rather than 50.
+
+### Section 8 of ACCURACY_BUDGET.md is invalid at `lambda_l1 > 0`
+
+**The identity requires `GL + GR = G`. Under L1 the gain is built from `T(GL)`,
+`T(GR)`, `T(G)`, and soft thresholding is not additive.** The document never
+mentions L1 anywhere.
+
+Applying it anyway measures a **systematic bias** of 1.6e-04 relative at a
+parent/gain ratio of 293, where the shipped form sits at 1.0e-05 -- with median
+and p99 agreeing to two figures, which rounding does not do. **Shipping section 8
+as written would have degraded every L1 fit.** The arm now refuses itself
+whenever `lambda_l1 != 0`.
+
+Four further corrections the lane reported and the document should absorb: its
+formula does not cover the categorical many-vs-many walk (children scored at
+`lambda_l2 + cat_l2` against a parent at `lambda_l2`); "never worse" is too
+strong; its three stated obligations dissolve because converting back to gain
+units costs one node constant which cancels against `l2/(H+l2)*P` rather than
+against `P`; and the effect is larger than its "up to 20x", reaching ~1000x on
+the median over all candidates.
+
+### Candidate 3 moved the ground under candidate 6 without removing it
+
+The budget derived 6 from an inexact dequantization. **That reason is gone**, and
+so is the next one: with a power-of-two scale the float subtraction is itself
+exact by Sterbenz whenever the left child holds between half and twice the total.
+
+What survives is stronger than what was written: the whole error is the two
+Int32-to-Float32 casts, each rounding by `2^-24` **of the node total**, so the
+derived right child inherits an error set by its parent's magnitude. Integer
+subtraction casts once, afterwards, and that does not shrink with the scale's
+shape. 6 still pays 2 to 2.5x on top of 5, and the "6 only with 5" rule holds --
+power-of-two arguably sharpens it, since the anti-correlation is now exact rather
+than approximate.
+
+### Bits move, fixtures do not, and the two unrunnable files now ran
+
+Bits move on **every** path through the device split search: every gain value,
+the `min_child_hess` admission test, and the record's child stats. The golden
+fixtures do not move -- `test_golden_bits` is cpu-safe, trains through the CPU
+path, and never reaches this module.
+
+The lane could not run `test_gpu_split_search` or `test_gpu_split_scan` under its
+budget and, rather than guessing, asserted a bound: 600 histograms of exactly
+their shape, both arms selecting the same split, differing by at most 1.96 units
+of `eps32*(parent_score + gain)`, which is 6e-06 against their `atol=1e-4`.
+
+**Both now run and both pass**, along with `test_gpu_gain_form` and
+`test_gpu_tree_resident`. The bound held.
+
+### The default, and what it rests on
+
+`GAIN_FORM_CROSS` ships as the default, following candidate 3's precedent. Its
+docstring states plainly that this rests on an identity, a derived bound and a
+NumPy model, and on **no mojotrees measurement**.
+
+That is the second numeric default this wave changed without a mojotrees
+measurement, after `pair_alignment`. Unlike that one, **this changes bits**. It
+is therefore gated on the real-data accuracy run against
+`bench/real_data/thresholds.json`, which is also the GPU path's first accuracy
+record of any kind. If that run does not clear the thresholds, the default flips
+to opt-in and the arm stays for the L1-free case where the bound is largest.
