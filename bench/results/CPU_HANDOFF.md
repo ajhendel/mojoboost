@@ -77,6 +77,32 @@ not in the tree.
 `canonical-naming`, `score-function`, `derivative-precision-wiring`,
 `mvs-bootstrap`. All four branched off `perf-round-2` at `901e31d`.
 
+**`src/mojotrees/sampling.mojo` has two lanes in it and the split is a
+ruling, not a convention.** `canonical-naming` holds
+`canonical_bootstrap_type`, `canonical_sampling_param` and
+`sampling_param_names` exclusively; `mvs-bootstrap` holds everything else in
+the file and hands me its three table lines as glue once naming lands. That
+makes naming a dependency of MVS rather than a parallel lane. MVS was told
+not to open `src/mojotrees/mvs.mojo`: a new file importing sampling's
+constants is the shape that produced the CEGB import cycle.
+
+## The naming spec
+
+`docs/PARAMETER_NAMING.md`, committed `3e9f0fa`. One canonical name per
+parameter, always an existing vendor name, every other spelling an accepted
+alias; LightGBM's names stay on the wire for model I/O and `check_parity`.
+Two corrections from Andrew are already folded in and both arrived after the
+lane's brief, so **the file wins over any brief**: `grow_policy` takes
+`lossguide | depthwise | symmetrictree` with `leafwise`/`oblivious`/
+`symmetric` as aliases and the alias words used in prose, and there is no
+`boosting_scheme` key -- one `boosting_type` carries
+`gbdt | dart | goss | rf | plain | ordered`, `plain` aliasing `gbdt` and
+`ordered` parsing then raising not-implemented.
+
+It also carries one behavior fix that is easy to read past: `subsample < 1`
+implies `subsample_freq = 1` unless set explicitly. LightGBM's silent no-op
+there is a defect we are not copying.
+
 ## Glue the lanes cannot reach
 
 - `src/mojotrees/__init__.mojo` — `GROW_OBLIVIOUS` export. **DONE.**
