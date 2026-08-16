@@ -4441,3 +4441,114 @@ for _scenario_id, _reason in CATBOOST_SCENARIO_SUPPORT.items():
 del _scenario_id, _reason
 if "_engines" in dir():
     del _engines
+
+
+# ---------------------------------------------------------------------------
+# THE FRONTIER BLOCK. Owned by lane/frontier-block; the arms themselves live in
+# bench/real_data/frontier.py.
+# ---------------------------------------------------------------------------
+#
+# The arms are in their own module rather than here for one reason and it is
+# not size: they are a PLAN and not a matrix this harness can run. The job
+# identity in `run.py` is (scenario, engine, device, threads, repeat) and has
+# no arm dimension, so a frontier arm cannot be scheduled today, and putting
+# unschedulable arms in the file `run.py` reads from is how a plan comes to be
+# mistaken for a configuration. `frontier.WIRE_NOTES` lists what has to change,
+# none of it in this lane's files.
+#
+# What is here is the part that belongs beside the other support tables: which
+# scenarios the frontier runs on, and why the rest are absent. The pattern is
+# `CATBOOST_SCENARIO_SUPPORT`'s, fail-closed for the same reason -- a scenario
+# added without a decision should be a KeyError at import and not a silent
+# "runs".
+
+#: The frontier's scenario support. `None` runs; a string is the reason it does
+#: not, and the reason is a property of the QUESTION rather than of the
+#: trainer. A scenario is absent from the frontier because measuring it does
+#: not help decide the shipped defaults, and a scenario the trainer refuses is
+#: recorded in `frontier.UNREACHABLE` instead, which is a different fact.
+FRONTIER_SCENARIO_SUPPORT = {
+    "dense_regression": None,
+    "high_cardinality_categorical": None,
+    "imbalanced_binary": (
+        "not in the frontier's first pass. It is a real question and it is "
+        "the scenario where the float32 derivative default already cost 9.4 "
+        "percent of average precision, so the precision axis has more to say "
+        "here than anywhere else. It is out because the three rows Andrew "
+        "ordered are the dense decision row, its real variant and one "
+        "categorical row, and adding a fourth is his call with a wall clock "
+        "attached rather than this lane's"
+    ),
+    "multiclass": (
+        "out for the same scheduling reason, and it would also lose two of "
+        "the four axes if it were in: the multiclass trainer takes no "
+        "bootstrap bundle, so the subsample axis has no meaning on it "
+        "(MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT['multiclass'])"
+    ),
+    "ranking": (
+        "out, and the trees axis would be half a question here: CatBoost's "
+        "coefficient table has no row for a ranking objective, so `T@auto` "
+        "leaves the rate alone and the auto points of the axis are not auto. "
+        "See frontier.UNREACHABLE['auto_rate_on_ranking']"
+    ),
+    "categorical_missing": (
+        "out, and it is the categorical scenario that was NOT chosen rather "
+        "than one nobody considered. It has no CatBoost row at all and never "
+        "will, so the accuracy budget on it would be set by LightGBM alone "
+        "at every tree count, where the directive says the BETTER of the "
+        "two. frontier.CATEGORICAL_ALTERNATIVE carries the argument"
+    ),
+    "ordered_boosting_small": (
+        "out. Its row count is its identity -- it exists so that CatBoost's "
+        "boosting_type resolution is the thing under test -- and the "
+        "frontier varies tree counts and sampling, both of which change what "
+        "that scenario is asking"
+    ),
+    "sparse_highdim": (
+        "out. Three of the four axes are refused on the sparse path: the "
+        "bootstrap by name (`sampling.check_bootstrap_honored`), the "
+        "symmetric grower because `GrowthSchedule` refuses GROW_OBLIVIOUS "
+        "and there is no sparse oblivious grower, and the accelerator "
+        "because the CSC path reports cpu whatever is asked for. A frontier "
+        "row with one live axis is not a frontier row"
+    ),
+}
+
+#: Where the arms are, so that a reader who finds this table first is not left
+#: looking for them.
+FRONTIER_ARMS_MODULE = "bench/real_data/frontier.py"
+
+#: The one thing about the frontier that has to be true in THIS file, because
+#: it is this file's tables that a competitor row is built from.
+#:
+#: The frontier judges an arm against the better of CatBoost-as-shipped and
+#: LightGBM stock+det AT A MATCHED TREE COUNT, and it abstains rather than
+#: substituting another count. `catboost_readback_key` is (scenario, tier,
+#: variant) and carries no tree count, so a run that puts CatBoost at more
+#: than one tree count on one cell writes every read-back to one key and the
+#: last one wins. The frontier runs CatBoost at five tree counts per cell.
+#:
+#: Nothing in the frontier reads it -- no frontier arm takes the read-back
+#: route, because the mode-defaults layer means Base A derives its own rate
+#: while carrying CatBoost's l2 of 3 -- so this is a latent collision rather
+#: than a live defect. It is named here because the key is defined here, and
+#: because `mojotrees_catboost_mode` DOES take the read-back route: a frontier
+#: run that also scheduled that arm would hand it whichever tree count wrote
+#: last.
+FRONTIER_READBACK_LIMITATION = (
+    "catboost_readback_key carries no n_estimators, so the frontier's five "
+    "competitor tree counts on one cell collide on one key. Latent while no "
+    "frontier arm reads it; live the moment a frontier run also schedules "
+    "mojotrees_catboost_mode. See frontier.WIRE_NOTES["
+    "'readback_key_has_no_tree_count']"
+)
+
+for _frontier_scenario in SCENARIOS:
+    if _frontier_scenario not in FRONTIER_SCENARIO_SUPPORT:
+        raise KeyError(
+            f"{_frontier_scenario!r} has no FRONTIER_SCENARIO_SUPPORT "
+            "decision. A scenario that joins this suite needs one, because "
+            "the alternative is defaulting silently to 'the frontier runs "
+            "here' and scheduling a row nobody costed"
+        )
+del _frontier_scenario

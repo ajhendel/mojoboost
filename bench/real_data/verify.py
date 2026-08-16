@@ -34,10 +34,17 @@ after it:
    in the direction and by the tolerance thresholds.json gives, plus a
    check that mojotrees is not implausibly better, which is what a
    mismatched problem looks like from the outside.
-7. The baseline floor. Each engine separately has to beat the trivial
+7. The accuracy budget, which is the frontier's verdict rather than a gate:
+   is this arm within 1 percent relative, on the primary metric, of the
+   BETTER of CatBoost-as-shipped and LightGBM stock+det AT A MATCHED TREE
+   COUNT. The direction comes from `quality.HIGHER_IS_BETTER`, and a missing
+   competitor row at that tree count ABSTAINS rather than falling back to
+   another count. `report.py` ranks the arms this passes, by speed, and names
+   the fastest one as a documented recommendation that nothing applies.
+8. The baseline floor. Each engine separately has to beat the trivial
    model. Two engines that agree because both produced rubbish pass the
    differential check and fail here.
-8. Device agreement. mojotrees on the accelerator against mojotrees on the
+9. Device agreement. mojotrees on the accelerator against mojotrees on the
    CPU, compared row by row on the predictions themselves rather than on a
    summary of them.
 
@@ -470,6 +477,214 @@ def check_baseline(ok, config, verdict):
         verdict.add(PASS if ok_ else FAIL, "baseline", scope, detail)
 
 
+#: The accuracy budget, when thresholds.json does not carry one.
+#:
+#: Andrew's standing directive: accuracy within 1 percent relative on the
+#: primary metric, against the BETTER of CatBoost-as-shipped and LightGBM
+#: stock+det AT A MATCHED TREE COUNT, is a budget, and it is to be spent for
+#: speed. The number lives here rather than only in thresholds.json so that
+#: the check works on a results file taken before the key existed; a
+#: thresholds.json entry, when one is added, wins.
+DEFAULT_ACCURACY_BUDGET = {
+    "max_worse_relative": 0.01,
+    "competitors": ["catboost", "lightgbm"],
+    "engines_judged": ["mojotrees", "mojotrees_catboost_mode"],
+}
+
+
+def _tree_count(record):
+    """How many boosting rounds this record's model was grown for.
+
+    `params.num_boost_round` is what the engine adapter reported and is the
+    only field all three engines fill in. The two fallbacks are the resolved
+    parameter under each library's own name, because a record written before
+    the adapter reported the round count should be read rather than dropped:
+    dropping it would abstain a verdict for a reason that has nothing to do
+    with the comparison.
+    """
+    params = record.get("params") or {}
+    rounds = params.get("num_boost_round")
+    if rounds:
+        return int(rounds)
+    engine_params = params.get("engine") or {}
+    for name in ("n_estimators", "num_boost_round", "iterations"):
+        if engine_params.get(name):
+            return int(engine_params[name])
+    return None
+
+
+def _budget_cell(record):
+    """The comparison ground: same scenario, same data, same thread count.
+
+    The DATA KIND is in the key deliberately. `dense_regression` runs as a
+    generator and as UCI YearPredictionMSD, and a budget spent against the
+    wrong one of those is not a smaller comparison, it is a different
+    problem.
+    """
+    data = record.get("data") or {}
+    return (
+        record["scenario"],
+        record.get("tier"),
+        data.get("data_kind"),
+        data.get("dataset"),
+        record["threads"],
+    )
+
+
+def _arm_of(record):
+    """The arm label, which is the engine until the harness grows an arm
+    dimension. `frontier.py` documents the change; reading it through this
+    helper is what lets this check work before and after it."""
+    return record.get("arm") or record.get("engine")
+
+
+def check_accuracy_budget(ok, config, verdict):
+    """The inside-1-percent verdict, per row, at a MATCHED TREE COUNT.
+
+    Three things this gets right on purpose, because each of them silently
+    inverts or fabricates a recommendation when got wrong.
+
+    **Direction.** `quality.HIGHER_IS_BETTER` records whether a larger value
+    is better and `_worse_by` reads it, so a relative comparison on RMSE
+    (lower better) and one on AUC (higher better) both come out positive when
+    our arm is worse. A sign error here would rank the frontier backwards and
+    nothing downstream could tell.
+
+    **The better competitor.** The directive says the BETTER of CatBoost as
+    shipped and LightGBM stock+det, so the budget is measured against
+    whichever of them scored better on the primary metric at that tree count,
+    which is the harder of the two. Taking the mean, or the nearer one, or
+    whichever happens to be present would each make the budget easier in a
+    way nobody asked for.
+
+    **A missing competitor row ABSTAINS.** A 360-tree arm is judged against
+    360-tree competitor rows or against nothing. Falling back to the 100-tree
+    row would produce a verdict that looks like a result and is a category
+    error: the accuracy of a 100-tree LightGBM is not the bar a 360-tree arm
+    has to clear. An abstention is recorded as a skip that says which count
+    was missing, and it is not a failure of the arm.
+
+    Not gating today. The budget decides what the frontier RECOMMENDS, and
+    the recommendation is documented rather than applied, so an arm outside
+    the budget is a WARN and a fact about that arm rather than a broken run.
+    A run may make it gating by setting `gating` true in thresholds.json.
+    """
+    rule = dict(DEFAULT_ACCURACY_BUDGET)
+    rule.update((config.get("defaults") or {}).get("accuracy_budget") or {})
+    limit = float(rule["max_worse_relative"])
+    competitors = tuple(rule["competitors"])
+    judged = tuple(rule["engines_judged"])
+    gating = bool(rule.get("gating", False))
+
+    # One record per cell, as `check_baseline` does: repeats of a
+    # deterministic trainer score identically and three copies of one line
+    # makes a verdict harder to read for no information.
+    cells = {}
+    for record in ok:
+        key = (
+            _budget_cell(record), _arm_of(record),
+            record.get("device_used") or record.get("device_requested"),
+            _tree_count(record),
+        )
+        cells.setdefault(key, record)
+
+    # The competitor index, keyed by cell and tree count. Built from the same
+    # representative records, so a competitor row that failed completeness is
+    # not in here and its absence abstains rather than passing quietly.
+    bar = {}
+    for (cell, arm, _device, trees), record in cells.items():
+        if arm not in competitors or trees is None:
+            continue
+        metric = record.get("primary_metric")
+        value = (record.get("quality") or {}).get(metric)
+        if value is None or np.isnan(value):
+            continue
+        bar.setdefault((cell, trees), {})[arm] = (value, metric)
+
+    for (cell, arm, device, trees), record in sorted(
+        cells.items(), key=lambda item: str(item[0])
+    ):
+        if arm not in judged:
+            continue
+        scenario, tier, data_kind, _dataset, threads = cell
+        scope = f"{scenario}/{arm}/{device}/t{threads}/n{trees}"
+        metric = record.get("primary_metric")
+        mine = (record.get("quality") or {}).get(metric)
+        if trees is None:
+            verdict.add(
+                SKIP, "accuracy_budget", scope,
+                "abstains: this record does not say how many boosting rounds "
+                "it grew, so there is no tree count to match a competitor at",
+            )
+            continue
+        if mine is None or np.isnan(mine):
+            verdict.add(
+                SKIP, "accuracy_budget", scope,
+                f"abstains: the primary metric {metric} is missing or nan",
+            )
+            continue
+
+        present = bar.get((cell, trees), {})
+        missing = [name for name in competitors if name not in present]
+        if not present:
+            verdict.add(
+                SKIP, "accuracy_budget", scope,
+                f"abstains: no competitor row at {trees} trees on this cell "
+                f"({', '.join(competitors)} all absent). The budget is "
+                "defined at a matched tree count and this check will not "
+                "fall back to another count, because the accuracy of a model "
+                "at a different budget is not the bar this arm has to clear",
+            )
+            continue
+
+        # Direction comes from the metric, through `_worse_by`, and the
+        # BETTER competitor is the one that makes `worse` largest.
+        scored = []
+        for name, (value, their_metric) in present.items():
+            if their_metric != metric:
+                # Two rows of one cell disagreeing about the primary metric
+                # is a harness fault, not a close call, and comparing across
+                # it would be comparing two different quantities.
+                verdict.add(
+                    WARN, "accuracy_budget", f"{scope}/{name}",
+                    f"competitor row reports primary metric {their_metric} "
+                    f"where this arm reports {metric}; not compared",
+                )
+                continue
+            scored.append((_worse_by(metric, mine, value, "relative"), name, value))
+        if not scored:
+            verdict.add(
+                SKIP, "accuracy_budget", scope,
+                "abstains: no competitor at this tree count reports the same "
+                "primary metric",
+            )
+            continue
+        worse, name, theirs = max(scored)
+
+        detail = (
+            f"{metric} {mine:.6g} against the better of "
+            f"{', '.join(sorted(present))} at {trees} trees, which is "
+            f"{name} at {theirs:.6g}: "
+            f"{'worse' if worse > 0 else 'better'} by {abs(worse) * 100:.3f} "
+            f"percent (budget {limit * 100:.3f} percent)"
+        )
+        if missing:
+            detail += (
+                f". PARTIAL: {', '.join(missing)} has no row at this tree "
+                "count, so the bar is the better of the ones present and may "
+                "be lower than the directive's"
+            )
+        if worse <= limit:
+            verdict.add(PASS, "accuracy_budget", scope, "inside budget. " + detail)
+        else:
+            verdict.add(
+                FAIL if gating else WARN, "accuracy_budget", scope,
+                "OUTSIDE budget. " + detail
+                + ". This arm's speed cannot be spent: report.py ranks only "
+                "arms inside the budget",
+            )
+
+
 def check_device_agreement(ok, config, verdict, run_dir):
     rule = config["defaults"]["device_agreement"]
     cells = {}
@@ -562,6 +777,7 @@ def main(argv=None):
     check_determinism(ok, config, verdict)
     check_backend_proof(ok, config, verdict)
     check_differential(ok, config, verdict, broken)
+    check_accuracy_budget(ok, config, verdict)
     check_baseline(ok, config, verdict)
     check_device_agreement(ok, config, verdict, run_dir)
 
