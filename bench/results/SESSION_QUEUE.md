@@ -628,3 +628,52 @@ one.
 If it fails on the merged tree, the registered consequence stands: the default
 flips to opt-in and the arm stays for the L1-free case where the bound is
 largest.
+
+# The oblivious census clears: 62 at depth 6, with one trap
+
+`level-batcher`'s recomputed static census, with the child build's shape now a
+**parameter** of `oblivious_launch_census` rather than an assumption, so all
+three shapes the package can be in are values of one function:
+
+| shape | `batch_max_items` | depth 6 |
+|---|---|---|
+| per-child + sibling subtraction (ships today) | -1 | **176** |
+| batched, default item bound | 32 | **64 -- ON the knee** |
+| batched, level-sized bound | 64 | **62** |
+
+The `-1` arm reproduces the previous lane's hand-computed 176 exactly, so the
+"before" number is now a value a test returns rather than prose.
+
+**The trap: `DEFAULT_MAX_ITEMS` is 32 and a depth-6 level's last generation has
+64 children.** At the default bound that level needs two batches, costing two
+extra launches, and the tree lands at **exactly 64 -- on the knee, not under
+it**. A batcher for this mode must be constructed with `max_items >= 64`.
+
+**Depth 5 tops out at 32 children, so a lane that validated only at depth 5 would
+have seen nothing.** That is the shape of every gate failure this project has
+had: a fixture that cannot reach the condition it is checking.
+
+Not banked: skipping the last level's build, search, stage and file -- a
+depth-`max_depth` node is never split -- would take it to 56. That is a
+level-schedule decision that does not exist yet, so it was not counted.
+
+## Two things that would have cost the margin
+
+**The partition's deferred copy-back.** `set_partition_fusion(True)` is the
+default and leaves the permutation in scratch for the next
+`enqueue_desc_histogram` to pay inside its slot zeroing. A batched build does not
+go through that entry point, so it would either read a stale permutation or spend
+a third partition launch -- one per level, six per tree, and **exactly the margin
+between 62 and 68**. Carried in the zeroing pass the batch already launches.
+
+**The K=1 speculation must not be combined with this arm.**
+`_pick_runner_up_kernel` publishes a leaf that is still live, and a plan that
+builds both children overwrites the histogram the next pick reads on a miss.
+Recorded in code, not left to be discovered.
+
+## Still not closed
+
+The wiring. The growth loop still calls `GpuHistogramBuilder.enqueue_desc_child`,
+and pointing it at the batcher is an edit in `histogram_gpu.mojo`, which that lane
+did not own. `OBLIVIOUS_LEVEL_HISTOGRAM` stands as a refusal whose docstring now
+says the primitive exists and names the one file that must change.
