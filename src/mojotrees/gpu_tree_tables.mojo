@@ -295,6 +295,13 @@ from .gpu_active_rows import (
     STEP_THRESHOLD,
     STEP_WORDS,
 )
+from .gpu_leaf_batching import (
+    ITEM_BEGIN,
+    ITEM_COUNT,
+    ITEM_DEAD,
+    ITEM_OUT,
+    ITEM_WORDS,
+)
 from .gpu_split_search import NODE_HIST_BASE, NODE_WORDS
 from .growth_policy import GROW_LEAFWISE
 from .gpu_split_search import (
@@ -933,6 +940,60 @@ struct TreeTablesSnapshot(Copyable, Movable):
 # --- The kernel -----------------------------------------------------------
 
 
+comptime PLAN_ITEMS = 2
+"""Item rows one leaf-wise commit fills in a batched-histogram plan: the two
+children, left then right.
+
+Two rather than one because the batched shape builds *both* children from
+their own rows instead of building the smaller and subtracting. That is the
+same two launches whatever the batch holds, so the second child is free where
+the descriptor path would have paid a second pair for it -- and it is what
+makes the same writer generalize to a level, where the count is `2^(l+1)` and
+the launch count is still two."""
+
+
+@always_inline
+def _write_plan_item(
+    plan: MutPointer[Int32, MutAnyOrigin],
+    item: Int,
+    begin: Int32,
+    count: Int32,
+    out_slot: Int32,
+):
+    """One row of `gpu_leaf_batching`'s item table, the three words a commit
+    decides.
+
+    The other four -- `ITEM_ROWS_PER_TILE`, `ITEM_TILE_BEGIN`, `ITEM_TILES`,
+    `ITEM_PLANE` -- are launch geometry and are staged once per tree by
+    `GpuLeafBatcher.stage_device_plan`, because a grid is a host argument to
+    `enqueue_function` and no kernel can change one. This is the whole of the
+    split between the two halves of a device-written plan, and it is why the
+    plan costs no launch of its own: everything the device gets to decide is
+    three Int32 written by a kernel that was already running."""
+    var base = item * ITEM_WORDS
+    plan[unsafe_offset = base + ITEM_BEGIN] = begin
+    plan[unsafe_offset = base + ITEM_COUNT] = count
+    plan[unsafe_offset = base + ITEM_OUT] = out_slot
+
+
+@always_inline
+def _kill_plan(plan: MutPointer[Int32, MutAnyOrigin], write_plan: Int32):
+    """Mark both plan items dead, so a batch already in the queue does
+    nothing.
+
+    Called from every exit of the commit kernel that commits nothing, for the
+    same reason those exits all write `STEP_LIVE = 0`: a whole tree's launches
+    are enqueued before the tree has decided how many splits it will take, so
+    "do nothing" has to be a state the tables can express rather than a launch
+    the host declines to make. `ITEM_DEAD` is stronger than a zero count --
+    zero means a live leaf with no rows, whose histogram slot must still be
+    cleared -- and a dead item's stale `ITEM_OUT` would otherwise have
+    `_batch_zero_kernel` erase a live leaf's histogram."""
+    if write_plan != Int32(0):
+        for i in range(PLAN_ITEMS):
+            _write_plan_item(plan, i, Int32(0), Int32(ITEM_DEAD), Int32(0))
+
+
 def _pick_and_commit_kernel(
     front: MutPointer[Int32, MutAnyOrigin],
     node_i: MutPointer[Int32, MutAnyOrigin],
@@ -944,6 +1005,8 @@ def _pick_and_commit_kernel(
     rec_f: MutPointer[Float32, MutAnyOrigin],
     step: MutPointer[Int32, MutAnyOrigin],
     order: MutPointer[Int32, MutAnyOrigin],
+    plan: MutPointer[Int32, MutAnyOrigin],
+    write_plan: Int32,
     num_leaves: Int32,
     max_depth: Int32,
     min_data_in_leaf: Int32,
@@ -1014,6 +1077,22 @@ def _pick_and_commit_kernel(
     log would build a tree whose `cat_offset` values differed from the host's
     even though every routing decision was identical. The log costs one Int32
     per commit and removes that discrepancy entirely.
+
+    `plan` is the third, and it is the one that changes what the growth loop
+    above can be shaped like. It is `gpu_leaf_batching`'s item table -- the
+    array `GpuLeafBatcher.enqueue_batch` reads its per-leaf windows and
+    destination slots out of -- and this kernel fills the three words of it
+    that a commit decides, for each of the commit's two children, under
+    `write_plan`. Until now that table was staged from the host, so a batched
+    build could not be driven from inside a device-owned tree without the
+    round trip the resident plane exists to remove. The geometry half of the
+    table is still host-staged, because a grid is a host argument to
+    `enqueue_function` and no kernel can change one, but the geometry does not
+    move inside a tree; see `GpuLeafBatcher.stage_device_plan`.
+
+    `write_plan = 0` writes nothing there and is what both `enqueue_step`
+    overloads pass, so every path that exists today is byte for byte
+    unchanged. `enqueue_step_with_plan` is the arm.
     """
     var tid = Int(thread_idx.x)
     var n_live = Int(ctr[unsafe_offset=CTR_N_LIVE][0])
@@ -1025,6 +1104,7 @@ def _pick_and_commit_kernel(
             ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
             ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_BUDGET_SPENT)
             step[unsafe_offset=STEP_LIVE] = Int32(0)
+            _kill_plan(plan, write_plan)
         return
 
     # Phase 2: this thread's best over its strided share of the frontier.
@@ -1083,6 +1163,7 @@ def _pick_and_commit_kernel(
         ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
         ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_NO_CANDIDATE)
         step[unsafe_offset=STEP_LIVE] = Int32(0)
+        _kill_plan(plan, write_plan)
         return
 
     var slot = Int(best)
@@ -1118,6 +1199,7 @@ def _pick_and_commit_kernel(
         ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
         ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_OVERFLOW)
         step[unsafe_offset=STEP_LIVE] = Int32(0)
+        _kill_plan(plan, write_plan)
         return
 
     # The histogram slot pool, device side. `acquire` takes the lowest free
@@ -1137,6 +1219,7 @@ def _pick_and_commit_kernel(
         ctr[unsafe_offset=CTR_PICK_NODE] = Int32(-1)
         ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_POOL_FULL)
         step[unsafe_offset=STEP_LIVE] = Int32(0)
+        _kill_plan(plan, write_plan)
         return
 
     # `Tree._set_split` on the parent, field for field.
@@ -1308,6 +1391,46 @@ def _pick_and_commit_kernel(
     # right child took `n_live`.
     step[unsafe_offset=STEP_LEFT_REC] = Int32(rec)
     step[unsafe_offset=STEP_RIGHT_REC] = Int32(n_live)
+
+    # The batched-histogram plan, when the caller asked for one. Two items,
+    # left child then right child, each naming its own rows and its own pool
+    # slot -- which are exactly the numbers this kernel has just decided and
+    # the numbers a batched build needs.
+    #
+    # **This describes a different build from `STEP_BUILT_*`, and the caller
+    # picks one of the two rather than running both.** The descriptor's build
+    # is the subtraction shape: accumulate the smaller child from its rows and
+    # derive the larger by subtracting it from the parent's slot, which is two
+    # launches per parent. The plan's build is the batched shape: accumulate
+    # *both* children from their own rows, which is two launches per batch
+    # however many parents the batch covers, and needs no subtraction at all.
+    # The parent's histogram is destroyed either way -- the pool reassigns its
+    # slot to a child in both -- so nothing downstream can tell which was used
+    # except by counting command buffers.
+    #
+    # **The two produce bit-identical histograms.** Both accumulate the same
+    # per-`(row, feature)` quantized value into the same bin of the same slot,
+    # in fixed-point Int32; a child's rows are the same rows either way,
+    # because both read the window this same commit wrote. Integer addition is
+    # associative and commutative, so a different launch shape over the same
+    # visits is the same sum, and the sibling the subtraction derives from two
+    # exact integer histograms is exactly the one the batch accumulates
+    # directly. There is no floating point in either path past the
+    # quantization, which both do identically.
+    #
+    # The one arm this must not be combined with is the K=1 speculation.
+    # `_pick_runner_up_kernel` publishes a leaf that is still live and the
+    # speculative build deliberately does not fold its subtraction in, for
+    # exactly the reason a batched build of both children would break it: the
+    # speculated leaf's own histogram is what the next pick reads on a miss,
+    # and this plan overwrites it.
+    if write_plan != Int32(0):
+        _write_plan_item(
+            plan, 0, Int32(begin), n_left, Int32(left_slot)
+        )
+        _write_plan_item(
+            plan, 1, Int32(begin) + n_left, n_right, Int32(right_slot)
+        )
 
     var commits = Int(ctr[unsafe_offset=CTR_COMMITS][0])
     if commits < Int(leaf_capacity):
@@ -1989,6 +2112,14 @@ struct DeviceTreeTables(Movable):
     # get a pointer. Eight words. It is never read by any other kernel.
     var step_scratch: DeviceBuffer[DType.int32]
 
+    # The same idea for the batched-histogram plan: two item rows of
+    # `gpu_leaf_batching`'s layout, so that the two `enqueue_step` overloads
+    # -- neither of which writes a plan -- still have a legal pointer to hand
+    # the kernel. `enqueue_step_with_plan` is the overload that aims the
+    # kernel at a real one, which on a wired path is `GpuLeafBatcher.items_dev`
+    # and not this. Never read by any other kernel.
+    var plan_scratch: DeviceBuffer[DType.int32]
+
     # Pinned staging, so a reset and a download are ordinary one-way copies
     # rather than `map_to_host` mappings, each of which moves the buffer in
     # both directions. The same choice `GpuSplitSearcher` makes for its
@@ -2149,6 +2280,9 @@ struct DeviceTreeTables(Movable):
         )
         self.step_scratch = self.ctx.enqueue_create_buffer[DType.int32](
             STEP_WORDS
+        )
+        self.plan_scratch = self.ctx.enqueue_create_buffer[DType.int32](
+            PLAN_ITEMS * ITEM_WORDS
         )
 
         self.stage_front = self.ctx.enqueue_create_host_buffer[DType.int32](
@@ -2621,6 +2755,8 @@ struct DeviceTreeTables(Movable):
                 rec_f.unsafe_ptr(),
                 self.step_scratch.unsafe_ptr(),
                 self.order_dev.unsafe_ptr(),
+                self.plan_scratch.unsafe_ptr(),
+                Int32(0),
                 Int32(num_leaves),
                 Int32(max_depth),
                 Int32(min_data_in_leaf),
@@ -2701,6 +2837,75 @@ struct DeviceTreeTables(Movable):
                 rec_f.unsafe_ptr(),
                 step,
                 self.order_dev.unsafe_ptr(),
+                self.plan_scratch.unsafe_ptr(),
+                Int32(0),
+                Int32(num_leaves),
+                Int32(max_depth),
+                Int32(min_data_in_leaf),
+                Int32(self.pool_capacity),
+                Int32(self.leaf_capacity),
+                Int32(self.node_capacity),
+                grid_dim=1,
+                block_dim=PICK_THREADS,
+            )
+
+    def enqueue_step_with_plan[
+        step_origin: MutOrigin,
+        plan_origin: MutOrigin, //
+    ](
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        step: MutPointer[Int32, step_origin],
+        plan: MutPointer[Int32, plan_origin],
+        num_leaves: Int,
+        max_depth: Int,
+        min_data_in_leaf: Int,
+    ) raises:
+        """`enqueue_step`, additionally writing a batched-histogram plan into
+        `plan`.
+
+        **One launch, exactly as before: the plan is three Int32 per child
+        written by a kernel that was already running.**
+
+        `plan` is `GpuLeafBatcher.items_dev`, whose geometry words
+        `stage_device_plan` has already fixed for this tree. This kernel writes
+        only `ITEM_BEGIN`, `ITEM_COUNT` and `ITEM_OUT`, and it writes them on
+        every execution -- `ITEM_DEAD` on the three exits that commit nothing,
+        for the same reason those exits write `STEP_LIVE = 0`.
+
+        This is the whole of what `gpu_resident_round.oblivious_launch_census`
+        needs to be true rather than assumed. The census's per-level figure of
+        two launches for the whole level's children is `enqueue_batch`'s
+        figure, and the one thing that kept `enqueue_batch` out of a
+        device-owned tree was that its item table came from the host, which
+        means from a read-back of this commit. It no longer does.
+
+        **A caller uses this or `enqueue_desc_child`, not both**, and both
+        produce the same histograms. See the plan-writing block in
+        `_pick_and_commit_kernel` for why the two shapes are bit-identical and
+        for the one arm -- the K=1 speculation -- that must not use this one.
+        """
+        self._check_step_args(num_leaves, min_data_in_leaf)
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_pick_and_commit_kernel](
+                self.front_dev.unsafe_ptr(),
+                self.node_i_dev.unsafe_ptr(),
+                self.node_f_dev.unsafe_ptr(),
+                self.ctr_dev.unsafe_ptr(),
+                self.slot_dev.unsafe_ptr(),
+                self.missing_dev.unsafe_ptr(),
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                step,
+                self.order_dev.unsafe_ptr(),
+                plan,
+                Int32(1),
                 Int32(num_leaves),
                 Int32(max_depth),
                 Int32(min_data_in_leaf),

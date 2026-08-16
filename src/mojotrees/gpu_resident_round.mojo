@@ -1269,7 +1269,9 @@ the order rows sit in inside the active-row permutation is not part of a tree,
 and the two backends do not have the same one."""
 
 
-def oblivious_launch_census(max_depth: Int, fused_reduce: Bool = True) -> Int:
+def oblivious_launch_census(
+    max_depth: Int, fused_reduce: Bool = True, batch_max_items: Int = 0
+) -> Int:
     """Command buffers one oblivious tree of depth `max_depth` would enqueue
     between waits, **on the launch shapes this package can actually build
     today**, counted statically off the source.
@@ -1320,12 +1322,25 @@ def oblivious_launch_census(max_depth: Int, fused_reduce: Bool = True) -> Int:
       The machinery does exist one module over. `GpuLeafBatcher.enqueue_batch`
       does a whole frontier in two or three launches, with the grid keyed
       `(feature, leaf-tile)` and per-leaf windows and destination slots read
-      from a device `BatchItemPlan` array. What it cannot do is be driven by a
-      device-written plan: `items_dev` is staged from the host, so nothing
-      inside a device-owned tree can produce one without the round trip this
-      plane exists to remove. Making the plan device-written is what closes
-      this, and the commit kernel is the natural writer since it already writes
-      a descriptor -- which would keep it at zero extra launches.
+      from a device `BatchItemPlan` array. **The plan is now device-written.**
+      `gpu_tree_tables._pick_and_commit_kernel` fills the three words of an
+      item row that a commit decides -- window, count, destination slot -- in
+      the launch it was already making, so the plan costs no command buffer of
+      its own; the four geometry words are staged once per tree by
+      `GpuLeafBatcher.stage_device_plan`, because a grid is a host argument to
+      `enqueue_function` and no kernel can change one. `enqueue_step_with_plan`
+      and `enqueue_device_plan_batch_fused` are the two ends of it, and the
+      second pays the descriptor partition's deferred copy-back in its own
+      zeroing pass so the partition stays at two launches rather than three.
+      That last detail is worth a sentence, because it is the whole margin: a
+      schedule that paid the copy-back separately would spend one more launch
+      per level, six per depth-6 tree, and land at 68 rather than 62.
+
+      What is **not** closed is the wiring. `GpuHistogramBuilder`'s
+      `enqueue_desc_child` is still the only child build the growth loop calls,
+      and pointing it at the batcher is an edit in `histogram_gpu.mojo`. Until
+      that lands the batched shape is reachable and exercised but not on the
+      growth path, which is why this refusal still stands.
 
     - *The level's partition.* `GpuActiveRows.enqueue_partition_desc` partitions
       the one window the descriptor names, and its prefix is over that window.
@@ -1340,11 +1355,80 @@ def oblivious_launch_census(max_depth: Int, fused_reduce: Bool = True) -> Int:
 
     `fused_reduce = False` returns the standalone-reduce count, which is what a
     lane told "one launch per level" would build.
+
+    `batch_max_items`: which of the three child-build shapes to count
+    ----------------------------------------------------------------
+    The two nines above were written as an assumption and the assumption was
+    the whole census. So the shape is now a parameter and every one of the
+    three shapes this package can be in is a value of it, rather than one
+    being the function and the other two being paragraphs of prose:
+
+    - **`0`, the default and the design's assumption.** The level's whole set
+      of `2^(l+1)` children is built by one batch, so the histogram term is 2
+      per level however wide the level is. This is the arithmetic above and it
+      is what the pinned values reproduce: **62** at depth 6, fused.
+
+    - **`m > 0`, the shape the batcher can actually launch.** One batch holds
+      at most `GpuLeafBatcher.max_items` items and a level offers `2^(l+1)` of
+      them, so the histogram term is `2 * ceil(2^(l+1) / m)`. **This is not a
+      formality at the default bound.** `gpu_leaf_batching.DEFAULT_MAX_ITEMS`
+      is 32, a depth-6 tree's last level has 64 children, and the extra batch
+      that costs puts the tree at **64 -- on the knee rather than under it**.
+      A batcher constructed with `max_items >= 64` is therefore a precondition
+      of the whole queue-depth argument at CatBoost's default depth, not a
+      sizing preference, and it is cheap: the item table is
+      `max_items * (ITEM_WORDS + 2)` Int32 plus `max_items * n_features` for
+      the feature table.
+
+    - **`m < 0`, the shape the package has today.** No batcher at all:
+      `enqueue_desc_child` builds one child per parent and derives the sibling
+      by subtraction, so the histogram term is `2 * 2^l` and a depth-6 tree is
+      **176**. That is the number the paragraph above states in prose, and it
+      is now a value the same function returns rather than a claim only a
+      reader can check.
+
+    The batched shape is exact against the per-child one and that is worth
+    stating where the counts are, because a launch shape that changed an
+    answer would make this whole census a comparison of two different
+    algorithms. Both accumulate the same per-`(row, feature)` quantized value
+    into the same bin of the same slot, in fixed-point Int32; the batch
+    changes which threadgroup does which visit and nothing else. Integer
+    addition is associative and commutative, so the sum is independent of that
+    order, and the sibling the per-child shape derives by subtracting exact
+    integers is exactly the histogram the batch accumulates directly. The two
+    shapes are bit-identical, so the only thing this parameter selects is a
+    number of command buffers.
+
+    What the parameter does **not** model, deliberately: a schedule that skips
+    the last level's child build, its search, its staging and its record on the
+    grounds that a depth-`max_depth` node is never split. That is worth six
+    launches at depth 6 (**56** rather than 62) and it is a decision belonging
+    to the level schedule, which does not exist yet. Counting it here would be
+    banking a saving no code has taken.
     """
     if max_depth < 1:
         return 0
-    var per_level = 9 if fused_reduce else 10
-    return 7 + max_depth * per_level + 1
+    # The per-level cost with the child build taken back out of it, since the
+    # child build is the term the shape moves and the other four phases are
+    # the same launches whatever builds the children.
+    var without_children = (9 if fused_reduce else 10) - 2
+    var total = 7 + max_depth * without_children + 1
+    for l in range(max_depth):
+        var parents = 1 << l
+        var children = parents * 2
+        if batch_max_items < 0:
+            # One built child per parent, sibling subtracted in the same
+            # launch: `GpuHistogramBuilder.enqueue_desc_child`, zero then
+            # accumulate.
+            total += 2 * parents
+        elif batch_max_items == 0:
+            total += 2
+        else:
+            var batches = (
+                children + batch_max_items - 1
+            ) // batch_max_items
+            total += 2 * batches
+    return total
 
 
 comptime OBLIVIOUS_OK = 0
@@ -1355,11 +1439,24 @@ what `gpu_split_search.OBLIVIOUS_MAX_LEAVES` reserves per-leaf scan state
 for, and the two limits agreeing is not a coincidence."""
 
 comptime OBLIVIOUS_LEVEL_HISTOGRAM = 2
-"""No descriptor-driven whole-level histogram build exists, so a level costs
-two launches per leaf instead of two per level and a depth-6 tree is 176
-command buffers rather than 62. The census function says what closes it. This
-is the refusal that makes the mode unreachable and it is the one to lift
-first: everything else on this list is smaller than it."""
+"""No descriptor-driven whole-level histogram build is **wired**, so a level
+costs two launches per leaf instead of two per level and a depth-6 tree is 176
+command buffers rather than 62.
+
+The primitive is no longer missing. `GpuLeafBatcher.stage_device_plan` and
+`enqueue_device_plan_batch_fused` build any number of children in two
+launches from a plan `gpu_tree_tables._pick_and_commit_kernel` writes on the
+device, at zero extra command buffers, and
+`oblivious_launch_census(6, batch_max_items=64)` is 62 -- under the knee by
+two. What is missing is one edit in `histogram_gpu.mojo`: the growth loop
+calls `GpuHistogramBuilder.enqueue_desc_child`, which is the one-child-per-
+launch-pair path, and nothing yet calls the batched one in its place.
+
+**And one sizing precondition, which is not a preference.** A depth-6 level
+offers 64 children and `gpu_leaf_batching.DEFAULT_MAX_ITEMS` is 32, so a
+batcher at the default bound needs two batches for the last level and the tree
+lands at exactly 64 -- on the knee rather than under it. The batcher this mode
+uses must be constructed with `max_items >= 64`."""
 
 comptime OBLIVIOUS_ROW_RANGES = 3
 """The one-partition-per-level arm leaves host row-range state the host table
@@ -1384,7 +1481,15 @@ the partition kernels. So the choice is: one launch per level and a new way to
 publish the windows, or containment and 3 launches per leaf. The census settles
 it -- the second is 3 * 63 = 189 launches of partition alone at depth 6 -- and
 what it costs is a direct window setter on `LeafRangeTable`, roughly twenty
-lines of host bookkeeping and no kernel."""
+lines of host bookkeeping and no kernel.
+
+**That setter now exists**: `LeafRangeTable.set_window`. It writes one node's
+window without requiring containment, keeps `split`'s orphan guard, and is not
+a hole in the poison -- it reads nothing out, it clears nothing, and
+`end_descriptor_partition` still lifts the refusal only after checking every
+window against the device's own frontier and running the tiling invariant. So
+this refusal is a schedule that does not exist rather than a table that cannot
+express one."""
 
 comptime OBLIVIOUS_CATEGORICAL = 4
 """The dataset has a categorical feature. The cross-leaf scan skips those (see
@@ -1453,10 +1558,14 @@ def oblivious_open_blockers() -> List[Int]:
        children can be built by a descriptor-driven launch, a depth-6 tree is
        176 command buffers and not 62, and the queue-depth argument that opened
        this round does not hold. `GpuLeafBatcher.enqueue_batch` is the shape
-       that closes it; what it needs is a device-written `BatchItemPlan`.
+       that closes it; what it needed was a device-written `BatchItemPlan`, and
+       it now has one. What is left is the wiring: `enqueue_desc_child` in
+       `histogram_gpu.mojo` is still what the growth loop calls.
     2. `OBLIVIOUS_ROW_RANGES`, which is host bookkeeping and is small: a direct
        window setter on `LeafRangeTable`, because a level partitioned in one
        pass leaves children that are not inside their parents.
+       `LeafRangeTable.set_window` is that setter and it is built; what is
+       missing is the level schedule that would call it.
     3. `OBLIVIOUS_NO_CPU_PEER`, which is not this lane's to close. The gate for
        the mode is node-identity with the CPU oblivious grower and there is not
        one yet.
