@@ -1,4 +1,4 @@
-"""The device-owned growth loop: one host synchronization per tree.
+"""The device-owned growth loop: one host round trip per tree.
 
 What this module is
 -------------------
@@ -28,12 +28,18 @@ is the removal of that round trip. Compute of every kind was 22.9% of a
 round, which is the ceiling on what any kernel-level change could have been
 worth.
 
-**No speedup is claimed and none was measured.** This lane ran no benchmark
-and no training run of any kind. What is claimed is a count: the launches
-below contain exactly one `synchronize` per tree, and the shipping loop
-contains `num_leaves - 1` of them plus one for the root. Whether one wait and
-a wider grid beat thirty-one waits and a tight grid is a measurement, and the
-first section of the report this lane files says so.
+**No speedup is claimed and none was measured.** What is claimed is a count,
+and the count has since been corrected downward in ambition. The loop below
+contains exactly one `synchronize` per tree against the shipping loop's
+`num_leaves`, which is what was originally reported. But on Metal every
+`enqueue_copy` is itself a full-queue drain in both directions, so the honest
+per-tree figure for this function is sixteen host waits and not one: nine
+uploads before the first split, six downloads and the `synchronize` at the
+end. `grow_tree_device_resident` itemizes them. What survives intact is the
+count of *round trips*, meaning points where host code reads a device answer
+before it can decide what to enqueue next: this plane makes one per tree and
+the shipping loop makes one per split. Whether that is worth anything is a
+measurement nobody has taken.
 
 The shape of the loop
 ---------------------
@@ -45,24 +51,42 @@ therefore enqueued before the first split has happened:
 
     per tree, once     seed rows, root histogram, root search, reset tables,
                        seed the root's value
-    per step, x31      pick and commit          (gpu_tree_tables)
+    per step, x30      pick and commit          (gpu_tree_tables)
                        stage the two searches   (gpu_tree_tables)
                        partition                (gpu_active_rows, 3 launches)
                        build the smaller child  (gpu_active_rows, 2 launches)
                        search both children     (gpu_split_search, 2 launches)
                        file the two records     (gpu_tree_tables)
-    per tree, once     download the tables      <- the one synchronization
+    per tree, once     one further pick, which ends growth rather than
+                       performing it            (gpu_tree_tables)
+    per tree, once     download the tables      <- the one round trip
 
-A step past the end of growth still runs. Every one of those kernels reads
-`STEP_LIVE` first and returns when it is zero, so a tree that stopped at
-seventeen leaves pays fourteen rounds of kernels that read one word each.
-That is the price of not knowing, on the host, how many splits there will be,
-and it is deliberately preferred to the alternative, which is asking.
+The step count is `num_leaves - 1`, because a tree of L leaves is L-1 splits.
+The step *after* those is not a split and is not optional: a terminal status
+is a word that some execution of the commit kernel stores, and a step that
+commits stores `running`, so a tree that spends its whole budget has no step
+left to notice that it has. `_growth_finished_normally` tells that story in
+full; it cost this plane every tree it grew until it was found.
+
+A step past the end of growth still runs, which is the price of not knowing
+on the host how many splits there will be, and is deliberately preferred to
+the alternative, which is asking. Most of what such a step enqueues is free:
+the commit, the partition, the child histogram, the search staging and the
+record filing all read `STEP_LIVE` first and return when it is zero. One part
+of it is not free, and calling it free would be wrong. The pair of search
+launches goes through `gpu_split_search._launch_search`, which knows nothing
+about the descriptor and scans the histogram slots the last live step left in
+the searcher's node table. So a tree that stops at seventeen leaves pays
+fourteen full two-record searches over slots it has already searched. They
+write only the two scratch records, which the record filing then declines to
+copy anywhere, so nothing is corrupted and no answer changes; what is spent
+is real work. Making it free means a descriptor-aware search launch, which
+lives in a module this lane does not own.
 
 The queue this stream goes into is 64 deep
 ------------------------------------------
-Ten launches a step over thirty-one steps, plus about five per tree, is on
-the order of 315 command buffers between waits, because on Metal every
+Ten launches a step over thirty steps, plus about six per tree, is on
+the order of 306 command buffers between waits, because on Metal every
 `enqueue_function` becomes its own single-encoder command buffer. The queue
 holds 64 of them: MAX creates it with a bare `newCommandQueue` and never
 sets `maxCommandBufferCount`, which was measured by disassembling the
@@ -78,6 +102,24 @@ every instrument this repository has counts as enqueue with no attribution,
 so it will read as the device getting slower when it is the host being held.
 The Metal timeline that motivated this module is the instrument that can see
 it, from outside the process.
+
+Seeing what it did
+------------------
+    MOJOTREES_GPU_TREE_RESIDENT_TRACE=/path/to/file   one record per tree
+    MOJOTREES_GPU_TREE_RESIDENT_TRACE=1               the same, to stdout
+    MOJOTREES_GPU_TREE_RESIDENT_TRACE_STEPS=1         and one per step
+
+Off by default and off in anything anyone measures. A record holds the status
+word, the counters, the whole live frontier in slot order, the slot pool and
+the commit log, all of it as integers a device kernel wrote. The step form
+downloads after every step, which puts the per-split wait back and is a
+debugging instrument only.
+
+This exists because there is no other way to look. The shipping loop can be
+read one split at a time from the host, since it downloads one split at a
+time; this plane brings home one snapshot per tree and a wrong tree in it
+offers no way to ask which split went wrong. Both faults this plane shipped
+with were found by reading rather than by looking, which does not scale.
 
 What day one supports, and what falls back
 ------------------------------------------
@@ -120,14 +162,18 @@ tree:
 - a searcher whose record capacity is smaller than one record per live leaf
   plus the two scratch records this loop searches into.
 
-Reaches this plane, untested, and named so it is not mistaken for tested:
+Reaches this plane, and how far each one has been checked:
 
-- **bagging and GOSS.** A sampled tree differs only in which rows the root
-  owns, and `GpuHistogramBuilder.begin_tree` already stages the bag; every
-  window below is arithmetic on `[0, n_active)` and does not care how that
-  prefix was chosen. It costs one extra host synchronization per tree, inside
+- **bagging.** A sampled tree differs only in which rows the root owns, and
+  `GpuHistogramBuilder.begin_tree` already stages the bag; every window below
+  is arithmetic on `[0, n_active)` and does not care how that prefix was
+  chosen. It costs one extra host synchronization per tree, inside
   `GpuActiveRows.begin_tree`, which drains the queue before it refills the row
-  staging buffer. Believed correct, not run.
+  staging buffer. **Run and checked** against `_device_search_resident` in
+  `tests/test_gpu_tree_resident.mojo`, tree for tree with no tolerance.
+- **GOSS.** The same argument as bagging and the same code path, but nothing
+  has run it. GOSS also rescales the sampled rows' gradients before upload,
+  which is outside this loop entirely. Believed correct, not run.
 - **multiclass.** A multiclass round grows one tree per class through
   `grow_tree_gpu`, with that class's gradients in the builder, so each class's
   tree reaches this plane through the same call site and nothing in the loop
@@ -207,6 +253,85 @@ def resident_round_requested() -> Bool:
     This lands as an opt-in path to be measured, not as a new default.
     """
     return getenv("MOJOTREES_GPU_TREE_RESIDENT") == "1"
+
+
+# --- The trace ------------------------------------------------------------
+#
+# Why this exists at all. The shipping loop can be debugged by printing,
+# because it downloads the frontier after every split and a reader can watch
+# a tree grow one line at a time. This plane deletes exactly that: the host
+# sees one snapshot per tree and nothing in between, so a tree that comes
+# home wrong offers a reader thirty-one splits' worth of state collapsed into
+# one answer, with no way to ask which split went wrong short of editing the
+# module. That is not a hypothetical inconvenience. The first fault this
+# plane produced -- a status of `running` on every tree it grew -- was
+# invisible from the outside beyond the single word in the error message, and
+# was found by reading rather than by looking, which does not scale to the
+# next one.
+#
+# So: a trace, off by default, outside the hot path, and producing text a
+# test can assert on rather than only text a human can read.
+
+
+comptime RESIDENT_TRACE_VAR = "MOJOTREES_GPU_TREE_RESIDENT_TRACE"
+"""Where a trace goes. Unset or empty is off, which is the default and the
+only state any measurement may be taken in. `1`, `stdout` or `-` print to
+standard output. Anything else is taken as a file path and is **appended**
+to, so a fit's trees accumulate in order and a caller that wants a fresh file
+truncates it before the fit."""
+
+comptime RESIDENT_TRACE_STEPS_VAR = "MOJOTREES_GPU_TREE_RESIDENT_TRACE_STEPS"
+"""`1` adds a download and a trace record after every enqueued step, which is
+the per-split host view this plane otherwise does not have.
+
+**This changes what is being measured and it is not subtle.** A download is a
+full-queue drain, so step tracing reinstates exactly the per-split
+synchronization the plane exists to remove, and a timing taken with it on is
+a timing of the shipping loop's wait pattern with extra kernels. It is a
+debugging instrument and nothing else. It is also the only way to see a
+frontier mid-tree, which is why it is here.
+
+Ignored unless `MOJOTREES_GPU_TREE_RESIDENT_TRACE` names a sink, so one
+variable turns everything off."""
+
+
+def resident_trace_sink() -> String:
+    """The trace destination, or the empty string when tracing is off.
+
+    Read once per tree rather than per step. `getenv` on a miss is cheap, but
+    reading a variable inside a loop that is supposed to contain no host work
+    at all is the kind of thing that quietly becomes the reason a loop is
+    slow, and there is nothing to gain from it: a variable does not change
+    inside a fit.
+    """
+    return getenv(RESIDENT_TRACE_VAR)
+
+
+def resident_trace_steps_requested() -> Bool:
+    """Whether per-step tracing was asked for. See the variable's note about
+    what it does to the wait count before turning it on."""
+    return getenv(RESIDENT_TRACE_STEPS_VAR) == "1"
+
+
+def _resident_trace_emit(sink: String, text: String) raises:
+    """Write one trace record to the sink, or nothing when tracing is off.
+
+    Appending rather than truncating, and one open per record rather than a
+    handle held across the fit. Both are deliberate. Appending is what makes
+    a whole fit's trees readable in the order they were grown. Opening per
+    record is what makes the trace survive the process dying mid-fit, which
+    is the case a trace is most wanted in: a plane that raises, or a kernel
+    that faults, leaves the records of every tree before it on disk. The cost
+    is one open per tree, which is not on any path anybody measures because
+    the sink is empty on every path anybody measures.
+    """
+    if sink == "":
+        return
+    if sink == "1" or sink == "stdout" or sink == "-":
+        print(text, end="")
+        return
+    with open(sink, "a") as handle:
+        handle.write(text)
 
 
 # --- Record capacity ------------------------------------------------------
@@ -356,12 +481,23 @@ def _growth_finished_normally(status: Int) -> Bool:
     `while n_leaves < num_leaves` and its `if len(picks) == 0: break` end a
     tree, so a tree that ends either way is finished and not faulted.
 
-    The other three cannot be reached without a wiring mistake. `running`
-    means the last enqueued step committed a split, which would mean the loop
-    enqueued too few steps for the budget. `pool_full` and `overflow` mean the
+    The other three are wiring faults. `pool_full` and `overflow` mean the
     tables were sized smaller than the budget the commit kernel was given.
-    All three are raised rather than trusted, because each of them would
-    otherwise return a tree that is quietly missing leaves.
+    `running` means the last kernel to write a status committed a split and
+    nothing ran after it, which is to say the schedule ended in the middle of
+    growth rather than at the end of it.
+
+    That third one is not hypothetical and the history is the reason this
+    docstring is longer than the function. The loop originally enqueued
+    `num_leaves - 1` steps, which is the right number of *splits*, and no
+    step after them; a tree that spent its budget therefore ended on a
+    committing step, whose status is `running` because from inside that
+    kernel growth has not stopped. Every tree that reached its leaf budget
+    came home saying `running` and this predicate rejected all of them. The
+    loop now enqueues one further step whose only possible act is to observe
+    that growth is over and say so, which is what makes `running` unreachable
+    rather than routine. All three stay raises, because each would otherwise
+    return a tree quietly missing leaves.
     """
     return status == TREE_BUDGET_SPENT or status == TREE_NO_CANDIDATE
 
@@ -429,6 +565,62 @@ def _launch_child_search(
     )
 
 
+def _publish_row_ranges(
+    mut builder: GpuHistogramBuilder, snap: TreeTablesSnapshot
+) raises:
+    """Replay the device's commits onto the host row-range table.
+
+    Why this exists, which is the part worth reading. `GpuActiveRows` keeps a
+    host-side `LeafRangeTable` mapping node id to the window of the active-row
+    buffer that node owns. The shipping loop maintains it as a side effect of
+    splitting: `GpuActiveRows.partition` ends with
+    `self.ranges.split(parent, left, right, n_left)` on every split, so when a
+    tree is finished the table holds one window per leaf and the windows tile
+    the active prefix. This plane's partition is `enqueue_partition_desc`,
+    which routes from the step descriptor and updates nothing on the host, so
+    a tree grown here used to leave the table saying node 0 owns everything
+    and no other node owns anything.
+
+    That was documented as harmless, on the reasoning that the windows live in
+    the device tree tables now and the host has no further use for them. The
+    reasoning was wrong about one caller, and it is not a marginal one.
+    `train_gpu`'s device-gradient round -- which is the default for every
+    built-in objective without row sampling, so the common case -- advances
+    the raw scores with `GpuHistogramBuilder.update_raw_device`, and that
+    reads exactly this table to find which rows belong to which leaf. Handed a
+    table that says node 0 owns every row, it added the *root's* value to
+    every row's score instead of each row's own leaf value. The tree itself
+    was correct and identical; the scores it produced were not, so round one
+    was right, round two saw wrong residuals, and every tree after the first
+    diverged. A comparison that stopped at one round would have seen nothing.
+
+    So the plane has to leave the same host state the shipping loop leaves,
+    and it can, exactly and without a wait, because the snapshot it already
+    downloaded holds everything needed: `commit_order` is the node ids in the
+    order they were split, and each parent's node row names its two children,
+    whose `count` fields are the exact integer row counts the histogram
+    produced. Replaying `split` in commit order is the same sequence of calls,
+    with the same arguments, that the shipping loop makes one at a time.
+    `LeafRangeTable.split` raises when a child already owns a window or a
+    count is outside the parent's, so a replay that did not correspond to a
+    real growth would be rejected rather than written.
+
+    This is host bookkeeping only. It enqueues nothing, transfers nothing and
+    waits for nothing, and it costs one list write per node.
+    """
+    for k in range(len(snap.commit_order)):
+        var parent = snap.commit_order[k]
+        if parent < 0 or parent >= len(snap.nodes):
+            raise Error("the device commit log names a node outside the tree")
+        var left = snap.nodes[parent].left
+        var right = snap.nodes[parent].right
+        if left < 0 or right < 0 or left >= len(snap.nodes):
+            raise Error("a device commit log entry names no children")
+        _ = builder.rows.ranges.split(
+            parent, left, right, snap.nodes[left].count
+        )
+
+
 def grow_tree_device_resident(
     mut builder: GpuHistogramBuilder,
     mut searcher: GpuSplitSearcher,
@@ -450,34 +642,49 @@ def grow_tree_device_resident(
     answered `RESIDENT_OK`.
 
     Host synchronizations, counted statically rather than measured, which is
-    all this lane is allowed to do:
+    all this lane is allowed to do. **Every copy counts, in both directions**,
+    because on Metal `enqueue_copy` is a synchronous full-queue drain in both
+    directions, measured by disassembly and recorded in
+    `docs/GPU_PORTABILITY.md` section 6.1. An earlier version of this list
+    counted only the `synchronize` at the end and said "one"; that was a count
+    of one kind of wait, not a count of the waits, and section 6.1 rule 1 says
+    so in as many words.
 
-    - **one**, the `download` at the end.
-    - plus the per-tree table crossing in `searcher.enqueue_frontier` below,
-      which is one drain on Metal: `enqueue_copy` there is a synchronous
-      full-queue drain in both directions, measured by disassembly and
-      recorded in `docs/GPU_PORTABILITY.md` section 6.1. This function makes
-      that call.
-    - plus **two** inside `GpuActiveRows.begin_tree` when the tree is
-      bagged: its explicit `synchronize` before it refills the row staging
-      buffer, and the bag upload itself, which drains again. The caller made
-      that call, not this function.
-    - plus whatever the caller's round does outside the tree, which is
-      unchanged and is not free: the gradient computation, its
-      `upload_staged` (two more drains, one per plane, every round), a GOSS
-      row and scale upload where that is on, and for a custom objective its
-      host callback.
+    Per tree, inside this function, on Metal:
 
-    So the honest headline is one wait per tree *inside this loop*, against
-    a round that still contains a handful outside it. Staging that does not
-    change per round should move to per fit; staging that must change per
-    round is named above so it is counted rather than assumed away.
+    - **five uploads** in `enqueue_desc_begin_tree`, which is
+      `DeviceTreeTables.begin_tree(wait=False)`: the frontier, the two node
+      planes, the counters and the slot pool, one copy each. The `wait=False`
+      removes the explicit `synchronize` and none of the drains.
+    - **four uploads** in `searcher.enqueue_frontier`, which is
+      `GpuSplitSearcher._copy_tables`: the node table, the feature table, the
+      allow mask and the float parameter block. One per table for the whole
+      record range, not one per record, which is what that entry point buys.
+    - **six downloads plus one `synchronize`** in `download_desc_tables`. The
+      `synchronize` is free on Metal, since the copy before it already
+      drained, and it stays because it is what keeps this correct on a
+      backend where a copy really is asynchronous.
+
+    Sixteen, then, of which nine are uploads. Not one. The one figure that is
+    genuinely one is the number of *round trips*, in the sense of host code
+    that reads a device answer and then decides what to enqueue next: there
+    is one such point per tree and it is the download at the end. That is the
+    property the plane was built for and it survives the correction; what
+    does not survive is the wait count that was reported for it.
+
+    Outside this function and unchanged by it: **two** inside
+    `GpuActiveRows.begin_tree` when the tree is bagged, its explicit
+    `synchronize` and the bag upload; and whatever the caller's round does,
+    which is the gradient upload (two drains, one per plane, every round), a
+    GOSS row and scale upload where that is on, and a custom objective's host
+    callback.
 
     The shipping loop's count for comparison, at the same leaf budget: one
-    per split from `download_frontier`, plus one for the root's search, which
-    is `num_leaves` in total and is 31 at the default budget. Both counts are
-    of `synchronize` calls on the path, read off the source; neither is a
-    measurement.
+    `synchronize` per split from `download_frontier` plus one for the root,
+    which is `num_leaves` in total and 31 at the default budget, and on top of
+    that its own copies, four staged tables per search among them. Comparing
+    31 against 16 is comparing two static counts read off the source, and
+    neither is a measurement of anything.
 
     Equivalence to the shipping loop, which outranks the count entirely. The
     claim is that this grows the same tree `_device_search_resident` grows,
@@ -502,20 +709,41 @@ def grow_tree_device_resident(
        cells with the same per-tree parameters, and the two scratch records
        are copied word for word into the frontier's slots with no
        arithmetic.
+    5. The host state left behind is the same host state. A tree is not only
+       the object returned: the trainer reads the row-range table out of the
+       builder afterwards to advance its raw scores, and this plane's
+       partition does not maintain it. `_publish_row_ranges` replays the
+       device's commit log onto it so that it holds what the shipping loop
+       would have left. That claim was missing from this list originally and
+       its absence cost every tree after the first.
 
-    What this lane could not do is run the harness that would check any of
-    that end to end. The report names what to run first.
+    Claims one through four are now checked end to end rather than argued:
+    `tests/test_gpu_tree_resident.mojo` compares this function's trees against
+    `_device_search_resident`'s node for node with no tolerance, over six
+    configurations, and asserts on the plane's own trace that the plane is
+    what produced them.
 
     **Not instrumented.** `PhaseProfile` is not threaded through this loop and
     a profiled run of a fit that takes this plane will report an empty table
     rather than a wrong one. That is the same honest failure
     `_device_search_incremental` has, and it is a deliberate omission rather
     than an oversight: the profile's three phases are separated by inserting
-    fences, and a loop whose entire claim is that it contains one
-    synchronization cannot be measured by an instrument that adds two per
+    fences, and a loop whose entire claim is that it makes one round trip
+    cannot be measured by an instrument that adds two synchronizations per
     split without measuring something other than itself. What this plane
     needs instead is the Metal timeline that motivated it, which counts
     serialization points from outside the process.
+
+    **Traceable, though.** `MOJOTREES_GPU_TREE_RESIDENT_TRACE` writes one
+    record per tree, and with `MOJOTREES_GPU_TREE_RESIDENT_TRACE_STEPS` one
+    per step as well, holding the status, the counters and the whole frontier.
+    That is a debugging instrument rather than a profiling one and it is off
+    by default; see `RESIDENT_TRACE_VAR`. It is also what a test asserts on to
+    prove this function ran at all, which matters more than it sounds: the
+    caller falls back to the shipping loop for any configuration this plane
+    refuses, so a comparison of two fits can agree perfectly while the plane
+    under test never executed, and the first test written against this module
+    did exactly that.
     """
     if n_root < 0:
         raise Error("the root row count must be nonnegative")
@@ -534,6 +762,9 @@ def grow_tree_device_resident(
     var widest = len(searcher.active)
     if widest < 1:
         widest = len(tree_features)
+    # Both read once, before the first launch. See `resident_trace_sink`.
+    var trace = resident_trace_sink()
+    var trace_steps = trace != "" and resident_trace_steps_requested()
 
     # --- Per-tree staging, all of it, before any split ---------------------
     #
@@ -598,16 +829,21 @@ def grow_tree_device_resident(
     #
     # `num_leaves - 1` steps, because a tree of L leaves is L-1 splits, and
     # every step is enqueued whether or not growth has already stopped. A
-    # stopped step's kernels read one word and return; see the module
-    # docstring for why that is preferred to asking the host how many splits
-    # there will be, which is the question that costs 606 microseconds.
+    # stopped step's kernels mostly read one word and return, with the search
+    # pair the exception the module docstring names; see there for why that
+    # is preferred to asking the host how many splits there will be, which is
+    # the question that costs 606 microseconds. The step that *ends* growth is
+    # below the loop rather than in it.
     #
     # There is no host state in this loop. Nothing is read, nothing is
     # accumulated, and the body would be identical for step 1 and step 30.
     # That is what would make widening it to several independent trees a
     # matter of indexing rather than of restructuring, and it is the door the
-    # coordinator asked be left open.
-    for _ in range(params.num_leaves - 1):
+    # coordinator asked be left open. The step trace is the one thing in the
+    # body that reads the device back, and it is off unless a variable turns
+    # it on, precisely so that this stays true of every run that is not being
+    # debugged.
+    for step in range(params.num_leaves - 1):
         # Pick the leaf, commit the split, write the tree, move the slot
         # pool, and publish the step descriptor. One block, one launch.
         builder.enqueue_desc_step(
@@ -642,9 +878,84 @@ def grow_tree_device_resident(
         builder.enqueue_desc_copy_records(
             searcher.rec_i_dev, searcher.rec_f_dev, scratch_l, scratch_r
         )
+        if trace_steps:
+            # A download inside the loop, which is the wait this plane exists
+            # to remove, taken deliberately and only when asked for. See
+            # `RESIDENT_TRACE_STEPS_VAR`.
+            var mid = builder.download_desc_tables()
+            _resident_trace_emit(
+                trace,
+                String(
+                    "mojotrees.resident step=",
+                    step,
+                    " ",
+                    mid.trace_line(),
+                    "\n",
+                    mid.describe(),
+                ),
+            )
 
-    # --- The one wait ------------------------------------------------------
+    # --- The step that ends growth rather than performing it ---------------
+    #
+    # One more pick-and-commit launch than there are splits, and the whole
+    # reason for it is that a terminal status is *written by a step*, not by
+    # the loop ending.
+    #
+    # The commit kernel's five statuses are `running`, `budget_spent`,
+    # `no_candidate`, `pool_full` and `overflow`, and every one of them is a
+    # word some execution of that kernel stored. A committing step stores
+    # `running`, because from inside the kernel that is what has just
+    # happened: a split was taken and the tree may take another. So a tree
+    # that spends its whole budget has `num_leaves - 1` committing steps, the
+    # last of which stores `running`, and if nothing runs after it the tables
+    # come home saying growth is still in progress. That is not a wiring
+    # mistake that produced a wrong tree; it is a correct tree with no full
+    # stop on the end of it, and the download's check could not tell the two
+    # apart. It is what made this plane fail on every tree that reached its
+    # leaf budget, which at any useful data size is every tree.
+    #
+    # The fix is the step that would have run next. It cannot commit
+    # anything, and that is worth arguing rather than asserting, because a
+    # step that could commit would grow a tree of `num_leaves + 1` leaves:
+    #
+    # - If every earlier step committed, `n_live == num_leaves`, and the
+    #   kernel's first phase returns on the budget before it reads a record.
+    # - Otherwise some earlier step found no admissible leaf and stored
+    #   `no_candidate`, which also wrote `STEP_LIVE = 0`. Every kernel after
+    #   it in that step reads that word first and returns, so the frontier
+    #   and the records it was decided from are exactly what they were, and
+    #   this step reduces over the same numbers and reaches the same answer.
+    #   The reduction is over device memory nothing has written since, and it
+    #   is integer comparison of Float32 words, so "the same answer" is bit
+    #   equality and not a probable outcome.
+    #
+    # The cost is one launch of one threadgroup per tree, and no wait: this
+    # goes into the same queue as everything above it.
+    builder.enqueue_desc_step(
+        searcher.rec_i_dev,
+        searcher.rec_f_dev,
+        params.num_leaves,
+        params.max_depth,
+        params.min_data_in_leaf,
+    )
+
+    # --- The one round trip ------------------------------------------------
     var snap = builder.download_desc_tables()
+    _resident_trace_emit(
+        trace,
+        String(
+            "mojotrees.resident plane=device-resident ",
+            snap.trace_line(),
+            " budget=",
+            params.num_leaves,
+            " root_rows=",
+            n_root,
+            " steps=",
+            params.num_leaves - 1,
+            "\n",
+            snap.describe(),
+        ),
+    )
     # Every check the shipping path made per split, made once here instead:
     # no two live leaves share a node id, a histogram slot, or a record slot;
     # the slot pool and the frontier agree about every owner; the live
@@ -658,6 +969,50 @@ def grow_tree_device_resident(
             String(
                 "the device-owned tree stopped abnormally: ",
                 tree_status_name(snap.status),
+                "; ",
+                snap.trace_line(),
+                ". Set ",
+                RESIDENT_TRACE_VAR,
+                " to a path and ",
+                RESIDENT_TRACE_STEPS_VAR,
+                "=1 for the frontier at every step.",
             )
         )
+    # Three numbers the loop above knows and the tables cannot check for
+    # themselves, because `check_invariants` sees a snapshot and not the
+    # schedule that produced it. Each one is a way the step count and the
+    # growth could disagree without any table being malformed, which is
+    # precisely the class of fault that produced a tree missing its last
+    # leaves and reported nothing.
+    if snap.commits != snap.n_live - 1:
+        raise Error(
+            String(
+                "the device-owned tree committed ",
+                snap.commits,
+                " splits but holds ",
+                snap.n_live,
+                " leaves; a tree of L leaves is L-1 splits",
+            )
+        )
+    if snap.n_live > params.num_leaves:
+        raise Error(
+            String(
+                "the device-owned tree grew ",
+                snap.n_live,
+                " leaves against a budget of ",
+                params.num_leaves,
+            )
+        )
+    if snap.status == TREE_BUDGET_SPENT and snap.n_live != params.num_leaves:
+        raise Error(
+            String(
+                "the device-owned tree reports a spent budget at ",
+                snap.n_live,
+                " leaves of ",
+                params.num_leaves,
+            )
+        )
+    # The host state the rest of the trainer reads back out of the builder.
+    # Not optional and not cosmetic; see `_publish_row_ranges`.
+    _publish_row_ranges(builder, snap)
     return tree_from_snapshot(snap)
