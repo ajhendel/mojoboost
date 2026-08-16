@@ -78,6 +78,10 @@ from .auto_learning_rate import (
 )
 from .device import CPU_DEVICE, GPU_DEVICE, parse_device
 from .objective_registry import MULTICLASS as _MULTICLASS
+from .objective_registry import (
+    objective_unimplemented_canonical,
+    objective_unimplemented_reason,
+)
 from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
 from .validation import check_booster_ranges, check_max_bin
@@ -408,6 +412,24 @@ def _raise_if_unimplemented_objective(name: String) raises:
         raise Error(
             "objective 'rank_xendcg' is not implemented; 'lambdarank' is"
             " the ranking objective mojotrees provides"
+        )
+    # The reserved objective codes. Their derivatives, their init rules and
+    # their round loops are merged and nothing imports them, so the refusal
+    # names the module and the entry point rather than calling a real loss
+    # unknown. The registry is the single statement of both the name set and
+    # the sentence; this arm delegates rather than repeating it.
+    #
+    # Additive on purpose. This arm subsumes the three above it, but
+    # collapsing them would drop `multiclassoneversusall` (CatBoost's
+    # spelling, accepted above and not in the registry chain), so the three
+    # stay until the registry carries that name.
+    var reserved = objective_unimplemented_canonical(name)
+    if reserved.byte_length() > 0:
+        raise Error(
+            "objective '",
+            reserved,
+            "' is not implemented; ",
+            objective_unimplemented_reason(name),
         )
 
 
