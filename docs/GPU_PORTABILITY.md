@@ -494,7 +494,10 @@ the block occurs, not observed.
    there is no second queue to overlap with, and there is no
    `MetalDeviceGraphBuilder` although `CUDADeviceGraphBuilder` and
    `HIPDeviceGraphBuilder` both ship. Whatever pipelining a design wants on
-   this backend, it takes from the 64-deep queue alone.
+   this backend, it takes from the 64-deep queue alone. The graph half of
+   that sentence was derived from a symbol table when it was written; it has
+   since been **verified by execution** and the raise it produces is quoted
+   in section 6.5.
 
 ### 6.3 What each backend provides, on these two points
 
@@ -504,7 +507,7 @@ the block occurs, not observed.
 | `asynchronous-device-to-host-copy` | **no**, measured by disassembly | unestablished | unestablished |
 | `queue-depth` | 64 command buffers, one per launch, measured by disassembly; not raisable | unestablished | unestablished |
 | `second-queue-or-stream` | none, `"Metal stream not implemented"` in the runtime | unestablished | unestablished |
-| `capture-and-replay` | none, no `MetalDeviceGraphBuilder` | `CUDADeviceGraphBuilder` ships; never exercised here | `HIPDeviceGraphBuilder` ships; never exercised here |
+| `capture-and-replay` | none, **verified by execution**: `DeviceGraph.create` raises `createGraphBuilder() not supported on this device context` on an M4. Section 6.5 | `CUDADeviceGraphBuilder` ships; never exercised here | `HIPDeviceGraphBuilder` ships; never exercised here |
 
 "unestablished" is deliberately not "specified" here. Section 1's table can
 say "specified" because it is quoting what an API documents about a kernel
@@ -638,3 +641,123 @@ believe about what the API guarantees. They answer different questions, and the
 gap between them was exactly where the design assumption 6.1.1 withdraws had
 been hiding: the disassembly's answer, which is about ordering, was read as an
 answer about time.
+
+### 6.5 Device graphs: the Mojo API is complete, Metal does not back it
+
+**Verified by execution, 2026-08-16, MAX 26.5.0 / Mojo 1.0.0 (ed45d567),
+Apple M4.** `tools/probe_device_graph.mojo` reproduces it in one command.
+
+`DeviceGraph.create(ctx, build)` raises on this device:
+
+```
+At max/mojo/max/gpu/host/device_graph.mojo:285:17:
+createGraphBuilder() not supported on this device context
+```
+
+That is the whole answer, and it arrives at the first call. Nothing is
+captured, nothing is replayed, and there is no partially-working path to
+characterize: the failure is at *builder creation*, so every one of
+`add_function`, `add_copy`, `add_memset`, `add_empty`, `region`,
+`create_buffer`, `recording_context` and `replay` is unreachable on Metal.
+
+**The exact missing API.** Not a Mojo symbol. `max.gpu.host.device_graph`
+compiles, its types construct, and `DeviceGraph.create` type-checks and
+elaborates against a real kernel; the gap is one layer below, in the C++
+driver. The shipped `libAsyncRTMojoBindings.dylib` names its driver sources
+in its string table, and the device-context implementations it contains are:
+
+```
+MLRT/lib/Driver/DeviceContext/CPU/CpuDeviceContext.cpp
+MLRT/lib/Driver/DeviceContext/CUDA/CUDADeviceContext.cpp
+MLRT/lib/Driver/DeviceContext/CUDA/CUDADeviceGraphBuilder.cpp
+MLRT/lib/Driver/DeviceContext/DeviceContext.cpp
+MLRT/lib/Driver/DeviceContext/HIP/HIPCompilationDevice.cpp
+MLRT/lib/Driver/DeviceContext/HIP/HIPDeviceContext.cpp
+MLRT/lib/Driver/DeviceContext/HIP/HIPDeviceGraphBuilder.cpp
+MLRT/lib/Driver/DeviceContext/Metal/MetalDeviceContext.cpp
+MLRT/lib/Driver/DeviceContext/Virtual/VirtualDeviceContext.cpp
+```
+
+CUDA has a graph builder. HIP has a graph builder. Metal has a device context
+and no graph builder, so `MetalDeviceContext` inherits the base
+`DeviceContext::createGraphBuilder()`, whose entire body is the throw quoted
+above. The missing API is therefore **`MLRT/lib/Driver/DeviceContext/Metal/
+MetalDeviceGraphBuilder.cpp`, a file that does not exist in this build**, and
+nothing on our side of the boundary can substitute for it. There is no
+environment variable that changes this: the only `MODULAR_*` and `MTL_*`
+knobs in the binary are `MODULAR_DEBUG`, `MODULAR_DERIVED_PATH`,
+`MODULAR_DISABLE_METAL_GPU_PRINT`, `MODULAR_DRIVER_PLUGINS`,
+`MODULAR_ENABLE_AFFINITY`, `MODULAR_ENABLE_CACHE_LOGGING`, `MODULAR_HOME`,
+`MODULAR_NVPTX_COMPILER_PATH`, `MODULAR_PROFILER_PLUGIN` and
+`MODULAR_THREAD_BUSY_WAIT_US`, none of which is a graph gate.
+
+**This upgrades a claim the repository already made, it does not overturn
+it.** Section 6.2's fourth point and section 6.3's `capture-and-replay` row
+already said "no `MetalDeviceGraphBuilder`", derived from the same string
+table. What was never established is the thing that actually matters, and it
+is not the same claim: a missing implementation file is consistent with a
+silent no-op, with a fallback that batches submissions, and with a hard
+raise, and those three would have led a design to three different places.
+It raises. Loudly, at the first call, before any node is added. Of the three
+that is the best of the bad outcomes, because no design can accidentally
+build on it and no benchmark can accidentally measure a graph that captured
+nothing.
+
+**What the API is, for whoever revisits this on CUDA or HIP.** Recorded
+because the question will come back and the surface is not in any source
+this install ships; it was recovered from the compiled package's docstrings
+and mangled signatures, so treat the shapes as read rather than as run.
+
+- `DeviceGraph.create(ctx, build)` is the only entry point. It calls `build`
+  with a fresh `DeviceGraphBuilder`, then instantiates. The builder and every
+  `DeviceGraphNode` it hands out are origin-branded to the `create` scope, so
+  a handle cannot escape the callback or be mixed into another graph. The
+  borrow checker enforces that, which is why there is no way to hold a
+  half-built graph across a host decision.
+- Nodes: `add_function` (compiled `DeviceFunction`, `DeviceExternalFunction`,
+  a `{var}`-capturing closure, or a kernel passed as a parameter),
+  `add_copy` in all three directions, `add_memset`, and `add_empty`.
+- Ordering is an explicit DAG, not enqueue order: every `add_*` takes a
+  required `dependencies=` list of predecessor handles, and an empty list
+  means "graph root". `add_empty` exists to express an `m`-to-`n` barrier in
+  `m + n` edges instead of `m * n`, and `builder.region(work)` runs a closure
+  and returns one handle joining everything it added.
+- `builder.recording_context()` returns a `DeviceContext` view on which
+  ordinary `enqueue_*` calls record into the graph instead of executing.
+  That is the migration path that would matter to us: existing launch code
+  records unmodified. Host-visible waits -- `synchronize()`, events, timers
+  -- raise inside it, by design, because they observe a device result that
+  does not exist until replay.
+- `builder.create_buffer[dtype](size, is_host)` allocates with a lifetime
+  tied to the graph, and the docstring is explicit that graph allocations
+  must go through it rather than `DeviceContext.enqueue_create_buffer`.
+- `DeviceGraph` itself exposes `replay()`, a refcounting `copy`, and
+  `take_handle`. **That is the whole surface, and the absence is the
+  important part: there is no node-update call.** CUDA's
+  `cudaGraphExecKernelNodeSetParams` is not exposed, so between two replays
+  of an instantiated graph *nothing* may change except the contents of
+  device memory. Grid dimensions, block dimensions, shared-memory bytes and
+  every kernel argument are frozen at capture.
+
+**Does our step-descriptor design satisfy those constraints? Half of it does,
+and the half that does not is the expensive half.** The device-resident plane
+already had kernels read their decisions out of device memory rather than take
+them as launch arguments, and that is exactly what the frozen-argument rule
+demands: pointers into session-owned buffers are stable across a whole fit, so
+every *argument* our per-tree sequence passes would survive capture unchanged.
+That much is a real dividend from work already done. What does not survive is
+launch *geometry*. Our per-node and per-frontier launches size their grids to
+the live frontier, and a captured graph freezes `grid_dim`, so a captured
+per-tree sequence would have to launch max-sized grids that early-out on a
+device-read descriptor, paying for the largest frontier on every round.
+Whether that trade is worth taking is unmeasurable here and must not be
+guessed at; it is the first thing to measure on a CUDA or HIP device, and it
+is the reason this section stops rather than recommending anything.
+
+**What this does not say.** It says nothing about whether capture-and-replay
+would be *faster* on a backend that has it -- no timing was taken and none
+should be quoted from this work. It says nothing about the CPU or Virtual
+device contexts, which were not probed. And it does not close the question
+for MAX versions after 26.5.0: a `MetalDeviceGraphBuilder.cpp` is a file
+Modular can add, and `tools/probe_device_graph.mojo` exists so that the day
+it appears, nobody has to re-derive any of this.
