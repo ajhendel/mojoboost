@@ -56,7 +56,18 @@ from .goss import (
     goss_round,
     goss_select,
 )
-from .monotone import MonotoneConstraints
+from .monotone import MonotoneConstraints, OutputBounds
+from .ordered_boosting import (
+    OrderedBoostingParams,
+    check_ordered_hessian_declaration,
+    check_ordered_honored,
+    fold_ids,
+    fold_ladder,
+    n_rungs,
+    ordered_permutation,
+    permutation_choice,
+    plane_offsets,
+)
 from .sampling import (
     ClassBaggingParams,
     has_positive_rows,
@@ -1388,6 +1399,7 @@ struct BoosterParams(Copyable, Movable):
     var tree: TreeParams
     var bundling: EfbSettings
     var linear: LinearParams
+    var ordered: OrderedBoostingParams
 
     def __init__(
         out self,
@@ -1396,6 +1408,7 @@ struct BoosterParams(Copyable, Movable):
         var tree: TreeParams,
         var bundling: EfbSettings = EfbSettings.disabled(),
         var linear: LinearParams = LinearParams(),
+        var ordered: OrderedBoostingParams = OrderedBoostingParams.disabled(),
     ):
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
@@ -1406,6 +1419,13 @@ struct BoosterParams(Copyable, Movable):
         # linear leaves when it is on, and the binned-only trainers here
         # refuse it because they have no raw matrix to fit them from.
         self.linear = linear^
+        # CatBoost's `boosting_type=Ordered` (ordered_boosting.mojo). Off by
+        # default, appended last so every positional caller of this
+        # constructor -- `bindings/_mojotrees.mojo`, `cli/`, `capi/` -- keeps
+        # working unchanged, exactly as `bundling` and `linear` were. Only
+        # `train` honors it; every other trainer here refuses it with
+        # `check_ordered_honored` rather than ignoring it.
+        self.ordered = ordered^
 
     @staticmethod
     def default() -> BoosterParams:
@@ -1909,6 +1929,166 @@ def _add_tree_scores(
     )
 
 
+# ---------------------------------------------------------------------------
+# Ordered boosting (CatBoost `boosting_type=Ordered`)
+# ---------------------------------------------------------------------------
+
+
+def _check_ordered(
+    ordered: OrderedBoostingParams,
+    objective: Int,
+    bagging: BaggingParams,
+    goss: GossParams,
+    class_bagging: ClassBaggingParams,
+    round_offset: Int,
+) raises:
+    """Everything ordered boosting is exclusive with, refused before the first
+    tree rather than silently composed with.
+
+    - **Row samplers.** Bagging, GOSS and balanced bagging all remove rows from
+      the round. Ordered boosting's premise is that every row's derivative
+      comes from a model fitted on a known prefix of a known permutation; a
+      sampler that drops rows changes which prefix each rung was actually
+      fitted on and the ladder stops meaning what it says. CatBoost does
+      compose ordered boosting with its bootstrap, but it does so by rebuilding
+      the sampled derivatives per rung
+      (`tensor_search_helpers.cpp::Bootstrap` runs inside the per-rung loop);
+      that is a second mechanism and this lane did not build it.
+    - **Renewing objectives.** `MAPE`, `L1` and the quantile family replace a
+      leaf's value with a percentile of residuals rather than a Newton step
+      (`_renew_leaf_values`), and there is no per-rung analogue of that here:
+      the rung planes would have to be advanced by a value fitted a different
+      way from the model's. Refused rather than approximated.
+    - **Continued training.** The rung planes are fit state, not model state,
+      and a `Booster` does not carry them. Resuming would restart every rung
+      from the ensemble's current score, which is precisely the leakage
+      ordered boosting removes. CatBoost snapshots them
+      (`TFold::SaveApproxes` / `LoadApproxes`); we do not, so we refuse.
+    """
+    ordered.validate()
+    if not ordered.enabled:
+        return
+    if bagging_enabled(bagging):
+        raise Error(
+            "boosting_type=ordered is exclusive with bagging: a dropped row"
+            " changes which prefix each fold was fitted on"
+        )
+    if goss.enabled:
+        raise Error(
+            "boosting_type=ordered is exclusive with goss: a dropped row"
+            " changes which prefix each fold was fitted on"
+        )
+    if class_bagging.enabled():
+        raise Error(
+            "boosting_type=ordered is exclusive with balanced bagging: a"
+            " dropped row changes which prefix each fold was fitted on"
+        )
+    if objective_renews_leaves(objective):
+        raise Error(
+            "boosting_type=ordered is not implemented for objectives that"
+            " renew leaf values from residual percentiles"
+        )
+    if round_offset > 0:
+        raise Error(
+            "boosting_type=ordered cannot continue training: the per-fold raw"
+            " score planes are fit state and are not carried by a model"
+        )
+
+
+def _ordered_leaf_of_row(
+    tree: Tree,
+    data: BinnedMatrix,
+    leaves: LeafMembership,
+    n: Int,
+    mut leaf_of_row: List[Int],
+) raises:
+    """Each row's leaf *node index* in this tree, once per round.
+
+    Every ordered consumer below needs the same map -- the model's leaf refit,
+    and each rung's own refit and plane advance -- and walking the tree once
+    per row per rung would be `K` traversals of the dataset instead of one
+    array read. The membership the grower just handed back covers the whole
+    dataset whenever it is usable (ordered boosting bags nothing, so it always
+    is on the honored path); the traversal is the fallback, and it is the same
+    fallback `_estimate_leaf_values` takes.
+    """
+    if len(leaf_of_row) != n:
+        leaf_of_row.resize(n, 0)
+    if _renewal_membership_usable(tree, leaves, n):
+        for l in range(leaves.n_leaves()):
+            var node = leaves.node[l]
+            ref rows = leaves.rows[l]
+            for i in range(len(rows)):
+                leaf_of_row[rows[i]] = node
+        return
+    for r in range(n):
+        leaf_of_row[r] = tree.leaf_index_row(data, r)
+
+
+def _ordered_fit_leaf_values(
+    tree: Tree,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_offset: Int,
+    n_rows: Int,
+    leaf_of_row: List[Int],
+    lambda_l1: Float64,
+    lambda_l2: Float64,
+    max_delta_step: Float64,
+    bounds: List[OutputBounds],
+    mut values: List[Float64],
+) raises:
+    """One Newton step per leaf on a chosen row set, written into `values`
+    indexed by node.
+
+    `rows[row_offset : row_offset + n_rows]` is the row set: the caller keeps
+    every permutation end to end in one buffer and passes the window belonging
+    to the one it is advancing, so a rung body is named without materializing
+    it. An empty `rows` means "rows `0 .. n_rows - 1` in order", which is the
+    model's own refit over the whole dataset.
+
+    **The fold order is the ascending order of the row list handed in, on both
+    routes, and nothing is summed across any decomposition** -- there is no
+    dispatch here at all -- so every leaf's `G` and `H` are the same `Float64`
+    at any `MOJOTREES_NUM_WORKERS`.
+
+    A leaf with no rows keeps value 0, which is what an empty rung body gives
+    the leaves it does not reach. That is the correct answer and not a
+    fallback: a rung whose body never entered a leaf has learned nothing about
+    it and must add nothing there.
+    """
+    var n_nodes = len(tree.feature)
+    if len(values) != n_nodes:
+        values.resize(n_nodes, 0.0)
+    var g_sum = List[Float64](capacity=n_nodes)
+    var h_sum = List[Float64](capacity=n_nodes)
+    for _ in range(n_nodes):
+        g_sum.append(0.0)
+        h_sum.append(0.0)
+    var indexed = len(rows) > 0
+    for i in range(n_rows):
+        var r = rows[row_offset + i] if indexed else i
+        var node = leaf_of_row[r]
+        g_sum[node] += grad[i]
+        h_sum[node] += hess[i]
+    for node in range(n_nodes):
+        if tree.feature[node] >= 0:
+            values[node] = 0.0
+            continue
+        var h = h_sum[node]
+        if h + lambda_l2 <= 0.0:
+            values[node] = 0.0
+            continue
+        var v = cap_leaf_output(
+            raw_leaf_output(g_sum[node], h, lambda_l1, lambda_l2),
+            max_delta_step,
+        )
+        if len(bounds) > 0:
+            v = bounds[node].clamp(v)
+        values[node] = v
+
+
 def _boost_rounds(
     data: BinnedMatrix,
     target: List[Float64],
@@ -2033,6 +2213,62 @@ def _boost_rounds(
     var const_hessian = round_has_constant_hessian(
         objective, sample_weight, goss
     )
+    # ---- ordered boosting state, all empty and untouched when it is off ----
+    # `_check_ordered` runs whether or not it is on, because `validate` refuses
+    # a malformed bundle a caller built and then disabled, which is a typo
+    # worth reporting at the same place every other configuration error is.
+    var ordered = params.ordered.copy()
+    _check_ordered(
+        ordered, objective, bagging, goss, class_bagging, round_offset
+    )
+    check_ordered_hessian_declaration(ordered, const_hessian)
+    # `ladder[f]` is rung `f`'s body end and `ladder[f + 1]` its tail end;
+    # `plane_off[f]` is where rung `f`'s raw-score plane starts in the one flat
+    # buffer; `ord_fold[q]` is which rung permuted position `q` reads.
+    var ladder = List[Int]()
+    var plane_off = List[Int]()
+    var ord_fold = List[Int]()
+    var ord_perm = List[Int]()
+    var ord_plane = List[Float64]()
+    var n_rung = 0
+    var plane_stride = 0
+    var n_perm = 1
+    # Per-round scratch, allocated once for the whole fit.
+    var ord_score = List[Float64]()
+    var leaf_of_row = List[Int]()
+    var model_values = List[Float64]()
+    var rung_values = List[Float64]()
+    var pgrad = List[Float64]()
+    var phess = List[Float64]()
+    var sub_raw = List[Float64]()
+    var sub_tgt = List[Float64]()
+    var sub_w = List[Float64]()
+    var sub_grad = List[Float64]()
+    var sub_hess = List[Float64]()
+    if ordered.enabled:
+        ladder = fold_ladder(n, ordered.fold_len_multiplier)
+        plane_off = plane_offsets(ladder)
+        n_rung = n_rungs(ladder)
+        plane_stride = plane_off[n_rung]
+        ord_fold = fold_ids(ladder, n)
+        n_perm = ordered.permutation_count
+        var block = ordered.resolve_block_size(n)
+        ord_perm.reserve(n_perm * n)
+        for p in range(n_perm):
+            var one = ordered_permutation(ordered.seed, p, n, block)
+            for q in range(n):
+                ord_perm.append(one[q])
+        # Every plane starts where the ensemble starts. Seeded from `raw`
+        # through the permutation rather than from a scalar base score, so a
+        # per-row `init_score` reaches the planes too.
+        ord_plane.resize(n_perm * plane_stride, 0.0)
+        for p in range(n_perm):
+            for f in range(n_rung):
+                var base = p * plane_stride + plane_off[f]
+                for q in range(ladder[f + 1]):
+                    ord_plane[base + q] = raw[ord_perm[p * n + q]]
+        ord_score.resize(n, 0.0)
+        leaf_of_row.resize(n, 0)
     for i in range(params.n_estimators):
         var round = round_offset + i
         # The round's wall clock is taken in two brackets, before the tree and
@@ -2045,11 +2281,38 @@ def _boost_rounds(
         else:
             refresh_bag(bag, bagging, n, round)
         var grad_started = profile.clock()
-        _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess,
-            settings,
-            float64_derivatives=params.tree.extra.wants_float64_derivatives(),
-        )
+        if ordered.enabled:
+            # Which permutation this tree is grown against. One draw, a pure
+            # function of `(seed, round)`, taken before the gradient fill
+            # because it selects which raw scores the fill reads.
+            var perm_idx = permutation_choice(ordered.seed, round, n_perm)
+            # The ordered raw score of every row: the score held by the LAST
+            # rung whose body ends at or before this row's permuted position,
+            # which is the tightest model in the ladder that has never been
+            # fitted on it. Scattered back into row order so the gradient fill,
+            # the grower and the score update all keep reading rows the way
+            # they already do -- the permutation lives here and nowhere else.
+            var pbase = perm_idx * n
+            var sbase = perm_idx * plane_stride
+            for q in range(n):
+                ord_score[ord_perm[pbase + q]] = ord_plane[
+                    sbase + plane_off[ord_fold[q]] + q
+                ]
+            _fill_grad_hess(
+                ord_score, target, objective, sample_weight, alpha, grad, hess,
+                settings,
+                float64_derivatives=(
+                    params.tree.extra.wants_float64_derivatives()
+                ),
+            )
+        else:
+            _fill_grad_hess(
+                raw, target, objective, sample_weight, alpha, grad, hess,
+                settings,
+                float64_derivatives=(
+                    params.tree.extra.wants_float64_derivatives()
+                ),
+            )
         goss_round(bag, grad, hess, goss, round, learning_rate)
         # Round-level work belonging to no node, so it is charged at the
         # tree's root row count and files under `root`. The GOSS rescale is
@@ -2076,6 +2339,45 @@ def _boost_rounds(
             const_hessian_env,
         )
         var post_started = profile.clock()
+        # Hoisted out of the two ordered blocks below because they are split
+        # by the degenerate-tree test: the model's values must be written
+        # before that test sees them, and the rung planes must be advanced
+        # only if the tree actually joins the ensemble.
+        var ord_bounds = List[OutputBounds]()
+        if ordered.enabled:
+            # ---- the model's leaf values ----
+            #
+            # **Ordered boosting decides the tree's STRUCTURE, not the values
+            # the model carries.** That is CatBoost's own division of labour
+            # and it is worth being exact about, because it is the half every
+            # summary of the mechanism drops: `train.cpp::TrainOneIteration`
+            # searches the structure on `takenFold` (a ladder fold) and then
+            # calls `CalcLeafValues`, which reads
+            # `ctx->LearnProgress->AveragingFold` -- a plain, single-rung fold
+            # over every row. `UpdateLearningFold` afterwards advances each
+            # ladder fold's own approxes, which never reach the model.
+            #
+            # So the value written here is a Newton step on the PLAIN raw
+            # scores over every row, which is exactly what the grower would
+            # have written in plain mode for this structure. The grower's
+            # value, fitted on the ordered scores, is overwritten.
+            _ordered_leaf_of_row(tree, data, leaves, n, leaf_of_row)
+            ord_bounds = node_bounds(tree, signs)
+            _fill_grad_hess(
+                raw, target, objective, sample_weight, alpha, pgrad, phess,
+                settings,
+                float64_derivatives=(
+                    params.tree.extra.wants_float64_derivatives()
+                ),
+            )
+            _ordered_fit_leaf_values(
+                tree, pgrad, phess, List[Int](), 0, n, leaf_of_row,
+                params.tree.lambda_l1, params.tree.lambda_reg,
+                params.tree.extra.max_delta_step, ord_bounds, model_values,
+            )
+            for node in range(len(tree.feature)):
+                if tree.feature[node] < 0:
+                    tree.value[node] = model_values[node]
         if renews:
             # The membership growth just handed back, so renewal reads each
             # row's leaf off the partition instead of walking the tree once
@@ -2124,6 +2426,74 @@ def _boost_rounds(
             raw, tree, leaves, data, learning_rate, by_leaf, 1, 0, settings
         )
         profile.charge(PROF_SCORE_UPDATE, n, update_started)
+        if ordered.enabled:
+            # ---- advance every rung of every permutation ----
+            #
+            # After the score update, and only for a tree the ensemble kept,
+            # so a round that broke out above leaves the planes exactly where
+            # `raw` was left.
+            #
+            # Rung `f` fits its own leaf values on its own body -- permuted
+            # positions `[0, ladder[f])`, read at rung `f`'s own scores -- and
+            # then adds `learning_rate * value` over its own tail,
+            # `[0, ladder[f + 1])`. `approx_calcer.cpp::CalcApproxDeltaSimple`
+            # is the same two ranges: `CalcLeafDersSimple(..., bt.BodyFinish,
+            # ...)` for the fit and `UpdateApproxDeltas(..., bt.TailFinish,
+            # ...)` for the apply. **These values are bookkeeping and never
+            # reach the model**; the model's are the plain ones written above.
+            #
+            # Nothing is shared across rungs. Each fits its own `G` and `H` at
+            # its own scores with the same `lambda_l2`; no scale, threshold or
+            # bound derived on one rung is reused on another, which matters
+            # because the rungs are systematically NOT magnitude-comparable --
+            # an early rung sees a short prefix, underfits harder, and carries
+            # larger residuals, monotonically in the rung index.
+            #
+            # Cost per round, derived and not measured: the bodies sum to
+            # under `n * m / (m - 1)` and the tails to under
+            # `n * (2m - 1) / (m - 1)`, so it is a bounded multiple of one
+            # dataset pass per permutation -- under `2n` derivative
+            # evaluations and under `3n` plane writes at the default
+            # multiplier -- and not `K` passes.
+            for p in range(n_perm):
+                var pbase = p * n
+                var sbase = p * plane_stride
+                for f in range(n_rung):
+                    var body = ladder[f]
+                    var tail = ladder[f + 1]
+                    var off = sbase + plane_off[f]
+                    sub_raw.resize(body, 0.0)
+                    sub_tgt.resize(body, 0.0)
+                    if len(sample_weight) > 0:
+                        sub_w.resize(body, 0.0)
+                    for q in range(body):
+                        var r = ord_perm[pbase + q]
+                        sub_raw[q] = ord_plane[off + q]
+                        sub_tgt[q] = target[r]
+                        if len(sample_weight) > 0:
+                            sub_w[q] = sample_weight[r]
+                    _fill_grad_hess(
+                        sub_raw, sub_tgt, objective, sub_w, alpha,
+                        sub_grad, sub_hess, settings,
+                        float64_derivatives=(
+                            params.tree.extra.wants_float64_derivatives()
+                        ),
+                    )
+                    # The row window is this permutation's prefix, so
+                    # `_ordered_fit_leaf_values` reads `grad[i]` beside
+                    # `leaf_of_row[perm[i]]` and folds in permuted order.
+                    _ordered_fit_leaf_values(
+                        tree, sub_grad, sub_hess, ord_perm, pbase, body,
+                        leaf_of_row,
+                        params.tree.lambda_l1, params.tree.lambda_reg,
+                        params.tree.extra.max_delta_step, ord_bounds,
+                        rung_values,
+                    )
+                    for q in range(tail):
+                        ord_plane[off + q] += (
+                            learning_rate
+                            * rung_values[leaf_of_row[ord_perm[pbase + q]]]
+                        )
         trees.append(tree^)
         profile.note_wall(post_started)
 
@@ -2388,6 +2758,9 @@ def train_with_valid(
     # The same once-per-fit check and the same count `_boost_rounds` makes.
     var leaf_iters = params.tree.extra.leaf_estimation_iterations
     _check_leaf_estimation_config(params.tree.extra, objective, goss)
+    # This loop is `_boost_rounds`'s twin and does not carry the ordered
+    # ladder, so an active bundle is refused rather than silently ignored.
+    check_ordered_honored(params.ordered, String("train_with_valid"))
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
@@ -2840,6 +3213,13 @@ def _boost_rounds_multiclass(
     # `catboost_leaf_estimation_iterations`), so there is nothing lost here
     # that CatBoost has by default.
     _refuse_leaf_estimation(params.tree.extra, "the multiclass trainers")
+    # Ordered boosting is single-output here. A softmax row carries
+    # `n_classes` raw scores and class k's derivative depends on all of them,
+    # so a ladder would need `n_classes` planes per rung and a rule for which
+    # class's tree advances which -- a second mechanism, not a widening. It is
+    # also the case CatBoost itself excludes from its Ordered default
+    # (`catboost_options.cpp:802-806`, `ordered_boosting.catboost_auto_is_ordered`).
+    check_ordered_honored(params.ordered, String("the multiclass trainers"))
     var bundling = prepare_bundling(data, params.bundling)
     # ONE ledger across every class, not one per class. A feature computed
     # for class 0's tree is computed for the row, so charging it again for
@@ -3159,6 +3539,8 @@ def train_multiclass_with_valid(
     # The same refusal `_boost_rounds_multiclass` makes, for the same reason:
     # a softmax row's derivative for class k reads every class's raw score.
     _refuse_leaf_estimation(params.tree.extra, "the multiclass trainers")
+    # And the same ordered refusal, for the same reason.
+    check_ordered_honored(params.ordered, String("the multiclass trainers"))
     # Fitted once, from the training matrix alone: the validation matrix is
     # only ever scored through the trees, which name original features.
     var bundling = prepare_bundling(data, params.bundling)

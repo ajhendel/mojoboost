@@ -2876,62 +2876,62 @@ def build_histogram_subset_quantized_into_scratch(
     if bits == HIST_BITS_16:
         if group >= 16:
             _accumulate_packed_at[DType.int32, HIST_BITS_16, 16](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
         elif group >= 8:
             _accumulate_packed_at[DType.int32, HIST_BITS_16, 8](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
         elif group >= 4:
             _accumulate_packed_at[DType.int32, HIST_BITS_16, 4](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
         elif group >= 2:
             _accumulate_packed_at[DType.int32, HIST_BITS_16, 2](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
         else:
             _accumulate_packed_at[DType.int32, HIST_BITS_16, 1](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
     else:
         if group >= 16:
             _accumulate_packed_at[DType.int64, HIST_BITS_32, 16](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
         elif group >= 8:
             _accumulate_packed_at[DType.int64, HIST_BITS_32, 8](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
         elif group >= 4:
             _accumulate_packed_at[DType.int64, HIST_BITS_32, 4](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
         elif group >= 2:
             _accumulate_packed_at[DType.int64, HIST_BITS_32, 2](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
         else:
             _accumulate_packed_at[DType.int64, HIST_BITS_32, 1](
-                out._grad, out._hess, out._count, qscratch, data, qgrad, qhess,
+                out._gh, out._count, qscratch, data, qgrad, qhess,
                 rows, row_start, row_count, features, plan, blocks, block_rows,
                 cells, n_active, scales, const_h, settings,
             )
@@ -2952,8 +2952,7 @@ def build_histogram_subset_quantized_into_scratch(
 def _accumulate_packed_at[
     CELL: DType, HIST_BITS: Int, GROUP: Int
 ](
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     mut scratch: List[Int64],
     data: BinnedMatrix,
@@ -3022,8 +3021,7 @@ def _accumulate_packed_at[
     var hist_off = n_sub
     var count_off = n_sub + blocks * cells
 
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
+    var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var sp = scratch.unsafe_ptr().unsafe_bitcast[Scalar[CELL]]()
     var qg = qgrad.unsafe_ptr()
@@ -3187,8 +3185,15 @@ def _accumulate_packed_at[
                 var cq = lo
                 if not const_h:
                     cq = sp.unsafe_load(c0 + b).cast[DType.int64]()
-                gp.unsafe_store(out0 + b, Float64(gq) * g_inv)
-                hp.unsafe_store(out0 + b, Float64(lo) * h_inv)
+                # One 16-byte store into the interleaved output cell where
+                # there were two scalar stores into planes a whole histogram
+                # apart. Same two Float64, same dequantization.
+                ghp.unsafe_store(
+                    2 * (out0 + b),
+                    SIMD[DType.float64, 2](
+                        Float64(gq) * g_inv, Float64(lo) * h_inv
+                    ),
+                )
                 cp.unsafe_store(out0 + b, Int(cq))
 
     var fold_ops = plan.fold_ops if plan.blocked() else 3 * cells

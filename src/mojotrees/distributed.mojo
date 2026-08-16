@@ -486,8 +486,8 @@ def partition_values(
 
 def _zero_histogram(n_features: Int, n_bins: Int) -> Histogram:
     var size = n_features * n_bins
-    return Histogram.from_planes(
-        zeros_f64(size), zeros_f64(size), zeros_int(size), n_features, n_bins
+    return Histogram.from_pairs(
+        zeros_f64(2 * size), zeros_int(size), n_features, n_bins
     )
 
 
@@ -495,8 +495,10 @@ def _accumulate_histogram(mut acc: Histogram, src: Histogram) raises:
     """Add one local rank's histogram into this process's contribution.
     Called in ascending local rank order to match the ascending rank order a
     conforming transport uses across processes."""
-    add_into_f64(acc._grad, src._grad)
-    add_into_f64(acc._hess, src._hess)
+    # One pass over the interleaved pair plane where there were two over
+    # separate gradient and hessian planes. Same additions, same order, same
+    # bits; four memory streams instead of six.
+    add_into_f64(acc._gh, src._gh)
     add_into_int(acc._count, src._count)
 
 
@@ -506,25 +508,28 @@ def allreduce_histogram[C: Collective](
     """Sum a histogram across every rank, leaving the identical result
     everywhere.
 
-    Three reductions rather than one, so that counts stay integers and their
-    exactness is obvious. A production transport should pack gradients and
-    hessians into one message; see docs/distributed.md section 8.
+    **Two reductions, not three.** The gradient and the hessian now share one
+    interleaved plane, so the "a production transport should pack gradients
+    and hessians into one message" note that used to sit here is done: they
+    ARE one message, of `2 * cells` Float64, and the packing costs nothing
+    because it is the storage. The count stays a separate integer reduction
+    so counts stay integers and their exactness is obvious. One fewer
+    collective per node, and the same bytes on the wire.
 
-    The three buffers are checked against `histogram_plan` first. That is the
-    cost contract in distributed_transport.mojo, and checking here is what
+    The buffers are checked against `histogram_plan` first. That is the cost
+    contract in distributed_transport.mojo, and checking here is what
     connects it to the schedule it describes rather than leaving it as an
     assertion about a comment: a histogram whose buffers do not describe one
     features-by-bins grid is refused locally, by the rank that built it, rather
     than reaching the peers as a length disagreement attributed to whoever
     happened to receive it. It costs three integer comparisons per node and no
-    messages.
+    messages. `check_histogram_buffers` still counts CELLS on all three
+    arguments, so the pair plane is offered as its cell count.
     """
     var plan = histogram_plan(hist.n_features, hist.n_bins)
-    check_histogram_buffers(
-        plan, len(hist._grad), len(hist._hess), len(hist._count)
-    )
-    comm.allreduce_sum_f64(hist._grad)
-    comm.allreduce_sum_f64(hist._hess)
+    var cells = len(hist._gh) // 2
+    check_histogram_buffers(plan, cells, cells, len(hist._count))
+    comm.allreduce_sum_f64(hist._gh)
     comm.allreduce_sum_int(hist._count)
 
 

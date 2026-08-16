@@ -28,7 +28,7 @@ slice, which is the one thing the no-atomics argument above rules out.
 Each builder comes in two forms. The plain one allocates and returns a fresh
 `Histogram` and is what callers outside tree growth want. The `_into` one
 writes a caller-owned buffer, so a grower that visits hundreds of nodes can
-recycle a handful of histograms instead of allocating three arrays per node
+recycle a handful of histograms instead of allocating two arrays per node
 (see `Histogram.zeroed` / `Histogram.reset`). The two forms run the same
 kernels and produce bit-identical results; only the allocation differs.
 
@@ -238,26 +238,48 @@ the default arm's row loops are the instruction stream they were before the
 switch existed, and the `float64` arm gives up the gathered pair buffer and
 the row-blocked histograms because both are Float32 shapes.
 
-**A private histogram cell is an interleaved `(gradient, hessian)` pair.**
-`include/LightGBM/bin.h` has `typedef double hist_t`, `kHistEntrySize = 2 *
-sizeof(hist_t)`, `GET_GRAD(hist, i) = hist[(i) << 1]` and `GET_HESS(hist, i) =
-hist[((i) << 1) + 1]`: 16 bytes a cell, no count plane. The row-blocked
-kernel's partials are laid out that way, so one row's visit to one feature
-touches one contiguous cell rather than three planes a stride apart --
-`_accumulate_blocked_at` carries the arithmetic and the two divergences (a
-third slot for an exact count off the constant-hessian path, and a stride of
-two rather than a `<< 1`, because the general arm needs three). The
-`Histogram` the builders *produce* still has three separate planes: that
-layout is read by the GPU download path, by the distributed allreduce and by
-the C ABI, and narrowing it is not this lane's to do.
+**A histogram cell is an interleaved `(gradient, hessian)` pair, in the
+private partials and in the output alike.** `include/LightGBM/bin.h` has
+`typedef double hist_t`, `kHistEntrySize = 2 * sizeof(hist_t)`, `GET_GRAD(
+hist, i) = hist[(i) << 1]` and `GET_HESS(hist, i) = hist[((i) << 1) + 1]`: 16
+bytes a cell, no count plane. `Histogram._gh` is that array, and the
+row-blocked kernel's partials are the same shape, so one row's visit to one
+feature touches one contiguous cell rather than two planes a whole histogram
+apart. `_accumulate_blocked_at` carries the partials' arithmetic and the two
+divergences (a third slot for an exact count off the constant-hessian path,
+and a stride of two rather than a `<< 1`, because the general arm needs
+three).
+
+The interleave used to stop at the fold: the partials were interleaved, then
+scattered back into separate `grad` and `hess` planes on the way out. Both
+ends now agree, and three consequences follow directly from that.
+
+- The fold stopped being a scatter. On the general arm the private cell's
+  first two floats ARE the output cell, so `fold_slots` copies 16 bytes
+  rather than writing two scalars into two streams.
+- The unblocked kernels' read-modify-write per (row, feature) touches **two**
+  cache lines rather than three: the pair, and the count. That is the same
+  argument the private cell already made, applied to the buffer the small and
+  medium nodes accumulate into directly.
+- The sibling subtraction, `Histogram.reset`, the zeroing passes and the
+  distributed allreduce each lost one of their streams, and the allreduce
+  lost a whole collective: gradients and hessians are one message now because
+  they are one array.
+
+**The count is not in the interleave, and that is a decision with evidence
+rather than an omission.** `Histogram`'s docstring states it: different type,
+different reduction, different access pattern, and a 24-byte cell straddles
+cache lines where a 16-byte one never does. LightGBM's histogram entry is two
+`hist_t` and nothing else.
 
 The constant-hessian plane
 --------------------------
-A cell is three planes, and for four of the built-in objectives one of them
-carries no information. `SQUARED_ERROR`, `L1`, `HUBER` and `QUANTILE` all
-write the same hessian into every row when the fit has no sample weights, and
-that value is exactly 1.0, so the hessian plane is the count plane and storing
-both is waste. `objective_has_constant_hessian` is the predicate, and it is
+A cell is a `(gradient, hessian)` pair beside a count, and for four of the
+built-in objectives the hessian carries no information. `SQUARED_ERROR`,
+`L1`, `HUBER` and `QUANTILE` all write the same hessian into every row when
+the fit has no sample weights, and that value is exactly 1.0, so the hessian
+slot is the count plane and storing both is waste.
+`objective_has_constant_hessian` is the predicate, and it is
 deliberately about the objective rather than about a round's numbers: hessians
 that happen to be equal once are not a guarantee, and a weighted or GOSS round
 breaks the guarantee while leaving the objective code unchanged.
@@ -973,37 +995,68 @@ def _resolve_narrow(
 struct Histogram(Copyable, Movable):
     """Per-(feature, bin) statistics, flattened as `[f * n_bins + b]`.
 
-    The three planes are named with a leading underscore **on purpose**. They
-    were `grad`, `hess` and `count`, and call sites across the package, the
-    tests and the benches read them directly, which pins the storage: three
-    separate `List`s, an `Int` count, three streams touched per cell.
-    Changing that layout (an interleaved array of structs, an `Int32` count)
-    is a later lane, and what stood in its way was not the arithmetic but the
-    impossibility of *knowing* every reader had been found. Renaming the
-    fields turns that from a belief into a build error list: the compiler
-    enumerates the couplings, exhaustively and mechanically, and a new direct
-    reader cannot appear without someone typing the underscore on purpose.
+    **Storage is LightGBM's `hist_t`: one interleaved `(gradient, hessian)`
+    pair per cell, plus a separate count plane.** `include/LightGBM/bin.h`
+    has `typedef double hist_t`, `kHistEntrySize = 2 * sizeof(hist_t)`,
+    `GET_GRAD(hist, i) = hist[(i) << 1]` and `GET_HESS(hist, i) =
+    hist[((i) << 1) + 1]`. `_gh` is exactly that array: `2 * n_features *
+    n_bins` Float64, cell `i` at `[2 * i]` and `[2 * i + 1]`. The private
+    accumulation cell in `_accumulate_blocked_at` was already laid out this
+    way; before this lane the fold then *scattered* it back into two separate
+    planes, so the interleave stopped at the task boundary and every consumer
+    that wanted a bin's `(g, h)` paid two lines to get them. It no longer
+    does.
+
+    **The count is deliberately NOT in the interleave.** It is a different
+    type, a different reduction and a different access pattern: the split
+    scan SIMD-accumulates it as `SIMD[DType.int]` while the gradient pair is
+    Float64, `distributed` moves it through `allreduce_sum_int` while the
+    pair goes through `allreduce_sum_f64`, and under `const_h` it is not
+    accumulated at all but derived. Folding it in would mean either an
+    odd 24-byte cell that straddles cache lines (against a 16-byte pair, four
+    to a line, never straddling) or storing it as Float64 and converting on
+    every read. LightGBM reaches the same conclusion by construction: its
+    histogram entry is two `hist_t` and nothing else.
+
+    The planes are named with a leading underscore **on purpose**, and that
+    is what made this change checkable rather than believed: the compiler
+    enumerates every direct reader, exhaustively and mechanically, and a new
+    one cannot appear without someone typing the underscore.
 
     Read a cell through `grad_at` / `hess_at` / `count_at` and write one
-    through `set_grad_at` / `set_hess_at` / `set_count_at`; `n_cells` is the
-    old `len(hist.grad)`. There is deliberately no accessor that hands out a
-    whole plane, so `grep -rn '\\._grad\\b'` is the exact and complete list of
-    what a storage change must rewrite by hand.
+    through `set_grad_at` / `set_hess_at` / `set_count_at`; those take the
+    CELL index and do the `<< 1` themselves, so every one of the several
+    hundred accessor call sites is layout-agnostic and none of them moved.
+    `n_cells` is the old `len(hist.grad)`.
 
-    Construction goes through `from_planes`. The fieldwise constructor still
-    exists and Mojo has no way to hide it, so `Histogram(g, h, c, nf, nb)`
-    would still compile; every construction site in the tree goes through
-    `from_planes` instead, which is what makes it the one interception point.
-
-    Storage here is unchanged from before the rename: three planes, `Float64`
-    gradients and hessians, `Int` counts, same flattening, same arithmetic.
+    Construction goes through `from_planes`, which still takes three separate
+    planes and interleaves the two float ones on the way in. Keeping that
+    signature is what confines this change: the GPU download, the sparse
+    builders, `distributed` and thirty test helpers all build their planes
+    separately and hand them over unchanged. Callers already holding an
+    interleaved buffer use `from_pairs` and pay no copy. The fieldwise
+    constructor still exists and Mojo has no way to hide it, but it now takes
+    `(gh, count, nf, nb)`, so the old four-plane spelling is a build error
+    rather than a silent misread.
     """
 
-    var _grad: List[Float64]
-    var _hess: List[Float64]
+    var _gh: List[Float64]
     var _count: List[Int]
     var n_features: Int
     var n_bins: Int
+
+    @staticmethod
+    def from_pairs(
+        var gh: List[Float64],
+        var count: List[Int],
+        n_features: Int,
+        n_bins: Int,
+    ) -> Histogram:
+        """Take ownership of an already-interleaved `(g, h)` array of
+        `2 * n_features * n_bins` floats and a count plane. No copy, no
+        repack: the named entry point for anything that builds in the storage
+        layout."""
+        return Histogram(gh^, count^, n_features, n_bins)
 
     @staticmethod
     def from_planes(
@@ -1013,35 +1066,53 @@ struct Histogram(Copyable, Movable):
         n_features: Int,
         n_bins: Int,
     ) -> Histogram:
-        """Take ownership of three already-built planes, in the order the
-        fieldwise constructor took them. The named entry point for
-        construction, so that a storage change has one place to intercept."""
-        return Histogram(grad^, hess^, count^, n_features, n_bins)
+        """Take ownership of three separate planes and interleave the two
+        float ones, in the order the fieldwise constructor used to take them.
+
+        The interleave is one sequential pass over `2 * n_cells` floats,
+        which is the same order of traffic the caller just spent building the
+        planes, and it is why every producer that naturally emits separate
+        planes (the GPU download, the sparse builders, the distributed
+        reduce, the test fixtures) needed no change. A producer on a hot path
+        should emit pairs and call `from_pairs` instead; none of the current
+        ones is on a hot path."""
+        var n = len(grad)
+        var gh = List[Float64](capacity=2 * n)
+        gh.resize(2 * n, 0.0)
+        var p = gh.unsafe_ptr()
+        var gsrc = grad.unsafe_ptr()
+        var hsrc = hess.unsafe_ptr()
+        for i in range(n):
+            p.unsafe_store(2 * i, gsrc.unsafe_load(i))
+            p.unsafe_store(2 * i + 1, hsrc.unsafe_load(i))
+        return Histogram(gh^, count^, n_features, n_bins)
 
     @staticmethod
     def zeroed(n_features: Int, n_bins: Int) -> Histogram:
         """An all-zero histogram of the given shape, ready to accumulate
         into. Callers that build many histograms of one shape allocate once
-        with this and recycle with `reset`."""
+        with this and recycle with `reset`.
+
+        Two allocations where there were three, for every histogram the
+        grower ever holds."""
         var size = n_features * n_bins
-        return Histogram.from_planes(
-            _zeroed_f64(size), _zeroed_f64(size), _zeroed_int(size),
-            n_features, n_bins,
+        return Histogram.from_pairs(
+            _zeroed_f64(2 * size), _zeroed_int(size), n_features, n_bins,
         )
 
     # --- cell accessors ---------------------------------------------------
     #
-    # Flat index, `f * n_bins + b`, exactly as the fields were indexed. No
-    # bounds check beyond what `List.__getitem__` already did, so these are
-    # the same code the direct reads were.
+    # Flat CELL index, `f * n_bins + b`, exactly as the fields used to be
+    # indexed. The pair accessors shift it; the count accessor does not. No
+    # bounds check beyond what `List.__getitem__` already did.
 
     @always_inline
     def grad_at(self, i: Int) -> Float64:
-        return self._grad[i]
+        return self._gh[i << 1]
 
     @always_inline
     def hess_at(self, i: Int) -> Float64:
-        return self._hess[i]
+        return self._gh[(i << 1) + 1]
 
     @always_inline
     def count_at(self, i: Int) -> Int:
@@ -1049,11 +1120,11 @@ struct Histogram(Copyable, Movable):
 
     @always_inline
     def set_grad_at(mut self, i: Int, v: Float64):
-        self._grad[i] = v
+        self._gh[i << 1] = v
 
     @always_inline
     def set_hess_at(mut self, i: Int, v: Float64):
-        self._hess[i] = v
+        self._gh[(i << 1) + 1] = v
 
     @always_inline
     def set_count_at(mut self, i: Int, v: Int):
@@ -1061,22 +1132,26 @@ struct Histogram(Copyable, Movable):
 
     def n_cells(self) -> Int:
         """Number of cells, `n_features * n_bins`. Was `len(hist.grad)`."""
-        return len(self._grad)
+        return len(self._gh) >> 1
 
     # --- raw plane access -------------------------------------------------
     #
     # There is deliberately no accessor for a whole plane. The few callers
     # that must hand a `List` to something else (the accumulate helpers in
     # this module, the allreduce in `distributed`, the pointer taken for a hot
-    # scan) name `hist._grad` / `hist._hess` / `hist._count` directly. The
-    # underscore is the marker: `grep -rn '\._grad\b'` is the exact, complete
-    # list of what a storage change has to rewrite by hand, and everything
-    # else is already going through the cell accessors above.
+    # scan) name `hist._gh` / `hist._count` directly. The underscore is the
+    # marker: `grep -rn '\._gh\b'` is the exact, complete list of what a
+    # storage change has to rewrite by hand, and everything else is already
+    # going through the cell accessors above.
 
     def reset(mut self):
         """Zero every bin in place, keeping the allocation. Cheaper than a
         fresh `zeroed` by exactly one malloc/free per buffer, which is what
         tree growth spends most of its allocator time on.
+
+        Two streams where there were three, and the pair stream is one
+        contiguous run of `2 * size` floats rather than two runs of `size` a
+        whole histogram apart.
 
         Serial by construction, and the builders below no longer call it:
         they zero each feature's slice inside that feature's task instead. It
@@ -1086,19 +1161,16 @@ struct Histogram(Copyable, Movable):
         zero pass would nest one `sync_parallelize` inside another.
         """
         var size = self.n_features * self.n_bins
-        var gp = self._grad.unsafe_ptr()
-        var hp = self._hess.unsafe_ptr()
+        var ghp = self._gh.unsafe_ptr()
         var cp = self._count.unsafe_ptr()
         comptime W = SIMD_LANES
         var i = 0
         while i + W <= size:
-            gp.unsafe_store(i, SIMD[DType.float64, W](0.0))
-            hp.unsafe_store(i, SIMD[DType.float64, W](0.0))
+            ghp.unsafe_store(2 * i, SIMD[DType.float64, 2 * W](0.0))
             cp.unsafe_store(i, SIMD[DType.int, W](0))
             i += W
         while i < size:
-            gp.unsafe_store(i, 0.0)
-            hp.unsafe_store(i, 0.0)
+            ghp.unsafe_store(2 * i, SIMD[DType.float64, 2](0.0))
             cp.unsafe_store(i, 0)
             i += 1
 
@@ -1162,8 +1234,7 @@ def ensure_pair_capacity(mut pairs: List[Float64], n_rows: Int):
 
 
 def _zero_excluded(
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     n_features: Int,
     n_bins: Int,
@@ -1213,8 +1284,7 @@ def _zero_excluded(
     for i in range(len(features)):
         active[features[i]] = UInt8(1)
 
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
+    var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var active_p = active.unsafe_ptr()
     comptime W = SIMD_LANES
@@ -1225,17 +1295,17 @@ def _zero_excluded(
                 var base = f * n_bins
                 var b = 0
                 while b + W <= n_bins:
-                    gp.unsafe_store(
-                        base + b, SIMD[DType.float64, W](0.0)
-                    )
-                    hp.unsafe_store(
-                        base + b, SIMD[DType.float64, W](0.0)
+                    # One pair store at double the width where there were two
+                    # single-width stores into planes a whole histogram apart.
+                    ghp.unsafe_store(
+                        2 * (base + b), SIMD[DType.float64, 2 * W](0.0)
                     )
                     cp.unsafe_store(base + b, SIMD[DType.int, W](0))
                     b += W
                 while b < n_bins:
-                    gp.unsafe_store(base + b, 0.0)
-                    hp.unsafe_store(base + b, 0.0)
+                    ghp.unsafe_store(
+                        2 * (base + b), SIMD[DType.float64, 2](0.0)
+                    )
                     cp.unsafe_store(base + b, 0)
                     b += 1
 
@@ -1335,7 +1405,7 @@ def build_histogram_into_scratch(
     if const_h and _resolve_const_hessian_verify(const_hessian_env):
         _check_constant_hessian(hess, data.n_rows)
 
-    # The three output buffers are passed as separate `mut` lists rather than
+    # The two output buffers are passed as separate `mut` lists rather than
     # reached through `out`: a pointer taken from a struct field carries that
     # field's origin, which a worker closure cannot capture.
     #
@@ -1345,12 +1415,12 @@ def build_histogram_into_scratch(
     # the other arm put there.
     if _resolve_narrow(const_hessian_env):
         _accumulate_full[True](
-            out._grad, out._hess, out._count, scratch, data, grad, hess,
+            out._gh, out._count, scratch, data, grad, hess,
             features, const_h, settings,
         )
     else:
         _accumulate_full[False](
-            out._grad, out._hess, out._count, scratch, data, grad, hess,
+            out._gh, out._count, scratch, data, grad, hess,
             features, const_h, settings,
         )
 
@@ -1384,8 +1454,7 @@ def _plan_accumulation(
 def _accumulate_full[
     NARROW: Bool
 ](
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     mut scratch: List[Float64],
     data: BinnedMatrix,
@@ -1405,7 +1474,7 @@ def _accumulate_full[
     )
 
     _zero_excluded(
-        out_grad, out_hess, out_count,
+        out_gh, out_count,
         n_features, n_bins, features, plan.excluded_ops, settings,
     )
 
@@ -1445,7 +1514,7 @@ def _accumulate_full[
         if len(scratch) < wanted:
             scratch.resize(wanted, 0.0)
         _accumulate_full_blocked(
-            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            out_gh, out_count, scratch, data, grad, hess,
             features, plan, n_active, const_h, settings,
         )
         return
@@ -1459,34 +1528,33 @@ def _accumulate_full[
     var group = plan.group_width
     if group >= 16:
         _accumulate_full_at[16, NARROW](
-            out_grad, out_hess, out_count, data, grad, hess, features,
+            out_gh, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     elif group >= 8:
         _accumulate_full_at[8, NARROW](
-            out_grad, out_hess, out_count, data, grad, hess, features,
+            out_gh, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     elif group >= 4:
         _accumulate_full_at[4, NARROW](
-            out_grad, out_hess, out_count, data, grad, hess, features,
+            out_gh, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     elif group >= 2:
         _accumulate_full_at[2, NARROW](
-            out_grad, out_hess, out_count, data, grad, hess, features,
+            out_gh, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     else:
         _accumulate_full_at[1, NARROW](
-            out_grad, out_hess, out_count, data, grad, hess, features,
+            out_gh, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
 
 
 def _accumulate_full_blocked(
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     mut scratch: List[Float64],
     data: BinnedMatrix,
@@ -1508,31 +1576,31 @@ def _accumulate_full_blocked(
     var group = plan.group_width
     if group >= 16:
         _accumulate_blocked_at[16, False](
-            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            out_gh, out_count, scratch, data, grad, hess,
             empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
             settings,
         )
     elif group >= 8:
         _accumulate_blocked_at[8, False](
-            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            out_gh, out_count, scratch, data, grad, hess,
             empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
             settings,
         )
     elif group >= 4:
         _accumulate_blocked_at[4, False](
-            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            out_gh, out_count, scratch, data, grad, hess,
             empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
             settings,
         )
     elif group >= 2:
         _accumulate_blocked_at[2, False](
-            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            out_gh, out_count, scratch, data, grad, hess,
             empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
             settings,
         )
     else:
         _accumulate_blocked_at[1, False](
-            out_grad, out_hess, out_count, scratch, data, grad, hess,
+            out_gh, out_count, scratch, data, grad, hess,
             empty, 0, data.n_rows, features, plan, 0, n_active, const_h,
             settings,
         )
@@ -1541,8 +1609,7 @@ def _accumulate_full_blocked(
 def _accumulate_full_at[
     GROUP: Int, NARROW: Bool
 ](
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     data: BinnedMatrix,
     grad: List[Float64],
@@ -1640,8 +1707,7 @@ def _accumulate_full_at[
     var n_rows = data.n_rows
     var n_bins = data.n_bins
     var use_all = len(features) == 0
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
+    var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
@@ -1675,18 +1741,23 @@ def _accumulate_full_at[
                 if k < owned:
                     var z0 = Int(base[k])
                     var zb = 0
+                    # The `const_h` skip of the hessian plane is gone, and
+                    # the branch with it: a hessian shares a 16-byte cell and
+                    # therefore a cache line with its gradient, so the store
+                    # that zeroes the gradient owns the line either way and
+                    # the elided lanes were never a saved line -- only a
+                    # saved 8 bytes inside one already being written. The
+                    # refill below still overwrites them.
                     while zb + W <= n_bins:
-                        gp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
-                        if not const_h:
-                            hp.unsafe_store(
-                                z0 + zb, SIMD[DType.float64, W](0.0)
-                            )
+                        ghp.unsafe_store(
+                            2 * (z0 + zb), SIMD[DType.float64, 2 * W](0.0)
+                        )
                         cp.unsafe_store(z0 + zb, SIMD[DType.int, W](0))
                         zb += W
                     while zb < n_bins:
-                        gp.unsafe_store(z0 + zb, 0.0)
-                        if not const_h:
-                            hp.unsafe_store(z0 + zb, 0.0)
+                        ghp.unsafe_store(
+                            2 * (z0 + zb), SIMD[DType.float64, 2](0.0)
+                        )
                         cp.unsafe_store(z0 + zb, 0)
                         zb += 1
 
@@ -1702,7 +1773,8 @@ def _accumulate_full_at[
                             var b = Int(base[k]) + Int(
                                 bins_p.unsafe_load(Int(col[k]) + r)
                             )
-                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                            var p = b << 1
+                            ghp.unsafe_store(p, ghp.unsafe_load(p) + g)
                             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
             else:
                 for r in range(n_rows):
@@ -1716,8 +1788,12 @@ def _accumulate_full_at[
                             var b = Int(base[k]) + Int(
                                 bins_p.unsafe_load(Int(col[k]) + r)
                             )
-                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
-                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            var p = b << 1
+                            ghp.unsafe_store(
+                                p,
+                                ghp.unsafe_load[width=2](p)
+                                + SIMD[DType.float64, 2](g, h),
+                            )
                             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
 
             # The boundary at which the elided plane is refilled, and the only
@@ -1733,17 +1809,36 @@ def _accumulate_full_at[
                     if k < owned:
                         var f0 = Int(base[k])
                         var fb = 0
+                        # Writing only the odd lanes of an interleaved run
+                        # means reading the even ones back to rejoin them.
+                        # The read is of lines this task just wrote and that
+                        # are therefore in its own L1, and `deinterleave` /
+                        # `interleave` are lane permutations with no
+                        # arithmetic, so the Float64 that lands is the Float64
+                        # the plane store landed.
                         while fb + W <= n_bins:
-                            hp.unsafe_store(
-                                f0 + fb,
-                                cp.unsafe_load[width=W](f0 + fb).cast[
-                                    DType.float64
-                                ](),
+                            var cur = ghp.unsafe_load[width = 2 * W](
+                                2 * (f0 + fb)
+                            )
+                            # `rebind` only tells the elaborator that
+                            # `(2 * W) / 2` is `W`; it is not a conversion
+                            # and emits nothing.
+                            var gvec = rebind[SIMD[DType.float64, W]](
+                                cur.deinterleave()[0]
+                            )
+                            ghp.unsafe_store(
+                                2 * (f0 + fb),
+                                gvec.interleave(
+                                    cp.unsafe_load[width=W](f0 + fb).cast[
+                                        DType.float64
+                                    ]()
+                                ),
                             )
                             fb += W
                         while fb < n_bins:
-                            hp.unsafe_store(
-                                f0 + fb, Float64(cp.unsafe_load(f0 + fb))
+                            ghp.unsafe_store(
+                                2 * (f0 + fb) + 1,
+                                Float64(cp.unsafe_load(f0 + fb)),
                             )
                             fb += 1
 
@@ -1882,13 +1977,13 @@ def build_histogram_subset_into_scratch(
     # and not inside a row loop.
     if _resolve_narrow(const_hessian_env):
         _accumulate_subset[True](
-            out._grad, out._hess, out._count, pairs,
+            out._gh, out._count, pairs,
             data, grad, hess, rows, row_start, row_count, features, const_h,
             settings,
         )
     else:
         _accumulate_subset[False](
-            out._grad, out._hess, out._count, pairs,
+            out._gh, out._count, pairs,
             data, grad, hess, rows, row_start, row_count, features, const_h,
             settings,
         )
@@ -1954,8 +2049,7 @@ def _gather_pairs(
 def _accumulate_subset[
     NARROW: Bool
 ](
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     mut pairs: List[Float64],
     data: BinnedMatrix,
@@ -1978,7 +2072,7 @@ def _accumulate_subset[
     )
 
     _zero_excluded(
-        out_grad, out_hess, out_count,
+        out_gh, out_count,
         n_features, n_bins, features, plan.excluded_ops, settings,
     )
 
@@ -2031,31 +2125,31 @@ def _accumulate_subset[
         var bgroup = plan.group_width
         if bgroup >= 16:
             _accumulate_blocked_at[16, True](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
             )
         elif bgroup >= 8:
             _accumulate_blocked_at[8, True](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
             )
         elif bgroup >= 4:
             _accumulate_blocked_at[4, True](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
             )
         elif bgroup >= 2:
             _accumulate_blocked_at[2, True](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
             )
         else:
             _accumulate_blocked_at[1, True](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, plan, part_off,
                 n_active, const_h, settings,
             )
@@ -2065,35 +2159,35 @@ def _accumulate_subset[
     var group = plan.group_width
     if group >= 16:
         _accumulate_subset_at[16, NARROW](
-            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     elif group >= 8:
         _accumulate_subset_at[8, NARROW](
-            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     elif group >= 4:
         _accumulate_subset_at[4, NARROW](
-            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     elif group >= 2:
         _accumulate_subset_at[2, NARROW](
-            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     else:
         _accumulate_subset_at[1, NARROW](
-            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
@@ -2103,8 +2197,7 @@ def _accumulate_subset[
 def _accumulate_subset_at[
     GROUP: Int, NARROW: Bool
 ](
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     pairs: List[Float64],
     data: BinnedMatrix,
@@ -2150,8 +2243,7 @@ def _accumulate_subset_at[
     var n_bins = data.n_bins
     var n_sub = row_count
     var use_all = len(features) == 0
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
+    var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
@@ -2182,18 +2274,23 @@ def _accumulate_subset_at[
                 if k < owned:
                     var z0 = Int(base[k])
                     var zb = 0
+                    # The `const_h` skip of the hessian plane is gone, and
+                    # the branch with it: a hessian shares a 16-byte cell and
+                    # therefore a cache line with its gradient, so the store
+                    # that zeroes the gradient owns the line either way and
+                    # the elided lanes were never a saved line -- only a
+                    # saved 8 bytes inside one already being written. The
+                    # refill below still overwrites them.
                     while zb + W <= n_bins:
-                        gp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
-                        if not const_h:
-                            hp.unsafe_store(
-                                z0 + zb, SIMD[DType.float64, W](0.0)
-                            )
+                        ghp.unsafe_store(
+                            2 * (z0 + zb), SIMD[DType.float64, 2 * W](0.0)
+                        )
                         cp.unsafe_store(z0 + zb, SIMD[DType.int, W](0))
                         zb += W
                     while zb < n_bins:
-                        gp.unsafe_store(z0 + zb, 0.0)
-                        if not const_h:
-                            hp.unsafe_store(z0 + zb, 0.0)
+                        ghp.unsafe_store(
+                            2 * (z0 + zb), SIMD[DType.float64, 2](0.0)
+                        )
                         cp.unsafe_store(z0 + zb, 0)
                         zb += 1
 
@@ -2209,7 +2306,8 @@ def _accumulate_subset_at[
                                 var b = Int(base[k]) + Int(
                                     bins_all_p.unsafe_load(Int(col[k]) + r)
                                 )
-                                gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                                var p = b << 1
+                                ghp.unsafe_store(p, ghp.unsafe_load(p) + g)
                                 cp.unsafe_store(b, cp.unsafe_load(b) + 1)
                 else:
                     for i_row in range(n_sub):
@@ -2220,7 +2318,8 @@ def _accumulate_subset_at[
                                 var b = Int(base[k]) + Int(
                                     bins_all_p.unsafe_load(Int(col[k]) + r)
                                 )
-                                gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                                var p = b << 1
+                                ghp.unsafe_store(p, ghp.unsafe_load(p) + g)
                                 cp.unsafe_store(b, cp.unsafe_load(b) + 1)
             elif compact:
                 for i_row in range(n_sub):
@@ -2233,8 +2332,12 @@ def _accumulate_subset_at[
                             var b = Int(base[k]) + Int(
                                 bins_all_p.unsafe_load(Int(col[k]) + r)
                             )
-                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
-                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            var p = b << 1
+                            ghp.unsafe_store(
+                                p,
+                                ghp.unsafe_load[width=2](p)
+                                + SIMD[DType.float64, 2](g, h),
+                            )
                             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
             else:
                 # Small node, or one active feature: the gather would cost a
@@ -2249,8 +2352,12 @@ def _accumulate_subset_at[
                             var b = Int(base[k]) + Int(
                                 bins_all_p.unsafe_load(Int(col[k]) + r)
                             )
-                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
-                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            var p = b << 1
+                            ghp.unsafe_store(
+                                p,
+                                ghp.unsafe_load[width=2](p)
+                                + SIMD[DType.float64, 2](g, h),
+                            )
                             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
 
             # The refill, exactly as in `_accumulate_full_at`: the elided
@@ -2261,17 +2368,36 @@ def _accumulate_subset_at[
                     if k < owned:
                         var f0 = Int(base[k])
                         var fb = 0
+                        # Writing only the odd lanes of an interleaved run
+                        # means reading the even ones back to rejoin them.
+                        # The read is of lines this task just wrote and that
+                        # are therefore in its own L1, and `deinterleave` /
+                        # `interleave` are lane permutations with no
+                        # arithmetic, so the Float64 that lands is the Float64
+                        # the plane store landed.
                         while fb + W <= n_bins:
-                            hp.unsafe_store(
-                                f0 + fb,
-                                cp.unsafe_load[width=W](f0 + fb).cast[
-                                    DType.float64
-                                ](),
+                            var cur = ghp.unsafe_load[width = 2 * W](
+                                2 * (f0 + fb)
+                            )
+                            # `rebind` only tells the elaborator that
+                            # `(2 * W) / 2` is `W`; it is not a conversion
+                            # and emits nothing.
+                            var gvec = rebind[SIMD[DType.float64, W]](
+                                cur.deinterleave()[0]
+                            )
+                            ghp.unsafe_store(
+                                2 * (f0 + fb),
+                                gvec.interleave(
+                                    cp.unsafe_load[width=W](f0 + fb).cast[
+                                        DType.float64
+                                    ]()
+                                ),
                             )
                             fb += W
                         while fb < n_bins:
-                            hp.unsafe_store(
-                                f0 + fb, Float64(cp.unsafe_load(f0 + fb))
+                            ghp.unsafe_store(
+                                2 * (f0 + fb) + 1,
+                                Float64(cp.unsafe_load(f0 + fb)),
                             )
                             fb += 1
 
@@ -2283,8 +2409,7 @@ def _accumulate_subset_at[
 def _accumulate_blocked_at[
     GROUP: Int, INDIRECT: Bool
 ](
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     mut pairs: List[Float64],
     data: BinnedMatrix,
@@ -2345,9 +2470,9 @@ def _accumulate_blocked_at[
     hessian are adjacent Float64 and there is no count plane. The partials
     here are laid out the same way, `stride` floats per cell, so one row's
     visit to one feature reads and writes one contiguous 16- or 24-byte cell
-    instead of touching three planes a `n_blocks * block_cells` stride apart.
-    Three scattered lines per (row, feature) become one. The zeroing pass and
-    the fold both become contiguous streams for the same reason.
+    instead of touching separate planes a `n_blocks * block_cells` stride
+    apart. Three scattered lines per (row, feature) become one. The zeroing
+    pass and the fold both become contiguous streams for the same reason.
 
     `stride` is 2 under `const_h` and 3 otherwise, and the difference is what
     the second slot means:
@@ -2408,8 +2533,7 @@ def _accumulate_blocked_at[
     var block_rows = plan.block_rows
     var block_cells = plan.block_cells
     var use_all = len(features) == 0
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
+    var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
@@ -2631,11 +2755,13 @@ def _accumulate_blocked_at[
     # It runs in two passes over one slot. The first sums blocks 1..n-1 into
     # block 0's slots *in place*, which is elementwise over a contiguous run
     # of `n_bins * stride` floats and therefore vectorizes at full width; the
-    # interleaved cell is what makes that run contiguous, where the three
-    # separate planes it replaced forced three strided streams. The second
-    # walks the folded cells once per bin and writes the three output planes.
-    # The addition order per slot is block 0, then block 1, and so on, which
-    # is the order the previous per-cell fold used.
+    # interleaved cell is what makes that run contiguous, where the separate
+    # planes it replaced forced strided streams. The second walks the folded
+    # cells once per bin and copies each cell's pair into the output's own
+    # interleaved plane -- a 16-byte move on the general arm, not a scatter --
+    # alongside the one count store. The addition order per slot is block 0,
+    # then block 1, and so on, which is the order the previous per-cell fold
+    # used.
     def fold_slots(s_start: Int, s_end: Int) {imm}:
         for j in range(s_start, s_end):
             var f = j if use_all else feat_p.unsafe_load(j)
@@ -2659,21 +2785,32 @@ def _accumulate_blocked_at[
                         )
                     )
                     i += 1
+            # THE SCATTER IS GONE. On the general arm the private cell's
+            # first two floats ARE the output cell, so this is a 16-byte
+            # copy from one interleaved buffer to another rather than two
+            # scalar stores into planes a whole histogram apart. Under
+            # `const_h` the private cell is `(g, count)` and the output pair
+            # is `(g, Float64(count))`, so one word is copied and one is a
+            # rename of the value already in the register.
             for b in range(n_bins):
                 var c0 = in0 + b * stride
-                gp.unsafe_store(out0 + b, pp.unsafe_load(c0))
                 var sc = pp.unsafe_load(c0 + count_slot)
                 if const_h:
                     # `sc` counted rows, so it is exactly `Float64(count)`;
                     # `factor` is exactly 1.0 and `derived_count` truncates
-                    # `count + 0.5` back to `count`. The hessian plane is that
-                    # same Float64, which is what the three-plane path
-                    # accumulated cell for cell.
+                    # `count + 0.5` back to `count`. The hessian slot is that
+                    # same Float64, which is what the separate-plane path
+                    # wrote cell for cell.
                     cp.unsafe_store(out0 + b, derived_count(sc, factor))
-                    hp.unsafe_store(out0 + b, sc)
+                    ghp.unsafe_store(
+                        2 * (out0 + b),
+                        SIMD[DType.float64, 2](pp.unsafe_load(c0), sc),
+                    )
                 else:
                     cp.unsafe_store(out0 + b, Int(sc))
-                    hp.unsafe_store(out0 + b, pp.unsafe_load(c0 + 1))
+                    ghp.unsafe_store(
+                        2 * (out0 + b), pp.unsafe_load[width=2](c0)
+                    )
 
     dispatch_feature_ranges_with(
         settings, fold_slots, n_active, plan.fold_ops
@@ -2767,17 +2904,17 @@ def build_histogram_subset_replica_into[
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
     _zero_excluded(
-        out._grad, out._hess, out._count,
+        out._gh, out._count,
         n_features, n_bins, features,
         (n_features - n_active) * n_bins,
     )
 
-    # The three output buffers are passed as separate `mut` lists rather than
+    # The two output buffers are passed as separate `mut` lists rather than
     # reached through `out`, exactly as `build_histogram_into` explains: a
     # pointer taken from a struct field carries that field's origin, which a
     # worker closure cannot capture.
     _accumulate_replica(
-        out._grad, out._hess, out._count, fixed,
+        out._gh, out._count, fixed,
         data, grad_f32, hess_f32, rows, row_start, row_count,
         g_scale, h_scale, features,
         _resolve_const_hessian(const_hessian),
@@ -2787,8 +2924,7 @@ def build_histogram_subset_replica_into[
 def _accumulate_replica[
     grad_origin: ImmOrigin, hess_origin: ImmOrigin, //
 ](
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     mut fixed: List[Int32],
     data: BinnedMatrix,
@@ -2813,8 +2949,7 @@ def _accumulate_replica[
     var hsf = Float32(h_scale)
     var g_inv = 1.0 / g_scale
     var h_inv = 1.0 / h_scale
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
+    var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var fixed_p = fixed.unsafe_ptr()
     var grad_p = grad_f32.unsafe_ptr()
@@ -2891,9 +3026,7 @@ def _accumulate_replica[
                 )
         for b in range(n_bins):
             var cq = fixed_p.unsafe_load(2 * hist_size + base + b)
-            gp.unsafe_store(
-                base + b, Float64(fixed_p.unsafe_load(base + b)) * g_inv
-            )
+            var gval = Float64(fixed_p.unsafe_load(base + b)) * g_inv
             # `hq_const * cq` is the exact Int32 the loop above would have
             # accumulated: `cq` copies of `hq_const` added together. The
             # dequantization is then the same `Float64(q) * (1 / scale)` the
@@ -2904,7 +3037,10 @@ def _accumulate_replica[
                 if const_h
                 else fixed_p.unsafe_load(hist_size + base + b)
             )
-            hp.unsafe_store(base + b, Float64(hq_sum) * h_inv)
+            ghp.unsafe_store(
+                2 * (base + b),
+                SIMD[DType.float64, 2](gval, Float64(hq_sum) * h_inv),
+            )
             cp.unsafe_store(base + b, Int(cq))
 
     dispatch_features(
@@ -2931,25 +3067,30 @@ def feature_totals(hist: Histogram, feature: Int) raises -> FeatureTotals:
     if feature < 0 or feature >= hist.n_features:
         raise Error("feature index out of range")
     comptime W = SIMD_LANES
-    var grad_p = hist._grad.unsafe_ptr()
-    var hess_p = hist._hess.unsafe_ptr()
+    var gh_p = hist._gh.unsafe_ptr()
     var count_p = hist._count.unsafe_ptr()
     var base = feature * hist.n_bins
-    var vg = SIMD[DType.float64, W](0.0)
-    var vh = SIMD[DType.float64, W](0.0)
+    # One 2W-wide pair accumulator where there were two W-wide ones. Lane
+    # `2k` of `vp` receives the gradient of bins `base + k`, `base + k + W`,
+    # ... in ascending order, which is exactly what lane `k` of the old `vg`
+    # received; `deinterleave` is a permutation, not arithmetic, so the half
+    # it hands back is that vector and `reduce_add` folds it in the same tree.
+    # No bit moves.
+    var vp = SIMD[DType.float64, 2 * W](0.0)
     var vc = SIMD[DType.int, W](0)
     var b = 0
     while b + W <= hist.n_bins:
-        vg += grad_p.unsafe_load[width=W](base + b)
-        vh += hess_p.unsafe_load[width=W](base + b)
+        vp += gh_p.unsafe_load[width = 2 * W](2 * (base + b))
         vc += count_p.unsafe_load[width=W](base + b)
         b += W
-    var total_g = vg.reduce_add()
-    var total_h = vh.reduce_add()
+    var halves = vp.deinterleave()
+    var total_g = halves[0].reduce_add()
+    var total_h = halves[1].reduce_add()
     var total_c = Int(vc.reduce_add())
     while b < hist.n_bins:
-        total_g += grad_p.unsafe_load(base + b)
-        total_h += hess_p.unsafe_load(base + b)
+        var cell = gh_p.unsafe_load[width=2](2 * (base + b))
+        total_g += cell[0]
+        total_h += cell[1]
         total_c += count_p.unsafe_load(base + b)
         b += 1
     return FeatureTotals(total_g, total_h, total_c)
@@ -2969,14 +3110,11 @@ def subtract_histogram(
 
 
 def _subtract_histogram_arrays(
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
-    parent_grad: List[Float64],
-    parent_hess: List[Float64],
+    parent_gh: List[Float64],
     parent_count: List[Int],
-    child_grad: List[Float64],
-    child_hess: List[Float64],
+    child_gh: List[Float64],
     child_count: List[Int],
     size: Int,
     const_h: Bool,
@@ -2998,62 +3136,103 @@ def _subtract_histogram_arrays(
     computing. Writing it from the integer difference is therefore the same
     Float64.
 
-    Two of the pass's nine memory streams go, and it is worth being exact
-    about which two rather than calling it a third. The general pass runs a
-    load, a load and a store on each of three planes. The elided one still
-    stores the hessian plane, because the output histogram has three planes
-    like every other; what it stops doing is *reading* the two operands'
-    hessian planes, since the value it needs is the integer difference it
-    already has in a register. Nine streams become seven, and 72 bytes per
-    cell become 56. `subtract_ops_for_planes` is told two planes rather than
-    three so the parallel crossover is priced on traffic that resembles what
-    happens.
+    **What the interleave did to each arm, in bytes per cell, and it is not
+    the same sign on both.**
+
+    The general arm improves in streams and is flat in bytes. It used to run
+    a load, a load and a store on each of three planes: nine streams, 72
+    bytes per cell. It now runs one 16-byte pair load from each operand, one
+    16-byte pair store, and the three count accesses: six streams, the same
+    72 bytes. Nothing was saved from DRAM; three fewer sequential streams
+    were, which is three fewer prefetch trains and three fewer pages in
+    flight.
+
+    The elided arm gets **worse in bytes** and this is the honest price of
+    the change. It used to read only the two gradient planes and the two
+    count planes -- 32 bytes per cell in -- because the hessian value it
+    needed was an integer difference already in a register. A gradient and a
+    hessian now share a 16-byte cell and therefore a cache line, so reading
+    the gradient fetches the hessian whether or not it is wanted: 48 bytes
+    per cell in. Writes are unchanged at 24 (the pair store writes exactly
+    the two words the two separate stores wrote). 56 bytes per cell becomes
+    72, a 28.6% increase, on `const_h` sibling subtraction only. There is no
+    addressing trick that avoids it: the unwanted word is in the line the
+    wanted word is in. LightGBM does not pay it because LightGBM has no
+    elided arm here at all -- `SubtractHistogram` walks the interleaved
+    `hist_t` array and subtracts both words.
+
+    Both arms keep their vector width. The elided one reaches it through
+    `deinterleave` (to separate the gradient half of a pair load) and
+    `interleave` (to rejoin it with the count difference cast to Float64);
+    both are lane permutations with no arithmetic, so the vector stored is
+    exactly the pair of values the two separate wide stores used to store.
+
+    `subtract_ops_for_planes` is still told two planes on the elided arm.
+    That now *understates* its traffic rather than describing it, which
+    biases the crossover toward running it serially at a size where the
+    general arm would dispatch; it is left alone because retuning a
+    crossover is a measurement, and this lane has no clock.
     """
-    var pg = parent_grad.unsafe_ptr()
-    var ph = parent_hess.unsafe_ptr()
+    var pgh = parent_gh.unsafe_ptr()
     var pc = parent_count.unsafe_ptr()
-    var cg = child_grad.unsafe_ptr()
-    var ch = child_hess.unsafe_ptr()
+    var cgh = child_gh.unsafe_ptr()
     var cc = child_count.unsafe_ptr()
-    var og = out_grad.unsafe_ptr()
-    var oh = out_hess.unsafe_ptr()
+    var ogh = out_gh.unsafe_ptr()
     var oc = out_count.unsafe_ptr()
 
     def subtract_block(start: Int, end: Int) {imm}:
         comptime W = SIMD_LANES
         var i = start
         if const_h:
+            # The elided arm's odd lanes are not a subtraction: they are the
+            # integer count difference cast to Float64, which is the whole
+            # point of eliding. `interleave` is a lane permutation with no
+            # arithmetic, so the vector written here holds exactly the values
+            # the two separate wide stores wrote, and the arm keeps its width.
             while i + W <= end:
-                og.unsafe_store(
-                    i, pg.unsafe_load[width=W](i) - cg.unsafe_load[width=W](i)
-                )
+                var pp2 = pgh.unsafe_load[width = 2 * W](2 * i)
+                var cp2 = cgh.unsafe_load[width = 2 * W](2 * i)
+                var dg = rebind[SIMD[DType.float64, W]](
+                    pp2.deinterleave()[0]
+                ) - rebind[SIMD[DType.float64, W]](cp2.deinterleave()[0])
                 var dc = pc.unsafe_load[width=W](i) - cc.unsafe_load[width=W](
                     i
                 )
                 oc.unsafe_store(i, dc)
-                oh.unsafe_store(i, dc.cast[DType.float64]())
+                ogh.unsafe_store(
+                    2 * i, dg.interleave(dc.cast[DType.float64]())
+                )
                 i += W
             while i < end:
-                og.unsafe_store(i, pg.unsafe_load(i) - cg.unsafe_load(i))
+                ogh.unsafe_store(
+                    2 * i, pgh.unsafe_load(2 * i) - cgh.unsafe_load(2 * i)
+                )
                 var dc = pc.unsafe_load(i) - cc.unsafe_load(i)
                 oc.unsafe_store(i, dc)
-                oh.unsafe_store(i, Float64(dc))
+                ogh.unsafe_store(2 * i + 1, Float64(dc))
                 i += 1
             return
+        # The general arm is now ONE elementwise stream over the pair plane
+        # instead of two, at double the width. Six memory streams become
+        # four, and `out`, `parent` and `child` each contribute one contiguous
+        # run rather than two runs a whole histogram apart. The subtractions
+        # are the same subtractions in the same pairing, so no bit moves.
         while i + W <= end:
-            og.unsafe_store(
-                i, pg.unsafe_load[width=W](i) - cg.unsafe_load[width=W](i)
-            )
-            oh.unsafe_store(
-                i, ph.unsafe_load[width=W](i) - ch.unsafe_load[width=W](i)
+            ogh.unsafe_store(
+                2 * i,
+                pgh.unsafe_load[width = 2 * W](2 * i)
+                - cgh.unsafe_load[width = 2 * W](2 * i),
             )
             oc.unsafe_store(
                 i, pc.unsafe_load[width=W](i) - cc.unsafe_load[width=W](i)
             )
             i += W
         while i < end:
-            og.unsafe_store(i, pg.unsafe_load(i) - cg.unsafe_load(i))
-            oh.unsafe_store(i, ph.unsafe_load(i) - ch.unsafe_load(i))
+            ogh.unsafe_store(
+                2 * i,
+                pgh.unsafe_load[width=2](2 * i)
+                - cgh.unsafe_load[width=2](2 * i),
+            )
             oc.unsafe_store(i, pc.unsafe_load(i) - cc.unsafe_load(i))
             i += 1
 
@@ -3108,14 +3287,11 @@ def subtract_histogram_into(
         raise Error("output histogram shape must match the operands")
 
     _subtract_histogram_arrays(
-        out._grad,
-        out._hess,
+        out._gh,
         out._count,
-        parent._grad,
-        parent._hess,
+        parent._gh,
         parent._count,
-        child._grad,
-        child._hess,
+        child._gh,
         child._count,
         parent.n_features * parent.n_bins,
         _resolve_const_hessian(const_hessian, const_hessian_env),
@@ -3370,13 +3546,13 @@ def build_histogram_subset_row_major_into_scratch(
 
     if _resolve_narrow(const_hessian_env):
         _accumulate_subset_row_major[True](
-            out._grad, out._hess, out._count, pairs,
+            out._gh, out._count, pairs,
             data, grad, hess, rows, row_start, row_count, features, const_h,
             settings,
         )
     else:
         _accumulate_subset_row_major[False](
-            out._grad, out._hess, out._count, pairs,
+            out._gh, out._count, pairs,
             data, grad, hess, rows, row_start, row_count, features, const_h,
             settings,
         )
@@ -3385,8 +3561,7 @@ def build_histogram_subset_row_major_into_scratch(
 def _accumulate_subset_row_major[
     NARROW: Bool
 ](
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     mut pairs: List[Float64],
     data: BinnedMatrix,
@@ -3415,7 +3590,7 @@ def _accumulate_subset_row_major[
     )
 
     _zero_excluded(
-        out_grad, out_hess, out_count,
+        out_gh, out_count,
         n_features, n_bins, features, plan.excluded_ops, settings,
     )
     if n_active <= 0 or n_sub <= 0:
@@ -3425,7 +3600,7 @@ def _accumulate_subset_row_major[
         # kernel needs an empty case.
         if n_active > 0:
             _zero_active_slices(
-                out_grad, out_hess, out_count, n_features, n_bins, features,
+                out_gh, out_count, n_features, n_bins, features,
                 n_active, plan.active_ops, settings,
             )
         return
@@ -3461,35 +3636,35 @@ def _accumulate_subset_row_major[
         var group = plan.group_width
         if group >= 16:
             _accumulate_subset_row_major_at[16, NARROW](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
                 settings,
             )
         elif group >= 8:
             _accumulate_subset_row_major_at[8, NARROW](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
                 settings,
             )
         elif group >= 4:
             _accumulate_subset_row_major_at[4, NARROW](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
                 settings,
             )
         elif group >= 2:
             _accumulate_subset_row_major_at[2, NARROW](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
                 settings,
             )
         else:
             _accumulate_subset_row_major_at[1, NARROW](
-                out_grad, out_hess, out_count, pairs, data, grad, hess,
+                out_gh, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
                 settings,
@@ -3508,15 +3683,14 @@ def _accumulate_subset_row_major[
         pairs, grad, hess, rows, row_start, n_sub, plan.gather_ops, settings,
     )
     _accumulate_subset_row_major_blocked(
-        out_grad, out_hess, out_count, pairs, data, rows,
+        out_gh, out_count, pairs, data, rows,
         row_start, row_count, features, plan, part_off, n_active, cells,
         meta, const_h, settings,
     )
 
 
 def _zero_active_slices(
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     n_features: Int,
     n_bins: Int,
@@ -3534,8 +3708,7 @@ def _zero_active_slices(
     that every cell of the output is written, and an empty node is exactly the
     case where a caller recycling a histogram would notice it was not.
     """
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
+    var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var feat_p = features.unsafe_ptr()
     var use_all = len(features) == 0
@@ -3547,13 +3720,13 @@ def _zero_active_slices(
             var base = f * n_bins
             var b = 0
             while b + W <= n_bins:
-                gp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
-                hp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
+                ghp.unsafe_store(
+                    2 * (base + b), SIMD[DType.float64, 2 * W](0.0)
+                )
                 cp.unsafe_store(base + b, SIMD[DType.int, W](0))
                 b += W
             while b < n_bins:
-                gp.unsafe_store(base + b, 0.0)
-                hp.unsafe_store(base + b, 0.0)
+                ghp.unsafe_store(2 * (base + b), SIMD[DType.float64, 2](0.0))
                 cp.unsafe_store(base + b, 0)
                 b += 1
 
@@ -3563,8 +3736,7 @@ def _zero_active_slices(
 def _accumulate_subset_row_major_at[
     GROUP: Int, NARROW: Bool
 ](
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     pairs: List[Float64],
     data: BinnedMatrix,
@@ -3606,8 +3778,7 @@ def _accumulate_subset_row_major_at[
     var n_sub = row_count
     var stride = data.row_stride
     var use_all = len(features) == 0
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
+    var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
@@ -3647,18 +3818,23 @@ def _accumulate_subset_row_major_at[
                 if k < owned:
                     var z0 = Int(base[k])
                     var zb = 0
+                    # The `const_h` skip of the hessian plane is gone, and
+                    # the branch with it: a hessian shares a 16-byte cell and
+                    # therefore a cache line with its gradient, so the store
+                    # that zeroes the gradient owns the line either way and
+                    # the elided lanes were never a saved line -- only a
+                    # saved 8 bytes inside one already being written. The
+                    # refill below still overwrites them.
                     while zb + W <= n_bins:
-                        gp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
-                        if not const_h:
-                            hp.unsafe_store(
-                                z0 + zb, SIMD[DType.float64, W](0.0)
-                            )
+                        ghp.unsafe_store(
+                            2 * (z0 + zb), SIMD[DType.float64, 2 * W](0.0)
+                        )
                         cp.unsafe_store(z0 + zb, SIMD[DType.int, W](0))
                         zb += W
                     while zb < n_bins:
-                        gp.unsafe_store(z0 + zb, 0.0)
-                        if not const_h:
-                            hp.unsafe_store(z0 + zb, 0.0)
+                        ghp.unsafe_store(
+                            2 * (z0 + zb), SIMD[DType.float64, 2](0.0)
+                        )
                         cp.unsafe_store(z0 + zb, 0)
                         zb += 1
 
@@ -3675,7 +3851,8 @@ def _accumulate_subset_row_major_at[
                                 var b = Int(base[k]) + (
                                     (raw >> Int(rshift[k])) & Int(rmask[k])
                                 )
-                                gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                                var p = b << 1
+                                ghp.unsafe_store(p, ghp.unsafe_load(p) + g)
                                 cp.unsafe_store(b, cp.unsafe_load(b) + 1)
                 else:
                     for i_row in range(n_sub):
@@ -3690,7 +3867,8 @@ def _accumulate_subset_row_major_at[
                                 var b = Int(base[k]) + (
                                     (raw >> Int(rshift[k])) & Int(rmask[k])
                                 )
-                                gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                                var p = b << 1
+                                ghp.unsafe_store(p, ghp.unsafe_load(p) + g)
                                 cp.unsafe_store(b, cp.unsafe_load(b) + 1)
             elif compact:
                 for i_row in range(n_sub):
@@ -3705,8 +3883,12 @@ def _accumulate_subset_row_major_at[
                             var b = Int(base[k]) + (
                                 (raw >> Int(rshift[k])) & Int(rmask[k])
                             )
-                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
-                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            var p = b << 1
+                            ghp.unsafe_store(
+                                p,
+                                ghp.unsafe_load[width=2](p)
+                                + SIMD[DType.float64, 2](g, h),
+                            )
                             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
             else:
                 for i_row in range(n_sub):
@@ -3722,8 +3904,12 @@ def _accumulate_subset_row_major_at[
                             var b = Int(base[k]) + (
                                 (raw >> Int(rshift[k])) & Int(rmask[k])
                             )
-                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
-                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            var p = b << 1
+                            ghp.unsafe_store(
+                                p,
+                                ghp.unsafe_load[width=2](p)
+                                + SIMD[DType.float64, 2](g, h),
+                            )
                             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
 
             if const_h:
@@ -3731,17 +3917,36 @@ def _accumulate_subset_row_major_at[
                     if k < owned:
                         var f0 = Int(base[k])
                         var fb = 0
+                        # Writing only the odd lanes of an interleaved run
+                        # means reading the even ones back to rejoin them.
+                        # The read is of lines this task just wrote and that
+                        # are therefore in its own L1, and `deinterleave` /
+                        # `interleave` are lane permutations with no
+                        # arithmetic, so the Float64 that lands is the Float64
+                        # the plane store landed.
                         while fb + W <= n_bins:
-                            hp.unsafe_store(
-                                f0 + fb,
-                                cp.unsafe_load[width=W](f0 + fb).cast[
-                                    DType.float64
-                                ](),
+                            var cur = ghp.unsafe_load[width = 2 * W](
+                                2 * (f0 + fb)
+                            )
+                            # `rebind` only tells the elaborator that
+                            # `(2 * W) / 2` is `W`; it is not a conversion
+                            # and emits nothing.
+                            var gvec = rebind[SIMD[DType.float64, W]](
+                                cur.deinterleave()[0]
+                            )
+                            ghp.unsafe_store(
+                                2 * (f0 + fb),
+                                gvec.interleave(
+                                    cp.unsafe_load[width=W](f0 + fb).cast[
+                                        DType.float64
+                                    ]()
+                                ),
                             )
                             fb += W
                         while fb < n_bins:
-                            hp.unsafe_store(
-                                f0 + fb, Float64(cp.unsafe_load(f0 + fb))
+                            ghp.unsafe_store(
+                                2 * (f0 + fb) + 1,
+                                Float64(cp.unsafe_load(f0 + fb)),
                             )
                             fb += 1
 
@@ -3751,8 +3956,7 @@ def _accumulate_subset_row_major_at[
 
 
 def _accumulate_subset_row_major_blocked(
-    mut out_grad: List[Float64],
-    mut out_hess: List[Float64],
+    mut out_gh: List[Float64],
     mut out_count: List[Int],
     mut pairs: List[Float64],
     data: BinnedMatrix,
@@ -3843,8 +4047,7 @@ def _accumulate_subset_row_major_blocked(
     var block_rows = plan.block_rows
     var rec_stride = data.row_stride
     var use_all = len(features) == 0
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
+    var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
     var rm_p = data.row_bins.unsafe_ptr()
@@ -4009,7 +4212,8 @@ def _accumulate_subset_row_major_blocked(
     # block 0's cells *in place*, which is elementwise over a contiguous run
     # of `(lim - lo) * stride` floats and therefore vectorizes at full width;
     # the interleaved cell is what makes that run contiguous. Pass two walks
-    # the folded cells once per bin and writes the three output planes. The
+    # the folded cells once per bin and copies each cell's pair into the
+    # output's own interleaved plane, alongside the one count store. The
     # addition order per cell is block 0, then block 1, and so on, which is
     # the order the feature-major fold uses and the reason the two agree.
     def fold_units(u_start: Int, u_end: Int) {imm}:
@@ -4044,23 +4248,28 @@ def _accumulate_subset_row_major_blocked(
                             pp.unsafe_load(in0 + i) + pp.unsafe_load(off + i),
                         )
                         i += 1
+                # The same 16-byte cell copy as the feature-major fold; see
+                # `_accumulate_blocked_at` for why the scatter is gone.
                 for b in range(lo, lim):
                     var c0 = part_off + (slot_off + b) * stride
-                    gp.unsafe_store(out0 + b, pp.unsafe_load(c0))
                     var sc = pp.unsafe_load(c0 + count_slot)
                     if const_h:
                         cp.unsafe_store(out0 + b, derived_count(sc, factor))
-                        hp.unsafe_store(out0 + b, sc)
+                        ghp.unsafe_store(
+                            2 * (out0 + b),
+                            SIMD[DType.float64, 2](pp.unsafe_load(c0), sc),
+                        )
                     else:
                         cp.unsafe_store(out0 + b, Int(sc))
-                        hp.unsafe_store(out0 + b, pp.unsafe_load(c0 + 1))
+                        ghp.unsafe_store(
+                            2 * (out0 + b), pp.unsafe_load[width=2](c0)
+                        )
             # The bins this feature never realizes, and the whole chunk when
             # it starts past the realized width. Zero on both paths, which is
             # what the feature-major kernel leaves there.
             var b2 = lim if lim > lo else lo
             while b2 < hi:
-                gp.unsafe_store(out0 + b2, 0.0)
-                hp.unsafe_store(out0 + b2, 0.0)
+                ghp.unsafe_store(2 * (out0 + b2), SIMD[DType.float64, 2](0.0))
                 cp.unsafe_store(out0 + b2, 0)
                 b2 += 1
 

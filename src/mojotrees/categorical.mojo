@@ -425,8 +425,7 @@ struct CatSplit(Copyable, Movable):
 
 
 def _onehot_search(
-    grad: List[Float64],
-    hess: List[Float64],
+    gh: List[Float64],
     count: List[Int],
     base: Int,
     n_categories: Int,
@@ -443,8 +442,8 @@ def _onehot_search(
     single category goes left."""
     var best = CatSplit.none()
     for t in range(1, n_categories + 1):
-        var left_g = grad[base + t]
-        var left_h = hess[base + t]
+        var left_g = gh[2 * (base + t)]
+        var left_h = gh[2 * (base + t) + 1]
         var left_c = count[base + t]
         if left_c < min_data_in_leaf or left_h < min_child_hess:
             continue
@@ -475,8 +474,7 @@ def _onehot_search(
 
 
 def _sorted_search(
-    grad: List[Float64],
-    hess: List[Float64],
+    gh: List[Float64],
     count: List[Int],
     base: Int,
     n_categories: Int,
@@ -503,7 +501,9 @@ def _sorted_search(
             continue
         candidates.append(t)
         keys.append(
-            cat_sort_key(grad[base + t], hess[base + t], cat.cat_smooth)
+            cat_sort_key(
+                gh[2 * (base + t)], gh[2 * (base + t) + 1], cat.cat_smooth
+            )
         )
     var used = len(candidates)
     if used < 2:
@@ -530,8 +530,11 @@ def _sorted_search(
         for i in range(steps):
             var t = sorted_bins[pos]
             pos += dir
-            left_g += grad[base + t]
-            left_h += hess[base + t]
+            # `t` walks the categories in SORTED order, so this is a random
+            # bin per step, not a scan: the interleaved pair costs one cache
+            # line where two planes cost two.
+            left_g += gh[2 * (base + t)]
+            left_h += gh[2 * (base + t) + 1]
             left_c += count[base + t]
             cnt_cur_group += count[base + t]
 
@@ -569,8 +572,7 @@ def _sorted_search(
 
 
 def find_best_categorical_split(
-    grad: List[Float64],
-    hess: List[Float64],
+    gh: List[Float64],
     count: List[Int],
     base: Int,
     n_categories: Int,
@@ -585,9 +587,11 @@ def find_best_categorical_split(
 ) raises -> CatSplit:
     """Best category partition for one categorical feature at one node.
 
-    `grad`/`hess`/`count` are a node's histogram arrays and `base` is the
-    feature's offset into them; bins `1 ..= n_categories` are the categories
-    and bin 0 (missing, unseen, dropped) is excluded from every candidate
+    `gh` is a node's interleaved `(gradient, hessian)` histogram plane (cell
+    `i` at `[2 * i]` and `[2 * i + 1]`, as in `Histogram`), `count` is its
+    count plane, and `base` is the feature's CELL offset into them; bins
+    `1 ..= n_categories` are the categories and bin 0 (missing, unseen,
+    dropped) is excluded from every candidate
     set. Totals are over all of the node's bins for this feature. Returns a
     partition only when its gain is positive.
     """
@@ -630,8 +634,7 @@ def find_best_categorical_split(
         one_hot = n_categories <= cat.max_cat_to_onehot
     if one_hot:
         return _onehot_search(
-            grad,
-            hess,
+            gh,
             count,
             base,
             n_categories,
@@ -645,8 +648,7 @@ def find_best_categorical_split(
             min_data_in_leaf,
         )
     return _sorted_search(
-        grad,
-        hess,
+        gh,
         count,
         base,
         n_categories,

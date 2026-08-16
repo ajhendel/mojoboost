@@ -1131,30 +1131,32 @@ HIGH_CARDINALITY_LEVELS = {
 #: threshold or the scenario compares ordered boosting against plain
 #: boosting and reports the difference as engine quality.
 #:
-#: 50,000 is what this scenario assumes, from the commonly quoted reading of
-#: CatBoost's documentation that `Ordered` is chosen for small datasets.
-#: **Nobody in this repository has read that out of CatBoost's source.**
-#: `lane/ordered-boosting` is source-verifying it; until that lands this
-#: constant is a placeholder with an argument attached, and it is a constant
-#: rather than five literals so that the verified number is a one-line
-#: change and every tier moves with it.
+#: **RESOLVED 2026-08-16, and the premise above is FALSE.** The
+#: source-verification came back and there is no CPU row threshold at all.
+#: `boosting_options.cpp:16` constructs `BoostingType` with `Plain`, and on
+#: CPU that is what a fit KEEPS at every row count. The only place `Ordered`
+#: is installed as a default has `TaskType == ETaskType::GPU` in its
+#: condition (`catboost_options.cpp:802-806`). The famous 50,000 is real but
+#: it is a **GPU** rule at `defaults_helper.h:33-42` that turns Ordered
+#: **OFF**, and it carries an iteration clause (`IterationCount < 500`) that
+#: every retelling drops -- so a retelling that keeps the 50,000 and loses
+#: the iteration bound describes a rule that fires on cases it should not.
 #:
-#: There is evidence in this very file that the naive reading is WRONG, and
-#: it belongs next to the assumption rather than in a lane report.
-#: `CATBOOST_LEFT_AT_STOCK` records `boosting_type: "Plain"`, and
-#: `CATBOOST_DEFAULTS_SOURCE` says that was read back from
-#: `get_all_params()` after a two-iteration fit on **20,000 rows** by 20
-#: features. 20,000 is well under 50,000 and CatBoost still resolved Plain.
-#: Two readings of that, and this harness cannot tell them apart:
-#: the threshold may be far below 50,000, or the rule may not be a row count
-#: at all and may take the iteration count or the cell count as an input,
-#: in which case a two-iteration fit says nothing about a 100-iteration one.
-#: Either way, **a row of this scenario is only the row it claims to be if
-#: the resolved `boosting_type` in that record reads `Ordered`.** The
-#: CatBoost adapter already writes `get_all_params()` into every record, so
-#: that is checkable per run and must be checked before the column is
-#: quoted; it is repeated in the scenario's caveats, which travel into every
-#: record.
+#: So **CatBoost on CPU never chooses ordered boosting by itself**, and the
+#: harness's own contrary evidence -- `Plain` resolved on a 20,000-row fit --
+#: was not a hint that the threshold was lower. It was the rule.
+#:
+#: What that costs this scenario: a row here is a **Plain-vs-Plain** row
+#: under an Ordered heading unless `boosting_type=Ordered` is passed to the
+#: CatBoost arm explicitly. Passing it makes the arm no longer "CatBoost at
+#: its own defaults", which is what `CATBOOST_ARM_LABEL` promises, so this
+#: needs a THIRD CatBoost arm rather than a change to the existing one --
+#: the same shape as `catboost_lossguide`. That arm is not built.
+#:
+#: The row count is kept at 50,000 because the scenario is still worth
+#: having: it is a small-data shape where ordered boosting is the mechanism
+#: most likely to pay, and it is the size CatBoost's GPU rule would have
+#: chosen Ordered below. It is no longer a threshold, only a size.
 ORDERED_BOOSTING_ROWS = 50_000
 
 #: Size tiers. `smoke` exists to prove the wiring end to end in seconds and

@@ -33,8 +33,8 @@ reported beside LightGBM `stock+det`; never instead of it.
 | A3 | `random_strength` (`scoreStDev = RandomStrength * derivativesStDevFromZero * modelSizeDecrease`; `SetBestScore(randSeed + taskIdx, ...)`) | Seeded noise added to candidate scores before argmax; a regularizer LightGBM lacks | Only when > 0 | Yes, all growth modes, default 0 | CPU (`split.mojo`), GPU search kernel for parity | (3) when on; deterministic under the seed and across workers |
 | A4 | Bayesian bootstrap / `bootstrap_type` (**verified from source**, see A4 note) | Row weighting instead of row dropping: every row kept, each given weight `(-log(U + 1e-100)) ** bagging_temperature`, redrawn once per tree | Only when on | Yes for CatBoost mode (their default sampler). Built in `sampling.mojo`, off by default. **Device cost, checked:** per-row weights disable the constant-hessian plane (`round_has_constant_hessian`), so the device accumulates three planes and the Int16 gradient-staging arm loses its better half (staged bytes per visit 7 -> 9 at the default group, not 9 -> 7). Not free on the device even before any device code was written. **Device plane now live** (weight-plane-device lane): `GpuObjectiveState.refresh_weights` rewrites the per-row weight plane once per tree and `GpuHistogramBuilder.refresh_objective_weights` refuses one beside a constant-hessian declaration. The weight is applied in the gradient kernel, where the CPU applies it, so the histogram accumulation gains no multiply and no fetch. Unreached: no trainer constructs a `BayesianBootstrapParams` yet. | CPU (`sampling.mojo`), device plane in `gpu_objectives_native.mojo` | (3) when on; **carries a constant-hessian exclusion**, see the note |
 | A5 | Ordered target statistics for categoricals (CTRs; "verify" against `catboost/private/libs/algo/` CTR code) | For each of several random permutations, a categorical value in row i is replaced by (sum of targets of earlier rows with that category + prior) / (count + 1); plus counters and pairwise combinations; test time uses all rows | Yes (feature values change) | Yes; it is CatBoost's real accuracy edge on high-cardinality columns and independent of tree shape | CPU (`binning.mojo`, categorical, dataset) | (3); design section B2 first, then lanes |
-| A6 | `leaf_estimation_iterations` (`gradient_walker.h::FastGradientWalker`; defaults in `catboost_options.cpp::GetEstimationMethodDefaults`) -- **verified from source** | Re-estimate leaf values 1..k times, derivatives recomputed at the current leaf value each pass | Only when > 1 | Built on the CPU and now on the device, opt-in, default 1. **DEVICE: built 2026-08-16**, the first of the two shapes the earlier survey named -- a per-iteration device reduction inside the tree, launches accepted, host kept out of the loop (`gpu_objectives_native.GpuLeafEstimator`). `3 * (k - 1)` launches per tree plus one round trip; at `k = 3` that is 278 -> 284 leaf-wise and 62 -> 68 oblivious, which crosses the 64-command-buffer knee and is why the same six launches cost proportionally more on the oblivious schedule. The earlier "structural, decide before any device lane" deferral is discharged, not still open. **Correction:** an earlier version of this row said CatBoost defaults to 10 for logloss AND multiclass. Logloss is 10; **multiclass is 1**. The 10 in that block is the unreachable Gradient slot while the default method is Newton, and CatBoost's own docs agree. | CPU built; device built | (3) when > 1; see A6 notes |
-| A7 | Ordered boosting (`BodyTailArr`, tail derivatives only) | Derivatives for row i from a model that never saw i | Yes | No for now; large machinery, matters most on small data | — | design note only |
+| A6 | `leaf_estimation_iterations` (`gradient_walker.h::FastGradientWalker`; defaults in `catboost_options.cpp::GetEstimationMethodDefaults`) -- **verified from source** | Re-estimate leaf values 1..k times, derivatives recomputed at the current leaf value each pass | Only when > 1 | Built on the CPU, opt-in, default 1. **DEVICE: not cheap, structural** (GPU orchestrator, 2026-08-16): each extra iteration needs per-leaf grad/hess sums after the previous raw-score update, so a second reduction per leaf per iteration inside the tree (more launches, against the oblivious command-buffer budget) or leaf estimation moved out of the device round (more host trips). **Correction:** an earlier version of this row said CatBoost defaults to 10 for logloss AND multiclass. Logloss is 10; **multiclass is 1**. The 10 in that block is the unreachable Gradient slot while the default method is Newton, and CatBoost's own docs agree. | CPU built; device design decision before any device lane | (3) when > 1; see A6 notes |
+| A7 | Ordered boosting, `boosting_type=Ordered` (`fold.h::TFold::TBodyTail`, `fold.cpp::BuildDynamicFold`, `train.cpp::TrainOneIteration`) -- **verified from source**, see the A7 note | Derivatives for row i from a model that never saw i: a geometric ladder of prefixes of a permuted row order, each rung fitted on its own body and scored over its own tail | Yes | **BUILT**, `ordered_boosting.mojo` + the `_boost_rounds` round loop, opt-in `BoosterParams.ordered`, default off, single-output dense CPU trainer only. **Two corrections to what this row used to say.** (1) "Matters most on small data" was inferred from CatBoost's default and the default is not what it is usually said to be -- **on the CPU CatBoost's default is Plain at every row count**; the 50000 threshold is a GPU rule and it turns Ordered OFF. (2) The memory is much smaller than "K planes": the rungs are nested prefixes, so the planes total **under 3n** and are **2.64n at 1e6**, not 14n | CPU (`ordered_boosting.mojo`, `boosting.mojo`) | (2) trade behind a switch; deterministic under the seed, across `MOJOTREES_NUM_WORKERS` and across machines. **Carries no constant-hessian exclusion**, and that is a checked claim: see `ordered_varies_hessian` |
 | A8 | Symmetric (oblivious) trees (`numScoreBlocks = 1` for `SymmetricTree`; leaf index = split-condition bits; depth default 6) | One split per level for all leaves | New mode | Yes, opt-in `grow_policy=oblivious`, both backends | CPU search+schedule; GPU cross-leaf reduce + level partition | Part B. **CPU half BUILT.** Shape/numbering/aggregation **verified from source**; the per-leaf min-child rule is **NOT verified, it is ours** (see below) |
 
 ## A8, verified from source
@@ -181,6 +181,16 @@ chosen. Building it would be building a gate that cannot open.
 | A18 | `text_features`: the `BoW` / `NaiveBayes` / `BM25` estimators (`catboost/private/libs/text_features/bow.cpp`, `naive_bayesian.cpp`, `bm25.cpp`, `feature_calcer.h`, `helpers.h`; `catboost/private/libs/feature_estimator/base_text_feature_estimator.h`, `text_feature_estimators.cpp`; `catboost/private/libs/algo/estimated_features.cpp`, `fold.cpp`, `data.cpp`, `full_model_saver.cpp`) -- **verified from source**, see the A18 note | Three numeric features off a token bag. `BoW` is target-free. **`NaiveBayes` and `BM25` are target-aware and ARE computed on the ordered permutation prefix, the same machinery the CTRs use** | Feature values only; they are handed to `binning.fit_bins` like any other numeric column | Yes, opt-in. `BoW` and the calcers are ours today; the ordered pass CONSUMES `lane/ordered-ts-2`'s permutation and must never build its own | CPU (`text_features.mojo`, NEW, imports only `text_processing`) | (3) bit-moving when on, inert when off. A18 note, and read the leakage section of it before writing any caller |
 | A19 | Ordered target statistics, the simple (single-cat-feature) projection (`catboost/private/libs/algo/online_ctr.{h,cpp}`, `.../ctr_helper.{h,cpp}`, `.../fold.cpp`, `.../split.cpp`, `catboost/libs/model/online_ctr.h`) -- **verified from source**, see the A19 note | The mechanism A5 named. A categorical value becomes a *numeric* feature whose value at row `i` is a target statistic over the rows that precede `i` in a random permutation, quantized to 16 buckets. Four CTR types, three priors, an unshuffled fold 0, and a separate non-online table for inference | Yes -- it adds features that did not exist | Yes. This is the one mechanism that makes a categorical CatBoost comparison possible at all, and `bench/real_data` runs no such scenario today because we had no counterpart | CPU (`ctr.mojo`, new file; `categorical.mojo` untouched) | A19 note. **BUILT, off by default, unreached.** (3) when on. Deterministic under the seed, across `MOJOTREES_NUM_WORKERS`, and across machines, by a keyed sort rather than a shuffle |
 | A20 | `embedding_features`: the `LDA` and `KNN` embedding estimators (`catboost/private/libs/embedding_features/lda.{h,cpp}`, `knn.{h,cpp}`, `catboost/private/libs/feature_estimator/{base_,}embedding_feature_estimators.{h,cpp}`, `catboost/private/libs/options/embedding_processing_options.{h,cpp}`, `catboost/private/libs/algo/{fold,estimated_features}.cpp`) -- **verified from source**, see the A20 note | Host-side generation of numeric columns from a raw embedding column, which are then quantized by the ordinary float binning path. LDA projects the embedding onto the leading generalized eigenvectors of (between-class scatter, within-class scatter); KNN emits per-class neighbour counts (classification) or the neighbour target mean (regression). **Both read the target**, and both are computed **online against the fold's permutation** -- the same `TFold::GetLearnPermutationArray()` the ordered CTRs use | Yes: new columns, so every downstream bit moves | Yes, and it is bucket C before it is bucket B: CatBoost takes a raw embedding column and mojotrees cannot, so an embedding benchmark today is not a comparison at all | CPU (`embedding.mojo`, new file). **Consumes** `ordered-ts-2`'s permutation; does not own one | A20 note. **BUILT, off by default**, no existing default changed, nothing in the package imports it |
+| A21 | The learn-permutation layer: `permutation_count`, `fold_permutation_block`, `has_time` (`learn_context.cpp::IsPermutationNeeded` / `CountLearningFolds` / `TFoldsCreationParams`, `objects_grouping.cpp::NCB::Shuffle`, `defaults_helper.h::DefaultFoldPermutationBlockSize`) -- **verified from source**, see the A17 note | The permutations themselves, separately from what consumes them. CatBoost builds `max(1, permutation_count - 1)` **learning** permutations plus one **averaging** fold, each a permutation of *blocks* of `min(256, n/1000 + 1)` consecutive rows. **Both A5 (CTRs) and A7 (ordered boosting) read this same layer**, and `IsPermutationNeeded` is what decides whether either gets a shuffle at all | Yes when either consumer is on | Built as part of A7 (`ordered_boosting.ordered_permutation`, `default_permutation_block_size`, `permutation_choice`). **A5's lane should consume it rather than draw its own**: two independent permutation layers keyed by two seeds is two answers to one question | CPU (`ordered_boosting.mojo`); A5's lane is the second consumer | A17 note. Deterministic under the seed and worker-independent, which CatBoost's own `CreateShuffledIndices` is not |
+| A22 | `QueryRMSE` (`catboost/private/libs/algo_helpers/error_functions.h::TQueryRmseError::CalcDersForQueries` and its private `CalcQueryAvrg`) -- **verified from source**, see the A22/A23/A24 note | Squared error with the query's weighted mean residual removed, so only *within-query* level is learned. `Der1 = w_i (t_i - a_i - avg)`, `Der2 = -w_i`, `avg = sum_j w_j (t_j - a_j) / sum_j w_j`. `IsStoreExpApprox` false | Yes -- it is a new objective | Yes. It is the cheapest of the three CatBoost ranking losses and the only one whose hessian stays constant under unit weights | CPU (`catboost_ranking.mojo`, new file) | A22/A23/A24 note. **BUILT, off by default, unreached.** (3) when on. Deterministic: no RNG at all |
+| A23 | `PairLogit` + its automatic pair generation (`error_functions.h::TPairLogitError::CalcDersForQueries`; `catboost/private/libs/pairs/util.cpp::GeneratePairLogitPairs` / `GenerateBruteForce`; `catboost/private/libs/target/data_providers.cpp::GeneratePairs`) -- **verified from source** | Pairwise logistic loss over (winner, loser) pairs inside a group. `p = e^{a_lose} / (e^{a_lose} + e^{a_win})`, `Der1[win] += c p`, `Der1[lose] -= c p`, `Der2[both] += c p (p-1)`. With `max_pairs` unset, pairs are *every* label-distinct pair in the group, weight = group weight, no RNG | Yes -- a new objective, and it is the first mojotrees objective whose hessian is pairwise by construction | Yes. It is also the gradient kernel `YetiRank` reuses | CPU (`catboost_ranking.mojo`) | A22/A23/A24 note. **BUILT, off by default, unreached.** (3) when on. **Carries a constant-hessian exclusion.** Deterministic: default pair generation draws nothing |
+| A24 | `YetiRank` (`catboost/private/libs/algo/yetirank_helpers.cpp`: `UpdatePairsForYetiRank`, `GenerateYetiRankPairsForQuery`, `TYetiRankPairWeightsCalcer::{AddNoise,CalcWeightsClassic}`; defaults in `catboost/private/libs/options/loss_description.cpp::GetYetiRankPermutations` / `GetYetiRankDecay`) -- **verified from source** | A *sampled* pairwise scheme, not a closed form: each round, per group, draw `permutations`=10 noisy rankings of the current scores, and in each ranking charge each adjacent pair `0.15 * decay^k * |rel_i - rel_j|`. Average the pair weights over the 10 draws and feed them to the `PairLogit` gradient | Yes, and it is the only objective in the catalog whose gradients depend on an RNG stream | Yes. It is CatBoost's flagship ranking loss and the one a CatBoost ranking comparison will be run under | CPU (`catboost_ranking.mojo`) | A22/A23/A24 note. **BUILT, off by default, unreached.** (3) when on. **Carries a constant-hessian exclusion.** Deterministic under `(seed, iteration, query, permutation, doc)` keying, across `MOJOTREES_NUM_WORKERS` and machines. CatBoost's own stream is NOT nameable |
+| A25 | `group_id` and the two ranking eval metrics `NDCG`, `PFound` (`catboost/libs/data/objects.cpp::CheckGroupIds`; `catboost/libs/data/target.cpp::CheckGroupWeights`; `catboost/libs/metrics/dcg.cpp` + `catboost/libs/metrics/metric.cpp::TDcgMetric`; `catboost/libs/metrics/pfound.h::TPFoundCalcer` + `metric.cpp::TPFoundMetric`; tie rule in `catboost/libs/metrics/doc_comparator.h`) -- **verified from source**, see the A25 note | The grouping contract (contiguous, *not* sorted; loud failure when violated; weights constant inside a group) and the two metrics a CatBoost ranking run is actually judged by. CatBoost's default `NDCG` is **not** LightGBM's: `type=Base` (raw relevance, not `2^l - 1`), no truncation, and an adversarial tie rule | No (metrics move no bits) | Yes. Without them we cannot score a CatBoost ranking run at all, which is bucket C | CPU (`catboost_ranking.mojo`); `ranking.RankGroups` reused unchanged | A25 note. **BUILT, off by default, unreached.** (3) as a metric selection. Deterministic: no RNG |
+| A26 | `Cox` (`catboost/private/libs/algo_helpers/error_functions.h` `TCoxError`, `.cpp:110-207` `ArgSort`/`CalcCoxApproxSum`/`CalcDersRange`; metric `catboost/libs/metrics/metric.cpp:880-947`) -- **verified from source**, see the A26 note | Cox proportional-hazards partial likelihood. One signed label column: `abs(y)` is the time, `y > 0` is an event and `y <= 0` is right-censored. The risk set is a **suffix of a stable sort by `abs(y)`**, so the derivative of every row depends on every other row and there is **no tie correction at all** | New objective | Yes, and it is the only one of the three whose whole shape our machinery already carries: approx dimension 1, one label column, one grad/hess plane | CPU (`survival.mojo`, new file) | (3) when selected, and it is a **coupled** objective: the hessian is per-row and non-constant, and must be declared. Cox is `IsPlainOnlyModeLoss` in CatBoost, which is CatBoost saying the same thing about ordered boosting |
+| A27 | `SurvivalAft` (`error_functions.h` `TSurvivalAftError`, `.cpp:360-450`; `catboost/private/libs/algo_helpers/survival_aft_utils.{h,cpp}`; `catboost/libs/helpers/distribution_helpers.{h,cpp}`; construction in `BuildError`; metric `metric.cpp:408-444`) -- **verified from source**, see the A27 note | Accelerated failure time. **TWO label columns per row**, a lower and an upper bound, with `-1` the unbounded sentinel; `lower == upper` is an exact event, `upper == -1` right-censored, `lower == -1` left-censored, otherwise interval-censored. `dist` in {`Normal` (default), `Logistic`, `Extreme`}, `scale` default 1 and required positive. Approx dimension is **1** (`approx_dimension.cpp`) | New objective | Yes for the derivatives and the metric; **the input contract is the blocker, not the gradient** | CPU (`survival.mojo`), input path unowned | (3) when selected. Per-row non-constant hessian (clipped into `[1e-16, 15]`), declared. **Needs a two-column target that `List[Float64]` cannot spell** |
+| A28 | `MultiRMSE` (`error_functions.h:191-218` `TMultiRMSEError`; `approx_dimension.cpp`; `online_predictor.cpp` `CalcDeltaNewtonMulti`; `hessian.cpp` `TDiagonalHessian::SolveNewtonEquation`; multi-dim score accumulation `catboost/private/libs/algo/scoring.cpp:741-767`; metric `metric.cpp:474-515`) -- **verified from source**, see the A28 note | Multi-target regression. **T label columns per row**, approx dimension T, diagonal hessian, `der[i] = w*(y[i] - p[i])`, `der2[i] = -w`. **One tree per iteration with a vector leaf value** (`model.h:118`, `LeafValues[leafId * ApproxDimension + dim]`), and the split score is the **sum over dimensions into one accumulator** | New objective **and a new tree shape** | The derivatives and the metric yes. The tree shape is `multiclass_tree_count` again, and this time it is not a cosmetic difference: see the A28 note | CPU (`multi_target.mojo`), tree shape unowned (`tree.mojo`, `histogram.mojo`) | (3) when selected. **The shared tree structure is the entire modeling content of MultiRMSE**; without it the objective degenerates into T independent RMSE fits |
+| A29 | Model save/load and interchange export (`catboost/libs/model/model_export/`: `cbm`, `json`, `onnx`, `coreml`, `python`, `cpp`) | CatBoost saves every fitted artifact the model needs to score, CTR tables and text dictionaries included, and can additionally emit an ONNX `ai.onnx.ml` tree ensemble | No. Nothing here changes a trained model; the whole rule is that a reloaded model scores **bit-identically** | Yes, and it is bucket C: an arm we cannot save is an arm nobody can ship, and an export that silently drops fitted state is a wrong comparison that looks fine | `serialize.mojo` (mine), `onnx_export.mojo` (new, mine) | A29 note. **Enumeration is the deliverable.** Format: NO version bump needed for A8/A11-A16; ONNX exporter BUILT for the numerical/expressible subset and REFUSES the rest by name |
+| A30 | CTR feature combinations: `max_ctr_complexity`, `ctr_leaf_count_limit`, `TreeCtrs` (`greedy_tensor_search.cpp::AddTreeCtrs`, `index_hash_calcer.cpp::CalcHashes` and `ComputeReindexHash`, `ctr_helper.h::GetCtrInfo`) -- **verified from source**, see the A30 note | A projection of several categorical columns plus float and one-hot splits, hashed to one bucket per row and fed to A19's ordered machinery. Candidates are **grown from the splits already in the tree**, one feature at a time -- NOT exhaustive to depth 4 -- and `max_ctr_complexity` silently resolves to **1**, not 4, whenever the iteration count is under 200 | Yes when on | Built, off by default, reached by nothing. **CatBoost's default of 4 is not affordable at 1M rows** (about 1.6e9 element ops and 1.1 GB of CTR columns per tree, against 3e8 for a 50-feature histogram build), so record the 4 and wire 1 | CPU (`ctr_combinations.mojo`, beside `ctr.mojo`) | (3) when on |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -3173,3 +3183,1412 @@ cheaper than coordinating on an abstraction neither lane has seen.
 columns before `fit_bins`. All three are outside this lane's territory
 (`params.mojo`, `raw_data.mojo`, `binning.mojo`, `bindings/`) and are handed
 over as a diff in the lane report rather than applied here.
+
+### A7 note: ordered boosting, verified from source
+
+Status: **verified from CatBoost source**, `master` (the checkout at
+`58c7bb8b`), read 2026-08-16. Built on the CPU, opt-in, default off. Nothing
+in this note is measured; there is no timing in this lane at all.
+
+Files read, and what each settles:
+
+- `catboost/private/libs/algo/fold.h:33-66` -- `TFold::TBodyTail`: the
+  `BodyQueryFinish` / `TailQueryFinish` / `BodyFinish` / `TailFinish` /
+  `BodySumWeight` quintuple, and the three per-rung planes `Approx`,
+  `WeightedDerivatives`, `SampleWeightedDerivatives`, each `[dim][]`.
+  `:215` -- `TVector<TBodyTail> BodyTailArr` is the ladder.
+- `catboost/private/libs/algo/fold.cpp:35-41` -- `SelectMinBatchSize`
+  (`n > 500 ? min(100, n/50) : 1`) and `SelectTailSize`
+  (`ceil(oldSize * multiplier)`).
+- `catboost/private/libs/algo/fold.cpp:150-198` -- `BuildDynamicFold`'s
+  ladder loop, and the allocation of all three planes at `bt.TailFinish`.
+- `catboost/private/libs/algo/fold.cpp:43-96` -- `InitPermutationData`.
+- `catboost/private/libs/algo/learn_context.cpp:38-50, :53-103, :492-592` --
+  `IsPermutationNeeded`, `CountLearningFolds`, `TFoldsCreationParams`, and the
+  loop that builds `Folds` **plus a separate `AveragingFold`**.
+- `catboost/private/libs/algo/train.cpp:206-243` -- `TrainOneIteration`: one
+  fold taken at random per tree, one `CalcWeightedDerivatives` per rung.
+- `catboost/private/libs/algo/train.cpp:302-382` -- `CalcLeafValues` for the
+  model, then `UpdateLearningFold` for every fold.
+- `catboost/private/libs/algo/tensor_search_helpers.cpp:568-660` --
+  `CalcWeightedDerivatives`: derivatives over `[0, bt.TailFinish)` computed
+  from `bt.Approx`, that rung's own scores.
+- `catboost/private/libs/algo/approx_calcer.cpp:706-830` --
+  `CalcApproxDeltaSimple`: `CalcLeafDersSimple(..., bt.BodyFinish, ...)` fits,
+  `UpdateApproxDeltas(..., bt.TailFinish, ...)` applies.
+- `catboost/private/libs/algo/approx_calcer.cpp:1101-1159` --
+  `CalcApproxForLeafStruct`, one delta plane per rung.
+- `catboost/private/libs/algo/approx_calcer.cpp` `CalcLeafValues` -- **the
+  model's** leaf values, read off `ctx->LearnProgress->AveragingFold`.
+- `catboost/private/libs/algo/scoring.cpp:735-770` -- the split score is
+  SUMMED over every rung, each rung scaling `l2` by its own
+  `BodySumWeight / BodyFinish`.
+- `catboost/private/libs/algo/calc_score_cache.cpp:274-295` -- the scoring
+  copy holds `bodyFinish` derivatives per rung and `tailFinish` sampled ones.
+- `catboost/private/libs/options/boosting_options.cpp:9-27, :64-78` -- the
+  option surface, its defaults, and `Validate`.
+- `catboost/private/libs/options/catboost_options.cpp:778-816, :1040-1044` --
+  where Ordered is installed as a default and where `has_time` forces
+  `PermutationCount = 1`.
+- `catboost/private/libs/options/defaults_helper.h:7-42` --
+  `DefaultFoldPermutationBlockSize` and `UpdateBoostingTypeOption`.
+
+#### 1. What a body is, what a tail is, and how the ladder grows
+
+`BuildDynamicFold` grows a geometric ladder of prefixes of the permuted row
+order. Writing `b_0 < b_1 < ... < b_K = n`:
+
+    b_0     = SelectMinBatchSize(n) = (n > 500 ? min(100, n / 50) : 1)
+    b_{f+1} = min(ceil(b_f * fold_len_multiplier), n)
+
+Rung `f` has **body** `[0, b_f)` and **tail** `[0, b_{f+1})`. There are `K`
+rungs and CatBoost's loop condition (`while (BodyTailArr.empty() ||
+leftPartLen < learnSampleCount)`) guarantees at least one.
+
+- The **body** is what rung `f`'s leaf values are fitted on
+  (`CalcLeafDersSimple(..., bt.BodyFinish, ...)`).
+- The **tail** is what rung `f`'s raw-score plane covers and what its delta is
+  applied over (`UpdateApproxDeltas(..., bt.TailFinish, ...)`).
+- Therefore a row at permuted position `q` in `[b_f, b_{f+1})` is inside rung
+  `f`'s tail and outside rung `f`'s body: **rung `f`'s model has never been
+  fitted on it**, and `CalcWeightedDerivatives` evaluating that row against
+  `bt.Approx` is the derivative-from-a-model-that-has-not-seen-it that the
+  mechanism is named for.
+- The first `b_0` positions are a **leak that CatBoost accepts**: they are
+  inside every rung's body. That is the price of keeping `K` models rather
+  than `n`.
+- `UpdateSize` additionally rounds a body up to a query boundary when the data
+  has group info. mojotrees has no query grouping on this path and does not
+  carry that clause.
+
+#### 2. The permutation count rule, with the citations the device needs
+
+    LearningFoldCount = isPermutationNeeded ? max(1, permutation_count - 1) : 1
+
+`CountLearningFolds`, `learn_context.cpp:48-50`, called at `:81-83`.
+`permutation_count` defaults to **4** (`boosting_options.cpp:14`), so **three
+learning permutations at CatBoost's defaults**, plus one more permutation for
+the `AveragingFold` built at `learn_context.cpp:575-589` -- four permuted
+orders in total, three of which carry ladders.
+
+`isPermutationNeeded` is `IsPermutationNeeded(hasTime, hasCtrs,
+isOrderedBoosting, isAveragingFold=false)`, `learn_context.cpp:38-46`:
+
+    if (hasTime)  return false;
+    if (hasCtrs)  return true;
+    return isOrderedBoosting && !isAveragingFold;
+
+and `hasTime` is `HasTimeFlag || objects order == Ordered`
+(`learn_context.cpp:68-69`). Separately, `has_time` also forces
+`BoostingOptions->PermutationCount = 1` outright
+(`catboost_options.cpp:1042-1044`). So under `has_time` there is exactly one
+learning fold and its permutation is the identity
+(`InitPermutationData`'s `else` branch fills `iota`).
+
+`fold_permutation_block_size` does **not** change the count; it changes what a
+permutation *is*. `NCB::Shuffle` (`objects_grouping.cpp`) permutes **blocks**
+of `permuteBlockSize` consecutive rows and keeps rows inside a block in their
+original relative order. The default is
+`DefaultFoldPermutationBlockSize(n) = min(256, n / 1000 + 1)`
+(`defaults_helper.h:9-11`), and `!isLearnFoldPermuted` sets it to
+`learnSampleCount` -- one block, identity (`learn_context.cpp:93-95`).
+
+**The fold (rung) count is not constant and depends on `n`:**
+
+    K = the number of steps from b_0 to n at ratio m = fold_len_multiplier
+      = ceil(log_m(n / b_0)) + 1,   b_0 = SelectMinBatchSize(n)
+
+At `n = 1e6` with the defaults (`b_0 = 100`, `m = 2`) that is **14 rungs**.
+It grows logarithmically, and it is computable from `n` alone before the first
+tree, so a device can size buffers once at fit time.
+
+#### 3. Memory: a derived bound, and why it is not `K * n`
+
+The rungs are **nested prefixes**, not disjoint blocks. Plane `f` has length
+`b_{f+1}`, so with `b_{K-1} < n`:
+
+    sum_{f=0}^{K-1} b_{f+1}  =  n + sum_{f=1}^{K-1} b_f
+                             <  n + n * m / (m - 1)
+                             =  n * (2m - 1) / (m - 1)     = 3n at m = 2
+
+A strict `3n`, independent of `K`. The exact count at `n = 1e6` with the
+defaults is **2 638 200 entries, or 2.64n** -- not 14n.
+`ordered_boosting.ordered_plane_entries` computes it. Derived, not measured.
+
+In bytes, per permutation, at `n = 1e6`: 21.1 MB of `Float64` on the host;
+10.6 MB on a device staging derivatives at Int16 and 21.1 MB at Int32. At
+CatBoost's three learning permutations that is 31.7 MB / 63.3 MB.
+
+CatBoost is worse than this by a factor of three, because `BuildDynamicFold`
+allocates `Approx`, `WeightedDerivatives` **and** `SampleWeightedDerivatives`
+at `TailFinish` per rung per dimension. Ours keeps one plane per rung (the raw
+score) and recomputes derivatives into a shared scratch buffer, because a
+derivative is cheaper to recompute than to store `2.64n` of.
+
+#### 4. What we built, and the three places it diverges
+
+`src/mojotrees/ordered_boosting.mojo` (new) and the round loop in
+`src/mojotrees/boosting.mojo`. `BoosterParams.ordered`, default disabled,
+appended last so every positional caller is unaffected. Honored by the dense
+single-output CPU `train` only; `train_with_valid`, the multiclass trainers
+and continued training refuse it by name rather than ignore it.
+
+Per round: pick a permutation from `(seed, round)`; read each row's raw score
+off the tightest rung that never saw it; fill gradients from those scores;
+grow the tree; **refit the leaf values on the plain scores over every row**;
+update `raw`; then advance every rung of every permutation.
+
+Three divergences, all deliberate:
+
+1. **One gradient per row, not a sum over rungs.** CatBoost sums the split
+   score over every rung's body (`scoring.cpp:746`), so a row in an early
+   position contributes to `K - f` of the `K` summands and an early row is
+   weighted far more heavily than a late one. We give each row exactly one
+   gradient, from the tightest model that has not seen it, which is the
+   CatBoost paper's Algorithm 1 with the same ladder as its approximation.
+   Strictly less work -- one histogram pass instead of `K` -- and it removes a
+   position-dependent row weight that nothing in the paper asks for. It is a
+   **(2) trade behind a switch**, and it is the largest divergence here.
+2. **The permutation is counter-keyed, not Fisher-Yates.** See the A17 note.
+3. **We keep one permutation by default, not three.** CatBoost's rule is
+   `max(1, permutation_count - 1) = 3`; `permutation_count=3` reproduces it
+   and costs exactly three times the planes. One permutation is the mechanism;
+   three is variance reduction on top of it.
+
+And one thing that is **not** a divergence and is worth stating because it is
+the half of the mechanism most summaries drop: **ordered boosting decides the
+tree's structure, not the values the model carries.**
+`train.cpp::TrainOneIteration` searches the structure on a ladder fold and
+then calls `CalcLeafValues`, which reads the `AveragingFold` -- a plain,
+single-rung fold over every row. `UpdateLearningFold` advances the ladder
+folds' own approxes and those never reach the model. We do the same.
+
+#### 5. Hessian declaration
+
+`ordered_varies_hessian` is **False**, always, and it is a checked claim.
+Ordered boosting changes the *point* at which derivatives are evaluated; it
+installs no per-row weight and no multiplier. For the objectives whose
+unweighted hessian is the literal 1.0 the value written is still exactly 1.0
+at any raw score, so `boosting.round_has_constant_hessian` stays correct
+without knowing the bundle exists and the two-plane histogram path stays
+admissible. This is the opposite answer from A4 and A11, and the distinction
+is exactly theirs: a *weight* that multiplies the derivative is a hessian, a
+*different evaluation point* is not.
+`check_ordered_hessian_declaration` is installed anyway and is called by the
+round loop, on the same reasoning as `check_langevin_hessian_declaration`.
+
+#### 6. What CatBoost's auto rule actually is
+
+**The widely repeated "Ordered below 50 000 rows on CPU, Plain above" is not
+in the source.** `ordered_boosting.catboost_auto_is_ordered` is the corrected
+rule and `tests/test_ordered_boosting.mojo` pins it:
+
+- `boosting_options.cpp:16` constructs `BoostingType("boosting_type",
+  EBoostingType::Plain)`. **On the CPU that is the value a fit keeps, at every
+  row count.**
+- `catboost_options.cpp:802-806` is the only place Ordered is installed as a
+  default and its condition includes `TaskType == ETaskType::GPU`.
+- The same block excludes the multiclass-only metrics and
+  `RMSEWithUncertainty` / `MultiLogloss` / `MultiCrossEntropy`.
+  `docs/en/references/training-parameters/common.md` agrees:
+  "Any number of objects, MultiClass or MultiClassOneVsAll mode: Plain."
+- `defaults_helper.h:33-42::UpdateBoostingTypeOption` then hard-sets Plain
+  when `learnSampleCount >= 50000 || IterationCount < 500`. **The iteration
+  clause is real and is usually omitted.** `TOption::SetDefault` does not
+  raise `IsSetFlag` (`option.h:28-31, 80-85`), so this later test still sees
+  `NotSet()` and wins over the GPU default above.
+
+So 50000 is a real number, but it is a threshold for turning Ordered **off**
+on the GPU, not for turning it on at all on the CPU. Any comparison that
+claims "CatBoost defaults to ordered boosting on small data" on a CPU run is
+comparing against a Plain fit.
+
+### A17 note: the learn-permutation layer, verified from source
+
+Status: **verified from CatBoost source**, `master`, read 2026-08-16. Built as
+part of A7. Files: `learn_context.cpp:38-50, :53-103`,
+`objects_grouping.cpp::NCB::Shuffle`, `fold.cpp::InitPermutationData`,
+`defaults_helper.h:7-11`, `boosting_options.cpp:9-27`.
+
+The permutations are a layer that two mechanisms consume, not a private detail
+of either. A7 (ordered boosting) reads them for the fold ladder; **A5 (ordered
+target statistics / CTRs) reads the same ones** -- `IsPermutationNeeded`
+returns true on `hasCtrs` alone, with no reference to the boosting type, and
+`TFold::InitOnlineCtrs` computes the CTRs *inside* the fold that owns the
+permutation. A5's lane should consume `ordered_boosting.ordered_permutation`
+rather than draw its own: two permutation layers keyed by two seeds is two
+answers to one question, and the CTR values and the ordered gradients would
+then disagree about what "earlier" means for the same row.
+
+#### What a permutation is
+
+`NCB::Shuffle`'s trivial-grouping arm, `permuteBlockSize != 1`:
+
+    blocksCount = ceil(n / permuteBlockSize)
+    blockedPermute = CreateShuffledIndices(blocksCount, rand)
+    emit each block's rows in ORIGINAL order, blocks in shuffled order
+
+So it is a permutation of **blocks**, and rows inside a block keep their
+original relative order. The short final block is placed wherever its draw
+sends it and `currentIdx` advances by its actual width, so permuted positions
+are **not** aligned to the block size in general.
+
+`DefaultFoldPermutationBlockSize(n) = min(256, n / 1000 + 1)`: block size 1
+below 1000 rows (a plain row permutation), the 256 cap from 255 000 rows up.
+
+#### Determinism, and where we deliberately diverge
+
+CatBoost's `CreateShuffledIndices` is a sequential Fisher-Yates over one
+running generator, so a block's destination depends on every draw taken before
+it, and the permutation drawn at a given point in a run depends on how many
+draws the run has already made.
+
+Ours is counter-based, in the same family as `sampling._mvs_stream` and
+`langevin._langevin_row_stream` but a different **shape**, and the difference
+is worth being explicit about:
+
+- MVS and Langevin give each row an *independent* draw, so "row `r` reads
+  `stream + r`, nothing advances" is the whole scheme.
+- A permutation cannot be built that way: the draws have to be turned into a
+  global total order. So each **block** gets an independent 64-bit key
+  (`block_key(stream, b) = splitmix64(stream ^ (b * GOLDEN))`, a pure function
+  of `(seed, permutation index, block index)`) and the blocks are sorted by
+  `(key, block index)` with a bottom-up merge sort. A stable merge over a
+  total order has exactly one answer, at any worker count, on any machine, and
+  no comparison's result depends on how the range was cut.
+- Two domain constants, for the reason `langevin.mojo` gives for having two:
+  the permutation stream and the per-round permutation-choice stream are both
+  keyed by a small integer against the same seed, so without separation
+  permutation 3's keys and round 3's choice would come off one counter run.
+- Key collisions: 64-bit keys over at most a few tens of thousands of blocks,
+  so under `m^2 / 2^65`, about `5e-11` at `m = 40000`. The tie-break makes the
+  *result* exact regardless, at a negligible bias toward low block indices
+  among colliding pairs.
+
+One property this buys that CatBoost's does not have, and which
+`test_permutation_does_not_depend_on_how_the_sort_is_cut` pins: a block's key
+does not depend on how many blocks there are, so changing `n` by less than a
+block leaves every full block's relative order unchanged.
+
+The per-round *choice* of permutation is the same shape:
+`permutation_choice(seed, round, count)` is a function of `(seed, round)`
+alone, where CatBoost's is `Folds[Rand.GenRand() % foldCount]`
+(`train.cpp:208`) off the sequential learn-progress generator. Ours is what
+makes a continued run draw what an uninterrupted run would have drawn, the
+same reason every other seeded decision in `_boost_rounds` reads the absolute
+round index.
+
+### A22/A23/A24 note: the three CatBoost ranking objectives, verified from source
+
+Files read, CatBoost `master`, 2026-08-16:
+
+- `catboost/private/libs/algo_helpers/error_functions.h`
+  (`TQueryRmseError::CalcDersForQueries`, `TQueryRmseError::CalcQueryAvrg`,
+  `TPairLogitError::CalcDersForQueries`)
+- `catboost/private/libs/algo_helpers/approx_updater_helpers.h`
+  (`IsStoreExpApprox`, `CalcPairwiseWeights`)
+- `catboost/private/libs/algo/yetirank_helpers.{h,cpp}`
+  (`UpdatePairsForYetiRank`, `YetiRankRecalculation`,
+  `GenerateYetiRankPairsForQuery`, `TYetiRankPairWeightsCalcer`)
+- `catboost/private/libs/pairs/util.cpp` (`GeneratePairLogitPairs`,
+  `GenerateBruteForce`, `GenerateRandomly`, `TryGeneratePair`)
+- `catboost/private/libs/target/data_providers.cpp` (`GeneratePairs`)
+- `catboost/private/libs/options/loss_description.cpp`
+  (`GetYetiRankPermutations`, `GetYetiRankDecay`, `GetMaxPairCount`)
+
+#### Sign convention, which everything below depends on
+
+CatBoost's `TDers` carries `Der1` and `Der2` as derivatives of the
+*log-likelihood*, so `Der1` is the NEGATIVE gradient and `Der2` is the
+NEGATIVE hessian. mojotrees carries LightGBM's convention: `grad = dL/df`,
+`hess = d2L/df2`. Every formula below is transcribed and then negated once,
+and the negation is stated at each site rather than assumed. A lane that
+copies `Der1` into `grad` gets a model that boosts away from the loss.
+
+#### A22. QueryRMSE
+
+`TQueryRmseError::CalcDersForQueries`, per document `i` of query `q`:
+
+    avg      = sum_j w_j (t_j - a_j) / sum_j w_j          (0 if sum_j w_j <= 0)
+    Der1[i]  = w_i (t_i - a_i - avg)
+    Der2[i]  = -w_i
+
+so in mojotrees terms
+
+    grad[i]  = w_i (a_i - t_i + avg)
+    hess[i]  = w_i
+
+`CalcQueryAvrg` takes `w = 1` when the weight vector is empty, and computes
+`querySum` and `queryCount` in document order over the query; the division
+guard is `queryCount > 0`.
+
+Three consequences worth naming:
+
+1. **The hessian is the weight.** Under unit weights it is the literal 1.0,
+   exactly as for squared error, so `QueryRMSE` is *admissible* on the
+   two-plane constant-hessian path. It is the only one of the three that is.
+   `catboost_ranking.query_rmse_varies_hessian` returns True exactly when a
+   non-empty `sample_weight` was supplied, which is the same rule squared
+   error already lives under.
+2. **The gradients of a query sum to zero** when the weights are uniform, so
+   the objective learns only within-query level and boosts from 0.
+   `objective_init_kind` is `INIT_ZERO`, the same answer `LAMBDARANK` gets.
+3. `IsStoreExpApprox` does **not** list `QueryRMSE`, so its approxes are raw.
+
+#### A23. PairLogit, and where its pairs come from
+
+`TPairLogitError::CalcDersForQueries`, for winner `i` and each competitor
+`(j, c)` in `queriesInfo[q].Competitors[i - begin]`:
+
+    p            = expApprox[j] / (expApprox[j] + expApprox[i])
+    Der1[i]     += c p
+    Der1[j]     -= c p
+    Der2[i]     += c p (p - 1)
+    Der2[j]     += c p (p - 1)
+
+`IsStoreExpApprox` DOES list `PairLogit`, so `expApprox` is `exp(a)` and
+therefore
+
+    p        = sigmoid(a_j - a_i)
+    grad[i] -= c p        grad[j] += c p
+    hess[i] += c p (1-p)  hess[j] += c p (1-p)
+
+**The hessian is per row and per round by construction.** `c p (1-p)` depends
+on the current scores of both members of every pair the row appears in. There
+is no configuration of `PairLogit` under which it is constant, which is why
+`catboost_ranking.pairwise_varies_hessian` is unconditional rather than a
+predicate over parameters, and why
+`check_catboost_ranking_hessian_declaration` refuses a constant-hessian
+declaration beside it with no escape hatch. This is the same guard shape as
+`sampling.check_mvs_hessian_declaration`; the difference is that MVS's is a
+consequence of a *knob* and this one is a consequence of the loss.
+
+**Where the pairs come from when the user supplies none.**
+`data_providers.cpp::GeneratePairs` calls `GeneratePairLogitPairs`, which for
+each group counts the pairs of distinct target values and then takes one of
+two branches. With `max_pairs` unset, `GetMaxPairCount` returns the sentinel
+`MAX_AUTOGENERATED_PAIRS_COUNT` and the branch is `GenerateBruteForce` with
+the truncation disabled: **every** ordered pair `(first, second)` with
+`first < second` inside the group and `target[first] != target[second]`, the
+higher target as winner, weight = the group weight, emitted in nested-loop
+order. **No RNG is consulted on this path.** That is the path mojotrees
+implements, and it is the path a default `loss_function=PairLogit` run takes.
+
+`max_pairs` set is NOT implemented here and is refused rather than
+approximated, for two reasons. It shuffles with `TRestorableFastRng64`, whose
+stream is drawn from the unnamed global learn-progress generator; and its
+branch condition is `pairCount / 2 < maxPairCount` *after* `pairCount` has
+already been halved on the line above, so the brute-force branch is taken
+whenever the true pair count is under `4 * max_pairs` and the truncation
+inside `GenerateBruteForce` then fires anyway. Reproducing a bug we cannot
+seed is worth nothing.
+
+**Numerics, a deliberate divergence.** CatBoost forms
+`e^{a_j} / (e^{a_j} + e^{a_i})` from stored exponentials, which overflows to
+`inf/inf = NaN` once an approx passes about 709. mojotrees computes
+`p = sigmoid(a_j - a_i)` through a branch on the sign of the difference, which
+is finite for every finite pair of scores. Same value wherever CatBoost's is
+finite, defined where CatBoost's is not. Classification: **(1) strictly less
+work and exact** (one `exp` instead of two plus a division).
+
+#### A24. YetiRank: what it samples, how many times, and what seeds it
+
+This is the question that decides whether the objective is reproducible, so
+it is answered in CatBoost's own terms first.
+
+**What it samples.** `GenerateYetiRankPairsForQuery` does, per query, for
+`permutationIndex` in `[0, permutationCount)`:
+
+1. Copy the query's `expApproxes`.
+2. `AddNoise`. In the default `Gumbel` arm this is
+   `expApproxes[d] *= u / (1.000001f - u)` with `u = rand.GenRandReal1()`.
+   Since `IsStoreExpApprox` lists `YetiRank`, the values are `exp(a)`, so the
+   multiplication is `a_d + log(u) - log(1.000001 - u)` on the score scale:
+   **logistic** noise, not Gumbel. The name in CatBoost's enum is wrong; the
+   arithmetic is what it is. `u` is stored into a `float`, and `1.000001f` is
+   a `float` literal, so CatBoost's noise is computed in single precision.
+3. `StableSort` the query's indices by noisy value descending.
+4. `CalcWeightsClassic` walks the sorted list once and charges each ADJACENT
+   pair `0.15 * decayCoefficient * |rel[first] - rel[second]|`, with
+   `decayCoefficient` starting at 1 and multiplied by `decay` after each
+   position. The charge is added to `competitorsWeights[winner][loser]` where
+   the winner is the member with the larger relevance; an equal-relevance pair
+   is charged nothing (`AddWeight` has no `==` branch).
+
+After all permutations, every nonzero cell becomes a competitor with weight
+`queryWeight * cell / permutationCount`, scanned winner-major then
+loser-major.
+
+**How many times.** `GetYetiRankPermutations` defaults to **10**.
+
+**Decay.** `GetYetiRankDecay` defaults to **0.85**. The `Decay = 0.99` field
+initializer inside `TYetiRankPairWeightsCalcer::TConfig` is DEAD: the
+constructor overwrites it unconditionally on the next line. Reading 0.99 off
+the header and calling it CatBoost's default is wrong by a factor that
+compounds over the whole ranking.
+
+**The 0.15.** A literal in the source, commented `// Like in GPU`. It scales
+every pair weight uniformly inside a query, so it is absorbed by the learning
+rate up to the interaction with `reg_lambda`; it is carried across anyway
+because that interaction is real.
+
+**What seeds it, and why we cannot copy it.** `UpdatePairsForYetiRank` splits
+the query range into `CB_THREAD_LIMIT` blocks, draws one `ui64` per block from
+`GenRandUI64Vector(blockCount, randomSeed)`, and inside a block runs a single
+`TFastRng64` from which each query in turn takes `rand.GenRand()` as its own
+seed. Query `q`'s stream therefore depends on how many queries precede it
+*inside its block*, and the per-document uniforms inside a query are one
+sequential run shared by all 10 permutations. This is deterministic in
+CatBoost only because `CB_THREAD_LIMIT` is a compile-time constant rather than
+the thread count -- the same accident that makes MVS reproducible there (A11).
+It is not a stream that can be named from outside, and it is exactly the
+shape this repository forbids.
+
+mojotrees keys instead on `(seed, iteration, query, permutation)` through
+`_yetirank_stream`, with document `d` reading `stream + d`. Nothing advances,
+nothing is shared between permutations, and no draw depends on how many
+queries or documents were processed first. The draws differ from CatBoost's;
+the distribution does not. Bit-identity was never on offer, because their
+stream has no name.
+
+**Storage, and a real saving.** CatBoost allocates a dense `querySize x
+querySize` float matrix per query and then scans all of it, which is O(n^2)
+time and memory in the group size for a mode that can only ever touch
+`permutations * (querySize - 1)` cells. mojotrees collects the charged pairs
+into a flat list, sorts it by `(winner, loser)` and merge-sums runs. The sort
+key reproduces CatBoost's winner-major/loser-major emission order exactly, so
+the pair sequence handed to the gradient is the same sequence, and the
+summation order inside a cell is fixed by permutation index. Classification:
+**(1) strictly less work and exact** in the pair set and its order;
+the per-cell sum is a reassociation of the same 10-or-fewer addends and is
+therefore **(3) bit-moving** at the last ulp.
+
+**Modes not implemented.** `mode` in {`DCG`, `NDCG`, `MRR`, `ERR`, `MAP`},
+`noise=Gauss`, `num_neighbors != 1`, and `top`. `Classic` with
+`noise=Gumbel` and `num_neighbors=1` is the constructed default and is the
+whole of what a default `loss_function=YetiRank` run does; `top` is not read
+by `CalcWeightsClassic` at all. The others are refused by name rather than
+silently ignored.
+
+**`YetiRankPairwise` is a different loss** and is not implemented. It shares
+the pair generator but is trained through CatBoost's pairwise scoring path
+(`pairwise_scoring.cpp`), not through leafwise `PairLogit` derivatives.
+
+#### Three further YetiRank facts from `catboost_options.cpp`, verified
+
+`SetNotSpecifiedOptionsToDefaults` and `GetEstimationMethodDefaults` say
+things about a `YetiRank` fit that a comparison harness has to honor or the
+comparison is against a differently-configured CatBoost:
+
+1. **The default eval metric is `PFound`**, not NDCG:
+   `lossDescription.Load(LossDescriptionToJson("PFound")); MetricOptions->
+   ObjectiveMetric.Set(lossDescription);` in the `YetiRank` /
+   `YetiRankPairwise` case. `PairLogit`'s objective metric is `PairLogit`
+   itself; mojotrees implements neither `QueryRMSE` nor `PairLogit` as a
+   *metric*, so the registry diff points those two at `ndcg_catboost` and
+   records the divergence rather than inventing a metric.
+2. **`l2_leaf_reg` defaults to 0 under `YetiRank`**, not to CatBoost's usual
+   3 (`defaultL2Reg = 0`). A harness that leaves `l2_leaf_reg` at 3 while
+   CatBoost silently used 0 is comparing two different regularizations.
+3. **Leaf estimation is Newton with exactly one iteration**
+   (`defaultEstimationMethod = ELeavesEstimation::Newton`,
+   `defaultNewtonIterations = 1`), and CatBoost *refuses* to let you change
+   it: "At the moment, in the YetiRank mode, changing the
+   leaf_estimation_method parameter is prohibited." Backtracking is likewise
+   forced off. So catalog A6 (`leaf_estimation_iterations`) has no bearing on
+   a YetiRank comparison.
+
+CatBoost also records that `YetiRank` "cannot be used as a metric"
+(`IsSkipInMetricsParamsExport`), which is why there is no YetiRank eval
+metric to implement.
+
+#### Why `YetiRank` is not aliased to `lambdarank`
+
+Recorded by the naming lane and restated here because it is the mistake a
+reader of this file is most likely to make. LambdaRank weights a pair by the
+NDCG change that swapping it would cause, computed on the *deterministic*
+current ranking. YetiRank weights a pair by how often it lands adjacent in a
+*noisy* ranking, with a positional decay and a relevance-difference factor,
+and never computes an NDCG at all. They agree only in being pairwise. An alias
+would make a comparison table say two libraries were run on the same loss when
+they were not.
+
+### A25 note: `group_id` and the two eval metrics, verified from source
+
+#### The `group_id` contract
+
+`catboost/libs/data/objects.cpp::CheckGroupIds` is the whole of it:
+
+- Rows of one group must be **CONTIGUOUS**. The function walks the column once
+  collecting the id of each maximal run, then sorts the run ids and calls
+  `std::adjacent_find`; a repeat means some group's rows were interleaved with
+  another's, and it raises **`"group Ids are not consecutive"`**.
+- Groups need **NOT be sorted** by id, and the ids need not be dense, ordered,
+  or numeric (CatBoost hashes string ids through `CalcGroupIdFor`). Only the
+  runs matter.
+- The failure is **loud**. CatBoost does not regroup, does not sort, and does
+  not drop. This is the one thing that has to be true, because a ranking
+  objective reading a mis-grouped column produces a plausible model and a
+  meaningless one, and nothing downstream can detect it.
+- `catboost/libs/data/target.cpp::CheckGroupWeights` additionally requires the
+  weight to be `FuzzyEquals`-constant inside a group: a group weight is a
+  property of the group, and a per-row weight that varies inside one is
+  refused rather than averaged.
+
+mojotrees already had exactly the first three: `ranking.groups_from_query_ids`
+walks the runs, sorts the run ids, and raises
+`"query ids must be contiguous: rows of query N are not consecutive"`. It was
+built against LightGBM and it happens to match CatBoost's rule line for line.
+It is reused unchanged and re-exported under CatBoost's name. The fourth,
+constant weight inside a group, did not exist and is added
+(`check_group_weights_constant`).
+
+#### `NDCG`, and how it differs from the `ndcg` mojotrees already has
+
+`metric.cpp::TDcgMetric` + `dcg.cpp::{CalcNdcg,CalcDcg,CalcIDcg,CalcDcgSorted,
+FillDcgDecay,GetTopSortedTargets}` + `doc_comparator.h::CompareDocs`.
+
+Defaults, from `TDcgMetric`: `DefaultTopSize = -1` (passed as `ui32`, so it
+becomes `Max<ui32>`, i.e. no truncation), `DefaultMetricType =
+ENdcgMetricType::Base`, `DefaultDenominatorType =
+ENdcgDenominatorType::LogPosition`, `UseWeights` default true.
+
+    numerator(rel)  = rel                    (Base, the DEFAULT)
+                    = 2^rel - 1              (Exp)
+    decay[0]        = 1
+    decay[i]        = 1 / log2(i + 2)        (LogPosition, the DEFAULT)
+                    = 1 / (i + 1)            (Position)
+    DCG             = sum_{i < top} numerator(target[order[i]]) * decay[i]
+    IDCG            = same, over targets sorted DESCENDING by target alone
+    NDCG            = IDCG > 0 ? DCG / IDCG : 1
+    reported        = sum_q qw_q NDCG_q / sum_q qw_q      (0 if the sum is 0)
+
+Three differences from `ranking.ndcg`, which is LightGBM's, and every one of
+them changes the number:
+
+1. **The gain.** CatBoost's default is `Base`: the numerator is the raw
+   relevance. LightGBM's is `2^l - 1`, which is CatBoost's `Exp`. A graded
+   relevance set scored under the wrong one is not a rescaling; it reorders
+   which of two models is better.
+2. **The truncation.** CatBoost's default is none. LightGBM's `eval_at`
+   defaults to 5 and mojotrees follows it (`DEFAULT_NDCG_EVAL_AT`).
+3. **The tie rule.** `CompareDocs` is
+   `approxLeft != approxRight ? approxLeft > approxRight : targetLeft <
+   targetRight`: on an exact score tie the LOWER relevance is ranked FIRST.
+   That is adversarial on purpose and is what makes an untrained model score
+   near its floor instead of at whatever the input order happened to give.
+   LightGBM stable-sorts and keeps input order, which flatters the model on
+   any dataset that arrives sorted by relevance -- and ranking datasets
+   frequently do.
+
+`GetTopSortedTargets` uses `PartialSort` with an index tiebreak when
+`top < size` and `StableSort` otherwise. Both are the same total order
+(`CompareDocs`, then input index), so mojotrees does one stable sort and
+truncates. Classification: **(1) strictly less work and exact** -- one sort
+instead of a branch over two.
+
+`CalcIDcg` sorts by `left.Target > right.Target` alone, stably, so the ideal
+ordering keeps input order among equal relevances. That matters only for
+`top < size`.
+
+#### `PFound`
+
+`pfound.h::TPFoundCalcer::AddQuery` + `metric.cpp::TPFoundMetric`. Defaults
+`DefaultTopSize = -1` (`ui32`, so no truncation), `DefaultDecay = 0.85`,
+`UseWeights` default true.
+
+    order    = StableSort by CompareDocs           (the SAME tie rule)
+    pLook    = 1, pFound = 0
+    for position in [0, min(size, top)):
+        pRel   = relevance[order[position]]
+        pFound += pRel * pLook
+        pLook  *= (1 - pRel) * decay
+    reported = sum_q qw_q pFound_q / sum_q qw_q    (0 if the sum is 0)
+
+`GetBestValue` is `Max` with `bestValue = 0`, which is a CatBoost quirk (the
+attainable maximum is 1, not 0) and is not carried across; mojotrees records
+only "higher is better".
+
+**Relevances are probabilities here**, not grades: the recursion is only a
+probability if `pRel` is in `[0, 1]`. CatBoost does not check. mojotrees does
+not check either, because refusing would break the CatBoost-compatible reading
+of a graded column, but `pfound` documents the range and the value is
+meaningless outside it.
+
+**`subgroup_id` is not implemented.** CatBoost skips a document whose
+`subgroupId` was already seen at a higher position, which deduplicates
+near-identical results. There is no subgroup column in mojotrees and inventing
+one is a data-model change this lane does not own. A `PFound` computed here on
+data that HAS subgroups in CatBoost will read high. Named, not hidden.
+
+#### The metric-name collision, which needs a ruling
+
+`NDCG` is not a CatBoost-only concept, so `docs/PARAMETER_NAMING.md`'s rule
+does not settle it, and the two vendors' `NDCG` are different functions (see
+above). mojotrees already spells LightGBM's as `ndcg`. This lane registers the
+CatBoost one as `ndcg_catboost` (alias `catboost_ndcg`), which is a mojotrees
+coinage and not anybody's existing name; it is the only truthful option short
+of carrying CatBoost's `NDCG:type=Base;denominator=LogPosition` parameter
+syntax through a registry that has one scalar slot per metric. `PFound` has no
+collision and is registered under CatBoost's own name, `pfound`. The naming
+lane owns the final spelling of the first.
+
+### A26/A27/A28 note: the input contract comes first
+
+Status: **verified from CatBoost source**, `master`, read 2026-08-16 by the
+`survival-multitarget` lane. Files read, all under `catboost/`:
+
+- `private/libs/algo_helpers/error_functions.h` (`IDerCalcer`,
+  `TMultiDerCalcer`, `TMultiRMSEError`, `TSurvivalAftError`, `TCoxError`)
+- `private/libs/algo_helpers/error_functions.cpp` (`ArgSort`,
+  `CalcCoxApproxSum`, `TCoxError::CalcDersRange`,
+  `TCoxError::CalcFirstDerRange`, `TSurvivalAftError::CalcDers`)
+- `private/libs/algo_helpers/survival_aft_utils.h` / `.cpp`
+  (`TDerivativeConstants`, `ECensoredType`, `InverseMonotoneTransform`,
+  `ClipDerivatives`, `GetDerivativeLimits`, `DispatchDerivativeLimits`)
+- `libs/helpers/distribution_helpers.h` / `.cpp` (`TNormalDistribution`,
+  `TLogisticDistribution`, `TExtremeDistribution`)
+- `private/libs/algo/approx_dimension.cpp` (`GetApproxDimension`)
+- `private/libs/algo/tensor_search_helpers.cpp` (`BuildError`: the `dist` and
+  `scale` parsing and their defaults)
+- `private/libs/algo/scoring.cpp` (`CalcScoresForSubCandidate`, the
+  `for (int dim ...) UpdateScores(..., scoreCalcer)` loop)
+- `private/libs/algo_helpers/online_predictor.cpp` (`CalcDeltaNewtonMulti`),
+  `private/libs/algo_helpers/hessian.cpp`
+  (`TDiagonalHessian::SolveNewtonEquation`)
+- `private/libs/options/enum_helpers.cpp` (`MultiRegressionObjectives`,
+  `SurvivalRegressionObjectives`, `MultiTargetObjectives`,
+  `IsPlainOnlyModeLoss`), `private/libs/options/enums.h`
+- `private/libs/target/data_providers.cpp` ("SurvivalAft is compatible only
+  with a single-dimensional model")
+- `libs/metrics/metric.cpp` (`TCoxMetric`, `TSurvivalAftMetric`,
+  `TMultiRMSEMetric`)
+- `libs/model/model.h:118`
+
+**The headline is not a gradient.** `boosting.fill_grad_hess`,
+`boosting.train`, `objective.GradHessFn`, `Booster`, and every Python and C
+entry point in this repo take the label as `List[Float64] target`, one number
+per row. That is a **one-column contract**, and two of these three objectives
+cannot be spelled in it at all:
+
+| objective | label columns | approx dimension | fits `List[Float64]`? |
+|---|---|---|---|
+| `Cox` | 1 (signed) | 1 | **yes** |
+| `SurvivalAft` | **2** (lower, upper) | 1 | no |
+| `MultiRMSE` | **T** | **T** | no |
+
+So the deliverable that matters here is `target_matrix.TargetMatrix`, a flat
+row-major `List[Float64]` of `n_rows * n_targets` with `n_targets` beside it,
+and the honest statement that **nothing reaches it yet**: the Python layer,
+the C API, `bindings/_mojotrees.mojo` and the sklearn wrapper all pass one
+column and none of them is this lane's to widen. A two-bound or vector target
+is a change to the *ingestion* path, and it is a bigger and more valuable
+piece of work than any of the three derivative functions.
+
+CatBoost's own layout is the same shape: `TConstArrayRef<TConstArrayRef<float>>
+target` indexed `[dim][row]`, column-major where ours is row-major. Row-major
+is the deliberate choice: the gradient loop for `MultiRMSE` touches
+`target[r*T + t]` and `raw[r*T + t]` for all `t` at one `r`, which is a
+contiguous run of `T` in both, and it is the same layout
+`train_multiclass` already uses for its `raw[r * n_classes + k]` scores.
+
+#### A26. Cox, and the two things everyone gets wrong about it
+
+**The target encoding.** One column. `ArgSort` (error_functions.cpp:110-127)
+sorts by `std::abs(targets[i])`, and the event test throughout is `y > 0`.
+So `abs(y)` is the time and the *sign* is the event indicator. `y == 0` is
+censored, which means **an event at time 0 cannot be expressed**; our
+`cox_signed_target` refuses `time <= 0` for an event rather than silently
+recoding it as censored.
+
+**How the risk set is formed, and it is not Breslow.** `CalcDersRange` walks
+the rows in sorted order carrying a one-position-lagged `accumulatedSum`, and
+subtracts it from `expPSum` at each event:
+
+```cpp
+accumulatedSum += lastExpP;
+if (y > 0) { expPSum -= accumulatedSum; accumulatedSum = 0;
+             rk += 1.0 / expPSum; sk += 1.0 / (expPSum * expPSum); }
+const double grad = static_cast<double>(y > 0) - expP * rk;
+const double hess = expP * rk - expP * expP * sk;
+ders[ind].Der1 = grad;  ders[ind].Der2 = -hess;
+```
+
+so at sorted position `k` the risk set is exactly `{k, k+1, ..., n-1}` --
+**the suffix of the sort order**, not the set of rows with time `>= t_k`.
+The two differ precisely on ties. Two events at the same time: the first sees
+both, the second does **not** see the first. That is neither Breslow (which
+gives every tied event the full risk set) nor Efron (which averages); it is
+**no tie correction**, with ties broken by `StableSort`, therefore by original
+row index. mojotrees reproduces exactly this, and reproduces it with its own
+stable index merge sort keyed on `(abs(y), row index)` so that the tiebreak is
+a stated rule rather than a property of whatever sort is linked in.
+
+**Consequences that are not details.**
+
+- The hessian `h_k = e^{p_k} r_k - e^{2 p_k} s_k` is **per-row, non-constant,
+  and coupled**: it depends on the approxes of every row that shares a risk
+  set with `k`. `cox_varies_hessian()` is unconditionally `True` and
+  `check_cox_hessian_declaration` refuses a `CONSTANT_HESSIAN` declaration
+  beside it, in the shape of `sampling.check_mvs_hessian_declaration`. It is
+  non-negative -- `h_k = e^{p_k} sum_i (S_i - e^{p_k}) / S_i^2` and
+  `e^{p_k} <= S_i` whenever `k` is in `R_i` -- so the Newton step is safe, but
+  it reaches exactly 0 for the last row and that is a real leaf-denominator
+  case, not a numerical accident.
+- **CatBoost ignores `weights` for Cox.** Both `CalcDersRange` and
+  `CalcFirstDerRange` name the parameter `const float* /*weights*/`. A
+  weighted Cox partial likelihood needs the weights inside `S_i`, which
+  CatBoost never does. mojotrees **refuses** a non-empty `sample_weight` for
+  Cox rather than accepting and dropping it.
+- **`labelOrder` is indexed out of its own bounds when `start != 0`.**
+  `ArgSort` returns a vector of length `count` filled `iota` from `start`, and
+  the caller reads `labelOrder[i]` for `i` in `[start, start + count)`.
+  `CalcFirstDerRange` also reads `getApprox(0)` where its sibling reads
+  `getApprox(start)`. Both are only harmless because Cox is always called with
+  `start == 0` over the whole learn set. It is worth recording as the
+  strongest available evidence that CatBoost itself treats Cox as a
+  whole-dataset objective.
+- Adding a constant to every raw score leaves the partial likelihood
+  unchanged, so Cox has **no meaningful base score**; ours starts at 0, which
+  is CatBoost's `INIT_ZERO` equivalent.
+- The metric (`TCoxMetric::Eval`) is the partial log-likelihood itself,
+  higher-is-better, and it is **not** additive over rows -- CatBoost derives it
+  from `TNonAdditiveSingleTargetMetric` for exactly that reason. It also does
+  **not** subtract the maximum approx before exponentiating where the
+  derivative code does, so it overflows above `|approx| ~ 709`. Ours subtracts
+  the maximum in both places. That is analytically the identical quantity and
+  bit-moving only, class (3).
+
+#### A27. SurvivalAft, and how an interval target is spelled
+
+**The input.** `TSurvivalAftError::CalcDers` reads `target[0]` and
+`target[1]`. The four cases, in CatBoost's own branch order:
+
+| test | `ECensoredType` | meaning |
+|---|---|---|
+| `target[0] == target[1]` | `Uncensored` | exact event at that time |
+| `target[1] == -1` | `RightCensored` | still alive after `target[0]` |
+| `target[0] == -1` | `LeftCensored` | event before `target[1]` |
+| otherwise | `IntervalCensored` | event inside `(lower, upper)` |
+
+`-1` is the sentinel, in **both** columns, and the metric agrees
+(`realTarget` maps `-1` to `+infinity`). Note that the uncensored test comes
+first, so `(-1, -1)` is read as an exact event at time `-1` and
+`log(-1)` follows; `TargetMatrix.check_survival_aft` refuses it.
+
+**The transform.** `InverseMonotoneTransform(approx, target, scale)` is
+`(log(target) - approx) / scale`, so the model predicts `log` of the survival
+time and `exp(approx)` is a time. Every target must be strictly positive; we
+check it, CatBoost does not.
+
+**The derivatives.** With `z = (log t - a) / scale`, `f` the distribution's
+pdf and `F` its cdf, the loss is `-log(f(z) / (scale t))` uncensored and
+`-log(F(z_U) - F(z_L))` otherwise, and CatBoost's two numerator/denominator
+pairs are exactly the first and second derivatives of those:
+
+```
+uncensored:  g = f'(z) / (scale * f(z))
+             h = -(f(z) f''(z) - f'(z)^2) / (scale * f(z))^2
+censored:    P = f(z_U) - f(z_L),  D = F(z_U) - F(z_L),  Q = f'(z_U) - f'(z_L)
+             g = P / (scale * D)
+             h = (P^2 - D Q) / (scale * D)^2
+```
+
+with `f = F = f' = 0` substituted at an unbounded lower end and
+`f = f' = 0, F = 1` at an unbounded upper end. CatBoost stores `Der1 = -g` and
+`Der2 = -h` throughout (its `RMSE` stores `target - approx` against a loss
+whose gradient is `approx - target`), which is why the two minus signs appear
+in `CalcDers` and why the diagonal Newton solve reads
+`negativeDer[d] / (Data[d] - l2)`.
+
+**Then it clips, and the clip is load-bearing.** `TDerivativeConstants`:
+`g` into `[-15, 15]`, `h` into `[1e-16, 15]`. The `1e-16` floor is what makes
+the hessian strictly positive for every row and every distribution, so a leaf
+denominator can never be zero -- and it is also why the hessian is **non-
+constant per row**, declared through `survival_aft_varies_hessian`. The
+`DispatchDerivativeLimits` table is the *second* fallback, reached only when
+the denominator is below `1e-12` **and** the quotient came out NaN or
+infinite; it substitutes a per-(distribution, order, censoring, sign) limit.
+That table is transcribed verbatim in `survival.aft_derivative_limit`,
+including the two entries that look like typos and are reproduced as written:
+`Normal`/`Second`/`RightCensored` returns `(1/scale^2, 1e-16)` with the larger
+value in the `min` slot, and `Extreme`/`Second` returns `(15, 1e-16)` the same
+way. They are used as `targetSign ? min : max`, so the order of the pair is
+the whole meaning and guessing at it would change answers.
+
+**`scale` and `dist`.** `BuildError` accepts exactly two loss params, `dist`
+and `scale`; `dist` defaults to `Normal` and `scale` to `1`, and
+`TSurvivalAftError`'s constructor enforces `scale > 0`. The three
+distributions are transcribed from `distribution_helpers.cpp` -- Normal,
+Logistic, and Extreme (Gumbel-minimum, `F(x) = 1 - exp(-e^x)`).
+
+**Divergences, both deliberate.** CatBoost calls `fast_exp` and `FastLogf`;
+we call `std.math.exp` and `std.math.log`. **Both sides are approximate** and
+this lane makes no accuracy claim in either direction, because Mojo's
+transcendentals are not libm: measured on this toolchain, `exp(log(5.0))` is
+`4.999999998698298` (2.6e-10 relative) and the Normal cdf at 1 is
+`0.841344750494095` against libm's `0.8413447460685429` (5.3e-9 relative).
+Class (3), bit-moving, and it is why the AFT tolerances in
+`tests/test_survival_multitarget.mojo` are 1e-7 rather than 1e-12. And `TSurvivalAftError::CalcDers` takes
+`float /*weight*/` and **drops it**, exactly as Cox does; we multiply both
+derivatives by the row weight, because a weight is a clean multiplier here
+(unlike Cox, where it would have to enter the risk-set sums) and silently
+ignoring an argument the caller passed is the worse failure.
+
+**The eval metric is not the likelihood.** `TSurvivalAftMetric` is the mean
+weighted **distance from the interval in time units**: it exponentiates the
+approx, and adds `min(|e^a - lower|, |e^a - upper|)` whenever `e^a <= lower`
+or `e^a >= upper`, with `-1` read as `+infinity` in both columns so that the
+right- and left-censored cases fall out of the same expression. Lower is
+better, best 0. Anyone reporting "SurvivalAft" as a number is reporting that,
+not a log-likelihood.
+
+#### A28. MultiRMSE, where the tree shape *is* the objective
+
+**The derivatives are trivial and are not the point.** For each of `T`
+dimensions, `der[i] = w * (y[i] - p[i])` and `der2[i] = -w`; the hessian type
+is `Diagonal`, so there is no cross-target term anywhere in the derivative.
+`TMultiRMSEErrorWithMissingValues` is the same function with `NaN` targets
+zeroing both, which is a second registered loss
+(`MultiRMSEWithMissingValues`) and is built here beside it because it costs
+one branch.
+
+**The tree shape is the point, and it is verified.**
+`approx_dimension.cpp` returns `targetDimension` for a multi-target
+objective; `model.h:118` says leaf values are laid out
+`[treeIndex][leafId * ApproxDimension + dimension]`; and `scoring.cpp:751-766`
+loops `for (int dim = 0; dim < approxDimension; ++dim) UpdateScores(stats +
+dim*splitStatsCount, ..., scoreCalcer)` into **one** `scoreCalcer`, whose
+`AddLeaf` does `Scores[splitIdx] += ...`. So:
+
+> CatBoost builds **one tree per iteration** whose structure is chosen by the
+> **sum over targets** of the per-target split score, and gives it a **vector
+> leaf value** solved per target from the diagonal hessian:
+> `value[d] = -sum(der[d]) / (sum(der2[d]) - l2_scaled)`.
+
+This is the same distinction `bench/real_data/scenarios.py`
+`CATBOOST_UNMATCHABLE["multiclass_tree_count"]` already records for
+`MultiClass` -- but for `MultiRMSE` it is not a bookkeeping difference, it is
+**the entire model**. Because the `MultiRMSE` derivative has no cross-target
+coupling, the shared structure is the *only* thing that couples the targets:
+grow one tree per target per round, as our multiclass machinery does, and the
+result is **bit-identical to `T` independent `SQUARED_ERROR` boosters**.
+`train_multi_rmse` in `multi_target.mojo` is that shape, is labelled that way
+in its docstring, and is useful as a multi-output regression API and as the
+consumer that gives `TargetMatrix` a reason to exist -- but it is **not
+CatBoost's `MultiRMSE`** and no comparison should say it is.
+
+Two things are needed from the tree lanes and they are stated as an owed
+interface rather than built here:
+
+1. `histogram.mojo`: `T` gradient planes and `T` hessian planes per node, or
+   one plane set of stride `T`. This is the same request `multiclass-device`
+   makes; the only new part is that the planes must be summable into one score.
+2. `tree.mojo`: a split gain that is `sum over d of gain_d`, not the gain of
+   the summed planes. **These are different numbers** and collapsing them is
+   the easy wrong answer here. `multi_target.multi_target_split_gain` and
+   `multi_target.multi_target_leaf_values` are written and tested against
+   CatBoost's formulas so that whoever owns the grower calls a checked
+   function instead of rederiving it.
+
+**The metric.** `sqrt( sum over d of sum over i of w_i (p - y)^2 / sum over i
+of w_i )`. The denominator is the row-weight sum and is **not** multiplied by
+`T`, so `MultiRMSE` is the root-mean-square *Euclidean norm* of the residual
+vector, not the mean of the per-target RMSEs. At `T = 1` it is exactly RMSE.
+
+### A30 note: CTR feature combinations, verified from source
+
+Numbering: A20 was the last entry on `perf-round-2` at `56b08c1`; `A21` was
+already taken by the `ranking-objectives` lane when this was written, so this
+lane takes **A30**. `ordered-boosting` and `survival-multitarget` had written
+nothing at that moment and may land on A21/A30 as well; renumber on merge.
+
+Status: **verified from CatBoost source**, `master`, read 2026-08-16 by the
+`ctr-combinations` lane. This entry discharges the four items A19 named as
+deliberately not built and left to this lane. A19 stands; A30 extends it from
+the complexity-1 projection to the general one.
+
+Files read, and every claim below cites one of them.
+
+- `catboost/private/libs/algo/projection.h` -- `TProjection`, `TBinFeature`,
+  `IsRedundant`, `IsSingleCatFeature`, `GetFullProjectionLength`, `operator<`.
+- `catboost/private/libs/algo/index_hash_calcer.h` and `.cpp` -- `CalcHashes`,
+  `ComputeReindexHash`, `UpdateReindexHash`.
+- `catboost/private/libs/algo/greedy_tensor_search.cpp` -- `AddSimpleCtrs`,
+  `AddTreeCtrs`, `AddCtrsToCandList`, `DropStatsForProjection`,
+  `SelectDatasetFeaturesForScoring`, `SelectFeaturesForScoring`,
+  `GreedyTensorSearchOblivious`, `GreedyTensorSearch`, `TrimOnlineCTRcache`,
+  `SelectCtrsToDropAfterCalc`, `MAX_ONLINE_CTR_FEATURES`.
+- `catboost/private/libs/algo/ctr_helper.h` and `.cpp` -- `TCtrHelper::GetCtrInfo`,
+  `TCtrHelper::InitCtrHelper`, `MakeCtrInfo`.
+- `catboost/private/libs/algo/online_ctr.cpp` -- `ComputeOnlineCTRs`'
+  single-cat shortcut and its general branch, `approxBucketsCount`, the
+  `topSize` resolution, `CalcFinalCtrs`.
+- `catboost/private/libs/options/cat_feature_options.h` and `.cpp` --
+  `SimpleCtrs`, `CombinationCtrs`, `MaxTensorComplexity`, `CtrLeafCountLimit`,
+  `StoreAllSimpleCtrs`, `TCatFeatureParams::Validate`.
+- `catboost/private/libs/options/catboost_options.cpp` -- `SetCtrDefaults`,
+  `CreateDefaultCounter`, `SetDefaultBinarizationsIfNeeded`, and the
+  `IsSmallIterationCount` override.
+- `catboost/private/libs/options/catboost_options.h` -- `IsSmallIterationCount`.
+- `catboost/private/libs/options/restrictions.h` -- `GetMaxTreeDepth`.
+- `catboost/libs/model/split.h` -- `IsTrueHistogram`, `IsTrueOneHotFeature`.
+- `catboost/libs/model/model_export/resources/ctr_calcer.py` -- `calc_hashes`.
+- `library/cpp/grid_creator/binarization.cpp` -- `MakeBinarizer`, `BestSplit`
+  (the exact DP), `TWeightedFeatureBin::UpdateBestSplitProperties` (the
+  greedy), `Penalty<MinEntropy>`. This last file is for the appendix at the
+  bottom, which is A15's territory and not this lane's.
+
+#### 1. A projection is not a tuple of categorical columns
+
+`TProjection` (`projection.h:61`) has **three** vectors, not one:
+
+```cpp
+struct TProjection {
+    TVector<int> CatFeatures;
+    TVector<TBinFeature> BinFeatures;      // {FloatFeature, SplitIdx}
+    TVector<TOneHotSplit> OneHotFeatures;  // {CatFeatureIdx, Value}
+};
+```
+
+and `CalcHashes` (`index_hash_calcer.cpp:70`) folds all three into one `ui64`
+per row, in that order, with `CalcHash` -- the same `MAGIC_MULT` fold A19
+already built as `ctr_combination_hash`. What is folded in differs per kind.
+
+| kind | folded value | citation |
+|---|---|---|
+| categorical, **training** | `(ui64)quantizedBin + 1` | `index_hash_calcer.cpp:104` |
+| categorical, **final CTR table** | `(int)originalHashedValue` | `index_hash_calcer.cpp:117` |
+| float split | `IsTrueHistogram(bin, SplitIdx)` = `bin > SplitIdx` | `:138`, `model/split.h:12` |
+| one-hot split | `IsTrueOneHotFeature(bin, Value)` = `bin == Value` | `:159`, `model/split.h:16` |
+
+Three things fall out and each is a way to get this wrong.
+
+**The float and one-hot members contribute a 0 or a 1, not a value.** A
+projection that names `f7 > bin 12` folds in the bit, so a projection over one
+categorical column and two float splits has a bucket space of `cardinality x 4`
+and not `cardinality x bins x bins`. `ctr_calcer.py:13-18` is the readable
+statement of the same loop and it merges `BinFeatures` and `OneHotFeatures`
+into one `binarized_indexes` list distinguished by a `check_value_equal` flag,
+which is the export format's spelling of the `>` versus `==` difference above.
+
+**The categorical fold is `+ 1` in training and is not `+ 1` in the final
+table.** Training folds the perfect-hash bin index plus one; `CalcFinalCtrs`
+passes a non-null `perfectHashedToHashedCatValuesMap` and folds the *original*
+hashed value instead. The two hash spaces are therefore different, and it does
+not matter because `ComputeReindexHash` renames every hash to a dense bucket id
+on each side separately and the model file carries the final side's map. It
+does matter to anyone who tries to compare a training bucket id against a model
+bucket id, which is a thing implementations do. Note also that
+`(int)origValsView[...]` narrows a `ui32` hash to a signed `int` before the
+implicit widening to `CalcHash`'s `ui64` parameter, so any original hash with
+the top bit set is sign-extended to `0xFFFFFFFF........`. That is CatBoost's
+arithmetic as written and it is stable, not a bug that changes answers, but it
+is not what a reimplementer would write.
+
+**The single-categorical projection does not go through `CalcHashes` at all.**
+`ComputeOnlineCTRs` (`online_ctr.cpp:626`) branches on `proj.IsSingleCatFeature()`
+and copies the quantized column straight into the hash array
+(`CopyCatColumnToHash`), no fold. So A19's remark that "a one-element
+projection is `calc_hash(0, v)` and NOT `v`" is right about the export path and
+is bypassed on the training path. Since `ComputeReindexHash` renames afterwards
+either way, the induced *partition* is identical and only the labels differ.
+The reason the shortcut exists is that it also gets to size the rehash table
+from the known cardinality (`:653`) instead of guessing it (`:680-687`).
+
+#### 2. Candidate enumeration is grown from the tree, not exhaustive
+
+This is the question that changes the cost by orders of magnitude, and the
+answer is unambiguous: **grown from the splits already in the current tree.**
+`AddTreeCtrs` (`greedy_tensor_search.cpp:491`) is the whole of it.
+
+```cpp
+TProjection binAndOneHotFeaturesTree;
+binAndOneHotFeaturesTree.BinFeatures    = currentTree.GetBinFeatures();
+binAndOneHotFeaturesTree.OneHotFeatures = currentTree.GetOneHotFeatures();
+seenProj.insert(binAndOneHotFeaturesTree);
+for (const auto& ctr : currentTree.GetUsedCtrs()) { seenProj.insert(ctr.Projection); }
+
+for (const auto& baseProj : seenProj) {
+    if (baseProj.IsEmpty()) continue;
+    for each available categorical feature f {
+        if (isOneHot(f) || rand() > Rsm) continue;
+        TProjection proj = baseProj;  proj.AddCatFeature(f);
+        if (proj.IsRedundant() || proj.GetFullProjectionLength() > MaxTensorComplexity) continue;
+        if (addedProjHash.contains(proj)) continue;
+        addedProjHash.insert(proj);
+        AddCtrsToCandList(*fold, *ctx, proj, candList);
+    }
+}
+```
+
+Five facts, each load-bearing.
+
+**The base set is `{ the tree's bin+one-hot splits as ONE projection } union
+{ the projection of every CTR already used in the tree }`.** So the bases at
+depth `d` number at most `d + 1`. There is no enumeration over subsets of the
+tree's splits; the whole set of float and one-hot splits in the tree is a
+single base.
+
+**One categorical feature is added per step.** A projection therefore only
+grows by walking down the tree, and a combination of four categorical columns
+can only be reached if a combination of three was itself chosen as a split
+earlier in the same tree. That is the greedy in "greedy tensor search". It is
+NOT exhaustive to depth 4, and the folklore reading -- "CatBoost tries all
+4-way combinations" -- is wrong.
+
+**`GetFullProjectionLength` counts the bin/one-hot blob as ONE**
+(`projection.h:138`): `CatFeatures.size() + (BinFeatures.size() + OneHotFeatures.size() > 0 ? 1 : 0)`.
+So `max_ctr_complexity = 4` permits four categorical columns, or three
+categorical columns plus arbitrarily many float and one-hot splits.
+
+**`AddSimpleCtrs` and `AddTreeCtrs` run at EVERY depth**, not once per tree:
+`GreedyTensorSearchOblivious` (`:1189`) calls `SelectFeaturesForScoring` inside
+the depth loop, and `SelectDatasetFeaturesForScoring` (`:997-1008`) calls both.
+`AddTreeCtrs` is skipped only at depth 0, where `currentSplitTree` is empty and
+every base is empty.
+
+**Each surviving projection expands into several split candidates.**
+`AddCtrsToCandList` (`:400`) emits one candidate per
+`(ctrIdx, targetBorder, prior)`, i.e.
+`sum over descriptions of GetTargetBorderCount x priors.size()`. At the CPU
+defaults with a binary target that is `Borders: 1 x 3` plus `Counter: 1 x 1`,
+so **four candidates per projection**, exactly as A19's `ctr_feature_count`
+already computes for the simple case.
+
+Two smaller mechanisms are attached to the same loop and are worth recording
+because they are the reason the above is survivable at all.
+`TrimOnlineCTRcache` (`:65`) clears a fold's entire CTR cache once it holds
+more than `MAX_ONLINE_CTR_FEATURES = 50` projections, and it runs at the top of
+every `GreedyTensorSearch` (`:1907`). `SelectCtrsToDropAfterCalc` (`:580`)
+reads `NMemInfo::GetMemInfo().RSS` against `cpu_used_ram_limit` and marks
+candidate sublists to be dropped immediately after scoring. **Both make
+CatBoost's memory behavior depend on the machine's live RSS**, which is a thing
+mojotrees must not copy if determinism across machines is to mean anything.
+
+There is also a default override nobody documents. `catboost_options.cpp:1046`:
+
+```cpp
+if (CatFeatureParams->MaxTensorComplexity.NotSet() && IsSmallIterationCount(BoostingOptions->IterationCount)) {
+    CatFeatureParams->MaxTensorComplexity = 1;
+}
+```
+
+and `IsSmallIterationCount(n)` is `n < 200` (`catboost_options.h:88`). So **a
+default CatBoost fit with fewer than 200 iterations does not build combinations
+at all.** Any comparison harness that fits 100 trees and believes it is
+measuring `max_ctr_complexity = 4` is measuring 1.
+
+#### 3. `ctr_leaf_count_limit` and the top-K reindex
+
+`ComputeReindexHash(topSize, reindexHash, begin, end)`
+(`index_hash_calcer.cpp:171`) has three branches.
+
+1. `topSize > learnSize`: assign ids in first-seen scan order. This is the
+   default path, because `ctr_leaf_count_limit` defaults to `Max<ui64>()`
+   (`cat_feature_options.cpp:236`).
+2. otherwise, count frequencies first; if the distinct count is `<= topSize`,
+   assign ids by **iterating the hash table** (`for (auto& it : reindexHash) it.second = counter++`).
+   Same partition as branch 1, different labels.
+3. otherwise, `std::nth_element` the distinct hashes by descending frequency,
+   keep the first `topSize`, number them `0 .. topSize-1`, and map every other
+   hash to `reindexHash.Size() - 1`.
+
+Branch 3 has two properties that matter more than the mechanism.
+
+**The overflow bucket is the last KEPT bucket, not a fresh one.** The code
+writes `*hash = reindexHash.Size() - 1` (`:222`) where `reindexHash.Size()` is
+`topSize`. The header comment two files up says "map other hash values to value
+`reindexHash.Size()`" (`index_hash_calcer.h:42`), which would be a fresh
+`topSize + 1`-th bucket. **The comment and the code disagree**, the code wins,
+and the consequence is that every rare combination is merged into the least
+frequent of the *kept* buckets rather than into a bucket of its own. Read that
+twice before reproducing it.
+
+**`std::nth_element` is not stable and the comparator only looks at the
+count.** Two hashes with equal frequency at the `topSize` boundary are kept or
+dropped according to the standard library's partition, which differs between
+libstdc++ and libc++ and between versions of each. That is a portability hazard
+for us and not for CatBoost, whose contract does not include reproducing across
+machines.
+
+`topSize` is resolved at `online_ctr.cpp:689`:
+
+```cpp
+ui64 topSize = catFeatureParams.CtrLeafCountLimit;
+if (proj.IsSingleCatFeature() && catFeatureParams.StoreAllSimpleCtrs) { topSize = Max<ui64>(); }
+```
+
+so `store_all_simple_ctr` (default false) can exempt a single column and can
+**never** exempt a combination. This is the source-level confirmation of A19's
+claim that the top-K reindex is optional for a single column and not optional
+for a wide one.
+
+The bucket-space estimate CatBoost itself computes is at `:680-687`:
+
+```cpp
+size_t approxBucketsCount = 1;
+for (auto cf : proj.CatFeatures) {
+    approxBucketsCount *= uniqueValuesCount(cf);
+    if (approxBucketsCount > learnSampleCount) break;
+}
+rehashHashVal->MakeEmpty(Min(learnSampleCount, approxBucketsCount));
+```
+
+-- the product of the cardinalities, capped at the row count, and note that it
+ignores the bin and one-hot members, which can each multiply it by 2.
+
+#### 4. A combination is routed to `TreeCtrs` and inherits nothing
+
+`TCtrHelper::GetCtrInfo` (`ctr_helper.h:54`) is five lines:
+
+```cpp
+if (projection.IsSingleCatFeature()) {
+    const int featureId = projection.CatFeatures[0];
+    if (PerFeatureCtrs.contains(featureId)) { return PerFeatureCtrs.at(featureId); }
+    else { return SimpleCtrs; }
+}
+return TreeCtrs;
+```
+
+and `IsSingleCatFeature()` (`projection.h:102`) requires `BinFeatures.empty() &&
+OneHotFeatures.empty() && CatFeatures.size() == 1`. So **one categorical column
+plus one float split is already a `TreeCtrs` projection**, not a simple one.
+
+`InitCtrHelper` (`ctr_helper.cpp:59-114`) fills `SimpleCtrs` from
+`catFeatureParams.SimpleCtrs` and `TreeCtrs` from
+`catFeatureParams.CombinationCtrs`, two separate option lists
+(`cat_feature_options.h:85-86`), each carrying its own priors, its own
+`ctr_binarization` and its own `target_binarization`, each passed through the
+same `MakeCtrInfo` independently. CatBoost warns about exactly this, twice, in
+`SetCtrDefaults` (`catboost_options.cpp:455-460`):
+
+```
+"Change of simpleCtr will not affect combinations ctrs."
+"Change of combinations ctrs will not affect simple ctrs"
+```
+
+On the CPU the two default lists happen to be built with identical content --
+`{Borders with priors {0,0.5,1}, Counter with prior {0}}` for both -- because
+`CreateDefaultCounter` ignores its `EProjectionType` argument on the CPU
+(`:394-395`). On the GPU they genuinely differ: `FeatureFreq` with `MinEntropy`
+binarization for simple, `FeatureFreq` with `Median` binarization for
+combinations (`:398-414`), and `SetDefaultBinarizationsIfNeeded` (`:418`)
+re-applies that split to any user list. So the *routing* is real everywhere and
+the *values* differ only off the CPU defaults. An implementation that shares one
+description list is correct at the CPU defaults and silently wrong the moment a
+user sets `simple_ctr`.
+
+The complexity bound itself is validated at `cat_feature_options.cpp:266-275`:
+`CB_ENSURE(MaxTensorComplexity.Get() < GetMaxTreeDepth())` with
+`GetMaxTreeDepth() == 16` (`restrictions.h:14`), and
+`CB_ENSURE(CtrLeafCountLimit.Get() > 0)`.
+
+#### 5. Derived bounds, and the honest answer about 1M rows
+
+Every number in this section is a **derived bound** from the loop structure
+above. This lane has no clock and measured nothing.
+
+Let `C` be the number of categorical columns wide enough to escape one-hot
+(`uniqueValues > one_hot_max_size`, `greedy_tensor_search.cpp:469`), `D` the
+tree depth, `n` the learn row count, and `P` the number of split candidates one
+projection expands into (4 at the CPU defaults with a binary target).
+
+**Projections considered per tree.** At depth `d` there are at most `d + 1`
+non-empty bases, so `AddTreeCtrs` considers at most `(d + 1) * C` projections
+and `AddSimpleCtrs` a further `C`. Summing over `d = 0 .. D-1`:
+
+    projections per tree  <=  C * D * (D + 3) / 2
+
+which at `D = 6` is `27C` and at `D = 8` is `44C`. Redundancy rejection and the
+complexity cap only reduce it. Split candidates are `P` times that: `108C` at
+`D = 6` and the CPU defaults.
+
+**Work per projection per fold.** Hashing is `(|cat| + |bin| + |onehot|)`
+multiply-add folds over `n` rows; `ComputeReindexHash` is `n` hash probes plus,
+in the top-K branch, a sort of the distinct set; and each of the `P`
+`(border, prior)` pairs is one `O(n)` online pass writing `n` bucket indices.
+So a projection costs **at least `6n` element operations** at the defaults, and
+produces `4n` bytes of CTR column.
+
+**Per tree, at `n = 10^6`, `C = 10`, `D = 6`, complexity 4.**
+`27 * 10 = 270` projections, `270 * 6 * 10^6 = 1.6 * 10^9` element operations,
+and `270 * 4 * 10^6 = 1.1 GB` of CTR columns if none were dropped -- which is
+precisely why `MAX_ONLINE_CTR_FEATURES = 50` exists and why
+`SelectCtrsToDropAfterCalc` reads live RSS. For scale, the histogram build of a
+50-feature 1M-row depth-6 tree in this repo is on the order of
+`n * F * D = 3 * 10^8` element operations. **The combination CTRs are a derived
+~5x the entire rest of the tree, from ten categorical columns.** Over a
+1000-tree fit that is `~1.6 * 10^12` element operations spent on candidate
+features that mostly lose.
+
+**So, plainly: at 1M rows the default `max_ctr_complexity = 4` is not
+affordable in this repo and should not be the default here.** The derived
+bounds say so and no measurement is needed to see the order of magnitude.
+Complexity 1 costs `C` projections per tree -- `6 * 10^7` element operations at
+the numbers above, comfortably under the histogram budget -- and is the setting
+CatBoost itself silently selects for any fit under 200 iterations. Complexity 2
+costs `C * (D + 1)` per tree, roughly `4 * 10^8`, which is the same order as the
+histogram build and is the first setting that has to be paid for rather than
+absorbed.
+
+**The bucket-space bound.** A projection of `k` categorical columns with
+cardinalities `m_1 .. m_k` and `b` binarized members has a bucket space of
+`2^b * prod(m_i)`. Four columns of 1000 levels is `10^12`. The *realized*
+bucket count is bounded by `min(n, distinct observed)`, and that bound is the
+problem rather than the reassurance: as the realized count approaches `n`,
+every bucket's ordered prefix holds zero or one row, `CalcCTR` returns the pure
+prior almost everywhere, and the feature is noise with a constant. `ctr_leaf_count_limit`
+is the only mechanism that bounds it, and **it is off by default**
+(`Max<ui64>()`). CatBoost's actual defences against a degenerate wide
+projection are the complexity cap, the one-hot cutoff, and the fact that the
+CTR value is quantized into 16 buckets regardless. This is a real hole in the
+default configuration and it is worth saying out loud rather than porting
+silently.
+
+#### 6. What mojotrees built for A30
+
+`src/mojotrees/ctr_combinations.mojo`, a new file, **off by default and reached
+by nothing**, with `tests/test_ctr_combinations.mojo` beside it. It imports
+`.ctr` and `std` and nothing else, and `.ctr` imports only `.rng`, so the module
+stays outside the `efb -> binning -> tree_parameters_extra` cycle for the same
+reason A19's does. No existing default moved. Classification: **(3) bit-moving
+when on** -- it manufactures projections and features that did not exist -- and
+a no-op when off.
+
+Built, and matching the source above.
+
+- `BinSplit` and `OneHotSplit`, with `is_true` reproducing `IsTrueHistogram`
+  (`bin > split_idx`) and `IsTrueOneHotFeature` (`bin == value`).
+- `Projection`, with `TProjection`'s sorted inserts, `is_redundant`,
+  `is_empty`, `is_single_cat_feature`, `has_single_feature` and
+  `full_projection_length` -- including the rule that the whole bin/one-hot set
+  counts as one.
+- `cat_value_train` (`bin + 1`) and `cat_value_final` (the original hash, with
+  the `(int)` sign extension reproduced and documented), the two halves of the
+  categorical fold.
+- `projection_row_hash`, the whole of `CalcHashes` for one row, in CatBoost's
+  order: categorical, then float splits as a bit, then one-hot splits as a bit.
+- `projection_hashes`, the bulk column-driven form.
+- `compute_reindex_hash` and `update_reindex_hash`, the top-K machinery,
+  including the overflow-into-the-last-kept-bucket rule.
+- `projection_bucket_space_bound`, `approxBucketsCount` including the `2^b`
+  factor CatBoost's version drops.
+- `simple_ctr_projections`, `tree_base_projections`, `grow_tree_ctr_projections`
+  -- `AddSimpleCtrs` and `AddTreeCtrs` without the Rsm coin flip and without
+  the RSS-reading drop policy.
+- `ctr_candidates_per_projection` and `ctr_candidate_count_bound`, which
+  compute the `P` and the `C * D * (D + 3) / 2` of section 5 rather than
+  asserting them.
+- `CtrRouting` and `ctr_info_for_projection`, `GetCtrInfo`'s five lines, with
+  `CtrRouting.catboost_cpu_defaults()` building the two lists **independently**
+  so that changing one cannot change the other, and `ctr_routing_warning`
+  carrying CatBoost's two warning strings verbatim.
+- `resolve_max_ctr_complexity`, the `iterations < 200` override, and
+  `check_max_ctr_complexity`, the `1 <= v < 16` bound.
+- `check_ctr_combination_trainer_support`, the same honest "unreached" refusal
+  A19's `check_ctr_trainer_support` is.
+
+`src/mojotrees/ctr.mojo` changed in exactly one place: `check_ctr_complexity`
+no longer refuses above 1. It now enforces CatBoost's own `1 <= v < 16` and
+points at this module. That was the guard A19 left for this lane to delete and
+it is the only edit to that file's behavior.
+
+**Divergences, deliberate and recorded.**
+
+1. **Enumeration order is canonical, not hash-set order.** CatBoost iterates
+   `seenProj`, a `THashSet<TProjection>`, so the order in which bases are
+   expanded is the table's bucket order. Ours sorts bases and candidates by
+   `TProjection::operator<`'s own key (cat features, then bin splits, then
+   one-hot splits, lexicographically) and emits in that order. The *set* of
+   candidates is identical; only the order is, and the order is what a
+   tie-breaking `SelectBestCandidate` would see. Ours does not depend on a
+   hash table's layout, so it is identical across `MOJOTREES_NUM_WORKERS` and
+   across machines. This is `ctr_permutation`'s keyed-sort discipline applied
+   to a different object.
+2. **The top-K tie-break is a total order, not `nth_element`.** Distinct hashes
+   are ordered by `(count descending, hash ascending)` with a stable merge
+   sort. The hashes are distinct by construction, so the key is a strict total
+   order and the kept set is the same on every machine and every standard
+   library. CatBoost's `nth_element` is not, and this is the one place where
+   matching CatBoost would cost us the determinism claim.
+3. **Bucket ids in the under-limit branch are first-seen order.** CatBoost's
+   branch 2 numbers them in hash-table iteration order. The partition is
+   identical; only the labels differ, and first-seen order makes branch 1 and
+   branch 2 agree with each other, which CatBoost's do not.
+4. **The overflow bucket rule IS reproduced**, `top_size - 1`, the last kept
+   bucket, because it changes which rows share a statistic and is therefore
+   behavior rather than labelling. It is reproduced with the discrepancy
+   against `index_hash_calcer.h:42` written into the docstring so nobody
+   "fixes" it by accident.
+5. **No Rsm coin flip and no RSS-driven dropping.** `AddSimpleCtrs` and
+   `AddTreeCtrs` each consult `ctx->LearnProgress->Rand.GenRandReal1() > Rsm`
+   per feature per level, off the run's single advancing RNG, so CatBoost's
+   candidate set for a given tree depends on every draw any earlier tree made.
+   Reproducing that would forfeit the determinism this repo requires, and
+   feature sampling in mojotrees already has its own keyed-stream mechanism.
+   The enumeration here returns the full candidate set and a sampler is the
+   caller's business. `SelectCtrsToDropAfterCalc` reads
+   `NMemInfo::GetMemInfo().RSS`, which makes CatBoost's answer depend on what
+   else is running on the machine; it is not ported and should never be.
+6. **`max_ctr_complexity` still defaults to CatBoost's 4 in `CtrParams`, and
+   the whole module is off.** Section 5's bound says 4 is unaffordable at 1M
+   rows. Changing the recorded CatBoost default would make a ported
+   configuration read differently from the configuration it was ported from,
+   which is worse; the place to state the position is the wiring lane's
+   default, and this note is the argument it should cite.
+
+**Not built, deliberately.** The Rsm coin flip and the RSS drop policy (item 5
+above); `PerFeatureCtrs`, which `GetCtrInfo` consults ahead of `SimpleCtrs` and
+which is a per-feature option surface rather than a mechanism; the actual
+`ComputeOnlineCTRs` call over a combination, which is A19's four loops taking
+this module's bucket ids as their `categories` argument and needs no new code
+here, only a caller; and the tree-level CTR cache with its 50-projection trim,
+which is a caching policy for a trainer that does not exist yet.
+
+#### Appendix: `ctr_target_border_count` and MinEntropy, for scoping
+
+Not this lane's territory (A15's), asked for as a scoping question, and the
+answer is: **the orchestrator's reading is correct, and the fix is much smaller
+than 500 lines at the default.**
+
+The two are genuinely different at one border. The greedy's
+`TWeightedFeatureBin::UpdateBestSplitProperties` (`binarization.cpp:1473-1493`)
+computes the weighted-median position `lb` by `LowerBound` on the cumulative
+weights and then scores **exactly two** candidate cuts, `lb` and `lb + 1`:
+
+```cpp
+const double scoreLeft  = CalcSplitScore(lb);
+const double scoreRight = CalcSplitScore(ub);   // ub = lb + 1
+BestSplit = scoreLeft >= scoreRight ? lb : ub;
+```
+
+The exact binarizer runs the banded DP at `binarization.cpp:193`. But at
+`maxBordersCount = 1` that DP does not run its main loop at all: `bins = 2`, the
+loop is `for (l = 0; l < bins - 2; ++l)`, and the whole computation collapses to
+the "Last match" block at `:630-667`. Written out, with `W` the cumulative
+weights of the `k` distinct target values and `P(w) = w * log(w + 1e-8)`
+(`:175`), it is:
+
+    threshold = argmin over i in [0, k-2] of  P(W[i]) + P(W[k-1] - W[i])
+    ties keep the smallest i        (the comparison at :649 is strict `<`)
+    border    = (values[t] + values[t+1]) / 2                    (:691)
+
+That is a **linear scan over the distinct target values, about ten lines**, not
+a dynamic program. The weights are the counts of each distinct target value
+(`SelectBorders` -> `BestSplit` -> `TExactBinarizer` ->
+`SplitWithGuaranteedOptimum` -> `BestSplit<float, type>(weight, 1, thresholds,
+E_RLM2)`), and `MinEntropy`'s argmin is invariant under scaling the weights, so
+the normalization question does not arise.
+
+**What it would take**, as a scoping estimate: implementing exact `MinEntropy`
+*restricted to one border* is ten lines plus a test, and it is the only case a
+default CTR comparison needs, since `ctr_target_border_count` defaults to 1.
+Implementing it for `borderCount >= 2` is the real DP -- `E_RLM2`'s
+divide-and-conquer band at `:560-627`, plus `E_Base`/`E_Base2`/`E_Linear_2L`
+/`E_DaC` which are alternative modes of the same recurrence -- and only the one
+mode CatBoost actually calls (`E_RLM2`) needs porting, which is roughly seventy
+lines. So the honest scope is: **one border, ten lines, unblocks the default
+comparison; all borders, one DP mode, ~seventy lines.** Neither is 500. It
+belongs to whichever lane owns `binning.mojo`'s `check_border_type`, which is
+not this one, and the `BORDER_MIN_ENTROPY` refusal is left standing here.
