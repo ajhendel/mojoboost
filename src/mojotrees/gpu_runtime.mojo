@@ -19,6 +19,7 @@ that outlives a single `fit`:
   data cannot silently reuse stale bins.
 - `StagingRing` rotates pinned staging slots so the host can convert the
   next round's gradients while the previous round's copy is still in flight.
+  On Metal no copy is ever still in flight; see the note on its struct.
 - `HazardTracker` is the dependency model. It is the piece that matters.
 - `PhaseCounters` attributes time to compile, allocation, transfer, kernel,
   synchronization, and cleanup phases.
@@ -55,6 +56,19 @@ synchronization clears every resource at once; that is why the tracker
 counts *elided* checks separately from *required* ones. An elided check is
 a place where today's code synchronizes unconditionally and the model says
 it did not have to.
+
+One backend fact the model does not encode, and must not be read as denying.
+On Metal `enqueue_copy` is itself a synchronous full-queue drain in both
+directions, measured by disassembly of the shipped runtime and recorded in
+`docs/GPU_PORTABILITY.md` section 6.1. Two things follow for anyone reading
+this model's output on that backend. A copy is a synchronization whether or
+not the model was told to record one, so a per-round upload is a per-round
+wait and belongs in any count of them. And the second hazard class above,
+the host about to overwrite a staging buffer a copy may still be reading, is
+vacuous there, so an elided check the tracker reports against `RES_STAGE` is
+not a wait anyone could have removed. The model stays written against queue
+ordering rather than against Metal, which is what makes it portable and what
+makes it conservative in the safe direction.
 
 Nothing in this file removes a synchronization from histogram_gpu.mojo or
 train_gpu.mojo, and nothing here has been measured. It is the model and the
@@ -465,6 +479,18 @@ struct StagingRing(Copyable, Movable):
     way means the ring cannot disagree with the hazard tracker about what
     the device has finished, which a second set of flags would eventually
     manage to do.
+
+    **On Metal this ring can never save a wait, and the count above is the
+    reason.** `enqueue_copy` there is a synchronous full-queue drain in both
+    directions, measured by disassembly of the shipped runtime and recorded
+    in `docs/GPU_PORTABILITY.md` section 6.1. A copy that has already
+    drained the queue is retired the instant it returns, so `pending()` is
+    False for every slot on every call and `MOJOTREES_GPU_STAGING_SLOTS`
+    above 1 changes nothing observable. The ring is kept because it is
+    correct, cheap, and the right model for a backend where the copy is
+    asynchronous, and because it is the bookkeeping a removal would have to
+    be argued from. What must not be claimed is a Metal speedup from turning
+    it up.
     """
 
     var n_slots: Int

@@ -59,6 +59,26 @@ seventeen leaves pays fourteen rounds of kernels that read one word each.
 That is the price of not knowing, on the host, how many splits there will be,
 and it is deliberately preferred to the alternative, which is asking.
 
+The queue this stream goes into is 64 deep
+------------------------------------------
+Ten launches a step over thirty-one steps, plus about five per tree, is on
+the order of 315 command buffers between waits, because on Metal every
+`enqueue_function` becomes its own single-encoder command buffer. The queue
+holds 64 of them: MAX creates it with a bare `newCommandQueue` and never
+sets `maxCommandBufferCount`, which was measured by disassembling the
+shipped runtime and is recorded with its consequences in
+`docs/GPU_PORTABILITY.md` section 6.2. So this loop does not fly; it fills
+the queue and then runs at one in and one out, which is a derived bound from
+that depth and this launch count, and is not a measurement.
+
+That is not fatal and nothing is dropped. What it means for anyone measuring
+this plane is that **enqueue time has to be timed separately from wall
+time**. A queue-full stall blocks the host inside `objc_msgSend`, which
+every instrument this repository has counts as enqueue with no attribution,
+so it will read as the device getting slower when it is the host being held.
+The Metal timeline that motivated this module is the instrument that can see
+it, from outside the process.
+
 What day one supports, and what falls back
 ------------------------------------------
 The scope for the first version is dense numeric features, a single output,
@@ -433,12 +453,25 @@ def grow_tree_device_resident(
     all this lane is allowed to do:
 
     - **one**, the `download` at the end.
-    - plus one inside `GpuActiveRows.begin_tree` when the tree is bagged,
-      which drains the queue before it refills the row staging buffer. The
-      caller made that call, not this function.
+    - plus the per-tree table crossing in `searcher.enqueue_frontier` below,
+      which is one drain on Metal: `enqueue_copy` there is a synchronous
+      full-queue drain in both directions, measured by disassembly and
+      recorded in `docs/GPU_PORTABILITY.md` section 6.1. This function makes
+      that call.
+    - plus **two** inside `GpuActiveRows.begin_tree` when the tree is
+      bagged: its explicit `synchronize` before it refills the row staging
+      buffer, and the bag upload itself, which drains again. The caller made
+      that call, not this function.
     - plus whatever the caller's round does outside the tree, which is
-      unchanged: the gradient computation, and for a custom objective its
+      unchanged and is not free: the gradient computation, its
+      `upload_staged` (two more drains, one per plane, every round), a GOSS
+      row and scale upload where that is on, and for a custom objective its
       host callback.
+
+    So the honest headline is one wait per tree *inside this loop*, against
+    a round that still contains a handful outside it. Staging that does not
+    change per round should move to per fit; staging that must change per
+    round is named above so it is counted rather than assumed away.
 
     The shipping loop's count for comparison, at the same leaf budget: one
     per split from `download_frontier`, plus one for the root's search, which

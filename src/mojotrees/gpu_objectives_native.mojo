@@ -718,7 +718,13 @@ struct GpuObjectiveState(Movable):
     """Pinned staging for the node-value table. `map_to_host` copies in both
     directions on every use and blocks (the reasoning is written out in
     histogram_gpu.mojo), so the per-tree upload goes through an ordinary
-    one-way asynchronous copy out of this buffer instead."""
+    one-way copy out of this buffer instead.
+
+    One-way, not asynchronous. On Metal `enqueue_copy` is a synchronous
+    full-queue drain in both directions, measured by disassembly and
+    recorded in `docs/GPU_PORTABILITY.md` section 6.1, so what this buys
+    over the mapping is the second direction's bytes and not the wait. The
+    wait is still there, once per tree."""
     var stage_step: HostBuffer[DType.float32]
     """Pinned staging for `step_dev`, on the same grounds."""
     var stage_seg: HostBuffer[DType.int32]
@@ -1059,17 +1065,26 @@ struct GpuObjectiveState(Movable):
         """Upload the tree's node values through pinned staging.
 
         This replaces a `map_to_host` on `value_dev`. The two are not the
-        same transfer: a mapping is bidirectional and blocks until the
-        device is idle, so it cost a hidden host synchronization every time
-        it was opened, once per tree here. A staged copy is one-way and
-        asynchronous, which is the convention histogram_gpu.mojo documents
-        and the split searcher already follows for its per-node tables.
+        same transfer: a mapping is bidirectional, so it moved the buffer
+        both ways every time it was opened. A staged copy is one-way, which
+        is the convention histogram_gpu.mojo documents and the split
+        searcher already follows for its per-node tables.
 
-        The staging contract that buys is the usual one: the pinned buffer
-        must not be rewritten while a copy out of it is in flight. It is
-        rewritten once per tree, and the next tree's growth blocks on the
-        device well before it reaches this point (the round's magnitude
-        reduction alone synchronizes), so the copy has long retired.
+        One-way is the whole difference on Metal, and the earlier version of
+        this docstring claimed more. It said the staged copy was
+        asynchronous where the mapping blocked. It is not: on Metal
+        `enqueue_copy` is a synchronous full-queue drain in both directions,
+        measured by disassembly of the shipped runtime and recorded in
+        `docs/GPU_PORTABILITY.md` section 6.1. So this call still costs one
+        host synchronization per tree, exactly as the mapping did, and a
+        wait budget for a round has to carry it.
+
+        The staging contract is the usual one and is kept for the backend
+        where the copy really is asynchronous: the pinned buffer must not be
+        rewritten while a copy out of it is in flight. It is rewritten once
+        per tree, and the next tree's growth blocks on the device well
+        before it reaches this point (the round's magnitude reduction alone
+        synchronizes), so the copy has long retired.
 
         Words past `len(values)` are whatever the previous tree left, which
         is exactly what the mapping left there too: no kernel reads a node

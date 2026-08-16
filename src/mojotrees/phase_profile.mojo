@@ -173,13 +173,25 @@ integer parse would turn a typo into a default:
 - unset, `0`, or `off` -- off, and the run is the run that shipped.
 - `1` or `async` -- on, with no fences added. This is the honest default
   because it perturbs nothing. On the host every phase is synchronous and the
-  clocks mean what they say. On the device the queue is in order and
-  asynchronous, so a phase's clock measures the host-side enqueue plus
-  whatever device execution happened to drain into it, and the phase that
-  waits (the download) absorbs the rest. That is not a defect for the
-  question being asked -- if the small-node tail is launch-bound, enqueue time
-  and dispatch count are precisely the evidence -- but a reader must not read
+  clocks mean what they say. On the device the queue is in order and kernel
+  launches are asynchronous, so a phase's clock measures the host-side
+  enqueue plus whatever device execution happened to drain into it, and the
+  phases that wait absorb the rest. That is not a defect for the question
+  being asked -- if the small-node tail is launch-bound, enqueue time and
+  dispatch count are precisely the evidence -- but a reader must not read
   `PROF_HISTOGRAM` on a device arm under `async` as device accumulation time.
+
+  Two Metal-specific corrections to that picture, both measured by
+  disassembly and written out in `docs/GPU_PORTABILITY.md` section 6. First,
+  the download is not the only phase that waits: `enqueue_copy` is a
+  synchronous full-queue drain in *both* directions, so every upload charged
+  to `PROF_TRANSFER` is a wait too, and an `async` profile on Metal is
+  already partly fenced by its own uploads. Second, a launch stream longer
+  than 64 command buffers backpressures inside `objc_msgSend`, which this
+  profiler counts as enqueue time with no attribution, so a rising enqueue
+  clock on a long unwaited stream is the host blocking and not the device
+  slowing down. Neither is a reason to distrust the counters; both are
+  reasons not to read a clock as device time.
 - `fenced` -- on, and the device growers drain the queue after the partition
   and after the histogram enqueue so each phase's clock closes over its own
   device execution. This buys per-phase device time and pays two extra host

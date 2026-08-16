@@ -1530,12 +1530,22 @@ def _device_search_resident(
         dispatches=SPLIT_SEARCH_DEVICE_LAUNCHES,
         cells=builder.n_features * builder.n_bins,
     )
-    # The batch's one wait. `download_frontier` copies the record buffer and
-    # synchronizes inside the same call, so this charge is the copy and the
-    # wait together and the sync count is what separates them. Under `async`
-    # this is also where every kernel enqueued since the last wait actually
-    # finishes, which is why a device arm's `transfer` line is large and its
-    # `histogram` line is small: see the mode note in phase_profile.mojo.
+    # The batch's one *download*. `download_frontier` copies the record
+    # buffer and synchronizes inside the same call, so this charge is the
+    # copy and the wait together and the sync count is what separates them.
+    # Under `async` this is also where every kernel enqueued since the last
+    # wait actually finishes, which is why a device arm's `transfer` line is
+    # large and its `histogram` line is small: see the mode note in
+    # phase_profile.mojo.
+    #
+    # Not the batch's one wait, which is what this comment used to say. The
+    # `enqueue_frontier` above copies four staged tables across first, and on
+    # Metal each of those is itself a full-queue drain (measured by
+    # disassembly, docs/GPU_PORTABILITY.md section 6.1). So the batch costs
+    # four upload waits and this one download wait, and only the download is
+    # charged with `syncs=1` because only the download calls `synchronize`
+    # by name. A wait count taken from this profile is a count of explicit
+    # synchronizations, not of times the host blocked.
     var root_dl_started = profile.clock()
     var root_recs = searcher.download_frontier(1)
     profile.charge(PROF_TRANSFER, n_root, root_dl_started, syncs=1)

@@ -1,6 +1,6 @@
 # GPU portability contract
 
-Written: 2026-08-14
+Written: 2026-08-14. Section 6 added 2026-08-15.
 
 mojotrees has one GPU source. `docs/GPU_VALIDATION.md` states that
 commitment and holds the record of what has actually run on hardware. This
@@ -240,7 +240,201 @@ most likely to differ first on a backend whose atomics or scheduling differ,
 which is why `docs/GPU_VALIDATION.md` gates every timing behind a
 determinism check.
 
-## 6. Gates and environment variables
+**Queue ordering is not the whole synchronization contract on Metal.**
+Section 6 records two things Metal provides differently from what the code
+above was written against. Both were established this week and neither had
+been written down anywhere in this repository.
+
+## 6. Two Metal facts established by disassembly
+
+Everything else in this document is either what an API specifies or what the
+code in this tree does. This section is a third kind of thing: what one
+backend's shipped implementation actually does, read out of the binary. The
+provenance vocabulary is the one the rest of the project now uses, stated
+each time, because the unusual part here is that both facts are **measured**
+without a clock. A disassembly is a measurement of the code that runs. It is
+exact for the build it was taken from, it says nothing about the next build,
+and it is not a timing.
+
+Neither fact is a defect in MAX and neither is a reason to stop using it.
+Both change what a design is allowed to assume, which is the only reason
+they are in this document rather than in a benchmark report.
+
+### 6.1 `enqueue_copy` is a synchronous full-queue drain in both directions
+
+**What it is.** On Metal, `DeviceContext.enqueue_copy` blocks the calling
+thread until the whole queue has drained, and then copies. Host to device as
+well as device to host. The name says enqueue and the code waits.
+
+**How it was established. Measured**, by disassembling the shipped MAX Metal
+runtime (`libMGPRT.dylib`). `enqueueCopyToDevice` and `enqueueCopyFromDevice`
+have the identical body, and it is not an enqueue:
+
+```
+[queue commandBuffer]      ; an empty command buffer, no encoder
+[cmdbuf commit]
+[cmdbuf waitUntilCompleted]
+memcpy                     ; host memcpy against the shared MTLBuffer
+```
+
+`enqueueSetMemory` and `synchronize` have the same shape, so
+`enqueue_memset` is a drain too. Those empty command buffers are visible
+from outside the process as well: `docs/METAL_TIMELINE.md:174` counted 3,225
+command buffers carrying no work beside the 22,107 carrying work, which it
+recorded without explaining. That is the same fact **measured** a second
+way, by an instrument that never saw the binary.
+
+**What this is not.** It is not a claim about CUDA or HIP. Those APIs
+specify an asynchronous copy family, and nothing in this repository has
+established what MAX does on top of them. Their behavior here is
+**unestablished**, which is different from asynchronous, and a design that
+needs an asynchronous upload has to establish it before relying on it.
+
+**What in this repository assumes otherwise.** Docstrings that state the
+opposite have been corrected in place and are listed in the commit that adds
+this section. What could not be corrected by editing a comment:
+
+- `gpu_runtime.StagingRing` exists to let the host convert round `i+1`'s
+  gradients while round `i`'s copy is still in flight. On Metal no copy is
+  ever still in flight, so the ring's second slot can never be the thing
+  that avoids a wait, and `MOJOTREES_GPU_STAGING_SLOTS` above 1 buys nothing
+  on this backend. The ring is correct, cheap, and portable, and it should
+  stay; what is wrong is the expected value of turning it up.
+- `HazardTracker`'s host-write hazard class (the host is about to overwrite
+  a staging buffer whose copy may still be reading it) is vacuous on Metal
+  for the same reason. The model is still the right model, because it is
+  written against queue ordering rather than against Metal, and it is
+  conservative in the safe direction. But an "elided check" it reports
+  against a staging buffer is not a synchronization anyone could have
+  removed, since the copy that follows drains anyway.
+- Every `ctx.synchronize()` that immediately follows an `enqueue_copy` with
+  no enqueue in between is redundant on Metal. It is what keeps the code
+  correct on a backend where the copy really is asynchronous, so it should
+  stay. What must stop is counting it as a second wait: on Metal it is free
+  and the copy before it was not.
+
+**What a design must do about it.**
+
+1. **Count every copy as a synchronization, in both directions.** The wait
+   is the cost and it does not scale with the byte count. A design that
+   removed thirty-one downloads per tree and left one upload per round did
+   not remove thirty-one waits per tree.
+2. **Stage per fit wherever the data does not change per round.** The binned
+   matrix already does this. The per-node parameter tables, the feature set,
+   the allow mask, the monotone vector and the categorical parameters are
+   per-tree or per-fit constants under the common configuration and should
+   cross once, not per node and not per batch.
+3. **Where a stage must change per round, say so and count it.** The
+   per-round stages that exist today are the gradient and hessian planes,
+   the bag mask on a bagged tree, the GOSS row and scale vectors, the
+   per-round fixed-point scale words, and the per-tree node value and step
+   tables. Each is one drain. A round's wait budget is not complete until
+   all of them are in it.
+4. **A device-resident control plane states a wait count, so the count has
+   to include what crossed before the loop started.** One wait per tree plus
+   one bag-mask upload per tree is two, and it should be written as two.
+5. **Do not argue for new pinned staging buffers on Metal grounds.** One
+   buffer per destination is fine and costs nothing, but the argument that a
+   shared buffer would force a drain between copies is vacuous when every
+   copy has already drained. The argument is a portability argument, not a
+   Metal one.
+
+### 6.2 The command queue is 64 command buffers deep and MAX never raises it
+
+**What it is.** One Metal command queue per `DeviceContext`, created once,
+holding at most 64 command buffers in flight, with no MAX-level knob,
+environment variable, or `DeviceContext` parameter that changes it. And one
+command buffer per launch: there is no encoder batching anywhere on this
+path, so 64 in flight means 64 launches in flight.
+
+**How it was established. Measured**, by reading how MAX creates its queue
+in the same shipped runtime. The queue is created with a bare
+`[device newCommandQueue]` (`MetalDeviceContext.cpp:397`). The two selectors
+that would raise the limit, `newCommandQueueWithMaxCommandBufferCount:` and
+`setMaxCommandBufferCount:`, have zero load sites anywhere in the 38.6 MB
+binary, and no `MTLCommandQueueDescriptor` is constructed on that path. So
+Apple's default of 64 applies by absence, which is a stronger reading than a
+constant would have been: there is no code that could set it to anything
+else.
+
+The one-buffer-per-launch half is **measured** from the same disassembly.
+`enqueueFunctionExecDirect` is a closed sequence: `[queue commandBuffer]`,
+`computeCommandEncoder`, `setComputePipelineState:`, the argument loop,
+`dispatchThreadgroups:`, `endEncoding`, `commit`. One buffer, one encoder,
+one dispatch, committed immediately, per `enqueue_function`, with no seam to
+batch at. `docs/METAL_TIMELINE.md:174` observed the same thing from outside
+the process: 22,107 command buffers carrying work, one encoder each.
+
+**What happens when it fills is a derived bound, not a measurement.** Apple
+documents that `MTLCommandQueue.commandBuffer` blocks the calling thread
+when the queue is full rather than returning nil, so MAX's null check never
+fires and no error is raised. From that plus the 64, the steady state is
+**derived**: 64 launches go in, the host blocks on the 65th until the first
+completes, and thereafter the stream runs at one in and one out. That is a
+throttled pipeline and not a queue overrun. Nothing is dropped and nothing
+fails. No one has measured it on this hardware.
+
+**The stall is invisible to every instrument in this repository.** The block
+happens inside `objc_msgSend`, which `phase_profile.mojo`, `PhaseCounters`
+in `gpu_runtime.mojo`, and any wall-clock benchmark all count as host enqueue
+time with no attribution. In a Metal System Trace it lands in the
+"completion signal to next commit" bucket that `docs/METAL_TIMELINE.md`
+already lists as uninvestigated host code. This is **derived** from where
+the block occurs, not observed.
+
+**What in this repository assumes otherwise.**
+
+- `docs/design/CLEANSHEET_GPU.md:279` reasons that 187 command buffers
+  submitted back to back with no `synchronize()` behave like one. Up to 64
+  they do.
+- `gpu_resident_round.mojo` enqueues about ten launches per split (commit,
+  stage the search, three partition, two child histogram, two search, file
+  the records) over `num_leaves - 1` splits, plus roughly five per tree.
+  At the default 32-leaf budget that is on the order of 315 launches between
+  waits, which is nearly five times the depth. **Derived bound**, from the 64
+  and from a launch count read off the source; not measured.
+- `hybrid_leaf_scheduler.HybridCosts.launch_nanos` is documented as the
+  fixed cost of enqueuing and running one histogram kernel. Under
+  backpressure the enqueue half is not fixed: it is zero while the queue has
+  room and the completion time of an older buffer once it does not. A cost
+  model calibrated on a short launch stream will underestimate a long one.
+
+**What a design must do about it.**
+
+1. **Measure enqueue time separately from wall time.** Without that split, a
+   queue-full stall reads as "the GPU got slower" when it is the host being
+   blocked, and the two call for opposite fixes.
+2. **Bound any "N launches with no host wait" claim at 64 on Metal, and say
+   so in the same sentence.** The claim is still worth making. It is the
+   count that has to be honest.
+3. **Compose the two facts before counting.** A copy in the middle of a
+   launch stream drains the queue, so the usable depth is not 64 launches
+   per tree, it is 64 launches between copies. A per-round upload resets the
+   pipeline as well as costing its own wait.
+4. **Expect no assist.** MAX exposes no asynchronous copy on Metal,
+   `"Metal stream not implemented"` is a literal string in the runtime so
+   there is no second queue to overlap with, and there is no
+   `MetalDeviceGraphBuilder` although `CUDADeviceGraphBuilder` and
+   `HIPDeviceGraphBuilder` both ship. Whatever pipelining a design wants on
+   this backend, it takes from the 64-deep queue alone.
+
+### 6.3 What each backend provides, on these two points
+
+| Requirement | Metal | CUDA | HIP |
+|---|---|---|---|
+| `asynchronous-host-to-device-copy` | **no**, measured by disassembly | unestablished; the API specifies one, MAX's use of it has not been read | unestablished, same reason |
+| `asynchronous-device-to-host-copy` | **no**, measured by disassembly | unestablished | unestablished |
+| `queue-depth` | 64 command buffers, one per launch, measured by disassembly; not raisable | unestablished | unestablished |
+| `second-queue-or-stream` | none, `"Metal stream not implemented"` in the runtime | unestablished | unestablished |
+| `capture-and-replay` | none, no `MetalDeviceGraphBuilder` | `CUDADeviceGraphBuilder` ships; never exercised here | `HIPDeviceGraphBuilder` ships; never exercised here |
+
+"unestablished" is deliberately not "specified" here. Section 1's table can
+say "specified" because it is quoting what an API documents about a kernel
+primitive. These rows are about what the runtime *does* between the API and
+the device, which is exactly the layer where Metal turned out to differ, so
+quoting the API would be the wrong kind of answer.
+
+## 7. Gates and environment variables
 
 | Gate | Refuses |
 |---|---|
@@ -288,7 +482,7 @@ The second follows `MOJOTREES_GPU_TRANSFER_UNPROVEN` in
 gate can only be produced by running the thing the gate blocks, so without
 an override the gate is unsatisfiable by construction.
 
-## 7. Specialization points, and why none is taken
+## 8. Specialization points, and why none is taken
 
 Each of these is a place a backend could diverge without forking the source.
 None is enabled anywhere, on any backend, because none has been measured on
@@ -309,7 +503,7 @@ implementation of the same arithmetic sits next to it producing the
 identical integers. The portable implementation is the definition. The fast
 path is an optimization that has to reproduce it.
 
-## 8. Per-backend notes
+## 9. Per-backend notes
 
 `docs/NVIDIA_GPU.md` and `docs/AMD_GPU.md` carry what to expect and what to
 check first on each. `docs/GPU_VALIDATION.md` carries the procedure that

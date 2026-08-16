@@ -80,6 +80,20 @@ reports: `stage_gradients` (Float64 to Float32 conversion), `upload_staged`
 (host to device), `enqueue_leaf` (kernels), `download_raw` (device to host),
 and `histogram_from_host` (fixed-point to Float64 conversion).
 
+One-way is the whole claim, and in particular it is not a claim that the
+upload is asynchronous. On Metal `enqueue_copy` is a synchronous full-queue
+drain in **both** directions: it commits an empty command buffer, waits for
+it, and then memcpys. That was measured by disassembling the shipped MAX
+Metal runtime and is written out with its consequences in
+`docs/GPU_PORTABILITY.md` section 6.1. So `upload_staged` is a host
+synchronization exactly as `download_raw` is, the `stage_gradients` and
+`upload_staged` split above is a split between host conversion work and a
+wait rather than between two enqueues, and any per-round staging (gradients,
+a bag mask, a GOSS row vector, a scale word) is a per-round wait that has to
+be counted as one. What the staged route still buys over `map_to_host` is
+the second direction's bytes and a separately timeable phase, which is why
+it stays.
+
 Which transfer route the binned matrix takes is resolved once per builder
 through `unified_memory_policy.resolve_from_env`, so `MOJOTREES_GPU_TRANSFER`
 is answered by the one route policy in the package rather than ignored here.

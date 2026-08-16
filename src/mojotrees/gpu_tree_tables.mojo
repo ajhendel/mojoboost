@@ -1404,20 +1404,31 @@ struct DeviceTreeTables(Movable):
     # get a pointer. Eight words. It is never read by any other kernel.
     var step_scratch: DeviceBuffer[DType.int32]
 
-    # Pinned staging, so a reset and a download are ordinary asynchronous
-    # copies rather than `map_to_host` mappings, each of which blocks until
-    # the device is idle. The same choice `GpuSplitSearcher` makes for its
+    # Pinned staging, so a reset and a download are ordinary one-way copies
+    # rather than `map_to_host` mappings, each of which moves the buffer in
+    # both directions. The same choice `GpuSplitSearcher` makes for its
     # per-node tables and for the same measured reason.
     #
-    # One staging buffer per destination rather than one shared buffer, which
-    # matters more than it looks. An enqueued copy reads its source
-    # asynchronously, so a shared buffer forces a `synchronize` between every
-    # pair of copies before the host may refill it, and a `begin_tree` that
-    # writes five tables then costs five drains instead of one. That is the
-    # opposite of what this whole module is for, and it is not a theoretical
-    # cost: on an Apple M4 the five-drain form of `begin_tree` and a
-    # five-drain `stage_frontier` were together the dominant cost of the
-    # test file, well above the kernel they existed to set up.
+    # One staging buffer per destination rather than one shared buffer. The
+    # argument for that used to be that an enqueued copy reads its source
+    # asynchronously, so a shared buffer would force a `synchronize` between
+    # every pair of copies before the host could refill it, and a
+    # `begin_tree` writing five tables would cost five drains instead of
+    # one. On Metal that argument does not hold: `enqueue_copy` is itself a
+    # synchronous full-queue drain in both directions (measured by
+    # disassembly of the shipped runtime, `docs/GPU_PORTABILITY.md` section
+    # 6.1), so five copies are five drains whatever memory they read, and a
+    # shared buffer would have added no wait that was not already there.
+    #
+    # The separate buffers stay, for two reasons that survive. They are what
+    # makes this correct on a backend where the copy really is asynchronous,
+    # and they cost nothing. What does not survive is the expected saving on
+    # Metal, and this note deliberately stops short of reinterpreting the
+    # M4 measurement it replaces: that measurement was taken, it was real,
+    # and nobody has re-taken it knowing that both forms drain five times.
+    # Until someone does, treat the separate buffers as free and portable
+    # rather than as a wait that was removed. A design that wants fewer
+    # drains has to stage fewer times, not stage into more places.
     var stage_front: HostBuffer[DType.int32]
     var stage_node_i: HostBuffer[DType.int32]
     var stage_node_f: HostBuffer[DType.float32]

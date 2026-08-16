@@ -2590,9 +2590,15 @@ struct GpuSplitSearcher(Movable):
     var rec_i_dev: DeviceBuffer[DType.int32]
     var rec_f_dev: DeviceBuffer[DType.float32]
     # Pinned staging for the per-node tables, so a node's parameters upload
-    # as an ordinary asynchronous copy rather than through `map_to_host`,
-    # which synchronizes on every use. One slot per record: see the staging
-    # contract above.
+    # as an ordinary one-way copy rather than through `map_to_host`, which
+    # moves the buffer both ways on every use. One slot per record: see the
+    # staging contract above.
+    #
+    # One-way, not asynchronous. On Metal `enqueue_copy` is a synchronous
+    # full-queue drain in both directions (measured by disassembly,
+    # `docs/GPU_PORTABILITY.md` section 6.1), so an upload here is a host
+    # synchronization and the copies below have to be counted as waits, not
+    # as enqueues.
     var stage_node: HostBuffer[DType.int32]
     var stage_feat: HostBuffer[DType.int32]
     var stage_allow: HostBuffer[DType.int32]
@@ -2787,9 +2793,13 @@ struct GpuSplitSearcher(Movable):
             var dst = host.unsafe_ptr()
             for f in range(n_features):
                 dst.unsafe_store(f, Int32(MONOTONE_FREE))
-        # The three table copies above are asynchronous out of pinned
-        # buffers those tables reuse every node, so the session starts with
-        # them retired rather than in flight.
+        # The three table copies above read pinned buffers those tables
+        # reuse every node, so the session starts with them retired rather
+        # than in flight. On Metal each copy already drained the queue
+        # (`docs/GPU_PORTABILITY.md` section 6.1) and this call is therefore
+        # redundant there; it is kept because it is what makes the sequence
+        # correct on a backend where the copy is asynchronous, and because
+        # it costs nothing once the queue is empty.
         self.ctx.synchronize()
 
     def synchronize(self) raises:
@@ -3071,7 +3081,15 @@ struct GpuSplitSearcher(Movable):
         hist_slot: Int = 0,
     ) raises:
         """Enqueue the scan and reduction over `hist`, writing record slot
-        `record`. Does not transfer or synchronize.
+        `record`.
+
+        It does transfer, and on Metal it therefore waits. `_launch` copies
+        the four staged per-node tables across before either kernel is
+        enqueued, and `enqueue_copy` on Metal is a synchronous full-queue
+        drain (measured by disassembly, `docs/GPU_PORTABILITY.md` section
+        6.1). An earlier version of this line said "does not transfer or
+        synchronize" and was wrong on both halves. Nothing about the launch
+        changed; what changed is what a wait count may claim.
 
         `hist` is a device buffer of `3 * n_features * n_bins` Int32 words in
         `GpuHistogramBuilder`'s `[grad | hess | count]` layout, and `g_scale`
@@ -3228,16 +3246,25 @@ struct GpuSplitSearcher(Movable):
         h_scale: Float64,
     ) raises:
         """Enqueue a whole frontier's searches in one pair of launches,
-        writing record slots `[0, len(nodes))`. Does not transfer and does
-        not synchronize.
+        writing record slots `[0, len(nodes))`.
 
-        This is the entry point that removes the wait per node. Every
+        This is the entry point that removes the *download* per node. Every
         node's feature set, allow mask, monotone bounds, and histogram slot
         are written into their own record's staging slot first, then each
         table crosses once, then one scan covers the whole batch and one
-        reduction writes every record. The host's next wait is
+        reduction writes every record. The host's next download is
         `download_frontier`, which is one for the level rather than one per
         leaf.
+
+        It does transfer, and on Metal it therefore waits. Four table
+        copies cross in `_copy_tables` before the launches, and on Metal an
+        `enqueue_copy` is a synchronous full-queue drain in both directions,
+        measured by disassembly and recorded in `docs/GPU_PORTABILITY.md`
+        section 6.1. An earlier version of this line said "does not transfer
+        and does not synchronize", which was wrong on both halves. What this
+        entry point buys is one table crossing for a whole level instead of
+        one per node, which is still the point of it; what it does not buy
+        is a level with no host wait in it at all.
 
         `hist` holds every node's histogram: the builder's single-node
         buffer when the batch has one node, and a multi-slot buffer

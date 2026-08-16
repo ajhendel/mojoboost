@@ -460,7 +460,19 @@ struct HybridCosts(Copyable, Movable):
 
     var launch_nanos: Int
     """Fixed cost of enqueuing and running one histogram kernel, exclusive
-    of the row work: the term a four-row leaf pays in full."""
+    of the row work: the term a four-row leaf pays in full.
+
+    Fixed is an approximation on Metal, and it fails in one direction. Every
+    `enqueue_function` there becomes its own command buffer and the queue
+    holds 64 of them, with no way to raise it (measured by disassembly,
+    `docs/GPU_PORTABILITY.md` section 6.2). While the queue has room the
+    enqueue half is nearly free; once it is full the host blocks until an
+    older buffer completes. So a coefficient calibrated on a short launch
+    stream *underestimates* the enqueue cost of a long one, which biases a
+    placement toward the device on exactly the launch-bound tail this module
+    exists to catch. Calibrate it against a stream of realistic length, and
+    treat a measured `launch_nanos` as valid only for streams no longer than
+    the one it was fitted on."""
 
     var sync_nanos: Int
     """Host round trip for one `ctx.synchronize()`. Paid once per node by
@@ -472,7 +484,14 @@ struct HybridCosts(Copyable, Movable):
     """Device-to-host copy rate through the pinned staging buffers, in
     nanoseconds per KiB. One rate for both directions of interest here: the
     fixed-point histogram download and the row-id readback go through the
-    same path."""
+    same path.
+
+    A rate per KiB is the byte term only. On Metal the wait is the larger
+    half and it does not scale with bytes: `enqueue_copy` drains the whole
+    queue before it moves anything, in either direction (measured by
+    disassembly, `docs/GPU_PORTABILITY.md` section 6.1). `sync_nanos` below
+    is where that wait is charged, and a calibration must not fold it into
+    this rate or a small transfer will look nearly free."""
 
     var device_nanos_per_krow_slot: Int
     """Device accumulation, per thousand (row, active-feature) pairs."""
