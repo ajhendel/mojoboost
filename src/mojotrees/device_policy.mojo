@@ -150,6 +150,47 @@ present: `gpu` raises and `auto` chooses the CPU on a machine that does
 have one. It exists to exercise the unavailable-GPU path and to pin a
 mixed fleet to the CPU backend.
 
+Parameters the accelerator cannot honor, and why they are blocks
+----------------------------------------------------------------
+A block is not only "the kernels cannot index this many rows". Three
+*training parameters* are blocks too, and all three arrived on 2026-08-16
+from a sweep whose whole point was that nobody had checked:
+
+- `enable_bundle` (`BLOCK_FEATURE_BUNDLING`),
+- `linear_tree` (`BLOCK_LINEAR_TREE`),
+- a forced-split document (`BLOCK_FORCED_SPLITS`).
+
+Each was accepted by the GPU trainers, applied by none of them, and
+reported as success. The pattern that hid all three, and that hid
+`leaf_estimation_iterations` and `MOJOTREES_DERIVATIVE_PRECISION=float64`
+before them, is an *aggregate guard assumed to cover a knob it does not*:
+`ExtraTreeParams.is_active()` names `forced`, which reads as coverage and
+is coverage only for the non-default `MOJOTREES_GPU_SPLIT_STRATEGY=device`
+path; the shipping host split scan refuses only
+`ExtraTreeParams.needs_grower_support()`, a strictly smaller set. Do not
+read an aggregate as an answer here. Check the knob against the code that
+would have to read it.
+
+The two device requests get different answers, and that asymmetry is the
+whole design: an explicit `device='gpu'` raises, because a caller who named
+a backend is entitled to be told it cannot honor what they asked for, while
+`device='auto'` selects the CPU with `DECISION_AUTO_CPU_BLOCKED`, because a
+caller who asked us to pick asked for the backend that *can*. Blocks are
+collected before `crossover_rules()` is consulted, so no shape is compared
+and `AUTO_GPU_MIN_ROWS` never enters the answer for any of them.
+
+WHAT THIS MODULE CANNOT CLOSE ON ITS OWN. `resolve_device`, which is what
+`model.fit` calls, describes the shape and the objective and nothing else,
+so it cannot see any of these three. `resolve_device_full` takes all of
+them and is the entry point a trainer holding its own `BoosterParams`
+should call; until each call site passes them (one argument each, in
+model.mojo and trainset.mojo, which are other lanes' files) an `auto` fit
+that sets one of the three still reaches `train_gpu` and is refused *there*
+rather than routed. That is the trainers' refusal, not a fallback, and it
+is a strictly better outcome than the silent ignore it replaces -- but it
+is not the outcome this policy specifies, and it is written down here
+rather than left to be rediscovered.
+
 Unknown hardware
 ----------------
 A device whose API this module cannot name gets `GpuProfile.generic()`, the
@@ -239,7 +280,7 @@ from .boosting import CUSTOM
 # `decide_device` can stay pure. Safe to import: histogram.mojo reaches only
 # binning, objective_registry, apple_cpu_policy and parallel, none of which
 # come back here, and `boosting` (already imported above) reaches it anyway.
-from .histogram import derivative_precision_narrows
+from .histogram import const_hessian_verify, derivative_precision_narrows
 from .initialization import SessionState, warmup_level_name
 
 # The one table of objective facts. Imported rather than restated: this
@@ -360,7 +401,14 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # rather than at it, and `crossover_rules()` states the trade and what would
 # reverse it; a version-4 GPU selection between 250,000 and 1,000,000 rows is
 # a provisional selection and a report carrying this number says so.
-comptime POLICY_VERSION = 4
+# 5: three gates were added and no rule moved. `enable_bundle`, `linear_tree`,
+# and a forced-split document are now blocks (`BLOCK_FEATURE_BUNDLING`,
+# `BLOCK_LINEAR_TREE`, `BLOCK_FORCED_SPLITS`); under version 4 and every
+# version before it they were accepted by the GPU trainers and silently not
+# applied. A version-4 report saying a GPU selection was unblocked and a
+# version-5 report saying the same thing therefore mean different things for
+# a request that set any of the three, which is what this number is for.
+comptime POLICY_VERSION = 5
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -439,6 +487,38 @@ comptime BLOCK_OUTPUT_LIMIT = 10
 comptime BLOCK_MEMORY_BUDGET = 11
 comptime BLOCK_DERIVATIVE_PRECISION = 12
 
+# --- The 2026-08-16 refusal sweep -------------------------------------
+#
+# Three parameters that the GPU growers accepted and then did not apply.
+# Each was found the same way the derivative-precision defect above was
+# found: by checking a knob against the code that would have to read it,
+# rather than against an aggregate guard that was assumed to cover it.
+#
+# `ExtraTreeParams.is_active()` names `forced` and so looks like coverage,
+# and it is coverage for exactly one path: `_check_device_search_supported`
+# refuses the whole bundle under `MOJOTREES_GPU_SPLIT_STRATEGY=device`. The
+# host split scan is the *default*, it routes through `tree._search`, and
+# `tree._search` refuses only `needs_grower_support()` -- which is
+# `max_delta_step`, `path_smooth`, `extra_trees`, and `random_strength`, and
+# is not `forced`. So a forced-split document reached the shipping GPU
+# grower, was never read, and produced an unforced tree reported as success.
+# distributed.mojo refuses the same parameter for the same reason
+# (`_UNSUPPORTED_FORCED_SPLITS`), which is the precedent these follow.
+#
+# The fourth is an environment knob rather than a parameter, and it is the
+# most instructive of the four. `MOJOTREES_CONST_HESSIAN` and
+# `MOJOTREES_CONST_HESSIAN_VERIFY` are one pair: the first enables a
+# histogram shortcut, the second audits it. The GPU honors the first through
+# its own read in `gpu_active_rows.GpuActiveRows.__init__` and does not
+# implement the second at all, because the audit walks a host hessian array
+# and the device's hessians are on the device. So a GPU fit under the audit
+# took the shortcut and reported it as checked, which is a worse failure than
+# a knob that merely does nothing: the user has stopped looking.
+comptime BLOCK_FEATURE_BUNDLING = 13
+comptime BLOCK_LINEAR_TREE = 14
+comptime BLOCK_FORCED_SPLITS = 15
+comptime BLOCK_CONST_HESSIAN_VERIFY = 16
+
 
 def block_reason_name(code: Int) -> String:
     if code == BLOCK_NO_ACCELERATOR:
@@ -465,6 +545,14 @@ def block_reason_name(code: Int) -> String:
         return String("memory-budget")
     if code == BLOCK_DERIVATIVE_PRECISION:
         return String("derivative-precision")
+    if code == BLOCK_FEATURE_BUNDLING:
+        return String("feature-bundling")
+    if code == BLOCK_LINEAR_TREE:
+        return String("linear-tree")
+    if code == BLOCK_FORCED_SPLITS:
+        return String("forced-splits")
+    if code == BLOCK_CONST_HESSIAN_VERIFY:
+        return String("const-hessian-verify")
     return String("unknown-block")
 
 
@@ -723,6 +811,27 @@ def env_derivative_precision_is_float64() -> Bool:
     return not derivative_precision_narrows()
 
 
+def env_const_hessian_verify() -> Bool:
+    """Whether this process asked for the constant-hessian audit, through
+    `MOJOTREES_CONST_HESSIAN_VERIFY=1`.
+
+    The one read of that variable on this side of the boundary, and not a
+    second copy of the rule: `histogram.const_hessian_verify` is the rule, and
+    this is it folded into `DeviceCapabilities` so that `decide_device` stays
+    pure. Exactly the arrangement `env_derivative_precision_is_float64` above
+    has, for exactly the same reason.
+
+    Why the device policy cares. The audit is a host walk over the host
+    hessian array (`histogram._check_constant_hessian`), and every CPU builder
+    performs it; no GPU builder can, because the hessians it accumulates from
+    are the device's. Until 2026-08-16 a GPU fit accepted the flag, took the
+    constant-hessian shortcut, and reported an audited result. The trainers
+    now refuse it, which is correct for `device='gpu'`; this function is what
+    lets `auto` route around it instead.
+    """
+    return const_hessian_verify()
+
+
 def env_auto_min_cells() -> Int:
     """The `auto` size threshold in cells. Unset, negative, or unparsable
     means disabled, in which case `auto` never selects the GPU on size
@@ -911,6 +1020,29 @@ struct DeviceRequest(Copyable, Movable):
       not blocked.
     - `uses_validation`: the run has an eval set. Validation metrics are
       scored on the CPU, so a run with one trains there too.
+
+    The last three are the 2026-08-16 refusal sweep, and they are here for
+    one reason: each names a parameter that the GPU growers accepted and
+    silently did not apply, and routing `auto` around a parameter requires
+    the policy to be told about it. They default False, which is each
+    parameter's own default, so a request that does not mention them is the
+    request this struct has always described.
+
+    - `bundling`: `BoosterParams.bundling.enabled`, LightGBM's
+      `enable_bundle`. Only the dense CPU trainers in boosting.mojo build a
+      bundled matrix; `train_gpu` builds its histograms from the unbundled
+      binned matrix and read the setting nowhere.
+      `train_gpu_sparse._refuse_bundling` already refused it, which is what
+      made the dense gap visible.
+    - `linear_tree`: `BoosterParams.linear.enabled`, LightGBM's
+      `linear_tree`. Linear leaves need the raw feature matrix and the GPU
+      trainers take a binned one, exactly as `boosting.train` does; that
+      trainer refuses it (`check_linear_tree_unconnected`) and the GPU ones
+      did not.
+    - `forced_splits`: a non-empty `TreeParams.extra.forced`, LightGBM's
+      `forcedsplits_filename`. Applied by `tree.grow_tree` and by nothing
+      else. See `BLOCK_FORCED_SPLITS` for why the aggregate guard everyone
+      reads did not cover it.
     """
 
     var requested_device: Int
@@ -923,6 +1055,9 @@ struct DeviceRequest(Copyable, Movable):
     var categorical: Bool
     var has_missing: Bool
     var uses_validation: Bool
+    var bundling: Bool
+    var linear_tree: Bool
+    var forced_splits: Bool
 
     def __init__(
         out self,
@@ -936,6 +1071,9 @@ struct DeviceRequest(Copyable, Movable):
         categorical: Bool = False,
         has_missing: Bool = False,
         uses_validation: Bool = False,
+        bundling: Bool = False,
+        linear_tree: Bool = False,
+        forced_splits: Bool = False,
     ):
         self.requested_device = requested_device
         self.n_rows = n_rows
@@ -947,6 +1085,9 @@ struct DeviceRequest(Copyable, Movable):
         self.categorical = categorical
         self.has_missing = has_missing
         self.uses_validation = uses_validation
+        self.bundling = bundling
+        self.linear_tree = linear_tree
+        self.forced_splits = forced_splits
 
     def cells(self) -> Int:
         """`n_rows * n_features`, the size measure the crossover rules and
@@ -992,6 +1133,11 @@ struct DeviceCapabilities(Copyable, Movable):
       grower can honor. A *capability* rather than a preference, which is
       why it lands here beside the kernel limits and not near the crossover
       rules: it blocks, and a block is consulted before any threshold.
+    - `const_hessian_verify`: this process asked for the constant-hessian
+      audit (`MOJOTREES_CONST_HESSIAN_VERIFY=1`), which walks the host
+      hessian array and which no GPU builder performs. Here for the same
+      reason as the line above, and it is the same shape of defect: the flag
+      was accepted and the audit never ran.
     - `session`: how much of the one-time startup cost this process has
       already paid, from initialization.mojo. Reported and warned on, never
       selected on: see `SessionState`.
@@ -1015,6 +1161,7 @@ struct DeviceCapabilities(Copyable, Movable):
     var max_bins: Int
     var auto_min_cells: Int
     var derivative_precision_float64: Bool
+    var const_hessian_verify: Bool
     var session: SessionState
     var transfer: SessionMemoryPlan
 
@@ -1032,6 +1179,7 @@ struct DeviceCapabilities(Copyable, Movable):
         min_bins: Int = MIN_GPU_BINS,
         max_bins: Int = MAX_GPU_BINS,
         derivative_precision_float64: Bool = False,
+        const_hessian_verify: Bool = False,
     ):
         self.gpu_available = gpu_available
         self.built_with_accelerator = built_with_accelerator
@@ -1047,6 +1195,7 @@ struct DeviceCapabilities(Copyable, Movable):
         # constructors below and a fixture built by hand must stay a value
         # the caller wrote down. `detect` and `from_profile` fill it in.
         self.derivative_precision_float64 = derivative_precision_float64
+        self.const_hessian_verify = const_hessian_verify
         self.session = session^
         self.transfer = transfer^
 
@@ -1133,6 +1282,7 @@ struct DeviceCapabilities(Copyable, Movable):
             session^,
             transfer^,
             derivative_precision_float64=env_derivative_precision_is_float64(),
+            const_hessian_verify=env_const_hessian_verify(),
         )
 
     @staticmethod
@@ -1168,6 +1318,7 @@ struct DeviceCapabilities(Copyable, Movable):
             session^,
             transfer^,
             derivative_precision_float64=env_derivative_precision_is_float64(),
+            const_hessian_verify=env_const_hessian_verify(),
         )
 
     @staticmethod
@@ -1735,6 +1886,31 @@ def _collect_blocks(
             ),
         )
 
+    if caps.const_hessian_verify:
+        # The same treatment and for the same reason as the line above: an
+        # audit the accelerator does not run is a capability question, not a
+        # size question, so it sits above every shape gate and `auto` never
+        # compares a row count before answering.
+        #
+        # It is worth being precise about what is missing, because the two
+        # halves of this diagnostic pair are NOT in the same state.
+        # `MOJOTREES_CONST_HESSIAN` is honored on the device
+        # (`GpuActiveRows.const_hessian_allowed`, ANDed with the trainer's
+        # declaration), so the shortcut itself obeys its knob. What no device
+        # path has is `histogram._check_constant_hessian`, which walks the
+        # host hessian array. A GPU fit therefore took an *unaudited*
+        # shortcut under a flag whose entire purpose is the audit.
+        blocks.add(
+            BLOCK_CONST_HESSIAN_VERIFY,
+            String(
+                "MOJOTREES_CONST_HESSIAN_VERIFY=1 asks for the declared"
+                " constant hessian to be audited against the data, which is a"
+                " walk over the host hessian array that only the CPU"
+                " histogram builders perform, so no accelerator path can"
+                " report an audited result"
+            ),
+        )
+
     # An impossible shape is not a block. `estimate_gpu_memory` raises for
     # it before this function is reached, because a workload with no rows
     # or no features is a caller error and not something the CPU path
@@ -1811,6 +1987,53 @@ def _collect_blocks(
             String(
                 "validation metrics are scored on the CPU, so a run with an"
                 " eval set trains there too"
+            ),
+        )
+
+    # --- The refusal sweep, 2026-08-16 ---
+    #
+    # Three parameters no GPU grower applies. They sit together, above the
+    # kernel limits and below the objective gates, because each is a fact
+    # about what the device path *implements* rather than about the shape:
+    # the answer is the same at every size, so a report that named a
+    # threshold would send the reader to the wrong knob. `decide_device`
+    # reads the blocks before the crossover table, so `auto` takes the CPU
+    # for these without any shape being compared, exactly as it does for
+    # `BLOCK_DERIVATIVE_PRECISION`.
+    #
+    # The trainers refuse the same three by name (`_check_gpu_params` in
+    # train_gpu.mojo and train_gpu_sparse.mojo). That is not a duplicate
+    # policy: this module decides *where a run goes* and the trainers refuse
+    # *a run that arrived anyway*, which is the only protection a caller who
+    # reaches `train_gpu` directly has.
+    if request.bundling:
+        blocks.add(
+            BLOCK_FEATURE_BUNDLING,
+            String(
+                "enable_bundle is applied by the dense CPU trainers in"
+                " boosting.mojo, which build a bundled matrix before they"
+                " grow; the GPU trainers build their histograms from the"
+                " unbundled binned matrix and cannot apply it"
+            ),
+        )
+
+    if request.linear_tree:
+        blocks.add(
+            BLOCK_LINEAR_TREE,
+            String(
+                "linear_tree fits an affine model in each leaf from the raw"
+                " feature matrix, and the GPU trainers take a binned matrix"
+                " only, so no accelerator path can produce those leaves"
+            ),
+        )
+
+    if request.forced_splits:
+        blocks.add(
+            BLOCK_FORCED_SPLITS,
+            String(
+                "forced splits are applied by tree.grow_tree and by no other"
+                " grower; the GPU growers never read the document, so a GPU"
+                " fit would return an unforced tree"
             ),
         )
 
@@ -2194,6 +2417,13 @@ struct DeviceDecision(Copyable, Movable):
             _bool_text(self.request.uses_validation),
             "\n",
         )
+        out += String("bundling=", _bool_text(self.request.bundling), "\n")
+        out += String(
+            "linear_tree=", _bool_text(self.request.linear_tree), "\n"
+        )
+        out += String(
+            "forced_splits=", _bool_text(self.request.forced_splits), "\n"
+        )
 
         out += String(
             "gpu_available=",
@@ -2255,6 +2485,11 @@ struct DeviceDecision(Copyable, Movable):
         out += String(
             "derivative_precision_float64=",
             _bool_text(self.capabilities.derivative_precision_float64),
+            "\n",
+        )
+        out += String(
+            "const_hessian_verify=",
+            _bool_text(self.capabilities.const_hessian_verify),
             "\n",
         )
 
@@ -2765,6 +3000,9 @@ def decide_device_report(
     categorical: Bool = False,
     has_missing: Bool = False,
     uses_validation: Bool = False,
+    bundling: Bool = False,
+    linear_tree: Bool = False,
+    forced_splits: Bool = False,
 ) raises -> String:
     """The whole contract across a flat boundary: workload in, serialized
     decision out.
@@ -2798,6 +3036,9 @@ def decide_device_report(
         categorical,
         has_missing,
         uses_validation,
+        bundling,
+        linear_tree,
+        forced_splits,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     return decide_device(request, caps).serialize()
@@ -2823,6 +3064,9 @@ def decide_device_report_reported(
     context_open: Bool = True,
     kernels_ready: Bool = False,
     warmup_level: Int = 0,
+    bundling: Bool = False,
+    linear_tree: Bool = False,
+    forced_splits: Bool = False,
 ) raises -> String:
     """`decide_device_report` for a caller that has read the device.
 
@@ -2843,6 +3087,9 @@ def decide_device_report_reported(
         categorical,
         has_missing,
         uses_validation,
+        bundling,
+        linear_tree,
+        forced_splits,
     )
     var caps = capabilities_from_reported(
         reported_api,
@@ -2869,6 +3116,9 @@ def resolve_device_full(
     categorical: Bool = False,
     has_missing: Bool = False,
     uses_validation: Bool = False,
+    bundling: Bool = False,
+    linear_tree: Bool = False,
+    forced_splits: Bool = False,
 ) raises -> Int:
     """Resolve a fully described workload to `CPU_DEVICE` or `GPU_DEVICE`,
     raising the refusal when it cannot run.
@@ -2898,6 +3148,9 @@ def resolve_device_full(
         categorical,
         has_missing,
         uses_validation,
+        bundling,
+        linear_tree,
+        forced_splits,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     var decision = decide_device(request, caps)

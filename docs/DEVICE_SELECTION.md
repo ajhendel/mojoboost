@@ -180,6 +180,14 @@ raises on it and `"auto"` takes the CPU:
 | `max_bin` outside [2, 256] | `workload-limit` | `MAX_BINS` there and the binner |
 | The memory estimate does not fit the budget | `insufficient-memory` | the estimate below |
 | `MOJOTREES_DERIVATIVE_PRECISION=float64` | `derivative-precision` | `stage_gradients` in `src/mojotrees/gpu_gradient_stream.mojo` narrows every derivative to Float32 |
+| `enable_bundle` | `feature-bundling` | only the dense CPU trainers in `boosting.mojo` build a bundled matrix; `_check_gpu_booster_params` in `src/mojotrees/train_gpu.mojo` |
+| `linear_tree` | `linear-tree` | linear leaves need the raw feature matrix and every GPU trainer takes a binned one; same function |
+| A forced-split document | `forced-splits` | applied by `tree.grow_tree` and nothing else; `_check_gpu_forced_splits` in `src/mojotrees/train_gpu.mojo` |
+| `MOJOTREES_CONST_HESSIAN_VERIFY=1` | `const-hessian-verify` | the audit walks the host hessian array, which only the CPU builders do; `_check_gpu_const_hessian_verify` there |
+
+The last four arrived together on 2026-08-16 from the refusal sweep, and
+each of them was, until that day, accepted and silently not applied. The
+enumeration that found them is the next section.
 
 **Soft uncertainty** is a workload nobody has measured or documented as
 covered, most often an objective outside the set `device.mojo` names
@@ -189,6 +197,113 @@ layer would have accepted is its own kind of lie. It does keep `"auto"` on
 the CPU, since choosing the GPU on an uncharacterized path is exactly the
 guess `auto` exists to not make. An unidentifiable backend is soft for the
 same reason: no crossover rule can be scoped to a device nobody can name.
+
+## What a GPU fit honours, refuses, and used to ignore
+
+**This table is the deliverable of the 2026-08-16 refusal sweep and is
+meant to be re-run rather than trusted.** It exists because
+`leaf_estimation_iterations`, `MOJOTREES_DERIVATIVE_PRECISION=float64`, and
+`MOJOTREES_GPU_VERIFY_ROWS` were each found by accident, in the same week,
+to be accepted by a GPU entry point and silently not applied. Three
+instances of one failure is a method, not a coincidence, and the method is
+this: **check each knob against the code that would have to read it, never
+against an aggregate predicate that appears to cover it.**
+
+Every one of the three, and every one found since, was hidden by an
+aggregate that a reader assumed was the guard. `ExtraTreeParams.is_active()`
+names `forced`, and refuses it on exactly one non-default path.
+`ExtraTreeParams.is_active()` gates the device split search and the resident
+tree and does *not* gate the histogram, which is how a Float64 derivative
+request reached a Float32 kernel. `tree._search` refuses
+`needs_grower_support()`, which is strictly smaller than `is_active()`, and
+the difference between the two sets is where things live that nobody
+refuses. Do not read any of those three as an answer.
+
+Verdicts are for the dense GPU trainers (`train_gpu`,
+`train_gpu_with_valid`, `train_custom_gpu`, `train_multiclass_gpu`) unless a
+row says otherwise. "Ignored (was)" means the sweep found it silently
+ignored and this release refuses it.
+
+### Ensemble parameters (`BoosterParams`)
+
+| Knob | Verdict | Where |
+|---|---|---|
+| `n_estimators`, `learning_rate` | honoured | the round loop in `train_gpu.mojo` |
+| `enable_bundle` (`bundling`) | **ignored (was)** → refused | `_check_gpu_booster_params`; `train_gpu_sparse._refuse_bundling` already refused it, which is what exposed the dense gap |
+| `linear_tree` (`linear`) | **ignored (was)** → refused | `_check_gpu_booster_params` and `train_gpu_sparse._refuse_unhonored`; `boosting.train` had always refused it |
+
+### Tree parameters (`TreeParams`)
+
+| Knob | Verdict | Where |
+|---|---|---|
+| `num_leaves`, `min_data_in_leaf`, `max_depth` | honoured | the growth loop and `tree._search` |
+| `lambda_l1`, `lambda_l2`, `min_sum_hessian_in_leaf` | honoured | `tree._search` on the host arm, `GpuSplitParams` on the device arm |
+| `interaction_constraints` | honoured | `constraints.allowed_features` per node |
+| `feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed` | honoured | `sampling.select_tree_features` / `select_split_features` |
+| `feature_fraction_bylevel` | honoured on the host scan, refused on the device scan | `_check_device_search_supported` |
+| `monotone_constraints` | honoured | `active_signs`, `node_bounds`, `child_bounds` |
+| the categorical family (`max_cat_threshold`, `cat_smooth`, `cat_l2`, `min_data_per_group`, `max_cat_to_onehot`) | honoured | `find_best_split(cat_params=)` on the host arm, `GpuSplitParams` on the device arm |
+| `grow_policy` | honoured (`oblivious` routes to the device plane, which is its only GPU grower) | `check_grow_policy`, `GrowthSchedule` |
+
+### Tree extras (`ExtraTreeParams`)
+
+| Knob | Verdict | Where |
+|---|---|---|
+| `min_gain_to_split`, `monotone_penalty`, `feature_contri` | honoured | `split.find_best_split`, which reads `extra` directly |
+| `max_delta_step`, `path_smooth` | honoured | `_leaf_value` in the GPU grower; `grower_applies_extra=True` |
+| `extra_trees`, `extra_seed` | honoured | keyed by node id and tree index, both passed |
+| `random_strength`, `random_score_scale`, `random_strength_seed` | honoured | `split.mojo`'s per-candidate noise |
+| `monotone_method` (non-`basic`) | refused | `ExtraTreeParams.check_scalars` |
+| `cegb_penalty_split` / `cegb_tradeoff` | honoured | reconstructed in `find_best_split` when the grower carries no ledger |
+| `cegb_penalty_feature_coupled` / `_lazy` | refused | `cegb.check_cegb_grower_support` |
+| **`forced_splits`** | **ignored (was)** → refused | `_check_gpu_forced_splits`; applied only by `tree.grow_tree`, and AUTO steered *into* the gap because `is_active()` being true is what declines the device arm |
+| `use_quantized_grad` | refused (both backends) | `ExtraTreeParams.check_quantized_grad` |
+| `derivative_precision=float64` (the parameter) | refused (both backends) | `ExtraTreeParams.check_derivative_precision` |
+| `leaf_estimation_iterations > 1` | honoured in `train_gpu` / `train_gpu_with_valid`; refused by entry point in `train_custom_gpu` and `train_multiclass_gpu` | `_check_leaf_estimation_config`, `_refuse_leaf_estimation` |
+| `leaf_estimation_iterations > 1`, sparse GPU | **ignored (was)** → refused | `train_gpu_sparse._refuse_unhonored` |
+
+### Side bundles
+
+| Knob | Verdict | Where |
+|---|---|---|
+| `BaggingParams`, `GossParams` | honoured, identical draws on both backends | `check_bagging`, `_check_goss`, `refresh_bag`, `goss_round` |
+| `ClassBaggingParams` | honoured (sparse GPU only; no dense GPU entry point takes it) | `train_gpu_sparse` |
+| `DartParams` | refused | `boosting_dart` refuses a non-CPU device |
+| `RfParams`, `AlternateBoostingParams`, `RankerParams`, `BayesianBootstrapParams`, `QuantGradParams` | cannot reach a GPU fit | no GPU trainer takes them |
+
+### Environment knobs a GPU fit can be handed
+
+Knobs prefixed `MOJOTREES_GPU_*` are device-plane tuning and are honoured by
+definition; knobs prefixed `MOJOTREES_CPU_*` declare their own scope in
+their name and a GPU run ignoring them is correct. What follows is
+everything else, plus the two GPU knobs the sweep found inert.
+
+| Knob | Verdict on a GPU fit | Where |
+|---|---|---|
+| `MOJOTREES_DISABLE_GPU`, `MOJOTREES_AUTO_MIN_CELLS`, `MOJOTREES_GPU_BACKEND` | honoured | `device_policy.mojo` |
+| `MOJOTREES_DERIVATIVE_PRECISION=float64` | refused (fixed 2026-08-16) | `BLOCK_DERIVATIVE_PRECISION` |
+| `MOJOTREES_CONST_HESSIAN` | honoured, through the device's own read | `GpuActiveRows.const_hessian_allowed` |
+| **`MOJOTREES_CONST_HESSIAN_VERIFY`** | **ignored (was)** → refused | the audit is a host walk; `_check_gpu_const_hessian_verify` |
+| **`MOJOTREES_GPU_VERIFY_ROWS`** | honoured on the incremental loop; **inert on the device-owned plane (was)** → refused there | `_check_verify_rows_reachable`, at the one place the plane is elected |
+| `MOJOTREES_BINNING_SELECT_MIN_ROWS` | honoured (binning precedes both backends and changes the bins the device is fed) | `binning.fit_bins` |
+| `MOJOTREES_NUM_WORKERS`, `MOJOTREES_PARALLEL_MIN_OPS`, `MOJOTREES_PARALLEL_MIN_TASK_OPS`, `MOJOTREES_CPU_TASK_FLOOR`, `MOJOTREES_CPU_CORE_POOL`, `MOJOTREES_CPU_TASKS_PER_CORE` | partly honoured: they govern host dispatch, which a GPU fit still uses for its host-side work | `parallel.mojo`, `apple_cpu_policy.mojo` |
+| `MOJOTREES_PHASE_PROFILE`, `MOJOTREES_STARTUP_TRACE`, `MOJOTREES_GPU_WARMUP` | honoured | `phase_profile.mojo`, `initialization.mojo` |
+| `MOJOTREES_LEAF_SCORE_UPDATE` | ignored, and **not** refused | `boosting.mojo` only. It selects between two ways of advancing raw scores that produce the same numbers, so ignoring it costs a GPU fit nothing observable, and refusing it would break an interleaved CPU/GPU benchmark that sets it once for the process. Classified, deliberately not refused. |
+| `MOJOTREES_OBLIVIOUS_TRACE` | ignored | `tree._grow_oblivious_levels` only; the device oblivious plane has its own trace under `MOJOTREES_GPU_TREE_RESIDENT_TRACE` |
+| `MOJOTREES_CPU_*` (bin layout, feature group, row blocks, row-major, compaction floor, quant grad and scale) | ignored, correctly | the prefix declares the scope |
+| `MOJOTREES_DIST_*`, `MOJOTREES_DISTRIBUTED_*`, `MOJOTREES_DASK_BACKEND` | not on any training path here | `distributed_transport.mojo` |
+
+Three knobs in that last group are inert on **both** backends, which is a
+different defect and belongs to whoever owns those modules rather than to
+the device policy: `MOJOTREES_GPU_GRAD_LAYOUT` has no caller anywhere,
+`MOJOTREES_CPU_BIN_LAYOUT`'s reader chain ends at
+`histogram.choose_bin_layout_timed`, which nothing calls, and
+`MOJOTREES_CPU_QUANT_GRAD` / `MOJOTREES_CPU_QUANT_SCALE` end at
+`quantized_gradient.decide_cpu_histogram` / `cpu_quant_params`, whose only
+caller is a test. Likewise `quant_train_renew_leaf` and
+`stochastic_rounding` on `ExtraTreeParams` have no reader in the package at
+all; they are moot only because `use_quantized_grad` is refused ahead of
+them.
 
 ## Environment variables
 
@@ -209,7 +324,7 @@ measurement.
 
 **The table is native, not Python.** It lives in
 `crossover_rules()` in `src/mojotrees/device_policy.mojo`, carries
-`POLICY_VERSION = 2`, and holds one rule. The Python module no longer
+`POLICY_VERSION = 5`, and holds one rule. The Python module no longer
 defines `RULES_VERSION`, `CROSSOVER_RULES`, or a `CrossoverRule` type at
 all: it formats the native decision and adds nothing to it, so a rule that
 existed only in Python would be a rule the Mojo API, the CLI, and the C API
