@@ -440,8 +440,26 @@ def test_gpu_unsplittable_data_matches_cpu() raises:
         var cpu = train(data, target, SQUARED_ERROR, _params())
         var gpu = train_gpu(data, target, SQUARED_ERROR, _params())
 
-        # Neither backend may invent a split on constant features.
-        assert_equal(len(cpu.trees), 0)
+        # Neither backend may invent a split on constant features. That is
+        # the claim; the tree COUNT is not, and asserting it was a mistake.
+        #
+        # This read `assert_equal(len(cpu.trees), 0)` until 2026-08-16, which
+        # pinned one backend's stopping rule rather than the property the
+        # docstring above states. When the CPU campaign's wave changed when a
+        # converged single-leaf round stops the loop, the CPU began emitting
+        # single-leaf trees where it had emitted none -- which is the GPU's
+        # behaviour, so the two backends became MORE alike and the test failed
+        # anyway. A test that fails when two backends converge is testing the
+        # wrong thing.
+        #
+        # What is asserted now is the invariant, on both backends
+        # symmetrically: no tree may hold more than one leaf, because there is
+        # no split to be found, and any tree that exists must be a near-zero
+        # correction. Whether a backend stops at zero trees or keeps emitting
+        # empty ones is a stopping rule and belongs to whoever owns it.
+        for i in range(len(cpu.trees)):
+            assert_equal(cpu.trees[i].n_leaves, 1)
+            assert_true(abs(cpu.trees[i].value[0]) < 1e-6)
         for i in range(len(gpu.trees)):
             assert_equal(gpu.trees[i].n_leaves, 1)
             assert_true(abs(gpu.trees[i].value[0]) < 1e-6)
