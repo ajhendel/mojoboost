@@ -80,6 +80,24 @@ a stated ETA and nothing to release it. From the outside a stale lock and a busy
 lock are the same bytes, so the other campaign waited on it correctly and would
 have kept waiting past the ETA.
 
+**A dead pid reports `STALE-PID`, not `ABANDONED`, and the distinction is the
+point.** The tool knows one thing: the recorded process is not running. It does
+**not** know the work finished -- a shell can exit while the job it started
+keeps going, and once the pid is gone there is nothing left to ask, because the
+record that would have answered is the process that exited and its children are
+reparented carrying no back-reference. On 2026-08-16 a lane read the earlier
+wording while **eight `mojo` processes were running at load 11**. The detection
+was correct both times; the word was what misled, because ABANDONED reads as
+permission. So `status` now says what is known, refuses to say what is not, and
+prints the live process count and load beside it -- the thing that actually
+answers "is the box free", rather than telling you to go and check.
+
+**Acquire from a process that outlives the window.** Each shell invocation is
+its own process, so acquiring in one call and checking in the next records a pid
+that is already gone: correctly reported, and useless. Hold the lock from inside
+the long-lived job, or export `BENCH_LOCK_PID`. If nothing survives the window,
+record no pid at all.
+
 **Every uncertain case reports HELD, deliberately.** Reporting a live lock as
 abandoned lets two sessions measure at once and silently corrupts both windows;
 reporting an abandoned lock as held costs somebody a wait. Those are not

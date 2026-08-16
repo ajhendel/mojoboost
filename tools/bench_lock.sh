@@ -26,8 +26,25 @@
 # abandoned lets two sessions measure at once and silently corrupts both
 # windows; reporting an abandoned lock as held costs somebody a wait. Those are
 # not comparable, so every uncertain case here resolves to HELD. A lock is
-# reported ABANDONED only when the holder's PID is positively confirmed gone.
+# reported STALE-PID only when the holder's PID is positively confirmed gone.
 # No `pid:` line, an unreadable file, a PID we cannot ask about: all HELD.
+#
+# THE PID MUST OUTLIVE THE WINDOW, AND A PER-CALL SHELL DOES NOT. Each shell
+# invocation is its own process, so `acquire` from one call and `status` from
+# the next will record a pid that is already gone -- correctly reported, and
+# useless. Acquire from the process that will still be running when the window
+# ends: hold it from inside the long-lived job, or export BENCH_LOCK_PID with a
+# pid that survives. If nothing survives, record no pid, because a missing pid
+# reports HELD and a dead pid invites a steal.
+#
+# WHAT A DEAD PID DOES AND DOES NOT TELL YOU. It tells you the recorded process
+# is not running. It does NOT tell you the work finished: a shell can exit while
+# the job it started keeps going, and once the pid is gone there is nothing left
+# to ask -- the record that would have answered is the process that exited, and
+# its children are reparented carrying no back-reference. So this reports
+# STALE-PID and not ABANDONED. On 2026-08-16 a lane read the earlier wording
+# while eight `mojo` processes were running at load 11. The detection was right
+# both times; the word was what misled, because ABANDONED reads as permission.
 #
 # AND IT NEVER STEALS. `status` reports; `take` is a separate verb somebody has
 # to type. The stale file is preserved under a `.dead-<session>` suffix rather
@@ -79,10 +96,15 @@ status)
         sed -n '1,12p' "$LOCK"
         exit 1
     fi
-    echo "ABANDONED  '${holder:-unknown}' (pid $pid is gone)"
+    echo "STALE-PID  '${holder:-unknown}' (recorded pid $pid is not running)"
+    echo "  THIS IS NOT EVIDENCE THE BOX IS FREE. It means one recorded process"
+    echo "  is gone. A shell can exit while the work it started continues, and"
+    echo "  nothing here can tell those apart. The box itself, right now:"
+    echo "    mojo processes: $(ps -Ao comm | grep -c 'mojo$')"
+    echo "    $(uptime | sed 's/.*load/load/')"
     echo "  the fields below were written at acquisition and are NOT current:"
     sed -n '1,12p' "$LOCK"
-    echo "  take it with: tools/bench_lock.sh take"
+    echo "  if the box is genuinely idle: tools/bench_lock.sh take"
     exit 2
     ;;
 acquire)
@@ -135,6 +157,8 @@ take)
         echo "REFUSED: holder is alive, or its liveness is unknown." >&2
         exit 1
     fi
+    # Reached only when status says STALE-PID, which is not the same as "free".
+    # Whoever types this has been told to look at the box; the tool cannot.
     dead="$LOCK.dead-$(_field session | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
     mv "$LOCK" "$dead"
     echo "TOOK the lock; the stale file is preserved at $dead"
