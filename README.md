@@ -367,36 +367,177 @@ Lower-level entry points `train`, `train_with_valid`, and
 ### Where the speed stands
 
 Correctness, determinism, portability, memory, and accuracy are the parts
-of this project that are good and measured. Speed is the part that is
-behind, and this section says by how much rather than leaving a reader to
-find out from a benchmark file.
+of this project that are good and measured. Speed has been the part that is
+behind. As of 2026-08-15 there is exactly one shape where it is not, and
+most of this section is what that single result does and does not license.
 
-Every number here is Apple M4, Mojo 1.0.0, 100 rounds, 31 leaves, 255 bins,
-squared error, seconds of training time with binning excluded, median of
-three with the arms interleaved. The record is
+This project separates measurement from inference on purpose, so every
+figure below is labeled **measured**, **fitted**, **derived**, or
+**estimated**, and the label is part of the claim.
+
+Every number is Apple M4, Mojo 1.0.0, 100 rounds, 31 leaves, 255 bins,
+squared error, seconds of training time with binning excluded. Our own arms
+are interleaved inside one process; the LightGBM column comes from a
+separate single run of `bench/bench_lightgbm.py` on the same generated data,
+which is the asymmetry condition 4 below is about. LightGBM is 4.7 at 10
+threads. The second
+sweep runs five repeats and reports the median with its spread; the earlier
+profile run is a median of three. The records are
+[`bench/results/sweep2_2026-08-15/RESULTS.md`](bench/results/sweep2_2026-08-15/RESULTS.md)
+and
 [`bench/results/profile_2026-08-15/RESULTS.md`](bench/results/profile_2026-08-15/RESULTS.md),
-taken under the rules committed beforehand in
+both taken under the rules committed beforehand in
 [`bench/results/PROFILE_PROTOCOL.md`](bench/results/PROFILE_PROTOCOL.md).
 
-| shape | our CPU | our GPU | LightGBM, 10 threads |
-|---|---|---|---|
-| 1,000,000 x 50 | 6.98 | **3.58** | **2.86** |
-| 250,000 x 50 | **1.66** | 1.89 | **1.00** |
-| 50,000 x 50 | **0.564** | 1.63 | 0.594 |
+**Measured**, second sweep:
 
-Read plainly:
+| shape | our CPU | our GPU, leaf-wise | our GPU, depth-wise | LightGBM, 10 threads |
+|---|---|---|---|---|
+| 250,000 x 50 | 1.649 | 1.967 | 1.909 | **1.023** |
+| 1,000,000 x 50 | 5.942 | 3.756 | **2.587** | 2.767 |
+| 2,000,000 x 50 | 13.483 | 6.093 | 5.417 | **5.228** |
 
-- **At the headline shape we lose.** LightGBM is 2.44x our CPU and 1.25x
-  our GPU at 1,000,000 x 50. Those gaps were 4.06x and 1.46x before this
-  round's work, so they are closing, and they are still gaps.
-- **At 50,000 rows on the CPU we win**, 0.564 against 0.594. It is a narrow
-  win and it is the shape a new user is most likely to try first.
+Spreads in the same order: our GPU 1.1 / 1.8 / 12.5 percent, depth-wise
+6.7 / 0.3 / 10.8, our CPU 9.3 / 13.5 / 35.6. The two-million-row CPU arm at
+35.6 percent is too noisy to carry a verdict and is reported rather than
+relied on.
+
+#### The first measured win, and the four ways it could mislead
+
+**At 1,000,000 x 50, `grow_policy="depthwise"` on Metal trains in 2.587
+seconds against LightGBM's 2.767 on ten CPU cores. That is 6.5 percent
+faster at a 0.3 percent spread**, the tightest arm in the sweep. At
+2,000,000 x 50 the same arm is 3.6 percent behind (5.417 against 5.228),
+which is parity. This is the first measured win this project has against
+LightGBM on training speed at a large shape, and it is measured, not
+projected.
+
+Four conditions travel with that sentence. Without them it is misleading,
+and in four separate ways.
+
+**1. It is a different model.** Depth-wise growth grows a different tree
+than leaf-wise growth does, from the same data and the same parameters.
+LightGBM grows leaf-wise and has no `grow_policy`; XGBoost grows depth-wise
+by default, so this is a growth order users legitimately choose, but the
+comparison above is *our depth-wise against LightGBM's leaf-wise* and it is
+not a like-for-like race. Our own leaf-wise arm is still behind LightGBM at
+every shape measured: 1.92x at 250,000, 1.36x at 1,000,000, 1.17x at
+2,000,000. For that reason depth-wise is not the default and does not
+become one. Answering a speed question by silently changing the model is
+not something this project does.
+
+**2. Accuracy has not been shown for these arms, and no accuracy parity is
+claimed for depth-wise.** `bench_train_gpu.mojo` computes a training loss
+per arm on the first repeat and prints it as `<arm>_train_loss`, and
+`bench_lightgbm.py` prints `train_mse` for the same generated data; the
+committed sweep record kept only the timing lines, so **no training loss
+survives for any arm of this sweep, ours or LightGBM's**. Nobody has
+measured whether a depth-wise tree at these shapes is as accurate as the
+leaf-wise tree it is being timed against, and a speed win from a worse model
+is not a win. What would establish it is two runs that already have
+harnesses: re-run the same arms and keep the `_train_loss` lines beside the
+times, and run `bench/real_data/` with a depth-wise arm for held-out metrics
+on real datasets rather than a training loss on a generator. Until both
+exist, read the table as a timing result only.
+
+The accuracy parity this project does have is **leaf-wise only**, on
+LightGBM-matched defaults, and is stated as a range rather than a single
+figure: across five pinned real datasets the relative difference on each
+scenario's primary metric runs from 5.7e-06 (RCV1, auc) to 3.2e-03 (Bank
+Marketing, average precision), a factor of about 560 between the closest and
+the furthest. The record, including why the widest cell is the noisiest
+metric in the suite, is
+[`bench/real_data/results/README.md`](bench/real_data/results/README.md).
+
+**3. It is one machine, one shape family, one dataset generator.** Apple M4,
+synthetic dense regression from the splitmix64 stream both drivers share, 50
+features, squared error. No real dataset, no second machine, and no NVIDIA
+or AMD hardware has ever executed this code
+([docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md)).
+
+**4. Our side is repeated and LightGBM's is not.** Our arms are five repeats
+interleaved inside one process, and the 0.3 percent figure is the spread of
+those five. `bench/bench_lightgbm.py` trains once, in a separate process,
+and reports no median and no spread, so 2.767 is a single sample and its
+noise floor is unknown rather than zero. This machine is documented as
+drifting by a factor of two to three across time windows, which is why the
+Mojo harness interleaves at all. A 6.5 percent margin measured that way is
+the best evidence in the tree and is still weaker than the 0.3 percent
+suggests. What would settle it is a LightGBM arm inside the same interleaved
+loop, which the harness does not currently have.
+
+#### What the same sweep says about everything else
+
+**Our marginal cost per row now equals LightGBM's on ten CPU cores, and the
+whole remaining deficit is fixed cost.** **Fitted** from the measured
+points, three shapes and two segments each:
+
+| segment | our GPU | LightGBM, 10 threads |
+|---|---|---|
+| 250,000 to 1,000,000 | 2.385 us/row | 2.325 us/row |
+| 1,000,000 to 2,000,000 | 2.337 us/row | 2.461 us/row |
+
+The four fitted slopes span 2.33 to 2.46 microseconds per row and they
+interleave, so on the marginal cost of a row this library and LightGBM are
+even. Two older claims do not survive that: the cost per row is not
+superlinear above one million rows, and we are not about 10 percent better
+per row than LightGBM.
+
+Extrapolating each fit back to zero rows, our intercept is about 1.42
+seconds and LightGBM's about 0.44, so the gap is roughly **1.0 second of
+fixed cost that does not grow with the data** (**derived** from the fits
+above, not measured directly). That is the same finding the Metal timeline
+reached in a different unit.
+
+The consequence is the part worth carrying, and it is an **estimate**:
+remove the entire second of excess fixed cost and 1,000,000 rows lands near
+2.8 seconds, which is **parity with LightGBM, not a win**. Depth-wise beat
+that number, so it did not only remove fixed cost. Batching a level into one
+host wait also fills the GPU better per launch, which moves the **slope**
+rather than only the intercept. That reframes the plan: the histogram kernel
+is not a phase behind the control plane, it is the entire margin.
+
+**The one-line status, which is the honest form of all of the above: our
+per-row cost is even with LightGBM's, our fixed cost is about one second
+behind, and the win, if it comes, comes from the histogram kernel.**
+
+#### The automatic split-search gate is tuned for the wrong growth policy
+
+The GPU's automatic split search compares `normalized_split_work`
+(`n_rows * active_features * (n_bins/255) * (num_leaves/31)`) against a
+threshold of 50,000,000 and sends anything below it to the host scan. So
+250,000 x 50 is 12.5 million and both GPU arms took the host scan there,
+while 1,000,000 and 2,000,000 took the device search. **Measured**, five
+repeats each at 250,000 x 50:
+
+| arm | automatic (host scan) | device search forced |
+|---|---|---|
+| GPU leaf-wise | 1.967 | 2.268 |
+| GPU depth-wise | 1.909 | **1.214** |
+
+The gate is right for leaf-wise, which is 15 percent worse on the device
+search at this size, and wrong for depth-wise, which is 36 percent better
+because only the device search batches a level into one search and one host
+wait. The threshold was measured for leaf-wise and is applied to both. At
+1.214 seconds, depth-wise at 250,000 rows is 1.19x behind LightGBM rather
+than 1.87x, so the older statement that the GPU simply loses below a million
+rows was substantially the gate's doing rather than the hardware's.
+
+#### From the earlier profile run, at other shapes
+
+These are the median-of-three figures at 50,000 x 50 and the shapes the
+second sweep did not repeat. They are a different run and are not comparable
+cell by cell with the table above.
+
+- **At 50,000 rows on the CPU we may be ahead**, 0.564 against LightGBM's
+  0.594. Read that as indistinguishable rather than as a win: the 5.3 percent
+  margin sits inside our own arm's 11.3 percent spread, and the LightGBM
+  number is a single unrepeated sample. This library's earlier description of
+  it as the first shape it was faster than LightGBM at anything was not
+  established by the run that produced it.
 - **We bin 3.2x faster**, 0.377s against LightGBM's 1.207s, on the same
-  data. Binning is excluded from the table above, so this is a column we win
-  outright and it is separate from every training figure here.
-- **The GPU beats our own CPU only at a million rows**, by 1.85x. Below
-  that it loses to our own CPU, because it carries roughly 1.5 seconds of
-  fixed cost per fit that does not scale with rows.
+  data. Binning is excluded from every training figure here, so this is a
+  column we win outright.
 - **The GPU wins multiclass**, 15.30 against the CPU's 25.47 at 465,000 rows
   by 54 features over 7 classes, so 1.63x. That is the first honest
   multiclass measurement in the project; every earlier one was a CPU fit
@@ -406,7 +547,7 @@ Read plainly:
   from ten cores where LightGBM gets 3.08x, so both are true at once: the
   inner loop is slower and the parallel scaling is worse.
 
-The dominant GPU cost is now located and not yet fixed. The first Metal
+The dominant GPU cost is located and not yet fixed. The first Metal
 timeline this project has taken
 ([docs/METAL_TIMELINE.md](docs/METAL_TIMELINE.md)) says the GPU is idle for
 76.5% of a training span at 200,000 rows and 87.5% at 50,000, at the
@@ -415,11 +556,13 @@ blits and on 2 compute kernels out of 18,701, which is 32.1 serialization
 points per round. One blocking readback costs 606 microseconds of wall
 clock, of which 3.7 microseconds is the GPU moving bytes. Compute of every
 kind is 22.9% of a round, so even an infinitely fast histogram kernel leaves
-most of the round in place.
+most of the round in place. That last sentence and the fitted slopes above
+are in tension worth keeping in view: the timeline prices the fixed cost and
+the fits say removing all of it reaches parity and stops, so both the wait
+count and the kernel have to move.
 
-Nothing here has been measured on any device other than one Apple M4. No
-NVIDIA or AMD hardware has ever executed this code
-([docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md)).
+Nothing anywhere in this section has been measured on any device other than
+one Apple M4.
 
 ## Sparse input
 
@@ -792,12 +935,19 @@ the device from device-resident labels and raw scores, and each grown tree
 advances those raw scores from its leaf ranges, so nothing per-row crosses
 the host/device boundary in a plain round; bagging and GOSS rank their
 samples host-side and keep the host gradient path. Per-node split selection
-runs on the host over downloaded histograms by default, which is what keeps
-CPU and GPU split decisions identical; `MOJOTREES_GPU_SPLIT_STRATEGY=device`
-moves the scan onto the device (one 136-byte record per node instead of the
-histogram, Float32 gains that can flip near-tie decisions, bit-deterministic
-run to run), growing over a device-resident frontier so that a split builds
-one histogram and subtracts for the sibling. On an M4 with
+runs on the host over downloaded histograms, which is what keeps CPU and GPU
+split decisions identical, on every shape except the largest.
+`MOJOTREES_GPU_SPLIT_STRATEGY=device` moves the scan onto the device (one
+136-byte record per node instead of the histogram, Float32 gains that can
+flip near-tie decisions, bit-deterministic run to run), growing over a
+device-resident frontier so that a split builds one histogram and subtracts
+for the sibling, and the automatic policy selects that path by itself on an
+observed Apple M4 once `normalized_split_work` reaches 50,000,000, which
+1,000,000 rows by 50 features at the default bins and leaves hits exactly.
+Below that threshold the host scan is what runs. The threshold was measured
+for leaf-wise growth and is applied to depth-wise growth as well, where it
+is wrong by a wide margin; see
+[Where the speed stands](#where-the-speed-stands). On an M4 with
 `bench-train-gpu` over 100 trees, the device scan is about 24% behind at
 50000 rows by 100 features (3.03 to 3.06 s over three runs against the host
 scan's 2.43 to 2.49 s), which is the expected direction, since a device scan
@@ -1057,9 +1207,25 @@ The mode changes only which leaf is split next: partitioning, sibling
 subtraction, leaf values, and every constraint go through the same code, so
 the CPU dense and sparse growers and all three GPU growers make the same
 choice on the same inputs (`tests/test_grow_policy.mojo`). The distributed
-prototype rejects it. On the GPU the depth-wise order is not yet batched
-into one launch per level (`docs/design/GPU_LEVELWISE.md` describes that
-step); it costs what leaf-wise growth costs today.
+prototype rejects it.
+
+On the GPU, half of the launch batching now ships: the device-resident split
+search commits a planned level and searches it in one launch pair, so a
+level costs one host wait instead of one per split, about 5 waits per tree
+rather than 30. The row partition and the histogram build are still per
+node (`docs/design/GPU_LEVELWISE.md` describes what remains). Batching only
+exists on the device split search, so a shape the automatic policy sends to
+the host scan gets none of it.
+
+That is why depth-wise is the fastest GPU arm this project has measured.
+**Measured** on an Apple M4, 1,000,000 x 50, five repeats: 2.587 seconds
+against leaf-wise's 3.756 and LightGBM's 2.767 on ten threads, the only
+shape where this library is ahead of LightGBM on training time. Read
+[Where the speed stands](#where-the-speed-stands) before quoting that
+anywhere, because it compares our depth-wise trees against LightGBM's
+leaf-wise ones, and because no accuracy measurement of any kind has been
+taken on a depth-wise arm. Choose `depthwise` because you want depth-wise
+trees, and if you choose it for the speed, measure your own loss.
 
 ```python
 MojoTreesRegressor(grow_policy="depthwise", max_depth=6, num_leaves=64)
@@ -2048,12 +2214,16 @@ synthetic data from the same splitmix64 stream and train with matched
 parameters.
 
 The current numbers, and the honest reading of them, are under
-[Where the speed stands](#where-the-speed-stands) above. The record behind
-them is
+[Where the speed stands](#where-the-speed-stands) above. The records behind
+them are
+[`bench/results/sweep2_2026-08-15/RESULTS.md`](bench/results/sweep2_2026-08-15/RESULTS.md)
+and
 [`bench/results/profile_2026-08-15/RESULTS.md`](bench/results/profile_2026-08-15/RESULTS.md).
-In one line: 2.44x behind LightGBM on the CPU and 1.25x behind on the GPU
-at 1,000,000 x 50, ahead of LightGBM at 50,000 rows on the CPU, and 3.2x
-ahead on binning.
+In one line: our per-row cost is even with LightGBM's, our fixed cost is
+about a second behind, our leaf-wise GPU arm is 1.36x behind at 1,000,000 x
+50, our depth-wise GPU arm is 6.5 percent ahead of LightGBM at that shape
+while growing a different tree and with its accuracy unmeasured, and we are
+3.2x ahead on binning.
 
 The table below is the original single-threaded baseline at a different
 shape and a different revision. It is kept because it is what several

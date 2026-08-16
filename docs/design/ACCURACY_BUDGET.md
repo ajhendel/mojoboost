@@ -56,6 +56,22 @@ behind; the second is the run whose covertype rows turned out to be CPU
 timings wearing a GPU label. The only head-to-head quality numbers that
 survive anywhere are on synthetic data:
 
+> **Correction, 2026-08-15, later the same day.** The paragraph above was
+> true when written and is not true now. `bench/real_data/results/` now
+> commits a `summary.json` from each of those two runs and a README that
+> states the parity spread as a range: across the five scenarios that ran on
+> pinned real data, the relative difference on each scenario's primary
+> metric runs from 5.7e-06 (RCV1, auc) to 3.2e-03 (Bank Marketing, average
+> precision), a factor of about 560. So held-out evidence exists, and the
+> brief's "a few parts in ten thousand" is still the wrong form of the claim,
+> for a different reason than this section gives: it is accurate for three of
+> the five, understates RCV1 by two orders of magnitude, and overstates Bank
+> Marketing by one. Quote the range with the metric attached. The rest of
+> this section stands: 3.2e-03 is not precise enough to detect a half-percent
+> regression, so no verdict below is discharged by pointing at it. All of that
+> evidence is leaf-wise; nothing in it covers `grow_policy=depthwise`, whose
+> accuracy no run has measured.
+
 | source | comparison | delta |
 | --- | --- | --- |
 | `bench/README.md` | binary train logloss, 100k x 100 | 5.0 parts in ten thousand, mojotrees better |

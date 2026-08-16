@@ -9,6 +9,23 @@ shipped implementation. It reads the shipped implementation only where the code
 is the cheapest available description of what the hardware does, and it says so
 each time it does that.
 
+**Correction, 2026-08-15.** One measured input to the arithmetic below has
+since been remeasured and did not hold. This document's per-row slopes come
+from a three-point fit at 50,000, 250,000, and 1,000,000 rows and put our
+marginal cost 14 percent below LightGBM's (2.05 against 2.39 microseconds per
+row, section 3). A five-repeat sweep to 2,000,000 rows
+(`bench/results/sweep2_2026-08-15/RESULTS.md`) fits four segments in which the
+two libraries span 2.33 to 2.46 microseconds per row and **interleave**, so on
+the marginal cost of a row this library and LightGBM are even and no per-row
+advantage may be assumed. That changes the conclusion of the short version
+below: removing the whole fixed-cost term is now **estimated** to reach parity
+with LightGBM at 1,000,000 rows rather than to beat it, and the margin, if
+there is one, has to come from the layout work in sections 4 onward. The
+measured shipped datum that supports the layout half of the argument is the
+depth-wise arm in that same sweep, which moved the slope and not only the
+intercept. Every projection in this document that multiplies a per-row
+advantage should be read against that.
+
 Every number below is either **measured**, **derived** by arithmetic from
 measured numbers, or **assumed**. Those three words are used literally
 throughout. Where a quantity cannot be obtained on this device at all, the

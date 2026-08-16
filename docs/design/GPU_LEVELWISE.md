@@ -22,9 +22,29 @@ batched histogram pass over the active row buffer per level, using the
 multi-leaf kernels in `gpu_leaf_batching.mojo`) and step 5 (one segmented
 partition per level) are what remains.
 
-No benchmark has been run on any of it. The counts above are counts. What
-they would have to be read against is `pixi run bench-launch-cost`, which
-prices one launch and one wait on the device in hand.
+**Benchmarked 2026-08-15, and the counts turned into seconds.**
+`bench/results/sweep2_2026-08-15/RESULTS.md`, Apple M4, five interleaved
+repeats, 100 rounds, 31 leaves, 255 bins, squared error: at 1,000,000 x 50
+the depth-wise arm trains in **2.587 seconds** against leaf-wise's 3.756, a
+0.3 percent spread, and against LightGBM's 2.767 on ten CPU cores. That is
+the first shape and arm on which this project is ahead of LightGBM on
+training time. The 1.17 seconds it removes is close to the 1.0 second of
+excess fixed cost the same sweep derives from the intercepts, which is two
+independent routes to one number.
+
+Three limits on reading that as a verdict for this document. The batching
+only exists on the device split search, so at 250,000 x 50 the automatic
+policy routes to the host scan and the arm gets none of it; forcing the
+device search there takes depth-wise from 1.909 to 1.214 seconds, so the
+threshold, measured for leaf-wise, is wrong for depth-wise. Depth-wise also
+beat the parity that removing all fixed cost is estimated to reach, which
+means level batching moved the **slope** and not only the intercept, and that
+is the histogram argument in section 2 rather than the wait argument in
+section 1. And **the sweep recorded no quality figure of any kind**, so
+section 8 below is exactly as unmeasured as it was.
+
+`pixi run bench-launch-cost` remains what prices one launch and one wait on
+the device in hand.
 
 The host-side prototype this document names (`gpu_levelwise.mojo`:
 `LevelFrontier`, `plan_level`, `decide_level`, `LevelCommit`, `child_sums`)

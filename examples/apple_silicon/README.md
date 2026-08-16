@@ -27,12 +27,19 @@ because it carries roughly 1.5 seconds of fixed cost per fit that does not
 scale with rows. Multiclass is the clearer win: 15.30s against the CPU's
 25.47s at 465,000 rows by 54 features over 7 classes, which is 1.63x.
 
-Two things this does not say. It does not say mojotrees is fast against
-LightGBM, which at 1,000,000 x 50 trains the same model in 2.86s and is
-still ahead of both our backends. And it says nothing about any Apple part
-other than this one M4. `TIMINGS.md` next to this file is the per-machine
-table, and every cell in it is still empty until somebody runs it on their
-own hardware.
+Two things this does not say. It does not say mojotrees is broadly fast
+against LightGBM, which at 1,000,000 x 50 trains the same model in about 2.8s
+and is still ahead of both the backends in that table. There is now one
+exception, and it is narrow: at that shape `grow_policy="depthwise"` on the
+GPU trains in 2.587s against LightGBM's 2.767s, which is a real measured win
+at a 0.3 percent spread over five repeats
+(`bench/results/sweep2_2026-08-15/RESULTS.md`), but depth-wise growth builds a
+different tree than LightGBM's leaf-wise growth, nobody has measured whether
+that tree is as accurate, and our own leaf-wise arm is still behind at every
+shape. Read the caveats in the README's "Where the speed stands" before
+repeating it. And it says nothing about any Apple part other than this one
+M4. `TIMINGS.md` next to this file is the per-machine table, and every cell
+in it is still empty until somebody runs it on their own hardware.
 
 With that in hand, treat the headline as accurate at the large end and as a
 statement of direction at the small end, and use the tour below for what it
