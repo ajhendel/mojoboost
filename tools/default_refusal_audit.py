@@ -654,10 +654,108 @@ def audit(default_set):
     return params, rows
 
 
+#: Files that only a fit which has already been routed to the accelerator
+#: reaches. A refusal here cannot fire while a policy block is sending the
+#: fit to the CPU, which is the whole point of the check below.
+DEVICE_FILES = (
+    "src/mojotrees/train_gpu.mojo",
+    "src/mojotrees/train_gpu_sparse.mojo",
+    "src/mojotrees/gpu_split_search.mojo",
+    "src/mojotrees/gpu_resident_round.mojo",
+    "src/mojotrees/gpu_tree_tables.mojo",
+    "src/mojotrees/gpu_active_rows.mojo",
+)
+
+
+def unmasked_by_removing(default_set, parameter):
+    """What a proposed default set still walks into once one policy block is
+    removed. Returns `(device_rows, unrouted)`.
+
+    **The insight this encodes is not mine and is worth stating before the
+    code.** A `BLOCK_*` in `device_policy` does two jobs at once. It refuses a
+    configuration, and it is **the only thing making `auto` route to the CPU
+    instead of failing.** So retiring a block because its capability finally
+    landed **silently withdraws the fallback for every other reason that fit
+    would still have been refused for.** The removal is correct, scheduled,
+    and creates a cliff.
+
+    The live instance, which is why this exists. The proposed default set is
+    `score_function=cosine` **and** `random_strength=1`. Today
+    `BLOCK_SCORE_FUNCTION` fires and `auto` falls back to the CPU, so the fit
+    runs. When the device Cosine kernel lands and that block is removed on
+    schedule, the policy has nothing left to see: `auto` selects the GPU on
+    shape, and the fit **raises in the grower**, because
+    `ExtraTreeParams.is_active()` still carries `random_strength > 0.0`
+    (`tree_parameters_extra.mojo:1774`) while `device_policy` contains **zero**
+    occurrences of `random_strength`. A capability landing turns a working
+    default into a raising one.
+
+    So the two halves reported here are:
+
+    `device_rows`   refusals in device-only files, for OTHER parameters of the
+                    set, which the removed block was masking.
+    `unrouted`      parameters of the set that a device path refuses but that
+                    `device_policy` never names, so no block can route around
+                    them. **These are the dangerous ones**: a masked refusal
+                    at least has a block somewhere, and an unrouted one has
+                    nothing that could ever have routed it.
+
+    Static and name-based, like the rest of this file. It reports where to
+    read; it does not prove a fit reaches any of these.
+
+    **It reads the WORKING TREE, not HEAD, and that is a hazard rather than a
+    convenience.** The first time this function ran it reported
+    `random_strength` as safely masked, contradicting a verified finding from
+    the other campaign that `device_policy` contained zero occurrences of it.
+    Both were right: the finding was true of HEAD, and by the time this ran
+    there were 76 uncommitted lines adding `BLOCK_RANDOM_STRENGTH` in the
+    shared checkout, written by the session that had made the finding.
+
+    So on a shared checkout this tool can report another session's half-written
+    work as landed, in the direction that says a cliff is already guarded when
+    it is not. **When the answer matters, run it against a clean tree or check
+    `git status` first.** The failure is silent and it looks like good news,
+    which is the combination worth naming.
+    """
+    params, rows = audit(default_set)
+    policy = _read_source("src/mojotrees/device_policy.mojo")
+    device_rows, unrouted = [], []
+    for name in sorted(rows):
+        if name == parameter:
+            continue
+        hits = [
+            r
+            for r in rows[name]
+            if r["looks_like_refusal"] and r["file"] in DEVICE_FILES
+        ]
+        if not hits:
+            continue
+        device_rows.append((name, hits))
+        if not re.search(r"\b" + re.escape(name) + r"\b", policy):
+            unrouted.append(name)
+    return device_rows, unrouted
+
+
+def _read_source(rel):
+    try:
+        return open(os.path.join(ROOT, rel), errors="ignore").read()
+    except OSError:
+        return ""
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--set", default="catboost_defaults", choices=sorted(DEFAULT_SETS))
+    parser.add_argument(
+        "--removing",
+        metavar="PARAMETER",
+        help=(
+            "name the parameter whose device_policy block is about to be "
+            "removed; reports what the default set still walks into once the "
+            "fallback that block provided is gone"
+        ),
+    )
     parser.add_argument(
         "--check",
         action="store_true",
@@ -669,6 +767,30 @@ def main(argv=None):
         help="include raises that do not read as refusals",
     )
     args = parser.parse_args(argv)
+
+    if args.removing:
+        device_rows, unrouted = unmasked_by_removing(args.set, args.removing)
+        print(f"Removing the block for {args.removing!r} unmasks:")
+        print()
+        for name, hits in device_rows:
+            mark = "  UNROUTED" if name in unrouted else "  masked  "
+            print(f"{mark} {name}")
+            for h in hits[:3]:
+                print(f"      {h['file']}:{h['line']}")
+                print(f"        {h['message'][:130]}")
+            print()
+        if unrouted:
+            print(
+                "UNROUTED means device_policy never names the parameter, so "
+                "no block\ncould route around it. After the removal, auto "
+                "selects the accelerator\non shape and the fit raises in the "
+                "grower. Add a block for each of\nthese BEFORE removing the "
+                "one you named."
+            )
+        elif not device_rows:
+            print("  nothing: the set walks into no device refusal without it")
+        return 1 if unrouted else 0
+
     params, rows = audit(args.set)
 
     if args.check:
