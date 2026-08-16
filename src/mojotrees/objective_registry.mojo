@@ -262,10 +262,61 @@ comptime MAPE = 10
 comptime FAIR = 11
 comptime CROSS_ENTROPY = 12
 
+# CatBoost's three ranking losses (catboost_ranking.mojo). Their gradients
+# come from query groups, like LambdaRank's, and `train_catboost_ranker` is
+# the loop that computes them.
+comptime QUERY_RMSE = 13
+comptime PAIR_LOGIT = 14
+comptime YETI_RANK = 15
+
+# Survival analysis (survival.mojo). `train_cox` and `train_survival_aft`.
+#
+# **16 and 17, not 13 and 14, and the near miss is the reason this block is
+# here at all.** Two lanes in one round independently assigned 13 and 14 to
+# different objectives -- ranking's QueryRMSE/PairLogit and survival's
+# Cox/SurvivalAft -- because each staged its codes in its own module rather
+# than in this file, so neither could see the other's. What caught it was a
+# lane's own unit test pinning its values, not any gate. An objective code is
+# a number in a serialized model: `serialize.save_model` writes it and
+# `load_model` reads it, so two objectives sharing one is not a merge
+# conflict, it is a model that loads as the wrong loss with the wrong inverse
+# link and raises nothing. Survival was renumbered on merge because ranking's
+# codes were written first. Assign codes HERE, where the next assignment can
+# see them and `compatibility/api_snapshot.json` freezes them.
+comptime COX = 16
+comptime SURVIVAL_AFT = 17
+
 # Softmax multiclass. Negative to stay out of the single-output code space
 # forever: multiclass is trained by `train_multiclass`, not by `train`, and a
 # model of it holds one tree per class per round.
 comptime MULTICLASS = -1
+
+# Multi-output regression (multi_target.mojo), `train_multi_rmse`. Negative
+# for exactly `MULTICLASS`'s stated reason: a multi-output model is not
+# trained by `boosting.train` and does not hold one tree per round.
+comptime MULTI_RMSE = -2
+comptime MULTI_RMSE_WITH_MISSING = -3
+
+# --- the seven codes above are RESERVED, not reachable --------------------
+#
+# `objective_reserved` below is the predicate, and it is deliberately outside
+# `objective_is_known`. Every one of these names a loss whose gradient loop is
+# merged and whose module is imported by nothing -- `catboost_ranking.mojo`,
+# `survival.mojo` and `multi_target.mojo` have zero importers anywhere in
+# `src/`, `bindings/`, `capi/` or `cli/`, including `__init__.mojo`. So the
+# trainers exist and only a hand-written Mojo call that imports the module
+# directly can reach them.
+#
+# What is registered here is therefore the half that must be right BEFORE a
+# trainer is connected, not after: the number, the name it round-trips under,
+# its task, and its inverse link. Those are the facts a *serialized model*
+# depends on, and a model file outlives the fit that wrote it. Registering
+# them now is what makes the eighth assignment safe; connecting a trainer is
+# a separate, additive step that flips one predicate.
+#
+# `objective_is_builtin` stays False for all seven, so `boosting._check_
+# objective` still refuses them and no fit can be routed to the wrong loop by
+# this block existing.
 
 # LightGBM's fair_c and tweedie_variance_power defaults, the value the
 # objective's one scalar slot takes for FAIR and TWEEDIE when a caller does
@@ -514,11 +565,72 @@ def objective_is_known(objective: Int) -> Bool:
 
 
 @always_inline
+def objective_reserved(objective: Int) -> Bool:
+    """Whether this code is assigned, serializable, and reachable by no
+    trainer this package connects.
+
+    The seven of them: `QUERY_RMSE`, `PAIR_LOGIT`, `YETI_RANK` (
+    catboost_ranking.mojo), `COX`, `SURVIVAL_AFT` (survival.mojo),
+    `MULTI_RMSE`, `MULTI_RMSE_WITH_MISSING` (multi_target.mojo).
+
+    This predicate is what lets a caller tell "I have never heard of this
+    number" from "I know exactly what this number means and nothing in this
+    build fits it". Those are different answers and only the second one is
+    actionable, which is the whole reason the codes are registered rather
+    than left staged in three modules that import nothing and are imported
+    by nothing.
+
+    It is deliberately NOT folded into `objective_is_known`. Every caller of
+    that predicate is deciding whether a fit may proceed, and the answer for
+    these is no.
+    """
+    return (
+        objective == QUERY_RMSE
+        or objective == PAIR_LOGIT
+        or objective == YETI_RANK
+        or objective == COX
+        or objective == SURVIVAL_AFT
+        or objective == MULTI_RMSE
+        or objective == MULTI_RMSE_WITH_MISSING
+    )
+
+
+def objective_reserved_trainer(objective: Int) -> String:
+    """The Mojo entry point that trains this reserved objective, or an empty
+    string when the code is not reserved.
+
+    A refusal that says "not implemented" for a merged trainer is what let
+    three modules sit unused through a whole round. This is the sentence a
+    refusal should carry instead: the function exists, here is its name, and
+    what is missing is the call.
+    """
+    if objective == QUERY_RMSE or objective == PAIR_LOGIT or (
+        objective == YETI_RANK
+    ):
+        return String("catboost_ranking.train_catboost_ranker")
+    if objective == COX:
+        return String("survival.train_cox")
+    if objective == SURVIVAL_AFT:
+        return String("survival.train_survival_aft")
+    if objective == MULTI_RMSE or objective == MULTI_RMSE_WITH_MISSING:
+        return String("multi_target.train_multi_rmse")
+    return String("")
+
+
+@always_inline
 def objective_is_multi_output(objective: Int) -> Bool:
     """Whether one boosting iteration grows more than one tree, which is
     what makes a model's tree count the round count times the class count
-    rather than the round count."""
-    return objective == MULTICLASS
+    rather than the round count.
+
+    True for the reserved `MULTI_RMSE` pair too: `multi_target.
+    train_multi_rmse` grows one tree per output plane per round, which is why
+    those two codes are negative in the first place."""
+    return (
+        objective == MULTICLASS
+        or objective == MULTI_RMSE
+        or objective == MULTI_RMSE_WITH_MISSING
+    )
 
 
 def objective_task(objective: Int) raises -> Int:
@@ -539,6 +651,17 @@ def objective_task(objective: Int) raises -> Int:
         return TASK_MULTICLASS
     if objective == LAMBDARANK:
         return TASK_RANKING
+    # The three reserved CatBoost ranking losses. QueryRMSE is a squared
+    # error with the query mean removed, which is still a ranking task: its
+    # gradients need the grouping and its level is unidentifiable.
+    if objective == QUERY_RMSE or objective == PAIR_LOGIT or (
+        objective == YETI_RANK
+    ):
+        return TASK_RANKING
+    # Cox, SurvivalAft and MultiRMSE are regression: one real-valued output
+    # per row (per plane, for MultiRMSE) and no class or query structure.
+    if objective_reserved(objective):
+        return TASK_REGRESSION
     if objective == CUSTOM or objective_is_builtin(objective):
         return TASK_REGRESSION
     raise Error("unknown objective code ", objective)
@@ -584,6 +707,24 @@ def objective_canonical_name(objective: Int) raises -> String:
         return String("lambdarank")
     if objective == CUSTOM:
         return String("custom")
+    # The reserved codes. Lowercase snake case, this module's convention, and
+    # `objective_code_from_name` also accepts CatBoost's own capitalization
+    # (`QueryRMSE`, `SurvivalAft`, `MultiRMSE`) since that is what a ported
+    # script writes.
+    if objective == QUERY_RMSE:
+        return String("query_rmse")
+    if objective == PAIR_LOGIT:
+        return String("pair_logit")
+    if objective == YETI_RANK:
+        return String("yeti_rank")
+    if objective == COX:
+        return String("cox")
+    if objective == SURVIVAL_AFT:
+        return String("survival_aft")
+    if objective == MULTI_RMSE:
+        return String("multi_rmse")
+    if objective == MULTI_RMSE_WITH_MISSING:
+        return String("multi_rmse_with_missing")
     raise Error("unknown objective code ", objective)
 
 
@@ -606,6 +747,23 @@ def objective_unimplemented_canonical(name: String) -> String:
         return String("multiclassova")
     if name == "rank_xendcg" or name == "xendcg":
         return String("rank_xendcg")
+    # The seven RESERVED codes, by name. They land here rather than in
+    # `objective_code_from_name` on purpose: this branch is the "you asked
+    # for a real thing and here is what is missing" path, and resolving them
+    # to a code instead would hand a trainer a number it cannot fit. Both
+    # spellings, because a ported CatBoost script writes theirs.
+    if name == "queryrmse" or name == "query_rmse":
+        return String("query_rmse")
+    if name == "pairlogit" or name == "pair_logit":
+        return String("pair_logit")
+    if name == "yetirank" or name == "yeti_rank":
+        return String("yeti_rank")
+    if name == "cox":
+        return String("cox")
+    if name == "survivalaft" or name == "survival_aft" or name == "aft":
+        return String("survival_aft")
+    if name == "multirmse" or name == "multi_rmse":
+        return String("multi_rmse")
     return String("")
 
 
@@ -642,6 +800,44 @@ def objective_unimplemented_reason(name: String) -> String:
     if name == "rank_xendcg" or name == "xendcg":
         return String(
             "'lambdarank' is the ranking objective mojotrees provides"
+        )
+    # The reserved codes. The reason is the same sentence for all six names
+    # and it is deliberately NOT "not implemented": the loss, its gradients
+    # and its round loop are all merged, and what is missing is one call.
+    # `objective_reserved_trainer` names the entry point per code; these
+    # spell it per name, because this function is reached from a name.
+    if name == "queryrmse" or name == "query_rmse" or (
+        name == "pairlogit" or name == "pair_logit"
+    ) or (name == "yetirank" or name == "yeti_rank"):
+        return String(
+            "its gradients, its pair generation and its round loop are"
+            " implemented in src/mojotrees/catboost_ranking.mojo"
+            " (train_catboost_ranker), which nothing imports: no binding, no"
+            " __init__, no trainer. Reaching it needs an entry point that"
+            " bins the matrix and passes a RankGroups, which no fit path"
+            " builds. 'lambdarank' is the ranking objective that is connected"
+        )
+    if name == "cox":
+        return String(
+            "the partial likelihood and its round loop are implemented in"
+            " src/mojotrees/survival.mojo (train_cox), which nothing imports."
+            " Reaching it needs a binding entry point that bins the matrix"
+            " and passes CatBoost's one signed target column"
+        )
+    if name == "survivalaft" or name == "survival_aft" or name == "aft":
+        return String(
+            "the accelerated-failure-time loss and its round loop are"
+            " implemented in src/mojotrees/survival.mojo"
+            " (train_survival_aft), which nothing imports. Reaching it needs"
+            " a binding entry point that bins the matrix and passes a"
+            " two-column TargetMatrix of interval bounds"
+        )
+    if name == "multirmse" or name == "multi_rmse":
+        return String(
+            "the per-plane loss and its round loop are implemented in"
+            " src/mojotrees/multi_target.mojo (train_multi_rmse), which"
+            " nothing imports. Reaching it needs a binding entry point that"
+            " returns a MultiTargetBooster, which no Python model type wraps"
         )
     return String("")
 
@@ -768,6 +964,16 @@ def objective_link(objective: Int) -> Int:
         return LINK_EXP
     if objective == MULTICLASS:
         return LINK_SOFTMAX
+    # `SurvivalAft`'s raw score is the LOG of the survival time, so its
+    # inverse link is `exp`. This is the one reserved code whose link is not
+    # the identity, and it is the reason registering these numbers before a
+    # trainer is connected is worth doing on its own: an unregistered code
+    # fell through to `LINK_IDENTITY` here, which is correct for `COX` and
+    # silently wrong for `SURVIVAL_AFT`, and `survival.survival_aft_predicted_
+    # time` exists only as the workaround for that. It is now the workaround
+    # for nothing.
+    if objective == SURVIVAL_AFT:
+        return LINK_EXP
     return LINK_IDENTITY
 
 
@@ -964,8 +1170,17 @@ def check_objective_param(objective: Int, value: Float64) raises:
 def objective_needs_groups(objective: Int) -> Bool:
     """Whether training this objective needs query groups. LambdaRank's
     gradients are pairwise within a query, so a group array is not optional
-    for it and is meaningless for everything else."""
-    return objective == LAMBDARANK
+    for it and is meaningless for everything else. The same is true of
+    CatBoost's three ranking losses: `QueryRMSE` centers residuals within a
+    query and the two pairwise losses see only within-query score
+    differences, so `train_catboost_ranker` takes a `RankGroups` and cannot
+    be called without one."""
+    return (
+        objective == LAMBDARANK
+        or objective == QUERY_RMSE
+        or objective == PAIR_LOGIT
+        or objective == YETI_RANK
+    )
 
 
 def objective_grad_hess_source(objective: Int) raises -> Int:
@@ -1008,6 +1223,24 @@ def objective_init_kind(objective: Int) raises -> Int:
         return INIT_ZERO
     if objective == MULTICLASS:
         return INIT_LOG_CLASS_PRIOR
+    # The reserved codes, each taken from its own trainer rather than
+    # guessed. All three ranking losses boost from zero because their level
+    # is unidentifiable -- QueryRMSE subtracts the query mean, the two
+    # pairwise losses see only differences -- which is LambdaRank's answer
+    # for LambdaRank's reason. `COX` likewise: adding a constant to every raw
+    # score leaves the partial likelihood exactly unchanged, so there is no
+    # meaningful starting score and `train_cox` gives it none. `SURVIVAL_AFT`
+    # takes a caller-supplied `base_score` (default 0, a predicted time of 1),
+    # which is `INIT_CALLER`. `MULTI_RMSE` is squared error per plane, so it
+    # is `INIT_LINK_MEAN` per plane.
+    if objective == QUERY_RMSE or objective == PAIR_LOGIT or (
+        objective == YETI_RANK or objective == COX
+    ):
+        return INIT_ZERO
+    if objective == SURVIVAL_AFT:
+        return INIT_CALLER
+    if objective == MULTI_RMSE or objective == MULTI_RMSE_WITH_MISSING:
+        return INIT_LINK_MEAN
     if objective_renews_leaves(objective):
         return INIT_LABEL_PERCENTILE
     if objective_is_builtin(objective):

@@ -115,7 +115,9 @@ comptime SUPPORTED_KEYS = String(
     " use_missing,"
     " use_quantized_grad, num_grad_quant_bins, quant_train_renew_leaf,"
     " stochastic_rounding, leaf_estimation_iterations,"
-    " derivative_precision, auto_learning_rate"
+    " derivative_precision, auto_learning_rate,"
+    " permutation_count, fold_len_multiplier, fold_permutation_block,"
+    " ordered_seed"
 )
 
 # Parameters that name a real feature this parser does not cover, reported as
@@ -510,8 +512,10 @@ def params_names_mojo_api_only(spec: String) -> Bool:
             return True
         # Same rule for the three `boosting_type` values that name a real
         # trainer needing a parameter bundle. `ordered` is deliberately not
-        # here: it is not implemented at all, so it is not a feature reached
-        # the wrong way.
+        # here, and the reason changed on 2026-08-16: it used to be absent
+        # because it was not implemented, and it is absent now because this
+        # surface implements it. Its knobs are four scalars, so there is no
+        # bundle a string cannot carry.
         if key == "boosting_type" or key == "boosting" or key == "booster":
             if lowered == "dart" or lowered == "goss" or lowered == "rf":
                 return True
@@ -585,10 +589,17 @@ def _check_boosting_type(value: String) raises:
     default configuration answers it by doing nothing.
 
     `ordered` is CatBoost's ordered boosting: derivatives for row i taken
-    from a model that never saw row i. It is not implemented anywhere in
-    mojotrees (docs/design/CATBOOST_CATALOG.md, A7), so it parses and is
-    then refused by name -- the user asked for a real thing and being told
-    the value is unknown would be misleading.
+    from a model that never saw row i. **It is implemented**
+    (ordered_boosting.mojo, and the fold ladder inside `boosting.train`), and
+    since 2026-08-16 this surface sets `BoosterParams.ordered` rather than
+    refusing the value. It differs from `dart`, `goss` and `rf` in the way
+    that matters to a parameter string: its four knobs are scalars
+    (`permutation_count`, `fold_len_multiplier`, `fold_permutation_block`,
+    `ordered_seed`) and a whitespace-separated string can carry every one of
+    them, so there is no bundle the string cannot express.
+
+    It is refused on the GPU in `_validate` rather than here, because the
+    device is a separate key and is not known at this call.
 
     `dart`, `goss` and `rf` are implemented, but selecting one means handing
     a trainer a `DartParams`, a `GossParams` or the RF loop, which a
@@ -601,13 +612,7 @@ def _check_boosting_type(value: String) raises:
     ):
         return
     if value == "ordered":
-        raise Error(
-            "boosting_type 'ordered' is not implemented: CatBoost's ordered"
-            " boosting takes each row's derivatives from a model fitted"
-            " without that row, which needs a per-permutation model set"
-            " mojotrees does not build. 'plain' (an alias of 'gbdt') is the"
-            " scheme mojotrees trains"
-        )
+        return
     if value == "dart" or value == "goss" or value == "rf" or (
         value == "random_forest" or value == "dart_mode"
     ):
@@ -626,7 +631,9 @@ def _check_boosting_type(value: String) raises:
     )
 
 
-def _validate(config: TrainConfig, saw_num_class: Bool) raises:
+def _validate(
+    config: TrainConfig, saw_num_class: Bool, saw_ordered_knob: Bool = False
+) raises:
     """Range checks that do not depend on the training data. Objective
     specific checks on the label values stay in boosting.mojo, which sees
     the labels; the `alpha` range checks are here as well as there, so a
@@ -660,6 +667,24 @@ def _validate(config: TrainConfig, saw_num_class: Bool) raises:
         config.booster.bundling.enabled, config.device == CPU_DEVICE
     )
     config.booster.bundling.check()
+    # Ordered boosting: the same two questions bundling is asked, in the same
+    # order. Its own range check first (`permutation_count`,
+    # `fold_len_multiplier`, the block size), then whether the run that would
+    # carry it can honor it.
+    config.booster.ordered.validate()
+    if config.booster.ordered.enabled and config.device != CPU_DEVICE:
+        raise Error(
+            "boosting_type=ordered trains on the CPU only: the fold ladder"
+            " lives in boosting.train and train_gpu reads"
+            " BoosterParams.ordered nowhere, so a GPU run would train a plain"
+            " ensemble and report an ordered one. Set device=cpu"
+        )
+    if saw_ordered_knob and not config.booster.ordered.enabled:
+        raise Error(
+            "permutation_count, fold_len_multiplier, fold_permutation_block"
+            " and ordered_seed configure ordered boosting and are read only"
+            " when boosting_type=ordered; set that too, or drop the knob"
+        )
     check_max_bin(config.max_bin)
 
     if config.objective == HUBER and config.alpha <= 0.0:
@@ -713,6 +738,11 @@ def parse_params(spec: String) raises -> TrainConfig:
     var saw_lambda_l2 = False
     var saw_leaf_estimation_iterations = False
     var saw_auto_learning_rate = False
+    # Whether the string named any of ordered boosting's four knobs. Tracked
+    # for one reason: a knob without `boosting_type=ordered` is a value that
+    # would be parsed, stored, and then never read, which is the shape this
+    # package refuses everywhere else. `_validate` turns it into a message.
+    var saw_ordered_knob = False
 
     for token_slice in spec.split():
         var token = String(token_slice)
@@ -821,6 +851,37 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.grow_policy = parse_grow_policy(lowered)
         elif key == "boosting_type" or key == "boosting" or key == "booster":
             _check_boosting_type(lowered)
+            # CatBoost's `Ordered`. `_check_boosting_type` has already
+            # accepted or refused the vocabulary; this turns the one value
+            # that names a mechanism into the bundle that mechanism reads.
+            # `enable` supplies the module's defaults, and the four keys
+            # below overwrite whichever of them the string names -- in either
+            # order, because they set fields on an already-enabled bundle and
+            # `boosting_type=ordered` is what flips `enabled`.
+            if lowered == "ordered":
+                config.booster.ordered.enabled = True
+        # The four knobs of ordered boosting (ordered_boosting.mojo). Each is
+        # a scalar, which is why this surface can carry the mechanism at all
+        # where it cannot carry dart's or GOSS's. They are read whether or not
+        # `boosting_type=ordered` appeared, and `_validate` is what refuses a
+        # knob set beside a plain fit: a value that would be dropped is the
+        # thing this parser reports rather than ignores.
+        elif key == "permutation_count":
+            config.booster.ordered.permutation_count = _parse_int(key, value)
+            saw_ordered_knob = True
+        elif key == "fold_len_multiplier":
+            config.booster.ordered.fold_len_multiplier = _parse_f64(
+                key, value
+            )
+            saw_ordered_knob = True
+        elif key == "fold_permutation_block":
+            config.booster.ordered.permutation_block_size = _parse_int(
+                key, value
+            )
+            saw_ordered_knob = True
+        elif key == "ordered_seed":
+            config.booster.ordered.seed = _parse_int(key, value)
+            saw_ordered_knob = True
         elif (
             key == "colsample_bytree"
             # LightGBM; CatBoost.
@@ -1249,7 +1310,7 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.feature_fraction_seed = random_state
         if not saw_extra_seed:
             config.booster.tree.extra.extra_seed = random_state
-    _validate(config, saw_num_class)
+    _validate(config, saw_num_class, saw_ordered_knob)
     if saw_auto_learning_rate:
         _enable_auto_learning_rate(
             config,

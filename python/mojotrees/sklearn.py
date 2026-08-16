@@ -215,8 +215,13 @@ class _Base(_ParamsMixin):
     `boosting_type` (LightGBM's `boosting`, XGBoost's `booster`) selects the
     training strategy: "gbdt", the default, trains every tree on
     every row, and "goss" is Gradient-based One-Side Sampling. CatBoost's
-    "plain" is an alias of "gbdt"; its "ordered" is not implemented and
-    raises by name rather than being rejected as an unknown value. Under GOSS
+    "plain" is an alias of "gbdt". Its "ordered" trains CatBoost's ordered
+    boosting, where row i's derivatives come from a model fitted on a prefix
+    of a permutation that excludes it (`permutation_count`,
+    `fold_len_multiplier`, `fold_permutation_block`, `has_time`,
+    `ordered_seed`); it runs on a dense, single-output CPU fit without
+    eval_set, a callable objective, or row sampling, and raises by name
+    anywhere else. Under GOSS
     each round keeps the `top_rate` share of rows with the largest gradient
     magnitude, samples `other_rate` of the rest, and scales the sampled rows
     up to compensate. `goss_seed` makes the sample reproducible and
@@ -269,13 +274,31 @@ class _Base(_ParamsMixin):
     take it too. A value given to `fit` wins, being the more specific
     statement.
 
-    The CatBoost-only parameters -- `random_strength`, `bootstrap_type`,
-    `bagging_temperature`, `leaf_estimation_iterations`, `score_function`,
-    `max_ctr_complexity` -- keep CatBoost's names. Each is accepted at the
-    value that names what mojotrees already does (`random_strength=0`,
-    `leaf_estimation_iterations=1`, `score_function="L2"`,
-    `bootstrap_type="No"`) and refused by name with what it would take
-    otherwise, rather than accepted and ignored.
+    The CatBoost-only parameters keep CatBoost's names, and they split into
+    two groups.
+
+    **Wired.** `leaf_estimation_iterations` keeps taking Newton steps on a
+    leaf's own rows after the tree's structure is fixed; above 1 it changes
+    every leaf value on a plain dense, single-output fit (either device), and
+    raises with the entry point's name everywhere else -- the sparse,
+    multiclass, ranking and custom-objective paths, and eval_set, whose round
+    loop is `custom_metric.fit_with_metrics` and not
+    `boosting.train_with_valid`. It moves nothing under squared error, whose
+    loss is exactly the quadratic one Newton step already minimizes.
+    `boosting_type="ordered"` and its five knobs are described above.
+
+    **Not wired, and refused by name with the missing piece.**
+    `random_strength` (the noise is implemented; its per-tree scale is
+    computed by a function with no callers), `score_function` (the Cosine
+    scorer is implemented; no parameter field carries the choice, so it is
+    accepted only at `"L2"`, and it is not a no-op above `reg_lambda=0`),
+    `bootstrap_type` and `bagging_temperature` (the Bayesian and MVS weights
+    are implemented; no trainer takes the bundle -- CatBoost's `"Bernoulli"`
+    is row bagging under another name and is `subsample` with
+    `subsample_freq`, and `"No"` is what an unbagged fit already is), and
+    `max_ctr_complexity` (the CTR modules are implemented; nothing imports
+    them, so no fit builds a CTR column). None of these is accepted and
+    ignored.
 
     `use_missing` is LightGBM's parameter of the same name. With it (the
     default), `NaN` is a missing value: a feature that has any in training
@@ -471,6 +494,16 @@ class _Base(_ParamsMixin):
         boosting="gbdt",
         boosting_type=None,
         booster=None,
+        # CatBoost's ordered-boosting knobs, read only when the resolved
+        # boosting strategy is "ordered" (src/mojotrees/ordered_boosting.mojo).
+        # `None` is "not named" and takes the native default, so the whole
+        # group is inert on every other fit and none of them appears on the
+        # wire with a value this class invented.
+        permutation_count=None,
+        fold_len_multiplier=None,
+        fold_permutation_block=None,
+        has_time=None,
+        ordered_seed=0,
         top_rate=0.2,
         other_rate=0.1,
         goss_seed=3,
@@ -591,6 +624,11 @@ class _Base(_ParamsMixin):
         self.boosting = boosting
         self.boosting_type = boosting_type
         self.booster = booster
+        self.permutation_count = permutation_count
+        self.fold_len_multiplier = fold_len_multiplier
+        self.fold_permutation_block = fold_permutation_block
+        self.has_time = has_time
+        self.ordered_seed = ordered_seed
         self.top_rate = top_rate
         self.other_rate = other_rate
         self.goss_seed = goss_seed
@@ -1044,17 +1082,25 @@ class _Base(_ParamsMixin):
                 )
 
     def _refuse_alternate_boosting(self, where):
-        """Raise when `boosting` is dart or rf and `where` names a fit path
-        that only the plain trainer serves.
+        """Raise when `boosting` is dart, rf or ordered and `where` names a
+        fit path that only the plain trainer serves.
 
         Only `_mojotrees.fit` (dense, single-output, CPU, no eval_set, no
         callable objective) reads the `boosting` key and routes dart and rf
         to `alternate_boosting.fit_boosting`. Every other native entry point
         would train gbdt and say nothing, so those paths refuse by name here
         instead of quietly fitting a different model than the one asked for.
+
+        `ordered` reaches exactly the same one entry point and for the same
+        reason: `boosting.train` is the only trainer that grows the fold
+        ladder, and `_mojotrees.fit` on the CPU is the only way this
+        estimator reaches it. The native binding refuses it too
+        (`_parse_params(ordered_ok=...)`), which is the check that cannot be
+        forgotten; this one exists so the message names the fit path the
+        user is on rather than the entry point they never typed.
         """
         boosting = self._resolve_boosting()
-        if boosting in ("dart", "rf"):
+        if boosting in ("dart", "rf", "ordered"):
             raise ValueError(
                 f"boosting={boosting!r} is not available {where}; it trains "
                 "dense, single-output models on the CPU without eval_set or "
@@ -1107,19 +1153,20 @@ class _Base(_ParamsMixin):
         resolved = None
         if isinstance(boosting, str):
             resolved = self._BOOSTING_ALIASES.get(boosting.strip().lower())
+        # `ordered` is not in `_BOOSTING_TYPES` and must not be: that tuple
+        # (`_fit_args.py`) is the set of *trainers* -- the four values that
+        # select which round loop runs -- and ordered boosting is not a
+        # fourth trainer. It is gbdt with the derivatives read off a fold
+        # ladder instead of off the ensemble, so it goes over the wire as
+        # `boosting="gbdt"` plus the `ordered` bundle `_params` sends beside
+        # it, and `BoosterParams.ordered` is what `boosting.train` reads.
         if resolved == "ordered":
-            raise ValueError(
-                "boosting_type='ordered' is not implemented: CatBoost's "
-                "ordered boosting takes each row's derivatives from a model "
-                "fitted without that row, which needs a per-permutation "
-                "model set mojotrees does not build. 'plain' (an alias of "
-                "'gbdt') is the scheme mojotrees trains."
-            )
+            return "ordered"
         if resolved is None or resolved not in _BOOSTING_TYPES:
             raise ValueError(
                 f"unknown boosting_type {boosting!r}; expected one of "
                 + ", ".join(sorted(_BOOSTING_TYPES))
-                + ", plain (= gbdt), or ordered (not implemented)"
+                + ", plain (= gbdt), or ordered"
             )
         return resolved
 
@@ -1175,6 +1222,12 @@ class _Base(_ParamsMixin):
         "extra_seed": 6,
         "goss_seed": 3,
         "drop_seed": 4,
+        # `ordered_boosting.DEFAULT_ORDERED_SEED`, which is 0. CatBoost has
+        # no name for this one -- its permutation comes off the global
+        # generator -- so the default is the native module's and the reason
+        # it is a parameter at all is that the permutation is then
+        # reproducible by name.
+        "ordered_seed": 0,
     }
 
     def _resolve_seeds(self):
@@ -1248,77 +1301,113 @@ class _Base(_ParamsMixin):
         )
 
     def _check_catboost_only(self):
-        """The CatBoost-only parameters, each accepted at the value that
-        names what mojotrees already does and refused by name otherwise.
+        """The CatBoost-only parameters that this estimator still cannot
+        honor, each accepted at the value that names what mojotrees already
+        does and refused by name otherwise.
 
-        None of these reaches a trainer from Python today: the binding's
-        `extra_params_from_mapping` does not read `random_strength` or
-        `leaf_estimation_iterations`, and `bootstrap_type` needs a
-        `BayesianBootstrapParams` handed to a trainer, which no Python entry
-        point builds. So each is either a statement of the current behavior,
-        which costs nothing to honor, or a request for something that would
-        not happen, which is refused with what it would take -- the same
-        refuse-rather-than-ignore rule src/mojotrees/params.mojo applies to
-        the same names on the parameter-string surface.
+        **This function is shorter than it was, and what left it is the
+        point.** `leaf_estimation_iterations` is no longer here: the binding
+        now folds it onto `TreeParams.extra` and refuses it by entry point
+        rather than outright (`_parse_params(leaf_estimation_ok=...)`), so a
+        value above 1 reaches `boosting._estimate_leaf_values` on the dense
+        single-output fits and raises with the entry point's name on the
+        rest. `boosting_type='ordered'` left `_resolve_boosting` for the same
+        reason. What remains here are the names whose mechanism this build
+        genuinely does not run from any Python entry point, and each message
+        says which piece is missing rather than that the parameter is
+        unknown -- the refuse-rather-than-ignore rule
+        src/mojotrees/params.mojo applies to the same names on the
+        parameter-string surface.
 
         `None` everywhere is "not named", and nothing is checked for it.
         """
         if self.random_strength is not None:
             if float(self.random_strength) != 0.0:
+                # Not a missing implementation: `split.find_best_split` adds
+                # the seeded normal, `GpuSplitSearcher.stage_random_score`
+                # stages it on the device, and
+                # `ExtraTreeParams.random_score_stdev` is the standard
+                # deviation both read. The missing piece is one factor of
+                # that product. CatBoost's scoreStDev is `random_strength *
+                # derivativesStDevFromZero * modelSizeDecrease`, and the last
+                # two are properties of the ensemble at the current
+                # iteration; `random_score_scale_from_gradients` computes
+                # them and **has no callers**, so no trainer puts a scale on
+                # the bundle and `check_random_strength` refuses a positive
+                # strength beside a zero scale. Setting it from here would
+                # therefore raise in the native layer anyway; this message is
+                # the one that says which line is missing.
                 raise ValueError(
                     "random_strength must be 0.0 here: the per-split score "
-                    "noise needs a per-tree scale taken from the ensemble's "
-                    "gradients, which no trainer in this build computes and "
-                    "a histogram scan cannot reconstruct. 0.0 is LightGBM's "
-                    "behavior and mojotrees's, and is accepted."
-                )
-        if self.leaf_estimation_iterations is not None:
-            if int(self.leaf_estimation_iterations) != 1:
-                raise ValueError(
-                    "leaf_estimation_iterations must be 1 here: extra Newton "
-                    "steps per leaf are implemented by boosting.train, "
-                    "train_more and train_with_valid in the Mojo API only, "
-                    "and this estimator also reaches the sparse, "
-                    "custom-objective, multiclass, ranking and GPU trainers, "
-                    "which do not, so a value above 1 would be honored by "
-                    "some fits and dropped by others. 1 is LightGBM's "
-                    "behavior and mojotrees's, and is accepted."
+                    "noise is implemented (split.find_best_split and "
+                    "gpu_split_search both add it), but its per-tree scale "
+                    "is not supplied by any trainer -- "
+                    "tree_parameters_extra.random_score_scale_from_gradients "
+                    "computes CatBoost's derivativesStDevFromZero * "
+                    "modelSizeDecrease and has no caller, so "
+                    "ExtraTreeParams.random_score_scale stays 0.0 and "
+                    "ExtraTreeParams.check_random_strength refuses the pair. "
+                    "0.0 is LightGBM's behavior and mojotrees's, and is "
+                    "accepted."
                 )
         if self.score_function is not None:
-            # `Cosine`, CatBoost's default, is refused rather than accepted
-            # as an equivalent even though at stock settings it would pick
-            # the same split: its numerator is the L2 sum and at
-            # `lambda_l2 = 0` its denominator collapses onto the same
-            # expression, so it degenerates to `sqrt(L2)` and the argmax
-            # cannot move (docs/design/CATBOOST_CATALOG.md, A10 section 3).
-            # That equivalence is conditional on a value the user may
-            # change, and it bites under leaf-wise growth, which is the
-            # default.
+            # `Cosine` is CatBoost's default and is **not** a no-op here.
+            # It degenerates to `sqrt(L2)`, and so cannot move the argmax,
+            # at `lambda_l2 = 0` and only there: its numerator is the L2 sum
+            # and at zero regularizer its denominator collapses onto the same
+            # expression (docs/design/CATBOOST_CATALOG.md, A10 section 3).
+            # Every CatBoost-mode comparison this repository runs sets
+            # `lambda_l2 = 3`, which is off that point, so treating the two
+            # as aliases would silently score every candidate with the wrong
+            # functional in exactly the arm that names CatBoost.
+            #
+            # The arithmetic exists: `split.SCORE_COSINE`, `_cosine_pair`,
+            # `_cosine_score` and the `cosine` arms of `find_best_split` and
+            # `find_best_split_shared` are all merged. What is missing is a
+            # field to carry the choice. `find_best_split(score_function=...)`
+            # is a default argument that every caller leaves alone, no
+            # `TreeParams` or `ExtraTreeParams` field holds it, and
+            # `tree._search` therefore has nothing to pass. Wiring it is two
+            # lines in files this lane does not own; until they land, the
+            # value is refused rather than accepted and dropped.
             if str(self.score_function).lower() != "l2":
                 raise ValueError(
-                    f"score_function={self.score_function!r} is not "
-                    "implemented; mojotrees scores a split as "
-                    "G^2/(H+lambda), which is CatBoost's 'L2', and that is "
-                    "the only value accepted. 'Cosine' picks the same split "
-                    "at reg_lambda=0, where it degenerates to sqrt(L2), but "
-                    "not above it, so it is not accepted as an alias."
+                    f"score_function={self.score_function!r} is not reachable "
+                    "from Python: the Cosine scorer is implemented "
+                    "(split.SCORE_COSINE and the cosine arms of "
+                    "split.find_best_split), but no TreeParams or "
+                    "ExtraTreeParams field carries the choice, so "
+                    "tree._search leaves find_best_split at its SCORE_L2 "
+                    "default. 'L2' is what every fit scores with -- "
+                    "G^2/(H+lambda) -- and is accepted. Cosine picks the same "
+                    "split at reg_lambda=0, where it degenerates to sqrt(L2), "
+                    "but not above it, so it is not accepted as an alias."
                 )
         if self.max_ctr_complexity is not None:
             raise ValueError(
-                "max_ctr_complexity is not implemented: it bounds the arity "
-                "of CatBoost's target-statistic (CTR) feature combinations, "
-                "and mojotrees builds none. Its categorical handling is "
-                "LightGBM's category-set split, under max_cat_to_onehot, "
-                "max_cat_threshold, cat_smooth and cat_l2."
+                "max_ctr_complexity is not reachable: CatBoost's "
+                "target-statistic (CTR) features are implemented "
+                "(src/mojotrees/ctr.mojo builds the ordered statistics and "
+                "src/mojotrees/ctr_combinations.mojo the projections this "
+                "parameter bounds the arity of), but neither module is "
+                "imported by any trainer, binner or dataset path, so no fit "
+                "constructs a CTR column and there is nothing for an arity "
+                "bound to bound. The categorical handling every fit actually "
+                "gets is LightGBM's category-set split, under "
+                "max_cat_to_onehot, max_cat_threshold, cat_smooth and cat_l2."
             )
         if self.bagging_temperature is not None:
             raise ValueError(
-                "bagging_temperature is reachable from the Mojo API only, "
-                "through BayesianBootstrapParams "
-                "(src/mojotrees/sampling.mojo); no Python entry point builds "
-                "one. CatBoost's Bernoulli bootstrap is row bagging under "
-                "another name and is reachable here as subsample with "
-                "subsample_freq."
+                "bagging_temperature is not reachable: the Bayesian "
+                "bootstrap's weights are implemented "
+                "(sampling.BayesianBootstrapParams, "
+                "sampling.bayesian_bootstrap_weights, "
+                "sampling.refresh_bayesian_bootstrap), but no trainer takes "
+                "the bundle -- boosting.train's row sampler is BaggingParams "
+                "and GossParams and nothing else -- so no Python or Mojo "
+                "entry point applies the weights. CatBoost's Bernoulli "
+                "bootstrap is row bagging under another name and is "
+                "reachable here as subsample with subsample_freq."
             )
         if self.bootstrap_type is not None:
             kind = str(self.bootstrap_type).lower()
@@ -1347,6 +1436,116 @@ class _Base(_ParamsMixin):
                 f"unknown bootstrap_type {self.bootstrap_type!r}; expected "
                 "No, Bayesian, Bernoulli, MVS, or Poisson"
             )
+
+    #: The four wire keys of ordered boosting and the native default each
+    #: takes when the estimator names nothing. The numbers are
+    #: `ordered_boosting.DEFAULT_*`, restated here because the wire mapping
+    #: is subscripted key by key on the native side and a missing key is a
+    #: KeyError at the boundary rather than a default.
+    _ORDERED_DEFAULTS = {
+        "permutation_count": 1,
+        "fold_len_multiplier": 2.0,
+        "fold_permutation_block": 0,
+    }
+
+    def _resolve_ordered(
+        self, ordered, ordered_seed, bagging_fraction, bagging_freq
+    ):
+        """The four wire values ordered boosting runs under, and the
+        refusals for every configuration it cannot compose with.
+
+        Returns the mapping `_params` splices into the wire dict. When
+        `ordered` is False it is the defaults, unread by the native side
+        because `ordered=0` sits beside them, and any knob named anyway is
+        refused rather than dropped: a value that would be parsed and never
+        read is the failure this whole lane exists to stop.
+
+        **`has_time` is a block size, not a flag.** CatBoost's `has_time`
+        forces `PermutationCount = 1` (`catboost_options.cpp:1043`) and makes
+        `IsPermutationNeeded` false (`learn_context.cpp:38-46`), which sets
+        `FoldPermutationBlockSize = learnSampleCount` -- one block, identity
+        permutation. `OrderedBoostingParams.resolve_block_size` clamps a
+        block larger than the row count down to the row count, so sending a
+        block of `2**31 - 1` is exactly "one block" at any row count without
+        this layer having to know `n_rows`, which `_params` is not given.
+        An explicit `fold_permutation_block` beside it is refused rather than
+        silently overridden.
+        """
+        named = [
+            name
+            for name in (
+                "permutation_count",
+                "fold_len_multiplier",
+                "fold_permutation_block",
+                "has_time",
+            )
+            if getattr(self, name) is not None
+        ]
+        if not ordered:
+            if named:
+                raise ValueError(
+                    ", ".join(named)
+                    + " configure ordered boosting and are read only when "
+                    "boosting_type='ordered'; set that too, or drop the knob"
+                )
+            return {"ordered": 0, "ordered_seed": int(ordered_seed),
+                    **self._ORDERED_DEFAULTS}
+        out = dict(self._ORDERED_DEFAULTS)
+        if self.permutation_count is not None:
+            if int(self.permutation_count) < 1:
+                raise ValueError("permutation_count must be positive")
+            out["permutation_count"] = int(self.permutation_count)
+        if self.fold_len_multiplier is not None:
+            if not float(self.fold_len_multiplier) > 1.0:
+                raise ValueError(
+                    "fold_len_multiplier must be greater than 1"
+                )
+            out["fold_len_multiplier"] = float(self.fold_len_multiplier)
+        if self.fold_permutation_block is not None:
+            if int(self.fold_permutation_block) < 0:
+                raise ValueError(
+                    "fold_permutation_block must be nonnegative"
+                )
+            out["fold_permutation_block"] = int(self.fold_permutation_block)
+        if self.has_time:
+            if self.fold_permutation_block is not None:
+                raise ValueError(
+                    "has_time=True and fold_permutation_block cannot both be "
+                    "set: has_time is one block over the whole learn set, "
+                    "which is a block size, and honoring both would mean "
+                    "choosing one of two answers"
+                )
+            if self.permutation_count is not None and (
+                int(self.permutation_count) != 1
+            ):
+                raise ValueError(
+                    "has_time=True forces permutation_count=1 (CatBoost's "
+                    "catboost_options.cpp:1043); drop permutation_count or "
+                    "set it to 1"
+                )
+            out["permutation_count"] = 1
+            out["fold_permutation_block"] = 2**31 - 1
+        # The exclusions `boosting._check_ordered` enforces, stated here so
+        # the message names the estimator parameter the user set rather than
+        # the native bundle they never saw. Row samplers change which prefix
+        # each rung was fitted on, so the ladder stops meaning what it says.
+        # `bagging_fraction` and `bagging_freq` arrive already resolved, from
+        # the one `_resolve_alias` chain in `_params` that owns those two
+        # aliases. Resolving them a second time here would work and would put
+        # a second call site on the `subsample` / `subsample_freq` pairs,
+        # which `tools/api_snapshot.py:alias_pairs` counts and reports as a
+        # change to the alias table.
+        if int(bagging_freq) > 0 and float(bagging_fraction) < 1.0:
+            raise ValueError(
+                "boosting_type='ordered' cannot be combined with row "
+                "bagging: every rung's derivatives come from a model fitted "
+                "on a known prefix of a known permutation, and a sampler "
+                "that drops rows changes which prefix that was. Leave "
+                "subsample at 1.0 or subsample_freq at 0."
+            )
+        out["ordered"] = 1
+        out["ordered_seed"] = int(ordered_seed)
+        return out
 
     def _resolve_grow_policy(self):
         """The canonical `grow_policy` value a fit runs under.
@@ -1509,6 +1708,21 @@ class _Base(_ParamsMixin):
         if int(bagging_freq) < 0:
             raise ValueError("subsample_freq must be nonnegative")
         boosting = self._resolve_boosting()
+        # CatBoost's ordered boosting (src/mojotrees/ordered_boosting.mojo).
+        # It is not a fourth trainer, so it leaves here as `boosting="gbdt"`
+        # plus its own bundle; `_parse_params` builds the
+        # `OrderedBoostingParams` and refuses it on every entry point but the
+        # dense single-output CPU one, which is the only trainer that grows
+        # the fold ladder.
+        ordered = boosting == "ordered"
+        if ordered:
+            boosting = "gbdt"
+        ordered_knobs = self._resolve_ordered(
+            ordered,
+            int(seeds["ordered_seed"]),
+            bagging_fraction,
+            bagging_freq,
+        )
         goss = boosting == "goss"
         if goss:
             top_rate = float(self.top_rate)
@@ -1602,6 +1816,18 @@ class _Base(_ParamsMixin):
             # the trainer they always used. The dart bundle is read only
             # when the mode is dart; ints, not bools, as everywhere here.
             "boosting": boosting,
+            # CatBoost's ordered boosting (src/mojotrees/ordered_boosting.mojo),
+            # read by `_parse_params` in bindings/_mojotrees.mojo into the
+            # `OrderedBoostingParams` that rides on `BoosterParams.ordered`.
+            # `ordered` is an int, not a bool, as everywhere here. Sent on
+            # every fit, defaults included, because the native parser
+            # subscripts the mapping rather than testing for a key.
+            #
+            # Until this group existed, `BoosterParams.ordered` was set by no
+            # binding: the fold ladder was merged into `boosting.train`,
+            # tested, and reachable from a hand-written Mojo call and from
+            # nowhere else.
+            **ordered_knobs,
             "drop_rate": float(drop_rate),
             "max_drop": int(self.max_drop),
             "skip_drop": float(self.skip_drop),
@@ -1643,6 +1869,21 @@ class _Base(_ParamsMixin):
             # authority for what these values may be rather than a Python
             # copy of it that can drift.
             "min_gain_to_split": float(min_gain_to_split),
+            # CatBoost's `leaf_estimation_iterations`: keep taking Newton
+            # steps on a leaf's own rows after the structure is fixed
+            # (`boosting._estimate_leaf_values`). 1, the default, is
+            # LightGBM's behavior and is the early return in that function,
+            # so 1 and "absent" are the same code path and the same bits.
+            # Above 1 it is honored by `boosting.train`, `train_more` and
+            # `train_gpu`, which `_mojotrees.fit` reaches, and refused by name
+            # by every other entry point in `_parse_params` -- including the
+            # eval_set one, which routes to `custom_metric.fit_with_metrics`
+            # rather than to `boosting.train_with_valid` despite the name.
+            "leaf_estimation_iterations": (
+                1
+                if self.leaf_estimation_iterations is None
+                else int(self.leaf_estimation_iterations)
+            ),
             "max_delta_step": float(self.max_delta_step),
             "path_smooth": float(self.path_smooth),
             # int, not bool: the binding reads it as an integer.

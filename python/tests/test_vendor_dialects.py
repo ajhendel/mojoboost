@@ -357,8 +357,6 @@ def test_ranker_accepts_the_objective_it_trains(objective):
         {"score_function": "Cosine"},
         {"bootstrap_type": "Bayesian"},
         {"bagging_temperature": 1.0},
-        {"leaf_estimation_iterations": 5},
-        {"boosting_type": "Ordered"},
         {"tree_method": "exact"},
     ],
 )
@@ -401,6 +399,14 @@ def test_a_value_that_states_the_current_behavior_is_accepted(
     A CatBoost script that spells out `bootstrap_type="No"` or a LightGBM
     script that writes `verbose=-1` has described what happens here anyway,
     so it runs, and the model is the one an unadorned fit trains.
+
+    Two names left the refusal list on 2026-08-16 and belong on **neither**
+    list: `leaf_estimation_iterations` above 1 and `boosting_type="Ordered"`
+    are now wired, so they no longer raise, and they do not state the
+    current behavior either -- they change it. Their home is
+    `python/tests/test_catboost_reachability.py`, which asserts the
+    predictions differ, which is the only test that separates wired from
+    accepted. Adding a wired parameter here would assert it was ignored.
     """
     X, y = regression
     baseline = MojoTreesRegressor(n_estimators=8).fit(X, y)
