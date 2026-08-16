@@ -849,6 +849,43 @@ CATBOOST_UNMATCHABLE = {
         "different places. This entry is the placement half and it is open "
         "and unclosable by any parameter"
     ),
+    "leaf_estimation_iterations": (
+        "FOUND BY A RUN on 2026-08-16 and this entry is the correction of a "
+        "claim this file used to make. CatBoost resolves "
+        "leaf_estimation_iterations PER OBJECTIVE: 1 under RMSE and **10** "
+        "under Logloss, read live off get_all_params() on dense_regression "
+        "and imbalanced_binary at the smoke tier. "
+        "MOJOTREES_CATBOOST_MODE_REASONS used to say the value was 'CatBoost's "
+        "resolved value for the objectives this suite runs, 1 for RMSE and "
+        "Logloss', which was a transcription taken on an RMSE fit and "
+        "generalized to a loss it was never read on. "
+        "Our side CANNOT match the Logloss value through this harness's entry "
+        "point: mojotrees.train(params, Dataset) routes to "
+        "trainset.train_dataset, which refuses the parameter above 1 BY NAME "
+        "-- 'leaf_estimation_iterations > 1 is not implemented by a Dataset "
+        "fit; it is implemented by boosting.train, boosting.train_more, "
+        "boosting.train_with_valid, train_gpu.train_gpu and "
+        "train_gpu.train_gpu_with_valid'. Verified by calling it, not by "
+        "reading it. So on every Logloss cell CatBoost takes ten Newton steps "
+        "per leaf and this arm takes one, and no parameter available here "
+        "closes that. The arm keeps 1, which is right on the RMSE cells and "
+        "is the only value the path accepts on the others. Closing this needs "
+        "the Dataset fit to reach a round loop that estimates leaves more "
+        "than once"
+    ),
+    "boost_from_average": (
+        "FOUND BY A RUN on 2026-08-16. CatBoost resolves boost_from_average "
+        "per objective too: True under RMSE and **False** under Logloss. "
+        "mojotrees has no such parameter on any surface this harness reaches "
+        "-- mojotrees.train forwards it into the estimator constructor, which "
+        "raises '_Base.__init__() got an unexpected keyword argument "
+        "boost_from_average'. Verified by calling it. LIGHTGBM_STOCK_DEFAULTS "
+        "records LightGBM's own default as True, which is where the harness's "
+        "previous belief that all three arms agreed came from; that belief "
+        "was about LightGBM and was never checked against CatBoost on a "
+        "classification loss. So on every Logloss cell CatBoost starts from "
+        "zero and the other two start from the prior mean"
+    ),
     "multiclass_tree_count": (
         "CatBoost builds one tree per iteration with a vector leaf value "
         "for MultiClass, where LightGBM and mojotrees build one tree per "
@@ -1348,9 +1385,14 @@ MOJOTREES_CATBOOST_MODE_REASONS = {
         "the dense CPU round loop now computes it before each tree"
     ),
     "leaf_estimation_iterations": (
-        "CatBoost's resolved value for the objectives this suite runs. It is "
-        "1 for RMSE and Logloss and this arm does not run the losses where "
-        "CatBoost resolves it higher"
+        "1, which is CatBoost's resolved value under RMSE and is the ONLY "
+        "value this harness's entry point accepts. This entry used to claim "
+        "it was 'CatBoost's resolved value for the objectives this suite "
+        "runs, 1 for RMSE and Logloss'; a run on 2026-08-16 read 10 off a "
+        "live Logloss fit and that claim was a transcription from an RMSE fit "
+        "generalized to a loss nobody had read it on. See "
+        "CATBOOST_UNMATCHABLE['leaf_estimation_iterations'] for what our side "
+        "refuses and why the arm is unmatched on every binary cell"
     ),
     "bootstrap_type": (
         "CatBoost's actual CPU default sampler, and the largest single "
@@ -1693,7 +1735,8 @@ CATBOOST_PARAM_MAP = {
     },
     "leaf_estimation_iterations": {
         "ours": "leaf_estimation_iterations",
-        "verdict": "matched",
+        "verdict": "unmatchable",
+        "unmatchable_key": "leaf_estimation_iterations",
         "translate": "identity",
     },
     "boosting_type": {
@@ -1721,14 +1764,9 @@ CATBOOST_PARAM_MAP = {
         ),
     },
     "boost_from_average": {
-        "ours": "boost_from_average",
-        "verdict": "matched",
-        "translate": "identity",
-        "our_default": True,
-        "our_default_source": (
-            "LIGHTGBM_STOCK_DEFAULTS['boost_from_average'], stock on all "
-            "three engines and passed by none of them"
-        ),
+        "ours": None,
+        "verdict": "unmatchable",
+        "unmatchable_key": "boost_from_average",
     },
     "task_type": {
         "ours": "device",
@@ -3825,23 +3863,56 @@ MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS = (
 )
 
 
-def catboost_resolved_declared(spec, threads=None, extra=None):
-    """What this harness declares CatBoost will resolve to for `spec`.
+def catboost_resolved_declared(spec, threads=None, extra=None, live=None):
+    """What CatBoost resolves for `spec`, live where that is known.
 
-    `CATBOOST_LEFT_AT_STOCK` overlaid with everything `catboost_params`
-    passes. It is the static half of the read-back: every value in it was
-    transcribed from `CatBoost.get_all_params()` at
-    `CATBOOST_DEFAULTS_SOURCE`, and `check_catboost_readback` is what proves a
-    live fit still agrees with it.
+    Three layers, and the order is the whole point:
 
-    `CATBOOST_RESOLVED_PER_FIT` keys are ABSENT, not defaulted. There is no
-    honest static value for `learning_rate`, so this dict does not carry one.
+    1. `CATBOOST_LEFT_AT_STOCK`, this file's TRANSCRIPTION of
+       `get_all_params()`, taken on one shape and one loss on 2026-08-16.
+    2. everything `catboost_params` passes.
+    3. `live`, a real `get_all_params()` for THIS cell, which wins.
+
+    **Layer 3 was missing until it was caught by a run, and its absence made
+    the parity table say `agree` about a key the two engines disagreed on.**
+    CatBoost resolves several parameters PER OBJECTIVE, not once:
+    `leaf_estimation_iterations` is 1 under RMSE and 10 under Logloss, and
+    `boost_from_average` is True under RMSE and False under Logloss. Measured
+    2026-08-16 on this machine, `imbalanced_binary` at the smoke tier. The
+    transcription holds only the RMSE reading, so a table built from layers 1
+    and 2 alone compared our arm against CatBoost-on-a-different-loss and
+    reported a match. Live values win here so that the comparison is against
+    the fit that actually happened.
+
+    `CATBOOST_RESOLVED_PER_FIT` keys are ABSENT from the static layers, not
+    defaulted. There is no honest static value for `learning_rate`.
     """
     declared = dict(CATBOOST_LEFT_AT_STOCK)
     declared.update(catboost_params(spec, 1 if threads is None else threads, extra))
     if threads is None:
         declared.pop("thread_count", None)
+    if live:
+        for key, value in live.items():
+            if key in declared or key in CATBOOST_RESOLVED_PER_FIT:
+                declared[key] = value
     return declared
+
+
+def catboost_live_resolved(spec, catboost_readback):
+    """This cell's real `get_all_params()` out of a read-back, or `{}`.
+
+    Never raises. A parity table is a reporting field and must not be the
+    thing that takes a run down, so a read-back that does not cover this cell
+    yields an empty dict and the table falls back to the transcription with
+    `source` saying so.
+    """
+    if not catboost_readback:
+        return {}
+    try:
+        return dict((load_catboost_readback(catboost_readback, spec) or {})
+                    .get("resolved") or {})
+    except CatBoostReadbackMissing:
+        return {}
 
 
 def mojotrees_catboost_mode_resolved(
@@ -3893,7 +3964,8 @@ def catboost_parity_rows(spec, device="cpu", extra=None, catboost_readback=None)
     * `UNCLASSIFIED`    a key in neither table. A failure, and the one this
                         whole structure exists to make impossible.
     """
-    declared = catboost_resolved_declared(spec, None, extra)
+    live = catboost_live_resolved(spec, catboost_readback)
+    declared = catboost_resolved_declared(spec, None, extra, live)
     try:
         ours = mojotrees_catboost_mode_resolved(
             spec, device, extra, catboost_readback=catboost_readback
@@ -3946,6 +4018,14 @@ def catboost_parity_rows(spec, device="cpu", extra=None, catboost_readback=None)
             "mojotrees": ours_key,
             "mojotrees_value": None if ours_value is missing else ours_value,
             "mojotrees_container": entry.get("ours_container", "train"),
+            # Where the CatBoost value came from. A `declared` row is being
+            # compared against a transcription taken on one shape and one
+            # loss; a `live` row is being compared against the fit that
+            # actually happened. The distinction is not cosmetic: see
+            # catboost_resolved_declared.
+            "catboost_value_source": (
+                "live" if theirs_key in live else "declared"
+            ),
             "status": entry["verdict"],
             "detail": entry.get("reason") or entry.get("note") or "",
         }
