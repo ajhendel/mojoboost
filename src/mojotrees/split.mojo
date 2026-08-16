@@ -112,7 +112,32 @@ right -- share a single draw, because the noise belongs to the threshold and
 not to the routing direction. Sharing it keeps the LightGBM rule above
 intact: an exact tie between the two directions still keeps `default_left`,
 because equal gains stay equal after the same number is added to both.
+
+Which functional is maximized
+-----------------------------
+`score_function` selects it, and defaults to `SCORE_L2`, which is the
+second-order gain spelled at the top of this docstring and is what every
+caller in the package gets. `SCORE_COSINE` is CatBoost's CPU default
+(`docs/design/CATBOOST_CATALOG.md` A10, verified from source): a ratio,
+`sum(-out * G) / sqrt(sum(out^2 * H))` over the children, minus the same
+functional of the unsplit node.
+
+**At `lambda_l2 = 0` the two have the same argmax, provably.** Substituting
+the free Newton step makes the numerator and the denominator the same
+expression, so Cosine collapses to `sqrt` of the L2 score and `sqrt` is
+strictly increasing. mojotrees stock is `lambda_l2 = 0`. Cosine is therefore
+a difference only under a positive `lambda_l2`, under a leaf-wise queue that
+compares gains from different parents, or beside one of the absolute costs
+(`min_gain_to_split`, `feature_contri`, CEGB, `random_strength`) whose units
+it has changed. That is a result, not a reason to leave it out; see A10.
+
+Nothing on the default path is conditional on it. The selector is read once
+per node into a `Bool`, the branch that reads it is loop-invariant for the
+whole scan, and `_split_gain` is not touched. The two extra accumulator
+planes the shared search needs are allocated with length 0 when it is off.
 """
+
+from std.math import sqrt
 
 from .apple_cpu_policy import split_scan_ops
 from .parallel import DispatchSettings, dispatch_features_with
@@ -163,6 +188,191 @@ from .tree_parameters_extra import (
 # told apart.
 comptime _FLAG_DEFAULT_LEFT = 1
 comptime _FLAG_CATEGORICAL = 2
+
+
+# --------------------------------------------------------------------------
+# score_function: which functional of the children's sums is maximized
+# --------------------------------------------------------------------------
+#
+# `SCORE_L2` is the default and is what every line below this block already
+# did: LightGBM's second-order gain, `_split_gain`. `SCORE_COSINE` is
+# CatBoost's CPU default (`catboost/private/libs/options/
+# oblivious_tree_options.cpp`, `ScoreFunction("score_function",
+# EScoreFunction::Cosine)`), and it is a RATIO rather than a sum. See
+# `docs/design/CATBOOST_CATALOG.md` A10 for the full source reading; the
+# short form is in `_cosine_pair` below.
+#
+# Nothing here is reachable from `TreeParams` or `ExtraTreeParams` yet: this
+# lane owns `split.mojo` only, and the parameter surface lives in files it
+# does not own. The two search entry points take the selector directly and
+# default it to `SCORE_L2`.
+
+comptime SCORE_L2 = 0
+"""LightGBM's second-order gain, `_split_gain`. The default. Unchanged."""
+
+comptime SCORE_COSINE = 1
+"""CatBoost `score_function=Cosine`: `sum(-out * G) / sqrt(sum(out^2 * H))`
+over the children, minus the same functional of the unsplit node."""
+
+
+# CatBoost seeds the denominator accumulator at 1e-100 rather than 0
+# (`score_calcers.h`, `Scores.resize(splitsCount, {0, 1e-100})`). It is a
+# divide-by-zero guard and not a regularizer: `den -> 0` forces `num -> 0`
+# through the same zero-weight guard in `_cosine_out`, so the ratio is 0/0
+# without it. `min_child_hess` is what actually keeps H off the floor.
+comptime _COSINE_DEN_FLOOR = 1e-100
+
+
+def check_score_function(score_function: Int) raises:
+    """Refuse an unknown selector by name rather than falling through to the
+    default, which would silently give an L2 answer to a caller who asked for
+    something else."""
+    if score_function != SCORE_L2 and score_function != SCORE_COSINE:
+        raise Error(
+            "score_function must be split.SCORE_L2 (0) or split.SCORE_COSINE"
+            " (1); got ",
+            score_function,
+        )
+
+
+@fieldwise_init
+struct _CosineTerms(Copyable, Movable):
+    """One candidate's contribution to the two cross-child accumulators
+    CatBoost's `TCosineScoreCalcer` keeps, plus whether the candidate is
+    admissible at all.
+
+    `ok` is False only for a candidate rejected by an active monotonic
+    constraint, which is the one rejection `_split_gain` expresses by
+    returning 0.0. A ratio cannot express a rejection that way, because 0.0 is
+    a legitimate numerator, so it is carried out of band and the caller
+    decides: `find_best_split` drops the candidate, and
+    `find_best_split_shared` substitutes that leaf's unsplit terms, which is
+    what "contributes 0.0 to a sum of (child - parent) differences" means once
+    the sum has been replaced by a ratio.
+    """
+
+    var num: Float64
+    var den: Float64
+    var ok: Bool
+
+
+@always_inline
+def _cosine_out(g: Float64, h: Float64, lambda_reg: Float64) -> Float64:
+    """The value CatBoost calls `leafApprox`, in our sign convention.
+
+    `CalcAverage` (`catboost/private/libs/algo_helpers/online_predictor.h`) is
+    `count > 0 ? sumDelta / (count + reg) : 0`, so a child of zero weight
+    emits zero and contributes nothing to either accumulator instead of
+    dividing by `lambda` alone. That guard is CatBoost's and is kept, so the
+    Cosine path has no divide-by-zero at `lambda_l2 = 0` where the L2 path
+    would produce an infinity; the difference is confined to the Cosine
+    branch and cannot reach the default.
+    """
+    if not (h > 0.0):
+        return 0.0
+    return -g / (h + lambda_reg)
+
+
+@always_inline
+def _cosine_unsplit(
+    g: Float64, h: Float64, lambda_reg: Float64
+) -> _CosineTerms:
+    """The two accumulator terms of a node scored WITHOUT a split, which is
+    CatBoost's `CalcScoreWithoutSplit` (`leafwise_scoring.cpp`): the same
+    calcer run over the node's own totals with an empty second child."""
+    var out = _cosine_out(g, h, lambda_reg)
+    return _CosineTerms(-out * g, out * out * h, True)
+
+
+@always_inline
+def _cosine_pair(
+    left_g: Float64,
+    left_h: Float64,
+    right_g: Float64,
+    right_h: Float64,
+    lambda_reg: Float64,
+    sign: Int,
+    bounds: OutputBounds,
+    constrained: Bool,
+    finish: Bool,
+    max_delta_step: Float64,
+    path_smooth: Float64,
+    left_c: Int,
+    right_c: Int,
+    parent_output: Float64,
+) -> _CosineTerms:
+    """One candidate's contribution to CatBoost's two Cosine accumulators.
+
+    `TCosineScoreCalcer::AddLeaf` (`catboost/private/libs/algo/
+    score_calcers.h`) is
+
+        Scores[i][0] += leafApprox * leafStats.SumWeightedDelta
+        Scores[i][1] += leafApprox * leafApprox * leafStats.SumWeight
+
+    and the score is `Scores[i][0] / sqrt(Scores[i][1])`. CatBoost's
+    `SumWeightedDelta` is a sum of derivatives, which is `-G` in our sign
+    convention, and their `SumWeight` sits where our `H` sits, so their
+    `leafApprox` is our child output and the two terms are `-out * G` and
+    `out^2 * H`.
+
+    Why this is not just a rescaling of `_split_gain`. Substituting the free
+    Newton step `out = -G / (H + lambda)` gives
+
+        num = sum  G^2 / (H + lambda)          <- exactly the L2 score
+        den = sum  G^2 * H / (H + lambda)^2
+
+    **At `lambda = 0` those two expressions are the same one**, so the score
+    collapses to `sqrt(num)` and, `sqrt` being strictly increasing, has the
+    same argmax as L2. Cosine's entire difference from L2 is a function of
+    `lambda_l2`, which mojotrees stock now sets to 0. Said the other way: for
+    a single child the ratio is `|G| / sqrt(H)`, in which `lambda` has
+    cancelled outright -- Cosine is L2 with the regularizer left in the leaf
+    value and taken back out of the score. `docs/design/CATBOOST_CATALOG.md`
+    A10 carries the full argument and the consequences.
+
+    `finish` and `constrained` are handled exactly as `_split_gain` handles
+    them, and for the same reason: CatBoost's monotone branch
+    (`scoring.cpp`, `UpdateScores`) calls `AddLeaf` with the *monotonized*
+    leaf value, so the accumulators are built from the output the leaf will
+    actually emit rather than from the free step. Our monotone rule rejects
+    where CatBoost projects, which predates this parameter; a rejection comes
+    back as `ok = False` rather than as a zero, because 0.0 is a legitimate
+    numerator here and cannot double as a sentinel.
+
+    Addend order is fixed by this function -- left child, then right child,
+    in both accumulators -- and never crosses a task boundary, so the value
+    does not move with `MOJOTREES_NUM_WORKERS`. CatBoost's SIMD kernel
+    accumulates the right child first and seeds the denominator before either
+    (`_cosine_score` applies that seed once, at the end, instead); both are
+    divergences in association, recorded in A10.
+    """
+    var left_out = _cosine_out(left_g, left_h, lambda_reg)
+    var right_out = _cosine_out(right_g, right_h, lambda_reg)
+    if finish:
+        left_out = finish_leaf_output(
+            left_out, max_delta_step, path_smooth, left_c, parent_output
+        )
+        right_out = finish_leaf_output(
+            right_out, max_delta_step, path_smooth, right_c, parent_output
+        )
+    if constrained:
+        left_out = bounds.clamp(left_out)
+        right_out = bounds.clamp(right_out)
+        if violates(sign, left_out, right_out):
+            return _CosineTerms(0.0, 0.0, False)
+    var num = -left_out * left_g
+    num += -right_out * right_g
+    var den = left_out * left_out * left_h
+    den += right_out * right_out * right_h
+    return _CosineTerms(num, den, True)
+
+
+@always_inline
+def _cosine_score(num: Float64, den: Float64) -> Float64:
+    """`Scores[i][0] / sqrt(Scores[i][1])` with CatBoost's denominator seed
+    folded in. Kept as one function so the seed cannot be applied twice or
+    forgotten at one of the four call sites."""
+    return num / sqrt(den + _COSINE_DEN_FLOOR)
 
 
 struct SplitInfo(Copyable, Movable, Writable):
@@ -377,6 +587,7 @@ def find_best_split(
     parent_output: Float64 = 0.0,
     cegb: CegbNodeCosts = CegbNodeCosts.inactive(),
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    score_function: Int = SCORE_L2,
 ) raises -> SplitInfo:
     """Scan all (feature, bin) split candidates and return the one with the
     highest gain. `lambda_reg` is the L2 penalty on the leaf hessian sum and
@@ -458,6 +669,17 @@ def find_best_split(
     same ascending strict `>` at every task count, which is the property
     `test_cpu_dispatch` pins. The default sentinel keeps the live reads, so a
     caller that has not been wired behaves exactly as it did.
+
+    `score_function` selects which functional of the children's sums is
+    maximized. `SCORE_L2` (the default) is the second-order gain this
+    function has always computed and takes exactly the path it always took.
+    `SCORE_COSINE` is CatBoost's CPU default, a ratio rather than a sum; see
+    the module docstring, `_cosine_pair`, and
+    `docs/design/CATBOOST_CATALOG.md` A10. It is refused on a matrix with a
+    categorical feature, because a categorical candidate is a category *set*
+    scored inside `find_best_categorical_split` under the L2 gain and only
+    that search's winner reaches here; rescoring the winner under Cosine
+    would put two score functions inside one argmax.
 
     Exclusive feature bundling (efb.mojo) never reaches here: a bundled
     histogram is expanded back to one slice per original feature before the
@@ -549,6 +771,21 @@ def find_best_split(
             " cannot each be noised from this function"
         )
     var noise_seed = extra.random_strength_seed
+
+    # Read once per node, never per candidate: an L2 scan must leave this
+    # function on exactly the path it took before the parameter existed, and
+    # a `Bool` the whole scan holds constant is a branch the compiler can
+    # hoist out of the bin loop.
+    check_score_function(score_function)
+    var cosine = score_function == SCORE_COSINE
+    if cosine and cats.any_categorical():
+        raise Error(
+            "score_function=cosine is implemented for numerical thresholds"
+            " only; a categorical feature is searched as category partitions"
+            " scored with the L2 gain, and only that search's winner reaches"
+            " this function, so the two score functions would end up inside"
+            " one argmax"
+        )
 
     comptime W = SIMD_LANES
     var grad_p = hist._grad.unsafe_ptr()
@@ -689,6 +926,14 @@ def find_best_split(
 
         var parent_g = soft_threshold_l1(total_g, lambda_l1)
         var parent_score = parent_g * parent_g / (total_h + lambda_reg)
+        # The same functional applied to the node without a split, which is
+        # CatBoost's `CalcScoreWithoutSplit`. Constant across this node's
+        # candidates, as `parent_score` is, so subtracting it only sets the
+        # zero point the `> f_gain` test measures from.
+        var parent_cos = 0.0
+        if cosine:
+            var pt = _cosine_unsplit(parent_g, total_h, lambda_reg)
+            parent_cos = _cosine_score(pt.num, pt.den)
 
         # Ordinary bins are [0, n_scan); the missing bin sits at n_scan and is
         # never a threshold, only a side to route.
@@ -759,23 +1004,50 @@ def find_best_split(
                 ):
                     var tl = soft_threshold_l1(dl_left_g, lambda_l1)
                     var tr = soft_threshold_l1(dl_right_g, lambda_l1)
-                    var gain = _split_gain(
-                        tl,
-                        dl_left_h,
-                        tr,
-                        dl_right_h,
-                        lambda_reg,
-                        parent_score,
-                        sign,
-                        bounds,
-                        constrained,
-                        finish,
-                        extra.max_delta_step,
-                        extra.path_smooth,
-                        dl_left_c,
-                        total_c - dl_left_c,
-                        parent_output,
-                    )
+                    var gain: Float64
+                    if cosine:
+                        var ct = _cosine_pair(
+                            tl,
+                            dl_left_h,
+                            tr,
+                            dl_right_h,
+                            lambda_reg,
+                            sign,
+                            bounds,
+                            constrained,
+                            finish,
+                            extra.max_delta_step,
+                            extra.path_smooth,
+                            dl_left_c,
+                            total_c - dl_left_c,
+                            parent_output,
+                        )
+                        # A monotone rejection is `ok = False`, and 0.0 is the
+                        # value `_split_gain` returns for it: a candidate must
+                        # beat the running best, which starts at 0.0 under a
+                        # strict `>`, so the rejection is expressed the same
+                        # way under both score functions.
+                        gain = 0.0
+                        if ct.ok:
+                            gain = _cosine_score(ct.num, ct.den) - parent_cos
+                    else:
+                        gain = _split_gain(
+                            tl,
+                            dl_left_h,
+                            tr,
+                            dl_right_h,
+                            lambda_reg,
+                            parent_score,
+                            sign,
+                            bounds,
+                            constrained,
+                            finish,
+                            extra.max_delta_step,
+                            extra.path_smooth,
+                            dl_left_c,
+                            total_c - dl_left_c,
+                            parent_output,
+                        )
                     if noisy:
                         gain += noise
                     if gain > f_gain:
@@ -797,23 +1069,45 @@ def find_best_split(
                 ):
                     var tl = soft_threshold_l1(left_g, lambda_l1)
                     var tr = soft_threshold_l1(right_g, lambda_l1)
-                    var gain = _split_gain(
-                        tl,
-                        left_h,
-                        tr,
-                        right_h,
-                        lambda_reg,
-                        parent_score,
-                        sign,
-                        bounds,
-                        constrained,
-                        finish,
-                        extra.max_delta_step,
-                        extra.path_smooth,
-                        left_c,
-                        total_c - left_c,
-                        parent_output,
-                    )
+                    var gain: Float64
+                    if cosine:
+                        var ct = _cosine_pair(
+                            tl,
+                            left_h,
+                            tr,
+                            right_h,
+                            lambda_reg,
+                            sign,
+                            bounds,
+                            constrained,
+                            finish,
+                            extra.max_delta_step,
+                            extra.path_smooth,
+                            left_c,
+                            total_c - left_c,
+                            parent_output,
+                        )
+                        gain = 0.0
+                        if ct.ok:
+                            gain = _cosine_score(ct.num, ct.den) - parent_cos
+                    else:
+                        gain = _split_gain(
+                            tl,
+                            left_h,
+                            tr,
+                            right_h,
+                            lambda_reg,
+                            parent_score,
+                            sign,
+                            bounds,
+                            constrained,
+                            finish,
+                            extra.max_delta_step,
+                            extra.path_smooth,
+                            left_c,
+                            total_c - left_c,
+                            parent_output,
+                        )
                     if noisy:
                         gain += noise
                     if gain > f_gain:
@@ -906,6 +1200,7 @@ def find_best_split_shared(
     node: Int = 0,
     tree_index: Int = 0,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    score_function: Int = SCORE_L2,
 ) raises -> SplitInfo:
     """The one split a whole level of leaves shares, for `grow_policy =
     oblivious` (growth_policy.mojo, `docs/design/OBLIVIOUS.md` B2).
@@ -986,9 +1281,39 @@ def find_best_split_shared(
     level -- every feature's bins total to the same per-leaf sums -- so the
     two forms have the same argmax, and ours is LightGBM's spelling of it.
     CatBoost's CPU *default* is `Cosine`, which is a ratio of two cross-leaf
-    sums (`Scores[i][0] / sqrt(Scores[i][1])`) and is NOT this and NOT
-    implemented here; A10 of `CATBOOST_CATALOG.md` already says we keep
-    LightGBM's gain.
+    sums (`Scores[i][0] / sqrt(Scores[i][1])`) and is NOT this. It is
+    available here as `score_function=SCORE_COSINE`, off by default; see
+    below and `docs/design/CATBOOST_CATALOG.md` A10.
+
+    `score_function` under a shared split
+    -------------------------------------
+    `SCORE_L2` (the default) is everything described above and takes exactly
+    the path it took before the parameter existed. `SCORE_COSINE` is a ratio,
+    so a level's candidate cannot be a sum of per-leaf gains: CatBoost keeps
+    `numScoreBlocks = 1` for `SymmetricTree`
+    (`catboost/cuda/methods/greedy_subsets_searcher/greedy_search_helper.cpp`)
+    precisely because the two accumulators are summed across every leaf of the
+    level and ONE ratio is taken per candidate. That is what is built here:
+    two accumulator planes per (bin, direction) instead of one, folded over
+    leaves in the same ascending order, and the level's unsplit score
+    subtracted once at the end.
+
+    **A leaf that fails a minimum, or whose candidate an active monotonic
+    constraint rejects, contributes its UNSPLIT terms** rather than nothing.
+    That is the exact generalization of the L2 rule and not a new one: under
+    L2, `sum over legal leaves of (child - parent)` is identically
+    `(sum over legal of child + sum over illegal of parent) - sum over all of
+    parent`. Cosine's ratio admits only the second spelling. The illegal-leaf
+    count `audit` reports is unchanged and counts the same leaves.
+
+    **At `lambda_l2 = 0` this changes nothing.** Numerator and denominator
+    become the same expression, the ratio collapses to `sqrt` of the L2 sum,
+    and `sqrt` is strictly increasing, so the level picks the same candidate.
+    mojotrees stock is `lambda_l2 = 0`. See A10; this is a result rather than
+    a reason to leave the parameter out.
+
+    Cosine's extra planes are allocated with length 0 when it is off, so an
+    L2 level allocates exactly what it allocated before.
 
     Determinism
     -----------
@@ -1076,6 +1401,9 @@ def find_best_split_shared(
         )
     var noise_seed = extra.random_strength_seed
 
+    check_score_function(score_function)
+    var cosine = score_function == SCORE_COSINE
+
     # The two accumulators a feature's task folds its leaves into, one per
     # bin per direction, plus the illegal-leaf counts beside them. Allocated
     # once for the whole dispatch and striped by feature slot, so a task
@@ -1092,6 +1420,15 @@ def find_best_split_shared(
     ill_left.resize(stripe, 0)
     var ill_right = List[Int](capacity=stripe)
     ill_right.resize(stripe, 0)
+    # Cosine's second accumulator, one plane per direction. Zero-length when
+    # the score function is L2, which is the `res_bits` pattern in
+    # `find_best_split`: the pointer is taken either way and dereferenced
+    # only under the flag that sized the list.
+    var cos_stripe = stripe if cosine else 0
+    var den_left = List[Float64](capacity=cos_stripe)
+    den_left.resize(cos_stripe, 0.0)
+    var den_right = List[Float64](capacity=cos_stripe)
+    den_right.resize(cos_stripe, 0.0)
 
     var res_gain = List[Float64](capacity=n_active)
     res_gain.resize(n_active, 0.0)
@@ -1108,6 +1445,8 @@ def find_best_split_shared(
 
     var accl_out = acc_left.unsafe_ptr()
     var accr_out = acc_right.unsafe_ptr()
+    var denl_out = den_left.unsafe_ptr()
+    var denr_out = den_right.unsafe_ptr()
     var illl_out = ill_left.unsafe_ptr()
     var illr_out = ill_right.unsafe_ptr()
     var gain_out = res_gain.unsafe_ptr()
@@ -1158,6 +1497,18 @@ def find_best_split_shared(
             accr_out.unsafe_store(off + b, 0.0)
             illl_out.unsafe_store(off + b, 0)
             illr_out.unsafe_store(off + b, 0)
+        if cosine:
+            for b in range(n_top):
+                denl_out.unsafe_store(off + b, 0.0)
+                denr_out.unsafe_store(off + b, 0.0)
+
+        # The level's own unsplit score under Cosine, accumulated leaf by leaf
+        # beside the candidates in the same loop below. Constant across this
+        # feature's candidates -- every feature's bins total to the same
+        # per-leaf sums -- so subtracting it sets the zero point the `>
+        # f_gain` test measures from and nothing else.
+        var p_num = 0.0
+        var p_den = 0.0
 
         # THE CROSS-LEAF REDUCTION. Outer loop over leaves, ascending, inside
         # this one feature's task: each leaf's slice is read once in bin order
@@ -1190,6 +1541,13 @@ def find_best_split_shared(
 
             var parent_g = soft_threshold_l1(total_g, lambda_l1)
             var parent_score = parent_g * parent_g / (total_h + lambda_reg)
+            # This leaf's unsplit terms: the level's zero point, and also what
+            # this leaf contributes at a candidate it cannot take.
+            var pt = _CosineTerms(0.0, 0.0, True)
+            if cosine:
+                pt = _cosine_unsplit(parent_g, total_h, lambda_reg)
+                p_num += pt.num
+                p_den += pt.den
             var lb = bounds[l].copy() if len(bounds) > 0 else (
                 OutputBounds.unbounded()
             )
@@ -1226,19 +1584,28 @@ def find_best_split_shared(
                         illl_out.unsafe_store(
                             off + b, illl_out.unsafe_load(off + b) + 1
                         )
+                        if cosine:
+                            # An illegal leaf stays as it is. Under L2 that is
+                            # written as adding 0.0 to a sum of differences;
+                            # under a ratio the only way to write it is to add
+                            # the leaf's unsplit terms to both accumulators,
+                            # and the two are arithmetically the same rule.
+                            accl_out.unsafe_store(
+                                off + b, accl_out.unsafe_load(off + b) + pt.num
+                            )
+                            denl_out.unsafe_store(
+                                off + b, denl_out.unsafe_load(off + b) + pt.den
+                            )
                     else:
                         var tl = soft_threshold_l1(dl_left_g, lambda_l1)
                         var tr = soft_threshold_l1(dl_right_g, lambda_l1)
-                        accl_out.unsafe_store(
-                            off + b,
-                            accl_out.unsafe_load(off + b)
-                            + _split_gain(
+                        if cosine:
+                            var ct = _cosine_pair(
                                 tl,
                                 dl_left_h,
                                 tr,
                                 dl_right_h,
                                 lambda_reg,
-                                parent_score,
                                 sign,
                                 lb,
                                 constrained,
@@ -1248,8 +1615,41 @@ def find_best_split_shared(
                                 dl_left_c,
                                 total_c - dl_left_c,
                                 pout,
-                            ),
-                        )
+                            )
+                            # A monotone rejection is the illegal case again:
+                            # this leaf stays as it is and does not veto the
+                            # level, which is what `_split_gain` returning 0.0
+                            # means on the L2 path.
+                            var cn = ct.num if ct.ok else pt.num
+                            var cd = ct.den if ct.ok else pt.den
+                            accl_out.unsafe_store(
+                                off + b, accl_out.unsafe_load(off + b) + cn
+                            )
+                            denl_out.unsafe_store(
+                                off + b, denl_out.unsafe_load(off + b) + cd
+                            )
+                        else:
+                            accl_out.unsafe_store(
+                                off + b,
+                                accl_out.unsafe_load(off + b)
+                                + _split_gain(
+                                    tl,
+                                    dl_left_h,
+                                    tr,
+                                    dl_right_h,
+                                    lambda_reg,
+                                    parent_score,
+                                    sign,
+                                    lb,
+                                    constrained,
+                                    finish,
+                                    extra.max_delta_step,
+                                    extra.path_smooth,
+                                    dl_left_c,
+                                    total_c - dl_left_c,
+                                    pout,
+                                ),
+                            )
 
                 if score_right:
                     var right_g = total_g - left_g
@@ -1263,19 +1663,23 @@ def find_best_split_shared(
                         illr_out.unsafe_store(
                             off + b, illr_out.unsafe_load(off + b) + 1
                         )
+                        if cosine:
+                            accr_out.unsafe_store(
+                                off + b, accr_out.unsafe_load(off + b) + pt.num
+                            )
+                            denr_out.unsafe_store(
+                                off + b, denr_out.unsafe_load(off + b) + pt.den
+                            )
                     else:
                         var tl = soft_threshold_l1(left_g, lambda_l1)
                         var tr = soft_threshold_l1(right_g, lambda_l1)
-                        accr_out.unsafe_store(
-                            off + b,
-                            accr_out.unsafe_load(off + b)
-                            + _split_gain(
+                        if cosine:
+                            var ct = _cosine_pair(
                                 tl,
                                 left_h,
                                 tr,
                                 right_h,
                                 lambda_reg,
-                                parent_score,
                                 sign,
                                 lb,
                                 constrained,
@@ -1285,8 +1689,37 @@ def find_best_split_shared(
                                 left_c,
                                 total_c - left_c,
                                 pout,
-                            ),
-                        )
+                            )
+                            var cn = ct.num if ct.ok else pt.num
+                            var cd = ct.den if ct.ok else pt.den
+                            accr_out.unsafe_store(
+                                off + b, accr_out.unsafe_load(off + b) + cn
+                            )
+                            denr_out.unsafe_store(
+                                off + b, denr_out.unsafe_load(off + b) + cd
+                            )
+                        else:
+                            accr_out.unsafe_store(
+                                off + b,
+                                accr_out.unsafe_load(off + b)
+                                + _split_gain(
+                                    tl,
+                                    left_h,
+                                    tr,
+                                    right_h,
+                                    lambda_reg,
+                                    parent_score,
+                                    sign,
+                                    lb,
+                                    constrained,
+                                    finish,
+                                    extra.max_delta_step,
+                                    extra.path_smooth,
+                                    left_c,
+                                    total_c - left_c,
+                                    pout,
+                                ),
+                            )
 
         # This feature's best candidate, in the scan order `find_best_split`
         # uses -- ascending bin, missing-left before missing-right -- under
@@ -1297,6 +1730,9 @@ def find_best_split_shared(
         var f_default_left = False
         var f_ill = 0
         var f_found = False
+        # One ratio per candidate for the whole level, which is CatBoost's
+        # `numScoreBlocks = 1`, minus the level's unsplit score.
+        var level_parent = _cosine_score(p_num, p_den) if cosine else 0.0
         for b in range(n_top):
             # One draw per (feature, bin) candidate, shared by the two routing
             # directions and by every leaf: the noise belongs to the split the
@@ -1308,7 +1744,13 @@ def find_best_split_shared(
                     noise_stdev, noise_seed, tree_index, node, f, b
                 )
             if score_left:
-                var g = accl_out.unsafe_load(off + b) + noise
+                var g = accl_out.unsafe_load(off + b)
+                if cosine:
+                    g = (
+                        _cosine_score(g, denl_out.unsafe_load(off + b))
+                        - level_parent
+                    )
+                g += noise
                 if g > f_gain:
                     f_gain = g
                     f_bin = b
@@ -1316,7 +1758,13 @@ def find_best_split_shared(
                     f_ill = illl_out.unsafe_load(off + b)
                     f_found = True
             if score_right:
-                var g = accr_out.unsafe_load(off + b) + noise
+                var g = accr_out.unsafe_load(off + b)
+                if cosine:
+                    g = (
+                        _cosine_score(g, denr_out.unsafe_load(off + b))
+                        - level_parent
+                    )
+                g += noise
                 if g > f_gain:
                     f_gain = g
                     f_bin = b
