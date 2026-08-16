@@ -102,6 +102,20 @@ window" in this repository's results are defined by their effect on the numbers
 and not by a reading. Every result labelled by regime should be read with that in
 mind.
 
+**Partly superseded, and only partly.** `bench/canary.mojo` is now a reading:
+two fixed probes, one CPU and one GPU, run first and last in every
+`bench_train_gpu.mojo` run and reported as a ratio against a recorded baseline
+(protocol amendment A5, and `bench/README.md`, "The regime canary"). It needs no
+privileged command, because it does not ask the machine what its thermal state
+is -- it asks what the machine delivers, which is the quantity that actually
+matters here. What it still cannot do is name a *cause*, so the `uptime` and
+top-process capture above stays: that one says what was running, the canary says
+whether it mattered. **And the canary's baselines have not been measured yet**,
+so as of this writing every regime label in the tree is still an inference from
+effect. Establishing them is
+`pixi run mojo run -I src bench/bench_canary.mojo 7` on a box quiet by the
+standard this file sets, and until that has happened nothing above is stale.
+
 ## What to do when you could not get a quiet box
 
 Do not silently publish. Two options, in order of preference:
