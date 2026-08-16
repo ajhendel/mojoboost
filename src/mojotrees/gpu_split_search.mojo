@@ -2351,6 +2351,452 @@ def _scan_slot_wide_primitive_kernel(
     )
 
 
+# --- grow_policy = oblivious: the cross-leaf reduction ---------------------
+#
+# See `docs/design/OBLIVIOUS.md` section B2. An oblivious tree chooses one
+# (feature, threshold, missing direction) per *level* and applies it to every
+# leaf of that level, so the quantity being maximized is not a leaf's gain but
+#
+#     score(f, b, dir) = sum over the level's leaves l of gain_l(f, b, dir)
+#
+# with each leaf using its own left/right sums. Gain is not additive across
+# histograms, so this cannot be computed from a merged histogram and the level
+# genuinely needs one histogram per leaf.
+#
+# **Why this is a kernel and not a launch.** The lane's own precondition is
+# that the cross-leaf reduction be FUSED into the existing per-level search
+# launch and never become a command buffer of its own. On Metal one
+# `enqueue_function` is one command buffer and the queue is 64 deep
+# (`docs/GPU_PORTABILITY.md` 6.2); the static census in
+# `gpu_resident_round.oblivious_launch_census` shows depth 6 landing at 62
+# buffers per tree fused and 68 standalone, so a standalone reduce puts the
+# tree past the measured knee and the queue-depth argument for oblivious
+# evaporates at CatBoost's own default depth. The fusion here is the cheapest
+# possible one: the sum over leaves is the innermost loop of the scan that
+# already runs, and the launch count is unchanged at two -- this scan, then
+# `_reduce_slots_kernel` over one record instead of over a frontier.
+
+comptime OBLIVIOUS_MAX_LEAVES = 64
+"""Leaves in one oblivious level this kernel will scan, which is `2 ** 6` and
+therefore CatBoost's default depth exactly.
+
+A bound rather than a preference: the per-leaf scan state below lives in a
+threadgroup allocation sized at compile time, and at twelve words a leaf that
+is 3,072 bytes, the same reservation `WIDE_SCAN_SHARED_BYTES` already makes
+and therefore no new device floor. Depth 7 would double it and also lands at
+71 command buffers per tree, over the queue's knee whatever this kernel does,
+so the two limits agree about where to stop."""
+
+
+def _scan_slot_oblivious_kernel(
+    hist: MutPointer[Int32, MutAnyOrigin],
+    node_tab: MutPointer[Int32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    allow: MutPointer[Int32, MutAnyOrigin],
+    missing: MutPointer[Int32, MutAnyOrigin],
+    cat_n: MutPointer[Int32, MutAnyOrigin],
+    mono: MutPointer[Int32, MutAnyOrigin],
+    fparams: MutPointer[Float32, MutAnyOrigin],
+    out_i: MutPointer[Int32, MutAnyOrigin],
+    out_f: MutPointer[Float32, MutAnyOrigin],
+    n_bins: Int32,
+    hist_size: Int32,
+    level_record: Int32,
+    leaf_base: Int32,
+    n_leaves: Int32,
+    feat_stride: Int32,
+    min_data_in_leaf: Int32,
+    constrained: Int32,
+    gain_form: Int32,
+):
+    """One threadgroup per active feature slot: scan that feature's candidates
+    for a whole oblivious *level* and write the level's best one as a per-slot
+    record, so that the existing cross-feature reduction folds a level exactly
+    as it folds a node.
+
+    The level's leaves are records `[leaf_base, leaf_base + n_leaves)`, and the
+    only thing this kernel reads per leaf is that record's `NODE_HIST_BASE`.
+    Everything else -- the active feature list, the allow mask, the float
+    parameter block, the monotone vector -- is read from `level_record`, which
+    is correct rather than merely convenient under the resident plane's
+    refusals: a node's feature set is the tree's feature set, its allow mask is
+    "everything", and its output interval is unbounded, so all three are
+    tree-level and are staged once per tree. `_launch_child_search` relies on
+    the same three facts and says so.
+
+    The output is written where a one-node search would have written it, at
+    `(level_record * feat_stride + slot)`, so `_reduce_slots_kernel` or
+    `_reduce_slots_block_kernel` launched over `record_base = level_record,
+    n_records = 1` folds these slots into `level_record`'s record with no
+    change at all. That reduction walks slots in ascending order and accepts a
+    new best only on a strictly greater gain, which is the second half of the
+    tie rule below.
+
+    **The summation order is part of the answer and is fixed here.** Float32
+    addition is not associative, so a cross-leaf sum computed by a block
+    collective and one computed by a loop are different numbers, and this mode's
+    accuracy gate is node-identity against the CPU oblivious grower with no
+    tolerance. The sum is therefore taken **serially, in ascending leaf record
+    order**, which is the order a host loop over the level's frontier takes, and
+    the leaf loop is the innermost of the three. That is also why features and
+    not leaves are the parallel dimension, which is the same argument
+    `_scan_slot_kernel` makes for its own single thread: the candidate order is
+    the tie-breaking rule and a threshold scan is a prefix sum. A wide form of
+    this kernel is possible and is deliberately not written, because it would
+    have to agree with the CPU lane about a tree-reduction order before it could
+    be bit-identical to anything, and no such agreement exists.
+
+    **Candidate order and ties.** Bins ascend, and within a bin the
+    missing-left candidate is scored before missing-right, exactly as in
+    `_scan_slot_kernel`, so an exact tie keeps `default_left` as it does in
+    LightGBM and on the host. A new candidate is accepted only on a strictly
+    greater summed score, so the winner is the first candidate of the lowest
+    bin holding the maximum, and the reduction downstream extends that to the
+    first such feature.
+
+    **A leaf that cannot take the candidate contributes exactly zero.** The
+    legality tests -- `min_data_in_leaf` on both children and
+    `min_child_hess` on both children -- are applied per leaf, against that
+    leaf's own sums, because that is where they mean anything: an oblivious
+    split is one split but it makes 2^d children and each has to be a legal
+    leaf on its own. A leaf that fails adds `0.0` and the candidate stays
+    available to the rest of the level. That is CatBoost's rule as
+    `docs/design/OBLIVIOUS.md` B2 records it, and B2 marks it **verify**: it
+    has not been checked against CatBoost's source here. It is written down in
+    one place so that the CPU grower can be made to match it rather than
+    guessed at twice.
+
+    Note what the zero does *not* do: it does not make an illegal candidate
+    win. A candidate every leaf refuses scores exactly `0.0`, and `0.0` never
+    beats the initial best, so a level with no admissible candidate anywhere
+    writes no record and the commit reads `FLAG_FOUND` clear, exactly as a node
+    with no admissible split does today.
+
+    **The top-threshold rule is not special-cased and does not need to be.**
+    `_scan_slot_kernel` breaks out of the scan at the last ordinary bin when
+    the feature reserves no missing rows, because putting every row left is not
+    a split. Here the candidate set has to be identical across the level, so
+    the break cannot be taken per leaf; instead such a leaf fails the
+    legality test on its empty right child -- zero rows is below any
+    `min_data_in_leaf` of one or more, and zero hessian is below any positive
+    `min_child_hess` -- and contributes zero. With both minimums at zero the
+    candidate scores an exact `0.0` for that leaf, since its left child is the
+    parent, and `0.0` cannot win. The two spellings therefore agree on every
+    setting and this one needs no branch.
+
+    **Categorical features are refused, not scored.** A cross-leaf category
+    partition is a different search: the many-vs-many arm sorts bins by each
+    node's own gradient ordering, and a level has 2^d orderings that need not
+    agree, so there is no single prefix to walk. A feature with two or more
+    categories is skipped here and `_launch_oblivious_search` refuses a dataset
+    that has one, so the refusal is visible at the call rather than as a
+    silently narrower search."""
+    var slot = Int(block_idx.x)
+    var record = Int(level_record)
+    var nt = record * NODE_WORDS
+    if slot >= Int(node_tab[unsafe_offset = nt + NODE_SLOTS][0]):
+        return
+    var stride = Int(feat_stride)
+    var table = record * stride
+    var f = Int(feat_ids[unsafe_offset = table + slot][0])
+    var nb = Int(n_bins)
+    var hs = Int(hist_size)
+    var io = (table + slot) * SPLIT_IWORDS
+    var fo = (table + slot) * SPLIT_FWORDS
+    var pf = record * PF_WORDS
+    var nl = Int(n_leaves)
+    if nl > OBLIVIOUS_MAX_LEAVES:
+        nl = OBLIVIOUS_MAX_LEAVES
+
+    for i in range(SPLIT_IWORDS):
+        out_i[unsafe_offset = io + i] = Int32(0)
+    for i in range(SPLIT_FWORDS):
+        out_f[unsafe_offset = fo + i] = Float32(0.0)
+    out_i[unsafe_offset = io + IREC_FEATURE] = Int32(-1)
+    out_i[unsafe_offset = io + IREC_BIN] = Int32(-1)
+    out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(-1)
+
+    # Per-leaf scan state, twelve words a leaf. Threadgroup rather than local
+    # because `_scan_slot_kernel` already reserves two arrays this way in a
+    # one-thread launch and the budget is stated once, at
+    # `OBLIVIOUS_MAX_LEAVES`.
+    var base_of = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tot_g = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tot_h = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tot_c = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var mis_g = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var mis_h = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var mis_c = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var run_g = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var run_h = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var run_c = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var par_score = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var node_ss = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var cross_off = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var g_inv = fparams[unsafe_offset = pf + PF_G_INV][0]
+    var h_inv = fparams[unsafe_offset = pf + PF_H_INV][0]
+    var lambda_l2 = fparams[unsafe_offset = pf + PF_LAMBDA_L2][0]
+    var lambda_l1 = fparams[unsafe_offset = pf + PF_LAMBDA_L1][0]
+    var min_child_hess = fparams[unsafe_offset = pf + PF_MIN_CHILD_HESS][0]
+    var bound_lo = fparams[unsafe_offset = pf + PF_BOUND_LO][0]
+    var bound_hi = fparams[unsafe_offset = pf + PF_BOUND_HI][0]
+    var form = gpu_resolve_gain_form(gain_form, lambda_l1)
+
+    # The level's totals, summed over leaves in ascending record order for the
+    # same reason the score is. `IREC_TOTAL_COUNT` and the two total sums are
+    # what the reduction copies into the level's record and what a caller
+    # reads as "how big was this level", so they are the level's numbers and
+    # not any one leaf's.
+    var level_g = Float32(0.0)
+    var level_h = Float32(0.0)
+    var level_c = Int32(0)
+    for l in range(nl):
+        var lnt = (Int(leaf_base) + l) * NODE_WORDS
+        var lb = (
+            Int(node_tab[unsafe_offset = lnt + NODE_HIST_BASE][0]) + f * nb
+        )
+        base_of[unsafe_offset=l] = Int32(lb)
+        var tg = Int32(0)
+        var th = Int32(0)
+        var tc = Int32(0)
+        for b in range(nb):
+            tg += hist[unsafe_offset = lb + b][0]
+            th += hist[unsafe_offset = hs + lb + b][0]
+            tc += hist[unsafe_offset = 2 * hs + lb + b][0]
+        tot_g[unsafe_offset=l] = tg
+        tot_h[unsafe_offset=l] = th
+        tot_c[unsafe_offset=l] = tc
+        run_g[unsafe_offset=l] = Int32(0)
+        run_h[unsafe_offset=l] = Int32(0)
+        run_c[unsafe_offset=l] = Int32(0)
+        var tgf = tg.cast[DType.float32]() * g_inv
+        var thf = th.cast[DType.float32]() * h_inv
+        par_score[unsafe_offset=l] = gpu_leaf_score(
+            tgf, thf, lambda_l1, lambda_l2
+        )
+        var ns = gpu_cross_node_s(thf, lambda_l2)
+        node_ss[unsafe_offset=l] = ns
+        cross_off[unsafe_offset=l] = gpu_cross_offset(
+            tgf, thf, lambda_l1, lambda_l2, lambda_l2, ns
+        )
+        level_g += tgf
+        level_h += thf
+        level_c += tc
+    out_f[unsafe_offset = fo + FREC_TOTAL_GRAD] = level_g
+    out_f[unsafe_offset = fo + FREC_TOTAL_HESS] = level_h
+    out_i[unsafe_offset = io + IREC_TOTAL_COUNT] = level_c
+
+    if allow[unsafe_offset = table + slot][0] == Int32(0):
+        return
+    # A categorical feature is skipped rather than scored; see the docstring.
+    if Int(cat_n[unsafe_offset=f][0]) >= 2:
+        return
+
+    var sign = Int32(MONOTONE_FREE)
+    if constrained != Int32(0):
+        sign = mono[unsafe_offset=f][0]
+    var is_constrained = constrained != Int32(0)
+
+    var missing_bin = Int(missing[unsafe_offset=f][0])
+    var n_scan = missing_bin if missing_bin >= 0 else nb
+    if missing_bin >= 0:
+        for l in range(nl):
+            var lb = Int(base_of[unsafe_offset=l][0])
+            mis_g[unsafe_offset=l] = hist[unsafe_offset = lb + missing_bin][0]
+            mis_h[unsafe_offset=l] = hist[
+                unsafe_offset = hs + lb + missing_bin
+            ][0]
+            mis_c[unsafe_offset=l] = hist[
+                unsafe_offset = 2 * hs + lb + missing_bin
+            ][0]
+    else:
+        for l in range(nl):
+            mis_g[unsafe_offset=l] = Int32(0)
+            mis_h[unsafe_offset=l] = Int32(0)
+            mis_c[unsafe_offset=l] = Int32(0)
+
+    var best_gain = Float32(0.0)
+    var runner_gain = Float32(0.0)
+    var best_bin = -1
+    var best_ordinal = -1
+    var best_default_left = False
+    # The level's own left statistics at the winning candidate, summed over
+    # leaves in the same ascending order. They are the level's, not a node's,
+    # and the commit that applies this split derives each leaf's own children
+    # from that leaf's histogram rather than from these.
+    var best_left_c = Int32(0)
+    var best_left_gf = Float32(0.0)
+    var best_left_hf = Float32(0.0)
+    var found = False
+
+    for b in range(n_scan):
+        # Each leaf's prefix advances by this bin, in record order.
+        for l in range(nl):
+            var lb = Int(base_of[unsafe_offset=l][0])
+            run_g[unsafe_offset=l] = (
+                run_g[unsafe_offset=l][0] + hist[unsafe_offset = lb + b][0]
+            )
+            run_h[unsafe_offset=l] = (
+                run_h[unsafe_offset=l][0]
+                + hist[unsafe_offset = hs + lb + b][0]
+            )
+            run_c[unsafe_offset=l] = (
+                run_c[unsafe_offset=l][0]
+                + hist[unsafe_offset = 2 * hs + lb + b][0]
+            )
+
+        # Missing to the left first, so an exact tie keeps `default_left`.
+        for d in range(2):
+            var want_default_left = d == 0
+            if want_default_left and missing_bin < 0:
+                continue
+            if not want_default_left and missing_bin >= 0:
+                # `_scan_slot_kernel` scores the missing-right candidate of a
+                # feature that reserves a missing bin only when some row is
+                # actually missing; with none, the two candidates are the same
+                # split and scoring both would let the second win a tie the
+                # first should have kept. The test is over the level, since the
+                # candidate is.
+                var any_missing = False
+                for l in range(nl):
+                    if mis_c[unsafe_offset=l][0] > Int32(0):
+                        any_missing = True
+                if not any_missing:
+                    continue
+            var total = Float32(0.0)
+            var cand_c = Int32(0)
+            var cand_gf = Float32(0.0)
+            var cand_hf = Float32(0.0)
+            for l in range(nl):
+                var lg = run_g[unsafe_offset=l][0]
+                var lh = run_h[unsafe_offset=l][0]
+                var lc = run_c[unsafe_offset=l][0]
+                if want_default_left:
+                    lg += mis_g[unsafe_offset=l][0]
+                    lh += mis_h[unsafe_offset=l][0]
+                    lc += mis_c[unsafe_offset=l][0]
+                var tg = tot_g[unsafe_offset=l][0]
+                var th = tot_h[unsafe_offset=l][0]
+                var tc = tot_c[unsafe_offset=l][0]
+                var tgf = tg.cast[DType.float32]() * g_inv
+                var thf = th.cast[DType.float32]() * h_inv
+                var lhf = lh.cast[DType.float32]() * h_inv
+                var rhf = gpu_right_sum(thf, lhf, th, lh, h_inv, form)
+                var lgf = lg.cast[DType.float32]() * g_inv
+                var rgf = gpu_right_sum(tgf, lgf, tg, lg, g_inv, form)
+                # This leaf's own legality. A leaf that fails adds nothing and
+                # does not disqualify the candidate for the rest of the level.
+                if (
+                    lc < min_data_in_leaf
+                    or tc - lc < min_data_in_leaf
+                    or lhf < min_child_hess
+                    or rhf < min_child_hess
+                ):
+                    continue
+                total += gpu_split_gain(
+                    gpu_soft_threshold_l1(lgf, lambda_l1),
+                    lhf,
+                    gpu_soft_threshold_l1(rgf, lambda_l1),
+                    rhf,
+                    lambda_l2,
+                    par_score[unsafe_offset=l][0],
+                    sign,
+                    bound_lo,
+                    bound_hi,
+                    is_constrained,
+                    node_ss[unsafe_offset=l][0],
+                    cross_off[unsafe_offset=l][0],
+                    form,
+                )
+                cand_c += lc
+                cand_gf += lgf
+                cand_hf += lhf
+            if total > best_gain:
+                runner_gain = best_gain
+                best_gain = total
+                best_bin = b
+                best_ordinal = 2 * b + (0 if want_default_left else 1)
+                best_default_left = want_default_left
+                best_left_c = cand_c
+                best_left_gf = cand_gf
+                best_left_hf = cand_hf
+                found = True
+            elif total > runner_gain:
+                runner_gain = total
+
+    if not found:
+        return
+
+    var flags = Int32(FLAG_FOUND)
+    if best_default_left:
+        flags += Int32(FLAG_DEFAULT_LEFT)
+    out_i[unsafe_offset = io + IREC_FEATURE] = Int32(f)
+    out_i[unsafe_offset = io + IREC_BIN] = Int32(best_bin)
+    out_i[unsafe_offset = io + IREC_FLAGS] = flags
+    out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(best_ordinal)
+    out_i[unsafe_offset = io + IREC_LEFT_COUNT] = best_left_c
+    out_i[unsafe_offset = io + IREC_RIGHT_COUNT] = level_c - best_left_c
+    out_f[unsafe_offset = fo + FREC_GAIN] = best_gain
+    out_f[unsafe_offset = fo + FREC_RUNNER_GAIN] = runner_gain
+    out_f[unsafe_offset = fo + FREC_LEFT_GRAD] = best_left_gf
+    out_f[unsafe_offset = fo + FREC_LEFT_HESS] = best_left_hf
+    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = level_g - best_left_gf
+    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = level_h - best_left_hf
+
+
 def _reduce_slots_kernel(
     slot_i: MutPointer[Int32, MutAnyOrigin],
     slot_f: MutPointer[Float32, MutAnyOrigin],
@@ -3291,6 +3737,144 @@ def _launch_search(
                 grid_dim=n_records,
                 block_dim=1,
             )
+
+def _launch_oblivious_search(
+    mut ctx: DeviceContext,
+    mut hist: DeviceBuffer[DType.int32],
+    mut node: DeviceBuffer[DType.int32],
+    mut feat: DeviceBuffer[DType.int32],
+    mut allow: DeviceBuffer[DType.int32],
+    mut missing: DeviceBuffer[DType.int32],
+    mut catn: DeviceBuffer[DType.int32],
+    mut mono: DeviceBuffer[DType.int32],
+    mut fparam: DeviceBuffer[DType.float32],
+    mut slot_i: DeviceBuffer[DType.int32],
+    mut slot_f: DeviceBuffer[DType.float32],
+    mut rec_i: DeviceBuffer[DType.int32],
+    mut rec_f: DeviceBuffer[DType.float32],
+    n_bins: Int,
+    hist_size: Int,
+    feat_stride: Int,
+    widest_slots: Int,
+    level_record: Int,
+    leaf_base: Int,
+    n_leaves: Int,
+    min_data_in_leaf: Int,
+    constrained: Bool,
+    has_categorical: Bool,
+    primitives: Bool = True,
+    gain_form: Int = DEFAULT_GAIN_FORM,
+) raises:
+    """Enqueue the two kernels of one oblivious *level* search: the cross-leaf
+    scan and the ordinary cross-feature reduction over the single record the
+    scan wrote into.
+
+    **Two launches, which is the whole point.** A level search costs exactly
+    what a node search costs, because the sum over the level's leaves is the
+    innermost loop of `_scan_slot_oblivious_kernel` rather than a launch beside
+    it. The census this holds open is written out in
+    `gpu_resident_round.oblivious_launch_census`: at depth 6 a tree is 62
+    command buffers fused and 68 with a standalone reduce, against a queue that
+    is 64 deep and whose per-launch enqueue cost is measured to roughly double
+    past that. Anything added here is added six times a tree and is spent at
+    the point where it is most expensive.
+
+    The reduction is `_reduce_slots_kernel` unchanged, over
+    `record_base = level_record` and one record. Nothing about it is oblivious:
+    it walks the level's per-feature slots in ascending order, accepts a new
+    best only on a strictly greater gain, and fills in `FREC_LEFT_VALUE`,
+    `FREC_RIGHT_VALUE` and `FREC_PARENT_VALUE` from the sums the scan left. For
+    a level those three are the level's aggregate values and not any one leaf's,
+    which is correct as a summary and is deliberately **not** what a commit
+    should write onto a node: an oblivious commit derives each leaf's own
+    children from that leaf's own histogram at the winning candidate. The
+    record's gain, feature, bin and default direction are the level's decision
+    and are exactly what a commit needs.
+
+    `has_categorical` refuses rather than narrows. The scan skips a categorical
+    feature, so a dataset with one would be searched over a strictly smaller
+    candidate set than the CPU grower searches, and the accuracy gate for this
+    mode is node-identity with no tolerance. A refusal at the launch is a
+    reachable, named failure; a quietly narrower search is a wrong tree that
+    looks right."""
+    comptime if not has_accelerator():
+        raise Error(
+            "the device split search needs an accelerator; this binary was"
+            " built without one"
+        )
+    else:
+        if n_leaves < 1:
+            raise Error("an oblivious level holds at least one leaf")
+        if n_leaves > OBLIVIOUS_MAX_LEAVES:
+            raise Error(
+                String(
+                    "an oblivious level of ",
+                    n_leaves,
+                    " leaves is past the ",
+                    OBLIVIOUS_MAX_LEAVES,
+                    " this scan reserves per-leaf state for, which is depth"
+                    " 6 and CatBoost's default; depth 7 is over the measured"
+                    " 64-buffer queue knee whatever this kernel does",
+                )
+            )
+        if has_categorical:
+            raise Error(
+                "the oblivious cross-leaf scan does not search category"
+                " partitions: the many-vs-many arm walks prefixes of each"
+                " node's own gradient ordering and a level has one ordering"
+                " per leaf, which need not agree, so there is no single"
+                " prefix to walk"
+            )
+        ctx.enqueue_function[_scan_slot_oblivious_kernel](
+            hist.unsafe_ptr(),
+            node.unsafe_ptr(),
+            feat.unsafe_ptr(),
+            allow.unsafe_ptr(),
+            missing.unsafe_ptr(),
+            catn.unsafe_ptr(),
+            mono.unsafe_ptr(),
+            fparam.unsafe_ptr(),
+            slot_i.unsafe_ptr(),
+            slot_f.unsafe_ptr(),
+            Int32(n_bins),
+            Int32(hist_size),
+            Int32(level_record),
+            Int32(leaf_base),
+            Int32(n_leaves),
+            Int32(feat_stride),
+            Int32(min_data_in_leaf),
+            Int32(1) if constrained else Int32(0),
+            Int32(gain_form),
+            grid_dim=widest_slots,
+            block_dim=1,
+        )
+        if primitives:
+            ctx.enqueue_function[_reduce_slots_block_kernel](
+                slot_i.unsafe_ptr(),
+                slot_f.unsafe_ptr(),
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                node.unsafe_ptr(),
+                fparam.unsafe_ptr(),
+                Int32(level_record),
+                Int32(feat_stride),
+                grid_dim=1,
+                block_dim=REDUCE_SLOT_THREADS,
+            )
+        else:
+            ctx.enqueue_function[_reduce_slots_kernel](
+                slot_i.unsafe_ptr(),
+                slot_f.unsafe_ptr(),
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                node.unsafe_ptr(),
+                fparam.unsafe_ptr(),
+                Int32(level_record),
+                Int32(feat_stride),
+                grid_dim=1,
+                block_dim=1,
+            )
+
 
 struct GpuSplitSearcher(Movable):
     """Device-resident split search for one dataset shape.
@@ -4410,6 +4994,109 @@ struct GpuSplitSearcher(Movable):
         )
         self.ctx.synchronize()
 
+    def upload_level_histogram(
+        mut self, words: List[Int32], n_slots: Int
+    ) raises:
+        """Stage `n_slots` consecutive fixed-point histograms into this
+        searcher's own buffer, slot 0 first.
+
+        `upload_histogram` for an oblivious level, whose search reads one
+        histogram per leaf out of one allocation with a slot stride of
+        `3 * n_features * n_bins` -- the same stride `GpuLeafBatcher.out_dev`
+        uses, so a caller holding a real frontier's histograms hands them
+        straight to `enqueue_oblivious_level` instead. This reallocates rather
+        than growing, because it exists so the level search is exercisable on
+        its own and a standalone caller changes shape between calls."""
+        if n_slots < 1:
+            raise Error("a level holds at least one histogram slot")
+        var cells = 3 * self.n_features * self.n_bins
+        if len(words) != n_slots * cells:
+            raise Error(
+                "a level histogram must hold n_slots * 3 * n_features *"
+                " n_bins Int32 words"
+            )
+        self.hist_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            n_slots * cells
+        )
+        self.hist_owned = True
+        self.ctx.enqueue_copy(
+            dst_buf=self.hist_dev, src_ptr=words.unsafe_ptr()
+        )
+        self.ctx.synchronize()
+
+    def search_oblivious_level(
+        mut self,
+        params: GpuSplitParams,
+        g_scale: Float64,
+        h_scale: Float64,
+        leaf_slots: List[Int],
+        level_record: Int = 0,
+        leaf_base: Int = 1,
+    ) raises -> GpuSplitRecord:
+        """Search the level staged by `upload_level_histogram` and return the
+        level's record: one (feature, bin, missing direction) chosen by the
+        summed gain over `leaf_slots`, in that order.
+
+        The standalone counterpart of `search`, and it spells the field
+        borrows out at the free-function boundary for the same aliasing reason
+        that method does."""
+        self._check_record(level_record)
+        if len(leaf_slots) < 1:
+            raise Error("an oblivious level holds at least one leaf")
+        if leaf_base < 0 or leaf_base + len(leaf_slots) > self.max_records:
+            raise Error("the level's leaf records are outside the searcher")
+        if (
+            level_record >= leaf_base
+            and level_record < leaf_base + len(leaf_slots)
+        ):
+            raise Error(
+                "the level record must sit outside the leaf records it reads"
+            )
+        self._ensure_hist()
+        var has_cat = False
+        for f in range(self.n_features):
+            if self.cat_n[f] >= 2:
+                has_cat = True
+        self._stage_params(
+            params, g_scale, h_scale, OutputBounds.unbounded(), level_record
+        )
+        var slot_cells = 3 * self.n_features * self.n_bins
+        for i in range(len(leaf_slots)):
+            if leaf_slots[i] < 0:
+                raise Error("a histogram slot must be nonnegative")
+            self._stage_hist_base(
+                leaf_base + i, Int32(leaf_slots[i] * slot_cells)
+            )
+        self._copy_tables()
+        _launch_oblivious_search(
+            self.ctx,
+            self.hist_dev,
+            self.node_dev,
+            self.feat_dev,
+            self.allow_dev,
+            self.missing_dev,
+            self.catn_dev,
+            self.mono_dev,
+            self.fparam_dev,
+            self.slot_i_dev,
+            self.slot_f_dev,
+            self.rec_i_dev,
+            self.rec_f_dev,
+            self.n_bins,
+            self.n_features * self.n_bins,
+            self.n_features,
+            self.active_len[level_record],
+            level_record,
+            leaf_base,
+            len(leaf_slots),
+            params.min_data_in_leaf,
+            self.constrained,
+            has_cat,
+            self.use_primitives,
+            self.gain_form_code,
+        )
+        return self.download(level_record)
+
     def _stage_params(
         mut self,
         params: GpuSplitParams,
@@ -4536,6 +5223,104 @@ struct GpuSplitSearcher(Movable):
             record, Int32(hist_slot * 3 * self.n_features * self.n_bins)
         )
         self._launch(hist, params, record, 1, self.active_len[record])
+
+    def enqueue_oblivious_level(
+        mut self,
+        mut hist: DeviceBuffer[DType.int32],
+        params: GpuSplitParams,
+        g_scale: Float64,
+        h_scale: Float64,
+        leaf_slots: List[Int],
+        level_record: Int,
+        leaf_base: Int,
+    ) raises:
+        """Enqueue one oblivious level's search: the cross-leaf scan over the
+        level's leaves and the ordinary cross-feature reduction into
+        `level_record`.
+
+        `leaf_slots[i]` is the histogram pool slot leaf `i` of the level owns,
+        in the leaf-index order the level's frontier holds them, and this
+        stages it into record `leaf_base + i`'s `NODE_HIST_BASE`. Those records
+        are read for that one word and for nothing else: the feature list, the
+        allow mask, the monotone vector and the float parameter block all come
+        from `level_record`, because under the resident plane's refusals they
+        are tree-level and are staged once.
+
+        **The order of `leaf_slots` is the summation order and therefore part
+        of the answer.** `_scan_slot_oblivious_kernel` sums each candidate's
+        gain over the leaves in ascending record order, and Float32 addition is
+        not associative, so handing the same level's slots in a different order
+        is a different tree. The order this mode fixes is ascending leaf index,
+        where the leaf index of a row is the bit pattern of its split outcomes
+        with the **first** level's outcome as the least significant bit --
+        CatBoost's own convention, and the one
+        `gpu_resident_round.OBLIVIOUS_LEAF_INDEX_RULE` states for both backends
+        to hold to.
+
+        `leaf_base` must not overlap `level_record`, since the scan reads the
+        leaf records while writing the level record's slots.
+
+        This is the standalone, testable entry point, and it copies the staged
+        tables, which on Metal drains the queue. The resident plane must not
+        use it for the same reason `_launch_child_search` bypasses
+        `enqueue_frontier`: the per-record histogram base is written on the
+        device there, and copying the host's stale mirror over it would point
+        the scan at the previous level's slots. The plane calls
+        `_launch_oblivious_search` directly instead."""
+        self._check_record(level_record)
+        if len(leaf_slots) < 1:
+            raise Error("an oblivious level holds at least one leaf")
+        if leaf_base < 0 or leaf_base + len(leaf_slots) > self.max_records:
+            raise Error("the level's leaf records are outside the searcher")
+        if (
+            level_record >= leaf_base
+            and level_record < leaf_base + len(leaf_slots)
+        ):
+            raise Error(
+                "the level record must sit outside the leaf records it reads"
+            )
+        var has_cat = False
+        for f in range(self.n_features):
+            if self.cat_n[f] >= 2:
+                has_cat = True
+        self._stage_params(
+            params, g_scale, h_scale, OutputBounds.unbounded(), level_record
+        )
+        var slot_cells = 3 * self.n_features * self.n_bins
+        for i in range(len(leaf_slots)):
+            if leaf_slots[i] < 0:
+                raise Error("a histogram slot must be nonnegative")
+            self._stage_hist_base(
+                leaf_base + i, Int32(leaf_slots[i] * slot_cells)
+            )
+        self._copy_tables()
+        _launch_oblivious_search(
+            self.ctx,
+            hist,
+            self.node_dev,
+            self.feat_dev,
+            self.allow_dev,
+            self.missing_dev,
+            self.catn_dev,
+            self.mono_dev,
+            self.fparam_dev,
+            self.slot_i_dev,
+            self.slot_f_dev,
+            self.rec_i_dev,
+            self.rec_f_dev,
+            self.n_bins,
+            self.n_features * self.n_bins,
+            self.n_features,
+            self.active_len[level_record],
+            level_record,
+            leaf_base,
+            len(leaf_slots),
+            params.min_data_in_leaf,
+            self.constrained,
+            has_cat,
+            self.use_primitives,
+            self.gain_form_code,
+        )
 
     def enqueue_pick_best(
         mut self, n_records: Int, record: Int = 0

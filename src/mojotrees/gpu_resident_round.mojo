@@ -1236,6 +1236,243 @@ def resident_round_supported(
     return RESIDENT_OK
 
 
+# --- grow_policy = oblivious: the launch census, before the code ----------
+#
+# `docs/design/OBLIVIOUS.md` B5 registers one kill criterion ahead of any
+# number: if a level schedule does not bring the per-tree command-buffer count
+# under 64 -- the measured queue-depth knee, `docs/GPU_PORTABILITY.md` 6.2 and
+# the ladder in `bench/results/session3_2026-08-16/RESULTS.md` -- then the
+# queue-depth argument for oblivious evaporates and only the accuracy question
+# remains. What follows is that census, computed against the code as it stands
+# rather than against the design's estimate, and it does not say what the
+# design says.
+
+comptime OBLIVIOUS_LEAF_INDEX_RULE = (
+    "leaf index = sum over levels l of bit_l * 2**l, so the FIRST level's"
+    " outcome is the least significant bit (CatBoost's convention); node ids"
+    " are assigned level by level, over the level's leaves in ascending leaf"
+    " index, left child before right"
+)
+"""The one thing the two oblivious growers have to agree about, in one line.
+
+The accuracy gate for this mode is node-identity between the device grower and
+the CPU grower with no tolerance, and node-identity is a statement about node
+*ids*, so the order in which a level's 2^l splits are committed is part of the
+answer and not an implementation detail. So is the leaf numbering, because it
+is what the cross-leaf sum is ordered by and Float32 addition is not
+associative -- `gpu_split_search._scan_slot_oblivious_kernel` sums in ascending
+leaf-index order and a different numbering is a different tree.
+
+Stated here rather than negotiated, so that `oblivious-cpu` has one sentence to
+hold to or to contradict. Nothing else about the two growers needs to match:
+the order rows sit in inside the active-row permutation is not part of a tree,
+and the two backends do not have the same one."""
+
+
+def oblivious_launch_census(max_depth: Int, fused_reduce: Bool = True) -> Int:
+    """Command buffers one oblivious tree of depth `max_depth` would enqueue
+    between waits, **on the launch shapes this package can actually build
+    today**, counted statically off the source.
+
+    The shape is the one the leaf-wise census above is counted at, phase for
+    phase (see "The queue this stream goes into is 64 deep"): 7 launches once
+    per tree, some number per growth unit, and 1 for the packed download. What
+    changes is that the growth unit is a level rather than a split, so there
+    are `max_depth` of them instead of `num_leaves - 1`.
+
+    Per level, if every phase costs what its leaf-wise counterpart costs:
+
+        pick and commit the level        gpu_tree_tables      1
+        stage the level's searches       gpu_tree_tables      1
+        partition                        gpu_active_rows      2
+        build the level's children       gpu_active_rows      2
+        search the level                 gpu_split_search     2
+        file the level's record          gpu_tree_tables      1
+                                                per level     9
+
+    which is 7 + 6 * 9 + 1 = **62** at depth 6, under the knee by two, and
+    7 + 6 * 10 + 1 = 68 if the cross-leaf reduction is its own launch, over it
+    by four. That is the arithmetic the lane was opened on and this function
+    reproduces it, so that the claim is a value a test can assert rather than a
+    sentence in a docstring.
+
+    **Two of those nines are not free today, and one of them is not close.**
+    Both are recorded as refusals in `oblivious_device_supported` rather than
+    left in a comment:
+
+    - *The level's children.* `GpuHistogramBuilder.enqueue_desc_child` builds
+      exactly one child, from the one window `STEP_BUILT_BEGIN`/`_COUNT` names,
+      into the one slot `STEP_BUILT_SLOT` names, with the one subtraction
+      `STEP_SUB_SLOT` names. The step descriptor is a single flat row with no
+      count field (`gpu_active_rows`'s `STEP_*` layout) and every consumer reads
+      it as one. A level of 2^l parents therefore costs 2 launches per parent,
+      not 2 per level, and summed over depth 6 that is 2 * (1+2+4+8+16+32) =
+      126 launches of histogram alone. The whole tree is then
+      7 + 6*(1+1+2+2+1) + 126 + 1 = **176**, which is better than the leaf-wise
+      278 and is nowhere near 64. **The 9-per-level figure silently assumes a
+      whole-level histogram build that this package does not have on this
+      path**, and the design's sentence that "the existing range histogram
+      family builds all leaves' histograms per step already" is not true of it:
+      `GpuActiveRows.enqueue_range_histogram` is one node per call and reads its
+      window from the host table, and the kernel *family* is a family over
+      launch shape (GROUP x BIN_CAP), not over leaves.
+
+      The machinery does exist one module over. `GpuLeafBatcher.enqueue_batch`
+      does a whole frontier in two or three launches, with the grid keyed
+      `(feature, leaf-tile)` and per-leaf windows and destination slots read
+      from a device `BatchItemPlan` array. What it cannot do is be driven by a
+      device-written plan: `items_dev` is staged from the host, so nothing
+      inside a device-owned tree can produce one without the round trip this
+      plane exists to remove. Making the plan device-written is what closes
+      this, and the commit kernel is the natural writer since it already writes
+      a descriptor -- which would keep it at zero extra launches.
+
+    - *The level's partition.* `GpuActiveRows.enqueue_partition_desc` partitions
+      the one window the descriptor names, and its prefix is over that window.
+      A level's 2^l windows can be done in one partition only if they are one
+      window, and they are: at every level the live leaves tile `[0, n_active)`,
+      and an oblivious level applies the *same* routing rule to all of them, so
+      one stable partition of the whole prefix by that one rule produces the
+      whole next level. **That arm needs no change to the partition path at
+      all** -- the descriptor names `[0, n_active)` and the existing kernels do
+      the rest -- so this nine is real. It has a consequence, recorded under
+      `OBLIVIOUS_ROW_RANGES` below.
+
+    `fused_reduce = False` returns the standalone-reduce count, which is what a
+    lane told "one launch per level" would build.
+    """
+    if max_depth < 1:
+        return 0
+    var per_level = 9 if fused_reduce else 10
+    return 7 + max_depth * per_level + 1
+
+
+comptime OBLIVIOUS_OK = 0
+comptime OBLIVIOUS_DEPTH = 1
+"""`max_depth` outside `[1, 6]`. Depth 6 is CatBoost's default and is the last
+one under the queue's 64-buffer knee (`oblivious_launch_census`); it is also
+what `gpu_split_search.OBLIVIOUS_MAX_LEAVES` reserves per-leaf scan state
+for, and the two limits agreeing is not a coincidence."""
+
+comptime OBLIVIOUS_LEVEL_HISTOGRAM = 2
+"""No descriptor-driven whole-level histogram build exists, so a level costs
+two launches per leaf instead of two per level and a depth-6 tree is 176
+command buffers rather than 62. The census function says what closes it. This
+is the refusal that makes the mode unreachable and it is the one to lift
+first: everything else on this list is smaller than it."""
+
+comptime OBLIVIOUS_ROW_RANGES = 3
+"""The one-partition-per-level arm leaves host row-range state the host table
+cannot express, and `_publish_row_ranges` is not optional.
+
+Under a single stable partition of `[0, n_active)` a parent's rows land in two
+blocks that are not adjacent -- all of the level's left children first, then
+all of its right children -- so a child's window is not inside its parent's.
+`LeafRangeTable.split` is the only mutator that writes a window and it requires
+containment, so the table cannot be replayed for an oblivious tree. That
+matters because `update_raw_device` reads exactly this table to advance the raw
+scores, and handing it a table describing a different partition is the failure
+`_publish_row_ranges` documents at length: correct trees, wrong scores, and
+every round after the first diverging.
+
+This is a consequence of the leaf numbering rather than a bug in it. A stable
+global partition numbers the new level `j` and `j + 2^l`, which is the
+first-split-is-the-low-bit numbering `OBLIVIOUS_LEAF_INDEX_RULE` fixes and
+CatBoost uses; a per-leaf-contiguous partition would number it `2j` and `2j+1`
+and keep containment, but needs a segmented prefix scan, which is a change to
+the partition kernels. So the choice is: one launch per level and a new way to
+publish the windows, or containment and 3 launches per leaf. The census settles
+it -- the second is 3 * 63 = 189 launches of partition alone at depth 6 -- and
+what it costs is a direct window setter on `LeafRangeTable`, roughly twenty
+lines of host bookkeeping and no kernel."""
+
+comptime OBLIVIOUS_CATEGORICAL = 4
+"""The dataset has a categorical feature. The cross-leaf scan skips those (see
+`_scan_slot_oblivious_kernel`), and a search over a quietly narrower candidate
+set than the CPU grower's cannot meet a no-tolerance node-identity gate."""
+
+comptime OBLIVIOUS_NO_CPU_PEER = 5
+"""There is no CPU oblivious grower to be node-identical to yet.
+
+Not a technical refusal and deliberately in the same list as the technical
+ones. This mode's gate is bit-level agreement with `grow_policy = oblivious` on
+the CPU, `growth_policy.mojo` still holds only `GROW_LEAFWISE` and
+`GROW_DEPTHWISE`, and a device mode shipped before its comparator exists is a
+mode whose accuracy claim rests on nothing. `OBLIVIOUS_LEAF_INDEX_RULE` is the
+half of the agreement this side can state on its own."""
+
+
+def oblivious_reason_name(reason: Int) -> String:
+    if reason == OBLIVIOUS_OK:
+        return String("ok")
+    if reason == OBLIVIOUS_DEPTH:
+        return String("max_depth outside 1..6")
+    if reason == OBLIVIOUS_LEVEL_HISTOGRAM:
+        return String("no descriptor-driven whole-level histogram build")
+    if reason == OBLIVIOUS_ROW_RANGES:
+        return String("the host row-range table cannot express a level")
+    if reason == OBLIVIOUS_CATEGORICAL:
+        return String("categorical features")
+    if reason == OBLIVIOUS_NO_CPU_PEER:
+        return String("no CPU oblivious grower to compare against")
+    return String("unknown")
+
+
+def oblivious_device_supported(
+    params: TreeParams, builder: GpuHistogramBuilder
+) raises -> Int:
+    """Whether the device could grow an oblivious tree, and why not.
+
+    It cannot, today, and this returns the reason in the order a reader wants
+    it: the shape refusal first, then the two structural ones the census found,
+    then the data refusal, then the comparator.
+
+    This is a predicate and not a raise for the same reason
+    `resident_round_supported` is: the caller has a correct path either way.
+    The difference is that every refusal below is currently unconditional, so
+    the function's honest summary is that the mode is **not reachable** and the
+    two refusals worth lifting are named rather than described.
+    """
+    if params.max_depth < 1 or params.max_depth > 6:
+        return OBLIVIOUS_DEPTH
+    if builder.cats.any_categorical():
+        return OBLIVIOUS_CATEGORICAL
+    return OBLIVIOUS_LEVEL_HISTOGRAM
+
+
+def oblivious_open_blockers() -> List[Int]:
+    """Every standing reason this mode is not reachable, largest first.
+
+    `oblivious_device_supported` answers for one configuration and can only
+    return one reason, so the two blockers that hold for *every* configuration
+    would otherwise be visible only in a comment. They are the list a reader
+    wants -- "what would it take" -- rather than the answer to "can this fit
+    take it", and they are in cost order:
+
+    1. `OBLIVIOUS_LEVEL_HISTOGRAM`, which is the census. Until a level's
+       children can be built by a descriptor-driven launch, a depth-6 tree is
+       176 command buffers and not 62, and the queue-depth argument that opened
+       this round does not hold. `GpuLeafBatcher.enqueue_batch` is the shape
+       that closes it; what it needs is a device-written `BatchItemPlan`.
+    2. `OBLIVIOUS_ROW_RANGES`, which is host bookkeeping and is small: a direct
+       window setter on `LeafRangeTable`, because a level partitioned in one
+       pass leaves children that are not inside their parents.
+    3. `OBLIVIOUS_NO_CPU_PEER`, which is not this lane's to close. The gate for
+       the mode is node-identity with the CPU oblivious grower and there is not
+       one yet.
+
+    The cross-leaf reduction is deliberately **not** on this list. It is built,
+    it is fused into the search launch at no extra command buffer, and
+    `tests/test_gpu_oblivious_device.mojo` checks it against a host replica bit
+    for bit at the full 64-leaf width of a depth-6 level.
+    """
+    return [
+        OBLIVIOUS_LEVEL_HISTOGRAM,
+        OBLIVIOUS_ROW_RANGES,
+        OBLIVIOUS_NO_CPU_PEER,
+    ]
+
+
 def resident_round_refusal_detail(params: TreeParams) raises -> String:
     """The tables' own reason, for a refusal this module reports as
     `RESIDENT_TABLES`. Split out so the caller can print one line that names
