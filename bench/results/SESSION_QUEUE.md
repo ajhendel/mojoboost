@@ -470,9 +470,25 @@ it would inflate the number in our favour and be invisible. Our binning advantag
 is the largest single ratio this project has measured -- 6.3x at 1M -- and under
 an end-to-end headline it flows directly into the result.
 
-**So the order is: `engines.py` fix lands, then the window opens.** Recorded here
-rather than raised as a conversation, because it is a sequencing fact rather than
-a disagreement.
+**RESOLVED, same hour, and nothing in the sequencing changes.** The fix already
+exists on `cpu-round-1` -- `f37354b` "Bin at LightGBM's stock defaults, not at
+ours" and `3b26481` "One comparator, stock+det, recorded on every run it
+produces". **Verified rather than taken on report:** both commits exist in this
+object store, and `git show cpu-round-1:bench/real_data/engines.py` reads *"No
+`bin_construct_sample_cnt` here"* where `perf-round-2` still has the injection at
+lines 441 and 454.
+
+So `perf-round-2` carries the defect only because the wave-end merge has not
+happened, and that merge already precedes the window in the agreed order.
+**The end-to-end headline is taken on the merged tree**, which is the same
+sequencing as before -- the blocker was real on this branch and had already been
+fixed on the other one.
+
+Worth keeping as a coordination note rather than deleting: a defect can be live
+on your branch and fixed on your peer's, and a report of either state is only
+true of the branch it was made about. This project has already made the mirror
+error in the other direction, when an orphan-module claim was accurate for
+`perf-round-2` and wrong for `cpu-round-1`.
 
 # Closed with evidence. Do not reopen without a new number.
 
