@@ -134,6 +134,16 @@ cross-leaf accumulators. A10 already says we keep LightGBM's gain; this row
 now says explicitly that doing so puts us on CatBoost's `L2` and not on its
 default.
 
+> **Superseded in part, 2026-08-16.** "A10 already says we keep LightGBM's
+> gain" was true when written and is not now: Cosine is implemented, opt-in,
+> default off, and A10 carries the note. The rest of Correction 2 stands
+> unchanged. And the practical consequence is smaller than this paragraph
+> implies -- at `lambda_l2 = 0`, which is mojotrees stock as of this round,
+> Cosine and L2 have the **same argmax by derivation**, because Cosine's
+> numerator IS the L2 sum and its denominator collapses onto it. Being on
+> CatBoost's `L2` rather than its default is a difference of zero at our
+> settings. See A10 section 3.
+
 **Correction 3.** B3 said `num_leaves` "is ignored under oblivious and says
 so". CatBoost does not ignore it: `catboost_options.cpp` overwrites
 `MaxLeaves` with `1 << MaxDepth` when it is defaulted and raises
