@@ -88,6 +88,58 @@ def digest(array):
     return hashlib.sha256(arr.tobytes()).hexdigest()
 
 
+#: The pieces a feature matrix is hashed over, in the order they are fed to
+#: the hash. Dense matrices are one contiguous block; a CSC matrix is its
+#: three vectors, because the dense form of a 50,000-column matrix is not a
+#: thing this harness is going to materialize to take a digest of.
+def matrix_pieces(x):
+    if hasattr(x, "tocsc"):
+        return [x.data, x.indices, x.indptr]
+    return [np.ascontiguousarray(x)]
+
+
+def matrix_digest(x):
+    """sha256 over a feature matrix's exact bytes, in its own dtype.
+
+    Unlike `digest` above, this does NOT cast to float64. It hashes what it
+    is given, which is the point: the question it answers is "are these the
+    same bytes", and a cast would answer a weaker one.
+    """
+    h = hashlib.sha256()
+    for piece in matrix_pieces(x):
+        h.update(np.ascontiguousarray(piece).tobytes())
+    return h.hexdigest()
+
+
+def canonical_digest(x, y, group=None):
+    """The digest of a scenario's canonical form: matrix, then label, then
+    group, fed to one running sha256.
+
+    Lives here rather than in `worker` because it has TWO callers and the
+    whole value of it is that they are the same function. `worker.data_
+    digest` computes it from the canonical data before any engine sees it.
+    `engines._catboost_categorical_frame` computes it again from the
+    canonical matrix reconstructed out of the mixed frame CatBoost was
+    handed, which is how "the re-encoding did not change a value" becomes a
+    measurement instead of a claim. A proof that hashes a different way,
+    or in a different order, or with a different cast, proves nothing.
+
+    The byte stream is unchanged from the inline version in `worker` that
+    wrote every record in bench/results. Moving it must never change the
+    value: a digest whose definition drifts silently makes old records and
+    new ones incomparable, which is a worse failure than the one the digest
+    was added to catch.
+    """
+    pieces = list(matrix_pieces(x))
+    pieces.append(np.asarray(y, dtype=np.float64))
+    if group is not None:
+        pieces.append(np.asarray(group, dtype=np.int64))
+    h = hashlib.sha256()
+    for piece in pieces:
+        h.update(np.ascontiguousarray(piece).tobytes())
+    return h.hexdigest()
+
+
 def file_digest(path, chunk=1 << 20):
     h = hashlib.sha256()
     with open(path, "rb") as handle:

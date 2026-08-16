@@ -735,6 +735,123 @@ def check_catboost_arm():
         "the CatBoost arm block does not carry its cost warnings, so a "
         "matrix can be scheduled without them",
     )
+    # 5. The categorical path, and the digest promise it rests on.
+    #
+    # The failure this guards against is the one the lane that built it was
+    # warned about: a categorical CatBoost row that LOOKS rigorous because
+    # the record carries a digest, on a re-encoding nobody proved was the
+    # same data. Three things have to hold and none of them is checkable by
+    # reading the record afterwards, so they are checked here.
+    import numpy as np
+
+    import measure
+    import worker
+
+    check(
+        engines.CATBOOST_CATEGORICAL_FORM
+        == scenarios.CATBOOST_CATEGORICAL_ENCODING["form"],
+        "the encoder's form name and the scenario table's disagree, so a "
+        "record says it was encoded one way and the argument for why that "
+        "is still one dataset is written about another",
+    )
+    check(
+        worker.CANONICAL_ENCODING != engines.CATBOOST_CATEGORICAL_FORM,
+        "the re-encoded form is named the same as the canonical one, so a "
+        "reader of a record cannot tell which container an arm got",
+    )
+    check(
+        "categorical_encoding" in arm,
+        "the CatBoost arm block does not carry its categorical encoding "
+        "contract, so a published table can print a CatBoost categorical "
+        "number without the one field that says why it is comparable",
+    )
+    # The encoder is a bijection on a column that looks like every
+    # categorical column this harness produces, and REFUSES one that holds a
+    # missing value. The second half is the load-bearing one: it is what
+    # keeps `categorical_missing` out even if somebody flips its support
+    # entry, and it is checked by calling the encoder rather than by reading
+    # CATBOOST_SCENARIO_SUPPORT, because the support table is the thing that
+    # could be wrong.
+    _clean = {
+        "X": np.ascontiguousarray(
+            np.column_stack([
+                np.array([0.5, -1.25, 3.0, 7.75]),
+                np.array([0.0, 3.0, 1.0, 2.0]),
+                np.array([250000.0, 1.0, 0.0, 199999.0]),
+            ])
+        ),
+        "y": np.array([0.0, 1.0, 0.0, 1.0]),
+    }
+    try:
+        frame, report = engines._catboost_categorical_frame(_clean, [1, 2])
+    except Exception as exc:  # pragma: no cover - environment-dependent
+        frame, report = None, None
+        check(
+            False,
+            "the CatBoost categorical encoder refused a clean integer-coded "
+            f"column: {type(exc).__name__}: {exc}",
+        )
+    if report is not None:
+        check(
+            report["canonical_digest_recomputed"]
+            == measure.canonical_digest(_clean["X"], _clean["y"]),
+            "the CatBoost encoder's reconstruction does not hash to the "
+            "canonical matrix on a four-row case, so the per-run digest "
+            "proof would pass nothing or fail everything",
+        )
+        check(
+            [str(frame.dtypes.iloc[i]) for i in range(3)]
+            == ["float64", "int64", "int64"],
+            "the CatBoost encoder did not produce a mixed frame; CatBoost "
+            "refuses cat_features on an all-float container",
+        )
+    _missing = {
+        "X": np.ascontiguousarray(
+            np.column_stack([
+                np.array([0.5, -1.25, 3.0, 7.75]),
+                np.array([0.0, np.nan, 1.0, 2.0]),
+            ])
+        ),
+        "y": np.array([0.0, 1.0, 0.0, 1.0]),
+    }
+    try:
+        engines._catboost_categorical_frame(_missing, [1])
+    except engines.EngineError:
+        pass
+    except Exception as exc:  # pragma: no cover - environment-dependent
+        FAILURES.append(
+            "the CatBoost categorical encoder failed on a missing category "
+            f"with the wrong error type: {type(exc).__name__}: {exc}"
+        )
+    else:
+        FAILURES.append(
+            "the CatBoost categorical encoder ACCEPTED a categorical column "
+            "holding a missing value. CatBoost has no representation for a "
+            "missing category, so whatever it built is a level the harness "
+            "invented, and on categorical_missing that level is correlated "
+            "with the target and unavailable to the other two arms. See "
+            "CATBOOST_CATEGORICAL_ENCODING['missing_categories']"
+        )
+    check(
+        scenarios.CATBOOST_SCENARIO_SUPPORT["categorical_missing"] is not None,
+        "categorical_missing runs the CatBoost arm. It must not: its "
+        "generator drops values inside categorical columns as a function of "
+        "the target, and any level the harness invents for absence is a "
+        "target-correlated feature only one of the three arms can use",
+    )
+    check(
+        "encode" in scenarios.PHASE_SHAPE["catboost"],
+        "PHASE_SHAPE does not describe the CatBoost encode phase, so an "
+        "e2e line that contains it cannot be read against the other two",
+    )
+    for _knob in ("max_ctr_complexity", "one_hot_max_size", "has_time"):
+        check(
+            _knob in scenarios.CATBOOST_REFUSED_PARAMS,
+            f"{_knob} is not refused. The arm now has a categorical path, "
+            "and every one of these turns 'CatBoost at its own defaults' "
+            "into something else while leaving the column heading alone",
+        )
+
     check(
         set(scenarios.CATBOOST_SCENARIO_SUPPORT) == set(scenarios.SCENARIOS),
         "CATBOOST_SCENARIO_SUPPORT and SCENARIOS disagree: "

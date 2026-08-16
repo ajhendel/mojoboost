@@ -329,6 +329,34 @@ def _model(group):
     return out
 
 
+def _encoding(block):
+    """The container an engine was handed, in three fields.
+
+    Absent on a record written before the field existed, and that case is
+    reported as unknown rather than as canonical. Defaulting it to
+    "canonical" would be the cheap choice and the wrong one: it would make
+    an old record and a correctly-canonical new one indistinguishable,
+    which is precisely the confusion this field was added to remove.
+    """
+    encoding = block.get("encoding")
+    if not encoding:
+        return {
+            "form": None,
+            "is_canonical": None,
+            "agrees_with_canonical": None,
+            "note": (
+                "this record predates the encoding block. Which container "
+                "the engine was handed is not recorded, so it is unknown "
+                "rather than canonical"
+            ),
+        }
+    return {
+        "form": encoding.get("form"),
+        "is_canonical": encoding.get("is_canonical"),
+        "agrees_with_canonical": encoding.get("agrees_with_canonical"),
+    }
+
+
 def _data(group):
     data = group[0].get("data") or {}
     train = data.get("train") or {}
@@ -339,11 +367,20 @@ def _data(group):
             "rows": block.get("rows"),
             "features": block.get("features"),
             "sparse": block.get("sparse"),
-            # The digest of the exact bytes this engine was handed. Two
-            # engines with equal digests were given the same problem, which
-            # is the whole basis of the comparison, and it is checkable from
-            # this file alone.
+            # The digest of the CANONICAL form. Two engines with equal
+            # digests were given the same problem, which is the whole basis
+            # of the comparison, and it is checkable from this file alone.
             "digest": block.get("digest"),
+            # What each engine was PHYSICALLY handed, which since 2026-08-16
+            # is not always the canonical container: CatBoost takes a
+            # categorical block only in an integer-typed one. Reduced to the
+            # three fields a summary reader needs -- the container's name,
+            # whether it is the canonical one, and whether the adapter's
+            # reconstruction hashed back to the digest above -- with the
+            # argument and the per-column proof left in the record. A
+            # summary that carried the digest and not this would let a
+            # re-encoded row read as an unencoded one.
+            "encoding": _encoding(block),
         }
         for optional in (
             "nnz", "density", "missing_fraction", "queries",
