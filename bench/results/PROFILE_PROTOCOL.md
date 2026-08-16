@@ -9,8 +9,10 @@ that must be read in full before each use is one that gets skimmed.
    timing` only, your addressable session name, what and an ETA. Compiles proceed
    freely; timing does not. See `MACHINE_LOCK.md`.
 2. **Record the box** before the first arm and after the last: `uptime`, and
-   `ps -Ao pcpu,comm | sort -rn | head`. Record it even when it looks fine, and
-   record the **canary ratio** at both ends. A quiet box can still be a slow one.
+   `ps -Ao pcpu,comm | sort -rn | head`. Record it even when it looks fine. A
+   quiet box can still be a slow one, and load alone will not tell you, so the
+   regime label comes from the arms moving together (A3) and not from these two
+   commands. They establish contention, which is a different question.
 3. **Interleave arms in one process** where the harness allows. Alternating
    processes turns a neighbour's build into your result.
 4. **Five pairs minimum**, and read the verdict off **M0** as amended by **A2**:
@@ -486,13 +488,23 @@ discovered in a postmortem.
    else's in-flight work. The file ownership table is load-bearing.
 2. **A second orchestrator is running the GPU campaign on the same box.**
    Agreed with it, in writing, before this round starts:
-   - **There is no measurement lock.** One was negotiated between the two
-     orchestrators and then overruled by Andrew, who instructed both sessions
-     to work the same tree in parallel. `/tmp/mojotrees-bench.lock` is deleted
-     and neither session recreates it. This is recorded because the previous
-     paragraph of this protocol was written assuming a lock existed, and a
-     protocol that describes a control which is not in force is worse than one
-     that admits it has none.
+   - **There is a measurement lock, and this bullet used to deny it.** As
+     originally written it read "There is no measurement lock", recording that
+     one had been negotiated between the two orchestrators and then overruled,
+     that `/tmp/mojotrees-bench.lock` was deleted, and that neither session
+     would recreate it. That was true for one interval on the night of
+     2026-08-16 and is not true now: the lock was reinstated in a narrower form
+     the same night, `mode: timing` only, and `MACHINE_LOCK.md` is the
+     authority on it. The instruction audit found the file present and held
+     while three passages of this repository disagreed about whether it
+     existed.
+
+     The correction is kept visible rather than silently overwritten, because
+     the justification this bullet gave for recording the absence — "a protocol
+     that describes a control which is not in force is worse than one that
+     admits it has none" — applies with the sign flipped to a protocol
+     describing the absence of a control that *is* in force. Both are the same
+     error. **Take the lock before timing; see `MACHINE_LOCK.md`.**
    - **What replaces it is measurement technique, not scheduling.** Every A/B
      in this round is interleaved *within one process* wherever the harness
      supports it, so both arms are sampled repeatedly inside the same window
@@ -731,15 +743,29 @@ a second time.
 ## A1. The thermal instruction was never followable. Replace it, do not keep it.
 
 Session conditions above say to "capture thermal state into the results header
-with `bench/apple/thermal_capture.sh`, before and after". **No session has ever
-done this and none could have.** That script measures nothing: it is a plan
-printer, its own header says it "starts no sampler, runs no privileged command,
-fits no model, and writes no record", and `--execute` is parsed and deliberately
-refused with exit code 3 because the plan it prints contains `sudo powermetrics`.
+with `bench/apple/thermal_capture.sh`, before and after". That script measures
+nothing: it is a plan printer, its own header says it "starts no sampler, runs
+no privileged command, fits no model, and writes no record", and `--execute` is
+parsed and deliberately refused with exit code 3 because the plan it prints
+contains `sudo powermetrics`.
 
-An instruction nobody can follow is worse than no instruction, because a protocol
-that lists it reads as though the step is being taken. That is exactly the defect
-this protocol exists to prevent, sitting inside the protocol.
+**A session did follow it, and that is worse than nobody having followed it.**
+This paragraph originally read "No session has ever done this and none could
+have", and the instruction audit refuted it from a committed artifact.
+`bench/results/profile_2026-08-15/header.txt` opens a section headed
+`=== thermal before ===` and pastes the script's output into it. What is pasted
+is a plan, carrying `run id thermal-PENDING` and `would write
+.../thermal-PENDING.json`. So the header of the first stage-level profile this
+repository ever recorded carries a plan printer's plan under a heading that
+reads as a capture, and has since `24e5330`. There is no matching
+`=== thermal after ===`, so even the half that ran, ran once.
+
+An instruction nobody can follow is bad because a protocol that lists it reads
+as though the step is being taken. An instruction somebody *does* follow, which
+returns a plausible block of text that is not a measurement, is worse: it leaves
+a **record**, and the record is what the next reader trusts. That is exactly the
+defect this protocol exists to prevent, sitting inside the protocol and inside
+its own results.
 
 **The instruction is now:** capture
 
@@ -747,10 +773,27 @@ this protocol exists to prevent, sitting inside the protocol.
     ps -Ao pcpu,comm | sort -rn | head
 
 before the first arm and after the last, into the results file, **including when
-the box looks fine**. Both campaigns now do this. The script stays where it is,
-because the plan it prints is a real plan and `handoffs/performance_17_thermal_
-energy.md` lists the privileged commands for a human; it is simply not an
-instrument and the protocol must stop implying it is.
+the box looks fine**. Both campaigns say they now do this; the audit found the
+`uptime` half recorded in one results directory and the `ps` half in none, so
+treat it as a rule that is not yet habit.
+
+The script stays where it is, because the plan it prints is a real plan. **But
+the pointer this paragraph used to give was itself dangling**, and the audit
+caught it: `handoffs/performance_17_thermal_energy.md` was deleted on
+2026-08-14 in `21ff9fa`, two days before this section was written to point at
+it. `bench/apple/thermal_capture.sh --self-check` fails, exit code 4, on
+exactly that missing file, and its `--execute` refusal message sends the reader
+there too.
+
+Until it is restored, the surviving listing of the privileged commands is
+`docs/APPLE_THERMAL_ENERGY.md`, sections at lines 167-173 and 426-438, and the
+full original is one command away:
+
+    git show 21ff9fa^:handoffs/performance_17_thermal_energy.md
+
+`bench/results/INSTRUCTION_AUDIT.md` section 10 reproduces the commands
+verbatim. The script is simply not an instrument and the protocol must stop
+implying it is.
 
 **And the limitation gets stated wherever a regime is named.** `pmset -g therm`
 returns nothing useful on Apple silicon. So "fast window" and "slow window" in

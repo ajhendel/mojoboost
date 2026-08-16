@@ -72,14 +72,34 @@ narrower form the same night.
 
 `PROFILE_PROTOCOL.md` instructs every session to "capture thermal state into the
 results header with `bench/apple/thermal_capture.sh`". **That instruction has
-never been followable and no session has ever followed it.**
+never been followable. One session followed it anyway, and the result is filed
+as though it were a measurement.**
 
 The CPU orchestrator read the script on 2026-08-16 and reports that it measures
 nothing: it is a plan printer, its own header says it "starts no sampler, runs no
 privileged command, fits no model, and writes no record", and `--execute` is
 parsed and deliberately refused with exit code 3 because the plan it prints
-includes `sudo powermetrics`. The real commands are listed for a human to run by
-hand in `handoffs/performance_17_thermal_energy.md`.
+includes `sudo powermetrics`.
+
+This paragraph originally added "and no session has ever followed it". The
+instruction audit refuted that from a committed artifact:
+`bench/results/profile_2026-08-15/header.txt` has a `=== thermal before ===`
+section holding the script's plan output, `run id thermal-PENDING` and all, and
+it has been there since `24e5330` on 2026-08-15. Read every regime label in
+that results directory accordingly.
+
+**The pointer to the real commands was also dangling.** This paragraph used to
+end by sending the reader to `handoffs/performance_17_thermal_energy.md`. That
+file was deleted on 2026-08-14 in `21ff9fa`, two days before this document was
+written; `bench/apple/thermal_capture.sh --self-check` fails on its absence with
+exit code 4. Until it is restored, use `docs/APPLE_THERMAL_ENERGY.md`, or
+recover the original with
+
+    git show 21ff9fa^:handoffs/performance_17_thermal_energy.md
+
+The commands are reproduced verbatim in
+`bench/results/INSTRUCTION_AUDIT.md` section 10, with the privileged ones
+marked. Do not run those from a session.
 
 `pmset -g therm` was tried on this machine and returned "No thermal warning level
 has been recorded", which is the expected answer on Apple silicon.
@@ -90,7 +110,11 @@ So the best instrument either campaign currently has is:
     ps -Ao pcpu,comm | sort -rn | head
 
 captured before and after every arm, into the results file. That is what both
-orchestrators now use. Everything either of us knows about this machine's fast
+orchestrators have agreed to use, and the instruction audit found the agreement
+ahead of the practice: exactly one results directory records `uptime` at both
+ends (`apple_m4_unified_memory_2026-08-15/env_start.txt` and `env_end.txt`), and
+**no results file anywhere records the `ps` line at all.** It is two seconds of
+work and it is still being skipped. Everything either of us knows about this machine's fast
 and slow regimes was inferred **from effect** — both arms rising together by 65
 percent — and not read from any instrument. One attribution was made and
 retracted on that basis (a slow pair was blamed on `mobileassetd` at 100 percent
