@@ -283,6 +283,177 @@ it is also no longer a control-plane argument. It has to be argued on
 occupancy, which is a kernel question and is measured with a kernel
 instrument.
 
+K=1 speculative prebuild, and the census that gates it
+------------------------------------------------------
+Leaf-wise growth commits one split at a time, so each step's launches are
+sized by one node and the device is underfilled. Depth-wise growth batches a
+level and fills it better, and half of that advantage is not about host round
+trips -- those are already gone from this plane. The proposal registered as
+K2 in `bench/results/PHASE2_PREREGISTRATION.md` is to recover the other half
+without changing the tree: **while step k commits, speculatively build the
+child histograms of the leaf step k+1 is most likely to pick.**
+
+**What ships here is the census, not the speculation.** The speculation is
+not built, and the reason is stated at "What is not built" below. What is
+built is the instrument that decides whether it is worth building, because
+the registration says so in as many words: *the measured hit rate is what
+makes K=1 sufficient or not*. That number turns out to cost nothing at all --
+no extra launch, no extra round trip, no extra byte moved -- and everything
+below is the argument for why.
+
+**The speculatable set, which is a theorem and not a census.** At step k the
+only leaves whose splits are known are the ones live *before* step k. The two
+children step k creates have no records until step k's own search writes them,
+which is the last device work of the step, so they cannot be speculated on by
+that step at all: their candidacy is established exactly when speculating on
+them would stop being speculation. So the candidate set for step k's
+speculation is precisely the pre-existing leaves other than the one step k is
+splitting.
+
+Over that set the ranking does not move. A commit touches four things a pick
+reads -- the split leaf's frontier row, the appended row at `n_live`, the
+record at `STEP_LEFT_REC` (which is the split leaf's own) and the record at
+`STEP_RIGHT_REC` (which is `n_live`) -- and every one of them belongs to the
+leaf being split or to a child of it. Every other live leaf keeps its slot
+index, its record index, its `FRONT_DEPTH`, its `FRONT_ROW_COUNT` and
+therefore its admissibility and its gain, unchanged, bit for bit. The pick is
+`block.max` over gains and then `block.min` over the slots that tie, so
+ordering *within* an unchanged set is unchanged including its tie resolution.
+
+Two consequences follow, and the second is the one that matters:
+
+1. **The best pre-existing leaf at step k+1 is exactly the top runner-up at
+   step k.** Not approximately and not usually: the same gains in the same
+   slot order under the same comparison.
+2. **Therefore K >= 2 is provably worthless.** A second speculative candidate
+   is the third-best pre-existing leaf, and the third-best can only be picked
+   at step k+1 if the second-best is not, which the paragraph above says
+   cannot happen. K=1 covers the whole of the speculatable set. The registered
+   proposal's K is right, and it is right for a reason stronger than the census
+   that was offered for it.
+
+**What the 100-percent census actually established.** A census reporting that
+the greedy pick was the top runner-up in 100 percent of 4,030 decisions is
+what consequence 1 predicts *for the decisions where the pick is a
+pre-existing leaf*, and it is a tautology over those. It says nothing about
+how often the pick is a pre-existing leaf, which is the hit rate. The
+registration already suspected the figure could not be trusted as a hit rate;
+the reason it cannot is that it is measuring a different quantity, and that
+quantity is provable a priori.
+
+**The hit rate is a different number, and it is free.** The pick at step k+1
+is a hit exactly when it is not one of the two nodes step k created. Node ids
+are assigned by `_pick_and_commit_kernel` from a counter that starts at 1 and
+advances by two per commit, so commit `j` creates nodes `2j+1` and `2j+2` and
+nothing else can. The commit log `TreeTablesSnapshot.commit_order` already
+comes home in the one download this plane makes, and
+
+    hit(j) == commit_order[j] not in (2*j - 1, 2*j)     for j >= 1
+
+is the whole census. It is host arithmetic over a list of about thirty
+integers, it enqueues nothing, and it cannot perturb what it measures.
+`speculation_census` is that function and `SPECULATION_CENSUS_VAR` is where
+its answer goes. Because it is derived from the tree rather than from a clock,
+it is reproducible: the same fit reports the same census in a fast window and
+a slow one.
+
+Two structural facts fall out of the arithmetic and both are worth knowing
+before reading a census:
+
+- **Step 0 speculates nothing.** Before the root split the only live leaf is
+  the root, which is also the pick, so the candidate set is empty. The
+  decision at `j == 1` therefore has no build to consume and is excluded from
+  the accounting rather than counted as a wrong guess.
+- **`consumed + wasted == builds` by construction**, and all three are counts
+  rather than fractions, deliberately. A fit's consumed fraction is the sum of
+  the counts divided by the sum of the counts; averaging per-tree fractions
+  would weight a three-leaf tree like a thirty-leaf one. The trace emits
+  counts and the harness does the division.
+
+**Exactness, by construction, and the two assumptions it rests on.** A
+speculatively built child histogram is bit-identical to the one the
+non-speculative path would build, and the argument is that neither the inputs
+nor the arithmetic can differ:
+
+- *Same rows.* The speculative partition permutes rows inside leaf B's window
+  and inside nothing else, because a partition's grid is derived from the
+  descriptor's window and the live windows are disjoint. If B is committed
+  later, the split it is committed on is the one already in its record -- the
+  record cannot have changed, by the invariance paragraph above -- so the
+  routing flag of every row is the same flag, and re-running the partition
+  over an already-partitioned window moves the same rows to the same side.
+  The *multiset* of rows on each side is therefore identical whether the
+  partition ran once or twice.
+- *Order does not reach the answer.* Accumulation is fixed-point Int32 and
+  integer addition is associative and commutative, so a histogram is a
+  function of the multiset of rows and not of their order. This is the same
+  property `enqueue_desc_histogram` already relies on to let the atomic and
+  tiled strategies agree, and the same one `enqueue_resident_subtract` relies
+  on for the sibling subtraction.
+- *Same scales.* `PF_G_INV` and `PF_H_INV` are recomputed per round, and
+  `builder.g_scale`/`h_scale` are per round, not per step. A speculative build
+  and its consuming step are inside one tree and therefore inside one round.
+- *Same feature set.* Under `resident_round_supported`'s refusals a node's
+  feature set is the tree's feature set (`feature_fraction_bynode` and
+  interaction constraints are refused by name), so there is no per-node
+  narrowing that a speculative build could get wrong.
+
+The two named assumptions, so that a later reader can check them rather than
+inherit them: **(a)** the search records of leaves other than the one being
+split are never written, which is a property of `_copy_records_kernel`'s two
+destinations and would break the moment a step wrote a third record; and
+**(b)** rows within a leaf's window are order-insensitive to every consumer,
+which holds for the histogram (above), for `update_raw_device` (it broadcasts
+one leaf value over a window), and for a later partition (set-preserving), and
+would break if anything ever indexed a row by its position in the window.
+
+**Where the speculation must not fold the subtraction in.** `enqueue_desc_child`
+builds the smaller child into a fresh slot and derives the larger by
+subtracting *in place from the parent's slot*, which destroys the parent's
+histogram. A speculative step must not do that: leaf B is still live and its
+histogram must survive a miss. So a speculative build builds the smaller
+child into a spare slot and leaves the subtraction to the consuming step,
+which needs one more pool slot than the frontier (`open_resident(num_leaves)`
+becomes `num_leaves + 1`) and two more scratch records than
+`RESIDENT_SCRATCH_RECORDS` names today.
+
+**Dead steps make the speculation worse, not neutral.** A step past the end of
+growth is nearly free today because every descriptor-aware kernel reads
+`STEP_LIVE` and returns; the exception the docstring names above is the search
+pair, which is not descriptor-aware. A speculative build adds a second
+partition and a second histogram launch to *every* step including the dead
+ones, and its own search pair on top. So a tree that stops at seventeen leaves
+of a thirty-one budget pays fourteen wasted speculative builds it could not
+possibly consume, which is why `dead` is reported next to `builds` rather than
+folded into it.
+
+**What is not built, and exactly what it needs.** The speculation itself is
+not implementable from this file. Every descriptor-aware launch reads one
+fixed buffer, `GpuActiveRows.step_dev`: `enqueue_partition_desc` and
+`enqueue_desc_histogram` both pass `self.step_dev.unsafe_ptr()` rather than a
+descriptor the caller hands in, and `_zero_slot_desc_kernel` and the atomic
+family take the pointer from the same place. A speculative step needs a
+*second* descriptor and a kernel that publishes a runner-up into it without
+committing anything. Concretely, and in the two files this lane may not edit:
+
+- `gpu_active_rows.mojo`: give `enqueue_partition_desc` and
+  `enqueue_desc_histogram` a descriptor-pointer parameter, exactly as
+  `DeviceTreeTables.enqueue_step` already has one, defaulting to `step_dev`
+  so no existing call site moves; and allocate a second `STEP_WORDS` buffer
+  for the speculative row. The kernels already take the descriptor as an
+  argument and already have a "ignore the descriptor" flag, so nothing below
+  the launch changes.
+- `gpu_tree_tables.mojo`: a `_pick_runner_up_kernel`, which is
+  `_pick_and_commit_kernel`'s phase two with the committing third phase
+  replaced by a descriptor write -- same strided walk, same shape rules, same
+  `block.max`/`block.min`, excluding the slot this step's commit took. It must
+  write no table, so it cannot reuse phase three at all.
+
+Neither is large and neither is this lane's to make. **The order to do them in
+is census first**: if the measured hit rate is materially below one, the
+speculation is a second partition and a second histogram per step bought for
+a fraction of a step, and the honest outcome is to report that.
+
 Numerics
 --------
 `docs/NUMERICS.md` records that this codebase's floats contract into fused
@@ -486,6 +657,215 @@ def _resident_trace_emit(sink: String, text: String) raises:
         return
     with open(sink, "a") as handle:
         handle.write(text)
+
+
+# --- The speculation census -----------------------------------------------
+#
+# See "K=1 speculative prebuild, and the census that gates it" in the module
+# docstring for the whole argument. What lives here is the arithmetic and the
+# sink; the argument for why this arithmetic is the hit rate, and why K=1 is
+# provably the right K, is there and is not repeated.
+
+
+comptime SPECULATION_K = 1
+"""How many pre-existing leaves a speculative step would prebuild.
+
+One, and not as a tuning choice. The module docstring proves that the best
+pre-existing leaf at step k+1 is exactly the top runner-up at step k, so a
+second speculative candidate would be a leaf that provably cannot be picked
+next. This constant exists to be *read* -- by the census line, so that a
+result file records which K produced it -- rather than to be varied. A K of
+two would need a different theorem, not a different number here."""
+
+comptime SPECULATION_CENSUS_VAR = "MOJOTREES_GPU_SPECULATION_CENSUS"
+"""Where the per-tree speculation census goes. Unset or empty is off. `1`,
+`stdout` or `-` print to standard output; anything else is a file path, which
+is **appended** to, exactly as `RESIDENT_TRACE_VAR` is and for the same
+reasons.
+
+Its own variable rather than a mode of the trace, because the two instruments
+have opposite costs. `MOJOTREES_GPU_TREE_RESIDENT_TRACE_STEPS` reinstates a
+download per split and cannot be on while anything is being measured; the
+census adds one host loop over about thirty integers and one file append per
+tree, and perturbs nothing it measures. A caller who wants both in one file
+points this at the trace's path.
+
+When this is unset but the trace sink is set, the census line goes to the
+trace instead, so that a debugging trace is never missing it. When both are
+set the census line goes here only, so that a census run's output file holds
+one line per tree and nothing else."""
+
+
+def speculation_census_sink() -> String:
+    """The census destination, or the empty string when the census is off.
+
+    Read once per tree, next to `resident_trace_sink`, and for the same
+    reason: a variable does not change inside a fit, and reading one inside a
+    loop that is supposed to contain no host work at all is how such a loop
+    quietly becomes slow."""
+    return getenv(SPECULATION_CENSUS_VAR)
+
+
+struct SpeculationCensus(Copyable, Movable):
+    """What a K=1 speculative prebuild would have built, and how much of it
+    would have been consumed, for one tree.
+
+    Counts and not fractions. A fit's consumed fraction is the sum of
+    `consumed` over its trees divided by the sum of `builds`; averaging the
+    per-tree fractions would weight a three-leaf tree the same as a
+    thirty-leaf one, which is the wrong answer and is the mistake counts make
+    impossible.
+
+    Every field is derived from the commit log of a tree that has already been
+    grown. Nothing here is a timing, an estimate or a bound: given the log,
+    each number is exact, and the log is what a device kernel wrote.
+    """
+
+    var steps: Int
+    """Growth steps enqueued for this tree, `num_leaves - 1`. Not the
+    terminal pick step, which performs no growth and would speculate on
+    nothing."""
+
+    var commits: Int
+    """Splits the device actually took. Equal to `steps` on a tree that spends
+    its budget, smaller on one that ran out of admissible leaves first."""
+
+    var dead: Int
+    """`steps - commits`: steps enqueued past the end of growth. Every one of
+    them issues a speculative build under an enqueue-blind design and every
+    one of those builds is wasted, which is why this is reported beside
+    `builds` rather than folded into it."""
+
+    var builds: Int
+    """Speculative builds a K=1 design would issue for this tree: `steps - 1`,
+    every step but the first, dead steps included.
+
+    Step 0 is excluded because before the root split the only live leaf is the
+    root, which is also the pick, so the candidate set is empty and there is
+    nothing to speculate on.
+
+    An **upper bound** in one narrow case: a live step whose pre-existing
+    leaves are all inadmissible would issue no build, and the commit log
+    cannot distinguish that from a build that missed. The bound is tight
+    whenever any pre-existing leaf is admissible, which after the first few
+    splits is essentially always."""
+
+    var consumed: Int
+    """Builds whose leaf was picked by the very next commit. This is the hit
+    count, and `consumed / builds` is the hit rate the registration calls
+    decisive."""
+
+    var wasted: Int
+    """`builds - consumed`. Real device work -- a partition and a histogram
+    accumulation over a whole leaf's rows -- spent on a child that is
+    discarded."""
+
+    def __init__(out self, steps: Int, commits: Int, consumed: Int):
+        self.steps = steps
+        self.commits = commits
+        self.dead = steps - commits
+        var b = steps - 1
+        if b < 0:
+            b = 0
+        self.builds = b
+        self.consumed = consumed
+        self.wasted = b - consumed
+
+    def trace_line(self) -> String:
+        """The census as one line of `key=value` pairs.
+
+        Flat, single-line and stable, the same contract `TreeTablesSnapshot.
+        trace_line` states: a harness sums these with `grep` and `awk` rather
+        than by understanding them, and anything added later goes on the end
+        so an existing reader keeps working. Deliberately carrying no
+        `plane=device-resident` token, since that substring is what
+        `tests/test_gpu_tree_resident.mojo` counts to prove the plane ran and
+        a second line carrying it would double every one of those counts.
+        """
+        return String(
+            "k=",
+            SPECULATION_K,
+            " steps=",
+            self.steps,
+            " commits=",
+            self.commits,
+            " dead=",
+            self.dead,
+            " builds=",
+            self.builds,
+            " consumed=",
+            self.consumed,
+            " wasted=",
+            self.wasted,
+        )
+
+
+def speculation_census(
+    commit_order: List[Int], steps: Int
+) raises -> SpeculationCensus:
+    """How much of a K=1 speculative prebuild this tree's commit log would
+    have consumed.
+
+    A pure function of the log, so it is testable without a device and
+    reproducible without a clock, which is most of why the census is worth
+    having at all: it is a property of the tree rather than of the machine,
+    and the same fit answers the same way in a fast window and a slow one.
+
+    The rule, whose derivation is in the module docstring. `_pick_and_commit_
+    kernel` assigns node ids from a counter that `_reset_tables_kernel` starts
+    at 1 and every commit advances by two, so commit `j` creates nodes
+    `2j + 1` and `2j + 2` and no other commit can create them. The build
+    issued during step `j - 1` targets the best leaf that was live before that
+    step, so the pick at commit `j` consumes it exactly when that pick is
+    **not** one of the two nodes commit `j - 1` created:
+
+        consumed(j) == commit_order[j] not in (2j - 1, 2j)
+
+    for `j` in `[2, commits)`. `j == 1` is excluded and is not a miss: step 0
+    issues no build, so there was nothing at commit 1 to consume.
+
+    Two checks rather than none, because a log that does not describe a legal
+    leaf-wise growth would otherwise produce a plausible-looking census. A
+    commit's parent must be a node that already exists, which bounds it below
+    `2j + 1`; and the log cannot be longer than the steps that could have
+    written it. Both raise, since a census computed from a malformed log is
+    worse than no census.
+    """
+    if steps < 0:
+        raise Error("a tree cannot enqueue a negative number of growth steps")
+    var commits = len(commit_order)
+    if commits > steps:
+        raise Error(
+            String(
+                "the commit log holds ",
+                commits,
+                " commits but only ",
+                steps,
+                " growth steps were enqueued; a step commits at most once",
+            )
+        )
+    var consumed = 0
+    for j in range(commits):
+        var parent = commit_order[j]
+        if parent < 0 or parent >= 2 * j + 1:
+            raise Error(
+                String(
+                    "commit ",
+                    j,
+                    " names node ",
+                    parent,
+                    ", which did not exist yet; a leaf-wise commit log must"
+                    " split a node an earlier commit created",
+                )
+            )
+        if j < 2:
+            # j == 0 is the root split, which no earlier step preceded, and
+            # j == 1 is preceded by step 0, which speculates on an empty
+            # candidate set. Neither is a decision a build could have served.
+            continue
+        if parent != 2 * j - 1 and parent != 2 * j:
+            consumed += 1
+    return SpeculationCensus(steps, commits, consumed)
 
 
 # --- Record capacity ------------------------------------------------------
@@ -1121,9 +1501,10 @@ def grow_tree_device_resident(
     var widest = len(searcher.active)
     if widest < 1:
         widest = len(tree_features)
-    # Both read once, before the first launch. See `resident_trace_sink`.
+    # All three read once, before the first launch. See `resident_trace_sink`.
     var trace = resident_trace_sink()
     var trace_steps = trace != "" and resident_trace_steps_requested()
+    var census_sink = speculation_census_sink()
 
     # --- Per-tree staging, all of it, before any split ---------------------
     #
@@ -1374,4 +1755,31 @@ def grow_tree_device_resident(
     # The host state the rest of the trainer reads back out of the builder.
     # Not optional and not cosmetic; see `_publish_row_ranges`.
     _publish_row_ranges(builder, snap)
+    # What a K=1 speculative prebuild would have consumed on this tree, from
+    # the commit log that is already in host memory. One loop over about
+    # thirty integers, no launch, no transfer, and no effect on anything above
+    # it; see "K=1 speculative prebuild, and the census that gates it".
+    #
+    # Computed only when somewhere wants it. The arithmetic is negligible but
+    # the emission is a file open, and this plane's rule is that an instrument
+    # nobody asked for costs nothing at all.
+    if census_sink != "" or trace != "":
+        var census = speculation_census(
+            snap.commit_order, params.num_leaves - 1
+        )
+        # The census's own sink when it has one, so that a census run's file
+        # holds one line per tree and nothing else; the trace otherwise, so
+        # that a debugging trace is never missing it. See
+        # `SPECULATION_CENSUS_VAR`.
+        var sink = census_sink if census_sink != "" else trace
+        _resident_trace_emit(
+            sink,
+            String(
+                "mojotrees.speculation ",
+                census.trace_line(),
+                " root_rows=",
+                n_root,
+                "\n",
+            ),
+        )
     return tree_from_snapshot(snap)

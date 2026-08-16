@@ -95,6 +95,17 @@ count wants text a test can read back. Truncated before each arm and read
 after it, so the two arms never share a record.
 """
 
+comptime _CENSUS_PATH = "./.test_gpu_tree_resident_census.tmp"
+"""Where the K=1 speculation census lands, which is deliberately not
+`_TRACE_PATH`.
+
+Two files rather than one because the separation is itself under test: the
+census has its own sink so that a census run's output holds one line per tree
+and nothing else, and so that a debugging trace is not doubled by an
+instrument that costs nothing to leave on. Pointing both at one path is a
+supported way to use them and is exactly what would hide a mistake here.
+"""
+
 comptime _PLANE_MARK = "plane=device-resident"
 """The token `grow_tree_device_resident` writes once per tree it grows.
 
@@ -640,6 +651,119 @@ def test_the_step_trace_shows_every_step_of_every_tree() raises:
         assert_true(
             text.find("leaf slot=0 node=1") >= 0,
             "step trace: the frontier rows should be in the record",
+        )
+
+
+def test_the_speculation_census_reaches_the_plane_and_is_not_vacuous() raises:
+    """The K=1 speculation census is emitted by the plane, once per tree, into
+    its own sink, with a denominator that is not zero.
+
+    Why a denominator assertion is the load-bearing one here. The instrument
+    this file's own header describes -- six fixtures that all ran below the
+    gate they were meant to exercise -- failed by having nothing to measure
+    rather than by measuring wrongly, and it passed every assertion that only
+    checked a number came back. A census whose `builds` is zero on every tree
+    is that failure exactly: consumed over builds is undefined, the fit
+    reports nothing, and any assertion phrased as "a census line appeared"
+    still passes. So `builds` is asserted at its exact value, `steps - 1`,
+    which is a denominator this fixture is known to reach.
+
+    The second assertion is two-sided in the direction a fit can guarantee.
+    `wasted` is at least one on every tree with a build, always and
+    structurally: the build a step issues can only be consumed by the commit
+    after it, and the last growth step has no commit after it. So a census
+    that came back saying everything was consumed -- the constant-100-percent
+    instrument the registration warns about -- fails here. The other pole, a
+    census that can report a nonzero `consumed`, is not assertable from a fit
+    whose tree shape is not known in advance, and is proved instead by
+    `tests/test_gpu_speculation_census.mojo`, which runs the same function
+    over commit logs written out by hand at both poles and needs no device.
+
+    **This is not a test that a speculative build was consumed**, because no
+    speculative build is shipped. `gpu_resident_round.mojo` says what the
+    speculation needs from `gpu_active_rows.mojo` and `gpu_tree_tables.mojo`,
+    and states what the consumption test must assert once it exists: a device
+    counter incremented only on the consuming branch, downloaded with the
+    tables. Counting launches would not do it.
+
+    One round, one tree, because this exercises an instrument and not a model.
+    """
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 2_000
+        var n_features = 4
+        var features = _make_features(n_rows, n_features)
+        var target = _regression_target(features, n_rows)
+        var data = bin_equal_width(features, n_rows, n_features, 32)
+        var params = BoosterParams(1, 0.1, TreeParams(8, 20, 1.0, 1e-3))
+
+        with open(_CENSUS_PATH, "w") as handle:
+            handle.write(String(""))
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "device")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "1")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", _TRACE_PATH)
+        _ = setenv("MOJOTREES_GPU_SPECULATION_CENSUS", _CENSUS_PATH)
+        _truncate_trace()
+        var booster = train_gpu(data, target, SQUARED_ERROR, params)
+        var trace = _read_trace()
+        var census = open(_CENSUS_PATH, "r").read()
+        _ = setenv("MOJOTREES_GPU_SPECULATION_CENSUS", "")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", "")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "")
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "")
+
+        assert_true(len(booster.trees) > 0, "census: the fit grew no trees")
+        assert_equal(
+            trace.count(_PLANE_MARK),
+            len(booster.trees),
+            "census: the plane has to have run for its census to mean"
+            " anything",
+        )
+        assert_equal(
+            census.count("mojotrees.speculation "),
+            len(booster.trees),
+            "census: one census line per tree the plane grew",
+        )
+        # Its own sink, so a census run's file holds one line per tree and
+        # nothing else, and the trace is not doubled.
+        assert_equal(
+            trace.count("mojotrees.speculation "),
+            0,
+            "census: with its own sink named, the census must not also go to"
+            " the trace",
+        )
+        assert_equal(
+            census.count(_PLANE_MARK),
+            0,
+            "census: the census line must not carry the token this file"
+            " counts to prove the plane ran",
+        )
+        # The denominator, at its exact value. `num_leaves` is 8, so the
+        # schedule is seven growth steps and every step but the first issues
+        # one speculative build.
+        assert_equal(
+            census.count("steps=7 "),
+            len(booster.trees),
+            "census: seven growth steps for a budget of eight leaves",
+        )
+        assert_equal(
+            census.count(" builds=6 "),
+            len(booster.trees),
+            "census: six builds per tree, which is the denominator the"
+            " consumed fraction is taken over; a zero here is the vacuous"
+            " pass this assertion exists to catch",
+        )
+        assert_equal(
+            census.count(" wasted=0"),
+            0,
+            "census: the last step's build has no commit after it, so a tree"
+            " reporting no waste at all is an instrument that cannot come"
+            " back below one hundred percent",
+        )
+        assert_true(
+            census.find("k=1 ") >= 0,
+            "census: the line records which K produced it",
         )
 
 
