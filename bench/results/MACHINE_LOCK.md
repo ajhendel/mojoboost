@@ -60,6 +60,41 @@ narrower form the same night.
   they are timing, and an ETA.
 - Both parties check it before starting any timing run. Neither times against a
   lock they do not hold.
+
+**Use `tools/bench_lock.sh` rather than writing the file by hand.**
+
+    tools/bench_lock.sh status                            # 0 free, 1 held, 2 abandoned
+    tools/bench_lock.sh acquire "<session>" "<what>" "<eta>"
+    tools/bench_lock.sh release
+    tools/bench_lock.sh take                              # only after status says ABANDONED
+
+It records the holder's **pid** and socket, which is what makes the difference
+between held and abandoned answerable instead of guessed. Everything else in the
+file -- the session name, the workload, the ETA -- is a claim written once at
+acquisition by a session that may not survive to release it, and nothing updates
+them afterwards. Read those as history, not status.
+
+**It exists because on 2026-08-16 a lane died mid-window holding this lock**,
+when three sessions were terminated at once on a spend limit. The file sat with
+a stated ETA and nothing to release it. From the outside a stale lock and a busy
+lock are the same bytes, so the other campaign waited on it correctly and would
+have kept waiting past the ETA.
+
+**Every uncertain case reports HELD, deliberately.** Reporting a live lock as
+abandoned lets two sessions measure at once and silently corrupts both windows;
+reporting an abandoned lock as held costs somebody a wait. Those are not
+comparable. So a lock is called ABANDONED only when the holder's pid is
+positively confirmed gone -- a lock with no `pid:` line, including every
+hand-written one that predates this tool, reports HELD and cannot be taken.
+
+**The tool never steals.** `take` is a separate verb somebody types, and it
+preserves the stale file under a `.dead-<session>` suffix rather than deleting
+it, because what a window was doing when it died is evidence. That is how the
+2026-08-16 lane's own note survived to be read.
+
+`tools/with_build_lock.sh` is a **different** lock and needs none of this: it
+serializes heavy builds on `/tmp/mojotrees-build.lock` through an fcntl flock,
+and the kernel releases an fcntl lock when the holding process dies.
 - The holder deletes it when done. A lock whose ETA has long passed may be
   queried by message before being assumed stale.
 - Whoever wants the box for timing asks; the other stops launching new lanes and
