@@ -885,3 +885,54 @@ Not measured, and therefore not claimed:
   sibling was, and nothing was run to find out.
 - **any performance consequence of anything in this document.** No benchmark was
   run and none should be inferred.
+
+## The fixed-point scale cannot live on the device, and this is why
+
+**A property, recorded because the next person will try the same dodge.**
+Established 2026-08-16 by the `trip-count` lane while attempting exactly it.
+
+The device fixed-point scale is currently folded on the host once per round, from
+device partials, and handed to nine kernels as a `Float32` launch argument. That
+readback is one of only two host round trips per round, so "compute the scale on
+device and never read it back" is the obvious move.
+
+**It does not work, and the obstruction is arithmetic rather than plumbing.**
+
+The host needs the scale's *value* in three places. Two are mechanical: a launch
+argument, and a staged table for the batching paths. The third is
+`Float32(1.0 / g_scale)`, packed into the split searcher's parameter block.
+
+**The gain `G^2 / (H + lambda)` and the leaf value `-G / (H + lambda)` are not
+homogeneous in the scale, because `lambda` is not scaled.** Scale `G` and `H` by
+`s` and the gain becomes `s^2 G^2 / (sH + lambda)`, which is not `s^k` times the
+original for any `k`. So a searcher told the scale is 1.0 does not compute a
+rescaled gain — it computes a **different** gain, and picks a **different split**.
+
+### The dodge that looks like it works, and where it fails
+
+Pre-scale the gradients on device and hand every kernel a scale of 1.0. With a
+power-of-two scale this is genuinely exact -- `g * 2^k` is an exact `Float32`
+product -- so the histogram is bit-identical and the first two sites are
+satisfied.
+
+**It fails on the third.** The searcher still needs the real `1/s` to weigh
+`lambda` against sums that are now in scaled units. There is no value of the
+parameter block that makes an unscaled `lambda` correct against scaled sums.
+
+### What is available instead
+
+Only **how often** the host asks, not **whether** it must. That is
+`GpuHistogramBuilder.set_scale_refresh(N, H)`: the magnitudes are still reduced
+every round into a pinned window, and only the readback is deferred. Its
+amortization is verified rather than assumed -- every round under an outgoing
+scale is checked against the overflow bound and a violation **raises**.
+
+### One further fact, for whoever tries a device fold anyway
+
+Apple GPUs have no `Float64`. A device fold would be `Float32` or double-float
+(~2^-48) against the host's ~2^-53. Because `largest_power_of_two_at_most` is a
+**step function**, the two agree except when the two quotients straddle a power
+of two -- and then the scale differs by exactly 2x and every histogram cell
+moves. The overflow bound survives either way. The bit-motion condition is
+**dataset-dependent and unbounded**, not a probability, so it cannot be traded
+away against an error budget.
