@@ -967,7 +967,30 @@ def subtract_ops(n_cells: Int) -> Int:
     independent streams, so it is counted as three ops rather than one: the
     pass is memory-bound and a single-op estimate keeps it serial well past
     the point where the streams saturate one core."""
-    return 3 * n_cells
+    return subtract_ops_for_planes(n_cells, 3)
+
+
+def subtract_ops_for_planes(n_cells: Int, n_planes: Int) -> Int:
+    """`subtract_ops` for a subtraction that touches `n_planes` of the three.
+
+    The constant-hessian specialization in `histogram.mojo` subtracts the
+    gradient and count planes and derives the hessian plane from the count it
+    just wrote, so its pass runs two of the three read-modify-write streams
+    rather than three. The estimate is the traffic, so it has to follow: a
+    two-plane pass that told `parallel.plan_tasks` it was a three-plane one
+    would clear the crossover at two thirds of the size that actually
+    saturates a core.
+
+    Nothing about this can move a value. The subtraction is elementwise over
+    disjoint ascending blocks, so the task count changes which core writes a
+    cell and nothing else, which is the guarantee `parallel.mojo` states for
+    `dispatch_rows` and the reason a work estimate is allowed to be a
+    judgment call at all. A plane count below one is clamped to one, so a
+    degenerate caller still gets a positive estimate rather than a zero that
+    would read as no work.
+    """
+    var planes = n_planes if n_planes > 0 else 1
+    return planes * n_cells
 
 
 # What one scored split candidate costs, in the histogram-op equivalents

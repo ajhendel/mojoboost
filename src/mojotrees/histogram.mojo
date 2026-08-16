@@ -112,6 +112,44 @@ is proposing to give all of that up, and should say so explicitly rather than
 discover it by breaking parity. The GPU path escapes the same argument only
 because it accumulates in fixed-point Int32, where addition *is* associative;
 see `_range_hist_partial_kernel` in `gpu_active_rows.mojo`.
+
+The constant-hessian plane
+--------------------------
+A cell is three planes, and for four of the built-in objectives one of them
+carries no information. `SQUARED_ERROR`, `L1`, `HUBER` and `QUANTILE` all
+write the same hessian into every row when the fit has no sample weights, and
+that value is exactly 1.0, so the hessian plane is the count plane and storing
+both is waste. `objective_has_constant_hessian` is the predicate, and it is
+deliberately about the objective rather than about a round's numbers: hessians
+that happen to be equal once are not a guarantee, and a weighted or GOSS round
+breaks the guarantee while leaving the objective code unchanged.
+
+The elision is a **declaration**, threaded as the trailing `const_hessian`
+argument of every builder here and as `GpuActiveRows.set_constant_hessian` on
+the device. Nothing infers it, nothing defaults to it, and
+`MOJOTREES_CONST_HESSIAN=0` forces every declaration back onto the three-plane
+path. When it is on, the accumulation loop and the device kernel stop touching
+the hessian plane entirely and the plane is refilled from the count at the end
+of the pass, so the assembled `Histogram` still presents `grad`, `hess` and
+`count` and no consumer changes.
+
+Exactness on this backend, which is the whole argument for shipping it. A cell
+that received `count` rows accumulated `1.0 + 1.0 + ... + 1.0`, count times, in
+Float64. Every partial sum of that series is one of the integers 1, 2, ...,
+count, each of which is exactly representable in Float64 while count stays
+below 2^53, so no rounding occurs anywhere in the series and the total is
+exactly `Float64(count)`. The refill writes `Float64(count)` and is therefore
+the identical Float64, not an approximation of it.
+
+Note what the choice of 1.0 buys, because it is not incidental. For a general
+constant `h` the series `h + h + ... + h` is *not* `h * count` in floating
+point, and reconstructing it would need a multiply next to the additions that
+already exist in this file, which is exactly the neighborhood
+`docs/NUMERICS.md` says a fusion can appear in and cannot be refused at a
+single site. At `h = 1.0` there is no multiply at all: the refill is an
+integer-to-float conversion, and no optimizer has anything to contract. The
+device path does have a multiply and it is an Int32 one, argued in
+`_range_hist_atomic_kernel`.
 """
 
 from std.math import round
@@ -121,11 +159,159 @@ from .apple_cpu_policy import (
     cpu_profile,
     derive_accumulation_plan,
     subtract_ops,
+    subtract_ops_for_planes,
 )
 from .binning import BinnedMatrix
-from .parallel import dispatch_feature_ranges, dispatch_features, dispatch_rows
+from .objective_registry import HUBER, L1, QUANTILE, SQUARED_ERROR
+from .parallel import (
+    _env_int,
+    dispatch_feature_ranges,
+    dispatch_features,
+    dispatch_rows,
+)
 
 comptime SIMD_LANES = 4 * simd_width_of[DType.float64]()
+
+
+# ---------------------------------------------------------------------------
+# The constant-hessian specialization
+# ---------------------------------------------------------------------------
+
+comptime CONSTANT_HESSIAN = 1.0
+"""The only per-row hessian this package specializes on.
+
+Not a tunable and not a general constant. It is 1.0 because that is the
+value four built-in objectives write into every row of `hess` when there
+are no sample weights, and because 1.0 is the one constant for which the
+reconstruction below is exact in Float64 without a multiply. See
+`objective_has_constant_hessian` for the objectives and
+`_accumulate_full_at` for the exactness argument.
+"""
+
+
+def objective_has_constant_hessian(objective: Int, weighted: Bool) -> Bool:
+    """Whether `objective` *guarantees* a per-row hessian of exactly
+    `CONSTANT_HESSIAN` for every row, at every raw score, on every dataset.
+
+    This is a statement about the objective's second derivative, read off
+    `boosting._fill_grad_hess_into`, and deliberately not a statement about
+    any particular round's numbers. A run whose hessians happen to be equal
+    on one round is not the same thing, cannot be relied on for the next
+    round, and is not what this returns.
+
+    The four that qualify, and why each is safe. Every one of them ends its
+    row body with `hp.unsafe_store(r, w)` and nothing else, where `w` is
+    `weights[r]` when the fit has sample weights and the Float64 literal
+    `1.0` when it does not:
+
+    - `SQUARED_ERROR`. The loss is `(raw - y)^2 / 2`, second derivative 1.
+    - `L1`. The gradient is `sign(raw - y)`; LightGBM (and this package)
+      carry the second derivative as 1 so the Newton step reduces to the
+      gradient step, and `renew_tree_output` corrects the leaf afterwards.
+    - `HUBER`. Quadratic inside the band and linear outside, and the linear
+      arm carries the same hessian of 1 for the same reason as L1.
+    - `QUANTILE`. The pinball gradient with a hessian of 1, same reason.
+
+    That set is exactly LightGBM's `IsConstantHessian()`, which is
+    `return !weights_` on `RegressionL2loss` and is inherited unchanged by
+    its L1, Huber, and quantile subclasses. `MAPE` inherits it too in this
+    package's shape but overrides the hessian to `w * label_weight(y)`,
+    which varies per row, so it is excluded here as it is there.
+
+    Everything else is excluded, and the exclusions matter more than the
+    inclusions:
+
+    - **Sample weights of any kind.** The hessian *is* the weight, so a
+      weighted fit has a per-row hessian by construction. That covers an
+      explicit `sample_weight`, `class_weight` (which becomes one), and any
+      other path that folds a weight into `hess`.
+    - **GOSS.** `goss.apply_goss_scaling` multiplies the sampled
+      small-gradient rows' hessians by an amplification factor and leaves
+      the top rows alone, so a GOSS round has two distinct hessian values
+      even under squared error. A caller that turns GOSS on must not
+      declare a constant hessian, and this function cannot see that it did:
+      the objective is still `SQUARED_ERROR`. The declaration is the
+      caller's and this is the reason it has to be.
+    - Every objective with a curvature that depends on the raw score or the
+      label: logistic, cross entropy, Poisson, gamma, tweedie, fair, MAPE,
+      and softmax multiclass.
+    - `CUSTOM` and `LAMBDARANK`, whose hessians come from a caller-supplied
+      callable and from query groups. Neither is a code this function can
+      reason about, so both return False.
+
+    Nothing in this package calls this yet. It is the predicate a trainer
+    should evaluate once per round, next to where it decides whether to pass
+    weights, and hand to the builders below; see the module-level note on
+    what is and is not wired.
+    """
+    if weighted:
+        return False
+    return (
+        objective == SQUARED_ERROR
+        or objective == L1
+        or objective == HUBER
+        or objective == QUANTILE
+    )
+
+
+def const_hessian_allowed() -> Bool:
+    """Whether the constant-hessian specialization may run at all.
+
+    `MOJOTREES_CONST_HESSIAN=0` forces every builder back onto the
+    three-plane path regardless of what a caller declared, which is the
+    off switch a bisection wants. Anything else, including unset, leaves
+    the specialization available; it still does nothing until a caller
+    declares an objective that guarantees it.
+
+    The convention is `parallel.mojo`'s: an integer read through `_env_int`,
+    a default that means "unchanged behavior", and zero meaning off. The
+    explicit setters (`GpuActiveRows.set_constant_hessian`,
+    `GpuHistogramBuilder.set_constant_hessian`, and the `const_hessian`
+    argument the CPU builders take) exist alongside it for the reason
+    `set_feature_group` gives: an A/B that reads its arm from the
+    environment can run one arm under the other's label, which has happened
+    in this repository once.
+    """
+    return _env_int("MOJOTREES_CONST_HESSIAN", 1) != 0
+
+
+def const_hessian_verify() -> Bool:
+    """Whether a declared constant hessian is checked against the data.
+
+    `MOJOTREES_CONST_HESSIAN_VERIFY=1` makes every CPU builder that was
+    told the hessians are constant walk the hessian array once and raise if
+    any entry is not exactly `CONSTANT_HESSIAN`. Off by default because it
+    is one extra pass over `n_rows` per build, which on a node with a
+    handful of rows means a pass over the whole dataset.
+
+    It is a diagnostic, not the safety mechanism. The safety mechanism is
+    that the declaration comes from the objective. This exists so that a
+    test, or somebody wiring a new trainer up, can find out immediately that
+    a declaration is wrong instead of discovering it as a bit difference six
+    rounds later.
+    """
+    return _env_int("MOJOTREES_CONST_HESSIAN_VERIFY", 0) != 0
+
+
+def _check_constant_hessian(hess: List[Float64], n_rows: Int) raises:
+    """Raise unless every one of the first `n_rows` hessians is exactly
+    `CONSTANT_HESSIAN`. Only called under `const_hessian_verify`."""
+    for r in range(n_rows):
+        if hess[r] != CONSTANT_HESSIAN:
+            raise Error(
+                "a constant hessian was declared but row ",
+                r,
+                " has hessian ",
+                hess[r],
+                "; the declaration must come from an objective that"
+                " guarantees it, and a weighted or GOSS round does not",
+            )
+
+
+def _resolve_const_hessian(declared: Bool) -> Bool:
+    """The specialization's on/off decision for one build: the caller's
+    declaration, ANDed with the environment's permission."""
+    return declared and const_hessian_allowed()
 
 
 @fieldwise_init
@@ -282,12 +468,19 @@ def build_histogram(
     grad: List[Float64],
     hess: List[Float64],
     features: List[Int] = [],
+    const_hessian: Bool = False,
 ) raises -> Histogram:
     """Build a full-dataset histogram from per-row gradients and hessians.
     With a non-empty `features`, only those features are accumulated and the
-    rest of the output stays zero."""
+    rest of the output stays zero.
+
+    `const_hessian` declares that every entry of `hess` is exactly
+    `CONSTANT_HESSIAN`, which is a property of the objective and never of
+    the array; see `objective_has_constant_hessian`. The result is
+    bit-identical either way.
+    """
     var out = Histogram.zeroed(data.n_features, data.n_bins)
-    build_histogram_into(out, data, grad, hess, features)
+    build_histogram_into(out, data, grad, hess, features, const_hessian)
     return out^
 
 
@@ -297,6 +490,7 @@ def build_histogram_into(
     grad: List[Float64],
     hess: List[Float64],
     features: List[Int] = [],
+    const_hessian: Bool = False,
 ) raises:
     """`build_histogram` into a caller-owned buffer, every cell of which is
     written: the accumulation pass zeroes each slice before filling it, so a
@@ -307,12 +501,15 @@ def build_histogram_into(
     if not out.matches(data.n_features, data.n_bins):
         raise Error("output histogram shape must match the data")
     _check_features(features, data.n_features)
+    var const_h = _resolve_const_hessian(const_hessian)
+    if const_h and const_hessian_verify():
+        _check_constant_hessian(hess, data.n_rows)
 
     # The three output buffers are passed as separate `mut` lists rather than
     # reached through `out`: a pointer taken from a struct field carries that
     # field's origin, which a worker closure cannot capture.
     _accumulate_full(
-        out.grad, out.hess, out.count, data, grad, hess, features
+        out.grad, out.hess, out.count, data, grad, hess, features, const_h
     )
 
 
@@ -324,6 +521,7 @@ def _accumulate_full(
     grad: List[Float64],
     hess: List[Float64],
     features: List[Int],
+    const_h: Bool,
 ) raises:
     var n_rows = data.n_rows
     var n_bins = data.n_bins
@@ -349,27 +547,27 @@ def _accumulate_full(
     if group >= 16:
         _accumulate_full_at[16](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops,
+            n_active, plan.group_count, plan.active_ops, const_h,
         )
     elif group >= 8:
         _accumulate_full_at[8](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops,
+            n_active, plan.group_count, plan.active_ops, const_h,
         )
     elif group >= 4:
         _accumulate_full_at[4](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops,
+            n_active, plan.group_count, plan.active_ops, const_h,
         )
     elif group >= 2:
         _accumulate_full_at[2](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops,
+            n_active, plan.group_count, plan.active_ops, const_h,
         )
     else:
         _accumulate_full_at[1](
             out_grad, out_hess, out_count, data, grad, hess, features,
-            n_active, plan.group_count, plan.active_ops,
+            n_active, plan.group_count, plan.active_ops, const_h,
         )
 
 
@@ -386,6 +584,7 @@ def _accumulate_full_at[
     n_active: Int,
     n_groups: Int,
     active_ops: Int,
+    const_h: Bool,
 ) raises:
     """The full-dataset accumulation at one interleave width.
 
@@ -430,6 +629,37 @@ def _accumulate_full_at[
     are not this lane's to make: the layout is read by every consumer,
     including the GPU download path and the C ABI, so it is its own change
     behind its own profile.
+
+    **The elided hessian plane.** With `const_h` the row loop performs two
+    read-modify-writes per (row, feature) instead of three, the zeroing pass
+    covers two planes instead of three, and the hessian slice is written once
+    per bin at the end of the group's work as `Float64(count)`. The module
+    docstring carries the exactness argument; the shape of it is that the
+    three-plane path sums the Float64 literal 1.0 into the cell `count` times,
+    every partial sum of which is an exactly representable integer, so the
+    plane it produces *is* `Float64(count)` cell for cell. There is no
+    multiply in the refill, so this introduces no contraction site of the kind
+    `docs/NUMERICS.md` catalogues.
+
+    The refill is written as a separate pass over the group's bins rather than
+    folded into the flush of each cell, because a bin's count is not final
+    until the whole row walk is done. It runs on the task that owns the slice,
+    so it neither adds a dispatch nor crosses a task boundary.
+
+    The trade it makes is honest and small. Per (row, feature) the row loop
+    drops one read and one write of a Float64, which is 16 of the 48 bytes of
+    scattered read-modify-write traffic a visit costs. Per bin the pass now
+    writes two zeroed planes instead of three but then reads a count and
+    writes a hessian, so bin-side traffic goes from 24 bytes to 32. The first
+    term is multiplied by `n_rows` and the second by `n_bins`, which is why
+    this is a saving and not a wash, and it is also why it is a saving that
+    shrinks as a node gets smaller. `active_ops` is left alone: the estimate
+    counts one op per zeroed cell and one per accumulated row, and three
+    cell-touches per bin is what both arms do.
+
+    The branch is taken once per group, outside the row walk, which is the
+    same reason `_accumulate_subset_at` has two row loops for `compact`
+    rather than one loop with a branch in it.
     """
     var n_rows = data.n_rows
     var n_bins = data.n_bins
@@ -462,36 +692,84 @@ def _accumulate_full_at[
 
             # Zeroing stays fused into the pass that fills the slice, as the
             # module docstring explains, and now covers the whole group before
-            # the shared row walk begins.
+            # the shared row walk begins. The hessian plane is skipped under
+            # `const_h`: it is overwritten wholesale by the refill below, so
+            # zeroing it would be a write nothing reads.
             comptime for k in range(GROUP):
                 if k < owned:
                     var z0 = Int(base[k])
                     var zb = 0
                     while zb + W <= n_bins:
                         gp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
-                        hp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
+                        if not const_h:
+                            hp.unsafe_store(
+                                z0 + zb, SIMD[DType.float64, W](0.0)
+                            )
                         cp.unsafe_store(z0 + zb, SIMD[DType.int, W](0))
                         zb += W
                     while zb < n_bins:
                         gp.unsafe_store(z0 + zb, 0.0)
-                        hp.unsafe_store(z0 + zb, 0.0)
+                        if not const_h:
+                            hp.unsafe_store(z0 + zb, 0.0)
                         cp.unsafe_store(z0 + zb, 0)
                         zb += 1
 
-            for r in range(n_rows):
-                # Contiguous: the whole dataset is one ascending walk, so the
-                # gradients, the hessians, and all `GROUP` binned columns are
-                # sequential streams.
-                var g = grad_p.unsafe_load(r)
-                var h = hess_p.unsafe_load(r)
+            if const_h:
+                # Two planes per (row, feature), and the hessian is not read
+                # at all: it is the same value on every row by the objective's
+                # construction, so the accumulation carries no information the
+                # count does not.
+                for r in range(n_rows):
+                    var g = grad_p.unsafe_load(r)
+                    comptime for k in range(GROUP):
+                        if k < owned:
+                            var b = Int(base[k]) + Int(
+                                bins_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                            cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+            else:
+                for r in range(n_rows):
+                    # Contiguous: the whole dataset is one ascending walk, so
+                    # the gradients, the hessians, and all `GROUP` binned
+                    # columns are sequential streams.
+                    var g = grad_p.unsafe_load(r)
+                    var h = hess_p.unsafe_load(r)
+                    comptime for k in range(GROUP):
+                        if k < owned:
+                            var b = Int(base[k]) + Int(
+                                bins_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+
+            # The boundary at which the elided plane is refilled, and the only
+            # place this loop touches the hessian plane at all under
+            # `const_h`. It runs on the task that owns these slices, after
+            # that task's row walk has finalized the counts, so it neither
+            # adds a dispatch nor crosses a task boundary. Exact by the
+            # argument in this function's docstring: a cell that received `n`
+            # rows holds `Float64(n)` on the three-plane path, and
+            # `Float64(n)` is what is written here.
+            if const_h:
                 comptime for k in range(GROUP):
                     if k < owned:
-                        var b = Int(base[k]) + Int(
-                            bins_p.unsafe_load(Int(col[k]) + r)
-                        )
-                        gp.unsafe_store(b, gp.unsafe_load(b) + g)
-                        hp.unsafe_store(b, hp.unsafe_load(b) + h)
-                        cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+                        var f0 = Int(base[k])
+                        var fb = 0
+                        while fb + W <= n_bins:
+                            hp.unsafe_store(
+                                f0 + fb,
+                                cp.unsafe_load[width=W](f0 + fb).cast[
+                                    DType.float64
+                                ](),
+                            )
+                            fb += W
+                        while fb < n_bins:
+                            hp.unsafe_store(
+                                f0 + fb, Float64(cp.unsafe_load(f0 + fb))
+                            )
+                            fb += 1
 
     dispatch_feature_ranges(accumulate_groups, n_groups, active_ops)
 
@@ -502,13 +780,18 @@ def build_histogram_subset(
     hess: List[Float64],
     rows: List[Int],
     features: List[Int] = [],
+    const_hessian: Bool = False,
 ) raises -> Histogram:
     """Build a histogram over a subset of rows (one tree node's rows). With a
     non-empty `features`, only those features are accumulated and the rest of
-    the output stays zero."""
+    the output stays zero.
+
+    `const_hessian` declares the objective's guarantee that every hessian is
+    exactly `CONSTANT_HESSIAN`; the result is bit-identical either way.
+    """
     var out = Histogram.zeroed(data.n_features, data.n_bins)
     build_histogram_subset_into(
-        out, data, grad, hess, rows, 0, len(rows), features
+        out, data, grad, hess, rows, 0, len(rows), features, const_hessian
     )
     return out^
 
@@ -522,6 +805,7 @@ def build_histogram_subset_into(
     row_start: Int,
     row_count: Int,
     features: List[Int] = [],
+    const_hessian: Bool = False,
 ) raises:
     """`build_histogram_subset` over the window `rows[row_start :
     row_start + row_count]`, into a caller-owned buffer every cell of which
@@ -539,7 +823,8 @@ def build_histogram_subset_into(
     """
     var pairs = List[Float64]()
     build_histogram_subset_into_scratch(
-        out, pairs, data, grad, hess, rows, row_start, row_count, features
+        out, pairs, data, grad, hess, rows, row_start, row_count, features,
+        const_hessian,
     )
 
 
@@ -553,6 +838,7 @@ def build_histogram_subset_into_scratch(
     row_start: Int,
     row_count: Int,
     features: List[Int] = [],
+    const_hessian: Bool = False,
 ) raises:
     """`build_histogram_subset_into` with a caller-owned scratch buffer.
 
@@ -569,6 +855,15 @@ def build_histogram_subset_into_scratch(
     feature, or too few rows for the gather to pay for itself, reads the
     gradients through the row ids as before. Both paths accumulate the same
     values in the same order.
+
+    Under `const_hessian` the gather still writes the pair buffer as it
+    always did. Halving it to a gradient-only buffer is a change to the
+    scratch contract this lane deliberately does not make: the buffer's
+    stride is `2 * row_count` in this function's documented interface, a
+    grower holds one across a whole tree, and a stride that depends on the
+    objective is a worse thing to own than one wasted store per row. The
+    saving that matters is in the feature loop, which visits the buffer
+    `n_active` times.
     """
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
@@ -577,10 +872,13 @@ def build_histogram_subset_into_scratch(
     if row_start < 0 or row_count < 0 or row_start + row_count > len(rows):
         raise Error("row window out of range")
     _check_features(features, data.n_features)
+    var const_h = _resolve_const_hessian(const_hessian)
+    if const_h and const_hessian_verify():
+        _check_constant_hessian(hess, data.n_rows)
 
     _accumulate_subset(
         out.grad, out.hess, out.count, pairs,
-        data, grad, hess, rows, row_start, row_count, features,
+        data, grad, hess, rows, row_start, row_count, features, const_h,
     )
 
 
@@ -596,6 +894,7 @@ def _accumulate_subset(
     row_start: Int,
     row_count: Int,
     features: List[Int],
+    const_h: Bool,
 ) raises:
     var n_bins = data.n_bins
     var n_features = data.n_features
@@ -637,30 +936,35 @@ def _accumulate_subset(
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            const_h,
         )
     elif group >= 8:
         _accumulate_subset_at[8](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            const_h,
         )
     elif group >= 4:
         _accumulate_subset_at[4](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            const_h,
         )
     elif group >= 2:
         _accumulate_subset_at[2](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            const_h,
         )
     else:
         _accumulate_subset_at[1](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+            const_h,
         )
 
 
@@ -682,6 +986,7 @@ def _accumulate_subset_at[
     n_active: Int,
     n_groups: Int,
     active_ops: Int,
+    const_h: Bool,
 ) raises:
     """The subset accumulation at one interleave width.
 
@@ -701,7 +1006,12 @@ def _accumulate_subset_at[
     `GROUP` times instead of once.
 
     Tail groups, the SIMD-lane slot arrays, and the bit-identity argument are
-    as in `_accumulate_full_at`.
+    as in `_accumulate_full_at`, and so is the elided hessian plane: with
+    `const_h` the row loops drop the hessian read-modify-write, the zeroing
+    pass drops that plane, and the slice is refilled from the count once per
+    bin after the walk. That makes four row loops rather than two, which is
+    the same trade the `compact` pair already took: a branch evaluated once
+    per group instead of once per (row, feature).
     """
     var n_rows = data.n_rows
     var n_bins = data.n_bins
@@ -741,16 +1051,45 @@ def _accumulate_subset_at[
                     var zb = 0
                     while zb + W <= n_bins:
                         gp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
-                        hp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
+                        if not const_h:
+                            hp.unsafe_store(
+                                z0 + zb, SIMD[DType.float64, W](0.0)
+                            )
                         cp.unsafe_store(z0 + zb, SIMD[DType.int, W](0))
                         zb += W
                     while zb < n_bins:
                         gp.unsafe_store(z0 + zb, 0.0)
-                        hp.unsafe_store(z0 + zb, 0.0)
+                        if not const_h:
+                            hp.unsafe_store(z0 + zb, 0.0)
                         cp.unsafe_store(z0 + zb, 0)
                         zb += 1
 
-            if compact:
+            if const_h:
+                if compact:
+                    for i_row in range(n_sub):
+                        var r = rows_p.unsafe_load(i_row)
+                        # The gather still interleaves (g, h); only the
+                        # gradient half is read here.
+                        var g = pairs_p.unsafe_load(2 * i_row)
+                        comptime for k in range(GROUP):
+                            if k < owned:
+                                var b = Int(base[k]) + Int(
+                                    bins_all_p.unsafe_load(Int(col[k]) + r)
+                                )
+                                gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                                cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+                else:
+                    for i_row in range(n_sub):
+                        var r = rows_p.unsafe_load(i_row)
+                        var g = grad_p.unsafe_load(r)
+                        comptime for k in range(GROUP):
+                            if k < owned:
+                                var b = Int(base[k]) + Int(
+                                    bins_all_p.unsafe_load(Int(col[k]) + r)
+                                )
+                                gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                                cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+            elif compact:
                 for i_row in range(n_sub):
                     var r = rows_p.unsafe_load(i_row)
                     # Adjacent, so one cache line carries both.
@@ -781,6 +1120,28 @@ def _accumulate_subset_at[
                             hp.unsafe_store(b, hp.unsafe_load(b) + h)
                             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
 
+            # The refill, exactly as in `_accumulate_full_at`: the elided
+            # plane is written once per bin as `Float64(count)`, which is bit
+            # for bit what the three-plane path accumulated.
+            if const_h:
+                comptime for k in range(GROUP):
+                    if k < owned:
+                        var f0 = Int(base[k])
+                        var fb = 0
+                        while fb + W <= n_bins:
+                            hp.unsafe_store(
+                                f0 + fb,
+                                cp.unsafe_load[width=W](f0 + fb).cast[
+                                    DType.float64
+                                ](),
+                            )
+                            fb += W
+                        while fb < n_bins:
+                            hp.unsafe_store(
+                                f0 + fb, Float64(cp.unsafe_load(f0 + fb))
+                            )
+                            fb += 1
+
     dispatch_feature_ranges(accumulate_groups, n_groups, active_ops)
 
 
@@ -798,6 +1159,7 @@ def build_histogram_subset_replica_into[
     g_scale: Float64,
     h_scale: Float64,
     features: List[Int] = [],
+    const_hessian: Bool = False,
 ) raises:
     """The host replica of the device's fixed-point histogram build, over
     the window `rows[row_start : row_start + row_count]`.
@@ -825,6 +1187,22 @@ def build_histogram_subset_replica_into[
     `3 * n_features * n_bins + 2 * row_count` as needed and its contents on
     entry are irrelevant. Excluded features' output slices are zeroed, as every
     builder here guarantees, so the result has the full dataset shape.
+
+    `const_hessian` elides the fixed-point hessian plane exactly as the
+    device kernels do, and must be set to whatever the device build it is
+    replicating was set to -- although, and this is the point, the two agree
+    even when it is not. On the elided path this function quantizes the
+    constant once as `Int32(round(Float32(CONSTANT_HESSIAN) * h_scale))` and
+    multiplies by the count; on the three-plane path it adds that same Int32
+    into the bin once per row. The two are equal as integers, and equal even
+    under Int32 wraparound, since repeated addition and multiplication agree
+    modulo 2^32. So the elision cannot move this replica relative to the
+    device, whichever arm each of them is on. What it does do is shrink the
+    claim `MODE_MIRROR` has to establish: instead of the host and the device
+    agreeing on `round` at every one of `n_rows` products, they need only
+    agree on it at one, because `Float32(1.0) * h_scale` is exactly
+    `h_scale` on any IEEE-754 unit and both sides therefore round the same
+    number.
     """
     var n_rows = data.n_rows
     var n_bins = data.n_bins
@@ -863,6 +1241,7 @@ def build_histogram_subset_replica_into[
         out.grad, out.hess, out.count, fixed,
         data, grad_f32, hess_f32, rows, row_start, row_count,
         g_scale, h_scale, features,
+        _resolve_const_hessian(const_hessian),
     )
 
 
@@ -882,6 +1261,7 @@ def _accumulate_replica[
     g_scale: Float64,
     h_scale: Float64,
     features: List[Int],
+    const_h: Bool,
 ) raises:
     var n_rows = data.n_rows
     var n_bins = data.n_bins
@@ -914,6 +1294,13 @@ def _accumulate_replica[
     # `_accumulate_subset`.
     var pairs_off = 3 * hist_size
 
+    # The elided plane's one quantized value, computed once for the whole
+    # build. `Float32(CONSTANT_HESSIAN) * hsf` is exactly `hsf` on any
+    # IEEE-754 unit, since multiplying by one is the identity and cannot
+    # round, so this is `Int32(round(hsf))` and it is the same Int32 the
+    # three-plane path below would have produced for every row.
+    var hq_const = Int32(round(Float32(CONSTANT_HESSIAN) * hsf))
+
     def fill_quantized(start: Int, end: Int) {imm}:
         for i in range(start, end):
             var r = Int(rows_p.unsafe_load(i))
@@ -921,10 +1308,11 @@ def _accumulate_replica[
                 pairs_off + 2 * i,
                 Int32(round(grad_p.unsafe_load(r) * gsf)),
             )
-            fixed_p.unsafe_store(
-                pairs_off + 2 * i + 1,
-                Int32(round(hess_p.unsafe_load(r) * hsf)),
-            )
+            if not const_h:
+                fixed_p.unsafe_store(
+                    pairs_off + 2 * i + 1,
+                    Int32(round(hess_p.unsafe_load(r) * hsf)),
+                )
 
     dispatch_rows(fill_quantized, row_count, row_count)
 
@@ -933,33 +1321,52 @@ def _accumulate_replica[
         var base = f * n_bins
         for b in range(n_bins):
             fixed_p.unsafe_store(base + b, Int32(0))
-            fixed_p.unsafe_store(hist_size + base + b, Int32(0))
+            if not const_h:
+                fixed_p.unsafe_store(hist_size + base + b, Int32(0))
             fixed_p.unsafe_store(2 * hist_size + base + b, Int32(0))
         var col = bins_all_p.unsafe_offset(f * n_rows)
-        for j in range(row_count):
-            var r = Int(rows_p.unsafe_load(j))
-            var slot = base + Int(col.unsafe_load(r))
-            var gq = fixed_p.unsafe_load(pairs_off + 2 * j)
-            var hq = fixed_p.unsafe_load(pairs_off + 2 * j + 1)
-            fixed_p.unsafe_store(slot, fixed_p.unsafe_load(slot) + gq)
-            fixed_p.unsafe_store(
-                hist_size + slot, fixed_p.unsafe_load(hist_size + slot) + hq
-            )
-            fixed_p.unsafe_store(
-                2 * hist_size + slot,
-                fixed_p.unsafe_load(2 * hist_size + slot) + Int32(1),
-            )
+        if const_h:
+            for j in range(row_count):
+                var r = Int(rows_p.unsafe_load(j))
+                var slot = base + Int(col.unsafe_load(r))
+                var gq = fixed_p.unsafe_load(pairs_off + 2 * j)
+                fixed_p.unsafe_store(slot, fixed_p.unsafe_load(slot) + gq)
+                fixed_p.unsafe_store(
+                    2 * hist_size + slot,
+                    fixed_p.unsafe_load(2 * hist_size + slot) + Int32(1),
+                )
+        else:
+            for j in range(row_count):
+                var r = Int(rows_p.unsafe_load(j))
+                var slot = base + Int(col.unsafe_load(r))
+                var gq = fixed_p.unsafe_load(pairs_off + 2 * j)
+                var hq = fixed_p.unsafe_load(pairs_off + 2 * j + 1)
+                fixed_p.unsafe_store(slot, fixed_p.unsafe_load(slot) + gq)
+                fixed_p.unsafe_store(
+                    hist_size + slot,
+                    fixed_p.unsafe_load(hist_size + slot) + hq,
+                )
+                fixed_p.unsafe_store(
+                    2 * hist_size + slot,
+                    fixed_p.unsafe_load(2 * hist_size + slot) + Int32(1),
+                )
         for b in range(n_bins):
+            var cq = fixed_p.unsafe_load(2 * hist_size + base + b)
             gp.unsafe_store(
                 base + b, Float64(fixed_p.unsafe_load(base + b)) * g_inv
             )
-            hp.unsafe_store(
-                base + b,
-                Float64(fixed_p.unsafe_load(hist_size + base + b)) * h_inv,
+            # `hq_const * cq` is the exact Int32 the loop above would have
+            # accumulated: `cq` copies of `hq_const` added together. The
+            # dequantization is then the same `Float64(q) * (1 / scale)` the
+            # three-plane path applies, so the Float64 that lands is the same
+            # Float64.
+            var hq_sum = (
+                hq_const * cq
+                if const_h
+                else fixed_p.unsafe_load(hist_size + base + b)
             )
-            cp.unsafe_store(
-                base + b, Int(fixed_p.unsafe_load(2 * hist_size + base + b))
-            )
+            hp.unsafe_store(base + b, Float64(hq_sum) * h_inv)
+            cp.unsafe_store(base + b, Int(cq))
 
     dispatch_features(
         accumulate_feature,
@@ -1009,11 +1416,13 @@ def feature_totals(hist: Histogram, feature: Int) raises -> FeatureTotals:
     return FeatureTotals(total_g, total_h, total_c)
 
 
-def subtract_histogram(parent: Histogram, child: Histogram) raises -> Histogram:
+def subtract_histogram(
+    parent: Histogram, child: Histogram, const_hessian: Bool = False
+) raises -> Histogram:
     """Sibling histogram via the subtraction trick: build the smaller child
     directly, get the larger one as parent - child for free."""
     var out = Histogram.zeroed(parent.n_features, parent.n_bins)
-    subtract_histogram_into(out, parent, child)
+    subtract_histogram_into(out, parent, child, const_hessian)
     return out^
 
 
@@ -1028,6 +1437,7 @@ def _subtract_histogram_arrays(
     child_hess: List[Float64],
     child_count: List[Int],
     size: Int,
+    const_h: Bool,
 ) raises:
     """Parallel SIMD sibling subtraction over independent array borrows.
 
@@ -1035,6 +1445,26 @@ def _subtract_histogram_arrays(
     stable origin that Mojo's ownership checker can carry into the parallel
     closure. The dispatch, range partitioning, SIMD width, and arithmetic are
     identical to the original optimized implementation.
+
+    With `const_h` the hessian plane is not subtracted at all. Both operands
+    hold `Float64(count)` cell for cell, so the difference the general path
+    would compute is `Float64(parent_count) - Float64(child_count)`; both
+    operands of that subtract are exactly representable integers below 2^53
+    and so is their difference, so it is exactly `Float64(parent_count -
+    child_count)`, which is `Float64` of the count this same loop is already
+    computing. Writing it from the integer difference is therefore the same
+    Float64.
+
+    Two of the pass's nine memory streams go, and it is worth being exact
+    about which two rather than calling it a third. The general pass runs a
+    load, a load and a store on each of three planes. The elided one still
+    stores the hessian plane, because the output histogram has three planes
+    like every other; what it stops doing is *reading* the two operands'
+    hessian planes, since the value it needs is the integer difference it
+    already has in a register. Nine streams become seven, and 72 bytes per
+    cell become 56. `subtract_ops_for_planes` is told two planes rather than
+    three so the parallel crossover is priced on traffic that resembles what
+    happens.
     """
     var pg = parent_grad.unsafe_ptr()
     var ph = parent_hess.unsafe_ptr()
@@ -1049,6 +1479,24 @@ def _subtract_histogram_arrays(
     def subtract_block(start: Int, end: Int) {imm}:
         comptime W = SIMD_LANES
         var i = start
+        if const_h:
+            while i + W <= end:
+                og.unsafe_store(
+                    i, pg.unsafe_load[width=W](i) - cg.unsafe_load[width=W](i)
+                )
+                var dc = pc.unsafe_load[width=W](i) - cc.unsafe_load[width=W](
+                    i
+                )
+                oc.unsafe_store(i, dc)
+                oh.unsafe_store(i, dc.cast[DType.float64]())
+                i += W
+            while i < end:
+                og.unsafe_store(i, pg.unsafe_load(i) - cg.unsafe_load(i))
+                var dc = pc.unsafe_load(i) - cc.unsafe_load(i)
+                oc.unsafe_store(i, dc)
+                oh.unsafe_store(i, Float64(dc))
+                i += 1
+            return
         while i + W <= end:
             og.unsafe_store(
                 i, pg.unsafe_load[width=W](i) - cg.unsafe_load[width=W](i)
@@ -1066,15 +1514,31 @@ def _subtract_histogram_arrays(
             oc.unsafe_store(i, pc.unsafe_load(i) - cc.unsafe_load(i))
             i += 1
 
-    dispatch_rows(subtract_block, size, subtract_ops(size))
+    var ops = subtract_ops_for_planes(size, 2) if const_h else subtract_ops(
+        size
+    )
+    dispatch_rows(subtract_block, size, ops)
 
 
 def subtract_histogram_into(
-    mut out: Histogram, parent: Histogram, child: Histogram
+    mut out: Histogram,
+    parent: Histogram,
+    child: Histogram,
+    const_hessian: Bool = False,
 ) raises:
     """`subtract_histogram` into a caller-owned buffer. Every element is
     written, so unlike the accumulating builders this one needs no zeroing
     pass at all.
+
+    `const_hessian` declares that **both operands** were built under the
+    constant-hessian specialization, so each holds `Float64(count)` in its
+    hessian plane. It is the caller's declaration and not something this
+    function can see: a histogram carries no record of how it was built, on
+    purpose, since the layout is read by the C ABI and by the GPU download
+    path and is not this lane's to widen. Declaring it for a pair of
+    histograms that were not built that way produces a wrong hessian plane,
+    which is why the declaration belongs at the trainer, next to the
+    objective, and travels down rather than being guessed here.
 
     "For free" was always an overstatement: the pass reads two histograms and
     writes a third, six streams over `n_features * n_bins` cells each, and at
@@ -1104,4 +1568,5 @@ def subtract_histogram_into(
         child.hess,
         child.count,
         parent.n_features * parent.n_bins,
+        _resolve_const_hessian(const_hessian),
     )

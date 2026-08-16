@@ -724,6 +724,7 @@ def _range_hist_atomic_kernel[
     sub_offset: Int32,
     do_sub: Int32,
     use_quant: Int32,
+    const_hess: Int32,
 ):
     """One node's histogram over a compacted row range, accumulated in
     threadgroup memory and folded into the output with global atomics.
@@ -798,6 +799,50 @@ def _range_hist_atomic_kernel[
     under one scale, so a parent's bins are the exact integer sum of its
     children's. Bins this node never touched are left alone, which is what
     subtracting zero from them would have done anyway.
+
+    **The elided hessian plane.** With `const_hess` the caller has declared
+    that every row's hessian is exactly `histogram.CONSTANT_HESSIAN`, which
+    four of the built-in objectives guarantee when the fit carries no sample
+    weights. The row loop then performs two shared-memory atomics per (row,
+    feature) instead of three, the shared zeroing covers two planes instead
+    of three, and the flush writes the global hessian plane as
+    `hq_const * vc` instead of reading a third shared plane.
+
+    That reconstruction is the exact integer the three-plane path would have
+    accumulated, and the argument is worth spelling out because everything
+    rests on it. Every row contributes
+    `Int32(round(hess[r] * h_scale))` to its bin. With `hess[r]` equal to
+    1.0f for every row, and `1.0f * x` exactly `x` for every finite Float32
+    because multiplying by one cannot round, every one of those contributions
+    is the single value `Int32(round(h_scale))`, which is what `hq_const`
+    below computes -- in this kernel, on this device, from the same launch
+    argument, so no host-versus-device rounding claim is made or needed. A
+    bin that received `vc` rows therefore holds `vc` copies of `hq_const`
+    added together, and `hq_const * vc` is that sum. Int32 addition and
+    multiplication agree modulo 2^32, so the two are the same bits even in
+    the overflow regime neither of them ever reaches: under
+    `SCALE_MAGNITUDE_SUM` the hessian scale is `2^30 / sum|h|`, so the whole
+    dataset's hessian plane sums to about 2^30 and one bin is a subset of
+    that.
+
+    `const_hess` is a runtime flag and not a third comptime parameter, for
+    the reason the two row loops give below: forty instantiations are already
+    what every build on every backend pays for, and eighty is a compile-time
+    cost this specialization has not earned. The consequence is honest and
+    worth stating rather than eliding: `sh` below is a comptime
+    `stack_allocation` and is still allocated on the elided path, so the
+    threadgroup footprint does not shrink and **no occupancy improvement
+    follows from this flag**. What follows is one third fewer shared atomics
+    in the row loop and one third less shared zeroing. Making the plane count
+    comptime, and getting the residency with it, is a separate change behind
+    a measurement of the compile-time trade.
+
+    The global flush still writes three planes, because the device-resident
+    split search in `gpu_split_search.mojo` scans this buffer in place and
+    reads all three. Eliding the plane from the device *layout* would be a
+    change to that module's contract and is not this lane's; the download in
+    `histogram_gpu.histogram_from_host` therefore still moves three planes as
+    well.
     """
     var slot0 = GROUP * Int(block_idx.x)
     var owned = Int(n_slots) - slot0
@@ -825,11 +870,20 @@ def _range_hist_atomic_kernel[
         address_space = AddressSpace.SHARED,
     ]()
 
+    # The elided plane's one quantized value, and the flag that selects it.
+    # `Float32(1.0) * h_scale` is exactly `h_scale`, so this is
+    # `Int32(round(h_scale))`, computed here rather than passed in so that it
+    # is the same expression evaluated by the same device compiler as the
+    # per-row quantization it stands in for.
+    var celide = Int(const_hess) != 0
+    var hq_const = Int32(round(Float32(1.0) * h_scale))
+
     var span = owned * nb
     var b = tid
     while b < span:
         sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
+        if not celide:
+            sh[unsafe_offset=b] = 0
         sc[unsafe_offset=b] = 0
         b += block_dim.x
     barrier()
@@ -852,7 +906,37 @@ def _range_hist_atomic_kernel[
     if tile_end > n:
         tile_end = n
 
-    if Int(use_quant) != 0:
+    if celide:
+        # Two atomics per (row, feature). The hessian is neither read nor
+        # accumulated: it is the same Int32 for every row, so the count plane
+        # already carries everything the hessian plane would have.
+        if Int(use_quant) != 0:
+            var j = tile_begin + tid
+            while j < tile_end:
+                var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+                var gqv = gq[unsafe_offset = 2 * r][0]
+                comptime for k in range(GROUP):
+                    if k < owned:
+                        var s = k * nb + Int(
+                            bins[unsafe_offset = col[unsafe_offset=k] + r]
+                        )
+                        _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
+                        _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+                j += block_dim.x
+        else:
+            var j = tile_begin + tid
+            while j < tile_end:
+                var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+                var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+                comptime for k in range(GROUP):
+                    if k < owned:
+                        var s = k * nb + Int(
+                            bins[unsafe_offset = col[unsafe_offset=k] + r]
+                        )
+                        _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
+                        _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+                j += block_dim.x
+    elif Int(use_quant) != 0:
         var j = tile_begin + tid
         while j < tile_end:
             var r = Int(rows[unsafe_offset = Int(begin) + j][0])
@@ -894,8 +978,13 @@ def _range_hist_atomic_kernel[
                 var s = lift + c
                 if sc[unsafe_offset=s][0] != 0:
                     var vg = sg[unsafe_offset=s][0]
-                    var vh = sh[unsafe_offset=s][0]
                     var vc = sc[unsafe_offset=s][0]
+                    # The refill. `hq_const * vc` is the sum of `vc` copies of
+                    # `hq_const`, which is precisely what the three-plane
+                    # accumulation would have left in `sh`.
+                    var vh = (
+                        hq_const * vc if celide else sh[unsafe_offset=s][0]
+                    )
                     _ = Atomic.fetch_add(out_hist.unsafe_offset(base + c), vg)
                     _ = Atomic.fetch_add(
                         out_hist.unsafe_offset(hs + base + c), vh
@@ -934,6 +1023,7 @@ def _range_hist_partial_kernel[
     g_scale: Float32,
     h_scale: Float32,
     use_quant: Int32,
+    const_hess: Int32,
 ):
     """The tiled twin of `_range_hist_atomic_kernel`: the same threadgroup
     accumulation, written to a per-(tile, slot) partial slot instead of folded
@@ -966,6 +1056,25 @@ def _range_hist_partial_kernel[
     makes measurable and it has NOT been measured. The measurement is an
     interleaved A/B of group 2 against group 4 at a bin count of 64 or below,
     in one process, the protocol `bench_histogram.mojo` already implements.
+
+    **The elided hessian plane.** `const_hess` carries the same declaration
+    the atomic kernel's docstring argues in full, and has one extra
+    consequence here: the partial buffer holds two planes per tile rather
+    than three, laid out as `[grad | count]`, so the write this kernel does
+    and the read `_range_reduce_kernel` does are both a third smaller. That
+    layout change is contained: the partial buffer is written by this kernel
+    and read by that one and by nothing else in the package, and the
+    allocation is unchanged, so a two-plane build simply uses two thirds of a
+    buffer sized for three. The two kernels are handed the same flag from the
+    same launch site, which is what keeps them agreeing about which layout
+    they are looking at.
+
+    The reconstruction happens in the reduction rather than here, because a
+    partial tile's count is not the bin's count. Multiplying each tile's
+    count by `hq_const` and summing would give the same integer -- integer
+    multiplication distributes over addition exactly, at every width, and
+    modulo 2^32 as well -- but it would spend one multiply per tile per cell
+    instead of one per cell, so the reduction is where it belongs.
     """
     var slot0 = GROUP * Int(block_idx.x)
     var owned = Int(n_slots) - slot0
@@ -977,6 +1086,10 @@ def _range_hist_partial_kernel[
     var nr = Int(n_rows)
     var n = Int(count)
     var plane = Int(n_slots) * nb
+    var celide = Int(const_hess) != 0
+    # Planes per tile in the partial buffer: `[grad | hess | count]`, or
+    # `[grad | count]` when the hessian plane is elided.
+    var n_planes = 2 if celide else 3
 
     var sg = stack_allocation[
         GROUP * BIN_CAP,
@@ -998,7 +1111,8 @@ def _range_hist_partial_kernel[
     var b = tid
     while b < span:
         sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
+        if not celide:
+            sh[unsafe_offset=b] = 0
         sc[unsafe_offset=b] = 0
         b += block_dim.x
     barrier()
@@ -1016,7 +1130,34 @@ def _range_hist_partial_kernel[
     if tile_end > n:
         tile_end = n
 
-    if Int(use_quant) != 0:
+    if celide:
+        if Int(use_quant) != 0:
+            var j = tile_begin + tid
+            while j < tile_end:
+                var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+                var gqv = gq[unsafe_offset = 2 * r][0]
+                comptime for k in range(GROUP):
+                    if k < owned:
+                        var s = k * nb + Int(
+                            bins[unsafe_offset = col[unsafe_offset=k] + r]
+                        )
+                        _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
+                        _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+                j += block_dim.x
+        else:
+            var j = tile_begin + tid
+            while j < tile_end:
+                var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+                var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+                comptime for k in range(GROUP):
+                    if k < owned:
+                        var s = k * nb + Int(
+                            bins[unsafe_offset = col[unsafe_offset=k] + r]
+                        )
+                        _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
+                        _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+                j += block_dim.x
+    elif Int(use_quant) != 0:
         var j = tile_begin + tid
         while j < tile_end:
             var r = Int(rows[unsafe_offset = Int(begin) + j][0])
@@ -1048,18 +1189,22 @@ def _range_hist_partial_kernel[
             j += block_dim.x
     barrier()
 
+    # The count plane is last in both layouts, so its index is
+    # `n_planes - 1`: plane 2 of three, plane 1 of two.
+    var count_plane = (n_planes - 1) * plane
     comptime for k in range(GROUP):
         if k < owned:
-            var base = t * 3 * plane + (slot0 + k) * nb
+            var base = t * n_planes * plane + (slot0 + k) * nb
             var lift = k * nb
             var c = tid
             while c < nb:
                 var s = lift + c
                 partials[unsafe_offset = base + c] = sg[unsafe_offset=s][0]
-                partials[unsafe_offset = base + plane + c] = sh[
-                    unsafe_offset=s
-                ][0]
-                partials[unsafe_offset = base + 2 * plane + c] = sc[
+                if not celide:
+                    partials[unsafe_offset = base + plane + c] = sh[
+                        unsafe_offset=s
+                    ][0]
+                partials[unsafe_offset = base + count_plane + c] = sc[
                     unsafe_offset=s
                 ][0]
                 c += block_dim.x
@@ -1075,6 +1220,8 @@ def _range_reduce_kernel(
     n_tiles: Int32,
     sub_offset: Int32,
     do_sub: Int32,
+    h_scale: Float32,
+    const_hess: Int32,
 ):
     """Element-wise reduction of the tiled partials, in ascending tile order.
 
@@ -1094,11 +1241,35 @@ def _range_reduce_kernel(
     inactive features', which are zero in every live slot -- the build zeroes
     a whole slot whenever the feature set is narrowed -- so subtracting them
     would have been a no-op.
+
+    **The elided hessian plane.** With `const_hess` the partials hold two
+    planes per tile, `[grad | count]`, so the grid covers two thirds of the
+    cells and each thread reads two thirds of the words. The thread that owns
+    a count cell writes two output cells instead of one: the count itself,
+    and the hessian plane as `hq_const * acc`, where `hq_const` is
+    `Int32(round(Float32(1.0) * h_scale))` and `acc` is the bin's total row
+    count. That is the exact integer the three-plane path would have reduced
+    to, because on the three-plane path every row contributed the same
+    `hq_const` to the hessian plane and `acc` rows contributed in total; the
+    argument is written out in full in `_range_hist_atomic_kernel`.
+
+    The fused subtraction stays exact for the same reason and needs no
+    special case beyond doing it twice: the sibling's hessian cell is reduced
+    by `hq_const * acc`, which is what the three-plane path would have
+    subtracted from it.
+
+    No thread races another over the extra write. The hessian output cell is
+    reached only from the count plane's thread for the same (feature, bin),
+    and on the elided path no thread is assigned the hessian plane at all,
+    since the grid is sized by the partial layout rather than by the output
+    layout.
     """
     var i = global_idx.x
     var nb = Int(n_bins)
     var plane = Int(n_slots) * nb
-    var n = 3 * plane
+    var celide = Int(const_hess) != 0
+    var n_planes = 2 if celide else 3
+    var n = n_planes * plane
     if i < n:
         var acc = Int32(0)
         var off = i
@@ -1110,11 +1281,25 @@ def _range_reduce_kernel(
         var slot = rem // nb
         var b = rem - slot * nb
         var f = Int(feat_ids[unsafe_offset=slot][0])
-        var cell = p * Int(hist_size) + f * nb + b
+        # Plane `p` of the partial layout maps to plane `p` of the output,
+        # except that the elided layout's second plane is the count, which is
+        # the output's third.
+        var out_plane = 2 if (celide and p == 1) else p
+        var cell = out_plane * Int(hist_size) + f * nb + b
         out_hist[unsafe_offset=cell] = acc
         if Int(do_sub) != 0:
             var sc = Int(sub_offset) + cell
             out_hist[unsafe_offset=sc] = out_hist[unsafe_offset=sc][0] - acc
+        if celide and p == 1:
+            var hq_const = Int32(round(Float32(1.0) * h_scale))
+            var hv = hq_const * acc
+            var hcell = Int(hist_size) + f * nb + b
+            out_hist[unsafe_offset=hcell] = hv
+            if Int(do_sub) != 0:
+                var hs = Int(sub_offset) + hcell
+                out_hist[unsafe_offset=hs] = (
+                    out_hist[unsafe_offset=hs][0] - hv
+                )
 
 
 @fieldwise_init
@@ -1430,6 +1615,16 @@ struct GpuActiveRows(Movable):
     # one reason: `3 * group * bin_cap * 4` has to be checked against
     # something before a group is accepted.
     var max_shared_bytes: Int
+    # --- const-hessian lane ---
+    # Whether the caller has declared that this round's objective guarantees a
+    # per-row hessian of exactly `histogram.CONSTANT_HESSIAN`, and whether the
+    # environment permits acting on such a declaration at all. The effective
+    # answer is the conjunction, kept in `constant_hessian` so the launch site
+    # reads one field. Declared, never inferred: see
+    # `histogram.objective_has_constant_hessian` for why a round whose
+    # hessians happen to be equal is not the same thing.
+    var constant_hessian: Bool
+    var const_hessian_allowed: Bool
 
     def __init__(
         out self,
@@ -1538,6 +1733,15 @@ struct GpuActiveRows(Movable):
         self.scan_primitives = _env_int(
             "MOJOTREES_GPU_SCAN_PRIMITIVES", 1
         ) != 0 and _scan_primitive_width_supported(threads)
+        # The constant-hessian specialization is available but not declared.
+        # A builder that says nothing gets the three-plane path that shipped,
+        # which is the only default a specialization keyed on the objective
+        # can have: this constructor cannot see an objective.
+        # `MOJOTREES_CONST_HESSIAN=0` withdraws the permission, so a later
+        # `set_constant_hessian(True)` is refused rather than silently
+        # honored, which is the off switch a bisection wants.
+        self.const_hessian_allowed = _env_int("MOJOTREES_CONST_HESSIAN", 1) != 0
+        self.constant_hessian = False
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -1614,6 +1818,36 @@ struct GpuActiveRows(Movable):
         """
         self.quantized_gradients = on
         self.quant_valid = False
+
+    def set_constant_hessian(mut self, on: Bool):
+        """Declare that every row's hessian this round is exactly
+        `histogram.CONSTANT_HESSIAN`, so the histogram kernels may stop
+        accumulating the hessian plane and reconstruct it from the count.
+
+        **This is a declaration about the objective, and the caller owns
+        it.** `histogram.objective_has_constant_hessian` is the predicate
+        that answers it correctly, and it is false for every weighted fit and
+        for every GOSS round regardless of the objective code, because both
+        put more than one value into `hess`. Declaring it on a round where it
+        is not true produces a wrong hessian plane, silently, so it belongs
+        next to where the trainer decides whether to pass weights and not
+        anywhere further down.
+
+        An argument as well as an environment variable, for the reason
+        `set_feature_group` gives: an A/B that reads its arm from the
+        environment can run one arm under the other's label, which happened
+        once in this repository, so a benchmark holding both arms in one
+        process passes the arm in rather than re-execing.
+        `MOJOTREES_CONST_HESSIAN=0` wins over an argument in the one
+        direction that is always safe, off, and this method reports what it
+        actually did through `constant_hessian`.
+
+        Takes effect on the next `enqueue_range_histogram`. When the
+        declaration is true it cannot change a histogram: the plane it stops
+        accumulating is reconstructed as the identical Int32, argued in
+        `_range_hist_atomic_kernel`.
+        """
+        self.constant_hessian = on and self.const_hessian_allowed
 
     def set_scan_primitives(mut self, on: Bool) raises:
         """Whether the partition's two scan stages run on `block.prefix_sum`
@@ -2090,6 +2324,16 @@ struct GpuActiveRows(Movable):
         pre-quantized gradient buffer is rebuilt here too, once per tree per
         scale, above the strategy branch because every strategy and every
         width now reads it.
+
+        The constant-hessian flag is resolved here for the same reason, from
+        `constant_hessian`, and handed to whichever kernels this launch uses.
+        On the tiled path it also changes the reduction's grid, because the
+        partial layout it selects has two planes per tile rather than three;
+        the two kernels get the same flag from this one place, which is what
+        keeps them agreeing about the layout. It does not change the zeroing
+        rule: the reduction still writes every active feature's slice of all
+        three output planes, so the same three conditions that force a
+        zeroing pass force it here.
         """
         if n_slots < 1 or n_slots > self.n_features:
             raise Error("active feature count out of range")
@@ -2132,6 +2376,9 @@ struct GpuActiveRows(Movable):
             self._ensure_quantized(grad, hess, g_scale, h_scale)
             use_quant = Int32(1)
 
+        var const_hess = Int32(1) if self.constant_hessian else Int32(0)
+        var hist_planes = 2 if self.constant_hessian else 3
+
         if tiling.strategy == STRATEGY_TILED:
             self._enqueue_partial_family(
                 bins,
@@ -2146,10 +2393,11 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 tiling.n_tiles,
                 threads,
             )
-            var n_cells = 3 * n_slots * self.n_bins
+            var n_cells = hist_planes * n_slots * self.n_bins
             var blocks = (n_cells + threads - 1) // threads
             self.ctx.enqueue_function[_range_reduce_kernel](
                 partials,
@@ -2161,6 +2409,8 @@ struct GpuActiveRows(Movable):
                 Int32(tiling.n_tiles),
                 Int32(sub_offset),
                 do_sub,
+                h_scale,
+                const_hess,
                 grid_dim=blocks,
                 block_dim=threads,
             )
@@ -2181,6 +2431,7 @@ struct GpuActiveRows(Movable):
                 sub_offset,
                 do_sub,
                 use_quant,
+                const_hess,
                 tiling.n_tiles,
                 threads,
             )
@@ -2219,6 +2470,7 @@ struct GpuActiveRows(Movable):
         g_scale: Float32,
         h_scale: Float32,
         use_quant: Int32,
+        const_hess: Int32,
         n_tiles: Int,
         threads: Int,
     ) raises:
@@ -2245,6 +2497,7 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2262,6 +2515,7 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2279,6 +2533,7 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2296,6 +2551,7 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2313,6 +2569,7 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2338,6 +2595,7 @@ struct GpuActiveRows(Movable):
         g_scale: Float32,
         h_scale: Float32,
         use_quant: Int32,
+        const_hess: Int32,
         n_tiles: Int,
         threads: Int,
     ) raises:
@@ -2368,6 +2626,7 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -2389,6 +2648,7 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -2410,6 +2670,7 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -2431,6 +2692,7 @@ struct GpuActiveRows(Movable):
                 g_scale,
                 h_scale,
                 use_quant,
+                const_hess,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -2458,6 +2720,7 @@ struct GpuActiveRows(Movable):
         sub_offset: Int,
         do_sub: Int32,
         use_quant: Int32,
+        const_hess: Int32,
         n_tiles: Int,
         threads: Int,
     ) raises:
@@ -2480,6 +2743,7 @@ struct GpuActiveRows(Movable):
                 sub_offset,
                 do_sub,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2500,6 +2764,7 @@ struct GpuActiveRows(Movable):
                 sub_offset,
                 do_sub,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2520,6 +2785,7 @@ struct GpuActiveRows(Movable):
                 sub_offset,
                 do_sub,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2540,6 +2806,7 @@ struct GpuActiveRows(Movable):
                 sub_offset,
                 do_sub,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2560,6 +2827,7 @@ struct GpuActiveRows(Movable):
                 sub_offset,
                 do_sub,
                 use_quant,
+                const_hess,
                 n_tiles,
                 threads,
             )
@@ -2588,6 +2856,7 @@ struct GpuActiveRows(Movable):
         sub_offset: Int,
         do_sub: Int32,
         use_quant: Int32,
+        const_hess: Int32,
         n_tiles: Int,
         threads: Int,
     ) raises:
@@ -2615,6 +2884,7 @@ struct GpuActiveRows(Movable):
                 Int32(sub_offset),
                 do_sub,
                 use_quant,
+                const_hess,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -2639,6 +2909,7 @@ struct GpuActiveRows(Movable):
                 Int32(sub_offset),
                 do_sub,
                 use_quant,
+                const_hess,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -2663,6 +2934,7 @@ struct GpuActiveRows(Movable):
                 Int32(sub_offset),
                 do_sub,
                 use_quant,
+                const_hess,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -2687,6 +2959,7 @@ struct GpuActiveRows(Movable):
                 Int32(sub_offset),
                 do_sub,
                 use_quant,
+                const_hess,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
