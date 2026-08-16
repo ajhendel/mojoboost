@@ -36,6 +36,20 @@ these draws come from the tree's set and the allow mask is applied
 afterwards, in the split search. The candidates are drawn from the same
 pool either way; a node can simply end up with fewer of them here.
 
+The prefiltered pool
+--------------------
+`select_tree_features` takes the pool as an argument rather than building it
+from `n_features`, because `feature_pre_filter` deletes features. LightGBM's
+`ColSampler` samples `Dataset::ValidFeatureIndices()` -- the features that
+survived Dataset construction -- and sizes the draw by *their* count
+(`GetCnt(valid_feature_indices_.size(), fraction)`,
+`src/treelearner/col_sampler.hpp`), so a prefiltered fit both never draws a
+dropped feature and draws a fraction of the survivors rather than of
+everything. `binning.fit_bins(feature_pre_filter=True)` produces the list and
+`BinnedMatrix.usable_features()` carries it to a grower. An empty pool is the
+default and means nothing was filtered, so it is the draw this module has
+always made, from the same counter stream.
+
 Per-level selection
 -------------------
 `feature_fraction_bylevel` draws a third set once per depth, sitting between
@@ -183,21 +197,63 @@ def sample_without_replacement(
     return out^
 
 
+def check_feature_pool(pool: List[Int], n_features: Int) raises:
+    """A prefiltered pool has to be ascending, unique, and inside the matrix.
+
+    Ascending because `sample_without_replacement` keeps its input's order and
+    every caller downstream (`select_split_features`, the growers' column
+    lists) reads the result as ascending; unique because a repeated id would
+    give one feature two chances in the same draw.
+    """
+    if len(pool) == 0:
+        raise Error("feature pool must not be empty")
+    if pool[0] < 0 or pool[len(pool) - 1] >= n_features:
+        raise Error(
+            "feature pool ids must be in [0, ", n_features, ")"
+        )
+    for i in range(1, len(pool)):
+        if pool[i] <= pool[i - 1]:
+            raise Error("feature pool must be strictly ascending")
+
+
 def select_tree_features(
-    n_features: Int, fraction: Float64, seed: Int, tree_index: Int
+    n_features: Int,
+    fraction: Float64,
+    seed: Int,
+    tree_index: Int,
+    usable: List[Int] = [],
 ) raises -> List[Int]:
-    """The ascending feature ids one tree may split on."""
+    """The ascending feature ids one tree may split on.
+
+    `usable` is LightGBM's `Dataset::ValidFeatureIndices()`, the pool its
+    `ColSampler` actually samples from (`src/treelearner/col_sampler.hpp`:
+    `used_cnt_bytree_ = GetCnt(valid_feature_indices_.size(), fraction)` then
+    `random_.Sample(valid_feature_indices_.size(), used_cnt_bytree_)`). Two
+    things follow, and both are reproduced here: a prefiltered feature is never
+    drawn, and the *count* drawn is the fraction of the surviving features
+    rather than of all of them.
+
+    An empty `usable` -- the default -- means nothing was prefiltered, so the
+    pool is every feature and this is the function it has always been, down to
+    the same counter stream. Passing `binning.all_features(n_features)`
+    explicitly is the same draw.
+    """
     check_feature_fraction(fraction, "feature_fraction")
     if n_features < 1:
         raise Error("n_features must be positive")
-    var all_features = List[Int](capacity=n_features)
-    for f in range(n_features):
-        all_features.append(f)
+    var pool: List[Int]
+    if len(usable) > 0:
+        check_feature_pool(usable, n_features)
+        pool = usable.copy()
+    else:
+        pool = List[Int](capacity=n_features)
+        for f in range(n_features):
+            pool.append(f)
     if fraction >= 1.0:
-        return all_features^
+        return pool^
     return sample_without_replacement(
-        all_features,
-        selection_count(n_features, fraction),
+        pool,
+        selection_count(len(pool), fraction),
         _stream(seed, tree_index, _TREE_TAG),
     )
 

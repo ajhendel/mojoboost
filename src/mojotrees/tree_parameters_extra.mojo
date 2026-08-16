@@ -38,11 +38,16 @@ tier is a property of what the rule needs rather than of the backend:
   `cegb.check_cegb_grower_support`.
 - Refused by *value* rather than by name: `feature_pre_filter`.
   `check_feature_pre_filter` accepts `false`, which is the behavior mojotrees
-  has, and refuses `true`, which would change the pool `feature_fraction`
-  samples from. `check_extra_option_supported` no longer knows the name at
-  all, so every name that checker still refuses is refused for how it is
-  spelled rather than for being missing, which is the
-  `forcedsplits_filename` case above.
+  has, and refuses `true` **from a parameter string only**: the filter is
+  implemented (`binning.filter_count`, `binning.need_filter`,
+  `fit_bins(feature_pre_filter=...)`, `BinnedMatrix.usable_features`,
+  `sampling.select_tree_features(..., usable)`) and reachable from the Mojo
+  API, but `params.TrainConfig` has no field to carry the flag into binning,
+  so a string that set it would be ignored. That is the
+  `forcedsplits_filename` case above, not a missing feature.
+  `check_extra_option_supported` no longer knows the name at all, so every
+  name that checker still refuses is refused for how it is spelled rather
+  than for being missing.
   `linear_tree` and `linear_lambda` are `BoosterParams.linear`
   (linear_tree.mojo), not tree controls, and are live on the metric-path
   trainers.
@@ -1018,7 +1023,8 @@ def check_extra_option_supported(name: String) raises:
 
 
 def check_feature_pre_filter(enabled: Bool) raises:
-    """Accept `feature_pre_filter=false`, which is the behavior mojotrees has.
+    """Accept `feature_pre_filter=false`; refuse `true` *in a parameter
+    string*, because a parameter string cannot reach the filter.
 
     LightGBM's prefilter is a Dataset construction step: before training it
     drops the features whose every bin boundary would leave a child under
@@ -1028,12 +1034,24 @@ def check_feature_pre_filter(enabled: Bool) raises:
     by name for any value at all. A LightGBM configuration that spells out
     the setting mojotrees matches now ports across unchanged.
 
-    `true` is still refused, and not only for the missing speed-up. Dropping a
-    feature from the Dataset also drops it from the pool `feature_fraction`
-    samples, so a prefiltered fit can grow different trees rather than the
-    same trees faster; and LightGBM additionally forbids reusing a prefiltered
-    Dataset with a larger `min_data_in_leaf`. Neither is something a silently
-    ignored setting would report.
+    `true` is no longer unimplemented either. `binning.fit_bins` takes
+    `feature_pre_filter` and `min_data_in_leaf`, counts each feature's bins on
+    the sample it fit the edges from, runs `binning.need_filter` (LightGBM's
+    `NeedFilter`, transcribed) against `binning.filter_count` (LightGBM's
+    `filter_cnt`, `min_data_in_leaf` scaled to the sample), and hands back a
+    `BinMapper` whose `usable` list is LightGBM's `used_features`. The list
+    rides onto the `BinnedMatrix` through `transform`, and
+    `sampling.select_tree_features` takes it as the pool, which is what makes
+    the narrowed `feature_fraction` draw the *same* narrowing LightGBM does.
+
+    What a parameter string still cannot do is carry it. `params.TrainConfig`
+    holds neither this flag nor `min_data_in_leaf`'s route into `fit_bins`, so
+    a string that said `feature_pre_filter=true` would be a setting this
+    library read and then ignored, which is the one outcome this repository
+    refuses outright. It is refused here for that reason and reported as such,
+    the same way `forcedsplits_filename` is refused for naming a document a
+    string cannot carry while being fully implemented and reachable from the
+    Mojo API.
 
     Takes the parsed value rather than the key, because the two values mean
     different things here -- which is exactly what a name-only check could not
@@ -1042,17 +1060,16 @@ def check_feature_pre_filter(enabled: Bool) raises:
     if not enabled:
         return
     raise Error(
-        "'feature_pre_filter=true' is not implemented. It is a Dataset"
-        " construction step: LightGBM drops, before training, the features"
-        " whose every bin boundary would leave a child under"
-        " 'min_data_in_leaf'. mojotrees's split search rejects those"
-        " candidates as it scans (split.find_best_split), so"
-        " feature_pre_filter=false is accepted and is the behavior mojotrees"
-        " already has. What is missing at true is the speed-up, LightGBM's"
-        " rule that a prefiltered Dataset cannot be reused with a larger"
-        " min_data_in_leaf, and the narrowing of the pool feature_fraction"
-        " samples from, which can change the trees rather than only their"
-        " cost"
+        "'feature_pre_filter=true' cannot be set from a parameter string:"
+        " TrainConfig carries neither this flag nor min_data_in_leaf into"
+        " binning, so the string would be read and ignored. The filter itself"
+        " is implemented and reachable from the Mojo API: fit with"
+        " binning.fit_bins(..., feature_pre_filter=True,"
+        " min_data_in_leaf=<the same number the trees use>), transform with"
+        " that mapper, and the resulting BinnedMatrix carries LightGBM's"
+        " used_features as `usable` for sampling.select_tree_features to draw"
+        " from. Note LightGBM's own rule that a prefiltered Dataset cannot"
+        " then be reused with a larger min_data_in_leaf"
     )
 
 

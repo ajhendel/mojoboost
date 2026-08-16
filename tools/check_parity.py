@@ -1399,13 +1399,10 @@ def stock_defaults(problems):
     than to a literal, so a signature that drifted back to `= 1` would fail
     here even with the constant left correct.
 
-    `feature_pre_filter` is deliberately not in the table. It is not a
-    default on this side at all: LightGBM's `true` is a Dataset construction
-    step that deletes features, and until mojotrees implements the deletion
-    the honest state is that `check_feature_pre_filter` still refuses `true`.
-    That refusal is asserted here, so that flipping the flag without
-    implementing the filter fails the gate rather than quietly making the two
-    libraries fit different feature spaces.
+    `feature_pre_filter` is checked separately, by `feature_pre_filter_gate`.
+    It is not a binning *default* on this side -- `fit_bins` defaults it to
+    `False` and has to, because `False` is the fit that preceded the option --
+    so it does not belong in the table above.
     """
     binning = ROOT / "src" / "mojotrees" / "binning.mojo"
     if not binning.is_file():
@@ -1452,10 +1449,115 @@ def stock_defaults(problems):
                     "says nothing gets",
                 )
 
+
+# The growers that draw a tree's feature set. Each calls
+# `sampling.select_tree_features`, and each has to hand it the pool for a
+# prefiltered fit to reach `feature_fraction` at all.
+FEATURE_POOL_GROWERS = (
+    "tree.mojo",
+    "tree_sparse.mojo",
+    "train_gpu.mojo",
+    "train_gpu_sparse.mojo",
+)
+
+
+def feature_pre_filter_gate(problems):
+    """`feature_pre_filter` is applied, and stays applied.
+
+    This gate used to assert the opposite: that `check_feature_pre_filter`
+    still refused `true`, because accepting a flag while keeping every feature
+    would leave mojotrees and LightGBM fitting **different feature spaces**,
+    which is the same error EFB is held back for. The filter is implemented
+    now, so the thing worth guarding has moved. What follows is the chain that
+    makes `true` honest, asserted link by link, so that removing any one link
+    fails here rather than quietly turning the flag back into a no-op:
+
+    1. `binning.filter_count` -- LightGBM's `filter_cnt`, `min_data_in_leaf`
+       scaled to the bin-construction sample (`src/io/dataset_loader.cpp`).
+    2. `binning.need_filter` -- LightGBM's `NeedFilter` (`src/io/bin.cpp`).
+    3. `fit_bins` takes `feature_pre_filter` and defaults it to `False`,
+       because `False` has to remain the fit that preceded the option.
+    4. `BinMapper` and `BinnedMatrix` both carry `usable`, LightGBM's
+       `used_features`, and `transform` propagates it -- a grower is handed a
+       matrix and nothing else.
+    5. `sampling.select_tree_features` takes the pool and sizes the draw by
+       `len(pool)`, which is LightGBM's
+       `GetCnt(valid_feature_indices_.size(), fraction)`.
+
+    The last link, the growers passing the pool, is not asserted as a
+    requirement because it is not landed yet; it is asserted as the *condition*
+    for `check_feature_pre_filter` to stop refusing `true`. A parameter string
+    additionally cannot carry the flag at all while `params.TrainConfig` has no
+    field for it, so that is required too. Accepting the flag without both is
+    a setting read and ignored.
+    """
+    binning = ROOT / "src" / "mojotrees" / "binning.mojo"
+    sampling = ROOT / "src" / "mojotrees" / "sampling.mojo"
     extra = ROOT / "src" / "mojotrees" / "tree_parameters_extra.mojo"
-    if not extra.is_file():
-        fail(problems, "stock defaults: tree_parameters_extra.mojo is missing")
-        return
+    for path in (binning, sampling, extra):
+        if not path.is_file():
+            fail(problems, f"feature_pre_filter: {path.name} is missing")
+            return
+    text = binning.read_text()
+    sampler = sampling.read_text()
+
+    for pattern, what in (
+        (r"^def filter_count\(", "binning.filter_count (LightGBM's filter_cnt)"),
+        (r"^def need_filter\(", "binning.need_filter (LightGBM's NeedFilter)"),
+        (r"^    var usable: List\[Int\]", "a `usable` field in binning.mojo"),
+        (r"def usable_features\(", "BinnedMatrix.usable_features"),
+    ):
+        if not re.search(pattern, text, re.M):
+            fail(
+                problems,
+                f"feature_pre_filter: {what} is gone from binning.mojo. The "
+                "filter is what lets the flag be set without the two "
+                "libraries fitting different feature spaces; if it is being "
+                "removed, restore the refusal in check_feature_pre_filter in "
+                "the same commit",
+            )
+    # Two of them, one per struct, so losing either is caught.
+    if len(re.findall(r"^    var usable: List\[Int\]", text, re.M)) < 2:
+        fail(
+            problems,
+            "feature_pre_filter: only one of BinMapper and BinnedMatrix "
+            "carries `usable`. A grower is handed the matrix and nothing "
+            "else, so the pool has to ride on both",
+        )
+    sig = re.search(r"^def fit_bins\[", text, re.M)
+    if not sig:
+        fail(problems, "feature_pre_filter: fit_bins is not where this expects it")
+    elif not re.search(
+        r"\bfeature_pre_filter\s*:\s*Bool\s*=\s*False\b",
+        text[sig.start() : sig.start() + 1600],
+    ):
+        fail(
+            problems,
+            "feature_pre_filter: fit_bins does not take "
+            "`feature_pre_filter: Bool = False`. Off has to stay the fit that "
+            "preceded the option, and on has to be reachable",
+        )
+    if not re.search(
+        r"^def select_tree_features\((?:.|\n)*?usable: List\[Int\] = \[\]",
+        sampler,
+        re.M,
+    ):
+        fail(
+            problems,
+            "feature_pre_filter: sampling.select_tree_features no longer "
+            "takes the usable pool, so a prefiltered fit cannot narrow the "
+            "set feature_fraction draws from -- which is the half of the "
+            "filter that changes the trees rather than only their cost",
+        )
+    if not re.search(r"selection_count\(len\(pool\)", sampler):
+        fail(
+            problems,
+            "feature_pre_filter: select_tree_features no longer sizes the "
+            "draw by the surviving count. LightGBM's ColSampler uses "
+            "GetCnt(valid_feature_indices_.size(), fraction), so a filtered "
+            "fit draws a fraction of the survivors, not of everything",
+        )
+
     checker = extra.read_text()
     body = re.search(
         r"^def check_feature_pre_filter\(.*?(?=^def |^struct |\Z)",
@@ -1465,17 +1567,46 @@ def stock_defaults(problems):
     if not body:
         fail(
             problems,
-            "stock defaults: check_feature_pre_filter is gone; if "
-            "feature_pre_filter=true is implemented now, say so in the "
-            "contract and update this gate in the same commit",
+            "feature_pre_filter: check_feature_pre_filter is gone. A "
+            "parameter string still cannot carry the flag into binning, so "
+            "the name still needs its own refusal rather than the "
+            "unknown-parameter path",
         )
-    elif "raise Error(" not in body.group(0):
+        return
+    if "raise Error(" in body.group(0):
+        return
+
+    # The refusal was removed. Everything it was standing in for has to be
+    # true now.
+    unwired = []
+    for name in FEATURE_POOL_GROWERS:
+        path = ROOT / "src" / "mojotrees" / name
+        if not path.is_file():
+            continue
+        grower = path.read_text()
+        if "select_tree_features(" not in grower:
+            continue
+        if "usable_features()" not in grower:
+            unwired.append(name)
+    if unwired:
         fail(
             problems,
-            "stock defaults: check_feature_pre_filter no longer refuses "
-            "feature_pre_filter=true. Accepting it without dropping the "
-            "features LightGBM drops makes the two libraries fit different "
-            "feature spaces, which is the same error EFB is held back for",
+            "feature_pre_filter: check_feature_pre_filter no longer refuses "
+            "feature_pre_filter=true, but "
+            + ", ".join(unwired)
+            + " still calls select_tree_features without the pool, so the "
+            "filter is computed and ignored there and those growers fit a "
+            "different feature space from LightGBM's",
+        )
+    params = ROOT / "src" / "mojotrees" / "params.mojo"
+    if params.is_file() and not re.search(
+        r"\.feature_pre_filter\s*=\s*_parse_bool", params.read_text()
+    ):
+        fail(
+            problems,
+            "feature_pre_filter: check_feature_pre_filter accepts true but "
+            "params.mojo never stores the parsed value on TrainConfig, so a "
+            "parameter string that set it would be read and ignored",
         )
 
 
@@ -1541,6 +1672,7 @@ def main():
     unwired_tests(text, problems)
     monotone_passthrough(problems)
     stock_defaults(problems)
+    feature_pre_filter_gate(problems)
 
     header, level_rows = levels_table(text)
     print(f"  {len(supported)} rows marked supported")
