@@ -186,6 +186,35 @@ This must be re-measured against stock LightGBM before any version of it is
 quoted again, and the project is about to move its own defaults to stock, which
 changes which world the number lives in.
 
+### A THIRD reason, found later, and it is the largest of the three
+
+**LightGBM's binning time has always contained its ingestion. Ours contained
+none.**
+
+`lgb.Dataset(X).construct()` takes a C-ordered array by pointer with **no
+copy** and goes row-major raw to binned columns directly. LightGBM never
+materializes a column-major Float64 matrix at all. Our harness generated the
+benchmark matrix **already column-major**, so our binner was handed its input
+in exactly the layout it wanted and paid nothing to get there.
+
+So `binning_s: 0.199` against `lightgbm_binning_s: 1.006` was comparing **a
+binner against a binner plus an ingester**. That is not a pin, not a
+configuration, and not a window effect. It is two different quantities under
+one name.
+
+The fix is measurement rather than argument: `bench/bench_train.mojo` now
+reports `ingest_s` separately and an `e2e_s` that is ingest plus binning plus
+train, which is the quantity comparable to LightGBM's total. A structural fix
+also exists and is not taken yet — `fit_bins` and `transform` could accept a
+`row_stride` and read the caller's row-major buffer where it lies, deleting
+the transpose entirely — and it is recorded as needing an A/B rather than a
+straight build, because it trades a 400 MB copy for a strided per-column read.
+
+**So the binning claim fails on three independent counts**: the comparator was
+pinned to bin every row, the comparator itself was superseded, and the two
+sides were never measuring the same work. Any one of them would have been
+enough to withdraw it.
+
 The credit for catching this belongs to the GPU campaign, which read the pin's
 rationale rather than the pin. It is the fourth instance this week of a real
 number being quoted for a question it could not answer, and the third of them
