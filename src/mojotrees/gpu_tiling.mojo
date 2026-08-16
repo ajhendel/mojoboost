@@ -122,6 +122,19 @@ comptime TARGET_BLOCKS_PER_SM = 8
 
 # A tile must scan enough rows to amortize writing (or atomically folding)
 # its n_bins-wide partial histogram.
+#
+# `row_tile_floor` records the measurement that says this bound is too loose:
+# raising the tile count lost 22 to 36 percent at shapes where a tile still
+# held 12,500 rows against a 2,048 minimum, so the whole loss happened inside
+# the region this factor calls safe. Raising the factor is a defensible next
+# change and it is not made here, for two reasons. It is a default that moves
+# every shape at once, and `MOJOTREES_GPU_ROW_TILE` already sweeps the same
+# quantity directly, so the sweep should decide the constant rather than the
+# constant anticipating the sweep. And the balance it sits at has just moved:
+# `gpu_active_rows.HIST_ROW_UNROLL` changes what a tile's row scan costs
+# without changing what its zero-and-flush costs, so the tile length at which
+# the two trade is not the one the earlier runs measured. Sweep it again on
+# the unrolled walk before believing either figure.
 comptime MIN_ROWS_PER_TILE_BIN_FACTOR = 8
 comptime MIN_ROWS_PER_TILE_THREAD_FACTOR = 4
 
