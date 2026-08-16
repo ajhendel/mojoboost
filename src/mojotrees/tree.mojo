@@ -84,7 +84,7 @@ from .histogram import (
     build_histogram_subset_into_scratch,
     subtract_histogram_into,
 )
-from .parallel import plan_row_blocks, run_row_blocks
+from .parallel import DispatchSettings, plan_row_blocks, run_row_blocks
 from .phase_profile import (
     HOST_HIST_DISPATCHES,
     HOST_PARTITION_DISPATCHES,
@@ -801,10 +801,27 @@ struct GrowScratch(Movable):
 
     var pool: _HistPool
     var pairs: List[Float64]
+    var settings: DispatchSettings
 
-    def __init__(out self, n_features: Int, n_bins: Int):
+    def __init__(out self, n_features: Int, n_bins: Int) raises:
         self.pool = _HistPool(n_features, n_bins)
         self.pairs = List[Float64]()
+        # The scheduling environment, read once here and then never again for
+        # the life of this scratch. Every dispatch the grower makes -- the
+        # histogram builds, the sibling subtractions, the split scans -- takes
+        # this snapshot instead of re-reading `getenv` and re-detecting the
+        # core counts per call, which is what they all did before.
+        #
+        # A snapshot does not depend on the histogram shape, so `prepare` does
+        # not rebuild it: pointing a scratch at a different matrix does not
+        # change what the machine is or what the user asked for.
+        #
+        # One behaviour change worth naming rather than discovering: an
+        # off-ladder `MOJOTREES_CPU_FEATURE_GROUP` is refused by
+        # `env_feature_group`, and that refusal now surfaces when the scratch
+        # is constructed rather than at the first histogram build. Earlier,
+        # and with the same message.
+        self.settings = DispatchSettings.resolve()
 
     def prepare(mut self, n_features: Int, n_bins: Int) raises:
         """Point this scratch at a histogram shape, discarding pooled buffers
@@ -867,6 +884,7 @@ def _search(
     grower_applies_extra: Bool = False,
     cegb: CegbNodeCosts = CegbNodeCosts.inactive(),
     grower_applies_cegb: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises -> SplitInfo:
     """Best split for one node. `allowed` is the node's interaction-constraint
     allow mask and `features` its subsampled feature ids; empty means every
@@ -940,6 +958,7 @@ def _search(
         tree_index=tree_index,
         parent_output=parent_output,
         cegb=cegb,
+        settings=settings,
     )
 
 
@@ -978,6 +997,7 @@ def _hist_full(
     features: List[Int],
     columns: List[Int],
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """Accumulate every row into `hist`, which is always per feature.
 
@@ -1005,10 +1025,12 @@ def _hist_full(
     exactly what it would have seen on the three-plane path.
     """
     if not bundled.active:
-        build_histogram_into(hist, data, grad, hess, features, const_hessian)
+        build_histogram_into(
+            hist, data, grad, hess, features, const_hessian, settings
+        )
         return
     build_histogram_into(
-        scratch, bundled.data, grad, hess, columns, const_hessian
+        scratch, bundled.data, grad, hess, columns, const_hessian, settings
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -1027,6 +1049,7 @@ def _hist_subset(
     features: List[Int],
     columns: List[Int],
     const_hessian: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """`_hist_full` for a row subset. Row ids index the original matrix and the
     bundled one identically, because bundling rearranges columns and never
@@ -1050,12 +1073,12 @@ def _hist_subset(
     if not bundled.active:
         build_histogram_subset_into_scratch(
             hist, pairs, data, grad, hess, rows, start, count, features,
-            const_hessian,
+            const_hessian, settings,
         )
         return
     build_histogram_subset_into_scratch(
         scratch, pairs, bundled.data, grad, hess, rows, start, count, columns,
-        const_hessian,
+        const_hessian, settings,
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -1526,7 +1549,7 @@ def grow_tree_leaves_profiled(
         var root_hist_started = profile.clock()
         _hist_full(
             root_hist, bundle_scratch, data, bundling, grad, hess,
-            tree_features, tree_columns, const_hessian,
+            tree_features, tree_columns, const_hessian, scratch.settings,
         )
         profile.note_node()
         profile.charge(
@@ -1554,7 +1577,7 @@ def grow_tree_leaves_profiled(
         _hist_subset(
             root_hist, bundle_scratch, scratch.pairs, data, bundling, grad,
             hess, bag, 0, len(bag), tree_features, tree_columns,
-            const_hessian,
+            const_hessian, scratch.settings,
         )
         profile.note_node()
         profile.charge(
@@ -1628,6 +1651,7 @@ def grow_tree_leaves_profiled(
         grower_applies_extra=True,
         cegb=root_costs,
         grower_applies_cegb=carries_cegb,
+        settings=scratch.settings,
     )
     # The scan reads one bin at a time over the node's own feature draw, so
     # its cells are `len(root_features) * n_bins` and not the buffer's full
@@ -1803,7 +1827,7 @@ def grow_tree_leaves_profiled(
             _hist_subset(
                 left_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, left_rows, 0, len(left_rows), tree_features,
-                tree_columns, const_hessian,
+                tree_columns, const_hessian, scratch.settings,
             )
             profile.note_node()
             profile.charge(
@@ -1816,7 +1840,8 @@ def grow_tree_leaves_profiled(
             )
             var sub_started = profile.clock()
             subtract_histogram_into(
-                right_hist, parent_hist, left_hist, const_hessian
+                right_hist, parent_hist, left_hist, const_hessian,
+                scratch.settings,
             )
             # Filed at the *derived* child's size: it is that child's
             # histogram that comes out, and the point of the trick is that a
@@ -1835,7 +1860,7 @@ def grow_tree_leaves_profiled(
             _hist_subset(
                 right_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, right_rows, 0, len(right_rows), tree_features,
-                tree_columns, const_hessian,
+                tree_columns, const_hessian, scratch.settings,
             )
             profile.note_node()
             profile.charge(
@@ -1848,7 +1873,8 @@ def grow_tree_leaves_profiled(
             )
             var sub_started = profile.clock()
             subtract_histogram_into(
-                left_hist, parent_hist, right_hist, const_hessian
+                left_hist, parent_hist, right_hist, const_hessian,
+                scratch.settings,
             )
             profile.note_node()
             profile.charge(
@@ -1987,6 +2013,7 @@ def grow_tree_leaves_profiled(
             grower_applies_extra=True,
             cegb=left_costs,
             grower_applies_cegb=carries_cegb,
+            settings=scratch.settings,
         )
         profile.charge(
             PROF_SPLIT_SEARCH,
@@ -2030,6 +2057,7 @@ def grow_tree_leaves_profiled(
             grower_applies_extra=True,
             cegb=right_costs,
             grower_applies_cegb=carries_cegb,
+            settings=scratch.settings,
         )
         profile.charge(
             PROF_SPLIT_SEARCH,
