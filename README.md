@@ -1642,9 +1642,10 @@ categorical node, matching LightGBM's `CategoricalDecision`:
   `used_cnt < cut_cnt || num_bin_ < max_bin` (`src/io/bin.cpp:461-462`) and
   widens its bin storage to `uint16_t` or `uint32_t` to hold the result,
   where a mojotrees bin id is one byte. Categories past the ceiling fall into
-  bin 0, which no split set can reach; a `Dataset` answers that by giving
-  such a column ordered target statistics, which is what
-  `Dataset(params={"ctr": "auto"})` does by default.
+  bin 0, which no split set can reach. `Dataset(params={"ctr": "auto"})`
+  gives such a column ordered target statistics, and is off by default
+  because those statistics are computed from the binned bucket and so
+  cannot recover an evicted level; see `binning.ctr_slot_columns`.
 - LightGBM's `kEpsilon` (1e-15) Hessian nudges are omitted.
 - Monotonic constraints on a categorical feature are rejected rather than
   silently applied.

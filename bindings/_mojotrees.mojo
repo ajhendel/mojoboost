@@ -1122,7 +1122,7 @@ def _parse_ctr(params: PythonObject) raises -> SimpleCtrConfig:
     Anything else raises here rather than resolving to a default, so a typo is
     an error and not a silently different model.
     """
-    var name = String(py=params.get("ctr", PythonObject("auto")))
+    var name = String(py=params.get("ctr", PythonObject("off")))
     if name == "auto":
         return SimpleCtrConfig.auto()
     if name == "off":

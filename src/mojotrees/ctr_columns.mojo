@@ -231,12 +231,23 @@ statistic is the other way to represent such a column: it turns it into
 ordinary numeric columns whose value is a function of the raw category, so a
 category evicted from the table is still distinguished.
 
-The rule therefore fires **only where the loss is**, and that is what makes it
-affordable as a default. A categorical column the table holds in full loses
-nothing to binning, gains nothing from a CTR, and gets none: on such a dataset
-`plan_ctr_columns` returns inactive tables, `trainset._build_ctr` returns
-before allocating anything, and the binned matrix is byte-identical to the one
-built before this rule existed."""
+The rule therefore fires **only where the loss is**. A categorical column the
+table holds in full loses nothing to binning, gains nothing from a CTR, and
+gets none: on such a dataset `plan_ctr_columns` returns inactive tables,
+`trainset._build_ctr` returns before allocating anything, and the binned
+matrix is byte-identical to the one built before this rule existed.
+
+**This rule is correct and it is NOT the default, and the reason is measured
+rather than argued.** It was the `Dataset` default for part of 2026-08-16 and
+was reverted the same day. `binning.ctr_slot_columns` sources a CTR from the
+BINNED bucket (`out[dst + r] = Int(bins[src + r])`), so every level the table
+evicted shares bucket 0 and shares one statistic, and a CTR column carries no
+information the truncated column does not already carry. Two runs on exactly
+the shape this rule selects measured nulls in both directions; the numbers and
+the full argument are in that function's docstring. Until the CTR is sourced
+from the raw category code, this rule names the right columns and hands them a
+mechanism that cannot recover what they lost, so turning it on spends four
+columns per source column and buys nothing measurable."""
 
 
 comptime CTR_SOURCE_RULES = 2
@@ -402,8 +413,19 @@ struct SimpleCtrConfig(Copyable, Movable):
         var target_borders: List[Float64] = [],
         permutation_index: Int = DEFAULT_CTR_PERMUTATION_INDEX,
         seed: Int = DEFAULT_CTR_SEED,
-    ) raises -> SimpleCtrConfig:
+    ) -> SimpleCtrConfig:
         """The bundle a dense `Dataset` takes by default.
+
+        **Its `descriptions` are deliberately empty and this function
+        deliberately does not raise.** Mojo refuses a raising call in a
+        default argument, and this bundle IS a default argument on two
+        `Dataset` constructors, so it cannot call
+        `catboost_simple_ctr_defaults` -- that reaches `ctr.default_priors`,
+        which validates its argument and therefore raises.
+        `resolve_descriptions` fills them in, and `trainset._build_ctr` calls
+        it in the same breath as `resolve_target_borders` for the same
+        reason: both are things a default defers until it has a raising
+        context to resolve them in.
 
         Enabled, at CatBoost's CPU `simple_ctr` descriptions, but selecting its
         source columns by `CTR_SOURCE_BIN_OVERFLOW` rather than by CatBoost's
@@ -426,13 +448,28 @@ struct SimpleCtrConfig(Copyable, Movable):
         """
         var out = SimpleCtrConfig()
         out.enabled = True
-        out.descriptions = catboost_simple_ctr_defaults()
         out.target_borders = target_borders^
         out.permutation_index = permutation_index
         out.seed = seed
         out.max_ctr_complexity = 1
         out.source_rule = CTR_SOURCE_BIN_OVERFLOW
         return out^
+
+    def resolve_descriptions(mut self) raises:
+        """Fill `descriptions` from `catboost_simple_ctr_defaults` if the
+        caller gave none, the way `resolve_target_borders` fills the borders.
+
+        Only `auto()` leaves them empty, and only because a default argument
+        may not call a raising function. A bundle built any other way already
+        has its descriptions and this is a no-op. A disabled bundle is left
+        alone: an empty `descriptions` is what disabled looks like, and
+        `validate` returns before it reads them.
+        """
+        if not self.enabled:
+            return
+        if len(self.descriptions) != 0:
+            return
+        self.descriptions = catboost_simple_ctr_defaults()
 
     @staticmethod
     def catboost_defaults(

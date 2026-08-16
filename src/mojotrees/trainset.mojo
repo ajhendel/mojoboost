@@ -518,6 +518,11 @@ def _build_ctr(
     # count: one target border means two classes, and `Borders` emits
     # `n_classes - 1` columns. The config keeps what it resolved, so the dataset
     # records the borders its columns were actually built from.
+    # Both of these fill in what a DEFAULT bundle could not: `auto()` is a
+    # default argument, Mojo forbids a raising call in one, and building the
+    # descriptions reaches `ctr.default_priors`, which raises. This is the
+    # first raising context they have.
+    config.resolve_descriptions()
     config.resolve_target_borders(label)
     config.validate()
     # `mapper.n_bins` is the binning budget, the same `max_bins`
@@ -616,7 +621,7 @@ struct Dataset(Copyable, Movable, Writable):
         max_bin: Int = 255,
         use_missing: Bool = True,
         keep_raw: Bool = False,
-        var ctr: SimpleCtrConfig = SimpleCtrConfig.auto(),
+        var ctr: SimpleCtrConfig = SimpleCtrConfig.disabled(),
     ) raises:
         """Bin a column-major raw feature matrix (`features[f * n_rows + r]`)
         and take ownership of the columns that describe its rows.
@@ -778,7 +783,7 @@ struct Dataset(Copyable, Movable, Writable):
         max_bin: Int = 255,
         use_missing: Bool = True,
         keep_raw: Bool = False,
-        var ctr: SimpleCtrConfig = SimpleCtrConfig.auto(),
+        var ctr: SimpleCtrConfig = SimpleCtrConfig.disabled(),
     ) raises -> Dataset:
         """Bin a `RawData`, dense or sparse, and own the result.
 
