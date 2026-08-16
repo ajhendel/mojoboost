@@ -266,3 +266,85 @@ If the tree-resident plane measures **no faster** at 1,000,000 rows despite
 removing thirty host round trips per tree, then the 1.33 second constant is not
 the round trips and the model of this workload is wrong. That is the single
 most informative possible outcome and it must be reported as loudly as a win.
+
+---
+
+# Session III protocol, registered 2026-08-15 evening, before any of it ran
+
+The previous session ended with three numbers that had earned different amounts
+of belief and were written down as though they had earned the same amount. This
+section fixes the rules first so that cannot happen again, and it is committed
+before the lanes it judges have finished.
+
+## M0. The resolution rule, stated once and referred to by name
+
+An A/B is **resolved** when the two arms' medians differ by more than the wider
+arm's own min-to-max spread, over at least five alternating pairs. It is
+**consistent** when the direction is the same in a majority of pairs but the
+spread is as large as the effect. It is **indistinguishable** otherwise.
+
+Only a resolved result goes in a summary table as a number. A consistent one may
+be reported, and must be reported with the word "consistent" and the spread
+beside it. This is the rule the resident-plane figure failed: three pairs, one
+inverted, an ON arm ranging 3.136 to 3.612 against an effect of 0.57. It was
+written as "15 percent". It was consistent, not resolved.
+
+## M1. Quiet-box precondition, and it is a precondition rather than a preference
+
+No measurement counts if any lane, build, or compile is running. This has cost
+this project two numbers already, one of them taken at 18.6 percent spread with
+four agents compiling. Lanes run between measurement sessions, never during. The
+coordinator verifies the machine is idle before the first pair and after the
+last, and records that it did.
+
+## M2. What gets measured this session, in this order
+
+1. **The upload collapse.** Resident plane with the begin-tree reset kernel and
+   the hoisted search tables against the resident plane without them. This is
+   the round's main claim and it goes first while the box is coldest.
+2. **The resident plane itself, re-taken.** ON against OFF at five or more
+   pairs, to settle M0 on a figure that is currently only consistent.
+3. **The histogram row unroll.** `gpu-unroll` against `gpu-nounroll`,
+   interleaved in one process, which is the whole reason `set_row_unroll` is a
+   runtime argument rather than a comptime knob.
+4. **LightGBM, interleaved, with its own repeat spread.** Never measured on this
+   machine. Until it exists there is no noise floor to judge any margin against
+   and every "we beat LightGBM" sentence is unearned.
+
+## M3. The prediction, registered before the data
+
+Removing eleven of sixteen waits per tree in the tables path and three of four
+in the search path is fourteen fewer waits per tree. At the **measured** 458
+microseconds per synchronization over 100 trees that is an **estimated** 0.64
+seconds, taking a 3.17 second leaf-wise fit to roughly 2.5. That estimate is
+recorded here so the measurement can refute it rather than be fitted to it.
+
+If the collapse lands and the fit does **not** move by at least 0.3 seconds,
+then per-copy cost is not 458 microseconds in this position, and the per-sync
+constant that three independent routes have agreed on is wrong somewhere. Say
+so at least as loudly as a win, per S4.
+
+## M4. What the LightGBM spread decides
+
+If LightGBM's own repeat spread on this machine is wider than the margin being
+claimed against it, then no margin either way is a result, and both the 6.5
+percent depthwise win and any leaf-wise deficit revert to "indistinguishable"
+until the comparison is repeated enough times to separate them. This rule is
+registered before the spread is known, precisely because it could go against
+the result this project wants.
+
+## M5. The comparator changed, so figures across it do not compare
+
+Putting LightGBM inside the interleaved loop also removed a serialize-and-reload
+round trip from inside its timed call. That makes LightGBM **faster**, so it
+moves the comparison against us, which is the correct direction for a
+comparator to move and the reason it stays. But no figure taken before that
+commit may be placed in a table beside one taken after it. Every LightGBM number
+in this session is re-taken.
+
+## M6. What is allowed to be called a win at the end of this session
+
+Leaf-wise, at 1,000,000 x 50, resolved by M0, against a LightGBM arm measured in
+the same process in the same window with its own spread reported. Nothing else.
+Not depthwise, which grows a different tree and is an opt-in by S2. Not a
+projection from a wait count, however well the wait count has behaved.
