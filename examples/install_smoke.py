@@ -304,14 +304,16 @@ def device_selection():
     shown = threshold if threshold else "disabled (the default)"
     print(f"\nauto threshold   {shown}")
     print(
-        "\ndevice='auto' resolves to the CPU on every machine and every\n"
-        "workload unless MOJOTREES_AUTO_MIN_CELLS is set. The crossover\n"
-        "table holds one rule, scoped to Metal on an Apple M4 for squared\n"
-        "error at 1,000,000 rows by 50 features and above, where the GPU\n"
-        "trains in 3.58s against the CPU's 6.98s. It cannot fire, because\n"
-        "the capability probe opens no device and a rule scoped to\n"
-        "particular hardware cannot match a profile that names none. See\n"
-        "docs/DEVICE_SELECTION.md and docs/GPU_VALIDATION.md."
+        "\ndevice='auto' resolves to the CPU unless a crossover rule covers\n"
+        "the run, or MOJOTREES_AUTO_MIN_CELLS is set. The crossover table\n"
+        "holds one rule, scoped to Metal on an Apple M4 for squared error,\n"
+        "single output, at 1,000,000 rows by 50 features and above, where\n"
+        "the GPU trains in 3.58s against the CPU's 6.98s. Below that the\n"
+        "CPU wins and is chosen: 1.66s against 1.89s at 250,000 rows and\n"
+        "0.564s against 1.63s at 50,000. The hardware is identified from\n"
+        "the accelerator this build was compiled for, which is reported as\n"
+        "profile_source 'build-target'. See docs/DEVICE_SELECTION.md and\n"
+        "docs/GPU_VALIDATION.md."
     )
 
 

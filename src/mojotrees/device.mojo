@@ -42,11 +42,18 @@ device code, and neither one is a different policy:
 A Mojo caller that would rather hold the decision than parse it should
 still go straight to `decide_device` in device_policy.mojo.
 
-Why `auto` is the CPU today, what `MOJOTREES_AUTO_MIN_CELLS` and
-`MOJOTREES_DISABLE_GPU` do, and why accelerator availability is a
-property of the build rather than of the running machine are all
-documented in device_policy.mojo, where the rules that implement them
-live.
+Where `auto` reaches the GPU, what `MOJOTREES_AUTO_MIN_CELLS` and
+`MOJOTREES_DISABLE_GPU` do, and why accelerator availability *and identity*
+are properties of the build rather than of the running machine are all
+documented in device_policy.mojo, where the rules that implement them live.
+
+One thing worth knowing before importing `resolve_device` from here rather
+than reading that module: it takes the shape and, since 2026-08-16, an
+optional `objective`, and every installed crossover rule is scoped to the
+objective it was measured on. A caller that leaves `objective` defaulted
+gets the CPU under `auto` at every shape, by design and not by accident. A
+trainer that knows what it is training should pass it, or should call
+`resolve_device_full`.
 
 LightGBM difference: LightGBM spells this `device_type` and takes `cpu`,
 `gpu`, or `cuda`, with no `auto`. mojotrees has a single portable GPU
@@ -89,9 +96,11 @@ from .device_policy import (
 #     say which; inventing a bin count or an objective to fill the gap is
 #     how a gate silently starts admitting the wrong thing.
 # AUTO_MIN_CELLS
-#     Cells (n_rows * n_features) at or above which `auto` chooses the GPU.
-#     Negative disables the heuristic, which is the default: see
-#     device_policy.mojo for why there is no measured crossover to ship.
+#     Cells (n_rows * n_features) at or above which `auto` chooses the GPU
+#     with no rule behind it. Negative disables the heuristic, which is the
+#     default and stays the default: it is the knob for running a crossover
+#     benchmark on hardware no rule covers, not a shipped threshold. The
+#     shipped thresholds are the crossover rules in device_policy.mojo.
 # gpu_available
 #     True when training can run on an accelerator: one was present when
 #     this build was compiled and `MOJOTREES_DISABLE_GPU=1` is not set.
@@ -107,8 +116,10 @@ from .device_policy import (
 #     many outputs per round (1 for single-output, the class count for
 #     multiclass).
 # resolve_device
-#     Requested device and shape in, CPU_DEVICE or GPU_DEVICE out, never
-#     AUTO_DEVICE; raises for a `gpu` request that cannot run.
+#     Requested device, shape, and optionally an objective in; CPU_DEVICE or
+#     GPU_DEVICE out, never AUTO_DEVICE; raises for a `gpu` request that
+#     cannot run. Without an objective, `auto` cannot reach an
+#     objective-scoped crossover rule and therefore never selects the GPU.
 # resolve_device_full
 #     The same answer over the whole workload (objective, bins, sparse,
 #     validation, memory gates all apply).

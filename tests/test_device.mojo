@@ -461,9 +461,15 @@ def test_unmeasured_hardware_still_gets_no_rule() raises:
     assert_true(blind.message.find("No device attributes were read") >= 0)
     assert_equal(blind.capabilities.profile.api, API_UNKNOWN)
 
-    # Which is why the narrow entry point, which detects rather than
-    # reports, keeps the CPU on the measured shape too. This is a gap in
-    # the plumbing, recorded here so that closing it is a visible change.
+    # The narrow entry point keeps the CPU on the measured shape too, and as
+    # of 2026-08-16 that is for a different reason than the fixture above.
+    # Detection can now name the hardware (`PROFILE_BUILD_TARGET`), so what
+    # declines the rule here is the undeclared objective: every rule is
+    # scoped to the objective it was measured on and a four-argument call
+    # declares none. That is deliberate and must stay; the remaining gap is
+    # at the six call sites that hold an objective and drop it.
+    # `tests/test_device_auto_crossover.mojo` pins both halves, including the
+    # five-argument call that does reach the GPU here.
     assert_equal(
         resolve_device(
             AUTO_DEVICE, M4_TRAINING_MIN_ROWS, M4_TRAINING_MIN_FEATURES, 1

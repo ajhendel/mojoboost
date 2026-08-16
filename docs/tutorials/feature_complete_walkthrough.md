@@ -511,7 +511,7 @@ numerical one.
 |---|---|
 | `device="gpu"` with an `eval_set` | Validation is scored on the CPU |
 | `device="gpu"` with sparse input from the estimators | The Mojo API has `train_gpu_sparse`; the Python path keeps the CPU |
-| `device="auto"` selecting the GPU | One measured rule exists and cannot fire, because the capability probe opens no device and a hardware-scoped rule cannot match an unidentified profile |
+| `device="auto"` selecting the GPU from `fit` | One measured rule exists and fires for any caller that declares an objective, but `resolve_device`'s four-argument form, which is what `fit` calls, declares none, and every rule is objective-scoped |
 
 Multiclass has left that list. `fit_multiclass` dispatches on the device it
 resolves, so `device="gpu"` trains softmax on the accelerator.
