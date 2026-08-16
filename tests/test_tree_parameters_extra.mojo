@@ -35,6 +35,7 @@ from mojotrees.tree_parameters_extra import (
     cat_side_cap,
     cat_sort_key,
     check_extra_option_supported,
+    check_feature_pre_filter,
     extra_candidate_index,
     extra_split_stream,
     extra_threshold_index,
@@ -593,10 +594,16 @@ def test_forced_splits_reject_malformed_documents() raises:
 
 
 def test_deferred_options_are_rejected_by_name() raises:
-    # `feature_pre_filter` is a Dataset construction step mojotrees does not
-    # perform, so the name is refused rather than ignored.
+    # `feature_pre_filter` is no longer refused by name. `false` is the
+    # behavior mojotrees has -- our split search rejects the same candidates
+    # LightGBM's Dataset prefilter would drop -- so the name is accepted and
+    # the *value* is what decides. `true` is still refused, because
+    # prefiltering also removes features from the pool `feature_fraction`
+    # samples and so can change the trees and not only their cost.
+    check_extra_option_supported("feature_pre_filter")
+    check_feature_pre_filter(False)
     with assert_raises():
-        check_extra_option_supported("feature_pre_filter")
+        check_feature_pre_filter(True)
     # Forced splits are implemented and reachable from the Mojo API, but a
     # parameter string cannot carry a document, so every LightGBM spelling of
     # the key is refused with that path named.
