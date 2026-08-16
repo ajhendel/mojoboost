@@ -61,15 +61,16 @@ Intentional differences from LightGBM
   Hessian sum (`round(hess * num_data / sum_hess)`) because its histograms do
   not carry counts; mojotrees histograms do, so `min_data_in_leaf`,
   `min_data_per_group`, and the `cat_smooth` count filter use exact counts.
-- One-vs-rest search is selected on the number of categories, matching the
-  documented meaning of `max_cat_to_onehot`, rather than on an internal bin
-  count that may or may not include the unknown bin. LightGBM tests
-  `num_bin <= max_cat_to_onehot` (`FindBestThresholdCategoricalInner`,
-  `src/treelearner/feature_histogram.cpp`), and its `num_bin` counts the
-  bin 0 dummy, so at the default of 4 LightGBM one-hots up to 3 categories
-  while this module one-hots up to 4. A feature holding exactly
-  `max_cat_to_onehot` categories is searched by different algorithms on the
-  two sides. That is a real divergence, not a naming nicety.
+- One-vs-rest selection now matches LightGBM exactly and used to not.
+  LightGBM tests `num_bin <= max_cat_to_onehot`
+  (`FindBestThresholdCategoricalInner`,
+  `src/treelearner/feature_histogram.cpp:183`) and its `num_bin` counts the
+  bin 0 dummy (`src/io/bin.cpp:456-460`), so at the default of 4 it one-hots
+  up to 3 real categories. This module compared `n_categories` and so
+  one-hotted up to 4, and a feature holding exactly `max_cat_to_onehot`
+  categories was searched by a different algorithm on each side. Corrected
+  2026-08-16 to `n_categories + 1 <= max_cat_to_onehot`; the default value
+  did not move, the quantity compared did.
 - **Capacity.** LightGBM's `max_bin` is a *floor* on a categorical
   feature's bin count, not a ceiling. `BinMapper::FindBin`
   (`src/io/bin.cpp`) keeps admitting categories while
@@ -612,15 +613,23 @@ def find_best_categorical_split(
     #
     # The two thresholds are NOT the same boundary and must not be collapsed
     # onto one comparison. LightGBM's test is `num_bin <= max_cat_to_onehot`
-    # (`src/treelearner/feature_histogram.cpp:183`) where `num_bin` is
-    # `kept_categories + 1` because `src/io/bin.cpp:456-459` pushes a dummy
-    # bin at index 0 first, so LightGBM one-hots up to `max_cat_to_onehot - 1`
-    # real categories. The test below on `max_cat_to_onehot` therefore
-    # one-hots one category more than LightGBM does; that is the known
-    # off-by-one, it is the `wide-categorical-bins` lane's to move because
-    # moving it changes every default categorical fit, and giving the CatBoost
-    # boundary its own parameter here is what stops the two from being fixed
-    # as if they were one. See `docs/design/CATBOOST_CATALOG.md` A16.
+    # (`src/treelearner/feature_histogram.cpp:183`, verified verbatim on
+    # 4.7.0.99: `bool use_onehot = meta_->num_bin <=
+    # meta_->config->max_cat_to_onehot;`) where `num_bin` is
+    # `kept_categories + 1` because `src/io/bin.cpp:456-460` pushes a dummy
+    # bin at index 0 first and sets `num_bin_ = 1` before admitting any
+    # category. So LightGBM one-hots up to `max_cat_to_onehot - 1` REAL
+    # categories: three, at the default of 4.
+    #
+    # FIXED here on 2026-08-16 by the `wide-categorical-bins` lane, which
+    # this comment used to name as the owner of the move. The test below is
+    # now `n_categories + 1`, LightGBM's `num_bin`, so a column of exactly
+    # `max_cat_to_onehot` categories takes the sorted many-vs-many branch on
+    # both sides instead of one-vs-rest here and sorted there. The default
+    # value 4 did not move and neither did any other categorical default;
+    # what moved is the quantity being compared. Giving the CatBoost boundary
+    # its own parameter is what kept the two from being fixed as if they were
+    # one. See `docs/design/CATBOOST_CATALOG.md` A16.
     #
     # DIVERGENCE above the threshold: CatBoost sends a wider feature to CTRs
     # (`AddSimpleCtrs` returns early on `<= oneHotMaxSize`, :469), which
@@ -631,7 +640,7 @@ def find_best_categorical_split(
     if cat.uses_catboost_one_hot():
         one_hot = n_categories <= cat.one_hot_max_size
     else:
-        one_hot = n_categories <= cat.max_cat_to_onehot
+        one_hot = n_categories + 1 <= cat.max_cat_to_onehot
     if one_hot:
         return _onehot_search(
             gh,

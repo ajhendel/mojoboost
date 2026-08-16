@@ -107,7 +107,13 @@ _DATASET_PARAMS = {
 
 #: Binning parameters a `Dataset` accepts in its `params` dict, with their
 #: defaults. Everything else belongs to `train`.
-_BINNING_DEFAULTS = {"max_bin": 255, "use_missing": True}
+#: The ordered-target-statistic rules a Dataset accepts. See
+#: `_mojotrees._parse_ctr`, which is where each one resolves to a bundle.
+#: "auto" gives CTR columns only to categorical columns that filled their
+#: category table, so it plans nothing at all unless a column overflowed.
+_CTR_RULES = ("auto", "off", "catboost")
+
+_BINNING_DEFAULTS = {"max_bin": 255, "use_missing": True, "ctr": "off"}
 
 _IMPORTANCE_TYPES = {"split": 0, "gain": 1}
 
@@ -394,8 +400,35 @@ class Dataset:
     - `categorical_feature`, the indices (or names, with a named frame) of
       integer-coded categorical features.
 
-    `params` takes the two parameters that change the binning itself,
-    `max_bin` and `use_missing`; everything else is a `train()` parameter.
+    `params` takes the three parameters that change the binning itself,
+    `max_bin`, `use_missing` and `ctr`; everything else is a `train()`
+    parameter.
+
+    `ctr` is `"auto"`, `"off"` or `"catboost"` and defaults to `"off"`.
+    Ordered target statistics (catalog A19) turn a categorical column into
+    numeric columns whose value is a statistic of the target over the rows
+    preceding each row in a fixed permutation. `"auto"` builds them for the
+    categorical columns that **filled their category table** and no others: a
+    mojotrees categorical column keeps at most `max_bin - 1` levels and drops
+    the rest into one bin no split set can reach, which is the one place this
+    library loses resolution LightGBM keeps, and a target statistic is the way
+    to get it back. A dataset with no categorical column, or none wide enough
+    to overflow, builds no CTR column and is binned exactly as before.
+    `"catboost"` is CatBoost's own source rule and gives nearly every
+    categorical column four extra numeric columns.
+
+    `"auto"` is not the default, and the reason is measured. A CTR here is
+    computed from the BINNED bucket (`binning.ctr_slot_columns`), so every
+    level the category table evicted shares bucket 0 and shares one
+    statistic: the columns carry no information the truncated categorical
+    column does not already carry, and on the shape they are meant for they
+    measured no gain in either AUC or average precision. They cost four
+    columns per source column. Read that function's docstring before turning
+    this on.
+
+    This is a `Dataset` parameter. The scikit-learn estimators bin their own
+    input and do not route through here, so they do not build CTR columns
+    yet.
 
     Binning happens on `construct()`, or on the first `train()` that uses
     the dataset. Until then this is validated data and nothing more.
@@ -518,9 +551,16 @@ class Dataset:
             )
         if int(out["max_bin"]) < 2:
             raise ValueError("max_bin must be at least 2")
+        ctr = str(out["ctr"])
+        if ctr not in _CTR_RULES:
+            raise ValueError(
+                f"ctr must be one of {', '.join(sorted(_CTR_RULES))};"
+                f" got {ctr!r}"
+            )
         return {
             "max_bin": int(out["max_bin"]),
             "use_missing": bool(out["use_missing"]),
+            "ctr": ctr,
         }
 
     @staticmethod
@@ -689,6 +729,7 @@ class Dataset:
             "categorical_len": 0 if cat is None else len(cat),
             "max_bin": int(self.params["max_bin"]),
             "use_missing": int(bool(self.params["use_missing"])),
+            "ctr": str(self.params["ctr"]),
             "feature_names": [] if self._names is None else list(self._names),
             "n_names": 0 if self._names is None else len(self._names),
             "keep_raw": int(self.keep_raw),
@@ -778,6 +819,13 @@ class Dataset:
         self.params = {
             "max_bin": int(meta["max_bin"]),
             "use_missing": bool(meta["use_missing"]),
+            # Present so this dict has the same keys as a binned Dataset's
+            # and nothing reading it hits a KeyError. It is NOT a reading:
+            # `dataset_metadata` does not report the ctr source rule, and
+            # this Dataset wraps columns somebody else binned and will never
+            # re-bin them, so the value is the default rather than a fact
+            # about the handle.
+            "ctr": "off",
         }
         self.free_raw_data = False
         self.keep_raw = bool(meta["has_raw"])

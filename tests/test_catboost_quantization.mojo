@@ -458,14 +458,23 @@ def _set_size(bitset: SIMD[DType.uint64, 4]) -> Int:
 
 
 def test_one_hot_max_size_off_leaves_the_lightgbm_threshold_in_charge() raises:
-    # max_cat_to_onehot = 6 with six categories, so the one-vs-rest path, and
+    # max_cat_to_onehot = 7 with six categories, so the one-vs-rest path, and
     # the winning set is a single category.
+    #
+    # Seven and not six, because LightGBM's test is on `num_bin` and its
+    # `num_bin` counts the reserved bin 0
+    # (`src/treelearner/feature_histogram.cpp:183`, `src/io/bin.cpp:456-460`).
+    # `categorical.mojo` compared `n_categories` until 2026-08-16 and so
+    # one-hotted one category more than LightGBM; the comparison is now
+    # `n_categories + 1 <= max_cat_to_onehot` and this line moved with it.
+    # What the test pins is unchanged: with `one_hot_max_size` off, the
+    # LightGBM threshold is the one in charge.
     var spec = CategoricalSpec([True], [0, 1, 2, 3, 4, 5], [0, 6])
     var split = find_best_split(
         _alternating_hist(),
         lambda_reg=0.0,
         min_data_in_leaf=0,
-        cat_params=CategoricalParams(6, 32, 1.0, 0.0, 1),
+        cat_params=CategoricalParams(7, 32, 1.0, 0.0, 1),
         cats=spec,
     )
     assert_true(split.found and split.is_categorical)

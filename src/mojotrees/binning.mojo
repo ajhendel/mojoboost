@@ -1827,6 +1827,39 @@ def ctr_slot_columns(
     is a real bucket with real statistics, which is why CatBoost's
     absent-category arm is unreachable from this wiring.
 
+    **THE CONSEQUENCE, MEASURED 2026-08-16, AND IT BOUNDS WHAT A CTR CAN DO
+    HERE.** The line below is `out[dst + r] = Int(bins[src + r])`: the source
+    is the BINNED bucket, not the raw category code. So a CTR column is a
+    deterministic function of the bucket, and every level the category table
+    evicted shares bucket 0 and therefore shares one statistic. A CTR built
+    this way carries **no information the truncated categorical column does
+    not already carry**; it re-expresses it as an ordinal, which is a real
+    thing to be able to do, but it cannot recover a single evicted level.
+
+    That matters because recovering evicted levels is the reason
+    `bench/real_data/thresholds.json` names an ordered target statistic as
+    `high_cardinality_categorical`'s exit condition. It cannot be, as wired.
+    Two measurements on the shape that gate is about, 400 near-uniform levels
+    against a 254-entry table so roughly a third of the rows fall into bucket
+    0, 256,000 training rows, 100 rounds:
+
+        ctr=off   auc 0.891191   ap 0.837608
+        ctr=auto  auc 0.891210   ap 0.837575
+
+    and at 3,000 levels with 15 rows each, `auc 0.681706 -> 0.681534` and
+    `ap 0.576727 -> 0.577537`. Both nulls, in both directions, which is what
+    "adds no information" looks like from the outside. The `ctr` section does
+    reach the saved model in both runs, so this is the mechanism working and
+    not the mechanism being unreached.
+
+    Making the CTR recover evicted levels means sourcing it from the raw
+    category code instead, which is a change to this function, to
+    `plan_ctr_columns`' bucket counts, to `fit_ctr_tables`, to
+    `ctr_predict_columns`, and to what `CategoricalSpec` stores, since it
+    keeps the kept codes and not the distinct count it started from. That is
+    a design change and not an edit, and it is why `Dataset`'s `ctr` default
+    is `disabled()` rather than the overflow policy it briefly was.
+
     Cost: `n_slots * n_rows` `Int`s, `8 * C * n` bytes, transient.
     """
     var out = List[Int]()

@@ -1679,13 +1679,19 @@ categorical node, matching LightGBM's `CategoricalDecision`:
   because its histograms carry no counts; mojotrees's do, so
   `min_data_in_leaf`, `min_data_per_group`, and the `cat_smooth` count filter
   use exact counts.
-- One-vs-rest is selected on the number of categories, matching the
-  documented meaning of `max_cat_to_onehot`, rather than on an internal bin
-  count that may or may not include the unknown bin.
 - LightGBM keeps the most frequent categories covering 99% of rows and drops
   categories below `min_data_in_bin`; mojotrees keeps the `max_bins - 1` most
   frequent and drops nothing else, leaving rare categories to the
-  `cat_smooth` filter during split search.
+  `cat_smooth` filter during split search. **`max_bin` is a FLOOR on a
+  LightGBM categorical column's bin count and a CEILING here**: its
+  `BinMapper::FindBin` keeps admitting categories while
+  `used_cnt < cut_cnt || num_bin_ < max_bin` (`src/io/bin.cpp:461-462`) and
+  widens its bin storage to `uint16_t` or `uint32_t` to hold the result,
+  where a mojotrees bin id is one byte. Categories past the ceiling fall into
+  bin 0, which no split set can reach. `Dataset(params={"ctr": "auto"})`
+  gives such a column ordered target statistics, and is off by default
+  because those statistics are computed from the binned bucket and so
+  cannot recover an evicted level; see `binning.ctr_slot_columns`.
 - LightGBM's `kEpsilon` (1e-15) Hessian nudges are omitted.
 - Monotonic constraints on a categorical feature are rejected rather than
   silently applied.

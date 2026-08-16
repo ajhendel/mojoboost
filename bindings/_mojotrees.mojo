@@ -209,6 +209,7 @@ from mojotrees.trainset import (
     update_dataset_multiclass as mojo_update_dataset_multiclass,
 )
 from mojotrees.binning import BinnedMatrix
+from mojotrees.ctr_columns import SimpleCtrConfig
 from mojotrees.linear_tree import LinearParams
 from mojotrees.ordered_boosting import OrderedBoostingParams
 from mojotrees.device import (
@@ -1095,6 +1096,41 @@ def _parse_cat_params(params: PythonObject) raises -> CategoricalParams:
         Float64(py=params["cat_smooth"]),
         Float64(py=params["cat_l2"]),
         Int(py=params["min_data_per_group"]),
+    )
+
+
+def _parse_ctr(params: PythonObject) raises -> SimpleCtrConfig:
+    """The dataset's ordered-target-statistic bundle, catalog A19.
+
+    Three values, passed as a string because they name rules rather than
+    counting anything:
+
+    - `"auto"`, the default. `SimpleCtrConfig.auto()`: CTR columns for the
+      categorical columns that filled their category table and so lost levels
+      into `categorical.UNKNOWN_BIN`, and for no others. On a dataset with no
+      categorical column, or none wide enough to overflow, this plans nothing
+      and the binned matrix is the one it would have been.
+    - `"off"`. `SimpleCtrConfig.disabled()`, the behavior of every release
+      before this default moved.
+    - `"catboost"`. `SimpleCtrConfig.catboost_defaults()`: CatBoost's own
+      source rule, `uniqueValues > one_hot_max_size` at 2, which gives almost
+      every categorical column four extra numeric columns. It is the faithful
+      port and it is not the default, because away from the overflow boundary
+      those columns cost histogram width without recovering anything the
+      category table already holds.
+
+    Anything else raises here rather than resolving to a default, so a typo is
+    an error and not a silently different model.
+    """
+    var name = String(py=params.get("ctr", PythonObject("off")))
+    if name == "auto":
+        return SimpleCtrConfig.auto()
+    if name == "off":
+        return SimpleCtrConfig.disabled()
+    if name == "catboost":
+        return SimpleCtrConfig.catboost_defaults()
+    raise Error(
+        "ctr must be 'auto', 'off' or 'catboost'; got '", name, "'"
     )
 
 
@@ -3511,6 +3547,7 @@ def dataset_create(
         Int(py=params["max_bin"]),
         _parse_use_missing(params),
         Int(py=params["keep_raw"]) != 0,
+        _parse_ctr(params),
     )
     return PythonObject(alloc=dataset^)
 
