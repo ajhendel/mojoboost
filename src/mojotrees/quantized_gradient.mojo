@@ -14,10 +14,28 @@ gradients onto a 2^30 fixed-point lattice, accumulates them with Int32
 integer atomics, and dequantizes on download, for exactly the reason above:
 Metal has no float atomic add, and integer accumulation is the only
 order-independent option that is portable across CUDA, ROCm, and Metal. What
-it does not have is a *choice* of lattice: the scale is always
-`2^30 / sum|g|`, the rounding is always deterministic, and the integers are
-always as wide as the accumulator. This module is the one place that decides
-those three things, for the CPU and the GPU alike.
+it does not have is a *choice* of lattice: the scale is always the
+magnitude-sum rule, the rounding is always deterministic, and the integers
+are always as wide as the accumulator. This module is the one place that
+decides those three things, for the CPU and the GPU alike.
+
+THE SCALE RULE, IN ONE PARAGRAPH
+--------------------------------
+The magnitude-sum scale is a **power of two**: take `2^30 / sum|g|` and round
+it **down** to a power of two -- the largest one at or below it, never the
+nearest one. `fixed_point_scale_pow2` is that
+rule, stated once, and it is what a CPU fixed-point histogram calls or copies
+verbatim -- this module imports nothing from `max.gpu.*` and nothing from any
+GPU file, which is why it can be the shared definition at all. Down rather
+than to nearest, because the whole overflow argument rests on the exact
+scaled total staying at or below 2^30 and rounding up would raise it. A power
+of two rather than an arbitrary real, because it deletes three separate
+roundings: from the dequantization on download, from the Float32 product
+inside the quantization kernel, and from the narrowing of the scale itself.
+It costs at most one bit of lattice resolution, and that cost is stated
+rather than buried. The bound, the proof, the extremes, and the rejected
+alternatives are all at `fixed_point_scale_pow2`; the pre-existing arm
+survives as `SCALE_SHAPE_ARBITRARY` so the change can be measured.
 
 WHAT IS HERE, AND WHAT IS DELIBERATELY NOT
 ------------------------------------------
@@ -55,10 +73,12 @@ Converting between the two is one division; the docstring on
   bound `n_rows * B/2` and lets a narrow accumulator be chosen from the node
   size.
 - `SCALE_MAGNITUDE_SUM` is the rule `histogram_gpu.mojo` ships:
-  `units = 2^30 / sum|g|`. The bound is on the *total*, not per row: any
-  node's rows are a subset of all rows, so no partial sum of scaled values
-  can exceed 2^30 plus the rounding residue. There is no clamp, because
-  nothing can reach one.
+  `units = 2^30 / sum|g|`, rounded down to a power of two. The bound is on
+  the *total*, not per row: any node's rows are a subset of all rows, so no
+  partial sum of scaled values can exceed 2^30 plus the rounding residue.
+  There is no clamp, because nothing can reach one. Rounding the factor down
+  can only lower the exact scaled total (into `(2^29, 2^30]`), so it moves
+  that bound in the safe direction and never the other way.
 
 They are not interchangeable, and the difference is the whole point of
 having both. `SCALE_MAX_ABS` at B = 4 is lossy by design: it is a
@@ -150,7 +170,18 @@ smoothing, and every count-based guard behave identically.
 Sibling subtraction. In floating point the subtraction trick is exact only
 up to cancellation; in integers it is exact, full stop. `subtract_quantized`
 is therefore the one histogram operation that quantization makes *more*
-accurate rather than less.
+accurate rather than less. **The scale cannot affect this, and that is worth
+stating rather than assuming**, because every other exactness claim in the
+package rests on it. The exactness comes from the accumulator: Int32 addition
+is associative and commutative, and a parent cell is the exact integer sum of
+its two children's cells, so `parent - left == right` identically. A scale is
+one fixed multiplier applied to every row of the round before any integer
+reaches a bin, so parent and both children are counts in the same unit
+whatever that unit is. Changing the unit from an arbitrary real to a power of
+two changes which integers are counted and changes nothing about the identity
+that relates them. `check_same_lattice` is what refuses a subtraction across
+two different scales, and it gets easier rather than harder under the default
+shape: two equal powers of two are bit-equal at every float width.
 
 Leaf renewal for `mae`, `quantile`, and `mape`. Those objectives rewrite
 every leaf value from residuals after the tree is grown
@@ -176,6 +207,7 @@ policy in prose.
 """
 
 from std.math import floor, isfinite, round
+from std.memory import bitcast
 
 from .binning import BinnedMatrix
 from .gain import leaf_score
@@ -218,6 +250,27 @@ comptime SCALE_MAX_ABS = 0
 
 comptime SCALE_MAGNITUDE_SUM = 1
 """The rule `histogram_gpu.mojo` ships: a total-sum lattice at 2^30."""
+
+comptime SCALE_SHAPE_ARBITRARY = 0
+"""The magnitude-sum factor as it shipped: `Float32(2^30 / T)`, whatever
+real number that lands on. Kept reachable so the change to
+`SCALE_SHAPE_POW2` can be measured rather than asserted; it is never the
+more accurate arm."""
+
+comptime SCALE_SHAPE_POW2 = 1
+"""The magnitude-sum factor rounded *down* to a power of two. The default.
+`fixed_point_scale_pow2` is the rule and states the whole argument."""
+
+comptime DEFAULT_SCALE_SHAPE = SCALE_SHAPE_POW2
+"""Which shape `fixed_point_scale` returns when no caller names one.
+
+`SCALE_SHAPE_POW2`, because it deletes three separate roundings outright and
+tightens the overflow bound, at a cost of at most one bit of lattice
+resolution. Deleting a rounding and coarsening a lattice are not the same
+kind of thing and the net is a *trade*, not a free win; the three roundings,
+the bound, and the cost are all argued at `fixed_point_scale_pow2`, which
+works the trade through per bin rather than asserting a direction.
+"""
 
 comptime ROUND_NEAREST = 0
 """Round to nearest through `std.math.round`, the rule the shipped device
@@ -287,6 +340,12 @@ def describe_rounding(mode: Int) -> String:
     if mode == ROUND_STOCHASTIC:
         return "stochastic"
     return "nearest"
+
+
+def describe_scale_shape(shape: Int) -> String:
+    if shape == SCALE_SHAPE_ARBITRARY:
+        return "arbitrary"
+    return "power-of-two"
 
 
 def describe_reason(reason: Int) -> String:
@@ -629,11 +688,23 @@ def combine_stats(a: GradientStats, b: GradientStats) -> GradientStats:
     count.
 
     The float sums are not bit-associative, so `sum_abs_*` can differ in the
-    last ulp between partitions. That moves the scale by a relative 2^-52,
-    which moves a quantized value by at most one unit at 2^30 and by nothing
-    at all at a small bin count. It is the same tolerance
+    last ulp between partitions. It is the same tolerance
     `histogram_gpu._fixed_scale` already lives with, since it sums a Float64
     list in row order and the device sums in reduction order.
+
+    What that ulp costs depends on the scale shape, and the two differ in
+    kind rather than in degree. Under `SCALE_SHAPE_ARBITRARY` it moves the
+    scale by a relative 2^-52, which moves a quantized value by at most one
+    unit at 2^30 and by nothing at all at a small bin count: small, and
+    always present. Under `SCALE_SHAPE_POW2`, the default, the scale is a
+    step function of the sum and is constant across a whole binade, so the
+    ulp moves it by *nothing at all* except in the vanishingly rare case
+    where the two partitions' quotients straddle a power-of-two boundary --
+    in which case it moves it by a factor of two. Almost always better, and
+    worse in a measure-2^-52 set of inputs. `fixed_point_scale_pow2` names
+    that discontinuity and points at the mitigation, which is this function's
+    caller in the distributed case: agree on one total first, then derive one
+    scale from it.
     """
     var max_g = a.max_abs_grad
     if b.max_abs_grad > max_g:
@@ -727,28 +798,67 @@ def magnitude_sum(values: List[Float64]) raises -> Float64:
     return total
 
 
-def fixed_point_scale(total: Float64) raises -> Float32:
-    """The `SCALE_MAGNITUDE_SUM` factor for a magnitude sum: every partial
-    sum of scaled values stays within +/- 2^30, half the Int32 range.
+def floored_magnitude(total: Float64) raises -> Float64:
+    """The magnitude sum a scale is actually derived from: `total`, floored
+    at `MAGNITUDE_FLOOR` and refused if it is not finite.
 
-    Returned as Float32 because that is the precision the device kernel
-    multiplies by, so a host-side inverse matches the device quantization
-    exactly. Magnitude sums below `MAGNITUDE_FLOOR` are numerically zero
-    against any regularization; the floor keeps the scale finite instead of
-    dividing by (near) zero.
-
-    This is `gpu_objectives_native.device_fixed_scale` and the scalar core
-    of `histogram_gpu._fixed_scale`, expression for expression, with no
-    dependency on `max.gpu.*`. That is the point: those two are the same
-    arithmetic written twice in modules a CPU-only build cannot import, and
-    their own docstrings ask for exactly this single definition. The handoff
-    carries the two-line patch that makes them call it.
+    Split out of the two scale rules below so both floor the same value the
+    same way and neither can drift from the other. A sum below the floor is
+    numerically zero against any regularization; the floor is what keeps the
+    scale finite instead of dividing by (near) zero, and it is why the
+    all-zero-gradient case has a defined answer rather than an infinity.
     """
     var t = total
     if not isfinite(t):
         raise Error("gradients and hessians must be finite")
     if t < MAGNITUDE_FLOOR:
         t = MAGNITUDE_FLOOR
+    return t
+
+
+def largest_power_of_two_at_most(x: Float64) raises -> Float64:
+    """`2^floor(log2(x))` for a positive normal Float64 `x`: the largest
+    power of two that does not exceed `x`.
+
+    Exact, by construction rather than by tolerance. A positive normal
+    Float64 is `1.m * 2^e` with `1 <= 1.m < 2`, so clearing the mantissa
+    field leaves exactly `2^e`, and `2^e <= x < 2^(e+1)` is precisely the
+    floor. No `log2`, no `floor` on a float, and therefore no way for the
+    answer to come back one power off at an exact power of two, which is the
+    failure mode a `floor(log2(x))` spelling has and which would round the
+    scale *up* -- the unsafe direction (see `fixed_point_scale_pow2`).
+
+    Rejected alternative: `ldexp(1.0, ilogb(x))`. Same answer where both are
+    defined, one more libm dependency, and `ilogb`'s behavior on the
+    subnormal and zero edges is exactly the part this function has to be
+    explicit about. The bit spelling is the one already used in this
+    repository (`binning.mojo`, `distributed_transport.f64_from_bits`).
+
+    Raises on zero, on a subnormal, and on a non-finite input. Zero and
+    subnormal are not oversights: a subnormal `x` is below 2^-1022, which is
+    hundreds of binades below anything Float32 can hold, so every caller here
+    would have had to refuse it one line later anyway.
+    """
+    if not isfinite(x) or x <= 0.0:
+        raise Error("a power-of-two floor needs a positive finite value")
+    var bits = x.to_bits().cast[DType.uint64]()
+    var biased = (bits >> 52) & 0x7FF
+    if biased == 0:
+        raise Error(
+            "a power-of-two floor needs a normal value; this one is subnormal"
+        )
+    return bitcast[DType.float64, 1](SIMD[DType.uint64, 1](biased << 52))
+
+
+def fixed_point_scale_arbitrary(total: Float64) raises -> Float32:
+    """The magnitude-sum factor as it shipped: `Float32(2^30 / T)`.
+
+    Kept reachable, unchanged expression for expression, so
+    `SCALE_SHAPE_POW2` can be A/B'd against the thing it replaced instead of
+    against a reconstruction of it. It is never the more accurate arm; see
+    `fixed_point_scale_pow2`.
+    """
+    var t = floored_magnitude(total)
     var scale = Float32(FIXED_ONE / t)
     if not isfinite(scale) or scale <= 0.0:
         raise Error(
@@ -756,6 +866,252 @@ def fixed_point_scale(total: Float64) raises -> Float32:
             " fixed-point histogram"
         )
     return scale
+
+
+def fixed_point_scale_pow2(total: Float64) raises -> Float32:
+    """THE RULE. Given `total = sum|g|` (or `sum|h|`) for the round, return
+    the power of two `2^k` with `2^k <= fl(2^30 / T)`, where `T` is `total`
+    floored at `MAGNITUDE_FLOOR`.
+
+    A CPU implementation calls this function. It is in this module, which
+    imports nothing from `max.gpu.*` and nothing from any GPU file, precisely
+    so a CPU-only build can call it; `gpu_objectives_native.device_fixed_scale`
+    already forwards here, so host and device get the same `2^k` from the same
+    line of code rather than from two spellings that have to be kept in step.
+    Copying it verbatim is also fine, and if it is copied, copy
+    `largest_power_of_two_at_most` with it: the bit spelling is load-bearing,
+    not stylistic.
+
+    WHY A POWER OF TWO: THREE ROUNDINGS DELETED
+    -------------------------------------------
+    The accumulated cell is an Int32 count of lattice units and every consumer
+    has to get back to a Float64 gradient sum. With an arbitrary scale `s`,
+    three separate roundings sit between the gradient and the reconstructed
+    sum, and all three vanish when `s = 2^k`:
+
+    1. **Dequantization.** `histogram_gpu.download` computes
+       `1.0 / self.g_scale` once and multiplies every cell by it. For an
+       arbitrary `s` the reciprocal is not representable, so the stored
+       inverse is `fl(1/s) = (1/s)(1 + d)` with `|d| <= 2^-53`, and the
+       product carries a second rounding on top. For `s = 2^k`, `2^-k` is
+       exact in Float64 for every `k` this rule can produce, and a Float64
+       times a power of two is exact, so `Float64(cell) * 2^-k` is the exact
+       real value of the cell. Zero error, not less error.
+    2. **Quantization.** Every histogram kernel computes
+       `Int32(round(x * scale))` with `x` and `scale` both Float32
+       (`gpu_active_rows.mojo`, `gpu_leaf_batching.mojo`). For an arbitrary
+       `s` narrowed to Float32 the product `x * s` is itself rounded before
+       `round` sees it, so the kernel rounds a number that is already off the
+       true product by a relative 2^-24; the result can therefore differ from
+       the correctly-rounded quantization of `x * s` by a whole unit. For
+       `s = 2^k` the Float32 product is exact (a binary exponent shift), so
+       `round` sees the true product and the quantization is the correctly
+       rounded one. This is the rounding that reaches the *bits of the
+       histogram*, which is why it is the one worth the most.
+    3. **The scale itself.** `Float32(2^30 / T)` is the arbitrary rule's own
+       narrowing, a relative 2^-24 the host and device both inherit and which
+       the `QuantScales` docstring currently has to warn about ("derived
+       through Float32 ... because that is the width the device kernel stores
+       the scale in"). `2^k` is exactly representable at Float32, Float64,
+       and every device float width, so that warning stops applying: the host
+       factor and the device factor are the same number by construction, at
+       any width, with nothing to keep in step.
+
+    THE SAFETY BOUND, AND WHY THE ROUNDING GOES DOWN
+    ------------------------------------------------
+    The repository's overflow argument (`docs/GPU_PORTABILITY.md`,
+    `test_gpu_portability.test_fixed_point_accumulation_cannot_overflow_int32`,
+    `distributed_gpu.check_fixed_point_headroom`) is: the exact scaled sum of
+    every row's magnitude is at most 2^30, any node holds a subset of the
+    rows, deterministic rounding adds at most 1/2 per row, so no cell exceeds
+    `2^30 + n/2`, and at `n = Int32.MAX` that is exactly `Int32.MAX`.
+
+    Rounding the scale to a power of two changes the first term, and it must
+    change it downward or the argument breaks. So the rule floors rather than
+    rounds to nearest:
+
+        s2 = 2^k <= fl(2^30 / T)          by construction
+        sum_i |g_i| * s2 <= T * s2
+                         <= T * fl(2^30 / T)
+                         <= T * (2^30 / T)(1 + 2^-53)
+                          = 2^30 (1 + 2^-53)
+
+    against the shipped arm, whose Float32 narrowing rounds to *nearest* and
+    so admits `2^30 (1 + 2^-24)`. In units: the shipped arm's exact term can
+    stand 64 units above 2^30; this one can stand at most 2^-23 of a unit
+    above it, which no integer accumulation can see. **Derived bound**, not
+    measured. The bound therefore does not merely survive, it tightens by 64
+    units, and every downstream statement of `2^30 + n/2` remains true with
+    strictly more slack than it had. Nothing in the repository has to be
+    re-derived in the loosening direction, because there is no loosening.
+
+    Rejected alternative: round to *nearest* power of two. It is the more
+    accurate arm on average (half the resolution loss, below) and it is
+    unsafe, because it admits `s2 <= sqrt(2) * (2^30 / T)` and pushes the
+    exact term to `2^30 * sqrt(2) ~ 1.52 * 10^9`, which leaves
+    `Int32.MAX - 2^30*sqrt(2) ~ 6.3 * 10^8` for the residue and cuts the safe
+    row ceiling from about 2.1 billion to about 1.3 billion. Buying half a bit
+    by moving a headroom argument in the unsafe direction is the wrong trade
+    at any price, and the argument is the thing this file exists to protect.
+
+    THE PRECISION COST, STATED HONESTLY
+    -----------------------------------
+    `2^k` can be as little as half of `2^30 / T` and as much as all of it, so
+    the exact scaled total lands in `(2^29, 2^30]` where the shipped arm put
+    it at `2^30`. That is **up to one bit** of lattice resolution given up,
+    and on the order of half a bit on average if `log2(2^30 / T)` is taken to
+    be uniform in its fractional part (**estimated**; nothing here measured
+    the distribution of gradient magnitude sums over real rounds, and it is
+    not uniform in general). The lattice goes from 30 bits of headroom below
+    the total to between 29 and 30.
+
+    That cost is real and it does not cancel. Worked through at the level
+    that matters, one bin of `n_b` rows, in units of value rather than
+    lattice units, all four terms **derived bounds**:
+
+        deterministic rounding, either arm:  (n_b / 2) / s
+        Float32 product error, arbitrary:    <= 2^30 * 2^-24 / s = 64 / s
+                                             (over the whole round, since
+                                              sum|x| * s <= 2^30)
+        dequantization, arbitrary:           two roundings per cell
+        dequantization, power of two:        zero
+
+    With `s2 >= s_arb / 2`, the first term at worst doubles and the second
+    and third go to zero. So the bin's error bound *improves* while
+    `n_b < 128` and *worsens*, by at most a factor of two, above that. A
+    histogram's populated bins near the root are far above 128 rows and its
+    bins near the frontier are far below, so both regimes occur in one fit
+    and no single sentence covers them.
+
+    What is unconditional: the dequantization error goes to exactly zero
+    (item 1), the scale's own narrowing error goes to exactly zero (item 3),
+    and the quantization stops being the rounding of an already-wrong product
+    (item 2). What is conditional: the lattice step doubles at worst, which
+    dominates in large bins. **This is a trade, and calling it anything else
+    would be dishonest.** It is taken because exactness is composable and
+    resolution at the 29th bit of a Float64-derived gradient is not: an exact
+    conversion is a property the CPU and GPU can be held to and a shared
+    numeric contract can be written against, and half a bit at 2^-30 is
+    already far below the Float32 the device stores the gradient in.
+
+    THE EXTREMES
+    ------------
+    - **All-zero gradients.** `T` floors to `MAGNITUDE_FLOOR = 1e-12`, so
+      `2^30 / T ~ 1.15e21` and `k = 70`. Every value quantizes to 0, the
+      histogram is all zeros, and the split search finds no gain -- the same
+      outcome the shipped arm produces, reached by the same floor.
+    - **A single enormous outlier.** `T ~ |g_max|`, so the outlier alone
+      quantizes to between 2^29 and 2^30 and every other row rounds toward
+      zero. No clamp is applied and none is needed: the bound above is on the
+      total and holds whatever the distribution is. This is the case that
+      pays the full one-bit cost, because it is also the case where the
+      arbitrary scale was landing exactly on 2^30.
+    - **Denormals.** A subnormal `T` is below the floor and never reaches the
+      exponent extraction. A subnormal *quotient* means `T` above about
+      4.5e291, which no finite gradient sum in a Float64 dataset reaches
+      before `magnitude_sum` raises; `largest_power_of_two_at_most` refuses it
+      rather than returning a power of two it cannot represent.
+    - **Below Float32.** The returned Float32 is checked to be *exactly*
+      `2^k` (`Float64(scale) != p` raises), which is what makes every claim
+      above true of the value the kernels actually receive. It refuses at
+      `k < -149`, where the shipped arm would have rounded a Float64 quotient
+      *up* to the smallest Float32 subnormal and quantized with a scale
+      larger than the rule asked for. That is the one input on which this arm
+      raises and the shipped arm does not; it needs `T` above roughly 7.6e53
+      and it is refused rather than accepted precisely because accepting it
+      would round the scale up.
+
+    WHAT THIS DOES NOT TOUCH
+    ------------------------
+    **Sibling subtraction stays exact, and nothing here can make it
+    otherwise.** `subtract_quantized`, and the device sibling subtraction in
+    `gpu_split_search.mojo`, are exact because Int32 addition is associative
+    and commutative and because a parent cell is the exact integer sum of its
+    two children's cells -- properties of the *accumulator*, not of the
+    scale. A scale is a fixed multiplier applied identically to every row of
+    the round before any integer touches a bin, so parent, left child, and
+    right child are all counts in the same unit whatever that unit is, and
+    `parent - left == right` holds identically. `check_same_lattice` is what
+    enforces that two histograms being subtracted came from the same scale,
+    and it compares the factors for equality; that comparison gets *easier*
+    under this rule, since two equal powers of two are bit-equal at every
+    width. This paragraph is here because sibling subtraction is the property
+    every other exactness claim in the package rests on, and "a scale change
+    cannot affect it" is worth stating rather than assuming.
+
+    Counts are untouched for the same reason they always were: the count
+    plane holds no scaled value.
+
+    ONE DISCONTINUITY, NAMED
+    ------------------------
+    The arbitrary rule is continuous in `T`; this one is a step function. Two
+    partitions that sum the same magnitudes in different orders can differ in
+    the last ulp (`combine_stats` documents that tolerance), and under the
+    arbitrary rule that moved the scale by an ulp. Under this rule it almost
+    always moves it by *nothing at all*, because a step function is constant
+    over a binade -- but in the vanishingly rare case where the two sums
+    straddle a power-of-two boundary of the quotient, it moves the scale by a
+    factor of two. The mitigation already exists and does not change:
+    `distributed_gpu.agree_fixed_scales` all-reduces the two magnitude sums
+    and derives one scale for every rank *before* any rank quantizes, which
+    is requirement 1 of `docs/distributed.md` section 5. That reduction was
+    belt-and-braces against an ulp; it is load-bearing against a binade, and
+    this sentence is the record that its status changed.
+    """
+    var t = floored_magnitude(total)
+    var quotient = FIXED_ONE / t
+    if not isfinite(quotient) or quotient <= 0.0:
+        raise Error(
+            "gradient/hessian magnitudes are out of range for the"
+            " fixed-point histogram"
+        )
+    var p = largest_power_of_two_at_most(quotient)
+    var scale = Float32(p)
+    # Exactness, checked rather than argued. A power of two below 2^-149 is
+    # not a Float32 at all and narrowing rounds it *up* to the smallest
+    # subnormal, which is the one direction the bound above forbids. The
+    # equality catches that, catches an overflow to infinity, and catches a
+    # flush to zero, in one comparison.
+    if not isfinite(scale) or scale <= 0.0 or Float64(scale) != p:
+        raise Error(
+            "gradient/hessian magnitudes are out of range for the"
+            " fixed-point histogram"
+        )
+    return scale
+
+
+def fixed_point_scale_shaped(total: Float64, shape: Int) raises -> Float32:
+    """`fixed_point_scale` with the arm named explicitly.
+
+    The arm is a function argument and not an environment variable and not a
+    module-level switch, for the reason `histogram_gpu.set_row_unroll` gives:
+    this machine's device timings drift several-fold between time windows, so
+    only two arms interleaved inside one process compare, and a module-level
+    switch would also be a global, which this package does not have.
+    """
+    if shape == SCALE_SHAPE_ARBITRARY:
+        return fixed_point_scale_arbitrary(total)
+    return fixed_point_scale_pow2(total)
+
+
+def fixed_point_scale(total: Float64) raises -> Float32:
+    """The `SCALE_MAGNITUDE_SUM` factor for a magnitude sum, at
+    `DEFAULT_SCALE_SHAPE`: every partial sum of scaled values stays within
+    +/- 2^30, half the Int32 range.
+
+    Returned as Float32 because that is the precision the device kernel
+    multiplies by, so a host-side inverse matches the device quantization
+    exactly. Under the default shape the width no longer matters -- the
+    factor is a power of two and is the same number at every width -- but the
+    signature is what six call sites already import, so it stays.
+
+    This is `gpu_objectives_native.device_fixed_scale` and the scalar core
+    of `histogram_gpu._fixed_scale`, expression for expression, with no
+    dependency on `max.gpu.*`. That is the point: those two are the same
+    arithmetic written twice in modules a CPU-only build cannot import, and
+    their own docstrings ask for exactly this single definition.
+    """
+    return fixed_point_scale_shaped(total, DEFAULT_SCALE_SHAPE)
 
 
 @fieldwise_init
@@ -777,6 +1133,15 @@ struct QuantScales(Copyable, Movable):
     `SCALE_MAGNITUDE_SUM`, because that is the width the device kernel
     stores the scale in; keeping the host and device factors bit-identical
     is what makes a CPU replica of a GPU histogram reproduce it.
+
+    Under `DEFAULT_SCALE_SHAPE` that narrowing is a no-op and the warning
+    above no longer has anything to warn about: the factor is a power of two,
+    which is exactly representable at Float32, at Float64, and at every
+    device float width, so the host factor and the device factor are the same
+    number by construction rather than by a convention two files have to
+    keep. The Float32 round trip is retained anyway, because it is also the
+    range check -- a power of two too small to be a Float32 is refused there
+    (`fixed_point_scale_pow2`).
     """
 
     var grad_units: Float64
@@ -844,7 +1209,10 @@ def derive_scales(
     if params.scale_rule == SCALE_MAGNITUDE_SUM:
         # Float32 on purpose: the device stores the scale at that width and
         # multiplies by it, so a host factor of any other precision would
-        # put the CPU and GPU on different lattices.
+        # put the CPU and GPU on different lattices. Under
+        # `DEFAULT_SCALE_SHAPE` the width is no longer what makes them agree
+        # -- a power of two is the same number at every width -- but the call
+        # is unchanged so the arbitrary arm keeps the property it needs.
         var g_units = Float64(fixed_point_scale(stats.sum_abs_grad))
         var h_units = Float64(fixed_point_scale(stats.sum_abs_hess))
         return QuantScales(
@@ -1033,7 +1401,14 @@ def accumulation_bound(
 
     Under `BOUND_TOTAL` the scale itself bounds the exact scaled sum at
     `FIXED_ONE`, and the rounding adds up to `residue_per_row * n_rows` on
-    top. That second term is the reason this function exists rather than
+    top. `FIXED_ONE` is the right constant for both scale shapes and is
+    conservative for the default one: `SCALE_SHAPE_POW2` floors the factor,
+    so the exact scaled total it produces lands in `(2^29, 2^30]` and this
+    bound holds with up to a factor of two of unused slack. Using the real
+    per-round total instead would tighten the answer and would make the
+    accumulator width depend on the round's magnitudes, which is exactly the
+    kind of data-dependent width this function refuses to have. That second
+    term is the reason this function exists rather than
     returning a constant: at `Int32.MAX` rows the deterministic bound is
     `2^30 + (2^31 - 1)/2`, which floors to exactly `Int32.MAX` and fits the
     shipped Int32 accumulator with zero slack, while the stochastic bound is
@@ -1831,6 +2206,15 @@ def lattice_resolution_bits(scales: QuantScales) -> Float64:
     Reported for gradients only. The hessian lattice is one bit wider by
     construction under the max-abs rule, and identical under the
     magnitude-sum rule.
+
+    This reports the lattice's *capacity*, not the resolution a given round
+    achieves, and the two now differ. `grad_max_unit` is `FIXED_ONE` under
+    the magnitude-sum rule whatever the round's magnitudes are, so this still
+    answers 31; under `SCALE_SHAPE_POW2` the round's exact scaled total lands
+    somewhere in `(2^29, 2^30]`, so between zero and one bit of that capacity
+    goes unused. Deliberately not folded in here: this function takes a
+    lattice and not a round, and a capacity that moved with the data would be
+    a worse diagnostic, not a better one.
     """
     var v = scales.grad_max_unit
     var bits = 0.0

@@ -105,17 +105,68 @@ narrow accumulator be chosen from the node's size.
 ### `SCALE_MAGNITUDE_SUM`, the rule the GPU already ships
 
 ```
-grad units = 2^30 / sum|g|             no clamp is reachable
-hess units = 2^30 / sum|h|
+grad units = pow2_floor(2^30 / sum|g|)   no clamp is reachable
+hess units = pow2_floor(2^30 / sum|h|)
 ```
+
+where `pow2_floor(x)` is the largest power of two at or below `x`. **This is
+THE rule**, and `quantized_gradient.fixed_point_scale_pow2` is the one place
+it is written. A CPU fixed-point histogram calls that function or copies it
+verbatim; `histogram_gpu._fixed_scale`,
+`gpu_objectives_native.device_fixed_scale`, and
+`distributed_gpu.fixed_scale_from_total` all forward to it, so host, device,
+and every rank derive the factor from the same line.
 
 The bound is on the **total**, not per row: any node's rows are a subset of
 all rows, so no partial sum of scaled values can exceed 2^30 plus the
-rounding residue. This is `histogram_gpu._fixed_scale` and
-`gpu_objectives_native.device_fixed_scale`, which are the same expression
-written twice today;
-`quantized_gradient.fixed_point_scale` is the single definition both are
-asked to call.
+rounding residue.
+
+#### Why a power of two, and why it rounds down
+
+Down, because the overflow argument in section 4 rests on the exact scaled
+total staying at or below 2^30, and rounding the factor up would raise it.
+Flooring can only lower it, into `(2^29, 2^30]`, so every bound stated in
+this document holds with strictly more slack than before rather than less.
+It is in fact *tighter* than the arbitrary factor was: `Float32(2^30 / T)`
+rounds to nearest and could sit a relative `2^-24` above the target, which
+is 64 units of the Int32 headroom; a power of two is exact at Float32 and
+sits at most `2^-23` of a unit above it. **Derived bound**, both sides.
+
+A power of two, because it deletes three roundings that an arbitrary factor
+carries:
+
+| Where | Arbitrary factor | Power of two |
+|---|---|---|
+| Dequantizing a cell: `Float64(cell) * (1/s)` | `1/s` not representable, then the product rounds again | `1/s` exact, product exact, **zero error** |
+| Quantizing a row: `Int32(round(x * s))` in Float32 | `x * s` already off by up to `2^-24` relative before `round` sees it | product exact, so `round` sees the true product |
+| The factor itself, narrowed to the device's Float32 | a relative `2^-24` the host and device inherit together | exact at every float width |
+
+The cost is up to one bit of lattice resolution, since the scaled total may
+land as low as `2^29`. That is a **trade, not a free win**: per bin of `n_b`
+rows the rounding residue term at worst doubles while the other two go to
+zero, so the error bound improves below roughly 128 rows per bin and worsens
+by at most a factor of two above it.
+`quantized_gradient.fixed_point_scale_pow2` works that through, states the
+extremes (all-zero gradients, a single dominant outlier, denormals, and the
+Float32 range edge), and records the one rejected alternative: rounding to
+the *nearest* power of two, which buys half the resolution back and pushes
+the exact scaled total to `2^30 * sqrt(2)`, cutting the safe row ceiling from
+about 2.1 billion to about 1.3 billion. Moving a headroom argument in the
+unsafe direction is not a trade worth half a bit.
+
+Both arms stay in the binary. `SCALE_SHAPE_POW2` is `DEFAULT_SCALE_SHAPE`;
+`SCALE_SHAPE_ARBITRARY` is what shipped before it and is reachable through
+`fixed_point_scale_shaped` and, on the GPU builder, through
+`histogram_gpu.GpuHistogramBuilder.set_scale_shape`. The accuracy argument
+above needs no measurement; the **speed** effect of the change is
+**unmeasured** in either direction, and the arm exists so it can be measured
+interleaved inside one process.
+
+Sibling subtraction is untouched by any of this. It is exact because Int32
+addition is associative and commutative and a parent cell is the exact
+integer sum of its children's, and a scale is one fixed multiplier applied to
+every row of the round before any integer reaches a bin, so parent and both
+children count in the same unit whatever that unit is.
 
 ### They are not interchangeable
 
