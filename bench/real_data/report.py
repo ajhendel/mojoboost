@@ -30,6 +30,16 @@ travelling further than it deserves:
 There is no summary line, no headline speedup, and no "x faster" anywhere
 in this file. If a headline is wanted, a person writes it, having read the
 distribution and named the conditions.
+
+The one place this file names a single arm is the frontier block, and it is
+the exception that proves the rule rather than a retreat from it. The
+accuracy budget makes "fastest" a well-defined question -- fastest AMONG the
+arms inside the budget, AT one tree count -- so the answer is an ordering
+this file can compute rather than a headline it would have to write. It is
+still a DOCUMENTED recommendation and nothing applies it: no file in this
+repository reads that name back into a default. See `_frontier` for the three
+structural rules it follows, and `bench/real_data/frontier.py` for what a
+one-axis sweep cannot see.
 """
 
 import argparse
@@ -42,6 +52,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import envinfo  # noqa: E402
+import verify  # noqa: E402
 
 
 def load(target):
@@ -355,6 +366,192 @@ def _ratios(rows, min_repeats, out):
     )
 
 
+#: What a frontier row is ranked ON. Training seconds, median over repeats.
+#:
+#: Not end to end: the import, the data build and the prediction phases are
+#: the same work for every arm at one tree count, so including them would
+#: dilute exactly the difference the frontier is looking for. They are already
+#: in the tables above for anyone who wants them.
+FRONTIER_RANK_FIELD = "train"
+
+
+def _frontier_group(record):
+    """The group a frontier row is ranked inside.
+
+    **The tree count is in this key and that is the whole mechanism.** A
+    ranking is built per group, so a group holding two tree counts cannot
+    exist, so a 360-tree arm and a 100-tree competitor have no table to meet
+    in. That constraint is carried by this tuple rather than by a caption
+    under a table, because a caption does not stop anybody reading a row
+    against the row above it.
+    """
+    data = record.get("data") or {}
+    return (
+        record["scenario"],
+        record.get("tier"),
+        data.get("data_kind"),
+        record.get("device_used") or record.get("device_requested"),
+        record["threads"],
+        verify._tree_count(record),
+    )
+
+
+def _frontier_verdicts(records, config):
+    """The inside-budget verdict per (arm, group), from verify.py.
+
+    Recomputed here rather than read from a verdict file so that a report and
+    a verdict cannot disagree about which arms were inside the budget: there
+    is one implementation of the rule and this calls it.
+    """
+    verdict = verify.Verdict()
+    ok = [r for r in records if r.get("status") == "ok"]
+    verify.check_accuracy_budget(ok, config, verdict)
+    out = {}
+    for check in verdict.checks:
+        if check["check"] != "accuracy_budget":
+            continue
+        out[check["scope"]] = check
+    return out
+
+
+def _frontier(records, config, out):
+    """The frontier block: inside-budget arms ranked by speed, per tree count.
+
+    Three rules, and each of them is structural rather than editorial.
+
+    **Ranked within one tree count only.** `_frontier_group` puts the count in
+    the key, so nothing here can order a 360-tree arm against a 100-tree one
+    or against a 100-tree competitor.
+
+    **Only arms that earned a PASS are ranked.** An arm outside the budget has
+    no speed worth quoting, because the budget is what its speed was to be
+    bought with. An arm that ABSTAINED -- no competitor row at its tree count
+    -- is listed separately as unjudged and is not ranked at all, since
+    ranking it would be the cross-count comparison arriving through a missing
+    row instead of through a layout.
+
+    **The fastest inside-budget row is named as a DOCUMENTED recommendation
+    and nothing applies it.** No file in this repository reads this name back
+    into a default; changing a shipped default is a person's decision, taken
+    with this table in front of them.
+    """
+    ok = [r for r in records if r.get("status") == "ok"]
+    if not ok:
+        return
+    verdicts = _frontier_verdicts(records, config)
+    if not verdicts:
+        return
+
+    groups = {}
+    for record in ok:
+        arm = verify._arm_of(record)
+        group = _frontier_group(record)
+        cell = groups.setdefault(group, {})
+        cell.setdefault(arm, []).append(record)
+
+    out("\n## The accuracy budget frontier\n")
+    out(
+        "One table per tree count, and that is the only grouping there is. A "
+        "row is ranked against the rows beside it and against nothing else; "
+        "there is no ordering in this section that spans two tree counts, "
+        "and no arm appears in a table with a competitor it was not compared "
+        "against.\n"
+    )
+
+    recommendations = []
+    for group in sorted(groups, key=str):
+        scenario, tier, kind, device, threads, trees = group
+        if trees is None:
+            continue
+        rows = []
+        unjudged = []
+        for arm, group_records in groups[group].items():
+            summary = summarise(
+                [phase_value(r, FRONTIER_RANK_FIELD) for r in group_records]
+            )
+            first = group_records[0]
+            scope = (
+                f"{scenario}/{arm}/{device}/t{threads}/n{trees}"
+            )
+            check = verdicts.get(scope)
+            block = first.get("frontier_block") or (
+                "competitor" if arm in ("catboost", "lightgbm") else "arm"
+            )
+            if check is None:
+                if block != "competitor":
+                    unjudged.append((arm, block, "no budget verdict for this row"))
+                rows.append((None, arm, block, summary, first, "bar"))
+                continue
+            if check["status"] == verify.SKIP:
+                unjudged.append((arm, block, check["detail"]))
+                continue
+            if check["status"] == verify.PASS:
+                rows.append(
+                    (summary["median"] if summary else None, arm, block,
+                     summary, first, "inside")
+                )
+            else:
+                rows.append((None, arm, block, summary, first, "outside"))
+
+        inside = sorted(
+            [r for r in rows if r[5] == "inside" and r[0] is not None],
+            key=lambda r: r[0],
+        )
+        others = [r for r in rows if r[5] != "inside" or r[0] is None]
+        if not inside and not others and not unjudged:
+            continue
+
+        metric = (
+            (groups[group][next(iter(groups[group]))][0]).get("primary_metric")
+        )
+        out(
+            f"\n**{scenario} / {kind} / {device} / t{threads} / "
+            f"{trees} trees**, ranked on median train seconds, primary "
+            f"metric {metric}.\n"
+        )
+        if inside or others:
+            out("| rank | arm | block | train s | primary metric | budget |")
+            out("| --- | --- | --- | --- | --- | --- |")
+        for index, (_speed, arm, block, summary, first, _state) in enumerate(
+            inside, start=1
+        ):
+            value = (first.get("quality") or {}).get(metric)
+            out(
+                f"| {index} | {arm} | {block} | "
+                f"{fmt_time(summary, 0.25)} | "
+                f"{'n/a' if value is None else f'{value:.6g}'} | inside |"
+            )
+        for _speed, arm, block, summary, first, state in others:
+            value = (first.get("quality") or {}).get(metric)
+            label = "the bar" if state == "bar" else "OUTSIDE, not ranked"
+            out(
+                f"| -- | {arm} | {block} | {fmt_time(summary, 0.25)} | "
+                f"{'n/a' if value is None else f'{value:.6g}'} | {label} |"
+            )
+        if inside:
+            fastest = inside[0]
+            recommendations.append((group, fastest[1], fastest[3]))
+            out(
+                f"\nFastest inside the budget at {trees} trees: "
+                f"**{fastest[1]}**. That is a DOCUMENTED recommendation for "
+                "the shipped defaults and nothing applies it: no file here "
+                "reads this name back into a default, and it is the fastest "
+                "AMONG THE ARMS THAT RAN rather than the fastest "
+                "configuration, because this is a one-axis sweep and not a "
+                "grid. See bench/real_data/frontier.py for what it cannot "
+                "see.\n"
+            )
+        for arm, block, why in unjudged:
+            out(f"\nUNJUDGED, not ranked: `{arm}` ({block}). {why}\n")
+
+    if recommendations:
+        out(
+            "\nEvery recommendation above belongs to its own tree count and "
+            "to no other. Two of them are not comparable with each other "
+            "either, for the same reason the rows inside them are not.\n"
+        )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("results", help="a records.json file or a run directory")
@@ -372,6 +569,7 @@ def main(argv=None):
     emit("# Real-data differential run\n")
     emit(f"Source: `{os.path.abspath(args.results)}`\n")
     render(records, config, emit)
+    _frontier(records, config, emit)
     emit(
         "\nCorrectness is not decided here. Run verify.py against the same "
         "results file for that."
