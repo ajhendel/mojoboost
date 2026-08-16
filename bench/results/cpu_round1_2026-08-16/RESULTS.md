@@ -1,5 +1,36 @@
 # CPU round 1, clean window and the in-run scaling profile. 2026-08-16
 
+> ## SUPERSEDED COMPARATOR. Every speed ratio below is NOT PUBLISHED.
+>
+> **The project now has exactly one comparator: LightGBM at stock defaults
+> plus `use_quantized_grad=true`, with its own defaults for the
+> sub-parameters.** Every mojotrees arm runs with quantized gradients on. The
+> GPU already does, in fixed-point Int32. The CPU does not yet: it needs a
+> `use_quantized_grad` option built to LightGBM's scheme, which is a lane that
+> has not started.
+>
+> **Until that option exists, a CPU-versus-LightGBM speed number compares our
+> float path against their quantized path.** That is not a like-for-like
+> comparison and Andrew's ruling is that such numbers are **not published**
+> rather than published with a caveat.
+>
+> So every ratio in this file — 2.01x behind at 1,000,000 rows, 1.49x at
+> 250,000, 4.6 percent ahead at 50,000 — is **superseded and must not be
+> quoted**, including by this campaign's own later write-ups. They are kept
+> here because the file is a record of what was measured and when, and
+> deleting a measurement because its comparator changed is how a project loses
+> the ability to explain its own history.
+>
+> **What survives, and is still worth reading:** everything in this file that
+> is a comparison of mojotrees against *itself* — the in-run scaling profile
+> by node size class, the retractions, the instrument corrections, and the
+> golden-fixture coverage finding. None of those involve LightGBM's
+> configuration and none are affected.
+>
+> **The binning ratios were already withdrawn** for an unrelated and
+> independent reason (the comparator was pinned to bin every row), and remain
+> so. They now fail on two counts rather than one.
+
 Taken under `mode: timing` with the GPU campaign holding every compile and
 commit. Protocol in `../PROFILE_PROTOCOL.md` sections C0-C8. Saved before
 interpretation.

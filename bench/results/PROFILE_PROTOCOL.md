@@ -977,3 +977,75 @@ mislabels every session afterwards in a form that reads as data.
 And per A4: **this has never been run in anger.** The probe constants were
 sized from an estimate, no baseline exists, and no session has yet carried a
 canary line. Treat it as suspect until someone does.
+
+---
+
+# C9. One comparator, and what may be published against it
+
+Registered 2026-08-16, before any measurement is taken under it. It
+supersedes the comparator every CPU figure in this round was taken against.
+
+## The rule
+
+**There is exactly one comparator: LightGBM at stock defaults plus
+`use_quantized_grad=true`, with LightGBM's own defaults for the
+sub-parameters** (`num_grad_quant_bins`, `quant_train_renew_leaf`,
+`stochastic_rounding`).
+
+**Every mojotrees arm runs with quantized gradients on.** The GPU already
+does, in fixed-point Int32, because Metal forces it. The CPU does not yet and
+needs a `use_quantized_grad` option built to LightGBM's scheme.
+
+**Speed and accuracy are always reported together against that comparator.**
+`bench/real_data/thresholds.json` is measured relative to it. **No other
+LightGBM configuration is published.**
+
+## What this does to the numbers already taken
+
+Until the CPU option exists, a CPU-versus-LightGBM speed number compares our
+float path against their quantized path. That is not like-for-like.
+
+**Andrew's ruling: such numbers are NOT PUBLISHED, rather than published with
+a caveat.** The alternative — a "provisional, CPU float vs LightGBM
+quantized" label — was considered and declined, because a labelled number
+still gets quoted without its label.
+
+So every CPU-versus-LightGBM ratio taken in this round is superseded: 2.04x
+and 2.01x at 1,000,000 rows, 1.55x and 1.49x at 250,000, 9.6 and 4.6 percent
+at 50,000, and the 1.36x serial ratio. They stay in their results files, with
+a banner, because a measurement whose comparator later changed is still a
+record of what was true when it was taken, and deleting it is how a project
+loses the ability to explain its own history.
+
+**What is unaffected**, and this is most of the round's actual content:
+anything comparing mojotrees against itself. The in-run scaling profile by
+node size class, the serial-versus-auto ratios, the instrument corrections,
+the golden-fixture coverage finding, and the C3 result — which is a statement
+about the difference between LightGBM's own two builders and involves no
+mojotrees arm at all.
+
+## Why the defaults do not move with the benchmark
+
+**The benchmark configuration is a configuration, not the default**, exactly
+as it is for LightGBM. Users get LightGBM stock: float sums, a 200,000-row
+bin sample, `min_data_in_bin=3`, and `feature_pre_filter` on once it is
+actually implemented. `use_quantized_grad` is off by default on both sides
+and turned on for the comparison.
+
+This separation is the thing to hold. A project that quietly makes its
+benchmark configuration its default is optimizing for the benchmark.
+
+## The ordering this forces
+
+1. The harness lane makes `LIGHTGBM_ALIGNMENT` become stock plus
+   `use_quantized_grad=true`: one arm, one label, wired into
+   `bench_train_gpu.mojo`'s comparator, `bench/real_data/engines.py`, and the
+   results template. Old pinned figures are marked "pinned configuration,
+   superseded".
+2. `lane/lgbm-cell-layout` lands the float substrate.
+3. `lane/cpu-quantized-grad` lands the CPU quantized path on top of it.
+4. **Only then does a CPU speed number get published**, and only with its
+   accuracy from `bench/real_data` beside it.
+
+Accuracy against the quantized comparator is established by a real-data run
+**before any speed number is quoted**, not after.

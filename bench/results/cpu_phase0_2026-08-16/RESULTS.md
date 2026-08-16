@@ -1,5 +1,26 @@
 # CPU round 1, Phase 0. Apple M4, 2026-08-16
 
+> ## SUPERSEDED COMPARATOR. Every speed ratio below is NOT PUBLISHED.
+>
+> The project's comparator is now **LightGBM at stock defaults plus
+> `use_quantized_grad=true`**, against mojotrees arms that also run quantized
+> gradients. The CPU has no such option yet, so every CPU-versus-LightGBM
+> ratio in this file compares our float path against their quantized path.
+> Andrew's ruling: **not published** rather than published with a caveat.
+>
+> That covers the 2.04x at 1,000,000 rows, the 1.55x at 250,000, the 9.6
+> percent at 50,000, the R1 serial ratio of 1.36x, and the whole
+> serial-versus-parallel decomposition built on them.
+>
+> **What survives:** the CPU stage profile, the C3 builder finding (LightGBM's
+> two builders differ by a consistent 6.9 percent, which is a statement about
+> LightGBM alone), the core-pool result, the harness's minima-versus-median
+> defect, and the `bench_profile` `predict` retraction. None of those depend
+> on the comparator's gradient precision.
+>
+> Kept rather than deleted, because a measurement whose comparator later
+> changed is still a record of what was true when it was taken.
+
 The first CPU-side profile and baseline this repository has taken against its
 own registered rules. Protocol in `../PROFILE_PROTOCOL.md`, sections C0 through
 C8, all committed before any of this ran (commit 04ba2ea).
