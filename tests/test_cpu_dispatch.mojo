@@ -84,6 +84,8 @@ from mojotrees.apple_cpu_policy import (
     env_tasks_per_core,
     plan_feature_group,
     split_scan_ops,
+    subtract_ops,
+    subtract_ops_for_planes,
 )
 from mojotrees.binning import BinnedMatrix
 from mojotrees.histogram import (
@@ -360,9 +362,15 @@ def test_crossing_the_crossover_buys_at_least_two_tasks() raises:
     for i in range(len(probes)):
         var n = plan_tasks(1_000_000, probes[i])
         assert_true(n >= MIN_TASKS_ABOVE_GRAIN)
-    # The established slope is untouched where it already answered more than
-    # one: two grains still buys exactly two tasks.
-    assert_equal(plan_tasks(1_000_000, 2 * PARALLEL_MIN_OPS), 2)
+    # Two grains buys two tasks by the grain alone; the core floor raises that
+    # to one task per core, and the item count and the per-core ceiling still
+    # cap it. `test_the_core_floor_moves_only_the_idle_shapes` is where that
+    # rule is pinned per caller.
+    var cores = cpu_profile().dispatch_cores()
+    assert_equal(
+        plan_tasks(1_000_000, 2 * PARALLEL_MIN_OPS),
+        cores if cores > MIN_TASKS_ABOVE_GRAIN else MIN_TASKS_ABOVE_GRAIN,
+    )
     # And the item count still caps everything.
     assert_equal(plan_tasks(1, 1000 * PARALLEL_MIN_OPS), 1)
     assert_equal(plan_tasks(2, 1000 * PARALLEL_MIN_OPS), 2)
@@ -484,6 +492,183 @@ def test_per_task_floor_is_overridable() raises:
     assert_equal(plan_tasks(1_000_000, 8 * PARALLEL_MIN_OPS), default_tasks)
     _ = setenv("MOJOTREES_PARALLEL_MIN_TASK_OPS", "not-a-number")
     assert_equal(plan_tasks(1_000_000, 8 * PARALLEL_MIN_OPS), default_tasks)
+    _clear_grain()
+
+
+def _rule_before_the_core_floor(n_items: Int, total_ops: Int) raises -> Int:
+    """The auto-mode fan-out rule exactly as it stood before the core floor.
+
+    A frozen literal copy of the previous `plan_tasks` / `_cap_tasks`, so that
+    "this caller's task count moved" and "this caller's task count did not"
+    are assertions against the old behavior rather than against a restatement
+    of the new one. If this ever needs updating, the change under it was not
+    a pure scheduling change.
+    """
+    if n_items <= 1:
+        return 1
+    if total_ops < PARALLEL_MIN_OPS:
+        return 1
+    var max_auto = cpu_profile().max_auto_tasks()
+    var by_grain = total_ops // DEFAULT_MIN_TASK_OPS
+    if by_grain < MIN_TASKS_ABOVE_GRAIN:
+        by_grain = MIN_TASKS_ABOVE_GRAIN
+    var n = by_grain if by_grain < max_auto else max_auto
+    if n > n_items:
+        n = n_items
+    return n
+
+
+def test_the_core_floor_moves_only_the_idle_shapes() raises:
+    """Every caller shape of one profiled fit, old task count against new.
+
+    The fit is the one the round's scaling profile was taken on: 1,000,000
+    rows, 50 features, 255 bins, 31 leaves, feature-group width 2 (so 25
+    accumulation groups). Every `(n_items, total_ops)` pair below is the pair
+    its call site actually passes, computed here from the same estimator
+    functions the call site calls, so a change to an estimator moves this
+    table with it instead of leaving it stale.
+
+    Three things are asserted, and none of them is a timing:
+
+    1. **No caller lost tasks.** `new >= old` for every shape. The core floor
+       only ever raises `by_grain`, and the crossover is tested before it, so
+       nothing that was parallel became serial and nothing that was serial
+       became parallel.
+    2. **The shapes the profile reported as losing never fanned out at all**,
+       before or after. Sibling subtraction at 50 x 255 cells and the row
+       partition at small and tiny nodes are all below the crossover, on any
+       machine, so no fan-out cost can be charged to them and no floor change
+       can recover their time.
+    3. **The shape that was leaving cores idle now fills them.** The split
+       scan's estimate does not depend on the node's row count at all, so the
+       old rule answered 3 for every node in the fit whatever the machine;
+       that constant is asserted directly, and the new answer is at least one
+       task per core.
+    """
+    _auto()
+    _clear_grain()
+    var cores = cpu_profile().dispatch_cores()
+    var ceiling = cpu_profile().max_auto_tasks()
+    print("  dispatch_cores:", cores, "max_auto_tasks:", ceiling)
+
+    comptime N_FEATURES = 50
+    comptime N_BINS = 255
+    comptime N_GROUPS = 25  # 50 features at the width-2 group the policy picks
+    comptime N_LEAVES = 31
+    comptime CELLS = N_FEATURES * N_BINS
+    comptime ROOT = 1_000_000
+
+    # (name, n_items, total_ops), one row per dispatch the fit makes.
+    var names = [
+        String("subtract 3-plane"),          # histogram.mojo:1611
+        String("subtract 2-plane const-h"),  # histogram.mojo:1611
+        String("partition tiny 1953"),       # tree.mojo:673
+        String("partition small 15625"),
+        String("partition medium 50000"),
+        String("partition large 300000"),
+        String("partition root 1000000"),
+        String("histogram root"),            # histogram.mojo:842/1230
+        String("histogram medium 50000"),
+        String("histogram small 5000"),
+        String("histogram tiny 1953"),
+        String("histogram tiny 1000"),
+        String("zeroing, nothing excluded"), # histogram.mojo:489
+        String("gather compact root"),       # histogram.mojo:1014
+        String("split scan two-sided"),      # split.mojo:773
+        String("split scan one-sided"),
+        String("grad fill root"),            # boosting.mojo:602
+        String("grad fill 100000"),
+        String("score update traversal"),    # boosting.mojo:1222
+        String("score update by leaf"),      # boosting.mojo:1290
+    ]
+    var items = [
+        CELLS, CELLS,
+        1_953, 15_625, 50_000, 300_000, ROOT,
+        N_GROUPS, N_GROUPS, N_GROUPS, N_GROUPS, N_GROUPS,
+        N_FEATURES,
+        ROOT,
+        N_FEATURES, N_FEATURES,
+        ROOT, 100_000,
+        ROOT, N_LEAVES,
+    ]
+    var ops = [
+        subtract_ops(CELLS),
+        subtract_ops_for_planes(CELLS, 2),
+        3 * 1_953, 3 * 15_625, 3 * 50_000, 3 * 300_000, 3 * ROOT,
+        N_FEATURES * (N_BINS + ROOT),
+        N_FEATURES * (N_BINS + 50_000),
+        N_FEATURES * (N_BINS + 5_000),
+        N_FEATURES * (N_BINS + 1_953),
+        N_FEATURES * (N_BINS + 1_000),
+        0,
+        2 * ROOT,
+        split_scan_ops(N_FEATURES, N_BINS, True),
+        split_scan_ops(N_FEATURES, N_BINS, False),
+        elementwise_row_ops(ROOT),
+        elementwise_row_ops(100_000),
+        8 * ROOT,
+        2 * ROOT,
+    ]
+    assert_equal(len(items), len(ops))
+    assert_equal(len(items), len(names))
+
+    for i in range(len(items)):
+        var old = _rule_before_the_core_floor(items[i], ops[i])
+        var new = plan_tasks(items[i], ops[i])
+        print("   ", names[i], "ops", ops[i], "items", items[i], ":", old, "->", new)
+        # 1. No caller lost tasks, and the go/no-go decision did not move.
+        assert_true(new >= old)
+        assert_equal(new == 1, old == 1)
+        assert_equal(new == 1, ops[i] < PARALLEL_MIN_OPS or items[i] <= 1)
+        # 3. Anything that fans out fills the machine, up to what it has.
+        if new > 1:
+            var reachable = cores if cores < items[i] else items[i]
+            if reachable > ceiling:
+                reachable = ceiling
+            assert_true(new >= reachable)
+
+    # 2. The two phases the profile reported as slower in parallel are serial
+    # on both sides of this change, on every machine, so no fan-out cost was
+    # ever charged to them. These are absolute, not machine-relative.
+    assert_equal(plan_tasks(CELLS, subtract_ops(CELLS)), 1)
+    assert_equal(plan_tasks(CELLS, subtract_ops_for_planes(CELLS, 2)), 1)
+    assert_equal(plan_row_blocks(15_625, 3 * 15_625).n_blocks, 1)
+    assert_equal(plan_row_blocks(1_953, 3 * 1_953).n_blocks, 1)
+    # ...and the first node size at which the partition does fan out, so the
+    # boundary is pinned rather than implied. 3n >= 65536 at n = 21846.
+    assert_equal(plan_row_blocks(21_845, 3 * 21_845).n_blocks, 1)
+    assert_true(plan_row_blocks(21_846, 3 * 21_846).n_blocks > 1)
+
+    # 3, stated as the constant it was. The split scan's estimate carries no
+    # row count, so the old rule fanned every node in the fit three ways.
+    var scan_ops = split_scan_ops(N_FEATURES, N_BINS, True)
+    assert_equal(scan_ops // DEFAULT_MIN_TASK_OPS, 3)
+    assert_equal(_rule_before_the_core_floor(N_FEATURES, scan_ops), 3)
+    var scan_now = plan_tasks(N_FEATURES, scan_ops)
+    var scan_reachable = cores if cores < N_FEATURES else N_FEATURES
+    assert_true(scan_now >= scan_reachable)
+    assert_true(scan_now >= 3)
+
+    # The root histogram is the shape that must not move, and the reason it
+    # cannot is arithmetic rather than luck: 50 * (255 + 1000000) is 50012750
+    # ops, which is 763 whole grains, so the grain answer is already past both
+    # the group count and any ceiling this hardware family reports and the
+    # floor has nothing left to raise.
+    var root_hist_ops = N_FEATURES * (N_BINS + ROOT)
+    assert_equal(root_hist_ops // DEFAULT_MIN_TASK_OPS, 763)
+    assert_equal(
+        plan_tasks(N_GROUPS, root_hist_ops),
+        _rule_before_the_core_floor(N_GROUPS, root_hist_ops),
+    )
+    # Same for the medium node, which is the regression the round could least
+    # afford: 50 * (255 + 50000) is 2512750 ops, 38 whole grains, above the
+    # 25 groups the dispatch has to give out.
+    var med_hist_ops = N_FEATURES * (N_BINS + 50_000)
+    assert_equal(med_hist_ops // DEFAULT_MIN_TASK_OPS, 38)
+    assert_equal(
+        plan_tasks(N_GROUPS, med_hist_ops),
+        _rule_before_the_core_floor(N_GROUPS, med_hist_ops),
+    )
     _clear_grain()
 
 
