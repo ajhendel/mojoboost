@@ -1,0 +1,6 @@
+pair 1  resident ON:  3.16508
+pair 1  resident OFF: 3.896939
+pair 2  resident ON:  3.612224
+pair 2  resident OFF: 3.587237
+pair 3  resident ON:  3.136251
+pair 3  resident OFF: 3.729944

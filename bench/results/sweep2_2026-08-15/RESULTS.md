@@ -273,3 +273,55 @@ one small leaf at a time. Leaf-wise can have that without changing its tree, by
 building the frontier's pending histograms speculatively, since a child
 histogram is valid whenever it is computed. That is an exact transformation, not
 an approximation, and it is where this result should feed back in.
+
+## Addendum 4: the resident plane, fixed and measured
+
+It runs. The trace confirms it: `plane=device-resident status=budget_spent
+commits=30 leaves=31 nodes=61` at 1,000,000 rows, a terminal status rather than
+the `running` it used to come home with.
+
+Two bugs, and the second is the one that matters. The plane enqueued
+`num_leaves - 1` steps, which is the right number of splits and one short of the
+number of picks, so a tree that spent its budget ended on a committing step and
+never wrote a terminal status. Fixing that exposed the second: `GpuActiveRows`
+keeps a host-side node-to-row-window table that the shipping loop maintains
+inside `partition` and the descriptor-driven partition does not touch. The
+device-gradient round, which is the default for a built-in objective without row
+sampling, reads exactly that table to advance raw scores, found node 0 owning
+every row, and **added the root's value to every row instead of each row's own
+leaf value**. Tree 0 was bit-identical and every tree after it diverged.
+
+That is the failure my own vacuous test could never have caught, and it is the
+argument for the gate-proof assertion the test now carries.
+
+Alternating processes on a quiet machine, five repeats each, 1,000,000 x 50:
+
+| pair | resident ON | resident OFF |
+|---|---|---|
+| 1 | 3.165 | 3.897 |
+| 2 | 3.612 | 3.587 |
+| 3 | 3.136 | 3.730 |
+| median | **3.165** | 3.730 |
+
+**About 0.57 seconds, 15 percent.** Two of three pairs favor it clearly and one
+inverts, so the direction is consistent rather than unanimous and the figure
+should be read as approximate.
+
+It agrees with the model. The plane makes **16 waits per tree, nine of them
+uploads**, against the shipping loop's 31, so it removes 15. At the measured 458
+microseconds per synchronization over 100 trees that predicts 0.69 seconds, and
+0.57 was measured. The prediction and the measurement agree within the spread of
+the arms, which is the third independent confirmation that the per-split wait is
+what the intercept is made of.
+
+**It is not one wait per tree, and the earlier claim that it was counted only
+`synchronize` calls.** On Metal `enqueue_copy` drains the queue in both
+directions, so the nine table uploads per tree are nine waits. That is now the
+next target and it is a bounded one: reaching one wait per tree would remove a
+further 15 per tree, worth an estimated 0.69 seconds, which would put leaf-wise
+at roughly 2.47 seconds against LightGBM's 2.767.
+
+### Where leaf-wise stands after it
+
+3.165 seconds against LightGBM's 2.767, so **1.14x behind**, down from 1.36x.
+The slope is untouched, as it must be, since nothing here changed the kernel.

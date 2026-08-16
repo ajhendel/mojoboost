@@ -1,0 +1,2 @@
+gpu_train_s_median: 3.64396
+gpu_spread_pct: 9.0
