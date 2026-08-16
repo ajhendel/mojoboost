@@ -69,6 +69,19 @@ _UNHONORED = (
     ("random_strength", None, "random_strength"),
     ("score_function", None, "score_function"),
     ("leaf_estimation_iterations", None, "leaf_estimation_iterations"),
+    # CatBoost's automatic learning rate (catalog A12/A38). `multi_rmse_fit`
+    # is a separate binding that never calls `_parse_params`, so the
+    # derivation and its refusals are both out of reach here and an explicit
+    # request would be dropped in silence.
+    #
+    # Only an EXPLICIT request is refused, which is what `None` as the
+    # default here means, and the mode default that
+    # `grow_policy='symmetrictree'` carries stays silent on this path
+    # deliberately: CatBoost's coefficient table is keyed by an `ETargetType`
+    # of Logloss, MultiClass or RMSE (`options_helper.cpp:181-194`) and has
+    # no MultiRMSE row at all, so CatBoost declines the same run in the same
+    # silence. Declining is parity here; dropping an explicit ask is not.
+    ("auto_learning_rate", None, "CatBoost's automatic learning rate"),
 )
 
 

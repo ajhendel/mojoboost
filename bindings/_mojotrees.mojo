@@ -153,6 +153,17 @@ from catboost_reach_bindings import (
     text_features_write,
 )
 
+from mojotrees.auto_learning_rate import (
+    AUTO_LR_TASK_CPU,
+    AUTO_LR_TASK_GPU,
+    AutoLearningRateParams,
+    resolve_learning_rate,
+)
+from mojotrees.objective_registry import (
+    CUSTOM as _CUSTOM_OBJECTIVE,
+    LAMBDARANK as _LAMBDARANK_OBJECTIVE,
+    MULTICLASS as _MULTICLASS_OBJECTIVE,
+)
 from mojotrees.bagging import BaggingParams
 from mojotrees.categorical import CategoricalParams, CategoricalSpec
 from mojotrees.contrib import ContribExplainer
@@ -679,6 +690,33 @@ def _parse_monotone(
     )
 
 
+# The reason the three eval-set entry points cannot derive CatBoost's rate.
+# Shared because it is one reason and not three: what disqualifies them is
+# the eval set itself, which is the only thing all three have in common and
+# is exactly the input CatBoost's `use_best_model` is resolved from.
+comptime _AUTO_LR_EVAL_SET_REASON = (
+    "an eval_set is what makes CatBoost's use_best_model resolvable"
+    " (UpdateUseBestModel, options_helper.cpp:100-113, which forces it false"
+    " only when there is no eval set), and use_best_model is one of the four"
+    " keys of the coefficient table, so with an eval set present the row to"
+    " read is not the row a plain fit reads. mojotrees has no use_best_model"
+    " parameter to resolve, so this would be a rate derived from a guess"
+)
+
+# The reason continued training cannot derive it either. `n_estimators` on a
+# `booster_update` call is how many rounds to ADD, and CatBoost's formula
+# reads `IterationCount`, the length of the whole run: deriving from the
+# increment would give a 20-round top-up a rate fitted for a 20-round model.
+comptime _AUTO_LR_CONTINUED_REASON = (
+    "continued training adds n_estimators rounds to a model that already"
+    " has some, and CatBoost's derivation reads the iteration count of the"
+    " whole run (options_helper.cpp:272), which this call does not know."
+    " The trees already in the model were grown at their own rate as well,"
+    " so a rate derived here would apply to part of an ensemble. Derive it"
+    " on the first fit, or pass an explicit learning_rate"
+)
+
+
 def _parse_params(
     params: PythonObject,
     n_features: Int,
@@ -689,6 +727,10 @@ def _parse_params(
     leaf_estimation_ok: Bool = False,
     score_function_ok: Bool = False,
     random_strength_ok: Bool = False,
+    auto_lr_ok: Bool = False,
+    auto_lr_reason: String = "",
+    auto_lr_rows: Int = 0,
+    auto_lr_objective: Int = _CUSTOM_OBJECTIVE,
 ) raises -> BoosterParams:
     """The `BoosterParams` a fit runs under, from the params mapping.
 
@@ -763,6 +805,33 @@ def _parse_params(
       construction and routes to `boosting.train_more`. Multiclass, sparse,
       ranking, custom-objective, custom-metric, distributed and every device
       loop compute no scale and keep the refusal.
+    - `auto_lr_ok`: CatBoost's automatic `learning_rate`
+      (src/mojotrees/auto_learning_rate.mojo, catalog A12/A38). Unlike the
+      four above, this one needs **data** and not just a declaration: the
+      derived rate is a function of the objective, the iteration count and
+      the **train row count**, so an entry point that may honor it has to
+      hand over `auto_lr_rows` and `auto_lr_objective` as well. `auto_lr_ok`
+      alone would be a promise with nothing behind it, which is why the row
+      count defaults to 0 and the objective to `CUSTOM`: a call site that
+      sets the flag and forgets the data derives a rate from no rows, and
+      `catboost_auto_learning_rate` raises on that rather than returning
+      something.
+      Every trainer applies `BoosterParams.learning_rate` the same way, so
+      what decides the verdict here is not the round loop but whether the
+      three inputs exist and mean what CatBoost means by them. Six entry
+      points cannot supply them and refuse by name through `auto_lr_reason`:
+      `fit_custom` (a callback objective is not a loss function, so there is
+      no `ETargetType` to look up), the three `*_with_metrics` fits (an eval
+      set is exactly what makes CatBoost's `use_best_model` resolvable, and
+      `use_best_model` selects a different coefficient row; we have no
+      parameter to resolve it from), and `booster_update` /
+      `booster_update_multiclass` (`n_estimators` there is the increment,
+      not the `IterationCount` the formula reads, and the trees already in
+      the model were grown at another rate).
+    - `auto_lr_reason` is the sentence such a refusal ends with. It is a
+      per-call-site argument rather than a table here because the reason
+      differs by entry point and a shared message would have to be vague
+      enough to be true of all six.
     """
     var who = entry.copy()
     if who.byte_length() == 0:
@@ -915,13 +984,145 @@ def _parse_params(
             " sampling. 'plain' (an alias of 'gbdt') is the scheme every"
             " other path trains",
         )
-    return BoosterParams(
+    var bp = BoosterParams(
         Int(py=params["n_estimators"]),
         Float64(py=params["learning_rate"]),
         tree^,
         bundling^,
         linear^,
         ordered^,
+    )
+    _apply_auto_learning_rate(
+        bp,
+        params,
+        who,
+        auto_lr_ok,
+        auto_lr_reason,
+        auto_lr_rows,
+        auto_lr_objective,
+        cpu,
+    )
+    return bp^
+
+
+def _apply_auto_learning_rate(
+    mut bp: BoosterParams,
+    params: PythonObject,
+    who: String,
+    ok: Bool,
+    reason: String,
+    n_rows: Int,
+    objective: Int,
+    cpu: Bool,
+) raises:
+    """Replace `bp.learning_rate` with CatBoost's derived rate, or refuse.
+
+    The one call in the Python extension that reaches
+    `auto_learning_rate.resolve_learning_rate`
+    (src/mojotrees/auto_learning_rate.mojo). The C ABI and the CLI reach the
+    same free function through `params.TrainConfig.resolved_learning_rate`;
+    this path never builds a `TrainConfig`, and nothing had to move for it
+    to get there.
+
+    Four keys carry the request, and every fit sends all four because this
+    parser subscripts the mapping rather than testing for a key:
+
+    - `auto_learning_rate`: the derivation is wanted AND the user left
+      `learning_rate` alone. That second half is folded in on the Python
+      side because it is the one part of CatBoost's gate this side cannot
+      see: the wire carries a resolved float and a float cannot say whether
+      anybody typed it. `TOption::NotSet()` (`option.h:80-85`) is provenance,
+      not a comparison against the default, and provenance stops at the
+      estimator.
+    - `auto_learning_rate_required`: the user asked in so many words
+      (`auto_learning_rate=True`) rather than inheriting the default that
+      `grow_policy='symmetrictree'` carries. It decides refuse versus
+      decline, and the two are both right in their own case. An explicit
+      request that cannot be honored must not be dropped, which is this
+      repository's rule. A CatBoost-mode default that cannot be honored
+      falls back to the given rate in silence, which is CatBoost's own
+      behavior: handed a loss with no row in the coefficient table it keeps
+      its constant 0.03 and prints nothing.
+    - the two `*_set` provenance flags, which close CatBoost's gate on
+      `l2_leaf_reg` and `leaf_estimation_iterations`
+      (`options_helper.cpp:279-280`). They are handed to
+      `AutoLearningRateParams` rather than tested here so that the gate has
+      one implementation and this is not a second copy of it;
+      `AutoLearningRateParams.fires` is what applies them.
+
+    `use_best_model` is False and cannot be anything else here: every entry
+    point that reaches this with `ok` true is a fit without an eval set,
+    because the three eval-set entry points refuse by name above.
+    `boost_from_average` is left to `catboost_boost_from_average_default`,
+    which is what CatBoost would resolve for the loss -- notably **false**
+    for Logloss, where mojotrees does start from the optimal constant. That
+    is deliberate: the coefficient row has to be the row CatBoost would pick
+    for the same run, or the two derived rates are not comparable, which is
+    the whole point of deriving it.
+
+    Determinism: `resolve_learning_rate` is scalar Float64 on one thread with
+    no reduction and no parallel region, and its inputs here are an Int row
+    count, an Int iteration count and an Int objective code. Nothing it reads
+    depends on `MOJOTREES_NUM_WORKERS`, on the device, or on row order, and
+    the result is narrowed to float32 before it is used.
+    """
+    if Int(py=params["auto_learning_rate"]) == 0:
+        return
+    var required = Int(py=params["auto_learning_rate_required"]) != 0
+    if not ok:
+        if required:
+            var why = reason.copy()
+            if why.byte_length() == 0:
+                why = String(
+                    "this entry point cannot supply the train row count, the"
+                    " iteration count and the loss function that CatBoost's"
+                    " derivation reads"
+                )
+            raise Error(
+                "auto_learning_rate=True is not honored by ",
+                who,
+                ": ",
+                why,
+                ". Pass an explicit learning_rate instead",
+            )
+        return
+    # A Booster constructed on a training set trains a zero-round model
+    # before anything is boosted, and CatBoost's formula takes
+    # log(iterationCount), which is undefined at zero rounds. Nothing
+    # is fitted at zero rounds, so there is no rate to derive and no request
+    # being dropped; the rounds that follow come through `booster_update`,
+    # which refuses the parameter by name.
+    if bp.n_estimators <= 0:
+        return
+    var auto = AutoLearningRateParams.catboost_defaults(
+        AUTO_LR_TASK_CPU if cpu else AUTO_LR_TASK_GPU
+    )
+    auto.l2_leaf_reg_set = (
+        Int(py=params["auto_learning_rate_l2_set"]) != 0
+    )
+    auto.leaf_estimation_iterations_set = (
+        Int(py=params["auto_learning_rate_leaf_iters_set"]) != 0
+    )
+    if not auto.fires(objective):
+        if required:
+            raise Error(
+                "auto_learning_rate=True has nothing to derive for this run"
+                " at ",
+                who,
+                ": CatBoost's coefficient table is keyed by (target type,"
+                " task type, use_best_model, boost_from_average) and has no"
+                " row for this one. Its target types are Logloss, MultiClass"
+                " and RMSE (options_helper.cpp:181-194), and the MultiClass"
+                " rows exist only with boost_from_average false, so a"
+                " ranking or survival objective, or a MultiClass run boosted"
+                " from the average, leaves the rate alone. l2_leaf_reg and"
+                " leaf_estimation_iterations close the same gate"
+                " (options_helper.cpp:279-280). Pass an explicit"
+                " learning_rate instead",
+            )
+        return
+    bp.learning_rate = resolve_learning_rate(
+        auto, objective, bp.n_estimators, n_rows, bp.learning_rate
     )
 
 
@@ -1191,6 +1392,17 @@ def fit(
         random_strength_ok=device == CPU_DEVICE,
         leaf_estimation_ok=True,
         score_function_ok=True,
+        # CatBoost's automatic learning rate. Unconditional here, and the
+        # fork does not have to be settled the way `ordered_ok`'s does: the
+        # derived rate is a number in `BoosterParams`, and `boosting.train`,
+        # `train_gpu` and `alternate_boosting.fit_boosting` all shrink by it.
+        # The one fork that would discard it is `boosting='rf'`, which trains
+        # at 1.0 whatever it was given, and the estimator refuses that pair
+        # before it gets here rather than deriving a rate for a forest to
+        # throw away.
+        auto_lr_ok=True,
+        auto_lr_rows=nr,
+        auto_lr_objective=Int(py=objective),
     )
     var weights = _parse_weights(params, nr)
     # CatBoost's `bootstrap_type`. This entry point is the ONLY one in this
@@ -1375,7 +1587,19 @@ def distributed_train_local(
     # `SCORE_L2` default, so a Cosine fit routed here would be an L2 tree
     # reported as a Cosine one. Refused by name instead.
     var bp = _parse_params(
-        params, nf, cpu=True, entry=String("distributed_train_local")
+        params,
+        nf,
+        cpu=True,
+        entry=String("distributed_train_local"),
+        # Honored, and this is the one flag on this call that is not a
+        # refusal. `train_local_world` shrinks each rank's tree by
+        # `BoosterParams.learning_rate` exactly as the serial trainer does,
+        # and the world is hosted in this process, so `nr` is the whole
+        # training set rather than a shard: the row count CatBoost's formula
+        # reads is the one it would read for the same data trained serially.
+        auto_lr_ok=True,
+        auto_lr_rows=nr,
+        auto_lr_objective=Int(py=objective),
     )
     check_bootstrap_honored(
         _parse_bootstrap(params),
@@ -1429,6 +1653,12 @@ def fit_custom(
         unbundled="fit_custom",
         entry=String("fit_custom"),
         score_function_ok=True,
+        auto_lr_reason=String(
+            "a custom objective is a pair of derivative buffers, not a loss"
+            " function, and CatBoost's coefficient table is keyed by one"
+            " (GetTargetType, options_helper.cpp:181-194). There is no"
+            " target type to look the coefficients up with"
+        ),
     )
     # `boosting._check_bootstrap` refuses the pair outright rather than for
     # want of wiring: a callback's derivatives are the caller's, and a draw
@@ -1537,6 +1767,7 @@ def fit_with_metrics(
         nf,
         unbundled="fit_with_metrics",
         score_function_ok=True,
+        auto_lr_reason=String(_AUTO_LR_EVAL_SET_REASON),
     )
     # An eval_set, a callback, or linear_tree routes here rather than to
     # `boosting.train_with_valid`, and `custom_metric`'s round loop does not
@@ -1784,6 +2015,7 @@ def fit_multiclass_with_metrics(
         nf,
         unbundled="fit_multiclass_with_metrics",
         score_function_ok=True,
+        auto_lr_reason=String(_AUTO_LR_EVAL_SET_REASON),
     )
     check_bootstrap_honored(
         _parse_bootstrap(params),
@@ -1857,6 +2089,7 @@ def fit_ranker_with_metrics(
         nf,
         unbundled="fit_ranker_with_metrics",
         score_function_ok=True,
+        auto_lr_reason=String(_AUTO_LR_EVAL_SET_REASON),
     )
     check_bootstrap_honored(
         _parse_bootstrap(params),
@@ -2053,6 +2286,13 @@ def fit_multiclass(
         cpu=device == CPU_DEVICE,
         entry=String("the multiclass trainers"),
         score_function_ok=True,
+        # Honored. CatBoost's table has MultiClass rows, on both task types,
+        # for `boost_from_average = false` -- which is what
+        # `catboost_boost_from_average_default` returns for MultiClass, so
+        # the row exists for exactly the run this entry point makes.
+        auto_lr_ok=True,
+        auto_lr_rows=nr,
+        auto_lr_objective=_MULTICLASS_OBJECTIVE,
     )
     # `model.fit_multiclass` refuses an enabled bundle itself, on either
     # backend; parsing here means the value is refused with the same message
@@ -2099,6 +2339,12 @@ def fit_csc(
         csc.n_features,
         entry=String("a sparse (CSC) fit"),
         score_function_ok=True,
+        # Honored. `csc.n_rows` is the train row count whether or not the
+        # matrix is stored compressed: CatBoost's formula reads how many
+        # objects there are, not how they are laid out.
+        auto_lr_ok=True,
+        auto_lr_rows=nr,
+        auto_lr_objective=Int(py=objective),
     )
     check_bootstrap_honored(
         _parse_bootstrap(params),
@@ -2137,6 +2383,10 @@ def fit_multiclass_csc(
         csc.n_features,
         entry=String("a sparse (CSC) fit"),
         score_function_ok=True,
+        # Honored, for the reasons `fit_csc` and `fit_multiclass` are.
+        auto_lr_ok=True,
+        auto_lr_rows=nr,
+        auto_lr_objective=_MULTICLASS_OBJECTIVE,
     )
     check_bootstrap_honored(
         _parse_bootstrap(params),
@@ -2304,6 +2554,17 @@ def fit_ranker(
         unbundled="fit_ranker",
         entry=String("fit_ranker"),
         score_function_ok=True,
+        # `auto_lr_ok=True` on a ranker looks wrong and is not. The three
+        # inputs all exist here, so the entry point is not what disqualifies
+        # the run; what disqualifies it is that `GetTargetType` maps
+        # LambdaRank to Unknown and the table has no row. Handing the
+        # objective over and letting `AutoLearningRateParams.fires` say so
+        # keeps that judgement in the module that owns the table, instead of
+        # copying "ranking has no row" into this file where it would go
+        # stale the day CatBoost adds one.
+        auto_lr_ok=True,
+        auto_lr_rows=nr,
+        auto_lr_objective=_LAMBDARANK_OBJECTIVE,
     )
     check_bootstrap_honored(
         _parse_bootstrap(params),
@@ -3630,6 +3891,16 @@ def train_dataset(
             entry=String("a Dataset fit"),
             score_function_ok=True,
             random_strength_ok=scale_is_computed,
+            # Honored, and this is the entry point that makes the capability
+            # worth having: `mojotrees.train(params, Dataset)` is what
+            # `bench/real_data` trains through, and a CatBoost-mode arm whose
+            # rate is not CatBoost's rate is not a comparison of defaults.
+            # No fork to settle, unlike `random_strength_ok` right above:
+            # all three of the sparse, dense-CPU and dense-GPU arms shrink by
+            # `BoosterParams.learning_rate`.
+            auto_lr_ok=True,
+            auto_lr_rows=d[].num_data(),
+            auto_lr_objective=Int(py=params["objective"]),
         ),
         Float64(py=params["alpha"]),
         device,
@@ -3665,6 +3936,12 @@ def train_dataset_multiclass(
             cpu=device == CPU_DEVICE,
             entry=String("a Dataset fit"),
             score_function_ok=True,
+            # Honored. The objective key on a multiclass Dataset fit is not
+            # read by the trainer (it takes the class count instead), so the
+            # code is named here rather than taken from the mapping.
+            auto_lr_ok=True,
+            auto_lr_rows=d[].num_data(),
+            auto_lr_objective=_MULTICLASS_OBJECTIVE,
         ),
         device,
         _parse_bagging(params),
@@ -3690,6 +3967,12 @@ def train_dataset_ranker(
             d[].num_feature(),
             unbundled="train_dataset_ranker",
             score_function_ok=True,
+            # `True` for the reason `fit_ranker` passes True: the inputs are
+            # all here, and it is the coefficient table that has no
+            # LambdaRank row, which is the module's judgement to make.
+            auto_lr_ok=True,
+            auto_lr_rows=d[].num_data(),
+            auto_lr_objective=_LAMBDARANK_OBJECTIVE,
         ),
         _parse_advanced_rank_params(params),
         _parse_positions(params, d[].num_data()),
@@ -3731,6 +4014,7 @@ def booster_update(
             # `update_dataset`'s own message about continued training instead
             # of a message about random_strength, which is not its problem.
             random_strength_ok=True,
+            auto_lr_reason=String(_AUTO_LR_CONTINUED_REASON),
         ),
         Float64(py=params["alpha"]),
         _parse_bagging(params),
@@ -3762,6 +4046,7 @@ def booster_update_multiclass(
             d[].num_feature(),
             entry=String("a Dataset fit"),
             score_function_ok=True,
+            auto_lr_reason=String(_AUTO_LR_CONTINUED_REASON),
         ),
         _parse_bagging(params),
         _parse_goss(params),

@@ -85,7 +85,7 @@ from .objective_registry import (
 from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
 from .validation import check_booster_ranges, check_max_bin
-from .growth_policy import parse_grow_policy
+from .growth_policy import GROW_OBLIVIOUS, parse_grow_policy
 from .tree_parameters_extra import (
     check_extra_option_supported,
     check_feature_pre_filter,
@@ -174,10 +174,12 @@ struct TrainConfig(Copyable, Movable):
     `fit_multiclass`. `n_classes` is 1 for every single-output objective.
 
     `auto_learning_rate` is CatBoost's data-dependent learning rate
-    (auto_learning_rate.mojo, catalog A9) and is **disabled** unless the
-    parameter string says `auto_learning_rate=true`. When it is disabled,
-    which is the default, `booster.learning_rate` is the whole story and
-    `resolved_learning_rate` returns it unchanged.
+    (auto_learning_rate.mojo, catalog A12/A38). It is **enabled by default
+    under `grow_policy=oblivious` and disabled under every other grow
+    policy**, which is the standing rule that CatBoost mode mirrors CatBoost
+    and our own default mirrors LightGBM. `auto_learning_rate=true|false` in
+    the string overrides both. When it is disabled, `booster.learning_rate`
+    is the whole story and `resolved_learning_rate` returns it unchanged.
     """
 
     var objective: Int
@@ -771,7 +773,13 @@ def parse_params(spec: String) raises -> TrainConfig:
     var saw_learning_rate = False
     var saw_lambda_l2 = False
     var saw_leaf_estimation_iterations = False
+    # Two flags, not one, because "absent" and "auto_learning_rate=false" are
+    # different answers under `grow_policy=oblivious`: absent takes CatBoost's
+    # own default, which is ON, and an explicit false turns it off. A single
+    # boolean folded the two together and would have made the CatBoost-mode
+    # default unturnoffable.
     var saw_auto_learning_rate = False
+    var auto_learning_rate_asked = False
     # Whether the string named any of ordered boosting's four knobs. Tracked
     # for one reason: a knob without `boosting_type=ordered` is a value that
     # would be parsed, stored, and then never read, which is the shape this
@@ -1329,15 +1337,25 @@ def parse_params(spec: String) raises -> TrainConfig:
         elif key == "use_missing":
             config.use_missing = _parse_bool(key, value)
         # CatBoost's data-dependent learning rate (auto_learning_rate.mojo,
-        # catalog A9). CatBoost has no such key -- there the derivation is
-        # implied by leaving `learning_rate` unset -- so this is an explicit
-        # opt-in rather than a parity name, because mojotrees' own default of
-        # 0.1 is a real default that a silent override would erase. Off
-        # unless the string says so, and it changes nothing at parse time:
-        # the rate needs the train row count, so `resolved_learning_rate`
-        # applies it.
+        # catalog A12/A38). CatBoost has no such key -- there the derivation
+        # is implied by leaving `learning_rate` unset -- so this is an
+        # explicit override of a default that now depends on the grow policy:
+        #
+        #   grow_policy=oblivious (CatBoost mode)  ON  unless the string
+        #                                              sets any of the gated
+        #                                              parameters, which is
+        #                                              CatBoost's own rule
+        #   every other grow policy                OFF, because our default
+        #                                              mirrors LightGBM and
+        #                                              LightGBM has no such
+        #                                              feature
+        #
+        # Naming the key wins over both, in either direction. It changes
+        # nothing at parse time either way: the rate needs the train row
+        # count, so `resolved_learning_rate` applies it.
         elif key == "auto_learning_rate":
-            saw_auto_learning_rate = _parse_bool(key, value)
+            saw_auto_learning_rate = True
+            auto_learning_rate_asked = _parse_bool(key, value)
         elif _is_mojo_api_only(key):
             raise Error(
                 "parameter '",
@@ -1371,13 +1389,64 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.extra.extra_seed = random_state
     _validate(config, saw_num_class, saw_ordered_knob)
     if saw_auto_learning_rate:
-        _enable_auto_learning_rate(
+        if auto_learning_rate_asked:
+            _enable_auto_learning_rate(
+                config,
+                saw_learning_rate,
+                saw_lambda_l2,
+                saw_leaf_estimation_iterations,
+            )
+    elif config.booster.tree.grow_policy == GROW_OBLIVIOUS:
+        _default_auto_learning_rate(
             config,
             saw_learning_rate,
             saw_lambda_l2,
             saw_leaf_estimation_iterations,
         )
     return config^
+
+
+def _default_auto_learning_rate(
+    mut config: TrainConfig,
+    saw_learning_rate: Bool,
+    saw_lambda_l2: Bool,
+    saw_leaf_estimation_iterations: Bool,
+) raises:
+    """CatBoost's own default for `grow_policy=oblivious`: derive the rate.
+
+    The standing rule is that `grow_policy=oblivious` (CatBoost's symmetric
+    tree) mirrors CatBoost exactly and every other grow policy mirrors
+    LightGBM, so this fires here and nowhere else. LightGBM has no automatic
+    learning rate, which is why the default under `lossguide` -- ours -- is
+    still a flat 0.1.
+
+    This is `UpdateLearningRate`'s gate (`options_helper.cpp:276-281`) with
+    nothing added: all four of `learning_rate`, `leaf_estimation_method`,
+    `leaf_estimation_iterations` and `l2_leaf_reg` must be **unset**, where
+    unset means the string did not name the key. It is not "equal to the
+    default": `learning_rate=0.1` names the key and closes the gate even
+    though 0.1 is what the parser would have produced anyway, which is
+    exactly what CatBoost's `TOption::NotSet()` means (`option.h:80-85`,
+    an `IsSetFlag` written on assignment, never a comparison against a
+    default). mojotrees has no `leaf_estimation_method` key at all, so that
+    one of the four is permanently open here.
+
+    **Silent when the gate is closed, and that is deliberate.** A user who
+    writes `grow_policy=oblivious l2_leaf_reg=5` asked for nothing about the
+    learning rate, so there is nothing to refuse; CatBoost quietly keeps its
+    constant in the same situation and this keeps ours. An *explicit*
+    `auto_learning_rate=true` beside the same `l2_leaf_reg=5` is a different
+    act and `_enable_auto_learning_rate` refuses it by name.
+    """
+    if saw_learning_rate:
+        return
+    if saw_lambda_l2:
+        return
+    if saw_leaf_estimation_iterations:
+        return
+    config.auto_learning_rate = AutoLearningRateParams.catboost_defaults(
+        AUTO_LR_TASK_GPU if config.device == GPU_DEVICE else AUTO_LR_TASK_CPU
+    )
 
 
 def _enable_auto_learning_rate(
