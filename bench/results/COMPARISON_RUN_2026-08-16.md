@@ -84,6 +84,43 @@ search's documented near-tie divergence. Worth contrasting with Block A, where
 the same check returned 3.19e-06 on synthetic data of a similar size: same
 code, four million times the divergence.
 
+**That WARN was characterized after the run, from the saved prediction arrays,
+and it is not a near-tie divergence.** Nothing was retrained; this is arithmetic
+over artifacts already on disk.
+
+| | value |
+| --- | --- |
+| test rows | 51,630 |
+| rows differing by more than 1e-06 | **51,630 -- all of them, 100.0000%** |
+| rows differing by more than 0.1 | 45,424 (87.98%) |
+| rows differing by more than 1.0 | 8,361 (16.19%) |
+| median absolute difference | 0.4601 |
+| mean absolute difference | 0.5753 |
+| CPU prediction range | 1976.30 to 2009.24 |
+
+**A near-tie divergence moves the rows a differently-routed split sends
+elsewhere. This moves every row in the test set.** The label is a year, so
+predictions live near 2000, and the median disagreement is 0.46 of a year.
+
+Normalizing removes the part of the gap that is just target scale and leaves
+the part that is real. Against each block's own RMSE, the largest CPU/GPU
+disagreement is **1.06 (Block B) against 1.04e-05 (Block A)** -- still five
+orders of magnitude, so the effect survives normalization and is not an
+artifact of comparing a target near 2000 with one near 0.3.
+
+**What this does and does not say about the decision row.** Block A's own
+device-agreement check passed at 3.19e-06 and is direct evidence about Block A.
+But synthetic data here is drawn well-conditioned, so a scale-dependent defect
+would be invisible in it by construction. **The decision row's GPU number is
+therefore not shown to be wrong and not shown to be right**, and that is the
+honest state of it until the cause is separated. Two candidates worth
+separating first, both cheap: whether the divergence tracks the column with the
+largest magnitude range, which would point at the fixed-point histogram's scale
+rather than at any kernel; and that it spreads across all rows rather than
+concentrating, which the table above already establishes and which argues
+against a binning-boundary explanation. If it is the fixed-point scale, it is a
+correctness bound on every GPU number in this artifact.
+
 ## Block C -- high-cardinality categorical, 799,110 train rows x 15 features
 
 `high_cardinality_categorical --tier standard`, primary metric AUC.
