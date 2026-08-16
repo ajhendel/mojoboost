@@ -367,6 +367,13 @@ def command_train(args: List[String]) raises -> String:
     var features = column_major_features(table, label, weight)
     var n_features = len(features) // table.n_rows
 
+    # CatBoost's data-dependent learning rate, if `--params` asked for it
+    # (`auto_learning_rate=true`, src/mojotrees/auto_learning_rate.mojo,
+    # docs/design/CATBOOST_CATALOG.md A9). It reads the train row count, so
+    # it cannot be resolved at parse time. A no-op for every run that did
+    # not ask, which is the default.
+    config.booster.learning_rate = config.resolved_learning_rate(table.n_rows)
+
     var sample_weight = List[Float64]()
     if weight >= 0:
         sample_weight = List[Float64](capacity=table.n_rows)
