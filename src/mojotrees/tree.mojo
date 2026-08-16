@@ -1463,8 +1463,25 @@ struct GrowScratch(Movable):
         # `MOJOTREES_CPU_BIN_LAYOUT=feature` is the off switch and reproduces
         # the accumulation that shipped, which is what a bisection wants.
         var requested = env_bin_layout()
+        # AUTO maps to FEATURE-MAJOR, and that is a correction rather than a
+        # preference. This line used to map AUTO to row-major on the stated
+        # reasoning that "on today's default the view does not exist, so this
+        # changes nothing at all". `lane/row-major-auto` falsified that
+        # premise in the same round: the view is now built by default under a
+        # memory budget, so mapping AUTO to row-major here would silently
+        # turn every CPU fit under that budget row-major with no timing at
+        # all -- the flat default flip that was explicitly declined and
+        # replaced with LightGBM's auto rule.
+        #
+        # **AUTO is not a layout. It means nobody has chosen yet**, and until
+        # the timed probe runs the layout that shipped is the one that runs.
+        # `scratch.resolve_layout_timed` is the missing half; it lands with
+        # `lane/interleave-finish`, which owns the histogram file the probe
+        # lives in. Until then this is deliberately conservative.
         self.bin_layout = (
-            BIN_LAYOUT_ROW_MAJOR if requested == BIN_LAYOUT_AUTO else requested
+            BIN_LAYOUT_FEATURE_MAJOR
+            if requested == BIN_LAYOUT_AUTO
+            else requested
         )
         # The scheduling environment, read once here and then never again for
         # the life of this scratch. Every dispatch the grower makes -- the

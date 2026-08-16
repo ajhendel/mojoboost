@@ -156,10 +156,24 @@ def test_environment_reaches_the_kernel() raises:
     and the layout the scratch holds reaches the row-major kernel."""
     _ = setenv("MOJOTREES_CPU_BIN_LAYOUT", "")
     var auto = GrowScratch(6, 40)
+    # **This assertion was inverted on 2026-08-16 and the inversion is the
+    # point.** It used to require that an unrequested grower asks for
+    # row-major, which was safe only while the view did not exist by default.
+    # `lane/row-major-auto` made the view default-on under a memory budget, so
+    # that mapping would have silently turned every CPU fit under the budget
+    # row-major with no timing -- the flat default flip that was declined and
+    # replaced with LightGBM's build-both-keep-the-faster rule.
+    #
+    # AUTO is not a layout; it means nobody has chosen yet. Until
+    # `resolve_layout_timed` lands with the histogram file's lane, the layout
+    # that shipped is the one that runs. When the probe lands, this assertion
+    # changes again -- to "AUTO is still unresolved at construction and is
+    # decided at the root" -- and not back to row-major.
     assert_equal(
         auto.bin_layout,
-        BIN_LAYOUT_ROW_MAJOR,
-        "a grower with no explicit request should ask for row-major",
+        BIN_LAYOUT_FEATURE_MAJOR,
+        "an unrequested grower must not silently take row-major before the"
+        " timed probe has chosen",
     )
     _ = setenv("MOJOTREES_CPU_BIN_LAYOUT", "row")
     var asked = GrowScratch(6, 40)
@@ -181,14 +195,36 @@ def test_environment_reaches_the_kernel() raises:
     var rows = _every_k(600, 2, 0)
     var out = Histogram.zeroed(data.n_features, data.n_bins)
     var pairs = List[Float64]()
+    # Driven from the EXPLICITLY-row grower rather than the default one. The
+    # default now carries feature-major until the timed probe chooses, so
+    # asking it to prove the row kernel is reachable would prove nothing --
+    # it would pass on a grower that never wanted row-major in the first
+    # place. `asked` is the one that carries the request.
     var ran = build_histogram_subset_by_layout_into_scratch(
-        out, pairs, data, grad, hess, rows, 0, len(rows), auto.bin_layout,
+        out, pairs, data, grad, hess, rows, 0, len(rows), asked.bin_layout,
         [], False,
     )
     assert_equal(
         ran,
         BIN_LAYOUT_ROW_MAJOR,
-        "the layout a default grower carries did not reach the row kernel",
+        "the layout an explicitly-row grower carries did not reach the row"
+        " kernel",
+    )
+    # And the other end of the same chain: the default grower's layout must
+    # reach the FEATURE kernel on the very same matrix -- one that does have
+    # the view. Without this the assertion above could pass while the default
+    # quietly ran row-major anyway, which is the exact regression this pair
+    # of assertions exists to catch.
+    var out2 = Histogram.zeroed(data.n_features, data.n_bins)
+    var ran_default = build_histogram_subset_by_layout_into_scratch(
+        out2, pairs, data, grad, hess, rows, 0, len(rows), auto.bin_layout,
+        [], False,
+    )
+    assert_equal(
+        ran_default,
+        BIN_LAYOUT_FEATURE_MAJOR,
+        "a default grower ran the row kernel on a matrix that has the view,"
+        " which is the flat default flip that was declined",
     )
 
 
