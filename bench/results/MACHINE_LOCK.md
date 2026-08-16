@@ -236,3 +236,29 @@ merge alone before anything else touches the tree.
 None in throughput. Timing windows are minutes; lanes run for hours. The lock
 costs one message and buys the only thing that makes any of the numbers
 believable.
+
+
+---
+
+## The wave-end handover, agreed 2026-08-16
+
+The narrow `mode: timing` lock is not enough for a whole campaign's window, so
+the two campaigns hand the box over explicitly at wave end:
+
+1. The CPU campaign messages **starting**. From that moment the GPU campaign
+   **holds all compiles and all background agents** -- not just timing runs.
+2. The CPU campaign messages **done**. The GPU campaign then takes its window
+   and the CPU campaign holds on the same terms.
+3. `cpu-round-1` merges into `perf-round-2` immediately after, and anything
+   pending on the GPU side rebases onto it.
+
+**The drain interval is real and gets reported rather than assumed.** A compile
+cannot be killed mid-flight, so "holding" means launching nothing new and saying
+when the last in-flight build has actually finished. A campaign that answers
+"holding" while three lanes are still linking has not handed the box over; it has
+described an intention.
+
+That is not hypothetical here: the CPU campaign measured the same configuration
+at 6.115, 9.655 and 13.047 seconds across twelve minutes **while holding an
+uncontested timing lock**, because the other campaign was compiling. A 2.1x
+degradation under a lock that was working exactly as designed.
