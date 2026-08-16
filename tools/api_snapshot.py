@@ -690,12 +690,30 @@ def mojo_exports_by_module(d: Deriver) -> dict:
 
 
 def mojo_objective_codes(d: Deriver) -> dict:
-    """Uppercase `comptime NAME = <int>` constants in boosting.mojo, plus
-    MULTICLASS from params.mojo. Restricted to uppercase names so that
+    """Uppercase `comptime NAME = <int>` constants in objective_registry.mojo,
+    boosting.mojo and params.mojo. Restricted to uppercase names so that
     tuning constants written in lower case do not enter the snapshot as
-    though they were part of the objective vocabulary."""
+    though they were part of the objective vocabulary.
+
+    **`objective_registry.mojo` was missing from this list and that made the
+    whole check inert.** The constants moved there; `boosting.mojo` only
+    re-imports them under `_`-prefixed aliases, which this pattern
+    deliberately skips. So the key derived `{}` and reported a gap rather
+    than a failure, and nothing was frozen.
+
+    That matters more than a stale path, because **these integers ARE the
+    model file format**: `serialize.save_model` writes `objective <code>` and
+    `load_model` reads it back, so renumbering one silently reinterprets
+    every model file ever written -- a Poisson model loads as a Huber model,
+    applies the wrong inverse link, and nothing raises. Migration rule R6
+    forbids repurposing a field and this is one.
+
+    Found the expensive way: two lanes in one round independently assigned
+    codes 13 and 14 to different objectives, and what caught it was a lane's
+    own unit test pinning its values, not this gate.
+    """
     out = {}
-    for path in (MOJO_BOOSTING, MOJO_PARAMS):
+    for path in (MOJO_REGISTRY, MOJO_BOOSTING, MOJO_PARAMS):
         text = read(path, d)
         for name, value in re.findall(
             r"comptime\s+([A-Z][A-Z0-9_]*)\s*=\s*(-?\d+)\b", text
