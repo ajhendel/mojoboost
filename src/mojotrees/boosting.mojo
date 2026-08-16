@@ -110,7 +110,12 @@ from .tree import (
     grow_tree_with_cegb,
     node_bounds,
 )
-from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
+from .tree_parameters_extra import (
+    ExtraTreeParams,
+    cap_leaf_output,
+    finish_leaf_output,
+    raw_leaf_output,
+)
 from .validation import (
     check_class_code_range,
     check_class_count,
@@ -970,6 +975,347 @@ def _renew_leaf_values(
         tree.value[node] = renewed
 
 
+def catboost_leaf_estimation_iterations(objective: Int) -> Int:
+    """What CatBoost would default `leaf_estimation_iterations` to for the
+    CatBoost loss that corresponds to `objective`, on **CPU**.
+
+    **A record, not a default.** Nothing in this package reads this function.
+    `ExtraTreeParams.leaf_estimation_iterations` defaults to 1 for every
+    objective, which is LightGBM's behavior and this project's; this is here so
+    that a caller who asks for CatBoost's settings by name has one place to
+    read them from and so that the numbers are checked rather than remembered.
+
+    Verified from source, `github.com/catboost/catboost` at `master`, read
+    2026-08-16. The table is `GetEstimationMethodDefaults` in
+    `catboost/private/libs/options/catboost_options.cpp`, and the value that
+    takes effect is the one belonging to the loss's default
+    `leaf_estimation_method`: that function sets `defaultNewtonIterations`
+    *and* `defaultGradientIterations` for every loss, and
+    `SetLeavesEstimationDefault` then selects between them by method. A number
+    in the unselected slot is dead at the defaults.
+
+    That selection is where the widely repeated "CatBoost takes 10 Newton
+    steps for logloss and for multiclass" comes from, and it is **half wrong**:
+
+    - `Logloss`, `CrossEntropy`, `MultiLogloss`, `MultiCrossEntropy` really do
+      default to **10**. Their block sets `defaultNewtonIterations = 10`,
+      `defaultGradientIterations = 40`, method `Newton`.
+    - `MultiClass` and `MultiClassOneVsAll` default to **1**, not 10. Their
+      block sets `defaultEstimationMethod = Newton`,
+      `defaultNewtonIterations = 1`, `defaultGradientIterations = 10`. The 10
+      is the Gradient slot and is unreachable unless the caller passes
+      `leaf_estimation_method="Gradient"`. CatBoost's own documentation says
+      "Multiclassification mode -- One Newton iteration", which agrees with
+      the source; the folklore does not.
+
+    The rest of the table, for the losses that have a mojotrees counterpart:
+
+    | mojotrees | CatBoost loss | method | iterations |
+    |---|---|---|---|
+    | `SQUARED_ERROR` | `RMSE` | Newton | 1 |
+    | `BINARY_LOGISTIC` | `Logloss` | Newton | **10** |
+    | `CROSS_ENTROPY` | `CrossEntropy` | Newton | **10** |
+    | `POISSON` | `Poisson` | Newton | **10** |
+    | `HUBER` | `Huber` | Newton | 1 |
+    | `QUANTILE` | `Quantile` | Exact | 1 |
+    | `L1` | `MAE` | Exact | 1 |
+    | `MAPE` | `MAPE` | Exact | 1 |
+    | `TWEEDIE` | `Tweedie` | Newton | 1 on CPU (**20** on GPU) |
+    | `GAMMA`, `FAIR`, `CUSTOM` | no CatBoost counterpart | -- | 1 |
+    | `LAMBDARANK` | `LambdaMart` | Newton | 1 |
+
+    Two rows deserve a sentence. `Quantile`, `MAE` and `MAPE` reach 1 through
+    `useExact` in `SetLeavesEstimationDefault`, which switches those losses (on
+    a single host, without `approx_on_full_history`, without monotone
+    constraints) to `ELeavesEstimation::Exact` and pins both iteration counts
+    to 1. Exact is a closed-form weighted-quantile leaf refit -- it is
+    `_renew_leaf_values`, and CatBoost reaching for it on exactly the three
+    objectives LightGBM renews is the strongest evidence that these are one
+    mechanism and not two. And `Tweedie` is the one loss whose count differs
+    by task type, which is why this function says CPU in its first line.
+    """
+    if (
+        objective == BINARY_LOGISTIC
+        or objective == CROSS_ENTROPY
+        or objective == POISSON
+    ):
+        return 10
+    return 1
+
+
+def _refuse_leaf_estimation(
+    extra: ExtraTreeParams, trainer: StringSlice
+) raises:
+    """What a trainer that does **not** implement `leaf_estimation_iterations`
+    calls, so a fit that would have ignored the setting says which entry point
+    ignored it instead of training a model that silently took one step per
+    leaf. Returns on the first comparison at the default of 1.
+    """
+    if not extra.leaf_estimation_active():
+        return
+    raise Error(
+        "leaf_estimation_iterations > 1 is not implemented by ",
+        trainer,
+        "; it is implemented by boosting.train, boosting.train_more and"
+        " boosting.train_with_valid, through"
+        " TreeParams.extra.leaf_estimation_iterations",
+    )
+
+
+def _check_leaf_estimation_config(
+    extra: ExtraTreeParams, objective: Int, goss: GossParams
+) raises:
+    """Refuse `leaf_estimation_iterations > 1` in the two configurations where
+    an extra Newton step would be evaluating something other than the quantity
+    the first step used. Returns immediately at the default of 1, so an unset
+    parameter costs one integer comparison and nothing else.
+
+    **Renewing objectives (`L1`, `QUANTILE`, `MAPE`).** These are the
+    objectives whose leaf value is not a Newton step at all:
+    `_renew_leaf_values` throws the Newton value away and writes the weighted
+    alpha-percentile of the leaf's residuals, which is LightGBM's
+    `RenewTreeOutput` and is the *exact* minimizer of the leaf's own loss.
+    Their hessian is the sample weight and their gradient is a sign, so a
+    Newton step on them is `-mean(sign) / (n + lambda)`, a number with no
+    relation to the minimum. Iterating from the percentile would walk the leaf
+    away from the exact answer it already holds. CatBoost draws the same line, and
+    that is source-verified rather than inferred: `SetLeavesEstimationDefault`
+    switches `MAE`, `MAPE`, `Quantile` and their relatives to
+    `ELeavesEstimation::Exact` with both iteration counts pinned to 1, and a
+    `CB_ENSURE` refuses `Exact` for any other loss. Exact is a closed-form
+    weighted-quantile refit and is not what its iteration count applies to. So
+    the
+    relation between the two mechanisms is neither composition nor
+    generalization: they are the *same* job, done exactly for the objectives
+    where a closed form exists and iteratively for the objectives where one
+    does not, and running both on one tree would apply two corrections where
+    one is called for.
+
+    **GOSS.** `goss_round` multiplies the sampled small-gradient rows'
+    gradients and hessians by the amplification factor after
+    `_fill_grad_hess` filled them, so the leaf value the grower wrote is a
+    Newton step on *amplified* derivatives. This function recomputes from
+    `raw` and the objective, which knows nothing about the amplification, so
+    iteration 2 onward would be stepping on a differently scaled loss than
+    iteration 1. Reweighting here would mean reproducing the GOSS draw, which
+    is `sampling`'s to own.
+
+    A trainer that does not implement the mechanism at all calls
+    `_refuse_leaf_estimation` instead, which is the same refusal keyed on the
+    entry point rather than on the configuration.
+    """
+    if not extra.leaf_estimation_active():
+        return
+    if objective_renews_leaves(objective):
+        raise Error(
+            "leaf_estimation_iterations > 1 cannot be combined with an"
+            " objective that renews its leaves (l1, quantile, mape). Their"
+            " leaf value is already the exact minimizer of the leaf's loss"
+            " (the weighted percentile of its residuals, LightGBM's"
+            " RenewTreeOutput), and a Newton step on a sign gradient and a"
+            " constant hessian would move it away from that minimum. Extra"
+            " Newton steps apply to the smooth objectives, where no closed"
+            " form exists"
+        )
+    if goss.enabled:
+        raise Error(
+            "leaf_estimation_iterations > 1 cannot be combined with goss."
+            " GOSS amplifies the sampled rows' gradients and hessians after"
+            " they are computed, so the first Newton step is taken on"
+            " rescaled derivatives; this recomputes them from the raw scores"
+            " and the objective, which carry no amplification, and the second"
+            " step would be minimizing a differently weighted loss than the"
+            " first"
+        )
+
+
+def _estimate_leaf_values(
+    mut tree: Tree,
+    data: BinnedMatrix,
+    target: List[Float64],
+    raw: List[Float64],
+    objective: Int,
+    weights: List[Float64],
+    alpha: Float64,
+    iterations: Int,
+    lambda_l1: Float64,
+    lambda_l2: Float64,
+    max_delta_step: Float64,
+    bag: List[Int] = [],
+    monotone: List[Int] = [],
+    leaves: LeafMembership = LeafMembership(),
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """CatBoost's `leaf_estimation_iterations`: keep taking Newton steps on a
+    leaf's own rows after the tree's structure is fixed.
+
+    A leaf's value from the grower is one Newton step,
+    `-T(G) / (H + lambda_l2)`, with `G` and `H` summed at the raw scores the
+    round started from. That is the minimizer of a quadratic fitted at a point
+    the leaf is about to leave: once the leaf emits a nonzero value, the rows
+    in it sit at a different score, where the objective has a different
+    gradient and a different curvature. Iteration `k` re-evaluates every row of
+    the leaf at `raw[r] + v`, where `v` is the value the leaf currently holds,
+    sums the derivatives, and adds another step. It is Newton's method on the
+    leaf's one-dimensional problem, and one iteration is the first Newton
+    iterate, which is where every other trainer in this repository stops.
+
+    **`iterations <= 1` returns before it touches a row, and that early return
+    is the bit-identity guarantee.** Iteration 1 is never recomputed here: the
+    value the grower wrote is kept exactly as written, so there is no second
+    route to the first Newton step whose fold order could disagree with the
+    histogram's. A fit with the parameter absent, a fit with it set to 1, and a
+    fit from before this function existed produce the same `Float64` in every
+    leaf.
+
+    **The shift is `v`, not `learning_rate * v`, and that is deliberate.** The
+    ensemble adds `learning_rate * v` to each row, so evaluating derivatives at
+    `raw[r] + v` is asking "what is the best *full* step for this leaf", and
+    shrinkage then takes a fixed fraction of that answer. That is the same
+    division of labour every step of this loop already makes: the grower's
+    Newton step is unshrunk, `_renew_leaf_values` takes the percentile of
+    unshrunk residuals, and `_add_tree_scores` applies the rate once, at the
+    end. Evaluating at `raw[r] + learning_rate * v` instead would solve for the
+    best *shrunken* step, which `_add_tree_scores` would then shrink a second
+    time. CatBoost does the same and it is worth saying where: the walker in
+    `catboost/private/libs/algo/approx_calcer/gradient_walker.h` carries no
+    rate at all, and `approx_updater_helpers.cpp::NormalizeLeafValues`
+    multiplies the *accumulated* leaf value by `learning_rate` once, after the
+    last iteration. Raising the iteration count therefore does not compound
+    the rate on either side.
+
+    **Three deliberate differences from CatBoost, all recorded rather than
+    accidental.**
+
+    1. *No line search.* CatBoost defaults `leaf_estimation_backtracking` to
+       `AnyImprovement` and, at more than one iteration, halves a step that
+       does not lower the loss -- and on CPU a rejected halving consumes an
+       iteration, so `leaf_estimation_iterations=10` there is between 1 and 10
+       accepted steps. This takes every step. For the smooth objectives this
+       function accepts, the leaf's one-dimensional problem is convex and its
+       curvature is bounded below by `lambda_l2`, which damps the step; but
+       undamped Newton on a convex non-quadratic can still overshoot, and
+       nothing here detects that. A backtracking arm needs a *weighted*
+       per-leaf loss and `_mean_loss` is unweighted, so it is not built here.
+    2. *`lambda_l2` is not rescaled.* CatBoost's denominator is
+       `-SumDer2 + l2_leaf_reg * (sumAllWeights / allDocCount)`
+       (`online_predictor.h::ScaleL2Reg`), so its regularizer tracks the mean
+       sample weight. This uses `raw_leaf_output`, which is LightGBM's
+       `-T(G) / (H + lambda_l2)` with the same `lambda_l2` the grower used --
+       the point of the iteration is to keep solving *our* leaf problem more
+       exactly, not to change which problem it is. `lambda_l1` likewise stays
+       in the soft threshold, which CatBoost has no counterpart for.
+    3. *No Gradient method.* CatBoost's `ELeavesEstimation::Gradient` replaces
+       the curvature with the leaf's weight sum. Only Newton is implemented
+       here, which is the method CatBoost itself defaults to for every loss
+       this function accepts.
+
+    **What composes and what does not.** `max_delta_step` and the monotone
+    interval are re-applied after every step because both are projections onto
+    a fixed set: applying one to an already-projected value is the identity, so
+    re-applying them costs nothing and keeps every intermediate value -- the
+    value the *next* iteration differentiates at -- inside the cap and inside
+    the constraint the tree was grown under. `path_smooth` is not a projection
+    and is refused beside this parameter in
+    `ExtraTreeParams.check_leaf_estimation`, which is why no smoothing appears
+    below. The renewing objectives and GOSS are refused by
+    `_check_leaf_estimation_supported`.
+
+    **Determinism across `MOJOTREES_NUM_WORKERS`.** Two folds happen here and
+    both are worker-independent by construction. The per-row derivatives come
+    from `fill_grad_hess`, which splits rows into blocks but sums nothing
+    across them, so every row's pair is the same `Float64` at any worker count.
+    The reduction to `G` and `H` is then a plain sequential loop over
+    `rows` in the order that list holds, dispatched nowhere: no task
+    decomposition exists for the worker count to move. That order is ascending
+    row index on both routes below, for the reason `_renew_leaf_values`
+    records at length -- `partition_rows_into` keeps each side of every split
+    ascending, and the traversal fallback sweeps rows in ascending order --
+    so the two routes fold the same list, not merely the same multiset, and
+    agree bit for bit. The leaf loop itself runs in ascending node order and
+    leaves are independent, so nothing about it is order-sensitive at all.
+    """
+    if iterations <= 1:
+        return
+    var n_nodes = len(tree.feature)
+    var n_used = len(bag) if len(bag) > 0 else data.n_rows
+    # One row list per node, ascending. The membership route copies the list
+    # the grower's partition already built; the fallback rebuilds it by
+    # walking the tree once per row, which is what every caller without a
+    # membership gets.
+    var node_rows = List[List[Int]]()
+    for _ in range(n_nodes):
+        node_rows.append(List[Int]())
+    if _renewal_membership_usable(tree, leaves, n_used):
+        for l in range(leaves.n_leaves()):
+            var node = leaves.node[l]
+            ref rows = leaves.rows[l]
+            node_rows[node].reserve(len(rows))
+            for i in range(len(rows)):
+                node_rows[node].append(rows[i])
+    else:
+        for i in range(n_used):
+            var r = bag[i] if len(bag) > 0 else i
+            node_rows[tree.leaf_index_row(data, r)].append(r)
+
+    var bounds = node_bounds(tree, monotone)
+    var weighted = len(weights) > 0
+    # Five scratch lists for the whole tree rather than five per leaf per
+    # iteration. They are resized to each leaf's row count and then fully
+    # overwritten, so nothing survives from one leaf to the next.
+    var raw_l = List[Float64]()
+    var tgt_l = List[Float64]()
+    var w_l = List[Float64]()
+    var grad_l = List[Float64]()
+    var hess_l = List[Float64]()
+    for node in range(n_nodes):
+        if tree.feature[node] >= 0:
+            continue
+        ref rows = node_rows[node]
+        var n_l = len(rows)
+        if n_l == 0:
+            continue
+        raw_l.resize(n_l, 0.0)
+        tgt_l.resize(n_l, 0.0)
+        grad_l.resize(n_l, 0.0)
+        hess_l.resize(n_l, 0.0)
+        # Left empty, and so read as unweighted by `fill_grad_hess`, exactly
+        # when the fit is unweighted.
+        if weighted:
+            w_l.resize(n_l, 0.0)
+        for i in range(n_l):
+            tgt_l[i] = target[rows[i]]
+            if weighted:
+                w_l[i] = weights[rows[i]]
+        var v = tree.value[node]
+        for _ in range(iterations - 1):
+            for i in range(n_l):
+                raw_l[i] = raw[rows[i]] + v
+            fill_grad_hess(
+                raw_l, tgt_l, objective, w_l, alpha, grad_l, hess_l, settings
+            )
+            var g_sum = 0.0
+            var h_sum = 0.0
+            for i in range(n_l):
+                g_sum += grad_l[i]
+                h_sum += hess_l[i]
+            # The grower refuses a leaf whose hessian sum is below
+            # `min_child_hess`, so this is not reachable from a grown tree at
+            # the default regularization; it is here because a caller may set
+            # `lambda_l2` to 0 and an objective may drive a leaf's curvature
+            # to zero, and a division by zero would write an infinity into a
+            # model rather than stopping.
+            if h_sum + lambda_l2 <= 0.0:
+                break
+            v = cap_leaf_output(
+                v + raw_leaf_output(g_sum, h_sum, lambda_l1, lambda_l2),
+                max_delta_step,
+            )
+            if len(bounds) > 0:
+                v = bounds[node].clamp(v)
+        tree.value[node] = v
+
+
 struct BoosterParams(Copyable, Movable):
     """Ensemble-level hyperparameters.
 
@@ -1573,6 +1919,10 @@ def _boost_rounds(
     var renews = objective_renews_leaves(objective)
     var renew_w = renewal_weights(objective, target, sample_weight)
     var renew_a = renewal_alpha(objective, alpha)
+    # Once per fit, not once per tree: nothing it reads moves inside the loop.
+    # At the default of 1 both return on the first comparison.
+    var leaf_iters = params.tree.extra.leaf_estimation_iterations
+    _check_leaf_estimation_config(params.tree.extra, objective, goss)
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
     var bag = List[Int]()
@@ -1675,6 +2025,17 @@ def _boost_rounds(
                 tree, data, target, raw, renew_w, renew_a, bag, signs,
                 params.tree.extra, leaves,
             )
+        # CatBoost's extra Newton steps, on the same membership and the same
+        # bag. At the default of 1 this returns before it reads a row, so the
+        # tree keeps exactly the value the grower wrote and no bits move.
+        # Placed before the degenerate-tree test below, so that test sees the
+        # value the ensemble is about to carry. Exclusive with renewal, which
+        # `_check_leaf_estimation_config` refuses above rather than ordering.
+        _estimate_leaf_values(
+            tree, data, target, raw, objective, sample_weight, alpha,
+            leaf_iters, params.tree.lambda_l1, params.tree.lambda_reg,
+            params.tree.extra.max_delta_step, bag, signs, leaves, settings,
+        )
 
         # A single-leaf tree with a near-zero value means the objective has
         # converged; further rounds cannot make progress. Under any row
@@ -1962,6 +2323,9 @@ def train_with_valid(
     var renews = objective_renews_leaves(objective)
     var renew_w = renewal_weights(objective, target, sample_weight)
     var renew_a = renewal_alpha(objective, alpha)
+    # The same once-per-fit check and the same count `_boost_rounds` makes.
+    var leaf_iters = params.tree.extra.leaf_estimation_iterations
+    _check_leaf_estimation_config(params.tree.extra, objective, goss)
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
@@ -2023,6 +2387,13 @@ def train_with_valid(
                 tree, data, target, raw, renew_w, renew_a, bag, signs,
                 params.tree.extra, leaves,
             )
+        # The same extra Newton steps `_boost_rounds` takes, in the same place
+        # and with the same arguments; a no-op at the default of 1.
+        _estimate_leaf_values(
+            tree, data, target, raw, objective, sample_weight, alpha,
+            leaf_iters, params.tree.lambda_l1, params.tree.lambda_reg,
+            params.tree.extra.max_delta_step, bag, signs, leaves, settings,
+        )
         # Under any row sampler a degenerate tree indicts the sample, not
         # the run.
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
@@ -2348,6 +2719,17 @@ def _boost_rounds_multiclass(
     every round, which is what makes it worth fitting at all: the plan depends
     on the matrix, not on the gradients.
     """
+    # Multiclass does not take extra Newton steps, and refuses rather than
+    # ignoring the setting. The single-output form recomputes one row's
+    # derivatives from that row's one raw score; a softmax row has
+    # `n_classes` of them and class k's derivative depends on all of them, so
+    # re-estimating class k's leaves would have to hold the other K-1 trees'
+    # contributions fixed at a value they do not have yet -- this round's
+    # trees for classes k+1.. are not grown. CatBoost defaults `MultiClass` to
+    # **1** Newton iteration anyway (see
+    # `catboost_leaf_estimation_iterations`), so there is nothing lost here
+    # that CatBoost has by default.
+    _refuse_leaf_estimation(params.tree.extra, "the multiclass trainers")
     var bundling = prepare_bundling(data, params.bundling)
     # ONE ledger across every class, not one per class. A feature computed
     # for class 0's tree is computed for the row, so charging it again for
@@ -2662,6 +3044,9 @@ def train_multiclass_with_valid(
     check_bagging(bagging)
     _check_goss(goss, bagging)
     params.tree.monotone.check_features(data.n_features)
+    # The same refusal `_boost_rounds_multiclass` makes, for the same reason:
+    # a softmax row's derivative for class k reads every class's raw score.
+    _refuse_leaf_estimation(params.tree.extra, "the multiclass trainers")
     # Fitted once, from the training matrix alone: the validation matrix is
     # only ever scored through the trees, which name original features.
     var bundling = prepare_bundling(data, params.bundling)
