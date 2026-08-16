@@ -296,6 +296,7 @@ class Workload:
         ordered_boosting=False,
         score_function=SCORE_L2,
         random_strength=0.0,
+        derivative_precision=0,
     ):
         self.n_rows = int(n_rows)
         self.n_features = int(n_features)
@@ -318,6 +319,13 @@ class Workload:
         self.ordered_boosting = bool(ordered_boosting)
         self.score_function = int(score_function)
         self.random_strength = float(random_strength)
+        # The CODE, not the string. `tree_parameters_extra.parse_derivative_precision`
+        # is the only thing that turns a name into one, and it refuses an unknown
+        # spelling rather than resolving it to float32 -- so a value that reaches
+        # here has already been accepted natively. Kept as an Int for the reason
+        # the policy blocks on `!= DERIV_PRECISION_FLOAT32`: a third precision must
+        # refuse rather than be squeezed into a boolean about float64.
+        self.derivative_precision = int(derivative_precision)
         if self.n_rows < 1 or self.n_features < 1:
             raise ValueError(
                 "a workload needs at least one row and one feature; got "
@@ -698,6 +706,7 @@ class _FullNativePolicy:
                 "ordered_boosting": 1 if workload.ordered_boosting else 0,
                 "score_function": int(workload.score_function),
                 "random_strength": float(workload.random_strength),
+                "derivative_precision": int(workload.derivative_precision),
             },
         )
         return _parse_decision(str(text))

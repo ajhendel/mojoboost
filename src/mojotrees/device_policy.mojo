@@ -312,6 +312,7 @@ from .histogram import const_hessian_verify, derivative_precision_narrows
 # reaching it, which means the Cosine constant is never named here. Importing
 # it for symmetry would be an unused import that reads like a coupling.
 from .split import SCORE_L2
+from .tree_parameters_extra import DERIV_PRECISION_FLOAT32
 from .initialization import SessionState, warmup_level_name
 
 # The one table of objective facts. Imported rather than restated: this
@@ -1148,6 +1149,7 @@ struct DeviceRequest(Copyable, Movable):
     var ordered_boosting: Bool
     var score_function: Int
     var random_strength: Float64
+    var derivative_precision: Int
 
     def __init__(
         out self,
@@ -1167,6 +1169,7 @@ struct DeviceRequest(Copyable, Movable):
         ordered_boosting: Bool = False,
         score_function: Int = SCORE_L2,
         random_strength: Float64 = 0.0,
+        derivative_precision: Int = DERIV_PRECISION_FLOAT32,
     ):
         self.requested_device = requested_device
         self.n_rows = n_rows
@@ -1184,6 +1187,7 @@ struct DeviceRequest(Copyable, Movable):
         self.ordered_boosting = ordered_boosting
         self.score_function = score_function
         self.random_strength = random_strength
+        self.derivative_precision = derivative_precision
 
     def cells(self) -> Int:
         """`n_rows * n_features`, the size measure the crossover rules and
@@ -2143,7 +2147,29 @@ def _collect_blocks(
             )
         return blocks^
 
-    if caps.derivative_precision_float64:
+    if (
+        caps.derivative_precision_float64
+        or request.derivative_precision != DERIV_PRECISION_FLOAT32
+    ):
+        # TWO ENTRIES, ONE ANSWER, and until 2026-08-16 evening only one of them
+        # reached here. `caps.derivative_precision_float64` is read from
+        # `MOJOTREES_DERIVATIVE_PRECISION` at capability detection, so the
+        # ENVIRONMENT entry routed correctly: `auto` to the CPU, explicit `gpu`
+        # told. The PARAMETER entry supplied nothing, so a fit that asked for
+        # float64 as a parameter selected the accelerator on shape and then
+        # raised inside the grower at `histogram.check_device_derivative_precision`
+        # -- a late raise where the same request through the environment got an
+        # early route. `ExtraTreeParams.is_active()`'s own docstring already
+        # recorded that this setting has two entries which once diverged; that
+        # divergence was fixed for the gain pass and survived here.
+        #
+        # `!= DERIV_PRECISION_FLOAT32` rather than `== DERIV_PRECISION_FLOAT64`,
+        # for the reason `BLOCK_SCORE_FUNCTION` was written the same way: a third
+        # precision added later and not taught to the device must refuse rather
+        # than silently receive the Float32 answer under its own name. A Bool
+        # here would have foreclosed that, because a third value would have to be
+        # squeezed into "is it float64" and either resolution is wrong for one
+        # of them.
         # Precision is a capability, not a preference, so it sits here with
         # the kernel limits and above every shape question. `stage_gradients`
         # in gpu_gradient_stream.mojo narrows each per-row derivative with a
@@ -2828,6 +2854,9 @@ struct DeviceDecision(Copyable, Movable):
         out += String(
             "random_strength=", self.request.random_strength, "\n"
         )
+        out += String(
+            "derivative_precision=", self.request.derivative_precision, "\n"
+        )
 
         out += String(
             "gpu_available=",
@@ -3241,6 +3270,7 @@ def resolve_device(
     ordered_boosting: Bool = False,
     score_function: Int = SCORE_L2,
     random_strength: Float64 = 0.0,
+    derivative_precision: Int = DERIV_PRECISION_FLOAT32,
 ) raises -> Int:
     """Resolve a requested device to the backend that will actually run:
     `CPU_DEVICE` or `GPU_DEVICE`, never `AUTO_DEVICE`.
@@ -3308,6 +3338,7 @@ def resolve_device(
         ordered_boosting=ordered_boosting,
         score_function=score_function,
         random_strength=random_strength,
+        derivative_precision=derivative_precision,
     )
     var caps = DeviceCapabilities.detect()
     var decision = decide_device(request, caps)
@@ -3421,6 +3452,7 @@ def decide_device_report(
     ordered_boosting: Bool = False,
     score_function: Int = SCORE_L2,
     random_strength: Float64 = 0.0,
+    derivative_precision: Int = DERIV_PRECISION_FLOAT32,
 ) raises -> String:
     """The whole contract across a flat boundary: workload in, serialized
     decision out.
@@ -3460,6 +3492,7 @@ def decide_device_report(
         ordered_boosting=ordered_boosting,
         score_function=score_function,
         random_strength=random_strength,
+        derivative_precision=derivative_precision,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     return decide_device(request, caps).serialize()
@@ -3491,6 +3524,7 @@ def decide_device_report_reported(
     ordered_boosting: Bool = False,
     score_function: Int = SCORE_L2,
     random_strength: Float64 = 0.0,
+    derivative_precision: Int = DERIV_PRECISION_FLOAT32,
 ) raises -> String:
     """`decide_device_report` for a caller that has read the device.
 
@@ -3517,6 +3551,7 @@ def decide_device_report_reported(
         ordered_boosting=ordered_boosting,
         score_function=score_function,
         random_strength=random_strength,
+        derivative_precision=derivative_precision,
     )
     var caps = capabilities_from_reported(
         reported_api,
@@ -3549,6 +3584,7 @@ def resolve_device_full(
     ordered_boosting: Bool = False,
     score_function: Int = SCORE_L2,
     random_strength: Float64 = 0.0,
+    derivative_precision: Int = DERIV_PRECISION_FLOAT32,
 ) raises -> Int:
     """Resolve a fully described workload to `CPU_DEVICE` or `GPU_DEVICE`,
     raising the refusal when it cannot run.
@@ -3584,6 +3620,7 @@ def resolve_device_full(
         ordered_boosting=ordered_boosting,
         score_function=score_function,
         random_strength=random_strength,
+        derivative_precision=derivative_precision,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     var decision = decide_device(request, caps)

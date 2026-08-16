@@ -93,8 +93,9 @@ def decide_device_workload(
     | `ordered_boosting` | `boosting_type='ordered'` (0/1) |
     | `score_function` | `split.SCORE_L2` (0) or `split.SCORE_COSINE` (1) |
     | `random_strength` | CatBoost's per-candidate split noise (float) |
+    | `derivative_precision` | `DERIV_PRECISION_FLOAT32` (0) or `..._FLOAT64` (1) |
 
-    The last three are required keys, not optional ones, and that is the same
+    The last four are required keys, not optional ones, and that is the same
     convention every other key here follows: `device_selection.py` is the only
     sender and it always sends the whole mapping. A key read with a default
     would let a stale sender silently mean "L2, plain boosting", which is the
@@ -158,6 +159,7 @@ def decide_device_workload(
             ),
             score_function=Int(py=workload["score_function"]),
             random_strength=Float64(py=workload["random_strength"]),
+            derivative_precision=Int(py=workload["derivative_precision"]),
         )
     )
 
