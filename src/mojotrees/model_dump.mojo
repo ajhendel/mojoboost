@@ -56,6 +56,12 @@ from std.math import isnan
 comptime _F64_MAX = 1.7976931348623157e308
 
 from .binning import BinMapper
+# Catalog A19's remaining refusal, and this is now the only caller of it:
+# `trainset.mojo` stopped calling it when the v5 `ctr` section made a
+# CTR-carrying model saveable and loadable, and this schema is what is left
+# that a CTR mapper would break. `ctr` imports only `.rng`, so this adds no
+# cycle.
+from .ctr import check_ctr_model_support
 from .linear_tree import LinearEnsemble, linear_model_format_version
 from .categorical import (
     CAT_MAX_BINS,
@@ -72,11 +78,18 @@ from .tree import Tree
 # not survive; adding an optional field does not bump it.
 comptime DUMP_FORMAT_VERSION = 1
 
-# The save format a model written today serializes to (see serialize.mojo).
-# Recorded in the dump so a consumer knows which optional facts a model of
-# this vintage can carry at all. It has to track `CURRENT_FORMAT_VERSION`
-# there, which exists to be tracked; v4 is the one that carries split
-# gains, so a model saved by this build keeps them.
+# The save format a model with no optional v5 section serializes to (see
+# serialize.mojo). Recorded in the dump so a consumer knows which optional
+# facts a model of this vintage can carry at all; v4 is the one that carries
+# split gains, so a model saved by this build keeps them.
+#
+# This is the BASE version, `serialize._BASE_FORMAT_VERSION`, not
+# `serialize.CURRENT_FORMAT_VERSION`, and the distinction became real when
+# v5 arrived: a v5 file is one that carries linear leaves or CTR tables, and
+# a model with neither still writes v4. `linear_model_format_version` raises
+# this to 5 for a model whose linear sidecar is active. There is no CTR arm
+# because `_build` refuses a CTR-carrying mapper outright; see the guard
+# there.
 comptime MODEL_FORMAT_VERSION = 4
 
 # `_MAX_CATEGORY`, the codes a categorical feature can represent, is imported
@@ -645,6 +658,15 @@ def _build(
             " trees does not divide into iterations of ",
             per_iteration,
         )
+    # Catalog A19. A CTR model saves, loads and predicts (serialize.mojo's v5
+    # `ctr` section); this schema is what has not been widened for it. Every
+    # field below is sized by `mapper.n_features`, which counts base features
+    # only, while a CTR tree splits on ids up to `n_total_features() - 1`:
+    # `_build_features` would describe none of those columns and
+    # `threshold_value` would index `mapper.edge_offsets` past its end. A
+    # dump that silently described the wrong features is the failure this
+    # refuses; widening the schema is its own piece of work.
+    check_ctr_model_support(mapper.has_ctr())
     var names = feature_names_or_default(feature_names, mapper.n_features)
     var dump = ModelDump(mapper.n_features, mapper.n_bins)
     dump.objective_code = objective_code

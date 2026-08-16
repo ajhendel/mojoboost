@@ -2568,9 +2568,20 @@ struct BinMapper(Copyable, Movable):
     **`n_features` does not count CTR columns.** A raw row and a raw matrix stay
     exactly as wide as the caller's data, which is what keeps every existing
     call site of `transform` and `bin_row` correct without an edit; the *binned*
-    width is `n_total_features()`. The tables are model state (they are read off
-    the target), and `ctr_columns.check_ctr_serializable` refuses to let them
-    reach a writer that would silently drop them.
+    width is `n_total_features()`. That split is also the thing a consumer gets
+    wrong: anything that walks features by `n_features` and then indexes by a
+    tree's `feature[i]` reads past its own arrays on a CTR model, which is why
+    `model_dump._build` refuses one by name.
+
+    The tables are model state (they are read off the target) and they travel
+    with the model: `serialize._write_ctr` writes them as format v5's optional
+    `ctr` section and `serialize._read_ctr` reads them back inside
+    `_read_mapper`, so a saved mapper and its tables cannot be separated.
+    `ctr_columns.check_ctr_serializable` guards the one part of the state the
+    file leaves out (the derived bucket -> bin lookup, rebuilt on load), and
+    `ctr_columns.check_ctr_dataset_serializable` still refuses at the prepared
+    table writer, which carries the *ordered training* columns and cannot
+    describe them.
     """
 
     def __init__(
@@ -2640,9 +2651,12 @@ struct BinMapper(Copyable, Movable):
         last. After this call the mapper can no longer produce the training
         matrix, and nothing asks it to.
 
-        A `Model` built from a mapper in this state predicts correctly and saves
-        incorrectly; `ctr.check_ctr_model_support` is what stops the second from
-        happening, at the trainer boundary in `trainset.mojo`.
+        A `Model` built from a mapper in this state predicts correctly and, as
+        of format v5, saves correctly too: `serialize._write_ctr` writes these
+        tables and `serialize._read_ctr` calls this method to put them back.
+        The trainer-boundary refusal that used to stand in `trainset.mojo` is
+        gone with the reason for it; `ctr.check_ctr_model_support` survives as
+        the model-dump guard, which is a schema limit and not a save one.
         """
         if tables.is_active():
             if tables.n_base_features != self.n_features:

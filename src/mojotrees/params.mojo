@@ -1089,12 +1089,20 @@ def parse_params(spec: String) raises -> TrainConfig:
             # it, so it is refused by name.
             #
             # This key only bounds the arity. It does NOT turn CTRs on, and
-            # there is deliberately no parameter-string name that does,
-            # because a fit that built CTR columns cannot be SAVED yet -- the
-            # tables are model state and the format has no section for them.
-            # `ctr.check_ctr_model_support` refuses at every model-producing
-            # entry point and `serialize.check_ctr_serializable` refuses at
-            # every writer.
+            # there is still no parameter-string name that does -- but the
+            # reason has changed and the old one should not be repeated. A
+            # fit that builds CTR columns can now be saved: the fitted tables
+            # are model state and `serialize.mojo` carries them as format
+            # v5's `ctr` section, so `trainset.train_dataset*` produces a
+            # CTR model and `save_model` / `load_model` round-trip it.
+            # What is missing is the switch itself. The bundle a dataset
+            # takes is `ctr_columns.SimpleCtrConfig`, which is a Mojo-API
+            # argument to `Dataset.from_raw` / `from_dense`, and nothing on
+            # this string surface constructs one. Adding a name here would
+            # also have to answer for the surfaces that still refuse a CTR
+            # model: the prepared-table writer
+            # (`ctr_columns.check_ctr_dataset_serializable`) and the model
+            # dump (`ctr.check_ctr_model_support`).
             var complexity = _parse_int(key, value)
             if complexity != 1:
                 raise Error(

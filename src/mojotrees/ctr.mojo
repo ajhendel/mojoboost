@@ -992,8 +992,9 @@ def check_ctr_complexity(max_ctr_complexity: Int) raises:
     `greedy_tensor_search.cpp`, and `ctr_leaf_count_limit`'s top-K reindexing.
     The refusal that survives is `ctr_combinations.check_ctr_combination_trainer_support`,
     which refuses an ENABLED complexity above 1 because no grow loop drives the
-    enumeration yet -- the same honest "unreached" statement
-    `check_ctr_trainer_support` makes below.
+    enumeration yet. `check_ctr_trainer_support` below is a different statement
+    now: complexity 1 IS reached, and what that guard refuses is an enabled
+    `CtrParams`, the bundle no trainer reads.
 
     The bound is written out here rather than imported from
     `ctr_combinations.mojo`, because that module imports this one and a call in
@@ -1009,60 +1010,67 @@ def check_ctr_complexity(max_ctr_complexity: Int) raises:
 
 
 def check_ctr_trainer_support(params: CtrParams) raises:
-    """Refuses an enabled bundle at a trainer boundary. See
-    `check_ctr_model_support`, which is the refusal that now actually holds.
+    """Refuses an enabled `CtrParams` bundle, because no trainer reads one.
 
-    The original reason -- "nothing appends CTR columns to a design matrix" --
-    stopped being true on 2026-08-16. `ctr_columns.mojo` builds them,
-    `binning.append_ctr_train_columns` appends them to a `BinnedMatrix`, and
-    `BinMapper.transform` and `BinMapper.bin_row` append the inference half, so
-    the mechanism reaches the histogram and reaches a score. What has NOT
-    landed is the model file: `serialize._write_mapper` has no ctr section, so a
-    fitted model would save without its tables and load scoring wrong.
+    **The reason here has been wrong twice and this is the third statement of
+    it.** It first said "nothing appends CTR columns to a design matrix",
+    which stopped being true on 2026-08-16 when `ctr_columns.mojo` landed. It
+    then said "the fitted tables have no place in the model file", which
+    stopped being true when `serialize.mojo` grew its v5 `ctr` section: a
+    CTR-carrying `Model` now saves, loads and predicts, and
+    `trainset.train_dataset*` no longer refuses one.
 
-    This overload is kept because it takes a `CtrParams`, which is A19's own
-    bundle and is still what a caller holding one has. `check_ctr_model_support`
-    is the one the dataset path calls, and it names the real blocker.
+    What is true is narrower and is about this struct rather than about CTRs.
+    `CtrParams` is A19's original parameter bundle and **nothing consumes
+    it**. The bundle a trainer actually reads is
+    `ctr_columns.SimpleCtrConfig`, handed to `trainset.Dataset.from_raw` /
+    `from_dense`, and that is the one that turns the columns on. An enabled
+    `CtrParams` therefore describes a fit that will not happen, and answering
+    it silently would be answering it wrong.
+
+    Use `SimpleCtrConfig.catboost_defaults` to ask for CTRs.
     """
     if params.enabled:
         raise Error(
-            "ordered target statistics cannot be trained into a model yet:"
-            " the columns build and score, but their fitted tables have no"
-            " place in the model file, so a saved model would load without"
-            " them (catalog A19, and A29 owns serialize.mojo)"
+            "an enabled CtrParams reaches no trainer: it is catalog A19's"
+            " original bundle and nothing consumes it. The bundle a dataset"
+            " takes is ctr_columns.SimpleCtrConfig; pass one of those to"
+            " Dataset.from_raw or Dataset.from_dense to build ctr columns"
         )
 
 
 def check_ctr_model_support(active: Bool) raises:
-    """Refuses to turn CTR columns into a `Model`, and says why by name.
+    """Refuses a CTR-carrying mapper to a consumer whose schema is sized by
+    `BinMapper.n_features`.
 
-    The four fitted tables (`final_ctr_class_table`, `final_ctr_mean_table`,
-    `final_ctr_counter_table`, and the counter denominator) are **model state**:
-    they are read off the target, and a model that lost them keeps every tree
-    that references a CTR column and then bins those columns as if the columns
-    were absent. That is a wrong answer that looks like a right one, which is
-    the one failure mode worth refusing loudly for.
+    **What this used to refuse.** Every `trainset.train_dataset*` entry point,
+    so that a CTR-carrying `Model` was never produced at all. The reason was
+    the model file: the fitted tables are read off the target, and a format
+    with no section for them would have loaded a model that kept every tree
+    referencing a CTR column and binned that column as if the feature were
+    absent. `serialize.mojo`'s v5 `ctr` section carries them now
+    (`_write_ctr` / `_read_ctr`, and `_read_trees` validates tree topology
+    against `n_total_features()`), so those six calls are gone and a CTR model
+    saves, loads and scores.
 
-    `serialize._write_mapper` writes `n_features`, `n_bins`, the edges, the edge
-    offsets and the missing-bin table; `_write_categorical` writes the category
-    tables. Neither writes a CTR section and neither reader reads one. Adding
-    that section, bumping the format version, and calling
-    `ctr_columns.check_ctr_serializable` from `save_model`,
-    `save_multiclass_model` and `save_dataset` is catalog A29's work in
-    `serialize.mojo`, which the CTR wiring lane does not own.
-
-    Until then this raises at every `trainset.train_dataset*` entry point, so a
-    CTR-carrying model is never produced and therefore never saved wrong.
-    Deleting this guard is the export lane's first step, not a side effect of
-    anything here.
+    **What is left, and why the guard is not deleted.** A CTR column is a
+    column of the *binned* matrix and not of a raw row, so `n_features` counts
+    base features while a CTR tree splits on ids up to
+    `n_total_features() - 1`. Any consumer that walks features by
+    `mapper.n_features` and then indexes by a tree's `feature[i]` reads past
+    the end of its own arrays. `model_dump._build` is such a consumer and is
+    this function's caller. The others are named in `CTR_WIRE.md` with the
+    guard each one needs; they are in files this lane does not own.
     """
     if active:
         raise Error(
-            "a dataset carrying ctr columns cannot be trained into a model:"
-            " the fitted ctr tables are model state (catalog A19) and the"
-            " mojotrees model format has no ctr section, so the model would"
-            " save without them and load scoring wrong. serialize.mojo and the"
-            " format version belong to the model-export lane (catalog A29)"
+            "a model carrying ctr columns cannot be described by this schema:"
+            " it is sized by mapper.n_features, which counts base features"
+            " only, while a ctr tree splits on ids up to"
+            " n_total_features() - 1 (catalog A19). The model itself saves,"
+            " loads and predicts -- serialize.mojo's v5 ctr section carries"
+            " the fitted tables -- so this is the schema's gap and not the"
+            " model's"
         )
 
 
