@@ -180,3 +180,37 @@ comparison can still be invalid if the two arms straddle a clock transition.
   seconds against LightGBM's 4 to 7, and nothing here measures it.
 - Fenced and async attribute differently by construction, and the true
   per-phase device time is bracketed by the two rather than given by either.
+
+## Multiclass, measured for the first time, 465,000 x 54, 7 classes
+
+The dispatch bug that made every previous multiclass GPU number a mislabelled
+CPU fit is fixed, and `bench/bench_train_gpu.mojo` gained a `multi:K` arm, so
+this is the first honest multiclass measurement in the project.
+
+| arm | median | spread |
+|---|---|---|
+| mojotrees CPU | 25.47 | 7.7% |
+| mojotrees GPU | **15.30** | 0.1% |
+| mojotrees GPU, `MOJOTREES_GPU_CLASS_BATCH=7` | 15.45 | 0.8% |
+
+**The GPU wins multiclass by 1.63x**, resolved well outside the noise floor.
+That settles the route-then-measure question the right way: honoring an
+explicit `device='gpu'` for multiclass is a win, not a silent regression, so
+the dispatch fix stands without needing a fallback warning.
+
+**Class batching is indistinguishable.** 15.45 against 15.30 is inside the
+spread, so batching seven classes into one launch buys nothing at this shape.
+That matters beyond multiclass: classes in a round are independent trees over
+one shared uploaded matrix, which is structurally the same problem as
+independent fits, so this is the first measured point on the multi-fit
+batching idea and it points against it. The idea was ranked highly on
+reasoning; the reasoning was that batching amortizes per-dispatch cost, and
+the Metal timeline has since shown that per-dispatch cost is not what the
+round is spending its time on. The two results agree.
+
+Against LightGBM, using its own recorded covertype figures of 6.7 to 6.9
+seconds, we are roughly **2.2x behind** on multiclass rather than the 10x that
+the mislabelled record implied. Not comparable arm for arm, because
+`bench_lightgbm.py` has no multiclass mode and covertype is a real dataset
+rather than this synthetic shape, so treat 2.2x as an order of magnitude and
+not a measurement.
