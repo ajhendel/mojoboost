@@ -200,6 +200,72 @@ comptime CTR_ONE_HOT_MAX_SIZE = 2
 comptime DEFAULT_CTR_PERMUTATION_INDEX = 1
 
 
+# Which categorical columns earn CTR columns. The two rules answer different
+# questions and are deliberately not one comparison.
+comptime CTR_SOURCE_ONE_HOT_MAX_SIZE = 0
+"""CatBoost's rule: a column earns CTRs when it is too wide to one-hot,
+`uniqueValues > one_hot_max_size` (`greedy_tensor_search.cpp:469`). At
+CatBoost's default of 2 that is almost every categorical column in a dataset,
+which is why CatBoost pays for a permutation whenever one exists."""
+
+comptime CTR_SOURCE_BIN_OVERFLOW = 1
+"""mojotrees' rule, and the default: a column earns CTRs when the category
+table could not hold it.
+
+This is not CatBoost's boundary and does not claim to be. It is addressed at
+the one place a mojotrees categorical column loses information that LightGBM
+keeps. LightGBM's `max_bin` is a FLOOR on a categorical column's bin count,
+not a ceiling: `BinMapper::FindBin` keeps admitting categories while
+`used_cnt < cut_cnt || num_bin_ < max_bin` (`src/io/bin.cpp:461-462`, with
+`cut_cnt` = 99 percent of the rows at `:443-444`), and LightGBM says so in its
+own warning -- "For categorical features, max_bin and max_bin_by_feature may
+be ignored with a large number of categories"
+(`src/io/dataset_loader.cpp:1583`). It then widens its bin storage to
+`uint16_t` or `uint32_t` to hold the result (`src/io/bin.cpp:618-628`).
+
+mojotrees cannot do that: a bin id is one `UInt8` (`binning.MAX_BINS`) and a
+node's category set is a fixed 256-bit `categorical.CatBitset`, so a column
+keeps at most `max_bin - 1` categories and every other code falls into bin 0
+beside the missing rows, where no split set can ever reach it. A target
+statistic is the other way to represent such a column: it turns it into
+ordinary numeric columns whose value is a function of the raw category, so a
+category evicted from the table is still distinguished.
+
+The rule therefore fires **only where the loss is**, and that is what makes it
+affordable as a default. A categorical column the table holds in full loses
+nothing to binning, gains nothing from a CTR, and gets none: on such a dataset
+`plan_ctr_columns` returns inactive tables, `trainset._build_ctr` returns
+before allocating anything, and the binned matrix is byte-identical to the one
+built before this rule existed."""
+
+
+comptime CTR_SOURCE_RULES = 2
+"""One past the last rule code, for the range check in `validate`."""
+
+
+comptime CTR_OVERFLOW_MIN_CATEGORIES = 32
+"""The absolute floor `CTR_SOURCE_BIN_OVERFLOW` applies beside the table test,
+and it is LightGBM's `max_cat_threshold` default rather than a tuned number.
+
+`max_cat_threshold` caps the number of categories on ONE SIDE of a
+many-versus-many categorical split (`CategoricalParams.max_cat_threshold`,
+`categorical._sorted_search`). Below that many categories a set split can name
+every category it wants on a side, so the partition search is not capacity
+limited and a target statistic offers it a representation it already has.
+Above it, both the split cap and the bin table start to bind and the CTR is
+buying something.
+
+**The hole this leaves, stated rather than discovered.** The count being
+tested is `CategoricalSpec.n_categories`, the KEPT count, which saturates at
+`bin_budget - 1`. At `max_bin = 16` a column of 200 levels and a column of 15
+levels both report 15, so this floor makes the overflow rule unable to fire at
+all below `max_bin = 33` -- including on a column that really did lose 185
+levels. Distinguishing those two needs the pre-truncation distinct count,
+which `CategoricalSpec` does not store and cannot be given without widening
+the model format. At the default `max_bin = 255` the floor is inert, because
+`bin_budget - 1` is 254 and already far above it."""
+
+
 # ---------------------------------------------------------------------------
 # One CTR description
 # ---------------------------------------------------------------------------
@@ -303,6 +369,12 @@ struct SimpleCtrConfig(Copyable, Movable):
     var prior_denom: Float64
     var seed: Int
 
+    var source_rule: Int
+    """Which categorical columns earn CTR columns:
+    `CTR_SOURCE_ONE_HOT_MAX_SIZE` (CatBoost's) or `CTR_SOURCE_BIN_OVERFLOW`
+    (the columns the category table could not hold). Read by
+    `ctr_source_features` and by nothing else."""
+
     def __init__(out self):
         """Disabled, and otherwise CatBoost's verified defaults, so a ported
         configuration reads the same even where this refuses to run."""
@@ -318,11 +390,49 @@ struct SimpleCtrConfig(Copyable, Movable):
         self.max_ctr_complexity = DEFAULT_MAX_CTR_COMPLEXITY
         self.prior_denom = CPU_PRIOR_DENOM
         self.seed = DEFAULT_CTR_SEED
+        self.source_rule = CTR_SOURCE_ONE_HOT_MAX_SIZE
 
     @staticmethod
     def disabled() -> SimpleCtrConfig:
         """The inactive bundle, spelled out at a call site."""
         return SimpleCtrConfig()
+
+    @staticmethod
+    def auto(
+        var target_borders: List[Float64] = [],
+        permutation_index: Int = DEFAULT_CTR_PERMUTATION_INDEX,
+        seed: Int = DEFAULT_CTR_SEED,
+    ) raises -> SimpleCtrConfig:
+        """The bundle a dense `Dataset` takes by default.
+
+        Enabled, at CatBoost's CPU `simple_ctr` descriptions, but selecting its
+        source columns by `CTR_SOURCE_BIN_OVERFLOW` rather than by CatBoost's
+        one-hot cutoff. Read that constant for why the boundary moved; the
+        short form is that this is the boundary at which mojotrees loses
+        information LightGBM keeps, and away from it a CTR is cost without a
+        gain.
+
+        **This being the default is the whole point and is also the whole
+        risk, so state what it costs.** On a dataset whose categorical columns
+        all fit the category table -- which is every dataset with no
+        categorical column at all, and every one whose widest categorical
+        column holds fewer than `max_bin - 1` levels -- `ctr_source_features`
+        returns nothing, `plan_ctr_columns` returns inactive tables, and
+        `trainset._build_ctr` returns before it allocates. Nothing is read but
+        one `n_categories` per feature. On a dataset that DOES overflow, each
+        overflowing column costs four `UInt8` columns of `n_rows` (the
+        `Borders` triple plus `Counter`, `catboost_simple_ctr_defaults`), one
+        pass to build them, and their share of every histogram from then on.
+        """
+        var out = SimpleCtrConfig()
+        out.enabled = True
+        out.descriptions = catboost_simple_ctr_defaults()
+        out.target_borders = target_borders^
+        out.permutation_index = permutation_index
+        out.seed = seed
+        out.max_ctr_complexity = 1
+        out.source_rule = CTR_SOURCE_BIN_OVERFLOW
+        return out^
 
     @staticmethod
     def catboost_defaults(
@@ -358,6 +468,21 @@ struct SimpleCtrConfig(Copyable, Movable):
 
     def is_active(self) -> Bool:
         return self.enabled
+
+    def is_policy(self) -> Bool:
+        """Whether this bundle is a default POLICY rather than a REQUEST, and
+        the difference decides whether a shape it cannot serve raises.
+
+        `CTR_SOURCE_BIN_OVERFLOW` is what a dense `Dataset` takes when its
+        caller said nothing, so it must never turn a dataset that used to build
+        into one that raises. Where it cannot run -- a sparse matrix, or no
+        label to take a statistic of -- it declines and the dataset is the one
+        it would have been. `CTR_SOURCE_ONE_HOT_MAX_SIZE` is a caller naming
+        the bundle, and those same shapes refuse by name, because silently
+        doing nothing with something that was asked for is the defect this
+        distinction exists to avoid.
+        """
+        return self.source_rule == CTR_SOURCE_BIN_OVERFLOW
 
     def n_target_classes(self) -> Int:
         """`GetClassesCount`: `Borders.ysize() + 1`.
@@ -421,6 +546,11 @@ struct SimpleCtrConfig(Copyable, Movable):
             raise Error("permutation_block_size must be nonnegative")
         if self.one_hot_max_size < 0:
             raise Error("one_hot_max_size must be nonnegative")
+        if self.source_rule < 0 or self.source_rule >= CTR_SOURCE_RULES:
+            raise Error(
+                "source_rule must be CTR_SOURCE_ONE_HOT_MAX_SIZE or"
+                " CTR_SOURCE_BIN_OVERFLOW"
+            )
         if self.counter_calc_method == COUNTER_CALC_FULL:
             raise Error(
                 "counter_calc_method='Full' is not implemented: it counts the"
@@ -449,6 +579,43 @@ struct SimpleCtrConfig(Copyable, Movable):
                 raise Error(
                     "BinarizedTargetMeanValue needs at least two target classes"
                 )
+
+
+def can_derive_target_borders(label: List[Float64]) -> Bool:
+    """Whether `default_target_borders` would succeed on this label, asked
+    without raising.
+
+    The same two-distinct-values scan, answering rather than refusing. It
+    exists because `SimpleCtrConfig.auto()` is a DEFAULT: a regression target
+    has more than two distinct values, `default_target_borders` refuses one by
+    name, and a default that turns every regression fit with a wide
+    categorical column into an error would be a defect rather than a policy.
+    `trainset._build_ctr` asks this first and declines quietly when the answer
+    is no. A caller who NAMED a bundle still reaches the refusal, which is
+    where the explanation of what to pass instead lives.
+
+    It answers `False` where `default_target_borders` raises, and it takes no
+    other exit: no branch here raises, so "cannot derive" arrives as a value
+    and never as an error condition a caller has to catch.
+    """
+    var first = 0.0
+    var second = 0.0
+    var n_distinct = 0
+    for i in range(len(label)):
+        var v = label[i]
+        if n_distinct == 0:
+            first = v
+            n_distinct = 1
+        elif v == first:
+            continue
+        elif n_distinct == 1:
+            second = v
+            n_distinct = 2
+        elif v == second:
+            continue
+        else:
+            return False
+    return n_distinct == 2
 
 
 def default_target_borders(label: List[Float64]) raises -> List[Float64]:
@@ -902,10 +1069,31 @@ def ctr_source_features(
     config: SimpleCtrConfig,
     is_categorical: List[Bool],
     n_categories: List[Int],
+    bin_budget: Int,
 ) raises -> List[Int]:
     """The categorical columns that earn CTRs, ascending.
 
-    A column earns them when it is **too wide to one-hot**:
+    `bin_budget` is the binning's `max_bin`, so a categorical column filled its
+    table when it kept `bin_budget - 1` categories (bin 0 is reserved,
+    `categorical.UNKNOWN_BIN`). It is read only by
+    `CTR_SOURCE_BIN_OVERFLOW`; the CatBoost rule ignores it.
+
+    **Under `CTR_SOURCE_BIN_OVERFLOW`** a column earns CTRs when
+    `n_categories[f] >= bin_budget - 1` and it holds at least
+    `CTR_OVERFLOW_MIN_CATEGORIES` of them. The first test is
+    `fit_categorical_spec`'s
+    `_keep_most_frequent(codes, counts, max_bins - 1)` having run out of
+    budget. The test is `>=` and not `>` because a truncated table is
+    indistinguishable from a full one here: `CategoricalSpec` stores the kept
+    codes and not the distinct count it started from, so a column holding
+    exactly `bin_budget - 1` distinct categories -- which lost nothing -- is
+    treated as an overflow. That is a false positive costing four columns on a
+    column of exactly 254 levels, and it is preferred to widening
+    `CategoricalSpec` and with it the model format, which is a change no
+    accuracy this buys would pay for.
+
+    **Under `CTR_SOURCE_ONE_HOT_MAX_SIZE`** a column earns them when it is
+    **too wide to one-hot**:
     `uniqueValues > one_hot_max_size`. That is the test at
     `greedy_tensor_search.cpp:469` and the same quantity `IsPermutationNeeded`
     uses to decide whether a permutation exists at all
@@ -929,10 +1117,21 @@ def ctr_source_features(
         raise Error(
             "is_categorical and n_categories must have one entry per feature"
         )
+    if config.source_rule == CTR_SOURCE_BIN_OVERFLOW and bin_budget < 2:
+        raise Error(
+            "bin_budget must be at least 2 to decide which categorical"
+            " columns overflowed their table"
+        )
     for f in range(len(is_categorical)):
         if not is_categorical[f]:
             continue
-        if n_categories[f] > config.one_hot_max_size:
+        if config.source_rule == CTR_SOURCE_BIN_OVERFLOW:
+            if (
+                n_categories[f] >= bin_budget - 1
+                and n_categories[f] >= CTR_OVERFLOW_MIN_CATEGORIES
+            ):
+                out.append(f)
+        elif n_categories[f] > config.one_hot_max_size:
             out.append(f)
     return out^
 
@@ -941,8 +1140,15 @@ def plan_ctr_columns(
     config: SimpleCtrConfig,
     is_categorical: List[Bool],
     n_categories: List[Int],
+    bin_budget: Int,
 ) raises -> CtrTables:
     """The column layout, with the tables still empty.
+
+    `bin_budget` is the binning's `max_bin` and is handed straight to
+    `ctr_source_features`, which is the only thing that reads it. It has no
+    default: the answer under `CTR_SOURCE_BIN_OVERFLOW` depends on it entirely,
+    and a caller that got it wrong by taking a default would get a plan with
+    the wrong columns in it rather than an error.
 
     Order is `AllocateCtrData`'s (`online_ctr.cpp:741`): source feature
     ascending, then description in the order the config lists them, then target
@@ -967,7 +1173,9 @@ def plan_ctr_columns(
     if not config.enabled:
         return tables^
     var n_base = len(is_categorical)
-    var sources = ctr_source_features(config, is_categorical, n_categories)
+    var sources = ctr_source_features(
+        config, is_categorical, n_categories, bin_budget
+    )
     var n_classes = config.n_target_classes()
     if n_classes < 1:
         raise Error("a ctr fit needs at least one target class")

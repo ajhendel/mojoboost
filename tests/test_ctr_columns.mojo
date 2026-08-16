@@ -90,7 +90,7 @@ def _one_wide_column() raises -> CtrTables:
     var counts = List[Int]()
     counts.append(0)
     counts.append(4)
-    return plan_ctr_columns(_binary_config(), flags, counts)
+    return plan_ctr_columns(_binary_config(), flags, counts, 255)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ def test_a_narrow_categorical_column_earns_no_ctrs() raises:
     var counts = List[Int]()
     counts.append(2)  # one-hot, no CTRs
     counts.append(3)  # one over the cutoff, CTRs
-    var sources = ctr_source_features(config, flags, counts)
+    var sources = ctr_source_features(config, flags, counts, 255)
     assert_equal(len(sources), 1)
     assert_equal(sources[0], 1)
 
@@ -159,7 +159,7 @@ def test_a_narrow_categorical_column_earns_no_ctrs() raises:
     var narrow_counts = List[Int]()
     narrow_counts.append(2)
     narrow_counts.append(1)
-    var none_tables = plan_ctr_columns(config, flags, narrow_counts)
+    var none_tables = plan_ctr_columns(config, flags, narrow_counts, 255)
     assert_false(none_tables.is_active())
     assert_equal(none_tables.n_columns(), 0)
 
@@ -169,7 +169,9 @@ def test_a_disabled_config_plans_nothing() raises:
     flags.append(True)
     var counts = List[Int]()
     counts.append(10)
-    var tables = plan_ctr_columns(SimpleCtrConfig.disabled(), flags, counts)
+    var tables = plan_ctr_columns(
+        SimpleCtrConfig.disabled(), flags, counts, 255
+    )
     assert_false(tables.is_active())
     assert_equal(tables.n_columns(), 0)
 

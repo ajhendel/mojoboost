@@ -92,6 +92,7 @@ from .binning import (
 from .ctr_columns import (
     SimpleCtrConfig,
     build_ctr_train_columns,
+    can_derive_target_borders,
     ctr_train_permutation,
     fit_ctr_tables,
     plan_ctr_columns,
@@ -503,20 +504,39 @@ def _build_ctr(
     """
     if not config.is_active():
         return
+    if config.is_policy() and len(config.target_borders) == 0:
+        if not can_derive_target_borders(label):
+            # A DEFAULT bundle declines on a target it cannot binarize rather
+            # than refusing. `default_target_borders` handles a two-valued
+            # label and raises by name on anything wider, which is every
+            # regression target; letting that reach a caller who asked for
+            # nothing would turn working fits into errors. A caller who named
+            # the bundle skips this branch and gets the refusal, which is
+            # where the instruction to pass `target_borders` lives.
+            return
     # Before anything is planned, because the plan's shape depends on the class
     # count: one target border means two classes, and `Borders` emits
     # `n_classes - 1` columns. The config keeps what it resolved, so the dataset
     # records the borders its columns were actually built from.
     config.resolve_target_borders(label)
     config.validate()
+    # `mapper.n_bins` is the binning budget, the same `max_bins`
+    # `categorical.fit_categorical_spec` capped its tables with, so it is
+    # exactly the quantity `CTR_SOURCE_BIN_OVERFLOW` compares a kept-category
+    # count against. The mapper is still bare here, so this is the base
+    # feature width and no CTR column can be its own source.
     var tables = plan_ctr_columns(
-        config, _is_categorical_flags(mapper), _feature_category_counts(mapper)
+        config,
+        _is_categorical_flags(mapper),
+        _feature_category_counts(mapper),
+        mapper.n_bins,
     )
     if not tables.is_active():
-        # No categorical column was wide enough to escape the one-hot cutoff,
-        # so CatBoost would build no CTRs here either and the permutation it
-        # keys off (`IsPermutationNeeded`'s `hasCtrs`) would be off as well.
-        # Nothing is attached and the dataset is the one it would have been.
+        # No categorical column earned CTRs under this config's source rule:
+        # none was wide enough to escape the one-hot cutoff, or under
+        # `CTR_SOURCE_BIN_OVERFLOW` none filled its category table. Nothing is
+        # attached and the dataset is the one it would have been -- which is
+        # what makes the overflow rule affordable as a default.
         return
     var borders = config.target_borders.copy()
     var n_rows = data.n_rows
@@ -561,9 +581,19 @@ struct Dataset(Copyable, Movable, Writable):
 
     var ctr: SimpleCtrConfig
     """The ordered-target-statistic configuration this dataset was built with,
-    catalog A19. `SimpleCtrConfig.disabled()` by default, in which case nothing
-    below it ever runs and the binned matrix is byte-identical to the one this
-    type held before CTRs existed.
+    catalog A19.
+
+    It records what HAPPENED and not what was offered. The dense constructors
+    default to `SimpleCtrConfig.auto()`, which builds CTR columns only for
+    categorical columns that filled their category table
+    (`ctr_columns.CTR_SOURCE_BIN_OVERFLOW`); when that policy declines --
+    because the matrix is sparse, or there is no label, or the target has more
+    than two distinct values, or simply because no column overflowed -- this
+    field is set back to `SimpleCtrConfig.disabled()` before it is stored. So
+    a disabled value here still means exactly what it always meant: nothing
+    below it ever ran and the binned matrix is byte-identical to the one this
+    type held before CTRs existed. `subset` and the model writer read this
+    field and are entitled to that reading.
 
     `n_features` stays the **raw** feature count whether or not CTRs are on, so
     every column check, every subset and every caller reading it keeps its
@@ -586,7 +616,7 @@ struct Dataset(Copyable, Movable, Writable):
         max_bin: Int = 255,
         use_missing: Bool = True,
         keep_raw: Bool = False,
-        var ctr: SimpleCtrConfig = SimpleCtrConfig.disabled(),
+        var ctr: SimpleCtrConfig = SimpleCtrConfig.auto(),
     ) raises:
         """Bin a column-major raw feature matrix (`features[f * n_rows + r]`)
         and take ownership of the columns that describe its rows.
@@ -597,10 +627,21 @@ struct Dataset(Copyable, Movable, Writable):
         that needs the raw values after construction; it costs one extra
         `n_rows * n_features` buffer for as long as the dataset lives.
 
-        `ctr` is catalog A19's ordered target statistics and is off by default.
-        An active one needs a `label`, because the columns it builds are
-        statistics of the target; it is refused without one rather than
-        producing a column of pure priors.
+        `ctr` is catalog A19's ordered target statistics. It is ON by default,
+        at `SimpleCtrConfig.auto()`, and that default builds nothing on almost
+        every dataset: `auto()` selects its source columns by
+        `ctr_columns.CTR_SOURCE_BIN_OVERFLOW`, which names only the
+        categorical columns that filled their category table and so lost
+        levels into `categorical.UNKNOWN_BIN`. A dataset with no categorical
+        column, or whose categorical columns all fit, plans no CTR column, and
+        its binned matrix is the one it was before this default moved.
+
+        An active bundle needs a `label`, because the columns it builds are
+        statistics of the target. A bundle the caller NAMED is refused without
+        one rather than producing a column of pure priors; the default policy
+        declines instead and records itself disabled, because a default that
+        turns a working label-free `Dataset` into an error is a defect. See
+        `SimpleCtrConfig.is_policy`.
         """
         _check_columns(
             n_rows,
@@ -629,8 +670,21 @@ struct Dataset(Copyable, Movable, Writable):
         # and attaches the tables, in that order.
         var data = mapper.transform(features, n_rows)
         if ctr.is_active():
-            _check_ctr_label(label, n_rows)
-            _build_ctr(mapper, data, label, ctr)
+            if ctr.is_policy() and len(label) == 0:
+                # The default policy declines rather than refusing. See the
+                # docstring; a named bundle takes the branch below and
+                # `_check_ctr_label` raises for it.
+                ctr = SimpleCtrConfig.disabled()
+            else:
+                _check_ctr_label(label, n_rows)
+                _build_ctr(mapper, data, label, ctr)
+                if ctr.is_policy() and not mapper.ctr.is_active():
+                    # No column overflowed its table, so nothing was planned,
+                    # nothing was appended and nothing was attached. Record the
+                    # bundle that describes what happened rather than the one
+                    # that was offered, so `subset` and the model writer see
+                    # the state they would have seen.
+                    ctr = SimpleCtrConfig.disabled()
         self.mapper = mapper^
         self.data = data^
         self.ctr = ctr^
@@ -724,7 +778,7 @@ struct Dataset(Copyable, Movable, Writable):
         max_bin: Int = 255,
         use_missing: Bool = True,
         keep_raw: Bool = False,
-        var ctr: SimpleCtrConfig = SimpleCtrConfig.disabled(),
+        var ctr: SimpleCtrConfig = SimpleCtrConfig.auto(),
     ) raises -> Dataset:
         """Bin a `RawData`, dense or sparse, and own the result.
 
@@ -739,12 +793,19 @@ struct Dataset(Copyable, Movable, Writable):
         constructor. It is retained afterwards only when `keep_raw` asks for
         it, and dropped otherwise.
 
-        `ctr` (catalog A19) is refused on sparse input, by name. A CTR column
-        is dense by construction -- every row of a categorical column has a
-        bucket, `categorical.UNKNOWN_BIN` included, so every row has a
-        statistic and there is no default value a `SparseBinnedMatrix` column
-        could be built around. Appending it would silently densify the matrix
-        the sparse path exists to avoid.
+        `ctr` (catalog A19) is a NAMED bundle refused on sparse input, by name.
+        A CTR column is dense by construction -- every row of a categorical
+        column has a bucket, `categorical.UNKNOWN_BIN` included, so every row
+        has a statistic and there is no default value a `SparseBinnedMatrix`
+        column could be built around. Appending it would silently densify the
+        matrix the sparse path exists to avoid.
+
+        The DEFAULT bundle, `SimpleCtrConfig.auto()`, declines on sparse input
+        instead of refusing, for the reason `SimpleCtrConfig.is_policy` gives:
+        this is the constructor `from_csc`, `from_csr` and `subset` all arrive
+        at, and a default that raises on every sparse dataset in the library
+        would be a defect rather than a policy. The same applies when there is
+        no label to take a statistic of.
         """
         var n_rows = raw.n_rows
         var n_features = raw.n_features
@@ -766,19 +827,28 @@ struct Dataset(Copyable, Movable, Writable):
         var sparse_data = _empty_sparse_binned(n_features)
         if is_sparse:
             if ctr.is_active():
-                raise Error(
-                    "ordered target statistics are a dense-matrix mechanism:"
-                    " every row of a categorical column has a bucket, so a ctr"
-                    " column has a value in every row and no default bin a"
-                    " sparse column could be stored around. Build the dataset"
-                    " from a dense matrix, or leave ctr disabled"
-                )
+                if ctr.is_policy():
+                    ctr = SimpleCtrConfig.disabled()
+                else:
+                    raise Error(
+                        "ordered target statistics are a dense-matrix"
+                        " mechanism: every row of a categorical column has a"
+                        " bucket, so a ctr column has a value in every row and"
+                        " no default bin a sparse column could be stored"
+                        " around. Build the dataset from a dense matrix, or"
+                        " leave ctr disabled"
+                    )
             sparse_data = raw.transform_sparse(mapper)
         else:
             data = raw.transform_dense(mapper)
             if ctr.is_active():
-                _check_ctr_label(label, n_rows)
-                _build_ctr(mapper, data, label, ctr)
+                if ctr.is_policy() and len(label) == 0:
+                    ctr = SimpleCtrConfig.disabled()
+                else:
+                    _check_ctr_label(label, n_rows)
+                    _build_ctr(mapper, data, label, ctr)
+                    if ctr.is_policy() and not mapper.ctr.is_active():
+                        ctr = SimpleCtrConfig.disabled()
         var kept: RawData
         if keep_raw:
             kept = raw^

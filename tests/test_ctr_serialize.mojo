@@ -299,7 +299,7 @@ def test_a_table_set_whose_lookup_is_not_derived_refuses() raises:
     var counts: List[Int] = [0, 6]
     var borders: List[Float64] = [0.5]
     var config = SimpleCtrConfig.catboost_defaults(borders^)
-    var planned = plan_ctr_columns(config, flags, counts)
+    var planned = plan_ctr_columns(config, flags, counts, 255)
     assert_true(planned.is_active())
     with assert_raises():
         check_ctr_serializable(planned)
