@@ -1982,7 +1982,18 @@ def _boost_rounds(
     # 200 reads a fit instead of 2; that is what this hoist removes. Same
     # decision either way -- the variables do not change mid-fit -- so no bits
     # move.
-    var const_hessian_env = ConstHessianSettings.resolve()
+    # `resolve_with` is `resolve()` plus the `derivative_precision`
+    # parameter, on the precedence `ConstHessianSettings.widened` states:
+    # `float64` from either the parameter or the environment wins. The grower
+    # folds the same parameter in again from its own `params.extra`, which is
+    # deliberate and costs nothing -- the fold is monotone and idempotent, so
+    # applying it at the fit and again at each tree gives the identical
+    # snapshot. It is done here as well so that this loop's snapshot is the
+    # one it will actually train under, rather than a value the grower
+    # silently corrects a level down.
+    var const_hessian_env = ConstHessianSettings.resolve_with(
+        params.tree.extra.wants_float64_derivatives()
+    )
     var leaves = LeafMembership()
     var by_leaf = _leaf_score_update_enabled()
     # Whether every entry of `hess` below is exactly 1.0 on every round, which
