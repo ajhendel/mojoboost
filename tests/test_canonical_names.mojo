@@ -241,9 +241,30 @@ def test_a_vendor_loss_that_is_a_different_curve_is_refused_by_name() raises:
     with assert_raises(contains="pseudo-Huber"):
         _ = objective_from_name(String("reg:pseudohubererror"))
     # CatBoost's YetiRank is its own pairwise loss, not LambdaRank spelled
-    # differently, so it falls to the unknown-name message rather than being
-    # told it needs query groups.
-    with assert_raises(contains="unknown objective"):
+    # differently. That claim is unchanged and is what the `assert_raises`
+    # below is for: the name must not RESOLVE, because resolving it to
+    # LAMBDARANK would silently fit a different loss.
+    #
+    # What changed is which refusal it gets. YetiRank used to fall through to
+    # "unknown objective"; it is now the reserved code YETI_RANK=15 with a
+    # registry entry, so it lands on the "real thing, not implemented" path
+    # instead. That is a strictly better message and the old assertion was
+    # matching the fall-through -- which means it would have kept passing if
+    # the name had been dropped from the registry altogether.
+    #
+    # Asserted three ways so it still discriminates. It must refuse; the
+    # refusal must be the reserved one rather than the unknown one; and it
+    # must name its own trainer, which is what distinguishes "we know exactly
+    # what this is and have not connected it" from "we have never heard of
+    # it". `tests/test_objective_reserved_codes.mojo` pins the same refusal
+    # from the registry side.
+    with assert_raises(contains="not implemented"):
+        _ = objective_from_name(String("YetiRank"))
+    with assert_raises(contains="train_catboost_ranker"):
+        _ = objective_from_name(String("YetiRank"))
+    # And it is still not lambdarank: the connected ranking loss is named as
+    # the alternative, not as the answer.
+    with assert_raises(contains="lambdarank"):
         _ = objective_from_name(String("YetiRank"))
 
 
@@ -462,7 +483,20 @@ def test_catboost_only_names_state_or_refuse() raises:
     _ = parse_params(String("score_function=cosine"))
     with assert_raises(contains="score_function"):
         _ = parse_params(String("score_function=NewtonCosine"))
-    with assert_raises(contains="CTR"):
+    # `max_ctr_complexity=1` is ACCEPTED since the CTR-dataset lane: 1 is the
+    # value CatBoost itself resolves to for any fit under 200 iterations. The
+    # key used to be refused outright, and the assertion here used to match
+    # `contains="CTR"` against the old message's literal `(CTR)`. The reword
+    # dropped that spelling while keeping the refusal, so the test failed for
+    # prose rather than for behavior -- the same shape as fb356d9.
+    #
+    # Matched on the key name instead, which the refuse-by-name rule
+    # obliges any refusal for this key to carry, and paired with the
+    # accepted arm. The pair is what discriminates: matching the key alone
+    # would also be satisfied by the `unknown parameter 'max_ctr_complexity'`
+    # fall-through, and the `=1` arm is what rules that out.
+    _ = parse_params(String("max_ctr_complexity=1"))
+    with assert_raises(contains="max_ctr_complexity"):
         _ = parse_params(String("max_ctr_complexity=4"))
     # `random_strength` and `leaf_estimation_iterations` already had this
     # shape and keep it.

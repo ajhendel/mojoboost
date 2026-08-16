@@ -425,10 +425,24 @@ def test_catboost_mode_default_is_silent_on_a_closed_gate() raises:
     var l2 = parse_params("grow_policy=oblivious lambda_l2=3")
     assert_false(l2.auto_learning_rate.enabled)
 
+    # The gate reads the KEY, and 1 is the only value this surface accepts:
+    # `leaf_estimation_iterations > 1` is refused by name (params.mojo), for
+    # the reason a parameter string also reaches the sparse,
+    # custom-objective, multiclass and ranking trainers, none of which
+    # implement extra Newton steps. This case was written as `=2` and so
+    # never reached its assertion at all; `parse_params` raised and the test
+    # failed on the call rather than on the claim.
     var leaves = parse_params(
-        "grow_policy=oblivious leaf_estimation_iterations=2"
+        "grow_policy=oblivious leaf_estimation_iterations=1"
     )
     assert_false(leaves.auto_learning_rate.enabled)
+    assert_true(close(leaves.resolved_learning_rate(100000), 0.1))
+
+    # And the refusal the original spelling ran into is kept as its own
+    # claim, rather than being deleted along with the value that tripped it.
+    # The gate is not a way in.
+    with assert_raises(contains="leaf_estimation_iterations"):
+        _ = parse_params("grow_policy=oblivious leaf_estimation_iterations=2")
 
     # And an explicit false turns the mode default off, which is why
     # "absent" and "auto_learning_rate=false" are tracked separately.

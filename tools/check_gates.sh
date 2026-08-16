@@ -16,7 +16,7 @@
 #   tools/check_gates.sh              # every cheap gate
 #   tools/check_gates.sh api pixi     # only the named ones
 #
-# Names: api, parity, pixi, connectivity, integration
+# Names: api, parity, pixi, connectivity, integration, tests
 #
 # Exit status is 0 when every selected gate passes and 1 otherwise.
 
@@ -46,11 +46,18 @@ run_gate() {
     # repository has now been caught by four times. CI runs it with the same
     # flag (.github/workflows/ci.yml, connectivity-audit).
     integration)  "$PY" tools/audit_integration.py --strict ;;
+    # Structure only, and cheap because of it: it reads the test files as
+    # text and never invokes `mojo`. It catches the file that cannot run --
+    # no `def main()`, or an import the compiler cannot resolve -- which is
+    # the one defect the suite itself cannot report, because such a file
+    # aborts the run rather than being counted as a failure. It does NOT
+    # prove any test file compiles; `tools/run_tests.sh` is that check.
+    tests)        "$PY" tools/audit_test_structure.py ;;
     *)            echo "unknown gate: $1" >&2; return 2 ;;
   esac
 }
 
-ALL="api parity pixi connectivity integration"
+ALL="api parity pixi connectivity integration tests"
 SELECTED="${*:-$ALL}"
 
 failed=""

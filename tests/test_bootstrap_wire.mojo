@@ -1,8 +1,16 @@
 """The two round-loop edges: `bootstrap_type` and `random_strength`.
 
-**UNRUN.** Written under a hard no-tests order covering every lane of this
-campaign; not compiled, not executed, not once. Every assertion below is a
-claim about what the code should do, and none of them has been observed.
+RUN for the first time on 2026-08-16, having been written under a hard
+no-tests order and never compiled. It did not compile: `BootstrapParams`
+stopped being `ImplicitlyCopyable` and the ternary in
+`test_the_hessian_declaration_is_refused_beside_a_bootstrap` needed a
+`.copy()`, so the FILE failed to build and none of its fourteen tests ran.
+That is why a suite counting it as a passing or failing test file was
+counting neither.
+
+Thirteen of the fourteen were correct as written. The one that was not is in
+`test_the_mvs_round_drops_its_zero_weight_rows`, and it was wrong about IEEE
+754 rather than about the sampler: see the comment there on negative zero.
 
 `tests/test_mvs_bootstrap.mojo` and `tests/test_bayesian_bootstrap.mojo` pin
 the draws themselves and `tests/test_random_strength.mojo` pins the noise; all
@@ -294,7 +302,16 @@ def test_ordered_boosting_refuses_a_bootstrap() raises:
 
 def test_an_unwired_entry_point_refuses_rather_than_ignores() raises:
     """`check_bootstrap_honored` is what a trainer with no `bootstrap_round`
-    in its loop calls, so a bundle is never accepted and dropped."""
+    in its loop calls, so a bundle the user NAMED is never accepted and
+    dropped.
+
+    Narrowed rather than left as written. As a general statement it stopped
+    being true when the bootstrap reached the multiclass and sparse loops:
+    `BootstrapRequest.resolve` / `resolve_or_defer` deliberately drop a
+    DEFAULTED bundle in silence on a path that cannot honor it, and only a
+    request carrying `named_by_user` still routes here. The two assertions
+    below were always about the named case and are unchanged.
+    """
     var raised = False
     try:
         check_bootstrap_honored(
@@ -335,7 +352,13 @@ def test_the_hessian_declaration_is_refused_beside_a_bootstrap() raises:
     assert_true(BootstrapParams.bayesian_at(0.0, 1).varies_hessian())
 
     for i in range(2):
-        var params = mvs if i == 0 else bayes
+        # `.copy()` on both arms. `BootstrapParams` is not
+        # `ImplicitlyCopyable`, and a ternary needs to copy whichever arm it
+        # takes, so this line did not compile -- which is why the whole FILE
+        # did not compile and no test in it had run since the type stopped
+        # being implicitly copyable. `mvs` and `bayes` are read again after
+        # the loop, so copying is what is wanted here rather than `^`.
+        var params = mvs.copy() if i == 0 else bayes.copy()
         var raised = False
         try:
             params.check_hessian_declaration(True)
@@ -396,6 +419,10 @@ def test_the_mvs_round_drops_its_zero_weight_rows() raises:
     """
     var rows = List[Int]()
     var grad = _ramp_gradients(N_ROWS)
+    # The gradients as they went in, so a dropped row can be asserted against
+    # the product the sampler actually forms. See the comment at the drop
+    # check below for why the bare `_bits(0.0)` there was wrong.
+    var before = grad.copy()
     var hess = _ones(N_ROWS)
     var weights = List[Float64]()
     var audit = MvsAudit.empty()
@@ -417,8 +444,29 @@ def test_the_mvs_round_drops_its_zero_weight_rows() raises:
     for r in range(N_ROWS):
         if _bits(weights[r]) == _bits(0.0):
             dropped += 1
-            assert_equal(_bits(grad[r]), _bits(0.0), String("grad ", r))
-            assert_equal(_bits(hess[r]), _bits(0.0), String("hess ", r))
+            # NOT `_bits(0.0)`. `apply_bootstrap_weights` MULTIPLIES the
+            # derivatives by the drawn weight rather than assigning zero, and
+            # the fixture makes odd rows negative, so a dropped odd row comes
+            # out as `-0.0`: `(-2.0) * 0.0` is negative zero under IEEE 754
+            # and `to_bits` is exact, so the sign bit made the comparison
+            # fail. `hess` escaped only because it enters as `+1.0`, which is
+            # why this line failed and the next one passed.
+            #
+            # The claim being made is "a dropped row contributes nothing",
+            # and `-0.0` satisfies it: the row is compacted out of the row
+            # list and never reaches a histogram, and it sums identically to
+            # `+0.0` in any case. So the sign bit comes out of the assertion
+            # rather than out of the sampler -- assigning zero instead of
+            # multiplying would cost a branch per row on a hot path to fix
+            # nothing.
+            #
+            # Still bit-exact, and still discriminating: a row left unscaled
+            # holds `±(r+1)` and a row scaled by anything other than its
+            # drawn zero holds something else again, and both fail here.
+            assert_equal(
+                _bits(grad[r]), _bits(before[r] * 0.0), String("grad ", r)
+            )
+            assert_equal(_bits(hess[r]), _bits(1.0 * 0.0), String("hess ", r))
     if dropped == 0:
         assert_equal(len(rows), 0, "nothing dropped means the full row set")
     else:

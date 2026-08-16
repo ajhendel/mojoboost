@@ -86,6 +86,10 @@ MOJO_PARAMS = ROOT / "src" / "mojotrees" / "params.mojo"
 MOJO_SERIALIZE = ROOT / "src" / "mojotrees" / "serialize.mojo"
 MOJO_DUMP = ROOT / "src" / "mojotrees" / "model_dump.mojo"
 MOJO_REGISTRY = ROOT / "src" / "mojotrees" / "objective_registry.mojo"
+#: The test file that pins the objective codes by literal value. Named here
+#: rather than assumed, because for its first day it could not run at all;
+#: see `mojo_objective_code_pin`.
+TEST_CODE_PIN = ROOT / "tests" / "test_objective_reserved_codes.mojo"
 BINDINGS = ROOT / "bindings" / "_mojotrees.mojo"
 
 CAPI_HEADER = ROOT / "capi" / "mojotrees.h"
@@ -735,6 +739,74 @@ def mojo_objective_codes(d: Deriver) -> dict:
     return dict(sorted(out.items()))
 
 
+def mojo_objective_code_pin(d: Deriver) -> dict:
+    """The test file that pins the objective codes by literal value, and the
+    values it pins, recorded rather than assumed.
+
+    `mojo_objective_codes` above freezes the integers as the registry spells
+    them, which catches a renumber. It cannot catch the *other* loss: the
+    test that asserts those integers by literal being deleted, renamed,
+    gutted, or -- the case that produced this block -- never having run.
+
+    `tests/test_objective_reserved_codes.mojo` was written on 2026-08-16 and
+    for its first day imported `from testing` rather than `from std.testing`
+    and had no `def main()`. It did not parse, so the suite aborted on it
+    rather than counting it, and every one of its assertions about the seven
+    reserved codes had never touched the code. It was the only two-sided
+    check that the registry and the three staged trainer copies agree about
+    the numbers, and it was doing nothing. That the codes turned out to be
+    right when it finally ran is luck, not evidence.
+
+    So the file's role is now a snapshot key. Deleting it, renaming it, or
+    dropping a code from it is a diff a reviewer has to sign off on, in the
+    same file where the codes themselves are frozen. `tools/audit_test_
+    structure.py` separately guarantees it is shaped like a file that runs.
+
+    Derived, not typed out: the `assert_equal(NAME, <int>)` pairs inside
+    `test_the_numbers_are_the_numbers`, which is the function whose entire
+    job is the literal values.
+    """
+    text = read(TEST_CODE_PIN, d)
+    out: dict = {"source": rel(TEST_CODE_PIN)}
+    if not text:
+        d.gap(
+            "mojo.objective_code_pin",
+            f"{rel(TEST_CODE_PIN)} is missing; nothing in the test suite "
+            "pins the objective codes by literal value",
+        )
+        out["pinned"] = {}
+        return out
+
+    body = re.search(
+        r"^def test_the_numbers_are_the_numbers\(.*?\n(?=^def |\Z)",
+        text,
+        re.S | re.M,
+    )
+    if body is None:
+        d.gap(
+            "mojo.objective_code_pin",
+            f"{rel(TEST_CODE_PIN)} has no test_the_numbers_are_the_numbers; "
+            "the codes are no longer pinned by literal value",
+        )
+        out["pinned"] = {}
+        return out
+
+    pinned = {
+        name: int(value)
+        for name, value in re.findall(
+            r"assert_equal\(\s*([A-Z][A-Z0-9_]*)\s*,\s*(-?\d+)\s*\)",
+            body.group(0),
+        )
+    }
+    if not pinned:
+        d.gap(
+            "mojo.objective_code_pin",
+            "test_the_numbers_are_the_numbers asserts no literal codes",
+        )
+    out["pinned"] = dict(sorted(pinned.items()))
+    return out
+
+
 def registry_body(text: str, fn: str) -> str:
     """The source text of one top-level `def` in the registry, from its
     header to the next top-level `def` or `comptime`. Shared by the metric
@@ -1255,6 +1327,53 @@ def check_objective_identity(snap: dict, d: Deriver) -> None:
                 "loss and raises nothing"
             )
 
+    # I15. The snapshot and the test suite must pin the same integers.
+    #
+    # `mojo.objective_code_pin` records what tests/test_objective_reserved_
+    # codes.mojo asserts by literal. This compares it against the registry.
+    # It is not redundant with the test: the test proves the numbers to a
+    # suite run, and this proves the TEST still covers them to a gate that
+    # runs on every commit. For a day it covered nothing at all, because the
+    # file did not parse and the suite aborted rather than reporting it.
+    pinned = (
+        snap.get("mojo", {}).get("objective_code_pin", {}).get("pinned") or {}
+    )
+    for const, value in sorted(pinned.items()):
+        if const not in codes:
+            d.problem(
+                f"I15: {const} is pinned to {value} by the test suite and is "
+                "not a comptime integer in the registry; the test asserts a "
+                "constant that no longer exists"
+            )
+        elif codes[const] != value:
+            d.problem(
+                f"I15: {const} is {codes[const]} in the registry and pinned "
+                f"to {value} by tests/test_objective_reserved_codes.mojo; "
+                "these integers are the model file format, so the two must "
+                "not disagree"
+            )
+    # And the other direction, over the RESERVED codes only. A reserved code
+    # is one no trainer is connected to yet, which is exactly when its number
+    # is cheap to change and nothing in a fit would notice -- and it is the
+    # set two lanes collided inside. `test_objective_reserved_codes.mojo` is
+    # the file whose job is those seven, so a new reserved code landing
+    # without a literal pin there fails here rather than being noticed the
+    # next time someone reads the registry.
+    #
+    # Scoped to reserved on purpose. The connected objectives are pinned by
+    # the fits that use them, several tests over, and demanding they also
+    # appear in this one file would be a rule nobody would keep.
+    reserved = sorted(set((names.get("reserved_aliases") or {}).values()))
+    for const in reserved:
+        if const not in pinned:
+            d.problem(
+                f"I15: {const} is a reserved objective code and "
+                "tests/test_objective_reserved_codes.mojo does not pin its "
+                "value by literal. Reserved codes are the ones no fit would "
+                "notice being renumbered; add an assert_equal to "
+                "test_the_numbers_are_the_numbers"
+            )
+
 
 def _version_tuple(text):
     if not isinstance(text, str):
@@ -1487,6 +1606,7 @@ def build(commit: str | None) -> tuple:
         ),
         "exports_by_module": mojo_exports_by_module(d),
         "objective_codes": mojo_objective_codes(d),
+        "objective_code_pin": mojo_objective_code_pin(d),
         "objective_names": mojo_objective_names(d),
     }
     snap["mojo"]["export_count"] = sum(
