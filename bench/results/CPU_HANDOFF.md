@@ -266,6 +266,49 @@ there is a defect we are not copying.
   numerical configuration, which is worse than either arm. No bits moved:
   `widened(False)` is asserted identity on all four fields.
 
+## THE STANDING RULE OF THIS ROUND: BUILT IS NOT REACHED
+
+Measured on `perf-round-2`, 2026-08-16, by counting importers in `src/` and
+`bindings/` (not by reading reports):
+
+| module | importers |
+|---|---|
+| `ctr`, `ctr_combinations`, `langevin`, `embedding`, `text_features`, `catboost_ranking`, `survival`, `multi_target`, `onnx_export` | **0** |
+| `ordered_boosting`, `auto_learning_rate` | 2 |
+
+**Eight of ten modules this round built are imported by nothing outside their
+own tests.** Every one of them has passing tests, a source-verified catalog
+note, and a determinism argument. None of them can be asked for.
+
+And above them sits a second layer of the same defect: the knobs that ARE in
+the Mojo package are **refused at the Python surface**, and `bench/real_data`
+reaches only what `python/mojotrees/sklearn.py` accepts. So the "us in
+CatBoost mode" arm is depthwise plus `lambda_l2 = 3` and nothing else.
+
+This is now **five separate occurrences in one round**: CatBoost built and
+unreachable, oblivious trees built and unreachable, `float64` accepted and
+ignored on sparse and distributed, `float64` accepted and ignored on the GPU,
+and the whole CatBoost knob set refused at the Python layer. Plus CatBoost's
+own instance of it, `mvs_reg = 0`, which drives every row weight to zero
+through a NaN its comparison eats.
+
+**The rule, for every lane from here:**
+
+1. A lane is not done when its tests pass. It is done when something outside
+   its own test imports it, or when it has said in one line why nothing does.
+2. **Test that a setting CHANGES A FIT**, not that it validates. Every one of
+   these five passed validation. Accepted-and-silently-ignored is the failure
+   mode this project produces, and it is invisible to the tests we write.
+3. Audit **reachability**, not correctness: not "is this validated" but "if I
+   set this and run a fit, is there code that reads it, and does the answer
+   differ".
+4. A feature the Python layer refuses is as absent as one never written, and
+   it passes every Mojo test.
+
+`tools/connectivity_audit.py` classifies orphans and `docs/INTEGRATION_INVENTORY.md`
+renders it; several lanes owe entries there. That gate is the mechanical form
+of rule 1 and it is currently non-strict.
+
 ## Standing traps, learned the hard way this round
 
 - Never quote a SHA you have not run `git cat-file -t` on. This was violated
