@@ -177,6 +177,16 @@ million and 3.3x at five million at half the resident memory; that ratio has
 since fallen to 1.85x because the CPU trainer got 1.63x faster in the round
 that followed, not because the device got slower.
 
+`bench/results/sweep2_2026-08-15/RESULTS.md` extends that to 2,000,000 rows
+and fits the two libraries' cost per row against each other. The finding that
+bears on this division of labor is that our GPU's marginal cost per row and
+LightGBM's on ten CPU cores are even, 2.33 to 2.46 microseconds across four
+fitted segments, and the remaining deficit is roughly one second of fixed
+cost derived from the intercepts. A GPU whose per-row cost equals a laptop
+CPU's is not yet earning its data plane, so the control plane is a necessary
+fix and not a sufficient one: removing all of the fixed cost is **estimated**
+to reach parity at 1,000,000 rows and stop there.
+
 Where the device's time goes is measured too, and it is the mechanism behind
 the third row of the table above. The Metal timeline in
 `docs/METAL_TIMELINE.md` finds the GPU idle for 76.5% of a training span at

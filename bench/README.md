@@ -55,25 +55,67 @@ The same record also shows we get 2.29x from ten cores where LightGBM gets
 either one alone is an incomplete account.
 
 The current comparison is
-[`results/profile_2026-08-15/RESULTS.md`](results/profile_2026-08-15/RESULTS.md),
-which supersedes both this baseline and
+[`results/sweep2_2026-08-15/RESULTS.md`](results/sweep2_2026-08-15/RESULTS.md),
+with
+[`results/profile_2026-08-15/RESULTS.md`](results/profile_2026-08-15/RESULTS.md)
+behind it for the shapes the sweep did not repeat. Between them they
+supersede both this baseline and
 [`results/apple_m4_large_scaling_2026-08-14.md`](results/apple_m4_large_scaling_2026-08-14.md)
 for anything quoted as current. In seconds of training with binning
-excluded, 100 rounds, 31 leaves, 255 bins, squared error, Apple M4, median
-of three interleaved:
+excluded, 100 rounds, 31 leaves, 255 bins, squared error, Apple M4, arms
+interleaved, **measured** as the median of five repeats:
 
-| shape | our CPU | our GPU | LightGBM, 10 threads |
-|---|---|---|---|
-| 1,000,000 x 50 | 6.98 | **3.58** | **2.86** |
-| 250,000 x 50 | **1.66** | 1.89 | **1.00** |
-| 50,000 x 50 | **0.564** | 1.63 | 0.594 |
+| shape | our CPU | our GPU, leaf-wise | our GPU, depth-wise | LightGBM, 10 threads |
+|---|---|---|---|---|
+| 250,000 x 50 | 1.649 | 1.967 | 1.909 | **1.023** |
+| 1,000,000 x 50 | 5.942 | 3.756 | **2.587** | 2.767 |
+| 2,000,000 x 50 | 13.483 | 6.093 | 5.417 | **5.228** |
 
-We are 2.44x behind LightGBM on the CPU and 1.25x behind on the GPU at the
-headline shape, ahead of it at 50,000 rows on the CPU, and ahead of it by
-3.2x on binning (0.377s against 1.207s, which the table above excludes).
+Spreads: our GPU 1.1 / 1.8 / 12.5 percent, depth-wise 6.7 / 0.3 / 10.8, our
+CPU 9.3 / 13.5 / 35.6. The two-million-row CPU arm is too noisy to carry a
+verdict.
+
+Three readings, and the order matters.
+
+**The depth-wise GPU arm beats LightGBM at 1,000,000 x 50**, 2.587 against
+2.767, which is 6.5 percent faster at a 0.3 percent spread, the tightest arm
+in the sweep. It is 3.6 percent behind at 2,000,000, which is parity. That is
+the first measured win this project has against LightGBM on training speed at
+a large shape, and four conditions travel with it: it grows a **different
+tree** than LightGBM's leaf-wise growth, **no training loss was recorded for
+any arm of this sweep** so its accuracy against that leaf-wise model is
+unmeasured, it is one machine and one generator, and **the spreads quoted
+above are ours alone**. `bench_lightgbm.py` trains once in a separate process
+with no repeat loop and no median, so every LightGBM cell in this file is a
+single sample whose noise floor is unknown, on a machine this file elsewhere
+documents as drifting by a factor of two to three across time windows. A
+LightGBM arm inside the interleaved loop is what would settle any margin
+narrower than that. Our own leaf-wise arm is still behind LightGBM
+everywhere: 1.92x, 1.36x, 1.17x.
+
+**Our marginal cost per row now equals LightGBM's on ten CPU cores.**
+**Fitted** from the measured points, ours is 2.385 then 2.337 microseconds
+per row across the two segments and LightGBM's is 2.325 then 2.461. The four
+slopes interleave. **Derived** from those fits, our intercept is about 1.42
+seconds against LightGBM's 0.44, so roughly one second of fixed cost is the
+whole remaining deficit.
+
+**That one second is worth less than it looks.** Removing all of it puts
+1,000,000 rows near 2.8 seconds, which is parity rather than a win
+(**estimated**). The margin has to come from the histogram kernel, and
+depth-wise beat parity precisely because level-batched histograms move the
+slope and not only the intercept.
+
 None of that replaces the 100,000-row baseline, because the shapes and the
 implementation revisions are different; it replaces any extrapolation from
 it.
+
+The loss columns in the baseline table above have no counterpart in the
+sweep. `bench_train_gpu.mojo` prints `<arm>_train_loss` on the first repeat
+and `bench_lightgbm.py` prints `train_mse`, and the committed sweep record
+kept only the timing lines. Any rerun of these arms should keep the loss
+lines, because a speed table with no loss beside it cannot answer the only
+question a growth-policy change raises.
 
 ## CPU stage profile
 
@@ -351,7 +393,13 @@ Two things about the dense rule are worth stating here, because a reader of
 this file will otherwise draw the wrong conclusion from `auto` still
 choosing the CPU. The rule's floor is the measured shape and not a fraction
 of it, so it says nothing about 250,000 rows, where the device in fact loses
-to our own CPU (1.89s against 1.66s). And the rule cannot fire through
+to our own CPU (1.89s against 1.66s, and 1.967 against 1.649 when the second
+sweep repeated it). That holds for leaf-wise growth. Depth-wise growth on a
+forced device split search runs 250,000 rows in 1.214s and beats our own CPU
+there, which is a property of the automatic gate rather than of the rule, and
+is written up in
+[`results/sweep2_2026-08-15/RESULTS.md`](results/sweep2_2026-08-15/RESULTS.md).
+And the rule cannot fire through
 `resolve_device` at all, because `DeviceCapabilities.detect()` opens no
 device and a hardware-scoped rule cannot match a profile that names no
 hardware. That is a wiring gap, not a missing measurement.

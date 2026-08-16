@@ -468,8 +468,22 @@ them or choose between them, and it has not noticed that it must.
 *The check, and it is the cheapest experiment in this document.* Run
 `grow_policy=depthwise` against the default on the existing GPU path at one
 million rows, interleaved, reporting wall clock, sync count, and validation
-metric. It uses only shipped code and requires no engineering. **It has never
-been run.**
+metric. It uses only shipped code and requires no engineering.
+
+**Run on 2026-08-15, and O3 is upheld.**
+`bench/results/sweep2_2026-08-15/RESULTS.md`, five repeats interleaved:
+`grow_policy=depthwise` on the shipped resident device search trains
+1,000,000 x 50 in **2.587 seconds** against leaf-wise's 3.756, at a 0.3
+percent spread. The table above predicted ~2.53 and the measurement landed
+2 percent from it, so the pricing route was sound. The depth-wise path did
+stay eligible at one million rows, which was the open question. Two of the
+three things the check was asked to report did not come back: the sync count
+per arm was not collected, and neither was any validation metric or training
+loss, so the quality half of this objection is exactly as unresolved as it
+was before the run. The incompatibility in `gpu_tree_tables.mojo` also stands,
+and the tree-resident path was found in the same sweep to fail whenever it
+actually executes, so the choice O3 says the plan must make is now between a
+working batched path and a broken unbatched one.
 
 ### O4. Two of the four justifying numbers do not exist and the real ones point the other way
 
@@ -1214,7 +1228,7 @@ sweep is the only new number that changes what should be built.
 |---|---|---|---|---|
 | O1 | 0.8-1.0s is unreachable; the floor is 2.1-2.4s because the slope is all compute | 0.90 | total | slope fit at 1M/2M/5M |
 | O2 | Packed int16 breaks at 32,766 rows, 30x below target; carry corrupts the neighbor field; underflow collapses the plane to zero | 0.95 | very high | write the bound inequality before any code |
-| O3 | `grow_policy=depthwise` on the shipped resident loop already removes ~78% of the waits and has never been benchmarked | 0.70 | very high | run it today, no engineering |
+| O3 | `grow_policy=depthwise` on the shipped resident loop already removes ~78% of the waits. Benchmarked 2026-08-15 and upheld: 2.587s against leaf-wise's 3.756s at 1,000,000 x 50, within 2 percent of the prediction, and ahead of LightGBM. Quality still unmeasured | 0.70 | very high | done, see O3 |
 | O4 | The roofline and slope figures do not exist and the real slopes point the other way | 0.95 | high | ask for the derivation |
 | O5 | Every LightGBM number is one repeat, cross-process, no clock record; the 50k win is inside noise | 0.95 | med-high | interleaved sweep with LightGBM as an arm |
 | O6 | `enqueue_copy` is a synchronous drain in both directions, so the staging uploads block too and the plan addresses only the downloads | 0.85 | med-high | split the 3,206 blocking blits by direction, on the trace already on disk |

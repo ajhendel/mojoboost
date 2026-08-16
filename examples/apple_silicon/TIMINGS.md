@@ -5,9 +5,11 @@ actual hardware, by the person who ran it, and by nothing else. No estimate,
 no extrapolation from another chip, no number carried over from a different
 shape or a different build.
 
-If you are reading this file to find out whether the GPU is faster, the
-answer today is that we do not know, and the one measurement that exists says
-no. See [What we already know](#what-we-already-know).
+If you are reading this file to find out whether the GPU is faster on your
+Apple part, the answer is that we do not know, because the only Apple part
+anyone has run this on is one M4. On that one M4 the GPU is faster than our
+own CPU at a million rows and slower below it. See
+[What we already know](#what-we-already-know).
 
 ## The table
 
@@ -42,6 +44,17 @@ error, median of three interleaved arms
 | 50,000 x 50 | **0.564** | 1.63 |
 
 Multiclass, 465,000 x 54 over 7 classes: CPU 25.47, GPU **15.30**.
+
+A second sweep on the same machine, five repeats per arm, repeated the first
+two shapes (5.942 CPU against 3.756 GPU, and 1.649 against 1.967), added
+2,000,000 x 50 at 13.483 against 6.093, and added a `grow_policy="depthwise"`
+GPU arm that is the fastest thing this project has measured: 1.909 / 2.587 /
+5.417 across the three shapes. At 1,000,000 x 50 that arm is faster than
+LightGBM on ten CPU cores, 2.587 against 2.767, which is the first time this
+library has been ahead of LightGBM on training time at a large shape
+(`bench/results/sweep2_2026-08-15/RESULTS.md`). It grows a different tree than
+LightGBM does and its accuracy has not been measured, so read the caveats in
+the main README before quoting it.
 
 The structural reason for the small-shape losses is also better understood
 than "each per leaf histogram build scans all rows", which order-preserving

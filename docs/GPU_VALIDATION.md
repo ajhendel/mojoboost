@@ -338,6 +338,27 @@ at 50,000. The device carries about 1.5 seconds of fixed cost per fit, which
 is what those three numbers imply and which the timeline below then
 attributes.
 
+A second sweep on the same machine at five repeats
+(`bench/results/sweep2_2026-08-15/RESULTS.md`) repeats the top two shapes,
+adds 2,000,000 x 50, and adds a `grow_policy="depthwise"` GPU arm:
+
+| shape | our CPU | our GPU, leaf-wise | our GPU, depth-wise | LightGBM, 10 threads |
+|---|---|---|---|---|
+| 250,000 x 50 | 1.649 | 1.967 | 1.909 | **1.023** |
+| 1,000,000 x 50 | 5.942 | 3.756 | **2.587** | 2.767 |
+| 2,000,000 x 50 | 13.483 | 6.093 | 5.417 | **5.228** |
+
+Two things in that table are new and neither is a general performance claim.
+**Fitted** across the two segments, our marginal cost per row (2.385 then
+2.337 microseconds) and LightGBM's (2.325 then 2.461) interleave, so the two
+are even per row and the whole deficit is an intercept of roughly one second
+(**derived** from the same fits). And the depth-wise arm is ahead of LightGBM
+at 1,000,000 x 50 by 6.5 percent at a 0.3 percent spread, which is the first
+measured win this project has on training time at a large shape. It compares
+our depth-wise trees against LightGBM's leaf-wise trees, which are different
+models, and no training loss was recorded for any arm of the sweep, so this
+is a timing result and not an accuracy one.
+
 Binning, excluded from the table: ours 0.377s against LightGBM's 1.207s, so
 we bin 3.2x faster.
 
