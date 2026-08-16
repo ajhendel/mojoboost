@@ -123,10 +123,12 @@ Environment contract, matching the `MOJOTREES_` convention in parallel.mojo:
   creation, and first versus warm fit. Off by default, and the phase *counts*
   are kept either way, which is what `session_state()` answers from.
 - `MOJOTREES_GPU_READBACK` names the transport a small device answer comes
-  home on, from `readback_transport_name`. Default `pinned_pair_sync`, which
-  is what the code does today; `require_readback_correct` refuses the two
-  spellings this backend is measured to get wrong. See the readback section
-  below and `probes/readback_cost.mojo`.
+  home on, from `readback_transport_name`. Default `plain_one`, which the
+  probe measured at 124.85 us a trip against the `pinned_pair_sync` shape
+  that shipped before it at 202.14; `require_readback_correct` refuses the
+  two spellings this backend is measured to get wrong, and
+  `GpuSplitSearcher.set_readback_transport` refuses those and `map`. See the
+  readback section below and `probes/readback_cost.mojo`.
 - `MOJOTREES_GPU_WARMUP` (`off`, `train`, `all`) names which kernels a
   session intends to front-load. Nothing is created up front yet; what the
   plan buys today is that the first launch of a named kernel is attributed to
@@ -650,16 +652,32 @@ comptime READBACK_PINNED_PAIR_NOSYNC = 5
 comptime READBACK_PINNED_ONE_NOSYNC = 6
 comptime N_READBACK_TRANSPORTS = 7
 
-comptime READBACK_DEFAULT = READBACK_PINNED_PAIR_SYNC
-"""What ships until a measurement says otherwise.
+comptime READBACK_DEFAULT = READBACK_PLAIN_ONE
+"""What ships, and as of 2026-08-16 it is a measurement rather than a
+placeholder.
 
-It is what `download_words` does today, and the default is deliberately the
-current behavior rather than the arm with the fewest command buffers: this
-lane produced no timings, and `docs/GPU_PORTABILITY.md` section 6.4 records
-what happens here when a count is turned into a prediction without one. Two
-arms below carry strictly fewer command buffers for the same bytes and are
-correct; choosing between them is a measurement, and `pixi run
-probe-readback` is the measurement."""
+The measurement is `pixi run probe-readback` on an Apple M4, every arm
+interleaved inside one process so that the several-fold drift this machine
+shows between time windows cannot separate them:
+
+| arm | command buffers/trip | per-trip |
+|---|---|---|
+| `bare_sync` (the floor) | 1 | 10.59 us |
+| `plain_one` | 2 | 124.85 us |
+| `pinned_pair_sync` | 4 | 202.14 us |
+| `map` | 3 | 349.47 us |
+
+`plain_one` is 38 percent under `pinned_pair_sync`, which is what this
+library shipped until the same date, for the same 34 words: one packed
+device buffer instead of two, one ordinary heap destination instead of two
+pinned ones, two command buffers instead of four. Nothing about a record's
+value changes, which is why this is a default flip and not a gated arm.
+
+This default was `READBACK_PINNED_PAIR_SYNC` when the table was written,
+deliberately, because the lane that wrote it had produced no timings and
+`docs/GPU_PORTABILITY.md` section 6.4 records what happens here when a
+command-buffer count is turned into a prediction without one. The count and
+the measurement agree in rank order; the flip rests on the measurement."""
 
 
 def readback_transport_name(transport: Int) -> String:
@@ -703,6 +721,31 @@ struct ReadbackTransport(Copyable, Movable):
     var command_buffers: Int
     var host_waits: Int
     var pinned_destination: Bool
+    """Whether the copy lands in memory from `enqueue_create_host_buffer`.
+
+    **The correctness discriminator, not a description.** Section 6.5.1 of
+    `docs/GPU_PORTABILITY.md` establishes by execution that `enqueue_copy`
+    has two implementations on Metal and that this field picks which one
+    runs: into a pinned `HostBuffer` it enqueues a blit and returns, so the
+    host must wait before reading; into an arbitrary host pointer it commits,
+    waits, and memcpys inside itself, so there is nothing left to wait for.
+
+    An adoption site that drops the trailing `synchronize()` is therefore
+    obliged to check this field rather than to reason about the destination
+    it thinks it passed, because the failure is latency-dependent: the unsafe
+    shape passes under a fast kernel and returns the previous record under a
+    slow one. `GpuSplitSearcher.download_words` asserts on it."""
+
+    var packed_source: Bool
+    """Whether one copy moves the whole record, or one copy moves each plane.
+
+    A packed transport requires the integer and float planes to be one
+    device allocation, which they are: `GpuSplitSearcher.records_dev` owns
+    them and `rec_i_dev` / `rec_f_dev` are `create_sub_buffer` windows onto
+    it. Before that they were two allocations and only the pair transports
+    were reachable, which is why the two packed rows below used to say the
+    layout was a change someone still had to make."""
+
     var correct_on_metal: Bool
     var correct_elsewhere: Bool
     """True where the transport's correctness depends only on queue ordering,
@@ -723,58 +766,61 @@ def readback_transport(transport: Int) raises -> ReadbackTransport:
     """
     if transport == READBACK_PINNED_PAIR_SYNC:
         return ReadbackTransport(
-            transport, 4, 1, True, True, True,
+            transport, 4, 1, True, False, True, True,
             String(
-                "today's shape: one enqueue_copy per record plane into pinned"
-                " host memory, then synchronize(). The two copies are"
-                " asynchronous blits, so the round trip is the synchronize"
-                " alone"
+                "the shape this library shipped until 2026-08-16: one"
+                " enqueue_copy per record plane into pinned host memory, then"
+                " synchronize(). The two copies are asynchronous blits, so the"
+                " round trip is the synchronize alone. Measured 202.14 us a"
+                " trip, and still reachable as the A/B arm"
             ),
         )
     if transport == READBACK_PINNED_ONE_SYNC:
         return ReadbackTransport(
-            transport, 3, 1, True, True, True,
+            transport, 3, 1, True, True, True, True,
             String(
                 "the same with both planes in one device buffer: one blit"
-                " instead of two, same single wait. Needs the record laid out"
-                " in one buffer, which is a gpu_split_search change"
+                " instead of two, same single wait. Reachable since"
+                " GpuSplitSearcher.records_dev made the record one allocation"
             ),
         )
     if transport == READBACK_PLAIN_PAIR:
         return ReadbackTransport(
-            transport, 3, 2, False, True, True,
+            transport, 3, 2, False, False, True, True,
             String(
                 "two enqueue_copy calls into ordinary heap memory and no"
                 " synchronize at all. That destination kind takes MAX's"
                 " synchronous path, so each copy drains inside itself: fewer"
-                " command buffers than today and one more wait"
+                " command buffers than the pinned pair and one more wait"
             ),
         )
     if transport == READBACK_PLAIN_ONE:
         return ReadbackTransport(
-            transport, 2, 1, False, True, True,
+            transport, 2, 1, False, True, True, True,
             String(
                 "one enqueue_copy into ordinary heap memory. The whole"
-                " readback is the kernel's command buffer and the copy's:"
-                " the fewest of any correct arm, and no pinned staging buffer"
-                " to keep alive"
+                " readback is the kernel's command buffer and the copy's: the"
+                " fewest of any correct arm, and no pinned staging buffer to"
+                " keep alive. Measured 124.85 us a trip against the pinned"
+                " pair's 202.14, and READBACK_DEFAULT since 2026-08-16"
             ),
         )
     if transport == READBACK_MAP:
         return ReadbackTransport(
-            transport, 3, 2, False, True, True,
+            transport, 3, 2, False, False, True, True,
             String(
                 "map_to_host(). Documented as a host-accessible view; on"
                 " Metal it is a fresh host allocation with a copy in on entry"
                 " and a copy out on exit, so it is the most expensive"
-                " transport here and not the cheapest"
+                " transport here and not the cheapest. Measured 349.47 us, and"
+                " GpuSplitSearcher.download_words declines to implement it"
             ),
         )
     if transport == READBACK_PINNED_PAIR_NOSYNC:
         return ReadbackTransport(
-            transport, 3, 0, True, False, True,
+            transport, 3, 0, True, False, False, True,
             String(
-                "today's shape with the trailing synchronize removed, which"
+                "the pinned pair with the trailing synchronize removed, which"
                 " docs/GPU_PORTABILITY.md 6.1 licensed. WRONG on Metal: the"
                 " pinned copy is asynchronous, so the host reads the previous"
                 " record. Measured 34 of 34 words wrong"
@@ -782,7 +828,7 @@ def readback_transport(transport: Int) raises -> ReadbackTransport:
         )
     if transport == READBACK_PINNED_ONE_NOSYNC:
         return ReadbackTransport(
-            transport, 2, 0, True, False, True,
+            transport, 2, 0, True, True, False, True,
             String(
                 "the packed shape with the same edit, and wrong for the same"
                 " reason: 34 of 34 words"
@@ -831,15 +877,68 @@ def require_readback_correct(transport: Int, api_is_metal: Bool) raises:
         )
 
 
+def require_readback_table_consistent() raises:
+    """The trap of section 6.5.1, written as a check over the whole table.
+
+    A row is not free to say whatever it likes. The destination kind decides
+    where the wait lives, and a row that claims a destination and a wait count
+    that cannot both hold is a row that will license the wrong edit at an
+    adoption site. Two rules, and the second is the one that cost a lane:
+
+    - An **unpinned** destination takes MAX's synchronous path, so the copy
+      drains inside itself. Such a row must carry at least one wait (the
+      copy's own) and must be correct on Metal. There is no unpinned row that
+      needs a trailing `synchronize()`, and none that is wrong here.
+    - A **pinned** destination takes the asynchronous blit. Such a row is
+      correct only if it carries a wait. A pinned row with zero waits is the
+      edit `docs/GPU_PORTABILITY.md` 6.1 licensed and 6.5.1 refuted, and it
+      must be marked wrong on Metal so `require_readback_correct` refuses it.
+
+    Called by `tests/test_gpu_readback_transport.mojo`, and cheap enough to
+    call anywhere; it reads seven rows and allocates no device memory. It
+    exists so that a later edit to a row's numbers has to keep the row's
+    story straight, rather than being free to make an unsafe arm look safe.
+    """
+    for t in range(N_READBACK_TRANSPORTS):
+        var row = readback_transport(t)
+        if not row.pinned_destination:
+            if row.host_waits < 1:
+                raise Error(
+                    "readback transport ",
+                    readback_transport_name(t),
+                    " has an unpinned destination but claims no wait; the"
+                    " synchronous copy path drains inside itself and that"
+                    " drain is a wait",
+                )
+            if not row.correct_on_metal:
+                raise Error(
+                    "readback transport ",
+                    readback_transport_name(t),
+                    " has an unpinned destination and is marked wrong on"
+                    " Metal; section 6.5.1 measured 0 of 64 stale words on"
+                    " that path",
+                )
+        elif row.host_waits < 1 and row.correct_on_metal:
+            raise Error(
+                "readback transport ",
+                readback_transport_name(t),
+                " reads a pinned destination with no wait and claims to be"
+                " correct on Metal; that is the asynchronous blit and section"
+                " 6.5.1 measured 34 of 34 stale words",
+            )
+
+
 def readback_report() raises -> String:
-    """Every transport as `name buffers waits metal_ok` lines, for a probe or
-    a debug print. Not for parsing by anything shipped."""
+    """Every transport as `name buffers waits dst packing metal_ok` lines, for
+    a probe or a debug print. Not for parsing by anything shipped."""
     var out = String("")
     for t in range(N_READBACK_TRANSPORTS):
         var row = readback_transport(t)
         out += "readback." + readback_transport_name(t)
         out += " " + String(row.command_buffers)
         out += " " + String(row.host_waits)
+        out += " " + ("pinned" if row.pinned_destination else "plain")
+        out += " " + ("packed" if row.packed_source else "pair")
         out += " " + ("ok" if row.correct_on_metal else "wrong") + "\n"
     return out
 
