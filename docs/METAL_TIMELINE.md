@@ -490,7 +490,9 @@ the host committing the next command buffer is 285 microseconds.
 `HybridCosts.launch_nanos`, at 62,128 nanoseconds, matches none of the
 intervals in the table because it is not an interval. It is a fitted
 coefficient from `bench_hybrid_costs`, documented in
-`src/mojotrees/hybrid_leaf_scheduler.mojo` as the fixed cost of "enqueuing and
+`src/mojotrees/hybrid_leaf_scheduler.mojo` (deleted 2026-08-16 with the hybrid
+leaf scheduler; the calibration survives in
+`bench/results/apple_m4_hybrid_costs_2026-08-15.md`) as the fixed cost of "enqueuing and
 running one histogram kernel, exclusive of the row work", which is a
 regression intercept over a two-kernel operation and not something the timeline
 contains a matching pair of timestamps for. There was never a contradiction to
@@ -498,8 +500,9 @@ resolve. There was an undocumented difference in what the two numbers denote,
 and it should be said in the docstring that this is a fitted intercept rather
 than a measured launch.
 
-**Checked, and it still does not say it.** As of this revision the docstring
-on `HybridCosts.launch_nanos` in `src/mojotrees/hybrid_leaf_scheduler.mojo`
+**Checked, and it still does not say it. Then the whole module went.** As of
+this revision the docstring on `HybridCosts.launch_nanos` in
+`src/mojotrees/hybrid_leaf_scheduler.mojo` (deleted 2026-08-16)
 reads "Fixed cost of enqueuing and running one histogram kernel, exclusive of
 the row work: the term a four-row leaf pays in full", which is a description
 of an interval and is exactly the reading that produced the apparent 3x

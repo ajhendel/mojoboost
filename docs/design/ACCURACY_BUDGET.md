@@ -1271,7 +1271,9 @@ But order-independence is the whole reason the fixed-point path exists.
 Giving it up to gain resolution that nothing measures would be a bad
 trade. It would break the bit-identity between the `tiled` and `atomic` GPU
 strategies that `tests/test_gpu_strategies.mojo` asserts, it would break the
-CPU replica path that `hybrid_leaf_scheduler`'s `MODE_MIRROR` is built on,
+CPU replica path that `tests/test_host_replica.mojo` is built on (and that
+`hybrid_leaf_scheduler`'s `MODE_MIRROR` was, until that module was deleted
+on 2026-08-16),
 and it would break the `require_identical_predictions` gate. All of that in
 exchange for moving a `5e-8` error to a `3e-10` error, when the flip curve
 says nothing happens until `1e-3`.

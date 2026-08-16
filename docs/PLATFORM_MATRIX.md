@@ -184,10 +184,19 @@ The consequences, in order of how much trouble they cause:
   it.** A wheel built on a Mac with a working Metal toolchain reports a GPU as
   available on every machine that installs it. On a machine that then cannot
   open a device, the failure arrives when the device is opened rather than when
-  it is resolved. Today that gap is invisible, because `auto` never selects the
-  GPU on its own, and `device="gpu"` raises rather than falling back. It becomes
-  reachable the moment `MOJOTREES_AUTO_MIN_CELLS` is set on a redistributed
-  build. `MOJOTREES_DISABLE_GPU=1` is the way to pin such a build to the CPU.
+  it is resolved. As of 2026-08-16 the *identity* of the accelerator is baked in
+  the same way and for the same reason: `auto` now reads
+  `_accelerator_arch()`, which is comptime, so a wheel built on an M4 tells the
+  device policy it is on an M4 wherever it runs. That is reported as
+  `profile_source=build-target` and warned on as `build-target-hardware`, and it
+  is a stronger error than a wrong availability answer because it can select a
+  backend rather than merely fail one. It only becomes reachable at all above
+  the crossover rule's floor (1,000,000 rows by 50 features, Metal, M4, squared
+  error, single output), or the moment `MOJOTREES_AUTO_MIN_CELLS` is set on a
+  redistributed build. `MOJOTREES_DISABLE_GPU=1` is the way to pin such a build
+  to the CPU, and `device="cpu"` is the per-call way; a caller that opens a
+  `DeviceContext` and goes through `decide_device_report_reported` gets a real
+  reading instead, which outranks the build target.
 - **A wheel built where no accelerator was visible has no GPU path in it at
   all**, and `device="gpu"` raises everywhere it is installed, including on
   machines with a perfectly good GPU. This is why the provenance sidecar records
@@ -329,7 +338,7 @@ mistake is, loudly, rather than somewhere convenient and quietly.
 | `device="gpu"` with no accelerator in the build | Raises. It never falls back to the CPU silently | `src/mojotrees/device.mojo` |
 | `device="gpu"` on a redistributed build whose host has no usable device | Raises when the device is opened, later than the resolve | `has_accelerator()` is compile time |
 | `device="gpu"` for multiclass | Trains on the device. `fit_multiclass` dispatches on the resolved device and `gpu_supports_outputs` admits every output count; on an M4 the GPU wins multiclass by 1.63x | `device.mojo`, `fit_multiclass` |
-| `device="auto"` anywhere | Chooses the CPU, and says which half of "no rule covered this" applied. One rule exists, scoped to Metal on an M4; it cannot match because `DeviceCapabilities.detect()` opens no device | `crossover_rules()`, `PROFILE_FALLBACK` |
+| `device="auto"` anywhere | Chooses the GPU where the one installed rule covers the run (Metal on an M4, squared error, single output, 1,000,000 x 50 and above) and the CPU everywhere else, saying which half of "no rule covered this" applied. The hardware is identified from the build target, not from a reading | `crossover_rules()`, `PROFILE_BUILD_TARGET` |
 | GPU tests on a machine with no accelerator | Print `skipped: no accelerator` and pass. A pass that says `skipped` is not a validation | test suites |
 | A wheel whose tag no target declares | `validate_artifact.py` rule R1 fails the release | release check |
 

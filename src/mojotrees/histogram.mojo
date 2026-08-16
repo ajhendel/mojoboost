@@ -1768,8 +1768,11 @@ def build_histogram_subset_replica_into[
     addition is associative and commutative, so the per-feature tasks and
     their order cannot change a sum; whether the host's multiply-and-round
     matches the device's bit for bit is a hardware claim this function
-    cannot make, and `MODE_MIRROR` in hybrid_leaf_scheduler.mojo is how it
-    is established before a replica is allowed to substitute.
+    cannot make, and `tests/test_host_replica.mojo` is where it is
+    established on the target hardware. (`MODE_MIRROR` in
+    hybrid_leaf_scheduler.mojo established it in-run until that module was
+    deleted on 2026-08-16; this function outlives it, because the replica is
+    the CPU/GPU oracle and was never the scheduler's.)
 
     `fixed` is the caller-owned Int32 scratch holding the three planes in
     the device's `[grad | hess | count]` layout, followed by the node's
@@ -1788,7 +1791,7 @@ def build_histogram_subset_replica_into[
     under Int32 wraparound, since repeated addition and multiplication agree
     modulo 2^32. So the elision cannot move this replica relative to the
     device, whichever arm each of them is on. What it does do is shrink the
-    claim `MODE_MIRROR` has to establish: instead of the host and the device
+    claim that comparison has to establish: instead of the host and the device
     agreeing on `round` at every one of `n_rows` products, they need only
     agree on it at one, because `Float32(1.0) * h_scale` is exactly
     `h_scale` on any IEEE-754 unit and both sides therefore round the same

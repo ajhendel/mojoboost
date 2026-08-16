@@ -2,6 +2,11 @@
 
 Reproducible mojotrees vs LightGBM comparison on identical synthetic data.
 
+Every `pixi run` command in this file names a task that exists. Which of them
+have ever produced a recorded number is a different question, and it is answered
+per driver in [`results/INSTRUCTION_AUDIT.md`](results/INSTRUCTION_AUDIT.md).
+Several sections below say "no numbers are recorded here yet" and mean it.
+
 Both drivers generate the dataset from the same counter-based splitmix64
 stream, so every feature value and label is bit-identical between the two
 (no files exchanged, no RNG library differences). The target mixes linear,
@@ -256,9 +261,16 @@ on any run that trains. It cannot answer the resolved-task-count question:
 its host `dispatches` column is a structural constant charged per call site,
 not the count the scheduler chose.
 
-Sweeping `TASKS_PER_CORE` in `src/mojotrees/parallel.mojo` and rerunning this
-is how that constant should be settled; it is currently an unmeasured starting
-value of 4.
+Sweeping the tasks-per-core constant and rerunning this is how it should be
+settled; it is currently an unmeasured starting value of 4. **This no longer
+means editing the source.** `MOJOTREES_CPU_TASKS_PER_CORE` overrides
+`TASKS_PER_CORE` at runtime (`src/mojotrees/apple_cpu_policy.mojo`, and
+`src/mojotrees/parallel.mojo:172` names it for exactly this purpose), so the
+sweep is a loop over the environment variable rather than a rebuild per point,
+which also makes the points comparable on a machine that drifts.
+
+Nobody has run that sweep. The constant is still whatever
+`DEFAULT_TASKS_PER_CORE` says.
 
 **No numbers are recorded here yet.** Every run taken during the work that
 added this driver was on a machine carrying a load average above 8 on 10
@@ -309,6 +321,117 @@ different moments, which is exactly the protocol this file forbids everywhere
 else. They remain useful for a factor-of-two question and are useless for a
 few-percent one. Use the interleaved arm below for anything narrower than the
 machine's drift.
+
+## The regime canary
+
+Every figure in this file is a time, and this machine's times drift by
+factors of two and three between windows. Worse, **effect sizes move with
+the window and not only levels**: the device-resident tree plane measured 24
+percent in a fast window and 8 percent in a slow one, both resolved and both
+correct, and the histogram row unroll came out *indistinguishable* in one
+window and *resolved* in another from the same command and the same code
+(`results/session3_2026-08-16/RESULTS.md`).
+
+Until now nothing measured the window. `apple/thermal_capture.sh` prints a
+plan and refuses `--execute` with exit code 3, so the protocol step that told
+every session to capture thermal state with it was never followable;
+`pmset -g therm` returns nothing useful on Apple silicon; and the A1
+replacement (`uptime` plus the top processes) has a hole Session III walked
+into, which is that the slow window showed a **quiet box and slow results at
+the same time**. Every regime label in this repository was therefore inferred
+by hand from effect sizes, and one such attribution was made and retracted the
+same night.
+
+`canary.mojo` is the instrument that was missing. Two fixed probes:
+
+- **CPU probe.** A serial splitmix64 mixing chain, `2^26` rounds, one thread.
+  Serial so it cannot vectorize or overlap, which makes its wall time a
+  function of core clock and essentially nothing else; one thread so core
+  availability and other processes cannot move it. It measures clock in
+  isolation, deliberately, and its blind spot -- a window where the memory
+  system throttles but the core clock holds -- is stated in the source rather
+  than argued away.
+- **GPU probe.** A quarter of a million threads each running a serial 32-bit
+  mixing chain, four launches, one synchronization, **no copy back** (on Metal
+  every `enqueue_copy` is a synchronous full-queue drain, so a probe that read
+  its results back would be timing a transfer). The grid saturates, unlike the
+  CPU probe which isolates, because Apple GPU throttling presents as a
+  device-wide clock reduction and the GPU is not shared with the OS during a
+  session the way cores are. **Device open is excluded** and reported beside
+  it as `gpu_open_ms_excluded`; including it would make the start-of-session
+  reading structurally higher than the end-of-session one and would fire the
+  drift alarm on every single run.
+
+Neither probe calls into `src/mojotrees/`, touches a dataset, or reads any
+knob a session varies. That is the requirement, not an accident: a probe that
+went through the training code would move when another lane landed a kernel
+optimization, and a code change would become indistinguishable from a regime
+change -- the exact confusion the canary exists to end.
+
+The two are **reported separately and never averaged**. Session III measured
+ten CPU cores degrading by a factor of 2.2 in a window where the GPU arm
+degraded by 1.5; a single-engine canary would have mislabelled that window and
+an average would have reported 1.85, describing neither engine.
+
+`bench_train_gpu.mojo` runs the canary **first and last** in every run and
+prints `canary_cpu_ratio` and `canary_gpu_ratio` (reading over baseline; 1.0
+is the baseline window, larger is slower) alongside the raw milliseconds, and
+adds a `canary` object to the `json_summary` record. Running it first and last
+is the part that would have caught the six-pair sequence that straddled a
+regime change: when the two readings differ by more than 5 percent the output
+says in capitals that **the arms in between were not all taken on the same
+machine**, which is a stronger statement than "the box was slow", because a
+slow but stable session still yields valid A/Bs and a session that moved
+underneath its own arms does not. The 5 percent is **chosen, not measured** --
+the smallest effect this repository has ever resolved was 10.8 percent.
+
+### The baselines are not recorded yet, on purpose
+
+`canary_baseline.json` ships with `cpu_ms` and `gpu_ms` null. The mechanism
+handles that by printing raw milliseconds and `canary_cpu_ratio: unavailable`,
+which is the designed behavior and not a degraded one. Do not fill them in
+with an estimate or a figure that looks about right: a fabricated baseline in
+a regime detector does not fail loudly, it silently mislabels every session
+afterwards, in a form that reads as data. Having no detector is better.
+
+Establish them on a box that is verifiably quiet -- no lane, build, agent, or
+compile running, per `results/SESSION_QUEUE.md` -- with
+
+```sh
+pixi run mojo run -I src bench/bench_canary.mojo 7
+```
+
+The long form is deliberate for now: the lane that wrote this was scoped to
+`bench/` and could not add a `bench-canary` task to `pixi.toml`, so
+`check-pixi` reports it as an unwired benchmark. Registering
+`bench-canary = "mojo run -I src bench/bench_canary.mojo"` is a one-line change
+whenever somebody owns that file.
+
+That prints per-repeat samples, the minimum and the spread for each probe, and
+a ready-to-paste file body with `FILL-IN` markers for the date, the toolchain,
+the machine, and the evidence that the box was quiet. It refuses to write the
+file itself, because those four fields are the difference between a measured
+baseline and a number and the program cannot attest to any of them. If the
+repeats disagree by more than 3 percent it says so: the window was not quiet
+and the baseline must not come from it.
+
+The same command with no baseline recorded is also how you ask what regime the
+machine is in right now, in under a second, without a training run.
+
+Two caveats on the constants. `CPU_PROBE_ROUNDS` and the GPU grid were sized
+from an **estimate** -- a nominal 4.4 GHz and published instruction latencies
+-- and **have never been timed**, so whoever calibrates first is also the
+first to learn whether the estimate was any good; `bench_canary.mojo` checks
+the reading against that estimate and says what to do if it is far off. And
+any change to a probe constant must bump `CANARY_PROBE_VERSION` in the same
+commit, which invalidates the baseline loudly instead of leaving a stale
+denominator quietly dividing two different amounts of work.
+
+`MOJOTREES_CANARY=0` turns the canary off, for the one case that needs it:
+reproducing a run recorded before the canary existed, since opening a device
+for the canary shifts some one-time GPU setup out of the first GPU repeat. The
+off state is printed and lands in the JSON record, so it is a declared
+condition rather than a silent one.
 
 ## Interleaved LightGBM arm
 
@@ -489,6 +612,194 @@ would print a number under a label it had not earned; `train_multiclass_gpu`
 in particular takes no `row_unroll` argument, so both arms of the pair would
 be the same run.
 
+### The K1 hist-latency arms, one pair at a time
+
+Three more launch shapes landed on the GPU histogram path and were
+unreachable from any benchmark, which on this machine is the same as not
+having landed: only interleaved arms in one process resolve anything here,
+so a knob that a rebuild is the only way to move is a knob nobody can
+measure. They are now `bench_train_gpu.mojo` arms, wired as **three
+independent pairs** rather than as one combined arm, because three changes
+timed together cannot be attributed to any one of them.
+
+**No numbers below are measurements of these arms.** Nothing in this section
+has been timed. The only thing run was a smoke pass at 2,000 x 8 in which
+all nine arms executed and every one of them reported the same training loss
+to the last digit and the same tree count, which is the "cannot change a
+model" claim holding and is not a measurement of speed. Every arm prints
+`<arm>_train_s_samples`, `<arm>_spread_pct_of_median` and
+`<arm>_train_loss`, and the loss is what a reader checks first: all of these
+are launch shapes, accumulation is fixed-point Int32, integer addition is
+associative and commutative, so a pair whose losses differ has found a bug
+and not a speedup.
+
+Every run also prints one `arm_conditions:` line per arm before the loop,
+carrying the trainer, split strategy, grow policy and all four launch shapes
+with the tile request resolved to the `rows_per_tile` actually passed. The
+same string is in each arm's object in `json_summary` as `conditions`. An
+arm name is a label; this line is the record.
+
+#### Pair alignment, on against off
+
+```sh
+pixi run bench-train-gpu 1000000 50 binary 5 pair-align-on,pair-align-off
+```
+
+**`binary`, not `reg`, and this is a constraint and not a preference.** The
+width-2 load this knob annotates exists only where the histogram row loop
+carries a live hessian plane. Squared error guarantees a constant hessian,
+so an unweighted non-GOSS `reg` round elides that plane, gathers a single
+word per row, and reads `pair_alignment` nowhere at all; both halves of the
+pair would be the same run. Logistic curvature is `p(1-p)`, so `binary`
+rounds carry the plane and the pair load. `bench_train_gpu.mojo` refuses the
+`reg` combination rather than printing two identical runs under two labels.
+`MOJOTREES_CONST_HESSIAN=0` also makes the arm live on `reg`, at the cost of
+measuring a three-plane configuration the library does not ship.
+
+The knob is on by default on an *observation* of the emitted LLVM IR — the
+unannotated spelling emits `align 4` for a `<2 x i32>` load — and not on any
+device measurement. This pair is what would turn that into one.
+
+#### Index width, Int32 against Int
+
+```sh
+pixi run bench-train-gpu 1000000 50 reg 5 narrow-index-off,narrow-index-on
+```
+
+The control is written first so it is the baseline every comparison line is
+computed against, and it is the OFF arm because off is what the trainer
+defaults to. Unlike the other two knobs this one is exact only **under a
+bound on the dataset shape**: `n_features * n_rows` and `2 * n_rows` must
+both fit a signed 32-bit integer. The bound is not tight against anything
+this library runs — at 1,000,000 rows it admits 2,147 features — and a shape
+outside it is refused before any data is generated rather than run.
+
+The honest prior is that this is a null. The row loop issues three shared
+atomics and one scattered global gather per (row, feature), against which
+one index add either way is noise, and the wide form's expensive term is
+loop-invariant so a compiler that hoists it has already paid it once per
+slot. That is exactly why it needs a measurement and did not get an
+on-by-default.
+
+#### Row tiles, 1 against 2 against 4 against 8
+
+```sh
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-1
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-2
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-4
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-8
+```
+
+All four in one process, which is the better run if the box will hold still
+for it, since every arm is then in the same thermal window as every other:
+
+```sh
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    row-tiles-default,row-tiles-1,row-tiles-2,row-tiles-4,row-tiles-8
+```
+
+**Which direction is which.** `N` in `row-tiles-N` is the tile count at the
+**root**: the arm sets a fixed tile length of `ceil(n_rows / N)`, so a node
+holding `m` rows gets `ceil(m / length)` tiles and a node shorter than one
+tile gets one. Larger N is more and shorter tiles. That is the direction an
+earlier experiment went, and it went badly: a device-wide floor of 80 tiles
+*measured* 22 percent slower at 50 features and 36 percent slower at 100
+across a whole fit and was reverted (`gpu_tiling.row_tile_floor`). Smaller N
+is fewer and longer tiles and **has never been tested in either benchmark**.
+If per-tile zero-and-flush traffic is what dominated that loss, `row-tiles-1`
+is the arm most likely to win, and it is the one the earlier round could not
+express. The benchmark prints a `row_tiles_legend:` line saying all of this,
+so the direction is readable off the output without opening the source.
+
+**The control passes zeros, and is not `row-tiles-2`.** Zero on both
+`min_tiles` and `rows_per_tile` is byte for byte the geometry the trainer
+produced before those parameters existed. At 1,000,000 x 50 on the 10-core
+M4 that resolves to two tiles at the root (`ceil(target_blocks / n_slots)` =
+`ceil(80 / 50)`), which is *derived* and machine-specific, and it is still
+not the same rule as `row-tiles-2`: the default fixes a tile **count** per
+node so the length shrinks with the node, and these arms fix a tile
+**length** so the count shrinks with the node. The two agree at the root and
+diverge immediately below it, so the control has to be an arm of its own.
+
+**One parameter carries the whole sweep.** `min_tiles` is zero on every arm.
+It is a floor with `ceil(target_blocks / n_slots)` still underneath it, so it
+cannot express one tile at all on the shape being tested, and a sweep whose
+two ends came from two different mechanisms could not attribute what it
+found to the tile count.
+
+**Why `MOJOTREES_GPU_TREE_RESIDENT=0`.** The device-owned growth plane is the
+default and builds every non-root histogram through
+`gpu_active_rows.enqueue_desc_child`, which derives its tiling *without* the
+tile requests. Under it a tile arm would reach the root node and nothing
+else, which is worse to time than an arm that reaches nothing: the delta
+would be real and would be attributed to a geometry most of the tree never
+saw. `=0` forces the host-driven split loop, which honors the requests at
+every node. `bench_train_gpu.mojo` refuses a `gpu` or `gpu-device` tile arm
+while the plane is on rather than producing that pair. **This is a gap in
+`src/`, not a property of the experiment**: `enqueue_desc_child` should take
+the two requests the way `range_tiling` does, and until it does the tile
+question cannot be asked of the default growth plane.
+
+`gpu-host` never routes to the resident plane, so its tile arms need no
+environment variable and are not refused:
+
+```sh
+pixi run bench-train-gpu 1000000 50 reg 5 gpu-host-tiles-default,gpu-host-tiles-1
+```
+
+That is the further-from-default recipe of the two, though, because it also
+moves the split search off the device; prefer the `=0` form, which keeps
+device split search and moves only the tree plane.
+
+#### Composing with the strategy, the grow policy and each other
+
+Every arm above runs under `SPLIT_SEARCH_AUTO`, so each pair holds every
+condition but its own knob constant. Where the strategy or the grow policy
+needs pinning too, the same knobs are composable suffixes on any GPU arm, in
+any order:
+
+```sh
+MOJOTREES_GPU_TREE_RESIDENT=0 pixi run bench-train-gpu 1000000 50 reg 5 \
+    gpu-device-tiles-default,gpu-device-tiles-1
+pixi run bench-train-gpu 1000000 50 reg 5 \
+    gpu-device-depth-nonarrow,gpu-device-depth-narrow
+pixi run bench-train-gpu 1000000 50 binary 5 \
+    gpu-device-palign,gpu-device-nopalign
+```
+
+The suffixes are `-unroll` / `-nounroll`, `-narrow` / `-nonarrow`,
+`-palign` / `-nopalign`, and `-tiles-default` / `-tiles-1` / `-tiles-2` /
+`-tiles-4` / `-tiles-8`. A suffix naming the trainer's own default prints
+under the plain arm's name — `gpu-host-tiles-default` reports as `gpu-host`
+— which is the rule `-unroll` already follows: an arm that declares the
+default is the same configuration as the plain arm and must not enter the
+record under a second key. The `arm_conditions:` line still spells out every
+knob for both.
+
+#### What is refused rather than run
+
+A knob that reaches no kernel would still print a number under a label,
+which is the failure this whole file is built to prevent. All of these raise
+before any data is generated:
+
+| Combination | Why |
+| --- | --- |
+| any launch-shape arm under `MOJOTREES_GPU_HIST_SPECIALIZATION=batched` | the batched kernels in `gpu_leaf_batching.mojo` carry their own row loop and tile arithmetic and read none of the four fields |
+| any launch-shape arm on `multi` / `multi:N` | `train_multiclass_gpu` takes none of the four arguments |
+| `narrow-index-*` outside the Int32 shape bound | the wide arm is the only correct one there, so there is no pair |
+| `pair-align-*` on a constant-hessian objective, `reg` included | no width-2 pair load exists to annotate |
+| `row-tiles-*` on `gpu` or `gpu-device` while the resident plane is on | the arm would reach the root node and nothing else |
+| `cpu-*` or `lightgbm-*` with any of the four suffixes | neither trainer has a GPU histogram launch shape |
+
+The last row extends a refusal that was already here for `cpu-nounroll` and
+`lightgbm-depth`, and the batched row extends it to the row-walk pair as
+well: `row-unroll-on` / `row-unroll-off` under a batched specialization were
+two identical runs under two labels until this lane, and are now refused.
+
 ## GPU histogram scaling and phase breakdown
 
 `bench_histogram_scaling.mojo` is the driver for the histogram kernel
@@ -518,8 +829,17 @@ pixi run bench-hist-scaling 20 1000000 50      # reps, then (rows, features)
 
 `MOJOTREES_GPU_HIST_STRATEGY`, `MOJOTREES_GPU_ROW_TILE`, and
 `MOJOTREES_GPU_BLOCK_THREADS` (see `src/mojotrees/gpu_tiling.mojo`) sweep the
-tiling by hand, which is how the defaults in that module were chosen. Pin
-them when comparing runs.
+tiling by hand. Pin them when comparing runs.
+
+**Only one of the three has settled a default.** `MOJOTREES_GPU_HIST_STRATEGY`
+produced the `tiled` against `atomic` table below, which is a **measured**
+result. `MOJOTREES_GPU_ROW_TILE` and `MOJOTREES_GPU_BLOCK_THREADS` have never
+been swept and recorded — the "Not yet measured" note further down says so, and
+`gpu_tiling.mojo` is explicit that `TARGET_BLOCKS_PER_SM = 8` rests on a
+**derived bound** rather than a measurement: a small shared-memory footprint "is
+evidence that 8 blocks are not excluded, not evidence that more than 8 are
+resident". This paragraph used to claim all three knobs were how the module's
+defaults were chosen, which contradicted that note twenty lines away.
 
 The same caveat as above applies with more force here: the tiling is derived
 from the device's own reported capabilities, so numbers from one GPU say

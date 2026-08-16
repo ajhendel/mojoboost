@@ -47,6 +47,15 @@ tests that must force one path, matching the `MOJOTREES_` contract in
   the module chose before the knob existed. `device` measured slower at every
   shape tried, which is why it is a request; see `row_tile_floor`.
 
+`MOJOTREES_GPU_MIN_TILES` and `MOJOTREES_GPU_ROW_TILE` are both overridden by
+the explicit `min_tiles_request` and `rows_per_tile_request` arguments
+`resolve_tiling` takes, which is how `GpuActiveRows.set_row_tiling` reaches
+them. The arguments exist because an environment variable cannot be an arm:
+this machine's device timings drift several-fold between time windows, only
+interleaved repeats in one process compare, and a global read once per launch
+cannot be varied between them. Zero on both arguments is the same answer as
+an unset variable, so nothing changes for a caller that asks for nothing.
+
 Specialization sits above this module, not inside it. `derive_tiling` stays
 the one geometry every caller gets by default, on every backend;
 `apple_histogram_policy.mojo` can plan a specialized launch from reported
@@ -69,8 +78,8 @@ down:
                                 the specialization ladder and the multiclass
                                 schedule
         ^                                   ^
-    gpu_multiclass_batch.mojo       hybrid_leaf_scheduler.mojo
-    (per-round class batching)      (per-leaf placement; charges a node the
+    gpu_multiclass_batch.mojo       phase_profile.mojo
+    (per-round class batching)      (dispatch accounting; charges a node the
                                      launches `launches_for_strategy` says
                                      its resolved strategy costs)
 
@@ -166,10 +175,11 @@ comptime LAUNCHES_TILED = 2
 def launches_for_strategy(strategy: Int) raises -> Int:
     """Kernel launches one node's histogram costs under this strategy.
 
-    The one place that number is written down. `hybrid_leaf_scheduler.mojo`
-    charges a node `launch_nanos * gpu_launches`, and deriving that count
-    from the resolved strategy rather than defaulting it keeps the cost model
-    and the launch it models from drifting apart.
+    The one place that number is written down. The phase profile charges a
+    node its dispatches from it, and deriving that count from the resolved
+    strategy rather than defaulting it keeps the accounting and the launch it
+    accounts for from drifting apart. The hybrid leaf scheduler was its other
+    consumer until 2026-08-16, when that module was deleted.
 
     `STRATEGY_AUTO` has no launch count: it is a request, not a resolution,
     and a caller holding one has not yet planned a launch.
@@ -487,6 +497,8 @@ def resolve_tiling(
     target_blocks: Int,
     partial_cell_limit: Int,
     requested_strategy: Int = STRATEGY_AUTO,
+    min_tiles_request: Int = 0,
+    rows_per_tile_request: Int = 0,
 ) raises -> HistogramTiling:
     """Resolve a tile count, a row tile, and a strategy from bounds the
     caller has already decided.
@@ -505,14 +517,25 @@ def resolve_tiling(
       when residency was derived from the reported threadgroup memory.
     - `partial_cell_limit`: cells the partial buffer may use, from
       `partial_cell_limit_for` or from a reported memory budget.
+    - `min_tiles_request` and `rows_per_tile_request`: the two tile
+      quantities as a caller's explicit request, zero meaning no request.
+      They are the in-process spelling of `MOJOTREES_GPU_MIN_TILES` and
+      `MOJOTREES_GPU_ROW_TILE` and take precedence over them, so an
+      interleaved benchmark can hold two tile geometries as arms inside one
+      process. An environment variable cannot be an arm on this machine:
+      device timings drift several-fold between time windows, only
+      interleaved repeats compare, and a global read once per launch cannot
+      be varied between them. Zero on both reproduces the behavior this
+      function had before the parameters existed, variable for variable.
 
     Everything after that is one rule, applied once: a row-tile floor from
     `row_tile_floor`, clamped down by the row-amortization and memory bounds;
-    the `MOJOTREES_GPU_ROW_TILE` override; the grid bound; a re-derivation so
-    the last tile is never empty; and the `STRATEGY_AUTO` resolution. The
-    tile count is
+    the rows-per-tile override; the grid bound; a re-derivation so the last
+    tile is never empty; and the `STRATEGY_AUTO` resolution. The tile count
+    is
 
-        floor   = MOJOTREES_GPU_MIN_TILES when set, else target_blocks
+        floor   = the request when set, else MOJOTREES_GPU_MIN_TILES when
+                  set, else target_blocks
         n_tiles = min(tiles_by_rows,
                       tiles_by_memory,
                       MAX_GRID_DIM_Y,
@@ -543,6 +566,10 @@ def resolve_tiling(
         raise Error("a device wants a positive number of threadgroups")
     if partial_cell_limit < 1:
         raise Error("the partial buffer budget must admit at least one cell")
+    if min_tiles_request < 0:
+        raise Error("a row-tile floor is zero (no request) or positive")
+    if rows_per_tile_request < 0:
+        raise Error("a row tile is zero (no request) or positive")
 
     var strategy = requested_strategy
     if strategy == STRATEGY_AUTO:
@@ -556,7 +583,7 @@ def resolve_tiling(
     if tiles_by_rows < 1:
         tiles_by_rows = 1
 
-    var wanted = row_tile_floor(target_blocks, n_slots)
+    var wanted = row_tile_floor(target_blocks, n_slots, min_tiles_request)
     if tiles_by_rows < wanted:
         wanted = tiles_by_rows
 
@@ -568,7 +595,13 @@ def resolve_tiling(
         tiles_by_memory = MAX_GRID_DIM_Y
 
     var n_tiles = wanted
-    var forced_rows = _env_int("MOJOTREES_GPU_ROW_TILE", 0)
+    # An explicit request wins over the environment, and both mean "no
+    # request" at zero. The request is checked first so that a benchmark
+    # holding tile geometries as arms is not silently overridden by a
+    # variable some earlier session exported.
+    var forced_rows = rows_per_tile_request
+    if forced_rows < 1:
+        forced_rows = _env_int("MOJOTREES_GPU_ROW_TILE", 0)
     if forced_rows > 0:
         n_tiles = _ceil_div(n_rows, forced_rows)
     # The atomic path allocates no partial buffer, so the memory bound is
@@ -627,12 +660,18 @@ def env_min_tiles() -> Int:
     return _env_int("MOJOTREES_GPU_MIN_TILES", 0)
 
 
-def row_tile_floor(target_blocks: Int, n_slots: Int) raises -> Int:
+def row_tile_floor(
+    target_blocks: Int, n_slots: Int, request: Int = 0
+) raises -> Int:
     """Row tiles per feature to reach for before the row, memory, and grid
     bounds clamp the answer down.
 
     `target_blocks` is threadgroups wanted device-wide, and `n_slots` is the
-    features already occupying `grid.x`.
+    features already occupying `grid.x`. `request` is a caller's explicit
+    floor, zero meaning none, and it takes precedence over
+    `MOJOTREES_GPU_MIN_TILES`; it exists so that an interleaved benchmark can
+    hold two floors as arms in one process, which an environment variable
+    cannot do.
 
     The default answer is `ceil(target_blocks / n_slots)`, which is what this
     module has always computed. `MOJOTREES_GPU_MIN_TILES=device` asks instead for
@@ -741,12 +780,16 @@ def row_tile_floor(target_blocks: Int, n_slots: Int) raises -> Int:
         raise Error("a device wants a positive number of threadgroups")
     if n_slots < 1:
         raise Error("a launch covers a positive number of features")
+    if request < 0:
+        raise Error("a row-tile floor is zero (no request) or positive")
 
     var by_occupancy = _ceil_div(target_blocks, n_slots)
     if by_occupancy < 1:
         by_occupancy = 1
 
-    var requested = env_min_tiles()
+    var requested = request
+    if requested == 0:
+        requested = env_min_tiles()
     var floor = by_occupancy
     if requested < 0:
         floor = target_blocks
@@ -821,6 +864,8 @@ def derive_tiling(
     requested_strategy: Int = STRATEGY_AUTO,
     max_partial_cells: Int = 0,
     block_shared_bytes: Int = 0,
+    min_tiles_request: Int = 0,
+    rows_per_tile_request: Int = 0,
 ) raises -> HistogramTiling:
     """Resolve the launch geometry for one (rows, features, bins) shape.
 
@@ -846,6 +891,11 @@ def derive_tiling(
     constant so that a kernel sized to its bin count and this policy can meet
     without either one restating the other's footprint.
 
+    `min_tiles_request` and `rows_per_tile_request` are a caller's explicit
+    tile requests, zero meaning none, passed straight to `resolve_tiling`
+    where they are argued. They exist so a benchmark can hold two tile
+    geometries as arms in one process rather than in two environments.
+
     The bounds are this module's; the arithmetic over them is
     `resolve_tiling`'s, which is also what the shape-derived policy runs.
     """
@@ -864,6 +914,8 @@ def derive_tiling(
         target_blocks_for(caps, block_shared_bytes),
         partial_cell_limit_for(max_partial_cells),
         requested_strategy,
+        min_tiles_request,
+        rows_per_tile_request,
     )
 
 

@@ -83,28 +83,41 @@ and `histogram_from_host` (fixed-point to Float64 conversion).
 One-way is the whole claim, and in particular it is not a claim that the
 upload is asynchronous. On Metal `enqueue_copy` is a synchronous full-queue
 drain in **both** directions: it commits an empty command buffer, waits for
-it, and then memcpys. That was measured by disassembling the shipped MAX
+it, and then memcpys. That was **measured** by disassembling the shipped MAX
 Metal runtime and is written out with its consequences in
-`docs/GPU_PORTABILITY.md` section 6.1. So `upload_staged` is a host
-synchronization exactly as `download_raw` is, the `stage_gradients` and
-`upload_staged` split above is a split between host conversion work and a
-wait rather than between two enqueues, and any per-round staging (gradients,
-a bag mask, a GOSS row vector, a scale word) is a per-round wait that has to
-be counted as one. What the staged route still buys over `map_to_host` is
-the second direction's bytes and a separately timeable phase, which is why
-it stays.
+`docs/GPU_PORTABILITY.md` section 6.1. So `upload_staged` is a full-queue
+drain exactly as `download_raw` is, the `stage_gradients` and `upload_staged`
+split above is a split between host conversion work and a drain rather than
+between two enqueues, and any per-round staging (gradients, a bag mask, a
+GOSS row vector, a scale word) is a per-round ordering point that has to be
+counted as one. What the staged route still buys over `map_to_host` is the
+second direction's bytes and a separately timeable phase, which is why it
+stays.
 
-Counting the ordinary round's waits under that rule gives three, all of them
+A drain is not a wait, and the difference is the whole of section 6.1.1,
+withdrawn 2026-08-16. `download_raw` is a **round trip**: the host reads a
+histogram and then decides what to enqueue next, so it blocks on unfinished
+device work and costs whatever that work had left. `upload_staged` is not;
+nothing is queued behind it and nothing reads a device answer. Draining a
+queue that holds nothing costs nothing, and the **measured** null is on the
+record: thirteen copies removed per tree elsewhere on this plane bought 0.016
+seconds at 1,000,000 x 50 against a registered prediction of 0.64
+(`bench/results/session3_2026-08-16/RESULTS.md`). Count round trips here to
+predict time; count copies to predict portability risk and staleness.
+
+Counting the ordinary round's drains under that rule gives three, all of them
 on the `upload_gradients` path: the `synchronize` in `stage_gradients`, and
 one copy per derivative plane in `upload_staged`. The gradient and hessian
 planes now share one device allocation and one pinned host arena laid out as
 `[grad | hess]`, so `upload_staged` moves both with a single copy and the
-round pays two waits instead of three; `grad_dev` and `hess_dev` are
+round has two ordering points instead of three; `grad_dev` and `hess_dev` are
 `create_sub_buffer` windows onto that allocation, so nothing that consumes
 them -- kernels, the device objectives, the multiclass scatter -- sees a
-change. The remaining `synchronize` stays on purpose and `stage_gradients`
-says why. `stage_from_device`, which only hybrid leaf scheduling reaches,
-still costs two copies and a synchronize of its own on top.
+change. **Three to two is one fewer copy per round, not a predicted saving**;
+it is one fewer staging lifetime and one fewer place a plane can go stale.
+The remaining `synchronize` stays on purpose and `stage_gradients` says why.
+`stage_from_device`, which only the replica tests reach, adds two copies and
+a synchronize of its own on top.
 
 Which transfer route the binned matrix takes is resolved once per builder
 through `unified_memory_policy.resolve_from_env`, so `MOJOTREES_GPU_TRANSFER`
@@ -205,10 +218,16 @@ from .gpu_portability import (
 from .gpu_objectives_native import (
     DEFAULT_MAX_NODES,
     GpuObjectiveState,
-    device_fixed_scale,
 )
 from .parallel import _env_int, dispatch_rows
-from .quantized_gradient import fixed_point_scale, magnitude_sum
+from .quantized_gradient import (
+    DEFAULT_SCALE_SHAPE,
+    SCALE_SHAPE_ARBITRARY,
+    SCALE_SHAPE_POW2,
+    describe_scale_shape,
+    fixed_point_scale_shaped,
+    magnitude_sum,
+)
 from .unified_memory_policy import (
     ROLE_BINS,
     ROUTE_COPY_STAGED,
@@ -315,9 +334,20 @@ def build_kernel_features() -> KernelFeatures:
     return KernelFeatures(False, False, True)
 
 
-def _fixed_scale(values: List[Float64]) raises -> Float32:
-    """Fixed-point scale derived from a host-side value list."""
-    return fixed_point_scale(magnitude_sum(values))
+def _fixed_scale(
+    values: List[Float64], shape: Int = DEFAULT_SCALE_SHAPE
+) raises -> Float32:
+    """Fixed-point scale derived from a host-side value list.
+
+    `shape` selects the scale arm and defaults to the package default, which
+    is `SCALE_SHAPE_POW2`: `2^30 / sum|v|` rounded *down* to a power of two.
+    `quantized_gradient.fixed_point_scale_pow2` is the rule and carries the
+    whole argument for it -- the exactness it buys, the overflow bound it
+    tightens rather than loosens, and the up-to-one-bit of lattice resolution
+    it costs. Nothing about the rule lives here; this function is a magnitude
+    sum and a forward.
+    """
+    return fixed_point_scale_shaped(magnitude_sum(values), shape)
 
 
 struct GpuHistogramBuilder(Movable):
@@ -334,13 +364,20 @@ struct GpuHistogramBuilder(Movable):
     # derivatives as `[grad | hess]`, adjacent and in that order, and the two
     # windows onto it that every kernel and every consumer still sees.
     #
-    # Why one allocation. `enqueue_copy` is a host wait on Metal whatever the
-    # byte count is (`docs/GPU_PORTABILITY.md` section 6.1, established by
-    # disassembly), so two plane copies per round cost two waits and one
-    # costs one. The two planes are the same dtype and the same length, so
-    # concatenating them is a plain adjacency: no bitcast, no conversion, no
-    # padding, and the bytes each plane's window receives are exactly the
-    # bytes its separate buffer used to receive.
+    # Why one allocation. `enqueue_copy` is a full-queue drain on Metal
+    # whatever the byte count is (`docs/GPU_PORTABILITY.md` section 6.1,
+    # **measured** by disassembly), so two plane copies per round are two
+    # drains and one is one. The two planes are the same dtype and the same
+    # length, so concatenating them is a plain adjacency: no bitcast, no
+    # conversion, no padding, and the bytes each plane's window receives are
+    # exactly the bytes its separate buffer used to receive.
+    #
+    # Two drains to one is not two waits to one. Section 6.1.1, withdrawn
+    # 2026-08-16, took back the step that priced a drain: nothing is queued
+    # behind these uploads, and draining an empty queue costs nothing. So the
+    # argument for one allocation is one staging lifetime instead of two and
+    # one ordering point instead of two, plus a `[grad | hess]` pair that
+    # cannot arrive half fresh. No time may be predicted from it.
     #
     # Why windows rather than an offset pointer. `grad_dev` and `hess_dev`
     # leave this file as `DeviceBuffer`s (`gpu_objectives_native`'s fills and
@@ -402,6 +439,12 @@ struct GpuHistogramBuilder(Movable):
     var tiling: HistogramTiling
     var g_scale: Float64
     var h_scale: Float64
+    # Which shape this builder's fixed-point scales take:
+    # `SCALE_SHAPE_POW2` (the default and the accurate arm) or
+    # `SCALE_SHAPE_ARBITRARY` (what shipped). A *numeric* option, unlike
+    # every other arm on this builder, so it is the one that changes
+    # histogram bits; `set_scale_shape` says what that means for a fixture.
+    var fixed_scale_shape: Int
     var has_gradients: Bool
     # Whether the Float32 gradients the kernels read this round are also
     # sitting in the `stage_gh` arena on the host: True after
@@ -410,11 +453,6 @@ struct GpuHistogramBuilder(Movable):
     # device fill until one of those runs. A host replica build
     # (`build_leaf_host_replica`) is only possible when this is True.
     var gradients_host: Bool
-    # Whether the host fixed-point replica has been shown to reproduce this
-    # device's histograms bit for bit: 0 untested, 1 verified, 2 refuted.
-    # Set by the grower's mirror comparison (see hybrid_leaf_scheduler.mojo)
-    # and kept on the builder so one fit verifies once, not once per tree.
-    var replica_state: Int
     # The batched multi-leaf launcher, held as a zero-or-one list so a
     # builder that never batches allocates none of its buffers. `List` is
     # what holds a move-only value here; there is no second batcher and no
@@ -638,9 +676,9 @@ struct GpuHistogramBuilder(Movable):
             )
         self.g_scale = 1.0
         self.h_scale = 1.0
+        self.fixed_scale_shape = DEFAULT_SCALE_SHAPE
         self.has_gradients = False
         self.gradients_host = False
-        self.replica_state = 0
         self.round_epoch = 0
         self.feat_epoch = 0
         self.batch_feat_stamp = -1
@@ -753,6 +791,130 @@ struct GpuHistogramBuilder(Movable):
         """The row-walk arm `set_row_unroll` last chose."""
         return self.rows.row_unroll
 
+    def set_scale_shape(mut self, shape: Int) raises:
+        """Which shape this builder's fixed-point scales take from the next
+        `upload_gradients` or device fill on.
+
+        `SCALE_SHAPE_POW2` is the default: `2^30 / sum|g|` rounded *down* to
+        a power of two. `SCALE_SHAPE_ARBITRARY` is what shipped before it.
+        The rule, the exactness argument, the overflow proof, and the
+        one-bit resolution cost are all at
+        `quantized_gradient.fixed_point_scale_pow2`, which is the single
+        statement of the rule for the CPU and the GPU alike; nothing about it
+        is restated here.
+
+        **This is the one arm on this builder that changes histogram bits.**
+        `set_row_unroll`, `set_feature_group`, `set_narrow_index`,
+        `set_pair_alignment`, `set_row_tiling`, and
+        `set_fused_gradient_upload` are launch shapes and transfer shapes:
+        every one of them accumulates the same fixed-point integers into the
+        same bins, and their docstrings say so. This one changes the unit
+        those integers count in, so it changes every cell, therefore possibly
+        a split, therefore possibly a tree. A fixture taken under one shape
+        does not describe the other and must not be diffed against it.
+
+        It exists as a runtime arm for the same two reasons the others do.
+        First, `train_gpu` constructs its own builder, so an end-to-end
+        comparison has no other way to reach the setting -- though reaching
+        it end to end still needs a `train_gpu` parameter, exactly as
+        `set_fused_gradient_upload` records for itself. Second, an
+        environment variable would compare two arms across two processes, and
+        this machine's device timings drift several-fold between time
+        windows, so only interleaved arms inside one process resolve
+        anything.
+
+        The accuracy case for the default is the argument for the change, and
+        it is an argument rather than a measurement: three roundings deleted
+        against up to one bit of lattice step, worked through per bin at
+        `fixed_point_scale_pow2`. **The speed effect is unmeasured**, in
+        either direction, and this arm is what makes it measurable: a
+        power-of-two multiply is an exponent add where an arbitrary one is a
+        full multiply, and the reciprocal on the download path becomes exact,
+        but nothing here predicts a time from that and nothing may.
+
+        Refuses an unknown code rather than defaulting to one, because
+        silently quantizing on a lattice the caller did not ask for is the
+        failure this whole file is arranged to prevent.
+        """
+        if shape != SCALE_SHAPE_POW2 and shape != SCALE_SHAPE_ARBITRARY:
+            raise Error(
+                String(
+                    "unknown fixed-point scale shape: ",
+                    String(shape),
+                    "; expected SCALE_SHAPE_POW2 or SCALE_SHAPE_ARBITRARY",
+                )
+            )
+        self.fixed_scale_shape = shape
+
+    def scale_shape(self) -> Int:
+        """The scale arm `set_scale_shape` last chose."""
+        return self.fixed_scale_shape
+
+    def describe_scale(self) -> String:
+        """One phrase naming the scale arm, for a trace line."""
+        return describe_scale_shape(self.fixed_scale_shape)
+
+    def set_narrow_index(mut self, on: Bool) raises:
+        """Whether the histogram row loop forms its two data-dependent
+        indices in Int32 rather than in Int.
+
+        A forwarder for the reason `set_row_unroll`'s docstring gives:
+        `train_gpu` builds its own builder, so an end-to-end interleaved A/B
+        has no other way to reach the arm.
+
+        Off by default and refused outright on a dataset whose shape does not
+        admit it, which `GpuActiveRows.narrow_index_supported` states as a
+        bound and `GpuActiveRows.set_narrow_index` enforces. Under that bound
+        the two arms address the same bytes and accumulate the same integers,
+        so the histogram is identical; above it the narrow arm would wrap an
+        index, which is why it raises rather than degrading.
+        """
+        self.rows.set_narrow_index(on)
+
+    def narrow_index(self) -> Bool:
+        """The index-width arm `set_narrow_index` last chose."""
+        return self.rows.narrow_index
+
+    def set_pair_alignment(mut self, on: Bool):
+        """Whether the width-2 load of the quantized gradient pair states the
+        8-byte alignment its address actually has.
+
+        A forwarder, for the same reason the others here are. On by default:
+        the unannotated spelling emits `align 4` for a `<2 x i32>` load, and
+        an under-aligned vector load is one a backend may split back into the
+        two scalar loads that width-2 spelling exists to replace. Both read
+        the same eight bytes, so this cannot change a histogram.
+        """
+        self.rows.set_pair_alignment(on)
+
+    def pair_alignment(self) -> Bool:
+        """The pair-load arm `set_pair_alignment` last chose."""
+        return self.rows.pair_alignment
+
+    def set_row_tiling(
+        mut self, min_tiles: Int = 0, rows_per_tile: Int = 0
+    ) raises:
+        """Request a row-tile floor, a rows-per-tile length, or neither, for
+        every node this builder's device-resident path plans from here on.
+
+        Zero on both, the default, is the geometry this builder always
+        produced. A forwarder for the reason the others here are, and this one
+        matters more than most: the row-tile floor has to be re-measured
+        against the unrolled row walk, and the earlier measurement that made
+        it opt-in was taken across processes through an environment variable.
+
+        Affects only `GpuActiveRows.range_tiling`, which is the per-node
+        geometry the device-resident path derives. The whole-dataset
+        `self.tiling` this builder resolved in its constructor is not
+        re-derived, because it is a property of the dataset rather than of a
+        node and nothing here changes the dataset.
+
+        Cannot change a histogram: tiling is a launch geometry and
+        accumulation is fixed-point Int32, so two geometries over the same
+        rows sum the same bins in a different order to the same value.
+        """
+        self.rows.set_row_tiling(min_tiles, rows_per_tile)
+
     def set_fused_gradient_upload(mut self, on: Bool):
         """Whether `upload_staged` moves this round's two derivative planes
         with one copy of their shared allocation or with one copy each.
@@ -760,19 +922,32 @@ struct GpuHistogramBuilder(Movable):
         Not a numeric option and not a launch shape either: the two arms
         write identical bytes to identical device addresses, and the argument
         for that is at `upload_staged`. The only difference is the number of
-        host waits the round pays, because on Metal `enqueue_copy` is a
-        synchronous full-queue drain whose cost does not scale with the byte
-        count (`docs/GPU_PORTABILITY.md` section 6.1).
+        drains the round issues, because on Metal `enqueue_copy` is a
+        synchronous full-queue drain whose behavior does not scale with the
+        byte count (`docs/GPU_PORTABILITY.md` section 6.1).
 
-        Why fused is the default rather than the requested arm. The usual
-        rule here is that an unmeasured arm has to be asked for. That rule is
-        about arms whose sign is unknown, and this one's is not: section 6.1
-        establishes the wait and instructs a design to count every copy as a
-        synchronization, so removing a copy removes a synchronization by an
-        established fact rather than by a guess, and the bytes that move are
-        the same bytes. The split arm survives so the removal can be
-        **measured** rather than only **derived**, which is the only thing
-        the default costs.
+        **What that difference is worth is not a time.** An earlier version of
+        this docstring called the two copies two host waits and justified the
+        default on the ground that removing a copy removes a synchronization
+        by an established fact. Section 6.1.1 withdrew that inference on
+        2026-08-16: a drain of a queue holding nothing costs nothing, and
+        nothing is queued behind a gradient upload. The nearest **measured**
+        point is the thirteen-copy collapse on the device-resident plane,
+        which bought 0.016 seconds at 1,000,000 x 50 against a registered
+        prediction of 0.64 and did not resolve under M0
+        (`bench/results/session3_2026-08-16/RESULTS.md`). Nothing here
+        predicts that fusing these two is different.
+
+        Why fused is still the default rather than the requested arm. The
+        usual rule is that an unmeasured arm has to be asked for, and that
+        rule is about arms whose sign is unknown. This one's sign is known in
+        the dimension that is left: the bytes that move are the same bytes,
+        and one copy is one staging lifetime, one ordering point, and one
+        place a `[grad | hess]` pair can arrive half fresh, where two are two.
+        It is a hazard and portability default, not a speed default, and no
+        speed claim may be attached to it. The split arm survives so an
+        interleaved A/B can be run if anyone wants it; the **estimate**, from
+        the null above, is that it will not resolve.
 
         Reachable in process, and only in process. `train_gpu` builds its own
         builder and takes its arm knobs as function parameters (`row_unroll`
@@ -927,19 +1102,27 @@ struct GpuHistogramBuilder(Movable):
         with no build in between would come back to an arena whose copy is
         still in flight. A watermark (a copy sequence number against the
         sequence a synchronize last drained through) would be a real
-        guarantee and would cut the waits to one per arena-count rounds, but
+        guarantee and would cut the drains to one per arena-count rounds, but
         it buys a wait that is near zero where we can measure it, costs a
         pinned `2 * n_rows` Float32 per extra arena, and fails silently in
         exactly the way a stale host table failed silently in this project
-        this week. The fused upload below removes a wait unconditionally and
-        with no hazard at all, which is the better trade of the two.
+        this week. The fused upload below removes one drain unconditionally
+        and with no hazard at all, which is the better trade of the two.
+
+        Section 6.1.1, on 2026-08-16, strengthened the first reason rather
+        than weakening it: a copy is a drain but a drain is not a wait, and
+        the only **measured** point puts thirteen such copies per tree at
+        0.016 seconds, a null under M0. So the rotation is buying even less
+        than the paragraph above conceded, and the hazard argument in the
+        second reason is now the whole of the case. That argument is about
+        ordering and it stands unchanged.
         """
         if len(grad) != self.n_rows or len(hess) != self.n_rows:
             raise Error("gradient/hessian length must equal n_rows")
         self.has_gradients = False
 
-        var g_scale = _fixed_scale(grad)
-        var h_scale = _fixed_scale(hess)
+        var g_scale = _fixed_scale(grad, self.fixed_scale_shape)
+        var h_scale = _fixed_scale(hess, self.fixed_scale_shape)
         self.g_scale = Float64(g_scale)
         self.h_scale = Float64(h_scale)
         self.round_epoch += 1
@@ -969,11 +1152,21 @@ struct GpuHistogramBuilder(Movable):
         `stage_gh[n_rows : 2 * n_rows]` to `gh_dev[n_rows : 2 * n_rows]`,
         which is exactly what the split arm's two copies write into the two
         windows. Neither arm converts, reorders, or pads anything. What
-        differs is one host wait, because on Metal a copy is a wait whatever
-        its byte count is and under four microseconds of the roughly 458 it
-        costs is actual byte movement (`docs/GPU_PORTABILITY.md` section 6.1,
-        the wait established by disassembly and the split **derived** from
-        it).
+        differs is one drain, because on Metal a copy drains the whole queue
+        whatever its byte count is (`docs/GPU_PORTABILITY.md` section 6.1,
+        **measured** by disassembly).
+
+        **One drain, not one wait, and the ~458 microseconds that used to be
+        written here has been taken off it.** That constant is **derived**
+        from the depthwise A/B and it is the price of a *round trip*; neither
+        of these copies is one, because nothing is queued behind them and no
+        host decision reads a device answer. Section 6.1.1 records the
+        withdrawal and the data: thirteen copies per tree removed elsewhere on
+        this plane **measured** 0.016 seconds against a registered prediction
+        of 0.64, a null under M0
+        (`bench/results/session3_2026-08-16/RESULTS.md`). The fused arm is
+        kept because one copy is one ordering point and one staging lifetime
+        where two are two, not because it is faster.
         """
         if self.fused_upload:
             self.ctx.enqueue_copy(
@@ -1004,12 +1197,10 @@ struct GpuHistogramBuilder(Movable):
         The values that land are the exact Float32 the kernels read (a copy,
         no arithmetic), and `g_scale`/`h_scale` were already set by the
         device fill, so `build_leaf_host_replica` afterwards accumulates
-        exactly what `build_leaf` does — the same replica claim
-        `replica_state` records, no new one. Costs `2 * 4 * n_rows` bytes
-        and one synchronize per round (per class, on a softmax round), which
-        is the price of reaching the built-in-objective path with hybrid
-        leaf scheduling at all; the grower pays it only when that scheduling
-        is switched on and measured.
+        exactly what `build_leaf` does — the same replica claim, no new one.
+        Costs `2 * 4 * n_rows` bytes and one synchronize per round (per
+        class, on a softmax round). No grower calls this: it is how the
+        equivalence tests reach a device-objective round from the host.
 
         A no-op when the gradients are already host-side. Refused before any
         gradients exist.
@@ -1022,7 +1213,7 @@ struct GpuHistogramBuilder(Movable):
         # planes are now adjacent in both directions, so this is one
         # `dst_ptr=stage_gh, src_buf=gh_dev` away from costing one wait
         # instead of two, exactly as `upload_staged` is; it is not fused here
-        # because this path is hybrid-leaf-scheduling only and no arm of it
+        # because this path is verification-only and no arm of it
         # has been measured, and a second unmeasured arm in the same commit
         # would make the first one harder to attribute.
         var stage = self.stage_gh.unsafe_ptr()
@@ -1056,15 +1247,28 @@ struct GpuHistogramBuilder(Movable):
         """This round's gradients, computed on the device straight into the
         histogram buffers. Replaces `upload_gradients` for the built-in
         objectives; the fixed-point scales come from a device reduction
-        instead of a host pass, and nothing per-row crosses to the device."""
+        instead of a host pass, and nothing per-row crosses to the device.
+
+        The scale is derived by `quantized_gradient.fixed_point_scale_shaped`
+        rather than by `gpu_objectives_native.device_fixed_scale`, which is
+        the same rule reached one forward earlier: `device_fixed_scale` takes
+        no shape argument and this builder's arm has to reach the derivation.
+        Only where the magnitude sum comes from differs between this path and
+        the host one, and that difference is the point of the device
+        reduction, not of the scale.
+        """
         state.fill_grad_hess(
             self.ctx, objective, alpha, self.grad_dev, self.hess_dev
         )
         var sums = state.magnitude_sums(
             self.ctx, self.grad_dev, self.hess_dev
         )
-        self.g_scale = Float64(device_fixed_scale(sums.grad))
-        self.h_scale = Float64(device_fixed_scale(sums.hess))
+        self.g_scale = Float64(
+            fixed_point_scale_shaped(sums.grad, self.fixed_scale_shape)
+        )
+        self.h_scale = Float64(
+            fixed_point_scale_shaped(sums.hess, self.fixed_scale_shape)
+        )
         self.has_gradients = True
         self.gradients_host = False
         self.round_epoch += 1
@@ -1080,8 +1284,12 @@ struct GpuHistogramBuilder(Movable):
         var sums = state.magnitude_sums(
             self.ctx, self.grad_dev, self.hess_dev
         )
-        self.g_scale = Float64(device_fixed_scale(sums.grad))
-        self.h_scale = Float64(device_fixed_scale(sums.hess))
+        self.g_scale = Float64(
+            fixed_point_scale_shaped(sums.grad, self.fixed_scale_shape)
+        )
+        self.h_scale = Float64(
+            fixed_point_scale_shaped(sums.hess, self.fixed_scale_shape)
+        )
         self.has_gradients = True
         self.gradients_host = False
         self.round_epoch += 1
@@ -1154,6 +1362,17 @@ struct GpuHistogramBuilder(Movable):
         node -- and it buys the removal of one host synchronization per
         class, which is the cost the batch exists to remove. That trade has
         not been measured on any device.
+
+        `set_scale_shape` does not reach this path, and the boundary is real
+        rather than an oversight. The scales come from `GpuClassBatch`, which
+        derives its own through `gpu_objectives_native.device_fixed_scale`
+        and so gets `DEFAULT_SCALE_SHAPE` -- the same shape this builder
+        defaults to, so the shipping behavior of the two agrees. Asking this
+        builder for `SCALE_SHAPE_ARBITRARY` and then adopting a batched
+        class's scale would silently get the power-of-two arm anyway. The A/B
+        this arm exists for is a single-output one; a multiclass A/B needs
+        the shape threaded through `gpu_multiclass_batch.refresh_scales`,
+        which is a file this lane does not own.
         """
         if batch.n_rows != self.n_rows:
             raise Error("class batch and histogram builder disagree on n_rows")
@@ -1389,10 +1608,11 @@ struct GpuHistogramBuilder(Movable):
         shapes either side of the edge.
 
         On the host-scan path the cost is real. It covers
-        `3 * n_features * n_bins` cells, and the hybrid scheduler's
-        calibrated cost model prices the conversion at
+        `3 * n_features * n_bins` cells, and the (now deleted) hybrid
+        scheduler's calibrated cost model priced the conversion at
         `convert_nanos_per_kcell = 10024`, about 10 ns per cell, against a
-        modeled device fixed cost per node of roughly 263 microseconds.
+        modeled device fixed cost per node of roughly 263 microseconds
+        (bench/results/apple_m4_hybrid_costs_2026-08-15.md).
         Nothing here has been measured by this lane, and no speedup is
         claimed on either path; what changed is only the shape of the loop.
 
@@ -1437,6 +1657,15 @@ struct GpuHistogramBuilder(Movable):
         var g = _zeroed_f64(hist_size)
         var h = _zeroed_f64(hist_size)
         var c = _zeroed_int(hist_size)
+        # Reciprocal once, multiply per cell -- and under
+        # `SCALE_SHAPE_POW2`, the default, this whole conversion is *exact*.
+        # `g_scale` is a power of two, so `1.0 / g_scale` is representable in
+        # Float64 with no rounding, an Int32 cell is representable exactly,
+        # and a Float64 times a power of two is exact. Under
+        # `SCALE_SHAPE_ARBITRARY` neither the reciprocal nor the product is,
+        # and every cell carried both roundings. Trading a division per cell
+        # for a multiply is why the reciprocal is hoisted; that it now costs
+        # nothing in accuracy to hoist it is new.
         var g_inv = 1.0 / self.g_scale
         var h_inv = 1.0 / self.h_scale
         var gp = g.unsafe_ptr()
@@ -1510,8 +1739,9 @@ struct GpuHistogramBuilder(Movable):
         rather than accumulating a stale round.
 
         Whether the result is bit-identical to `build_leaf`'s is a claim
-        about this device's multiply-and-round, established by the grower's
-        mirror comparison and recorded in `replica_state`, never assumed.
+        about this device's multiply-and-round, never assumed. It is what
+        `tests/test_host_replica.mojo` asserts, and this builder is the
+        oracle side of the CPU/GPU equivalence docs/ARCHITECTURE.md names.
         """
         if not self.has_gradients or not self.gradients_host:
             raise Error(
@@ -1909,9 +2139,14 @@ struct GpuHistogramBuilder(Movable):
         budget and not from the data, both are held in a one-element list so
         that "not open" is a length rather than a sentinel, and both reuse an
         already-open instance when it is deep enough. `DeviceTreeTables` costs
-        eleven buffers and one synchronization to construct, so building one
-        per tree would put a host wait back into every tree that this whole
-        lane exists to take out of every split.
+        eleven device allocations and one synchronization to construct, so
+        building one per tree would put eleven allocations and a drain back
+        into every tree. The allocations are the part that is real work; the
+        drain is an ordering point and, under `docs/GPU_PORTABILITY.md`
+        section 6.1.1, is not by itself a time. Neither is a round trip, so
+        nothing here should be quoted in seconds. Reusing is right on
+        allocation grounds and on the ordinary grounds that per-fit state
+        belongs on a per-fit object.
 
         It lives on the builder rather than on the growth loop for one
         practical reason: the builder is the object a fit already threads
@@ -2163,6 +2398,8 @@ struct GpuHistogramBuilder(Movable):
         var g = _zeroed_f64(hist_size)
         var h = _zeroed_f64(hist_size)
         var c = _zeroed_int(hist_size)
+        # Exact under `SCALE_SHAPE_POW2`, for the reason spelled out at the
+        # same two lines in `histogram_from_host`.
         var g_inv = 1.0 / self.g_scale
         var h_inv = 1.0 / self.h_scale
         var gp = g.unsafe_ptr()

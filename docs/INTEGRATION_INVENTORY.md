@@ -100,6 +100,20 @@ overflow guard and no packed plan, `gpu_bin_packing` nothing at all,
 `hybrid_leaf_scheduler` a report that moves no histogram, and
 `histogram_cache_policy` only what that report reads. Their rows stay at
 `deferred` with the reach written into the evidence.
+*Dated note, 2026-08-16.* Two of those seven are gone rather than
+connected. `hybrid_leaf_scheduler` was deleted by the GPU campaign once the
+device-resident plane made its premise obsolete, and `histogram_cache_policy`
+— which only that module imported — was deleted by the CPU campaign
+immediately afterwards, having become an orphan with no importer at all. Its
+row is removed from the table above rather than left at PENDING, because a
+module that does not exist cannot be pending connection.
+
+The paragraph above stands as the record of what was true at that snapshot,
+and it is worth leaving intact for one reason: it argued that being *reached*
+is not the same as being *called*, and listed both modules among the four
+that were reached and not exercised. Both were deleted within the day. That
+is the distinction paying for itself.
+
 `CLASSIFICATION` in `tools/connectivity_audit.py` still carries
 entries for all seven; they are now judgments about modules that are no
 longer findings, and removing them is a patch for that file's owner.
@@ -202,9 +216,9 @@ to describe them as behavior a user gets.
 | `apple_gpu_policy` | `device_policy`, `apple_histogram_policy` | supplies the device profile and the memory estimate; its tuning derivations are consulted only through the line above | as above |
 | `gpu_split_search` | `train_gpu` | the host scan, because Float32 device gains can flip near-tie decisions and the measured difference (a few percent either way, `docs/LIGHTGBM_PARITY.md`) does not pay for that | `MOJOTREES_GPU_SPLIT_STRATEGY=device` |
 | `unified_memory_policy` | `device_policy`, `histogram_gpu` | one live route; the others it scores are not implemented in any trainer | `MOJOTREES_GPU_TRANSFER` |
-| `device_policy` crossover table | `device`, and through it every `fit` | one rule, scoped to Metal on an M4 for squared error at 1,000,000 x 50 and above, which cannot fire through `resolve_device` because `DeviceCapabilities.detect()` opens no device and a hardware-scoped rule cannot match an unidentified profile. `auto` therefore still resolves to the CPU everywhere, with a warning that says which half of "does not cover" applied | `MOJOTREES_AUTO_MIN_CELLS`, or a caller passing a profile read from an open `DeviceContext` to `decide_device_report_reported` |
+| `device_policy` crossover table | `device`, and through it every `fit` | one rule, scoped to Metal on an M4 for squared error at 1,000,000 x 50 and above. Reachable since 2026-08-16: `DeviceCapabilities.detect()` names the hardware from the build target and `parse_apple_generation` parses the architecture string a device really reports. `auto` selects the GPU there for any caller that declares an objective, and the CPU everywhere else, with a warning that says which half of "does not cover" applied. `resolve_device`'s four-argument form declares no objective and so still resolves to the CPU at every shape | pass `objective` to `resolve_device`, or call `resolve_device_full` / `decide_device_report`; `MOJOTREES_AUTO_MIN_CELLS` for hardware no rule covers; `decide_device_report_reported` for a caller holding an open `DeviceContext` |
 | `gpu_multiclass_batch` | `train_gpu`, `histogram_gpu` | a sequential schedule, so multiclass GPU training stays one tree per class per round and `_train_multiclass_gpu_batched` is not entered. Now measured rather than merely unmeasured: batching seven classes gives 15.45s against the sequential schedule's 15.30s at 465,000 x 54, which is inside the spread and therefore indistinguishable, so the default is right and there is nothing here to turn on | `MOJOTREES_GPU_CLASS_BATCH` above one, or a caller passing its own batch |
-| `hybrid_leaf_scheduler` | `gpu_runtime` | a report and nothing else. `GpuSession.note_hybrid` records what was asked for and why it was declined; no histogram changes device | nothing. `MOJOTREES_HYBRID_LEAVES` and `MOJOTREES_HYBRID_TRACE` change what is reported, not where a histogram is built |
+| `hybrid_leaf_scheduler` | *deleted 2026-08-16* | the module, its `gpu_runtime` report (`GpuSession.note_hybrid`), its `train_gpu` wiring, `MOJOTREES_HYBRID_LEAVES`, `MOJOTREES_HYBRID_COSTS`, `MOJOTREES_HYBRID_TRACE`, `MOJOTREES_HYBRID_GUARD_TRANSFER` and its cost-calibration bench are gone. Its premise was that the host could usefully take the leaves the device was slow at; the device-resident tree plane now beats the host path at every measured shape (`bench/results/session3_2026-08-16/RESULTS.md`), so there is no such leaf. The host replica builder it called is not gone and was never its own: see `histogram.build_histogram_subset_replica_into` and `tests/test_host_replica.mojo` | nothing; there is nothing left to turn on |
 
 Two of those rows are held off by default because they were measured and did
 not pay, not because the connecting work is outstanding, and the difference

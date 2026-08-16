@@ -87,6 +87,25 @@ The 458 microsecond constant, derived from the depthwise A/B where what was
 removed were per-level round trips, applies to round trips. It was extended to
 copies by analogy, by me, and the extension is refuted.
 
+### And the "three independent confirmations" was two errors agreeing
+
+This project stated, repeatedly and including to Andrew, that the per-split wait
+had been confirmed by three routes sharing no inputs: a curve fit giving a 1.42
+second intercept, a counter times a per-event cost giving 3,100 x 458 us = 1.42
+seconds, and the resident plane predicting 0.69 seconds and measuring 0.57.
+
+The first two are sound and remain so. **The third was a coincidence.** The 0.57
+seconds it measured came from removing about thirty *round trips* per tree. The
+model that predicted 0.69 was counting fifteen *copies and syncs*. Both numbers
+were near 0.6 and the agreement was read as confirmation of the model. It was
+two different quantities landing close together, and it made a wrong cost model
+look corroborated at exactly the moment it should have been questioned.
+
+That is why the collapse prediction was then wrong by a factor of forty rather
+than being caught early: the erroneous model had apparently just passed a test.
+A prediction that agrees with a measurement for the wrong reason is worse than
+one that fails, because it buys the model credit it has not earned.
+
 **None of the collapse work is reverted.** It is correct, it is tested, it makes
 staleness structurally impossible in the searcher's tables, and it removes real
 if unmeasurable work. It is simply not a speed result, and the parts of it that
@@ -290,10 +309,44 @@ scan, because the device search used to lose below it: this repository's own
 record says the device path "beats host scan at 250k rows, loses at 50k". At
 50,000 the normalized work is 2,500,000, a twentieth of the gate.
 
-The resident plane wins there by 2.2x. So the gate's premise is falsified at
-precisely the shape it was built to protect, and re-deriving or deleting it is
-now a live question rather than a tuning exercise. That is a **reduction** in the
-number of paths, not an addition of a small-data path.
+The resident plane wins there by 2.2x.
+
+> **CORRECTION, same night. That last sentence did not follow from this data and
+> is withdrawn.**
+>
+> The `gpu-device` bench arm passes `split_search=SPLIT_SEARCH_DEVICE`, which
+> **forces** the device split search and bypasses `M4_MIN_NORMALIZED_WORK`
+> entirely. So both arms of every S1 pair above had the device search forced:
+> the comparison is the resident plane against the **shipping device loop**, and
+> it is sound as such. It is not a comparison against the host scan.
+>
+> But the gate chooses host scan versus device search. **This session never
+> measured the host scan at 50,000 or 250,000 at all**, so it cannot say the
+> gate's premise is falsified. It can only say that when the device search is
+> taken, the resident plane is much better at running it.
+>
+> The missing measurement, and it is now the highest-value one outstanding:
+> **resident plane on the forced device arm against the automatic path (host
+> scan) at 50,000 and 250,000.** That is what decides whether
+> `M4_MIN_NORMALIZED_WORK` can be deleted. Until it exists, the gate stays and
+> no claim about its premise may be made.
+>
+> This is the "measured the wrong arm" error, which this project has now made in
+> three distinct forms in twenty-four hours: a vacuous test that ran below a
+> gate, a comparator throttled harder than us, and now an inference about a gate
+> drawn from data that bypassed it.
+
+### What S1 does and does not deliver to a default user
+
+The plane is only reachable when the device split search is chosen. On
+`SPLIT_SEARCH_AUTO` that requires `normalized_split_work >= 50,000,000`, which
+250,000 x 50 (12.5M) does not meet and 1,000,000 x 50 (exactly 50M) just does.
+
+**So flipping the default delivers the 2.2x and 44 percent to almost nobody
+yet.** They are real wins on the forced arm, and the flip is a **prerequisite**
+for retiring the gate rather than the delivery of anything to default users.
+Retiring the gate is what cashes this in, and retiring it needs the measurement
+named above first.
 
 ---
 
@@ -357,9 +410,85 @@ of 2.584 is still ahead, by 2 percent.
 
 Our arm did not degrade across five back-to-back runs; LightGBM went 2.80 to
 3.50 over the same sequence as load accumulated. The GPU arm is thermally stable
-under repetition and the ten-core CPU arm is not. That is a real property and it
-is why any single head-to-head number depends on how long the machine has been
-working.
+under repetition and the ten-core CPU arm is not.
+
+**Read that as a property of the engine, not of the comparator**, and the
+distinction is not pedantic. The CPU campaign measured the mirror image the same
+night: at 1,000,000 x 50 *their* CPU arm rose 18 percent across five repeats
+while LightGBM rose only 10 percent. So "LightGBM degrades harder under
+repetition" is false as a general claim. It held here because the GPU is
+thermally stable, not because LightGBM is fragile; against another ten-core CPU
+arm, LightGBM is the *steadier* side.
+
+Anyone quoting this asymmetry must say which engines were on which side. It is
+why a head-to-head number depends on how long the machine has been working, and
+it is why the canary reports the CPU and GPU probes separately and never
+averages them.
+
+### A caveat on every LightGBM number in this repository, found the same night
+
+`scenarios.LIGHTGBM_ALIGNMENT` pins **`force_row_wise = True`**. Found by the CPU
+campaign orchestrator reading the params line its own smoke test printed.
+
+So every LightGBM figure this project has ever recorded — the 2.767 that framed a
+week of work, the 2.662 standalone above, and the 2.883 in-process median used as
+the comparator here — was taken against a builder **we forced**, not against
+whatever LightGBM would have chosen.
+
+The pin is methodologically right and should stay: on auto, LightGBM spends its
+first iterations timing both strategies and that one-off lands inside the
+measured region. But the consequence has to travel with the margin. "Ahead by 5
+to 11 percent" is precisely "ahead of LightGBM with `force_row_wise` pinned", and
+if the column-wise builder is materially faster at this shape then the margin is
+against a handicapped configuration.
+
+That is the same class of error as the throttled comparator withdrawn above,
+reached from a different direction, and it would be found by the first outside
+reader who ran LightGBM themselves.
+
+### Resolved the same night: the pin is CONSERVATIVE, and the margins stand
+
+The CPU campaign measured it at 1,000,000 x 50, ten threads, both builders
+pinned, interleaved in one process, five repeats:
+
+| LightGBM builder | median | spread |
+|---|---|---|
+| `force_row_wise`, what we pin | **2.856** | 14.0% |
+| `force_col_wise` | 3.052 | 9.3% |
+
+All five pairs favor row-wise, median margin **6.9 percent**; consistent, not
+resolved, since the delta is smaller than the wider arm's own range.
+
+**The builder we pin is LightGBM's faster one at this shape, so pinning it makes
+the comparison harder on us, not easier.** The feared error — a margin won
+against a handicapped comparator — did not occur, and it failed to occur in the
+direction that supports rather than undermines what is published above. Nothing
+in this file is retracted on this account.
+
+**The caveat stays anyway**, in one sentence, because 6.9 percent is consistent
+rather than resolved and an outside reader on defaults could land anywhere in
+that band and would additionally pay the strategy-timing cost the pin removes.
+The correct phrasing wherever a margin appears: *the comparator is pinned to
+`force_row_wise`, which is LightGBM's faster builder at this shape by a
+consistent 6.9 percent, so the pin is conservative with respect to our margin.*
+
+### A statistic discrepancy in the harness, which may affect close verdicts
+
+The CPU campaign found that `bench_train_gpu.mojo` computes its
+`resolved` / `indistinguishable` verdict from the arms' **minima**, while this
+protocol requires the **median** and says why: the minimum is the luckiest
+sample, and contention here is the finding rather than noise.
+
+At 50,000 rows it flips this project's one claimed win over LightGBM: resolved on
+minima, consistent-not-resolved on medians. Every pair still favors us, so the
+direction is not in doubt, but the verdict word is.
+
+**Audited against this file: no verdict here changes.** The unroll is 10.8
+percent against a 2.1 percent floor on either statistic; the collapse null and
+the S1 figures were computed from medians by hand; the withdrawn slow-window
+LightGBM comparison is withdrawn on other grounds. The harness line should still
+be corrected to use the median, and that is queued behind the canary lane, which
+currently owns that file.
 
 ### The three sentences that are now supportable
 
@@ -368,7 +497,8 @@ working.
    seconds** depending on how it is run and how warm the machine is.
 3. We are **consistently ahead by 5 to 11 percent, and that margin is not
    resolved** under this project's own rule, because the comparator's spread is
-   wider than the margin.
+   wider than the margin -- and it is a margin against LightGBM with
+   `force_row_wise` pinned, per the caveat above.
 
 Not "1.14x behind". Not "1.50x ahead". Both of those were this project's
 headline within the last twenty-four hours and neither survives.
@@ -379,3 +509,272 @@ headline within the last twenty-four hours and neither survives.
 - Whether tonight's machine state is thermal, clock, or something else. Nothing
   in this session establishes it and the results are labelled by regime rather
   than corrected for it.
+
+
+---
+
+## The canary's first reading, and it is the most consequential number of the session
+
+Taken 2026-08-16 on the first run of `bench/canary.mojo` after it was wired in.
+Three repeats, one short run, the CPU campaign active on the same box. Two fixed
+probes: a serial single-threaded integer chain and a saturating GPU kernel.
+**Neither probe touches a dataset, the training code, or any knob either campaign
+varies**, so nothing here is a property of anything either of us wrote.
+
+    drift_cpu_pct: 22.5      regime: shifted
+    drift_gpu_pct:  0.7
+
+The CPU probe measured 467 ms at the start of the run and 572 ms at the end. The
+GPU probe held to 0.7 percent across the same interval.
+
+**Measured.** The baselines are not yet recorded so the ratios are null; only the
+start-to-end drift is meaningful, and it is enough.
+
+### What it settles
+
+Three separate findings this week were arguments from arm behavior, each open to
+the objection that the arm's own code explained it:
+
+- ours: the GPU arm held 2.7 percent spread across five runs while LightGBM
+  drifted 2.80 to 3.50
+- the CPU campaign's: their CPU arm rose 18 percent across five repeats while
+  LightGBM rose 10
+- the resident plane measuring 24 percent in one window and 8 percent in another
+
+All three are now explained by one directly measured fact: **on this machine the
+CPU throttles hard and fast and the GPU essentially does not.** It is not a
+property of LightGBM, not of our arms, and not of either campaign's code.
+
+### What it costs us
+
+**A CPU-versus-CPU comparison on this box drifts materially inside a single
+run.** Not between sessions, not between windows -- inside one three-repeat run
+lasting well under a minute.
+
+So absolute seconds from any CPU-heavy arm are not a property of the code, and
+may be reported only as ratios from interleaved arms with the canary line beside
+them. The CPU campaign has accepted this for its own headline and is rewriting
+its results file to lead with the ratio. That is the correct response and it was
+reached on evidence neither campaign could have produced from its own arms.
+
+### And it is the argument for the instrument itself
+
+`PROFILE_PROTOCOL.md` had asked for thermal state since the first session. The
+instruction pointed at a script that measures nothing, and for two days at a
+handoff file that had been deleted. Every regime label in this repository until
+now was inferred from effect, by hand, and one such inference was made and
+retracted the same night.
+
+The canary answers a different question than the protocol asked -- not what state
+the machine reports, but what the machine delivers -- and it answered it on the
+first run, without privileges, in a way that changed what another campaign is
+willing to publish.
+
+---
+
+## The speculation census: K=1's hit rate, measured before the speculation was built
+
+Lane K2 was asked to build speculative child histograms. It did not, and the
+reason is a better outcome than the build would have been.
+
+### K>=2 is provably useless, so K=1 is the only K
+
+Not a census result, a theorem, and it is worth stating because it closes a
+question rather than estimating it. At step *k* the two children that step *k*
+creates have no records until step *k*'s own search writes them, which is the
+last device work of the step -- so their candidacy is established exactly when
+speculating on them would stop being speculation. The candidate set is therefore
+the pre-existing leaves, and over that set the ranking **cannot move**: a commit
+writes only the split leaf's frontier row, the appended row at `n_live`, and the
+two records those children own. Every other leaf keeps its slot, record, depth
+and row count bit for bit, hence its gain and its admissibility, and the pick's
+`block.max` then `block.min` resolves an unchanged set identically, ties
+included.
+
+So the best pre-existing leaf at step *k+1* **is** the top runner-up at step *k*.
+A second speculative candidate is a leaf that provably cannot be picked next.
+
+### And the census that justified K=1 was measuring the theorem, not the hit rate
+
+"The greedy pick was the top runner-up in 100 percent of 4,030 decisions" is
+exactly what the theorem predicts **for the decisions where the pick is a
+pre-existing leaf**. It says nothing about how often it is one. The figure is a
+tautology over a conditioned subset, and this project has been quoting it as
+evidence for a hit rate it cannot speak to.
+
+### The actual hit rate, measured
+
+`MOJOTREES_GPU_SPECULATION_CENSUS=1`, one fit of 100 trees per shape, summed over
+the fit rather than averaged per tree (a three-leaf tree must not weigh the same
+as a thirty-leaf one):
+
+| shape | trees | builds | consumed | wasted | hit rate |
+|---|---|---|---|---|---|
+| 1,000,000 x 50 | 100 | 2900 | 1936 | 964 | **66.8%** |
+| 250,000 x 50 | 100 | 2900 | 1902 | 998 | **65.6%** |
+| 50,000 x 50 | 100 | 2900 | 1917 | 983 | **66.1%** |
+
+**Measured**, and note what kind of measurement it is: the census is a pure host
+function over the commit log that already comes home in the plane's one download.
+It launches nothing, transfers nothing, and derives its answer from the tree
+rather than from a clock, so **it is valid on a contaminated box and identical in
+a fast window and a slow one**. It was taken while a second campaign had four
+lanes compiling, and that does not weaken it at all.
+
+Two structural facts bound it below 1 before any run, both visible in the
+numbers: step 1 can never consume, because step 0's candidate set is empty, and
+the last step's build has no commit after it. So `consumed <= builds - 1` always.
+
+### What it decides
+
+The lane registered its own bar before seeing the number: a hit rate materially
+below about 50 percent makes the lane a loss before the launch-shape benefit is
+counted. **66.8 percent clears it**, and the stability across a twentyfold range
+of row counts is itself evidence that the rate is a property of leaf-wise growth
+rather than of a shape.
+
+The honest cost, which is not zero: **964 wasted builds per fit at 1M**, each a
+partition and a histogram over a child window, spent on a child that is
+discarded. A consumed build is the same work moved earlier; a wasted one is work
+that would not otherwise exist. So the trade is roughly a third more child
+histogram builds in exchange for a better launch shape, and whether that wins is
+a measurement nobody has taken.
+
+### Why it was not built, and what it needs
+
+The speculation cannot be expressed from `gpu_resident_round.mojo` alone. Every
+descriptor-aware launch reads one fixed buffer, `GpuActiveRows.step_dev`, so a
+speculative step needs a second descriptor and a kernel that publishes a
+runner-up without committing. Two changes, in two files that lane did not own,
+neither large:
+
+- `gpu_active_rows.mojo` -- a descriptor-pointer parameter on
+  `enqueue_partition_desc` and `enqueue_desc_histogram`, defaulting to `step_dev`
+  so no call site moves, plus a second `STEP_WORDS` buffer. The kernels already
+  take the descriptor as an argument and already carry an ignore-the-descriptor
+  flag.
+- `gpu_tree_tables.mojo` -- a `_pick_runner_up_kernel`: phase two of
+  `_pick_and_commit_kernel` with the committing phase replaced by a descriptor
+  write, excluding the slot this step's commit took.
+
+**Sequenced behind K1**, which owns the histogram kernel bodies in
+`gpu_active_rows.mojo`. Two lanes editing that file concurrently is the shape
+this batch was designed to avoid.
+
+### One design correction the lane found that would have been a silent bug
+
+**A speculative build must not fold the sibling subtraction in.**
+`enqueue_desc_child` derives the larger child in place from the parent's slot,
+which on a miss would destroy the histogram of the leaf being speculated on. The
+speculation must build the smaller child into a spare slot and leave the
+subtraction to the consuming step, so `open_resident(num_leaves)` becomes
+`num_leaves + 1` and `RESIDENT_SCRATCH_RECORDS` gains two.
+
+### And a note on dead steps
+
+They make this worse rather than neutral. A dead step is nearly free today
+because every descriptor-aware kernel reads `STEP_LIVE` and returns. A
+speculative build adds a partition, a histogram and a search pair to **every**
+step including dead ones, where it cannot possibly be consumed. `dead=0` at every
+shape above, so it does not bite here -- but a fit that stops early on
+`min_gain_to_split` would pay it, which is why `dead` is reported beside `builds`
+rather than folded into it.
+
+---
+
+## Candidates 5 and 6: the lane found a bug in the specification it was implementing
+
+### The retracted claim stays retracted, and a different change is the real win
+
+This project once relayed, enthusiastically, that dropping `- parent_score` from
+the gain was a free accuracy win. **That is still wrong.** Rounding is monotone,
+so subtracting a common constant preserves order, and in the near-tie regime
+Sterbenz applies (`P/2 <= left_score + right_score <= 2P`), making the
+subtraction exactly representable. A null, and no rewrite of it shipped.
+
+**The cross form is a different change and it is real.** The bits are lost one
+step earlier, in forming `left_score + right_score`, whose rounding error is
+`eps` of its own magnitude, roughly `eps * parent_score` -- an absolute floor
+that does not shrink as the gain shrinks. The cross form never forms that sum.
+
+**Derived bound:** shipped resolves to `eps*P`, cross to `eps*sqrt(P*gain)`, an
+improvement factor of `sqrt(parent_score/gain)`. Modelled in standalone NumPy,
+**not in mojotrees**, percent of near-tie pairs ranked correctly:
+
+| parent/gain | shipped resolves | cross resolves | ratio | bound predicts |
+|---|---|---|---|---|
+| 1 | 1e-6 | 1e-6 | 1 | 1 |
+| 30 | 1e-5 | 3e-6 | 3.3 | 5.5 |
+| 300 | 1e-4 | 1e-5 | 10 | 17 |
+| 2900 | 1e-3 | 1e-4 | 10 | 54 |
+
+Where it lives: one-sided gradients, late logistic and softmax rounds, nearly
+pure leaves. **Where it does not: below a parent/gain ratio of 1 it buys nothing
+and is about 30 percent worse on the median.** Said at the site rather than
+buried.
+
+Incidental and worth keeping: a form that cannot resolve a gap does not
+coin-flip. The shipped form *ties* the candidates and the scan keeps its
+incumbent, which is why it scores 19 percent rather than 50.
+
+### Section 8 of ACCURACY_BUDGET.md is invalid at `lambda_l1 > 0`
+
+**The identity requires `GL + GR = G`. Under L1 the gain is built from `T(GL)`,
+`T(GR)`, `T(G)`, and soft thresholding is not additive.** The document never
+mentions L1 anywhere.
+
+Applying it anyway measures a **systematic bias** of 1.6e-04 relative at a
+parent/gain ratio of 293, where the shipped form sits at 1.0e-05 -- with median
+and p99 agreeing to two figures, which rounding does not do. **Shipping section 8
+as written would have degraded every L1 fit.** The arm now refuses itself
+whenever `lambda_l1 != 0`.
+
+Four further corrections the lane reported and the document should absorb: its
+formula does not cover the categorical many-vs-many walk (children scored at
+`lambda_l2 + cat_l2` against a parent at `lambda_l2`); "never worse" is too
+strong; its three stated obligations dissolve because converting back to gain
+units costs one node constant which cancels against `l2/(H+l2)*P` rather than
+against `P`; and the effect is larger than its "up to 20x", reaching ~1000x on
+the median over all candidates.
+
+### Candidate 3 moved the ground under candidate 6 without removing it
+
+The budget derived 6 from an inexact dequantization. **That reason is gone**, and
+so is the next one: with a power-of-two scale the float subtraction is itself
+exact by Sterbenz whenever the left child holds between half and twice the total.
+
+What survives is stronger than what was written: the whole error is the two
+Int32-to-Float32 casts, each rounding by `2^-24` **of the node total**, so the
+derived right child inherits an error set by its parent's magnitude. Integer
+subtraction casts once, afterwards, and that does not shrink with the scale's
+shape. 6 still pays 2 to 2.5x on top of 5, and the "6 only with 5" rule holds --
+power-of-two arguably sharpens it, since the anti-correlation is now exact rather
+than approximate.
+
+### Bits move, fixtures do not, and the two unrunnable files now ran
+
+Bits move on **every** path through the device split search: every gain value,
+the `min_child_hess` admission test, and the record's child stats. The golden
+fixtures do not move -- `test_golden_bits` is cpu-safe, trains through the CPU
+path, and never reaches this module.
+
+The lane could not run `test_gpu_split_search` or `test_gpu_split_scan` under its
+budget and, rather than guessing, asserted a bound: 600 histograms of exactly
+their shape, both arms selecting the same split, differing by at most 1.96 units
+of `eps32*(parent_score + gain)`, which is 6e-06 against their `atol=1e-4`.
+
+**Both now run and both pass**, along with `test_gpu_gain_form` and
+`test_gpu_tree_resident`. The bound held.
+
+### The default, and what it rests on
+
+`GAIN_FORM_CROSS` ships as the default, following candidate 3's precedent. Its
+docstring states plainly that this rests on an identity, a derived bound and a
+NumPy model, and on **no mojotrees measurement**.
+
+That is the second numeric default this wave changed without a mojotrees
+measurement, after `pair_alignment`. Unlike that one, **this changes bits**. It
+is therefore gated on the real-data accuracy run against
+`bench/real_data/thresholds.json`, which is also the GPU path's first accuracy
+record of any kind. If that run does not clear the thresholds, the default flips
+to opt-in and the arm stays for the L1-free case where the bound is largest.

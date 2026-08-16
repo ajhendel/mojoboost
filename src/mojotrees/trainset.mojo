@@ -926,8 +926,10 @@ def train_dataset(
         )
         return Model(dataset.mapper.copy(), booster^)
 
+    # See `external_memory.train_external`: the objective is part of the
+    # crossover rule and dropping it declines the GPU unconditionally.
     var backend = resolve_device(
-        device, dataset.n_rows, dataset.n_features, 1
+        device, dataset.n_rows, dataset.n_features, 1, objective
     )
     if backend == GPU_DEVICE:
         if len(dataset.init_score) != 0:
@@ -1015,8 +1017,9 @@ def train_dataset_multiclass(
         return MulticlassModel(dataset.mapper.copy(), sparse_booster^)
 
     var backend = resolve_device(
-        device, dataset.n_rows, dataset.n_features, n_classes
-    )
+        device, dataset.n_rows, dataset.n_features, n_classes, MULTICLASS
+    )  # MULTICLASS is the registry's code for a softmax fit, which this
+    # entry point is by construction and takes no objective argument for.
     var booster: MulticlassBooster
     if backend == GPU_DEVICE:
         booster = train_multiclass_gpu(

@@ -167,6 +167,25 @@ comptime OBSERVED_M4_CORE_COUNT = 10
 comptime OBSERVED_M4_MAX_THREADS_PER_BLOCK = 1024
 comptime OBSERVED_M4_SHARED_BYTES = 32768
 
+# The architecture string that same M4 reports, verbatim.
+#
+# MEASURED, 2026-08-16: `DeviceContext().arch_name()` on the development M4
+# returns exactly `4-metal4`, and `std.sys.info._accelerator_arch()` on a
+# build targeting it returns `metal:4-metal4`. Both were read, not recalled;
+# `gpu_split_policy._is_observed_m4` had already hardcoded the same literal
+# for the same reason and from the same reading.
+#
+# It is a constant rather than a pattern because one reading is all this
+# project has. `parse_apple_generation` below matches it exactly and
+# extrapolates nothing: it is not known whether the leading digit is the
+# chip generation or the Metal feature-set family, and those two readings
+# disagree about what an M3 or an M5 would report. Guessing wrong there does
+# not fail loudly, it silently applies M4-measured evidence to a chip that
+# was never measured, which is the one outcome the crossover scope exists to
+# prevent. A second reading, from any other generation, is what would turn
+# this into a grammar.
+comptime OBSERVED_M4_ARCH_NAME = String("4-metal4")
+
 
 def _ceil_div(a: Int, b: Int) -> Int:
     return (a + b - 1) // b
@@ -236,7 +255,27 @@ def parse_apple_generation(arch_name: String) -> Int:
     The generation is metadata for the crossover inputs and for diagnostics.
     Nothing in `derive_policy` branches on it, and nothing should until a
     measurement distinguishes the generations.
+
+    THE SPELLING A REAL DEVICE USES IS NOT THE SPELLING THIS PARSED. Until
+    2026-08-16 this function recognized only human-readable forms ("Apple
+    M4", "m4"), and the string an actual Metal device reports is
+    `4-metal4`, which contains no "m4" substring: "metal4" ends in "l4".
+    So every profile built by `GpuProfile.from_reported` from a real Apple
+    reading came back with `APPLE_GEN_UNKNOWN`, and the one
+    generation-scoped crossover rule in device_policy.mojo could not fire
+    for any caller, including `capabilities_from_reported` and
+    `decide_device_report_reported`, which exist for precisely that caller.
+    Nothing caught it because `apple_m4_observed()` builds its profile with
+    the fieldwise constructor and hands `APPLE_GEN_M4` in directly, so the
+    tests that assert the rule fires were asserting it against a value this
+    parser could never produce.
+
+    `OBSERVED_M4_ARCH_NAME` fixes that for the one string this project has
+    read, exactly, and for no other. See that constant for why it is not a
+    pattern.
     """
+    if arch_name == OBSERVED_M4_ARCH_NAME:
+        return APPLE_GEN_M4
     var found = APPLE_GEN_UNKNOWN
     for generation in range(APPLE_GEN_M1, APPLE_GEN_M5 + 1):
         var lower = String("m", generation)

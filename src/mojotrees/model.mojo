@@ -21,6 +21,7 @@ from .boosting import (
     train_multiclass,
 )
 from .device import CPU_DEVICE, GPU_DEVICE, resolve_device
+from .objective_registry import MULTICLASS as _MULTICLASS
 from .goss import GossParams
 from .linear_tree import (
     check_linear_tree_unconnected,
@@ -374,7 +375,10 @@ def fit[
             "model.fit (use custom_metric.fit_with_metrics, which fits and"
             " predicts linear leaves)"
         )
-    var backend = resolve_device(device, n_rows, n_features, 1)
+    # The objective is part of every crossover rule in `device_policy`, and
+    # this entry point holds it and used to drop it, so `device='auto'` could
+    # never select the accelerator from here.
+    var backend = resolve_device(device, n_rows, n_features, 1, objective)
     var mapper = fit_bins(
         features,
         n_rows,
@@ -440,7 +444,12 @@ def fit_multiclass[
         check_linear_tree_unconnected(
             "model.fit_multiclass (use custom_metric.fit_multiclass_with_metrics)"
         )
-    var backend = resolve_device(device, n_rows, n_features, n_classes)
+    # `_MULTICLASS` from the registry rather than `params.objective`: the
+    # softmax entry point's per-class trainers carry a single-output
+    # objective code, and the crossover rule asks about the fit.
+    var backend = resolve_device(
+        device, n_rows, n_features, n_classes, _MULTICLASS
+    )
     var mapper = fit_bins(
         features,
         n_rows,

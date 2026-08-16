@@ -135,7 +135,9 @@ validation plan in the handoff leans on.
 Overflow: the fixed-point scale bounds the magnitude sum of all scaled values
 by `2^30`, so `total` and `sum(stored)` are each within that, and their
 difference is a sum over a subset of the same rows and so also within `2^30`.
-No intermediate leaves Int32.
+No intermediate leaves Int32. Flooring the scale to a power of two
+(`quantized_gradient.fixed_point_scale_pow2`) only lowers that first sum,
+into `(2^29, 2^30]`, so this argument holds unchanged and with more slack.
 
 ### Determinism
 

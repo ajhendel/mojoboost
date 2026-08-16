@@ -275,10 +275,21 @@ GPU faster, and a fast GPU does not write a driver.
 ### 4.2 The one real result: the scale has to be global
 
 The single-node GPU histogram accumulates in fixed point. Gradients and
-hessians are scaled by `2^30 / sum|values|`, rounded to `Int32`, and summed
-with integer atomics, which is what makes the GPU histogram bit-deterministic
-where a float atomic would not be. The scale is computed on the host from the
-magnitude sum of the values being uploaded.
+hessians are scaled by `2^30 / sum|values|` rounded **down to a power of
+two**, rounded to `Int32`, and summed with integer atomics, which is what
+makes the GPU histogram bit-deterministic where a float atomic would not be.
+The scale is computed on the host from the magnitude sum of the values being
+uploaded. `quantized_gradient.fixed_point_scale_pow2` is the rule, and
+`distributed_gpu.fixed_scale_from_total` forwards to it rather than
+restating it.
+
+The power-of-two shape makes the paragraph below **more** load-bearing, not
+less. An arbitrary factor is a continuous function of the magnitude sum, so
+two ranks whose sums differed in the last ulp derived scales differing by an
+ulp; a power-of-two factor is a step function, so they almost always derive
+the *identical* factor, but where their quotients straddle a binade boundary
+they derive factors a **factor of two** apart. The reduction below is what
+prevents that, and it prevented an ulp before.
 
 That has a consequence for distributing it which is easy to get wrong:
 

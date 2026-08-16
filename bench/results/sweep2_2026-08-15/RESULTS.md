@@ -315,6 +315,29 @@ quiet box with no lane compiling. Recorded here as the reason the number below
 is provisional rather than deleted: an unresolved measurement that agrees with a
 prediction is still evidence, it is just not a result.
 
+> **Annotation, 2026-08-16. The two paragraphs immediately below are the
+> refuted part of this file and are left standing.** They apply the 458
+> microsecond constant to *copies* and predict 0.69 seconds from removing
+> fifteen of them per tree. Session III took that A/B: it **measured** 0.016
+> seconds for thirteen copies per tree removed, a null under M0
+> (`../session3_2026-08-16/RESULTS.md`), and `docs/GPU_PORTABILITY.md` section
+> 6.1.1 records the withdrawal.
+>
+> **The derivation of the constant earlier in this file, under "458
+> microseconds per synchronization", is not affected and is not retracted.**
+> That A/B removed per-level **round trips** — host code blocking on a device
+> answer before it can decide what to enqueue next — and the constant remains
+> the correct price of one. What is withdrawn is its extension to copies by
+> analogy. The same Session III confirmed the round-trip half again: removing
+> about thirty round trips per tree bought 0.75 seconds, resolved.
+>
+> The 0.57 second measurement recorded above this annotation is a
+> resident-plane figure, is a round-trip result, and stands. What does not
+> stand is the sentence below that calls its agreement with the copy-priced
+> model a "third independent confirmation": the agreement was a coincidence of
+> two errors, since the plane's win came from its round trips and the model
+> that predicted it was counting copies. Text below unedited.
+
 It agrees with the model. The plane makes **16 waits per tree, nine of them
 uploads**, against the shipping loop's 31, so it removes 15. At the measured 458
 microseconds per synchronization over 100 trees that predicts 0.69 seconds, and

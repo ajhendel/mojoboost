@@ -1238,7 +1238,7 @@ def _copy_back_kernel(
       the *whole* permutation in one transfer. This one is not a pointer
       swap: under per-range ping-pong there is no single buffer that holds
       the whole permutation, so a snapshot becomes a gather across both
-      buffers driven by the range table, or a merge pass, and the hybrid
+      buffers driven by the range table, or a merge pass, and the host
       replica path that consumes it is exactly the path whose bit-for-bit
       agreement with the device is load-bearing.
     - `download_rows` and `download_range` in this module, which have the
@@ -1366,7 +1366,7 @@ comptime HIST_ROW_UNROLL = 4
 # in this module, the whole of `gpu_binned_layout.mojo`, the leaf-id scan in
 # `histogram_gpu.mojo`, `gpu_split_search.mojo`, `gpu_sparse.mojo`,
 # `gpu_categorical.mojo`, `gpu_leaf_batching.mojo`, `gpu_multiclass_batch.mojo`,
-# and the CPU builder in `histogram.mojo` that the hybrid replica has to stay
+# and the CPU builder in `histogram.mojo` that the host replica has to stay
 # bit-identical to. A half-applied stripe layout, where some kernels read the
 # striped copy and others read the column-major one, is a much worse state
 # than none: the two agree until a lane forgets to convert one of them, and
@@ -1419,6 +1419,55 @@ comptime _LocalI32 = Pointer[
 ]
 
 
+def narrow_index_fits(n_rows: Int, n_features: Int) -> Bool:
+    """Whether a dataset of this shape admits the histogram kernels' Int32
+    index arm (`GpuActiveRows.set_narrow_index`).
+
+    Host-side arithmetic, deliberately a free function rather than a method,
+    so the bound can be checked at its own boundary without allocating a
+    device buffer for two billion rows.
+
+    The two quantities the narrow arm forms in 32-bit arithmetic, and the
+    only two, are the bin column offset `feature * n_rows + row` and the
+    quantized pair offset `2 * row`. Both must fit a signed 32-bit integer
+    for the narrow expression to have the same value as the wide one:
+
+        n_features * n_rows <= Int32.MAX      (2,147,483,647)
+        2 * n_rows          <= Int32.MAX
+
+    The first bounds the column offset because a feature id is below
+    `n_features` and a row id is below `n_rows`, so the largest offset the
+    gather can form is `(n_features - 1) * n_rows + (n_rows - 1)`, which is
+    `n_features * n_rows - 1`. Requiring the product itself to fit is
+    therefore one short of tight, by exactly one cell, and it is written that
+    way because the product is the quantity a reader can check against the
+    matrix they allocated.
+
+    The second binds only at `n_features == 1`, where the first is the weaker
+    of the two. It is checked rather than inferred for that reason: a
+    single-feature fit of 1.5 billion rows passes the first test and would
+    wrap the second.
+
+    Both products are evaluated in `Int`, which is 64 bits on every platform
+    this backend builds for, so the check cannot itself overflow.
+    `GpuActiveRows.__init__` already refuses `n_rows > MAX_ROWS`, so
+    `n_features * n_rows` is at most `Int32.MAX * n_features` and cannot
+    approach the 64-bit range for any feature count a machine can hold.
+
+    This is a **derived bound**, not a measurement, and it is nowhere near
+    tight against anything this library can run: at 1,000,000 rows it admits
+    2,147 features, and at 50 features it admits 42,949,672 rows. A shape
+    that fails it needs a binned matrix above 2.1 GB, which is past the
+    memory of the device this backend is developed on. Nonpositive shapes
+    answer False, because a shape that is not a dataset admits nothing;
+    `__init__` refuses them outright and this is the answer for a caller that
+    asks anyway.
+    """
+    if n_rows < 1 or n_features < 1:
+        return False
+    return n_features * n_rows <= MAX_ROWS and 2 * n_rows <= MAX_ROWS
+
+
 @always_inline
 def _hist_rows_step[
     GROUP: Int, U: Int, CELIDE: Bool, QUANT: Bool
@@ -1432,7 +1481,7 @@ def _hist_rows_step[
     sh: _SharedI32,
     sc: _SharedI32,
     col: _LocalInt,
-    rr: _LocalInt,
+    rr: _LocalI32,
     gv: _LocalI32,
     hv: _LocalI32,
     bv: _LocalI32,
@@ -1443,6 +1492,8 @@ def _hist_rows_step[
     stride: Int,
     g_scale: Float32,
     h_scale: Float32,
+    narrow: Bool,
+    aligned: Bool,
 ):
     """Accumulate `U` rows of one thread's stride into the shared planes.
 
@@ -1494,67 +1545,207 @@ def _hist_rows_step[
     The elided-hessian arm reads only the gradient word and keeps the scalar
     load, because the second word is not wanted there.
 
-    **What stays 64-bit, and why.** The shared-plane index `s` is computed in
-    Int32 because it is bounded by `GROUP * BIN_CAP`, at most 16 * 256 =
-    4096, by construction rather than by data. The other three index
-    expressions in this loop are deliberately left in Int, and a later reader
-    should not narrow them:
+    `aligned` is that load's alignment arm and it is not cosmetic.
+    `unsafe_load[width=2]` without an explicit alignment emits
+    `load <2 x i32>, align 4`, which is the element alignment and not the
+    vector's: **observed** by compiling the two spellings side by side and
+    reading the emitted LLVM IR, which is a compiler fact rather than a
+    device measurement. An under-aligned vector load is one a backend is
+    free to split back into two scalar loads, which would leave the width-2
+    spelling costing exactly what the two loads it replaced cost.
+    `alignment=8` states the alignment the address actually has and is the
+    default here; `set_pair_alignment(False)` restores the weaker
+    annotation so the two can be held as arms in one process. Both spellings
+    read the same eight bytes and assign them to the same two variables, so
+    the arm cannot change a histogram.
 
-    - `col[k] + r` is `feature * n_rows + row`, which reaches
-      `n_features * n_rows` and overflows Int32 on any dataset past about
-      2.1 billion cells.
-    - `2 * r` reaches `2 * n_rows`, and `MAX_ROWS` in this module is
-      `Int32.MAX`, so it overflows for any fit past 2^30 rows.
-    - `row_begin + j + u * stride` is bounded by `n_rows`, so it would fit,
-      but it is formed once per row against three formed per (row, feature)
-      and is not worth a special case.
+    **What the alignment claim rests on.** `gq` is
+    `ctx.enqueue_create_buffer[DType.int32](2 * n_rows)`, and every device
+    allocator this project targets returns memory aligned far past 8 bytes
+    (256 on CUDA and HIP by their own documentation, page-aligned on Metal
+    for a buffer created without a host pointer). The pair for row `r`
+    begins at byte `8r` of that base, so the address is 8-byte aligned for
+    every row. That is a **derived bound** from the allocator contract, not
+    a measurement, which is why the weaker annotation stays reachable.
 
-    Whether narrowing `s` removes any instruction at all depends on whether
-    the Metal compiler was already narrowing it, which nothing on this
-    machine can show. It is written narrow because the bound is a
-    compile-time constant and writing it wide asserted something the code
-    did not need.
+    **The index arms.** `narrow` selects the width of the two index
+    computations in this loop that a bound can narrow. The shared-plane
+    index `s` is Int32 on both arms, because it is bounded by
+    `GROUP * BIN_CAP`, at most 16 * 256 = 4096, by construction rather than
+    by data. The two that depend on the dataset are:
+
+    - `col[k] + r`, which is `feature * n_rows + row` and reaches
+      `n_features * n_rows`. Wide it is an Int add of an Int product; narrow
+      it is an Int32 add whose result is widened once to form the address.
+    - `2 * r`, which reaches `2 * n_rows`.
+
+    `row_begin + j + u * stride` stays Int on both arms. It is bounded by
+    `n_rows` and would fit, but it is formed once per row against `GROUP`
+    formed per row in the gather, and it is the induction variable of the
+    enclosing loop, so narrowing it trades a 64-bit add for a 32-bit add
+    plus a widening at every use.
+
+    **What is claimed for `narrow`, and what is not.** Claimed: the narrow
+    arm forms those two indices in 32-bit arithmetic where the wide arm
+    forms them in 64-bit, on a backend whose ALU is 32 bits wide. Not
+    claimed: that this removes any instruction. The wide gather is
+    `bins + (base + sext(r))` with `base` loop-invariant, and a compiler
+    that reassociates the address and hoists `bins + base` out of the row
+    loop has already spent the 64-bit add once per slot rather than once per
+    visit, in which case the narrow arm saves nothing and may cost a
+    widening. Whether it does is exactly what the arm exists to measure, and
+    the honest prior is that it is a null: this loop issues three shared
+    atomics and one scattered global gather per (row, feature), against
+    which one index add either way is noise.
+
+    **Why `narrow` is off by default.** Every other launch-shape arm in this
+    file that defaults on does so on a proof that it is strictly less work
+    for the identical result. `narrow` has no such proof -- see the
+    paragraph above -- and it additionally carries a precondition on the
+    dataset shape that the wide arm does not. A default that can only be
+    justified by a measurement waits for the measurement.
+
+    **The precondition, and where it is checked.** The narrow arm is only
+    correct while both quantities fit in a signed 32-bit integer:
+
+        n_features * n_rows <= Int32.MAX      (2,147,483,647)
+        2 * n_rows          <= Int32.MAX
+
+    `GpuActiveRows.narrow_index_supported` evaluates both on the host in
+    64-bit arithmetic, so the check itself cannot overflow, and
+    `set_narrow_index` refuses a request the shape does not admit. Under
+    that precondition the Int32 expression and the Int expression have the
+    same mathematical value -- no wraparound occurs -- so the two arms
+    address the same bytes and accumulate the same integers. This is
+    therefore an exactness claim of a different kind from `U` or `GROUP`:
+    those are reorderings of integer adds and are exact whatever the data,
+    while this one is exact *given a checked bound on the shape*. That is
+    why the bound is enforced rather than asserted.
+
+    The bound is not tight against anything this library can run. At
+    1,000,000 rows it admits 2,147 features; at 50 features it admits
+    42,949,672 rows. A shape that fails it needs a `bins` matrix larger than
+    2.1 GB, which is past the memory of the device this backend is developed
+    on. `2 * n_rows` binds only when `n_features` is 1, and is the reason it
+    is checked separately rather than inferred.
     """
-    # Stage one: the row indices.
+    # Stage one: the row indices, in the width the permutation holds them.
+    # Int32 on both arms: `rows` is an Int32 buffer and `MAX_ROWS` is
+    # `Int32.MAX`, so the value fits by the same check that admits the fit at
+    # all, and the wide arm widens at the point of use exactly as the load
+    # itself used to.
     comptime for u in range(U):
-        rr[unsafe_offset=u] = Int(
-            rows[unsafe_offset = row_begin + j + u * stride][0]
-        )
+        rr[unsafe_offset=u] = rows[
+            unsafe_offset = row_begin + j + u * stride
+        ][0]
 
     # Stage two: the quantized gradient (and hessian) for each of them.
+    #
+    # `narrow` and `aligned` are block-uniform launch arguments, so each of
+    # the branches below is one scalar test per unrolled step and never a
+    # divergence. They are runtime branches rather than comptime parameters
+    # on purpose: this family is already forty instantiations, each of which
+    # inlines this body twice, and two more comptime flags would be a
+    # four-fold compile-time cost on every build on every backend. Branching
+    # once per `U` rows against `U * GROUP * 3` shared atomics is not
+    # measurable; four times the instantiations is.
     comptime if QUANT:
-        comptime for u in range(U):
-            comptime if CELIDE:
-                gv[unsafe_offset=u] = gq[
-                    unsafe_offset = 2 * rr[unsafe_offset=u]
-                ][0]
+        comptime if CELIDE:
+            if narrow:
+                comptime for u in range(U):
+                    gv[unsafe_offset=u] = gq[
+                        unsafe_offset = Int(Int32(2) * rr[unsafe_offset=u][0])
+                    ][0]
             else:
-                var pair = gq.unsafe_load[width=2](2 * rr[unsafe_offset=u])
-                gv[unsafe_offset=u] = pair[0]
-                hv[unsafe_offset=u] = pair[1]
+                comptime for u in range(U):
+                    gv[unsafe_offset=u] = gq[
+                        unsafe_offset = 2 * Int(rr[unsafe_offset=u][0])
+                    ][0]
+        else:
+            if narrow:
+                if aligned:
+                    comptime for u in range(U):
+                        var pair = gq.unsafe_load[width=2, alignment=8](
+                            Int(Int32(2) * rr[unsafe_offset=u][0])
+                        )
+                        gv[unsafe_offset=u] = pair[0]
+                        hv[unsafe_offset=u] = pair[1]
+                else:
+                    comptime for u in range(U):
+                        var pair = gq.unsafe_load[width=2](
+                            Int(Int32(2) * rr[unsafe_offset=u][0])
+                        )
+                        gv[unsafe_offset=u] = pair[0]
+                        hv[unsafe_offset=u] = pair[1]
+            elif aligned:
+                comptime for u in range(U):
+                    var pair = gq.unsafe_load[width=2, alignment=8](
+                        2 * Int(rr[unsafe_offset=u][0])
+                    )
+                    gv[unsafe_offset=u] = pair[0]
+                    hv[unsafe_offset=u] = pair[1]
+            else:
+                comptime for u in range(U):
+                    var pair = gq.unsafe_load[width=2](
+                        2 * Int(rr[unsafe_offset=u][0])
+                    )
+                    gv[unsafe_offset=u] = pair[0]
+                    hv[unsafe_offset=u] = pair[1]
     else:
+        # The Float32 arm gathers two separate planes by row id. There is no
+        # pair to widen and no product to narrow: the index is the row, which
+        # fits Int32 on every fit this module admits, so neither arm applies
+        # and the expression is written once. It is reproduced character for
+        # character from the loop it replaced, for the contraction reason
+        # `docs/NUMERICS.md` section 5.6 records.
         comptime for u in range(U):
             gv[unsafe_offset=u] = Int32(
                 round(
-                    grad[unsafe_offset = rr[unsafe_offset=u]][0] * g_scale
+                    grad[unsafe_offset = Int(rr[unsafe_offset=u][0])][0]
+                    * g_scale
                 )
             )
             comptime if not CELIDE:
                 hv[unsafe_offset=u] = Int32(
                     round(
-                        hess[unsafe_offset = rr[unsafe_offset=u]][0] * h_scale
+                        hess[unsafe_offset = Int(rr[unsafe_offset=u][0])][0]
+                        * h_scale
                     )
                 )
 
-    # Stages three and four, one owned slot at a time.
+    # Stages three and four, one owned slot at a time. The narrow branch is
+    # taken once per owned slot per step, and only the `U` address
+    # computations are written twice; the atomics that follow are one copy,
+    # because they do not depend on how the bin byte's address was formed.
     comptime for k in range(GROUP):
         if k < owned:
             var base = col[unsafe_offset=k]
             var lift = Int32(k * nb)
-            comptime for u in range(U):
-                bv[unsafe_offset=u] = Int32(
-                    Int(bins[unsafe_offset = base + rr[unsafe_offset=u]])
-                )
+            if narrow:
+                # Exact under the precondition: `base` is
+                # `feature * n_rows`, which the host proved below
+                # `Int32.MAX`, so this truncation loses nothing.
+                var base32 = Int32(base)
+                comptime for u in range(U):
+                    bv[unsafe_offset=u] = Int32(
+                        Int(
+                            bins[
+                                unsafe_offset = Int(
+                                    base32 + rr[unsafe_offset=u][0]
+                                )
+                            ]
+                        )
+                    )
+            else:
+                comptime for u in range(U):
+                    bv[unsafe_offset=u] = Int32(
+                        Int(
+                            bins[
+                                unsafe_offset = base
+                                + Int(rr[unsafe_offset=u][0])
+                            ]
+                        )
+                    )
             comptime for u in range(U):
                 var s = Int(lift + bv[unsafe_offset=u][0])
                 _ = Atomic.fetch_add(
@@ -1590,6 +1781,8 @@ def _hist_accumulate_rows[
     g_scale: Float32,
     h_scale: Float32,
     unrolled: Bool,
+    narrow: Bool,
+    aligned: Bool,
 ):
     """One thread's whole walk over its share of one tile.
 
@@ -1627,6 +1820,15 @@ def _hist_accumulate_rows[
     Both arms produce the identical histogram, for the reason `_hist_rows_step`
     argues in full, so this is a launch-shape knob and never a numeric one.
 
+    **`narrow` and `aligned`.** Two further block-uniform arms, passed
+    straight through to `_hist_rows_step`, which is where both are argued.
+    They are runtime flags for the same reason `unrolled` and `const_hess`
+    are: this family is forty kernel instantiations and each additional
+    comptime flag doubles the row-loop code every build on every backend
+    compiles. Neither changes a histogram; `narrow` carries a precondition
+    on the dataset shape that `GpuActiveRows` checks on the host before it
+    can ever be set.
+
     **What is claimed, and what is not.** Claimed, by counting: the main loop
     executes one loop test and one induction add per `UNROLL` rows instead of
     per row, and the quantized non-elided arm issues one 8-byte load per row
@@ -1656,7 +1858,14 @@ def _hist_accumulate_rows[
     # The rows in flight and what was gathered for them. Allocated once,
     # outside both loops, so there is one alloca per thread and not one per
     # iteration.
-    var rr = stack_allocation[UNROLL, Int]()
+    #
+    # The rows in flight are held Int32, which is the width `rows` stores
+    # them in and the width `MAX_ROWS` bounds them to. Holding them Int cost
+    # `UNROLL` 64-bit registers to carry values that had just been widened
+    # from 32 bits, and the wide index arm widens at the point of use
+    # instead, which is where the widening happened before the load was
+    # hoisted into this array.
+    var rr = stack_allocation[UNROLL, Scalar[DType.int32]]()
     var gv = stack_allocation[UNROLL, Scalar[DType.int32]]()
     var hv = stack_allocation[UNROLL, Scalar[DType.int32]]()
     var bv = stack_allocation[UNROLL, Scalar[DType.int32]]()
@@ -1691,6 +1900,8 @@ def _hist_accumulate_rows[
             stride,
             g_scale,
             h_scale,
+            narrow,
+            aligned,
         )
         j += UNROLL * stride
     while j < tile_end:
@@ -1715,6 +1926,8 @@ def _hist_accumulate_rows[
             stride,
             g_scale,
             h_scale,
+            narrow,
+            aligned,
         )
         j += stride
 
@@ -1744,14 +1957,23 @@ def _hist_accumulate_dispatch[
     celide: Bool,
     quant: Bool,
     unrolled: Bool,
+    narrow: Bool,
+    aligned: Bool,
 ):
-    """Resolve the two runtime flags into one of four comptime arms, once,
-    above the row loop.
+    """Resolve the two comptime-worthy runtime flags into one of four arms,
+    once, above the row loop.
 
-    Both flags are launch arguments and therefore block-uniform, so this is a
-    scalar branch taken once per threadgroup and not a divergence. It exists
-    so that the four arms are written once here instead of once in each of
-    the two kernels."""
+    Every flag here is a launch argument and therefore block-uniform, so this
+    is a scalar branch taken once per threadgroup and not a divergence. It
+    exists so that the four arms are written once here instead of once in
+    each of the two kernels.
+
+    Only `celide` and `quant` become comptime parameters. `unrolled`,
+    `narrow`, and `aligned` stay runtime values and are passed through,
+    because each one that became a parameter would double a row-loop body
+    that is already inlined twice into forty kernel instantiations. Where
+    they are consumed, and why each is cheap as a branch, is argued at
+    `_hist_accumulate_rows` and `_hist_rows_step`."""
     if celide:
         if quant:
             _hist_accumulate_rows[GROUP, UNROLL, True, True](
@@ -1774,6 +1996,8 @@ def _hist_accumulate_dispatch[
                 g_scale,
                 h_scale,
                 unrolled,
+                narrow,
+                aligned,
             )
         else:
             _hist_accumulate_rows[GROUP, UNROLL, True, False](
@@ -1796,6 +2020,8 @@ def _hist_accumulate_dispatch[
                 g_scale,
                 h_scale,
                 unrolled,
+                narrow,
+                aligned,
             )
     elif quant:
         _hist_accumulate_rows[GROUP, UNROLL, False, True](
@@ -1818,6 +2044,8 @@ def _hist_accumulate_dispatch[
             g_scale,
             h_scale,
             unrolled,
+            narrow,
+            aligned,
         )
     else:
         _hist_accumulate_rows[GROUP, UNROLL, False, False](
@@ -1840,6 +2068,8 @@ def _hist_accumulate_dispatch[
             g_scale,
             h_scale,
             unrolled,
+            narrow,
+            aligned,
         )
 
 
@@ -1869,6 +2099,8 @@ def _range_hist_atomic_kernel[
     desc: MutPointer[Int32, MutAnyOrigin],
     use_desc: Int32,
     row_unroll: Int32,
+    narrow_index: Int32,
+    pair_align: Int32,
 ):
     """One node's histogram over a compacted row range, accumulated in
     threadgroup memory and folded into the output with global atomics.
@@ -1940,6 +2172,16 @@ def _range_hist_atomic_kernel[
     keeps in flight; both settings visit the same rows and add the same
     integers in a different order, which cannot change a sum. See
     `_hist_accumulate_rows` and `_hist_rows_step` for the argument in full.
+
+    `narrow_index` and `pair_align` are two more, and they are launch
+    arguments for the same compile-time reason. `narrow_index` selects the
+    width of the two data-dependent index computations in the row loop and is
+    exact under a bound on the dataset shape that
+    `GpuActiveRows.narrow_index_supported` checks on the host before the flag
+    can be set. `pair_align` selects whether the width-2 load of the
+    quantized gradient pair states the alignment its address has; both
+    spellings read the same eight bytes. Neither reaches the flush, the
+    subtraction, or any floating-point expression. See `_hist_rows_step`.
 
     **Fused subtraction.** With `do_sub`, the flush also subtracts what it
     added from the slot `sub_offset` words away, which is the sibling
@@ -2130,6 +2372,8 @@ def _range_hist_atomic_kernel[
         celide,
         Int(use_quant) != 0,
         Int(row_unroll) != 0,
+        Int(narrow_index) != 0,
+        Int(pair_align) != 0,
     )
     barrier()
 
@@ -2191,6 +2435,8 @@ def _range_hist_partial_kernel[
     use_quant: Int32,
     const_hess: Int32,
     row_unroll: Int32,
+    narrow_index: Int32,
+    pair_align: Int32,
 ):
     """The tiled twin of `_range_hist_atomic_kernel`: the same threadgroup
     accumulation, written to a per-(tile, slot) partial slot instead of folded
@@ -2200,8 +2446,9 @@ def _range_hist_partial_kernel[
     the atomic kernel's docstring argues about capacity, group width,
     exactness, tail blocks, and the row loop holds here unchanged; the row
     loop is not merely equivalent but literally the same code, since both
-    kernels call `_hist_accumulate_dispatch`. `row_unroll` reaches it from
-    here for the same reason and with the same guarantee. What
+    kernels call `_hist_accumulate_dispatch`. `row_unroll`, `narrow_index`,
+    and `pair_align` reach it from here for the same reason and with the same
+    guarantees. What
     is particular to this kernel is the partial layout, and it is untouched:
     a block owning several slots writes the same per-slot
     `[grad | hess | count]` slices that as many one-slot blocks would have
@@ -2314,6 +2561,8 @@ def _range_hist_partial_kernel[
         celide,
         Int(use_quant) != 0,
         Int(row_unroll) != 0,
+        Int(narrow_index) != 0,
+        Int(pair_align) != 0,
     )
     barrier()
 
@@ -3119,6 +3368,51 @@ struct GpuActiveRows(Movable):
     # environment has already once in this repository run one arm under the
     # other's label.
     var row_unroll: Bool
+    # --- hist-latency lane ---
+    # Whether the histogram row loop forms its two data-dependent indices --
+    # the bin column offset `feature * n_rows + row` and the quantized pair
+    # offset `2 * row` -- in Int32 rather than in Int.
+    #
+    # OFF by default, and the reasoning is the reverse of `row_unroll`'s.
+    # That arm defaults on because it is provably strictly fewer
+    # instructions; this one is not provable in either direction, because the
+    # wide form's expensive term is loop-invariant and a compiler that
+    # hoists it has already paid it once per slot rather than once per visit
+    # (see `_hist_rows_step`). An arm that needs a measurement to justify it
+    # waits for the measurement.
+    #
+    # It also carries a precondition the wide arm does not:
+    # `narrow_index_supported` must hold. `set_narrow_index` refuses a
+    # request the shape does not admit rather than honoring it quietly,
+    # because the failure mode is a silently corrupted histogram and this
+    # project's whole accuracy argument rests on the accumulation being
+    # exact.
+    var narrow_index: Bool
+    # Whether the width-2 load of the quantized gradient pair states the
+    # 8-byte alignment the address actually has.
+    #
+    # ON by default, on the same footing `row_unroll` is: the unannotated
+    # spelling emits `align 4` for a `<2 x i32>` load, which is **observed**
+    # from the emitted LLVM IR rather than measured on a device, and a
+    # backend is free to split an under-aligned vector load back into the
+    # two scalar loads the width-2 spelling exists to replace. Stating the
+    # true alignment can only remove work, never add it. Off is reachable so
+    # the two can be interleaved in one process.
+    var pair_alignment: Bool
+    # Row-tile requests, overriding what `gpu_tiling` would otherwise take
+    # from the environment. Zero means "no request", which is what
+    # `MOJOTREES_GPU_MIN_TILES` and `MOJOTREES_GPU_ROW_TILE` unset already
+    # mean, so a caller that sets neither gets exactly the geometry this
+    # module chose before the fields existed.
+    #
+    # They exist because the row-tile floor has to be re-measured and the
+    # only protocol that compares anything on this machine is interleaved
+    # arms in one process. An environment variable cannot be an arm: it is
+    # read once per launch out of a global the harness cannot vary between
+    # repeats, and this repository has already run one arm under the other's
+    # label that way. See `gpu_tiling.row_tile_floor`.
+    var min_tiles_request: Int
+    var rows_per_tile_request: Int
 
     def __init__(
         out self,
@@ -3252,6 +3546,14 @@ struct GpuActiveRows(Movable):
         self.constant_hessian = False
         # The unrolled row walk is the default; see the field.
         self.row_unroll = True
+        # The narrow index arm is off until something measures it, and the
+        # aligned pair load is on because a truer alignment annotation cannot
+        # cost anything. Neither has an environment variable, for the reason
+        # `partition_block_cap` gives. See both fields.
+        self.narrow_index = False
+        self.pair_alignment = True
+        self.min_tiles_request = 0
+        self.rows_per_tile_request = 0
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -3374,6 +3676,108 @@ struct GpuActiveRows(Movable):
         Takes effect on the next `enqueue_range_histogram`.
         """
         self.row_unroll = on
+
+    def narrow_index_supported(self) -> Bool:
+        """Whether this dataset's shape admits the Int32 index arm.
+
+        `narrow_index_fits` over this instance's shape; the bound and its
+        derivation are written out there, where a test can reach them without
+        a device.
+        """
+        return narrow_index_fits(self.n_rows, self.n_features)
+
+    def set_narrow_index(mut self, on: Bool) raises:
+        """Whether the histogram row loop forms its two data-dependent
+        indices in Int32 rather than in Int.
+
+        Off is what this module shipped and is the default; see the
+        `narrow_index` field for why this arm does not get the
+        on-by-default treatment `row_unroll` gets.
+
+        **Refuses rather than ignores.** A request the shape does not admit
+        raises, because the two failure modes are not symmetric: honoring it
+        quietly on an oversized dataset wraps an index and silently
+        accumulates into the wrong bin, and a wrong histogram is the one
+        error this project has no tolerance for. `narrow_index_supported`
+        is the predicate and states the bound.
+
+        Under that bound both arms address the same bytes and add the same
+        integers, so the histogram is identical bit for bit. Unlike
+        `set_row_unroll`, which is exact whatever the data because it only
+        reorders integer adds, this one is exact *given a checked bound on
+        the shape*. That difference is why there is a check at all.
+
+        Takes effect on the next `enqueue_range_histogram`.
+        """
+        if on and not self.narrow_index_supported():
+            raise Error(
+                "the Int32 index arm needs n_features * n_rows and 2 *"
+                " n_rows to fit a signed 32-bit integer; this shape exceeds"
+                " it and the wide arm is the only correct one for it"
+            )
+        self.narrow_index = on
+
+    def set_pair_alignment(mut self, on: Bool):
+        """Whether the width-2 load of the quantized gradient pair states
+        the 8-byte alignment its address actually has.
+
+        On is the default. Off is the spelling that shipped with the
+        width-2 load, which emits `align 4` for a `<2 x i32>` load and
+        therefore permits a backend to split it back into the two scalar
+        loads the width-2 spelling replaced. Both read the same eight bytes
+        into the same two variables, so this cannot change a histogram; it
+        is an assertion to the code generator and nothing else.
+
+        Reachable at run time for the same reason `set_row_unroll` is: only
+        interleaved arms compare on this machine. The alignment itself is a
+        comptime parameter of the load, so the arm is a block-uniform branch
+        over two spellings of it rather than a second kernel instantiation.
+
+        Has no effect on the Float32 gradient arm, which gathers two
+        separate planes and issues no pair load, nor on the elided-hessian
+        arm, which wants only the first word and keeps a scalar load.
+
+        Takes effect on the next `enqueue_range_histogram`.
+        """
+        self.pair_alignment = on
+
+    def set_row_tiling(
+        mut self, min_tiles: Int = 0, rows_per_tile: Int = 0
+    ) raises:
+        """Request a row-tile floor, a rows-per-tile length, or neither.
+
+        Zero, the default for both, means "no request" and reproduces
+        exactly the geometry this module chose before the fields existed:
+        `gpu_tiling.resolve_tiling` then falls back to
+        `MOJOTREES_GPU_MIN_TILES` and `MOJOTREES_GPU_ROW_TILE`, which are
+        themselves unset by default.
+
+        `min_tiles` is a floor and is still clamped by row amortization, by
+        the partial-buffer budget, and by `MAX_GRID_DIM_Y`, and the
+        occupancy term stays a floor underneath it, so it can raise the tile
+        count and never lower it. `rows_per_tile` sets the tile length
+        directly and is the only way to ask for *fewer* tiles than the
+        occupancy term gives, which is the arm the re-test needs: the
+        earlier tile experiment only ever moved in one direction and
+        therefore could not tell a bad floor from a bad gradient. Passing
+        the node's whole row count is how one tile is spelled.
+
+        Neither can change a histogram. Tiling picks a launch geometry;
+        accumulation is fixed-point Int32 and integer addition is
+        associative and commutative, so two geometries over the same rows
+        sum the same bins in a different order to the same value. That is
+        the property `gpu_tiling`'s module docstring states and the strategy
+        tests assert bit-exactly.
+
+        Takes effect on the next `range_tiling`, which is where a node's
+        geometry is derived.
+        """
+        if min_tiles < 0:
+            raise Error("a row-tile floor is zero (no request) or positive")
+        if rows_per_tile < 0:
+            raise Error("a row tile is zero (no request) or positive")
+        self.min_tiles_request = min_tiles
+        self.rows_per_tile_request = rows_per_tile
 
     def set_constant_hessian(mut self, on: Bool):
         """Declare that every row's hessian this round is exactly
@@ -3956,6 +4360,16 @@ struct GpuActiveRows(Movable):
 
         var hist_size = self.n_features * self.n_bins
         var cells = 3 * hist_size
+        # The two tiling requests are passed here for the same reason
+        # `range_tiling` passes them: this is how the device-owned growth plane
+        # builds every non-root histogram, so omitting them made the row-tile
+        # arms reach the root and nothing else. Under the default resident
+        # plane that is 1 node of 61, which would have made the tile question
+        # look answered while being almost entirely unasked -- the same shape
+        # as a test that runs below the gate it is testing.
+        #
+        # Zero on both is byte-for-byte the previous behavior, so the default
+        # path is unchanged and only an explicitly requested arm moves.
         var tiling = derive_tiling(
             caps,
             max_rows,
@@ -3963,6 +4377,9 @@ struct GpuActiveRows(Movable):
             self.n_bins,
             STRATEGY_ATOMIC,
             self.part_capacity_unused(),
+            0,
+            self.min_tiles_request,
+            self.rows_per_tile_request,
         )
         var threads = tiling.block_threads
 
@@ -4215,12 +4632,27 @@ struct GpuActiveRows(Movable):
         This is the second half of the win: an empty or tiny node gets a
         grid sized for its own rows instead of for `n_rows`. A node with no
         rows still needs a launchable geometry, so it is derived at one row.
+
+        The two tile requests are the ones `set_row_tiling` holds, and they
+        are passed here rather than read from the environment inside
+        `gpu_tiling` so that a benchmark can vary them between interleaved
+        repeats in one process. Zero on both, the default, is the same
+        answer as an unset environment variable, so a caller that asks for
+        nothing gets the geometry this method returned before they existed.
         """
         var n = self.ranges.get(node).count()
         if n < 1:
             n = 1
         return derive_tiling(
-            caps, n, n_slots, self.n_bins, strategy, max_partial_cells
+            caps,
+            n,
+            n_slots,
+            self.n_bins,
+            strategy,
+            max_partial_cells,
+            0,
+            self.min_tiles_request,
+            self.rows_per_tile_request,
         )
 
     def enqueue_range_histogram[
@@ -4569,6 +5001,16 @@ struct GpuActiveRows(Movable):
         """
         var blocks = (n_slots + GROUP - 1) // GROUP
         var unroll = Int32(1) if self.row_unroll else Int32(0)
+        # `narrow_index` is already false whenever the shape does not admit
+        # it (`set_narrow_index` refuses such a request), so the conjunction
+        # is belt and braces: a field that could only have been set through a
+        # checked setter is re-checked at the one place it reaches a kernel.
+        var narrow = (
+            Int32(1)
+            if (self.narrow_index and self.narrow_index_supported())
+            else Int32(0)
+        )
+        var palign = Int32(1) if self.pair_alignment else Int32(0)
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 32]](
                 bins,
@@ -4589,6 +5031,8 @@ struct GpuActiveRows(Movable):
                 use_quant,
                 const_hess,
                 unroll,
+                narrow,
+                palign,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -4612,6 +5056,8 @@ struct GpuActiveRows(Movable):
                 use_quant,
                 const_hess,
                 unroll,
+                narrow,
+                palign,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -4635,6 +5081,8 @@ struct GpuActiveRows(Movable):
                 use_quant,
                 const_hess,
                 unroll,
+                narrow,
+                palign,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -4658,6 +5106,8 @@ struct GpuActiveRows(Movable):
                 use_quant,
                 const_hess,
                 unroll,
+                narrow,
+                palign,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -4840,6 +5290,16 @@ struct GpuActiveRows(Movable):
         it changes no grid, no threadgroup footprint, and no histogram."""
         var blocks = (n_slots + GROUP - 1) // GROUP
         var unroll = Int32(1) if self.row_unroll else Int32(0)
+        # `narrow_index` is already false whenever the shape does not admit
+        # it (`set_narrow_index` refuses such a request), so the conjunction
+        # is belt and braces: a field that could only have been set through a
+        # checked setter is re-checked at the one place it reaches a kernel.
+        var narrow = (
+            Int32(1)
+            if (self.narrow_index and self.narrow_index_supported())
+            else Int32(0)
+        )
+        var palign = Int32(1) if self.pair_alignment else Int32(0)
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 32]](
                 bins,
@@ -4865,6 +5325,8 @@ struct GpuActiveRows(Movable):
                 self.step_dev.unsafe_ptr(),
                 use_desc,
                 unroll,
+                narrow,
+                palign,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -4893,6 +5355,8 @@ struct GpuActiveRows(Movable):
                 self.step_dev.unsafe_ptr(),
                 use_desc,
                 unroll,
+                narrow,
+                palign,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -4921,6 +5385,8 @@ struct GpuActiveRows(Movable):
                 self.step_dev.unsafe_ptr(),
                 use_desc,
                 unroll,
+                narrow,
+                palign,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -4949,6 +5415,8 @@ struct GpuActiveRows(Movable):
                 self.step_dev.unsafe_ptr(),
                 use_desc,
                 unroll,
+                narrow,
+                palign,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )

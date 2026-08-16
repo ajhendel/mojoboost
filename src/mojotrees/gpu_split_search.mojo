@@ -38,7 +38,23 @@ Float32 near ties, and the host-scan fallback
 ---------------------------------------------
 The scan is Float32 (point 1 below), so two candidates whose exact gains
 differ by less than a few ulps can come back in either order, and that is a
-different *tree*, not a different last bit. Every record therefore carries
+different *tree*, not a different last bit.
+
+"A few ulps" is the wrong unit for that sentence and the right one is worth
+stating here, because it is what `set_gain_form` exists for. The parameter
+that controls how finely this scan can separate two candidates is not the row
+count and not an ulp of the gain: it is the ratio `parent_score / gain`. The
+shipped subtractive form resolves to about `eps * parent_score`, an absolute
+floor that does not shrink as the gain does, so at a nearly pure leaf under
+logistic loss -- where the ratio runs into the thousands -- two candidates a
+part in ten thousand apart land on the same Float32. `GAIN_FORM_CROSS`, the
+default, evaluates the same gain through an identity that never forms the
+large sum, which moves the resolution to about `eps * sqrt(parent_score *
+gain)`, and takes the right-hand child sums in the integer domain where they
+are exact. Candidates 5 and 6 of `docs/design/ACCURACY_BUDGET.md`; the
+argument is at `gpu_cross_gain` and `gpu_right_sum` and the arm is at
+`GpuSplitSearcher.set_gain_form`. It is the only arm in this module that
+changes a record. Every record therefore carries
 `runner_gain`, the best gain of every candidate the node scored except the
 winner, over every scanned feature, so the margin the decision was made by
 is a number the host can see. `GpuSplitRecord.is_near_tie` tests the margin
@@ -199,6 +215,7 @@ an interleaved benchmark resolves it and not before.
 """
 
 from std.gpu import block_idx, thread_idx
+from std.math import fma
 from std.memory import stack_allocation
 from std.os import getenv
 from std.sys import has_accelerator
@@ -391,6 +408,386 @@ def gpu_output_score(
     )
 
 
+# --- The two gain forms ---------------------------------------------------
+#
+# Candidates 5 and 6 of `docs/design/ACCURACY_BUDGET.md`, which land together
+# and only together. The whole argument for them is at `gpu_cross_gain` and
+# `gpu_right_sum`; `GpuSplitSearcher.set_gain_form` states what the arm costs
+# a caller.
+
+comptime GAIN_FORM_SUBTRACTIVE = 0
+"""The gain as this module shipped: `left_score + right_score -
+parent_score`, with each candidate's right-hand sums obtained by Float32
+subtraction from the node total."""
+
+comptime GAIN_FORM_CROSS = 1
+"""The cancellation-free gain, with the right-hand sums taken in the integer
+fixed-point domain before dequantization. One code for both changes because
+one without the other is a regression; see `set_gain_form`."""
+
+comptime DEFAULT_GAIN_FORM = GAIN_FORM_CROSS
+
+
+def gain_form_requested() -> Int:
+    """`MOJOTREES_GPU_SPLIT_GAIN_FORM=subtractive`, the switch back to the
+    shipped gain.
+
+    On unless refused, which is the same posture `MOJOTREES_GPU_SPLIT_
+    PRIMITIVES` and `histogram_gpu.set_scale_shape` take, and for the same
+    two reasons: the default has to be the arm the analysis prefers, and an
+    environment variable can only compare two arms across two processes,
+    which on a machine whose device timings drift several-fold between time
+    windows resolves nothing. `GpuSplitSearcher.set_gain_form` is the
+    in-process handle.
+
+    Anything other than the exact string `subtractive` leaves the default
+    alone rather than raising, because this is read in a constructor that
+    has no better failure mode; the setter is where a bad code is refused.
+    """
+    return (
+        GAIN_FORM_SUBTRACTIVE if getenv(
+            "MOJOTREES_GPU_SPLIT_GAIN_FORM"
+        ) == "subtractive" else DEFAULT_GAIN_FORM
+    )
+
+
+def describe_gain_form(form: Int) -> String:
+    """The arm's name, for `describe_scan` and for a test that wants to
+    assert which one is live without restating the constant."""
+    if form == GAIN_FORM_CROSS:
+        return "cross"
+    if form == GAIN_FORM_SUBTRACTIVE:
+        return "subtractive"
+    return "unknown"
+
+
+@always_inline
+def gpu_resolve_gain_form(requested: Int32, lambda_l1: Float32) -> Int32:
+    """The arm a scan actually runs, which is the requested one except under
+    L1.
+
+    **The cross form is not valid at `lambda_l1 != 0` and this is the guard
+    that says so.** The identity at `gpu_cross_gain` is derived from
+    `GL + GR = G`. With L1 the three gradient sums entering the gain are not
+    `GL`, `GR`, `G` but their soft-thresholded images `T(GL)`, `T(GR)`,
+    `T(G)`, and soft thresholding is not additive: `T(GL) + T(GR)` differs
+    from `T(G)` by up to `lambda_l1` whenever the two children pull the same
+    way. The identity is then simply false, and the error it introduces is a
+    *bias*, not a rounding.
+
+    Measured, in a standalone NumPy model of this scan (not a mojotrees
+    measurement): applying the cross form anyway at `lambda_l1 = 0.5`,
+    `lambda_l2 = 1`, 200,000 rows, over each node's top 200 candidates, the
+    median relative error of the computed gain runs 1.6e-06 at a
+    `parent_score / gain` ratio of 0.03 up to 1.6e-04 at a ratio of 293 --
+    where the shipped form is at 1.0e-05. The tell that it is a bias rather
+    than noise is that the median and the p99 agree to two figures and that
+    the Float32-right and Int32-right arms agree to three, which rounding
+    error does not do.
+
+    Rejected alternative: derive a second identity for the thresholded case.
+    There is not one to derive. `T` is piecewise linear with a dead zone, so
+    which of the three sums is in the dead zone changes the algebra, and the
+    resulting expression would need the same `T(GL) + T(GR) - T(G)` residual
+    that the subtraction it is trying to remove already carries. L1 keeps
+    the shipped form, and the shipped form at `lambda_l1 != 0` is exactly
+    what it was.
+    """
+    if lambda_l1 != Float32(0.0):
+        return Int32(GAIN_FORM_SUBTRACTIVE)
+    return requested
+
+
+@always_inline
+def gpu_right_sum(
+    total_f: Float32,
+    left_f: Float32,
+    total_q: Int32,
+    left_q: Int32,
+    inv: Float32,
+    form: Int32,
+) -> Float32:
+    """A candidate's right-hand child sum, by Float32 subtraction from the
+    node total or by Int32 subtraction before dequantization.
+
+    Candidate 6. `total_q` and `left_q` are the exact fixed-point sums the
+    scan already holds in registers, and `inv` is the dequantizing factor.
+
+    WHY THE INTEGER ROUTE IS THE EXACT ONE, AND WHERE THE ERROR ACTUALLY IS
+    ----------------------------------------------------------------------
+    `total_q - left_q` is exact: Int32 addition is associative and a parent
+    cell is the exact integer sum of its children's, which is the same
+    property `quantized_gradient.subtract_quantized` already relies on. What
+    is *not* obvious, and what changed under candidate 3, is where the
+    Float32 route loses its bits.
+
+    It is not the subtraction. Since `fixed_point_scale_pow2` made the scale
+    a power of two, `inv` is exactly representable and multiplying by it is
+    an exponent adjustment, so `total_f - left_f` equals
+    `inv * (fl32(total_q) - fl32(left_q))` exactly, and by Sterbenz's lemma
+    that inner subtraction is itself exact whenever the left child holds
+    between half and twice the node total. **The Float32 route's whole error
+    is the two Int32 -> Float32 casts in front of it.** A fixed-point sum
+    runs to `2^30` and Float32 carries 24 bits, so each cast rounds by up to
+    `2^-24` *of the node total*, and the derived right-hand sum inherits both
+    -- an absolute error set by the parent's magnitude, not by its own. The
+    integer route casts once, after the subtraction, so its error is `2^-24`
+    of the right child's own magnitude. On a candidate whose right child
+    holds a hundredth of the node, that is a hundredfold difference.
+
+    So candidate 3 did not make candidate 6 redundant; it moved the argument.
+    The budget document derived candidate 6 from an inexact dequantization,
+    and that reason is gone. The reason that remains is the cast, and it is
+    the stronger one, because it does not shrink with the scale's shape.
+
+    WHY IT IS BOUND TO THE CROSS FORM
+    ---------------------------------
+    Exactly the reasoning `ACCURACY_BUDGET.md` section 9 gives, and it
+    survives the power-of-two scale unchanged -- if anything the power of two
+    sharpens it, because with the dequantizing multiply now exact the
+    anti-correlation below is exact rather than approximate. Under the
+    Float32 route the derived right-hand sum carries the left's cast error
+    with the opposite sign. The subtractive gain adds `GL^2/HL'` and
+    `GR^2/HR'` together, so those two errors partly cancel: the shipped form
+    is quietly benefiting from an error it introduces. Make the right-hand
+    sum exact and the cancellation goes with it. The cross form subtracts
+    where the subtractive form adds, so the same anti-correlation hurts it,
+    and removing it helps.
+
+    Measured, standalone NumPy model, median relative error of the computed
+    gain over each node's top 200 candidates at `lambda_l2 = 1`, 200,000
+    rows, 20 features (**not** a mojotrees measurement):
+
+        parent/gain    sub+f32     sub+int     cross+f32   cross+int
+              3.1      3.15e-07    1.77e-07    1.37e-07    1.18e-07
+             27.5      1.07e-06    2.49e-06    3.93e-07    2.42e-07
+              293      1.24e-05    1.34e-05    1.07e-06    7.14e-07
+
+    Integer subtraction on top of the shipped form is worse than doing
+    nothing at two of those three settings. On top of the cross form it is
+    better at all three. That is why there is one arm code and not two.
+    """
+    if form == Int32(GAIN_FORM_CROSS):
+        return (total_q - left_q).cast[DType.float32]() * inv
+    return total_f - left_f
+
+
+@always_inline
+def gpu_cross_node_s(total_h: Float32, child_l2: Float32) -> Float32:
+    """`H + 2*child_l2`, the sum of the two children's L2 denominators, as a
+    node constant.
+
+    Spelled as two adds rather than `total_h + 2.0 * child_l2` on purpose:
+    a multiply feeding an add is the contractable shape
+    (`docs/NUMERICS.md` section 6), and this value is consumed by both the
+    cross term and the offset, so the host replica and the device kernel
+    have to agree on it. Two adds cannot be contracted and there is nothing
+    left for an optimizer to decide.
+    """
+    return total_h + child_l2 + child_l2
+
+
+@always_inline
+def gpu_cross_offset(
+    total_g: Float32,
+    total_h: Float32,
+    lambda_l1: Float32,
+    lambda_l2: Float32,
+    child_l2: Float32,
+    node_s: Float32,
+) -> Float32:
+    """The node constant the cross form subtracts, computed once per node.
+
+    `gpu_cross_gain`'s first term is the gain a parent scored with
+    `child_l2` would have; the node's actual parent score uses `lambda_l2`.
+    The difference is
+
+        G^2 / node_s - G^2 / (H + lambda_l2)
+            = G^2 * (2*child_l2 - lambda_l2) / (node_s * (H + lambda_l2))
+
+    which depends on nothing that varies between candidates. For the ordinal
+    and one-vs-rest paths `child_l2` is `lambda_l2` and this collapses to
+    the `lambda_l2 * G^2 / ((H + lambda_l2) * (H + 2*lambda_l2))` term
+    `ACCURACY_BUDGET.md` section 8 gives; the many-vs-many categorical walk
+    scores children at `lambda_l2 + cat_l2` against a parent at `lambda_l2`,
+    which the general form covers and the section 8 form does not.
+
+    Note what this subtraction is and is not. It is a cancelling subtract,
+    but the quantity removed is bounded by `lambda_l2 / (H + lambda_l2)`
+    times the parent score rather than by the parent score itself, so where
+    the shipped form cancels against `P` this cancels against a term that
+    vanishes with `lambda_l2` and is negligible whenever the node's hessian
+    mass exceeds it. At `lambda_l2 = 0` and `cat_l2 = 0` it is exactly zero
+    and the cross form has no subtraction anywhere.
+
+    `2*child_l2 - lambda_l2` is spelled as `(child_l2 + child_l2) -
+    lambda_l2` for the reason given at `gpu_cross_node_s`.
+    """
+    var tg = gpu_soft_threshold_l1(total_g, lambda_l1)
+    var scaled = (child_l2 + child_l2) - lambda_l2
+    return tg * tg * scaled / (node_s * (total_h + lambda_l2))
+
+
+@always_inline
+def gpu_cross_gain(
+    left_g: Float32,
+    left_h: Float32,
+    right_g: Float32,
+    right_h: Float32,
+    child_l2: Float32,
+    node_s: Float32,
+    cross_offset: Float32,
+) -> Float32:
+    """The split gain in the form that does not cancel against the parent
+    score. Candidate 5.
+
+    Writing `HL' = HL + child_l2`, `HR' = HR + child_l2`, `S = HL' + HR'`,
+    and using `GL + GR = G`:
+
+        GL^2/HL' + GR^2/HR' - G^2/S  ==  (GL*HR' - GR*HL')^2 / (HL'*HR'*S)
+
+    as an identity in exact arithmetic, for any values whatever. The node's
+    parent score is taken at `lambda_l2` rather than at `child_l2` and at
+    `H + lambda_l2` rather than at `S`, and `gpu_cross_offset` is exactly
+    that difference. So this returns the same gain the subtractive form
+    returns, not a surrogate ordering key: `best_gain` still starts at zero,
+    `min_gain_to_split` still applies to it, `SPLIT_TIE_RELATIVE` still
+    measures a margin against it, and the monotone branch below still
+    returns a comparable number. That was worth the one extra node constant.
+    A ranking-only key would have moved all four of those and bought nothing
+    the identity does not already give.
+
+    WHAT THE WIN IS, AND WHERE IT IS NOT
+    ------------------------------------
+    Not what it looks like. The subtraction of `parent_score` is **not**
+    where the shipped form loses its bits, and a previous claim in this
+    project that dropping it was a free accuracy win was wrong. Rounding is
+    monotone, so subtracting a constant preserves order; and in the near-tie
+    regime Sterbenz's lemma applies (`P/2 <= left_score + right_score <=
+    2P`), which makes that subtraction *exactly representable*. The
+    information is already gone one step earlier, in forming
+    `left_score + right_score`, whose rounding error is `eps` times its own
+    magnitude and therefore about `eps * P` in absolute terms -- no matter
+    how small the gain it is about to become.
+
+    That is the whole mechanism. The shipped form's absolute resolution is
+    `eps * parent_score`, a floor that does not shrink as the gain does. The
+    cross form never forms the large sum: its error enters through `D`,
+    whose relative error is `eps * |GL*HR'| / |D|`, and since the gain is
+    proportional to `D^2` this gives an absolute resolution of order
+    `eps * sqrt(parent_score * gain)`.
+
+    **Derived bound: the two resolutions differ by a factor of about
+    `sqrt(parent_score / gain)`.** That is the number to reason with. It is
+    one at a centered node, where the two forms are interchangeable, and it
+    grows without bound as a node's gradients become one-sided -- which is
+    what a nearly pure leaf under logistic or softmax loss looks like in a
+    late round.
+
+    Measured against that bound, in a standalone NumPy model of this scan
+    (**not** a mojotrees measurement, and not real data): draw pairs of
+    candidates in one node whose exact gains differ by a chosen relative gap
+    and count how often each form ranks the better one above the worse one.
+    Percent correct, at `lambda_l2 = 1`:
+
+        parent/gain    gap 1e-6   1e-5   1e-4   1e-3     resolves at
+          1  shipped      100     100    100    100      1e-6
+             cross        100     100    100    100      1e-6
+         30  shipped       40     100    100    100      1e-5
+             cross         97     100    100    100      3e-6
+        300  shipped       28      49    100    100      1e-4
+             cross         67     100    100    100      1e-5
+       2900  shipped       19      19     25    100      1e-3
+             cross         52      75    100    100      1e-4
+
+    Resolution ratios of 1, 3.3, 10, 10 against a bound predicting 1, 5.5,
+    17, 54 on a grid whose steps are a factor of three: the bound is the
+    right shape and is not tight. Note also that a form which cannot resolve
+    a gap does not coin-flip. The shipped form *ties* the two candidates and
+    the scan keeps its incumbent, which is why its scores sit near 19 percent
+    rather than near 50; it does not fail at random, it defers to scan order.
+
+    And the honest other end: at `parent / gain` below one this buys
+    nothing, and on the median it is a few percent worse. Over each node's
+    top 200 candidates at a centered node the shipped form's median relative
+    error is 5.3e-08 against the cross form's 6.9e-08. There is no
+    cancellation there to remove, and the cross form pays one more rounding
+    for the privilege. The case for it is entirely in the one-sided regime.
+
+    THE CONTRACTION, WHICH IS DELIBERATE AND NOT INCIDENTAL
+    -------------------------------------------------------
+    `GL*HR' - GR*HL'` is a product feeding a subtract, the shape
+    `docs/NUMERICS.md` section 6 warns about, and this project has been
+    bitten by it three times. Unfused is not expressible in this language
+    and binding to a named local does not block contraction, so leaving it
+    written as an infix expression would leave the result at the optimizer's
+    discretion -- and this expression is evaluated both in a device kernel
+    and in `reference_search` on the host, which is exactly the pair that
+    must not diverge. `fma` is therefore explicit: one rounding for
+    `right_g * hl`, one for the fused multiply-add, and nothing left to
+    decide.
+
+    **The exactness of this form does not depend on the fusion**, which is
+    the trap worth naming. The `eps * |GL*HR'| / |D|` bound above holds for
+    either contraction; fusing removes one of the two roundings inside `D`
+    and so is the better of two acceptable spellings, not a load-bearing
+    one. Measured in the same model, the fused and unfused arms score 97.8
+    and 97.2 percent on the 3e-05 row above -- a real difference, and a
+    small one.
+
+    `left_g` and `right_g` arrive already soft-thresholded, as in
+    `gpu_split_gain`. That is a formality here: `gpu_resolve_gain_form`
+    refuses this arm whenever `lambda_l1` is nonzero, because the identity
+    above is false under soft thresholding, and the reasoning is there.
+    """
+    var hl = left_h + child_l2
+    var hr = right_h + child_l2
+    var d = fma(left_g, hr, -(right_g * hl))
+    return d * d / (hl * hr * node_s) - cross_offset
+
+
+@always_inline
+def gpu_cat_gain(
+    left_g: Float32,
+    left_h: Float32,
+    right_g: Float32,
+    right_h: Float32,
+    lambda_l1: Float32,
+    child_l2: Float32,
+    parent_score: Float32,
+    node_s: Float32,
+    cross_offset: Float32,
+    form: Int32,
+) -> Float32:
+    """A categorical candidate's gain under either form.
+
+    The categorical searches never consult the monotone sign -- they scored
+    `gpu_leaf_score` twice and subtracted the parent inline before this
+    function existed -- so this is the whole of their gain arithmetic and
+    the subtractive arm below is that inline expression, unchanged term for
+    term. `left_g` and `right_g` arrive *un*-thresholded here, as they did
+    inline, and `gpu_leaf_score` thresholds them; the ordinal path passes
+    thresholded values to `gpu_split_gain` instead. The two conventions are
+    pre-existing and are kept rather than unified, because unifying them
+    would move the shipped arm's bits for no reason.
+    """
+    if form == Int32(GAIN_FORM_CROSS):
+        return gpu_cross_gain(
+            gpu_soft_threshold_l1(left_g, lambda_l1),
+            left_h,
+            gpu_soft_threshold_l1(right_g, lambda_l1),
+            right_h,
+            child_l2,
+            node_s,
+            cross_offset,
+        )
+    return (
+        gpu_leaf_score(left_g, left_h, lambda_l1, child_l2)
+        + gpu_leaf_score(right_g, right_h, lambda_l1, child_l2)
+        - parent_score
+    )
+
+
 @always_inline
 def gpu_split_gain(
     left_g: Float32,
@@ -403,11 +800,40 @@ def gpu_split_gain(
     bound_lo: Float32,
     bound_hi: Float32,
     constrained: Bool,
+    node_s: Float32 = Float32(0.0),
+    cross_offset: Float32 = Float32(0.0),
+    form: Int32 = Int32(GAIN_FORM_SUBTRACTIVE),
 ) -> Float32:
     """`split._split_gain` in Float32. `left_g` and `right_g` are already
     soft-thresholded; a candidate running against `sign` scores 0.0, which
-    no caller accepts."""
+    no caller accepts.
+
+    The three trailing parameters select and feed the cancellation-free arm
+    and default to the shipped one, so a caller that has no node constants
+    to hand gets exactly the expression this function held before they
+    existed.
+
+    **The monotone-constrained branch keeps the subtraction and is not
+    offered the cross arm.** Its gain is `output_score(left) +
+    output_score(right) - parent_score` over *clamped* leaf outputs, which
+    is a different expression that the identity does not cover: once an
+    output is clamped it is no longer `-G/H'`, and the algebra that turns
+    two quotients into one cross product has nothing to work with. That is
+    acceptable rather than a gap. Clamping an output moves the gain by far
+    more than the cancellation does, so a constrained candidate's gain was
+    never resolved to `eps * parent_score` in the first place.
+    """
     if not constrained:
+        if form == Int32(GAIN_FORM_CROSS):
+            return gpu_cross_gain(
+                left_g,
+                left_h,
+                right_g,
+                right_h,
+                lambda_l2,
+                node_s,
+                cross_offset,
+            )
         return (
             left_g * left_g / (left_h + lambda_l2)
             + right_g * right_g / (right_h + lambda_l2)
@@ -526,6 +952,7 @@ def _scan_slot_kernel(
     cat_onehot_max: Int32,
     cat_max_threshold: Int32,
     cat_min_group: Int32,
+    gain_form: Int32,
 ):
     """One threadgroup per (node, active feature slot): scan that feature's
     candidates for that node and write its best one as a per-slot record.
@@ -617,6 +1044,14 @@ def _scan_slot_kernel(
     var parent_score = gpu_leaf_score(
         total_g, total_h, lambda_l1, lambda_l2
     )
+    # The cross form's two node constants, hoisted here because that is what
+    # they are: neither depends on the candidate. `gpu_resolve_gain_form`
+    # sends L1 back to the subtractive arm, where both are ignored.
+    var form = gpu_resolve_gain_form(gain_form, lambda_l1)
+    var node_s = gpu_cross_node_s(total_h, lambda_l2)
+    var cross_offset = gpu_cross_offset(
+        total_g, total_h, lambda_l1, lambda_l2, lambda_l2, node_s
+    )
 
     var best_gain = Float32(0.0)
     # The best gain of every candidate this feature scored except the
@@ -654,15 +1089,22 @@ def _scan_slot_kernel(
                 var rc = tc - lc
                 if rc < min_data_in_leaf:
                     continue
-                var rhf = total_h - lhf
+                var rhf = gpu_right_sum(total_h, lhf, th, lh, h_inv, form)
                 if rhf < min_child_hess:
                     continue
                 var lgf = lg.cast[DType.float32]() * g_inv
-                var rgf = total_g - lgf
-                var gain = (
-                    gpu_leaf_score(lgf, lhf, lambda_l1, lambda_l2)
-                    + gpu_leaf_score(rgf, rhf, lambda_l1, lambda_l2)
-                    - parent_score
+                var rgf = gpu_right_sum(total_g, lgf, tg, lg, g_inv, form)
+                var gain = gpu_cat_gain(
+                    lgf,
+                    lhf,
+                    rgf,
+                    rhf,
+                    lambda_l1,
+                    lambda_l2,
+                    parent_score,
+                    node_s,
+                    cross_offset,
+                    form,
                 )
                 if gain > best_gain:
                     runner_gain = best_gain
@@ -716,6 +1158,14 @@ def _scan_slot_kernel(
                     sorted_bins[unsafe_offset = j + 1] = bv
 
                 var l2c = lambda_l2 + cat_l2
+                # The many-vs-many walk scores children at `l2c` against a
+                # parent scored at `lambda_l2`, so it needs its own pair of
+                # node constants; `gpu_cross_offset` is general in exactly
+                # that argument.
+                var cat_s = gpu_cross_node_s(total_h, l2c)
+                var cat_offset = gpu_cross_offset(
+                    total_g, total_h, lambda_l1, lambda_l2, l2c, cat_s
+                )
                 var max_num_cat = Int(cat_max_threshold)
                 if (used + 1) // 2 < max_num_cat:
                     max_num_cat = (used + 1) // 2
@@ -744,7 +1194,9 @@ def _scan_slot_kernel(
                         var rc = tc - lc
                         if rc < min_data_in_leaf or rc < cat_min_group:
                             break
-                        var rhf = total_h - lhf
+                        var rhf = gpu_right_sum(
+                            total_h, lhf, th, lh, h_inv, form
+                        )
                         if rhf < min_child_hess:
                             break
                         if group < cat_min_group:
@@ -752,11 +1204,20 @@ def _scan_slot_kernel(
                         group = Int32(0)
 
                         var lgf = lg.cast[DType.float32]() * g_inv
-                        var rgf = total_g - lgf
-                        var gain = (
-                            gpu_leaf_score(lgf, lhf, lambda_l1, l2c)
-                            + gpu_leaf_score(rgf, rhf, lambda_l1, l2c)
-                            - parent_score
+                        var rgf = gpu_right_sum(
+                            total_g, lgf, tg, lg, g_inv, form
+                        )
+                        var gain = gpu_cat_gain(
+                            lgf,
+                            lhf,
+                            rgf,
+                            rhf,
+                            lambda_l1,
+                            l2c,
+                            parent_score,
+                            cat_s,
+                            cat_offset,
+                            form,
                         )
                         if gain > best_gain:
                             runner_gain = best_gain
@@ -813,7 +1274,9 @@ def _scan_slot_kernel(
                 var dl_h = left_h + miss_h
                 var dl_c = left_c + miss_c
                 var dl_hf = dl_h.cast[DType.float32]() * h_inv
-                var dr_hf = total_h - dl_hf
+                var dr_hf = gpu_right_sum(
+                    total_h, dl_hf, th, dl_h, h_inv, form
+                )
                 if not (
                     dl_hf < min_child_hess
                     or dr_hf < min_child_hess
@@ -821,7 +1284,9 @@ def _scan_slot_kernel(
                     or tc - dl_c < min_data_in_leaf
                 ):
                     var dl_gf = dl_g.cast[DType.float32]() * g_inv
-                    var dr_gf = total_g - dl_gf
+                    var dr_gf = gpu_right_sum(
+                        total_g, dl_gf, tg, dl_g, g_inv, form
+                    )
                     var gain = gpu_split_gain(
                         gpu_soft_threshold_l1(dl_gf, lambda_l1),
                         dl_hf,
@@ -833,6 +1298,9 @@ def _scan_slot_kernel(
                         bound_lo,
                         bound_hi,
                         is_constrained,
+                        node_s,
+                        cross_offset,
+                        form,
                     )
                     if gain > best_gain:
                         runner_gain = best_gain
@@ -851,7 +1319,9 @@ def _scan_slot_kernel(
             # the only candidate and the scan is exactly the ordinal one.
             if missing_bin < 0 or miss_c > Int32(0):
                 var lhf = left_h.cast[DType.float32]() * h_inv
-                var rhf = total_h - lhf
+                var rhf = gpu_right_sum(
+                    total_h, lhf, th, left_h, h_inv, form
+                )
                 if lhf < min_child_hess or rhf < min_child_hess:
                     continue
                 if (
@@ -860,7 +1330,9 @@ def _scan_slot_kernel(
                 ):
                     continue
                 var lgf = left_g.cast[DType.float32]() * g_inv
-                var rgf = total_g - lgf
+                var rgf = gpu_right_sum(
+                    total_g, lgf, tg, left_g, g_inv, form
+                )
                 var gain = gpu_split_gain(
                     gpu_soft_threshold_l1(lgf, lambda_l1),
                     lhf,
@@ -872,6 +1344,9 @@ def _scan_slot_kernel(
                     bound_lo,
                     bound_hi,
                     is_constrained,
+                    node_s,
+                    cross_offset,
+                    form,
                 )
                 if gain > best_gain:
                     runner_gain = best_gain
@@ -906,8 +1381,17 @@ def _scan_slot_kernel(
     out_f[unsafe_offset = fo + FREC_RUNNER_GAIN] = runner_gain
     out_f[unsafe_offset = fo + FREC_LEFT_GRAD] = lgf
     out_f[unsafe_offset = fo + FREC_LEFT_HESS] = lhf
-    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = total_g - lgf
-    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = total_h - lhf
+    # The winner's child statistics take the same right-hand rule the gain
+    # that selected it took, so the record cannot report a child the search
+    # did not score. These feed the host's leaf values, which is a
+    # leaf-channel quantity and cheap by `ACCURACY_BUDGET.md` section 2's
+    # argument; the reason to make them exact is consistency, not accuracy.
+    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = gpu_right_sum(
+        total_g, lgf, tg, best_left_g, g_inv, form
+    )
+    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = gpu_right_sum(
+        total_h, lhf, th, best_left_h, h_inv, form
+    )
 
 
 # Threads per threadgroup in the wide ordinal scan. A warp multiple on every
@@ -968,6 +1452,7 @@ def _scan_slot_wide_kernel(
     feat_stride: Int32,
     min_data_in_leaf: Int32,
     constrained: Int32,
+    gain_form: Int32,
 ):
     """`_scan_slot_kernel`'s ordinal scan, spread over a threadgroup instead
     of run on one thread, and it writes the same per-slot record.
@@ -1151,6 +1636,13 @@ def _scan_slot_wide_kernel(
         sign = mono[unsafe_offset=f][0]
     var is_constrained = constrained != Int32(0)
     var parent_score = gpu_leaf_score(total_g, total_h, lambda_l1, lambda_l2)
+    # The cross form's node constants; see `_scan_slot_kernel` for what they
+    # are and `gpu_resolve_gain_form` for why L1 does not get this arm.
+    var form = gpu_resolve_gain_form(gain_form, lambda_l1)
+    var node_s = gpu_cross_node_s(total_h, lambda_l2)
+    var cross_offset = gpu_cross_offset(
+        total_g, total_h, lambda_l1, lambda_l2, lambda_l2, node_s
+    )
 
     var missing_bin = Int(missing[unsafe_offset=f][0])
     var n_scan = missing_bin if missing_bin >= 0 else nb
@@ -1222,7 +1714,7 @@ def _scan_slot_wide_kernel(
             var dl_h = left_h + miss_h
             var dl_c = left_c + miss_c
             var dl_hf = dl_h.cast[DType.float32]() * h_inv
-            var dr_hf = total_h - dl_hf
+            var dr_hf = gpu_right_sum(total_h, dl_hf, th, dl_h, h_inv, form)
             if not (
                 dl_hf < min_child_hess
                 or dr_hf < min_child_hess
@@ -1230,7 +1722,9 @@ def _scan_slot_wide_kernel(
                 or tc - dl_c < min_data_in_leaf
             ):
                 var dl_gf = dl_g.cast[DType.float32]() * g_inv
-                var dr_gf = total_g - dl_gf
+                var dr_gf = gpu_right_sum(
+                    total_g, dl_gf, tg, dl_g, g_inv, form
+                )
                 var gain = gpu_split_gain(
                     gpu_soft_threshold_l1(dl_gf, lambda_l1),
                     dl_hf,
@@ -1242,6 +1736,9 @@ def _scan_slot_wide_kernel(
                     bound_lo,
                     bound_hi,
                     is_constrained,
+                    node_s,
+                    cross_offset,
+                    form,
                 )
                 if gain > best_gain:
                     runner_gain = best_gain
@@ -1257,13 +1754,13 @@ def _scan_slot_wide_kernel(
         # the only candidate and the scan is exactly the ordinal one.
         if missing_bin < 0 or miss_c > Int32(0):
             var lhf = left_h.cast[DType.float32]() * h_inv
-            var rhf = total_h - lhf
+            var rhf = gpu_right_sum(total_h, lhf, th, left_h, h_inv, form)
             if lhf < min_child_hess or rhf < min_child_hess:
                 continue
             if left_c < min_data_in_leaf or tc - left_c < min_data_in_leaf:
                 continue
             var lgf = left_g.cast[DType.float32]() * g_inv
-            var rgf = total_g - lgf
+            var rgf = gpu_right_sum(total_g, lgf, tg, left_g, g_inv, form)
             var gain = gpu_split_gain(
                 gpu_soft_threshold_l1(lgf, lambda_l1),
                 lhf,
@@ -1275,6 +1772,9 @@ def _scan_slot_wide_kernel(
                 bound_lo,
                 bound_hi,
                 is_constrained,
+                node_s,
+                cross_offset,
+                form,
             )
             if gain > best_gain:
                 runner_gain = best_gain
@@ -1344,14 +1844,21 @@ def _scan_slot_wide_kernel(
     out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(ordinal)
     out_i[unsafe_offset = io + IREC_LEFT_COUNT] = won_left_c
     out_i[unsafe_offset = io + IREC_RIGHT_COUNT] = tc - won_left_c
-    var lgf = a_lg[unsafe_offset=win][0].cast[DType.float32]() * g_inv
-    var lhf = a_lh[unsafe_offset=win][0].cast[DType.float32]() * h_inv
+    var won_lg = a_lg[unsafe_offset=win][0]
+    var won_lh = a_lh[unsafe_offset=win][0]
+    var lgf = won_lg.cast[DType.float32]() * g_inv
+    var lhf = won_lh.cast[DType.float32]() * h_inv
     out_f[unsafe_offset = fo + FREC_GAIN] = m1
     out_f[unsafe_offset = fo + FREC_RUNNER_GAIN] = m2
     out_f[unsafe_offset = fo + FREC_LEFT_GRAD] = lgf
     out_f[unsafe_offset = fo + FREC_LEFT_HESS] = lhf
-    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = total_g - lgf
-    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = total_h - lhf
+    # The same right-hand rule the winning gain used; see `_scan_slot_kernel`.
+    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = gpu_right_sum(
+        total_g, lgf, tg, won_lg, g_inv, form
+    )
+    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = gpu_right_sum(
+        total_h, lhf, th, won_lh, h_inv, form
+    )
 
 
 def _scan_slot_wide_primitive_kernel(
@@ -1370,6 +1877,7 @@ def _scan_slot_wide_primitive_kernel(
     feat_stride: Int32,
     min_data_in_leaf: Int32,
     constrained: Int32,
+    gain_form: Int32,
 ):
     """`_scan_slot_wide_kernel` with its four hand-rolled reductions written
     as `gpu.primitives.block` collectives, and returning its record bit for
@@ -1492,6 +2000,13 @@ def _scan_slot_wide_primitive_kernel(
         sign = mono[unsafe_offset=f][0]
     var is_constrained = constrained != Int32(0)
     var parent_score = gpu_leaf_score(total_g, total_h, lambda_l1, lambda_l2)
+    # The cross form's node constants; see `_scan_slot_kernel` for what they
+    # are and `gpu_resolve_gain_form` for why L1 does not get this arm.
+    var form = gpu_resolve_gain_form(gain_form, lambda_l1)
+    var node_s = gpu_cross_node_s(total_h, lambda_l2)
+    var cross_offset = gpu_cross_offset(
+        total_g, total_h, lambda_l1, lambda_l2, lambda_l2, node_s
+    )
 
     var missing_bin = Int(missing[unsafe_offset=f][0])
     var n_scan = missing_bin if missing_bin >= 0 else nb
@@ -1561,7 +2076,7 @@ def _scan_slot_wide_primitive_kernel(
             var dl_h = left_h + miss_h
             var dl_c = left_c + miss_c
             var dl_hf = dl_h.cast[DType.float32]() * h_inv
-            var dr_hf = total_h - dl_hf
+            var dr_hf = gpu_right_sum(total_h, dl_hf, th, dl_h, h_inv, form)
             if not (
                 dl_hf < min_child_hess
                 or dr_hf < min_child_hess
@@ -1569,7 +2084,9 @@ def _scan_slot_wide_primitive_kernel(
                 or tc - dl_c < min_data_in_leaf
             ):
                 var dl_gf = dl_g.cast[DType.float32]() * g_inv
-                var dr_gf = total_g - dl_gf
+                var dr_gf = gpu_right_sum(
+                    total_g, dl_gf, tg, dl_g, g_inv, form
+                )
                 var gain = gpu_split_gain(
                     gpu_soft_threshold_l1(dl_gf, lambda_l1),
                     dl_hf,
@@ -1581,6 +2098,9 @@ def _scan_slot_wide_primitive_kernel(
                     bound_lo,
                     bound_hi,
                     is_constrained,
+                    node_s,
+                    cross_offset,
+                    form,
                 )
                 if gain > best_gain:
                     runner_gain = best_gain
@@ -1596,13 +2116,13 @@ def _scan_slot_wide_primitive_kernel(
         # the only candidate and the scan is exactly the ordinal one.
         if missing_bin < 0 or miss_c > Int32(0):
             var lhf = left_h.cast[DType.float32]() * h_inv
-            var rhf = total_h - lhf
+            var rhf = gpu_right_sum(total_h, lhf, th, left_h, h_inv, form)
             if lhf < min_child_hess or rhf < min_child_hess:
                 continue
             if left_c < min_data_in_leaf or tc - left_c < min_data_in_leaf:
                 continue
             var lgf = left_g.cast[DType.float32]() * g_inv
-            var rgf = total_g - lgf
+            var rgf = gpu_right_sum(total_g, lgf, tg, left_g, g_inv, form)
             var gain = gpu_split_gain(
                 gpu_soft_threshold_l1(lgf, lambda_l1),
                 lhf,
@@ -1614,6 +2134,9 @@ def _scan_slot_wide_primitive_kernel(
                 bound_lo,
                 bound_hi,
                 is_constrained,
+                node_s,
+                cross_offset,
+                form,
             )
             if gain > best_gain:
                 runner_gain = best_gain
@@ -1676,14 +2199,21 @@ def _scan_slot_wide_primitive_kernel(
     out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(ordinal)
     out_i[unsafe_offset = io + IREC_LEFT_COUNT] = won_left_c
     out_i[unsafe_offset = io + IREC_RIGHT_COUNT] = tc - won_left_c
-    var lgf = won[unsafe_offset=0][0].cast[DType.float32]() * g_inv
-    var lhf = won[unsafe_offset=1][0].cast[DType.float32]() * h_inv
+    var won_lg = won[unsafe_offset=0][0]
+    var won_lh = won[unsafe_offset=1][0]
+    var lgf = won_lg.cast[DType.float32]() * g_inv
+    var lhf = won_lh.cast[DType.float32]() * h_inv
     out_f[unsafe_offset = fo + FREC_GAIN] = top
     out_f[unsafe_offset = fo + FREC_RUNNER_GAIN] = m2
     out_f[unsafe_offset = fo + FREC_LEFT_GRAD] = lgf
     out_f[unsafe_offset = fo + FREC_LEFT_HESS] = lhf
-    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = total_g - lgf
-    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = total_h - lhf
+    # The same right-hand rule the winning gain used; see `_scan_slot_kernel`.
+    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = gpu_right_sum(
+        total_g, lgf, tg, won_lg, g_inv, form
+    )
+    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = gpu_right_sum(
+        total_h, lhf, th, won_lh, h_inv, form
+    )
 
 
 def _reduce_slots_kernel(
@@ -2402,6 +2932,7 @@ def _launch_search(
     cat_min_group: Int,
     wide: Bool = False,
     primitives: Bool = True,
+    gain_form: Int = DEFAULT_GAIN_FORM,
 ) raises:
     """Enqueue the two kernels of one search, over `n_records` consecutive
     nodes starting at `record_base`.
@@ -2437,7 +2968,13 @@ def _launch_search(
     it is already the LightGBM shape: one grid over every (leaf, feature)
     task, not one launch per feature or per leaf. See
     `split_primitives_requested` for the switch and
-    `GpuSplitSearcher.set_primitives` for the in-process override."""
+    `GpuSplitSearcher.set_primitives` for the in-process override.
+
+    `gain_form` reaches every scan kernel as a launch argument rather than a
+    second instantiation, for the same reason `primitives` does: the arms
+    have to be alternated inside one process. Unlike `primitives` and
+    `wide`, **this one changes records.** See
+    `GpuSplitSearcher.set_gain_form`."""
     # The whole dispatch sits behind a compile-time accelerator test, so a
     # CPU-only extension build never instantiates any of these kernels and
     # never asks the backend for a GPU architecture it was not built with.
@@ -2466,6 +3003,7 @@ def _launch_search(
                 Int32(feat_stride),
                 Int32(min_data_in_leaf),
                 Int32(1) if constrained else Int32(0),
+                Int32(gain_form),
                 grid_dim=(widest_slots, n_records),
                 block_dim=WIDE_SCAN_THREADS,
             )
@@ -2486,6 +3024,7 @@ def _launch_search(
                 Int32(feat_stride),
                 Int32(min_data_in_leaf),
                 Int32(1) if constrained else Int32(0),
+                Int32(gain_form),
                 grid_dim=(widest_slots, n_records),
                 block_dim=WIDE_SCAN_THREADS,
             )
@@ -2510,6 +3049,7 @@ def _launch_search(
                 Int32(cat_onehot_max),
                 Int32(cat_max_threshold),
                 Int32(cat_min_group),
+                Int32(gain_form),
                 grid_dim=(widest_slots, n_records),
                 block_dim=1,
             )
@@ -2575,11 +3115,19 @@ struct GpuSplitSearcher(Movable):
     The four per-node tables live at fixed offsets inside one pinned
     staging allocation and one device allocation, and `_copy_tables` moves
     the whole thing in a single `enqueue_copy`. On Metal that is the
-    difference between four host waits and one, because a copy there costs a
-    full-queue drain regardless of its size. `set_table_upload_hoisting`
-    puts the four-copy arm back at run time for an interleaved measurement,
-    and `_copy_tables` argues why the two arms leave the device holding
-    identical bytes.
+    difference between four full-queue drains and one, because a copy there
+    drains regardless of its size (**measured** by disassembly,
+    `docs/GPU_PORTABILITY.md` section 6.1). **Four drains is not four waits.**
+    None of the four blocks on a device answer the host needs next, and under
+    section 6.1.1, withdrawn 2026-08-16, that is what separates a copy count
+    from a time: the collapse this is part of **measured** 0.016 seconds at
+    1,000,000 x 50 against a registered prediction of 0.64, a null under M0
+    (`bench/results/session3_2026-08-16/RESULTS.md`). What one copy instead of
+    four earns is three fewer ordering points, one staging lifetime instead of
+    four, and a device that cannot be left holding three fresh tables and one
+    stale one. `set_table_upload_hoisting` puts the four-copy arm back at run
+    time for an interleaved measurement, and `_copy_tables` argues why the two
+    arms leave the device holding identical bytes.
     """
 
     var ctx: DeviceContext
@@ -2640,10 +3188,17 @@ struct GpuSplitSearcher(Movable):
     # staging contract above.
     #
     # One-way, not asynchronous. On Metal `enqueue_copy` is a synchronous
-    # full-queue drain in both directions (measured by disassembly,
-    # `docs/GPU_PORTABILITY.md` section 6.1), so an upload here is a host
-    # synchronization and the copy below has to be counted as a wait, not
-    # as an enqueue. That is why there is one buffer and not four.
+    # full-queue drain in both directions (**measured** by disassembly,
+    # `docs/GPU_PORTABILITY.md` section 6.1), so an upload here is an ordering
+    # point and the copy below has to be counted as a drain, not as an
+    # enqueue. That is why there is one buffer and not four.
+    #
+    # It is a drain and not a wait. Section 6.1.1, withdrawn 2026-08-16, took
+    # back the step that turned each such drain into time: nothing is queued
+    # behind these uploads, and draining a queue that holds nothing costs
+    # nothing. So the reason for one buffer instead of four is the ordering
+    # and staleness argument above, plus one staging lifetime to reason about
+    # instead of four. It is not a predicted saving, and none may be quoted.
     #
     # One pinned buffer holding all four staged tables end to end, in the
     # same order and at the same offsets as `tables_dev`, so the packed
@@ -2695,6 +3250,11 @@ struct GpuSplitSearcher(Movable):
     at construction from `MOJOTREES_GPU_SPLIT_TABLE_PACK` and settable
     afterwards, so one process can hold both arms; see
     `set_table_upload_hoisting`."""
+    var gain_form_code: Int
+    """Which gain form and right-hand subtraction rule the scans use.
+    `GAIN_FORM_CROSS` or `GAIN_FORM_SUBTRACTIVE`, read once at construction
+    from `MOJOTREES_GPU_SPLIT_GAIN_FORM` and settable afterwards. **The one
+    arm on this searcher that changes a record**; see `set_gain_form`."""
 
     def __init__(
         out self,
@@ -2770,6 +3330,7 @@ struct GpuSplitSearcher(Movable):
         self.wide_scan = wide_scan_for(any_cat)
         self.use_primitives = split_primitives_requested()
         self.hoist_tables = table_upload_hoisting_requested()
+        self.gain_form_code = gain_form_requested()
         self.mono_host = List[Int32](capacity=n_features)
         for _ in range(n_features):
             self.mono_host.append(Int32(MONOTONE_FREE))
@@ -2930,13 +3491,96 @@ struct GpuSplitSearcher(Movable):
         same bytes in the same four tables before either kernel is enqueued
         (`_copy_tables` argues that region by region) and the same monotone
         vector (`set_monotone` argues that one). What differs is only how
-        many times the host blocks on a queue drain to put them there.
+        many drains it takes to put them there.
+
+        **What differs is not expected to be a time.** Both arms make the same
+        number of round trips, which under `docs/GPU_PORTABILITY.md` section
+        6.1.1 is the count that predicts time; they differ only in copies,
+        which predict portability risk and ordering hazards. The thirteen-copy
+        collapse this knob is part of **measured** 0.016 seconds at
+        1,000,000 x 50 against a registered prediction of 0.64, a null under
+        M0 (`bench/results/session3_2026-08-16/RESULTS.md`). Keep the knob for
+        the A/B and for the staleness argument, not for a predicted win.
 
         Takes effect on the next `_copy_tables`, which is the next
         `enqueue`, `search` or `enqueue_frontier`, and on the next
         `set_monotone`.
         """
         self.hoist_tables = on
+
+    def set_gain_form(mut self, form: Int) raises:
+        """Which gain expression and right-hand subtraction rule this
+        searcher's scans use, overriding `MOJOTREES_GPU_SPLIT_GAIN_FORM`.
+
+        `GAIN_FORM_CROSS` is the default: the cancellation-free gain of
+        `gpu_cross_gain` with the right-hand sums taken in the integer
+        fixed-point domain by `gpu_right_sum`. `GAIN_FORM_SUBTRACTIVE` is
+        what this module shipped. The arithmetic, the derived bound, and the
+        standalone measurements are all at those two functions and nothing
+        about them is restated here.
+
+        **This is the one arm on this searcher that changes a record**, and
+        it is numeric in the sense `histogram_gpu.set_scale_shape` is:
+        `set_primitives`, `set_table_upload_hoisting`, and the wide scan are
+        launch shapes and transfer shapes, and every one of them returns the
+        same record by construction. This one changes the value of every
+        gain, therefore possibly which candidate wins, therefore possibly a
+        tree. A fixture taken under one arm does not describe the other and
+        must not be diffed against it. It also moves the `min_child_hess`
+        admission test, because the right-hand hessian that test reads is
+        one of the quantities the arm changes.
+
+        WHY THE TWO CHANGES ARE ONE CODE AND NOT TWO
+        --------------------------------------------
+        Because the four-way factorial has a cell that is worse than doing
+        nothing, and a knob whose settings include a known regression is a
+        trap rather than a measurement handle. Integer right-hand
+        subtraction on top of the *subtractive* gain removes an
+        anti-correlation the subtractive gain was quietly living off, and
+        measures worse than the shipped arm at two of three settings; the
+        table is at `gpu_right_sum`. If a later lane wants the factorial to
+        study the mechanism, it should reach the two helpers directly rather
+        than widen this code.
+
+        WHAT THE DEFAULT DOES AND DOES NOT REST ON
+        ------------------------------------------
+        It rests on an exact algebraic identity, a derived error bound, and
+        a standalone NumPy model of this scan. It does **not** rest on any
+        measurement of mojotrees, and `ACCURACY_BUDGET.md` section 1 is
+        explicit that no verdict in it is discharged until `bench/real_data`
+        has been run with a before arm and an after arm. Nothing in this
+        lane ran it. What is claimed is a mechanism and an order of
+        magnitude, in the split-selection channel, which is the channel that
+        does not self-correct.
+
+        On cost: one divide fewer and two multiplies more per candidate,
+        plus two node constants hoisted out of the candidate loop, and one
+        Int32 subtract in place of one Float32 subtract per right-hand sum.
+        **It is not more expensive, by inspection.** No time was measured,
+        in either direction, and none may be quoted.
+
+        Refuses an unknown code rather than defaulting to one, for the
+        reason `set_scale_shape` gives: silently scoring candidates by an
+        expression the caller did not ask for is the failure this module is
+        arranged to prevent.
+
+        Takes effect on the next launch, which is the next `enqueue`,
+        `search`, or `enqueue_frontier`. It selects a kernel argument and
+        owns no state, so it is safe to change between searches.
+        """
+        if form != GAIN_FORM_CROSS and form != GAIN_FORM_SUBTRACTIVE:
+            raise Error(
+                String(
+                    "unknown split gain form: ",
+                    String(form),
+                    "; expected GAIN_FORM_CROSS or GAIN_FORM_SUBTRACTIVE",
+                )
+            )
+        self.gain_form_code = form
+
+    def gain_form(self) -> Int:
+        """The gain arm `set_gain_form` last chose."""
+        return self.gain_form_code
 
     def _feat_off(self) -> Int:
         """First Int32 word of the feature table inside the packed tables.
@@ -2980,11 +3624,21 @@ struct GpuSplitSearcher(Movable):
         var tables = String(
             " tables=packed copies=1"
         ) if self.hoist_tables else String(" tables=split copies=4")
+        # And the gain arm, which belongs here more than either of the above
+        # do: it is the only one of the three that changes what the records
+        # say, so a result reported without it is unattributable.
+        var gain = String(
+            " gain=", describe_gain_form(self.gain_form_code)
+        )
         if self.wide_scan:
             return String(
-                "scan=wide threads=", WIDE_SCAN_THREADS, reduction, tables
+                "scan=wide threads=",
+                WIDE_SCAN_THREADS,
+                reduction,
+                tables,
+                gain,
             )
-        return String("scan=serial threads=1", reduction, tables)
+        return String("scan=serial threads=1", reduction, tables, gain)
 
     def _check_record(self, record: Int) raises:
         if record < 0 or record >= self.max_records:
@@ -3047,26 +3701,43 @@ struct GpuSplitSearcher(Movable):
         """Put the four staged per-node tables on the device: one copy when
         `hoist_tables` is on, four when it is off.
 
-        Why this is where the waits were
-        --------------------------------
+        Why this is one call and not four
+        ---------------------------------
         On Metal `enqueue_copy` is a synchronous full-queue drain in both
-        directions, measured by disassembly and recorded in
-        `docs/GPU_PORTABILITY.md` section 6.1 at roughly 458 microseconds
-        against under 4 microseconds of actual byte movement for these
-        table sizes. The cost is therefore per *call*, not per byte, by two
-        orders of magnitude. Four calls that together move a few tens of
-        kilobytes cost four drains; one call that moves the same bytes
-        costs one. That ratio is what this method is built around, and it is
-        why the packed arm does not bother to skip regions that did not
-        change: not copying a clean region saves bytes, and bytes are not
-        the price.
+        directions, **measured** by disassembly and recorded in
+        `docs/GPU_PORTABILITY.md` section 6.1. Four calls that together move a
+        few tens of kilobytes are four drains; one call that moves the same
+        bytes is one. That is why the packed arm does not bother to skip
+        regions that did not change: not copying a clean region saves bytes,
+        and bytes were never what this was about.
 
-        `grow_tree_device_resident` counts sixteen host waits per tree on
-        the device-resident plane and attributes four of them to this
-        method. The packed arm makes it one, so that count is thirteen. The
-        shipping node-at-a-time and frontier loops call this once per split
-        rather than once per tree, so there the same change is four waits
-        per split down to one.
+        **What four drains are worth was overstated and the overstatement is
+        withdrawn.** An earlier version of this docstring priced each drain at
+        the ~458 microsecond per-synchronization constant and called the four
+        "where the waits were". That constant is **derived**, from the
+        depthwise A/B, and what that A/B removed were per-level *round trips*:
+        host code blocking on a device answer it needs before it can decide
+        what to enqueue next. None of these four is one. Section 6.1.1 records
+        the withdrawal, on 2026-08-16, together with the data that forced it:
+        collapsing thirteen copies per tree on the device-resident plane, four
+        of them this method's, **measured** 0.016 seconds at 1,000,000 x 50
+        against a registered prediction of 0.64
+        (`bench/results/session3_2026-08-16/RESULTS.md`), which is a null under
+        M0. Draining a queue that holds nothing costs nothing.
+
+        `grow_tree_device_resident` counts sixteen copies per tree on the
+        device-resident plane and attributes four of them to this method. The
+        packed arm makes it one, so that count is thirteen. The shipping
+        node-at-a-time and frontier loops call this once per split rather than
+        once per tree, so there the same change is four copies per split down
+        to one. **Read those as hazard and portability counts, not as a wait
+        budget.** What one copy instead of four earns here is three fewer
+        ordering points per call, one staging lifetime instead of four, and a
+        device that can no longer be left holding three fresh tables and one
+        stale one; that last is the argument this method is actually built
+        around, and it is a correctness property rather than a speed one. The
+        four-copy arm is kept as the arm an interleaved A/B holds this
+        against, not because anyone predicts it will lose on a clock.
 
         Why one allocation and not four plus a scatter
         ----------------------------------------------
@@ -3184,8 +3855,10 @@ struct GpuSplitSearcher(Movable):
         each mutator is the auditable form and is what the enumeration above
         would have driven; it was rejected only because packing dominates it
         on this call graph, not because it was wrong. The one place a skip
-        is both provable and worth a wait is the monotone vector, which has
-        no device writer at all, and `set_monotone` takes it.
+        is provable is the monotone vector, which has no device writer at
+        all, and `set_monotone` takes it. What that skip removes is a copy
+        and therefore an ordering point, not a wait; under section 6.1.1 no
+        copy count in this docstring converts to seconds.
 
         Ordering is unchanged. The copy is issued from `_launch` before
         either kernel is enqueued, into the same in-order queue, so the
@@ -3285,11 +3958,14 @@ struct GpuSplitSearcher(Movable):
         Called once per tree by the trainer (`train_gpu.mojo` line 1034) and
         handed the fit's constraint vector, which does not vary by tree.
         `map_to_host` moves the buffer in both directions on every use, so
-        an unconditional map is one or two host waits per tree spent writing
-        the same words that are already there. With `hoist_tables` on, this
-        maps only when the vector it is handed differs from the one this
-        searcher last wrote, which makes it once per fit for every
-        configuration mojotrees supports.
+        an unconditional map is one or two drains per tree spent writing the
+        same words that are already there. With `hoist_tables` on, this maps
+        only when the vector it is handed differs from the one this searcher
+        last wrote, which makes it once per fit for every configuration
+        mojotrees supports. Per tree to per fit is a reduction in ordering
+        points and in places the mirror could go stale; it is **not** a
+        predicted time, because nothing is queued behind those maps and
+        section 6.1.1 no longer permits a copy count to be priced.
 
         Why a mirror here is trustworthy, where it is not for the four
         tables `_copy_tables` carries. The skip is sound exactly when the
@@ -3449,6 +4125,7 @@ struct GpuSplitSearcher(Movable):
             params.cat.min_data_per_group,
             self.wide_scan,
             self.use_primitives,
+            self.gain_form_code,
         )
 
     def enqueue(
@@ -3464,17 +4141,22 @@ struct GpuSplitSearcher(Movable):
         """Enqueue the scan and reduction over `hist`, writing record slot
         `record`.
 
-        It does transfer, and on Metal it therefore waits. `_launch` copies
+        It does transfer, and on Metal it therefore drains. `_launch` copies
         the staged per-node tables across before either kernel is enqueued,
         and `enqueue_copy` on Metal is a synchronous full-queue drain
-        (measured by disassembly, `docs/GPU_PORTABILITY.md` section 6.1). An
-        earlier version of this line said "does not transfer or
+        (**measured** by disassembly, `docs/GPU_PORTABILITY.md` section 6.1).
+        An earlier version of this line said "does not transfer or
         synchronize" and was wrong on both halves. Nothing about the launch
-        changed; what changed is what a wait count may claim.
+        changed; what changed is what a copy count may claim.
 
-        That wait is **one** with `hoist_tables` on, where it was four: the
+        That drain is **one** with `hoist_tables` on, where it was four: the
         four tables share an allocation and cross in one copy. See
         `_copy_tables`.
+
+        It is a drain, not a round trip. No host decision here reads a device
+        answer, so under section 6.1.1 this ordering point predicts no time,
+        and four to one is a hazard and portability improvement rather than a
+        measured saving.
 
         `hist` is a device buffer of `3 * n_features * n_bins` Int32 words in
         `GpuHistogramBuilder`'s `[grad | hess | count]` layout, and `g_scale`
@@ -3638,21 +4320,30 @@ struct GpuSplitSearcher(Movable):
         `download_frontier`, which is one for the level rather than one per
         leaf.
 
-        It does transfer, and on Metal it therefore waits. The tables cross
-        in `_copy_tables` before the launches, and on Metal an
-        `enqueue_copy` is a synchronous full-queue drain in both directions,
-        measured by disassembly and recorded in `docs/GPU_PORTABILITY.md`
-        section 6.1. An earlier version of this line said "does not transfer
-        and does not synchronize", which was wrong on both halves. What this
-        entry point buys is one table crossing for a whole level instead of
-        one per node, which is still the point of it; what it does not buy
-        is a level with no host wait in it at all.
+        **The download per node is the part that is worth time**, because a
+        download is a round trip: the host reads a device answer and then
+        decides what to enqueue next. Removing about thirty of those per tree
+        **measured** 0.75 seconds at 1,000,000 x 50, resolved by a wide margin
+        (`bench/results/session3_2026-08-16/RESULTS.md`). That is the count
+        this entry point should be defended on.
 
-        That crossing is **one** copy with `hoist_tables` on and four with
-        it off. It was four unconditionally before the table-packing lane,
-        and `grow_tree_device_resident`'s per-tree wait count, which
-        attributed four of its sixteen to this call, is therefore thirteen
-        on the packed arm.
+        It does transfer, and on Metal it therefore drains. The tables cross
+        in `_copy_tables` before the launches, and on Metal an `enqueue_copy`
+        is a synchronous full-queue drain in both directions, **measured** by
+        disassembly and recorded in `docs/GPU_PORTABILITY.md` section 6.1. An
+        earlier version of this line said "does not transfer and does not
+        synchronize", which was wrong on both halves; a later one called that
+        drain a host wait, which section 6.1.1 withdrew on 2026-08-16. So a
+        level is not free of ordering points, and it is free of round trips
+        but one.
+
+        That crossing is **one** copy with `hoist_tables` on and four with it
+        off. It was four unconditionally before the table-packing lane, and
+        `grow_tree_device_resident`'s per-tree copy count, which attributed
+        four of its sixteen to this call, is therefore thirteen on the packed
+        arm. That is a hazard and portability count. Four to one bought
+        0.016 seconds across the whole thirteen-copy collapse, a null under
+        M0, and no part of it may be quoted as a saving.
 
         `hist` holds every node's histogram: the builder's single-node
         buffer when the batch has one node, and a multi-slot buffer
@@ -3786,6 +4477,7 @@ def reference_search(
     monotone: List[Int] = [],
     cats: CategoricalSpec = CategoricalSpec.none(),
     bounds: OutputBounds = OutputBounds.unbounded(),
+    gain_form: Int = DEFAULT_GAIN_FORM,
 ) raises -> GpuSplitRecord:
     """The kernels' arithmetic, run on the host over the same fixed-point
     histogram.
@@ -3797,6 +4489,13 @@ def reference_search(
     arithmetic. It is also what makes the analytical tests runnable on a
     machine with no accelerator, and it is the reference the device path is
     validated against before it replaces the host scan.
+
+    `gain_form` selects the same arm the kernels take and defaults to the
+    same one they default to, so the replica keeps replicating. Passing a
+    different arm here than the searcher is running is how a test compares
+    the two forms on one histogram without a device; passing a different one
+    by accident is how a host/device comparison fails for a reason that is
+    not about either of them.
     """
     if len(hist) != 3 * n_features * n_bins:
         raise Error("histogram must hold 3 * n_features * n_bins Int32 words")
@@ -3819,6 +4518,7 @@ def reference_search(
     var cat_smooth = Float32(params.cat.cat_smooth)
     var cat_l2 = Float32(params.cat.cat_l2)
     var constrained = len(monotone) > 0
+    var form = gpu_resolve_gain_form(Int32(gain_form), lambda_l1)
 
     var active = features.copy()
     if len(active) == 0:
@@ -3868,6 +4568,12 @@ def reference_search(
         var parent_score = gpu_leaf_score(
             total_g, total_h, lambda_l1, lambda_l2
         )
+        # The kernels' node constants, computed from the same totals by the
+        # same two functions. See `_scan_slot_kernel`.
+        var node_s = gpu_cross_node_s(total_h, lambda_l2)
+        var cross_offset = gpu_cross_offset(
+            total_g, total_h, lambda_l1, lambda_l2, lambda_l2, node_s
+        )
         var gain_here = Float32(0.0)
         # The same runner-up rule the kernel applies: the best gain among
         # every candidate this feature scored except the winner.
@@ -3895,15 +4601,24 @@ def reference_search(
                     var rc = tc - lc
                     if rc < min_data_in_leaf:
                         continue
-                    var rhf = total_h - lhf
+                    var rhf = gpu_right_sum(
+                        total_h, lhf, th, lh, h_inv, form
+                    )
                     if rhf < min_child_hess:
                         continue
                     var lgf = lg.cast[DType.float32]() * g_inv
-                    var rgf = total_g - lgf
-                    var gain = (
-                        gpu_leaf_score(lgf, lhf, lambda_l1, lambda_l2)
-                        + gpu_leaf_score(rgf, rhf, lambda_l1, lambda_l2)
-                        - parent_score
+                    var rgf = gpu_right_sum(total_g, lgf, tg, lg, g_inv, form)
+                    var gain = gpu_cat_gain(
+                        lgf,
+                        lhf,
+                        rgf,
+                        rhf,
+                        lambda_l1,
+                        lambda_l2,
+                        parent_score,
+                        node_s,
+                        cross_offset,
+                        form,
                     )
                     if gain > gain_here:
                         runner_here = gain_here
@@ -3947,6 +4662,13 @@ def reference_search(
                         sorted_bins[j + 1] = bv
 
                     var l2c = lambda_l2 + cat_l2
+                    # Children at `l2c` against a parent at `lambda_l2`, so
+                    # this walk gets its own node constants, exactly as in
+                    # `_scan_slot_kernel`.
+                    var cat_s = gpu_cross_node_s(total_h, l2c)
+                    var cat_offset = gpu_cross_offset(
+                        total_g, total_h, lambda_l1, lambda_l2, l2c, cat_s
+                    )
                     var max_num_cat = params.cat.max_cat_threshold
                     if (used + 1) // 2 < max_num_cat:
                         max_num_cat = (used + 1) // 2
@@ -3976,7 +4698,9 @@ def reference_search(
                             var rc = tc - lc
                             if rc < min_data_in_leaf or rc < min_group:
                                 break
-                            var rhf = total_h - lhf
+                            var rhf = gpu_right_sum(
+                                total_h, lhf, th, lh, h_inv, form
+                            )
                             if rhf < min_child_hess:
                                 break
                             if group < min_group:
@@ -3984,11 +4708,20 @@ def reference_search(
                             group = Int32(0)
 
                             var lgf = lg.cast[DType.float32]() * g_inv
-                            var rgf = total_g - lgf
-                            var gain = (
-                                gpu_leaf_score(lgf, lhf, lambda_l1, l2c)
-                                + gpu_leaf_score(rgf, rhf, lambda_l1, l2c)
-                                - parent_score
+                            var rgf = gpu_right_sum(
+                                total_g, lgf, tg, lg, g_inv, form
+                            )
+                            var gain = gpu_cat_gain(
+                                lgf,
+                                lhf,
+                                rgf,
+                                rhf,
+                                lambda_l1,
+                                l2c,
+                                parent_score,
+                                cat_s,
+                                cat_offset,
+                                form,
                             )
                             if gain > gain_here:
                                 runner_here = gain_here
@@ -4034,7 +4767,9 @@ def reference_search(
                     var dl_h = left_h + miss_h
                     var dl_c = left_c + miss_c
                     var dl_hf = dl_h.cast[DType.float32]() * h_inv
-                    var dr_hf = total_h - dl_hf
+                    var dr_hf = gpu_right_sum(
+                        total_h, dl_hf, th, dl_h, h_inv, form
+                    )
                     if not (
                         dl_hf < min_child_hess
                         or dr_hf < min_child_hess
@@ -4042,7 +4777,9 @@ def reference_search(
                         or tc - dl_c < min_data_in_leaf
                     ):
                         var dl_gf = dl_g.cast[DType.float32]() * g_inv
-                        var dr_gf = total_g - dl_gf
+                        var dr_gf = gpu_right_sum(
+                            total_g, dl_gf, tg, dl_g, g_inv, form
+                        )
                         var gain = gpu_split_gain(
                             gpu_soft_threshold_l1(dl_gf, lambda_l1),
                             dl_hf,
@@ -4054,6 +4791,9 @@ def reference_search(
                             bound_lo,
                             bound_hi,
                             constrained,
+                            node_s,
+                            cross_offset,
+                            form,
                         )
                         if gain > gain_here:
                             runner_here = gain_here
@@ -4071,7 +4811,9 @@ def reference_search(
 
                 if missing_bin < 0 or miss_c > Int32(0):
                     var lhf = left_h.cast[DType.float32]() * h_inv
-                    var rhf = total_h - lhf
+                    var rhf = gpu_right_sum(
+                        total_h, lhf, th, left_h, h_inv, form
+                    )
                     if lhf < min_child_hess or rhf < min_child_hess:
                         continue
                     if (
@@ -4080,7 +4822,9 @@ def reference_search(
                     ):
                         continue
                     var lgf = left_g.cast[DType.float32]() * g_inv
-                    var rgf = total_g - lgf
+                    var rgf = gpu_right_sum(
+                        total_g, lgf, tg, left_g, g_inv, form
+                    )
                     var gain = gpu_split_gain(
                         gpu_soft_threshold_l1(lgf, lambda_l1),
                         lhf,
@@ -4092,6 +4836,9 @@ def reference_search(
                         bound_lo,
                         bound_hi,
                         constrained,
+                        node_s,
+                        cross_offset,
+                        form,
                     )
                     if gain > gain_here:
                         runner_here = gain_here
@@ -4114,9 +4861,15 @@ def reference_search(
             rec.left = ChildStats(
                 Float64(lgf), Float64(lhf), Int(left_best_c)
             )
+            # The same right-hand rule the winning gain used; see
+            # `_scan_slot_kernel`.
             rec.right = ChildStats(
-                Float64(total_g - lgf),
-                Float64(total_h - lhf),
+                Float64(
+                    gpu_right_sum(total_g, lgf, tg, left_best_g, g_inv, form)
+                ),
+                Float64(
+                    gpu_right_sum(total_h, lhf, th, left_best_h, h_inv, form)
+                ),
                 Int(tc - left_best_c),
             )
         slot_records.append(rec^)

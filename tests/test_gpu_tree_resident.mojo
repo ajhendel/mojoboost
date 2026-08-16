@@ -21,8 +21,13 @@ one of them:
    sets it for **both** arms, so what is being compared is
    `grow_tree_device_resident` against `_device_search_resident`, which is the
    identity the module actually claims.
-2. `MOJOTREES_GPU_TREE_RESIDENT=1` has to be set, and the configuration has to
-   be one the plane accepts.
+2. The plane's own gate has to be on, and the configuration has to be one the
+   plane accepts. Since 2026-08-16 that gate is on **by default**
+   (`resident_round_enabled`, `MOJOTREES_GPU_TREE_RESIDENT != "0"`), so what
+   the comparisons below set by hand is the **off** arm, `=0`. Both arms are
+   named explicitly rather than one of them relying on a default, because
+   that default has already moved once and the whole value of this file
+   depends on the two arms differing.
 
 Forcing the first is necessary and is not sufficient, because a future refusal
 in the second, or a change to either gate, would route around the plane again
@@ -90,6 +95,17 @@ count wants text a test can read back. Truncated before each arm and read
 after it, so the two arms never share a record.
 """
 
+comptime _CENSUS_PATH = "./.test_gpu_tree_resident_census.tmp"
+"""Where the K=1 speculation census lands, which is deliberately not
+`_TRACE_PATH`.
+
+Two files rather than one because the separation is itself under test: the
+census has its own sink so that a census run's output holds one line per tree
+and nothing else, and so that a debugging trace is not doubled by an
+instrument that costs nothing to leave on. Pointing both at one path is a
+supported way to use them and is exactly what would hide a mistake here.
+"""
+
 comptime _PLANE_MARK = "plane=device-resident"
 """The token `grow_tree_device_resident` writes once per tree it grows.
 
@@ -151,6 +167,17 @@ def _both_planes(
     Both fits happen in one process against one dataset, so nothing about the
     environment differs between them beyond the gate itself.
 
+    **Both arms set the variable explicitly, and the off arm sets `0`.** It
+    used to set the empty string, on the reasoning that unset meant off. That
+    stopped being true on 2026-08-16, when the plane became the default: the
+    gate is now `!= "0"`, so an empty value selects the plane rather than the
+    fallback and this helper would have run the same plane twice and compared
+    it with itself. `_assert_plane_ran` would have caught it, because it
+    requires the off arm to trace **zero** trees, which is exactly the
+    two-sidedness that assertion was written for and exactly the failure it
+    was written against. The fix is to name the arm rather than to rely on a
+    default that has now moved once.
+
     `MOJOTREES_GPU_SPLIT_STRATEGY=device` is set for both arms and is not
     optional. Without it the automatic policy sends a fixture this size to the
     host histogram scan, which reaches neither the plane nor the loop the
@@ -166,7 +193,7 @@ def _both_planes(
     _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", _TRACE_PATH)
 
     _truncate_trace()
-    _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "")
+    _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "0")
     var host_plane = train_gpu(
         data, target, SQUARED_ERROR, params, bagging=bagging
     )
@@ -496,6 +523,77 @@ def test_a_refused_configuration_falls_back_rather_than_diverging() raises:
         _assert_same_forest(run.host, run.device, "monotone falls back")
 
 
+def test_the_default_path_refuses_by_name_and_says_so_only_in_the_trace() raises:
+    """The refusal path with **nobody having set the variable at all**.
+
+    This is the case the default flip created and the case the other
+    refusal test does not cover. `_both_planes` names both arms, so it only
+    ever exercises a refusal that was explicitly asked for; a monotone fit on
+    a machine where nobody has heard of `MOJOTREES_GPU_TREE_RESIDENT` now
+    reaches the gate too, and has to refuse just as correctly.
+
+    Three claims, and the third is the one that is easy to get wrong when a
+    default moves:
+
+    - the plane did not run, so a refused configuration is not being
+      approximated by it;
+    - the refusal named its own reason, so a fallback is diagnosable rather
+      than merely quiet; the reason is written to the trace sink, which is
+      how a default-path refusal is inspected;
+    - the reason is `monotone constraints` and not some other refusal that
+      happened to fire first, which is what makes this a test of the refusal
+      rather than a test that something refused.
+
+    What is asserted about standard output is nothing, because a test cannot
+    read it. The design that keeps it quiet is
+    `resident_round_explicitly_requested`, asserted directly in
+    `tests/test_gpu_resident_gate.mojo`; here the trace record standing in
+    for it is the observable half.
+    """
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 3_000
+        var n_features = 4
+        var features = _make_features(n_rows, n_features)
+        var target = _regression_target(features, n_rows)
+        var data = bin_equal_width(features, n_rows, n_features, 32)
+        var params = BoosterParams(4, 0.1, TreeParams(16, 20, 1.0, 1e-3))
+        params.tree.monotone = MonotoneConstraints.from_signs(
+            [1, 0, 0, 0], n_features
+        )
+
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "device")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", _TRACE_PATH)
+        # Deliberately NOT set: that is the whole point of this test.
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "")
+        _truncate_trace()
+        var booster = train_gpu(data, target, SQUARED_ERROR, params)
+        var text = _read_trace()
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", "")
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "")
+
+        assert_true(
+            len(booster.trees) > 0, "default refusal: the fit grew no trees"
+        )
+        assert_equal(
+            text.count(_PLANE_MARK),
+            0,
+            "default refusal: a refused configuration reached the plane",
+        )
+        assert_equal(
+            text.count("mojotrees.resident refused:"),
+            1,
+            "default refusal: the refusal should be reported once per fit,"
+            " not once per tree and not never",
+        )
+        assert_true(
+            text.find("mojotrees.resident refused: monotone constraints") >= 0,
+            "default refusal: the reason should name the constraint that"
+            " caused it, down to the layer that refused",
+        )
+
+
 def test_the_step_trace_shows_every_step_of_every_tree() raises:
     """The per-step trace, which is the only per-split view of this plane.
 
@@ -553,6 +651,119 @@ def test_the_step_trace_shows_every_step_of_every_tree() raises:
         assert_true(
             text.find("leaf slot=0 node=1") >= 0,
             "step trace: the frontier rows should be in the record",
+        )
+
+
+def test_the_speculation_census_reaches_the_plane_and_is_not_vacuous() raises:
+    """The K=1 speculation census is emitted by the plane, once per tree, into
+    its own sink, with a denominator that is not zero.
+
+    Why a denominator assertion is the load-bearing one here. The instrument
+    this file's own header describes -- six fixtures that all ran below the
+    gate they were meant to exercise -- failed by having nothing to measure
+    rather than by measuring wrongly, and it passed every assertion that only
+    checked a number came back. A census whose `builds` is zero on every tree
+    is that failure exactly: consumed over builds is undefined, the fit
+    reports nothing, and any assertion phrased as "a census line appeared"
+    still passes. So `builds` is asserted at its exact value, `steps - 1`,
+    which is a denominator this fixture is known to reach.
+
+    The second assertion is two-sided in the direction a fit can guarantee.
+    `wasted` is at least one on every tree with a build, always and
+    structurally: the build a step issues can only be consumed by the commit
+    after it, and the last growth step has no commit after it. So a census
+    that came back saying everything was consumed -- the constant-100-percent
+    instrument the registration warns about -- fails here. The other pole, a
+    census that can report a nonzero `consumed`, is not assertable from a fit
+    whose tree shape is not known in advance, and is proved instead by
+    `tests/test_gpu_speculation_census.mojo`, which runs the same function
+    over commit logs written out by hand at both poles and needs no device.
+
+    **This is not a test that a speculative build was consumed**, because no
+    speculative build is shipped. `gpu_resident_round.mojo` says what the
+    speculation needs from `gpu_active_rows.mojo` and `gpu_tree_tables.mojo`,
+    and states what the consumption test must assert once it exists: a device
+    counter incremented only on the consuming branch, downloaded with the
+    tables. Counting launches would not do it.
+
+    One round, one tree, because this exercises an instrument and not a model.
+    """
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 2_000
+        var n_features = 4
+        var features = _make_features(n_rows, n_features)
+        var target = _regression_target(features, n_rows)
+        var data = bin_equal_width(features, n_rows, n_features, 32)
+        var params = BoosterParams(1, 0.1, TreeParams(8, 20, 1.0, 1e-3))
+
+        with open(_CENSUS_PATH, "w") as handle:
+            handle.write(String(""))
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "device")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "1")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", _TRACE_PATH)
+        _ = setenv("MOJOTREES_GPU_SPECULATION_CENSUS", _CENSUS_PATH)
+        _truncate_trace()
+        var booster = train_gpu(data, target, SQUARED_ERROR, params)
+        var trace = _read_trace()
+        var census = open(_CENSUS_PATH, "r").read()
+        _ = setenv("MOJOTREES_GPU_SPECULATION_CENSUS", "")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT_TRACE", "")
+        _ = setenv("MOJOTREES_GPU_TREE_RESIDENT", "")
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "")
+
+        assert_true(len(booster.trees) > 0, "census: the fit grew no trees")
+        assert_equal(
+            trace.count(_PLANE_MARK),
+            len(booster.trees),
+            "census: the plane has to have run for its census to mean"
+            " anything",
+        )
+        assert_equal(
+            census.count("mojotrees.speculation "),
+            len(booster.trees),
+            "census: one census line per tree the plane grew",
+        )
+        # Its own sink, so a census run's file holds one line per tree and
+        # nothing else, and the trace is not doubled.
+        assert_equal(
+            trace.count("mojotrees.speculation "),
+            0,
+            "census: with its own sink named, the census must not also go to"
+            " the trace",
+        )
+        assert_equal(
+            census.count(_PLANE_MARK),
+            0,
+            "census: the census line must not carry the token this file"
+            " counts to prove the plane ran",
+        )
+        # The denominator, at its exact value. `num_leaves` is 8, so the
+        # schedule is seven growth steps and every step but the first issues
+        # one speculative build.
+        assert_equal(
+            census.count("steps=7 "),
+            len(booster.trees),
+            "census: seven growth steps for a budget of eight leaves",
+        )
+        assert_equal(
+            census.count(" builds=6 "),
+            len(booster.trees),
+            "census: six builds per tree, which is the denominator the"
+            " consumed fraction is taken over; a zero here is the vacuous"
+            " pass this assertion exists to catch",
+        )
+        assert_equal(
+            census.count(" wasted=0"),
+            0,
+            "census: the last step's build has no commit after it, so a tree"
+            " reporting no waste at all is an instrument that cannot come"
+            " back below one hundred percent",
+        )
+        assert_true(
+            census.find("k=1 ") >= 0,
+            "census: the line records which K produced it",
         )
 
 

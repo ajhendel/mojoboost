@@ -54,25 +54,55 @@ measured point rather than a fraction of it, because nothing smaller has
 been measured end to end and extrapolating down is precisely what this
 policy exists to refuse.
 
-**Why `auto` still picks the CPU anyway, on the very machine the rule was
-measured on.** A hardware-scoped rule can match only a device profile that
-names the hardware, and `DeviceCapabilities.detect()` opens no device. It
-yields `PROFILE_FALLBACK`, or `PROFILE_DECLARED` when an environment
-variable names an API but no generation, and neither carries an Apple
-generation for the rule to match. Only `from_profile`, fed by a caller
-holding an open `DeviceContext`, reaches `PROFILE_REPORTED`. Until the
-trainers pass what they read, a defaulted `fit` gets `WARN_UNKNOWN_HARDWARE`
-and the CPU.
+**Why `auto` could not pick the GPU at all until 2026-08-16, on the very
+machine the rule was measured on.** Three things stopped it, each sufficient
+on its own, and the transcript below is what the second-to-last state of it
+looked like.
 
-That is a real gap and it is written down here rather than hidden, because
-"the table is empty" and "the table has a rule that cannot be reached" are
-different states and only one of them is fixed by taking a measurement.
+1. A hardware-scoped rule can match only a device profile that names the
+   hardware, and `DeviceCapabilities.detect()` opens no device, so it
+   returned the portable fallback with `api = unknown`.
+   `CrossoverEvidence.matches` tests the API first, so the rule was declined
+   before the shape was ever compared. Identity now comes from the accelerator
+   this binary was *compiled for*, through the comptime
+   `_accelerator_arch()`, reported as `profile_source=build-target`. It costs
+   nothing and opens nothing. It is a property of the build rather than of the
+   machine, exactly as `has_accelerator()` already is, so a decision that
+   selects a backend on it carries `WARN_BUILD_TARGET_HARDWARE` saying so.
+2. `parse_apple_generation` could not parse `4-metal4`, which is the string a
+   Metal device actually reports through `DeviceContext.arch_name()`:
+   "metal4" ends in "l4", not "m4". So `GpuProfile.from_reported` turned a
+   genuine M4 reading into `apple_generation = unknown` and the generation
+   scope declined the rule a second time, for `capabilities_from_reported` and
+   `decide_device_report_reported` too, which are the entry points built for a
+   caller holding an open `DeviceContext`. Nothing caught it because
+   `apple_m4_observed()` hands `APPLE_GEN_M4` in through the fieldwise
+   constructor, so the tests asserting the rule fires were asserting it
+   against a value no detection path could produce.
+3. Every crossover rule is scoped to the objective it was measured on, and
+   `resolve_device` declares no objective unless one is passed. This one is
+   deliberate and is not being closed by weakening the scope: a caller that
+   did not say what it is training has not earned a claim measured on
+   something else. `resolve_device` now takes an optional `objective`, and
+   until the six trainer entry points that hold one start passing it, a
+   defaulted `fit(device='auto')` still gets the CPU. `resolve_device_full`,
+   `decide_device`, `decide_device_report`, and the Python
+   `device_selection.select_device` all take an objective and all reach the
+   rule today.
+
+The transcript below is the state before (1) and (2) were fixed. It is kept
+because "the table is empty", "the table has a rule that cannot be reached",
+and "the rule fired" are three different states, the report distinguishes
+them, and only the first is fixed by taking a measurement.
 
 No NVIDIA or AMD device has ever executed this code at all (see
 `docs/GPU_VALIDATION.md`, where every CUDA and HIP row still reads
 **not run**), so no rule can exist for either.
 
 ```text
+# Historical: policy version 2, before 2026-08-16. The same request today
+# reports profile_source 'build-target', api metal, apple m4, and resolves
+# to GPU with decision 'auto-gpu-evidence'.
 device='auto' resolved to CPU.
 
 Device      accelerator available, metal, Apple M4
@@ -92,8 +122,10 @@ Why
 
 Note which half of "does not cover" fired. The shape above is exactly the
 shape the one rule was measured at, and the rule still did not match,
-because the profile named no hardware. That is the gap described above, and
-the report says so rather than implying the shape was too small.
+because the profile named no hardware. That the report said which half is
+what made the gap findable at all: it never implied the shape was too small.
+Under policy version 3 the same request names the hardware and matches, and
+a report that still says "does not cover" now means the shape.
 
 ## Hard blocks and soft uncertainty
 

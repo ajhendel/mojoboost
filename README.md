@@ -997,15 +997,29 @@ section of [docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md)), and every
 other backend, Apple generation, objective, smaller shape, and multiclass
 falls through to the CPU because nothing measured them.
 
-In practice a defaulted `fit(device="auto")` still gets the CPU with a
-warning, on the very machine the rule was measured on, and this is a real
-gap rather than caution. A hardware-scoped rule can match only a device
-profile that names the hardware, and `DeviceCapabilities.detect()` opens no
-device, so it yields an unidentified profile that no scoped rule can match.
-Only a caller holding an open `DeviceContext` and feeding `from_profile`
-reaches a profile the rule can see, and the trainers do not yet pass what
-they read. Until they do, `auto` reports `WARN_UNKNOWN_HARDWARE` and keeps
-the CPU, which is the honest answer to "I do not know what device this is".
+Below that shape the CPU is the measured winner rather than merely the
+untested one: at 250,000 x 50 it is 1.66s against the GPU's 1.89s and at
+50,000 x 50 it is 0.564s against 1.63s, because the device carries about
+1.5s of fixed cost per fit. The crossover itself lies somewhere in
+(250,000, 1,000,000] rows and has not been bracketed, so the rule's floor
+sits at the top of that interval.
+
+Two things about how `auto` identifies the hardware. The API and Apple
+generation come from the accelerator this binary was *compiled for*, through
+the comptime `_accelerator_arch()`, because probing costs a device open that
+a decision cannot afford; the decision reports `profile_source=build-target`
+and carries `WARN_BUILD_TARGET_HARDWARE`, since a wheel built for one chip
+and run on another will believe it is still on the first. A caller holding an
+open `DeviceContext` can pass what it read to
+`decide_device_report_reported`, and that reading outranks the build target.
+
+And a defaulted `fit(device="auto")` still gets the CPU at every shape, for
+one remaining reason: every rule is scoped to the objective it was measured
+on, and `resolve_device`'s four-argument form declares no objective, so it
+cannot inherit a squared-error measurement. That gate is deliberate.
+`resolve_device_full`, `decide_device_report`, and the Python
+`device_selection.select_device` all take an objective and all reach the rule
+today; the trainer entry points hold one and do not yet pass it.
 
 `MOJOTREES_AUTO_MIN_CELLS` is the escape hatch, an
 integer cell count (`n_rows * n_features`) at or above which `auto`
@@ -1105,9 +1119,12 @@ tile size are runtime values here rather than compile-time ones.
 1. Connect what is already written. The repository has grown faster than
    its call graph: several capability families are implemented, compile,
    and are reached by no entry point at all, including packed-bin GPU
-   layout, hybrid CPU and GPU leaf
-   placement, the sparse and categorical GPU kernels,
+   layout, the sparse and categorical GPU kernels,
    DART and random forest, CEGB, and LightGBM model file interop.
+   Hybrid CPU and GPU leaf placement left this list by deletion rather than
+   by connection on 2026-08-16: the device-resident tree plane beats the
+   host path at every measured shape, so there is no leaf left for the host
+   to usefully take.
    Class-batched multiclass rounds have since gained a call site behind
    `MOJOTREES_GPU_CLASS_BATCH`, and batching seven classes measured
    indistinguishable from the sequential schedule (15.45 against 15.30

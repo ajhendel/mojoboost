@@ -1949,7 +1949,13 @@ def train_external(
     var data = dataset.materialize_binned(max_bytes)
     var fields = dataset.row_fields()
     _check_labels(fields.label, data.n_rows)
-    var backend = resolve_device(device, data.n_rows, data.n_features, 1)
+    # The objective travels with the shape, because every crossover rule in
+    # `device_policy` is objective-scoped: a rule that was measured on squared
+    # error may not speak for logistic. Dropping it here is what made
+    # `auto` decline the GPU at every shape, one of three independent causes.
+    var backend = resolve_device(
+        device, data.n_rows, data.n_features, 1, objective
+    )
     var booster: Booster
     if backend == GPU_DEVICE:
         if len(fields.init_score) != 0:
@@ -1999,8 +2005,9 @@ def train_external_multiclass(
             " per row cannot say what each class starts from"
         )
     var backend = resolve_device(
-        device, data.n_rows, data.n_features, n_classes
-    )
+        device, data.n_rows, data.n_features, n_classes, MULTICLASS
+    )  # MULTICLASS is the registry's code for a softmax fit, which this
+    # entry point is by construction and takes no objective argument for.
     var booster: MulticlassBooster
     if backend == GPU_DEVICE:
         booster = train_multiclass_gpu(

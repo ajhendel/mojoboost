@@ -67,7 +67,7 @@ paths = [
 ]
 jobs = ["native:compile-package"]
 escalate = ["differential:backend-equivalence", "differential:gpu-training", "hardware:gpu-suites"]
-note = "Every module these four lanes wrote is in the gap list in subsystems.toml: no suite imports gpu_leaf_batching, gpu_levelwise, gpu_multiclass_batch, hybrid_leaf_scheduler, or levelwise_policy. A compile is the only focused evidence available until a caller and a suite exist. The escalations become the right answer the moment one of these is wired into the grower."
+note = "Every module these four lanes wrote is in the gap list in subsystems.toml: no suite imports gpu_leaf_batching, gpu_levelwise, gpu_multiclass_batch, or levelwise_policy. A compile is the only focused evidence available until a caller and a suite exist. The escalations become the right answer the moment one of these is wired into the grower. The fourth lane's module, hybrid_leaf_scheduler.mojo, was deleted 2026-08-16; its handoff stays here as the record of what was built and why it was retired."
 
 [[handoff]]
 paths = ["handoffs/algorithm_23_fused_round.md"]

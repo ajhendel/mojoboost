@@ -1,34 +1,38 @@
-"""The host fixed-point replica builder and hybrid leaf scheduling.
+"""The host fixed-point replica builder: the oracle the GPU path is checked
+against.
+
+This file was `test_hybrid_replica.mojo` until 2026-08-16, when the hybrid
+CPU/GPU leaf scheduler was deleted. The scheduler was one caller of the
+replica; it was never the reason the replica exists. docs/ARCHITECTURE.md
+names the CPU trainer as "the reference implementation the GPU path is
+verified against", and `build_histogram_subset_replica_into` is the only
+thing in the package that replays the device's histogram pipeline on the
+host bit for bit — same Float32 inputs, same scale, Int32 accumulation,
+same dequantization. A trace says what the device did; only this says
+whether it was right. So the replica and its tests outlive the scheduler
+and the fit-equivalence case that went with it.
 
 Three claims, in the order they build on each other. The replica builder
 reproduces its own specification on the CPU (shape, feature subsetting,
 determinism). The replica reproduces the device's histograms bit for bit on
-this hardware — experiment E2 of docs/design/HYBRID_TRAINING.md §9, the
-claim `MODE_REPLICA` substitutes under. And a fit grown with hybrid
-scheduling enabled is bit-identical to the pure-device fit, which is the
-whole safety contract of the integration in `grow_tree_gpu`. A fourth
-extends the third to device-produced gradients (`stage_from_device`), the
-path the unbagged built-in objectives take.
+this hardware — experiment E2 of docs/design/HYBRID_TRAINING.md §9. And the
+same holds over device-produced gradients once `stage_from_device` has read
+them back, which is the path the unbagged built-in objectives take.
 
 GPU cases skip (passing) when no accelerator is present.
 """
 
-from std.os import setenv
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojotrees.bagging import BaggingParams
 from mojotrees.binning import BinnedMatrix
-from mojotrees.boosting import SQUARED_ERROR, BoosterParams
+from mojotrees.boosting import SQUARED_ERROR
 from mojotrees.histogram import (
     Histogram,
     build_histogram_subset_into,
     build_histogram_subset_replica_into,
 )
 from mojotrees.histogram_gpu import GpuHistogramBuilder
-from mojotrees.hybrid_leaf_scheduler import REPLICA_VERIFIED
-from mojotrees.train_gpu import grow_tree_gpu, train_gpu
-from mojotrees.tree import TreeParams
 from support import _splitmix64, _uniform
 
 
@@ -202,99 +206,12 @@ def test_replica_matches_device_bitwise() raises:
         assert_true(refused)
 
 
-def test_hybrid_replica_training_is_bit_identical() raises:
-    """A fit with hybrid scheduling on (replica mode, measured costs) grows
-    the same model as the pure-device fit, prediction for prediction — and
-    the mirror comparison actually ran and verified the replica."""
-    comptime if not has_accelerator():
-        pass
-    else:
-        var n_rows = 6000
-        var n_features = 8
-        var n_bins = 63
-        var data = BinnedMatrix(
-            _make_bins(n_rows, n_features, n_bins), n_rows, n_features, n_bins
-        )
-        var target = List[Float64](capacity=n_rows)
-        for r in range(n_rows):
-            var b0 = Float64(data.bin_at(r, 0))
-            var b1 = Float64(data.bin_at(r, 1))
-            target.append(
-                0.15 * b0 - 0.07 * b1 + _uniform(UInt64(r) + 0x991) * 0.1
-            )
-
-        var params = BoosterParams(8, 0.1, TreeParams(31, 5, 1.0, 1e-3))
-        # Bagged on purpose: an unbagged built-in objective generates its
-        # gradients on the device, where hybrid scheduling correctly
-        # declines (`DECLINE_GRADIENTS_ON_DEVICE`). Bagging keeps the
-        # gradients host-staged, which is the intersection the design
-        # names, so these fits actually exercise the host builds.
-        var bagging = BaggingParams(0.8, 1, 7)
-
-        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
-        _ = setenv("MOJOTREES_HYBRID_COSTS", "")
-        var baseline = train_gpu(
-            data, target, SQUARED_ERROR, params, bagging=bagging
-        )
-
-        _ = setenv("MOJOTREES_HYBRID_LEAVES", "replica")
-        _ = setenv("MOJOTREES_HYBRID_COSTS", "apple-m4")
-        var hybrid = train_gpu(
-            data, target, SQUARED_ERROR, params, bagging=bagging
-        )
-
-        # Mirror mode must also change nothing: the device's histogram is
-        # the one consumed by construction.
-        _ = setenv("MOJOTREES_HYBRID_LEAVES", "mirror")
-        var mirrored = train_gpu(
-            data, target, SQUARED_ERROR, params, bagging=bagging
-        )
-
-        # The grower must actually have scheduled host work on this shape:
-        # a mirror comparison ran, passed, and flipped the builder to
-        # verified. Checked on a directly grown tree so the builder is
-        # observable.
-        _ = setenv("MOJOTREES_HYBRID_LEAVES", "replica")
-        var builder = GpuHistogramBuilder(data)
-        var grad = List[Float64](capacity=n_rows)
-        var hess = List[Float64](capacity=n_rows)
-        for r in range(n_rows):
-            grad.append(target[r])
-            hess.append(1.0)
-        builder.upload_gradients(grad, hess)
-        builder.begin_tree()
-        _ = grow_tree_gpu(builder, params.tree, [], 0, data=data)
-        assert_equal(builder.replica_state, REPLICA_VERIFIED)
-
-        # With the claim verified, a replica tree substitutes host builds
-        # for the leaves the cost model places there — and must be the same
-        # tree, node for node, as the pure-device grower's.
-        builder.begin_tree()
-        var t_hybrid = grow_tree_gpu(builder, params.tree, [], 1, data=data)
-        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
-        builder.begin_tree()
-        var t_plain = grow_tree_gpu(builder, params.tree, [], 1)
-        assert_equal(t_hybrid.n_leaves, t_plain.n_leaves)
-        assert_equal(len(t_hybrid.value), len(t_plain.value))
-        for i in range(len(t_plain.value)):
-            assert_equal(t_hybrid.value[i], t_plain.value[i])
-            assert_equal(t_hybrid.left[i], t_plain.left[i])
-            assert_equal(t_hybrid.right[i], t_plain.right[i])
-
-        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
-        _ = setenv("MOJOTREES_HYBRID_COSTS", "")
-
-        for r in range(n_rows):
-            var pb = baseline.predict_raw_row(data, r)
-            assert_equal(pb, hybrid.predict_raw_row(data, r))
-            assert_equal(pb, mirrored.predict_raw_row(data, r))
-
-
-def test_hybrid_reaches_device_gradients() raises:
+def test_replica_reaches_device_gradients() raises:
     """The unbagged built-in objective computes its gradients on the device;
     `stage_from_device` reads the exact Float32 back, so the replica has the
-    same inputs as the kernels, and a hybrid fit on that path is still
-    bit-identical to the pure-device fit."""
+    same inputs as the kernels and reproduces the device build over
+    device-made gradients. Before the readback the replica must refuse
+    rather than accumulate a stale round."""
     comptime if not has_accelerator():
         pass
     else:
@@ -337,23 +254,6 @@ def test_hybrid_reaches_device_gradients() raises:
         var device = builder.build_leaf(0)
         builder.build_leaf_host_replica(host, fixed, data, rows, 0, n_rows)
         _histograms_equal(device, host)
-
-        # And the fit: unbagged, so `train_gpu` takes the device-objective
-        # path, which hybrid scheduling could not reach before the readback.
-        var params = BoosterParams(8, 0.1, TreeParams(31, 5, 1.0, 1e-3))
-        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
-        _ = setenv("MOJOTREES_HYBRID_COSTS", "")
-        var baseline = train_gpu(data, target, SQUARED_ERROR, params)
-        _ = setenv("MOJOTREES_HYBRID_LEAVES", "replica")
-        _ = setenv("MOJOTREES_HYBRID_COSTS", "apple-m4")
-        var hybrid = train_gpu(data, target, SQUARED_ERROR, params)
-        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
-        _ = setenv("MOJOTREES_HYBRID_COSTS", "")
-        for r in range(n_rows):
-            assert_equal(
-                baseline.predict_raw_row(data, r),
-                hybrid.predict_raw_row(data, r),
-            )
 
 
 def main() raises:

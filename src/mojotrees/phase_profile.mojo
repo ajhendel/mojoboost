@@ -62,17 +62,19 @@ builds a root, a half, and a tenth. This module is the in-run complement --
 same stages, real trees, every node, and a size breakdown -- and neither
 replaces the other.
 
-`hybrid_leaf_scheduler.HybridCosts` is the fourth, and the buckets here are
-deliberately legible against it. That model prices a node's build as a fixed
-part (`launch_nanos`, `sync_nanos`, `host_fixed_nanos`), a per-cell part
+`HybridCosts`, in the hybrid leaf scheduler deleted on 2026-08-16, was the
+fourth, and the buckets here were made deliberately legible against it. Its
+calibrated coefficients survive in
+`bench/results/apple_m4_hybrid_costs_2026-08-15.md`. That model priced a
+node's build as a fixed part
+(`launch_nanos`, `sync_nanos`, `host_fixed_nanos`), a per-cell part
 (`convert_nanos_per_kcell`, `host_zero_nanos_per_kcell`) and a per row-slot
 part (`device_nanos_per_krow_slot`, `host_nanos_per_krow_slot`), where a *row
 slot* is one (row, active feature) pair. So this module records rows, row
 slots, and cells side by side and reports nanoseconds per thousand of each,
-which is the unit those coefficients are already stated in. A calibration run
-(`bench/bench_hybrid_costs.mojo`) and a profile run can be laid next to each
-other without either being converted. That comparison has not been done and
-nothing here says how it would come out.
+which is the unit those coefficients are stated in, and a profile row can
+still be read against that recorded calibration without conversion. The
+comparison was never done, and nothing here says how it would come out.
 
 `PROF_HIST_ALLOC`, `PROF_SUBTRACT`, and `PROF_CONVERT` are separate from
 `PROF_HISTOGRAM` for the same reason: each is a per-cell cost where the
@@ -183,10 +185,16 @@ integer parse would turn a typo into a default:
 
   Two Metal-specific corrections to that picture, both measured by
   disassembly and written out in `docs/GPU_PORTABILITY.md` section 6. First,
-  the download is not the only phase that waits: `enqueue_copy` is a
+  the download is not the only phase that drains: `enqueue_copy` is a
   synchronous full-queue drain in *both* directions, so every upload charged
-  to `PROF_TRANSFER` is a wait too, and an `async` profile on Metal is
-  already partly fenced by its own uploads. Second, a launch stream longer
+  to `PROF_TRANSFER` fences too, and an `async` profile on Metal is already
+  partly fenced by its own uploads. That is a statement about *ordering*, not
+  about cost: section 6.1.1 records that a drain of a queue holding nothing
+  costs nothing, and that the download is a **round trip** where the uploads
+  are not. So an upload's fencing effect is what shifts device time into
+  whichever phase's clock closes over it; it is not itself a charge, and a
+  `PROF_TRANSFER` total should not be read as a count of copies times a
+  per-copy price. Second, a launch stream longer
   than 64 command buffers backpressures inside `objc_msgSend`, which this
   profiler counts as enqueue time with no attribution, so a rising enqueue
   clock on a long unwaited stream is the host blocking and not the device
@@ -555,9 +563,10 @@ def _per_thousand(nanos: Int, units: Int) -> Float64:
     """Nanoseconds per thousand units, three decimal places, or 0.0 when no
     units were counted.
 
-    Per *thousand* because that is the unit every rate in
-    `hybrid_leaf_scheduler.HybridCosts` is stated in, so a profile row and a
-    calibrated coefficient can be read against each other with no conversion.
+    Per *thousand* because that is the unit every rate in the recorded M4
+    calibration (`bench/results/apple_m4_hybrid_costs_2026-08-15.md`) is
+    stated in, so a profile row and a calibrated coefficient can be read
+    against each other with no conversion.
     """
     if units == 0:
         return 0.0
@@ -898,8 +907,9 @@ struct PhaseProfile(Copyable, Movable):
 
         Times are nanoseconds, integers, exactly as counted. The three derived
         columns are nanoseconds per thousand rows, per thousand row slots, and
-        per thousand cells, which are the units
-        `hybrid_leaf_scheduler.HybridCosts` states its coefficients in. Each
+        per thousand cells, which are the units the recorded M4 calibration
+        (`bench/results/apple_m4_hybrid_costs_2026-08-15.md`) states its
+        coefficients in. Each
         is 0.0 where nothing was counted, and a 0.0 there is an absence rather
         than a measured zero. `pct` is the cell's share of attributed time.
 

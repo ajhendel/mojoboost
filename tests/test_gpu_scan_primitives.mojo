@@ -8,7 +8,7 @@ with two barriers per doubling step. The whole point of the lane is that the
 choice is invisible: the packed offset word, the block sums, the scatter, and
 therefore the permutation and the left count are meant to be byte for byte
 identical, so that the row order a node's compacted range holds is still the
-row order the CPU grower's row list holds, which the hybrid leaf scheduler
+row order the CPU grower's row list holds, which `tests/test_host_replica.mojo`
 verifies bit for bit and `readback_range` hands to a host histogram build.
 
 An equivalent permutation would not do. These tests therefore assert element

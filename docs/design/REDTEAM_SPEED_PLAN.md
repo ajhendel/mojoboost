@@ -80,6 +80,18 @@ blocking waits too. A device-resident tree that removes only the downloads
 leaves the uploads in place, and MAX offers no asynchronous copy, no Metal
 stream, and no Metal graph builder to replace them with.
 
+> **Annotation, 2026-08-16: this verdict is withdrawn along with O6, which it
+> summarizes.** The disassembly stands. "Blocking waits too" does not: a drain
+> of a queue holding nothing costs nothing, and the uploads are behind nothing.
+> **Measured**, removing thirteen copies per tree, nine of them uploads, bought
+> 0.016 seconds against 0.64 predicted, a null under M0; removing about thirty
+> **round trips** per tree bought 0.75 seconds, resolved
+> (`bench/results/session3_2026-08-16/RESULTS.md`,
+> `docs/GPU_PORTABILITY.md` section 6.1.1). Removing only the downloads was
+> removing the round trips, so the plan was aimed at the half that pays. The
+> paragraph is left in place because it is what the red team registered before
+> the data.
+
 **Step 1's direction is right and should be pursued anyway.** 32.1 blocking
 readbacks per round is indefensible, the mechanism is correctly identified, and
 the money is real. It is worth about 1.33 seconds at every shape. It is not
@@ -548,7 +560,43 @@ process, five repeats, GPU performance state printed before and after, at 50k,
 250k, and 1M. Until that exists there is no defensible statement about how far
 behind LightGBM we are at any shape.
 
-### O6. Half the drains are uploads, and on Metal there is no asynchronous copy to replace them with
+### O6. ~~Half the drains are uploads, and on Metal there is no asynchronous copy to replace them with~~ STRUCK 2026-08-16
+
+> **STRUCK, 2026-08-16, and the reason is a measurement.** O6's mechanism is
+> right and is not what is struck. Its **premise** is that because an upload
+> drains, an upload is a wait, so the plan's failure to remove uploads leaves
+> money on the table and removing them would be a prize. That premise was
+> registered as a prediction in `bench/results/SESSION_QUEUE.md` and measured
+> in Session III: removing thirteen copies per tree, nine of them uploads,
+> **measured** 0.016 seconds at 1,000,000 x 50 against a predicted 0.64, which
+> is a null under M0 (`bench/results/session3_2026-08-16/RESULTS.md`).
+> `docs/GPU_PORTABILITY.md` section 6.1.1 records the withdrawal.
+>
+> There is no prize in the uploads. Draining a queue that holds nothing costs
+> nothing, and nothing is queued behind a table upload. What costs is the
+> **round trip**, which is what the plan was removing all along, and the same
+> session measured that at 0.75 seconds, resolved. **So the plan's mechanism,
+> which O6 called half-aimed, was aimed at the right half.** O6 is struck in
+> the direction of the plan.
+>
+> What survives O6 and is not struck:
+>
+> - the disassembly, which is correct and is now section 6.1;
+> - "the docstring is wrong", which was true and has since been fixed in
+>   `gpu_split_search.mojo`;
+> - the ordering consequence, that an upload fences the queue and therefore
+>   bounds how deep a launch stream can get;
+> - the portability consequence, that MAX offers no asynchronous copy, no
+>   Metal stream and no `MetalDeviceGraphBuilder`, so a design that needs an
+>   asynchronous upload has nothing to build it from here.
+>
+> Those are hazard and portability findings and they should still be honored.
+> The check O6 proposed, splitting the blits by direction, is no longer worth
+> running: the direction split does not change the answer, because neither
+> direction of copy predicts time. **The text below is left unedited.** A
+> refuted objection that was registered and then measured is the record of a
+> working process, and editing it to look right in hindsight destroys the only
+> thing writing it down was for.
 
 **P(right) 0.85, from disassembly of the shipped runtime. Damage: medium to
 high, and it cuts both ways.**
@@ -880,6 +928,14 @@ comparison instead, and somebody has to decide what tolerance means for a chosen
 bin index, which is a discrete quantity where "close" has no meaning. Two splits
 that differ by one bin are not approximately equal, they are different trees.
 
+*Dated note, 2026-08-16.* The hybrid scheduler discussed in the next
+paragraph has been deleted. The argument above is unaffected and was in fact
+acted on: `histogram.build_histogram_subset_replica_into` was kept precisely
+because this section names it as the project's oracle, and
+`tests/test_host_replica.mojo` is where it is now asserted. The observation
+point this section says a device-resident tree removes is therefore still
+standing on the host side.
+
 There is one piece of good news here worth recording. The hybrid scheduler
 already fails safe rather than fails wrong. `MODE_MIRROR` compares and discards,
 so a mismatch is a diagnostic; `MODE_REPLICA` is downgraded to mirror for its
@@ -1179,7 +1235,10 @@ transition unchanged. Four named mechanisms in this document say it might not:
 worst-case grids taxing every dispatch (O7), the small-leaf tail becoming
 host-submission bound (O10 and 4.2), the 64-deep command queue throttling the
 launch stream (4.3), and the staging uploads that remain synchronous whatever
-happens to the downloads (O6). Each is individually plausible and each moves the
+happens to the downloads (O6, **struck 2026-08-16: measured at 0.016 seconds
+for thirteen copies per tree, a null; it does not bite and it never could,
+because a drain of an empty queue costs nothing**). Each is individually
+plausible and each moves the
 floor the wrong way. If two of the four bite, the device-resident tree lands at
 2.6 to 3.0 seconds at one million rows, which is **no better than today**, and
 the project will have spent weeks moving a bottleneck rather than removing it.
@@ -1231,7 +1290,7 @@ sweep is the only new number that changes what should be built.
 | O3 | `grow_policy=depthwise` on the shipped resident loop already removes ~78% of the waits. Benchmarked 2026-08-15 and upheld: 2.587s against leaf-wise's 3.756s at 1,000,000 x 50, within 2 percent of the prediction, and ahead of LightGBM. Quality still unmeasured | 0.70 | very high | done, see O3 |
 | O4 | The roofline and slope figures do not exist and the real slopes point the other way | 0.95 | high | ask for the derivation |
 | O5 | Every LightGBM number is one repeat, cross-process, no clock record; the 50k win is inside noise | 0.95 | med-high | interleaved sweep with LightGBM as an arm |
-| O6 | `enqueue_copy` is a synchronous drain in both directions, so the staging uploads block too and the plan addresses only the downloads | 0.85 | med-high | split the 3,206 blocking blits by direction, on the trace already on disk |
+| O6 | **STRUCK 2026-08-16.** `enqueue_copy` is a synchronous drain in both directions, so the staging uploads block too and the plan addresses only the downloads. The mechanism holds; the premise that an upload drain is a wait was measured and is a null (0.016s for thirteen copies per tree against 0.64 predicted). The plan was aimed at the right half. See O6 | ~~0.85~~ 0 | none | none; the direction split would not change the answer |
 | O7 | No indirect dispatch, so the counts that size two grids ride in the record the plan wants to stop downloading | 0.85 | high | confirm with Modular; price worst-case grids |
 | O8 | The relaxed promise is misidentified; row blocks break within-backend determinism unless the block count ignores worker count | 0.95 | medium | state the block decomposition rule |
 | O9 | Real covertype says the GPU loses multiclass to our own CPU, opposite of the synthetic result | 1.0 (fact) | high | Metal capture of the covertype run |
@@ -1258,8 +1317,14 @@ Stated in advance so this document can be falsified rather than argued with.
   does not.
 - A back-to-back submission microbenchmark flat to 22,000 command buffers removes
   4.3 and softens O10 and 4.2.
-- A direction split of the 3,206 blocking blits showing that nearly all of them
-  are downloads removes O6 and makes the plan's mechanism complete as stated.
+- ~~A direction split of the 3,206 blocking blits showing that nearly all of them
+  are downloads removes O6 and makes the plan's mechanism complete as stated.~~
+  **Superseded 2026-08-16.** The direction split was never taken and is no
+  longer worth taking. A stronger check was run instead: the uploads were
+  actually removed and the fit was timed. Thirteen copies per tree, nine of
+  them uploads, **measured** 0.016 seconds at 1,000,000 x 50, a null under M0.
+  O6 is removed by the A/B rather than by the count, and the plan's mechanism
+  is complete as stated.
 - An interleaved LightGBM measurement at five repeats reproducing 2.858 within a
   few percent removes most of O5, and I would then argue only about the target
   rather than the baseline.

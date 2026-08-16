@@ -1,3 +1,52 @@
+# HOW TO TAKE A NUMBER
+
+This checklist is the protocol. Everything below it is the reasoning, the
+history, and the decision rules, and it is worth reading once. This part is worth
+reading every time, which is why it is ten lines and sits at the top: a protocol
+that must be read in full before each use is one that gets skimmed.
+
+1. **Take the lock** if you are timing: `/tmp/mojotrees-bench.lock`, `mode:
+   timing` only, your addressable session name, what and an ETA. Compiles proceed
+   freely; timing does not. See `MACHINE_LOCK.md`.
+2. **Record the box** before the first arm and after the last: `uptime`, and
+   `ps -Ao pcpu,comm | sort -rn | head`. Record it even when it looks fine. A
+   quiet box can still be a slow one, and load alone will not tell you, so the
+   regime label comes from the arms moving together (A3) and not from these two
+   commands. They establish contention, which is a different question.
+3. **Interleave arms in one process** where the harness allows. Alternating
+   processes turns a neighbour's build into your result.
+4. **Five pairs minimum**, and read the verdict off **M0** as amended by **A2**:
+   resolved by spread, or resolved by the sign of the per-pair difference.
+5. **Label every number** `measured` / `fitted` / `derived bound` / `estimated`,
+   every time it appears.
+6. **Label the regime.** Effect sizes move with machine state, not just levels.
+   Where they differ, report both and refuse to pick one.
+7. **A null in a dirty or slow window closes nothing.** It defers. Retake before
+   using it to cancel a lane. (A3)
+8. **Compare against the comparator at its best**, not at a configuration we
+   pinned for our own convenience. See the comparator rule below.
+9. **Register the prediction and its falsification before the data**, in this
+   file, and do not edit either afterwards. A refuted registered prediction is
+   the process working.
+10. **Write the results file before interpreting any of it.**
+
+## The comparator rule
+
+`scenarios.LIGHTGBM_ALIGNMENT` pins `force_row_wise = True`, and that pin stays:
+on auto, LightGBM spends its first iterations timing both builders and that
+one-off lands inside the measured region, which would flatter us.
+
+But a pin we chose is not a fair comparator. **The rule is LightGBM's better
+pinned builder at each shape**, measured once per shape and recorded beside the
+result. Then "ahead by X" means ahead of LightGBM at its best, which is the only
+form of the claim that survives an outside reader running LightGBM themselves.
+
+Every LightGBM figure this repository has recorded to date was taken row-wise,
+including the 2.767 that framed a week of work. Until each shape has its builder
+measured, every margin carries that caveat explicitly.
+
+---
+
 # Profile session protocol, and the decisions it settles
 
 Written **before** the session ran, deliberately. The point of committing this
@@ -313,6 +362,30 @@ last, and records that it did.
 
 ## M3. The prediction, registered before the data
 
+> **Annotation, 2026-08-16. This prediction was measured and refuted. It is
+> left exactly as registered.** The measurement is 0.016 seconds against the
+> 0.64 below, a null under M0 (`session3_2026-08-16/RESULTS.md`); the
+> withdrawal of the model it rests on is `docs/GPU_PORTABILITY.md` section
+> 6.1.1. The falsification condition M3 states in its last paragraph fired as
+> written.
+>
+> Worth recording precisely, because M3 did name its own weakest assumption and
+> was half right about it. It predicted the failure mode as *per-copy cost
+> depending on size after all*. That is not what happened. Byte count is
+> irrelevant, as this document assumed; what is wrong is applying a
+> per-synchronization constant to a copy at all. The 458 microseconds is
+> **derived** from the depthwise A/B, and what that A/B removed were per-level
+> **round trips** — host code blocking on a device answer it needs before it
+> can decide what to enqueue next. A copy that drains a queue holding nothing
+> is not a round trip and costs nothing. The constant remains correct for round
+> trips: removing about thirty per tree **measured** 0.75 seconds in the same
+> session, resolved.
+>
+> The rule for the next registration: count round trips to predict time, count
+> copies to predict portability risk and ordering hazards, and never quote a
+> copy count times a per-synchronization constant as a predicted saving. Text
+> below unedited.
+
 **Corrected before any data was taken, and the error is worth keeping visible.**
 The brief for the tables lane said eleven waits removed. It is ten. Six
 downloads becoming one saves five, not six, and five plus five is ten. The lane
@@ -415,13 +488,41 @@ discovered in a postmortem.
    else's in-flight work. The file ownership table is load-bearing.
 2. **A second orchestrator is running the GPU campaign on the same box.**
    Agreed with it, in writing, before this round starts:
-   - `/tmp/mojotrees-bench.lock` gains a `mode:` field. `timing` is exclusive
-     and short and outranks `lanes`; `lanes` is long, yieldable, and is a
-     notice that the box is dirty rather than a claim on it. Neither session
-     times against a lock it does not hold.
-   - The lock covers **compiling lanes**, not only benchmark runs. Two numbers
-     have already been discarded in this project for being taken while agents
-     compiled, one at 18.6 percent spread.
+   - **There is a measurement lock, and this bullet used to deny it.** As
+     originally written it read "There is no measurement lock", recording that
+     one had been negotiated between the two orchestrators and then overruled,
+     that `/tmp/mojotrees-bench.lock` was deleted, and that neither session
+     would recreate it. That was true for one interval on the night of
+     2026-08-16 and is not true now: the lock was reinstated in a narrower form
+     the same night, `mode: timing` only, and `MACHINE_LOCK.md` is the
+     authority on it. The instruction audit found the file present and held
+     while three passages of this repository disagreed about whether it
+     existed.
+
+     The correction is kept visible rather than silently overwritten, because
+     the justification this bullet gave for recording the absence — "a protocol
+     that describes a control which is not in force is worse than one that
+     admits it has none" — applies with the sign flipped to a protocol
+     describing the absence of a control that *is* in force. Both are the same
+     error. **Take the lock before timing; see `MACHINE_LOCK.md`.**
+   - **What replaces it is measurement technique, not scheduling.** Every A/B
+     in this round is interleaved *within one process* wherever the harness
+     supports it, so both arms are sampled repeatedly inside the same window
+     and a compile happening in the middle of it hits both arms alike. An
+     alternating-*process* A/B is what breaks on a shared box: arm A runs
+     during somebody's build and arm B runs after it, and the difference is
+     the build.
+   - The size of that effect is now measured rather than assumed. The GPU
+     campaign's row-unroll A/B came out **indistinguishable** in a noisy
+     window, 8.1 percent against a 14.1 percent floor, and **resolved** in a
+     quiet one, 10.8 percent against a 2.1 percent floor. Same command, same
+     shape, opposite verdict.
+   - Every results header in this round states whether the box was
+     **verifiably quiet**, with the evidence it is claimed from. Where it was
+     not, the number is labelled and kept rather than presented as clean.
+   - Phase 0 is taken **before** this round launches any lane, because the
+     lanes this orchestrator controls are the largest noise source it can do
+     anything about.
    - `boosting.round_has_constant_hessian`,
      `histogram.objective_has_constant_hessian` and
      `histogram.CONSTANT_HESSIAN` are GPU-visible contracts. No CPU lane
@@ -480,7 +581,7 @@ parity, and neither can L1, L2 and L5 alone. This round needs both halves, and
 saying so now prevents a later result being read as a failure when it was
 always arithmetically insufficient on its own.
 
-## C3. The builder discriminator, and the one thing it is allowed to authorize
+## C3. The builder discriminator, on a premise that had to be corrected first
 
 LightGBM chooses between a column-wise and a row-wise histogram builder and
 picks by a cost model at dataset construction. We have only the column-wise
@@ -488,20 +589,45 @@ shape. L4 would add a row-major `UInt8` copy of the matrix used for histogram
 construction only, LightGBM's `MultiValDense` shape, chosen by a chooser, with
 the column matrix retained for partition and predict.
 
-That is a large additive lane and it does not start on a hunch.
+**The premise this round was planned on was wrong, and it was corrected from
+source before any data was taken rather than after.** The brief asked whether
+LightGBM's `force_row_wise` is faster than its `force_col_wise` here, on the
+assumption that our comparator runs LightGBM's default auto choice.
 
-- **`force_row_wise` materially faster than `force_col_wise` for LightGBM at
-  this shape, resolved by M0**: the row-wise builder is worth building and L4
-  is authorized.
-- **Indistinguishable, or `force_col_wise` faster**: L4 does not start, and
-  the reason is recorded rather than left as an unexplored option.
+It does not. `scenarios.LIGHTGBM_ALIGNMENT` sets **`force_row_wise = True`**,
+and `bench/bench_lightgbm.py` inherits it, so every LightGBM number this
+project has ever recorded against its CPU arm was taken on the **row-wise
+builder**, pinned. It is pinned for a methodological reason and a good one:
+left on auto, LightGBM spends its first iterations timing both strategies and
+that one-off lands inside the training measurement.
+
+So the question is not "would row-wise help LightGBM here". It is **how much of
+LightGBM's lead at 1,000,000 x 50 is the builder we do not have**, and that is
+answerable directly:
+
+Run the comparator at `force_row_wise=True` against `force_col_wise=True`,
+interleaved, ten threads, at 1,000,000 x 50. Both arms are pinned, so neither
+pays the auto-selection cost and the difference is the builder alone.
+
+- **Row-wise materially faster than column-wise, resolved by M0**: a
+  meaningful part of the gap we are chasing is a builder shape we lack rather
+  than an inefficiency in the shape we have. **L4 is authorized**, and the
+  measured delta is the ceiling on what it can return.
+- **Indistinguishable, or column-wise faster**: LightGBM beats us with the
+  same builder shape we already have, so the deficit is in our execution of it
+  and not in its structure. **L4 does not start**, and L1, L2, L3 and L5 are
+  the whole round.
 
 Registered before the data: at 50 dense features and 255 bins the two are
-expected to be close, with `force_col_wise` favored, because row-wise wins on
-sparse and high-feature-count data and this shape is neither. **estimated.**
-The prediction is that **L4 does not start**, and it is written down so that
-choosing not to build it later reads as a rule firing rather than as a lane
-being quietly dropped.
+expected to be close, with column-wise slightly favored, because row-wise wins
+on sparse and high-feature-count data and this shape is neither. **estimated.**
+The prediction is that **L4 does not start**. It is written down so that
+declining to build it later reads as a rule firing rather than as a lane
+quietly dropped.
+
+The second reading of the same measurement is worth as much as the first and
+costs nothing extra: if column-wise LightGBM is *also* far faster than us, then
+we lose to the builder we already have, and no amount of L4 would have helped.
 
 ## C4. The core pool, and what a single-shape result may not do
 
@@ -600,3 +726,254 @@ Therefore, and registered before any data:
 - A comparison whose two arms straddle a regime change is **discarded, not
   corrected**. Session III established that the regimes move a comparator by a
   factor of 2.2 and there is no correction factor that survives that.
+
+---
+
+# Amendments, 2026-08-16, written from what the protocol got wrong about itself
+
+Session III is the first round in which these rules were applied end to end. They
+worked: M3's registered falsification caught a prediction that was wrong by a
+factor of forty, M0 twice stopped a number going into a table that did not
+deserve to be there, and the gate-proof rule caught a test that verified nothing.
+None of that is being weakened.
+
+Three defects surfaced in use, and they are fixed here rather than worked around
+a second time.
+
+## A1. The thermal instruction was never followable. Replace it, do not keep it.
+
+Session conditions above say to "capture thermal state into the results header
+with `bench/apple/thermal_capture.sh`, before and after". That script measures
+nothing: it is a plan printer, its own header says it "starts no sampler, runs
+no privileged command, fits no model, and writes no record", and `--execute` is
+parsed and deliberately refused with exit code 3 because the plan it prints
+contains `sudo powermetrics`.
+
+**A session did follow it, and that is worse than nobody having followed it.**
+This paragraph originally read "No session has ever done this and none could
+have", and the instruction audit refuted it from a committed artifact.
+`bench/results/profile_2026-08-15/header.txt` opens a section headed
+`=== thermal before ===` and pastes the script's output into it. What is pasted
+is a plan, carrying `run id thermal-PENDING` and `would write
+.../thermal-PENDING.json`. So the header of the first stage-level profile this
+repository ever recorded carries a plan printer's plan under a heading that
+reads as a capture, and has since `24e5330`. There is no matching
+`=== thermal after ===`, so even the half that ran, ran once.
+
+An instruction nobody can follow is bad because a protocol that lists it reads
+as though the step is being taken. An instruction somebody *does* follow, which
+returns a plausible block of text that is not a measurement, is worse: it leaves
+a **record**, and the record is what the next reader trusts. That is exactly the
+defect this protocol exists to prevent, sitting inside the protocol and inside
+its own results.
+
+**The instruction is now:** capture
+
+    uptime
+    ps -Ao pcpu,comm | sort -rn | head
+
+before the first arm and after the last, into the results file, **including when
+the box looks fine**. Both campaigns say they now do this; the audit found the
+`uptime` half recorded in one results directory and the `ps` half in none, so
+treat it as a rule that is not yet habit.
+
+The script stays where it is, because the plan it prints is a real plan. **But
+the pointer this paragraph used to give was itself dangling**, and the audit
+caught it: `handoffs/performance_17_thermal_energy.md` was deleted on
+2026-08-14 in `21ff9fa`, two days before this section was written to point at
+it. `bench/apple/thermal_capture.sh --self-check` fails, exit code 4, on
+exactly that missing file, and its `--execute` refusal message sends the reader
+there too.
+
+Until it is restored, the surviving listing of the privileged commands is
+`docs/APPLE_THERMAL_ENERGY.md`, sections at lines 167-173 and 426-438, and the
+full original is one command away:
+
+    git show 21ff9fa^:handoffs/performance_17_thermal_energy.md
+
+`bench/results/INSTRUCTION_AUDIT.md` section 10 reproduces the commands
+verbatim. The script is simply not an instrument and the protocol must stop
+implying it is.
+
+**And the limitation gets stated wherever a regime is named.** `pmset -g therm`
+returns nothing useful on Apple silicon. So "fast window" and "slow window" in
+this repository are inferred **from effect** — both arms moving together — and
+not read from any instrument. That inference has already been made and retracted
+once: a slow pair was attributed to `mobileassetd` at 100 percent CPU, and after
+waiting it out and confirming the box idle the numbers stayed high.
+
+Note the trap that makes load average insufficient on its own: the slow regime
+showed a **quiet** box and slow results at the same time. Load alone would have
+said nothing was wrong.
+
+## A2. M0 is too strict in the one case that matters most. Use paired differences.
+
+As written, M0 resolves an A/B when the medians differ by more than the **wider
+arm's own spread**. That is right for two arms of comparable stability and wrong
+when one arm is an unstable comparator.
+
+Session III hit exactly that. Five interleaved runs at 1,000,000 x 50 had our arm
+at 2.7 percent spread and LightGBM drifting 24 percent upward from heat. Our arm
+was faster in **five runs of five**, by 5.6 to 11.3 percent. Under M0 as written
+that is unresolved forever, because no real effect of that size can ever exceed a
+comparator's 24 percent drift. But five of five in one direction is a one-in-
+thirty-two outcome under the null, and pretending it carries no information is
+not conservatism, it is a different error.
+
+**M0 is amended.** An A/B is **resolved** when either holds:
+
+- **(a)** the medians differ by more than the wider arm's min-to-max spread, over
+  at least five alternating pairs, as before; **or**
+- **(b)** the arms are **paired** — interleaved in one process, or alternated
+  process by process — and the **per-pair difference** has the same sign in at
+  least five of five, or six of seven, pairs. The magnitude reported is then the
+  median of the per-pair differences, with its own range, and never a difference
+  of pooled medians.
+
+Rule (b) is only available for paired designs, because it is drift that it
+survives and pairing is what makes drift common-mode. It is not available for two
+numbers taken in different windows, which remains forbidden.
+
+Both figures get reported when they disagree, and which rule fired gets named.
+
+## A3. Regime is part of a result, not noise to be averaged out
+
+This machine drifts two- to threefold and **effect sizes move with it, not just
+levels**. The resident plane measured 24 percent in a fast window and 8 percent
+in a slow one, both resolved, both correct. The row unroll measured
+*indistinguishable* at an 8.1 percent delta against a 14.1 percent floor in a slow
+window and *resolved* at 10.8 against 2.1 in a quiet one — **same command, same
+code, opposite verdict**.
+
+So:
+
+- A result carries its regime label. Where the effect size differs by regime,
+  **report both numbers and refuse to pick one.**
+- A null taken in a slow or dirty window **is not evidence of absence** and may
+  not close a question. It may only defer it. Anything called indistinguishable
+  outside a quiet window is retaken before it is used to cancel a lane.
+- Prefer in-process interleaved arms over alternating processes wherever the
+  harness supports both. Interleaving makes drift common-mode; alternating
+  processes turns a neighbour's build into your result.
+
+## A3b. Let the compiler enumerate, not the reader. Measured at 30x.
+
+Not a measurement rule, but it belongs beside them because it is the same
+discipline applied to code: **when a change has an unknown number of call sites,
+make the old form fail to compile rather than grepping for it.**
+
+The evidence, from the CPU campaign's `Histogram` field migration on 2026-08-16.
+A careful hand survey by two orchestrators found "about eight couplings". Making
+the fields private and letting the build fail found **233 direct reads across 35
+files**, plus a ninth file-level coupling nobody had listed. **A factor of
+thirty.**
+
+Three details worth carrying, because each defeats a different hand method:
+
+- **Most of the hand list was false positives.** Eight modules that looked like
+  couplings read `Tree.count`, `QuantizedHistogram.grad`, `FeatureTotals.grad` or
+  `PackedHistogram.count` -- different structs that share the field names and
+  nothing else. Grepping a field name finds the wrong set in both directions.
+- **Five test files read a plane without ever naming the type**, because the
+  value comes back from a builder with an inferred type. `grep Histogram tests/`
+  misses all five.
+- **The compiler-driven pass still made ten errors**, in the direction reading
+  cannot catch: it converted `local.grad[b]` where `local` was a different struct
+  with plain fields. A false positive compiles until it does not, and the suite
+  caught it.
+
+The limit, stated so nobody over-trusts it: Mojo has no field privacy, so a
+positional constructor still compiles and the single-chokepoint constructor is
+convention rather than a compiler guarantee. That gap closes at the storage
+change, which necessarily alters the signature.
+
+## A5b. Audit a document for the condition that would falsify it, not for errors
+
+The CPU campaign's diagnosis of its own `ACCURACY_BUDGET.md` defect, kept because
+it names a class rather than an instance:
+
+> The real defect was not the algebra. It was that a document about numerical
+> accuracy discussed a gain form and **never mentioned L1 anywhere** -- so nothing
+> prompted a reader to check the one condition that breaks it.
+
+The algebra in that section was correct. It was correct *under an assumption the
+document did not state and therefore did not invite anyone to test*: that
+`GL + GR = G`. Soft thresholding is not additive, so at `lambda_l1 > 0` the
+identity fails, and applying it anyway is a **systematic bias** of 1.6e-04
+relative where the shipped form sits at 1.0e-05 -- median and p99 agreeing to two
+figures, which is how you tell bias from rounding.
+
+**The audit question is therefore not "is this wrong" but "what setting would
+falsify this paragraph".** A reader checking for errors finds none; a reader
+asking which regularizer, which objective, which sampler, which bin count would
+break the claim finds the gap in one pass.
+
+This is the same shape as amendment A1 and the instruction audit. There the
+failure was an instruction nobody could execute; here it is an assumption nobody
+was invited to check. Both are silent, both survive review, and both are found by
+asking a document what it depends on rather than whether it is right.
+
+Neither campaign has read its documents this way yet, and both should.
+
+## A4. What this says about the protocol as a whole
+
+It is working, and the evidence is that every one of these defects was found by
+following it rather than by abandoning it. A protocol that never fires against
+its author is decoration; this one refuted its author's main claim of the round
+within an hour of the data arriving.
+
+The failure mode to watch is not strictness, it is **inherited instructions that
+nobody executes**. A1 was one. Anything in this file that has never actually been
+run should be treated as suspect until someone runs it.
+
+## A5. The regime now has an instrument, and it is not calibrated yet
+
+A1 replaced an unfollowable instruction with a followable one and was honest
+that the replacement is weak: `uptime` and the top processes did not, and could
+not, catch the Session III slow window, which showed a **quiet box and slow
+results at the same time**. A3 then made regime part of every result. Between
+them the protocol requires a label it has no way to read, so every regime label
+in this repository is inferred by hand from effect sizes -- an inference that
+was made and retracted the same night.
+
+`bench/canary.mojo` is the instrument. Two fixed probes, a single-threaded CPU
+mixing chain and a saturating GPU kernel, neither of which touches
+`src/mojotrees/`, a dataset, a thread count, or anything else a session varies.
+`bench/bench_train_gpu.mojo` runs both **first and last** in every run and
+reports `canary_cpu_ratio` and `canary_gpu_ratio` against a recorded baseline,
+plus the raw milliseconds, plus a `canary` object on the `json_summary` record.
+The two engines are reported separately and never averaged, because Session III
+measured the CPU degrading by 2.2 in a window where the GPU degraded by 1.5.
+
+**Three rules follow, and they take effect the moment a baseline exists.**
+
+- **A results header states `canary_cpu_ratio` and `canary_gpu_ratio`, or
+  states that no baseline was recorded.** A regime named without one is an
+  inference from effect and is labelled as such, exactly as A1 requires today.
+- **A run whose canary reports `SHIFTED-DURING-SESSION` is discarded, not
+  corrected.** This is C8's existing rule with the straddle now detectable
+  instead of noticed afterwards. The threshold is 5 percent of the smaller
+  reading, which is **chosen and not measured**: the smallest effect this
+  repository has ever resolved was 10.8 percent, so a machine that moved five
+  percent between the first arm and the last was already moving by half the
+  size of what is being hunted.
+- **The canary does not replace the A1 capture.** `uptime` and the top
+  processes say *what* was running; the canary says *whether it mattered*. Both
+  go in the header. The canary's blind spot is the mirror of A1's: it reads the
+  machine's delivery and cannot name the cause.
+
+**The baselines have not been measured and the file ships with them null.**
+Establish them on a verifiably quiet box with
+
+    pixi run mojo run -I src bench/bench_canary.mojo 7
+
+and paste the block it prints into `bench/canary_baseline.json`, filling in the
+date, the toolchain, the machine, and the evidence the box was quiet. Until
+then the mechanism reports raw milliseconds and says the ratio is unavailable,
+which is correct behavior and not a gap to be closed by filling in a plausible
+number. A fabricated baseline in a regime detector does not fail loudly; it
+mislabels every session afterwards in a form that reads as data.
+
+And per A4: **this has never been run in anger.** The probe constants were
+sized from an estimate, no baseline exists, and no session has yet carried a
+canary line. Treat it as suspect until someone does.

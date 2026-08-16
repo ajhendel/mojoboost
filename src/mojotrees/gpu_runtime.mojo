@@ -59,16 +59,33 @@ it did not have to.
 
 One backend fact the model does not encode, and must not be read as denying.
 On Metal `enqueue_copy` is itself a synchronous full-queue drain in both
-directions, measured by disassembly of the shipped runtime and recorded in
-`docs/GPU_PORTABILITY.md` section 6.1. Two things follow for anyone reading
-this model's output on that backend. A copy is a synchronization whether or
-not the model was told to record one, so a per-round upload is a per-round
-wait and belongs in any count of them. And the second hazard class above,
-the host about to overwrite a staging buffer a copy may still be reading, is
-vacuous there, so an elided check the tracker reports against `RES_STAGE` is
-not a wait anyone could have removed. The model stays written against queue
-ordering rather than against Metal, which is what makes it portable and what
-makes it conservative in the safe direction.
+directions, **measured** by disassembly of the shipped runtime and recorded
+in `docs/GPU_PORTABILITY.md` section 6.1. Two things follow for anyone
+reading this model's output on that backend. A copy is a synchronization
+whether or not the model was told to record one, so a per-round upload is a
+per-round ordering point and belongs in any *hazard* count of them. And the
+second hazard class above, the host about to overwrite a staging buffer a
+copy may still be reading, is vacuous there, so an elided check the tracker
+reports against `RES_STAGE` is not a synchronization anyone could have
+removed. The model stays written against queue ordering rather than against
+Metal, which is what makes it portable and what makes it conservative in the
+safe direction.
+
+A third thing follows, and it is the one this file is most likely to be
+misread on. **What this tracker counts is hazards, not time.** Section 6.1.1,
+withdrawn 2026-08-16, records that draining a queue holding nothing costs
+nothing, and that the count which predicts seconds is the count of *round
+trips*: host code blocking on a device answer it needs before it can decide
+what to enqueue next. Removing thirteen copies per tree from the
+device-resident plane **measured** 0.016 seconds at 1,000,000 x 50 against a
+registered prediction of 0.64, a null under M0
+(`bench/results/session3_2026-08-16/RESULTS.md`). So a required check this
+model reports is a real ordering constraint and an elided one is a real
+redundancy, and neither number converts to a saving. `StagingRing` inherits
+the same correction: on Metal no copy is ever still in flight, so a second
+slot cannot be what avoids a wait, and `MOJOTREES_GPU_STAGING_SLOTS` above 1
+buys nothing on this backend. The ring is correct, cheap and portable and
+should stay; what is wrong is the expected value of turning it up.
 
 Nothing in this file removes a synchronization from histogram_gpu.mojo or
 train_gpu.mojo, and nothing here has been measured. It is the model and the
@@ -108,14 +125,6 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from .gpu_tiling import DeviceCaps, query_device_caps
-from .hybrid_leaf_scheduler import (
-    MODE_OFF,
-    HybridContext,
-    LeafWork,
-    decline_name,
-    decline_reason,
-    describe_context,
-)
 from .initialization import (
     PHASE_CONTEXT_CREATE,
     PHASE_DEVICE_DISCOVERY,
@@ -1292,12 +1301,6 @@ struct GpuSession(RoundLifecycle, Movable):
     var startup: StartupTrace
     var fits: FitLatency
     var warmup: WarmupPlan
-    # What `hybrid_leaf_scheduler` decided for this run, or empty when
-    # `MOJOTREES_HYBRID_LEAVES` is off. A String rather than a context
-    # because the session neither makes nor consumes the placement: it is
-    # the thing that outlives a fit and can report one, and that module's
-    # switch exists precisely to make its decline reason observable.
-    var hybrid: String
 
     def __init__(out self, staging_slots: Int = 0) raises:
         """Open a device context and take the session's bookkeeping with it.
@@ -1343,7 +1346,6 @@ struct GpuSession(RoundLifecycle, Movable):
         # of disappearing into the first round. Front-loading the creation
         # itself needs typed `DeviceFunction` fields on whichever struct
         # owns the context; see handoffs/performance_15_startup.md.
-        self.hybrid = String("")
         self.warmup = WarmupPlan.from_env()
         if self.warmup.level >= WARMUP_TRAIN:
             _ = self.warmup.include(KERNEL_HIST_ATOMIC)
@@ -1405,63 +1407,6 @@ struct GpuSession(RoundLifecycle, Movable):
         Positional, not temporal: the first fit is the one that pays the
         one-time costs, however long the process sat idle first."""
         self.fits.note_fit(self.startup, started)
-
-    def note_hybrid(
-        mut self,
-        device_split_search: Bool,
-        gradients_host_resident: Bool,
-        bins_host_resident: Bool,
-        n_active_rows: Int,
-        n_features: Int,
-        n_bins: Int,
-        dataset_rows: Int,
-    ) raises:
-        """Resolve `MOJOTREES_HYBRID_LEAVES` against this run's facts and
-        keep the answer for `trace()`.
-
-        Nothing here moves a histogram. `hybrid_leaf_scheduler` can only
-        answer `PLACE_GPU` today, because no run has measured the
-        coefficients its comparison needs, and its own docstring says the
-        switch exists before the numbers do so that the decline reason is
-        *observable* rather than fatal. This is where it becomes observable:
-        a caller that set the variable and sees `costs_unmeasured` learns
-        which work would remove the decline, and a caller that set it on a
-        `SPLIT_SEARCH_DEVICE` run sees `no_host_parent` instead, which is a
-        different answer about a different obstacle.
-
-        Deliberately not a raise, unlike the transfer route in
-        histogram_gpu.mojo. That route's alternatives are unimplemented, so
-        asking for one and getting the default silently would mislead; this
-        mode's alternatives are implemented and merely unlicensed, and the
-        run it produces is the correct one either way.
-
-        The representative node is the root over every feature, which is
-        enough: every gate this can reach is a property of the run, not of a
-        node, since the per-node arithmetic sits behind the unmeasured-costs
-        gate.
-        """
-        var ctx = HybridContext.from_env(
-            device_split_search,
-            gradients_host_resident,
-            bins_host_resident,
-            n_active_rows,
-        )
-        if ctx.mode == MODE_OFF:
-            self.hybrid = String("")
-            return
-        var work = LeafWork.node_of(
-            0,
-            n_active_rows,
-            n_features,
-            n_features,
-            n_bins,
-            dataset_rows,
-        )
-        self.hybrid = (
-            describe_context(ctx)
-            + " placement="
-            + decline_name(decline_reason(ctx, work))
-        )
 
     def session_state(self) -> SessionState:
         """What this session has already paid, for `decide_device`.
@@ -1600,6 +1545,4 @@ struct GpuSession(RoundLifecycle, Movable):
         out += self.startup.report()
         out += self.warmup.report()
         out += "session.paid " + self.session_state().describe() + "\n"
-        if self.hybrid.byte_length() > 0:
-            out += "hybrid " + self.hybrid + "\n"
         return out

@@ -1,0 +1,18 @@
+{
+  "schema": "mojotrees-canary-baseline/1",
+  "probe_version": 1,
+  "machine": null,
+  "toolchain": null,
+  "measured_on": null,
+  "provenance": "none: no baseline has been measured yet",
+  "quiet_window_evidence": null,
+  "repeats": null,
+  "cpu_ms": null,
+  "cpu_spread_pct": null,
+  "cpu_checksum": null,
+  "gpu_ms": null,
+  "gpu_spread_pct": null,
+  "drift_threshold_pct": 5.0,
+  "note": "cpu_ms and gpu_ms are null because nothing has been measured. Every consumer handles that by reporting raw milliseconds and saying the ratio is unavailable, which is the correct behavior and not a degraded one. Do not fill these in with an estimate, a figure copied from another machine, or a number that looks about right: a fabricated baseline in a regime detector does not fail loudly, it silently mislabels every session afterwards, and it mislabels them in a form that reads as data. Establish them with `pixi run mojo run -I src bench/bench_canary.mojo 7` on a box that is verifiably quiet, then paste the block that command prints and fill in every FILL-IN field. The values are the minimum across repeats, in milliseconds, and they are only comparable to readings taken at the same probe_version.",
+  "reading_the_ratio": "reading_ms / baseline_ms. 1.0 is the window this file was measured in; larger is slower. The CPU and GPU figures are reported separately and are never averaged, because Session III measured ten CPU cores degrading by 2.2x in a window where the GPU arm degraded by 1.5x and a single number would have described neither."
+}

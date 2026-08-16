@@ -95,16 +95,41 @@ not changed is the standard. A rule is a benchmarking result, not a code
 change: it carries its `evidence_id` and its `measured_on`, and
 `POLICY_VERSION` is bumped with it.
 
-One structural consequence, and it is the reason `auto` still keeps the CPU
-on the very machine the rule was measured on when it is asked through
-`resolve_device`. A hardware-scoped rule can match only a profile that
-names the hardware, and `DeviceCapabilities.detect` opens no device, so it
-yields `PROFILE_FALLBACK` (or `PROFILE_DECLARED`, which carries an API name
-and no generation). Only `from_profile`, fed by a caller holding an open
-`DeviceContext`, reaches `PROFILE_REPORTED`. Until the trainers pass what
-they read (handoffs/connect_05_device_policy.md), a defaulted `fit` gets
-`WARN_UNKNOWN_HARDWARE` and the CPU, which is the honest answer to "I do
-not know what device this is" and not an accident.
+How the rule became reachable, 2026-08-16, and what still is not
+--------------------------------------------------------------
+The rule above was installed and then could not fire, anywhere, ever. Three
+independent things stopped it, each sufficient on its own, and all three had
+to be found before any of them was worth fixing:
+
+1. `DeviceCapabilities.detect` returned `GpuProfile.generic()`, whose `api`
+   is `API_UNKNOWN`. `CrossoverEvidence.matches` tests the API first, so the
+   rule was declined before the shape was ever compared. Fixed by
+   `PROFILE_BUILD_TARGET`: identity now comes from the comptime
+   `_accelerator_arch()`, which opens no device and so does not drag
+   `max.gpu.host` into `params.mojo`'s import graph. Numbers are still the
+   portable fallback.
+2. `parse_apple_generation` could not parse `4-metal4`, which is the string a
+   Metal device actually reports. "metal4" ends in "l4", not "m4". So even
+   `capabilities_from_reported` and `decide_device_report_reported`, the two
+   entry points built for a caller holding an open `DeviceContext`, produced
+   `APPLE_GEN_UNKNOWN` from a real M4 reading, and the generation scope
+   declined the rule a second time. Fixed in apple_gpu_policy.mojo. The
+   reason nobody noticed is worth keeping: `apple_m4_observed()` builds its
+   profile with the fieldwise constructor and hands `APPLE_GEN_M4` in
+   directly, so every test asserting that the rule fires was asserting it
+   against a profile no detection path in this repository could construct.
+3. `resolve_device`, which is what all six Mojo trainer entry points call,
+   declares no objective, and every rule is objective-scoped. This is NOT
+   fixed here and must not be "fixed" by weakening the scope. It is fixed at
+   the call sites, which hold the objective already; `resolve_device` now
+   takes one, with a backward-compatible default, so each site is one word.
+   Until those land, `auto` reaches the GPU through `resolve_device_full`,
+   `decide_device`, `decide_device_report` and `decide_device_report_reported`
+   and not through `model.fit`.
+
+`PROFILE_REPORTED` still outranks everything and is still the only
+authoritative source. What changed is that the absence of a reading is no
+longer the absence of an identity.
 
 `MOJOTREES_AUTO_MIN_CELLS` is the escape hatch for running that benchmark:
 an integer cell count (`n_rows * n_features`) at or above which `auto`
@@ -120,25 +145,41 @@ mixed fleet to the CPU backend.
 
 Unknown hardware
 ----------------
-A device that reports nothing gets `GpuProfile.generic()`, the conservative
-portable profile in apple_gpu_policy.mojo. It is deliberately not
-Apple-shaped and not NVIDIA-shaped. Nothing in this module infers hardware
-from an operating system name or from a marketing chip string: when a
-caller has an open `DeviceContext`, the reported attributes are
-authoritative and arrive through `DeviceCapabilities.from_profile`; when
-nobody has opened one, the profile is the portable fallback and the
-decision says so through `PROFILE_FALLBACK`. `MOJOTREES_GPU_BACKEND` is
-honored only as an operator's declaration of the API name, is recorded as
-`PROFILE_DECLARED`, and never overrides a reported capability.
+A device whose API this module cannot name gets `GpuProfile.generic()`, the
+conservative portable profile in apple_gpu_policy.mojo. It is deliberately
+not Apple-shaped and not NVIDIA-shaped. Nothing in this module infers
+hardware from an operating system name or from a marketing chip string. The
+ladder, strongest first: `PROFILE_REPORTED`, attributes a caller read off an
+open `DeviceContext`; `PROFILE_BUILD_TARGET`, the api and generation this
+binary was compiled for, identity only and every number still the fallback;
+`PROFILE_DECLARED`, an operator naming an API through `MOJOTREES_GPU_BACKEND`
+that contradicts the build target; `PROFILE_FALLBACK`, nothing at all. A
+declaration that agrees with the build target adds nothing and is not
+recorded; one that disagrees removes the generation rather than installing a
+different one, so hardware cannot be misdeclared into a crossover rule. No
+source below `PROFILE_REPORTED` ever supplies a capability number.
 
-Availability is a build property
---------------------------------
+Availability, and now identity, are build properties
+----------------------------------------------------
 Mojo resolves `has_accelerator()` at compile time, so a binary built where
 an accelerator was present reports one as available. On a redistributed
 build (a wheel) a `gpu` request therefore fails when the device is opened
 rather than when it is resolved. `WARN_BUILD_TIME_AVAILABILITY` marks every
 decision that rests on that comptime answer, and `MOJOTREES_DISABLE_GPU=1`
 is the way to pin such a build to the CPU.
+
+`_accelerator_arch()` is comptime in the same way and for the same reason,
+which is what makes `PROFILE_BUILD_TARGET` free. It is also wrong in the same
+way: on a wheel built for an M4 and run on an M3, it says M4. That is a
+stronger error than a wrong availability answer, because it can *select* a
+backend rather than merely fail one, so it gets its own
+`WARN_BUILD_TARGET_HARDWARE` on top of the availability warning, and the
+remedy is the same: `device='cpu'`, `MOJOTREES_DISABLE_GPU=1`, or a caller
+that opens a `DeviceContext` and goes through
+`decide_device_report_reported`, whose `PROFILE_REPORTED` outranks this.
+The alternative was for `auto` to keep selecting the CPU on every machine
+including the ones this project has measured, which is not the safer choice,
+only the quieter one.
 
 LightGBM difference: LightGBM spells this `device_type` and takes `cpu`,
 `gpu`, or `cuda`, with no `auto`. mojotrees has a single portable GPU
@@ -149,16 +190,33 @@ for every accelerator, and `auto` is an addition.
 from std.os import getenv
 from std.sys import has_accelerator
 
+# The accelerator this binary was compiled for, as `<api>:<arch>` (measured
+# on the development machine: `metal:4-metal4`). It is comptime, like
+# `has_accelerator()` beside it, and it opens no device, which is the whole
+# reason this module may call it: the purity contract below forbids importing
+# `max.gpu.host`, and identifying hardware by opening a `DeviceContext` in
+# `detect()` would have done exactly that, through `device.mojo` and into
+# `params.mojo`'s import graph.
+#
+# It is underscore-private in the standard library, which is a real risk and
+# is taken deliberately: it is the only zero-cost source of device identity
+# available here, and if it disappears the failure is a compile error at this
+# import rather than a silent wrong answer. `build_accelerator_target` below
+# is the only caller.
+from std.sys.info import _accelerator_arch
+
 from .apple_gpu_policy import (
     API_METAL,
     API_UNKNOWN,
     APPLE_GEN_M4,
+    APPLE_GEN_UNKNOWN,
     BYTES_PER_PARTIAL_CELL,
     CROSSOVER_DISABLED,
     GpuProfile,
     api_name,
     apple_generation_name,
     parse_api,
+    parse_apple_generation,
     partial_budget_bytes,
 )
 # `CUSTOM` only. The other objective codes were imported to spell out the
@@ -272,7 +330,14 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # 2: the first crossover rule, `apple-m4-metal-dense-regression`. Version 1
 # shipped an empty table, so `auto` was the CPU at every size on every
 # machine.
-comptime POLICY_VERSION = 2
+# 3: the rule became reachable. No threshold moved and no rule was added; what
+# changed is that `DeviceCapabilities.detect` can now name the hardware
+# (`PROFILE_BUILD_TARGET`) and that `parse_apple_generation` can parse the
+# architecture string a Metal device actually reports. Under version 2 the
+# table was non-empty and unreachable, so a version-2 report saying "no rule
+# covered this" and a version-3 report saying the same thing mean different
+# things, which is precisely what this number is for.
+comptime POLICY_VERSION = 3
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -300,6 +365,19 @@ comptime PROFILE_SYNTHETIC = 4
 """A named fixture (`apple_synthetic`), never a reading. Only tests and
 benchmarks should produce this."""
 
+comptime PROFILE_BUILD_TARGET = 5
+"""The API and Apple generation of the accelerator this binary was *compiled
+for*, from the comptime `_accelerator_arch()`. Identity only: every capability
+number is still the portable fallback, exactly as `PROFILE_DECLARED` takes
+only an API name.
+
+Weaker than `PROFILE_REPORTED` and stronger than `PROFILE_DECLARED`. It is a
+property of the build, not of the machine, which is the same standing caveat
+`WARN_BUILD_TIME_AVAILABILITY` already attaches to `gpu_available` for the
+same reason; a decision that *selects a backend* on it carries
+`WARN_BUILD_TARGET_HARDWARE` as well, because selecting on a build property
+is a stronger claim than reporting availability on one."""
+
 
 def profile_source_name(source: Int) -> String:
     if source == PROFILE_NONE:
@@ -312,6 +390,8 @@ def profile_source_name(source: Int) -> String:
         return String("reported")
     if source == PROFILE_SYNTHETIC:
         return String("synthetic")
+    if source == PROFILE_BUILD_TARGET:
+        return String("build-target")
     return String("unknown")
 
 
@@ -379,6 +459,7 @@ comptime WARN_MEMORY_BUDGET_UNKNOWN = 9
 comptime WARN_COLD_SESSION = 10
 comptime WARN_UNPROVEN_TRANSFER_ROUTE = 11
 comptime WARN_KERNEL_RETIREMENT_ROUTE = 12
+comptime WARN_BUILD_TARGET_HARDWARE = 13
 
 
 def warning_name(code: Int) -> String:
@@ -406,6 +487,8 @@ def warning_name(code: Int) -> String:
         return String("unproven-transfer-route")
     if code == WARN_KERNEL_RETIREMENT_ROUTE:
         return String("kernel-retirement-route")
+    if code == WARN_BUILD_TARGET_HARDWARE:
+        return String("build-target-hardware")
     return String("unknown-warning")
 
 
@@ -601,6 +684,96 @@ def env_auto_min_cells() -> Int:
         return Int(s)
     except:
         return AUTO_MIN_CELLS
+
+
+def build_accelerator_target() -> String:
+    """The accelerator this binary was compiled for, as `<api>:<arch>`, or
+    empty when it was compiled without one.
+
+    MEASURED on the development machine, 2026-08-16: `metal:4-metal4`. The
+    same reading `DeviceContext().arch_name()` gives as `4-metal4`, with the
+    API in front of it.
+
+    Comptime, exactly like `has_accelerator()` above, and guarded the way
+    every accelerator entry point in this repository is guarded: the call
+    sits inside `comptime if has_accelerator()` with an `else` covering the
+    whole body, so a CPU-only build never elaborates it. That pattern is not
+    decoration here. A build with no GPU architecture fails at compile time
+    rather than at run time, and an Apple machine never reproduces it, so the
+    guard is the only thing standing between this module and the x86-64 half
+    of CI.
+    """
+    comptime if has_accelerator():
+        return String(_accelerator_arch())
+    else:
+        return String("")
+
+
+def _target_api_text(target: String) -> String:
+    """The API half of `<api>:<arch>`, or the whole string when there is no
+    separator. A backend that reports a bare API name is not an error; it is
+    an arch this module cannot name, which is what `API_UNKNOWN` and
+    `APPLE_GEN_UNKNOWN` are for."""
+    var sep = target.find(":")
+    if sep < 0:
+        return target.copy()
+    return String(target[byte=0:sep])
+
+
+def _target_arch_text(target: String) -> String:
+    """The arch half of `<api>:<arch>`, or empty when there is no
+    separator."""
+    var sep = target.find(":")
+    if sep < 0:
+        return String("")
+    return String(target[byte = sep + 1 : target.byte_length()])
+
+
+def build_target_profile() raises -> GpuProfile:
+    """A `GpuProfile` carrying the build target's *identity* and the portable
+    fallback's *numbers*.
+
+    Identity only, and the split matters. `api` and `apple_generation` come
+    from the toolchain's own record of what this binary was compiled for, so
+    they are as trustworthy as `has_accelerator()` and no more. Every
+    capability number stays `GpuProfile.generic()`'s, because the build target
+    says nothing about core counts, threadgroup memory, or a memory budget,
+    and inventing them would put a fabricated number into the memory gate.
+    A zero memory budget cannot block a run (`_collect_blocks` requires
+    `memory_budget_known()`), so this profile can only ever widen what is
+    admitted through identity, never through capacity.
+
+    `synthetic` stays True for the same reason: the numbers were constructed.
+    `unified_memory` follows `GpuProfile.from_reported`'s rule, Metal implies
+    unified, which today changes nothing at all because
+    `plan_session_routes` returns the all-staged plan under an empty evidence
+    ledger whichever way it is answered.
+
+    Raises never in practice; it is `raises` because `GpuProfile.generic()`
+    is.
+    """
+    var target = build_accelerator_target()
+    var base = GpuProfile.generic()
+    if target.byte_length() == 0:
+        return base^
+    var api = parse_api(_target_api_text(target))
+    if api == API_UNKNOWN:
+        # An accelerator whose API this module cannot name. The fallback
+        # profile is the honest answer and no rule will match it.
+        return base^
+    var generation = APPLE_GEN_UNKNOWN
+    if api == API_METAL:
+        generation = parse_apple_generation(_target_arch_text(target))
+    return GpuProfile(
+        api,
+        generation,
+        base.core_count,
+        base.max_threads_per_block,
+        base.max_shared_memory_per_block,
+        base.memory_budget_bytes,
+        api == API_METAL,
+        True,
+    )
 
 
 def env_declared_api() -> Int:
@@ -821,13 +994,43 @@ struct DeviceCapabilities(Copyable, Movable):
     ) raises -> DeviceCapabilities:
         """Capabilities for the build and process running right now.
 
-        Opens no device. The hardware profile is therefore the portable
-        fallback (`PROFILE_FALLBACK`), or `PROFILE_DECLARED` when an
-        operator named the API through `MOJOTREES_GPU_BACKEND`. A caller
-        that already has a `DeviceContext` open should read its attributes
-        and call `from_profile` instead, which is the only way to reach
-        `PROFILE_REPORTED`, and should hand its own `SessionState` rather
-        than taking the cold default.
+        Opens no device, and that constraint is structural rather than a
+        preference: this module is reached from `params.mojo`'s import graph
+        through `device.mojo`, so importing `max.gpu.host` here would put the
+        GPU host runtime in front of every CPU-only compile, and
+        handoffs/migration_20_device_policy.md already declined a smaller
+        version of that change for the same reason.
+
+        Identity therefore comes from the build target
+        (`build_target_profile`, `PROFILE_BUILD_TARGET`), which is comptime
+        and free. Capability *numbers* remain the portable fallback in every
+        case; only a caller holding an open `DeviceContext` can supply real
+        ones, through `from_profile` or `capabilities_from_reported`, which
+        are still the only way to reach `PROFILE_REPORTED`. Such a caller
+        should also hand its own `SessionState` rather than taking the cold
+        default.
+
+        WHY THIS IS NOT A FALLBACK ANY MORE, AND WHAT IT COST TO BE ONE.
+        Until 2026-08-16 this returned `GpuProfile.generic()` unconditionally,
+        whose `api` is `API_UNKNOWN` and whose `apple_generation` is
+        `APPLE_GEN_UNKNOWN`. The one installed crossover rule is scoped to
+        Metal on an M4, and `CrossoverEvidence.matches` tests the API before
+        it tests anything else, so the rule could not fire on any request
+        resolved through here. `auto` was the CPU at every shape on every
+        machine including the one the rule was measured on, which is a
+        shipped-default bug and was documented as a structural consequence.
+
+        Precedence, and the one case where a declaration outranks the build
+        target. `MOJOTREES_GPU_BACKEND` names an API and nothing else. When it
+        agrees with the build target it adds nothing and the build target
+        stands, keeping the generation. When it *disagrees*, the operator is
+        asserting that this binary is running somewhere other than where it
+        was built, which is exactly the redistributed-build case
+        `WARN_BUILD_TIME_AVAILABILITY` exists for; the build target's identity
+        is then wrong and is dropped, leaving `PROFILE_DECLARED` with the
+        operator's API and no generation. A disagreement can only ever remove
+        identity, never install a different one, so no rule can be reached by
+        misdeclaring hardware.
 
         Raises for an unparsable `MOJOTREES_GPU_TRANSFER`, which is
         `plan_session_routes`' rule and the same one this module applies to
@@ -841,16 +1044,20 @@ struct DeviceCapabilities(Copyable, Movable):
         var source: Int = PROFILE_NONE
         if available:
             source = PROFILE_FALLBACK
-            if declared != API_UNKNOWN:
+            var target = build_target_profile()
+            if target.api != API_UNKNOWN:
+                source = PROFILE_BUILD_TARGET
+                profile = target^
+            if declared != API_UNKNOWN and declared != profile.api:
                 source = PROFILE_DECLARED
                 profile = GpuProfile(
                     declared,
-                    profile.apple_generation,
+                    APPLE_GEN_UNKNOWN,
                     profile.core_count,
                     profile.max_threads_per_block,
                     profile.max_shared_memory_per_block,
                     profile.memory_budget_bytes,
-                    profile.unified_memory,
+                    declared == API_METAL,
                     profile.synthetic,
                 )
         var transfer = plan_session_routes(profile.unified_memory)
@@ -1186,7 +1393,8 @@ struct CrossoverEvidence(Copyable, Movable):
     def cite(self) -> String:
         """Where the numbers came from and what they were taken on.
 
-        The form `HybridCosts.cite` uses, for the same reason: a decision
+        The form the deleted `HybridCosts.cite` used, for the same reason:
+        a decision
         that says "the GPU, on evidence" is worth what the reader can go
         and check, so the identifier and the device travel together.
         """
@@ -1220,7 +1428,7 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
     measured CPU against GPU end to end. Extrapolating down would be the
     thing this module exists to refuse: below a million rows the GPU's
     fixed per-round and per-node costs are a growing fraction of a tree
-    (see `hybrid_leaf_scheduler.mojo`, whose whole domain is that regime),
+    (the regime the deleted hybrid leaf scheduler addressed, and lost),
     so the crossover is somewhere below here and its location is a
     measurement nobody has taken.
 
@@ -1255,11 +1463,50 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
       reverses the sign. Neither is in the rule, because neither was swept,
       and that is a gap in the evidence rather than a claim of invariance.
 
-    A profiling session is imminent (see `phase_profile.mojo` and the
-    2026-08-15 round in docs/GPU_VALIDATION.md, which retired the earlier
-    0.56x figure). It may well find the real crossover well below a million
-    rows, at which point this floor comes down. It comes down by
-    measurement and a `POLICY_VERSION` bump, the way it went in.
+    WHERE THE CROSSOVER ACTUALLY SITS, which is the question this rule's
+    floor answers and which has since been measured on both sides. From
+    `bench/results/profile_2026-08-15/RESULTS.md`, taken under the
+    pre-registered rules in `bench/results/PROFILE_PROTOCOL.md`, arms
+    interleaved, median of three, seconds of training with binning excluded,
+    100 rounds, 31 leaves, 255 bins, squared error (MEASURED, and reproduced
+    at five repeats for the top two shapes in
+    `bench/results/sweep2_2026-08-15/RESULTS.md`):
+
+        shape             our CPU   our GPU
+        1,000,000 x 50       6.98      3.58     GPU 1.85x
+          250,000 x 50       1.66      1.89     CPU wins
+           50,000 x 50      0.564      1.63     CPU wins by 2.9x
+
+    So the floor is not merely the smallest shape anybody ran. 250,000 x 50
+    is a measured *loss* for the GPU and 50,000 x 50 is a large one, which is
+    the device's roughly 1.5 s of fixed cost per fit showing up as a growing
+    fraction of a smaller tree. `auto` therefore selects the GPU at
+    1,000,000 x 50 and the CPU at 250,000 and at 50,000, and both halves of
+    that are now backed by a measurement rather than by the absence of one.
+
+    What is still unmeasured is the crossover point itself: it lies somewhere
+    in (250,000, 1,000,000] rows at 50 features, and nothing in that interval
+    has been run. The floor sits at the top of the interval, which is the
+    conservative end, because a floor placed inside an unmeasured interval is
+    a guess with a number on it.
+
+    `bench/results/session3_2026-08-16/RESULTS.md` is the most recent round
+    and it does not move any of this, deliberately. Its 250,000 and 50,000
+    figures (1.126 s and 0.789 s) are GPU against GPU, the resident plane
+    against the shipping device loop with the device split search forced on
+    both arms, and that file's own same-night correction withdraws the
+    inference that was drawn from them about a gate. Its 1,000,000 x 50 GPU
+    arm at 2.584 s in a fast window corroborates this rule's direction at
+    exactly its floor. It also measured this machine drifting by a factor of
+    two between windows on the GPU and 2.2 on the CPU, with a verdict
+    flipping from "indistinguishable" to "resolved" on identical code, which
+    is the standing reason a threshold is not installed from a single window
+    at a shape where the margin is small.
+
+    The measurement that would move the floor down is an interleaved
+    CPU-arm-against-GPU-arm pair inside (250,000, 1,000,000] rows at 50
+    features on an idle M4, medians of five, in a single window. It comes
+    down by that and a `POLICY_VERSION` bump, the way it went in.
 
     Do not add a rule from reasoning. Add one from a recorded sweep, cite
     it in `evidence_id`, name the device in `measured_on`, and bump
@@ -1492,6 +1739,33 @@ def _collect_warnings(
                 api_name(caps.profile.api),
                 "' but no device attributes were read, so the capability"
                 " numbers are still the portable fallback",
+            ),
+        )
+    elif caps.profile_source == PROFILE_BUILD_TARGET:
+        # Two separate facts, and a reader needs both. The identity is a
+        # build property, which is what may select a backend and what may
+        # therefore be wrong on a redistributed wheel; the numbers were never
+        # read at all, which is what keeps the memory gate silent.
+        warnings.add(
+            WARN_BUILD_TARGET_HARDWARE,
+            String(
+                "the hardware identity used here (api '",
+                api_name(caps.profile.api),
+                "', apple generation '",
+                apple_generation_name(caps.profile.apple_generation),
+                "') is the accelerator this binary was compiled for, not one"
+                " that was read from this machine; on a redistributed build"
+                " set device='cpu' or MOJOTREES_DISABLE_GPU=1, or open a"
+                " DeviceContext and go through"
+                " decide_device_report_reported",
+            ),
+        )
+        warnings.add(
+            WARN_SYNTHETIC_CAPABILITIES,
+            String(
+                "only the api and generation came from the build target; the"
+                " core count, threadgroup memory, and memory budget are the"
+                " portable fallback and were not read from a device"
             ),
         )
     elif caps.profile_source == PROFILE_SYNTHETIC or caps.profile.synthetic:
@@ -2113,19 +2387,51 @@ def decide_device(
 
 
 def resolve_device(
-    device: Int, n_rows: Int, n_features: Int, n_outputs: Int = 1
+    device: Int,
+    n_rows: Int,
+    n_features: Int,
+    n_outputs: Int = 1,
+    objective: Int = OBJECTIVE_UNSPECIFIED,
 ) raises -> Int:
     """Resolve a requested device to the backend that will actually run:
     `CPU_DEVICE` or `GPU_DEVICE`, never `AUTO_DEVICE`.
 
     The narrow entry point the trainers use, in terms of the engine above:
-    it builds a request the caller has only partly described (no objective,
-    no bin count, no input flags), detects capabilities, and raises rather
-    than returning a refusal. Callers that can describe the whole workload
-    should build a `DeviceRequest` and call `decide_device` directly, which
-    is what gets them the memory gate, the objective gate, and a report.
+    it builds a request the caller has only partly described (no bin count,
+    no input flags), detects capabilities, and raises rather than returning a
+    refusal. Callers that can describe the whole workload should build a
+    `DeviceRequest` and call `decide_device` directly, or call
+    `resolve_device_full`, which is what gets them the memory gate, the
+    bin-limit gate, the sparse and validation blocks, and a report.
+
+    WHY `objective` IS HERE, AND WHY IT DEFAULTS TO UNDECLARED. Every
+    installed crossover rule is scoped to the objective it was measured on,
+    and `CrossoverEvidence.matches` declines an `OBJECTIVE_UNSPECIFIED`
+    request rather than letting it inherit a squared-error measurement. That
+    is the right rule and it is not being weakened: a caller that did not say
+    what it is training has not earned a claim measured on something else. It
+    does mean that a caller which leaves this defaulted can never reach the
+    GPU on evidence, whatever the shape and whatever the hardware.
+
+    Every caller in the tree leaves it defaulted today, and each of them is
+    holding the objective when it does. `model.fit` takes `objective` as a
+    parameter and drops it here; so do `model.fit_multiclass`,
+    `trainset.train_dataset`, `trainset.train_dataset_multiclass`,
+    `external_memory.train_external`, `external_memory.train_external_
+    multiclass`, and, on the Python side, `_Config.binding_params`, which
+    writes `params["objective"]` two statements after it resolves the device
+    without one. The parameter is added here with a backward-compatible
+    default so that closing that is one word at each site rather than a
+    signature change; the sites themselves belong to other lanes.
     """
-    var request = DeviceRequest(device, n_rows, n_features, n_outputs)
+    var request = DeviceRequest(
+        device,
+        n_rows,
+        n_features,
+        n_outputs,
+        BINS_UNSPECIFIED,
+        objective,
+    )
     var caps = DeviceCapabilities.detect()
     var decision = decide_device(request, caps)
     decision.raise_if_blocked()

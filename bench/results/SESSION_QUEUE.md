@@ -1,8 +1,28 @@
 # The measurement queue, written down so an interruption costs nothing
 
-Everything below is pending. It exists because this session's measurements are
-blocked on a precondition (M1, quiet box) rather than on a decision, and a
-blocked queue that lives only in a conversation is a queue that gets lost.
+> **STATUS, 2026-08-16: the Session III queue has been drained. Everything in
+> it ran.** This banner was added by the instruction audit, which found the file
+> still opening with "Everything below is pending" after every item in it had
+> been measured and written up in
+> [`session3_2026-08-16/RESULTS.md`](session3_2026-08-16/RESULTS.md).
+>
+> | item | verdict | where |
+> |---|---|---|
+> | S1, resident plane at 250k and 50k | **RUN**, both resolved, S1 **closed** | `session3` "S1, closed" |
+> | M2.1, the upload collapse | **RUN**, five pairs, **REFUTED** at 0.016s against a registered 0.64s | `session3` M2.1 |
+> | M2.2, the resident plane re-taken | **RUN**, six pairs, **resolved** | `session3` M2.2 |
+> | M2.3, the histogram row unroll | **RUN twice**: indistinguishable slow, **resolved 10.8%** fast | `session3` M2.3 |
+> | M2.4, LightGBM interleaved, at 1,000,000 | **RUN**; its spread measured for the first time | `session3` M2.4 |
+> | M2.4, the same at **250,000** | **NEVER RUN** — still open | — |
+> | M2.5, the parallel grain | **RUN**, three pairs, **NULL** | `session3` M2.5 |
+>
+> The commands below are kept, because they are how each item gets re-taken and
+> several deserve to be. Read each item's status line before running it. The
+> full audit is [`INSTRUCTION_AUDIT.md`](INSTRUCTION_AUDIT.md).
+
+It exists because this session's measurements were blocked on a precondition
+(M1, quiet box) rather than on a decision, and a blocked queue that lives only
+in a conversation is a queue that gets lost.
 
 Rules referred to by name live in `PROFILE_PROTOCOL.md`: **S1-S4** were
 registered before Sweep II, **M0-M6** before Session III. Read M0 before
@@ -20,21 +40,52 @@ session; the authoritative list is this file.
 
 ---
 
+> **Annotation, 2026-08-16. Session III has since run, and the cost model this
+> queue was written against was refuted.** Results are in
+> `session3_2026-08-16/RESULTS.md`; the withdrawal is
+> `docs/GPU_PORTABILITY.md` section 6.1.1.
+>
+> **Nothing below this line has been edited.** The predictions are left exactly
+> as they were registered, because a registered prediction that was refuted is
+> the evidence that the process worked, and rewriting it to look right in
+> hindsight destroys the only thing registering it was for.
+>
+> What was refuted, in one line: the queue prices every `enqueue_copy` at the
+> ~458 microsecond per-synchronization constant. **Measured**, removing thirteen
+> copies per tree bought 0.016 seconds against a registered prediction of 0.64,
+> a null under M0; removing about thirty *round trips* per tree bought 0.75
+> seconds, resolved. The mechanism is untouched: a copy really does drain the
+> queue on Metal. What is withdrawn is the price. Count round trips to predict
+> time; count copies to predict portability risk and ordering hazards.
+>
+> Read every "wait" below as "drain" and every wait-count projection as void.
+
+---
+
 ## Session II leftovers: the one decision Sweep II could not close
 
 ### S1. Does the tree-resident plane become the default GPU plane?
 
 Three conditions, all required. State as of now:
 
-| condition | state |
-|---|---|
-| trees node-identical to the host plane | **satisfied**, `tests/test_gpu_tree_resident.mojo`, no tolerance, six configurations, and it asserts on the plane's own trace that the gate opened |
-| faster at 250,000 **and** 1,000,000 rows | 1M is **consistent, not resolved** (M0). **250k has never been measured at all.** |
-| no regression at 50,000 | **never measured** |
+**CLOSED 2026-08-16.** All three conditions hold. The table below is the state
+as of the night before, kept for the record, with the outcome beside it.
 
-So S1 is two shapes short of decidable, and it has been two shapes short since
-the plane landed. Until both are taken the plane stays opt-in, which is the
-correct default and also the reason nobody noticed the gap.
+| condition | state when queued | outcome |
+|---|---|---|
+| trees node-identical to the host plane | **satisfied**, `tests/test_gpu_tree_resident.mojo`, no tolerance, six configurations, and it asserts on the plane's own trace that the gate opened | unchanged |
+| faster at 250,000 **and** 1,000,000 rows | 1M was **consistent, not resolved** (M0). 250k had never been measured at all. | **both resolved**: 44% at 250k, 24% at 1M in the fast regime |
+| no regression at 50,000 | never measured | **2.2x faster**, resolved, the largest relative win of the three |
+
+The gate was proved open rather than assumed, with
+`MOJOTREES_GPU_TREE_RESIDENT_TRACE=1`. Details in
+[`session3_2026-08-16/RESULTS.md`](session3_2026-08-16/RESULTS.md).
+
+**One gap remains and it is a code gap, not a measurement gap.** Under S1 the
+resident plane becomes the default GPU plane. It is still opt-in in the source:
+`src/mojotrees/gpu_resident_round.mojo` gates it on
+`getenv("MOJOTREES_GPU_TREE_RESIDENT") == "1"`. The decision was recorded and
+has not been shipped.
 
 ```
 # 250k and 50k, alternating processes, >= 5 pairs each, ON against OFF
@@ -65,6 +116,14 @@ restated there.
 Order matters: the main claim goes first, while the box is coldest.
 
 ### M2.1 The upload collapse, ON against OFF
+
+> **Annotation, 2026-08-16. RAN, and REFUTED.** 1,000,000 x 50, alternating
+> processes, five pairs, medians 2.489 ON against 2.505 OFF: **0.016 seconds**
+> against the 0.64 registered below. Not resolved under M0; the gap sits inside
+> the ON arm's own 0.039 spread. The registered falsification two paragraphs
+> down fired exactly as written, which is the outcome it said was more
+> informative than the win. Full table in `session3_2026-08-16/RESULTS.md`,
+> withdrawal in `docs/GPU_PORTABILITY.md` section 6.1.1. Text below unedited.
 
 **Blocked on merge.** Five lanes are out; two of them are this item.
 
@@ -244,19 +303,43 @@ so far.
   sharing kernels and a split-policy gate that is a lever for one policy and a
   no-op for the other.
 - `main` is unpromoted. All of this is on `perf-round-2`.
-- **`compatibility/api_snapshot.json` is stale and was already stale before this
-  round.** It is missing `MOJOTREES_CONST_HESSIAN`, `MOJOTREES_GPU_TREE_RESIDENT`
-  and its trace variables from earlier lanes, and this round adds
-  `MOJOTREES_GPU_TABLE_RESET` and `MOJOTREES_GPU_PACKED_DOWNLOAD`. Regenerate
-  **once** at merge with `--write` rather than per lane, or every lane conflicts
-  with every other. Then decide whether these knobs get declared in
-  `docs/COMPATIBILITY_POLICY.md`; the undeclared performance knobs from the last
-  two rounds were not, and that is a drift worth settling deliberately.
+- **`compatibility/api_snapshot.json`: regenerated, and the gate is green.**
+  This bullet used to say the snapshot was stale and missing
+  `MOJOTREES_CONST_HESSIAN`, `MOJOTREES_GPU_TREE_RESIDENT` and its trace
+  variables, `MOJOTREES_GPU_TABLE_RESET` and `MOJOTREES_GPU_PACKED_DOWNLOAD`.
+  All five are present. `7a73a64`, "Regenerate the API snapshot once, for all
+  six lanes at once", did it exactly as this bullet asked — once, at merge, with
+  `--write` — and `python3 tools/api_snapshot.py --check` returns `ok`.
+
+  **The remaining question is the one this bullet raised second and nobody has
+  answered:** whether these knobs get declared in
+  `docs/COMPATIBILITY_POLICY.md`. `environment.declared` holds **7** names
+  against `environment.undeclared`'s **61**, so the drift is now the rule rather
+  than the exception, and it is still worth settling deliberately.
+
+  Two things the audit found about that file, so the next reader does not
+  over-trust it. `environment.observed` is a **string-literal scan, not a read
+  scan** (`tools/api_snapshot.py:839`), so membership is not evidence a variable
+  does anything — one of the 68, `MOJOTREES_STARTUP_REPORT_FD`, is read by
+  nothing at all and says so at `src/mojotrees/initialization.mojo:114`. And
+  `ENV_SCAN_DIRS` excludes `bench/`, so the best-evidenced knobs in the
+  repository, the `MOJOTREES_UM_*` family behind
+  `apple_m4_unified_memory_2026-08-15.md`, are not in it. See
+  [`INSTRUCTION_AUDIT.md`](INSTRUCTION_AUDIT.md) section 9.
 - `stage_frontier` still uploads three tables. Untouched on purpose: it stages an
   arbitrary test-built frontier that no scalar describes, so the reset-kernel
   trick does not apply to it. It is not on the per-tree path.
 
 ### The copies that are still there, found by lanes and deliberately not taken
+
+> **Annotation, 2026-08-16.** This list is still worth having, and its reason
+> has changed. It was written as a list of unclaimed waits; after M2.1 it is a
+> list of unclaimed **hazards** and portability items. Every entry below that
+> says "wait" means "drain", and none of them should be picked up expecting a
+> clock to move. The one item here that would be a *round trip* is none of them.
+> Pick these up to reduce the places a stale byte can hide and the work a
+> non-Metal backend will need, not to make a fit faster. See
+> `docs/GPU_PORTABILITY.md` section 6.1.1. Text below unedited.
 
 Listed so the next round starts from a list rather than from another audit. None
 of these is on the default 1M leaf-wise path, which is why none was taken.
