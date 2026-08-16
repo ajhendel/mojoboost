@@ -319,6 +319,44 @@ Nine are PENDING, and they are **not nine independent jobs**:
 - `catboost_ranking` is a trainer-selection question, routed with the
   objective codes.
 
+## THE SIX SHAPES OF UNREACHABILITY
+
+All six were found in this repository on 2026-08-16. They are not variants of
+one bug. **Each is invisible to the tool that catches the one before it**, which
+is the reason this list exists rather than a single rule.
+
+| # | shape | what catches it | example |
+|---|---|---|---|
+| 1 | A module nothing imports | `tools/connectivity_audit.py`, walks the import graph | `text_features`, `langevin`, `onnx_export` |
+| 2 | A gate that IS imported, IS called on every fit, and is blind to its parameter | `tools/refusal_consistency.py`, compares what four layers claim | `boosting_type` appears zero times in `device_policy.mojo` |
+| 3 | A defaulted parameter that every call site leaves at its default | `tools/default_argument_audit.py`, counts arguments at call sites | `select_tree_features(usable=[])`, five callers, none passing, and a producer with no consumer |
+| 4 | A capability reachable on some entry surfaces and not others | `tools/surface_parity.py`, asks the same question at four surfaces | `auto_learning_rate` works from the CLI and C ABI, not from Python |
+| 5 | A value nothing produces, so a gate decides on a constant | nothing yet; found by reading | `resolve_device(score_function=SCORE_L2)`, eight callers, none supplying it |
+| 6 | **A field written on every row for exactly this purpose, with no consumer** | nothing yet | `engine_resolved_params`, written at `engines.py:1275`, read by nothing |
+
+**Six is the nastiest and is worth understanding.** It does not look like an
+absence from any angle. The write is there, the data is in the artifact, the
+schema documents it, the intent is recorded. Only the *read* is missing, and
+nothing counts reads of a JSON key. It cost this campaign a day of arguing
+about a learning rate whose answer was sitting in the record the whole time:
+`engine_resolved_params.learning_rate` was `0.10000000149011612`, which settles
+it in one line, and two orchestrators reasoned past it because neither opened
+the field.
+
+**Five is the same disease one level down.** A gate can be reachable, called,
+and correct, and still decide on a constant because the thing that would tell
+it otherwise is a defaulted argument nobody passes. `BLOCK_SCORE_FUNCTION` was
+evaluating against `SCORE_L2` on every Mojo native path no matter what the user
+asked, while on the Python full path the same block fired and wrongly refused a
+configuration that worked. **One gate, opposite failure modes, decided by who
+called.**
+
+The general lesson, which is cheaper than the six rules: **a thing is not
+reached because it exists, is imported, is called, is passed, is written, or is
+documented. It is reached when something reads it.** Every tool above is a
+different way of asking who reads this, and each was written after the shape it
+catches had already shipped.
+
 ## THE STANDING RULE OF THIS ROUND: BUILT IS NOT REACHED
 
 Measured on `perf-round-2`, 2026-08-16, by counting importers in `src/` and
