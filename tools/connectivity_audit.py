@@ -258,6 +258,94 @@ CLASSIFICATION = {
         "LightGBM cegb_* controls, complete and self-contained. Parked until "
         "a trainer accepts the cegb params and the boosting loop hooks it.",
     ),
+    # -- the cpu-round-2 feature set, landed built and not wired -----------
+    #
+    # Eleven modules classified together on 2026-08-16 because they share one
+    # state and one reason for it. Each is a CatBoost or export capability
+    # that its lane deliberately landed complete, self-contained, off by
+    # default and reached by nothing but its own test, on the round's rule
+    # that a capability is built first and connected in a separate change
+    # that can be reviewed for what it moves. None of them is settable: a
+    # sweep of every parameter name they would need found `max_ctr_complexity`
+    # alone reaching a parser, and it is REFUSED there (params.mojo:988) and
+    # again in Python (sklearn.py:1306). So this group is unreachable and
+    # unaskable, which is the honest half of built-and-not-wired and not the
+    # silent-ignore defect the round spent itself chasing.
+    #
+    # They are PENDING rather than EXPERIMENTAL for the reason `cegb` is:
+    # every one is meant to be reachable and is waiting on a connecting lane,
+    # so the finding should stay in the queue until that lane lands.
+    "catboost_ranking": (
+        PENDING,
+        "cpu_round_2",
+        "CatBoost ranking objectives and eval metrics (QueryRMSE, PairLogit, "
+        "YetiRank, NDCG, PFound). No trainer selects them.",
+    ),
+    "ctr": (
+        PENDING,
+        "cpu_round_2",
+        "Ordered target statistics, the simple CTR projection. Catalog A19. "
+        "Parked until binning or the trainer asks for a CTR column.",
+    ),
+    "ctr_combinations": (
+        PENDING,
+        "cpu_round_2",
+        "CTR feature combinations, CatBoost's TProjection above complexity 1. "
+        "Catalog A30, extending A19. Its parameter max_ctr_complexity is "
+        "refused rather than ignored while this is unreached.",
+    ),
+    "embedding": (
+        PENDING,
+        "cpu_round_2",
+        "CatBoost's LDA and KNN embedding feature estimators. Catalog A20. "
+        "Needs a raw embedding column the ingestion path does not accept.",
+    ),
+    "langevin": (
+        PENDING,
+        "cpu_round_2",
+        "Stochastic Gradient Langevin Boosting and model shrinkage "
+        "(langevin, diffusion_temperature, model_shrink_rate). The boosting "
+        "loop does not draw the noise or apply the shrinkage.",
+    ),
+    "multi_target": (
+        PENDING,
+        "cpu_round_2",
+        "CatBoost's MultiRMSE and MultiRMSEWithMissingValues. Blocked with "
+        "survival on the same thing target_matrix names.",
+    ),
+    "onnx_export": (
+        PENDING,
+        "cpu_round_2",
+        "ONNX export of the tree ensemble, arithmetic and refusals. No "
+        "binding registers it, so no Python caller can export.",
+    ),
+    "survival": (
+        PENDING,
+        "cpu_round_2",
+        "CatBoost's Cox and SurvivalAft objectives. Both need the "
+        "multi-column label contract target_matrix describes.",
+    ),
+    "target_matrix": (
+        PENDING,
+        "cpu_round_2",
+        "The multi-column label contract, and by its own docstring the "
+        "finding rather than the fix: every training entry point takes a "
+        "single target column. This is the head of the chain that reaches "
+        "multi_target and survival, so one connecting edge closes three.",
+    ),
+    "text_features": (
+        PENDING,
+        "cpu_round_2",
+        "CatBoost's text_features: the BoW, NaiveBayes and BM25 estimators. "
+        "Host-side feature generation nothing calls.",
+    ),
+    "text_processing": (
+        PENDING,
+        "cpu_round_2",
+        "The tokenizer, dictionary and digitizer behind text_features. "
+        "Reached only from that module, itself unreached, so it is the tail "
+        "of a two-module chain and not a separate decision.",
+    ),
     "gpu_vendor_policy": (
         EXPERIMENTAL,
         "consolidation_K2",

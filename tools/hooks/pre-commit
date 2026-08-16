@@ -2,12 +2,23 @@
 #
 # Refuse a commit that stages a gate artifact whose gate is failing.
 #
-# Three files in this repository are generated or checked rather than written
+# Several files in this repository are generated or checked rather than written
 # freehand, and each one has a gate that owns it:
 #
 #   compatibility/api_snapshot.json   python3 tools/api_snapshot.py --check
 #   docs/LIGHTGBM_PARITY.md           python3 tools/check_parity.py
 #   pixi.toml                         python3 tools/check_pixi_tasks.py
+#   docs/INTEGRATION_INVENTORY.md     python3 tools/audit_integration.py
+#   tools/connectivity_audit.py       python3 tools/audit_integration.py
+#
+# The last two are one gate over a pair that must agree: the CLASSIFICATION
+# table in `connectivity_audit.py` is where a judgment about an unreachable
+# module is recorded, and the table in `INTEGRATION_INVENTORY.md` is a
+# rendering of it rather than a second opinion. Editing either without the
+# other is how the two stop meaning the same thing. This does NOT gate on a
+# lane landing an unreachable module without recording it -- that check is
+# `--strict` and it lives in CI, where it does not sit in anyone's commit
+# loop.
 #
 # All three have been committed stale, because nothing made the gate run
 # first. One regeneration then swept in two unrelated drifts that other
@@ -52,6 +63,8 @@ while IFS= read -r path; do
     compatibility/api_snapshot.json) want api ;;
     docs/LIGHTGBM_PARITY.md)         want parity ;;
     pixi.toml)                       want pixi ;;
+    docs/INTEGRATION_INVENTORY.md)   want integration ;;
+    tools/connectivity_audit.py)     want integration ;;
   esac
 done <<< "$staged"
 
@@ -89,6 +102,8 @@ Regenerate or fix, then commit again:
   compatibility/api_snapshot.json   python3 tools/api_snapshot.py --write
   docs/LIGHTGBM_PARITY.md           edit until tools/check_parity.py passes
   pixi.toml                         edit until tools/check_pixi_tasks.py passes
+  docs/INTEGRATION_INVENTORY.md     python3 tools/audit_integration.py --table
+  tools/connectivity_audit.py       prints the corrected table; paste it in
 
 If the failure is somebody else's drift rather than yours, say so in the
 commit message rather than sweeping it into your snapshot regeneration, and

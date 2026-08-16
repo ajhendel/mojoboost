@@ -37,7 +37,10 @@
 #                         for that and this is the knob for it.  CI sets it
 #                         to the full count.
 #   MOJOTREES_TEST_PKG    set to 0 to compile from `src/` instead of the
-#                         package, which is slower but skips the build step
+#                         package, which skips the build step.  Slower for a
+#                         suite and much faster for one file; see below.
+#   MOJOTREES_TEST_REBUILD  set to 1 to rebuild the package even when it is
+#                         already newer than everything under `src/`
 #
 # This parallelizes *within* one suite run.  `tools/with_build_lock.sh` is
 # the opposite concern, serializing whole runs against other sessions in the
@@ -51,7 +54,21 @@
 # function pointer, and called by `TestSuite` (231.9 / 220.4 / 221.2 ms).
 # So the levers that matter are compile-side, and the two that work are
 # already here: one `mojo precompile` of the package instead of sixty, and
-# concurrent files.  Lowering the optimization level is NOT a lever, it is
+# concurrent files.
+#
+# That argument is about a SIXTY-file suite and does not carry to one file,
+# which is worth stating because it was carried anyway and cost every lane
+# real time.  Precompiling elaborates all sixty modules; `-I src` elaborates
+# only the modules the file being run imports, which for a light test is a
+# handful the cache serves immediately.  Measured on one 49-test file, warm,
+# interleaved, two repeats each: 12.2 s through the package against 0.75 s
+# with `MOJOTREES_TEST_PKG=0`, and at two files 16.3 s against 5.4 s.  The
+# precompile does not pay for itself until several files, so the rule is
+# `MOJOTREES_TEST_PKG=0` for one or two files and the default for more.
+# Skipping the rebuild when `src/` has not changed (below) removes most of
+# the difference without anyone having to remember the variable.
+#
+# Lowering the optimization level is NOT a lever, it is
 # worse on both counts (`-O0` compiled the file above in 4.68 s against
 # 3.09 s at the default `-O3`, and ran the tests ten times slower).  The
 # one lever left is the on-disk compile cache under
@@ -242,13 +259,41 @@ if [ "$MODE" = "list" ]; then
 fi
 
 if [ "$USE_PKG" = "1" ]; then
-  echo "building build/mojotrees.mojopkg"
-  mkdir -p build
-  if ! mojo precompile -I src src/mojotrees -o build/mojotrees.mojopkg; then
-    echo "package build failed; the suite cannot run against a package it" >&2
-    echo "could not build.  Re-run with MOJOTREES_TEST_PKG=0 to compile" >&2
-    echo "each test from src/ instead." >&2
-    exit 1
+  PKG="build/mojotrees.mojopkg"
+  # Rebuild only when there is something to rebuild.  This used to be
+  # unconditional, which put a floor of roughly eleven seconds under every
+  # invocation of this script -- measured at 12.2 s for one 49-test file
+  # against 0.75 s for the same file with the build skipped, on a warm cache
+  # that the build does not benefit from.  A lane running one file after one
+  # edit paid that floor every time, and it is the reason focused runs felt
+  # like they cost minutes.
+  #
+  # The test is mtime against `src/`, which is the precompile's entire input
+  # (`mojo precompile -I src src/mojotrees`).  Nothing else can invalidate the
+  # package: a branch switch rewrites the mtimes of the files it changes, so
+  # moving between commits invalidates exactly the way an edit does, and a
+  # missing `build/` invalidates by the `-f` test.  `find | head -1` rather
+  # than `find -quit`, which is not portable.
+  #
+  # This does not weaken the check the header describes.  Precompiling
+  # elaborates every module in `src/mojotrees/`, including the ones no test
+  # imports, and skipping it when no module changed means the elaboration
+  # that already succeeded still stands.  `MOJOTREES_TEST_REBUILD=1` forces
+  # the build anyway, which is what to reach for if a package is ever
+  # suspected of being stale for a reason mtime cannot see.
+  if [ "${MOJOTREES_TEST_REBUILD:-0}" = "0" ] &&
+     [ -f "$PKG" ] &&
+     [ -z "$(find src -newer "$PKG" | head -1)" ]; then
+    echo "build/mojotrees.mojopkg is up to date with src/, skipping the build"
+  else
+    echo "building build/mojotrees.mojopkg"
+    mkdir -p build
+    if ! mojo precompile -I src src/mojotrees -o "$PKG"; then
+      echo "package build failed; the suite cannot run against a package it" >&2
+      echo "could not build.  Re-run with MOJOTREES_TEST_PKG=0 to compile" >&2
+      echo "each test from src/ instead." >&2
+      exit 1
+    fi
   fi
   PKG_INCLUDE="-I build"
 else

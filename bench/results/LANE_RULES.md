@@ -60,6 +60,15 @@ product floor.
 - **your own test file(s), named explicitly, one at a time**:
   `bash tools/run_tests.sh cpu <your_test_name>`
 
+  **Run it once, after your last edit, and never a second file to confirm.**
+  For one or two files add `MOJOTREES_TEST_PKG=0`, which skips the package
+  build and compiles only the modules your test imports. Measured on one
+  49-test file, warm, interleaved, two repeats each: **0.75 s against 12.2 s**,
+  and at two files 5.4 s against 16.3 s. The package build pays for itself only
+  across several files, which is the suite case and not yours. It is also
+  skipped automatically now when nothing under `src/` has changed since the
+  last build, so a re-run of an unedited file costs about a second either way.
+
 **You may NOT run**, under any circumstance, without exception:
 - any test suite: `tools/run_tests.sh all|cpu|gpu` with no file named, or
   `pixi run test*`. **A suite counts as a compile** and invalidates the other
