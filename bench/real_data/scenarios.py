@@ -1068,9 +1068,37 @@ MOJOTREES_CATBOOST_MODE = {
     "lambda_l1": 0.0,
     "lambda_l2": 3.0,
     "score_function": "cosine",
-    "random_strength": 1.0,
+    # No `random_strength` row, and this one is a reachability fact, not a
+    # routing one. The noise itself exists -- `split.find_best_split` adds
+    # it and `GpuSplitSearcher` stages it -- but its **per-tree scale** is
+    # computed only by the dense `fit` entry point. This harness trains
+    # through `train(params, Dataset)`, and `_parse_params` in
+    # bindings/_mojotrees.mojo passes `random_strength_ok` True at exactly
+    # one call site (`fit`, and only on the CPU); every other entry point
+    # inherits the False default and refuses by name. So a Dataset fit
+    # raises rather than growing trees with unscaled noise, which is the
+    # refusal working.
+    #
+    # Found by the smoke pass on 2026-08-16, as the second of two failures
+    # in this arm. Restoring the key needs the scale computed for the
+    # Dataset path, not a change here.
     "leaf_estimation_iterations": 1,
-    "max_bin": 255,
+    # No `max_bin` row, and the reason is a routing fact rather than a
+    # parity one. `dataset_params` exists because `max_bin` belongs to the
+    # binning and **both libraries reject it on `train`**; this dict is
+    # applied over the shared *training* parameters, so a `max_bin` here
+    # reaches `mojotrees.train` and raises "'max_bin' describes the data,
+    # not the training run". It did: the smoke pass on 2026-08-16 killed
+    # this arm on dense_regression and high_cardinality_categorical alike,
+    # which under an infrastructure failure would have withheld the quality
+    # verdict for every cell that did run.
+    #
+    # Removing it changes no value. `BASE_PARAMS["max_bin"]` is already 255
+    # and already reaches the Dataset, so this arm binned at 255 before the
+    # key was added and bins at 255 without it. The parity argument the key
+    # carried is true and is kept in MOJOTREES_CATBOOST_MODE_REASONS, which
+    # is where a claim about granularity belongs; it just was not a key this
+    # dict could carry.
     "bootstrap_type": "MVS",
     # NOT row bagging. Under `bootstrap_type="MVS"` this key is the MVS rate
     # and row bagging is off, which is CatBoost's own contract for the
@@ -2729,7 +2757,20 @@ MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT = {
     "dense_regression": None,
     "imbalanced_binary": None,
     "ordered_boosting_small": None,
-    "high_cardinality_categorical": None,
+    "high_cardinality_categorical": (
+        "grow_policy=oblivious is implemented for numerical thresholds "
+        "only, and this arm asks for symmetric trees. A level of an "
+        "oblivious tree shares one split across every node on it, while a "
+        "categorical feature is searched as category partitions whose order "
+        "comes from one node's own statistics, so there is no single "
+        "partition a level could share. The grower refuses rather than "
+        "picking one node's order for the whole level. Found by the smoke "
+        "pass on 2026-08-16, as the third of three failures in this arm. "
+        "CatBoost does not hit this because a CTR turns the categorical "
+        "into a numeric column before its split search ever sees it, which "
+        "is the gap CATBOOST_UNMATCHABLE['ctr'] names: this is that gap "
+        "surfacing as a scheduling decision rather than as a quality one"
+    ),
     # Both of these are already skipped for the CatBoost arm itself by
     # CATBOOST_SCENARIO_SUPPORT, so the loop below never consults these two
     # entries today. They are here because the loop subscripts this table
