@@ -142,3 +142,127 @@ than optimizations.
 `main` is not promoted either. `perf-round-2` is bit-exact against pre-merge
 and green on the full suites, but "no regression at 50,000 rows" is not yet
 known, and that is the shape a user meets first.
+
+---
+
+# Sweep II protocol, written before the sweep ran
+
+Same discipline as above and for the same reason: the previous round produced
+three results that would each have been read differently had the rule been
+written afterwards. Committed before any arm is executed.
+
+## Provenance vocabulary, used from here on
+
+Every number in this project now carries one of four labels, stated each time:
+
+- **measured**: read off an instrument on a stated machine in a stated window.
+- **fitted**: derived from measured points by a model, with the points named.
+  A two-point fit and a three-point fit over different row ranges are different
+  numbers and must not be compared as though they were the same quantity.
+- **derived bound**: arithmetic over bytes, launches or counts. A bound, never
+  a prediction.
+- **estimated**: a judgment. Says so.
+
+This exists because two numbers were quoted all week as measurements when one
+was a derived bound and the other was a two-point fit from a different era over
+a different row range, and the confusion inverted a priority.
+
+## The open question this sweep exists to answer
+
+Two fits of our GPU wall clock disagree, and **both are real**:
+
+- **2.24 microseconds per row**, fitted from the post-round-2 points at 50,000,
+  250,000 and 1,000,000 rows, alongside a 1.33 second constant.
+- **3.2 microseconds per row**, fitted from the pre-round-2 pair at 1,000,000
+  and 5,000,000 rows.
+
+They are not in conflict. They are different row ranges. Taken together they
+say our cost per row may be **superlinear above one million rows**, which is
+exactly where the 2.24 figure stops having evidence. The claim "our marginal
+cost per row is about 10 percent better than LightGBM's" is supported **below**
+one million rows and **unproven above it**.
+
+So the sweep must include 2,000,000 rows, and 5,000,000 if the box allows,
+because that is the only part of the curve where the two fits can be told
+apart. A sweep that stops at 1,000,000 would confirm the number we already have
+and leave the question that matters untouched.
+
+## Arms
+
+Interleaved in one process where the harness supports it, alternated across
+processes where it does not. Five repeats, median as the decision statistic
+with min and spread beside it.
+
+- our CPU
+- our GPU, host-driven plane (today's default)
+- our GPU, `MOJOTREES_GPU_TREE_RESIDENT=1`
+- our GPU, `grow_policy=depthwise`
+- LightGBM at 10 threads
+
+## Shapes
+
+250,000 / 1,000,000 / 2,000,000 rows by 50 features, and 5,000,000 if memory
+and time allow. 50,000 is included for the tree-resident arm alone, as a
+regression check.
+
+## Recorded for every arm, without exception
+
+GPU performance state before and after, thermal state, sync count, and the
+backend proof. The clock state is not optional: two of four captures in the
+previous session ran entirely at Minimum GPU clock while two ran at Maximum,
+which is the most plausible cause of this machine's two-to-threefold drift, and
+an interleaved comparison straddling a clock transition is invalid even though
+it is interleaved.
+
+Enqueue time is recorded **separately from wall time**. The Metal command queue
+is 64 buffers deep and the stall when it fills is invisible inside
+`objc_msgSend`, so a device-resident plane emitting on the order of two hundred
+launches per tree can backpressure. If that happens it must show up as host
+time rather than as "the GPU got slower".
+
+## Decision rules
+
+### S1. Does the tree-resident plane become the default GPU plane?
+
+All three must hold:
+
+- trees are node-identical to the host plane. **Already satisfied**, by
+  `tests/test_gpu_tree_resident.mojo`, which compares value bits with no
+  tolerance across the leaf budget, early termination, missing values, bagging,
+  and a refused configuration.
+- it is faster at **both** 250,000 and 1,000,000 rows.
+- it does not regress at 50,000.
+
+Any one failing means it stays opt-in. Two of the three are speed; the first is
+not negotiable and is the reason it is listed first.
+
+### S2. What is depthwise allowed to be?
+
+**A benchmark row and an opt-in. Never the parity default.** Depth-wise growth
+grows a *different tree* than leaf-wise, so "it captures most of the 1.33
+seconds for free" is only true for a user who did not ask for leaf-wise. Making
+it the default would be answering a speed question by changing the model, which
+this project does not do. Measure it, report it, and if it wins decisively that
+is an argument for making the device-resident leaf-wise plane as good, not for
+switching growth policies underneath somebody.
+
+### S3. Where does the engineering go next?
+
+If the sweep confirms roughly a 1.33 second constant and roughly 2.1 seconds of
+compute at one million rows, then **after the resident plane lands the round is
+compute-dominated and the histogram kernel is the main event**, not a phase two.
+That inverts the ordering this project has assumed all week, so it should be
+stated explicitly rather than absorbed.
+
+The bound, labelled as a bound: an ideal-layout kernel is three to four times
+below today's byte traffic. A realistic one-and-a-half to two times on the
+histogram phase would put the fit near 1.4 to 1.7 seconds against LightGBM's
+2.86. That is an **estimate over a derived bound**, not a projection, and it
+should not be quoted as though the sweep produced it.
+
+### S4. What would falsify the whole direction?
+
+If the tree-resident plane measures **no faster** at 1,000,000 rows despite
+removing thirty host round trips per tree, then the 1.33 second constant is not
+the round trips and the model of this workload is wrong. That is the single
+most informative possible outcome and it must be reported as loudly as a win.
