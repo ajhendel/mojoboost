@@ -493,8 +493,9 @@ model.device_                            # the backend that actually ran
 the dependable backend. `"gpu"` raises when no accelerator is available or
 when the GPU path does not cover the workload, rather than falling back
 silently, so a GPU run that returns is a GPU run. `"auto"` picks a backend
-for you and **currently always picks the CPU**. Fitting records what ran
-on `device_`.
+for you and **currently always picks the CPU**, not for want of a measured
+crossover (one rule ships) but because the rule is scoped to hardware the
+capability probe never identifies. Fitting records what ran on `device_`.
 
 CPU parallelism is controlled by two environment variables.
 `MOJOTREES_NUM_WORKERS` is 1 for serial, N above 1 to force chunked
@@ -509,15 +510,24 @@ numerical one.
 | Wanted | State |
 |---|---|
 | `device="gpu"` with an `eval_set` | Validation is scored on the CPU |
-| `device="gpu"` for 3 or more classes | Multiclass training is CPU-only |
-| `device="gpu"` with sparse input | No sparse GPU kernel |
-| `device="auto"` selecting the GPU | The policy exists; it always resolves to the CPU today |
+| `device="gpu"` with sparse input from the estimators | The Mojo API has `train_gpu_sparse`; the Python path keeps the CPU |
+| `device="auto"` selecting the GPU | One measured rule exists and cannot fire, because the capability probe opens no device and a hardware-scoped rule cannot match an unidentified profile |
+
+Multiclass has left that list. `fit_multiclass` dispatches on the device it
+resolves, so `device="gpu"` trains softmax on the accelerator.
 
 **And the honest part.** GPU training has been run on exactly one device,
 an Apple M4 through Metal, where correctness and repeat-run determinism
-pass and it is slower than the four-worker CPU path at every shape
-measured. No NVIDIA and no AMD hardware has ever executed this code, not
-in CI and not on a laptop. There is one GPU source and no per-vendor
+pass. On speed it is now split rather than uniformly behind: at 1,000,000
+rows by 50 features the GPU trains in 3.58s against the CPU path's 6.98s, so
+1.85x, while at 250,000 and 50,000 rows it loses to that same CPU path
+(1.89 against 1.66, and 1.63 against 0.564), because it carries about 1.5
+seconds of fixed cost per fit. Multiclass is its clearest win, 15.30s
+against 25.47s. Against LightGBM we are still behind at the headline shape,
+2.44x on the CPU and 1.25x on the GPU. The record is
+`bench/results/profile_2026-08-15/RESULTS.md`. No NVIDIA and no AMD hardware
+has ever executed this code, not in CI and not on a laptop. There is one GPU
+source and no per-vendor
 files, which is a reason to expect portability and is not evidence of it.
 `docs/GPU_VALIDATION.md` is the record and says what a backend has to
 produce before any claim is made about it.
@@ -610,8 +620,8 @@ mojotrees should not have to assemble this list from thirteen sections.
 | Callbacks for softmax and ranking | No learning-rate schedule for multiclass | None; the trainers refuse rather than ignore |
 | Validation with a Python objective callback | No early stopping for a custom objective | The Mojo API's `train_custom_with_metrics` |
 | Validation, slicing, leaves, and contributions for sparse input | Sparse workflows | `X.toarray()`, when you can afford it |
-| GPU for multiclass, sparse, or any run with an `eval_set` | Those runs raise on `device="gpu"` | The CPU path, which is the dependable one |
-| `device="auto"` ever choosing the GPU | Nothing today; it always picks the CPU | Ask for `device="gpu"` explicitly |
+| GPU for sparse input from the estimators, or any run with an `eval_set` | Those runs raise on `device="gpu"` | The CPU path, which is the dependable one. Multiclass is no longer among them |
+| `device="auto"` ever choosing the GPU | One rule exists and cannot match an unidentified device profile | Ask for `device="gpu"` explicitly, or set `MOJOTREES_AUTO_MIN_CELLS` |
 | Any NVIDIA or AMD GPU result | Every claim about non-Apple GPUs | None. Nobody has run it |
 | `zero_as_missing=true` | Datasets whose zeros mean absent | None; no alias accepts it |
 | A LightGBM-shaped `best_score_` | Code that indexes it as a dict | `evals_result_`, which holds the whole grid |

@@ -372,11 +372,14 @@ MojoTreesRegressor(device="auto")   # picks for you, and today always picks the 
 
 `device="gpu"` is a request that gets honored or refused. It never quietly
 trains on the CPU while you believe you used the GPU. `device="auto"`
-resolves to the CPU on every machine and every workload right now, because no
-benchmark has established a size where GPU training wins, and shipping a
-crossover threshold before that measurement exists would be a performance
-claim with nothing behind it. [docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md)
-has the whole policy.
+resolves to the CPU on every machine and every workload right now, but not
+for want of a measurement: one crossover rule is installed, scoped to Metal
+on an Apple M4 for squared error at 1,000,000 rows by 50 features and above,
+where the GPU trains in 3.58s against the CPU's 6.98s. It cannot fire,
+because the capability probe opens no device and so a rule scoped to
+particular hardware can never match the profile it produces.
+[docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md) has the whole policy and the
+gap.
 
 ### 6. Print the diagnostics
 
@@ -615,11 +618,19 @@ model = MojoTreesRegressor(device="auto").fit(X, y)
 model.device_        # "cpu", on an M4 with a working Metal GPU
 ```
 
-The crossover table that `auto` consults is empty. Nothing in this repository
-has measured a workload shape where end-to-end GPU training beats the
-multicore CPU trainer, and the one end-to-end Apple measurement that exists
-came out slower. Until that changes, `auto` keeps the CPU rather than
-implying an evaluation happened that did not.
+The crossover table that `auto` consults holds one rule, and no rule matches
+in practice. The rule is scoped to Metal on an Apple M4 for unweighted
+squared error at 1,000,000 rows by 50 features and above, where the GPU has
+been measured at 3.58s against the CPU's 6.98s. What stops it matching is
+that the capability probe opens no device, so the machine is reported as
+unidentified and a rule scoped to particular hardware cannot apply to it.
+`auto` keeps the CPU and says which half of "no rule covered this" applied,
+rather than implying the shape was too small.
+
+Below that shape the CPU really is the right answer on this hardware: at
+250,000 rows the GPU takes 1.89s against the CPU's 1.66s, and at 50,000 it
+takes 1.63s against 0.564s, because the device carries about 1.5 seconds of
+fixed cost per fit.
 
 Two ways forward, depending on what you want.
 

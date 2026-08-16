@@ -213,7 +213,11 @@ contention and that a tiled reduction wins at high contention. That is
 exactly the kind of claim this repository has no measurement for on any
 NVIDIA or AMD part, and installing it from reasoning is what
 `device_policy.crossover_rules` refuses to do for the CPU/GPU threshold for
-the same reason.
+the same reason. That table is no longer empty, and the way its one rule was
+added is the standard here: it names the API, the Apple generation, and the
+objective it was measured at, cites two recorded interleaved sweeps in
+`evidence_id`, and came with a `POLICY_VERSION` bump. A strategy preference
+gets in the same way or not at all.
 
 `StrategyInputs` reports what a measured rule would key on (tile count,
 slot count, bin count, block width, residency, conflict degree, partial

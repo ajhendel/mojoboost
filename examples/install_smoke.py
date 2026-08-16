@@ -306,10 +306,11 @@ def device_selection():
     print(
         "\ndevice='auto' resolves to the CPU on every machine and every\n"
         "workload unless MOJOTREES_AUTO_MIN_CELLS is set. The crossover\n"
-        "table is empty because no benchmark has established a workload\n"
-        "size where end-to-end GPU training beats the multicore CPU\n"
-        "trainer, and shipping a threshold before that measurement would\n"
-        "be a performance claim with nothing behind it. See\n"
+        "table holds one rule, scoped to Metal on an Apple M4 for squared\n"
+        "error at 1,000,000 rows by 50 features and above, where the GPU\n"
+        "trains in 3.58s against the CPU's 6.98s. It cannot fire, because\n"
+        "the capability probe opens no device and a rule scoped to\n"
+        "particular hardware cannot match a profile that names none. See\n"
         "docs/DEVICE_SELECTION.md and docs/GPU_VALIDATION.md."
     )
 

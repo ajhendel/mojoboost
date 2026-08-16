@@ -47,12 +47,33 @@ Headline for this original baseline: a from-scratch Mojo GBDT is within 1.5x
 of single-threaded LightGBM on training, faster at binning, and matches its
 accuracy, before multicore histogram accumulation and without GOSS or EFB.
 
-The current large-data comparison, including three matched data seeds at one
-and five million rows, is recorded in
-[`results/apple_m4_large_scaling_2026-08-14.md`](results/apple_m4_large_scaling_2026-08-14.md).
-It supersedes extrapolations from this original 100,000-row baseline; it does
-not replace the baseline because the shapes and implementation revisions are
-different.
+**Do not carry that 1.5x anywhere else.** The serial ratio has since been
+measured at a different shape and it is worse: at 1,000,000 x 50 we are
+15.96s at one worker against LightGBM's 8.82s at one thread, so **1.81x**.
+The same record also shows we get 2.29x from ten cores where LightGBM gets
+3.08x, so the inner loop and the parallel scaling are both behind, and
+either one alone is an incomplete account.
+
+The current comparison is
+[`results/profile_2026-08-15/RESULTS.md`](results/profile_2026-08-15/RESULTS.md),
+which supersedes both this baseline and
+[`results/apple_m4_large_scaling_2026-08-14.md`](results/apple_m4_large_scaling_2026-08-14.md)
+for anything quoted as current. In seconds of training with binning
+excluded, 100 rounds, 31 leaves, 255 bins, squared error, Apple M4, median
+of three interleaved:
+
+| shape | our CPU | our GPU | LightGBM, 10 threads |
+|---|---|---|---|
+| 1,000,000 x 50 | 6.98 | **3.58** | **2.86** |
+| 250,000 x 50 | **1.66** | 1.89 | **1.00** |
+| 50,000 x 50 | **0.564** | 1.63 | 0.594 |
+
+We are 2.44x behind LightGBM on the CPU and 1.25x behind on the GPU at the
+headline shape, ahead of it at 50,000 rows on the CPU, and ahead of it by
+3.2x on binning (0.377s against 1.207s, which the table above excludes).
+None of that replaces the 100,000-row baseline, because the shapes and the
+implementation revisions are different; it replaces any extrapolation from
+it.
 
 ## CPU stage profile
 
@@ -239,7 +260,31 @@ the result, and states what one launch removed is worth over a default
 On an Apple M4 that is roughly 20us to submit a launch and 126us for the
 wait, so about 280us a split, or 0.85s of a 3.05s run at 50,000 x 100 --
 about a third of the device path is fixed cost, and one launch removed is
-worth near 2%, which is inside `bench_train_gpu.mojo`'s noise floor. The
+worth near 2%, which is inside `bench_train_gpu.mojo`'s noise floor.
+
+Those three figures have since been confirmed by an independent instrument,
+a Metal System Trace (`docs/METAL_TIMELINE.md`). The commit call measures
+12.62us at the median on an instrumented process, so 20us is a sound upper
+bound; the completion notification measures 101.33us against the 126us
+here; and the median serialized turnaround, from the GPU finishing a
+readback to the host committing the next command buffer, is 285us against
+the 280us derived here. `bench/README.md` was also right to call these
+properties of the device rather than of this repository: between a 50,000
+and a 200,000 row capture the median enqueue moved from 12.67 to 12.62us
+while the compute between them changed by a factor of 2.3.
+
+One figure the trace does **not** confirm is "about a third of the device
+path is fixed cost", and the difference is a denominator rather than an
+error. The 280us here is a launch plus a wait with an empty kernel. What a
+real blocking readback costs end to end, commit to next commit, is 606us at
+the median, and 32 of those per round is 20.16ms of a 23.50ms round, or
+85.8%. The extra 326us is mostly the readback queued behind compute the host
+had already submitted, half of which is the pipeline working as intended and
+half of which is the GPU idle with a command buffer it has not started. So
+read 280us as the floor for one round trip and 606us as what one costs in
+place.
+
+The
 consequence is recorded in `_device_search_resident` in `train_gpu.mojo`: a
 kernel fusion here has to justify itself as strictly less work for a
 bit-identical result, not by a measured speedup. Numbers from one GPU family
@@ -295,12 +340,24 @@ executed this code, so no CUDA or HIP number should appear anywhere.
 
 ## The two GPU training crossovers
 
-`src/mojotrees/device_policy.mojo` resolves `auto` to the CPU for every
-workload, because `crossover_rules()` is empty. Two measurements would fill
-it and neither has been taken. This section is the protocol for taking them.
+`crossover_rules()` in `src/mojotrees/device_policy.mojo` now holds one rule
+for the **dense** crossover, scoped to Metal on an Apple M4 for unweighted
+squared error at 1,000,000 rows by 50 features and above. The **sparse**
+crossover has still never been measured and has no rule. This section is the
+protocol for both, and the dense half is the worked example of it rather
+than an outstanding task.
 
-**No crossover rule may be written into `device_policy.mojo` until these
-numbers exist.** A rule is a performance claim that carries an
+Two things about the dense rule are worth stating here, because a reader of
+this file will otherwise draw the wrong conclusion from `auto` still
+choosing the CPU. The rule's floor is the measured shape and not a fraction
+of it, so it says nothing about 250,000 rows, where the device in fact loses
+to our own CPU (1.89s against 1.66s). And the rule cannot fire through
+`resolve_device` at all, because `DeviceCapabilities.detect()` opens no
+device and a hardware-scoped rule cannot match a profile that names no
+hardware. That is a wiring gap, not a missing measurement.
+
+**No further crossover rule may be written into `device_policy.mojo` until
+its own numbers exist.** A rule is a performance claim that carries an
 `evidence_id`, and a threshold derived from reasoning rather than from a
 recorded run is the one thing that module refuses to ship. Adding a rule is
 a benchmarking result, not a code change, and it is out of order before the
@@ -455,8 +512,11 @@ all.
 
 Record every sweep under `results/` beside the existing files, one per
 crossover, carrying the machine, the OS version, the Mojo version, the
-resolved worker count, and the full command lines. **No numbers are recorded
-here yet**, and `crossover_rules()` is empty for that reason.
+resolved worker count, and the full command lines. The dense sweep is
+recorded in `results/apple_m4_large_scaling_2026-08-14.md` and
+`results/profile_2026-08-15/RESULTS.md`, and one rule was written from them.
+**The sparse sweep has no numbers yet**, and `crossover_rules()` carries no
+sparse rule for that reason.
 
 ## Custom objectives
 

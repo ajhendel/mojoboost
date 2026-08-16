@@ -164,10 +164,29 @@ explicit list rather than a legacy: row sampling under bagging and GOSS,
 which draws its ranked sample on the host and uploads gradients per round;
 validation scoring, which walks the tree on the host; and the binning pass
 itself. Each is named in `train_gpu.mojo`'s module docstring with the switch
-that selects it. `bench/results/apple_m4_large_scaling_2026-08-14.md` is
-the end-to-end measurement of the split as it stands (Metal 2.6x the CPU
-trainer at one million rows and 3.3x at five million, at half the resident
-memory).
+that selects it.
+
+The end-to-end measurement of the split as it stands is
+`bench/results/profile_2026-08-15/RESULTS.md`. On an Apple M4 at 100 rounds,
+31 leaves, 255 bins, squared error, the GPU is **1.85x** the CPU trainer at
+1,000,000 x 50 (3.58s against 6.98s), loses to it at 250,000 (1.89 against
+1.66) and at 50,000 (1.63 against 0.564), and wins multiclass by 1.63x
+(15.30 against 25.47 at 465,000 x 54 over 7 classes).
+`bench/results/apple_m4_large_scaling_2026-08-14.md` recorded 2.6x at one
+million and 3.3x at five million at half the resident memory; that ratio has
+since fallen to 1.85x because the CPU trainer got 1.63x faster in the round
+that followed, not because the device got slower.
+
+Where the device's time goes is measured too, and it is the mechanism behind
+the third row of the table above. The Metal timeline in
+`docs/METAL_TIMELINE.md` finds the GPU idle for 76.5% of a training span at
+200,000 rows at the device's Maximum clock, with the host blocking on 94.1%
+of blits and on 2 of 18,701 compute kernels. That is 32.1 serialization
+points per round at 606 microseconds each, and compute of every kind is
+22.9% of a round. The control plane's per-split host round trip is therefore
+the dominant cost of a GPU fit today, which is a cost of this division of
+labor rather than an argument against it, and it is what a device-owned tree
+would remove.
 
 ## Where each policy lives
 

@@ -176,8 +176,16 @@ comparison can still be invalid if the two arms straddle a clock transition.
   work is unknown, and `bench/README.md` mentions a 1.6 to 1.9 second session
   setup that may or may not sit inside the timed region.
 - Multiclass, bagging, GOSS, and the real datasets are not in this profile at
-  all. The worst number on disk is covertype, where the GPU takes 44 to 56
-  seconds against LightGBM's 4 to 7, and nothing here measures it.
+  all. The original text of this bullet, retained so the correction is
+  legible: "The worst number on disk is covertype, where the GPU takes 44 to
+  56 seconds against LightGBM's 4 to 7, and nothing here measures it."
+  **Retracted.** Those 44 to 56 seconds were a CPU fit carrying a GPU label,
+  which is provable rather than suspected: the covertype CPU and GPU records
+  in `bench/real_data/results/20260815T023123Z` carry byte-identical
+  `predictions_sha256`, while the scenarios that reach the device through the
+  single-output path do not. `trainset.train_dataset_multiclass` resolved the
+  device and discarded the answer. The honest multiclass number is in the
+  section below, and it is 15.30 seconds on the GPU against 25.47 on the CPU.
 - Fenced and async attribute differently by construction, and the true
   per-phase device time is bracketed by the two rather than given by either.
 

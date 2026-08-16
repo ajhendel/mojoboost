@@ -23,7 +23,7 @@
   },
 
   "measurements": null,
-  "measurements_absent_because": "No specialized histogram kernel has been compiled or timed on any device, Apple or otherwise. The one end-to-end GPU training measurement this repository holds (M4, bench/bench_train_gpu.mojo) is of the unspecialized path and is slower than the CPU trainer, which is why device.mojo still resolves `auto` to the CPU. Until a measurement exists, every plan below at a level above `baseline` is a hypothesis.",
+  "measurements_absent_because": "No specialized histogram kernel has been compiled or timed on any device, Apple or otherwise, so every plan below at a level above `baseline` is a hypothesis. The end-to-end GPU training measurements this repository holds (M4, bench/bench_train_gpu.mojo) are all of the unspecialized path, and they have moved: at 1,000,000 rows by 50 features the GPU is 3.58 s against the CPU's 6.98 s, while below about a million rows it loses to the CPU (1.89 against 1.66 at 250,000). This field used to say the GPU was slower than the CPU trainer, which is no longer true at the large end. `auto` still resolves to the CPU, but for a different reason: the one crossover rule that ships is scoped to hardware DeviceCapabilities.detect() never identifies. Separately, docs/METAL_TIMELINE.md puts compute of every kind at 22.9 percent of a GPU round, so a kernel specialization cannot be justified by its effect on the current round even once it is measured.",
 
   "profiles": [
     {

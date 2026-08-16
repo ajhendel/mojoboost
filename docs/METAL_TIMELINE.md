@@ -498,6 +498,14 @@ resolve. There was an undocumented difference in what the two numbers denote,
 and it should be said in the docstring that this is a fitted intercept rather
 than a measured launch.
 
+**Checked, and it still does not say it.** As of this revision the docstring
+on `HybridCosts.launch_nanos` in `src/mojotrees/hybrid_leaf_scheduler.mojo`
+reads "Fixed cost of enqueuing and running one histogram kernel, exclusive of
+the row work: the term a four-row leaf pays in full", which is a description
+of an interval and is exactly the reading that produced the apparent 3x
+disagreement. The one-line fix is a docstring edit in `src/`, which is out of
+this lane's reach and is recorded here so it is not assumed done.
+
 The interesting number in that table is the last one. When the host is not
 blocked it commits a new command buffer every 14.58 microseconds, which is the
 enqueue cost and nothing else. The mean of 106.30 microseconds is seven times

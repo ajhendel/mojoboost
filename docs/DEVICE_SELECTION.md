@@ -26,20 +26,51 @@ information; a fallback destroys it.
 
 ## What `auto` currently does, and why
 
-**`auto` resolves to the CPU on every machine and every workload, unless
-`MOJOTREES_AUTO_MIN_CELLS` is set.**
+**`auto` still resolves to the CPU on every machine and every workload in
+practice, but the reason has changed and it is no longer "there is no
+evidence".**
 
-`CROSSOVER_RULES` is empty. Nothing in this repository has measured a
-workload size where GPU training beats CPU training. The one end-to-end
-measurement that exists is on an Apple M4 (`bench/bench_train_gpu.mojo`)
-and it came out slower than the CPU trainer, and no NVIDIA or AMD device
-has ever executed this code at all (see `docs/GPU_VALIDATION.md`, where
-every CUDA and HIP row still reads **not run**).
+The crossover table is no longer empty. `crossover_rules()` in
+`src/mojotrees/device_policy.mojo` holds exactly one rule, and it is the
+smallest claim the records support:
 
-A threshold written from reasoning rather than measurement would be a
-performance claim with no evidence under it. So the table ships empty,
-`auto` conservatively chooses the CPU, and the report says exactly that
-rather than implying the GPU was evaluated and lost.
+```text
+profile.api              == metal
+profile.apple_generation == m4
+request.objective        == squared error
+request.n_outputs        <= 1
+request.n_rows           >= 1,000,000
+request.n_features       >= 50
+request.cells()          >= 50,000,000
+```
+
+Its evidence is two interleaved CPU against GPU records at exactly that
+shape, `bench/results/apple_m4_large_scaling_2026-08-14.md` and the
+2026-08-15 section of `docs/GPU_VALIDATION.md`. Since then a third round has
+measured the same shape at CPU 6.98s against GPU 3.58s, so the GPU is 1.85x
+the CPU there, and at 250,000 and 50,000 rows the GPU loses to our own CPU
+(1.89 against 1.66, and 1.63 against 0.564). The rule's floor is the
+measured point rather than a fraction of it, because nothing smaller has
+been measured end to end and extrapolating down is precisely what this
+policy exists to refuse.
+
+**Why `auto` still picks the CPU anyway, on the very machine the rule was
+measured on.** A hardware-scoped rule can match only a device profile that
+names the hardware, and `DeviceCapabilities.detect()` opens no device. It
+yields `PROFILE_FALLBACK`, or `PROFILE_DECLARED` when an environment
+variable names an API but no generation, and neither carries an Apple
+generation for the rule to match. Only `from_profile`, fed by a caller
+holding an open `DeviceContext`, reaches `PROFILE_REPORTED`. Until the
+trainers pass what they read, a defaulted `fit` gets `WARN_UNKNOWN_HARDWARE`
+and the CPU.
+
+That is a real gap and it is written down here rather than hidden, because
+"the table is empty" and "the table has a rule that cannot be reached" are
+different states and only one of them is fixed by taking a measurement.
+
+No NVIDIA or AMD device has ever executed this code at all (see
+`docs/GPU_VALIDATION.md`, where every CUDA and HIP row still reads
+**not run**), so no rule can exist for either.
 
 ```text
 device='auto' resolved to CPU.
@@ -48,15 +79,21 @@ Device      accelerator available, metal, Apple M4
 Workload    1,000,000 rows x 100 features, objective 'regression', 1 output(s) per round, max_bin=255, dense
 Memory      107.1 MiB device, 171.1 MiB including the tiled partial-histogram budget, 7.9 MiB pinned host (estimate)
 Budget      16.0 GiB
-Rules       version 1, 0 rule(s), none matched
+Rules       version 2, 1 rule(s), none matched
 
 Why
-  [no-validated-rule] the crossover table (version 1) is empty: no
-  benchmark has established a workload size where GPU training beats CPU
-  training, so auto conservatively keeps the CPU. Set
-  MOJOTREES_AUTO_MIN_CELLS to run that benchmark, or device='gpu' to force
-  the accelerator
+  [auto-cpu-below-evidence] none of the 1 crossover rule(s) in policy
+  version 2 covers this device and workload, so auto keeps the CPU. No
+  device attributes were read (profile source 'fallback'), so every
+  hardware-scoped rule was out of reach whatever the shape; a caller
+  holding an open DeviceContext should read its attributes and go through
+  decide_device_report_reported
 ```
+
+Note which half of "does not cover" fired. The shape above is exactly the
+shape the one rule was measured at, and the rule still did not match,
+because the profile named no hardware. That is the gap described above, and
+the report says so rather than implying the shape was too small.
 
 ## Hard blocks and soft uncertainty
 
@@ -105,25 +142,29 @@ measurement.
 
 ## The crossover rule table
 
-```python
-RULES_VERSION = 1
-CROSSOVER_RULES = ()
-```
+**The table is native, not Python.** It lives in
+`crossover_rules()` in `src/mojotrees/device_policy.mojo`, carries
+`POLICY_VERSION = 2`, and holds one rule. The Python module no longer
+defines `RULES_VERSION`, `CROSSOVER_RULES`, or a `CrossoverRule` type at
+all: it formats the native decision and adds nothing to it, so a rule that
+existed only in Python would be a rule the Mojo API, the CLI, and the C API
+did not have. The field table below describes the native
+`CrossoverEvidence`, whose Mojo field names are given beside the older
+Python ones where the two differ.
 
-A `CrossoverRule` is a claim about measured performance, so it carries the
-measurement with it. `evidence` is required and the constructor refuses a
-rule without it.
+A `CrossoverEvidence` is a claim about measured performance, so it carries
+the measurement with it. `evidence_id` is required and the constructor
+refuses a rule without it.
 
 | Field | Meaning |
 |---|---|
 | `name` | Short identifier, shown in the report. |
-| `evidence` | Where the numbers live: a document section, a benchmark file, a commit. Required. |
+| `evidence_id` | Where the numbers live: a document section, a benchmark file, a commit. Required. |
 | `measured_on` | The device the numbers came from. |
-| `backend`, `chip` | Scope. Unset means the rule is not limited that way. |
-| `objectives` | The objectives that were benchmarked. |
+| `api`, `apple_generation` | Scope. Unset means the rule is not limited that way. |
+| `objective` | The objective that was benchmarked. |
 | `min_rows`, `min_features`, `min_cells` | The thresholds themselves. |
-| `max_classes` | Upper bound on classes the measurement covered. |
-| `speedup` | What was actually seen, for the record. |
+| `max_outputs` | Upper bound on trees per round the measurement covered. |
 
 A rule matches only when every field that is set matches, so widening a
 rule to hardware nobody measured takes a deliberate edit rather than an
@@ -143,12 +184,13 @@ Adding a rule is a benchmarking result, not a code change:
 3. Record the output in the record section of `docs/GPU_VALIDATION.md`,
    loss numbers next to throughput numbers.
 4. Add the rule scoped to what was measured, cite that record in
-   `evidence`, and bump `RULES_VERSION`.
+   `evidence_id`, name the device in `measured_on`, and bump
+   `POLICY_VERSION`.
 
 Do not add a rule from reasoning, from another project's numbers, or from
-a single shape. `python/tests/parallel/test_device_selection.py` asserts
-that the shipped table is empty; that test failing is the reminder to
-bring evidence.
+a single shape. `tests/test_device.mojo` checks that every shipped rule
+carries its evidence, which is what makes the citation a requirement rather
+than a convention.
 
 ## The memory estimate
 
@@ -184,9 +226,12 @@ shown is installed host RAM, which the report also says.
 
 ## The report
 
-`select_device(device, workload, capabilities=None, rules=None)` returns a
+`select_device(device, workload)` returns a
 `DeviceReport` and raises `DeviceUnavailableError` (a `RuntimeError`
-subclass) when an explicit `"gpu"` cannot run.
+subclass) when an explicit `"gpu"` cannot run. It takes no `capabilities`
+or `rules` argument: both were removed when the decision moved wholly
+behind the native seam, so there is no Python-side way to substitute a
+different machine or a different table.
 
 `explain_device_choice(X, y=None, device="auto", **workload_kwargs)` is
 the same policy in a form that never raises: a request that would fail
@@ -231,30 +276,19 @@ Reason codes are stable strings, safe to match on: `explicit-cpu`,
 
 ## Injecting capabilities
 
-`Capabilities` is data, never a probe, so a caller describes a machine it
-does not have and the policy cannot tell the difference. That is how the
-tests cover CUDA and HIP devices nobody here owns, and it is how a user
-can ask "would a bigger GPU change this answer".
+**This section describes an API that no longer exists in Python, and it is
+kept only so that a reader who remembers it knows where the behavior went.**
+`Capabilities`, `detect_capabilities()`, and the `capabilities=` and `rules=`
+arguments to `select_device` were removed when the decision moved wholly
+behind the native seam. `python/mojotrees/device_selection.py` exports
+`Workload`, `DeviceReport`, `Reason`, `TransferRoute`, `PredictSupport`,
+`select_device`, `explain_device_choice`, `explain_predict_device`, and
+`native_contract`, and nothing else.
 
-```python
-from mojotrees.device_selection import Capabilities, Workload, select_device
-
-caps = Capabilities(
-    gpu_available=True,
-    backend="cuda",
-    chip="NVIDIA L4",
-    device_memory_bytes=24 * 1024**3,
-)
-report = select_device("auto", Workload(5_000_000, 200), capabilities=caps)
-```
-
-`detect_capabilities()` fills one in from the real environment. It asks
-the compiled extension whether an accelerator is available, reads the
-three environment variables, and identifies the backend and chip when the
-platform will name them. Backend detection is a heuristic and says so
-through `backend_source`; `MOJOTREES_GPU_BACKEND` overrides it. Anything
-it cannot determine comes back None and the report prints "unknown"
-rather than a plausible value.
+Describing a machine you do not have is now a native-side operation:
+`decide_device_report_reported` in `src/mojotrees/device_policy.mojo` takes a
+profile a caller supplies, which is the same idea one layer down, and
+`tests/test_device.mojo` is where devices nobody here owns are covered.
 
 Note that accelerator availability is a property of the build, not of the
 running machine: Mojo resolves `has_accelerator()` at compile time. A

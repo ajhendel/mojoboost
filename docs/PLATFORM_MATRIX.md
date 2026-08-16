@@ -328,8 +328,8 @@ mistake is, loudly, rather than somewhere convenient and quietly.
 | `pip install mojotrees` on Linux, today | "no matching distribution found". No sdist is published, so pip cannot fall back to a source build that would fail with a compiler error instead | no sdist |
 | `device="gpu"` with no accelerator in the build | Raises. It never falls back to the CPU silently | `src/mojotrees/device.mojo` |
 | `device="gpu"` on a redistributed build whose host has no usable device | Raises when the device is opened, later than the resolve | `has_accelerator()` is compile time |
-| `device="gpu"` for multiclass | Raises. Multiclass grows one tree per class per round on the CPU | `device.mojo`, `fit_multiclass` |
-| `device="auto"` anywhere | Chooses the CPU. The size heuristic is disabled until a measured crossover exists | `AUTO_MIN_CELLS = -1` |
+| `device="gpu"` for multiclass | Trains on the device. `fit_multiclass` dispatches on the resolved device and `gpu_supports_outputs` admits every output count; on an M4 the GPU wins multiclass by 1.63x | `device.mojo`, `fit_multiclass` |
+| `device="auto"` anywhere | Chooses the CPU, and says which half of "no rule covered this" applied. One rule exists, scoped to Metal on an M4; it cannot match because `DeviceCapabilities.detect()` opens no device | `crossover_rules()`, `PROFILE_FALLBACK` |
 | GPU tests on a machine with no accelerator | Print `skipped: no accelerator` and pass. A pass that says `skipped` is not a validation | test suites |
 | A wheel whose tag no target declares | `validate_artifact.py` rule R1 fails the release | release check |
 
