@@ -244,6 +244,16 @@ from .gpu_blocked_bins import (
     check_blocked_group_matches,
     enqueue_blocked_relayout,
 )
+from .gpu_packed_bins import (
+    PACKED_TABLE_STRIDE,
+    PACKED_WIDTH_OFF,
+    check_packed_widths,
+    enqueue_packed_pack,
+    packed_bytes,
+    packed_is_identity,
+    packed_max_stream_bytes,
+    packed_table,
+)
 from .gpu_histogram_specializations import MAX_BINS
 from .gpu_tiling import (
     HIST_FEATURE_GROUP_LADDER,
@@ -2002,6 +2012,7 @@ def _hist_rows_step[
     sh: _SharedI32,
     sc: _SharedI32,
     col: _LocalInt,
+    bw: _LocalInt,
     rr: _LocalI32,
     gv: _LocalI32,
     hv: _LocalI32,
@@ -2191,6 +2202,60 @@ def _hist_rows_step[
     registered by its own author as an expected null against three shared
     atomics and a scattered gather. A fourth address arm to measure a null
     inside an arm is not a trade worth the code.
+
+    **The packed arm, `bw`.** One entry per owned slot: the feature's storage
+    width in bits, or `PACKED_WIDTH_OFF` when no packed matrix is on the
+    device. `gpu_packed_bins.mojo` stores feature `f` as a stream of `n_rows`
+    values at `ceil(log2(bins_used(f)))` bits beginning at `base[f]`, so a
+    64-bin feature moves six bits per visit where it moved eight, a 16-bin one
+    four, and a boolean one. A 255-bin feature needs all eight and gains
+    nothing, which is why `set_packed_bins` refuses an all-width-8 table
+    outright rather than uploading a second copy of the matrix.
+
+    Widths 1 through 7 take the window decode; width 8 falls through to the
+    byte gather two branches below, because at width 8 every shift is zero,
+    the mask is the identity and the second window byte contributes nothing --
+    `gpu_bin_packing`'s module docstring proves it -- so a width-8 stream is
+    the feature's own column at an aligned base and reads exactly as it reads
+    today. That is what makes a mixed-cardinality matrix pay the decode only
+    on the features that are actually narrow.
+
+    The width, the mask and the base are read once per owned slot, on exactly
+    the footing `feature * n_rows` is on. What the row walk gains per visit is
+    `(8 - w)/8` of the bin column's bytes; what it pays is one multiply, one
+    shift, one mask, and a second byte load *adjacent to the first*. The two
+    window bytes are one memory sector except where the pair straddles a
+    sector boundary, so the load count doubles while the sector count does
+    not; `gpu_packed_bins.packed_window_bytes` and
+    `packed_bin_bytes_per_visit` report the two sides separately so a
+    measurement has both.
+
+    The packed arm has no `narrow` twin either, and for a sharper reason than
+    the blocked arm's. `narrow`'s precondition is `n_features * n_rows <=
+    Int32.MAX`, which bounds `feature * n_rows + row`; it says nothing about
+    `row * width`, which this arm forms instead. The address is formed in Int
+    throughout and is bounded by `gpu_packed_bins.packed_bytes`, which the
+    host checked against `Int32.MAX` before the buffer was allocated.
+
+    **Why this cannot change a histogram.** By construction, and the argument
+    is that the bin id is not touched. `gpu_bin_packing` never renumbers a
+    value: packing at width `w` and unpacking at width `w` returns the integer
+    that went in, and the reader's expression here is
+    `unpack_value(base, row, w)` written out, so the id this loop decodes for
+    `(row, feature)` is the id `bins[feature * n_rows + row]` held. The same id
+    then selects the same shared cell, the same three quantized values are
+    added to it, and the tiling, the slot assignment, the visit set and the
+    flush are all untouched -- nothing reorders, so associativity is not even
+    needed, though accumulation is fixed-point Int32 and would supply it.
+
+    The encoding is lossless only while every width covers its feature's
+    largest bin id, its missing sentinel, and its categorical split-set bins.
+    All three fail *silently* -- a truncated id is a legal id -- so all three
+    are refused on the host before the buffer exists:
+    `gpu_packed_bins.packed_widths_from_matrix` derives widths from the
+    observed extents including the reserved missing bin,
+    `check_packed_widths_cover` re-checks a table against a matrix cell by
+    cell, and `packed_roundtrips` is the whole invariant as one function.
 
     **`probe_mode == HIST_PROBE_NO_GATHER` removes the loads and keeps the
     atomics, which is the reverse cut.** It is the third arm of the
@@ -2464,7 +2529,45 @@ def _hist_rows_step[
         if k < owned:
             var base = col[unsafe_offset=k]
             var lift = Int32(k * nb)
-            if rstride != BLOCKED_STRIDE_NONE:
+            # The packed arm. `bw[k]` is this slot's storage width in bits and
+            # is `PACKED_WIDTH_OFF` (zero) unless `set_packed_bins` put a
+            # bit-packed matrix on the device; a width of 8 is packed *and*
+            # takes the byte gather below, because a width-8 stream is the
+            # feature's own column displaced to an aligned base and the second
+            # window byte is provably never needed there. So this branch is
+            # entered only at widths 1 through 7, which are exactly the
+            # features that are narrower than a byte.
+            #
+            # `w`, `mask` and `base` are all per owned slot -- at most sixteen
+            # per threadgroup -- and never per row. What the row walk pays for
+            # a narrow feature is one multiply, one shift, one mask and a
+            # second adjacent byte load; what it saves is `(8 - w)/8` of the
+            # column's bytes.
+            var w = bw[unsafe_offset=k]
+            if w != PACKED_WIDTH_OFF and w != 8:
+                var mask = Int32((1 << w) - 1)
+                comptime for u in range(U):
+                    # `gpu_bin_packing.element_byte_offset` and
+                    # `element_bit_shift` written out, because a kernel cannot
+                    # call a raising host function.
+                    # `gpu_packed_bins.check_packed_matches_plan` is what
+                    # proves these two lines are the plan's own addresses.
+                    #
+                    # Formed in Int throughout: `r * w` reaches `8 * n_rows`
+                    # and the `narrow` arm's Int32 bound was derived for
+                    # `f * n_rows`, not for this product. The packed arm
+                    # therefore has no narrow twin, and the address it forms
+                    # is bounded by `packed_bytes`, which the host already
+                    # checked against `Int32.MAX`.
+                    var bit = Int(rr[unsafe_offset=u][0]) * w
+                    var at = base + (bit >> 3)
+                    var window = Int32(Int(bins[unsafe_offset=at][0])) | (
+                        Int32(Int(bins[unsafe_offset = at + 1][0])) << 8
+                    )
+                    bv[unsafe_offset=u] = (
+                        window >> Int32(bit & 7)
+                    ) & mask
+            elif rstride != BLOCKED_STRIDE_NONE:
                 # The blocked layout. `base` is the feature's block base plus
                 # its lane, computed once per slot in `_hist_accumulate_rows`;
                 # a row advances `rstride` bytes because the block is
@@ -2561,6 +2664,8 @@ def _hist_accumulate_rows[
     aligned: Bool,
     rstride: Int,
     probe_mode: Int,
+    ptab: MutPointer[Int32, MutAnyOrigin],
+    packed: Bool,
 ):
     """One thread's whole walk over its share of one tile.
 
@@ -2667,7 +2772,19 @@ def _hist_accumulate_rows[
     # so at most sixteen per threadgroup -- and never per row. That is the
     # same footing the feature-major multiply is on and is why the blocked
     # arm adds nothing to the row walk except the `r * rstride` term.
+    # Under the packed layout the base and the width both come out of the
+    # device table `gpu_packed_bins.packed_table` built: `ptab[2f]` is the
+    # feature's stream base and `ptab[2f + 1]` its width in bits. Two reads per
+    # owned slot, on the same footing as the feature-major multiply, and
+    # nothing per row. `bw` stays `PACKED_WIDTH_OFF` on every other arm, which
+    # is what makes the row loop's packed branch a per-slot test against a
+    # value that is a compile-time-invisible zero for every existing caller.
+    #
+    # The packed arm and the blocked arm are mutually exclusive and
+    # `set_packed_bins` refuses to have both on; the branch order here states
+    # it rather than assuming it.
     var col = stack_allocation[GROUP, Int]()
+    var bw = stack_allocation[GROUP, Int]()
     var bstride = 0
     if rstride != BLOCKED_STRIDE_NONE:
         bstride = (
@@ -2675,9 +2792,17 @@ def _hist_accumulate_rows[
         ) * BLOCK_ALIGN_BYTES
     comptime for k in range(GROUP):
         col[unsafe_offset=k] = 0
+        bw[unsafe_offset=k] = PACKED_WIDTH_OFF
         if k < owned:
             var fid_k = Int(feat_ids[unsafe_offset = slot0 + k][0])
-            if rstride != BLOCKED_STRIDE_NONE:
+            if packed:
+                col[unsafe_offset=k] = Int(
+                    ptab[unsafe_offset = PACKED_TABLE_STRIDE * fid_k][0]
+                )
+                bw[unsafe_offset=k] = Int(
+                    ptab[unsafe_offset = PACKED_TABLE_STRIDE * fid_k + 1][0]
+                )
+            elif rstride != BLOCKED_STRIDE_NONE:
                 col[unsafe_offset=k] = (fid_k // rstride) * bstride + (
                     fid_k % rstride
                 )
@@ -2736,6 +2861,7 @@ def _hist_accumulate_rows[
             sh,
             sc,
             col,
+            bw,
             rr,
             gv,
             hv,
@@ -2766,6 +2892,7 @@ def _hist_accumulate_rows[
             sh,
             sc,
             col,
+            bw,
             rr,
             gv,
             hv,
@@ -2832,6 +2959,8 @@ def _hist_accumulate_dispatch[
     aligned: Bool,
     rstride: Int,
     probe_mode: Int,
+    ptab: MutPointer[Int32, MutAnyOrigin],
+    packed: Bool,
 ):
     """Resolve the two comptime-worthy runtime flags into one of four arms,
     once, above the row loop.
@@ -2883,6 +3012,8 @@ def _hist_accumulate_dispatch[
                 aligned,
                 rstride,
                 probe_mode,
+                ptab,
+                packed,
             )
         else:
             _hist_accumulate_rows[GROUP, UNROLL, True, False](
@@ -2909,6 +3040,8 @@ def _hist_accumulate_dispatch[
                 aligned,
                 rstride,
                 probe_mode,
+                ptab,
+                packed,
             )
     elif quant:
         _hist_accumulate_rows[GROUP, UNROLL, False, True](
@@ -2935,6 +3068,8 @@ def _hist_accumulate_dispatch[
             aligned,
             rstride,
             probe_mode,
+            ptab,
+            packed,
         )
     else:
         _hist_accumulate_rows[GROUP, UNROLL, False, False](
@@ -2961,6 +3096,8 @@ def _hist_accumulate_dispatch[
             aligned,
             rstride,
             probe_mode,
+            ptab,
+            packed,
         )
 
 
@@ -2995,6 +3132,9 @@ def _range_hist_atomic_kernel[
     bins_blocked: MutPointer[UInt8, MutAnyOrigin],
     bin_row_stride: Int32,
     hist_probe: Int32,
+    bins_packed: MutPointer[UInt8, MutAnyOrigin],
+    bin_pack_tab: MutPointer[Int32, MutAnyOrigin],
+    bin_packed: Int32,
 ):
     """One node's histogram over a compacted row range, accumulated in
     threadgroup memory and folded into the output with global atomics.
@@ -3281,6 +3421,14 @@ def _range_hist_atomic_kernel[
     var rstride = Int(bin_row_stride)
     if rstride != BLOCKED_STRIDE_NONE:
         bsrc = bins_blocked
+    # The packed arm, resolved the same way and for the same reason: a third
+    # pointer, never dereferenced unless selected, because a launch may not be
+    # handed the same buffer twice. `bin_packed` and `bin_row_stride` are never
+    # both set -- `set_packed_bins` and `set_blocked_layout` refuse each other
+    # -- and the order here is the order that statement is enforced in.
+    var packed = Int(bin_packed) != 0
+    if packed:
+        bsrc = bins_packed
 
     _hist_accumulate_dispatch[GROUP, HIST_ROW_UNROLL](
         bsrc,
@@ -3308,6 +3456,8 @@ def _range_hist_atomic_kernel[
         Int(pair_align) != 0,
         rstride,
         probe_mode,
+        bin_pack_tab,
+        packed,
     )
     barrier()
 
@@ -3374,6 +3524,9 @@ def _range_hist_partial_kernel[
     bins_blocked: MutPointer[UInt8, MutAnyOrigin],
     bin_row_stride: Int32,
     hist_probe: Int32,
+    bins_packed: MutPointer[UInt8, MutAnyOrigin],
+    bin_pack_tab: MutPointer[Int32, MutAnyOrigin],
+    bin_packed: Int32,
 ):
     """The tiled twin of `_range_hist_atomic_kernel`: the same threadgroup
     accumulation, written to a per-(tile, slot) partial slot instead of folded
@@ -3508,6 +3661,14 @@ def _range_hist_partial_kernel[
     var rstride = Int(bin_row_stride)
     if rstride != BLOCKED_STRIDE_NONE:
         bsrc = bins_blocked
+    # The packed arm, resolved the same way and for the same reason: a third
+    # pointer, never dereferenced unless selected, because a launch may not be
+    # handed the same buffer twice. `bin_packed` and `bin_row_stride` are never
+    # both set -- `set_packed_bins` and `set_blocked_layout` refuse each other
+    # -- and the order here is the order that statement is enforced in.
+    var packed = Int(bin_packed) != 0
+    if packed:
+        bsrc = bins_packed
 
     _hist_accumulate_dispatch[GROUP, HIST_ROW_UNROLL](
         bsrc,
@@ -3535,6 +3696,8 @@ def _range_hist_partial_kernel[
         Int(pair_align) != 0,
         rstride,
         probe_mode,
+        bin_pack_tab,
+        packed,
     )
     barrier()
 
@@ -4515,6 +4678,34 @@ struct GpuActiveRows(Movable):
     var blocked_dev: DeviceBuffer[DType.uint8]
     var blocked_group: Int
     var blocked_valid: Bool
+    # --- packed bin layout lane ---
+    # The bit-packed re-encoding of the binned matrix
+    # (`gpu_packed_bins.mojo`): feature `f` as a stream of `n_rows` values at
+    # `packed_widths[f]` bits. `packed_widths` is empty when no layout has been
+    # requested, in which case both buffers below are one-byte placeholders
+    # that exist only so every histogram launch has a real pointer to pass.
+    #
+    # `packed_tab_dev` is the `[base, width]` table the row loop reads, two
+    # Int32 per feature. It is a device buffer rather than four launch
+    # arguments because the width is per *feature* and a threadgroup's slots
+    # are an arbitrary subset of them under `colsample`.
+    #
+    # It does not replace `bins`, for exactly the reason the blocked buffer
+    # does not: `_flag_scan_kernel` and `_scatter_kernel` here, `gpu_predict`,
+    # `gpu_sparse`, `gpu_categorical` and the CPU builder all still index
+    # `bins[f * n_rows + r]`. So both are resident. Unlike the blocked copy,
+    # this one is *smaller* than the matrix it shadows -- that is the whole
+    # point of it -- so the residency charge is `packed_bin_bytes_ratio` of
+    # the binned matrix and not another whole copy of it.
+    #
+    # `packed_valid` says whether the buffer holds this fit's matrix. Set by
+    # `_ensure_packed` on the first histogram launch after a layout is
+    # requested and never cleared, because the binned matrix is uploaded once
+    # per fit and nothing in this backend mutates it.
+    var packed_dev: DeviceBuffer[DType.uint8]
+    var packed_tab_dev: DeviceBuffer[DType.int32]
+    var packed_widths: List[Int]
+    var packed_valid: Bool
 
     def __init__(
         out self,
@@ -4690,6 +4881,13 @@ struct GpuActiveRows(Movable):
         self.blocked_dev = self.ctx.enqueue_create_buffer[DType.uint8](1)
         self.blocked_group = 0
         self.blocked_valid = False
+        # No bit-packed matrix until one is asked for, and the same one-byte
+        # placeholders for the same reason. `set_packed_bins` is where the real
+        # allocation happens and where its size is stated to the caller.
+        self.packed_dev = self.ctx.enqueue_create_buffer[DType.uint8](1)
+        self.packed_tab_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
+        self.packed_widths = List[Int]()
+        self.packed_valid = False
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -5154,6 +5352,11 @@ struct GpuActiveRows(Movable):
             self.blocked_group = 0
             self.blocked_valid = False
             return
+        if len(self.packed_widths) > 0:
+            raise Error(
+                "the packed and blocked bin layouts cannot both be on; turn"
+                " one off with set_packed_bins([]) or set_blocked_layout(0)"
+            )
         check_blocked_group_matches(group, self.feature_group)
         if blocked_is_identity(group):
             raise Error(
@@ -5197,6 +5400,143 @@ struct GpuActiveRows(Movable):
             self.block_threads,
         )
         self.blocked_valid = True
+
+    def packed_bins_active(self) -> Bool:
+        """Whether the histogram reader is decoding bit-packed bins.
+
+        The one value the launch sites read about this layout, and it is
+        false until `_ensure_packed` has actually filled the buffer. A
+        requested-but-unbuilt packed buffer would decode to legal bin ids
+        belonging to no row, which is the failure mode this layout family
+        shares and which nothing downstream would catch, so the flag tracks
+        the buffer rather than the request.
+        """
+        return len(self.packed_widths) > 0 and self.packed_valid
+
+    def packed_bin_widths(self) -> List[Int]:
+        """The per-feature storage widths in force, or an empty list when the
+        packed layout is off. A copy, so a caller cannot narrow a width under
+        a live buffer."""
+        return self.packed_widths.copy()
+
+    def set_packed_bins(mut self, var widths: List[Int]) raises:
+        """Ask the histogram kernels to read a bit-packed bin matrix.
+
+        An empty `widths` turns the layout off and frees both buffers.
+        Otherwise it is one width per feature, in bits, and
+        `gpu_packed_bins.packed_widths_from_matrix` is what derives a correct
+        one: a width has to cover its feature's largest bin id, its reserved
+        missing bin, and, for a categorical feature, its highest category bin.
+        All three fail *silently* if the width is short -- a truncated bin id
+        is a legal bin id -- so the derivation is not a convenience and a
+        hand-written table should be checked with
+        `gpu_packed_bins.check_packed_widths_cover` against the matrix it will
+        be used on.
+
+        **All widths 8 is refused**, because that plan's buffer is
+        `BinnedMatrix.bins` itself: a 255-bin feature needs eight bits and
+        packing it is the identity. So a matrix whose every column is
+        high-cardinality cannot use this layout at all, which is a finding
+        about the layout rather than an obstacle to it, and it is why the
+        reference shape this project benchmarks -- 1,000,000 x 50 at 255 bins
+        -- gains nothing here. What gains is a matrix with low-cardinality
+        columns in it, at `width / 8` of the bin bytes per column.
+
+        **The blocked layout is refused while this one is on**, and the other
+        way round. The two are orthogonal in principle -- one narrows the
+        cell, the other rearranges it -- and composing them would need a block
+        base, a lane, a row stride and a bit width in one address. Neither arm
+        has been measured yet; building the cross product before either is
+        would be three unmeasured things instead of two.
+
+        **What it costs.** One `gpu_packed_bins.packed_bytes` allocation plus
+        an `8 * n_features` byte table, on top of the feature-major matrix,
+        which stays because every other reader of `bins` in this package still
+        indexes it. Unlike the blocked copy that allocation is *smaller* than
+        the matrix it shadows, by exactly the ratio the layout exists to
+        deliver. The transform is one streamed kernel launch per fit, deferred
+        to the first histogram (`_ensure_packed`) so that requesting a layout
+        and never growing a tree costs an allocation and no device work.
+
+        No environment variable, for the reason `set_blocked_layout` gives:
+        an A/B that reads its arm from the environment has already once in
+        this repository run one arm under the other's label.
+        """
+        if len(widths) == 0:
+            self.packed_dev = self.ctx.enqueue_create_buffer[DType.uint8](1)
+            self.packed_tab_dev = self.ctx.enqueue_create_buffer[DType.int32](
+                1
+            )
+            self.packed_widths = List[Int]()
+            self.packed_valid = False
+            return
+        if len(widths) != self.n_features:
+            raise Error(
+                "a packed bin layout needs one width per feature of the"
+                " dataset this instance was built for"
+            )
+        check_packed_widths(widths)
+        if packed_is_identity(widths):
+            raise Error(
+                "a packed bin layout at eight bits throughout is the"
+                " feature-major matrix already on the device; a matrix with"
+                " no low-cardinality column has nothing to pack"
+            )
+        if self.blocked_group > 0:
+            raise Error(
+                "the packed and blocked bin layouts cannot both be on; turn"
+                " one off with set_blocked_layout(0) or set_packed_bins([])"
+            )
+        var total = packed_bytes(self.n_rows, widths)
+        var table = packed_table(self.n_rows, widths)
+        self.packed_dev = self.ctx.enqueue_create_buffer[DType.uint8](total)
+        self.packed_tab_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            len(table)
+        )
+        # The table is small (two Int32 per feature) and is uploaded here
+        # rather than in `_ensure_packed`, because it is pure host arithmetic
+        # that needs no `bins` pointer. Synchronized before the staging buffer
+        # leaves scope, which is once per fit against a copy of a few hundred
+        # bytes.
+        var host = self.ctx.enqueue_create_host_buffer[DType.int32](
+            len(table)
+        )
+        var dst = host.unsafe_ptr()
+        for i in range(len(table)):
+            dst.unsafe_store(i, table[i])
+        self.ctx.enqueue_copy(dst_buf=self.packed_tab_dev, src_ptr=dst)
+        self.ctx.synchronize()
+        self.packed_widths = widths^
+        self.packed_valid = False
+
+    def _ensure_packed[
+        bins_origin: MutOrigin, //
+    ](mut self, bins: MutPointer[UInt8, bins_origin]) raises:
+        """Build the packed buffer from the feature-major one, once.
+
+        Deferred to the first histogram launch rather than done in
+        `set_packed_bins` because that is where the `bins` pointer is: this
+        struct owns the index machinery and the binned matrix arrives as an
+        argument. Enqueued, not synchronized, so it is ordered before the
+        histogram that reads it by the queue, exactly as `_ensure_blocked`'s
+        pass is.
+
+        Never rebuilt, for the same reason: the binned matrix is uploaded once
+        per fit and nothing in this backend mutates it.
+        """
+        if len(self.packed_widths) == 0 or self.packed_valid:
+            return
+        enqueue_packed_pack(
+            self.ctx,
+            bins,
+            self.packed_dev.unsafe_ptr(),
+            self.packed_tab_dev.unsafe_ptr(),
+            self.n_rows,
+            self.n_features,
+            packed_max_stream_bytes(self.n_rows, self.packed_widths),
+            self.block_threads,
+        )
+        self.packed_valid = True
 
     def set_constant_hessian(mut self, on: Bool):
         """Declare that every row's hessian this round is exactly
@@ -6191,6 +6531,7 @@ struct GpuActiveRows(Movable):
         # the layout arm reaching the root and nothing else, which is the
         # exact shape the row-tile arms were found in.
         self._ensure_blocked(bins)
+        self._ensure_packed(bins)
         var const_hess = Int32(1) if self.constant_hessian else Int32(0)
 
         self._enqueue_atomic_family(
@@ -6565,6 +6906,7 @@ struct GpuActiveRows(Movable):
         # same buffer. It runs once per fit rather than once per tree, which
         # is the whole reason it can be afforded at all.
         self._ensure_blocked(bins)
+        self._ensure_packed(bins)
 
         var const_hess = Int32(1) if self.constant_hessian else Int32(0)
         var hist_planes = 2 if self.constant_hessian else 3
@@ -6855,6 +7197,18 @@ struct GpuActiveRows(Movable):
         # dereferences it at stride one.
         var rstride = Int32(self.blocked_row_stride())
         var blocked_ptr = self.blocked_dev.unsafe_ptr()
+        # The packed bin arm, resolved the same way and passed at every launch
+        # for the same reason the blocked buffer is: a kernel argument must be
+        # a real pointer, and both are one-byte placeholders until a layout is
+        # asked for. `packed_bins_active` is 0 until `_ensure_packed` has
+        # actually filled the buffer, so a requested but unbuilt layout reads
+        # the feature-major matrix rather than an uninitialized one -- which
+        # matters more here than anywhere else in this file, because an
+        # unbuilt packed buffer decodes to legal bin ids belonging to no row
+        # and nothing downstream would catch it.
+        var packed_on = Int32(1) if self.packed_bins_active() else Int32(0)
+        var packed_ptr = self.packed_dev.unsafe_ptr()
+        var pack_tab_ptr = self.packed_tab_dev.unsafe_ptr()
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 32]](
                 bins,
@@ -6880,6 +7234,9 @@ struct GpuActiveRows(Movable):
                 blocked_ptr,
                 rstride,
                 probe,
+                packed_ptr,
+                pack_tab_ptr,
+                packed_on,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -6908,6 +7265,9 @@ struct GpuActiveRows(Movable):
                 blocked_ptr,
                 rstride,
                 probe,
+                packed_ptr,
+                pack_tab_ptr,
+                packed_on,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -6936,6 +7296,9 @@ struct GpuActiveRows(Movable):
                 blocked_ptr,
                 rstride,
                 probe,
+                packed_ptr,
+                pack_tab_ptr,
+                packed_on,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -6964,6 +7327,9 @@ struct GpuActiveRows(Movable):
                 blocked_ptr,
                 rstride,
                 probe,
+                packed_ptr,
+                pack_tab_ptr,
+                packed_on,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -7186,6 +7552,18 @@ struct GpuActiveRows(Movable):
         # dereferences it at stride one.
         var rstride = Int32(self.blocked_row_stride())
         var blocked_ptr = self.blocked_dev.unsafe_ptr()
+        # The packed bin arm, resolved the same way and passed at every launch
+        # for the same reason the blocked buffer is: a kernel argument must be
+        # a real pointer, and both are one-byte placeholders until a layout is
+        # asked for. `packed_bins_active` is 0 until `_ensure_packed` has
+        # actually filled the buffer, so a requested but unbuilt layout reads
+        # the feature-major matrix rather than an uninitialized one -- which
+        # matters more here than anywhere else in this file, because an
+        # unbuilt packed buffer decodes to legal bin ids belonging to no row
+        # and nothing downstream would catch it.
+        var packed_on = Int32(1) if self.packed_bins_active() else Int32(0)
+        var packed_ptr = self.packed_dev.unsafe_ptr()
+        var pack_tab_ptr = self.packed_tab_dev.unsafe_ptr()
         # Inert when `use_desc` is zero, which is every host-argument caller;
         # the descriptor `set_descriptor_target` selected otherwise. Read here
         # rather than threaded through `_enqueue_atomic_family` for the same
@@ -7223,6 +7601,9 @@ struct GpuActiveRows(Movable):
                 blocked_ptr,
                 rstride,
                 probe,
+                packed_ptr,
+                pack_tab_ptr,
+                packed_on,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -7256,6 +7637,9 @@ struct GpuActiveRows(Movable):
                 blocked_ptr,
                 rstride,
                 probe,
+                packed_ptr,
+                pack_tab_ptr,
+                packed_on,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -7289,6 +7673,9 @@ struct GpuActiveRows(Movable):
                 blocked_ptr,
                 rstride,
                 probe,
+                packed_ptr,
+                pack_tab_ptr,
+                packed_on,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -7322,6 +7709,9 @@ struct GpuActiveRows(Movable):
                 blocked_ptr,
                 rstride,
                 probe,
+                packed_ptr,
+                pack_tab_ptr,
+                packed_on,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
