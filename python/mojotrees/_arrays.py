@@ -7,6 +7,14 @@ matrices) that the caller keeps referenced for the duration of the call.
 numpy is used when available and `array.array` otherwise, so the estimators
 work on a plain Python install.
 
+How many times the caller's matrix is touched is the whole cost of this
+file. A numpy array is C-ordered by default and `binning.fit_bins` reads
+`features[f * n_rows + r]`, so a transpose is unavoidable; everything beyond
+that one pass is not. `_as_column_major_numpy` therefore hands the common
+case -- a C-ordered native float64 matrix -- to a single native pass that
+transposes and validates together, and keeps numpy's `asfortranarray` for
+the inputs that genuinely need a conversion invented for them.
+
 Keeping the buffer referenced is a memory-safety requirement, not
 bookkeeping. The native side *borrows* the feature matrix rather than
 copying it (`_f64_view` in bindings/_mojotrees.mojo), which is what keeps a
@@ -36,6 +44,43 @@ try:
     import numpy as np
 except ImportError:  # pragma: no cover - exercised on numpy-free installs
     np = None
+
+
+_NOT_LOADED = object()
+_native_module = _NOT_LOADED
+
+_INF_MESSAGE = (
+    "{} must not contain infinite values (NaN is allowed and is treated as "
+    "missing)"
+)
+
+# Elements per tile of the numpy-only infinity scan. `np.isinf(A).any()` over
+# a whole matrix materializes one byte per element before it reduces, which at
+# 1,000,000 x 50 is a 50 MB allocation to answer a yes-or-no question, and it
+# reads the matrix from memory a second time to fill it. Scanning in slices of
+# this many elements keeps the temporary inside a cache and lets the first
+# infinity stop the scan. This is the *fallback*; the native scan below
+# allocates nothing at all.
+_INF_TILE = 1 << 16
+
+
+def _native():
+    """The extension module, or None when it cannot be imported.
+
+    Imported here rather than at module load because `__init__` imports this
+    module on its way to importing the extension, so a top-level import would
+    be a cycle. None is not an expected state -- the extension is the library
+    -- but every caller below has a numpy-only path that produces the same
+    answer, so a partially built tree degrades instead of failing.
+    """
+    global _native_module
+    if _native_module is _NOT_LOADED:
+        try:
+            from . import _mojotrees
+        except Exception:  # pragma: no cover - a tree without a built .so
+            _mojotrees = None
+        _native_module = _mojotrees
+    return _native_module
 
 
 def have_numpy():
@@ -142,11 +187,7 @@ def check_X_sparse(X, layout="csc", name="X"):
     if n_features == 0:
         raise ValueError(f"{name} must have at least one feature")
     data = np.ascontiguousarray(Xs.data, dtype=np.float64)
-    if data.size and np.isinf(data).any():
-        raise ValueError(
-            f"{name} must not contain infinite values (NaN is allowed and "
-            "is treated as missing)"
-        )
+    _reject_infinite(data, name)
     buffers = SparseBuffers(
         data,
         np.ascontiguousarray(Xs.indices, dtype=np.int64),
@@ -334,7 +375,106 @@ def frame_to_array(X, encoders, name="X"):
     return out
 
 
+def _reject_infinite(Xa, name):
+    """Raise when `Xa` holds `+inf` or `-inf`. `NaN` is allowed: it is the
+    missing-value marker and the binner reserves a bin for it.
+
+    Native when the extension is loaded and the array is contiguous, which is
+    a parallel read with no allocation. The numpy fallback is tiled rather
+    than whole-array for the reason `_INF_TILE` gives.
+    """
+    # Before the native branch: an empty array's `ctypes.data` is not
+    # required to be a valid address, and the boundary refuses a null one.
+    if Xa.size == 0:
+        return
+    native = _native()
+    scan = (
+        None if native is None else getattr(native, "buffer_has_infinite", None)
+    )
+    if (
+        scan is not None
+        and Xa.dtype == np.dtype(np.float64)
+        and Xa.dtype.isnative
+        and (Xa.flags.c_contiguous or Xa.flags.f_contiguous)
+    ):
+        if scan(addr(Xa), int(Xa.size)):
+            raise ValueError(_INF_MESSAGE.format(name))
+        return
+    per_row = max(1, int(Xa.size // Xa.shape[0]))
+    step = max(1, _INF_TILE // per_row)
+    for start in range(0, Xa.shape[0], step):
+        if np.isinf(Xa[start : start + step]).any():
+            raise ValueError(_INF_MESSAGE.format(name))
+
+
+def _fused_ingest_candidate(X):
+    """`X` when the whole conversion is one native transpose, else None.
+
+    The condition is exactly "a C-ordered native float64 matrix", which is
+    what `np.empty((n, m))`, `np.asarray(list_of_rows)`, `pandas.to_numpy()`,
+    and every other default numpy construction produce. That case is the one
+    worth a special path because it is the one where the caller's buffer
+    needs no dtype conversion, so the *only* work left is the transpose, and
+    the transpose can then be read straight out of the caller's memory.
+
+    An array that is already Fortran-ordered is deliberately excluded: it is
+    the binning input already, `np.asfortranarray` returns it untouched, and
+    transposing it into a fresh buffer would add a 400 MB copy at
+    1,000,000 x 50 to save nothing. An array that is both (a single row, a
+    single column, one element) goes the same way for the same reason.
+    """
+    native = _native()
+    if native is None or getattr(native, "ingest_column_major", None) is None:
+        return None
+    if not isinstance(X, np.ndarray) or X.ndim != 2:
+        return None
+    if X.dtype != np.dtype(np.float64) or not X.dtype.isnative:
+        return None
+    if not X.flags.c_contiguous or X.flags.f_contiguous:
+        return None
+    return X
+
+
 def _as_column_major_numpy(X, name):
+    """`X` as a validated column-major float64 array, plus its shape.
+
+    Two paths, and the difference between them is how many times the caller's
+    matrix is read.
+
+    The **fused** path takes a C-ordered float64 matrix -- the numpy default,
+    and so the shape nearly every `fit(X, y)` arrives in -- and makes one
+    pass: a tiled, parallel transpose straight from the caller's buffer into
+    the destination, with the infinity check answered from the value already
+    in a register. Two buffers exist at peak, the caller's and the result,
+    and neither is read twice.
+
+    The **general** path is the one that was always here, for anything that
+    needs a dtype conversion, a layout numpy has to invent, or an object that
+    is not an ndarray at all. `np.asfortranarray` does the conversion and the
+    transpose together; the infinity check that follows is a second read of
+    the result, and is at least no longer an `n_rows * n_features` byte
+    allocation.
+
+    Neither path moves a bit relative to the other or relative to what this
+    function returned before: a transpose relocates values and computes
+    nothing, so the returned buffer holds the caller's doubles, unrounded, in
+    the slots `binning.fit_bins` reads them from.
+    """
+    fused = _fused_ingest_candidate(X)
+    if fused is not None:
+        n_rows, n_features = fused.shape
+        if n_rows == 0:
+            raise ValueError(f"{name} must have at least one row")
+        if n_features == 0:
+            raise ValueError(f"{name} must have at least one feature")
+        Xa = np.empty((n_rows, n_features), dtype=np.float64, order="F")
+        found = _native().ingest_column_major(
+            addr(fused), addr(Xa), int(n_rows), int(n_features)
+        )
+        if found:
+            raise ValueError(_INF_MESSAGE.format(name))
+        return Xa, n_rows, n_features
+
     try:
         Xa = np.asfortranarray(X, dtype=np.float64)
     except (TypeError, ValueError) as exc:
@@ -354,11 +494,7 @@ def _as_column_major_numpy(X, name):
         raise ValueError(f"{name} must have at least one row")
     if n_features == 0:
         raise ValueError(f"{name} must have at least one feature")
-    if np.isinf(Xa).any():
-        raise ValueError(
-            f"{name} must not contain infinite values (NaN is allowed and "
-            "is treated as missing)"
-        )
+    _reject_infinite(Xa, name)
     return Xa, n_rows, n_features
 
 
