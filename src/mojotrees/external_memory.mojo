@@ -2004,10 +2004,14 @@ def train_external_multiclass(
             "init_score is not supported for multiclass training: one offset"
             " per row cannot say what each class starts from"
         )
+    # NOT `MULTICLASS`. See the same correction in `trainset.mojo`: -1 is a
+    # registry code for "softmax fit", `device_policy` reads the argument as a
+    # trainer objective where -2 means unspecified, and passing -1 made every
+    # multiclass GPU fit raise. The third instance of the same one-line bug,
+    # all three written on the same day from the same reasoning.
     var backend = resolve_device(
-        device, data.n_rows, data.n_features, n_classes, MULTICLASS
-    )  # MULTICLASS is the registry's code for a softmax fit, which this
-    # entry point is by construction and takes no objective argument for.
+        device, data.n_rows, data.n_features, n_classes
+    )
     var booster: MulticlassBooster
     if backend == GPU_DEVICE:
         booster = train_multiclass_gpu(

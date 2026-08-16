@@ -1260,10 +1260,23 @@ def train_dataset_multiclass(
         )
         return MulticlassModel(dataset.mapper.copy(), sparse_booster^)
 
+    # NOT `MULTICLASS`, and this is a bug that shipped and was measured.
+    # `objective_registry.MULTICLASS` is -1, a registry code meaning "this fit
+    # is a softmax fit". `device_policy` reads the same argument as a *trainer*
+    # objective, where -2 is OBJECTIVE_UNSPECIFIED and -1 is simply a code no
+    # trainer implements, so passing it made every multiclass GPU fit raise
+    # "objective code -1 is not one the built-in trainers implement". The
+    # first bench/real_data run after the patch found it here and in
+    # `model.fit_multiclass`, which had it for the same reason.
+    #
+    # Unspecified is the honest answer as well as the working one: a softmax
+    # fit grows one tree per class and each carries a single-output objective
+    # this entry point never sees. If the crossover rules should gate on
+    # multiclass as such, that is a case `device_policy` adds, not a code a
+    # caller can smuggle through an Int.
     var backend = resolve_device(
-        device, dataset.n_rows, dataset.n_features, n_classes, MULTICLASS
-    )  # MULTICLASS is the registry's code for a softmax fit, which this
-    # entry point is by construction and takes no objective argument for.
+        device, dataset.n_rows, dataset.n_features, n_classes
+    )
     var booster: MulticlassBooster
     if backend == GPU_DEVICE:
         booster = train_multiclass_gpu(
