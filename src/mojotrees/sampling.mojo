@@ -1523,11 +1523,22 @@ def mvs_bootstrap_weights(
         audit.blocks += 1
 
         # `thresholdCandidates[idx] = sqrt(lambda + sum_k der^2)`, in row order.
-        var candidates = List[Float64](capacity=block_size)
+        #
+        # Two buffers, not one, and the second is not a copy for tidiness. The
+        # solve PERMUTES its input, which destroys the row-to-magnitude
+        # mapping, so CatBoost recomputes every magnitude from the derivatives
+        # a second time in its weight loop -- a second `sum_k der^2` and a
+        # second `sqrt` for every row of every tree. Keeping the row-ordered
+        # copy costs 8 bytes per row of one block, `8 * MVS_BLOCK_SIZE` = 64 KiB
+        # at the ceiling, and removes `n_rows` square roots and
+        # `n_rows * n_outputs` multiply-adds per tree. Strictly less work for
+        # the identical result.
+        var magnitudes = List[Float64](capacity=block_size)
         for r in range(block_start, block_end):
-            candidates.append(
+            magnitudes.append(
                 sqrt(_row_magnitude_squared(gradients, r, n_outputs) + lam)
             )
+        var candidates = magnitudes.copy()
 
         var target = params.subsample * Float64(block_size)
         var mu = _mvs_threshold(candidates, 0, block_size, target)
@@ -1546,7 +1557,7 @@ def mvs_bootstrap_weights(
             continue
 
         for r in range(block_start, block_end):
-            var g = sqrt(_row_magnitude_squared(gradients, r, n_outputs) + lam)
+            var g = magnitudes[r - block_start]
             var p: Float64
             if g > mu:
                 p = 1.0
