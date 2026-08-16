@@ -108,12 +108,34 @@ _lane_env_main() {
       keep { print }
     ' "$1"
   }
+  # SUBSET is safe; superset is not.
+  #
+  # The question is not "are the manifests equal" but "does this worktree
+  # need anything the shared environment does not have". A worktree whose
+  # dependency tables are a SUBSET of the main checkout's asks for nothing
+  # that is missing, so sharing is correct and declining is pure cost.
+  #
+  # This matters because the main checkout drifts forward. Adding `pandas`
+  # to `[feature.bench.dependencies]` made every worktree branched before
+  # that commit look "different" and declined all of them, on both
+  # campaigns, for a dependency the shared environment already had. The
+  # equality test was still too strict after being narrowed once, and the
+  # symptom was lanes silently exporting the three variables by hand or
+  # installing their own 1.1 GB copy, which is the failure this file exists
+  # to prevent, arriving through the guard rather than around it.
+  #
+  # Lines only in the worktree are what disqualify it. Lines only in the
+  # main checkout are the environment being ahead, which is fine.
+  _lane_env_extra="$(
+    comm -23 <(_lane_env_deps "$here/pixi.toml" | sort -u) \
+             <(_lane_env_deps "$main/pixi.toml" | sort -u) 2>/dev/null
+  )"
   if [ -r "$here/pixi.toml" ] && [ -r "$main/pixi.toml" ] &&
-     ! diff -q <(_lane_env_deps "$here/pixi.toml") \
-               <(_lane_env_deps "$main/pixi.toml") >/dev/null 2>&1; then
-    _lane_env_warn "pixi.toml differs between this worktree and $main."
-    _lane_env_warn "DECLINING to share its environment: it was solved for a"
-    _lane_env_warn "different manifest. Use 'pixi run' and take your own."
+     [ -n "$_lane_env_extra" ]; then
+    _lane_env_warn "this worktree needs dependencies $main does not have:"
+    _lane_env_warn "$_lane_env_extra"
+    _lane_env_warn "DECLINING to share its environment: it was solved without"
+    _lane_env_warn "them. Use 'pixi run' and take your own."
     return 1
   fi
 
