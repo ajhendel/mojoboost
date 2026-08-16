@@ -4360,6 +4360,16 @@ struct GpuActiveRows(Movable):
 
         var hist_size = self.n_features * self.n_bins
         var cells = 3 * hist_size
+        # The two tiling requests are passed here for the same reason
+        # `range_tiling` passes them: this is how the device-owned growth plane
+        # builds every non-root histogram, so omitting them made the row-tile
+        # arms reach the root and nothing else. Under the default resident
+        # plane that is 1 node of 61, which would have made the tile question
+        # look answered while being almost entirely unasked -- the same shape
+        # as a test that runs below the gate it is testing.
+        #
+        # Zero on both is byte-for-byte the previous behavior, so the default
+        # path is unchanged and only an explicitly requested arm moves.
         var tiling = derive_tiling(
             caps,
             max_rows,
@@ -4367,6 +4377,9 @@ struct GpuActiveRows(Movable):
             self.n_bins,
             STRATEGY_ATOMIC,
             self.part_capacity_unused(),
+            0,
+            self.min_tiles_request,
+            self.rows_per_tile_request,
         )
         var threads = tiling.block_threads
 

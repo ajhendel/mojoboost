@@ -262,3 +262,58 @@ against a control-plane-dominated round.
 **K2's end-to-end condition therefore binds hard: the launch-shape gain must beat
 the wasted work in a whole fit, not in a phase.** A phase-level win that the fit
 does not show is the row-tile floor again.
+
+---
+
+## Two findings from wiring K1's arms, both before any measurement
+
+### 1. `pair_alignment` is unmeasurable on the objective this campaign benchmarks
+
+The width-2 gradient/hessian pair load **only exists where the hessian plane is
+live**. Squared error guarantees a constant hessian, so an unweighted non-GOSS
+`reg` round elides that plane and gathers one word. `pair_alignment` is then read
+by nothing, and both halves of the pair would be the same run under two labels --
+which the bench lane refused rather than reporting.
+
+**Every headline figure this project has is `reg`.** So K1 changed a default from
+an LLVM IR observation, and that default cannot affect a single number this
+campaign has published or is about to publish. It is live on `binary`, and that
+is where the arm must be run:
+
+    pixi run bench-train-gpu 1000000 50 binary 5 pair-align-on,pair-align-off
+
+The default staying ON is defensible on its own terms -- an aligned load cannot
+be slower than an unaligned one, and the change is exact -- but it should be
+recorded as **a default changed without measurement**, and its measurement is on
+an objective nobody here has been benchmarking.
+
+### 2. The row-tile arms reached 1 node in 61, and that would have looked like an answer
+
+`enqueue_desc_child` omitted `min_tiles_request` and `rows_per_tile_request` from
+its `derive_tiling` call, where `range_tiling` passes both. That call is **how
+the device-owned growth plane builds every non-root histogram**, so under the
+default resident plane the tile arms reached only the root -- built by a
+different entry point -- and nothing else.
+
+The tile question would have been asked of one node in sixty-one and answered
+"no effect", which is the fixtures-below-the-gate failure wearing a fourth
+costume: a measurement that runs, produces a number, and exercises almost none of
+what it claims to test.
+
+Fixed by passing both requests, with zero on both remaining byte-for-byte the
+previous behavior. Verified: `test_gpu_tile_floor` 9/9,
+`test_gpu_hist_index_arms`, and `test_gpu_tree_resident` all green.
+
+**Consequence for how the tile arms must be run:** the bench lane's commands pin
+`MOJOTREES_GPU_TREE_RESIDENT=0` precisely because of this gap. With the fix, they
+should be re-taken with the resident plane **on**, since that is the default and
+the shape anyone actually runs.
+
+### And a pre-existing pair that was two identical runs under two labels
+
+The same audit found that under `MOJOTREES_GPU_HIST_SPECIALIZATION=batched`, the
+`gpu_leaf_batching` kernels carry their own row loop and tile arithmetic and read
+none of these fields -- so the **existing** `row-unroll-on` / `row-unroll-off`
+pair was two identical runs there. The unroll result reported above was not taken
+in that mode, so it stands; but the pair is now refused in it rather than
+silently degenerate.
