@@ -84,7 +84,11 @@ from .objective_registry import (
     objective_renews_leaves,
 )
 from .cegb import CegbLedger, check_cegb_continued_training
-from .histogram import objective_has_constant_hessian, score_t
+from .histogram import (
+    ConstHessianSettings,
+    objective_has_constant_hessian,
+    score_t,
+)
 from .linear_tree import (
     LinearEnsemble,
     LinearParams,
@@ -1580,6 +1584,13 @@ def _boost_rounds(
     # refusal belongs.
     var settings = DispatchSettings.resolve()
     var scratch = GrowScratch(data.n_features, data.n_bins)
+    # The two constant-hessian environment variables, read once for the whole
+    # fit rather than once per histogram build and once per subtraction. The
+    # grower resolves the sentinel per tree if this is not passed, which is
+    # 200 reads a fit instead of 2; that is what this hoist removes. Same
+    # decision either way -- the variables do not change mid-fit -- so no bits
+    # move.
+    var const_hessian_env = ConstHessianSettings.resolve()
     var leaves = LeafMembership()
     var by_leaf = _leaf_score_update_enabled()
     # Whether every entry of `hess` below is exactly 1.0 on every round, which
@@ -1633,6 +1644,7 @@ def _boost_rounds(
             round,
             bundling,
             const_hessian,
+            const_hessian_env,
         )
         var post_started = profile.clock()
         if renews:

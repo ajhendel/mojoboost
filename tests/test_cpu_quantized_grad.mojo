@@ -116,6 +116,7 @@ from support import _uniform
 def _reset_env():
     _ = setenv("MOJOTREES_NUM_WORKERS", "")
     _ = setenv("MOJOTREES_CPU_ROW_BLOCKS", "")
+    _ = setenv("MOJOTREES_CPU_ROW_BLOCK_AMORTIZE", "")
     _ = setenv("MOJOTREES_CPU_FEATURE_GROUP", "")
     _ = setenv("MOJOTREES_CPU_COMPACT_MIN_ROWS", "")
     _ = setenv("MOJOTREES_CPU_QUANT_GRAD", "")

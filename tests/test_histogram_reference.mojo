@@ -353,6 +353,7 @@ def _clear_env() raises:
     _ = setenv("MOJOTREES_CPU_TASKS_PER_CORE", "")
     _ = setenv("MOJOTREES_CPU_FEATURE_GROUP", "")
     _ = setenv("MOJOTREES_CPU_ROW_BLOCKS", "")
+    _ = setenv("MOJOTREES_CPU_ROW_BLOCK_AMORTIZE", "")
     _ = setenv("MOJOTREES_CONST_HESSIAN", "")
 
 
