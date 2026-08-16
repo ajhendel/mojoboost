@@ -117,9 +117,40 @@ an async number are not comparable and no arm timing should be quoted from a
 fenced run. Both are off by default, and an off run reads no clock, writes no
 counter, and prints nothing.
 
+`row-unroll-on` and `row-unroll-off` are the end-to-end pair for the
+histogram row walk: how many rows one thread keeps in flight inside the
+histogram row loop, `HIST_ROW_UNROLL` against one
+(`GpuActiveRows.set_row_unroll`, reached through `train_gpu`'s `row_unroll`
+argument). Both run under SPLIT_SEARCH_AUTO, so the pair holds every
+condition but the knob constant. `gpu-unroll` and `gpu-nounroll` are accepted
+as the same two arms under their older names, and any GPU arm takes a
+`-unroll` or `-nounroll` suffix when the strategy needs pinning too
+(`gpu-device-nounroll`, `gpu-device-depth-nounroll`). A `-unroll` suffix
+prints under the plain arm's name, because on *is* the default and inventing
+a second key for an identical configuration would put one condition in the
+record twice; the pair aliases keep their own labels because there the two
+names are the point.
+
+**The arm cannot change a model.** Both walks visit the same rows of the same
+range and add the same fixed-point integers into the same bins, so the
+histograms are identical, so is every split chosen from them, and so is the
+fit. What differs is instruction count and how many memory requests a thread
+has outstanding, against a higher live register count and a threadgroup
+residency this backend does not let anyone query.
+
+`bench_histogram.mojo` already A/Bs the same knob in isolation, and this pair
+exists **because an isolated histogram win is a hypothesis about a fit and
+not a result about one**. The row-tile floor is the case in point: it
+measured well in isolation on this repo and was a 22 to 36 percent regression
+across a whole fit, because the isolated shape did not carry the partial
+traffic a real round does. Run both. If the two benchmarks disagree, the
+disagreement is the finding and neither number supersedes the other.
+
 `arms` is a comma-separated list of cpu, gpu, gpu-host, gpu-device,
-lightgbm, in the order they should run; the first is the baseline every
-other arm is compared against. Any arm but lightgbm takes a `-depth` suffix
+lightgbm, row-unroll-on, row-unroll-off, in the order they should run; the
+first is the baseline every other arm is compared against. Underscores read
+as hyphens, so an output key copied out of a transcript is a valid arm name.
+Any arm but lightgbm takes a `-depth` suffix
 (`cpu-depth`, `gpu-device-depth`, ...) to train the same configuration under
 `grow_policy=depthwise`; the
 leaf budget is unchanged, so a depth-wise arm commits the same number of
@@ -136,6 +167,7 @@ attack. Defaults: 100000 rows, 100 features, reg, 1 repeat, `cpu,gpu`.
     pixi run bench-train-gpu 250000 50 reg 5 gpu-device,gpu-device-depth
     pixi run bench-train-gpu 100000 54 multi:7 5 cpu,gpu
     pixi run -e bench bench-train-gpu 1000000 50 reg 5 lightgbm,gpu-device
+    pixi run bench-train-gpu 1000000 50 reg 5 row-unroll-on,row-unroll-off
 """
 
 from std.collections import Optional
@@ -301,6 +333,17 @@ comptime ARM_GPU_DEVICE = 3
 comptime ARM_LGBM = 4
 # Added to any of the above: the same arm under `grow_policy=depthwise`.
 comptime ARM_DEPTHWISE = 8
+# Added to a GPU arm: pass `row_unroll=False` to the trainer, so the histogram
+# row loop walks one row per iteration instead of keeping `HIST_ROW_UNROLL`
+# rows in flight. A launch shape and nothing else; see `_run_arm`.
+comptime ARM_NOUNROLL = 16
+# Marks the two arms of the named row-unroll pair, so they label themselves
+# `row-unroll-on` and `row-unroll-off` rather than `gpu` and `gpu-nounroll`.
+# The pair earns its own labels because it is the comparison the measurement
+# queue names, and because the ON arm is byte-for-byte the default: an arm
+# that prints as plain `gpu` invites the reader to treat it as a baseline
+# that happened to be lying around rather than as a declared condition.
+comptime ARM_UNROLL_PAIR = 32
 
 
 struct ArmRun(Copyable, Movable):
@@ -324,7 +367,27 @@ def _arm_depthwise(arm: Int) -> Bool:
     return (arm & ARM_DEPTHWISE) != 0
 
 
+def _arm_row_unroll(arm: Int) -> Bool:
+    """The `row_unroll` this arm passes to `train_gpu`. True is the default."""
+    return (arm & ARM_NOUNROLL) == 0
+
+
+def _arm_touches_unroll(arm: Int) -> Bool:
+    """Whether this arm names the row-walk knob at all, either way.
+
+    Both members of the pair count, not only the OFF one. `row-unroll-on`
+    passes the value the trainer would have defaulted to, so it cannot fail
+    for want of the argument; it is refused wherever its twin is refused
+    because half a pair measures nothing and would still print a number.
+    """
+    return (arm & (ARM_NOUNROLL | ARM_UNROLL_PAIR)) != 0
+
+
 def _arm_name(arm: Int) -> String:
+    if (arm & ARM_UNROLL_PAIR) != 0:
+        if _arm_row_unroll(arm):
+            return String("row-unroll-on")
+        return String("row-unroll-off")
     var base = _arm_base(arm)
     var name = String("gpu")
     if base == ARM_CPU:
@@ -337,6 +400,8 @@ def _arm_name(arm: Int) -> String:
         name = String("lightgbm")
     if _arm_depthwise(arm):
         name += "-depth"
+    if not _arm_row_unroll(arm):
+        name += "-nounroll"
     return name
 
 
@@ -346,18 +411,77 @@ def _arm_key(arm: Int) -> String:
 
 
 def _parse_arms(spec: String) raises -> List[Int]:
-    """A comma-separated arm list, in the order the arms should run."""
+    """A comma-separated arm list, in the order the arms should run.
+
+    Underscores are read as hyphens, so `row_unroll_off` and
+    `row-unroll-off` are the same arm. The output keys use underscores and
+    the command line uses hyphens, which is a distinction nobody should have
+    to hold in their head while copying a key out of a transcript back into a
+    command.
+
+    `gpu-unroll` and `gpu-nounroll` are accepted as the pair's older names,
+    because that is the spelling `bench/results/SESSION_QUEUE.md` recorded
+    while the arms did not yet exist. They resolve to the same two arms and
+    print under the same two labels, so a queued command and a fresh one
+    produce the same keys.
+    """
     var arms = List[Int]()
     for part in spec.split(","):
-        var name = String(part)
-        if name.byte_length() == 0:
+        var given = String(part)
+        if given.byte_length() == 0:
             continue
+        var name = given.replace("_", "-")
+
+        # The named pair, matched whole and before any suffix stripping, so
+        # that `gpu-nounroll` is the OFF arm of the pair rather than a plain
+        # `gpu` carrying a suffix. Both members run under SPLIT_SEARCH_AUTO:
+        # the pair holds every condition but the knob constant, and AUTO is
+        # what a caller actually gets. Pin the strategy with the composable
+        # suffix form (`gpu-device-nounroll`) when that is the question.
+        if name == "row-unroll-on" or name == "gpu-unroll":
+            arms.append(ARM_GPU | ARM_UNROLL_PAIR)
+            continue
+        if name == "row-unroll-off" or name == "gpu-nounroll":
+            arms.append(ARM_GPU | ARM_NOUNROLL | ARM_UNROLL_PAIR)
+            continue
+
+        # Suffixes, stripped in a loop so they compose in either order:
+        # `gpu-device-depth-nounroll` and `gpu-device-nounroll-depth` are the
+        # same arm.
         var flags = 0
-        if name.endswith("-depth"):
-            flags = ARM_DEPTHWISE
-            var trimmed = String(name[byte= : name.byte_length() - 6])
-            name = trimmed^
+        var named_unroll = False
+        while True:
+            if name.endswith("-nounroll"):
+                flags |= ARM_NOUNROLL
+                named_unroll = True
+                var trimmed = String(name[byte= : name.byte_length() - 9])
+                name = trimmed^
+            elif name.endswith("-unroll"):
+                # Sets no flag: on is the default. It is worth being able to
+                # write anyway, because an A/B whose ON arm inherits its
+                # condition has one arm's condition undeclared, and this file
+                # already refuses to let a strategy be inherited for the same
+                # reason.
+                named_unroll = True
+                var trimmed = String(name[byte= : name.byte_length() - 7])
+                name = trimmed^
+            elif name.endswith("-depth"):
+                flags |= ARM_DEPTHWISE
+                var trimmed = String(name[byte= : name.byte_length() - 6])
+                name = trimmed^
+            else:
+                break
+
         if name == "cpu":
+            if named_unroll:
+                # `row_unroll` is a GPU histogram launch shape. The CPU
+                # trainer has no such loop to reshape, so `cpu-nounroll`
+                # would be plain `cpu` under a label claiming an arm.
+                raise Error(
+                    "the row-walk knob is a GPU histogram launch shape and"
+                    " the CPU trainer has none, so 'cpu-nounroll' would be"
+                    " plain cpu under a misleading label; use 'cpu'"
+                )
             arms.append(ARM_CPU | flags)
         elif name == "gpu":
             arms.append(ARM_GPU | flags)
@@ -366,15 +490,18 @@ def _parse_arms(spec: String) raises -> List[Int]:
         elif name == "gpu-device":
             arms.append(ARM_GPU_DEVICE | flags)
         elif name == "lightgbm":
-            if flags != 0:
+            if flags != 0 or named_unroll:
                 # `grow_policy` is a mojotrees and XGBoost switch. LightGBM
                 # grows leaf-wise and has no depth-wise mode to ask for, so
                 # `lightgbm-depth` would silently be plain `lightgbm` under a
                 # label claiming otherwise. Compare a depth-wise mojotrees arm
-                # against `lightgbm` and read the label as what it says.
+                # against `lightgbm` and read the label as what it says. The
+                # row-walk knob is ours and reaches nothing on that side at
+                # all, so it is refused on the same grounds.
                 raise Error(
-                    "lightgbm has no depth-wise grow policy to select, so"
-                    " 'lightgbm-depth' would be plain lightgbm under a"
+                    "lightgbm has neither a depth-wise grow policy nor our"
+                    " histogram row-walk knob to select, so 'lightgbm-depth'"
+                    " or 'lightgbm-nounroll' would be plain lightgbm under a"
                     " misleading label; use 'lightgbm'"
                 )
             arms.append(ARM_LGBM)
@@ -382,9 +509,11 @@ def _parse_arms(spec: String) raises -> List[Int]:
             raise Error(
                 String(
                     "unknown arm '",
-                    name,
-                    "'; use cpu, gpu, gpu-host, gpu-device, or lightgbm, and"
-                    " any but lightgbm with an optional -depth suffix",
+                    given,
+                    "'; use cpu, gpu, gpu-host, gpu-device, lightgbm, or the"
+                    " row-walk pair row-unroll-on / row-unroll-off. Any arm"
+                    " but lightgbm takes a -depth suffix, and any GPU arm"
+                    " takes -unroll or -nounroll.",
                 )
             )
     if len(arms) == 0:
@@ -538,6 +667,11 @@ def _run_arm(
     if _arm_depthwise(arm):
         params.tree.grow_policy = GROW_DEPTHWISE
     var base = _arm_base(arm)
+    # Stated on every GPU arm rather than defaulted on the ON one, for the
+    # reason the split strategy is stated: a condition that is inherited is a
+    # condition nobody wrote down, and this file has already been burned once
+    # by an arm running under a label it did not earn.
+    var unroll = _arm_row_unroll(arm)
 
     if n_classes > 0:
         # Softmax on both backends: one tree per class per round, so the
@@ -550,6 +684,18 @@ def _run_arm(
             mc_strategy = SPLIT_SEARCH_HOST
         elif base == ARM_GPU_DEVICE:
             mc_strategy = SPLIT_SEARCH_DEVICE
+        if _arm_touches_unroll(arm):
+            # `train_multiclass_gpu` has no `row_unroll` argument, so an
+            # unroll arm reaching here would train under the trainer's own
+            # default whatever the arm asked for, and print a number under a
+            # label claiming otherwise. `main` refuses this combination
+            # before any data is generated; this is the second door on the
+            # same room, because the first one is a check somebody can move.
+            raise Error(
+                "the row-walk arms are single output: train_multiclass_gpu"
+                " takes no row_unroll argument, so a multiclass unroll arm"
+                " would run the default under an arm's label"
+            )
         if base == ARM_CPU:
             var mc_cpu_t0 = perf_counter_ns()
             var mc_cpu_model = train_multiclass(
@@ -589,7 +735,12 @@ def _run_arm(
     # Includes GpuHistogramBuilder construction and every transfer.
     var gpu_t0 = perf_counter_ns()
     var gpu_model = train_gpu(
-        data, target, objective, params, split_search=strategy
+        data,
+        target,
+        objective,
+        params,
+        split_search=strategy,
+        row_unroll=unroll,
     )
     var gpu_s = Float64(perf_counter_ns() - gpu_t0) / 1e9
     var gpu_loss = -1.0
@@ -738,6 +889,23 @@ def main() raises:
                 "the lightgbm arm is single output only; multiclass would"
                 " need `_class_labels` replicated on the Python side and it"
                 " has not been"
+            )
+
+        var want_unroll_arm = False
+        for a in range(len(arms)):
+            if _arm_touches_unroll(arms[a]):
+                want_unroll_arm = True
+        if want_unroll_arm and n_classes > 0:
+            # `row_unroll` is threaded through `train_gpu` and not through
+            # `train_multiclass_gpu`, so a multiclass unroll arm would train
+            # under the trainer's default whichever arm it claimed to be, and
+            # both arms of the pair would be the same run. Refused here,
+            # before a million rows are generated, rather than at the first
+            # repeat.
+            raise Error(
+                "the row-walk arms are single output: train_multiclass_gpu"
+                " takes no row_unroll argument, so both arms of the pair"
+                " would run the same code under two labels"
             )
 
         # Same data as bench_train.mojo: column-major features, target from

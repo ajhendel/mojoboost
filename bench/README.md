@@ -367,20 +367,40 @@ rather than a comptime one: a comptime knob would have forced a two-build
 comparison, and two builds minutes apart cannot settle anything on this
 machine.
 
-**No row-unroll numbers are recorded here.** The A/B compiles and has not
-been run; it needs a quiet box.
+**No row-unroll numbers are recorded here.** Both A/Bs compile and neither
+has been run for a timing; they need a quiet box. A smoke run of the
+end-to-end pair at 2,000 x 8 did have the two arms agree on the training loss
+to the last digit and on the tree count, which is the "cannot change a model"
+claim holding and is not a measurement of anything else.
 
-The same A/B **cannot currently be run end to end** through
-`bench_train_gpu.mojo`, and the reason is worth writing down rather than
-discovering twice. `train_gpu` constructs its own `GpuHistogramBuilder`
-internally, `GpuHistogramBuilder` has no `set_row_unroll` forwarder the way
-it has `set_feature_group`, and the knob has deliberately no environment
-variable. Reaching it from an end-to-end arm therefore needs two edits inside
-`src/`: a forwarder on `GpuHistogramBuilder` and a `row_unroll` argument on
-`train_gpu` carried to `builder.set_row_unroll`. The histogram-level A/B
-above needs neither, and it isolates the loop the knob actually changes
-instead of diluting it into a fraction of a whole fit, which is the better
-first measurement in any case.
+The same A/B also runs **end to end**, as the `row-unroll-on` /
+`row-unroll-off` arms of `bench_train_gpu.mojo`, once
+`GpuHistogramBuilder.set_row_unroll` and `train_gpu`'s `row_unroll` argument
+existed to carry it. Both benchmarks are kept and **both should be run**:
+
+```sh
+pixi run bench-hist 1000000 50 20                                        # isolated
+pixi run bench-train-gpu 1000000 50 reg 5 row-unroll-on,row-unroll-off   # end to end
+```
+
+They answer different questions, and the end-to-end one is the question.
+**An isolated histogram win is a hypothesis about a fit, not a result about
+one.** The row-tile floor is why that sentence is here rather than in a
+footnote: it measured well in isolation on this repo and turned out to be a
+22 to 36 percent regression across a whole fit, because the isolated shape
+did not carry the partial traffic a real round does. If the two disagree,
+that disagreement is the finding and neither number supersedes the other.
+
+Both end-to-end arms run under `SPLIT_SEARCH_AUTO`, so the pair holds every
+condition but the knob constant. `gpu-unroll` / `gpu-nounroll` parse to the
+same two arms under the same two labels, and any GPU arm takes a `-unroll` or
+`-nounroll` suffix when the strategy needs pinning as well
+(`gpu-device-nounroll`, `gpu-device-depth-nounroll`, in either suffix order).
+`cpu-nounroll`, `lightgbm-nounroll` and any multiclass unroll arm are refused
+rather than run, because in each case the knob reaches nothing and the arm
+would print a number under a label it had not earned; `train_multiclass_gpu`
+in particular takes no `row_unroll` argument, so both arms of the pair would
+be the same run.
 
 ## GPU histogram scaling and phase breakdown
 
