@@ -41,24 +41,54 @@ not in the tree.
 - `_multiclass_rf_gradients` needed nothing: it is a `def`, which raises in
   Mojo 1.0. That glue item was a non-issue and is struck.
 
+## The finding to route: oblivious shipped and is unreachable
+
+`GROW_OBLIVIOUS` merged in wave 4 and I exported it from
+`src/mojotrees/__init__.mojo` myself. It cannot be asked for.
+`python/mojotrees/sklearn.py` validates `grow_policy` against
+`_GROW_POLICIES` (around line 985), which carries `leafwise` (alias
+`lossguide`) and `depthwise` and nothing else, and **every arm in
+`bench/real_data` and every sklearn user goes through that surface**. This
+is the second feature this round that was built, tested, merged and
+unreachable; CatBoost was the first.
+
+It is with `lane/canonical-naming`, which owns that validator and whose spec
+already carries the value. Wiring it turns the largest caveat on the CatBoost
+comparison from a permanent unmatchable into a matched parameter. Check the
+whole path when it reports: accepted-and-dropped is worse than rejected, and
+`bench/real_data` has already shipped exactly that shape once.
+
 ## Owed, in order
 
 0. **Head against `e8c0877` needs a lambda-matched form, not a caveat.**
    `lambda_l2` moved 1.0 to 0.0 this round and lambda sits in the split gain,
    so the two builds grow different trees and a wall clock would confound
-   speed with tree shape. Run **head at `lambda_l2 = 1.0`** instead. The bench
-   harness has no flag for it, so this needs one line of glue first.
+   speed with tree shape. **The glue is written and not yet committed**:
+   `_bench_params()` in `bench/bench_train_gpu.mojo` reads
+   `MOJOTREES_BENCH_LAMBDA_L2`, raises on an unparseable value, prints on
+   the `arm_conditions:` line, and is the ONE construction point both arms
+   are built from -- an override reaching our arm and not LightGBM's would
+   silently fit two different models, which is worse than the confounded
+   number it was meant to fix. It needs a compile before it commits, and
+   then the run is `MOJOTREES_BENCH_LAMBDA_L2=1.0` on head.
 
-1. **Re-run the suite on the merged base.** It was green at 72/72 on the
-   wave-4 base, before the merge into `perf-round-2` brought the GPU
-   campaign's work in. Nobody has run it since.
+1. **Re-run the suite on the merged base.** IN FLIGHT as of this writing,
+   on `perf-round-2` at `c8ed5b2` -- f9's head rather than `901e31d`, which
+   verifies the merge and everything f9 has landed since. **119 test files,
+   not 72**: the merge brought the GPU campaign's tests in. f9 handed the
+   box over by message; its lock text is preserved at
+   `/tmp/mojotrees-bench.lock.f9-handover`.
 
-2. **A CatBoost Lossguide row** (their leaf-wise, `max_leaves` 31) beside
-   SymmetricTree, in `bench/real_data`. This is the one part of the CatBoost
-   harness item still outstanding; reachability and the `sparse_highdim` cap
-   landed in `9cc45e7`. Iterations and learning rate were already structural
-   through `CATBOOST_MATCHED` and already on every row, so that half needed
-   nothing.
+2. ~~A CatBoost Lossguide row.~~ **DONE, `ca33ebc`.** `catboost_lossguide`
+   passes exactly two parameters, `grow_policy=Lossguide` and
+   `max_leaves=31`, merged through `extra` so they meet
+   `CATBOOST_REFUSED_PARAMS` like any scenario value. Verified by a
+   3-iteration fit, not assumed: CatBoost accepts the pair, and it also
+   keeps `depth=6` as an active cap under Lossguide where LightGBM's
+   `max_depth` default is unlimited -- so the row **narrows** `tree_shape`
+   rather than closing it, and both the docstring and the record say so.
+   `CATBOOST_ENGINES`/`PEER_ENGINES` now replace the same tuple that was
+   hand-written in three files. This closes the CatBoost harness item.
 
 3. **`lane/ordered-ts` merges when it reports.** As of the merge its branch
    head was still an old base commit with none of its own work on it, so it
