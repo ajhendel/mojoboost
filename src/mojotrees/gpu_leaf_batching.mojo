@@ -150,14 +150,21 @@ to express.
 """
 
 from std.atomic import Atomic
-from std.gpu import block_dim, block_idx, global_idx, thread_idx
+from std.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
 from std.math import round
 from std.memory import stack_allocation
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 
-from .gpu_active_rows import MAX_ROWS, GpuActiveRows, LeafRange
+from .gpu_active_rows import (
+    MAX_ROWS,
+    STEP_LIVE,
+    STEP_ROW_BEGIN,
+    STEP_ROW_COUNT,
+    GpuActiveRows,
+    LeafRange,
+)
 from .gpu_frontier import NO_SLOT, LeafFrontier, LeafStats, LeafWorkItem
 from .gpu_histogram_specializations import (
     MAX_BINS,
@@ -176,6 +183,7 @@ from .gpu_tiling import (
     TARGET_BLOCKS_PER_SM,
     DeviceCaps,
     derive_block_threads,
+    derive_tiling,
 )
 
 # Gradient, hessian, and count planes, in that order, in every histogram.
@@ -201,6 +209,29 @@ caller holding several row permutations at once (one per class, say) puts the
 permutation's base into this offset and needs no extra word."""
 
 comptime ITEM_COUNT = 1
+"""Rows in this item's window. Zero is legal and means a live leaf that holds
+no rows, whose histogram is all zeros; `ITEM_DEAD` is the one negative value
+and means something else entirely, see below."""
+
+comptime ITEM_DEAD = -1
+"""`ITEM_COUNT` on an item that must not be touched at all.
+
+The one word a device-written plan needs that a host-written one does not.
+`_pick_and_commit_kernel` writes the plan on every execution including the
+three that commit nothing, exactly as it writes `STEP_LIVE` on every exit, so
+that a batch enqueued past the end of growth is already in the queue and reads
+its way to doing nothing. Zeroing is what makes that a real distinction rather
+than a cosmetic one: `_batch_zero_kernel` clears the slice `ITEM_OUT` names, so
+a dead item that left a stale `ITEM_OUT` behind would erase a live leaf's
+histogram. A dead item is skipped by the zeroing outright, and the
+accumulation's `tile_end = min(tile_begin + rows_per_tile, count)` is already
+negative for it, so its threadgroups exit at their first comparison.
+
+`_stage_plan` refuses a negative count, so a host-staged plan can never carry
+this value and the guard below is unreachable from every path that exists
+today. That is deliberate: it is what makes the sentinel a new arm rather than
+a change to the shipping one."""
+
 comptime ITEM_ROWS_PER_TILE = 2
 comptime ITEM_TILE_BEGIN = 3
 """This item's first tile on the packed tile axis: the exclusive prefix sum
@@ -273,13 +304,97 @@ def _batch_zero_kernel(
     leaves slices the reduction never writes, and an empty leaf's histogram
     is all zeros with no kernel to produce them. Indexed through the item
     table so slices belonging to other leaves are untouched.
+
+    An item whose count is `ITEM_DEAD` is skipped rather than zeroed, which is
+    the one thing that lets a device-written plan be enqueued before the
+    commit that fills it has run. A live item holding no rows is *not* dead
+    and is still zeroed: its histogram is legitimately all zeros and something
+    has to write them. See `ITEM_DEAD`; no host-staged plan can reach this
+    branch, because `_stage_plan` refuses a negative count.
     """
     var cells = N_PLANES * Int(hist_size)
     var i = global_idx.x
     if i < Int(n_items) * cells:
         var k = i // cells
         var r = i - k * cells
-        var slot = Int(items[unsafe_offset = k * ITEM_WORDS + ITEM_OUT][0])
+        var base = k * ITEM_WORDS
+        if items[unsafe_offset = base + ITEM_COUNT][0] < Int32(0):
+            return
+        var slot = Int(items[unsafe_offset = base + ITEM_OUT][0])
+        out_hist[unsafe_offset = slot * cells + r] = Int32(0)
+
+
+def _batch_copy_back_zero_kernel(
+    out_hist: MutPointer[Int32, MutAnyOrigin],
+    items: MutPointer[Int32, MutAnyOrigin],
+    n_items: Int32,
+    hist_size: Int32,
+    rows: MutPointer[Int32, MutAnyOrigin],
+    scratch: MutPointer[Int32, MutAnyOrigin],
+    desc: MutPointer[Int32, MutAnyOrigin],
+):
+    """`_batch_zero_kernel`, carrying the descriptor partition's deferred
+    copy-back.
+
+    **Why this exists, because without it the census fails by six.**
+    `GpuActiveRows.enqueue_partition_desc` under `set_partition_fusion(True)`
+    -- which is the default -- does not launch its copy-back. It leaves the
+    compacted permutation in the scratch buffer and a debt, and the next
+    `enqueue_desc_histogram` pays it inside the slot zeroing it has to launch
+    anyway (`_copy_back_zero_slot_kernel`). A batched build does not go through
+    that entry point, so a level whose children were built by a batch would
+    either read a permutation that is one partition out of date, or pay the
+    copy-back in a third partition launch. The third launch is 1 per level, 6
+    per depth-6 tree, and it is exactly the margin: the tree goes from 62
+    command buffers to 68 and back over the queue's knee. So the batch pays it
+    in its own zeroing pass, in the launch it has to make anyway, and the
+    partition stays two.
+
+    Every store here is a store one of the two kernels it replaces made, of the
+    same value, to the same address, under the same guard -- the same argument
+    `_copy_back_zero_slot_kernel` makes. There is no arithmetic beyond index
+    formation and no floating point anywhere, so nothing here can move a bit.
+
+    **The two halves are unordered with respect to each other and that is what
+    makes the fusion legal.** The copy-back writes `rows`, the zeroing writes
+    `out_hist`, and neither reads what the other writes. The launch boundaries
+    that matter are the ones this does not touch: the scatter before it writes
+    `scratch` across blocks, and the accumulation after it reads `rows` and
+    adds onto `out_hist` across blocks.
+
+    **The two guards are different and neither may be borrowed for the other.**
+    The copy-back is owed only by a live step, so it reads `STEP_LIVE`, exactly
+    as `_copy_back_kernel`'s descriptor arm does. The zeroing is owed by every
+    item the plan calls live, which is a per-item question (`ITEM_DEAD`) and
+    not a property of the step: a step may be dead while the plan still names
+    slots that must be cleared, and a step may be live while some item of the
+    plan is not. An earlier draft guarded both on `STEP_LIVE` and would have
+    skipped zeroing on exactly the steps a device-written plan is enqueued
+    ahead of.
+    """
+    var stride = Int(block_dim.x) * Int(grid_dim.x)
+
+    # Half one: the partition's deferred copy-back, `_copy_back_kernel`'s
+    # descriptor arm verbatim.
+    if desc[unsafe_offset=STEP_LIVE][0] != Int32(0):
+        var b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+        var n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+        var j = Int(global_idx.x)
+        while j < n:
+            var i = b + j
+            rows[unsafe_offset=i] = scratch[unsafe_offset=i][0]
+            j += stride
+
+    # Half two: `_batch_zero_kernel` verbatim, guarded store and all.
+    var cells = N_PLANES * Int(hist_size)
+    var i2 = global_idx.x
+    if i2 < Int(n_items) * cells:
+        var k = i2 // cells
+        var r = i2 - k * cells
+        var base = k * ITEM_WORDS
+        if items[unsafe_offset = base + ITEM_COUNT][0] < Int32(0):
+            return
+        var slot = Int(items[unsafe_offset = base + ITEM_OUT][0])
         out_hist[unsafe_offset = slot * cells + r] = Int32(0)
 
 
@@ -1707,6 +1822,16 @@ struct GpuLeafBatcher(Movable):
     var stage_scales: HostBuffer[DType.float32]
     var stage_feat: HostBuffer[DType.int32]
     var pool: HistogramSlotPool
+    # The device-written-plan arm's staged geometry: how many item rows the
+    # commit kernel may fill, how many packed tiles each of them was given,
+    # and how wide the feature axis was when they were sized. Zero until
+    # `stage_device_plan` has run, which is what `enqueue_device_plan_batch`
+    # refuses on. Kept as fields rather than passed per launch because they
+    # are the half of the plan the host owns and they do not move within a
+    # tree; see `stage_device_plan`.
+    var plan_items: Int
+    var plan_tiles_per_item: Int
+    var plan_slots: Int
 
     def __init__(
         out self,
@@ -1752,6 +1877,9 @@ struct GpuLeafBatcher(Movable):
         self.partial_capacity = partial_capacity
         self.block_threads = derive_block_threads(caps)
         self.pool = HistogramSlotPool(pool_capacity)
+        self.plan_items = 0
+        self.plan_tiles_per_item = 0
+        self.plan_slots = 0
 
         var hist_size = n_features * n_bins
         self.items_dev = self.ctx.enqueue_create_buffer[DType.int32](
@@ -1887,6 +2015,13 @@ struct GpuLeafBatcher(Movable):
         var sdst = self.stage_scales.unsafe_ptr()
         for i in range(plan.n_items()):
             var it = plan.items[i].copy()
+            # Keeps `ITEM_DEAD` out of every host-staged plan, so the dead
+            # branch in `_batch_zero_kernel` is reachable only from a
+            # device-written plan and nothing on the shipping path can take
+            # it. Stated as its own refusal rather than folded into the bound
+            # below, because the bound would pass a negative count.
+            if it.row_count < 0:
+                raise Error("a batch item's row count must be nonnegative")
             if it.row_begin < 0 or it.row_begin + it.row_count > self.n_rows:
                 raise Error("a batch item's rows escape the row buffer")
             if it.out_slot < 0 or it.out_slot >= self.pool.capacity:
@@ -2071,6 +2206,298 @@ struct GpuLeafBatcher(Movable):
                 )
         self.enqueue_batch(
             plan, bins, rows.rows_dev.unsafe_ptr(), grad, hess
+        )
+
+    # --- The device-written plan ------------------------------------------
+    #
+    # The gap this closes, in one sentence: `enqueue_batch` already builds a
+    # whole frontier in two launches whatever its width, and the only thing
+    # that keeps it out of a device-owned tree is that `_stage_plan` writes
+    # `items_dev` from the host, so a plan cannot exist until the host has
+    # read back the commit that implies it -- the round trip
+    # `gpu_resident_round` exists to remove.
+    #
+    # The plan splits cleanly in two, and that split is the whole design:
+    #
+    #   geometry   ROWS_PER_TILE, TILE_BEGIN, TILES, PLANE, and the scales
+    #   contents   BEGIN, COUNT, OUT
+    #
+    # The geometry is what the *grid* is derived from and a grid is a host
+    # argument to `enqueue_function`; no kernel can change it. So the host
+    # fixes it once per tree from a row bound, exactly as
+    # `GpuActiveRows.enqueue_desc_histogram` sizes its atomic launch from
+    # `max_rows` rather than from the row count it does not know. The
+    # contents are what the commit decides, and those are three Int32 per
+    # item that `gpu_tree_tables._pick_and_commit_kernel` writes in the same
+    # launch that writes the step descriptor -- so the plan costs **zero
+    # extra command buffers**, which is the property the census turns on.
+    #
+    # A geometry sized from a bound gives some threadgroups nothing to do,
+    # and that is not a wrong answer: a tile past its item's real count has
+    # `tile_begin >= count`, its row loop runs zero times, and its shared
+    # histogram flushes nothing because every count bin is zero. The same
+    # argument the descriptor histogram makes for its own bound.
+
+    def stage_device_plan(
+        mut self,
+        n_items: Int,
+        max_rows: Int,
+        n_slots: Int,
+        caps: DeviceCaps,
+        g_scale: Float32,
+        h_scale: Float32,
+        plane: Int = 0,
+    ) raises -> Int:
+        """Fix the host half of a device-written plan and upload it. Returns
+        the packed tile count the launch grid will use.
+
+        Called once per tree, before the first commit that writes into the
+        plan, and not again: the geometry is a function of the row bound, the
+        feature width and the item count, and none of the three moves inside a
+        tree. That is also what keeps `_stage_plan`'s pinned-memory ordering
+        contract satisfiable here -- the staging buffers are written once and
+        the device reads `items_dev` from then on, so there is no host write
+        racing a launch.
+
+        **Every item is staged dead.** `ITEM_COUNT` is `ITEM_DEAD` and
+        `ITEM_OUT` is zero, so a batch enqueued before any commit kernel has
+        filled the plan, or after growth has ended, zeroes nothing and
+        accumulates nothing. This is the same discipline
+        `_pick_and_commit_kernel` already applies to `STEP_LIVE`, and it is
+        what allows a whole tree's launches to sit in the queue before the
+        tree has decided how many splits it will take.
+
+        The strategy is the atomic one and there is no choice about it, for
+        the reason `enqueue_desc_histogram` states: the tiled strategy's
+        partial buffer and its reduction are both sized by the tile count, the
+        tile count would have to come from row counts the host does not have,
+        and deriving it from the row bound instead would give every shallow
+        leaf a reduction over thousands of empty tiles. The two strategies
+        produce the identical histogram, so this is a launch decision and not
+        a numeric one.
+        """
+        if n_items < 1 or n_items > self.max_items:
+            raise Error(
+                "a device-written plan holds between one item and this"
+                " batcher's max_items"
+            )
+        if n_slots < 1 or n_slots > self.n_features:
+            raise Error("active feature count out of range")
+        if max_rows < 1:
+            raise Error("a device-written plan needs a positive row bound")
+        if max_rows > self.n_rows:
+            raise Error("the row bound exceeds the row buffer")
+        if plane < 0 or plane >= self.n_planes:
+            raise Error("a plan's gradient plane is out of range")
+        if g_scale <= 0.0 or h_scale <= 0.0:
+            raise Error("fixed-point scales must be positive")
+
+        var tiling = derive_tiling(
+            caps,
+            max_rows,
+            n_slots,
+            self.n_bins,
+            STRATEGY_ATOMIC,
+            0,
+            0,
+            0,
+            0,
+        )
+        var tiles = tiling.n_tiles
+        if tiles < 1:
+            tiles = 1
+        var total_tiles = n_items * tiles
+        if total_tiles > MAX_GRID_DIM_Y:
+            raise Error(
+                "a device-written plan's packed tile axis exceeds the"
+                " portable grid.y bound; give the batcher fewer items or a"
+                " smaller row bound"
+            )
+
+        var dst = self.stage_items.unsafe_ptr()
+        var sdst = self.stage_scales.unsafe_ptr()
+        for k in range(n_items):
+            var base = k * ITEM_WORDS
+            dst.unsafe_store(base + ITEM_BEGIN, Int32(0))
+            dst.unsafe_store(base + ITEM_COUNT, Int32(ITEM_DEAD))
+            dst.unsafe_store(
+                base + ITEM_ROWS_PER_TILE, Int32(tiling.rows_per_tile)
+            )
+            dst.unsafe_store(base + ITEM_TILE_BEGIN, Int32(k * tiles))
+            dst.unsafe_store(base + ITEM_TILES, Int32(tiles))
+            dst.unsafe_store(base + ITEM_OUT, Int32(0))
+            dst.unsafe_store(base + ITEM_PLANE, Int32(plane))
+            dst.unsafe_store(base + 7, Int32(0))
+            sdst.unsafe_store(SCALE_WORDS * k + SCALE_G, g_scale)
+            sdst.unsafe_store(SCALE_WORDS * k + SCALE_H, h_scale)
+        self.ctx.enqueue_copy(dst_buf=self.items_dev, src_ptr=dst)
+        self.ctx.enqueue_copy(dst_buf=self.scales_dev, src_ptr=sdst)
+
+        self.plan_items = n_items
+        self.plan_tiles_per_item = tiles
+        self.plan_slots = n_slots
+        return total_tiles
+
+    def device_plan_staged(self) -> Bool:
+        """Whether `stage_device_plan` has run on this batcher.
+
+        Exposed so a caller can branch between the two arms rather than catch,
+        and so a test can assert that the device-plan arm was actually entered
+        instead of asserting that the host arm produced the right answer and
+        calling that a pass."""
+        return self.plan_items > 0
+
+    def enqueue_device_plan_batch[
+        bins_origin: MutOrigin,
+        rows_origin: MutOrigin,
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin, //
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        rows: MutPointer[Int32, rows_origin],
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+    ) raises:
+        """Build every item of the device-written plan. **Two launches,
+        whatever the plan holds.** Does not stage, transfer, or synchronize.
+
+        This is `enqueue_batch` with the staging removed and the strategy
+        fixed, and it reads `items_dev` exactly as that path's kernels do, so
+        the two arms run the same two kernels over the same table and differ
+        only in who wrote the table. That is what makes the batched shape
+        bit-identical to the host-staged one by inspection rather than by
+        argument: there is one accumulation kernel and one zeroing kernel in
+        this module and both arms launch those.
+
+        The zeroing is unconditional here, where `enqueue_batch` reasons about
+        whether it is needed. It always is: this arm is always the atomic
+        strategy, which accumulates into whatever the slot already holds.
+        """
+        if self.plan_items < 1:
+            raise Error(
+                "no device-written plan is staged; call stage_device_plan"
+                " before enqueueing a plan batch"
+            )
+        var n_items = self.plan_items
+        var total_tiles = n_items * self.plan_tiles_per_item
+        var threads = self.block_threads
+        var hs = self.hist_size()
+
+        var cells = n_items * N_PLANES * hs
+        self.ctx.enqueue_function[_batch_zero_kernel](
+            self.out_dev.unsafe_ptr(),
+            self.items_dev.unsafe_ptr(),
+            Int32(n_items),
+            Int32(hs),
+            grid_dim=_ceil_div(cells, threads),
+            block_dim=threads,
+        )
+        self.ctx.enqueue_function[_batch_hist_atomic_kernel](
+            bins,
+            rows,
+            grad,
+            hess,
+            self.feat_dev.unsafe_ptr(),
+            self.items_dev.unsafe_ptr(),
+            self.scales_dev.unsafe_ptr(),
+            self.out_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            Int32(n_items),
+            Int32(self.plan_slots),
+            Int32(self.n_bins),
+            Int32(hs),
+            Int32(self.n_features),
+            grid_dim=(self.plan_slots, total_tiles),
+            block_dim=threads,
+        )
+
+    def enqueue_device_plan_batch_fused[
+        bins_origin: MutOrigin,
+        rows_origin: MutOrigin,
+        scratch_origin: MutOrigin,
+        desc_origin: MutOrigin,
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin, //
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        rows: MutPointer[Int32, rows_origin],
+        scratch: MutPointer[Int32, scratch_origin],
+        desc: MutPointer[Int32, desc_origin],
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+        copy_back_blocks: Int = 0,
+    ) raises:
+        """`enqueue_device_plan_batch`, also paying the descriptor
+        partition's deferred copy-back, and still in two launches.
+
+        This is the entry point a level schedule wants, and the reason is
+        arithmetic rather than taste. `GpuActiveRows.enqueue_partition_desc`
+        defers its copy-back under `set_partition_fusion(True)`, which is the
+        default, and the debt is paid by the next `enqueue_desc_histogram`. A
+        batched build does not go through that entry point, so a schedule using
+        the plain `enqueue_device_plan_batch` would have to run the partition
+        with its fusion off and spend a third launch on the copy-back: one per
+        level, six per depth-6 tree, which is the whole margin between 62
+        command buffers and 68. `_batch_copy_back_zero_kernel` carries it in
+        the zeroing pass instead, which this arm has to launch anyway.
+
+        `desc` is the step descriptor the partition was launched against,
+        `scratch` the active-row scratch buffer it compacted into, and
+        `copy_back_blocks` the block count that partition used, so the fused
+        grid is at least as wide as the copy-back's own would have been. Both
+        halves are grid-strided or singly guarded, so a wider grid changes no
+        store; see the kernel.
+
+        **The caller still owes `GpuActiveRows` the bookkeeping half of the
+        debt.** Nothing here can clear `copy_back_debt`, because that flag
+        lives in a struct this module does not own and is checked by four
+        refusals there. A schedule wiring this up marks the debt paid on the
+        rows object in the same place it enqueues this.
+        """
+        if self.plan_items < 1:
+            raise Error(
+                "no device-written plan is staged; call stage_device_plan"
+                " before enqueueing a plan batch"
+            )
+        var n_items = self.plan_items
+        var total_tiles = n_items * self.plan_tiles_per_item
+        var threads = self.block_threads
+        var hs = self.hist_size()
+
+        var cells = n_items * N_PLANES * hs
+        var blocks = _ceil_div(cells, threads)
+        if copy_back_blocks > blocks:
+            blocks = copy_back_blocks
+        self.ctx.enqueue_function[_batch_copy_back_zero_kernel](
+            self.out_dev.unsafe_ptr(),
+            self.items_dev.unsafe_ptr(),
+            Int32(n_items),
+            Int32(hs),
+            rows,
+            scratch,
+            desc,
+            grid_dim=blocks,
+            block_dim=threads,
+        )
+        self.ctx.enqueue_function[_batch_hist_atomic_kernel](
+            bins,
+            rows,
+            grad,
+            hess,
+            self.feat_dev.unsafe_ptr(),
+            self.items_dev.unsafe_ptr(),
+            self.scales_dev.unsafe_ptr(),
+            self.out_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            Int32(n_items),
+            Int32(self.plan_slots),
+            Int32(self.n_bins),
+            Int32(hs),
+            Int32(self.n_features),
+            grid_dim=(self.plan_slots, total_tiles),
+            block_dim=threads,
         )
 
     def enqueue_subtract(

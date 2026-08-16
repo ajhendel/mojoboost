@@ -4931,6 +4931,81 @@ struct LeafRangeTable(Copyable, Movable):
         self.ranges[parent] = LeafRange.empty()
         return LeafRange(r.begin, mid)
 
+    def set_window(mut self, node: Int, begin: Int, end: Int) raises:
+        """Give `node` the window `[begin, end)` directly, without requiring
+        it to be inside anything.
+
+        **Why containment cannot be the only way in.** `split` is written for
+        a partition that keeps a parent's rows in one block, which is what
+        leaf-wise growth produces and what the shipping partition writes. An
+        oblivious level does not produce that. One stable partition of the
+        whole active prefix by the level's single routing rule sends all of
+        the level's left children to the front and all of its right children
+        to the back, so the level's new leaves are numbered `j` and
+        `j + 2^l` -- `gpu_resident_round.OBLIVIOUS_LEAF_INDEX_RULE`, which is
+        CatBoost's numbering and the one the cross-leaf scan sums in -- and a
+        parent's rows land in **two blocks that are not adjacent**. There is
+        no `n_left` that expresses that, so `split` cannot replay such a tree
+        at all, and `gpu_resident_round._publish_row_ranges` is not optional:
+        `GpuHistogramBuilder.update_raw_device` reads this table to advance
+        the raw scores, and the last time it was handed a table describing a
+        different partition the result was correct trees, wrong scores, and
+        every round after the first diverging. See this struct's docstring;
+        that is not a hypothetical, it shipped.
+
+        The alternative was a per-leaf-contiguous partition, which keeps
+        containment and numbers the level `2j` and `2j+1`, but needs a
+        segmented prefix scan per level rather than one scan over the prefix.
+        `gpu_resident_round.OBLIVIOUS_ROW_RANGES` costs that out at 3 launches
+        per leaf, 189 at depth 6, against the 20 host lines below.
+
+        **How this stays inside the poisoning discipline, which is the part
+        that matters.** The poison guards *readers*: `get`, `n_nodes`,
+        `total_active` and `check_invariants` all refuse while
+        `resident_owned`, because a stale window is well formed and nothing
+        downstream can tell it from a fresh one. This is a *writer*, and it is
+        permitted while poisoned for exactly the reason `split` is -- it is
+        how the replay that clears the poison happens -- and it is not a way
+        around the poison for three reasons, all of them structural rather
+        than conventional:
+
+        1. It returns nothing and reads no window out, not even through
+           `_get_raw`. A caller cannot learn a window from it, so it cannot
+           be used to observe a table it is not allowed to observe.
+        2. It never touches `resident_owned`. `end_descriptor_partition` is
+           still the only thing that clears the poison, and it still clears it
+           only after checking every replayed window against the device's own
+           frontier byte for byte and running `_check_invariants`. A table
+           built entirely out of this setter is therefore un-poisoned by the
+           same proof a table built out of `split` is, and by no weaker one.
+        3. It keeps `split`'s orphan guard, which is the one refusal that
+           does not depend on containment: a node that already owns rows
+           cannot be given a second nonempty window. Emptying a node is always
+           allowed, because that is what a level replay does to the parents it
+           has just replaced, and an empty window orphans nothing.
+
+        What it deliberately does not check is that the windows tile. That is
+        a property of the whole table and not of one write, it is false
+        halfway through any replay, and `_check_invariants` inside
+        `end_descriptor_partition` is where it is established -- once, over
+        the finished table, before the poison lifts.
+        """
+        if node < 0 or node > MAX_ROWS:
+            raise Error("leaf ids must be nonnegative and fit in Int32")
+        if begin < 0 or end < begin:
+            raise Error("an active-row window must be a nonnegative range")
+        if end > self.n_rows:
+            raise Error("an active-row window escapes the row buffer")
+        self._grow_to(node)
+        if begin != end and not self.ranges[node].is_empty():
+            raise Error(
+                "node ",
+                node,
+                " already owns an active-row window and a second nonempty"
+                " window would orphan the rows it holds",
+            )
+        self.ranges[node] = LeafRange(begin, end)
+
     def total_active(self) raises -> Int:
         """Rows the live windows account for. Refuses while the resident
         partition owns the windows, because it is a sum over exactly the
