@@ -211,6 +211,69 @@ sample is applied to the gradients before they are uploaded (see
 `hess[r]` by the time any kernel here reads it. A second weight vector would
 be a second place to scale, and two places to scale is one too many.
 
+Row compaction, and what it is a trade against
+----------------------------------------------
+Everything above compacts the *index*: a leaf's rows are contiguous in
+`rows[]`. What that does not fix is where those rows point. At the root
+`rows[j] == j`, so the histogram's `bins[f * n_rows + rows[j]]` is a dense
+run; after the first split every node reads a scattered subset, and a
+measurement this round put the histogram phase at 1M by 50 at **56.7 percent
+gather**. Feature-major layout makes a thread's features adjacent and does
+nothing for a scattered row.
+
+`set_row_compaction(True)` is CatBoost's answer to that, transplanted:
+physically reorder the data at every split so a leaf's rows are contiguous in
+*memory* (`catboost/cuda/methods/greedy_subsets_searcher/`
+`split_properties_helper.cpp`, `MakeSplit`). Two extra planes hold the binned
+matrix and the quantized gradient pair in permutation order, the same
+destination map the row scatter computes is applied to them, and the
+histogram launch is handed those planes and an identity index. The block
+comment above `_compact_build_kernel` states the invariant and proves the
+histogram cannot move; `set_row_compaction` states the memory cost.
+
+**It is off by default and it must be argued into the default by a window,
+not by this paragraph.** It removes gather traffic and pays a physical
+reorder at every split to do it, which is exactly the shape of change this
+repository has been burned by: the row-tile floor raised occupancy as
+designed and measured 22 percent slower at 50 features. What is claimed here
+is arithmetic, not a measurement. Writing `L` for a split's window length and
+`nf` for the feature count, a split moves `4 * L * (nf + 8)` bytes -- the
+scatter reads and writes the window, the copy-back reads and writes it again
+-- and every one of those accesses is contiguous. Against that, an
+un-compacted node at depth `d` reads a *sparse* column: its rows are spread
+with stride `2^d` over the full `n_rows` extent, so while `2^d` is below a
+cache line's worth of bins the node's read costs a full `n_rows * nf` however
+few rows it owns, and a level of `2^d` nodes costs that many full passes.
+Compaction replaces that with one full pass per level for the moves and one
+for the reads. The crossover on paper is around depth two or three; where it
+actually is, is what the interleaved A/B is for.
+
+**How it sits beside the two other arms that touch the same bytes**, because
+all three arrived in one round and only one pair composes.
+
+- The **Int16 gradient staging** arm composes, and is supported. It narrows
+  the staged derivative pair inside the same allocation, so the compacted
+  copy simply moves four bytes per row instead of eight; the three compaction
+  kernels take the width as `packed_grads` and `compact_packed` records which
+  width the planes were written at.
+- The **packed bin layout** does not compose and is refused from both
+  setters. That arm decodes bin ids out of a bit stream through the *same*
+  `bins` pointer the byte gather reads, so a live compaction would hand a
+  bit-stream decoder a byte plane and every id it produced would be legal and
+  wrong. Permuting a bit stream is a re-encode rather than a move, so there is
+  no plane both readers could share.
+- The **blocked layout** is refused for the reason it was already refused by
+  the packed one: two rearrangements of one matrix, one pointer.
+
+One warning for whoever edits these kernels next, because it cost this lane a
+debugging session and it *compiles*. `_scatter_kernel` and its two copies have
+carried a local named `packed` since the partition was written -- the packed
+routing offset, `(prefix << 1) | flag`. A kernel parameter named `packed` in
+that scope is silently shadowed by it, which on the Int32 arm moves the
+gradient plane at the Int16 width and produces a wrong histogram over
+legal-looking values. That is why the width parameter is spelled
+`packed_grads` here and nowhere `packed`.
+
 What is not here
 ----------------
 This module owns no dataset, gradients, or histogram output. Those live in
@@ -226,6 +289,7 @@ from std.atomic import Atomic
 from std.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
 from std.math import round
 from std.memory import stack_allocation
+from std.os import getenv
 from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
@@ -1645,6 +1709,397 @@ def _copy_back_kernel(
     while j < n:
         var i = b + j
         rows[unsafe_offset=i] = scratch[unsafe_offset=i][0]
+        j += stride
+
+
+# --- Row compaction ---------------------------------------------------------
+#
+# CatBoost's GPU grower physically reorders the *data* at every split so that
+# a leaf's rows are contiguous in memory rather than named by a scattered
+# index (`catboost/cuda/methods/greedy_subsets_searcher/`
+# `split_properties_helper.cpp`, `MakeSplit`: a segmented reorder plus part
+# offsets). These three kernels are that mechanism, and nothing else in this
+# module changes shape because of them.
+#
+# **The invariant, and it is the whole of the correctness argument.** Two
+# extra planes are held, `cbins` and `cgq`, and for every position `j` of the
+# row buffer
+#
+#     cbins[f * n_rows + j] == bins[f * n_rows + rows[j]]     for every f
+#     cgq[2 * j]            == gq[2 * rows[j]]
+#     cgq[2 * j + 1]        == gq[2 * rows[j] + 1]
+#
+# A histogram launched against `(cbins, cgq, identity)` therefore reads, for
+# every thread, **the identical bytes** the launch against `(bins, gq, rows)`
+# would have read -- not the same multiset in a different order, the same byte
+# at the same step of the same thread. So the histogram is bit-identical by
+# construction and not by an associativity argument, and the accumulation loop
+# needs no change at all: only which three pointers the launch is handed.
+#
+# **The permutation is untouched.** `rows_dev` is neither read nor written by
+# the incremental path and is read (never written) by the rebuild. Every
+# consumer of the permutation -- `_publish_row_ranges`, `update_raw_device`'s
+# segment table, `download_rows`, `snapshot_rows`, the speculative prebuild's
+# set-preservation argument -- sees exactly the buffer it saw before. That is
+# what makes this lane a data movement and not a reordering.
+#
+# **What it costs.** One extra copy of the binned matrix and of the quantized
+# gradients, doubled for the scatter's destination: `2 * n_rows * n_features`
+# bytes plus `16 * n_rows`. At the reference shape (1,000,000 by 50) that is
+# 100 MB plus 16 MB of device memory that the arm did not need before. This is
+# why it is off by default and allocates nothing until asked for.
+
+
+@always_inline
+def _any_origin_u8[
+    o: MutOrigin, //
+](p: MutPointer[UInt8, o]) -> MutPointer[UInt8, MutAnyOrigin]:
+    """Widen a bin pointer's origin to the one every kernel here declares.
+
+    Needed for one reason and it is worth writing down, because the spelling
+    looks gratuitous. The row-compaction arm has to hold **either** the
+    caller's `bins` **or** `self.cbins_dev.unsafe_ptr()` in one variable and
+    hand it to the launch. Those two have different origins -- `bins_origin`
+    and `origin_of(self.cbins_dev)` -- and `Pointer` has no origin-widening
+    conversion: the compiler refuses both, and it refuses
+    `self.rows_dev` against `self.ident_dev` for the same reason.
+
+    The two spellings that would avoid the widening both fail on something
+    else. Threading the three pointers in as arguments cannot be done, because
+    `_enqueue_atomic_family` takes `mut self` and a pointer into a field
+    cannot be handed down from a caller that holds it -- which is the reason
+    `blocked_ptr` and `desc` are already read inside the launch site rather
+    than passed to it. Duplicating each of the eight launch blocks under an
+    `if` would be sixteen copies of a twenty-eight-argument launch, which is
+    exactly the shape of edit that lets two arms drift apart.
+
+    What is actually unsafe about it is the lifetime, and the lifetime is not
+    in doubt at either call site: every pointer widened here is either a field
+    of `self` or an argument of the enclosing call, and both outlive the
+    enqueue. The kernels this feeds already declare `MutAnyOrigin`, so nothing
+    downstream sees a type it did not see before.
+    """
+    return MutPointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p))
+
+
+@always_inline
+def _any_origin_i32[
+    o: MutOrigin, //
+](p: MutPointer[Int32, o]) -> MutPointer[Int32, MutAnyOrigin]:
+    """The Int32 twin of `_any_origin_u8`, for the permutation and the
+    quantized gradient pair. Same argument, same lifetimes."""
+    return MutPointer[Int32, MutAnyOrigin](unsafe_from_address=Int(p))
+
+
+comptime COMPACTION_TRACE_VAR = "MOJOTREES_GPU_COMPACTION_TRACE"
+"""Where the per-tree compaction record goes, or empty for no record.
+
+A path is appended to; `1`, `stdout` or `-` goes to standard output. The same
+contract `RESIDENT_TRACE_VAR` has in `gpu_resident_round.mojo`, deliberately,
+because a reader who has learned one should not have to learn the other.
+
+It exists because the arm this module ships is reachable end to end only
+through an environment variable, and this repository has already once run one
+arm under the other's label that way. The record says, per tree, whether the
+arm was on and how many launches it had actually issued by then, which is a
+wire rather than a switch: an off arm reports zero for the whole fit and a
+requested-but-never-engaged arm is distinguishable from a working one.
+"""
+
+
+def _compact_trace_sink() -> String:
+    return getenv(COMPACTION_TRACE_VAR)
+
+
+def _compact_trace_emit(sink: String, text: String) raises:
+    """One record to the sink, or nothing when the sink is empty.
+
+    Appending, one open per record, for the reasons
+    `gpu_resident_round._resident_trace_emit` gives: a whole fit reads in the
+    order it was grown, and a fit that dies mid-way leaves every tree before
+    it on disk. One open per tree, on a path nobody measures because the sink
+    is empty on every path anybody measures.
+    """
+    if sink == "":
+        return
+    if sink == "1" or sink == "stdout" or sink == "-":
+        print(text, end="")
+        return
+    with open(sink, "a") as handle:
+        handle.write(text)
+
+
+def _compact_build_kernel(
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    cbins: MutPointer[UInt8, MutAnyOrigin],
+    cgq: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    n_features: Int32,
+    packed_grads: Int32,
+):
+    """Establish the invariant from scratch, over the whole row buffer.
+
+    One thread per position, each walking every feature. This is the only
+    scattered read in the mechanism -- `bins[f * n_rows + r]` with `r` out of
+    the permutation -- and it is paid once per tree, not once per split. Every
+    later split maintains the invariant incrementally out of the already
+    compacted plane, which is what makes the total telescope; a design that
+    re-gathered from `bins` at each split would pay a full scattered pass per
+    split and would be strictly worse than not compacting at all.
+
+    **Why it walks the whole buffer and not the active prefix.** `begin_tree`
+    fills every one of `n_rows` entries -- iota unbagged, the staged bag then
+    zeros when bagged -- so every entry is a valid row id and the extra work
+    past `n_active` is bounded by the buffer rather than unbounded. Reading
+    `n_active` here would mean reading `self.ranges`, and that table is
+    deliberately poisoned for the width of a descriptor partition; a rebuild
+    that raised because a window was under device control would be a rebuild
+    that failed exactly when it was needed.
+
+    **`packed_grads` is the staged gradient width, and it is `quant_packed`
+    and not `packed_gradients`.** The gradient-staging lane made `gq_dev` hold
+    either interleaved Int32 pairs or interleaved Int16 pairs in the first
+    `4 * n_rows` bytes of the same allocation, selected per launch. The
+    compacted copy has to hold whichever the source holds, or the histogram
+    would gather one width out of a plane written at the other, which is a
+    wrong histogram that decodes to legal values and that nothing downstream
+    would catch. The caller reads the *staging* state rather than the request
+    for exactly the reason the histogram launch does, and
+    `GpuActiveRows.compact_packed` then records which width these planes were
+    written at so a later flip cannot be missed.
+
+    **Why it is not just called `packed`.** Because `_compact_scatter_kernel`
+    already has a local of that name -- the *packed routing offset*,
+    `(prefix << 1) | flag`, which this file has spelled `packed` since the
+    partition was written -- and a parameter named `packed` there is silently
+    shadowed by it. That shadowing compiles, and what it produces is a
+    gradient plane moved at the Int16 width on the Int32 arm, which is a
+    wrong histogram over legal-looking values. It was caught by the
+    byte-level invariant check and by nothing else, so the three kernels
+    carry the longer name and this paragraph.
+
+    Under `packed_grads` the two words are moved through an Int16 view of both
+    pointers. That is a bitcast of the same allocation and not a second
+    buffer: `cgq` is `2 * n_rows` Int32 exactly as `gq` is, so the Int16 pair
+    for position `j` lives at Int16 index `2j`, at byte `4j`, inside the first
+    `4 * n_rows` bytes, which is the identical arithmetic the source uses.
+    """
+    var n = Int(n_rows)
+    var nf = Int(n_features)
+    var stride = Int(block_dim.x) * Int(grid_dim.x)
+    var j = Int(global_idx.x)
+    # Dereferenced only under `packed_grads`, which is block-uniform.
+    var gq16 = gq.unsafe_bitcast[Int16]()
+    var cgq16 = cgq.unsafe_bitcast[Int16]()
+    while j < n:
+        var r = Int(rows[unsafe_offset=j][0])
+        for f in range(nf):
+            cbins[unsafe_offset=f * n + j] = bins[unsafe_offset=f * n + r][0]
+        if Int(packed_grads) != 0:
+            cgq16[unsafe_offset=2 * j] = gq16[unsafe_offset=2 * r][0]
+            cgq16[unsafe_offset=2 * j + 1] = gq16[unsafe_offset=2 * r + 1][0]
+        else:
+            cgq[unsafe_offset=2 * j] = gq[unsafe_offset=2 * r][0]
+            cgq[unsafe_offset=2 * j + 1] = gq[unsafe_offset=2 * r + 1][0]
+        j += stride
+
+
+def _compact_scatter_kernel(
+    cbins: MutPointer[UInt8, MutAnyOrigin],
+    cbins_alt: MutPointer[UInt8, MutAnyOrigin],
+    cgq: MutPointer[Int32, MutAnyOrigin],
+    cgq_alt: MutPointer[Int32, MutAnyOrigin],
+    offsets: MutPointer[Int32, MutAnyOrigin],
+    block_sums: MutPointer[Int32, MutAnyOrigin],
+    begin: Int32,
+    count: Int32,
+    tiles: Int32,
+    n_blocks: Int32,
+    n_rows: Int32,
+    n_features: Int32,
+    packed_grads: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+    use_desc: Int32,
+):
+    """Apply the row scatter's permutation to the compacted planes.
+
+    The destination arithmetic below is `_scatter_kernel`'s, reproduced
+    expression for expression: the same head scan over `block_sums`, the same
+    `mine` and `carry`, the same packed offset, the same
+    `dst = p` / `dst = carry + (j - p)`. That is not a coincidence to be
+    tidied away into a shared helper -- the two kernels must agree on every
+    element or the invariant breaks silently, and the way this file already
+    argues its exactness is that the destination is a pure function of the
+    routing flags and the element's position in the range. This kernel
+    consumes the *same* `offsets` and `block_sums` the row scatter consumes,
+    written by the *same* flag pass, so the two cannot disagree even in
+    principle: they are evaluating one function of one input twice.
+
+    It writes no total. `_scatter_kernel` owns `total_dev` and this one is
+    launched beside it, so a second write would be two kernels storing the
+    same value to the same address for no reason.
+
+    One thread per element of the range, walking every feature, exactly as the
+    rebuild does. The alternative -- a second grid dimension over features --
+    would make every one of `n_blocks * n_features` blocks redo the head scan
+    over the block sums, and would read the packed offset once per feature
+    instead of once per row.
+
+    **Reads are contiguous, which is the entire point.** Position `j` of the
+    range reads `cbins[f * n_rows + begin + j]`, and consecutive threads take
+    consecutive `j`, so each feature's read is a dense run. The writes are two
+    monotone runs, the left rows ascending from `begin` and the right rows
+    ascending from `begin + carry`, because the partition is stable. So both
+    sides of the move coalesce, where the gather this exists to remove does
+    not.
+    """
+    var tid = thread_idx.x
+    var nthreads = block_dim.x
+    var nb = Int(n_blocks)
+    var me = Int(block_idx.x)
+    var n = Int(count)
+    var b = Int(begin)
+    if Int(use_desc) != 0:
+        if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+            return
+        b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+        n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+
+    var s = stack_allocation[
+        SCAN_MAX_THREADS,
+        Scalar[DType.int32],
+        address_space=AddressSpace.SHARED,
+    ]()
+
+    var carry = Int32(0)
+    var mine = Int32(0)
+    var base = 0
+    while base < nb:
+        var idx = base + tid
+        var own = Int32(0)
+        if idx < nb:
+            own = block_sums[unsafe_offset=idx][0]
+        s[unsafe_offset=tid] = own
+        barrier()
+
+        var offset = 1
+        while offset < nthreads:
+            var carried = Int32(0)
+            if tid >= offset:
+                carried = s[unsafe_offset=tid - offset][0]
+            barrier()
+            if tid >= offset:
+                s[unsafe_offset=tid] = s[unsafe_offset=tid][0] + carried
+            barrier()
+            offset += offset
+
+        if me >= base and me < base + nthreads:
+            mine = (
+                carry
+                + s[unsafe_offset=me - base][0]
+                - block_sums[unsafe_offset=me][0]
+            )
+        carry += s[unsafe_offset=nthreads - 1][0]
+        barrier()
+        base += nthreads
+
+    var nr = Int(n_rows)
+    var nf = Int(n_features)
+    # Dereferenced only under `packed_grads`, which is block-uniform. The
+    # name is deliberately not `packed`: that is the packed routing offset
+    # read four lines below, and a parameter of that name is shadowed by it
+    # silently. See `_compact_build_kernel`.
+    var cgq16 = cgq.unsafe_bitcast[Int16]()
+    var cgq16_alt = cgq_alt.unsafe_bitcast[Int16]()
+    var chunk = Int(tiles) * nthreads
+    var first = me * chunk
+    for t in range(Int(tiles)):
+        var j = first + t * nthreads + tid
+        if j < n:
+            var packed = offsets[unsafe_offset=j][0]
+            var p = Int(mine) + (Int(packed) >> 1)
+            var dst: Int
+            if (packed & Int32(1)) != 0:
+                dst = p
+            else:
+                dst = Int(carry) + (j - p)
+            var src = b + j
+            var out = b + dst
+            for f in range(nf):
+                cbins_alt[unsafe_offset=f * nr + out] = cbins[
+                    unsafe_offset=f * nr + src
+                ][0]
+            if Int(packed_grads) != 0:
+                cgq16_alt[unsafe_offset=2 * out] = cgq16[
+                    unsafe_offset=2 * src
+                ][0]
+                cgq16_alt[unsafe_offset=2 * out + 1] = cgq16[
+                    unsafe_offset=2 * src + 1
+                ][0]
+            else:
+                cgq_alt[unsafe_offset=2 * out] = cgq[unsafe_offset=2 * src][0]
+                cgq_alt[unsafe_offset=2 * out + 1] = cgq[
+                    unsafe_offset=2 * src + 1
+                ][0]
+
+
+def _compact_copy_back_kernel(
+    cbins: MutPointer[UInt8, MutAnyOrigin],
+    cbins_alt: MutPointer[UInt8, MutAnyOrigin],
+    cgq: MutPointer[Int32, MutAnyOrigin],
+    cgq_alt: MutPointer[Int32, MutAnyOrigin],
+    begin: Int32,
+    count: Int32,
+    n_rows: Int32,
+    n_features: Int32,
+    packed_grads: Int32,
+    desc: MutPointer[Int32, MutAnyOrigin],
+    use_desc: Int32,
+):
+    """Fold the scattered window back over the planes the next split reads.
+
+    The data twin of `_copy_back_kernel`, and it is a copy for exactly the
+    reason that one is: only the parent's own window moved, so a buffer swap
+    would strand every other live leaf's compacted rows in the other plane.
+    The row path writes up per-range ping-pong as a design it did not build
+    because four readers outside this module hold `rows_dev`; here there are
+    no outside readers at all, but there is still no single window whose swap
+    would leave both planes whole, so the copy stays.
+
+    It is the honest cost of the mechanism and it is reported as such: the
+    scatter moves the window once and this moves it again, so a split moves
+    `4 * count * (n_features + 8)` bytes in total rather than `2 *`.
+    """
+    var n = Int(count)
+    var b = Int(begin)
+    if Int(use_desc) != 0:
+        if desc[unsafe_offset=STEP_LIVE][0] == Int32(0):
+            return
+        b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+        n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+    var nr = Int(n_rows)
+    var nf = Int(n_features)
+    var stride = Int(block_dim.x) * Int(grid_dim.x)
+    var j = Int(global_idx.x)
+    # Dereferenced only under `packed_grads`; see `_compact_build_kernel`.
+    var cgq16 = cgq.unsafe_bitcast[Int16]()
+    var cgq16_alt = cgq_alt.unsafe_bitcast[Int16]()
+    while j < n:
+        var i = b + j
+        for f in range(nf):
+            cbins[unsafe_offset=f * nr + i] = cbins_alt[
+                unsafe_offset=f * nr + i
+            ][0]
+        if Int(packed_grads) != 0:
+            cgq16[unsafe_offset=2 * i] = cgq16_alt[unsafe_offset=2 * i][0]
+            cgq16[unsafe_offset=2 * i + 1] = cgq16_alt[
+                unsafe_offset=2 * i + 1
+            ][0]
+        else:
+            cgq[unsafe_offset=2 * i] = cgq_alt[unsafe_offset=2 * i][0]
+            cgq[unsafe_offset=2 * i + 1] = cgq_alt[unsafe_offset=2 * i + 1][0]
         j += stride
 
 
@@ -4975,6 +5430,48 @@ struct GpuActiveRows(Movable):
     var packed_tab_dev: DeviceBuffer[DType.int32]
     var packed_widths: List[Int]
     var packed_valid: Bool
+    # --- row-compaction lane ---
+    # CatBoost's physical reorder, behind a switch. See the block comment
+    # above `_compact_build_kernel` for the invariant and the cost.
+    #
+    # `row_compaction` is what the caller asked for; `compact_valid` is
+    # whether the planes currently satisfy the invariant. A histogram reads
+    # the compacted planes only when **both** hold, so an invalidation can
+    # never produce a wrong histogram, only a slower one: the next histogram
+    # rebuilds and the launch before it went to `bins` and `rows` exactly as
+    # it always did.
+    var row_compaction: Bool
+    var compact_valid: Bool
+    # Which staged gradient width `cgq_dev` was written at, mirroring
+    # `quant_packed` for the compacted copy. It exists because the two can
+    # come apart: `set_packed_gradients` invalidates `quant_valid` but a
+    # partition between that call and the next histogram would otherwise move
+    # the gradient pair at the newly requested width through a plane written
+    # at the old one, which is a wrong histogram that decodes to legal values.
+    # `row_compaction_live` requires the two to agree, so a mismatch falls back
+    # to the un-compacted launch until `_ensure_compacted` rebuilds.
+    var compact_packed: Bool
+    # Whether the four planes have been allocated at full size. False until
+    # the first `set_row_compaction(True)`, at which point the arm's memory
+    # cost is paid; before that all four are one-element placeholders, on the
+    # footing `blocked_dev` is a one-byte placeholder on.
+    var compact_allocated: Bool
+    var cbins_dev: DeviceBuffer[DType.uint8]
+    var cbins_alt_dev: DeviceBuffer[DType.uint8]
+    var cgq_dev: DeviceBuffer[DType.int32]
+    var cgq_alt_dev: DeviceBuffer[DType.int32]
+    # The identity permutation, `ident[j] == j`. This is what the histogram
+    # launch passes in place of `rows_dev` when the compacted planes are live,
+    # and it is a buffer rather than a kernel arm because the kernel that
+    # reads it is the accumulation loop and this lane does not touch it.
+    var ident_dev: DeviceBuffer[DType.int32]
+    # Launches actually issued, ever, not a prediction of how many there
+    # should be -- the same discipline `copy_back_folds` follows and for the
+    # same reason: the arm can be asserted to have engaged rather than assumed
+    # to have. `compact_builds` counts full rebuilds (one per tree in a clean
+    # run), `compact_scatters` counts incremental maintenance (one per split).
+    var compact_builds: Int
+    var compact_scatters: Int
 
     def __init__(
         out self,
@@ -5177,6 +5674,38 @@ struct GpuActiveRows(Movable):
         self.packed_widths = List[Int]()
         self.packed_valid = False
 
+        # Row compaction, off, allocating nothing. The four placeholders are
+        # one element each for the reason `blocked_dev`'s is: an arm nobody
+        # asked for must not cost `2 * n_rows * n_features` bytes of device
+        # memory on the chance somebody does.
+        #
+        # `MOJOTREES_GPU_ROW_COMPACTION=1` turns it on here. Every other
+        # launch-shape arm in this file that has no environment variable says
+        # in its own comment why the arm belongs in the call: because an A/B
+        # that reads its arm from the environment has already once in this
+        # repository run one arm under the other's label. That reasoning is
+        # sound and it is overridden here for one specific reason. This arm
+        # has to be A/B'd **end to end**, through `train_gpu` and the
+        # device-resident plane, and neither of those files may be edited by
+        # the lane that built it, so there is no call site for the arm to
+        # belong in. `set_row_compaction` is the arm a caller that *can* reach
+        # this struct should use, it is what the test file uses, and it is
+        # what makes both arms reachable at run time in one binary; the
+        # variable exists so the shipping trainer can reach the arm at all.
+        # `MOJOTREES_GPU_COMPACTION_TRACE` is what stops the two being
+        # confused: it says per tree whether the arm engaged.
+        self.row_compaction = False
+        self.compact_valid = False
+        self.compact_packed = False
+        self.compact_allocated = False
+        self.cbins_dev = self.ctx.enqueue_create_buffer[DType.uint8](1)
+        self.cbins_alt_dev = self.ctx.enqueue_create_buffer[DType.uint8](1)
+        self.cgq_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
+        self.cgq_alt_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
+        self.ident_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
+        self.compact_builds = 0
+        self.compact_scatters = 0
+
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
         # rather than left as whatever the allocation held. No kernel reads
@@ -5184,6 +5713,14 @@ struct GpuActiveRows(Movable):
         var stage = self.stage_rows.unsafe_ptr()
         for r in range(n_rows):
             stage.unsafe_store(r, Int32(0))
+
+        # Last, because it allocates and because it refuses configurations the
+        # fields above decide. A request the shape does not admit raises here
+        # rather than being honored quietly, which is the polarity
+        # `set_narrow_index` established for a precondition whose failure mode
+        # is a silently wrong histogram.
+        if _env_int("MOJOTREES_GPU_ROW_COMPACTION", 0) != 0:
+            self.set_row_compaction(True)
 
     def synchronize(mut self) raises:
         self.ctx.synchronize()
@@ -5273,6 +5810,12 @@ struct GpuActiveRows(Movable):
         """
         self.quantized_gradients = on
         self.quant_valid = False
+        # The compacted planes hold the quantized pair, so a change of arm
+        # invalidates them along with `gq` itself. `row_compaction_live` also
+        # tests `quantized_gradients`, so a caller that turns the quantized
+        # arm off gets the un-compacted launch rather than an identity index
+        # against a plane that is not there.
+        self.compact_valid = False
 
     def set_packed_gradients(mut self, on: Bool):
         """Whether the pre-quantized buffer is staged and gathered as
@@ -5718,6 +6261,16 @@ struct GpuActiveRows(Movable):
             )
         if group == self.blocked_group:
             return
+        # Held mutually exclusive with row compaction, from both sides. Both
+        # arms re-arrange the same matrix and a histogram reads one pointer,
+        # so a state in which both are on is a state in which one of them is
+        # silently ignored. See `set_row_compaction`.
+        if group >= 2 and self.row_compaction:
+            raise Error(
+                "the blocked bin layout and row compaction both re-arrange"
+                " the binned matrix and a histogram cannot read both; turn"
+                " one off"
+            )
         var total = blocked_bytes(self.n_rows, self.n_features, group)
         self.blocked_dev = self.ctx.enqueue_create_buffer[DType.uint8](total)
         self.blocked_group = group
@@ -5840,6 +6393,19 @@ struct GpuActiveRows(Movable):
                 "the packed and blocked bin layouts cannot both be on; turn"
                 " one off with set_blocked_layout(0) or set_packed_bins([])"
             )
+        # And row compaction, from this side, so the two orders of the same
+        # mistake reach the same refusal. Not orthogonal-in-principle the way
+        # the blocked pair is: this one narrows a cell to fewer bits and that
+        # one moves whole cells into permutation order, and a compacted bit
+        # stream would mean re-encoding packed runs under a permutation.
+        # Composing them is a project, and neither has been measured yet.
+        if self.row_compaction:
+            raise Error(
+                "the packed bin layout and row compaction cannot both be on:"
+                " the compacted plane is one byte per cell and this one is a"
+                " bit stream; turn one off with set_row_compaction(False) or"
+                " set_packed_bins([])"
+            )
         var total = packed_bytes(self.n_rows, widths)
         var table = packed_table(self.n_rows, widths)
         self.packed_dev = self.ctx.enqueue_create_buffer[DType.uint8](total)
@@ -5890,6 +6456,380 @@ struct GpuActiveRows(Movable):
             self.block_threads,
         )
         self.packed_valid = True
+    # --- Row compaction ----------------------------------------------------
+
+    def set_row_compaction(mut self, on: Bool) raises:
+        """Turn CatBoost-style physical row compaction on or off.
+
+        **Off by default and it stays off until a window resolves it.** This
+        is a trade and not a saving: it removes the scattered gather from the
+        histogram and pays a physical reorder of the binned matrix at every
+        split to do it. The repository has been burned by exactly this shape
+        of change before -- the row-tile floor raised occupancy as designed
+        and measured 22 percent slower at 50 features -- so the arm ships
+        reachable, default off, and is not argued into the default here.
+
+        **What it costs to say yes**, and it is stated where it is asked for,
+        on the footing `set_blocked_layout` states its residency cost:
+        `2 * n_rows * n_features` bytes of device memory for the binned matrix
+        and its scatter destination, plus `16 * n_rows` for the quantized
+        gradient pair and its destination, plus `4 * n_rows` for the identity
+        index. At 1,000,000 rows by 50 features that is 100 MB plus 16 MB plus
+        4 MB, allocated here and held for the life of the instance. Turning
+        the arm back off does not free them, deliberately: a benchmark that
+        interleaves arms would otherwise pay an allocation inside the window
+        it is timing.
+
+        **Two preconditions, both refused rather than worked around.**
+
+        - The quantized gradient arm must be on. The compacted planes hold
+          `cgq`, not the Float32 `grad` and `hess` planes, because the row
+          index feeds *both* gathers in the accumulation loop and an identity
+          index against un-compacted gradient planes would read the wrong
+          row's gradient. Compacting the Float32 planes as well is possible
+          and is not built: it is two more buffers and 8 more bytes per row
+          for the arm this backend does not default to.
+        - The blocked bin layout must be off. Both arms re-arrange the same
+          matrix and the blocked buffer is built from `bins` by row id, so a
+          histogram cannot read both. They are held mutually exclusive here
+          and in `set_blocked_layout`, which is the same discipline the two
+          histogram probe modes are held under.
+        - The packed bin layout must be off, and this one is not a
+          composability question that a later lane can just wire up. `cbins`
+          is one byte per cell; the packed plane is a bit stream at a
+          per-feature width. Permuting a bit stream is a re-encode, not a
+          move, so there is no plane both readers could share. Refused here
+          and in `set_packed_bins`.
+
+        **The gradient-staging lane's second width is NOT refused**, and the
+        difference is worth stating because it is the whole reason these two
+        neighbours are treated differently. `set_packed_gradients` narrows the
+        staged pair to Int16 inside the same allocation, which is a width and
+        not an encoding: the compacted copy simply moves four bytes per row
+        instead of eight. So the three compaction kernels take a `packed`
+        argument, `compact_packed` records which width the planes hold, and
+        `row_compaction_live` refuses to read them while that disagrees with
+        what the next staging would produce.
+
+        Enabling always invalidates the planes, so the first histogram after
+        this call rebuilds them. Disabling invalidates them too, so that a
+        re-enable cannot pick up planes that went stale while the arm was off.
+        """
+        if on:
+            if not self.quantized_gradients:
+                raise Error(
+                    "row compaction needs the quantized gradient arm: the"
+                    " compacted planes hold the interleaved quantized pair,"
+                    " and the row index feeds the gradient gather as well as"
+                    " the bin gather"
+                )
+            if self.blocked_group >= 2:
+                raise Error(
+                    "row compaction and the blocked bin layout both"
+                    " re-arrange the binned matrix and a histogram cannot"
+                    " read both; turn one off"
+                )
+            if len(self.packed_widths) > 0:
+                raise Error(
+                    "row compaction and the packed bin layout cannot both be"
+                    " on: the compacted plane is one byte per cell and the"
+                    " packed plane is a bit stream, so a histogram cannot read"
+                    " both; turn one off with set_packed_bins([]) or"
+                    " set_row_compaction(False)"
+                )
+            if not self.compact_allocated:
+                self.cbins_dev = self.ctx.enqueue_create_buffer[DType.uint8](
+                    self.n_rows * self.n_features
+                )
+                self.cbins_alt_dev = self.ctx.enqueue_create_buffer[
+                    DType.uint8
+                ](self.n_rows * self.n_features)
+                self.cgq_dev = self.ctx.enqueue_create_buffer[DType.int32](
+                    2 * self.n_rows
+                )
+                self.cgq_alt_dev = self.ctx.enqueue_create_buffer[DType.int32](
+                    2 * self.n_rows
+                )
+                self.ident_dev = self.ctx.enqueue_create_buffer[DType.int32](
+                    self.n_rows
+                )
+                var threads = self.block_threads
+                var blocks = (self.n_rows + threads - 1) // threads
+                self.ctx.enqueue_function[_iota_kernel](
+                    self.ident_dev.unsafe_ptr(),
+                    Int32(self.n_rows),
+                    grid_dim=blocks,
+                    block_dim=threads,
+                )
+                self.compact_allocated = True
+        self.row_compaction = on
+        self.compact_valid = False
+
+    def row_compaction_requested(self) -> Bool:
+        """Whether the arm is on. Not the same question as whether a histogram
+        will read the compacted planes; see `row_compaction_live`."""
+        return self.row_compaction
+
+    def row_compaction_live(self) -> Bool:
+        """Whether the next histogram launch will read the compacted planes.
+
+        The arm has to be on, the invariant has to currently hold, and the
+        quantized gradient arm has to be on. This is the one predicate the
+        launch sites test, so that "the planes are stale", "the arm is off"
+        and "the gradient plane the compaction holds is not the one the
+        kernel would read" all reach the same, always-correct, fallback to
+        `bins` and `rows_dev`.
+
+        The third conjunct is why `set_quantized_gradients` did not have to
+        grow a refusal and a `raises`: withdrawing the quantized arm withdraws
+        compaction with it at the launch, rather than leaving a state in which
+        an identity index is read against un-compacted gradient planes.
+
+        The fourth is the same discipline against the gradient-staging lane's
+        second width. `compact_packed` is the width `cgq_dev` was written at
+        and `packed_gradients` is the width the next staging would use; while
+        they disagree the compacted plane is a valid encoding of the wrong
+        thing, and the only safe reading of it is not to read it. They agree
+        again on the next `_ensure_compacted`, which the histogram entry points
+        call after `_ensure_quantized` has settled the width.
+
+        The packed *bin* layout is not a conjunct here and is refused at the
+        setter instead, because unlike these two it cannot be made to agree:
+        `cbins` is a byte-per-cell plane and the packed layout is a bit stream,
+        so there is no state in which both are readable. See
+        `set_row_compaction`.
+        """
+        return (
+            self.row_compaction
+            and self.compact_valid
+            and self.quantized_gradients
+            and self.compact_packed == self.packed_gradients
+        )
+
+    def compaction_packed_gradients(self) -> Bool:
+        """Which staged gradient width the compacted planes currently hold.
+
+        Not the same question as `packed_gradients_on()`, which is what the
+        next staging would produce; while the two disagree the planes are not
+        read at all. Exposed so a test can decode `download_compacted_grads`
+        at the width it was written at rather than guessing.
+        """
+        return self.compact_packed
+
+    def compaction_counts(self) -> Tuple[Int, Int]:
+        """Full rebuilds and incremental scatters issued, ever.
+
+        Launches enqueued, not launches predicted. A test asserts the arm
+        engaged on this rather than on the arm having been requested, which
+        is the difference between checking a switch and checking a wire.
+        """
+        return (self.compact_builds, self.compact_scatters)
+
+    def _ensure_compacted[
+        bins_origin: MutOrigin, //
+    ](mut self, bins: MutPointer[UInt8, bins_origin]) raises:
+        """Re-establish the compaction invariant if it does not hold.
+
+        Called by both histogram entry points, after `_ensure_quantized` and
+        after any deferred copy-back has been enqueued: it reads `gq` and it
+        reads `rows_dev`, so both have to be current in the queue before it.
+        Ordering is by the queue, not by a synchronize; nothing here waits.
+
+        A no-op on every launch but the first of a tree, because every
+        partition maintains the invariant incrementally. When it is *not* a
+        no-op mid-tree -- a gradient rescale invalidated `gq`, say -- it is a
+        full pass over the buffer, which is slow and correct rather than fast
+        and conditional.
+
+        **It builds from whichever `bins` the first histogram of the tree was
+        handed**, and every later launch of that tree reads the plane built
+        from it. That rests on the same statement `_ensure_blocked` rests on:
+        the binned matrix is uploaded once per fit and nothing in this backend
+        mutates it, so there is one matrix and the pointer identifies it. A
+        caller that handed two different matrices to one `GpuActiveRows`
+        inside one tree is already outside what the blocked layout assumes as
+        well, and would be outside what `n_rows` and `n_features` assume.
+        """
+        if not self.row_compaction or self.compact_valid:
+            return
+        var threads = self.block_threads
+        var blocks = (self.n_rows + threads - 1) // threads
+        self.ctx.enqueue_function[_compact_build_kernel](
+            bins,
+            self.gq_dev.unsafe_ptr(),
+            self.rows_dev.unsafe_ptr(),
+            self.cbins_dev.unsafe_ptr(),
+            self.cgq_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            Int32(self.n_features),
+            # The width the buffer actually holds, not the width that was
+            # asked for. `_ensure_quantized` ran immediately before this and
+            # settled `quant_packed`; reading `packed_gradients` here instead
+            # would be the one spelling that could disagree with the plane
+            # this kernel is copying from.
+            Int32(1) if self.quant_packed else Int32(0),
+            grid_dim=blocks,
+            block_dim=threads,
+        )
+        self.compact_valid = True
+        self.compact_packed = self.quant_packed
+        self.compact_builds += 1
+
+    def _maintain_compaction(
+        mut self,
+        begin: Int,
+        count: Int,
+        tiles: Int,
+        blocks: Int,
+        back_blocks: Int,
+        use_desc: Int32,
+    ) raises:
+        """Keep the compacted planes in step with a partition, or admit that
+        they no longer are.
+
+        The **else branch is the load-bearing half** and it is why this is a
+        method rather than an `if` at each partition. A partition that runs
+        while the planes are not live moves the permutation and leaves them
+        describing the tree before the split. If the reason they were not live
+        was transient -- `set_packed_gradients` flipped the staged width, say,
+        and nothing has restaged yet -- then a later flip back would make
+        `row_compaction_live` true again over planes that had silently missed
+        a split, and the histogram after it would be a correct sum over the
+        wrong rows. Invalidating here means the only way back to live is
+        through `_ensure_compacted`, which rebuilds from `rows_dev` and cannot
+        inherit a missed split.
+
+        Costs nothing when the arm was never requested, which is the default:
+        one field test and no launch.
+        """
+        if not self.row_compaction:
+            return
+        if self.row_compaction_live():
+            self._enqueue_compact_partition(
+                begin, count, tiles, blocks, back_blocks, use_desc
+            )
+            return
+        self.compact_valid = False
+
+    def _enqueue_compact_partition(
+        mut self,
+        begin: Int,
+        count: Int,
+        tiles: Int,
+        blocks: Int,
+        back_blocks: Int,
+        use_desc: Int32,
+    ) raises:
+        """Maintain the invariant across one partition. Two launches.
+
+        Enqueued from inside both partition entry points, after the flag pass
+        that wrote `offsets` and `block_sums` and beside the row scatter that
+        reads them. It must be given the **same** `blocks` and `tiles` the flag
+        pass and the row scatter were given, because the packed offsets are
+        chunk-relative and a different chunking would read a packed offset
+        against the wrong chunk's block sum. That is the same coupling
+        `_enqueue_scan_primitives` records for the two kernels it launches.
+
+        Not folded into anything. The partition tail fusion pairs the row
+        copy-back with the next histogram's slot zeroing; this pair is not a
+        candidate for it, because the second launch here reads what the first
+        writes and a fold would have to preserve that order across a command
+        buffer boundary the fusion exists to remove.
+        """
+        var desc = self._desc_buffer()
+        self.ctx.enqueue_function[_compact_scatter_kernel](
+            self.cbins_dev.unsafe_ptr(),
+            self.cbins_alt_dev.unsafe_ptr(),
+            self.cgq_dev.unsafe_ptr(),
+            self.cgq_alt_dev.unsafe_ptr(),
+            self.offsets_dev.unsafe_ptr(),
+            self.block_sums_dev.unsafe_ptr(),
+            Int32(begin),
+            Int32(count),
+            Int32(tiles),
+            Int32(blocks),
+            Int32(self.n_rows),
+            Int32(self.n_features),
+            # The width these planes were written at, held on the instance
+            # rather than re-derived, because a partition can be enqueued
+            # between a `set_packed_gradients` and the histogram that would
+            # restage at the new width. `row_compaction_live` refuses to reach
+            # here at all while the two disagree; passing the recorded width is
+            # the second half of the same guard.
+            Int32(1) if self.compact_packed else Int32(0),
+            desc.unsafe_ptr(),
+            use_desc,
+            grid_dim=blocks,
+            block_dim=self.block_threads,
+        )
+        self.ctx.enqueue_function[_compact_copy_back_kernel](
+            self.cbins_dev.unsafe_ptr(),
+            self.cbins_alt_dev.unsafe_ptr(),
+            self.cgq_dev.unsafe_ptr(),
+            self.cgq_alt_dev.unsafe_ptr(),
+            Int32(begin),
+            Int32(count),
+            Int32(self.n_rows),
+            Int32(self.n_features),
+            Int32(1) if self.compact_packed else Int32(0),
+            desc.unsafe_ptr(),
+            use_desc,
+            grid_dim=back_blocks,
+            block_dim=self.block_threads,
+        )
+        self.compact_scatters += 1
+
+    def download_compacted_bins(mut self) raises -> List[UInt8]:
+        """The whole compacted bin plane, host side. Synchronizes.
+
+        For the test that checks the invariant against `bins` and the
+        permutation, and for nothing else: training never needs it on the
+        host, and at the reference shape this is a 50 MB transfer.
+        """
+        if not self.compact_allocated:
+            raise Error("row compaction was never enabled on this instance")
+        var n = self.n_rows * self.n_features
+        var host = self.ctx.enqueue_create_host_buffer[DType.uint8](n)
+        self.ctx.enqueue_copy(
+            dst_ptr=host.unsafe_ptr(), src_buf=self.cbins_dev
+        )
+        self.ctx.synchronize()
+        var out = List[UInt8](capacity=n)
+        var src = host.unsafe_ptr()
+        for i in range(n):
+            out.append(src.unsafe_load(i))
+        return out^
+
+    def download_compacted_grads(mut self) raises -> List[Int32]:
+        """The whole compacted quantized-gradient plane. Synchronizes. Same
+        audience as `download_compacted_bins`."""
+        if not self.compact_allocated:
+            raise Error("row compaction was never enabled on this instance")
+        var n = 2 * self.n_rows
+        var host = self.ctx.enqueue_create_host_buffer[DType.int32](n)
+        self.ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=self.cgq_dev)
+        self.ctx.synchronize()
+        var out = List[Int32](capacity=n)
+        var src = host.unsafe_ptr()
+        for i in range(n):
+            out.append(src.unsafe_load(i))
+        return out^
+
+    def download_quantized_grads(mut self) raises -> List[Int32]:
+        """The un-compacted quantized-gradient plane, indexed by row id.
+
+        The other half of the invariant check: `cgq[2j]` has to equal
+        `gq[2 * rows[j]]`, so a test needs both planes.
+        """
+        var n = 2 * self.n_rows
+        var host = self.ctx.enqueue_create_host_buffer[DType.int32](n)
+        self.ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=self.gq_dev)
+        self.ctx.synchronize()
+        var out = List[Int32](capacity=n)
+        var src = host.unsafe_ptr()
+        for i in range(n):
+            out.append(src.unsafe_load(i))
+        return out^
 
     def set_constant_hessian(mut self, on: Bool):
         """Declare that every row's hessian this round is exactly
@@ -5996,6 +6936,29 @@ struct GpuActiveRows(Movable):
         # A new tree may carry a new round's gradients; the quantized copy
         # is rebuilt on the first histogram that asks for it.
         self.quant_valid = False
+        # And so are the compacted planes, for two reasons at once: the
+        # permutation is about to be reseeded, and the gradients they hold are
+        # about to be stale. Rebuilt by `_ensure_compacted` on the first
+        # histogram of this tree, which is one full pass per tree and is the
+        # only scattered read the mechanism performs.
+        self.compact_valid = False
+        # The record, and the sink is looked up before the line is built so
+        # that the default path pays one `getenv` and no String. See
+        # `COMPACTION_TRACE_VAR` for why the record exists at all.
+        var sink = _compact_trace_sink()
+        if sink != "":
+            _compact_trace_emit(
+                sink,
+                String(
+                    "mojotrees.compaction tree arm=",
+                    "on" if self.row_compaction else "off",
+                    " builds=",
+                    self.compact_builds,
+                    " scatters=",
+                    self.compact_scatters,
+                    "\n",
+                ),
+            )
         if len(bag) == 0:
             var blocks = (
                 self.n_rows + self.block_threads - 1
@@ -6172,6 +7135,14 @@ struct GpuActiveRows(Movable):
             Int32(0),
             grid_dim=copy_blocks,
             block_dim=threads,
+        )
+        # The data twin of everything above, when the arm is on. It reads the
+        # same `offsets` and `block_sums` at the same `blocks` and `tiles`, so
+        # it applies the identical permutation to the compacted planes that
+        # the scatter just applied to the rows. Nothing here is conditional on
+        # which arm the scan took: both arms write the same offsets.
+        self._maintain_compaction(
+            window.begin, n, tiles, blocks, copy_blocks, Int32(0)
         )
 
     def _enqueue_scan_primitives[
@@ -6686,6 +7657,16 @@ struct GpuActiveRows(Movable):
                 grid_dim=blocks,
                 block_dim=threads,
             )
+        # The data twin, when the arm is on, and it is placed **above** the
+        # fusion's early return on purpose: the fusion defers the row
+        # copy-back and this pair is not part of that deferral, so a return
+        # taken before this would skip the compaction on every step of every
+        # device-resident tree and leave the planes describing the tree before
+        # the split. It reads neither `rows_dev` nor `scratch_dev`, so it is
+        # indifferent to which of the two currently holds the permutation and
+        # the deferral cannot reach it.
+        self._maintain_compaction(0, bound, tiles, blocks, blocks, Int32(1))
+
         # Under the fusion the copy-back is not a launch of its own: the next
         # descriptor histogram folds it into its slot zeroing, which is a
         # launch that has to happen anyway and is unordered with respect to
@@ -6892,6 +7873,14 @@ struct GpuActiveRows(Movable):
         # exact shape the row-tile arms were found in.
         self._ensure_blocked(bins)
         self._ensure_packed(bins)
+        # The compacted planes, if the arm is on. Placed after the zeroing
+        # branch above rather than before it, because under
+        # `set_partition_fusion(True)` that branch is what discharges the
+        # previous partition's deferred row copy-back, and a rebuild here
+        # reads `rows_dev`. Launches on one stream are ordered, so enqueuing
+        # after it is what makes the rebuild see the permutation the partition
+        # produced rather than the one before it.
+        self._ensure_compacted(bins)
         var const_hess = Int32(1) if self.constant_hessian else Int32(0)
 
         self._enqueue_atomic_family(
@@ -7275,6 +8264,12 @@ struct GpuActiveRows(Movable):
         self._ensure_blocked(bins)
         self._ensure_packed(bins)
 
+        # And the compacted planes, on the same footing and in the same place,
+        # and after `_ensure_quantized` because it reads what that writes. A
+        # no-op unless the arm is on and the invariant has lapsed, which after
+        # the first histogram of a tree it has not.
+        self._ensure_compacted(bins)
+
         var const_hess = Int32(1) if self.constant_hessian else Int32(0)
         var hist_planes = 2 if self.constant_hessian else 3
 
@@ -7576,13 +8571,36 @@ struct GpuActiveRows(Movable):
         var packed_on = Int32(1) if self.packed_bins_active() else Int32(0)
         var packed_ptr = self.packed_dev.unsafe_ptr()
         var pack_tab_ptr = self.packed_tab_dev.unsafe_ptr()
+        # --- row-compaction lane ---
+        # The three pointers the mechanism swaps, and it swaps nothing else.
+        # When the compacted planes are live, the launch is handed `cbins`,
+        # the identity index, and `cgq` in place of the caller's `bins`, the
+        # permutation, and `gq`. Every thread then reads, at the identical
+        # step of the identical loop, the byte the un-compacted launch would
+        # have read at `bins[f * n_rows + rows[j]]` -- because that is exactly
+        # what `cbins[f * n_rows + j]` is defined to hold. So the histogram is
+        # bit-identical by construction, not by an argument about the order of
+        # integer adds, and the accumulation loop is untouched: this is an
+        # argument selection at the launch and nothing below it changes.
+        #
+        # Resolved here rather than threaded through the family dispatch for
+        # the reason `unroll`, `narrow` and `blocked_ptr` are: the dispatch is
+        # already eighteen arguments wide and a pointer cannot be handed down
+        # from a caller that also holds `mut self`.
+        var hist_bins = _any_origin_u8(bins)
+        var hist_rows = _any_origin_i32(self.rows_dev.unsafe_ptr())
+        var hist_gq = _any_origin_i32(self.gq_dev.unsafe_ptr())
+        if self.row_compaction_live():
+            hist_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
+            hist_rows = _any_origin_i32(self.ident_dev.unsafe_ptr())
+            hist_gq = _any_origin_i32(self.cgq_dev.unsafe_ptr())
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 32]](
-                bins,
-                self.rows_dev.unsafe_ptr(),
+                hist_bins,
+                hist_rows,
                 grad,
                 hess,
-                self.gq_dev.unsafe_ptr(),
+                hist_gq,
                 feat_ids,
                 partials,
                 Int32(self.n_rows),
@@ -7609,11 +8627,11 @@ struct GpuActiveRows(Movable):
             )
         elif self.bin_cap <= 64:
             self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 64]](
-                bins,
-                self.rows_dev.unsafe_ptr(),
+                hist_bins,
+                hist_rows,
                 grad,
                 hess,
-                self.gq_dev.unsafe_ptr(),
+                hist_gq,
                 feat_ids,
                 partials,
                 Int32(self.n_rows),
@@ -7640,11 +8658,11 @@ struct GpuActiveRows(Movable):
             )
         elif self.bin_cap <= 128:
             self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 128]](
-                bins,
-                self.rows_dev.unsafe_ptr(),
+                hist_bins,
+                hist_rows,
                 grad,
                 hess,
-                self.gq_dev.unsafe_ptr(),
+                hist_gq,
                 feat_ids,
                 partials,
                 Int32(self.n_rows),
@@ -7671,11 +8689,11 @@ struct GpuActiveRows(Movable):
             )
         else:
             self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 256]](
-                bins,
-                self.rows_dev.unsafe_ptr(),
+                hist_bins,
+                hist_rows,
                 grad,
                 hess,
-                self.gq_dev.unsafe_ptr(),
+                hist_gq,
                 feat_ids,
                 partials,
                 Int32(self.n_rows),
@@ -7931,6 +8949,29 @@ struct GpuActiveRows(Movable):
         var packed_on = Int32(1) if self.packed_bins_active() else Int32(0)
         var packed_ptr = self.packed_dev.unsafe_ptr()
         var pack_tab_ptr = self.packed_tab_dev.unsafe_ptr()
+        # --- row-compaction lane ---
+        # The three pointers the mechanism swaps, and it swaps nothing else.
+        # When the compacted planes are live, the launch is handed `cbins`,
+        # the identity index, and `cgq` in place of the caller's `bins`, the
+        # permutation, and `gq`. Every thread then reads, at the identical
+        # step of the identical loop, the byte the un-compacted launch would
+        # have read at `bins[f * n_rows + rows[j]]` -- because that is exactly
+        # what `cbins[f * n_rows + j]` is defined to hold. So the histogram is
+        # bit-identical by construction, not by an argument about the order of
+        # integer adds, and the accumulation loop is untouched: this is an
+        # argument selection at the launch and nothing below it changes.
+        #
+        # Resolved here rather than threaded through the family dispatch for
+        # the reason `unroll`, `narrow` and `blocked_ptr` are: the dispatch is
+        # already eighteen arguments wide and a pointer cannot be handed down
+        # from a caller that also holds `mut self`.
+        var hist_bins = _any_origin_u8(bins)
+        var hist_rows = _any_origin_i32(self.rows_dev.unsafe_ptr())
+        var hist_gq = _any_origin_i32(self.gq_dev.unsafe_ptr())
+        if self.row_compaction_live():
+            hist_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
+            hist_rows = _any_origin_i32(self.ident_dev.unsafe_ptr())
+            hist_gq = _any_origin_i32(self.cgq_dev.unsafe_ptr())
         # Inert when `use_desc` is zero, which is every host-argument caller;
         # the descriptor `set_descriptor_target` selected otherwise. Read here
         # rather than threaded through `_enqueue_atomic_family` for the same
@@ -7940,11 +8981,11 @@ struct GpuActiveRows(Movable):
         var desc = self._desc_buffer()
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 32]](
-                bins,
-                self.rows_dev.unsafe_ptr(),
+                hist_bins,
+                hist_rows,
                 grad,
                 hess,
-                self.gq_dev.unsafe_ptr(),
+                hist_gq,
                 feat_ids,
                 out_hist,
                 Int32(self.n_rows),
@@ -7976,11 +9017,11 @@ struct GpuActiveRows(Movable):
             )
         elif self.bin_cap <= 64:
             self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 64]](
-                bins,
-                self.rows_dev.unsafe_ptr(),
+                hist_bins,
+                hist_rows,
                 grad,
                 hess,
-                self.gq_dev.unsafe_ptr(),
+                hist_gq,
                 feat_ids,
                 out_hist,
                 Int32(self.n_rows),
@@ -8012,11 +9053,11 @@ struct GpuActiveRows(Movable):
             )
         elif self.bin_cap <= 128:
             self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 128]](
-                bins,
-                self.rows_dev.unsafe_ptr(),
+                hist_bins,
+                hist_rows,
                 grad,
                 hess,
-                self.gq_dev.unsafe_ptr(),
+                hist_gq,
                 feat_ids,
                 out_hist,
                 Int32(self.n_rows),
@@ -8048,11 +9089,11 @@ struct GpuActiveRows(Movable):
             )
         else:
             self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 256]](
-                bins,
-                self.rows_dev.unsafe_ptr(),
+                hist_bins,
+                hist_rows,
                 grad,
                 hess,
-                self.gq_dev.unsafe_ptr(),
+                hist_gq,
                 feat_ids,
                 out_hist,
                 Int32(self.n_rows),
@@ -8163,6 +9204,15 @@ struct GpuActiveRows(Movable):
         self.quant_packed = self.packed_gradients
         self.quant_g_scale = g_scale
         self.quant_h_scale = h_scale
+        # `gq` just moved under the compacted copy of it, so the invariant no
+        # longer holds and `_ensure_compacted` -- which the two histogram
+        # entry points call immediately after this one -- rebuilds both planes
+        # together. Only `cgq` is actually stale, and rebuilding `cbins` with
+        # it is deliberate: a partial rebuild would need a second kernel and a
+        # second validity flag to save a pass that, on every path this backend
+        # takes, happens once per tree at the same moment the full rebuild
+        # would have happened anyway.
+        self.compact_valid = False
 
     def _check_stage16_bound(
         mut self, g_scale: Float32, h_scale: Float32
