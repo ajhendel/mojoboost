@@ -30,7 +30,13 @@ level admits is therefore decided by the data, not by a rounding tie.
 """
 
 from std.sys import has_accelerator
-from std.testing import assert_equal, assert_false, assert_true, TestSuite
+from std.testing import (
+    assert_equal,
+    assert_false,
+    assert_raises,
+    assert_true,
+    TestSuite,
+)
 
 from mojotrees import (
     GROW_DEPTHWISE,
@@ -48,6 +54,7 @@ from mojotrees import (
 )
 from mojotrees.growth_policy import (
     BUDGET_WHOLE_LEVEL,
+    GROW_OBLIVIOUS,
     STOP_LEAF_BUDGET,
     STOP_MAX_DEPTH,
     GrowthSchedule,
@@ -460,6 +467,55 @@ def test_gpu_growers_follow_the_same_schedule() raises:
                 var depths = leaf_depths(want)
                 for i in range(len(depths)):
                     assert_true(depths[i] <= 4)
+
+
+# --------------------------------------------- the third policy, from here
+
+# `grow_policy=oblivious` is CatBoost's symmetric tree and is NOT a frontier
+# order: a level is searched once and the winner applied to every leaf of it,
+# so there is no per-leaf best split for `GrowthSchedule` to rank. Its own
+# tests are `tests/test_oblivious.mojo`. What belongs HERE is the boundary
+# with the two policies this file is about: that the parameter still round
+# trips, that the schedule refuses the third code rather than treating it as
+# depth-wise, and that the growers keyed off the schedule therefore refuse it
+# too instead of growing a tree that is not symmetric.
+
+
+def test_the_schedule_refuses_the_oblivious_code() raises:
+    with assert_raises():
+        _ = GrowthSchedule(GROW_OBLIVIOUS)
+    # The two it implements are unchanged, including the invalid-code
+    # behaviour: `check_grow_policy` is still the validator and the
+    # constructor is not.
+    assert_equal(GrowthSchedule(GROW_LEAFWISE).policy, GROW_LEAFWISE)
+    assert_equal(GrowthSchedule(GROW_DEPTHWISE).policy, GROW_DEPTHWISE)
+
+
+def test_the_sparse_grower_refuses_oblivious() raises:
+    """`grow_tree_sparse` builds a `GrowthSchedule` from the parameter, so the
+    refusal reaches it with no change on its side. Asserted rather than
+    assumed: without it the sparse grower would take the depth-wise branch
+    and answer a tree that is not symmetric, silently."""
+    var n_rows = 200
+    var n_features = 4
+    var dense = _dense_matrix(n_rows, n_features)
+    var csc = csc_from_dense(dense, n_rows, n_features)
+    var mapper = fit_bins_csc(csc, 16)
+    var sparse = transform_csc(mapper, csc)
+    var grad = _grads(n_rows)
+    var p = TreeParams(
+        8, 5, 1.0, 1e-3, max_depth=3, grow_policy=GROW_OBLIVIOUS
+    )
+    with assert_raises():
+        _ = grow_tree_sparse(sparse, grad, ones(n_rows), p)
+
+
+def test_the_policy_name_round_trips_for_all_three() raises:
+    var codes = [GROW_LEAFWISE, GROW_DEPTHWISE, GROW_OBLIVIOUS]
+    for i in range(len(codes)):
+        assert_equal(
+            parse_grow_policy(grow_policy_name(codes[i])), codes[i]
+        )
 
 
 def main() raises:

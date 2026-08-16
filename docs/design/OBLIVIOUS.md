@@ -5,6 +5,25 @@
 > marked **verify** have NOT been checked against CatBoost source and must be
 > before any lane builds them.
 
+> **CPU half BUILT, 2026-08-16, `lane/oblivious-cpu`.** The CPU items of B2
+> are implemented and tested (`growth_policy.GROW_OBLIVIOUS`,
+> `split.find_best_split_shared`, `tree._grow_oblivious_levels`,
+> `tests/test_oblivious.mojo`). CatBoost source was read first and returned
+> **four corrections** to this draft, recorded under A8 in
+> `CATBOOST_CATALOG.md`: the zero-contribution rule for an illegal leaf has
+> no CatBoost precedent and is **ours, explicitly NOT verified from source**
+> (CatBoost's `SymmetricTree` has neither `min_data_in_leaf` nor
+> `min_sum_hessian_in_leaf`, so it never had to define the case; we match the
+> GPU device, because host and device must grow the same tree); the
+> cross-leaf aggregate is a sum of child terms with the parent term removed
+> once per level, and CatBoost's CPU *default* score function is `Cosine`, a
+> ratio, not a sum; `num_leaves` is not "ignored" by CatBoost but forced to
+> `1 << depth` with an error on a conflicting value; and the tie rule is
+> randomized by default. **B5's first falsifier did NOT fire on the CPU**:
+> the cross-leaf reduction is fused into the single feature-parallel dispatch
+> the search already makes, so a level costs one dispatch and not one per leaf
+> plus a reduce. Nothing below is measured.
+
 ## Part B. `grow_policy = oblivious`
 
 ### B1. What it is
@@ -48,6 +67,40 @@ CPU (`tree.mojo`, `split.mojo`, `growth_policy.mojo`, `model.mojo` params):
   for tests (bit identity across workers, agreement with a brute-force
   reference on small data) and the accuracy run. Bits move only in the new
   mode.
+
+**As built (CPU), and where the fused reduction landed.** The requirement
+that the cross-leaf reduction never get its own launch is met on the CPU by
+construction, and the reason generalizes: a candidate (f, b) reads feature
+f's histogram slice and nothing else, in every leaf, so the whole reduction
+for feature f fits inside feature f's own task of the one
+`dispatch_features_with` the search already makes. The leaf loop is the OUTER
+loop inside that task, each leaf's slice walked once ascending by bin, folded
+into a per-bin accumulator the task owns.
+
+**Leaf numbering and node-id order are a cross-backend contract and the CPU
+implements the device's.** Leaf index is the bit pattern of a row's outcomes
+with the FIRST level's outcome as the LEAST significant bit (CatBoost's, from
+`index_calcer.cpp`: `splitWeight = 1 << splitParams.Depth`), so a left child
+keeps its parent's index and a right child at level d adds `1 << d`. Node ids
+are assigned level by level, over the level's leaves in ascending LEAF INDEX,
+left child before right. That is NOT ascending node id: at level 2 the leaves
+in node-id order carry indices 0, 2, 1, 3, so the two orders first diverge
+when level 2's children are created and a depth-3 tree already tells them
+apart. Both halves are asserted in `tests/test_oblivious.mojo`
+(`test_leaf_numbering_is_first_level_lowest_bit`,
+`test_node_ids_follow_ascending_leaf_index_left_before_right`).
+
+**Derived bound, arithmetic only,
+no measurement:** search dispatches per tree fall from `num_leaves - 1` to
+`max_depth`, i.e. 63 to 6 at depth 6 with 64 leaves. Cells read are unchanged
+(L slices of `n_active * n_bins` either way), so this removes fan-out and
+barrier cost and no arithmetic. Refused rather than half-applied under the
+mode: categorical features, forced splits, `extra_trees`, and the CEGB
+penalties that read the ensemble ledger. `max_depth` is required and capped
+at 16; `num_leaves` does not bind. Empty leaves are real leaves emitting 0.0
+and make `Tree.check_node_counts` (and so exact feature contributions) refuse
+such a tree, which is the one consumer the ordinary representation does not
+carry through unchanged.
 
 GPU (resident plane, `gpu_resident_round.mojo`, `gpu_split_search.mojo`,
 `gpu_active_rows.mojo`):

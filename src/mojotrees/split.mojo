@@ -130,6 +130,7 @@ from .categorical import (
 # here and the category partition search in categorical.mojo share one
 # definition, but `split.soft_threshold_l1` remains its public name.
 from .gain import soft_threshold_l1
+from .growth_policy import SharedSplitAudit
 from .histogram import Histogram, SIMD_LANES
 from .monotone import (
     MONOTONE_FREE,
@@ -883,4 +884,500 @@ def find_best_split(
                     (flag & _FLAG_DEFAULT_LEFT) != 0,
                 )
 
+    return best^
+
+
+def find_best_split_shared(
+    mut audit: SharedSplitAudit,
+    hists: List[Histogram],
+    lambda_reg: Float64 = 1.0,
+    min_child_hess: Float64 = 1e-3,
+    min_data_in_leaf: Int = 0,
+    lambda_l1: Float64 = 0.0,
+    allowed: List[Bool] = [],
+    features: List[Int] = [],
+    missing_bins: List[Int] = [],
+    monotone: List[Int] = [],
+    bounds: List[OutputBounds] = [],
+    parent_outputs: List[Float64] = [],
+    extra: ExtraTreeParams = ExtraTreeParams(),
+    n_rows: Int = 0,
+    depth: Int = 0,
+    node: Int = 0,
+    tree_index: Int = 0,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> SplitInfo:
+    """The one split a whole level of leaves shares, for `grow_policy =
+    oblivious` (growth_policy.mojo, `docs/design/OBLIVIOUS.md` B2).
+
+    `hists` is one histogram per leaf of the level, in the order the grower
+    will apply the split in, which `tree.grow_tree` fixes as ascending node
+    id. A candidate is a (feature, bin, missing direction) as it always was;
+    what changes is that its gain is the **sum over every leaf of the level**
+    of that leaf's own gain at that candidate, computed from that leaf's own
+    left/right sums, and the winner is applied to all of them. That is what
+    makes the tree symmetric and a row's leaf a bit pattern rather than a
+    traversal.
+
+    Where the cross-leaf reduction runs, which is the point
+    ------------------------------------------------------
+    It is **not a second pass**. `docs/design/OBLIVIOUS.md` B2 requires the
+    reduction be fused into a launch that already runs, and B5 registers "it
+    needs its own dispatch" as the first thing that would kill the design. It
+    does not need one. A candidate (f, b) reads feature f's histogram slice
+    and nothing else, in every leaf, so the whole reduction for feature f
+    fits inside feature f's own task of the single feature-parallel dispatch
+    this function makes -- the same `dispatch_features_with` that
+    `find_best_split` makes for one node. The leaf loop is the OUTER loop
+    inside that task: each leaf's slice is walked once, ascending by bin,
+    accumulating that leaf's contribution into a per-bin accumulator that the
+    task owns. There is one dispatch per level, not one per leaf and not one
+    per leaf plus a reduce.
+
+    Derived bound (arithmetic, not a measurement): a level of L leaves costs
+    L `find_best_split` dispatches under leaf-wise or depth-wise growth and
+    exactly 1 here. A depth-6 tree's search dispatches go from
+    1+2+4+8+16+32 = 63 to 6. The scan itself reads the same cells either way
+    (L slices of `n_active * n_bins`), so this removes fan-out and barrier
+    cost, not arithmetic.
+
+    Per-leaf legality contributes zero and is recorded
+    -------------------------------------------------
+    A leaf that cannot satisfy `min_data_in_leaf` or `min_child_hess` at a
+    candidate does NOT veto it: it adds 0.0 to that candidate's sum and is
+    split anyway, possibly into an empty child. Vetoing would let one narrow
+    leaf out of sixteen decide the level, which is the opposite of what a
+    symmetric tree is for. `audit` records how many leaves contributed zero
+    at the *chosen* candidate, because "legal for 1 leaf of 16" and "legal
+    for 16 of 16" are different objects and a reader has to be able to tell
+    them apart.
+
+    **This rule is OURS. It is NOT verified from CatBoost source and cannot
+    be.** `docs/design/OBLIVIOUS.md` B2 said, marked *verify*, that "CatBoost
+    scores leaves that fail as zero contribution". That sentence has no
+    referent: CatBoost's `SymmetricTree` has no `min_data_in_leaf` (their
+    documentation scopes it to Depthwise and Lossguide; the CPU code reads it
+    only in `GreedyTensorSearchDepthwise` and `FindBestCandidate`, where it
+    gates whether an *already existing* leaf is expanded rather than whether
+    a candidate's child is admissible; the CUDA searcher switches even that
+    off for symmetric trees), and CatBoost has no `min_sum_hessian_in_leaf`
+    parameter at all. They never had to define this case.
+
+    **Why zero-contribution rather than a veto:** the GPU device implements
+    zero-contribution-without-veto, and host and device must grow the same
+    tree. That is the reason. Everything else is corroboration: a veto would
+    let one narrow leaf of sixteen decide a whole level, and CatBoost's
+    nearest analogue is a zero *guard* rather than a zero *penalty*
+    (`CalcAverage` in
+    `catboost/private/libs/algo_helpers/online_predictor.h` returns 0 for a
+    child of zero weight, so an empty child adds nothing and the candidate
+    survives). Do not cite a CatBoost file for the rule itself; there is
+    none.
+
+    What the summed gain is, against CatBoost's
+    -------------------------------------------
+    Each leaf's contribution is `split._split_gain`, which subtracts that
+    leaf's parent score. CatBoost's `L2` score calcer
+    (`catboost/private/libs/algo/score_calcers.cpp`, `TL2ScoreCalcer`) sums
+    `sumDer^2 / (sumWeight + l2)` over every child of every leaf and does not
+    subtract anything; the parent term comes off once per level as
+    `gain = score - scoreBeforeSplit` in `SelectBestCandidate`. The sum of
+    the per-leaf parent scores is a constant across the candidates of one
+    level -- every feature's bins total to the same per-leaf sums -- so the
+    two forms have the same argmax, and ours is LightGBM's spelling of it.
+    CatBoost's CPU *default* is `Cosine`, which is a ratio of two cross-leaf
+    sums (`Scores[i][0] / sqrt(Scores[i][1])`) and is NOT this and NOT
+    implemented here; A10 of `CATBOOST_CATALOG.md` already says we keep
+    LightGBM's gain.
+
+    Determinism
+    -----------
+    Two sums and one maximum, and none of the three crosses a task boundary.
+    A leaf's prefix sums run ascending by bin inside one task, as they do in
+    `find_best_split`. The cross-leaf sum runs ascending by position in
+    `hists` inside that same task, so the order of the addends is a property
+    of the argument and not of the worker count. The choice among features is
+    a maximum, folded afterwards in ascending scan order under the same strict
+    `>` the serial loop would have used. Values are therefore identical at
+    `MOJOTREES_NUM_WORKERS` 1, 3 and 8.
+
+    Scope, and what is refused rather than half-applied
+    ---------------------------------------------------
+    Numerical thresholds only. A categorical feature's candidates are
+    category *sets* whose order is derived from that node's own
+    gradient/hessian ratios, so there is no one set to share across a level
+    without a different search; the caller refuses the combination
+    (`tree.grow_tree`). `extra_trees` draws one threshold per *node* and has
+    no meaning for a level, and the CEGB penalties that read the ensemble
+    ledger charge per node; both are refused here. `min_gain_to_split`,
+    `feature_contri`, `monotone_penalty` and `random_strength` are live and
+    apply to the level: the first three are charged once per feature against
+    the summed gain (`_feature_gain`, LightGBM's placement), and
+    `random_strength` draws once per (feature, bin) candidate keyed by
+    `node`, which the grower passes as the level's lowest node id, so the
+    level gets one draw per candidate rather than one per leaf.
+
+    `bounds` and `parent_outputs`, when non-empty, are per leaf and parallel
+    to `hists`: the monotone interval a leaf's output must lie in, and the
+    value it currently emits (what `path_smooth` shrinks its children
+    toward). Empty means unbounded and 0.0 for every leaf.
+    """
+    var n_leaves = len(hists)
+    audit = SharedSplitAudit.none()
+    if n_leaves <= 0:
+        raise Error(
+            "find_best_split_shared needs one histogram per leaf of the level"
+        )
+    var n_features = hists[0].n_features
+    var n_bins = hists[0].n_bins
+    for l in range(1, n_leaves):
+        if hists[l].n_features != n_features or hists[l].n_bins != n_bins:
+            raise Error(
+                "every leaf histogram of a level must have the same shape"
+            )
+    if len(missing_bins) > 0 and len(missing_bins) != n_features:
+        raise Error("missing_bins length must equal n_features")
+    if len(monotone) > 0 and len(monotone) != n_features:
+        raise Error("monotone length must equal n_features")
+    if len(bounds) > 0 and len(bounds) != n_leaves:
+        raise Error("bounds must hold one interval per leaf of the level")
+    if len(parent_outputs) > 0 and len(parent_outputs) != n_leaves:
+        raise Error("parent_outputs must hold one value per leaf of the level")
+    if extra.extra_trees:
+        raise Error(
+            "extra_trees draws one threshold per node and a level of an"
+            " oblivious tree has one split for every node in it; the two"
+            " rules cannot both hold"
+        )
+    if extra.penalties.cegb.is_active():
+        raise Error(
+            "the CEGB penalties are charged per node against a ledger that"
+            " spans the ensemble; a level's shared split is charged once and"
+            " that accounting is not written. Leave the cegb_penalty_*"
+            " parameters at 0 under grow_policy=oblivious"
+        )
+
+    var constrained = len(monotone) > 0
+    var masked = len(allowed) > 0
+    var use_all = len(features) == 0
+    var n_active = n_features if use_all else len(features)
+
+    var extra_active = extra.is_active()
+    var penalize = extra_active and extra.penalties.contri_active()
+    var costs = CegbNodeCosts.inactive()
+    var finish = extra.needs_leaf_finish()
+
+    var noise_stdev = extra.random_score_stdev()
+    var noisy = extra.random_strength > 0.0
+    if noisy and not (noise_stdev > 0.0):
+        raise Error(
+            "random_strength is set but ExtraTreeParams.random_score_scale"
+            " is not; see find_best_split"
+        )
+    var noise_seed = extra.random_strength_seed
+
+    # The two accumulators a feature's task folds its leaves into, one per
+    # bin per direction, plus the illegal-leaf counts beside them. Allocated
+    # once for the whole dispatch and striped by feature slot, so a task
+    # writes only its own `[i_feature * n_bins, (i_feature + 1) * n_bins)`
+    # range and no task allocates. At 50 features and 255 bins that is
+    # 50 * 255 * (8 + 8 + 8 + 8) = 408 KB for a level of any width, because
+    # the leaves are folded in rather than held.
+    var stripe = n_active * n_bins
+    var acc_left = List[Float64](capacity=stripe)
+    acc_left.resize(stripe, 0.0)
+    var acc_right = List[Float64](capacity=stripe)
+    acc_right.resize(stripe, 0.0)
+    var ill_left = List[Int](capacity=stripe)
+    ill_left.resize(stripe, 0)
+    var ill_right = List[Int](capacity=stripe)
+    ill_right.resize(stripe, 0)
+
+    var res_gain = List[Float64](capacity=n_active)
+    res_gain.resize(n_active, 0.0)
+    var res_feature = List[Int](capacity=n_active)
+    res_feature.resize(n_active, -1)
+    var res_bin = List[Int](capacity=n_active)
+    res_bin.resize(n_active, -1)
+    var res_flag = List[Int](capacity=n_active)
+    res_flag.resize(n_active, 0)
+    var res_ill = List[Int](capacity=n_active)
+    res_ill.resize(n_active, 0)
+    var res_fail = List[UInt8](capacity=n_active)
+    res_fail.resize(n_active, UInt8(0))
+
+    var accl_out = acc_left.unsafe_ptr()
+    var accr_out = acc_right.unsafe_ptr()
+    var illl_out = ill_left.unsafe_ptr()
+    var illr_out = ill_right.unsafe_ptr()
+    var gain_out = res_gain.unsafe_ptr()
+    var feature_out = res_feature.unsafe_ptr()
+    var bin_out = res_bin.unsafe_ptr()
+    var flag_out = res_flag.unsafe_ptr()
+    var ill_out = res_ill.unsafe_ptr()
+    var fail_out = res_fail.unsafe_ptr()
+
+    def scan_feature(i_feature: Int) raises {imm}:
+        var f = i_feature if use_all else features[i_feature]
+        if f < 0 or f >= n_features:
+            return
+        if masked and (f >= len(allowed) or not allowed[f]):
+            return
+        var sign = monotone_sign(monotone, f) if constrained else MONOTONE_FREE
+        var missing_bin = -1
+        if len(missing_bins) > 0:
+            missing_bin = missing_bins[f]
+            if missing_bin >= n_bins:
+                raise Error("missing bin index out of range")
+        var base = f * n_bins
+        var off = i_feature * n_bins
+
+        # Ordinary bins are [0, n_scan); the missing bin sits at n_scan and is
+        # never a threshold, only a side to route.
+        var n_scan = missing_bin if missing_bin >= 0 else n_bins
+
+        # Whether ANY leaf of the level has rows in the missing bin. It is a
+        # level-wide question because the candidate is level-wide: with no
+        # missing rows anywhere, "every ordinary bin left, missing alone
+        # right" puts every row of every leaf on one side and is not a split,
+        # and the two routing directions coincide so only one of them is
+        # scored (which is what keeps `default_left` on an exact tie, as in
+        # `find_best_split`).
+        var level_miss_c = 0
+        if missing_bin >= 0:
+            for l in range(n_leaves):
+                level_miss_c += hists[l].count_at(base + missing_bin)
+        var n_top = n_scan if level_miss_c > 0 else n_scan - 1
+        if n_top <= 0:
+            return
+        var score_left = missing_bin >= 0
+        var score_right = missing_bin < 0 or level_miss_c > 0
+
+        for b in range(n_top):
+            accl_out.unsafe_store(off + b, 0.0)
+            accr_out.unsafe_store(off + b, 0.0)
+            illl_out.unsafe_store(off + b, 0)
+            illr_out.unsafe_store(off + b, 0)
+
+        # THE CROSS-LEAF REDUCTION. Outer loop over leaves, ascending, inside
+        # this one feature's task: each leaf's slice is read once in bin order
+        # and folded straight into the per-bin accumulators above. No second
+        # pass, no second dispatch, and the addends of every sum are ordered
+        # by the loops rather than by the scheduler.
+        var level_c = 0
+        for l in range(n_leaves):
+            var b0 = 0
+            var vg = SIMD[DType.float64, SIMD_LANES](0.0)
+            var vh = SIMD[DType.float64, SIMD_LANES](0.0)
+            var vc = SIMD[DType.int, SIMD_LANES](0)
+            var gp = hists[l]._grad.unsafe_ptr()
+            var hp = hists[l]._hess.unsafe_ptr()
+            var cp = hists[l]._count.unsafe_ptr()
+            while b0 + SIMD_LANES <= n_bins:
+                vg += gp.unsafe_load[width=SIMD_LANES](base + b0)
+                vh += hp.unsafe_load[width=SIMD_LANES](base + b0)
+                vc += cp.unsafe_load[width=SIMD_LANES](base + b0)
+                b0 += SIMD_LANES
+            var total_g = vg.reduce_add()
+            var total_h = vh.reduce_add()
+            var total_c = Int(vc.reduce_add())
+            while b0 < n_bins:
+                total_g += gp.unsafe_load(base + b0)
+                total_h += hp.unsafe_load(base + b0)
+                total_c += cp.unsafe_load(base + b0)
+                b0 += 1
+            level_c += total_c
+
+            var parent_g = soft_threshold_l1(total_g, lambda_l1)
+            var parent_score = parent_g * parent_g / (total_h + lambda_reg)
+            var lb = bounds[l].copy() if len(bounds) > 0 else (
+                OutputBounds.unbounded()
+            )
+            var pout = parent_outputs[l] if len(parent_outputs) > 0 else 0.0
+
+            var miss_g = 0.0
+            var miss_h = 0.0
+            var miss_c = 0
+            if missing_bin >= 0:
+                miss_g = gp.unsafe_load(base + missing_bin)
+                miss_h = hp.unsafe_load(base + missing_bin)
+                miss_c = cp.unsafe_load(base + missing_bin)
+
+            var left_g = 0.0
+            var left_h = 0.0
+            var left_c = 0
+            for b in range(n_top):
+                left_g += gp.unsafe_load(base + b)
+                left_h += hp.unsafe_load(base + b)
+                left_c += cp.unsafe_load(base + b)
+
+                if score_left:
+                    var dl_left_g = left_g + miss_g
+                    var dl_left_h = left_h + miss_h
+                    var dl_left_c = left_c + miss_c
+                    var dl_right_g = total_g - dl_left_g
+                    var dl_right_h = total_h - dl_left_h
+                    if (
+                        dl_left_h < min_child_hess
+                        or dl_right_h < min_child_hess
+                        or dl_left_c < min_data_in_leaf
+                        or total_c - dl_left_c < min_data_in_leaf
+                    ):
+                        illl_out.unsafe_store(
+                            off + b, illl_out.unsafe_load(off + b) + 1
+                        )
+                    else:
+                        var tl = soft_threshold_l1(dl_left_g, lambda_l1)
+                        var tr = soft_threshold_l1(dl_right_g, lambda_l1)
+                        accl_out.unsafe_store(
+                            off + b,
+                            accl_out.unsafe_load(off + b)
+                            + _split_gain(
+                                tl,
+                                dl_left_h,
+                                tr,
+                                dl_right_h,
+                                lambda_reg,
+                                parent_score,
+                                sign,
+                                lb,
+                                constrained,
+                                finish,
+                                extra.max_delta_step,
+                                extra.path_smooth,
+                                dl_left_c,
+                                total_c - dl_left_c,
+                                pout,
+                            ),
+                        )
+
+                if score_right:
+                    var right_g = total_g - left_g
+                    var right_h = total_h - left_h
+                    if (
+                        left_h < min_child_hess
+                        or right_h < min_child_hess
+                        or left_c < min_data_in_leaf
+                        or total_c - left_c < min_data_in_leaf
+                    ):
+                        illr_out.unsafe_store(
+                            off + b, illr_out.unsafe_load(off + b) + 1
+                        )
+                    else:
+                        var tl = soft_threshold_l1(left_g, lambda_l1)
+                        var tr = soft_threshold_l1(right_g, lambda_l1)
+                        accr_out.unsafe_store(
+                            off + b,
+                            accr_out.unsafe_load(off + b)
+                            + _split_gain(
+                                tl,
+                                left_h,
+                                tr,
+                                right_h,
+                                lambda_reg,
+                                parent_score,
+                                sign,
+                                lb,
+                                constrained,
+                                finish,
+                                extra.max_delta_step,
+                                extra.path_smooth,
+                                left_c,
+                                total_c - left_c,
+                                pout,
+                            ),
+                        )
+
+        # This feature's best candidate, in the scan order `find_best_split`
+        # uses -- ascending bin, missing-left before missing-right -- under
+        # the same strict `>`, so an exact tie keeps the lower bin and, at
+        # that bin, `default_left`.
+        var f_gain = 0.0
+        var f_bin = -1
+        var f_default_left = False
+        var f_ill = 0
+        var f_found = False
+        for b in range(n_top):
+            # One draw per (feature, bin) candidate, shared by the two routing
+            # directions and by every leaf: the noise belongs to the split the
+            # level takes, and the level takes one. Added here rather than
+            # inside the fold so it is added once and not `n_leaves` times.
+            var noise = 0.0
+            if noisy:
+                noise = random_score_noise(
+                    noise_stdev, noise_seed, tree_index, node, f, b
+                )
+            if score_left:
+                var g = accl_out.unsafe_load(off + b) + noise
+                if g > f_gain:
+                    f_gain = g
+                    f_bin = b
+                    f_default_left = True
+                    f_ill = illl_out.unsafe_load(off + b)
+                    f_found = True
+            if score_right:
+                var g = accr_out.unsafe_load(off + b) + noise
+                if g > f_gain:
+                    f_gain = g
+                    f_bin = b
+                    f_default_left = False
+                    f_ill = illr_out.unsafe_load(off + b)
+                    f_found = True
+
+        if f_found:
+            var node_rows = n_rows if n_rows > 0 else level_c
+            var g = _feature_gain(
+                f_gain,
+                f,
+                extra,
+                extra_active,
+                penalize,
+                sign,
+                depth,
+                node_rows,
+                costs,
+            )
+            gain_out.unsafe_store(i_feature, g)
+            feature_out.unsafe_store(i_feature, f)
+            bin_out.unsafe_store(i_feature, f_bin)
+            ill_out.unsafe_store(i_feature, f_ill)
+            if f_default_left:
+                flag_out.unsafe_store(i_feature, _FLAG_DEFAULT_LEFT)
+
+    def scan_one(i_feature: Int) {imm}:
+        try:
+            scan_feature(i_feature)
+        except:
+            fail_out.unsafe_store(i_feature, UInt8(1))
+
+    # ONE dispatch for the whole level. `split_scan_ops` estimates one node's
+    # scan, so the level's estimate is that times the number of leaves folded
+    # into it, which is exactly the work this dispatch does.
+    dispatch_features_with(
+        settings,
+        scan_one,
+        n_active,
+        n_leaves * split_scan_ops(n_active, n_bins, len(missing_bins) > 0),
+    )
+
+    var best = SplitInfo(-1, -1, 0.0, False)
+    var best_ill = 0
+    for i_feature in range(n_active):
+        if res_fail[i_feature] != UInt8(0):
+            scan_feature(i_feature)
+            raise Error("shared split scan failed on feature ", i_feature)
+        var g = gain_out.unsafe_load(i_feature)
+        if g > best.gain:
+            var flag = flag_out.unsafe_load(i_feature)
+            best = SplitInfo(
+                feature_out.unsafe_load(i_feature),
+                bin_out.unsafe_load(i_feature),
+                g,
+                True,
+                (flag & _FLAG_DEFAULT_LEFT) != 0,
+            )
+            best_ill = ill_out.unsafe_load(i_feature)
+
+    if best.found:
+        audit = SharedSplitAudit(n_leaves, best_ill, n_leaves - best_ill)
     return best^
