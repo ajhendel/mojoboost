@@ -1807,16 +1807,25 @@ def describe_cpu_policy(profile: CpuProfile, plan: AccumulationPlan) -> String:
     does not carry. It is the number that makes a wide group's cost visible
     next to its benefit; a benchmark header that prints only the width is
     reporting half of the trade.
+
+    It is priced over `row_blocks * group_count`, which is what
+    `histogram._accumulate_blocked_at` actually dispatches
+    (`dispatch_feature_ranges_with(..., n_blocks * n_groups, ...)`). Printing
+    `group_count` alone under-reported a blocked build by the block count and
+    would have made a wider group look like a scheduling loss it is not.
     """
     var cores = profile.dispatch_cores()
+    var units = plan.row_blocks * plan.group_count
     return String(
         profile.describe(),
         " | ",
         plan.describe(),
+        " units=",
+        units,
         " rounds=",
-        dispatch_rounds(plan.group_count, cores),
+        dispatch_rounds(units, cores),
         " utilization=",
-        dispatch_utilization_percent(plan.group_count, cores),
+        dispatch_utilization_percent(units, cores),
         "%",
     )
 
