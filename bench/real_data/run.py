@@ -158,18 +158,29 @@ def build_matrix(args):
                             )
                         )
                         continue
+                    # The pairing ground is stated first and the device block
+                    # second, and the order is the point. This arm exists to be
+                    # read against CatBoost, CatBoost is CPU-only above, so a
+                    # GPU row here has nothing to pair against no matter what
+                    # the device can compute. BLOCK_SCORE_FUNCTION is why it
+                    # cannot run there today; the pairing is why it should not
+                    # be scheduled there even after a lane teaches the device
+                    # split search the Cosine ratio and the block goes away.
+                    # Written this way so that landing Cosine on the device
+                    # does not silently add a column to a comparison matrix.
                     if engine == "mojotrees_catboost_mode":
                         jobs.append(
                             _skip(
                                 scenario_id, engine, device, args,
-                                "the CatBoost-mode arm sets "
-                                "score_function=Cosine, and the device split "
+                                "the CatBoost-mode arm is read against "
+                                "CatBoost, and CatBoost is CPU-only in this "
+                                "harness, so a GPU row here has no counterpart "
+                                "to be read against; separately, the arm sets "
+                                "score_function=Cosine and the device split "
                                 "search computes G^2/(H+lambda) only, so "
-                                "device_policy blocks it "
-                                "(BLOCK_SCORE_FUNCTION). The arm is CPU-only "
-                                "by construction, and its CatBoost "
-                                "counterpart is CPU-only too, so a GPU row "
-                                "here would have had nothing to pair against",
+                                "device_policy blocks it today "
+                                "(BLOCK_SCORE_FUNCTION). The first reason "
+                                "outlives the second",
                             )
                         )
                         continue
