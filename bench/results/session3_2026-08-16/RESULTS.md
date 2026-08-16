@@ -112,6 +112,64 @@ argument that says this knob cannot change a model is no longer only an argument
 Taken in the slow regime, so the spreads are wide. This is the item most worth
 re-taking in a fast window.
 
+### Re-taken in a fast window. RESOLVED, and the verdict flips.
+
+Same command, same shape, quiet box:
+
+| arm | median | spread of median |
+|---|---|---|
+| unroll on (shipped default) | **2.597** | 2.1% |
+| unroll off | 2.881 | 1.7% |
+
+**Resolved: 10.8 percent, against a 2.1 percent noise floor.** The unroll is
+worth 0.284 seconds at 1,000,000 x 50.
+
+**Same code, same command, opposite verdict, because of machine state alone.**
+In the slow window this was 8.1 percent against a 14.1 percent floor and was
+correctly called indistinguishable. That is the clearest demonstration this
+project has of what a dirty or throttled box does to a real effect, and it is
+worth more than the unroll result itself: a null taken in a bad window is not
+evidence of absence.
+
+Training loss identical to the last digit in both arms in both windows.
+
+### The isolated benchmark agrees, and prices the kernel
+
+`bench-hist 1000000 50 20`, twenty repeats per arm:
+
+| arm | median per node | |
+|---|---|---|
+| unroll on | 1.488 ms | |
+| unroll off | 3.178 ms | |
+
+**2.14x on the histogram kernel alone**, resolved, band 3.0 percent.
+
+The plan registered that a disagreement between the isolated and end-to-end
+benchmarks would be the finding. **There is no disagreement.** Both resolve, both
+favor the unroll. The isolated arm shows the kernel more than halving; the fit
+moves 10.8 percent, which is the same win seen through everything else the round
+does. That ratio is itself informative and is the first honest read this project
+has on how much of a fit the histogram kernel is at this shape.
+
+Also measured in the same run, and a null: feature group 2 against group 1 is
+1.11x, **indistinguishable** at a band of 11.5 percent.
+
+## M2.5 The parallel grain at the host-scan shape. NULL.
+
+50,000 x 50 with the resident plane off so the host scan is genuinely taken,
+three alternating pairs.
+
+| pair | `PARALLEL_MIN_OPS=32768` | default 65,536 |
+|---|---|---|
+| 1 | 1.700 | 1.710 |
+| 2 | 1.703 | 1.704 |
+| 3 | 1.714 | 1.722 |
+
+A 0.001 to 0.010 second difference on a 1.70 second fit. **Indistinguishable.**
+The 38,250-op conversion sitting just under the default grain, on the knife edge
+this project flagged, is not costing anything measurable. The grain stays where
+it is and the docstring's refusal to move it without measurement is vindicated.
+
 ## M2.4 LightGBM, interleaved, with its own spread. THE COMPARATOR MOVED.
 
 1,000,000 x 50, same process, same window, five repeats each, LightGBM at ten
