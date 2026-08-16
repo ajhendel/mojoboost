@@ -569,3 +569,113 @@ The canary answers a different question than the protocol asked -- not what stat
 the machine reports, but what the machine delivers -- and it answered it on the
 first run, without privileges, in a way that changed what another campaign is
 willing to publish.
+
+---
+
+## The speculation census: K=1's hit rate, measured before the speculation was built
+
+Lane K2 was asked to build speculative child histograms. It did not, and the
+reason is a better outcome than the build would have been.
+
+### K>=2 is provably useless, so K=1 is the only K
+
+Not a census result, a theorem, and it is worth stating because it closes a
+question rather than estimating it. At step *k* the two children that step *k*
+creates have no records until step *k*'s own search writes them, which is the
+last device work of the step -- so their candidacy is established exactly when
+speculating on them would stop being speculation. The candidate set is therefore
+the pre-existing leaves, and over that set the ranking **cannot move**: a commit
+writes only the split leaf's frontier row, the appended row at `n_live`, and the
+two records those children own. Every other leaf keeps its slot, record, depth
+and row count bit for bit, hence its gain and its admissibility, and the pick's
+`block.max` then `block.min` resolves an unchanged set identically, ties
+included.
+
+So the best pre-existing leaf at step *k+1* **is** the top runner-up at step *k*.
+A second speculative candidate is a leaf that provably cannot be picked next.
+
+### And the census that justified K=1 was measuring the theorem, not the hit rate
+
+"The greedy pick was the top runner-up in 100 percent of 4,030 decisions" is
+exactly what the theorem predicts **for the decisions where the pick is a
+pre-existing leaf**. It says nothing about how often it is one. The figure is a
+tautology over a conditioned subset, and this project has been quoting it as
+evidence for a hit rate it cannot speak to.
+
+### The actual hit rate, measured
+
+`MOJOTREES_GPU_SPECULATION_CENSUS=1`, one fit of 100 trees per shape, summed over
+the fit rather than averaged per tree (a three-leaf tree must not weigh the same
+as a thirty-leaf one):
+
+| shape | trees | builds | consumed | wasted | hit rate |
+|---|---|---|---|---|---|
+| 1,000,000 x 50 | 100 | 2900 | 1936 | 964 | **66.8%** |
+| 250,000 x 50 | 100 | 2900 | 1902 | 998 | **65.6%** |
+| 50,000 x 50 | 100 | 2900 | 1917 | 983 | **66.1%** |
+
+**Measured**, and note what kind of measurement it is: the census is a pure host
+function over the commit log that already comes home in the plane's one download.
+It launches nothing, transfers nothing, and derives its answer from the tree
+rather than from a clock, so **it is valid on a contaminated box and identical in
+a fast window and a slow one**. It was taken while a second campaign had four
+lanes compiling, and that does not weaken it at all.
+
+Two structural facts bound it below 1 before any run, both visible in the
+numbers: step 1 can never consume, because step 0's candidate set is empty, and
+the last step's build has no commit after it. So `consumed <= builds - 1` always.
+
+### What it decides
+
+The lane registered its own bar before seeing the number: a hit rate materially
+below about 50 percent makes the lane a loss before the launch-shape benefit is
+counted. **66.8 percent clears it**, and the stability across a twentyfold range
+of row counts is itself evidence that the rate is a property of leaf-wise growth
+rather than of a shape.
+
+The honest cost, which is not zero: **964 wasted builds per fit at 1M**, each a
+partition and a histogram over a child window, spent on a child that is
+discarded. A consumed build is the same work moved earlier; a wasted one is work
+that would not otherwise exist. So the trade is roughly a third more child
+histogram builds in exchange for a better launch shape, and whether that wins is
+a measurement nobody has taken.
+
+### Why it was not built, and what it needs
+
+The speculation cannot be expressed from `gpu_resident_round.mojo` alone. Every
+descriptor-aware launch reads one fixed buffer, `GpuActiveRows.step_dev`, so a
+speculative step needs a second descriptor and a kernel that publishes a
+runner-up without committing. Two changes, in two files that lane did not own,
+neither large:
+
+- `gpu_active_rows.mojo` -- a descriptor-pointer parameter on
+  `enqueue_partition_desc` and `enqueue_desc_histogram`, defaulting to `step_dev`
+  so no call site moves, plus a second `STEP_WORDS` buffer. The kernels already
+  take the descriptor as an argument and already carry an ignore-the-descriptor
+  flag.
+- `gpu_tree_tables.mojo` -- a `_pick_runner_up_kernel`: phase two of
+  `_pick_and_commit_kernel` with the committing phase replaced by a descriptor
+  write, excluding the slot this step's commit took.
+
+**Sequenced behind K1**, which owns the histogram kernel bodies in
+`gpu_active_rows.mojo`. Two lanes editing that file concurrently is the shape
+this batch was designed to avoid.
+
+### One design correction the lane found that would have been a silent bug
+
+**A speculative build must not fold the sibling subtraction in.**
+`enqueue_desc_child` derives the larger child in place from the parent's slot,
+which on a miss would destroy the histogram of the leaf being speculated on. The
+speculation must build the smaller child into a spare slot and leave the
+subtraction to the consuming step, so `open_resident(num_leaves)` becomes
+`num_leaves + 1` and `RESIDENT_SCRATCH_RECORDS` gains two.
+
+### And a note on dead steps
+
+They make this worse rather than neutral. A dead step is nearly free today
+because every descriptor-aware kernel reads `STEP_LIVE` and returns. A
+speculative build adds a partition, a histogram and a search pair to **every**
+step including dead ones, where it cannot possibly be consumed. `dead=0` at every
+shape above, so it does not bite here -- but a fit that stops early on
+`min_gain_to_split` would pay it, which is why `dead` is reported beside `builds`
+rather than folded into it.
