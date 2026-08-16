@@ -651,7 +651,11 @@ host-authored. MAX exposes no asynchronous copy on Metal, `"Metal stream not
 implemented"` is a literal string in the runtime so there is no second queue to
 overlap with, and while the runtime ships `CUDADeviceGraphBuilder` and
 `HIPDeviceGraphBuilder` there is **no `MetalDeviceGraphBuilder`**, so
-capture-and-replay batching is unavailable too. The only escape is writing
+capture-and-replay batching is unavailable too. That last clause was derived
+from a symbol table when it was written and has since been **verified by
+execution**: `DeviceGraph.create` raises on an M4 at builder creation, before
+a node is added (`docs/GPU_PORTABILITY.md` section 6.5). The only escape is
+writing
 staging data directly into a `HostBuffer` the kernel reads through unified
 memory, and `docs/APPLE_UNIFIED_MEMORY.md` already records that the host-direct
 experiment was wrong and the map-write path was slower.

@@ -480,6 +480,21 @@ answers, in the order I would try them:
 
 ### 2.7 Command graphs, which may or may not exist on this backend
 
+> **Answered 2026-08-16 and the answer is no on Metal.** The ten-minute test
+> below was run. `DeviceGraph.create` raises
+> `createGraphBuilder() not supported on this device context` on an M4 under
+> MAX 26.5.0, at builder creation, before a single node is added; the driver
+> ships `CUDADeviceGraphBuilder.cpp` and `HIPDeviceGraphBuilder.cpp` and no
+> Metal equivalent. `docs/GPU_PORTABILITY.md` section 6.5 carries the
+> evidence and the recovered API surface, and
+> `tools/probe_device_graph.mojo` reruns the check on any device. The
+> section is kept as written because its reasoning about *why* a graph would
+> have suited this design is still correct and is what a CUDA or HIP port
+> should read first -- with one correction, which is that the frozen surface
+> is larger than this section assumed: there is no node-update call, so
+> `grid_dim` is frozen at capture too, and our frontier-sized grids are the
+> part of the design that does not fit.
+
 The brief states that there is no command-graph API in the portable surface. I
 found one documented: `max.gpu.host.device_graph`, with `DeviceGraph.create`,
 `DeviceGraphBuilder`, and `graph.replay()` described as "lower overhead than
