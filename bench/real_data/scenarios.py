@@ -94,12 +94,36 @@ number taken before this change is not comparable with one taken after it
 and both benchmarks' old figures are marked "pinned configuration,
 superseded" rather than deleted.
 
+A fifth came out on 2026-08-16, out of `BASE_PARAMS` rather than out of the
+LightGBM dict, and it is the same kind of thing:
+
+- `lambda_l2 = 1.0`, set on **both** sides. **Superseded 2026-08-16.** The
+  reasoning it was set under was correct for the world it was written in
+  and is kept here rather than deleted: mojotrees defaulted `lambda_l2` to
+  1.0 and LightGBM defaults it to 0.0, so leaving each engine on its own
+  default would have compared two different regularizers, and pinning both
+  to one value was the only way to ask the two libraries for the same
+  model. What changed is not that argument but its premise. mojotrees's
+  default is LightGBM's 0.0 now (`TreeParams.default()` in
+  `src/mojotrees/tree.mojo`), because the policy is that our defaults *are*
+  LightGBM stock and an arm labelled `stock+det` carrying a non-stock
+  regularizer is not stock. With the premise gone the pin is gone: both
+  engines take 0.0 by saying nothing, `lambda_l2` is recorded in
+  `LIGHTGBM_STOCK_DEFAULTS` instead of passed, and `tools/check_parity.py`
+  fails if either default drifts back.
+
+  **Numbers move across this change, and not slightly.** `lambda_l2` is the
+  denominator of every leaf value and every split gain, `-T(G) / (H + l2)`,
+  so on a node with small hessian removing it is a large multiplicative
+  change to the leaf and it reorders which candidate split wins. Every
+  accuracy figure taken before 2026-08-16 is on the old regularizer on both
+  sides and is not comparable with one taken after; a difference across the
+  boundary is this pin coming out, not a regression in anything else.
+  `COMPARATOR_VERSION` is bumped for exactly that reason.
+
 ## What is still set, and what it would take to unset it
 
 - `deterministic = true`. The comparator itself, framed above.
-- `lambda_l2 = 1.0`, in `BASE_PARAMS` and therefore on both sides.
-  mojotrees defaults to 1.0 and LightGBM to 0.0, so it is set explicitly
-  on both or the comparison is between two different regularisers.
 - `feature_pre_filter = false`. On by default, it deletes features that
   cannot satisfy `min_data_in_leaf` at Dataset construction time, which
   removes them from the matrix, from the pool `feature_fraction` samples,
@@ -143,7 +167,15 @@ difference is the failure mode this file exists to prevent.
 import copy
 
 #: Parameters both engines get, under the names both engines accept.
-#: These are LightGBM's defaults except for lambda_l2, which is mojotrees's.
+#: Every one of these is LightGBM's stock default, stated rather than
+#: assumed: the point of passing them is that a result's parameter string
+#: says what ran, not that either engine needed telling.
+#:
+#: `lambda_l2` was the exception until 2026-08-16, when it was 1.0 here
+#: because that was mojotrees's default. It is not in this dict any more
+#: and must not come back: mojotrees defaults it to LightGBM's 0.0 now, so
+#: a value here would be a pin rather than a restatement. See the module
+#: docstring for what that pin was for and why its premise is gone.
 BASE_PARAMS = {
     "num_leaves": 31,
     "max_depth": -1,
@@ -152,7 +184,6 @@ BASE_PARAMS = {
     "min_data_in_leaf": 20,
     "min_child_hess": 1e-3,
     "lambda_l1": 0.0,
-    "lambda_l2": 1.0,
     "max_bin": 255,
     "use_missing": True,
 }
@@ -160,9 +191,18 @@ BASE_PARAMS = {
 #: The comparator's identity, carried by every run and every published
 #: table. Bump `COMPARATOR_VERSION` when the resolved dict changes in a way
 #: that makes two numbers non-comparable, which is any change to
-#: `LIGHTGBM_ALIGNMENT` other than a comment.
+#: `LIGHTGBM_ALIGNMENT` other than a comment, and any change to a value in
+#: `BASE_PARAMS` or to which keys it holds. The second half was learned on
+#: 2026-08-16: `lambda_l2` reached LightGBM through `BASE_PARAMS`, not
+#: through `LIGHTGBM_ALIGNMENT`, so a rule naming only the alignment dict
+#: would have let the comparator's regularizer change without a bump.
 COMPARATOR_ID = "stock+det"
-COMPARATOR_VERSION = 1
+#: v2 as of 2026-08-16: `lambda_l2` came out of `BASE_PARAMS`, so the
+#: LightGBM side moved from a pinned 1.0 to its own stock 0.0. That changes
+#: every leaf value and some split choices on both engines, which is the
+#: definition of non-comparable, so a v1 number and a v2 number are not the
+#: same measurement.
+COMPARATOR_VERSION = 2
 COMPARATOR_LABEL = "LightGBM at stock defaults plus deterministic=true"
 COMPARATOR_REGISTERED = (
     "bench/results/PROFILE_PROTOCOL.md section C9, as amended 2026-08-16"
@@ -280,6 +320,11 @@ LIGHTGBM_HARNESS_SETTINGS = {
 #: registered with it turned on and that version was withdrawn the same
 #: day, so a reader who has seen the first text needs to be able to
 #: confirm from the run itself that the comparator is not quantized.
+#: `lambda_l2` is in this table as of 2026-08-16 for the same reason as
+#: `use_quantized_grad`: it used to be set, to 1.0, on both sides, and a
+#: reader who has seen a run from before then needs to be able to confirm
+#: from the run itself which regularizer produced the numbers in front of
+#: them. Both engines take 0.0 now by saying nothing.
 LIGHTGBM_STOCK_DEFAULTS = {
     "use_quantized_grad": False,
     "bin_construct_sample_cnt": 200000,
@@ -289,6 +334,7 @@ LIGHTGBM_STOCK_DEFAULTS = {
     "zero_as_missing": False,
     "min_gain_to_split": 0.0,
     "boost_from_average": True,
+    "lambda_l2": 0.0,
 }
 
 #: Where each shared parameter ends up on each side, by the name it ends up
@@ -330,7 +376,9 @@ SHARED_PARAM_ROUTING = {
         ("train", "min_child_hess"),
     ),
     "lambda_l1": (("train", "lambda_l1"), ("train", "lambda_l1")),
-    "lambda_l2": (("train", "lambda_l2"), ("train", "lambda_l2")),
+    # No `lambda_l2` row: it left BASE_PARAMS on 2026-08-16 and neither
+    # engine is handed it any more. A row here with no BASE_PARAMS key
+    # would describe a route nothing travels.
     "max_bin": (("train", "max_bin"), ("dataset", "max_bin")),
     "use_missing": (("train", "use_missing"), ("dataset", "use_missing")),
 }
@@ -694,6 +742,17 @@ def lightgbm_params(spec, threads, extra=None):
                 f"{COMPARATOR_LABEL} and pinning either compares two "
                 "different binnings: see LIGHTGBM_STOCK_DEFAULTS and C9."
             )
+    # `lambda_l2` joins them as of 2026-08-16. It was pinned to 1.0 on both
+    # sides for as long as mojotrees's default was 1.0, and the pin came out
+    # with the default. Setting it here again puts the comparator back on a
+    # non-stock regularizer under a label that says stock.
+    if "lambda_l2" in (extra or {}):
+        raise ValueError(
+            "lambda_l2 was passed to the comparator. It is stock (0.0) in "
+            f"{COMPARATOR_LABEL} and in mojotrees, and pinning it compares "
+            "an arm labelled stock against a regularizer no default "
+            "produces: see LIGHTGBM_STOCK_DEFAULTS and the module docstring."
+        )
     shared = shared_params(spec, extra)
     params = {
         "objective": shared["objective"],
@@ -702,8 +761,9 @@ def lightgbm_params(spec, threads, extra=None):
         "learning_rate": shared["learning_rate"],
         "min_data_in_leaf": shared["min_data_in_leaf"],
         "min_sum_hessian_in_leaf": shared["min_child_hess"],
+        # No `lambda_l2`: stock on both sides since 2026-08-16, so it is
+        # recorded in LIGHTGBM_STOCK_DEFAULTS rather than passed.
         "lambda_l1": shared["lambda_l1"],
-        "lambda_l2": shared["lambda_l2"],
         "max_bin": shared["max_bin"],
         "use_missing": shared["use_missing"],
         "num_threads": int(threads),
@@ -746,8 +806,10 @@ def mojotrees_params(spec, device, extra=None):
         "learning_rate": shared["learning_rate"],
         "min_data_in_leaf": shared["min_data_in_leaf"],
         "min_child_hess": shared["min_child_hess"],
+        # No `lambda_l2`, for the same reason as on the LightGBM side: the
+        # estimator's own default is LightGBM's 0.0 now, so passing it
+        # would restate a default rather than align anything.
         "lambda_l1": shared["lambda_l1"],
-        "lambda_l2": shared["lambda_l2"],
         "device": device,
     }
     for key in CATEGORICAL_PARAMS:

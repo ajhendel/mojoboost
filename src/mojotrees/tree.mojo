@@ -139,8 +139,14 @@ from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 
 struct TreeParams(Copyable, Movable):
     """Tree growth hyperparameters. `lambda_reg` is LightGBM's lambda_l2 and
-    `lambda_l1` its lambda_l1; both default to LightGBM's own defaults except
-    lambda_reg, which mojotrees defaults to 1.0 (see README). `constraints`
+    `lambda_l1` its lambda_l1; both default to LightGBM's own default, which
+    is 0.0 for each. `lambda_reg` defaulted to 1.0 until 2026-08-16, the last
+    tree default in this library that was not LightGBM's; it made every
+    benchmark arm carry an explicit `lambda_l2` to keep the two engines on
+    one regularizer, and it is stock now, so nothing has to be pinned to
+    compare them.
+
+    `constraints`
     holds LightGBM's interaction_constraints and defaults to unconstrained.
     `feature_fraction`, `feature_fraction_bynode`, and
     `feature_fraction_seed` are LightGBM's feature subsampling parameters
@@ -229,11 +235,18 @@ struct TreeParams(Copyable, Movable):
 
     @staticmethod
     def default() -> TreeParams:
-        # LightGBM defaults (min_child_hess mirrors min_sum_hessian_in_leaf,
-        # lambda_l1 defaults to 0, interaction and monotonic constraints to
-        # none, both feature fractions to 1.0, and max_depth to -1, as in
-        # LightGBM).
-        return TreeParams(31, 20, 1.0, 1e-3, 0.0)
+        # LightGBM's stock defaults, every one of them, read from
+        # include/LightGBM/config.h at v4.7.0: num_leaves 31,
+        # min_data_in_leaf 20, lambda_l2 0.0 (`lambda_reg` here),
+        # min_sum_hessian_in_leaf 1e-3 (`min_child_hess`), lambda_l1 0.0.
+        # The remaining fields default in the signature above, also to
+        # LightGBM's values: max_depth -1, both feature fractions 1.0,
+        # interaction and monotonic constraints none.
+        #
+        # `tools/check_parity.py` asserts every number on this line against
+        # LightGBM's, so a default cannot drift off stock without failing a
+        # gate. Changing one is a change to every fit that did not set it.
+        return TreeParams(31, 20, 0.0, 1e-3, 0.0)
 
 
 struct Tree(Copyable, Movable):
