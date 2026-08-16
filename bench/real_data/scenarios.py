@@ -1529,6 +1529,57 @@ CATBOOST_LOSS = {
 }
 
 
+#: Scenarios where the CatBoost arm runs, but only up to a tier. Distinct
+#: from `CATBOOST_SCENARIO_SUPPORT`, which answers "can this arm run this
+#: problem at all"; this answers "at what size does running it stop being a
+#: measurement and start being a timeout".
+#:
+#: A cap is not a quality judgement about CatBoost and it is not a skip for
+#: convenience. It exists because an arm that times out is an *infrastructure
+#: failure*, and `run.py` reports infrastructure failure by refusing to give
+#: the run a quality verdict at all -- so one uncapped peer cell can take the
+#: exit code of a matrix whose comparator rows all succeeded. Declaring the
+#: bound up front turns that into a skip with a reason, which is a result.
+CATBOOST_TIER_CAP = {
+    "sparse_highdim": (
+        "smoke",
+        "the standard tier is 100,000 rows by 50,000 features and the large "
+        "tier is 200,000 by 500,000. CatBoost builds borders per feature and "
+        "grows symmetric trees over the full feature set, and neither shape "
+        "has been shown to complete here inside any timeout this harness "
+        "sets. The smoke tier, 5,000 by 2,000, is where the CatBoost row on "
+        "this scenario is a measurement rather than a timeout, so that is "
+        "where it runs. This is a declared bound, not an observed limit: "
+        "nobody has timed CatBoost at the standard tier to find out how far "
+        "over it goes",
+    ),
+}
+
+#: Tiers in increasing size, so a cap can be compared rather than matched.
+TIER_ORDER = ("smoke", "standard", "large")
+
+
+def catboost_tier_ok(scenario, tier):
+    """(ok, reason). Whether the CatBoost arm runs this scenario at `tier`.
+
+    Separate from `catboost_supports` on purpose. Support is a property of
+    the problem and does not vary with size; this varies only with size. A
+    caller that asks one and not the other gets a wrong answer in one
+    direction each, so `run.py` asks both.
+    """
+    scenario_id = scenario["id"] if isinstance(scenario, dict) else scenario
+    capped = CATBOOST_TIER_CAP.get(scenario_id)
+    if capped is None:
+        return True, None
+    max_tier, reason = capped
+    if TIER_ORDER.index(tier) <= TIER_ORDER.index(max_tier):
+        return True, None
+    return False, (
+        f"the CatBoost arm on {scenario_id} is capped at the {max_tier} "
+        f"tier and this is {tier}: {reason}"
+    )
+
+
 def catboost_supports(scenario):
     """(runs, reason). Whether the CatBoost arm runs this scenario.
 

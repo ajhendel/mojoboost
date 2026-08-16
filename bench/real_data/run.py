@@ -57,6 +57,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import backend_proof  # noqa: E402
+# Imported for `ENGINES` alone, so that `--engine` offers exactly the names
+# worker.py can build and the two lists cannot drift into a flag that parses
+# and then fails in the child. It costs 0.077s and pulls in no engine
+# library: every one of those imports sits inside a method.
+import engines  # noqa: E402
 import envinfo  # noqa: E402
 import scenarios  # noqa: E402
 
@@ -105,6 +110,13 @@ def build_matrix(args):
             for engine in args.engine:
                 if engine not in spec["engines"]:
                     continue
+                if engine in ("catboost", "mojotrees_catboost_mode"):
+                    ok, reason = scenarios.catboost_tier_ok(spec, args.tier)
+                    if not ok:
+                        jobs.append(
+                            _skip(scenario_id, engine, device, args, reason)
+                        )
+                        continue
                 if device != "cpu":
                     if device not in spec["devices"]:
                         jobs.append(
@@ -479,8 +491,11 @@ def main(argv=None):
     parser.add_argument("--tier", choices=scenarios.TIERS, default="standard")
     parser.add_argument("--variant", choices=("auto", "real", "synthetic"), default="auto")
     parser.add_argument(
-        "--engine", action="append", choices=("mojotrees", "lightgbm"),
-        help="repeatable; both by default",
+        "--engine", action="append", choices=tuple(engines.ENGINES),
+        help="repeatable; mojotrees and lightgbm by default. The peer arms "
+             "'catboost' and 'mojotrees_catboost_mode' are selectable but "
+             "never default: the headline is against the comparator and a "
+             "peer arm must not be able to join it by accident",
     )
     parser.add_argument(
         "--device", action="append", choices=("cpu", "gpu"),
