@@ -1354,6 +1354,66 @@ since integer accumulation cannot absorb an addend.
 
 ## 8. Candidate 5: the split gain, its cancellation, and the form that removes it
 
+> **STOP. The cross form below is INVALID when `lambda_l1 > 0`, and this
+> section as originally written never mentions L1 anywhere.**
+>
+> The identity it rests on requires `GL + GR = G`. Under L1 the gain is built
+> from the soft-thresholded `T(GL)`, `T(GR)` and `T(G)`, and **soft
+> thresholding is not additive**: `T(GL) + T(GR) != T(G)` in general. The
+> algebra that cancels the parent term therefore does not hold.
+>
+> Applied anyway this is not rounding noise, it is a **systematic bias**.
+> Measured by the GPU campaign: **1.6e-04 relative error at a parent-to-gain
+> ratio of 293, where the shipped form sits at 1.0e-05** — and the median and
+> the p99 agree to two figures, which is what a bias looks like and is not
+> what rounding looks like.
+>
+> **Any implementation must refuse itself whenever `lambda_l1 != 0` and fall
+> back to the shipped form.** The GPU arm does exactly that, landed at
+> `09b35f6` on `perf-round-2`, implemented in `gpu_split_search.mojo` only.
+>
+> No CPU lane has implemented this and none should without reading the four
+> corrections immediately below.
+
+### Four corrections to this section, from the campaign that implemented it
+
+Reported by the GPU campaign after building the arm. **Recorded here rather
+than rewritten into the analysis below**, so that the original reasoning stays
+legible next to what implementing it actually taught. Provenance: measured by
+that campaign on its own instrument, relayed here, **not independently
+verified by the CPU campaign**.
+
+1. **It does not cover the categorical many-versus-many walk.** That walk
+   scores children at `lambda_l2 + cat_l2` while the parent sits at
+   `lambda_l2`. The general offset is `G^2 (2a - lambda_l2) / (S (H +
+   lambda_l2))`.
+2. **"Never worse" is too strong.** At a centered node the cross form is a few
+   percent *worse* on the median.
+3. **The three obligations this section states all dissolve.** Sending
+   `best_gain` to negative infinity, relocating `min_gain_to_split`, and
+   recomputing `SPLIT_TIE_RELATIVE` are all unnecessary: converting back to
+   gain units costs one node constant, and that constant cancels against
+   `lambda_l2 / (H + lambda_l2) * P`, not against `P`.
+4. **The effect is larger than the "up to 20x" stated below** — about **1000x
+   on the median** over all candidates.
+
+### Two related retractions carried here so they are not lost
+
+- **The "free accuracy win" from dropping `- parent_score` stays retracted.**
+  It recovers nothing. Rounding is monotone, so subtracting a common constant
+  preserves order, and Sterbenz makes that subtraction exactly representable
+  in the near-tie regime. The section already says this; it is repeated here
+  because the claim was relayed between campaigns once before being withdrawn.
+- **Candidate 3 landing removed two of candidate 6's reasons.** With a
+  power-of-two scale, dequantization is exact *and* the float subtraction is
+  itself exact by Sterbenz whenever the left child holds between half and
+  twice the total. What survives is stronger and independent of scale shape:
+  the error is the two `Int32 -> Float32` casts, each rounding by `2^-24`
+  **of the node total**. A revived fixed-point lane should build from that
+  argument and not from this budget's.
+
+---
+
 This candidate was not in the original brief. It is also the one where I got
 the analysis wrong twice before getting it right, so the reasoning is set out
 in full rather than just the conclusion.
