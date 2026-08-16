@@ -1292,6 +1292,533 @@ def _quantize_grad_hess_kernel(
         )
 
 
+# --- The row walk, shared by both accumulation strategies ----------------
+#
+# Rows one thread keeps in flight at once inside the histogram row loop.
+#
+# What this constant is for. The row loop's per-row work is a chain of
+# dependent loads: read the row index out of the permutation, use it to
+# gather the quantized gradient pair, use it again to gather this slot's bin
+# byte, and only then issue the shared atomics. Written one row at a time,
+# each of those loads has to complete before the next address can be formed,
+# so a thread has at most one memory request outstanding at any moment and
+# the loop runs at the latency of the gather rather than at the bandwidth of
+# it. Walking `HIST_ROW_UNROLL` rows per iteration, with every load of a
+# stage issued before any load of the next stage is consumed, puts that many
+# requests in flight per thread instead of one.
+#
+# Why 4 and not 2 or 8. This is a guess and it should be read as one. Four
+# rows costs four Int registers for the row indices plus three Int32 arrays
+# of four, which is small against what a threadgroup already holds, and four
+# is the smallest depth that covers a three-stage chain with one to spare.
+# Nothing on this machine measured the right value, and nothing could
+# without a device counter this backend does not expose. Changing it is a
+# one-line edit and a rebuild, and the result is bit-identical at every
+# value (see `_hist_rows_step`), so an A/B costs two builds and no
+# correctness argument.
+#
+# `GpuActiveRows.set_row_unroll(False)` puts the loop back to one row per
+# iteration at run time without a second instantiation, which is the arm a
+# benchmark holds against this one; see `_hist_accumulate_rows`.
+comptime HIST_ROW_UNROLL = 4
+
+
+# --- The blocked row-major stripe, and why it is not here ----------------
+#
+# `docs/design/CLEANSHEET_GPU.md` section 3.3 proposes replacing the
+# feature-major bin matrix with stripes of `W` features stored row-major,
+# `W = floor(threadgroup_memory / (n_bins * cell_bytes))`, so that one
+# gathered read of a padded `W`-byte record serves `W` features instead of
+# one. Its traffic model puts a whole tree at 752 MB against today's 2650 MB
+# at a 64-byte cache line, and 1136 MB at 128. That is the largest single
+# lever anyone has costed on this backend and it is not built here. The
+# reasons are worth writing down, because the next lane to reach for it
+# should reach for the measurement first and not for the layout.
+#
+# **It is not a change to this file.** The row loop above reads `bins` as
+# `feature * n_rows + row`. Every other reader of that buffer would have to
+# change with it or a second copy would have to be maintained, and the
+# readers are not in one place: `_partition_kernel` and `_flag_scan_kernel`
+# in this module, the whole of `gpu_binned_layout.mojo`, the leaf-id scan in
+# `histogram_gpu.mojo`, `gpu_split_search.mojo`, `gpu_sparse.mojo`,
+# `gpu_categorical.mojo`, `gpu_leaf_batching.mojo`, `gpu_multiclass_batch.mojo`,
+# and the CPU builder in `histogram.mojo` that the hybrid replica has to stay
+# bit-identical to. A half-applied stripe layout, where some kernels read the
+# striped copy and others read the column-major one, is a much worse state
+# than none: the two agree until a lane forgets to convert one of them, and
+# then one node's histogram is wrong on some shapes and not others.
+#
+# **The arithmetic that motivates it turns on a number nobody here has
+# measured.** The whole 3.5x-versus-2.3x spread in that section is the cache
+# line size, and section 8 of the same document lists it as unknown. There is
+# no counter on an Apple M4 that reports it and no documented figure this
+# project trusts. So the honest order of work is: measure the line first,
+# then decide whether the layout is worth its blast radius.
+#
+# **The measurement, which is small and is not this lane's file.** A
+# standalone kernel that gathers one 4-byte word per thread from a buffer far
+# larger than any cache, at a stride `S` swept over 4, 8, 16, 32, 64, 128,
+# and 256 bytes, and reports achieved bytes per second. Useful traffic is
+# constant across the sweep and real traffic is `max(S, L)` per gather, so
+# the achieved rate falls in proportion to `S` above the line size and is
+# flat at or below it. The knee is `L`. Two further points are worth taking
+# in the same harness, because they are the assumptions the stripe rests on
+# and not merely the line size: whether a 16-byte gathered read costs the
+# same as a 4-byte one at the same stride, which is the specific claim
+# section 3.3 flags as its least certain, and whether padding a record to a
+# power of two changes the answer. That harness belongs in `bench/`, which
+# this lane does not own, and it should be written before a single byte of a
+# second bin layout is.
+#
+# Nothing above is an argument that the stripe is wrong. It is an argument
+# that it is a project and not a patch, and that a cheap experiment stands
+# between here and knowing which of the two numbers in the model applies.
+
+
+# The three shared accumulation planes, as `stack_allocation` hands them
+# back. Named here because the row walk takes them as arguments rather than
+# allocating them, and a threadgroup pointer's type has to be written out to
+# cross a function boundary.
+comptime _SharedI32 = Pointer[
+    Int32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+]
+
+# Per-thread scratch: the column bases, the rows in flight, and the values
+# gathered for them. Every index into these arrays is a compile-time
+# constant, so they exist to be promoted into registers and never to be
+# addressed.
+comptime _LocalInt = Pointer[
+    Int, MutUntrackedOrigin, address_space = AddressSpace.GENERIC
+]
+comptime _LocalI32 = Pointer[
+    Int32, MutUntrackedOrigin, address_space = AddressSpace.GENERIC
+]
+
+
+@always_inline
+def _hist_rows_step[
+    GROUP: Int, U: Int, CELIDE: Bool, QUANT: Bool
+](
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
+    sg: _SharedI32,
+    sh: _SharedI32,
+    sc: _SharedI32,
+    col: _LocalInt,
+    rr: _LocalInt,
+    gv: _LocalI32,
+    hv: _LocalI32,
+    bv: _LocalI32,
+    owned: Int,
+    nb: Int,
+    row_begin: Int,
+    j: Int,
+    stride: Int,
+    g_scale: Float32,
+    h_scale: Float32,
+):
+    """Accumulate `U` rows of one thread's stride into the shared planes.
+
+    The rows are `j, j + stride, ..., j + (U - 1) * stride` of the node's
+    range, and the caller guarantees every one of them is inside the tile.
+    Written in four stages, each of which issues all `U` of its loads before
+    the next stage consumes any of them:
+
+    1. `U` row indices out of the permutation.
+    2. `U` quantized gradient pairs, gathered by those indices.
+    3. per owned slot, `U` bin bytes out of that slot's column.
+    4. per owned slot, `U` shared atomic triples.
+
+    Stages 2 and 3 both depend on stage 1 and stage 4 depends on stage 3, so
+    the chain is three deep however large `U` is; what `U` buys is `U`
+    independent requests at each level of it rather than one.
+
+    **Why this cannot change a histogram.** Every instantiation performs the
+    same set of adds. For each (row, feature) in the tile it adds the same
+    three quantized values -- the row's gradient, its hessian, and one -- to
+    the same three shared cells, chosen by the same bin byte read from the
+    same address. What `U` changes is only the order in which those adds are
+    issued and the order in which the loads that feed them are issued.
+    Accumulation is Int32 throughout and integer addition is associative and
+    commutative, so a reordering of the adds cannot move a bit. It is the
+    identical argument `_range_hist_atomic_kernel` already makes for `GROUP`
+    and `BIN_CAP`, applied to a third launch-shape parameter, and it is
+    structural rather than a tolerance.
+
+    The one thing that would break it is arithmetic that is not integer, and
+    there is exactly one such site: the Float32 arm's
+    `Int32(round(x * scale))`. That expression is reproduced here character
+    for character from the loop it replaces, on purpose. `docs/NUMERICS.md`
+    section 5.6 records why it is structurally immune to contraction (the
+    multiply is consumed by `round`, so there is no add for it to fuse
+    into), and that argument survives unrolling only because the expression
+    survives unrolling. A future edit that hoists the multiply, or that
+    lets an add reach it, breaks a property this file depends on. The
+    quantized arm, which is the default, has no floating-point arithmetic in
+    it at all.
+
+    **The gradient pair is one load.** `_quantize_grad_hess_kernel` writes
+    the two quantized words interleaved, so `gq[2r]` and `gq[2r + 1]` are
+    adjacent and, since the pair starts at byte `8r` of a device allocation,
+    8-byte aligned. A width-2 load therefore reads both in one instruction
+    where the loop it replaces issued two. It reads the identical eight bytes
+    and assigns them to the identical two variables, so it cannot change a
+    value; it is one fewer load and one fewer address computation per row.
+    The elided-hessian arm reads only the gradient word and keeps the scalar
+    load, because the second word is not wanted there.
+
+    **What stays 64-bit, and why.** The shared-plane index `s` is computed in
+    Int32 because it is bounded by `GROUP * BIN_CAP`, at most 16 * 256 =
+    4096, by construction rather than by data. The other three index
+    expressions in this loop are deliberately left in Int, and a later reader
+    should not narrow them:
+
+    - `col[k] + r` is `feature * n_rows + row`, which reaches
+      `n_features * n_rows` and overflows Int32 on any dataset past about
+      2.1 billion cells.
+    - `2 * r` reaches `2 * n_rows`, and `MAX_ROWS` in this module is
+      `Int32.MAX`, so it overflows for any fit past 2^30 rows.
+    - `row_begin + j + u * stride` is bounded by `n_rows`, so it would fit,
+      but it is formed once per row against three formed per (row, feature)
+      and is not worth a special case.
+
+    Whether narrowing `s` removes any instruction at all depends on whether
+    the Metal compiler was already narrowing it, which nothing on this
+    machine can show. It is written narrow because the bound is a
+    compile-time constant and writing it wide asserted something the code
+    did not need.
+    """
+    # Stage one: the row indices.
+    comptime for u in range(U):
+        rr[unsafe_offset=u] = Int(
+            rows[unsafe_offset = row_begin + j + u * stride][0]
+        )
+
+    # Stage two: the quantized gradient (and hessian) for each of them.
+    comptime if QUANT:
+        comptime for u in range(U):
+            comptime if CELIDE:
+                gv[unsafe_offset=u] = gq[
+                    unsafe_offset = 2 * rr[unsafe_offset=u]
+                ][0]
+            else:
+                var pair = gq.unsafe_load[width=2](2 * rr[unsafe_offset=u])
+                gv[unsafe_offset=u] = pair[0]
+                hv[unsafe_offset=u] = pair[1]
+    else:
+        comptime for u in range(U):
+            gv[unsafe_offset=u] = Int32(
+                round(
+                    grad[unsafe_offset = rr[unsafe_offset=u]][0] * g_scale
+                )
+            )
+            comptime if not CELIDE:
+                hv[unsafe_offset=u] = Int32(
+                    round(
+                        hess[unsafe_offset = rr[unsafe_offset=u]][0] * h_scale
+                    )
+                )
+
+    # Stages three and four, one owned slot at a time.
+    comptime for k in range(GROUP):
+        if k < owned:
+            var base = col[unsafe_offset=k]
+            var lift = Int32(k * nb)
+            comptime for u in range(U):
+                bv[unsafe_offset=u] = Int32(
+                    Int(bins[unsafe_offset = base + rr[unsafe_offset=u]])
+                )
+            comptime for u in range(U):
+                var s = Int(lift + bv[unsafe_offset=u][0])
+                _ = Atomic.fetch_add(
+                    sg.unsafe_offset(s), gv[unsafe_offset=u][0]
+                )
+                comptime if not CELIDE:
+                    _ = Atomic.fetch_add(
+                        sh.unsafe_offset(s), hv[unsafe_offset=u][0]
+                    )
+                _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+
+
+@always_inline
+def _hist_accumulate_rows[
+    GROUP: Int, UNROLL: Int, CELIDE: Bool, QUANT: Bool
+](
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    sg: _SharedI32,
+    sh: _SharedI32,
+    sc: _SharedI32,
+    slot0: Int,
+    owned: Int,
+    nb: Int,
+    nr: Int,
+    row_begin: Int,
+    tile_begin: Int,
+    tile_end: Int,
+    g_scale: Float32,
+    h_scale: Float32,
+    unrolled: Bool,
+):
+    """One thread's whole walk over its share of one tile.
+
+    This is the row loop both `_range_hist_atomic_kernel` and
+    `_range_hist_partial_kernel` run, factored out so there is one copy of it
+    rather than eight. The two kernels differ in what they do with the shared
+    planes afterwards, not in how they fill them, and the four arms each of
+    them used to write out longhand (`const_hess` by `use_quant`) are the two
+    comptime flags here. Selecting them at compile time rather than
+    branching per row is what the two longhand loops bought and it is kept:
+    the caller picks one of four instantiations from two block-uniform
+    runtime flags, once, outside the loop.
+
+    **The walk.** Thread `tid` owns rows `tile_begin + tid`,
+    `+ block_dim.x`, `+ 2 * block_dim.x`, ... of the range, up to
+    `tile_end`. That set is unchanged from the one-row-per-iteration loop
+    this replaces. The main loop takes `UNROLL` of them per iteration while
+    a full group remains, and the tail loop takes the rest one at a time, so
+    the union of the two is exactly the arithmetic progression above with no
+    row visited twice and none dropped. The tail is the same
+    `_hist_rows_step` at `U = 1`, so the two cannot drift apart under a later
+    edit.
+
+    **`unrolled`.** Setting it false collapses the main loop's bound to the
+    thread's first row, so the loop body never runs and the tail loop does
+    the whole walk one row at a time. That is precisely the shape this
+    module shipped before this lane, reachable at run time and therefore
+    interleavable inside one process, which is the only protocol that
+    compares anything on a machine whose device timings drift several-fold
+    between time windows. It costs one block-uniform branch outside the loop
+    and no second kernel instantiation, which matters: this family is already
+    forty instantiations and the const-hessian flag was left a runtime flag
+    for exactly that reason.
+
+    Both arms produce the identical histogram, for the reason `_hist_rows_step`
+    argues in full, so this is a launch-shape knob and never a numeric one.
+
+    **What is claimed, and what is not.** Claimed, by counting: the main loop
+    executes one loop test and one induction add per `UNROLL` rows instead of
+    per row, and the quantized non-elided arm issues one 8-byte load per row
+    where the loop it replaces issued two 4-byte loads. Not claimed: any
+    speedup. The unroll raises the number of live registers in the row loop
+    by roughly `UNROLL` times the values a single row needs, and threadgroup
+    residency on this backend is bounded by things this project cannot query.
+    If the unroll loses, that is how it loses, and `set_row_unroll(False)` is
+    the arm that shows it.
+    """
+    var tid = Int(thread_idx.x)
+    var stride = Int(block_dim.x)
+
+    # One column base per owned slot, read once and spent for every row.
+    # The unowned tail entries are zeroed rather than left undefined so that
+    # a comptime-unrolled body which computes an address it never uses --
+    # which is what `if k < owned` leaves the compiler free to do -- cannot
+    # form one out of stack garbage.
+    var col = stack_allocation[GROUP, Int]()
+    comptime for k in range(GROUP):
+        col[unsafe_offset=k] = 0
+        if k < owned:
+            col[unsafe_offset=k] = (
+                Int(feat_ids[unsafe_offset = slot0 + k][0]) * nr
+            )
+
+    # The rows in flight and what was gathered for them. Allocated once,
+    # outside both loops, so there is one alloca per thread and not one per
+    # iteration.
+    var rr = stack_allocation[UNROLL, Int]()
+    var gv = stack_allocation[UNROLL, Scalar[DType.int32]]()
+    var hv = stack_allocation[UNROLL, Scalar[DType.int32]]()
+    var bv = stack_allocation[UNROLL, Scalar[DType.int32]]()
+
+    var j = tile_begin + tid
+    # `limit` is where the last full group of `UNROLL` rows can start. Left
+    # at `j` when the unroll is off or unavailable, which skips the main
+    # loop entirely without a second code path.
+    var limit = j
+    comptime if UNROLL > 1:
+        if unrolled:
+            limit = tile_end - (UNROLL - 1) * stride
+    while j < limit:
+        _hist_rows_step[GROUP, UNROLL, CELIDE, QUANT](
+            bins,
+            rows,
+            grad,
+            hess,
+            gq,
+            sg,
+            sh,
+            sc,
+            col,
+            rr,
+            gv,
+            hv,
+            bv,
+            owned,
+            nb,
+            row_begin,
+            j,
+            stride,
+            g_scale,
+            h_scale,
+        )
+        j += UNROLL * stride
+    while j < tile_end:
+        _hist_rows_step[GROUP, 1, CELIDE, QUANT](
+            bins,
+            rows,
+            grad,
+            hess,
+            gq,
+            sg,
+            sh,
+            sc,
+            col,
+            rr,
+            gv,
+            hv,
+            bv,
+            owned,
+            nb,
+            row_begin,
+            j,
+            stride,
+            g_scale,
+            h_scale,
+        )
+        j += stride
+
+
+@always_inline
+def _hist_accumulate_dispatch[
+    GROUP: Int, UNROLL: Int
+](
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    sg: _SharedI32,
+    sh: _SharedI32,
+    sc: _SharedI32,
+    slot0: Int,
+    owned: Int,
+    nb: Int,
+    nr: Int,
+    row_begin: Int,
+    tile_begin: Int,
+    tile_end: Int,
+    g_scale: Float32,
+    h_scale: Float32,
+    celide: Bool,
+    quant: Bool,
+    unrolled: Bool,
+):
+    """Resolve the two runtime flags into one of four comptime arms, once,
+    above the row loop.
+
+    Both flags are launch arguments and therefore block-uniform, so this is a
+    scalar branch taken once per threadgroup and not a divergence. It exists
+    so that the four arms are written once here instead of once in each of
+    the two kernels."""
+    if celide:
+        if quant:
+            _hist_accumulate_rows[GROUP, UNROLL, True, True](
+                bins,
+                rows,
+                grad,
+                hess,
+                gq,
+                feat_ids,
+                sg,
+                sh,
+                sc,
+                slot0,
+                owned,
+                nb,
+                nr,
+                row_begin,
+                tile_begin,
+                tile_end,
+                g_scale,
+                h_scale,
+                unrolled,
+            )
+        else:
+            _hist_accumulate_rows[GROUP, UNROLL, True, False](
+                bins,
+                rows,
+                grad,
+                hess,
+                gq,
+                feat_ids,
+                sg,
+                sh,
+                sc,
+                slot0,
+                owned,
+                nb,
+                nr,
+                row_begin,
+                tile_begin,
+                tile_end,
+                g_scale,
+                h_scale,
+                unrolled,
+            )
+    elif quant:
+        _hist_accumulate_rows[GROUP, UNROLL, False, True](
+            bins,
+            rows,
+            grad,
+            hess,
+            gq,
+            feat_ids,
+            sg,
+            sh,
+            sc,
+            slot0,
+            owned,
+            nb,
+            nr,
+            row_begin,
+            tile_begin,
+            tile_end,
+            g_scale,
+            h_scale,
+            unrolled,
+        )
+    else:
+        _hist_accumulate_rows[GROUP, UNROLL, False, False](
+            bins,
+            rows,
+            grad,
+            hess,
+            gq,
+            feat_ids,
+            sg,
+            sh,
+            sc,
+            slot0,
+            owned,
+            nb,
+            nr,
+            row_begin,
+            tile_begin,
+            tile_end,
+            g_scale,
+            h_scale,
+            unrolled,
+        )
+
+
 def _range_hist_atomic_kernel[
     GROUP: Int, BIN_CAP: Int
 ](
@@ -1317,6 +1844,7 @@ def _range_hist_atomic_kernel[
     const_hess: Int32,
     desc: MutPointer[Int32, MutAnyOrigin],
     use_desc: Int32,
+    row_unroll: Int32,
 ):
     """One node's histogram over a compacted row range, accumulated in
     threadgroup memory and folded into the output with global atomics.
@@ -1371,14 +1899,23 @@ def _range_hist_atomic_kernel[
     `GROUP * n_bins <= GROUP * BIN_CAP` and the zeroing walk covers exactly
     the cells the flush will read.
 
-    **The two row loops.** `use_quant` selects between the pre-quantized
-    interleaved buffer `_quantize_grad_hess_kernel` writes and the two Float32
-    planes. They are two loops rather than one loop with a branch in it so the
-    default path spends no floating-point arithmetic in the row loop at all,
-    and one runtime flag rather than a third comptime parameter because
-    doubling forty instantiations to eighty is compile time every build on
-    every backend pays. The two produce bit-identical histograms by
-    construction; see `_quantize_grad_hess_kernel`.
+    **The row loop.** It lives in `_hist_accumulate_rows`, shared with
+    `_range_hist_partial_kernel`, because the two kernels differ in what they
+    do with the shared planes after the barrier and not at all in how they
+    fill them. `use_quant` selects between the pre-quantized interleaved
+    buffer `_quantize_grad_hess_kernel` writes and the two Float32 planes,
+    and it does so by picking one of four comptime arms above the loop rather
+    than by branching per row, so the default path spends no floating-point
+    arithmetic in the row loop at all. It is a runtime flag rather than a
+    third comptime parameter because doubling forty instantiations to eighty
+    is compile time every build on every backend pays. The two produce
+    bit-identical histograms by construction; see
+    `_quantize_grad_hess_kernel`.
+
+    `row_unroll` is a second such flag, selecting how many rows one thread
+    keeps in flight; both settings visit the same rows and add the same
+    integers in a different order, which cannot change a sum. See
+    `_hist_accumulate_rows` and `_hist_rows_step` for the argument in full.
 
     **Fused subtraction.** With `do_sub`, the flush also subtracts what it
     added from the slot `sub_offset` words away, which is the sibling
@@ -1532,79 +2069,44 @@ def _range_hist_atomic_kernel[
         b += block_dim.x
     barrier()
 
-    # One feature id and one column base per owned slot, read once. The loop
-    # is unrolled so both arrays are indexed by a compile-time constant and
-    # stay in registers rather than spilling to local memory.
+    # One feature id per owned slot, read once and used by the flush. The
+    # loop is unrolled so the array is indexed by a compile-time constant and
+    # stays in registers rather than spilling to local memory. The column
+    # bases the row loop needs are read the same way inside
+    # `_hist_accumulate_rows`, which is the only place they are wanted.
     var fid = stack_allocation[GROUP, Int]()
-    var col = stack_allocation[GROUP, Int]()
     comptime for k in range(GROUP):
         fid[unsafe_offset=k] = 0
-        col[unsafe_offset=k] = 0
         if k < owned:
-            var f = Int(feat_ids[unsafe_offset = slot0 + k][0])
-            fid[unsafe_offset=k] = f
-            col[unsafe_offset=k] = f * nr
+            fid[unsafe_offset=k] = Int(feat_ids[unsafe_offset = slot0 + k][0])
 
-    if celide:
-        # Two atomics per (row, feature). The hessian is neither read nor
-        # accumulated: it is the same Int32 for every row, so the count plane
-        # already carries everything the hessian plane would have.
-        if Int(use_quant) != 0:
-            var j = tile_begin + tid
-            while j < tile_end:
-                var r = Int(rows[unsafe_offset = row_begin + j][0])
-                var gqv = gq[unsafe_offset = 2 * r][0]
-                comptime for k in range(GROUP):
-                    if k < owned:
-                        var s = k * nb + Int(
-                            bins[unsafe_offset = col[unsafe_offset=k] + r]
-                        )
-                        _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
-                        _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
-                j += block_dim.x
-        else:
-            var j = tile_begin + tid
-            while j < tile_end:
-                var r = Int(rows[unsafe_offset = row_begin + j][0])
-                var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-                comptime for k in range(GROUP):
-                    if k < owned:
-                        var s = k * nb + Int(
-                            bins[unsafe_offset = col[unsafe_offset=k] + r]
-                        )
-                        _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
-                        _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
-                j += block_dim.x
-    elif Int(use_quant) != 0:
-        var j = tile_begin + tid
-        while j < tile_end:
-            var r = Int(rows[unsafe_offset = row_begin + j][0])
-            var gqv = gq[unsafe_offset = 2 * r][0]
-            var hqv = gq[unsafe_offset = 2 * r + 1][0]
-            comptime for k in range(GROUP):
-                if k < owned:
-                    var s = k * nb + Int(
-                        bins[unsafe_offset = col[unsafe_offset=k] + r]
-                    )
-                    _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
-                    _ = Atomic.fetch_add(sh.unsafe_offset(s), hqv)
-                    _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
-            j += block_dim.x
-    else:
-        var j = tile_begin + tid
-        while j < tile_end:
-            var r = Int(rows[unsafe_offset = row_begin + j][0])
-            var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-            var hqv = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-            comptime for k in range(GROUP):
-                if k < owned:
-                    var s = k * nb + Int(
-                        bins[unsafe_offset = col[unsafe_offset=k] + r]
-                    )
-                    _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
-                    _ = Atomic.fetch_add(sh.unsafe_offset(s), hqv)
-                    _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
-            j += block_dim.x
+    # `celide` takes two atomics per (row, feature) instead of three. The
+    # hessian is neither read nor accumulated: it is the same Int32 for every
+    # row, so the count plane already carries everything the hessian plane
+    # would have.
+    _hist_accumulate_dispatch[GROUP, HIST_ROW_UNROLL](
+        bins,
+        rows,
+        grad,
+        hess,
+        gq,
+        feat_ids,
+        sg,
+        sh,
+        sc,
+        slot0,
+        owned,
+        nb,
+        nr,
+        row_begin,
+        tile_begin,
+        tile_end,
+        g_scale,
+        h_scale,
+        celide,
+        Int(use_quant) != 0,
+        Int(row_unroll) != 0,
+    )
     barrier()
 
     var sub = Int(do_sub) != 0
@@ -1664,6 +2166,7 @@ def _range_hist_partial_kernel[
     h_scale: Float32,
     use_quant: Int32,
     const_hess: Int32,
+    row_unroll: Int32,
 ):
     """The tiled twin of `_range_hist_atomic_kernel`: the same threadgroup
     accumulation, written to a per-(tile, slot) partial slot instead of folded
@@ -1671,7 +2174,10 @@ def _range_hist_partial_kernel[
 
     Same two comptime parameters and the same rules for them, so everything
     the atomic kernel's docstring argues about capacity, group width,
-    exactness, tail blocks, and the two row loops holds here unchanged. What
+    exactness, tail blocks, and the row loop holds here unchanged; the row
+    loop is not merely equivalent but literally the same code, since both
+    kernels call `_hist_accumulate_dispatch`. `row_unroll` reaches it from
+    here for the same reason and with the same guarantee. What
     is particular to this kernel is the partial layout, and it is untouched:
     a block owning several slots writes the same per-slot
     `[grad | hess | count]` slices that as many one-slot blocks would have
@@ -1757,76 +2263,34 @@ def _range_hist_partial_kernel[
         b += block_dim.x
     barrier()
 
-    var col = stack_allocation[GROUP, Int]()
-    comptime for k in range(GROUP):
-        col[unsafe_offset=k] = 0
-        if k < owned:
-            col[unsafe_offset=k] = (
-                Int(feat_ids[unsafe_offset = slot0 + k][0]) * nr
-            )
-
     var tile_begin = t * Int(rows_per_tile)
     var tile_end = tile_begin + Int(rows_per_tile)
     if tile_end > n:
         tile_end = n
 
-    if celide:
-        if Int(use_quant) != 0:
-            var j = tile_begin + tid
-            while j < tile_end:
-                var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-                var gqv = gq[unsafe_offset = 2 * r][0]
-                comptime for k in range(GROUP):
-                    if k < owned:
-                        var s = k * nb + Int(
-                            bins[unsafe_offset = col[unsafe_offset=k] + r]
-                        )
-                        _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
-                        _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
-                j += block_dim.x
-        else:
-            var j = tile_begin + tid
-            while j < tile_end:
-                var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-                var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-                comptime for k in range(GROUP):
-                    if k < owned:
-                        var s = k * nb + Int(
-                            bins[unsafe_offset = col[unsafe_offset=k] + r]
-                        )
-                        _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
-                        _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
-                j += block_dim.x
-    elif Int(use_quant) != 0:
-        var j = tile_begin + tid
-        while j < tile_end:
-            var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-            var gqv = gq[unsafe_offset = 2 * r][0]
-            var hqv = gq[unsafe_offset = 2 * r + 1][0]
-            comptime for k in range(GROUP):
-                if k < owned:
-                    var s = k * nb + Int(
-                        bins[unsafe_offset = col[unsafe_offset=k] + r]
-                    )
-                    _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
-                    _ = Atomic.fetch_add(sh.unsafe_offset(s), hqv)
-                    _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
-            j += block_dim.x
-    else:
-        var j = tile_begin + tid
-        while j < tile_end:
-            var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-            var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-            var hqv = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-            comptime for k in range(GROUP):
-                if k < owned:
-                    var s = k * nb + Int(
-                        bins[unsafe_offset = col[unsafe_offset=k] + r]
-                    )
-                    _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
-                    _ = Atomic.fetch_add(sh.unsafe_offset(s), hqv)
-                    _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
-            j += block_dim.x
+    _hist_accumulate_dispatch[GROUP, HIST_ROW_UNROLL](
+        bins,
+        rows,
+        grad,
+        hess,
+        gq,
+        feat_ids,
+        sg,
+        sh,
+        sc,
+        slot0,
+        owned,
+        nb,
+        nr,
+        Int(begin),
+        tile_begin,
+        tile_end,
+        g_scale,
+        h_scale,
+        celide,
+        Int(use_quant) != 0,
+        Int(row_unroll) != 0,
+    )
     barrier()
 
     # The count plane is last in both layouts, so its index is
@@ -2296,6 +2760,27 @@ struct GpuActiveRows(Movable):
     # hessians happen to be equal is not the same thing.
     var constant_hessian: Bool
     var const_hessian_allowed: Bool
+    # --- hist-kernel-margin lane ---
+    # Whether the histogram row loop walks `HIST_ROW_UNROLL` rows per
+    # iteration with the loads of each stage issued together, or one row per
+    # iteration as it did before that lane. A launch-shape knob and nothing
+    # else: both arms visit the same rows and add the same integers, only in
+    # a different order, and integer addition does not care
+    # (`_hist_rows_step`).
+    #
+    # On by default, on the same footing the primitive scan arm is on by
+    # default: it is strictly fewer instructions and, on the quantized arm,
+    # strictly fewer loads for the identical result, so it does not need a
+    # measurement to justify being the default. What it is not is free of
+    # risk -- it raises the live register count in the row loop, and
+    # threadgroup residency on this backend is bounded by things this project
+    # cannot query -- which is why `set_row_unroll` exists.
+    #
+    # No environment variable, for the reason `partition_block_cap` gives:
+    # the arm belongs in the call, because an A/B that reads its arm from the
+    # environment has already once in this repository run one arm under the
+    # other's label.
+    var row_unroll: Bool
 
     def __init__(
         out self,
@@ -2427,6 +2912,8 @@ struct GpuActiveRows(Movable):
         # honored, which is the off switch a bisection wants.
         self.const_hessian_allowed = _env_int("MOJOTREES_CONST_HESSIAN", 1) != 0
         self.constant_hessian = False
+        # The unrolled row walk is the default; see the field.
+        self.row_unroll = True
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -2503,6 +2990,31 @@ struct GpuActiveRows(Movable):
         """
         self.quantized_gradients = on
         self.quant_valid = False
+
+    def set_row_unroll(mut self, on: Bool):
+        """Whether the histogram row loop keeps `HIST_ROW_UNROLL` rows in
+        flight or walks one row per iteration.
+
+        Off is the shape this module shipped before the hist-kernel-margin
+        lane, and it is reachable at run time rather than through a second
+        kernel instantiation, so a benchmark can hold both arms in one
+        process. That matters more here than it usually would: this machine's
+        device timings drift several-fold between time windows, so only
+        interleaved arms compare, and a comptime-only knob would have forced
+        a two-build comparison instead.
+
+        It cannot change a histogram. Both arms visit the same rows of the
+        same range and add the same fixed-point integers into the same bins;
+        only the order of the adds and of the loads that feed them differs,
+        and integer addition is associative and commutative. See
+        `_hist_rows_step` for the argument written out, and note that the one
+        floating-point expression involved, the Float32 arm's
+        `Int32(round(x * scale))`, is reproduced unchanged in both arms
+        because `docs/NUMERICS.md` section 5.6 depends on its exact form.
+
+        Takes effect on the next `enqueue_range_histogram`.
+        """
+        self.row_unroll = on
 
     def set_constant_hessian(mut self, on: Bool):
         """Declare that every row's hessian this round is exactly
@@ -3674,8 +4186,13 @@ struct GpuActiveRows(Movable):
         one, `(n_slots + 1) // 2` at the pairing, `(n_slots + 3) // 4` at the
         quad. A tail block owns the slots that remain and the kernel handles
         it, so nothing here rounds the slot count up.
+
+        `unroll` is the row-walk arm (`set_row_unroll`), read from the field
+        here rather than threaded through the family dispatch above, because
+        it changes no grid, no threadgroup footprint, and no histogram.
         """
         var blocks = (n_slots + GROUP - 1) // GROUP
+        var unroll = Int32(1) if self.row_unroll else Int32(0)
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 32]](
                 bins,
@@ -3695,6 +4212,7 @@ struct GpuActiveRows(Movable):
                 h_scale,
                 use_quant,
                 const_hess,
+                unroll,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -3717,6 +4235,7 @@ struct GpuActiveRows(Movable):
                 h_scale,
                 use_quant,
                 const_hess,
+                unroll,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -3739,6 +4258,7 @@ struct GpuActiveRows(Movable):
                 h_scale,
                 use_quant,
                 const_hess,
+                unroll,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -3761,6 +4281,7 @@ struct GpuActiveRows(Movable):
                 h_scale,
                 use_quant,
                 const_hess,
+                unroll,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -3936,8 +4457,13 @@ struct GpuActiveRows(Movable):
         use_desc: Int32,
     ) raises:
         """The atomic launch at one group width, over the four bin
-        capacities."""
+        capacities.
+
+        `unroll` is the row-walk arm (`set_row_unroll`), read from the field
+        here rather than threaded through the family dispatch above, because
+        it changes no grid, no threadgroup footprint, and no histogram."""
         var blocks = (n_slots + GROUP - 1) // GROUP
+        var unroll = Int32(1) if self.row_unroll else Int32(0)
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 32]](
                 bins,
@@ -3962,6 +4488,7 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 self.step_dev.unsafe_ptr(),
                 use_desc,
+                unroll,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -3989,6 +4516,7 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 self.step_dev.unsafe_ptr(),
                 use_desc,
+                unroll,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -4016,6 +4544,7 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 self.step_dev.unsafe_ptr(),
                 use_desc,
+                unroll,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -4043,6 +4572,7 @@ struct GpuActiveRows(Movable):
                 const_hess,
                 self.step_dev.unsafe_ptr(),
                 use_desc,
+                unroll,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
