@@ -296,6 +296,7 @@ work is spread.
 
 from std.math import isnan, log
 from std.memory import bitcast
+from std.os import getenv
 
 from .categorical import CategoricalSpec, fit_categorical_spec
 from .parallel import (
@@ -1805,18 +1806,113 @@ thrashes. Untuned, and no measurement here justifies a different number.
 """
 
 
-def env_row_major_bins() -> Bool:
-    """`MOJOTREES_CPU_ROW_MAJOR`: build the row-major view at fit time.
+comptime ROW_MAJOR_OFF = 0
+"""`MOJOTREES_CPU_ROW_MAJOR=0`: never build the view, at any size."""
 
-    **Off by default, and that is a decision rather than an oversight.** The
-    view is one extra copy of the binned matrix (see
-    `BinnedMatrix.row_major_bytes`, and the memory paragraph on the struct),
-    and nothing in this round has measured it. A default that doubles a user's
-    bin-matrix footprint on the strength of an unmeasured argument is exactly
-    the kind of thing this campaign refuses; the orchestrator's timed arms
-    decide whether it becomes one.
+comptime ROW_MAJOR_ON = 1
+"""`MOJOTREES_CPU_ROW_MAJOR=1`: always build it, budget or no budget."""
+
+comptime ROW_MAJOR_AUTO = 2
+"""`MOJOTREES_CPU_ROW_MAJOR` unset: build it when it fits the budget."""
+
+comptime ROW_MAJOR_DEFAULT_BUDGET_MB = 1024
+"""The memory budget, in mebibytes, and the paragraph that states the rule.
+
+*The rule.* Under `auto` -- the default -- the row-major view is built when
+`n_rows * row_stride <= budget` and **refused** otherwise, where the budget is
+1 GiB and `row_stride` is the realized record width computed in
+`BinnedMatrix.build_row_major`, not an estimate. A refusal is silent and
+total: no allocation happens, `has_row_major()` stays false, and every
+histogram build degrades to feature-major through
+`apple_cpu_policy.resolve_bin_layout`, which is the layout that shipped. A
+refusal never raises, because a dataset being large is not a user error.
+`MOJOTREES_CPU_ROW_MAJOR_MAX_MB` moves the budget; `0` there means no budget
+at all, and `MOJOTREES_CPU_ROW_MAJOR=1` overrides it outright.
+
+*Why there is a budget when LightGBM has none.* LightGBM's `auto` allocates
+both layouts unconditionally and mentions memory only in a log line
+(`src/io/dataset.cpp`, "And if memory is not enough, you can set
+`force_col_wise=true`"). The view is a **second full copy** of the bin ids, and
+at 255 bins nothing packs into a nibble, so `row_stride == n_features` and the
+bin-matrix footprint exactly doubles. Turning a fit that fit into a fit that
+does not is a hard failure, not a regression; a slower fit is recoverable and
+an OOM is not, so the default has to bound the absolute surprise.
+
+*Why 1 GiB.* It is chosen, not measured, and it is chosen to admit every shape
+this optimization was built for and refuse the ones that are dangerous. 1M x
+50 is 50 MB, 1M x 200 is 200 MB, 10M x 100 is 1000 MB: all admitted. 10M x 200
+is 2 GB and is refused. The bound is absolute rather than a fraction of free
+memory for two reasons. There is no portable free-memory query here, and a
+rule that read one would give different answers on two runs of the same fit on
+the same machine, which makes a report of "it was fast yesterday"
+unreproducible. This rule is a pure function of the data: the same matrix gets
+the same answer on every machine and at every `MOJOTREES_NUM_WORKERS`.
+
+*What it does not bound.* The feature-major matrix, the Float64 input the
+caller may still be holding, the gradient and hessian planes, and the
+histograms. It bounds one array, the one this file adds.
+"""
+
+
+def env_row_major_mode() raises -> Int:
+    """`MOJOTREES_CPU_ROW_MAJOR`: unset (auto), `1` (force), `0` (never).
+
+    Three states, and unset is not the same as `0`. Unset means **auto**: the
+    view is built when it fits `row_major_budget_bytes()`, which is the rule
+    written out on `ROW_MAJOR_DEFAULT_BUDGET_MB`. Explicit `1` builds it even
+    above the budget, which is how a caller who knows their machine buys the
+    layout on a 10M x 200 matrix. Explicit `0` never builds it, which is the
+    off switch a bisection wants and the one thing that guarantees the fit
+    allocates not one byte for this.
+
+    Raises on an unrecognized value rather than quietly meaning auto, on
+    `apple_cpu_policy.env_bin_layout`'s grounds: this campaign has already
+    thrown away results from arms that silently ran the other configuration.
     """
-    return _env_int("MOJOTREES_CPU_ROW_MAJOR", 0) != 0
+    var s = getenv("MOJOTREES_CPU_ROW_MAJOR")
+    if s.byte_length() == 0 or s == "auto":
+        return ROW_MAJOR_AUTO
+    if s == "0" or s == "off" or s == "false":
+        return ROW_MAJOR_OFF
+    if s == "1" or s == "on" or s == "true":
+        return ROW_MAJOR_ON
+    raise Error(
+        'MOJOTREES_CPU_ROW_MAJOR must be "auto" (or unset), "1" or "0". Got "',
+        s,
+        '"',
+    )
+
+
+def row_major_budget_bytes() -> Int:
+    """Bytes the row-major view may occupy under `auto`, 0 meaning no limit.
+
+    `MOJOTREES_CPU_ROW_MAJOR_MAX_MB` in mebibytes, defaulting to
+    `ROW_MAJOR_DEFAULT_BUDGET_MB`, where the rule and the reason for the
+    number are written out. `MOJOTREES_CPU_ROW_MAJOR_MAX_MB=0` lifts the
+    budget without forcing the view on a dataset that would not have got one.
+    """
+    return _env_int(
+        "MOJOTREES_CPU_ROW_MAJOR_MAX_MB", ROW_MAJOR_DEFAULT_BUDGET_MB
+    ) * 1024 * 1024
+
+
+def row_major_fits_budget(n_rows: Int, row_stride: Int, max_bytes: Int) -> Bool:
+    """The budget rule itself, in one place.
+
+    `n_rows * row_stride <= max_bytes`, with `max_bytes <= 0` meaning there is
+    no budget.
+
+    A function rather than an inline compare so the rule has one definition,
+    a test can assert the boundary without allocating the gigabyte that is
+    being refused, and a caller can ask the question before committing to a
+    layout. It takes the *realized* stride, so packing a feature into a nibble
+    earns admission rather than being rounded away.
+    """
+    if max_bytes <= 0:
+        return True
+    if n_rows <= 0 or row_stride <= 0:
+        return True
+    return n_rows * row_stride <= max_bytes
 
 
 def _row_major_widths(
@@ -1948,9 +2044,15 @@ struct BinnedMatrix(Copyable, Movable):
     feature fits in 4 bits** -- so a fit's bin-matrix footprint goes from 50 MB
     to between 75 MB and 100 MB. Packing recovers half a byte per packable
     feature per row and nothing else: it does not shrink `bins`. `row_stride`
-    and `row_major_bytes()` report the realized figure for a given dataset,
-    and `build_row_major` is opt-in (`MOJOTREES_CPU_ROW_MAJOR`) precisely
-    because this is a cost a user must choose.
+    and `row_major_bytes()` report the realized figure for a given dataset.
+
+    **The view is built by default and refused above a budget.** The default
+    is `auto`: build it when `n_rows * row_stride` is at most 1 GiB, skip it
+    silently above that and run feature-major, which is what shipped.
+    `ROW_MAJOR_DEFAULT_BUDGET_MB` states the rule and argues the number,
+    `MOJOTREES_CPU_ROW_MAJOR_MAX_MB` moves it, and `MOJOTREES_CPU_ROW_MAJOR`
+    forces either way (`1` builds above the budget, `0` never builds). At the
+    shapes above: 1M x 50 and 1M x 200 are built, 10M x 200 is not.
     """
 
     var bins: List[UInt8]
@@ -2115,8 +2217,26 @@ struct BinnedMatrix(Copyable, Movable):
             return 0
         return self.bin_offset[self.n_features]
 
-    def build_row_major(mut self) raises:
+    def build_row_major(mut self, max_bytes: Int = 0) raises:
         """Build (or rebuild) the row-major record array from `bins`.
+
+        `max_bytes` is the memory budget, `0` (the default) meaning none, and
+        it is checked against the **realized** `n_rows * row_stride` after the
+        layout is decided and before anything is allocated. Over budget, this
+        is a no-op that leaves the matrix in the state `drop_row_major` leaves
+        it: nothing allocated, `has_row_major()` false, every histogram build
+        degrading to feature-major. It does not raise. The rule and the number
+        are on `ROW_MAJOR_DEFAULT_BUDGET_MB`; the policy that picks the
+        argument is `env_row_major_mode` at the `transform` call site, so this
+        method stays mechanism and the default keeps its old contract, which
+        is "build it".
+
+        A refusal still pays the width scan below -- reads only, no
+        allocation -- because the exact answer needs the realized stride and
+        the conservative one (`n_rows * n_features`, nothing packed) would
+        refuse a low-cardinality matrix at twice its true cost. One scan of a
+        matrix that is about to be trained on many times is the cheaper
+        mistake.
 
         Three passes, none of which touches a Float64 and none of which can
         change a bin id:
@@ -2186,6 +2306,12 @@ struct BinnedMatrix(Copyable, Movable):
                     mask_of[f] = 15
                     packed += 1
             stride = whole + ((packed + 1) >> 1)
+
+            # The budget, checked here and nowhere else: after the stride is
+            # real and before the one allocation that costs the memory.
+            if not row_major_fits_budget(nr, stride, max_bytes):
+                self.drop_row_major()
+                return
 
             offsets.append(0)
             for f in range(nf):
@@ -2496,14 +2622,25 @@ struct BinMapper(Copyable, Movable):
             self.missing_bin.copy(),
             self.usable.copy(),
         )
-        # The row-major view, at fit time, off unless asked for. Its widths
-        # come from the bins this call just wrote, so it is built here rather
-        # than fused into the tile above: the packing decision needs each
-        # feature's realized bin count, which does not exist until the last
-        # tile has run. See `BinnedMatrix.build_row_major` for the write
-        # traffic that makes the second pass the cheap way round anyway.
-        if env_row_major_bins():
-            out.build_row_major()
+        # The row-major view, at fit time. Its widths come from the bins this
+        # call just wrote, so it is built here rather than fused into the tile
+        # above: the packing decision needs each feature's realized bin count,
+        # which does not exist until the last tile has run. See
+        # `BinnedMatrix.build_row_major` for the write traffic that makes the
+        # second pass the cheap way round anyway.
+        #
+        # This is the policy half of the decision and the only place the
+        # environment is read: `auto` (the default) offers the budget, an
+        # explicit `1` passes no budget at all, and an explicit `0` does not
+        # call the builder. Whether the view, once built, is the one the
+        # histograms actually read is a *separate* decision made once per fit
+        # by `histogram.choose_bin_layout_timed`; building it only makes both
+        # arms runnable.
+        var mode = env_row_major_mode()
+        if mode == ROW_MAJOR_ON:
+            out.build_row_major(0)
+        elif mode == ROW_MAJOR_AUTO:
+            out.build_row_major(row_major_budget_bytes())
         return out^
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
