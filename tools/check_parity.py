@@ -184,7 +184,23 @@ REQUIRED_SUPPORTED = [
     "max_cat_threshold",
     "cat_l2",
     "cat_smooth",
-    "max_cat_to_onehot",
+    # `max_cat_to_onehot` was here and is DOWNGRADED to partial, 2026-08-16.
+    #
+    # It is not missing and it is not broken; it is off by one against
+    # LightGBM, verified from both sources. LightGBM's test is
+    # `num_bin <= max_cat_to_onehot` (`feature_histogram.cpp:183`) where
+    # `num_bin` counts a dummy bin pushed at index 0 (`bin.cpp:456-459`), so
+    # LightGBM one-hots `max_cat_to_onehot - 1` real categories where we
+    # one-hot `max_cat_to_onehot`. At the shared default of 4 they one-hot 3
+    # and we one-hot 4, which is a different model on any categorical fit
+    # with exactly 4 levels.
+    #
+    # It stays out of this list until the boundary moves, because "supported"
+    # on a parity contract means a user gets LightGBM's behavior from
+    # LightGBM's parameter, and here they do not. Owned by the
+    # `wide-categorical-bins` lane. Do NOT put it back by editing the row in
+    # docs/LIGHTGBM_PARITY.md; put it back by fixing the comparison, in the
+    # same commit that removes these lines.
     "monotone_constraints",
     "interaction_constraints",
     "max_bin",
