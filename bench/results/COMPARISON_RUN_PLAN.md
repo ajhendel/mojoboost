@@ -54,12 +54,26 @@ the CPU and an explicit `device='gpu'` raising.
 So **`mojotrees_catboost_mode` cannot run on the GPU.** Under `auto` it
 resolves to the CPU and the record will say `device_used=cpu`; under an
 explicit `gpu` it raises. "Us in CatBoost mode on both backends" is therefore
-a CPU row and an empty GPU cell, until either Cosine lands in the device split
-search or the arm is run with `score_function=L2` and headed as the hybrid it
-would then be. This is a real reduction in what the table covers and it is not
-a measurement failure -- it is the refusal working, and the alternative was a
-GPU row that quietly maximized a different functional than the one its heading
-named.
+a CPU row and an empty GPU cell.
+
+**And that costs almost nothing, which was checked rather than assumed, after
+this session first wrote down that it cost a lot.** `CatBoostEngine.load` in
+`bench/real_data/engines.py` raises `EngineError` for any device but CPU, on
+the stated grounds that CatBoost's GPU training is a different quantization --
+`border_count` capped at 255 on GPU against 65535 on CPU -- and so is not the
+same measurement. That covers `catboost_lossguide` too, through
+`CATBOOST_ENGINES`. `verify.py` then groups by `(scenario, engine, device,
+threads)`, with device in the key.
+
+**CatBoost has no GPU row and never has.** A GPU `mojotrees_catboost_mode` row
+is the mojotrees half of a peer pair whose other half is CPU-only by
+construction, so it would have had no counterpart to be read against on that
+device. The refusal removes a cell that was already comparable to nothing.
+
+The lever this file previously offered -- run the arm at `score_function=L2`
+to buy the GPU cell back -- is therefore **withdrawn**, and it was the wrong
+trade in the first place: it would have given up a true CatBoost default to
+obtain a number nothing pairs with. `score_function=Cosine` stays.
 
 ## The blocks
 
