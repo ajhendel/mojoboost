@@ -180,6 +180,7 @@ chosen. Building it would be building a gate that cannot open.
 | A17 | `text_processing`: the tokenizer and the dictionaries (`library/cpp/text_processing/tokenizer/tokenizer.cpp` + `options.h`, `library/cpp/text_processing/dictionary/dictionary_builder.cpp` + `options.h`, `catboost/private/libs/options/text_processing_options.cpp`/`.h`, `catboost/libs/data/quantization.cpp::CreateDictionaries`, `catboost/private/libs/text_processing/dictionary.h::CreateDictionary`, `catboost/private/libs/data_types/text.h`) -- **verified from source**, see the A17 note | Turns a raw text column into a bag of dictionary token ids with counts. Default tokenizer splits on the literal string `" "` and does nothing else; default dictionaries are a unigram and a bigram over words, `occurrence_lower_bound=3`, `max_dictionary_size=50000` | No: pure host-side feature GENERATION feeding the existing binning path. Nothing in the trainer changes | Yes. It is the only way a text column becomes comparable at all; without it there is a whole class of dataset on which no CatBoost comparison exists | CPU (`text_processing.mojo`, NEW, imports nothing from the package) | (1) strictly-less-work does not apply -- it is new work that did not exist. Default OFF: no existing entry point calls it. A17 note |
 | A18 | `text_features`: the `BoW` / `NaiveBayes` / `BM25` estimators (`catboost/private/libs/text_features/bow.cpp`, `naive_bayesian.cpp`, `bm25.cpp`, `feature_calcer.h`, `helpers.h`; `catboost/private/libs/feature_estimator/base_text_feature_estimator.h`, `text_feature_estimators.cpp`; `catboost/private/libs/algo/estimated_features.cpp`, `fold.cpp`, `data.cpp`, `full_model_saver.cpp`) -- **verified from source**, see the A18 note | Three numeric features off a token bag. `BoW` is target-free. **`NaiveBayes` and `BM25` are target-aware and ARE computed on the ordered permutation prefix, the same machinery the CTRs use** | Feature values only; they are handed to `binning.fit_bins` like any other numeric column | Yes, opt-in. `BoW` and the calcers are ours today; the ordered pass CONSUMES `lane/ordered-ts-2`'s permutation and must never build its own | CPU (`text_features.mojo`, NEW, imports only `text_processing`) | (3) bit-moving when on, inert when off. A18 note, and read the leakage section of it before writing any caller |
 | A19 | Ordered target statistics, the simple (single-cat-feature) projection (`catboost/private/libs/algo/online_ctr.{h,cpp}`, `.../ctr_helper.{h,cpp}`, `.../fold.cpp`, `.../split.cpp`, `catboost/libs/model/online_ctr.h`) -- **verified from source**, see the A19 note | The mechanism A5 named. A categorical value becomes a *numeric* feature whose value at row `i` is a target statistic over the rows that precede `i` in a random permutation, quantized to 16 buckets. Four CTR types, three priors, an unshuffled fold 0, and a separate non-online table for inference | Yes -- it adds features that did not exist | Yes. This is the one mechanism that makes a categorical CatBoost comparison possible at all, and `bench/real_data` runs no such scenario today because we had no counterpart | CPU (`ctr.mojo`, new file; `categorical.mojo` untouched) | A19 note. **BUILT, off by default, unreached.** (3) when on. Deterministic under the seed, across `MOJOTREES_NUM_WORKERS`, and across machines, by a keyed sort rather than a shuffle |
+| A20 | `embedding_features`: the `LDA` and `KNN` embedding estimators (`catboost/private/libs/embedding_features/lda.{h,cpp}`, `knn.{h,cpp}`, `catboost/private/libs/feature_estimator/{base_,}embedding_feature_estimators.{h,cpp}`, `catboost/private/libs/options/embedding_processing_options.{h,cpp}`, `catboost/private/libs/algo/{fold,estimated_features}.cpp`) -- **verified from source**, see the A20 note | Host-side generation of numeric columns from a raw embedding column, which are then quantized by the ordinary float binning path. LDA projects the embedding onto the leading generalized eigenvectors of (between-class scatter, within-class scatter); KNN emits per-class neighbour counts (classification) or the neighbour target mean (regression). **Both read the target**, and both are computed **online against the fold's permutation** -- the same `TFold::GetLearnPermutationArray()` the ordered CTRs use | Yes: new columns, so every downstream bit moves | Yes, and it is bucket C before it is bucket B: CatBoost takes a raw embedding column and mojotrees cannot, so an embedding benchmark today is not a comparison at all | CPU (`embedding.mojo`, new file). **Consumes** `ordered-ts-2`'s permutation; does not own one | A20 note. **BUILT, off by default**, no existing default changed, nothing in the package imports it |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -2516,3 +2517,499 @@ border), the candidate enumeration in `greedy_tensor_search.cpp` that decides
 which combinations to try, and the `ctr_leaf_count_limit` top-K reindexing that
 keeps a wide combination's bucket count bounded. That last one is not optional
 for combinations the way it is for a single column.
+
+### A20 note: the `LDA` and `KNN` embedding estimators, verified from source
+
+Status: **verified from CatBoost source**, `master`, read 2026-08-16 by
+`lane/embedding-features` before any code was written. Every claim below cites
+the file and the function it came from. Paragraphs headed **OURS** are our
+decisions and cite nothing, because there is nothing to cite. Nothing in this
+section is measured; this lane took no timings and ran no benchmark.
+
+Numbering: this lane deliberately skipped A17 and A18 and left them for
+`ordered-ts-2` and `text-features`, the two live lanes working the same
+target-aware problem shape, rather than taking the next free number. Three
+lanes collided on numbering last round. Checked after the fact:
+`lane/ordered-ts-2` took A17 and `lane/text-features` took A17 **and** A18, so
+those two collide with each other and neither collides with this row. This
+diff adds A20 and touches no other row of the table.
+
+Files read:
+
+- `catboost/private/libs/embedding_features/lda.h`, `lda.cpp` --
+  `TLinearDACalcer`, `IncrementalCloud::AddVector`/`Update`,
+  `TLinearDACalcer::TotalScatterCalculation`, `CalculateProjection`,
+  `CalculateGaussianLikehood`, `InverseMatrix`,
+  `TLinearDACalcerVisitor::Update`/`Flush`.
+- `catboost/private/libs/embedding_features/knn.h`, `knn.cpp` --
+  `TKNNCalcer`, `TKNNCalcer::Compute`, `TKNNCalcerVisitor::Update`,
+  `TKNNUpdatableCloud`, `TKNNCloud`, `TL2Distance`.
+- `catboost/private/libs/embedding_features/embedding_feature_calcer.h` --
+  `TEmbeddingFeatureCalcer`, `IEmbeddingCalcerVisitor`.
+- `catboost/private/libs/feature_estimator/base_embedding_feature_estimator.h`
+  -- `TEmbeddingBaseEstimator::ComputeOnlineFeatures`, `::ComputeFeatures`,
+  `::EstimateFeatureCalcer`, `::MakeFinalFeatureCalcer`, `::Calc`.
+- `catboost/private/libs/feature_estimator/embedding_feature_estimators.cpp` --
+  `TLDAEstimator`, `TKNNEstimator`, `CreateEmbeddingEstimators`. **This is
+  where the reachable defaults live**, not in the calcer constructors.
+- `catboost/private/libs/options/embedding_processing_options.h`, `.cpp` --
+  `TEmbeddingProcessingOptions`, `DefaultEmbeddingCalcers`,
+  `ParseEmbeddingProcessingOptionsFromPlainJson`.
+- `catboost/private/libs/algo/estimated_features.cpp` --
+  `CreateEstimatedFeaturesData`, the `isOnline` branch at 448-464.
+- `catboost/private/libs/algo/fold.cpp` -- `TFold::InitOnlineEstimatedFeatures`
+  and its two call sites, one in each fold builder.
+- `catboost/private/libs/algo/data.cpp` -- the offline call site (537-546),
+  which passes `learnPermutation = Nothing()` and therefore does **not** run
+  these two.
+
+#### 1. The leakage answer, and the train-versus-predict asymmetry
+
+This is the centre of the lane and it comes out cleanly.
+
+**Both estimators are target-aware and both are `IOnlineFeatureEstimator`s.**
+`TLDAEstimator` and `TKNNEstimator` derive from
+`TEmbeddingBaseEstimator<...>`, which derives from `IOnlineFeatureEstimator`.
+`CreateEstimatedFeaturesData` splits on `isOnline = learnPermutation.Defined()`
+and calls `GetOnlineFeatureEstimators()` on that branch
+(`estimated_features.cpp:369-375`), so these two never reach the offline path
+that `data.cpp:537` drives with `Nothing()`.
+
+**They reuse the ordered-permutation machinery, and they reuse it per fold.**
+`TFold::InitOnlineEstimatedFeatures` (`fold.cpp:377-394`) calls
+`CreateEstimatedFeaturesData` with `GetLearnPermutationArray()` -- the fold's
+own permutation, the same object the ordered CTRs and ordered boosting are
+built on. It is called from **both** fold builders (`fold.cpp:200` and `:298`),
+so the online treatment is not conditional on ordered boosting: a Plain fold
+gets it too.
+
+**The train-time rule, exactly.** `ComputeOnlineFeatures`
+(`base_embedding_feature_estimator.h:44-82`) is:
+
+```
+TFeatureCalcer featureCalcer = CreateFeatureCalcer();   // empty
+for (ui64 line : learnPermutation) {
+    Compute(featureCalcer, learnDataset.GetVector(line), line, ...);
+    calcerVisitor.Update(target[line], vector, &featureCalcer);
+}
+```
+
+**Compute strictly precedes Update, for every row.** So the calcer state that
+produces row `i`'s feature has seen exactly the rows that precede `i` in the
+permutation, and has never seen `i`'s own target or `i`'s own embedding. That
+is the ordered target statistic discipline, expressed as a loop instead of a
+prefix sum, and it is the whole leakage answer for the training side.
+
+Two consequences that fall straight out and that an implementation gets wrong
+if it does not read this loop:
+
+- **The first row of the permutation gets an empty calcer.** For KNN the HNSW
+  index is empty and `GetNearestNeighbors` returns nothing, so
+  `TKNNCalcer::Compute` leaves `result` at its `TVector<float> result(n, 0)`
+  initialization and the row's features are all zero -- and the regression
+  branch is explicitly guarded, `if (neighbors.size())`, so the mean is 0 and
+  not a division by zero. For LDA the projection matrix is still zero, so the
+  projection is zero.
+- **The KNN query point is excluded from its own neighbourhood by
+  construction, not by a filter.** There is no "skip self" test anywhere in
+  `knn.cpp`. The point is simply not in the cloud yet: `TKNNCalcerVisitor::
+  Update` calls `cloudPtr->AddItem(embed.data())` *after* `Compute` has already
+  queried. A design that fits the neighbour structure over the whole training
+  set first and then queries it needs an explicit self-exclusion and does not
+  get one from CatBoost; CatBoost never needed one.
+
+**The predict-time rule, exactly, and it is a different object.** Two things
+change at once:
+
+1. **The calcer is fitted on the whole learn set, unpermuted.** Test features
+   go through `Calc` (`base_embedding_feature_estimator.h:107-132`) against
+   the calcer returned by `EstimateFeatureCalcer` (`:137-151`), which loops
+   `for line = 0 .. samplesCount` in **dataset order** and calls only
+   `Update`, never `Compute`. `MakeFinalFeatureCalcer` (`:94-104`) -- the
+   calcer that is serialized into the model and used at inference -- is that
+   same full-data calcer with `TrimFeatures` applied. So the mapping the model
+   applies at predict time was never applied to a single training row.
+2. **There is no target for the query row and none is needed.** Both `Compute`
+   methods take only the embedding. LDA's is a matrix-vector product against a
+   fitted projection; KNN's is a neighbour lookup whose *neighbours'* targets
+   supply the value. The target-awareness is entirely inside the fitted state,
+   which is why the asymmetry is a state asymmetry and not a formula
+   asymmetry.
+
+**The asymmetry, stated as the thing to get right:** at train time the feature
+is a function of a *strict prefix* of a permutation; at predict time it is a
+function of the *entire* learn set. Row `i`'s training feature and the feature
+the deployed model would compute for that same row are different numbers, and
+they are meant to be. The train-time value is deliberately noisier and
+deliberately less informative, and that is what stops the tree from fitting a
+leaked target. An implementation that "fixes" the mismatch by using the
+full-data calcer at train time has reintroduced exactly the leak the loop
+exists to prevent; an implementation that uses a prefix at predict time has
+thrown away half its data for nothing.
+
+**One CatBoost-specific quirk of the predict-time state, which is a real
+finding and not a transcription.** `IEmbeddingCalcerVisitor`
+(`embedding_feature_calcer.h:87-90`) declares exactly one virtual method,
+`Update`. `TLinearDACalcerVisitor::Flush` is **not** virtual and is not on the
+interface, so the generic `EstimateFeatureCalcer` has no way to call it and
+does not. The only caller of `Flush` is `TLinearDACalcerVisitor::Update`
+itself, under `if (2 * LastFlush <= lda->Size)` -- a doubling schedule that
+fires at `Size` = 1, 2, 4, 8, ... So **the final LDA calcer's projection
+matrix is the one fitted at the largest power of two `<= n`**, and the rows
+after it contributed to the class clouds but never to a re-solve. On a
+1,000-row learn set the deployed projection is the one computed from the first
+512 rows. We do not reproduce this by default; see section 6.
+
+#### 2. What the LDA estimator computes
+
+**The two matrices, and the names are inverted in the source.** Read the
+identifiers as what they hold, not as what they are called:
+
+- `TLinearDACalcer::BetweenMatrix` holds `sum_c (n_c / N) * Cov_c`, the
+  **within-class** scatter `S_W`. `TLinearDACalcerVisitor::Flush` builds it
+  from each class cloud's `ScatterMatrix`, weighted by that class's share of
+  the rows (`lda.cpp:181-190`). In regression mode (`IsClassification` false)
+  it is the single cloud's covariance (`:191-193`).
+- The local `totalScatter`, passed to `CalculateProjection` as `scatterTotal`,
+  holds `sum_c (n_c / N) mu_c mu_c^T - mu mu^T`, the **between-class**
+  scatter `S_B` (`TotalScatterCalculation`, `lda.cpp:140-161`).
+
+So the problem solved is the classical Fisher one, `S_B v = lambda S_W v`, and
+the misnaming is cosmetic. Each cloud's `ScatterMatrix` is a running
+*covariance*, not a raw second moment: `IncrementalCloud::Update`
+(`lda.cpp:82-107`) rescales by `BaseSize/TotalSize`, folds in
+`Buffer^T Buffer / TotalSize` for the newly buffered rows, and then subtracts
+the outer product of the mean shift.
+
+**The regularization.** `Flush` adds `RegParam` to the diagonal of the
+within-class matrix and to nothing else (`lda.cpp:194-196`, striding by
+`dim + 1`). The reachable default is **`5e-5`**, set by `TLDAEstimator` when
+the user gives no `reg` key (`embedding_feature_estimators.cpp:28-32`). The
+`0.01` in `TLinearDACalcer`'s constructor signature is dead: the estimator
+always passes a value. `CB_ENSURE(RegParam >= 0)` -- zero is legal, and at
+zero a rank-deficient `S_W` has nothing holding it up.
+
+**How many components.** `ProjectionDimension`, from the `components` key.
+The reachable default is
+`min(num_classes - 1, embedding_dim - 1)` for classification and `1` for
+regression (`embedding_feature_estimators.cpp:20-27`), with two guards:
+`> 0`, and **strictly** `< embedding_dim`. So a 2-class problem defaults to
+one component and a 10-class problem to nine. `num_classes - 1` is the right
+cap and CatBoost picks it: `S_B` is a sum of `C` rank-one terms constrained by
+one linear relation, so `rank(S_B) <= C - 1` and any further eigenvector has
+eigenvalue zero. **But the cap is only the default.** An explicit
+`components=` larger than `C - 1` is accepted, and the extra components are
+then eigenvectors of a zero eigenvalue -- arbitrary directions in a null
+space, whose only content is whatever the solver's arithmetic left there.
+
+**More than two classes** needs no special case: `ClassesDist` is
+`numClasses` clouds, the target is used as an integer class index
+(`lda.cpp:167`, `(size_t)target`), and the weighted sums run over all of them.
+
+**Regression LDA is degenerate, provably.** With one cloud,
+`TotalScatterCalculation` computes `1.0 * mu mu^T - mu mu^T`, which is the
+zero matrix identically -- so `S_B = 0`, every eigenvalue is zero, and the
+projection is an arbitrary direction. The feature is not merely weak, it
+carries no target information at all. CatBoost does not refuse it. We do; see
+section 6.
+
+**The optional likelihood features.** With `likelihood=true` (default false,
+`embedding_feature_estimators.cpp:33-37`) LDA emits `num_classes` further
+features: `Flush` inverts the regularized within-class matrix in place
+(`InverseMatrix`, `lda.cpp:202-204`), and `Compute` evaluates
+`exp(-0.5 * (mu_c - x)^T S_W^-1 (mu_c - x))` per class and normalizes across
+classes, falling back to a uniform `1/C` when the total is below `1e-6`
+(`lda.cpp:119-131`). Note what is *not* there: no class prior, no
+`det(S_W)` term, no `(2 pi)^{-d/2}`. The shared covariance makes the missing
+determinant a constant that cancels in the normalization; the missing prior
+does not cancel, so these are not posterior probabilities, they are
+normalized Mahalanobis kernels.
+
+**The two LAPACK findings, which are the reason we do not copy
+`CalculateProjection` line for line.** `CalculateProjection`
+(`lda.cpp:10-37`) does exactly three things: `ssygst_(itype=1, uplo='L')`,
+`ssyev_(jobz='V', uplo='L')`, and a `std::copy` of the tail of the reduced
+matrix into the projection. Two steps of the standard recipe are absent:
+
+1. **`spotrf_` is never called.** LAPACK's `ssygst` documents that its `B`
+   argument "must have been returned by `SPOTRF`" -- it expects the Cholesky
+   factor, and it forms `inv(L) A inv(L^T)`. CatBoost hands it the raw
+   regularized within-class matrix. The reduction is therefore by the
+   *matrix* treated as if it were its own Cholesky factor, which is not the
+   generalized problem and is not any problem with a name.
+2. **The back-transform is never applied.** After `ssyev` the eigenvectors
+   `y` belong to the reduced matrix; the generalized eigenvectors are
+   `x = inv(L^T) y`, which LAPACK expects you to obtain with `strsm`. There
+   is no `strsm` and no second `sgemm`; the `std::copy` at `lda.cpp:36` takes
+   `y` straight into `ProjectionMatrix`.
+
+The copy itself is right, and is the one subtle correct step: `ssyev` returns
+eigenvalues **ascending**, and `jobz='V'` overwrites `A` with eigenvectors as
+**columns** in **column-major** order, so the tail of the buffer is exactly
+the top-`k` eigenvectors laid out contiguously; reading that tail as
+row-major `k x d` recovers them as rows, which is what `Compute`'s
+`cblas_sgemv(RowMajor, NoTrans, M=k, N=d, lda=d)` then wants.
+
+**We do not reproduce either omission.** Both are bugs by any reading, and
+the first is not even reproducible: what `ssygst` does with a non-factor `B`
+is whatever the arithmetic does, and that differs between LAPACK builds. A
+parity claim against it would be a parity claim against one machine's
+reference BLAS. See section 6 for what we solve instead.
+
+#### 3. What the KNN estimator computes
+
+- **`k` is `CloseNum`, default 5**, from the `k` key
+  (`embedding_feature_estimators.cpp:96-100`). The `5` in `TKNNCalcer`'s
+  signature agrees with it, so unlike LDA's `reg` there is no dead default
+  here.
+- **The metric is squared L2.** `TOnlineHnswCloud` is parameterized on
+  `NHnsw::TL2SqrDistance<float>` (`knn.h:17`) and the static-cloud path wraps
+  the same distance in `TL2Distance` (`knn.h:48-61`). No square root anywhere,
+  which changes no ordering, and no normalization, which does: cosine
+  similarity is not what this computes, and an unnormalized embedding column
+  gets a magnitude-sensitive neighbourhood.
+- **The structure is approximate.** `TKNNUpdatableCloud` wraps
+  `NOnlineHnsw::TOnlineHnswDenseVectorIndex`, an online HNSW graph built with
+  `TOnlineHnswBuildOptions({CloseNum, 300})` (`knn.h:109-110`) -- max
+  neighbours per node equal to `k`, search neighbourhood 300 -- and the static
+  cloud searches with the same `300` (`knn.cpp:23`). **CatBoost's KNN feature
+  is not the exact k nearest neighbours** and does not claim to be. It is
+  whatever that graph returns, and what that graph returns depends on the
+  insertion order, which is the fold permutation.
+- **The output, classification:** `++result[TargetClasses.at(neighbor)]` --
+  raw **counts** per class, `num_classes` features, not normalized, not
+  distance-weighted (`knn.cpp:34-37`). With `k=5` these are integers in
+  `[0, 5]` carried in a float column, so the binning path downstream sees a
+  low-cardinality numeric feature. That matters: our binning already has a
+  "one bin per distinct value under budget" rule (memory: d7da434), so these
+  columns quantize exactly and cheaply.
+- **The output, regression:** the plain unweighted mean of the neighbours'
+  targets, one feature, guarded to 0 on an empty neighbourhood
+  (`knn.cpp:38-45`).
+- `FeatureCount` is `num_classes` for classification and 1 for regression
+  (`embedding_feature_estimators.cpp:91-95`).
+
+**Cost, as a derived bound and not a measurement.** An *exact* KNN over a
+growing prefix is quadratic: the online pass over `n` rows performs
+`sum_{i<n} i = n(n-1)/2` distance evaluations of `d` multiply-adds each, i.e.
+`Theta(n^2 d / 2)`. At `n = 10^6` and `d = 64` that is `3.2 x 10^13`
+multiply-adds for one column of one fold, which is not a number that appears
+in a benchmark that finishes. **Exact KNN cannot appear in a 1M-row
+comparison, and this lane does not pretend otherwise.** CatBoost's cost is not
+quadratic because HNSW is not exact: an online HNSW insert-and-query is
+`O(ef * M * log n)` per row under the usual assumptions, so `O(n log n)`
+overall with a large constant -- an approximation bound, not a guarantee.
+Closing that gap means implementing an approximate index and inheriting its
+nondeterminism, and this lane did not do it. What it did instead is refuse
+loudly above a row bound; see section 6.
+
+#### 4. How it is reached, and the default that is not off
+
+`ParseEmbeddingProcessingOptionsFromPlainJson`
+(`embedding_processing_options.cpp:104-133`) accepts either
+`embedding_processing` or `embedding_calcers`, and refuses both together.
+The part worth flagging for bucket C:
+
+```
+static TVector<TFeatureCalcerDescription> DefaultEmbeddingCalcers() {
+    return {{ TFeatureCalcerDescription{EFeatureCalcerType::LDA},
+              TFeatureCalcerDescription{EFeatureCalcerType::KNN} }};
+}
+```
+
+(`embedding_processing_options.h:37-42`, applied by
+`TEmbeddingProcessingOptions`'s constructor and by
+`SetNotSpecifiedOptionsToDefaults`.) **Both estimators are on by default for
+every embedding column.** A user who declares an embedding feature and sets
+nothing else gets LDA *and* KNN, per column, per fold. So "CatBoost at its
+defaults on a dataset with an embedding column" means CatBoost with two
+target-aware online estimators running, and any mojotrees arm that flattens
+the embedding into `d` raw float columns is not running a comparable model.
+That is the bucket C statement of this row.
+
+The resulting columns are ordinary floats from there on: `estimated_features.
+cpp` hands them to `CreateSingleFeatureWriter` with the run's
+`TBinarizationOptions` and the same border-selection machinery A15 describes.
+Nothing about them is special downstream, which is the design we copy.
+
+#### 5. What mojotrees built
+
+`src/mojotrees/embedding.mojo`, a **new module that nothing in the package
+imports**, so no existing default moves and no import edge is created in
+either direction. (The `efb -> binning -> tree_parameters_extra` cycle this
+repo has paid for is why that was checked rather than assumed: this module
+imports `parallel` and `std` only, and `parallel` imports
+`apple_cpu_policy`, so the one edge added points away from the data layer and
+nothing points back.)
+
+The shape is deliberately the shape CatBoost has, because it is the shape that
+composes with what we already own: **generate float columns, hand them to the
+existing binning path.** There is no new trainer, no new split rule, and no
+new histogram.
+
+Entry points, and they are two on purpose because the asymmetry in section 1
+is two:
+
+- `compute_online_features(embeddings, targets, permutation, params)` --
+  the **train** side. Walks `permutation`, computes row `i` from the strict
+  prefix before it, then folds row `i` in. Returns column-major
+  `List[List[Float64]]` ready for `binning.fit_bins`.
+- `fit_lda(...)` / `fit_knn(...)` then `apply_lda(...)` / `apply_knn(...)` --
+  the **predict** side. Fitted once on the whole learn set, applied to rows
+  that are not in it.
+
+`EmbeddingEstimatorParams` carries `enabled = False`. Every function refuses
+to run against a disabled parameter block by name rather than returning empty
+columns, which is this repo's refuse-rather-than-ignore rule.
+
+**The permutation is an argument, not something this module generates.** This
+lane owns no RNG, no shuffle and no fold. `identity_permutation(n)` exists for
+tests and says in its docstring that it is not a training permutation.
+
+#### 6. Divergences from CatBoost, each deliberate and each recorded
+
+1. **We solve the generalized eigenproblem properly.** Cholesky of the
+   regularized `S_W`, reduce, symmetric eigensolve, back-substitute. That is
+   the two missing LAPACK calls of section 2 put back. Consequence: our
+   projection is *not* CatBoost's projection, and a numeric parity test
+   against CatBoost's LDA column would fail by design. Reproducing an
+   unreproducible bug is not parity.
+2. **Eigensolver is cyclic Jacobi, not LAPACK.** Reason is determinism and
+   dependency: a fixed sweep order over `(p, q)` pairs with a fixed
+   convergence threshold gives the same rotations on every machine, where a
+   blocked LAPACK driver may not. Cost is `O(d^3)` per sweep with a small
+   number of sweeps -- worse than a tuned `ssyev` by a constant, on a `d x d`
+   problem where `d` is an embedding width, run `O(log n)` times per fold.
+   The eigensolve is not where the time is; the scatter accumulation
+   (`O(n d^2)`) and the KNN scan are.
+3. **LDA is refused for regression by name.** Section 2 shows `S_B` is
+   identically zero there, so the feature is an arbitrary direction. CatBoost
+   emits it. We raise.
+4. **Exact KNN, with a row bound and a refusal.** No HNSW. `KnnParams.
+   max_rows` defaults to 50,000 and `compute_online_features` raises above it
+   rather than silently entering an `n^2` loop. This is the honest position:
+   exact and deterministic up to a size we state, and absent above it, rather
+   than approximate and irreproducible everywhere. **It also means A20 has
+   nothing to say about a 1M-row benchmark**, and the catalog should not be
+   read as claiming otherwise.
+5. **Scatter accumulation is by raw second moments, not CatBoost's shifted
+   incremental update.** We keep per class `n_c`, `sum_c`, and
+   `M_c = sum x x^T`, and form `Cov_c = M_c/n_c - mu_c mu_c^T` at flush.
+   Simpler, one pass, and exact in exact arithmetic; in float it is the less
+   stable of the two formulations for data far from the origin, which is the
+   trade and it is stated rather than hidden. Embeddings are conventionally
+   near-centered, which is why the trade is acceptable and not why it is
+   invisible.
+6. **The final-calcer flush quirk is a switch, defaulting to correct.**
+   `LdaParams.catboost_final_flush_only` defaults `False`, which re-solves on
+   all `n` rows. Setting it `True` reproduces CatBoost's
+   largest-power-of-two-prefix behavior for anyone who wants that parity.
+   The *online* doubling schedule is reproduced unconditionally, because
+   there it is not a quirk: it is what makes the online pass
+   `O(log n)` eigensolves instead of `n`, and skipping it would be both
+   slower and a different feature.
+7. **Float64 throughout.** CatBoost's embeddings, calcers and estimated
+   features are `float`. Ours are `Float64`, like the rest of the mojotrees
+   data path. Another reason a numeric parity test is not the right test for
+   this row.
+8. **`likelihood` is not implemented.** It is off by CatBoost's own default
+   and it needs a matrix inverse we would otherwise not need.
+
+#### 7. Determinism, which for this row is two specific hazards
+
+Bit-identity against CatBoost is not required and is not claimed.
+Determinism across `MOJOTREES_NUM_WORKERS` and across machines **is**
+required, and two mechanisms here threaten it in ways the rest of the package
+does not.
+
+**Hazard one: an eigenvector's sign is arbitrary.** If `v` is an eigenvector
+so is `-v`, with the same eigenvalue, and a solver is free to return either.
+A projection feature whose sign flips run to run is not wrong and is not
+reproducible either. **Pinned by a canonical sign rule, applied to every
+eigenvector after the solve and before the back-transform:** find the
+component of largest absolute value; ties in absolute value go to the
+**lowest index**; if that component is negative, negate the whole vector. An
+all-zero vector is left alone. This is a total rule with no free choice in it.
+
+**Hazard two: eigenvalue ties leave the ordering free.** Sorting descending
+by eigenvalue is ambiguous when two eigenvalues are equal -- and they will be
+equal, because with `C` classes and `k > C - 1` requested components the null
+space of `S_B` supplies a whole block of exact zeros. **Pinned by a total
+order on eigenpairs:** descending eigenvalue first, and on an exact tie
+ascending lexicographic order of the sign-fixed eigenvector, and on a full
+tie of both the vectors are identical and the order does not matter. Sorting
+is a deterministic insertion sort over `d` items, not a library sort whose
+tie behavior we do not control.
+
+**Hazard three, the one the brief names: KNN neighbour ties.** Two candidate
+rows at the same distance must not be ordered by whichever thread saw them
+first. **Pinned by a total order on candidates:** `(distance, row index)`
+compared lexicographically ascending, with a non-finite distance mapped to
+`+inf` so that NaN coordinates cannot poison a comparison into
+non-transitivity. Row indices are unique, so the order is total and the
+selected `k` is a *set-valued function of the candidate set alone*, entirely
+independent of the order they were examined in.
+
+**Where parallelism is and is not.** The KNN pass is parallel over **query
+rows**: query `i` scans its own prefix and writes its own output slots, so
+the queries are independent and each one internally is a serial ascending
+scan. Worker count therefore cannot change any value. The LDA pass is
+**serial by construction** -- each row's feature depends on the accumulated
+state after the previous row -- and the class scatter sums are accumulated in
+ascending permutation order, so the float addend order is fixed by the loop
+and not by a scheduler. No reduction in this module is split across workers.
+
+#### 8. Classification, in the campaign's three buckets
+
+- **(3) bit-moving**, and unusually so: this row does not change a rule
+  applied to existing features, it *adds columns*. Every histogram, every
+  split and every leaf downstream is different the moment it is switched on.
+  It is off by default and nothing in the package calls it.
+- The proper eigensolve of divergence 1 is **not** a speed trade in either
+  direction; it is a correctness repair.
+- Divergence 4's row bound is the only place a switch changes reachability
+  rather than behavior, and it defaults to refusing.
+
+#### 9. What this row needs from the other two live lanes
+
+**From `ordered-ts-2`:** the permutation, as data. **Already satisfied**, and
+checked against their branch rather than assumed:
+`ctr.ctr_permutation(n_rows, block_size, seed, permutation_index)` returns
+`List[Int]` with `perm[position] = row`, which is exactly the convention
+`compute_online_features` takes. The consumption is two lines and needs no
+adapter:
+
+```mojo
+var perm = ctr_permutation(n_rows, block_size, seed, fold_index)
+var cols = compute_online_features(embed, targets, n_classes, perm, params)
+```
+
+The reason to insist on *their* permutation rather than a second one is
+CatBoost's own structure: `CreateEstimatedFeaturesData` and `InitOnlineCtrs`
+are called from the same `TFold` a few lines apart, off the same array. Two
+permutations where CatBoost has one would be both slower and a different
+model. **This lane deliberately implemented no permutation, no RNG and no
+fold.**
+
+One wrinkle worth carrying: their permutation index 0 is the identity, which
+is CatBoost's `shuffle = (foldIdx != 0)`. For an embedding estimator that
+means one learning fold computes its features in dataset order, so a dataset
+whose rows arrive sorted by target gets a maximally-correlated prefix on that
+fold. That is CatBoost's behavior and not a bug, but it is the reason
+`identity_permutation` here carries a docstring saying it is not a training
+permutation.
+
+**From `text-features`:** nothing structural, and that is the point --
+`TEmbeddingBaseEstimator` and `TTextBaseEstimator` are siblings under
+`IOnlineFeatureEstimator` with the same `Compute`-then-`Update` loop, so if
+that loop is factored out it should be factored out once. If `text-features`
+lands a shared "online estimator driver" abstraction, this module's
+`compute_online_features` should be rewritten onto it rather than kept
+beside it. Until then the loop is nine lines and duplicating nine lines is
+cheaper than coordinating on an abstraction neither lane has seen.
+
+**Owed to glue, not taken:** an `embedding_features=` parameter key, a
+`RawData` embedding column, and a call site that appends the generated
+columns before `fit_bins`. All three are outside this lane's territory
+(`params.mojo`, `raw_data.mojo`, `binning.mojo`, `bindings/`) and are handed
+over as a diff in the lane report rather than applied here.
