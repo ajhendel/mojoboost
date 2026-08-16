@@ -268,11 +268,26 @@ class _Base(_ParamsMixin):
     beside any other type, which is a deliberate divergence -- CatBoost
     accepts it beside MVS, never reads it, and tells the user nothing.
 
-    A bootstrap runs on the **dense, single-output, CPU** fit only. Every
-    other entry point -- the GPU, multiclass, sparse, rankers, custom
-    objectives, `eval_set`, `linear_tree`, dart, rf, and the `Dataset` API --
-    refuses an enabled `bootstrap_type` by name rather than training an
-    unsampled model and reporting a sampled one.
+    A bootstrap runs on **every CPU fit whose round loop draws one**, which is
+    now the dense single-output fit, the softmax fit, the sparse fit, the
+    sparse softmax fit, continued training, and all of those through the
+    `Dataset` API. What still cannot draw one -- the GPU on every shape, the
+    rankers, custom objectives, `eval_set` fits, `linear_tree`, dart, rf, and
+    the distributed prototype -- **refuses an enabled `bootstrap_type` by
+    name** rather than training an unsampled model and reporting a sampled
+    one. Two of those refusals are the round loop's own rather than an entry
+    point's: MVS with no `mvs_reg` cannot continue an existing ensemble, and
+    cannot run a softmax fit at all, because in both cases the lambda CatBoost
+    derives reads a previous tree that does not exist in that shape.
+
+    That last paragraph is about a `bootstrap_type` you **typed**. A
+    `bootstrap_type` this library defaulted for you, if it ever defaults one,
+    resolves quietly to `"No"` on a path that cannot honor it instead of
+    raising -- a default must never turn a working `fit` into an error. The
+    `bootstrap_explicit` wire key is what keeps the two apart; see
+    `_BOOTSTRAP_DEFAULTS`. **Today mojotrees's own default is `None`, meaning
+    `"No"`,** so nothing is being degraded and the distinction is machinery
+    waiting for the default to move, not a behavior you can observe.
 
     `boosting_type` (LightGBM's `boosting`, XGBoost's `booster`) selects the
     training strategy: "gbdt", the default, trains every tree on
@@ -1548,6 +1563,15 @@ class _Base(_ParamsMixin):
     #: is the bootstrap rate. `_resolve_bootstrap` decides which of the two
     #: the user meant while both are still visible and sends the resolved
     #: number under an unambiguous name.
+    #: `bootstrap_explicit` is the sixth key and is not a value of the
+    #: sampler; it is **who asked**. 1 means the user wrote a
+    #: `bootstrap_type` down, 0 means the value beside it is this library's
+    #: own default. `_parse_bootstrap_request` in bindings/_mojotrees.mojo
+    #: turns it into a `sampling.BootstrapRequest`, and the whole reason it
+    #: has to cross the wire is that a defaulted MVS and a typed MVS are the
+    #: same five numbers and must behave differently on a path that cannot
+    #: run one: a typed request is refused by name, a default is dropped in
+    #: silence. See `sampling.BootstrapRequest`.
     _BOOTSTRAP_DEFAULTS = {
         "bootstrap_type": "no",
         "bootstrap_subsample": -1.0,
@@ -1555,6 +1579,7 @@ class _Base(_ParamsMixin):
         "mvs_reg": -1.0,
         # `sampling.DEFAULT_BOOTSTRAP_SEED`.
         "bootstrap_seed": 0,
+        "bootstrap_explicit": 0,
     }
 
     def _resolve_bootstrap(self, bagging_fraction, bagging_freq):
@@ -1604,6 +1629,14 @@ class _Base(_ParamsMixin):
             if int(global_seed) < 0:
                 raise ValueError("random_state must be nonnegative")
             knobs["bootstrap_seed"] = int(global_seed)
+
+        # Who asked. Set from `self.bootstrap_type` alone and from nothing
+        # else, because that is the parameter that names a sampler: a user
+        # who set `subsample` or `bagging_temperature` beside no
+        # `bootstrap_type` is refused by name below rather than promoted into
+        # an explicit request. See `_BOOTSTRAP_DEFAULTS` for what the flag
+        # buys and `sampling.BootstrapRequest` for how it is spent.
+        knobs["bootstrap_explicit"] = int(self.bootstrap_type is not None)
 
         if self.bootstrap_type is None:
             kind = "no"

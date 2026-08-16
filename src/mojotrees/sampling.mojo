@@ -164,6 +164,21 @@ from std.math import log, sqrt, isfinite
 from .bagging import DEFAULT_BAGGING_SEED
 from .rng import GOLDEN, splitmix64, uniform
 
+# The three objective codes CatBoost's own `bootstrap_type` defaulting block
+# excludes from MVS, needed by `catboost_default_bootstrap_type` below and by
+# nothing else in this module.
+#
+# The edge is safe and was checked rather than assumed: `objective_registry`
+# imports `metrics` and nothing else, and `metrics` imports no module of this
+# package at all (it says so in its own header, and for this reason), so
+# `sampling -> objective_registry -> metrics` terminates. Nothing in either of
+# those two modules imports this one.
+from .objective_registry import (
+    MULTICLASS as _MULTICLASS,
+    MULTI_RMSE as _MULTI_RMSE,
+    MULTI_RMSE_WITH_MISSING as _MULTI_RMSE_WITH_MISSING,
+)
+
 # LightGBM's feature_fraction_seed default.
 comptime DEFAULT_FEATURE_FRACTION_SEED = 2
 
@@ -1846,6 +1861,317 @@ def check_bootstrap_honored(params: BootstrapParams, where: String) raises:
             " would be unsampled. Use boosting.train, boosting.train_more or"
             " boosting.train_with_valid, or drop bootstrap_type",
         )
+
+
+# The three `bootstrap_type` values CatBoost's own defaulting can land on.
+# `catboost_default_bootstrap_type` returns one of these; there is no fourth,
+# and in particular `No` is not one of them -- CatBoost never defaults a fit to
+# an unsampled one.
+comptime CATBOOST_DEFAULT_MVS = 0
+comptime CATBOOST_DEFAULT_BAYESIAN = 1
+comptime CATBOOST_DEFAULT_BERNOULLI = 2
+
+
+def catboost_default_bootstrap_type(objective: Int) raises -> Int:
+    """Which `bootstrap_type` CatBoost installs for `objective` when the user
+    names none. **THREE-WAY, per objective**, and flattening it to two would
+    be wrong.
+
+    **Read from CatBoost `master` (August 2026), quoted rather than
+    paraphrased**, and read as a whole rather than from one loss: the file is
+    `catboost/private/libs/options/catboost_options.cpp`, the function is
+    `TCatBoostOptions::SetNotSpecifiedOptionsToDefaults`, and it writes the
+    default **twice**, in two blocks separated by forty lines, with the second
+    overriding the first.
+
+    **Block one, lines 781-789** -- MVS unless excluded:
+
+        if (bootstrapType.NotSet()) {
+            if (!IsMultiClassOnlyMetric(lossFunction)
+                && !IsMultiRegressionObjective(lossFunction)
+                && TaskType == ETaskType::CPU
+                && ObliviousTreeOptions->BootstrapConfig->GetSamplingUnit()
+                     == ESamplingUnit::Object)
+            {
+                bootstrapType.SetDefault(EBootstrapType::MVS);
+            }
+        }
+
+    and lines 793-799, where the 0.8 comes from:
+
+        if (subsample.IsSet()) { ... } else {
+            if (bootstrapType == EBootstrapType::MVS) {
+                subsample.SetDefault(0.8);
+            }
+        }
+
+    **Block two, lines 818-835** -- Bernoulli at 0.5 for three ranking losses:
+
+        switch (lossFunction) {
+            case ELossFunction::QueryCrossEntropy:
+            case ELossFunction::YetiRankPairwise:
+            case ELossFunction::PairLogitPairwise: {
+                ...
+                if (...GetBaggingTemperature().IsSet()) {
+                    ... //fallback to bayesian bootstrap
+                } else {
+                    bootstrapType.SetDefault(EBootstrapType::Bernoulli);
+                    ...GetTakenFraction().SetDefault(0.5);
+                }
+
+    **Block two wins**, and that is a source fact rather than an assumption
+    about ordering: `TOption::SetDefault`
+    (`catboost/private/libs/options/option.h:28-33`) assigns `DefaultValue`
+    and then assigns `Value` too whenever `IsSetFlag` is false, so a second
+    `SetDefault` on an option the user never named overwrites the first. Those
+    three losses pass block one's test (none is multiclass-only or
+    multi-regression), so block one gives them MVS and block two takes it away
+    again.
+
+    **When neither block fires the option keeps the value it was DECLARED
+    with, which is Bayesian and not "no bootstrap".** The declaration is
+    `catboost/private/libs/options/bootstrap_options.h:18`,
+    `BootstrapType("type", EBootstrapType::Bayesian)`, beside
+    `BaggingTemperature("bagging_temperature", 1.0)` on line 16. CatBoost's
+    own error text at `catboost_options.cpp:795` says it in so many words:
+    "default bootstrap type (bayesian)".
+
+    The two predicates, both read rather than guessed:
+
+    - `IsMultiClassOnlyMetric`, `enum_helpers.cpp:668`: classification-only
+      AND multiclass-compatible AND **not** binary-compatible. In mojotrees's
+      objective space exactly one code satisfies it,
+      `objective_registry.MULTICLASS`. `Logloss` and `CrossEntropy` are
+      binary-compatible and so fall on the MVS side, which is why the CatBoost
+      column beside every binary benchmark in this repository has always been
+      an MVS fit.
+    - `IsMultiRegressionObjective`, `enum_helpers.cpp:683`, over the list at
+      `enum_helpers.cpp:551`: `{MultiRMSE, MultiRMSEWithMissingValues,
+      PythonUserDefinedMultiTarget}`. The first two are
+      `objective_registry.MULTI_RMSE` and `MULTI_RMSE_WITH_MISSING`; the third
+      is a multi-target callback, which mojotrees does not have (its `CUSTOM`
+      is single-output).
+
+    **The Bernoulli arm has no mojotrees objective code today, and saying so
+    is the point of returning it rather than folding it away.** CatBoost's
+    three losses are `QueryCrossEntropy` and the *Pairwise* variants of
+    YetiRank and PairLogit; mojotrees's `QUERY_RMSE`, `PAIR_LOGIT` and
+    `YETI_RANK` are the non-pairwise losses, which are separate
+    `ELossFunction` values and are not in that switch. So this function
+    returns `CATBOOST_DEFAULT_BERNOULLI` for nothing at present -- and a lane
+    that later adds `YetiRankPairwise` gets the right answer instead of
+    silently inheriting MVS, which is exactly the failure a two-way rule
+    transcribed from one loss produces.
+
+    Two conjuncts of block one are deliberately NOT tested here, because
+    neither is a property of the objective and this function takes only the
+    objective:
+
+    - `TaskType == ETaskType::CPU`. The device is the caller's, and every
+      device trainer in this package refuses a bootstrap by name. A caller
+      that resolved to the GPU asks for no bootstrap at all rather than for a
+      different one.
+    - `SamplingUnit == ESamplingUnit::Object`. Per-object is the only unit
+      implemented here; group sampling does not exist in
+      `MvsBootstrapParams`, so the conjunct is constantly true.
+
+    One further conditional inside block two is also not modeled: with an
+    explicit `bagging_temperature`, those three losses fall back to Bayesian
+    instead of Bernoulli. It cannot be reached from a *default*, which is all
+    this function describes -- a user who set `bagging_temperature` has named
+    a parameter, and `_parse_bootstrap` refuses it beside anything but
+    `bootstrap_type='bayesian'` before this rule is consulted.
+    """
+    if (
+        objective == _MULTICLASS
+        or objective == _MULTI_RMSE
+        or objective == _MULTI_RMSE_WITH_MISSING
+    ):
+        return CATBOOST_DEFAULT_BAYESIAN
+    return CATBOOST_DEFAULT_MVS
+
+
+def catboost_default_bootstrap(
+    objective: Int, seed: Int = DEFAULT_BOOTSTRAP_SEED
+) raises -> BootstrapParams:
+    """The bundle CatBoost installs for `objective` when the user names no
+    `bootstrap_type` at all.
+
+    ONE place, so that no call site restates the exclusion and no two call
+    sites can drift apart on it. `catboost_default_bootstrap_type` is the
+    rule and carries the citations; this is the rule turned into a bundle, and
+    the two rates come from `DEFAULT_MVS_SUBSAMPLE` and
+    `DEFAULT_BAGGING_TEMPERATURE`, which carry their own.
+
+    `CATBOOST_DEFAULT_BERNOULLI` **raises rather than returning a bundle**,
+    and that is the honest answer rather than a gap: Bernoulli is not a
+    `BootstrapParams` at all in mojotrees. It is row bagging, `BaggingParams`,
+    which `canonical_bootstrap_type` refuses the spelling of for precisely
+    this reason -- so a caller wanting CatBoost's default for one of those
+    three ranking losses needs `bagging.BaggingParams` at 0.5, not this
+    function. No objective code reaches that arm today; see
+    `catboost_default_bootstrap_type`.
+
+    This function is what a *default* is, and it is not what a user's request
+    is: `BootstrapRequest` below is the type that keeps the two apart, and it
+    exists because they must degrade differently on a path that cannot honor
+    a bootstrap. Nothing in this module calls this function; the surfaces that
+    apply defaults do.
+
+    **mojotrees's own shipped default is still `BootstrapParams.disabled()`**
+    at every trainer argument and every estimator parameter, and this function
+    does not change that. It states what CatBoost's default IS so that the
+    switch, when it is thrown, is thrown in one place against one rule.
+    """
+    var kind = catboost_default_bootstrap_type(objective)
+    if kind == CATBOOST_DEFAULT_BAYESIAN:
+        return BootstrapParams.bayesian_at(seed=seed)
+    if kind == CATBOOST_DEFAULT_MVS:
+        return BootstrapParams.mvs_at(seed=seed)
+    raise Error(
+        "CatBoost's default bootstrap_type for this objective is Bernoulli at"
+        " subsample=0.5 (catboost_options.cpp:818-835), and Bernoulli is row"
+        " bagging under mojotrees's own name rather than a bootstrap_type:"
+        " build bagging.BaggingParams at 0.5 instead of a BootstrapParams"
+    )
+
+
+@fieldwise_init
+struct BootstrapRequest(Copyable, Movable):
+    """A `BootstrapParams` together with **who asked for it**.
+
+    This is the whole of the difference between a default and a request, and
+    it is a field rather than a comment because the two have to behave
+    differently on any entry point that cannot run a bootstrap:
+
+    - **A DEFAULT that cannot be honored is dropped, silently.** A library
+      whose out-of-the-box `fit` raises on a multiclass problem, or on a CSR
+      matrix, or on the GPU, is not shippable, and a default is by definition
+      something the user did not ask for. There is nothing to tell them.
+    - **A REQUEST that cannot be honored is refused, by name, with the
+      reason.** A user who typed `bootstrap_type='MVS'` and got an unsampled
+      model would be reading a number that describes a different fit. That is
+      the failure `check_bootstrap_honored` exists to prevent and it is not
+      weakened here.
+
+    `named_by_user` is set by the surface that parses the user's input --
+    `bindings/_mojotrees.mojo`'s `_parse_bootstrap_request`, from a wire key
+    the estimator sets -- and by nothing downstream. Every **Mojo** API caller
+    is explicit by construction, because the Mojo trainers take a
+    `BootstrapParams` and have no defaulting surface of their own, which is
+    why they take that type and not this one.
+    """
+
+    var params: BootstrapParams
+    var named_by_user: Bool
+
+    @staticmethod
+    def named(var params: BootstrapParams) -> BootstrapRequest:
+        """The user typed a `bootstrap_type`. Refuse where it cannot run."""
+        return BootstrapRequest(params^, True)
+
+    @staticmethod
+    def defaulted(var params: BootstrapParams) -> BootstrapRequest:
+        """Nobody typed anything; this is the library's own default. Drop it
+        where it cannot run."""
+        return BootstrapRequest(params^, False)
+
+    @staticmethod
+    def none() -> BootstrapRequest:
+        """No bootstrap and nobody asked for one, which is mojotrees's shipped
+        default today. Resolves to `disabled()` on every path and raises on
+        none of them."""
+        return BootstrapRequest(BootstrapParams.disabled(), False)
+
+    def enabled(self) -> Bool:
+        """Whether a sampler is configured, however it got here."""
+        return self.params.enabled()
+
+    def resolve(self, honored: Bool, where: String) raises -> BootstrapParams:
+        """The bundle to hand on, for an entry point that refuses HERE.
+
+        `honored` is the caller's statement that the trainer it is about to
+        call threads this bundle into a round loop that calls
+        `bootstrap_round`. It is a property of the ROUTING and not of the
+        entry point's name, so a fork has to settle the fork -- the same rule
+        `_parse_params`'s reachability flags keep, and for the same reason:
+        `random_strength` was declared honored at one entry point and lost on
+        the fork the benchmark actually took.
+
+        Use this where the trainer would accept the bundle and ignore it. Use
+        `resolve_or_defer` instead where the trainer refuses it itself with a
+        better message than the generic one below.
+        """
+        if honored:
+            return self.params.copy()
+        if self.named_by_user:
+            # Raises iff a sampler is actually configured, so an explicit
+            # `bootstrap_type='No'` resolves quietly on every path.
+            check_bootstrap_honored(self.params, where)
+        return BootstrapParams.disabled()
+
+    def resolve_or_defer(self, honored: Bool) -> BootstrapParams:
+        """The bundle to hand on, for an entry point whose TRAINER refuses.
+
+        A named request is handed on unchanged even when `honored` is False,
+        so the refusal the user reads is the trainer's own -- "bootstrap_type
+        is not implemented on the GPU: train_gpu takes no bootstrap bundle..."
+        beats `check_bootstrap_honored`'s generic sentence, and duplicating
+        the routing knowledge at the boundary is how the two drift apart.
+
+        A defaulted bundle is dropped here instead, because deferring it would
+        let the trainer raise on a default, and a default must never raise.
+        """
+        if honored or self.named_by_user:
+            return self.params.copy()
+        return BootstrapParams.disabled()
+
+
+def check_mvs_reg_is_set(params: BootstrapParams, where: String) raises:
+    """Refuse a **derived** `mvs_reg` on a loop that cannot derive one.
+
+    `TMvsSampler::GetLambda` (`catboost/private/libs/algo/mvs.cpp:67-79`)
+    takes the explicit lambda when one is set and otherwise calls
+    `CalculateLastIterMeanLeafValue` (`mvs.cpp:21-34`) on the previous
+    iteration's leaf values, or `CalculateMeanGradValue` when no tree exists
+    yet. The leaf-value branch reads `lastIterValues[dim][leaf]`: **one tree,
+    with one value per output dimension per leaf.**
+
+    Two loops here have no such table and so cannot take that branch:
+
+    - **The softmax loops.** A CatBoost multiclass iteration is one oblivious
+      tree carrying a `K`-vector in every leaf; a mojotrees round is `K`
+      structurally different trees whose leaves do not correspond, so there is
+      no `[dim][leaf]` rectangle to reduce and no defensible substitute. The
+      squared mean norm the lambda needs is not recoverable from `K` separate
+      leaf tables, and inventing one would set the floor that decides which
+      rows survive to a number no CatBoost run computes.
+    - **Continued training**, which resumes from raw scores rather than from
+      the ensemble that produced them (`boosting._boost_rounds` makes that
+      refusal itself, with its own message).
+
+    An explicit `mvs_reg` needs no derivation and passes, as does the Bayesian
+    bootstrap, which has no lambda at all. This raises rather than silently
+    restarting the derivation from the gradients, which would give round `k`
+    a different lambda from round `k` of the run it claims to reproduce.
+    """
+    if not params.mvs.enabled:
+        return
+    if params.mvs.reg_is_set:
+        return
+    raise Error(
+        "bootstrap_type='mvs' without mvs_reg is not implemented by ",
+        where,
+        ": CatBoost derives the lambda from the PREVIOUS tree's leaf values"
+        " (TMvsSampler::GetLambda -> CalculateLastIterMeanLeafValue), which"
+        " reads one tree holding one value per output dimension per leaf. A"
+        " softmax round here is one tree per class with unrelated structures,"
+        " so that table does not exist and no substitute for it would be"
+        " CatBoost's number. Set mvs_reg explicitly, or use"
+        " bootstrap_type='bayesian', which is the type CatBoost itself"
+        " defaults the multiclass-only losses to"
+        " (catboost_default_bootstrap_type)",
+    )
 
 
 def apply_bootstrap_weights(

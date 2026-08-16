@@ -120,7 +120,11 @@ from .ranking_advanced import (
     train_ranker_advanced,
 )
 from .raw_data import RawData
-from .sampling import BootstrapParams, check_bootstrap_honored
+# `check_bootstrap_honored` is no longer imported: every arm of every trainer
+# in this module either threads the bundle into a round loop that draws it or
+# refuses it by name with the trainer that cannot (the two GPU arms). A generic
+# refusal has nothing left to say here.
+from .sampling import BootstrapParams
 from .sparse import CscMatrix, CsrMatrix, SparseBinnedMatrix, transform_csc
 from .train_gpu import train_gpu, train_multiclass_gpu
 from .validation import (
@@ -1506,13 +1510,17 @@ def train_dataset(
     way: it serializes, loads, and predicts on dense rows identically.
 
     `bootstrap` is CatBoost's `bootstrap_type` (see sampling.mojo) and is
-    honored on the **dense CPU** arm alone, which is the arm that calls
-    `boosting.train`. The sparse grower and `train_gpu` take no bundle and
-    their loops never call `sampling.bootstrap_round`, so an enabled bundle
-    on either raises rather than training an unsampled model and reporting a
-    sampled one. This is the same rule `model.fit` keeps, and it is here
-    because `bench/real_data`'s dense arm trains through a `Dataset`, not
-    through `model.fit`.
+    honored on **both CPU arms**, dense and sparse: `boosting.train` and
+    `boosting_sparse.train_sparse` both call `sampling.bootstrap_round` in
+    their round loops. Only `train_gpu` cannot -- it takes no bundle and its
+    loop never draws -- so a fit that resolved to the GPU raises rather than
+    training an unsampled model and reporting a sampled one.
+
+    The sparse arm used to raise here as well, through
+    `sampling.check_bootstrap_honored`, and that refusal is gone because the
+    loop behind it now exists rather than because the rule was relaxed. It is
+    here rather than only on `model.fit` because `bench/real_data`'s dense arm
+    trains through a `Dataset`, not through `model.fit`.
     """
     _check_labels(dataset.label, dataset.n_rows)
     # Catalog A19's trainer refusal USED TO STAND HERE. It is gone because
@@ -1527,9 +1535,6 @@ def train_dataset(
     if dataset.is_sparse:
         if device == GPU_DEVICE:
             _no_gpu_for_sparse()
-        check_bootstrap_honored(
-            bootstrap, String("a sparse Dataset fit (boosting_sparse)")
-        )
         booster = train_sparse(
             dataset.sparse_data,
             dataset.label,
@@ -1540,6 +1545,7 @@ def train_dataset(
             bagging,
             goss,
             dataset.init_score,
+            bootstrap=bootstrap,
         )
         return Model(dataset.mapper.copy(), booster^)
 
@@ -1592,6 +1598,7 @@ def train_dataset_multiclass(
     device: Int = CPU_DEVICE,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> MulticlassModel:
     """Train a softmax model on an already binned dataset, on the backend
     `device` resolves to, exactly as in `model.fit_multiclass`.
@@ -1616,6 +1623,20 @@ def train_dataset_multiclass(
     A sparse dataset trains through `train_multiclass_sparse`, which does
     not implement GOSS; asking for it raises rather than training every row
     and reporting a run that sampled.
+
+    `bootstrap` is CatBoost's `bootstrap_type` (see sampling.mojo). **This
+    function used to take no bundle at all**, which is why every binding that
+    reached it had to refuse the parameter upstream and why a CatBoost default
+    could not be shipped for a multiclass problem. Both CPU arms honor it now
+    -- `boosting._boost_rounds_multiclass` and
+    `boosting_sparse.train_multiclass_sparse` both call
+    `sampling.bootstrap_round`, once per round, shared by every class's tree.
+    `train_multiclass_gpu` still cannot and is refused by name below.
+
+    The type CatBoost defaults a multiclass loss to is the **Bayesian**
+    bootstrap, not MVS: `sampling.catboost_default_bootstrap_type` cites the
+    lines. MVS is accepted here but needs an explicit `mvs_reg`
+    (`sampling.check_mvs_reg_is_set`).
     """
     _check_labels(dataset.label, dataset.n_rows)
     # Catalog A19's trainer refusal USED TO STAND HERE. It is gone because
@@ -1647,6 +1668,7 @@ def train_dataset_multiclass(
             params,
             dataset.weight,
             bagging,
+            bootstrap=bootstrap,
         )
         return MulticlassModel(dataset.mapper.copy(), sparse_booster^)
 
@@ -1669,6 +1691,21 @@ def train_dataset_multiclass(
     )
     var booster: MulticlassBooster
     if backend == GPU_DEVICE:
+        # The same refusal `train_dataset` makes on its own GPU arm, in the
+        # same words: `train_multiclass_gpu` takes no bootstrap bundle and its
+        # round loop never calls `sampling.bootstrap_round`, so the fit would
+        # be unsampled while the run reported a sampled one. Named here rather
+        # than left to `check_bootstrap_honored`, whose message points at the
+        # single-output trainers.
+        if bootstrap.enabled():
+            raise Error(
+                "bootstrap_type is not implemented on the GPU:"
+                " train_multiclass_gpu takes no bootstrap bundle and its round"
+                " loop never draws one, so the fit would be unsampled. This"
+                " fit resolved to the GPU (device='gpu', or device='auto' on a"
+                " shape the policy sends there); set device='cpu' or drop"
+                " bootstrap_type"
+            )
         booster = train_multiclass_gpu(
             dataset.data,
             _int_labels(dataset.label, n_classes),
@@ -1687,6 +1724,7 @@ def train_dataset_multiclass(
             dataset.weight,
             bagging,
             goss,
+            bootstrap,
         )
     return MulticlassModel(dataset.mapper.copy(), booster^)
 
@@ -1798,6 +1836,7 @@ def update_dataset(
     alpha: Float64 = 0.9,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Int:
     """Append `params.n_estimators` more rounds to `model` from `dataset`,
     returning how many trees were added.
@@ -1815,6 +1854,14 @@ def update_dataset(
     trees it would produce are the CPU trees either way (see
     docs/GPU_VALIDATION.md). The sparse grower has no `train_more`
     counterpart, so a sparse dataset is refused rather than densified.
+
+    `bootstrap` reaches `boosting.train_more`, which is `_boost_rounds` with a
+    `round_offset`, so the draw is keyed on the ABSOLUTE round index and a
+    continued run draws what an uninterrupted one would have. One thing does
+    not continue: **MVS with a derived `mvs_reg`**, because the lambda is the
+    previous tree's leaf-value norm and a continued run resumes from raw
+    scores rather than from the ensemble. `_boost_rounds` refuses that pair by
+    name; an explicit `mvs_reg` and the Bayesian bootstrap both continue.
     """
     if dataset.is_sparse:
         raise Error(
@@ -1846,6 +1893,7 @@ def update_dataset(
         bagging,
         goss,
         dataset.init_score,
+        bootstrap=bootstrap,
     )
 
 
@@ -1855,6 +1903,7 @@ def update_dataset_multiclass(
     params: BoosterParams,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Int:
     """Append `params.n_estimators` more softmax rounds to `model` from
     `dataset`, returning how many rounds were added (one round is one tree
@@ -1897,6 +1946,11 @@ def update_dataset_multiclass(
             "init_score is not supported for multiclass training: one offset"
             " per row cannot say what each class starts from"
         )
+    # `bootstrap` continues here for the reason `update_dataset` gives, with
+    # one difference: the derived-`mvs_reg` case never arises, because every
+    # softmax round refuses it outright (`sampling.check_mvs_reg_is_set`), so
+    # the only MVS that reaches this call already carries an explicit lambda
+    # and needs no previous tree at all.
     return train_multiclass_more(
         model.booster,
         dataset.data,
@@ -1905,4 +1959,5 @@ def update_dataset_multiclass(
         dataset.weight,
         bagging,
         goss,
+        bootstrap,
     )

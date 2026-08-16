@@ -248,8 +248,8 @@ from mojotrees.gpu_predict import (
 from mojotrees.goss import GossParams
 from mojotrees.sampling import (
     BootstrapParams,
+    BootstrapRequest,
     canonical_bootstrap_type,
-    check_bootstrap_honored,
     check_mvs_bagging_temperature,
 )
 from mojotrees.alternate_boosting import (
@@ -1252,6 +1252,40 @@ def _parse_bootstrap(params: PythonObject) raises -> BootstrapParams:
     return BootstrapParams.bayesian_at(seed=seed)
 
 
+def _parse_bootstrap_request(
+    params: PythonObject,
+) raises -> BootstrapRequest:
+    """`_parse_bootstrap`'s bundle together with **whether the user asked for
+    it**, which is the sixth wire key of the group and the one that decides
+    how an entry point that cannot honor a bootstrap behaves.
+
+    `bootstrap_explicit` is 1 when the estimator saw a `bootstrap_type` the
+    user wrote down and 0 when the value on the wire is the library's own
+    default. The distinction cannot be recovered from the bundle -- a defaulted
+    MVS and a typed MVS are the same five numbers -- and it has to survive the
+    boundary because the two must degrade differently:
+
+    - **A typed request is refused by name** on any path whose round loop does
+      not call `sampling.bootstrap_round`. A user reading a benchmark of a
+      "sampled" fit that was not sampled is the failure this whole group of
+      refusals exists to prevent.
+    - **A defaulted bundle is dropped, silently**, on those same paths. A
+      library whose out-of-the-box `fit` raises on a multiclass problem, on a
+      CSR matrix, or on the GPU is not shippable, and there is nothing to tell
+      a user about a value they never set.
+
+    `BootstrapRequest.resolve` and `resolve_or_defer` are the two ways to spend
+    this; which one a call site wants depends on whether the trainer it is
+    about to call has a better refusal of its own. **Every call site below
+    picks one deliberately and none of them ignores the bundle**, which is the
+    property this file has had to learn twice.
+    """
+    var bundle = _parse_bootstrap(params)
+    if Int(py=params["bootstrap_explicit"]) != 0:
+        return BootstrapRequest.named(bundle^)
+    return BootstrapRequest.defaulted(bundle^)
+
+
 def _parse_boosting(params: PythonObject) raises -> AlternateBoostingParams:
     """LightGBM's `boosting` from the params dict: the mode by name, and the
     DART bundle from the `drop_*` keys when the mode is dart. `goss` keeps
@@ -1405,12 +1439,15 @@ def fit(
         auto_lr_objective=Int(py=objective),
     )
     var weights = _parse_weights(params, nr)
-    # CatBoost's `bootstrap_type`. This entry point is the ONLY one in this
-    # file that can honor it: `model.fit` on the CPU reaches `boosting.train`,
-    # whose round loop calls `sampling.bootstrap_round`. Every branch below
-    # that leaves that path refuses an enabled bundle by name rather than
-    # dropping it, and `model.fit` itself refuses one that resolved to the GPU.
-    var bootstrap = _parse_bootstrap(params)
+    # CatBoost's `bootstrap_type`, with the flag that says whether the user
+    # typed it. `model.fit` on the CPU with plain gbdt and no `linear_tree`
+    # reaches `boosting.train`, whose round loop calls
+    # `sampling.bootstrap_round`; the dart/rf and linear forks below leave that
+    # path and settle themselves, and the GPU fork is settled where `model.fit`
+    # is called. A fork is settled at the fork, not at the entry point, which
+    # is the rule `_parse_params`'s reachability flags keep and the rule
+    # `random_strength` was once shipped without.
+    var boot_req = _parse_bootstrap_request(params)
     var boosting = _parse_boosting(params)
     if bp.ordered.enabled and (
         boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF
@@ -1471,8 +1508,12 @@ def fit(
                 "boosting='dart' and boosting='rf' train on the CPU only;"
                 " set device='cpu'"
             )
-        check_bootstrap_honored(
-            bootstrap,
+        # `resolve`, not `resolve_or_defer`: `alternate_boosting.fit_boosting`
+        # takes no bootstrap argument at all, so there is no trainer-side
+        # refusal to defer to and this is the last place a typed request can
+        # be reported. A defaulted bundle is dropped here instead of raising.
+        _ = boot_req.resolve(
+            False,
             String(
                 "boosting='dart' and boosting='rf'"
                 " (alternate_boosting.fit_boosting)"
@@ -1505,8 +1546,11 @@ def fit(
             raise Error(
                 "linear_tree=True trains on the CPU only; set device='cpu'"
             )
-        check_bootstrap_honored(
-            bootstrap,
+        # Same shape as the dart/rf fork: `custom_metric.fit_with_metrics`
+        # takes no bundle, so a typed request is refused here and a default is
+        # dropped here.
+        _ = boot_req.resolve(
+            False,
             String("linear_tree=True (custom_metric.fit_with_metrics)"),
         )
         var train_set = List[RawValidSet]()
@@ -1542,6 +1586,12 @@ def fit(
             categorical_features=_parse_categorical(params),
         )
         return PythonObject(alloc=fitted.model.copy())
+    # The plain gbdt fork. `resolve_or_defer`, not `resolve`: `model.fit`
+    # refuses a GPU bootstrap itself and names `train_gpu` while doing it,
+    # which beats the generic sentence, so a typed request is handed on
+    # unchanged and read there. A defaulted bundle is dropped here, because
+    # deferring it would let a default raise.
+    var bootstrap = boot_req.resolve_or_defer(device == CPU_DEVICE)
     var model = mojo_fit(
         features,
         nr,
@@ -1601,8 +1651,8 @@ def distributed_train_local(
         auto_lr_rows=nr,
         auto_lr_objective=Int(py=objective),
     )
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
+    _ = _parse_bootstrap_request(params).resolve(
+        False,
         String("distributed_train_local (tree_learner other than 'serial')"),
     )
     var weights = _parse_weights(params, nr)
@@ -1663,8 +1713,8 @@ def fit_custom(
     # `boosting._check_bootstrap` refuses the pair outright rather than for
     # want of wiring: a callback's derivatives are the caller's, and a draw
     # would rescale them behind the caller's back.
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
+    _ = _parse_bootstrap_request(params).resolve(
+        False,
         String("fit_custom (a custom objective)"),
     )
     var weights = _parse_weights(params, nr)
@@ -1772,8 +1822,8 @@ def fit_with_metrics(
     # An eval_set, a callback, or linear_tree routes here rather than to
     # `boosting.train_with_valid`, and `custom_metric`'s round loop does not
     # call `sampling.bootstrap_round`.
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
+    _ = _parse_bootstrap_request(params).resolve(
+        False,
         String("fit_with_metrics (an eval_set or callback fit)"),
     )
     var weights = _parse_weights(params, nr)
@@ -2017,8 +2067,8 @@ def fit_multiclass_with_metrics(
         score_function_ok=True,
         auto_lr_reason=String(_AUTO_LR_EVAL_SET_REASON),
     )
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
+    _ = _parse_bootstrap_request(params).resolve(
+        False,
         String("fit_multiclass_with_metrics (a softmax eval_set fit)"),
     )
     var weights = _parse_weights(params, nr)
@@ -2091,8 +2141,8 @@ def fit_ranker_with_metrics(
         score_function_ok=True,
         auto_lr_reason=String(_AUTO_LR_EVAL_SET_REASON),
     )
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
+    _ = _parse_bootstrap_request(params).resolve(
+        False,
         String("fit_ranker_with_metrics (a LambdaRank eval_set fit)"),
     )
     var advanced = _parse_advanced_rank_params(params)
@@ -2294,13 +2344,14 @@ def fit_multiclass(
         auto_lr_rows=nr,
         auto_lr_objective=_MULTICLASS_OBJECTIVE,
     )
-    # `model.fit_multiclass` refuses an enabled bundle itself, on either
-    # backend; parsing here means the value is refused with the same message
-    # whether or not the trainer is ever reached, and that `bagging_temperature`
-    # beside MVS is caught before anything else runs.
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
-        String("the multiclass trainers (boosting.train_multiclass)"),
+    # CatBoost's `bootstrap_type`, HONORED on the CPU arm since
+    # `boosting._boost_rounds_multiclass` took a bundle: one draw per round,
+    # shared by every class's tree. `model.fit_multiclass` refuses the GPU arm
+    # itself and names `train_multiclass_gpu`, so this defers to it rather than
+    # restating the routing. Parsing here also means `bagging_temperature`
+    # beside MVS is still caught before anything else runs.
+    var bootstrap = _parse_bootstrap_request(params).resolve_or_defer(
+        device == CPU_DEVICE
     )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass(
@@ -2317,6 +2368,7 @@ def fit_multiclass(
         _parse_goss(params),
         use_missing=_parse_use_missing(params),
         categorical_features=_parse_categorical(params),
+        bootstrap=bootstrap,
     )
     return PythonObject(alloc=model^)
 
@@ -2346,9 +2398,13 @@ def fit_csc(
         auto_lr_rows=nr,
         auto_lr_objective=Int(py=objective),
     )
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
-        String("a sparse (CSC) fit (model_sparse.fit_csc)"),
+    # HONORED on the CPU arm since `boosting_sparse.train_sparse`'s round loop
+    # took a bundle and began calling `sampling.bootstrap_round`.
+    # `model_sparse.fit_csc` refuses the device arm itself and names
+    # `train_gpu_sparse`, so this defers to it.
+    var device = _parse_device(params)
+    var bootstrap = _parse_bootstrap_request(params).resolve_or_defer(
+        device == CPU_DEVICE
     )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_csc(
@@ -2363,7 +2419,8 @@ def fit_csc(
         _parse_goss(params),
         _parse_use_missing(params),
         _parse_categorical(params),
-        device=_parse_device(params),
+        device=device,
+        bootstrap=bootstrap,
     )
     return PythonObject(alloc=model^)
 
@@ -2388,9 +2445,12 @@ def fit_multiclass_csc(
         auto_lr_rows=nr,
         auto_lr_objective=_MULTICLASS_OBJECTIVE,
     )
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
-        String("a sparse (CSC) multiclass fit (model_sparse.fit_multiclass_csc)"),
+    # HONORED on the CPU arm since `boosting_sparse.train_multiclass_sparse`
+    # took a bundle; the sparse device trainer is refused inside
+    # `model_sparse.fit_multiclass_csc`, which names it.
+    var device = _parse_device(params)
+    var bootstrap = _parse_bootstrap_request(params).resolve_or_defer(
+        device == CPU_DEVICE
     )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass_csc(
@@ -2403,7 +2463,8 @@ def fit_multiclass_csc(
         _parse_bagging(params),
         _parse_use_missing(params),
         _parse_categorical(params),
-        device=_parse_device(params),
+        device=device,
+        bootstrap=bootstrap,
     )
     return PythonObject(alloc=model^)
 
@@ -2566,8 +2627,8 @@ def fit_ranker(
         auto_lr_rows=nr,
         auto_lr_objective=_LAMBDARANK_OBJECTIVE,
     )
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
+    _ = _parse_bootstrap_request(params).resolve(
+        False,
         String("fit_ranker (the LambdaRank trainers)"),
     )
     var weights = _parse_weights(params, nr)
@@ -3909,8 +3970,11 @@ def train_dataset(
         # The second reachable path, and the one `bench/real_data`'s dense
         # arm actually takes: `mojotrees.train(params, Dataset)` never
         # touches `model.fit`. `trainset.train_dataset` honors the bundle on
-        # its dense CPU arm and refuses it on the sparse and GPU arms.
-        _parse_bootstrap(params),
+        # BOTH CPU arms now, dense and sparse, and refuses only the GPU arm --
+        # by name, which is why this defers rather than restating the routing.
+        _parse_bootstrap_request(params).resolve_or_defer(
+            device == CPU_DEVICE
+        ),
     )
     return PythonObject(alloc=model^)
 
@@ -3923,9 +3987,14 @@ def train_dataset_multiclass(
     var d = dataset.downcast_value_ptr[Dataset]()
     # Read the device first, for the reason `fit` does.
     var device = _parse_device(params)
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
-        String("a Dataset multiclass fit (trainset.train_dataset_multiclass)"),
+    # CatBoost's `bootstrap_type`. This entry point REFUSED the parameter
+    # outright until `trainset.train_dataset_multiclass` grew a bundle to take,
+    # because until then nothing behind it could draw. Both CPU arms honor it
+    # now (dense through `boosting._boost_rounds_multiclass`, sparse through
+    # `boosting_sparse.train_multiclass_sparse`), and the GPU arm refuses it by
+    # name inside the trainer, which is what this defers to.
+    var bootstrap = _parse_bootstrap_request(params).resolve_or_defer(
+        device == CPU_DEVICE
     )
     var model = mojo_train_dataset_multiclass(
         d[],
@@ -3946,6 +4015,7 @@ def train_dataset_multiclass(
         device,
         _parse_bagging(params),
         _parse_goss(params),
+        bootstrap,
     )
     return PythonObject(alloc=model^)
 
@@ -3956,8 +4026,8 @@ def train_dataset_ranker(
     """Train a LambdaRank model on a constructed dataset, whose `group`
     holds the per-query row counts."""
     var d = dataset.downcast_value_ptr[Dataset]()
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
+    _ = _parse_bootstrap_request(params).resolve(
+        False,
         String("a Dataset ranker fit (trainset.train_dataset_ranker)"),
     )
     var model = mojo_train_dataset_ranker_advanced(
@@ -3990,9 +4060,19 @@ def booster_update(
     checks; see `trainset.update_dataset`."""
     var m = model.downcast_value_ptr[Model]()
     var d = dataset.downcast_value_ptr[Dataset]()
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
-        String("booster_update (trainset.update_dataset)"),
+    # CatBoost's `bootstrap_type` on a continued run. `boosting.train_more` is
+    # `_boost_rounds` with a `round_offset`, so it draws at the ABSOLUTE round
+    # index and a continued run draws what an uninterrupted one would have --
+    # honored, not refused. Two configurations it cannot continue, and both
+    # already refuse themselves with a better sentence than the generic one:
+    # a sparse dataset ("continued training has no sparse path") and MVS with
+    # a DERIVED mvs_reg ("the derived value is the squared mean leaf-value norm
+    # of the tree before"). `resolve_or_defer` hands a TYPED request on to
+    # those messages and drops a DEFAULTED bundle here, so a default cannot
+    # turn a working `booster_update` into a raise.
+    var boot_req = _parse_bootstrap_request(params)
+    var boot_can_continue = not d[].is_sparse and not (
+        boot_req.params.mvs.enabled and not boot_req.params.mvs.reg_is_set
     )
     var added = mojo_update_dataset(
         m[],
@@ -4019,6 +4099,7 @@ def booster_update(
         Float64(py=params["alpha"]),
         _parse_bagging(params),
         _parse_goss(params),
+        boot_req.resolve_or_defer(boot_can_continue),
     )
     return PythonObject(added)
 
@@ -4031,13 +4112,12 @@ def booster_update_multiclass(
     See `trainset.update_dataset_multiclass`."""
     var m = model.downcast_value_ptr[MulticlassModel]()
     var d = dataset.downcast_value_ptr[Dataset]()
-    check_bootstrap_honored(
-        _parse_bootstrap(params),
-        String(
-            "booster_update_multiclass"
-            " (trainset.update_dataset_multiclass)"
-        ),
-    )
+    # `booster_update`'s rule, minus one clause: the derived-`mvs_reg` case
+    # cannot arise on a softmax round because every softmax round refuses it
+    # (`sampling.check_mvs_reg_is_set`), so the only thing left that cannot
+    # continue is a sparse dataset, which `trainset.update_dataset_multiclass`
+    # refuses by name.
+    var boot_req = _parse_bootstrap_request(params)
     var added = mojo_update_dataset_multiclass(
         m[],
         d[],
@@ -4050,6 +4130,7 @@ def booster_update_multiclass(
         ),
         _parse_bagging(params),
         _parse_goss(params),
+        boot_req.resolve_or_defer(not d[].is_sparse),
     )
     return PythonObject(added)
 
