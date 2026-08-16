@@ -136,6 +136,28 @@ there is deliberately no global cache and no invalidation hook to forget:
 whoever resolves it owns it, and dropping it and resolving again is the
 whole of the invalidation story. A caller that must see a mid-process change
 either resolves again or uses the unresolved form.
+
+The unresolved sentinel, and why it exists
+------------------------------------------
+`ResolvedCpuPolicy.unresolved()` is a policy that says "I am not a snapshot".
+Every resolved method on it, and `derive_accumulation_plan_with` given it,
+falls back to reading the environment live, so it answers exactly what the
+unresolved free functions answer.
+
+It exists so that a threading parameter can be *defaulted*. The call chain
+from the booster down to a histogram build passes through modules that
+different lanes and different campaigns own, and a snapshot parameter with no
+default would force every one of those call sites to change at once. With the
+sentinel as the default, a caller that has a snapshot passes it and reads
+nothing; a caller that has not been wired yet passes nothing and behaves
+exactly as it did before, down to which `getenv` runs. That is deliberately a
+staging device and not a destination: a hot call site left on the sentinel is
+still paying per-dispatch, and the point of the parameter is to be filled in.
+
+The sentinel carries a zeroed profile rather than a detected one, because
+detecting the machine to build a value nobody will consult would be the cost
+this whole mechanism exists to remove. Nothing may read those zeros: every
+method checks `resolved` first and re-reads the machine when it is False.
 """
 
 from std.sys.info import (
@@ -551,6 +573,15 @@ struct ResolvedCpuPolicy(Copyable, Movable):
     var feature_group: Int
     var compact_min_rows: Int
 
+    var resolved: Bool
+    """Whether the four fields above and the profile were actually read.
+
+    False only for `unresolved()`, the sentinel a defaulted threading
+    parameter carries. Every method below tests it before touching a field,
+    so an unresolved policy answers what a live read answers rather than
+    answering from the zeros it carries. See "The unresolved sentinel" in the
+    module docstring."""
+
     @staticmethod
     def resolve() raises -> ResolvedCpuPolicy:
         """Detect the machine and read all four variables, once.
@@ -563,6 +594,7 @@ struct ResolvedCpuPolicy(Copyable, Movable):
             env_core_pool(),
             env_feature_group(),
             env_compact_min_rows(),
+            True,
         )
 
     @staticmethod
@@ -577,16 +609,36 @@ struct ResolvedCpuPolicy(Copyable, Movable):
             env_core_pool(),
             env_feature_group(),
             env_compact_min_rows(),
+            True,
+        )
+
+    @staticmethod
+    def unresolved() -> ResolvedCpuPolicy:
+        """The sentinel: no detection, no `getenv`, no answer of its own.
+
+        Cheap by construction, because it is what a defaulted parameter
+        builds at every unwired call site: a handful of integer stores and
+        not one system query. It is not raising, which is what lets it be a
+        default argument at all -- `resolve()` raises on an off-ladder
+        feature group, and a default that could raise would move that refusal
+        to a place no caller asked for it.
+        """
+        return ResolvedCpuPolicy(
+            CpuProfile(0, 0, 0, 0, False, 0, 0), 0, 0, 0, 0, False
         )
 
     def dispatch_cores(self) -> Int:
         """`CpuProfile.dispatch_cores` against the resolved pool."""
+        if not self.resolved:
+            return CpuProfile.detect().dispatch_cores()
         if self.core_pool == CORE_POOL_PERFORMANCE:
             return _positive_or(self.profile.performance_cores, 1)
         return _positive_or(self.profile.physical_cores, 1)
 
     def max_auto_tasks(self) -> Int:
         """`CpuProfile.max_auto_tasks` against the resolved knobs."""
+        if not self.resolved:
+            return CpuProfile.detect().max_auto_tasks()
         return _positive_or(
             _positive_or(self.tasks_per_core, DEFAULT_TASKS_PER_CORE)
             * self.dispatch_cores(),
@@ -600,6 +652,8 @@ struct ResolvedCpuPolicy(Copyable, Movable):
         cache estimate alone: the balance rule bounds it by how many groups
         the dispatch can still spread over the cores.
         """
+        if not self.resolved:
+            return plan_feature_group(CpuProfile.detect(), n_bins, n_active)
         return _plan_group(
             self.profile.l1d_bytes,
             self.dispatch_cores(),
@@ -612,6 +666,8 @@ struct ResolvedCpuPolicy(Copyable, Movable):
         """One line naming the snapshot, for benchmark headers. Distinct from
         `CpuProfile.describe`, which re-reads the environment to print it and
         so would report a live value next to a resolved plan."""
+        if not self.resolved:
+            return String("unresolved (live reads)")
         return String(
             "cores=",
             self.profile.physical_cores,
@@ -907,7 +963,20 @@ def derive_accumulation_plan_with(
     Identical arithmetic on identical inputs; the only difference is that the
     two variables come from the snapshot rather than from a fresh `getenv`,
     and no `CpuProfile.detect()` happens here at all.
+
+    Given the unresolved sentinel this is `derive_accumulation_plan` over a
+    fresh detection, so a call site that has not been handed a snapshot yet
+    keeps exactly the behaviour it had, including the `getenv` it had.
     """
+    if not policy.resolved:
+        return derive_accumulation_plan(
+            CpuProfile.detect(),
+            n_features,
+            n_active,
+            n_bins,
+            n_rows_touched,
+            rows_are_indirect,
+        )
     return _derive_plan(
         policy.profile.l1d_bytes,
         policy.dispatch_cores(),

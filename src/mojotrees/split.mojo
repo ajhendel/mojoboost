@@ -95,7 +95,7 @@ the first.
 """
 
 from .apple_cpu_policy import split_scan_ops
-from .parallel import dispatch_features
+from .parallel import DispatchSettings, dispatch_features_with
 from .categorical import (
     CAT_BITSET_WORDS,
     CatBitset,
@@ -354,6 +354,7 @@ def find_best_split(
     tree_index: Int = 0,
     parent_output: Float64 = 0.0,
     cegb: CegbNodeCosts = CegbNodeCosts.inactive(),
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises -> SplitInfo:
     """Scan all (feature, bin) split candidates and return the one with the
     highest gain. `lambda_reg` is the L2 penalty on the leaf hessian sum and
@@ -417,6 +418,16 @@ def find_best_split(
     them; a caller that passes none gets the split cost reconstructed from
     `extra.penalties.cegb` and is refused for the two penalties that need the
     ledger.
+
+    `settings` is the fit's `parallel.DispatchSettings` snapshot. The scan
+    dispatches once per node, and without a snapshot that dispatch re-reads
+    `MOJOTREES_NUM_WORKERS`, the two grain variables, and the two core-pool
+    variables, and re-detects the machine's core counts, every time -- to
+    answer a question whose inputs were fixed when the fit started. Passing a
+    snapshot reads none of them. It cannot move a gain: the fold below is the
+    same ascending strict `>` at every task count, which is the property
+    `test_cpu_dispatch` pins. The default sentinel keeps the live reads, so a
+    caller that has not been wired behaves exactly as it did.
 
     Exclusive feature bundling (efb.mojo) never reaches here: a bundled
     histogram is expanded back to one slice per original feature before the
@@ -759,7 +770,8 @@ def find_best_split(
         except:
             fail_out.unsafe_store(i_feature, UInt8(1))
 
-    dispatch_features(
+    dispatch_features_with(
+        settings,
         scan_one,
         n_active,
         split_scan_ops(n_active, hist.n_bins, len(missing_bins) > 0),
