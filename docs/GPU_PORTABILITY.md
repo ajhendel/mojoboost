@@ -262,6 +262,17 @@ they are in this document rather than in a benchmark report.
 
 ### 6.1 `enqueue_copy` is a synchronous full-queue drain in both directions
 
+**Read 6.1.1 first. Exactly one half of this section was withdrawn on
+2026-08-16 and the other half was not.** What stands: the mechanism below, the
+disassembly that established it, and every ordering consequence that follows
+from it, including the staging-buffer lifetime arguments and the hazard
+reasoning. A copy really does drain the queue, and that is still load-bearing.
+What was withdrawn: a **cost** model built on top of the mechanism during the
+2026-08-15 round, which said that because a copy drains, every copy is a host
+wait worth the ~458 microsecond per-synchronization constant, so removing a
+copy saves that much. That inference was refuted by measurement. Nothing in
+"What it is", "How it was established", or "What this is not" is retracted.
+
 **What it is.** On Metal, `DeviceContext.enqueue_copy` blocks the calling
 thread until the whole queue has drained, and then copies. Host to device as
 well as device to host. The name says enqueue and the code waits.
@@ -290,6 +301,58 @@ established what MAX does on top of them. Their behavior here is
 **unestablished**, which is different from asynchronous, and a design that
 needs an asynchronous upload has to establish it before relying on it.
 
+#### 6.1.1 The cost model derived from this was refuted. The mechanism was not.
+
+Withdrawn 2026-08-16, on the data in
+`bench/results/session3_2026-08-16/RESULTS.md`. Both figures below are
+**measured**: medians of five in-process repeats, alternating processes, quiet
+machine, 1,000,000 x 50, under the decision rules registered in
+`bench/results/PROFILE_PROTOCOL.md` before any of it ran.
+
+| what was removed | predicted | **measured** | verdict |
+|---|---|---|---|
+| thirteen copies per tree, ~1,300 per fit, from the device-resident plane | 0.64 s | **0.016 s** | not resolved under M0; the gap sits inside the arm's own spread |
+| ~thirty round trips per tree, the resident plane against the shipping loop | none registered | **0.75 s** | resolved by a wide margin, same shape, same session |
+
+The 0.75 is the fast regime, where it is 24% of the fit; in a slow window the
+same A/B fell to 0.35, or 8%, so the effect size moves with machine state and
+only its direction is regime-independent. The 0.016 is a null under M0 either
+way.
+
+Same session, same machine, same instrument. The two rows differ by a factor of
+about fifty, and what separates them is not how many copies were removed. It is
+whether anything was waiting.
+
+**Draining a queue that holds nothing costs nothing.** What costs is the
+**round trip**: host code blocking on a device answer that it needs before it
+can decide what to enqueue next. The ~458 microsecond per-synchronization
+constant is **derived**, from the depthwise A/B, and in that A/B what was
+removed were per-level round trips. It remains valid for what it was derived
+from. It was then extended to copies by analogy, and the extension is what the
+table above refutes.
+
+**The rule that replaces it:**
+
+> **Count round trips to predict time. Count copies to predict portability
+> risk and to reason about ordering hazards.** They are two different counts
+> with two different uses, and the 2026-08-15 round conflated them.
+
+A copy that drains a queue holding only already-finished work is very nearly
+free on Metal. A copy or a `synchronize` that waits on unfinished device work
+costs whatever that work had left to do. A round trip costs that, plus the
+refill of a pipeline it just emptied, plus the host's own decision.
+
+**What this does not license.** It does not make copies free in general, it
+does not make the drain go away, and it does not weaken anything in this
+section above. A copy still drains, so it still orders device work against host
+work, it still ends the usable depth of a launch stream (section 6.2 rule 3),
+and a staging buffer's lifetime still has to be argued against the drain rather
+than against an in-flight copy. Removing copies is still worth doing on the
+grounds it was actually earned on: fewer places for a stale byte to hide, fewer
+buffers to keep alive, less to get wrong on a backend where the copy is
+asynchronous. Those are correctness and portability arguments. They were always
+the good arguments. Only the stopwatch attached to them was wrong.
+
 **What in this repository assumes otherwise.** Docstrings that state the
 opposite have been corrected in place and are listed in the commit that adds
 this section. What could not be corrected by editing a comment:
@@ -310,15 +373,23 @@ this section. What could not be corrected by editing a comment:
 - Every `ctx.synchronize()` that immediately follows an `enqueue_copy` with
   no enqueue in between is redundant on Metal. It is what keeps the code
   correct on a backend where the copy really is asynchronous, so it should
-  stay. What must stop is counting it as a second wait: on Metal it is free
-  and the copy before it was not.
+  stay. What must stop is counting it as a second wait: the copy before it
+  already drained, so there is nothing left for it to wait on. Under 6.1.1
+  this cuts the other way as well. If that copy itself found an empty queue,
+  neither of the two cost anything, and the pair is one ordering point worth
+  no time at all rather than one wait worth 458 microseconds.
 
 **What a design must do about it.**
 
-1. **Count every copy as a synchronization, in both directions.** The wait
-   is the cost and it does not scale with the byte count. A design that
-   removed thirty-one downloads per tree and left one upload per round did
-   not remove thirty-one waits per tree.
+1. **Count round trips to predict time; count copies to predict portability
+   risk and ordering hazards.** Rewritten 2026-08-16; see 6.1.1 for the
+   measurement that forced it. This rule used to read "count every copy as a
+   synchronization, the wait is the cost", and that is the sentence the data
+   refutes. The two counts still both matter and are still both worth writing
+   down. What is no longer permitted is quoting the copy count and a
+   per-synchronization constant and calling the product a predicted saving.
+   Where a design does predict a time, the prediction is over round trips,
+   and it is **estimated** until it has been run interleaved.
 2. **Stage per fit wherever the data does not change per round.** The binned
    matrix already does this. The per-node parameter tables, the feature set,
    the allow mask, the monotone vector and the categorical parameters are
@@ -328,11 +399,16 @@ this section. What could not be corrected by editing a comment:
    per-round stages that exist today are the gradient and hessian planes,
    the bag mask on a bagged tree, the GOSS row and scale vectors, the
    per-round fixed-point scale words, and the per-tree node value and step
-   tables. Each is one drain. A round's wait budget is not complete until
-   all of them are in it.
-4. **A device-resident control plane states a wait count, so the count has
-   to include what crossed before the loop started.** One wait per tree plus
-   one bag-mask upload per tree is two, and it should be written as two.
+   tables. Each is one drain, and a drain is an ordering point whether or not
+   it is a cost. A round's **hazard** budget is not complete until all of them
+   are in it. Its **time** budget is a different list, made only of the ones
+   that block on unfinished device work.
+4. **A device-resident control plane states two counts, not one, and labels
+   which is which.** Its round-trip count is the one that predicts time. Its
+   copy count is the one that predicts what breaks on another backend and
+   where a stale byte could hide. A plane that makes one round trip per tree
+   and also uploads a bag mask per tree is one round trip and two copies, and
+   both numbers should be written, each under its own heading.
 5. **Do not argue for new pinned staging buffers on Metal grounds.** One
    buffer per destination is fine and costs nothing, but the argument that a
    shared buffer would force a drain between copies is vacuous when every
@@ -510,10 +586,12 @@ check first on each. `docs/GPU_VALIDATION.md` carries the procedure that
 turns either from `portable-untested` into `exercised`, and the empty record
 sections that procedure fills in.
 
-### 6.4 A tension with the timeline that is not yet resolved
+### 6.4 A tension with the timeline, resolved 2026-08-16
 
-Recorded because it is unresolved, and because resolving it by picking the more
-convenient half would be the wrong move.
+Recorded first as unresolved, on the grounds that resolving it by picking the
+more convenient half would be the wrong move. It has since been resolved by
+measurement rather than by picking, and the resolution is kept below the
+original statement so that the reasoning is visible and not just the answer.
 
 Section 6.1 establishes by disassembly that every `enqueue_copy` drains the
 queue. Section 6.2's audit found that `gpu_split_search._launch` calls
@@ -527,7 +605,7 @@ which is almost exactly one per split, and it measured that by counting where
 the host actually blocked rather than by reading source.
 
 Both are measurements and they disagree by a factor of five. Possible
-resolutions, none of them established:
+resolutions, none of them established at the time:
 
 - The measured path was `_device_search_resident`, which searches a whole
   frontier through `enqueue_frontier` rather than a node at a time, so
@@ -539,10 +617,22 @@ resolutions, none of them established:
   and the cost is not five times larger.
 - The disassembled path may not be the one MAX takes for small buffers.
 
-What follows from the tension regardless of how it resolves: **the wait count
-of any path must be measured rather than derived from the source**, because
-this project has now produced a source-derived count and an instrument-derived
-count for the same code that differ five-fold. The instrument is the one to
-believe about what the machine did. The disassembly is the one to believe about
-what the API guarantees. They answer different questions and the gap between
-them is exactly where a design assumption hides.
+**The second candidate is the one that holds.** Section 6.1.1's A/B removed
+thirteen of exactly these copies per tree and **measured** 0.016 seconds, so a
+drain on a queue that holds nothing costs so little that an instrument
+selecting for blocking blits is right not to count it. The count the trace
+reported was never five times low; it was counting the thing that costs, which
+is the round trip, and the source-derived 155 was counting a different thing
+and pricing it wrongly. The first candidate may also be true about how often
+`_copy_tables` runs, and nothing here establishes it either way; it is no
+longer needed to explain the gap.
+
+What follows from the tension regardless, and what still stands: **the wait
+count of any path must be measured rather than derived from the source.** This
+project produced a source-derived count and an instrument-derived count for the
+same code that differed five-fold, and the instrument was right. The instrument
+is the one to believe about what the machine did. The disassembly is the one to
+believe about what the API guarantees. They answer different questions, and the
+gap between them was exactly where the design assumption 6.1.1 withdraws had
+been hiding: the disassembly's answer, which is about ordering, was read as an
+answer about time.
