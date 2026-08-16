@@ -969,3 +969,28 @@ device contexts, which were not probed. And it does not close the question
 for MAX versions after 26.5.0: a `MetalDeviceGraphBuilder.cpp` is a file
 Modular can add, and `tools/probe_device_graph.mojo` exists so that the day
 it appears, nobody has to re-derive any of this.
+
+## Filed upstream: modular/modular#6899
+
+Every gap in sections 6.1 through 6.5 is now one upstream issue,
+**modular/modular#6899**, headlined by the ask that unblocks the other three:
+expose the host-visible pointer of a shared-storage `DeviceBuffer` on Metal.
+Beneath it, in order: `enqueue_copy` semantics with the **measured** 202 / 125 /
+10.6 microsecond figures, the absent events and fences, `DeviceGraph` raising at
+builder creation, the 64-deep queue, and launch batching.
+
+**Two reproductions are attachable, and both are programs rather than claims:**
+
+- `probes/readback_cost.mojo` (`pixi run probe-readback`) -- prices every
+  transport arm per trip, prints each unavailable arm **with the reason it is
+  unavailable**, and produces the 202 / 125 / 10.6 numbers and the queue-depth
+  ladder. A future MAX that closes a gap shows up as `unavailable -> ok` with no
+  edit to the harness.
+- `tools/probe_device_graph.mojo` -- constructs a `DeviceGraph`, catches the
+  raise, and on a backend that *does* construct goes on to verify a two-node
+  dependency edge and re-verify it across replays, because silent-no-op and
+  go-stale both pass a bare construction check.
+
+Neither is wired to a pixi task or a CI job on purpose: each needs a device and
+each asserts a toolchain property whose expected verdict differs by backend.
+
