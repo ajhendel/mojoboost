@@ -84,6 +84,7 @@ from .boosting import (
     _fill_softmax_grad_hess,
     _mean_loss,
     _multiclass_goss_select,
+    _refuse_boost_from_average,
     _refuse_leaf_estimation,
     _softmax_inplace,
     objective_renews_leaves,
@@ -240,6 +241,12 @@ def _refuse_unhonored(params: BoosterParams, trainer: String) raises:
             " be ordinary plain boosting",
         )
     _refuse_leaf_estimation(params.tree.extra, trainer)
+    # `boost_from_average=false` for the same reason and on the same terms:
+    # this trainer calls `boosting._base_score` without threading the value,
+    # so a false would start from the label mean under a parameter that asked
+    # for zero. Only false is refusable; true is what this trainer already
+    # does, so the common case costs one Bool.
+    _refuse_boost_from_average(params.tree.extra, trainer)
     if const_hessian_verify():
         raise Error(
             "MOJOTREES_CONST_HESSIAN_VERIFY=1 audits a declared constant"

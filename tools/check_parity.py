@@ -1478,6 +1478,14 @@ LIGHTGBM_STOCK = {
     "use_quantized_grad": False,
     "stochastic_rounding": True,
     "quant_train_renew_leaf": False,
+    # `include/LightGBM/config.h:948-950`, `bool boost_from_average = true`,
+    # read from source at microsoft/LightGBM `bdf3704`. Pinned here because
+    # mojotrees's default is this value by inheritance rather than by
+    # decision: `boosting._base_score` computed the optimal constant on every
+    # fit long before the parameter had a name, so the day somebody flips
+    # `DEFAULT_BOOST_FROM_AVERAGE` to match CatBoost's static `false` instead,
+    # this is what says LightGBM's surface moved with it.
+    "boost_from_average": True,
     "refit_decay_rate": 0.9,
 }
 
@@ -1548,6 +1556,11 @@ STOCK_COMPTIME_DEFAULTS = (
         "tweedie_variance_power",
     ),
     ("tree_parameters_extra.mojo", "DEFAULT_EXTRA_SEED", "extra_seed"),
+    (
+        "tree_parameters_extra.mojo",
+        "DEFAULT_BOOST_FROM_AVERAGE",
+        "boost_from_average",
+    ),
     (
         "tree_parameters_extra.mojo",
         "DEFAULT_NUM_GRAD_QUANT_BINS",
