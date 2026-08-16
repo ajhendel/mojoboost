@@ -36,6 +36,7 @@ run_gate() {
   case "$1" in
     api)          "$PY" tools/api_snapshot.py --check ;;
     parity)       "$PY" tools/check_parity.py ;;
+    defaults)     "$PY" tools/default_refusal_audit.py --check ;;
     pixi)         "$PY" tools/check_pixi_tasks.py ;;
     connectivity) "$PY" tools/connectivity_audit.py ;;
     # --strict, so an unrecorded disconnection FAILS here rather than being

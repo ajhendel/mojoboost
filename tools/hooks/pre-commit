@@ -10,6 +10,7 @@
 #   pixi.toml                         python3 tools/check_pixi_tasks.py
 #   docs/INTEGRATION_INVENTORY.md     python3 tools/audit_integration.py
 #   tools/connectivity_audit.py       python3 tools/audit_integration.py
+#   tools/default_refusal_audit.py    python3 tools/default_refusal_audit.py --check
 #
 # The last two are one gate over a pair that must agree: the CLASSIFICATION
 # table in `connectivity_audit.py` is where a judgment about an unreachable
@@ -65,6 +66,7 @@ while IFS= read -r path; do
     pixi.toml)                       want pixi ;;
     docs/INTEGRATION_INVENTORY.md)   want integration ;;
     tools/connectivity_audit.py)     want integration ;;
+    tools/default_refusal_audit.py)  want defaults ;;
   esac
 done <<< "$staged"
 

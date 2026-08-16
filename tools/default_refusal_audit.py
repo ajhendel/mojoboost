@@ -57,9 +57,32 @@ a `BLOCK_*` constant whose message says "this configuration" rather than naming
 the key is invisible here. Refusals in this repository are unusually good about
 naming the parameter, which is what makes the approach work at all.
 
-Advisory. Not wired into the pre-commit hook: the correct response to a row is
-to go and read it, and a check whose correct answer is "go and read" must not
+HOW IT GATES WITHOUT BECOMING NOISE
+-----------------------------------
+`--check` is the gated mode and it does NOT fail on every row. Failing on
+every row is how a gate gets disabled: this tool finds seventy-odd sites for
+the current proposal and most of them are conditions the default never
+reaches. A check whose honest output is "go and read seventy things" cannot
 block a commit.
+
+So `--check` fails only on a site that has NOT been acknowledged. `ACKNOWLEDGED`
+is the same shape as `MONOTONE_EXEMPT` in `check_parity.py` and
+`CATBOOST_UNMATCHABLE` in the harness: an entry is an argument, not a
+suppression, and it records which of three things is true.
+
+    RESOLVED   the refusal cannot fire for the default, and why
+    DIVERGENCE the default resolves to something other than the proposed
+               value on that path, recorded as OURS rather than as parity
+    BLOCKING   it fires, it is not yet fixed, and the default cannot ship
+               until it is
+
+**A BLOCKING entry still fails the check.** That is the point: the four
+collisions found by hand today were each discovered after the decision, and a
+gate that lets a known-blocking collision sit silently is the same failure one
+layer up. What the acknowledgement buys is that a NEW collision is
+distinguishable from an old one.
+
+Advisory in its default mode; gated in `--check`.
 """
 
 import argparse
@@ -101,6 +124,65 @@ DEFAULT_SETS = {
         "max_ctr_complexity": 1,
         "min_data_in_leaf": 1,
     },
+}
+
+#: Sites a human has read and ruled on, keyed by (parameter, file, message
+#: prefix). The message prefix rather than a line number because line numbers
+#: churn on every edit above them and a gate that fails on unrelated edits is
+#: a gate that gets skipped.
+#:
+#: Seeded 2026-08-16 with the four collisions found by hand. Everything not
+#: listed here is unreviewed, which is the state this table exists to make
+#: visible.
+ACKNOWLEDGED = {
+    ("bootstrap_type", "src/mojotrees/model.mojo"): (
+        "BLOCKING",
+        "train_gpu takes no bootstrap bundle, so MVS as a default breaks "
+        "every GPU fit. f9 owns the GPU round loop and is building the draw "
+        "and refresh; the per-row weight plane already exists there. Interim: "
+        "the default resolves to bootstrap_type=No on the GPU, recorded as "
+        "OUR divergence, never a raise",
+    ),
+    ("bootstrap_type", "src/mojotrees/trainset.mojo"): (
+        "BLOCKING",
+        "the sparse arm refuses the bundle by name and the multiclass trainer "
+        "takes no bundle at all, so CatBoost's own Bayesian fallback has "
+        "nowhere to land. lane/bootstrap-multiclass-sparse is building both "
+        "round loops. Interim: default resolves to No on those two paths",
+    ),
+    ("score_function", "src/mojotrees/gpu_split_search.mojo"): (
+        "BLOCKING",
+        "the oblivious level search raises on anything but L2, and earns it: "
+        "a level's Cosine score is a ratio of two cross-leaf accumulators "
+        "with one square root at the end, so summing per-leaf Cosine gains is "
+        "not the Cosine of the level. No merge order fixes it; f9 is building "
+        "oblivious-Cosine as its item (1)",
+    ),
+    ("grow_policy", "src/mojotrees/gpu_tree_tables.mojo"): (
+        "BLOCKING",
+        "the resident tree tables return TREE_RESIDENT_DEPTHWISE for anything "
+        "that is not leafwise, and symmetrictree is the proposed default. "
+        "Whether the oblivious device path goes through these tables at all "
+        "is the first question f9's build lane answers",
+    ),
+    ("boosting_type", "src/mojotrees/ordered_boosting.mojo"): (
+        "RESOLVED",
+        "every refusal naming boosting_type in this file is about "
+        "'ordered'. The proposed default is 'plain', which is what these "
+        "paths already do",
+    ),
+    ("boosting_type", "src/mojotrees/train_gpu.mojo"): (
+        "RESOLVED",
+        "refuses boosting_type='ordered'; the default is 'plain'",
+    ),
+    ("boosting_type", "src/mojotrees/train_gpu_sparse.mojo"): (
+        "RESOLVED",
+        "refuses boosting_type='ordered'; the default is 'plain'",
+    ),
+    ("boosting_type", "src/mojotrees/boosting.mojo"): (
+        "RESOLVED",
+        "refuses boosting_type='ordered'; the default is 'plain'",
+    ),
 }
 
 #: Words whose presence in a raise message means it is a refusal rather than a
@@ -208,12 +290,55 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--set", default="catboost_defaults", choices=sorted(DEFAULT_SETS))
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="gated mode: exit 1 on an unacknowledged or BLOCKING collision",
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         help="include raises that do not read as refusals",
     )
     args = parser.parse_args(argv)
     params, rows = audit(args.set)
+
+    if args.check:
+        unreviewed, blocking = [], []
+        for name, sites in sorted(rows.items()):
+            for site in sites:
+                if not site["looks_like_refusal"]:
+                    continue
+                verdict = ACKNOWLEDGED.get((name, site["file"]))
+                if verdict is None:
+                    unreviewed.append((name, site))
+                elif verdict[0] == "BLOCKING":
+                    blocking.append((name, site, verdict[1]))
+        for name, site in unreviewed:
+            print(
+                f"UNREVIEWED {name} -> {site['file']}:{site['line']}\n"
+                f"    {site['message'][:160]}\n"
+                f"    Read it, then add ({name!r}, {site['file']!r}) to "
+                "ACKNOWLEDGED as RESOLVED, DIVERGENCE or BLOCKING with the "
+                "reason."
+            )
+        seen = set()
+        for name, site, why in blocking:
+            if (name, site["file"]) in seen:
+                continue
+            seen.add((name, site["file"]))
+            print(f"BLOCKING {name} -> {site['file']}: {why}")
+        total = len(unreviewed) + len(seen)
+        if total == 0:
+            print(f"default set '{args.set}': no unreviewed or blocking collisions")
+            return 0
+        print()
+        print(
+            f"{len(unreviewed)} unreviewed, {len(seen)} blocking. A BLOCKING "
+            "entry fails on purpose: it is a collision somebody has read and "
+            "not yet fixed, and the default cannot ship over it."
+        )
+        return 1
+
     if args.json:
         print(json.dumps({"set": args.set, "params": params, "sites": rows}, indent=2))
         return 0
