@@ -20,7 +20,10 @@
     "task": {"enum": ["regression", "binary", "multiclass", "ranking"]},
     "primary_metric": {"type": "string"},
     "threads": {"type": "integer", "minimum": 1},
-    "engine": {"enum": ["mojotrees", "lightgbm"]},
+    "engine": {
+      "enum": ["mojotrees", "lightgbm", "catboost", "mojotrees_catboost_mode"],
+      "description": "Four names, two rows. `mojotrees` against `lightgbm` is the comparator row and is the only one anything is gated on. `catboost` is a peer arm reported beside it, and `mojotrees_catboost_mode` is the mojotrees side of the second peer row, differing from `mojotrees` by exactly scenarios.MOJOTREES_CATBOOST_MODE. engines.ENGINE_ARM maps each name to subject, comparator, peer or peer_subject."
+    },
     "engine_version": {"type": ["string", "null"]},
     "device_requested": {"enum": ["cpu", "gpu", "auto"]},
     "device_used": {
@@ -49,7 +52,7 @@
     },
     "path": {
       "type": "string",
-      "description": "Which API the run went through: `dataset` for the Dataset and train pair, `estimator_csc` for the sparse estimator path where binning is not separable."
+      "description": "Which API the run went through: `dataset` for the Dataset and train pair, `estimator_csc` for the sparse estimator path where binning is not separable, `pool` for CatBoost's Pool and fit pair, where binning is also not separable and for a different reason (see phases.binning_unavailable_reason)."
     },
     "data": {
       "type": "object",
@@ -91,6 +94,14 @@
         }
       }
     },
+    "engine_resolved_params": {
+      "type": ["object", "null"],
+      "description": "The parameter list the library itself resolved, read back from the fitted model, as distinct from `params.engine`, which is what was passed in. Present on the CatBoost rows and null elsewhere. It is there because CatBoost derives several defaults from the data: `learning_rate` is chosen from the iteration count and the dataset when it is not given one (0.5 at 2 iterations, 0.4273 at 100, 0.0657 at 1000 on one 20,000-row shape), and `boosting_type` is chosen from the dataset size. This harness pins the first and records the second per run. CatBoost.get_all_params() omits thread_count, so the adapter puts it back."
+    },
+    "engine_resolved_params_source": {
+      "type": ["string", "null"],
+      "description": "Where engine_resolved_params was read, or why it could not be."
+    },
     "histogram_builder": {
       "type": "object",
       "description": "Which histogram construction the engine ran. Row-wise and col-wise are different algorithms over the same bins, so a training time is not reproducible without it. `resolved` is a string when the request settles the question and an unavailable measurement when it does not, which is LightGBM's auto mode: 4.7 keeps that choice in the tree learner's share state and exposes no getter.",
@@ -125,9 +136,13 @@
       "type": "object",
       "properties": {
         "import": {"$ref": "#/$defs/phase"},
+        "ingest": {
+          "$ref": "#/$defs/phase",
+          "description": "Getting the caller's array into the library's own layout, where that is a step the library exposes separately from binning. Present only on the CatBoost rows: Pool(X, label=y) converts and does not quantize. LightGBM's ingestion is inside Dataset.construct() and is counted in its binning phase, and mojotrees's is the transpose bench_train.mojo times as ingest_s. scenarios.PHASE_SHAPE states this per engine so the three end-to-end lines can be read against each other."
+        },
         "binning": {
           "oneOf": [{"$ref": "#/$defs/phase"}, {"type": "null"}],
-          "description": "Null on a path that bins inside fit, with binning_unavailable_reason alongside."
+          "description": "Null on a path that bins inside fit, with binning_unavailable_reason alongside. That is every CatBoost row: pre-quantizing the Pool to expose the number changes the model above a few hundred thousand rows, because CatBoost draws its border-construction sample under a quantization seed the fit path does not share."
         },
         "binning_unavailable_reason": {"type": "string"},
         "train": {"$ref": "#/$defs/phase"},
@@ -139,6 +154,10 @@
       "type": "object",
       "properties": {
         "num_trees": {"type": ["integer", "null"]},
+        "num_trees_note": {
+          "type": "string",
+          "description": "Present when the count is not comparable across engines. CatBoost builds one tree per iteration with a vector leaf value for MultiClass, where LightGBM and mojotrees build one per class per iteration, so a 100-iteration seven-class fit is 100 trees on one side and 700 on the other. The matched quantity is the iteration count."
+        },
         "current_iteration": {"type": ["integer", "null"]},
         "num_bin": {
           "type": ["integer", "null"],
@@ -156,12 +175,16 @@
                 "max": {"type": "integer"},
                 "min": {"type": "integer"},
                 "mean": {"type": "number"},
-                "sha256": {"type": "string"}
+                "sha256": {"type": "string"},
+                "source": {
+                  "type": "string",
+                  "description": "Present when the counts did not come from Dataset.feature_num_bin. The CatBoost rows read CatBoost.get_borders() off the fitted model and add one per feature to turn thresholds into bins, because CatBoost has no queryable binned dataset: its Pool is not quantized and its borders only become readable after a fit."
+                }
               }
             },
             {"$ref": "#/$defs/optional_measurement"}
           ],
-          "description": "The per-feature bin counts from Dataset.feature_num_bin, which both libraries expose under that name, reduced to the distribution plus a digest of the exact vector. This is the field that lets the binning alignment be checked by measurement instead of by reading scenarios.py. The counts themselves are not stored: a run with half a million features would put half a million integers in every record."
+          "description": "The per-feature bin counts, reduced to the distribution plus a digest of the exact vector. This is the field that lets the binning alignment be checked by measurement instead of by reading scenarios.py. mojotrees and LightGBM both expose Dataset.feature_num_bin under that name and with that meaning; CatBoost does not, and its rows say where the counts came from in `source` rather than letting a reader assume all three came from the same kind of object. Note that CatBoost's GreedyLogSum picks well under its border budget on ordinary data where the other two fill theirs, so a lower total here is a binning difference and not a smaller budget."
         },
         "size": {
           "type": "object",
