@@ -887,6 +887,34 @@ positional constructor still compiles and the single-chokepoint constructor is
 convention rather than a compiler guarantee. That gap closes at the storage
 change, which necessarily alters the signature.
 
+## A5b. Audit a document for the condition that would falsify it, not for errors
+
+The CPU campaign's diagnosis of its own `ACCURACY_BUDGET.md` defect, kept because
+it names a class rather than an instance:
+
+> The real defect was not the algebra. It was that a document about numerical
+> accuracy discussed a gain form and **never mentioned L1 anywhere** -- so nothing
+> prompted a reader to check the one condition that breaks it.
+
+The algebra in that section was correct. It was correct *under an assumption the
+document did not state and therefore did not invite anyone to test*: that
+`GL + GR = G`. Soft thresholding is not additive, so at `lambda_l1 > 0` the
+identity fails, and applying it anyway is a **systematic bias** of 1.6e-04
+relative where the shipped form sits at 1.0e-05 -- median and p99 agreeing to two
+figures, which is how you tell bias from rounding.
+
+**The audit question is therefore not "is this wrong" but "what setting would
+falsify this paragraph".** A reader checking for errors finds none; a reader
+asking which regularizer, which objective, which sampler, which bin count would
+break the claim finds the gap in one pass.
+
+This is the same shape as amendment A1 and the instruction audit. There the
+failure was an instruction nobody could execute; here it is an assumption nobody
+was invited to check. Both are silent, both survive review, and both are found by
+asking a document what it depends on rather than whether it is right.
+
+Neither campaign has read its documents this way yet, and both should.
+
 ## A4. What this says about the protocol as a whole
 
 It is working, and the evidence is that every one of these defects was found by
