@@ -1,4 +1,51 @@
-# Upstream report to Modular: three Metal gaps in one subsystem
+# Upstream report to Modular: expose the host-visible pointer of a shared-storage DeviceBuffer on Metal
+
+**The headline ask, and everything else in this report is evidence under it:**
+
+> On Metal, every MAX buffer is already `MTLStorageModeShared` -- one
+> allocation the CPU and GPU both address. **Expose both addresses for it.**
+> Today `DeviceBuffer.unsafe_ptr()` returns the `gpuAddress`, which faults on a
+> host load, and `HostBuffer.unsafe_ptr()` returns `contents`, which a kernel
+> cannot address. The API hands out one name per allocation and never both.
+
+That single API unblocks three things at once, and they are the reason this is
+the headline rather than one gap among several:
+
+- **zero-copy ingest** -- a NumPy array written straight into device memory
+  rather than staged and copied;
+- **zero-copy readback** -- split records and predictions read where they were
+  written, instead of a blit whose measured cost is 202 microseconds for 136
+  bytes of which under 4 microseconds is the transfer;
+- **one histogram buffer shared between a CPU and a GPU backend**, which is a
+  combined-engine design that is simply unavailable while the two cannot name
+  the same allocation.
+
+The hardware premise already holds: verified by execution, MAX's Metal
+allocator has one `newBufferWithLength:options:` site with `options == 0`, so
+every buffer is shared storage. **Nothing needs to change about how memory is
+allocated. What is missing is a name.**
+
+**Two further asks, smaller and independent:**
+
+1. **Expose `maxCommandBufferCount` on the Metal queue.** MAX creates its queue
+   with a bare `newCommandQueue` and never sets it, leaving the default depth of
+   64. Verified three ways: one load site on `newCommandQueue`, zero load sites
+   on both raising selectors, no environment variable, and four
+   `DeviceContext` constructor overloads none of which takes one. **Measured
+   consequence:** per-launch enqueue cost is flat at 6-7 microseconds through 64
+   launches and rises to 14-17 beyond, a knee exactly where a 64-deep queue
+   predicts. A leaf-wise tree in this library issues **278 command buffers
+   between waits**, so it spends most of every tree past that knee paying
+   roughly double.
+2. **Expose batching of multiple launches into one command buffer.** On Metal
+   every `enqueue_function` becomes its own single-encoder command buffer, which
+   is what produces the 278 and what makes the queue depth bind at all. A
+   library that knows its next ten launches have no host decision between them
+   has no way to say so.
+
+---
+
+# Supporting detail: three Metal gaps in one subsystem
 
 Status: **drafted, not filed.** Filing needs a human with a Modular account.
 Everything below is a reproduction someone else can run, and every number is
