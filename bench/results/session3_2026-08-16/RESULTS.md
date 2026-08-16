@@ -309,10 +309,44 @@ scan, because the device search used to lose below it: this repository's own
 record says the device path "beats host scan at 250k rows, loses at 50k". At
 50,000 the normalized work is 2,500,000, a twentieth of the gate.
 
-The resident plane wins there by 2.2x. So the gate's premise is falsified at
-precisely the shape it was built to protect, and re-deriving or deleting it is
-now a live question rather than a tuning exercise. That is a **reduction** in the
-number of paths, not an addition of a small-data path.
+The resident plane wins there by 2.2x.
+
+> **CORRECTION, same night. That last sentence did not follow from this data and
+> is withdrawn.**
+>
+> The `gpu-device` bench arm passes `split_search=SPLIT_SEARCH_DEVICE`, which
+> **forces** the device split search and bypasses `M4_MIN_NORMALIZED_WORK`
+> entirely. So both arms of every S1 pair above had the device search forced:
+> the comparison is the resident plane against the **shipping device loop**, and
+> it is sound as such. It is not a comparison against the host scan.
+>
+> But the gate chooses host scan versus device search. **This session never
+> measured the host scan at 50,000 or 250,000 at all**, so it cannot say the
+> gate's premise is falsified. It can only say that when the device search is
+> taken, the resident plane is much better at running it.
+>
+> The missing measurement, and it is now the highest-value one outstanding:
+> **resident plane on the forced device arm against the automatic path (host
+> scan) at 50,000 and 250,000.** That is what decides whether
+> `M4_MIN_NORMALIZED_WORK` can be deleted. Until it exists, the gate stays and
+> no claim about its premise may be made.
+>
+> This is the "measured the wrong arm" error, which this project has now made in
+> three distinct forms in twenty-four hours: a vacuous test that ran below a
+> gate, a comparator throttled harder than us, and now an inference about a gate
+> drawn from data that bypassed it.
+
+### What S1 does and does not deliver to a default user
+
+The plane is only reachable when the device split search is chosen. On
+`SPLIT_SEARCH_AUTO` that requires `normalized_split_work >= 50,000,000`, which
+250,000 x 50 (12.5M) does not meet and 1,000,000 x 50 (exactly 50M) just does.
+
+**So flipping the default delivers the 2.2x and 44 percent to almost nobody
+yet.** They are real wins on the forced arm, and the flip is a **prerequisite**
+for retiring the gate rather than the delivery of anything to default users.
+Retiring the gate is what cashes this in, and retiring it needs the measurement
+named above first.
 
 ---
 
