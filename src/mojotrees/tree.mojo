@@ -2001,6 +2001,14 @@ def _check_oblivious(params: TreeParams, data: BinnedMatrix) raises:
       There is no one set to share across a level without a different search,
       so the combination is refused rather than searched per leaf and
       averaged into something that is not a partition.
+
+      The test is `BinnedMatrix.any_usable_categorical`, which asks whether a
+      categorical column is SEARCHABLE and not whether one is DECLARED. In
+      CatBoost mode a column above `one_hot_max_size` has been replaced by its
+      CTR columns and dropped from `usable`, so no split search is offered it
+      and this refusal is never the reason such a fit fails -- which is what
+      makes symmetric trees reachable on categorical data at all, and is what
+      CatBoost itself does rather than a workaround for it.
     - Forced splits describe a specific asymmetric binary tree; applying one
       to a single leaf of a level is exactly the thing this mode does not do.
     - `extra_trees` draws one threshold per node, and the CEGB penalties that
@@ -2023,12 +2031,21 @@ def _check_oblivious(params: TreeParams, data: BinnedMatrix) raises:
             params.max_depth,
             " would build a tree of that size whatever the data does",
         )
-    if data.cats.any_categorical():
+    if data.any_usable_categorical():
         raise Error(
             "grow_policy=oblivious is implemented for numerical thresholds"
-            " only; a categorical feature is searched as category partitions"
-            " whose order comes from one node's own statistics, and a level"
-            " shares one split"
+            " only, and this matrix still OFFERS a categorical column to the"
+            " split search. A categorical feature is searched as category"
+            " partitions whose order comes from one node's own statistics,"
+            " and a level shares one split, so there is no one partition to"
+            " share; that is still true and is still why. What changed is"
+            " that being declared categorical is no longer enough to refuse:"
+            " a column whose CTR columns REPLACED it is outside"
+            " BinnedMatrix.usable, is offered to no search, and does not"
+            " reach this. To train symmetric trees on categorical data, use"
+            " CatBoost-mode CTRs (SimpleCtrConfig.catboost_defaults), which"
+            " replace every column above one_hot_max_size. A column at or"
+            " below it stays searchable as one-hot and still lands here"
         )
     if not params.extra.forced.is_empty():
         raise Error(

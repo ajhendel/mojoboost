@@ -164,6 +164,7 @@ from .categorical import (
     CategoricalParams,
     CategoricalSpec,
     cat_contains,
+    any_searchable_categorical,
     cat_empty,
     find_best_categorical_split,
 )
@@ -656,9 +657,12 @@ def find_best_split(
       `tree_index`, `node`, feature, bin). Its standard deviation is
       `random_strength * random_score_scale`, and a positive strength with no
       scale is refused rather than silently scaled to nothing. It is refused
-      on a matrix with a categorical feature, for the reason `extra_trees`
-      is. At the default of 0 not a single instruction of arithmetic is
-      added, which is what makes it a no-op rather than a small one.
+      when THIS SCAN is offered a categorical feature
+      (`categorical.any_searchable_categorical`), for the reason `extra_trees`
+      is; a categorical column that CTR columns replaced is not offered and
+      does not trigger it. At the default of 0 not a single instruction of
+      arithmetic is added, which is what makes it a no-op rather than a small
+      one.
 
     `n_rows` is the node's row count, used by the per-split CEGB cost and, at
     0, taken from the histogram's own totals. `depth` is the node's depth in
@@ -766,7 +770,9 @@ def find_best_split(
             " tree_parameters_extra.random_score_scale_from_gradients(grad,"
             " n_rows, iteration * learning_rate)"
         )
-    if noisy and cats.any_categorical():
+    if noisy and any_searchable_categorical(
+        cats, hist.n_features, features, allowed
+    ):
         # A categorical feature's candidates are category *sets*, searched
         # inside `find_best_categorical_split`, and only that search's winner
         # reaches this function. Noising the winner would noise one candidate
@@ -775,11 +781,22 @@ def find_best_split(
         # combination is refused rather than half-applied; making it work
         # means the draw moving into the partition search, which is
         # categorical.mojo's.
+        #
+        # The test is over the features THIS SCAN WILL VISIT and not over the
+        # spec's flags. In CatBoost mode a wide categorical column is replaced
+        # by its CTR columns and dropped from `BinnedMatrix.usable`, so it is
+        # not in `features` and no partition search runs; refusing on the
+        # declaration would refuse that fit for a search it does not perform.
+        # The refusal itself is unchanged for a scan that really does reach
+        # one.
         raise Error(
-            "random_strength is implemented for numerical thresholds only; a"
-            " categorical feature is searched as category partitions, and"
-            " only that search's winner reaches here, so its candidates"
-            " cannot each be noised from this function"
+            "random_strength is implemented for numerical thresholds only,"
+            " and this scan is offered a categorical feature; it is searched"
+            " as category partitions, and only that search's winner reaches"
+            " here, so its candidates cannot each be noised from this"
+            " function. A categorical column replaced by CTR columns"
+            " (CatBoost mode) is not offered to this scan and does not reach"
+            " this refusal"
         )
     var noise_seed = extra.random_strength_seed
 
@@ -1358,8 +1375,19 @@ def find_best_split_shared(
     apply to the level: the first three are charged once per feature against
     the summed gain (`_feature_gain`, LightGBM's placement), and
     `random_strength` draws once per (feature, bin) candidate keyed by
-    `node`, which the grower passes as the level's lowest node id, so the
-    level gets one draw per candidate rather than one per leaf.
+    `depth`, so the level gets one draw per candidate rather than one per
+    leaf, and the draw lands on the level's AGGREGATE score after the
+    cross-leaf sum and before the argmax. That placement is CatBoost's:
+    `SetBestScore` (`tensor_search_helpers.cpp:716-757`) noises
+    `scores[binFeatureIdx]`, which is already the level-summed score out of
+    `CalculateNonPairwiseScore`, with a normal from `rand_score.h:42-49`.
+    Noising each leaf's contribution instead would be a different random
+    variable with a different variance wearing the same parameter name. The
+    scale is the ensemble's, computed once per tree before the depth loop
+    (`greedy_tensor_search.cpp:851-868`, `:1186`) and reaching here through
+    `ExtraTreeParams.random_score_scale`, which `boosting` writes per round.
+    `node` is accepted and unread on this path; see the draw below for why
+    depth is the term a level has.
 
     `bounds` and `parent_outputs`, when non-empty, are per leaf and parallel
     to `hists`: the monotone interval a leaf's output must lie in, and the
@@ -1761,8 +1789,31 @@ def find_best_split_shared(
             # inside the fold so it is added once and not `n_leaves` times.
             var noise = 0.0
             if noisy:
+                # Keyed on DEPTH where `find_best_split` keys on `node`, and
+                # the substitution is the whole difference between the
+                # leaf-wise draw and the level draw. A level has no node to
+                # key on -- that objection is what refused this combination
+                # once -- but it has a depth, and depth is the term CatBoost
+                # carries too: `CalcScores` takes a fresh
+                # `LearnProgress->Rand.GenRand()` per iteration of the depth
+                # loop (`greedy_tensor_search.cpp:1189`, `:1199`, `:884`), so
+                # the same (feature, border) candidate draws different noise
+                # at depth 0 and at depth 5.
+                #
+                # **We take the property and not the mechanism, deliberately.**
+                # CatBoost gets per-depth independence from a RUNNING
+                # generator, whose value depends on how many times it has been
+                # called; reproducing that would make the draw depend on the
+                # order depths are visited in and on how many calls a worker
+                # count produced, and the two backends would then diverge on a
+                # path whose output is noise and therefore looks like noise
+                # either way. A counter keyed on the depth VALUE has the same
+                # distribution, is worker-independent by construction, and is
+                # what lets a CPU draw and a device draw be compared as equal
+                # values for the same candidate at the same level. Do not
+                # "improve" this back into a running generator.
                 noise = random_score_noise(
-                    noise_stdev, noise_seed, tree_index, node, f, b
+                    noise_stdev, noise_seed, tree_index, depth, f, b
                 )
             if score_left:
                 var g = accl_out.unsafe_load(off + b)
