@@ -47,7 +47,7 @@ def _reference_histogram(
             g[b] += grad[r]
             h[b] += hess[r]
             c[b] += 1
-    return Histogram(g^, h^, c^, data.n_features, data.n_bins)
+    return Histogram.from_planes(g^, h^, c^, data.n_features, data.n_bins)
 
 
 def _assert_hist_close(a: Histogram, b: Histogram) raises:
@@ -55,9 +55,9 @@ def _assert_hist_close(a: Histogram, b: Histogram) raises:
     assert_equal(a.n_bins, b.n_bins)
     var size = a.n_features * a.n_bins
     for i in range(size):
-        assert_true(abs(a.grad[i] - b.grad[i]) < 1e-9)
-        assert_true(abs(a.hess[i] - b.hess[i]) < 1e-9)
-        assert_equal(a.count[i], b.count[i])
+        assert_true(abs(a.grad_at(i) - b.grad_at(i)) < 1e-9)
+        assert_true(abs(a.hess_at(i) - b.hess_at(i)) < 1e-9)
+        assert_equal(a.count_at(i), b.count_at(i))
 
 
 def test_build_histogram_matches_reference() raises:
@@ -117,13 +117,13 @@ def test_find_best_split_agrees_with_scalar_totals() raises:
     var total_g = 0.0
     var total_h = 0.0
     for b in range(hist.n_bins):
-        total_g += hist.grad[base + b]
-        total_h += hist.hess[base + b]
+        total_g += hist.grad_at(base + b)
+        total_h += hist.hess_at(base + b)
     var left_g = 0.0
     var left_h = 0.0
     for b in range(split.bin + 1):
-        left_g += hist.grad[base + b]
-        left_h += hist.hess[base + b]
+        left_g += hist.grad_at(base + b)
+        left_h += hist.hess_at(base + b)
     var right_g = total_g - left_g
     var right_h = total_h - left_h
     var gain = (

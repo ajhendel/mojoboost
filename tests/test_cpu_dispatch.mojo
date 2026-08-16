@@ -152,9 +152,9 @@ def _tied_histogram(
             # best gains and different best bins.
             var left = b <= (n_bins * (kind + 1)) // (n_distinct + 2)
             var g = -1.0 - Float64(kind) if left else 1.0
-            h.grad[f * n_bins + b] = g
-            h.hess[f * n_bins + b] = 1.0 + 0.25 * Float64(b % 3)
-            h.count[f * n_bins + b] = 4 + (b % 5)
+            h.set_grad_at(f * n_bins + b, g)
+            h.set_hess_at(f * n_bins + b, 1.0 + 0.25 * Float64(b % 3))
+            h.set_count_at(f * n_bins + b, 4 + (b % 5))
     return h^
 
 
@@ -270,9 +270,9 @@ def test_missing_direction_survives_the_parallel_scan() raises:
     var missing = List[Int]()
     for f in range(n_features):
         missing.append(n_bins - 1)
-        h.grad[f * n_bins + n_bins - 1] = -3.0
-        h.hess[f * n_bins + n_bins - 1] = 2.0
-        h.count[f * n_bins + n_bins - 1] = 9
+        h.set_grad_at(f * n_bins + n_bins - 1, -3.0)
+        h.set_hess_at(f * n_bins + n_bins - 1, 2.0)
+        h.set_count_at(f * n_bins + n_bins - 1, 9)
 
     _serial()
     var serial = find_best_split(
@@ -724,11 +724,11 @@ def _assert_same_histogram(a: Histogram, b: Histogram) raises:
     would be a defect in the change, not a rounding difference to absorb."""
     assert_equal(a.n_features, b.n_features)
     assert_equal(a.n_bins, b.n_bins)
-    assert_equal(len(a.grad), len(b.grad))
-    for i in range(len(a.grad)):
-        assert_equal(a.grad[i].to_bits(), b.grad[i].to_bits())
-        assert_equal(a.hess[i].to_bits(), b.hess[i].to_bits())
-        assert_equal(a.count[i], b.count[i])
+    assert_equal(a.n_cells(), b.n_cells())
+    for i in range(a.n_cells()):
+        assert_equal(a.grad_at(i).to_bits(), b.grad_at(i).to_bits())
+        assert_equal(a.hess_at(i).to_bits(), b.hess_at(i).to_bits())
+        assert_equal(a.count_at(i), b.count_at(i))
 
 
 def test_resolving_the_snapshot_is_where_a_bad_width_is_refused() raises:
@@ -943,10 +943,10 @@ def _build_all(
     subtract_histogram_into(sibling, parent, node, False, settings)
     # Fold the three into one value so the comparison cannot miss a plane:
     # the sibling carries the subtraction, and the counts carry both builds.
-    for i in range(len(node.grad)):
-        node.grad[i] = node.grad[i] + sibling.grad[i]
-        node.hess[i] = node.hess[i] + sibling.hess[i]
-        node.count[i] = node.count[i] + sibling.count[i]
+    for i in range(node.n_cells()):
+        node.set_grad_at(i, node.grad_at(i) + sibling.grad_at(i))
+        node.set_hess_at(i, node.hess_at(i) + sibling.hess_at(i))
+        node.set_count_at(i, node.count_at(i) + sibling.count_at(i))
     return node^
 
 

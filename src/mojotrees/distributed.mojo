@@ -484,7 +484,7 @@ def partition_values(
 
 def _zero_histogram(n_features: Int, n_bins: Int) -> Histogram:
     var size = n_features * n_bins
-    return Histogram(
+    return Histogram.from_planes(
         zeros_f64(size), zeros_f64(size), zeros_int(size), n_features, n_bins
     )
 
@@ -493,9 +493,9 @@ def _accumulate_histogram(mut acc: Histogram, src: Histogram) raises:
     """Add one local rank's histogram into this process's contribution.
     Called in ascending local rank order to match the ascending rank order a
     conforming transport uses across processes."""
-    add_into_f64(acc.grad, src.grad)
-    add_into_f64(acc.hess, src.hess)
-    add_into_int(acc.count, src.count)
+    add_into_f64(acc._grad, src._grad)
+    add_into_f64(acc._hess, src._hess)
+    add_into_int(acc._count, src._count)
 
 
 def allreduce_histogram[C: Collective](
@@ -519,11 +519,11 @@ def allreduce_histogram[C: Collective](
     """
     var plan = histogram_plan(hist.n_features, hist.n_bins)
     check_histogram_buffers(
-        plan, len(hist.grad), len(hist.hess), len(hist.count)
+        plan, len(hist._grad), len(hist._hess), len(hist._count)
     )
-    comm.allreduce_sum_f64(hist.grad)
-    comm.allreduce_sum_f64(hist.hess)
-    comm.allreduce_sum_int(hist.count)
+    comm.allreduce_sum_f64(hist._grad)
+    comm.allreduce_sum_f64(hist._hess)
+    comm.allreduce_sum_int(hist._count)
 
 
 def _total_count(hist: Histogram) -> Int:
@@ -531,7 +531,7 @@ def _total_count(hist: Histogram) -> Int:
     feature's bins sum to the same total."""
     var total = 0
     for b in range(hist.n_bins):
-        total += hist.count[b]
+        total += hist.count_at(b)
     return total
 
 
@@ -542,7 +542,7 @@ def _left_count(hist: Histogram, feature: Int, bin: Int) -> Int:
     var base = feature * hist.n_bins
     var total = 0
     for b in range(bin + 1):
-        total += hist.count[base + b]
+        total += hist.count_at(base + b)
     return total
 
 
@@ -565,8 +565,8 @@ def _leaf_value(
     var g = 0.0
     var h = 0.0
     for b in range(hist.n_bins):
-        g += hist.grad[b]
-        h += hist.hess[b]
+        g += hist.grad_at(b)
+        h += hist.hess_at(b)
     var value = -soft_threshold_l1(g, lambda_l1) / (h + lambda_reg)
     if max_delta_step <= 0.0 and path_smooth <= 0.0:
         return value

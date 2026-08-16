@@ -166,7 +166,9 @@ def test_equal_width_binning_has_no_missing_support() raises:
 def _hist(
     grad: List[Float64], hess: List[Float64], count: List[Int]
 ) -> Histogram:
-    return Histogram(grad.copy(), hess.copy(), count.copy(), 1, len(grad))
+    return Histogram.from_planes(
+        grad.copy(), hess.copy(), count.copy(), 1, len(grad)
+    )
 
 
 def test_split_sends_missing_to_the_better_side() raises:
@@ -454,17 +456,17 @@ def test_gpu_partitioning_follows_the_default_direction() raises:
             var n_left = 0
             var n_right = 0
             for b in range(left.n_bins):
-                n_left += left.count[b]
-                n_right += right.count[b]
+                n_left += left.count_at(b)
+                n_right += right.count_at(b)
             if default_left:
                 assert_equal(n_left, n_rows)
                 assert_equal(n_right, 0)
-                assert_equal(left.count[missing_bin], n_missing)
+                assert_equal(left.count_at(missing_bin), n_missing)
             else:
                 assert_equal(n_left, n_rows - n_missing)
                 assert_equal(n_right, n_missing)
-                assert_equal(right.count[missing_bin], n_missing)
-                assert_equal(left.count[missing_bin], 0)
+                assert_equal(right.count_at(missing_bin), n_missing)
+                assert_equal(left.count_at(missing_bin), 0)
 
 
 def test_gpu_training_routes_missing_like_the_cpu() raises:

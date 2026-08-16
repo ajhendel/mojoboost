@@ -101,9 +101,9 @@ def _assert_same_hist(a: Histogram, b: Histogram) raises:
     assert_equal(a.n_features, b.n_features)
     assert_equal(a.n_bins, b.n_bins)
     for i in range(a.n_features * a.n_bins):
-        assert_equal(a.grad[i], b.grad[i])
-        assert_equal(a.hess[i], b.hess[i])
-        assert_equal(a.count[i], b.count[i])
+        assert_equal(a.grad_at(i), b.grad_at(i))
+        assert_equal(a.hess_at(i), b.hess_at(i))
+        assert_equal(a.count_at(i), b.count_at(i))
 
 
 def test_reports_detected_simd_target() raises:

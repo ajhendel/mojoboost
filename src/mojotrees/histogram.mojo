@@ -130,8 +130,8 @@ the device. Nothing infers it, nothing defaults to it, and
 `MOJOTREES_CONST_HESSIAN=0` forces every declaration back onto the three-plane
 path. When it is on, the accumulation loop and the device kernel stop touching
 the hessian plane entirely and the plane is refilled from the count at the end
-of the pass, so the assembled `Histogram` still presents `grad`, `hess` and
-`count` and no consumer changes.
+of the pass, so the assembled `Histogram` still presents a gradient, a hessian
+and a count for every cell and no consumer changes.
 
 The declaration is made in exactly one place per backend, and both go through
 `boosting.round_has_constant_hessian`, which is where the exclusions this
@@ -337,13 +337,52 @@ def _resolve_const_hessian(declared: Bool) -> Bool:
 
 @fieldwise_init
 struct Histogram(Copyable, Movable):
-    """Per-(feature, bin) statistics, flattened as `[f * n_bins + b]`."""
+    """Per-(feature, bin) statistics, flattened as `[f * n_bins + b]`.
 
-    var grad: List[Float64]
-    var hess: List[Float64]
-    var count: List[Int]
+    The three planes are named with a leading underscore **on purpose**. They
+    were `grad`, `hess` and `count`, and call sites across the package, the
+    tests and the benches read them directly, which pins the storage: three
+    separate `List`s, an `Int` count, three streams touched per cell.
+    Changing that layout (an interleaved array of structs, an `Int32` count)
+    is a later lane, and what stood in its way was not the arithmetic but the
+    impossibility of *knowing* every reader had been found. Renaming the
+    fields turns that from a belief into a build error list: the compiler
+    enumerates the couplings, exhaustively and mechanically, and a new direct
+    reader cannot appear without someone typing the underscore on purpose.
+
+    Read a cell through `grad_at` / `hess_at` / `count_at` and write one
+    through `set_grad_at` / `set_hess_at` / `set_count_at`; `n_cells` is the
+    old `len(hist.grad)`. There is deliberately no accessor that hands out a
+    whole plane, so `grep -rn '\\._grad\\b'` is the exact and complete list of
+    what a storage change must rewrite by hand.
+
+    Construction goes through `from_planes`. The fieldwise constructor still
+    exists and Mojo has no way to hide it, so `Histogram(g, h, c, nf, nb)`
+    would still compile; every construction site in the tree goes through
+    `from_planes` instead, which is what makes it the one interception point.
+
+    Storage here is unchanged from before the rename: three planes, `Float64`
+    gradients and hessians, `Int` counts, same flattening, same arithmetic.
+    """
+
+    var _grad: List[Float64]
+    var _hess: List[Float64]
+    var _count: List[Int]
     var n_features: Int
     var n_bins: Int
+
+    @staticmethod
+    def from_planes(
+        var grad: List[Float64],
+        var hess: List[Float64],
+        var count: List[Int],
+        n_features: Int,
+        n_bins: Int,
+    ) -> Histogram:
+        """Take ownership of three already-built planes, in the order the
+        fieldwise constructor took them. The named entry point for
+        construction, so that a storage change has one place to intercept."""
+        return Histogram(grad^, hess^, count^, n_features, n_bins)
 
     @staticmethod
     def zeroed(n_features: Int, n_bins: Int) -> Histogram:
@@ -351,10 +390,54 @@ struct Histogram(Copyable, Movable):
         into. Callers that build many histograms of one shape allocate once
         with this and recycle with `reset`."""
         var size = n_features * n_bins
-        return Histogram(
+        return Histogram.from_planes(
             _zeroed_f64(size), _zeroed_f64(size), _zeroed_int(size),
             n_features, n_bins,
         )
+
+    # --- cell accessors ---------------------------------------------------
+    #
+    # Flat index, `f * n_bins + b`, exactly as the fields were indexed. No
+    # bounds check beyond what `List.__getitem__` already did, so these are
+    # the same code the direct reads were.
+
+    @always_inline
+    def grad_at(self, i: Int) -> Float64:
+        return self._grad[i]
+
+    @always_inline
+    def hess_at(self, i: Int) -> Float64:
+        return self._hess[i]
+
+    @always_inline
+    def count_at(self, i: Int) -> Int:
+        return self._count[i]
+
+    @always_inline
+    def set_grad_at(mut self, i: Int, v: Float64):
+        self._grad[i] = v
+
+    @always_inline
+    def set_hess_at(mut self, i: Int, v: Float64):
+        self._hess[i] = v
+
+    @always_inline
+    def set_count_at(mut self, i: Int, v: Int):
+        self._count[i] = v
+
+    def n_cells(self) -> Int:
+        """Number of cells, `n_features * n_bins`. Was `len(hist.grad)`."""
+        return len(self._grad)
+
+    # --- raw plane access -------------------------------------------------
+    #
+    # There is deliberately no accessor for a whole plane. The few callers
+    # that must hand a `List` to something else (the accumulate helpers in
+    # this module, the allreduce in `distributed`, the pointer taken for a hot
+    # scan) name `hist._grad` / `hist._hess` / `hist._count` directly. The
+    # underscore is the marker: `grep -rn '\._grad\b'` is the exact, complete
+    # list of what a storage change has to rewrite by hand, and everything
+    # else is already going through the cell accessors above.
 
     def reset(mut self):
         """Zero every bin in place, keeping the allocation. Cheaper than a
@@ -369,9 +452,9 @@ struct Histogram(Copyable, Movable):
         zero pass would nest one `sync_parallelize` inside another.
         """
         var size = self.n_features * self.n_bins
-        var gp = self.grad.unsafe_ptr()
-        var hp = self.hess.unsafe_ptr()
-        var cp = self.count.unsafe_ptr()
+        var gp = self._grad.unsafe_ptr()
+        var hp = self._hess.unsafe_ptr()
+        var cp = self._count.unsafe_ptr()
         comptime W = SIMD_LANES
         var i = 0
         while i + W <= size:
@@ -548,7 +631,7 @@ def build_histogram_into(
     # reached through `out`: a pointer taken from a struct field carries that
     # field's origin, which a worker closure cannot capture.
     _accumulate_full(
-        out.grad, out.hess, out.count, data, grad, hess, features, const_h,
+        out._grad, out._hess, out._count, data, grad, hess, features, const_h,
         settings,
     )
 
@@ -959,7 +1042,7 @@ def build_histogram_subset_into_scratch(
         _check_constant_hessian(hess, data.n_rows)
 
     _accumulate_subset(
-        out.grad, out.hess, out.count, pairs,
+        out._grad, out._hess, out._count, pairs,
         data, grad, hess, rows, row_start, row_count, features, const_h,
         settings,
     )
@@ -1315,7 +1398,7 @@ def build_histogram_subset_replica_into[
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
     _zero_excluded(
-        out.grad, out.hess, out.count,
+        out._grad, out._hess, out._count,
         n_features, n_bins, features,
         (n_features - n_active) * n_bins,
     )
@@ -1325,7 +1408,7 @@ def build_histogram_subset_replica_into[
     # pointer taken from a struct field carries that field's origin, which a
     # worker closure cannot capture.
     _accumulate_replica(
-        out.grad, out.hess, out.count, fixed,
+        out._grad, out._hess, out._count, fixed,
         data, grad_f32, hess_f32, rows, row_start, row_count,
         g_scale, h_scale, features,
         _resolve_const_hessian(const_hessian),
@@ -1479,9 +1562,9 @@ def feature_totals(hist: Histogram, feature: Int) raises -> FeatureTotals:
     if feature < 0 or feature >= hist.n_features:
         raise Error("feature index out of range")
     comptime W = SIMD_LANES
-    var grad_p = hist.grad.unsafe_ptr()
-    var hess_p = hist.hess.unsafe_ptr()
-    var count_p = hist.count.unsafe_ptr()
+    var grad_p = hist._grad.unsafe_ptr()
+    var hess_p = hist._hess.unsafe_ptr()
+    var count_p = hist._count.unsafe_ptr()
     var base = feature * hist.n_bins
     var vg = SIMD[DType.float64, W](0.0)
     var vh = SIMD[DType.float64, W](0.0)
@@ -1650,15 +1733,15 @@ def subtract_histogram_into(
         raise Error("output histogram shape must match the operands")
 
     _subtract_histogram_arrays(
-        out.grad,
-        out.hess,
-        out.count,
-        parent.grad,
-        parent.hess,
-        parent.count,
-        child.grad,
-        child.hess,
-        child.count,
+        out._grad,
+        out._hess,
+        out._count,
+        parent._grad,
+        parent._hess,
+        parent._count,
+        child._grad,
+        child._hess,
+        child._count,
         parent.n_features * parent.n_bins,
         _resolve_const_hessian(const_hessian),
         settings,

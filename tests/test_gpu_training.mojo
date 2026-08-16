@@ -88,20 +88,22 @@ def test_gpu_subset_histogram_and_partition_match_cpu() raises:
         var cpu_right = build_histogram_subset(data, grad, hess, right_rows)
 
         for i in range(n_features * n_bins):
-            assert_equal(cpu_left.count[i], gpu_left.count[i])
-            assert_equal(cpu_right.count[i], gpu_right.count[i])
+            assert_equal(cpu_left.count_at(i), gpu_left.count_at(i))
+            assert_equal(cpu_right.count_at(i), gpu_right.count_at(i))
             assert_true(
-                abs(cpu_left.grad[i] - gpu_left.grad[i]) <= 1e-4 * g_mag + 1e-6
-            )
-            assert_true(
-                abs(cpu_left.hess[i] - gpu_left.hess[i]) <= 1e-4 * h_mag + 1e-6
-            )
-            assert_true(
-                abs(cpu_right.grad[i] - gpu_right.grad[i])
+                abs(cpu_left.grad_at(i) - gpu_left.grad_at(i))
                 <= 1e-4 * g_mag + 1e-6
             )
             assert_true(
-                abs(cpu_right.hess[i] - gpu_right.hess[i])
+                abs(cpu_left.hess_at(i) - gpu_left.hess_at(i))
+                <= 1e-4 * h_mag + 1e-6
+            )
+            assert_true(
+                abs(cpu_right.grad_at(i) - gpu_right.grad_at(i))
+                <= 1e-4 * g_mag + 1e-6
+            )
+            assert_true(
+                abs(cpu_right.hess_at(i) - gpu_right.hess_at(i))
                 <= 1e-4 * h_mag + 1e-6
             )
 
@@ -318,22 +320,25 @@ def test_gpu_bagged_leaf_histogram_matches_cpu_subset() raises:
         var cpu_left = build_histogram_subset(data, grad, hess, left_rows)
 
         for i in range(n_features * n_bins):
-            assert_equal(cpu_root.count[i], gpu_root.count[i])
-            assert_equal(cpu_left.count[i], gpu_left.count[i])
+            assert_equal(cpu_root.count_at(i), gpu_root.count_at(i))
+            assert_equal(cpu_left.count_at(i), gpu_left.count_at(i))
             assert_true(
-                abs(cpu_root.grad[i] - gpu_root.grad[i]) <= 1e-4 * g_mag + 1e-6
+                abs(cpu_root.grad_at(i) - gpu_root.grad_at(i))
+                <= 1e-4 * g_mag + 1e-6
             )
             assert_true(
-                abs(cpu_root.hess[i] - gpu_root.hess[i]) <= 1e-4 * h_mag + 1e-6
+                abs(cpu_root.hess_at(i) - gpu_root.hess_at(i))
+                <= 1e-4 * h_mag + 1e-6
             )
             assert_true(
-                abs(cpu_left.grad[i] - gpu_left.grad[i]) <= 1e-4 * g_mag + 1e-6
+                abs(cpu_left.grad_at(i) - gpu_left.grad_at(i))
+                <= 1e-4 * g_mag + 1e-6
             )
 
         # Counts are exact integers: the bag, and only the bag, was counted.
         var counted = 0
         for b in range(n_bins):
-            counted += gpu_root.count[b]
+            counted += gpu_root.count_at(b)
         assert_equal(counted, len(bag))
 
 

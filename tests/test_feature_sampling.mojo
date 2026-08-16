@@ -229,9 +229,9 @@ def test_selected_histogram_matches_the_full_build() raises:
         everything.append(f)
     var indexed = build_histogram(data, grad, hess, everything)
     for i in range(n_features * n_bins):
-        assert_equal(full.grad[i], indexed.grad[i])
-        assert_equal(full.hess[i], indexed.hess[i])
-        assert_equal(full.count[i], indexed.count[i])
+        assert_equal(full.grad_at(i), indexed.grad_at(i))
+        assert_equal(full.hess_at(i), indexed.hess_at(i))
+        assert_equal(full.count_at(i), indexed.count_at(i))
 
     var some: List[Int] = [1, 4, 5, 8]
     var partial = build_histogram(data, grad, hess, some)
@@ -243,13 +243,13 @@ def test_selected_histogram_matches_the_full_build() raises:
         for b in range(n_bins):
             var i = f * n_bins + b
             if selected:
-                assert_equal(full.grad[i], partial.grad[i])
-                assert_equal(full.hess[i], partial.hess[i])
-                assert_equal(full.count[i], partial.count[i])
+                assert_equal(full.grad_at(i), partial.grad_at(i))
+                assert_equal(full.hess_at(i), partial.hess_at(i))
+                assert_equal(full.count_at(i), partial.count_at(i))
             else:
-                assert_equal(partial.grad[i], 0.0)
-                assert_equal(partial.hess[i], 0.0)
-                assert_equal(partial.count[i], 0)
+                assert_equal(partial.grad_at(i), 0.0)
+                assert_equal(partial.hess_at(i), 0.0)
+                assert_equal(partial.count_at(i), 0)
 
     # Same story for a row subset, which is what tree nodes build.
     var rows = List[Int]()
@@ -260,8 +260,12 @@ def test_selected_histogram_matches_the_full_build() raises:
     for i in range(len(some)):
         var base = some[i] * n_bins
         for b in range(n_bins):
-            assert_equal(sub_full.grad[base + b], sub_partial.grad[base + b])
-            assert_equal(sub_full.count[base + b], sub_partial.count[base + b])
+            assert_equal(
+                sub_full.grad_at(base + b), sub_partial.grad_at(base + b)
+            )
+            assert_equal(
+                sub_full.count_at(base + b), sub_partial.count_at(base + b)
+            )
 
     var out_of_range: List[Int] = [0, n_features]
     var raised = False

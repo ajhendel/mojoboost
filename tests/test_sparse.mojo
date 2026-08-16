@@ -292,7 +292,7 @@ def test_implicit_zero_is_a_numerical_zero() raises:
         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
     ]
     var hist = build_histogram_sparse(data, grad, grad)
-    assert_equal(hist.count[zero_bin], 4)
+    assert_equal(hist.count_at(zero_bin), 4)
 
 
 def test_explicit_zeros_match_implicit_zeros() raises:
@@ -508,20 +508,20 @@ def test_sparse_histogram_matches_dense() raises:
     assert_equal(got.n_features, want.n_features)
     assert_equal(got.n_bins, want.n_bins)
     # Counts are integer on both paths and must match exactly.
-    _assert_counts_equal(want.count, got.count)
+    _assert_counts_equal(want._count, got._count)
     # Gradient and hessian sums differ only by the rounding of one
     # subtraction per (feature, default bin).
-    assert_true(_max_abs_diff(want.grad, got.grad) < 1e-9)
-    assert_true(_max_abs_diff(want.hess, got.hess) < 1e-9)
+    assert_true(_max_abs_diff(want._grad, got._grad) < 1e-9)
+    assert_true(_max_abs_diff(want._hess, got._hess) < 1e-9)
 
     var rows = List[Int]()
     for r in range(0, n_rows, 3):
         rows.append(r)
     var want_sub = build_histogram_subset(binned, grad, hess, rows)
     var got_sub = build_histogram_sparse_subset(sparse, grad, hess, rows)
-    _assert_counts_equal(want_sub.count, got_sub.count)
-    assert_true(_max_abs_diff(want_sub.grad, got_sub.grad) < 1e-9)
-    assert_true(_max_abs_diff(want_sub.hess, got_sub.hess) < 1e-9)
+    _assert_counts_equal(want_sub._count, got_sub._count)
+    assert_true(_max_abs_diff(want_sub._grad, got_sub._grad) < 1e-9)
+    assert_true(_max_abs_diff(want_sub._hess, got_sub._hess) < 1e-9)
 
 
 def test_sparse_histogram_grouped_matches_masked() raises:
@@ -541,10 +541,10 @@ def test_sparse_histogram_grouped_matches_masked() raises:
         all_rows.append(r)
     var masked = build_histogram_sparse_subset(sparse, grad, hess, all_rows)
     var grouped = build_histogram_sparse(sparse, grad, hess)
-    _assert_counts_equal(masked.count, grouped.count)
-    for i in range(len(masked.grad)):
-        assert_equal(masked.grad[i], grouped.grad[i])
-        assert_equal(masked.hess[i], grouped.hess[i])
+    _assert_counts_equal(masked._count, grouped._count)
+    for i in range(masked.n_cells()):
+        assert_equal(masked.grad_at(i), grouped.grad_at(i))
+        assert_equal(masked.hess_at(i), grouped.hess_at(i))
 
 
 def test_sparse_histogram_rejects_bad_input() raises:
@@ -1064,10 +1064,10 @@ def test_worker_settings_do_not_change_results() raises:
         for i in range(s.nnz()):
             assert_equal(s.bin[i], sparse.bin[i])
         var h = build_histogram_sparse(s, grad, hess)
-        for i in range(len(h.grad)):
-            assert_equal(h.grad[i], serial_hist.grad[i])
-            assert_equal(h.hess[i], serial_hist.hess[i])
-            assert_equal(h.count[i], serial_hist.count[i])
+        for i in range(h.n_cells()):
+            assert_equal(h.grad_at(i), serial_hist.grad_at(i))
+            assert_equal(h.hess_at(i), serial_hist.hess_at(i))
+            assert_equal(h.count_at(i), serial_hist.count_at(i))
         var t = grow_tree_sparse(s, grad, hess, params.tree)
         _assert_same_tree(serial_tree.tree, t.tree, 0.0)
         for r in range(n_rows):

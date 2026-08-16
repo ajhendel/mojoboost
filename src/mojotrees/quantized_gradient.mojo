@@ -1334,7 +1334,7 @@ struct QuantizedHistogram(Copyable, Movable):
             gp.unsafe_store(i, Float64(sg.unsafe_load(i)) * g_inv)
             hp.unsafe_store(i, Float64(sh.unsafe_load(i)) * h_inv)
             cp.unsafe_store(i, sc.unsafe_load(i))
-        return Histogram(g^, h^, c^, self.n_features, self.n_bins)
+        return Histogram.from_planes(g^, h^, c^, self.n_features, self.n_bins)
 
     def totals(self, feature: Int) raises -> QuantTotals:
         """One feature's integer totals over its bins.

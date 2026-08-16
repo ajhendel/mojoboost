@@ -64,7 +64,7 @@ def _reference_full(
             g[b] += grad[r]
             h[b] += hess[r]
             c[b] += 1
-    return Histogram(g^, h^, c^, data.n_features, data.n_bins)
+    return Histogram.from_planes(g^, h^, c^, data.n_features, data.n_bins)
 
 
 def _reference_subset(
@@ -87,16 +87,16 @@ def _reference_subset(
             g[b] += grad[r]
             h[b] += hess[r]
             c[b] += 1
-    return Histogram(g^, h^, c^, data.n_features, data.n_bins)
+    return Histogram.from_planes(g^, h^, c^, data.n_features, data.n_bins)
 
 
 def _assert_same(a: Histogram, b: Histogram) raises:
     assert_equal(a.n_features, b.n_features)
     assert_equal(a.n_bins, b.n_bins)
     for i in range(a.n_features * a.n_bins):
-        assert_equal(a.grad[i], b.grad[i])
-        assert_equal(a.hess[i], b.hess[i])
-        assert_equal(a.count[i], b.count[i])
+        assert_equal(a.grad_at(i), b.grad_at(i))
+        assert_equal(a.hess_at(i), b.hess_at(i))
+        assert_equal(a.count_at(i), b.count_at(i))
 
 
 def test_full_matches_reference_serial_odd_shapes() raises:
@@ -192,14 +192,16 @@ def test_subtract_matches_reference_odd_tail() raises:
 
     var size = n_features * parent.n_bins
     for i in range(size):
-        assert_equal(sibling.grad[i], parent.grad[i] - child.grad[i])
-        assert_equal(sibling.hess[i], parent.hess[i] - child.hess[i])
-        assert_equal(sibling.count[i], parent.count[i] - child.count[i])
+        assert_equal(sibling.grad_at(i), parent.grad_at(i) - child.grad_at(i))
+        assert_equal(sibling.hess_at(i), parent.hess_at(i) - child.hess_at(i))
+        assert_equal(
+            sibling.count_at(i), parent.count_at(i) - child.count_at(i)
+        )
 
     # The two children partition the parent's rows.
     var total = 0
     for i in range(size):
-        total += child.count[i] + sibling.count[i]
+        total += child.count_at(i) + sibling.count_at(i)
     assert_equal(total, n_features * n_rows)
 
 

@@ -1198,9 +1198,9 @@ def pack_selected(
         var src = f * n_bins
         var dst = i * n_bins
         for b in range(n_bins):
-            packed.grad[dst + b] = hist.grad[src + b]
-            packed.hess[dst + b] = hist.hess[src + b]
-            packed.count[dst + b] = hist.count[src + b]
+            packed.grad[dst + b] = hist.grad_at(src + b)
+            packed.hess[dst + b] = hist.hess_at(src + b)
+            packed.count[dst + b] = hist.count_at(src + b)
     return packed^
 
 
@@ -1219,10 +1219,10 @@ def unpack_selected(
         raise Error(
             "the packed histogram does not match the selected feature list"
         )
-    for i in range(len(hist.grad)):
-        hist.grad[i] = 0.0
-        hist.hess[i] = 0.0
-        hist.count[i] = 0
+    for i in range(hist.n_cells()):
+        hist.set_grad_at(i, 0.0)
+        hist.set_hess_at(i, 0.0)
+        hist.set_count_at(i, 0)
     var n_bins = hist.n_bins
     for i in range(len(selected)):
         var f = selected[i]
@@ -1231,9 +1231,9 @@ def unpack_selected(
         var dst = f * n_bins
         var src = i * n_bins
         for b in range(n_bins):
-            hist.grad[dst + b] = packed.grad[src + b]
-            hist.hess[dst + b] = packed.hess[src + b]
-            hist.count[dst + b] = packed.count[src + b]
+            hist.set_grad_at(dst + b, packed.grad[src + b])
+            hist.set_hess_at(dst + b, packed.hess[src + b])
+            hist.set_count_at(dst + b, packed.count[src + b])
 
 
 def allreduce_selected[

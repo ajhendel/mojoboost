@@ -209,13 +209,13 @@ def _root_histogram(
     builder.upload_gradients(grad, hess)
     builder.begin_tree()
     var hist = builder.build_leaf(0)
-    var out = List[Float64](capacity=3 * len(hist.grad))
-    for i in range(len(hist.grad)):
-        out.append(hist.grad[i])
-    for i in range(len(hist.hess)):
-        out.append(hist.hess[i])
-    for i in range(len(hist.count)):
-        out.append(Float64(hist.count[i]))
+    var out = List[Float64](capacity=3 * hist.n_cells())
+    for i in range(hist.n_cells()):
+        out.append(hist.grad_at(i))
+    for i in range(hist.n_cells()):
+        out.append(hist.hess_at(i))
+    for i in range(hist.n_cells()):
+        out.append(Float64(hist.count_at(i)))
     return out^
 
 

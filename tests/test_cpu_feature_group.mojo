@@ -160,11 +160,11 @@ def _assert_identical(a: Histogram, b: Histogram, label: String) raises:
     assert_equal(a.n_features, b.n_features)
     assert_equal(a.n_bins, b.n_bins)
     for i in range(a.n_features * a.n_bins):
-        if a.grad[i] != b.grad[i] or a.hess[i] != b.hess[i]:
+        if a.grad_at(i) != b.grad_at(i) or a.hess_at(i) != b.hess_at(i):
             print("  mismatch at cell", i, "for", label)
-        assert_equal(a.grad[i], b.grad[i])
-        assert_equal(a.hess[i], b.hess[i])
-        assert_equal(a.count[i], b.count[i])
+        assert_equal(a.grad_at(i), b.grad_at(i))
+        assert_equal(a.hess_at(i), b.hess_at(i))
+        assert_equal(a.count_at(i), b.count_at(i))
 
 
 # --------------------------------------------------------------------------
@@ -567,9 +567,9 @@ def test_identical_under_feature_subsampling() raises:
     for f in range(n_features):
         if active[f] == UInt8(0):
             for b in range(17):
-                assert_equal(reference.grad[f * 17 + b], 0.0)
-                assert_equal(reference.hess[f * 17 + b], 0.0)
-                assert_equal(reference.count[f * 17 + b], 0)
+                assert_equal(reference.grad_at(f * 17 + b), 0.0)
+                assert_equal(reference.hess_at(f * 17 + b), 0.0)
+                assert_equal(reference.count_at(f * 17 + b), 0)
     _reset_env()
 
 
@@ -594,7 +594,7 @@ def test_totals_are_conserved_at_every_width() raises:
         for f in range(n_features):
             var total = 0
             for b in range(n_bins):
-                total += hist.count[f * n_bins + b]
+                total += hist.count_at(f * n_bins + b)
             assert_equal(total, n_rows)
     _reset_env()
 

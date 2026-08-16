@@ -857,8 +857,8 @@ def _leaf_value(
     var g = 0.0
     var h = 0.0
     for b in range(hist.n_bins):
-        g += hist.grad[base + b]
-        h += hist.hess[base + b]
+        g += hist.grad_at(base + b)
+        h += hist.hess_at(base + b)
     var value = -soft_threshold_l1(g, lambda_l1) / (h + lambda_reg)
     if max_delta_step <= 0.0 and path_smooth <= 0.0:
         return value
@@ -974,14 +974,14 @@ def _expand_bundled(
     taken from a struct field carries that field's origin.
     """
     expand_bundled_histogram(
-        hist.grad,
-        hist.hess,
-        hist.count,
+        hist._grad,
+        hist._hess,
+        hist._count,
         hist.n_bins,
         bundled.plan,
-        scratch.grad,
-        scratch.hess,
-        scratch.count,
+        scratch._grad,
+        scratch._hess,
+        scratch._count,
         scratch.n_bins,
         features,
     )
