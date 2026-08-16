@@ -25,7 +25,27 @@
     "device_requested": {"enum": ["cpu", "gpu", "auto"]},
     "device_used": {
       "type": ["string", "null"],
-      "description": "What the engine resolved to, which can differ from what was asked for. The sparse path is cpu whatever was requested."
+      "description": "What the engine resolved to, which can differ from what was asked for. The sparse path is cpu whatever was requested. A label, not evidence: it is Booster.device_, which the Python side sets from its own policy resolution while the trainer resolves the device again natively. See backend_proof."
+    },
+    "backend_proof": {
+      "type": "object",
+      "description": "Evidence from the trainer of which backend actually ran, as distinct from device_used, which is what the Python side resolved. Collected by turning the trainer's phase profile on for the measured fit only; the trainer prints it to the worker's stdout and run.py parses it back. `labels` are the report labels of the entry points that emitted a block, and train_gpu and grow_tree_gpu are literals in the GPU trainer's source that no CPU path can print. `transfer_calls` and `syncs` count work a host fit performs zero of. Any one of the three is enough for verify.py; none of them is a driver-level kernel count, and none of them attests a physical device, only the code path. An `unavailable_reason` with no counters means nobody looked, which is a different state from having looked and found nothing.",
+      "properties": {
+        "source": {"type": "string"},
+        "requested": {"type": "boolean"},
+        "mode": {"type": "string"},
+        "blocks": {"type": "integer"},
+        "labels": {"type": "array", "items": {"type": "string"}},
+        "modes_seen": {"type": "array", "items": {"type": "string"}},
+        "trees": {"type": "integer"},
+        "nodes": {"type": "integer"},
+        "transfer_calls": {"type": "integer"},
+        "convert_calls": {"type": "integer"},
+        "host_sync_calls": {"type": "integer"},
+        "syncs": {"type": "integer"},
+        "dispatches": {"type": "integer"},
+        "unavailable_reason": {"type": ["string", "null"]}
+      }
     },
     "path": {
       "type": "string",

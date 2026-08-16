@@ -38,6 +38,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import backend_proof  # noqa: E402
 import envinfo  # noqa: E402
 import scenarios  # noqa: E402
 
@@ -105,6 +106,7 @@ def build_matrix(args):
                                 "predict_repeats": args.predict_repeats,
                                 "allow_unpinned": args.allow_unpinned,
                                 "data_digest": not args.no_data_digest,
+                                "backend_proof": not args.no_backend_proof,
                             }
                         )
     for index, job in enumerate(jobs):
@@ -197,12 +199,23 @@ def run_job(job, run_dir, run_id, timeout):
         "wall_s": wall,
         "stderr_tail": proc.stderr[-2000:] if proc.stderr else "",
     }
+    # The trainer prints its profile through file descriptor 1 from
+    # compiled Mojo, which the worker cannot read back through sys.stdout.
+    # This process already holds the whole of that stream, so the evidence
+    # is parsed here and written onto the record the worker produced. Only
+    # a record that ran is given one; an error record has no fit to prove
+    # anything about.
+    if record.get("status") == "ok":
+        record["backend_proof"] = backend_proof.parse(
+            proc.stdout or "", job.get("backend_proof", True)
+        )
     return record
 
 
 CSV_COLUMNS = (
     "run_id", "scenario", "tier", "task", "data_kind", "dataset", "pinned",
-    "engine", "engine_version", "device_requested", "device_used", "threads",
+    "engine", "engine_version", "device_requested", "device_used",
+    "backend_proof", "threads",
     "histogram_builder", "repeat", "status", "primary_metric",
     "primary_value", "train_s", "train_cpu_s", "train_par_eff", "binning_s",
     "predict_batch_s", "predict_batch_par_eff", "predict_row_s",
@@ -274,6 +287,10 @@ def _flat(record):
         "engine_version": record.get("engine_version"),
         "device_requested": record.get("device_requested"),
         "device_used": record.get("device_used"),
+        # Beside device_used on purpose. The first is what the Python side
+        # resolved and the second is what the trainer emitted, and a reader
+        # scanning the sheet should be able to see them disagree.
+        "backend_proof": backend_proof.csv_cell(record.get("backend_proof")),
         "threads": record.get("threads"),
         "histogram_builder": _builder_column(record),
         "repeat": record.get("repeat"),
@@ -349,6 +366,13 @@ def main(argv=None):
         "--no-data-digest", action="store_true",
         help="skip hashing the input matrices; faster, and gives up the "
              "guarantee that both engines saw identical data",
+    )
+    parser.add_argument(
+        "--no-backend-proof", action="store_true",
+        help="do not turn the trainer's phase profile on for the measured "
+             "fit; the records then carry no evidence of which backend ran "
+             "and verify.py refuses every accelerator row that also matches "
+             "its CPU twin's prediction digest",
     )
     parser.add_argument(
         "--dry-run", action="store_true",

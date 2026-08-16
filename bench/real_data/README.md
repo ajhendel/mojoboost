@@ -60,6 +60,7 @@ scenarios.py          the six scenarios and the parameter alignment between the 
 engines.py            one adapter per library, same phases measured on both
 quality.py            one implementation of every metric, applied to both engines
 measure.py            timing, peak memory, model size, digests
+backend_proof.py      what the trainer emitted about which backend it ran on
 envinfo.py            machine, versions, git state, thermal and load conditions
 worker.py             one measured run in its own process, one JSON record out
 run.py                builds the matrix and runs it sequentially
@@ -117,11 +118,27 @@ ranking thresholds are correspondingly loose and say why.
 ## Correctness and performance are separated on purpose
 
 `verify.py` gates on quality and exits non-zero. It checks completeness,
-input agreement, dataset pinning, bit-identical repeat training, the
-mojotrees-against-LightGBM differential in the direction the metric runs, a
-floor against the trivial model, and accelerator-against-CPU agreement on
-the predictions themselves. Every tolerance lives in `thresholds.json` with
-its reasoning attached.
+input agreement, dataset pinning, bit-identical repeat training, proof of
+the backend a run actually used, the mojotrees-against-LightGBM
+differential in the direction the metric runs, a floor against the trivial
+model, and accelerator-against-CPU agreement on the predictions themselves.
+Every tolerance lives in `thresholds.json` with its reasoning attached.
+
+The backend check is newer than the rest and exists because the rest could
+not see past it. `device_used` is a label the Python side resolved, and for
+an unknown stretch every multiclass record written through the `Dataset`
+path carried `device_used="gpu"` over a fit that ran on the CPU, because
+`trainset.train_dataset_multiclass` resolved the device and then discarded
+the answer. Completeness, the self-check, the differential, device
+agreement and repeat determinism all passed, because all of them are
+consistent with a CPU fit wearing a GPU label. A human caught it by
+noticing two identical prediction digests. So every measured fit now runs
+with the trainer's phase profile on, the trainer's own report goes into
+`backend_proof`, and an accelerator row that carries no proof **and**
+reproduces its CPU twin's prediction digest is refused. Either of those on
+its own is reported and not refused: an uninstrumented run is not a lie,
+and two backends can in principle agree bit for bit, since the device
+histogram reduction is fixed point precisely so that they can.
 
 `report.py` prints timings and decides nothing. It shows the median across
 repeats with the min and max around it, marks any cell whose spread is wide,

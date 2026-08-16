@@ -29,7 +29,26 @@ The first repeat of the first GPU arm also pays one-time device setup, which
 is why the summary leads with the minimum rather than the mean.
 
 Usage: mojo run -I src bench/bench_train_gpu.mojo \\
-    [n_rows] [n_features] [reg|binary] [repeats] [arms] [seed]
+    [n_rows] [n_features] [reg|binary|multi[:classes]] [repeats] [arms] [seed]
+
+`multi` is softmax multiclass and defaults to 7 classes, which is
+covertype's shape; `multi:3` or `multi:10` names another count. The class
+count rides on the objective word rather than taking a positional argument
+of its own so that every documented reg and binary invocation keeps its
+argument positions. It exists because there was no way to measure whether
+GPU multiclass is faster or slower than CPU multiclass: the two trainers
+are `train_multiclass` and `train_multiclass_gpu`, and until
+`trainset.train_dataset_multiclass` was fixed, a caller reaching multiclass
+through a `Dataset` got the CPU trainer whatever it asked for, so a GPU
+multiclass timing taken through that path was a CPU timing wearing a GPU
+label. That question is open and this arm is what settles it.
+
+Read the multiclass arms with two differences from the single-output ones
+in mind. Softmax grows one tree per class per round on both backends, so
+`n_trees` is rounds times classes and is not comparable to a reg or binary
+arm's; and the reported loss is multiclass log loss, not squared error or
+binary log loss, so it is comparable across arms of the same run and across
+nothing else.
 
 `MOJOTREES_PHASE_PROFILE=async` on any run prints one `phase_profile` block
 per arm per repeat: wall time, call counts, kernel or dispatch counts, host
@@ -59,6 +78,7 @@ attack. Defaults: 100000 rows, 100 features, reg, 1 repeat, `cpu,gpu`.
 
     pixi run bench-train-gpu 50000 100 reg 5 gpu-host,gpu-device
     pixi run bench-train-gpu 250000 50 reg 5 gpu-device,gpu-device-depth
+    pixi run bench-train-gpu 100000 54 multi:7 5 cpu,gpu
 """
 
 from std.math import exp, log
@@ -71,7 +91,9 @@ from mojotrees.boosting import (
     SQUARED_ERROR,
     Booster,
     BoosterParams,
+    MulticlassBooster,
     train,
+    train_multiclass,
 )
 from mojotrees.binning import BinnedMatrix
 from mojotrees.growth_policy import GROW_DEPTHWISE
@@ -80,6 +102,7 @@ from mojotrees.train_gpu import (
     SPLIT_SEARCH_DEVICE,
     SPLIT_SEARCH_HOST,
     train_gpu,
+    train_multiclass_gpu,
 )
 
 
@@ -123,6 +146,83 @@ def _train_loss(
             var d = booster.predict_row(data, r) - target[r]
             loss += d * d
     return loss / Float64(data.n_rows)
+
+
+def _multiclass_loss(
+    booster: MulticlassBooster,
+    data: BinnedMatrix,
+    labels: List[Int],
+) -> Float64:
+    """Mean softmax log loss over the training rows.
+
+    The multiclass counterpart of `_train_loss`, and outside the timed
+    region for the same reason. Row by row through `predict_proba_bins`
+    rather than through `predict_batch`, because a batched predict fans out
+    over `dispatch_rows` and would put a parallel prediction inside a
+    function whose only job is to say that two arms fit the same model.
+    """
+    var loss = 0.0
+    var bins = List[Int](capacity=data.n_features)
+    for r in range(data.n_rows):
+        bins.clear()
+        for f in range(data.n_features):
+            bins.append(data.bin_at(r, f))
+        var probs = booster.predict_proba_bins(bins)
+        var p = probs[labels[r]]
+        if p < 1e-15:
+            p = 1e-15
+        loss -= log(p)
+    return loss / Float64(data.n_rows)
+
+
+def _class_labels(values: List[Float64], n_classes: Int) -> List[Int]:
+    """Bucket a continuous signal into `n_classes` near-equal classes.
+
+    The cuts are sample quantiles rather than an equal split of the
+    signal's range, because the range split would be badly unbalanced: the
+    generator's signal is a sum of four terms and is unimodal, so equal-
+    width buckets would leave the two extreme classes nearly empty and
+    their per-class trees would commit no splits worth timing. A benchmark
+    whose classes are empty measures the empty classes.
+
+    The quantiles come from a bounded sample rather than a full sort. A
+    thousand-odd points place a cut to within about a percent of the true
+    quantile, which is far tighter than the balance this needs, and it
+    keeps setup out of the way of the measurement. Deterministic, since the
+    sample is a fixed stride over deterministic data.
+    """
+    var n = len(values)
+    var probe = 1024 if n > 1024 else n
+    var stride = n // probe
+    if stride < 1:
+        stride = 1
+    var sample = List[Float64](capacity=probe)
+    var i = 0
+    while i < n and len(sample) < probe:
+        sample.append(values[i])
+        i += stride
+    for j in range(1, len(sample)):
+        var v = sample[j]
+        var k = j - 1
+        while k >= 0 and sample[k] > v:
+            sample[k + 1] = sample[k]
+            k -= 1
+        sample[k + 1] = v
+
+    var cuts = List[Float64](capacity=n_classes - 1)
+    for c in range(1, n_classes):
+        var idx = c * len(sample) // n_classes
+        if idx >= len(sample):
+            idx = len(sample) - 1
+        cuts.append(sample[idx])
+
+    var out = List[Int](capacity=n)
+    for r in range(n):
+        var cls = 0
+        while cls < len(cuts) and values[r] >= cuts[cls]:
+            cls += 1
+        out.append(cls)
+    return out^
 
 
 # An arm is a trainer plus, for the GPU trainer, an explicit split-search
@@ -215,6 +315,8 @@ def _run_arm(
     arm: Int,
     data: BinnedMatrix,
     target: List[Float64],
+    labels: List[Int],
+    n_classes: Int,
     objective: Int,
     want_loss: Bool,
 ) raises -> ArmRun:
@@ -224,11 +326,51 @@ def _run_arm(
     repeat only: the fit is deterministic, so scoring it again on every
     repeat would only add prediction time to a wall clock that is meant to
     measure training.
+
+    `n_classes` of 0 means single output and `objective` decides; anything
+    else is softmax and `objective` is not read at all, because there is no
+    single-output objective code for softmax to pass. `labels` is empty in
+    the first case and `target` is the bucketed signal in the second, and
+    each is ignored on the arm that does not use it.
     """
     var params = BoosterParams.default()
     if _arm_depthwise(arm):
         params.tree.grow_policy = GROW_DEPTHWISE
     var base = _arm_base(arm)
+
+    if n_classes > 0:
+        # Softmax on both backends: one tree per class per round, so the
+        # tree count reported below is rounds times classes. The split
+        # strategy reaches `train_multiclass_gpu` as an argument for the
+        # same reason it does on the single-output arms: a mistyped
+        # environment export cannot then relabel an arm.
+        var mc_strategy = SPLIT_SEARCH_AUTO
+        if base == ARM_GPU_HOST:
+            mc_strategy = SPLIT_SEARCH_HOST
+        elif base == ARM_GPU_DEVICE:
+            mc_strategy = SPLIT_SEARCH_DEVICE
+        if base == ARM_CPU:
+            var mc_cpu_t0 = perf_counter_ns()
+            var mc_cpu_model = train_multiclass(
+                data, labels, n_classes, params
+            )
+            var mc_cpu_s = Float64(perf_counter_ns() - mc_cpu_t0) / 1e9
+            var mc_cpu_loss = -1.0
+            if want_loss:
+                mc_cpu_loss = _multiclass_loss(mc_cpu_model, data, labels)
+            return ArmRun(
+                mc_cpu_s, mc_cpu_loss, len(mc_cpu_model.trees)
+            )
+        var mc_gpu_t0 = perf_counter_ns()
+        var mc_gpu_model = train_multiclass_gpu(
+            data, labels, n_classes, params, split_search=mc_strategy
+        )
+        var mc_gpu_s = Float64(perf_counter_ns() - mc_gpu_t0) / 1e9
+        var mc_gpu_loss = -1.0
+        if want_loss:
+            mc_gpu_loss = _multiclass_loss(mc_gpu_model, data, labels)
+        return ArmRun(mc_gpu_s, mc_gpu_loss, len(mc_gpu_model.trees))
+
     if base == ARM_CPU:
         var cpu_t0 = perf_counter_ns()
         var cpu_model = train(data, target, objective, params)
@@ -304,6 +446,9 @@ def main() raises:
         var n_features = 100
         var objective = SQUARED_ERROR
         var obj_name = String("reg")
+        # 0 is single output. Anything else selects softmax and makes
+        # `objective` unread; see `_run_arm`.
+        var n_classes = 0
         var repeats = 1
         var seed = 0
         var arms = List[Int]()
@@ -318,8 +463,22 @@ def main() raises:
             obj_name = String(args[3])
             if obj_name == "binary":
                 objective = BINARY_LOGISTIC
+            elif obj_name == "multi":
+                n_classes = 7
+            elif obj_name.startswith("multi:"):
+                n_classes = Int(
+                    String(obj_name[byte=6 : obj_name.byte_length()])
+                )
+                if n_classes < 2:
+                    raise Error(
+                        "multi needs at least 2 classes; a one-class softmax"
+                        " has nothing to separate"
+                    )
             elif obj_name != "reg":
-                raise Error("objective must be 'reg' or 'binary'")
+                raise Error(
+                    "objective must be 'reg', 'binary', or"
+                    " 'multi' / 'multi:<classes>'"
+                )
         if len(args) > 4:
             repeats = Int(String(args[4]))
             if repeats < 1:
@@ -348,11 +507,24 @@ def main() raises:
                 5.0 * x0 + 4.0 * x1 * x2 + 3.0 * (x3 - 0.5) * (x3 - 0.5)
             )
             var u = _uniform(noise_base + UInt64(r))
-            if objective == BINARY_LOGISTIC:
+            if n_classes > 0:
+                # The same signal, perturbed and then bucketed below. The
+                # noise is wider than the regression arm's because a class
+                # boundary needs rows on both sides of it to be worth a
+                # split: a label that is a step function of the signal
+                # alone is separable by four features and the trees stop
+                # growing early, which measures the early stop and not the
+                # backend.
+                target.append(signal + 0.5 * (u - 0.5))
+            elif objective == BINARY_LOGISTIC:
                 var p = _sigmoid(2.0 * (signal - 3.0))
                 target.append(1.0 if u < p else 0.0)
             else:
                 target.append(signal + 0.1 * (u - 0.5))
+
+        var labels = List[Int]()
+        if n_classes > 0:
+            labels = _class_labels(target, n_classes)
 
         print(
             "mojotrees gpu-vs-cpu bench:",
@@ -364,6 +536,8 @@ def main() raises:
             "seed",
             seed,
         )
+        if n_classes > 0:
+            print("classes:", n_classes)
 
         var t0 = perf_counter_ns()
         var mapper = fit_bins(features, n_rows, n_features, 255)
@@ -400,7 +574,13 @@ def main() raises:
         for rep in range(repeats):
             for a in range(n_arms):
                 var run = _run_arm(
-                    arms[a], data, target, objective, rep == 0
+                    arms[a],
+                    data,
+                    target,
+                    labels,
+                    n_classes,
+                    objective,
+                    rep == 0,
                 )
                 samples.append(run.seconds)
                 if rep == 0:
