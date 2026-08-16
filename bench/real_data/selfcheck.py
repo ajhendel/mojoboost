@@ -970,10 +970,16 @@ def check_catboost_arm():
             f"the resolved parity table could not be built for {name}: "
             f"{entry.get('error')}",
         )
+        # The same failures the gate above already reported, seen through the
+        # field a published record carries. Both are checked because they can
+        # come apart: the gate walks catboost_parity_rows directly and this
+        # walks the block catboost_arm_block writes, so a bug that drops the
+        # rows on their way into the record shows up here and only here.
         check(
             not entry.get("failures"),
-            f"{name}: the recorded parity table carries failures that the "
-            f"gate did not report: {entry.get('failures')}",
+            f"{name}: the parity table recorded in every manifest carries "
+            f"{len(entry.get('failures') or ())} failing key(s): "
+            f"{entry.get('failures')}",
         )
     try:
         json.dumps(parity)

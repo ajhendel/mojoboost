@@ -5672,11 +5672,11 @@ guards is in flux is not a gate.
 
 #### 6. What is unverified, and it is a lot
 
-- **The check has never been watched fail.** It cannot be, from here. The exact
-  edit that should make it fail, and the message it should print, are in the
-  lane report so that somebody with the box can confirm it before trusting it.
-  This repository has shipped inert gates this week; treat this one as inert
-  until it has been seen red.
+- **The check has never been watched fail.** It cannot be, from here. Section 7
+  below is the exact edit that should make it fail and the message it should
+  print, so that somebody with the box can confirm it before trusting it. This
+  repository has shipped inert gates this week; treat this one as inert until
+  it has been seen red.
 - **Nothing was run.** `selfcheck.py` was not executed, so a syntax error or a
   wrong assumption about a dict key would show up on the first run and not
   before.
@@ -5710,3 +5710,101 @@ guards is in flux is not a gate.
   call site changes, the parity table checks a dict the run did not use, and
   nothing from `scenarios.py` can assert against a call site. Both places name
   each other; that is the whole mitigation.
+
+#### 7. The exact edit that makes the gate fail, and what it should print
+
+Nobody has watched this check go red. Before trusting it, make it go red.
+
+**Edit A, one character, in `bench/real_data/scenarios.py`.** In
+`MOJOTREES_CATBOOST_MODE`, change
+
+```python
+    "max_depth": 6,
+```
+
+to
+
+```python
+    "max_depth": 8,
+```
+
+Then `python3 bench/real_data/selfcheck.py`. It should exit 1 and print, among
+other lines, one of these per scenario in
+`MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS`:
+
+```
+FAIL dense_regression: depth -> max_depth: CatBoost resolves depth=6 and this arm resolves max_depth=8. CATBOOST_PARAM_MAP calls this key matched, so the two arms are running different models under one heading. Fix the arm's value, or move the key into CATBOOST_UNMATCHABLE with a reason traced in our code
+```
+
+plus, from the recorded-block check, one of
+
+```
+FAIL dense_regression: the parity table recorded in every manifest carries 1 failing key(s): [...]
+```
+
+Nine lines in total across three scenarios and two checks, then
+`9 problems`. **If it prints `harness self-check passed`, the gate is inert and
+nothing in this entry should be believed.**
+
+**Edit B, which is the one that matters, because Edit A could be caught by the
+old check too.** Revert Edit A, then in `CATBOOST_LEFT_AT_STOCK` change
+
+```python
+    "l2_leaf_reg": 3,
+```
+
+to
+
+```python
+    "l2_leaf_reg": 4,
+```
+
+This is a wrong belief about CatBoost with the arm untouched, which is exactly
+the failure the old check could not see: `MOJOTREES_CATBOOST_MODE` still says
+`lambda_l2: 3.0` and still reaches the resolved dict, so every pre-A37 check
+passes. It should now print:
+
+```
+FAIL dense_regression: l2_leaf_reg -> lambda_l2: CatBoost resolves l2_leaf_reg=4 and this arm resolves lambda_l2=3.0. CATBOOST_PARAM_MAP calls this key matched, so the two arms are running different models under one heading. Fix the arm's value, or move the key into CATBOOST_UNMATCHABLE with a reason traced in our code
+```
+
+**Edit C, the classification gate.** Revert Edit B, then add a key to
+`CATBOOST_LEFT_AT_STOCK` that nothing classifies:
+
+```python
+    "diffusion_temperature": 0,
+```
+
+It should print:
+
+```
+FAIL dense_regression: CatBoost resolves diffusion_temperature=0 and neither CATBOOST_PARAM_MAP nor CATBOOST_PARAM_NOT_MAPPED says whether this arm matches it. A key nobody classified is the hand-written belief this table exists to remove
+```
+
+and, from `catboost_parity_rows`:
+
+```
+FAIL dense_regression: diffusion_temperature -> None: CatBoost resolves diffusion_temperature and nothing in CATBOOST_PARAM_MAP or CATBOOST_PARAM_NOT_MAPPED says whether this arm matches it. Classify it: a key nobody decided about is the hand-written belief this table removes
+```
+
+**Edit D, the refusal.** Revert Edit C, then in
+`mojotrees_catboost_mode_params` replace
+
+```python
+    params.update(catboost_readback_values(spec, catboost_readback))
+```
+
+with
+
+```python
+    params.setdefault("learning_rate", BASE_PARAMS["learning_rate"])
+```
+
+which is the fallback this entry exists to forbid, written the way somebody
+would actually write it. It should print:
+
+```
+FAIL the CatBoost-mode arm BUILT without CatBoost's read-back. It must refuse by name: every key in MOJOTREES_CATBOOST_MODE_FROM_READBACK has no static value, so whatever it used for the learning rate is a guess, and a guess of 0.1 against CatBoost's resolved 0.43 is the largest single error this arm can make
+```
+
+Revert Edit D. All four are one-line edits and none of them needs a fit.
