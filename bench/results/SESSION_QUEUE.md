@@ -60,6 +60,32 @@ session; the authoritative list is this file.
 >
 > Read every "wait" below as "drain" and every wait-count projection as void.
 
+
+---
+
+> **HOLD, 2026-08-16: do not measure or quote any binning comparison right now.**
+>
+> The CPU campaign flipped `bin_construct_sample_cnt` to 200,000 and
+> `min_data_in_bin` to 3 to match LightGBM stock. But `bench/real_data/
+> engines.py` (~441 and ~454) still injects `bin_construct_sample_cnt` from the
+> training row count for **LightGBM**.
+>
+> **That inverts the pin rather than dropping it.** Previously both sides binned
+> every row. Now we bin a 200,000-row subsample and the comparator is still
+> forced to bin all of them, so **the comparator does strictly more work than we
+> do** and any binning ratio taken in this window is wrong in our favour.
+>
+> This is the fourth comparator-configuration hazard in three days, and the first
+> one caught by its own campaign before anything was measured rather than after.
+> The CPU campaign owns the fix.
+>
+> Also on hold: **regenerating the GPU bin-pinning test expectations**
+> (`test_gpu_fma_consistency`'s `record.bin == 3` is the real one;
+> `test_gpu_kernel_family`'s capacity ladder is a kernel-family property and
+> should be unaffected). Six binning tests are currently failing on `cpu-round-1`
+> including the sparse-equals-dense contract, so the numbers will move again.
+> Wait for the green SHA.
+
 ---
 
 ## Session II leftovers: the one decision Sweep II could not close
