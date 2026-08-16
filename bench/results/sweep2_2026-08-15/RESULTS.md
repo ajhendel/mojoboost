@@ -303,9 +303,15 @@ Alternating processes on a quiet machine, five repeats each, 1,000,000 x 50:
 | 3 | 3.136 | 3.730 |
 | median | **3.165** | 3.730 |
 
-**About 0.57 seconds, 15 percent.** Two of three pairs favor it clearly and one
-inverts, so the direction is consistent rather than unanimous and the figure
-should be read as approximate.
+**About 0.57 seconds, and NOT YET RESOLVED.** Three pairs, one of them inverted,
+with the ON arm itself ranging 3.136 to 3.612. That is a 15 percent spread on an
+effect of 15 percent, which by rule S3 of `PROFILE_PROTOCOL.md` is "consistent
+with the prediction" and is not "resolved". The direction is consistent; the
+magnitude is not established, and this figure must not be quoted as 15 percent
+in a summary table until it has been re-taken over at least five pairs on a
+quiet box with no lane compiling. Recorded here as the reason the number below
+is provisional rather than deleted: an unresolved measurement that agrees with a
+prediction is still evidence, it is just not a result.
 
 It agrees with the model. The plane makes **16 waits per tree, nine of them
 uploads**, against the shipping loop's 31, so it removes 15. At the measured 458
@@ -324,4 +330,9 @@ at roughly 2.47 seconds against LightGBM's 2.767.
 ### Where leaf-wise stands after it
 
 3.165 seconds against LightGBM's 2.767, so **1.14x behind**, down from 1.36x.
+Both halves of that ratio are provisional: ours for the spread just described,
+theirs because the LightGBM figure is a single un-repeated sample taken in a
+separate process at a separate moment, on a machine this repository has
+documented as drifting two to three times across time windows. The interleaved
+arm exists to close the second half and has not yet been run.
 The slope is untouched, as it must be, since nothing here changed the kernel.
