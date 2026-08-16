@@ -136,6 +136,43 @@ def build_matrix(args):
                             )
                         )
                         continue
+                    # The same treatment for the two arms below, and it was
+                    # missing until 2026-08-16: both refuse a non-CPU device
+                    # somewhere further in, so without these they were
+                    # SCHEDULED and then failed at load or fit time. A failing
+                    # peer cell is an infrastructure failure, and this harness
+                    # answers an infrastructure failure by withholding the
+                    # quality verdict for the whole matrix -- so twenty-four
+                    # cells nobody wanted could have taken the exit code of a
+                    # run whose comparator rows all succeeded. Found by
+                    # `--dry-run` before the window rather than inside it.
+                    if engine in scenarios.CATBOOST_ENGINES:
+                        jobs.append(
+                            _skip(
+                                scenario_id, engine, device, args,
+                                "CatBoost runs on the CPU in this harness: its "
+                                "GPU training is a different quantization "
+                                "(border_count capped at 255 against 65535) "
+                                "and so is not the same measurement. "
+                                "CatBoostEngine.load refuses it by name",
+                            )
+                        )
+                        continue
+                    if engine == "mojotrees_catboost_mode":
+                        jobs.append(
+                            _skip(
+                                scenario_id, engine, device, args,
+                                "the CatBoost-mode arm sets "
+                                "score_function=Cosine, and the device split "
+                                "search computes G^2/(H+lambda) only, so "
+                                "device_policy blocks it "
+                                "(BLOCK_SCORE_FUNCTION). The arm is CPU-only "
+                                "by construction, and its CatBoost "
+                                "counterpart is CPU-only too, so a GPU row "
+                                "here would have had nothing to pair against",
+                            )
+                        )
+                        continue
                 for threads in args.threads:
                     for repeat in range(args.repeats):
                         jobs.append(
