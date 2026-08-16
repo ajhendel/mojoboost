@@ -65,54 +65,46 @@ not in the tree.
 - `_multiclass_rf_gradients` needed nothing: it is a `def`, which raises in
   Mojo 1.0. That glue item was a non-issue and is struck.
 
-## Two findings to route
+## Three findings routed this round -- ALL CLOSED
 
-### `MOJOTREES_DERIVATIVE_PRECISION=float64` is largely a no-op on sparse fits
+Kept because each was a *class* of defect, not a one-off, and the class is
+still live somewhere in this package.
 
-Found by `lane/derivative-precision-wiring` while auditing every fit path,
-and it **predates that lane** — it is live in the shipping env entry, not
-in anything we added. Under `float64` the objective stops narrowing, but
-`tree_sparse.grow_tree_sparse` still passes `narrow=True` at every
-`histogram_sparse` call site (`tree_sparse.mojo:494, 620, 624, 784, 797`),
-so the cells and the node totals silently re-narrow. GOSS and weighted
-rounds then accumulate `Float32(w*g)` where the arm the user asked for
-accumulates `w*g`. **Nothing says so anywhere.** `distributed.mojo` has the
-identical shape at nine `build_histogram`/`build_histogram_subset` sites.
+**1. `MOJOTREES_DERIVATIVE_PRECISION=float64` was largely a no-op on sparse
+and distributed fits.** The objective stopped narrowing and the grower
+re-narrowed at five `histogram_sparse` sites and nine `build_histogram`
+sites, so a user paid the slow arm's cost for the fast arm's precision with
+no signal at all. Closed in `7a01acd`. Two details worth keeping:
+`build_histogram_sparse_node` derives the default-bin leftover as `totals`
+minus the stored entries, so `totals` must be summed at the SAME setting as
+the accumulation or the whole node's rounding difference lands in one bin;
+and the distributed schema digest did not cover the setting, so a rank that
+had the variable exported and a rank that did not would all-reduce histograms
+taken at two precisions with nothing detecting it.
 
-A user who sets the documented flag on a sparse or distributed fit gets the
-slow arm's cost and the fast arm's precision. That is a wrong answer with no
-signal, which is the same class as the CatBoost `mvs_reg = 0` empty tree.
-Needs a lane, and the fix shape is known: one `ConstHessianSettings` or
-`narrow: Bool` parameter on `grow_tree_sparse`, forwarded.
+**2. A GPU fit at `float64` had ALWAYS silently returned the Float32
+answer.** `gpu_gradient_stream.stage_gradients` narrows on upload;
+`extra.is_active()` was believed to guard it and does not -- it gates the
+device split search and the resident tree, not the histogram. Now **refused**
+at both GPU growers from either entry, not forwarded: forwarding would make
+the host compute Float64 gradients the device then narrows, which is the
+third-configuration failure that kept the parameter refused for two rounds.
+A `device='auto'` fit at float64 now raises; f9 has a lane routing `auto` to
+CPU instead, on the rule that an explicit `gpu` must still raise.
 
-### The objective half is 25 call sites and there is no chokepoint
+**3. Oblivious shipped and was unreachable.** `GROW_OBLIVIOUS` merged in wave
+4 and could not be asked for, because the estimator validated `grow_policy`
+against a table carrying `leafwise` and `depthwise` only, and every benchmark
+arm and every sklearn user goes through that file. Closed in `05d498d`.
 
-To make `derivative_precision` mean anything the parameter has to reach
-`fill_grad_hess` (`boosting.mojo:452`), `_fill_grad_hess` (`:668`) and
-`_fill_softmax_grad_hess` (`:2490`), then be forwarded from about 25 call
-sites across 8 files. The cheap alternative was checked and does not work:
-folding it onto `DispatchSettings` looks like 6 sites, but every trainer
-outside `boosting.mojo` passes the sentinel, so it reproduces the same
-silent-downgrade defect one type over, and `_fill_softmax_grad_hess` takes
-no `settings` at all. `test_the_objective_half_is_still_missing` is the
-tripwire and its docstring carries the fit-level test to write in its place.
-
-### oblivious shipped and is unreachable
-
-`GROW_OBLIVIOUS` merged in wave 4 and I exported it from
-`src/mojotrees/__init__.mojo` myself. It cannot be asked for.
-`python/mojotrees/sklearn.py` validates `grow_policy` against
-`_GROW_POLICIES` (around line 985), which carries `leafwise` (alias
-`lossguide`) and `depthwise` and nothing else, and **every arm in
-`bench/real_data` and every sklearn user goes through that surface**. This
-is the second feature this round that was built, tested, merged and
-unreachable; CatBoost was the first.
-
-It is with `lane/canonical-naming`, which owns that validator and whose spec
-already carries the value. Wiring it turns the largest caveat on the CatBoost
-comparison from a permanent unmatchable into a matched parameter. Check the
-whole path when it reports: accepted-and-dropped is worse than rejected, and
-`bench/real_data` has already shipped exactly that shape once.
+**The class these three share is the important part**, and it is now four
+occurrences counting CatBoost-was-built-and-unreachable: *we ship settings
+that are accepted and then quietly ignored.* Every one was invisible until
+somebody audited a path end to end rather than at its entry. CatBoost has the
+same disease -- `mvs_reg = 0` drives every row weight to zero through a NaN
+that its own comparison eats, training a tree on nothing with no error.
+**Audit reachability, not just correctness**, and prefer a refusal to a
+silent downgrade every time.
 
 ## Owed, in order
 
@@ -158,18 +150,45 @@ whole path when it reports: accepted-and-dropped is worse than rejected, and
    boosting stays a design note, since CatBoost itself defaults to Plain
    above about 50k rows.
 
+## Out with lanes right now
+
+`ordered-ts-2`, `row-major-auto`, `interleave-finish`, `objective-marshaller`.
+All four branched off **`cpu-round-2` at `bfd6187`**, not `perf-round-2`,
+because that head is far ahead now.
+
+**`lane/ordered-ts` produced nothing at all** -- empty branch, empty worktree,
+no report, across two sessions. Retired as `lane/ordered-ts-abandoned` and
+relaunched clean as `ordered-ts-2`. A lane that reports a refusal is useful; a
+lane that reports nothing is not, and the two look identical from here until
+you check the worktree. Check for emptiness rather than waiting.
+
+**Two lanes are sequenced behind `interleave-finish`** and must not start
+early: retyping the eight row-id readers to `Int32`, then wiring
+`_LeafState.rows` to a `LeafSpan`. Both were declined this round for
+colliding with the histogram cell that lane is rewriting.
+
+**Catalog numbering collides on almost every merge.** Three lanes took
+A11/A12 and one took A9 against an existing A9; I renumbered each on merge.
+The catalog now runs to **A16**. Tell the next lane to read the file first and
+take A17 upward.
+
 ## The CatBoost set, against Andrew's list
 
-DONE and merged: oblivious CPU (**but unreachable, see above**), Bayesian
-bootstrap, `leaf_estimation_iterations`, Cosine score (`9b1f4da`, and it is a
-**provable no-op at stock** -- see below), MVS (`9e2d73e`), and the harness
-(defaults row, matched-trees-and-lr row, Lossguide row `ca33ebc`, iterations
-and lr structural on every row through `CATBOOST_MATCHED`).
+DONE and merged, the whole list except CTR combinations: oblivious CPU (**and
+reachable now**, `05d498d`), Bayesian bootstrap, `leaf_estimation_iterations`,
+Cosine score (`9b1f4da`, a **provable no-op at stock**, see below), MVS
+(`9e2d73e`), auto learning rate (`2174831`), Langevin plus `model_shrink_rate`
+(`5c13a7e`), border quantization plus `one_hot_max_size` (`b637ebf`), the
+naming spec wired (`05d498d`), and the harness (defaults row,
+matched-trees-and-lr row, Lossguide row `ca33ebc`, iterations and lr
+structural on every row through `CATBOOST_MATCHED`).
 
-OUT WITH LANES: `canonical-naming` (wiring `docs/PARAMETER_NAMING.md`,
-aliases included, `subsample < 1` implies `subsample_freq = 1`),
-`derivative-precision-wiring` (now on the sparse/distributed no-op, then the
-objective half), `auto-learning-rate`, `langevin-model-shrink`,
+OUTSTANDING: ordered target statistics, then CTR feature combinations under
+`max_ctr_complexity`, which start the hour ordered-ts lands. **Ordered-ts is
+the merge point**: when it lands, `cpu-round-2` goes into `perf-round-2` and
+f9 gets told.
+
+### Earlier this round, for the record
 `catboost-quantization` (border quantization plus `one_hot_max_size`).
 
 NOT REPORTED: `lane/ordered-ts`. CTR feature combinations under
@@ -194,37 +213,23 @@ Also settled: the widely-repeated "Lossguide defaults to NewtonL2" sits inside
 `if (TaskType == GPU)`. On CPU it is unreachable and NewtonL2 would be refused
 by `CB_ENSURE` anyway. Cosine is the CPU default for **every** grow policy.
 
-## Glue held, waiting on `canonical-naming`
+## Glue held, waiting on `canonical-naming` -- ALL THREE LANDED
 
-Three items, all blocked on the same lane because it owns the parameter-name
-surface. Ready to apply the moment it lands:
+`canonical-naming` merged at `05d498d` and all three unblocked:
 
-1. **MVS reachability.** Two hunks in `canonical_bootstrap_type` (split `mvs`
-   out of the not-implemented raise) and one key, `mvs_reg`, in
-   `sampling_param_names` and `canonical_sampling_param`. No `mvs_seed`: it
-   reuses `bootstrap_seed`.
-2. **`symmetrictree` in `_GROW_POLICIES`**, which is what makes the merged
-   oblivious policy reachable at all.
-3. **`subsample` is ONE key, not two.** The spec renames `bagging_fraction`
-   to `subsample` and MVS reads the same key. CatBoost has exactly one
-   `subsample` and which sampler consumes it depends on `bootstrap_type`, so
-   the collision is correct behavior -- but only if both wire to the one
-   shared key. The MVS lane deliberately added no `subsample` entry so
-   nothing pre-empts the decision.
+1. **MVS reachability** -- the `mvs` arm and the `mvs_reg` key are in.
+2. **`symmetrictree` in the grow-policy validator** -- so the oblivious
+   policy merged in wave 4 is finally callable. The lane verified the whole
+   path rather than the validator: `bindings/_mojotrees.mojo:680` is the
+   single shared `TreeParams` builder every fit entry point goes through, and
+   each grower either branches on `GROW_OBLIVIOUS` or constructs a
+   `GrowthSchedule` whose `__init__` **raises** on the code. No third shape.
+3. **`subsample` is ONE key** -- shared by every sampler that selects rows,
+   which is CatBoost's own shape. Bernoulli, MVS and Poisson read it;
+   Bayesian refuses it because it weights every row rather than selecting any.
 
-Also owed from the score-function lane, and NOT blocked on naming: a
-`score_function` field on `ExtraTreeParams` and a pass-through in `tree.mojo`
-to both `find_best_split` and `find_best_split_shared`. Without it Cosine is
-reachable only from its own test.
-
-**`src/mojotrees/sampling.mojo` has two lanes in it and the split is a
-ruling, not a convention.** `canonical-naming` holds
-`canonical_bootstrap_type`, `canonical_sampling_param` and
-`sampling_param_names` exclusively; `mvs-bootstrap` holds everything else in
-the file and hands me its three table lines as glue once naming lands. That
-makes naming a dependency of MVS rather than a parallel lane. MVS was told
-not to open `src/mojotrees/mvs.mojo`: a new file importing sampling's
-constants is the shape that produced the CEGB import cycle.
+Three test files asserted the old behavior and were corrected on merge:
+`test_sampling`, `test_bayesian_bootstrap`, `test_derivative_precision`.
 
 ## The naming spec
 
