@@ -1287,6 +1287,15 @@ MONOTONE_EXEMPT = {
         "does not parse constraints out of; see the import row in the "
         "contract"
     ),
+    ("catboost_reach_bindings.mojo", "TreeParams"): (
+        "the multi-target entry point, and the constraint is REFUSED by name "
+        "one layer up rather than dropped here: `_fit_multi_target` in "
+        "sklearn.py raises on `monotone_constraints`, because "
+        "`multi_target.train_multi_rmse` has no monotone pass and forwarding "
+        "the bundle would move the silence one layer down instead of ending "
+        "it. This gate found the drop and the gate was right; the exemption "
+        "is the refusal, not a dispensation"
+    ),
 }
 
 

@@ -4038,6 +4038,21 @@ class MojoTreesRegressor(_Base):
                 "a multi-target fit takes no callbacks: they are driven by "
                 "the metric-path round loop, which is single-output"
             )
+        if self.monotone_constraints is not None:
+            # `catboost_reach_bindings` builds its `TreeParams` without the
+            # monotone bundle, so a constraint set here would be dropped and
+            # the returned model would report none. `tools/check_parity.py`
+            # caught that as a silent drop, which is the defect class this
+            # whole round exists to end, and the honest close is a refusal
+            # rather than a forwarded constraint no trainer applies:
+            # `multi_target.train_multi_rmse` has no monotone pass, so
+            # passing it through would move the silence one layer down.
+            raise ValueError(
+                "a multi-target fit takes no monotone_constraints: "
+                "multi_target.train_multi_rmse has no monotone pass, so the "
+                "constraint would be accepted and never applied. Fit each "
+                "target separately if you need it"
+            )
         if _arrays.is_sparse(X):
             raise TypeError(
                 "a multi-target fit takes a dense X: train_multi_rmse bins "
