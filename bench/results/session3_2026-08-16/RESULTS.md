@@ -1120,3 +1120,55 @@ contexts only), and `event` (`eventCreate is not supported on this device`).
 The probe prints each unavailable arm **with why**, so a future MAX that closes a
 gap shows up as `unavailable -> ok` with no edit to the harness. That is the right
 shape for a capability probe and it is worth copying.
+
+
+---
+
+## The clock-state probe: indistinguishable, and the question closes with a number
+
+Bucket C. A fixed reference kernel -- `bench/canary.mojo`'s GPU probe, reused
+rather than reinvented so the reading is comparable with the canary line already
+in every window header -- timed under three conditions the probe controls, seven
+repeats each, **interleaved rather than blocked** so a drift across the run
+cannot land entirely on one condition.
+
+| condition | median | spread |
+|---|---|---|
+| **cold** (after a 2-second idle gap) | 252.8 ms | 10.0% |
+| **saturated** (immediately after a queue-filling burst) | 248.9 ms | 9.8% |
+| **warm** (burst, drain, then measure) | 243.5 ms | 5.6% |
+
+`saturated/cold` = **1.015**, `warm/cold` = **1.038**. Best gain over cold is
+**3.7 percent against a 10.0 percent band**: **indistinguishable** under M0.
+
+### What that closes
+
+The Metal timeline found runs sitting at the **Minimum** GPU performance state
+with the same kernel ~2.8x faster at Maximum, and nothing in this campaign could
+control or record it. **At these workloads the clock is not moving**, so:
+
+- **No lane follows.** The warm-up burst does not become a rule-(2) switch.
+- **`launch-fusion`, `trip-count` and the speculative prebuild do NOT get a
+  second payoff.** Each removes host stalls; if idle gaps had cost clock state,
+  they would have been buying it back on top of the work they remove. They are
+  worth exactly the work they remove and no more, which is the honest and less
+  flattering reading.
+- The 2.8x figure from the timeline is **not refuted** -- it was observed on a
+  different workload shape and probably a different power regime. What is refuted
+  is the idea that *this campaign's* idle gaps are causing it.
+
+### The caveat that comes with it, stated because it is the way this is wrong
+
+`IDLE_SECONDS = 2.0` is **chosen, not measured**. A machine that downclocks on a
+shorter gap than two seconds would read as flat here, because every "cold" sample
+would already be warm. The probe's own verdict text says so rather than leaving
+it to a reader.
+
+So the honest claim is narrow: **no clock effect at a two-second idle gap on this
+reference kernel**. Not "the clock is fixed". If a future window sees an
+unexplained regime shift, the first thing to vary is that constant, and the probe
+is in the tree to make that a one-line change.
+
+Taken at load 8.63 -- a busy box -- which the ratio design tolerates and the
+absolute milliseconds do not. The three medians are not quotable as kernel
+timings; only the ratios between them are.
