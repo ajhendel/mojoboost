@@ -305,8 +305,10 @@ Alternating processes on a quiet machine, five repeats each, 1,000,000 x 50:
 
 **About 0.57 seconds, and NOT YET RESOLVED.** Three pairs, one of them inverted,
 with the ON arm itself ranging 3.136 to 3.612. That is a 15 percent spread on an
-effect of 15 percent, which by rule S3 of `PROFILE_PROTOCOL.md` is "consistent
-with the prediction" and is not "resolved". The direction is consistent; the
+effect of 15 percent, which is **consistent** and not **resolved** in the sense
+rule M0 of `PROFILE_PROTOCOL.md` now defines. That rule was written after this
+measurement and because of it; the earlier protocol had no name for the
+distinction, which is part of why the number went into a table as 15 percent. The direction is consistent; the
 magnitude is not established, and this figure must not be quoted as 15 percent
 in a summary table until it has been re-taken over at least five pairs on a
 quiet box with no lane compiling. Recorded here as the reason the number below
