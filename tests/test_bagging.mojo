@@ -296,17 +296,20 @@ def test_bagged_tree_equals_tree_on_subset_dataset() raises:
     )
     _assert_same_tree(bagged, reference_bagged)
 
-    # Structure only, against the whole-dataset builder. The two builders no
-    # longer produce the same doubles and are not required to: the subset
-    # builder accumulates a node's rows in contiguous row blocks with a
-    # private histogram each and folds the partials, and the whole-dataset
-    # builder sums flat in ascending row order (see the "row blocks" section
-    # of histogram.mojo, which states the reassociation and the bound it
-    # buys). The observed spread on this fixture is a few ulp on a leaf
-    # value, which moves no split -- and *that* is the claim worth keeping,
-    # so it is what is asserted rather than a tolerance on the value.
+    # Bit for bit again, against the whole-dataset builder. This assertion
+    # was downgraded to structure-only when the subset builder began folding
+    # contiguous row blocks while the whole-dataset builder still summed flat:
+    # the two orders are different sequences of Float64 additions, and the
+    # observed spread on this fixture was four ulp on a leaf value. It is
+    # restored because the cause is fixed rather than because the tolerance
+    # was widened -- both builders now block on one plan
+    # (`apple_cpu_policy.plan_row_block_count`, which no longer looks at
+    # whether the rows arrive through a row-id list), so they perform the
+    # identical additions in the identical order. If this goes red again,
+    # the two builders have diverged and it is that, not this test, that is
+    # wrong.
     var reference_full = grow_tree(subset, sub_grad, sub_hess, params)
-    _assert_same_structure(bagged, reference_full)
+    _assert_same_tree(bagged, reference_full)
     assert_true(bagged.n_leaves > 1)
 
 

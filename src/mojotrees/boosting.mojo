@@ -84,7 +84,7 @@ from .objective_registry import (
     objective_renews_leaves,
 )
 from .cegb import CegbLedger, check_cegb_continued_training
-from .histogram import objective_has_constant_hessian
+from .histogram import objective_has_constant_hessian, score_t
 from .linear_tree import (
     LinearEnsemble,
     LinearParams,
@@ -458,6 +458,28 @@ def fill_grad_hess(
     summed across rows, which makes the output bit-identical at every worker
     count.
 
+    **Every value written here is rounded to single precision**, through
+    `histogram.score_t`. LightGBM's `score_t` is `float`
+    (`include/LightGBM/meta.h`) and every derivative it carries -- from the
+    objective's output, through `ordered_gradients`, into the histogram
+    accumulate -- is one. Raw scores, leaf values and gains stay Float64 on
+    both sides; only the per-row derivative narrows.
+
+    The containers stay `List[Float64]` because their type is fixed by
+    signatures in `tree.mojo`, so what lands here is a Float32 quantity in a
+    Float64 word. That is not a half measure, it is what makes the histogram's
+    gathered pair buffer able to hold two Float32 per row without the gathered
+    and un-gathered accumulation paths disagreeing: the narrowing is
+    idempotent, both paths apply it, and both therefore add the identical
+    Float64. `histogram.score_t` carries the full argument.
+
+    Two consequences worth stating. Every derivative-dependent number in a fit
+    moves -- a gradient's low 29 significand bits are now zero -- which is the
+    accuracy LightGBM has always had rather than a loss against it. And the
+    constant-hessian guarantee is untouched: `histogram.CONSTANT_HESSIAN` is
+    1.0, exactly representable in Float32, and the unweighted arms of
+    `SQUARED_ERROR`, `L1`, `HUBER` and `QUANTILE` still write exactly it.
+
     Public because it is the gradient-generation stage the CPU profiler times
     (bench/bench_profile.mojo); training calls it through the same entry.
     """
@@ -504,11 +526,11 @@ def _fill_grad_hess_into(
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var p = _sigmoid(raw_p.unsafe_load(r))
-                gp.unsafe_store(r, w * (p - tgt_p.unsafe_load(r)))
+                gp.unsafe_store(r, score_t(w * (p - tgt_p.unsafe_load(r))))
                 var h = p * (1.0 - p)
                 if h < 1e-16:
                     h = 1e-16
-                hp.unsafe_store(r, w * h)
+                hp.unsafe_store(r, score_t(w * h))
         elif objective == GAMMA:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
@@ -517,8 +539,8 @@ def _fill_grad_hess_into(
                 var y_over_mu = tgt_p.unsafe_load(r) * exp(
                     -raw_p.unsafe_load(r)
                 )
-                gp.unsafe_store(r, w * (1.0 - y_over_mu))
-                hp.unsafe_store(r, w * y_over_mu)
+                gp.unsafe_store(r, score_t(w * (1.0 - y_over_mu)))
+                hp.unsafe_store(r, score_t(w * y_over_mu))
         elif objective == TWEEDIE:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
@@ -528,9 +550,12 @@ def _fill_grad_hess_into(
                 # 2 - rho > 0 and the hessian below stays nonnegative.
                 var e1 = exp((1.0 - alpha) * raw_r)
                 var e2 = exp((2.0 - alpha) * raw_r)
-                gp.unsafe_store(r, w * (-y * e1 + e2))
+                gp.unsafe_store(r, score_t(w * (-y * e1 + e2)))
                 hp.unsafe_store(
-                    r, w * (-y * (1.0 - alpha) * e1 + (2.0 - alpha) * e2)
+                    r,
+                    score_t(
+                        w * (-y * (1.0 - alpha) * e1 + (2.0 - alpha) * e2)
+                    ),
                 )
         elif objective == MAPE:
             for r in range(start, end):
@@ -540,58 +565,63 @@ def _fill_grad_hess_into(
                 # a relative one, which is what MAPE measures.
                 var lw = w * _mape_label_weight(y)
                 gp.unsafe_store(
-                    r, lw * _sign(raw_p.unsafe_load(r) - y)
+                    r, score_t(lw * _sign(raw_p.unsafe_load(r) - y))
                 )
-                hp.unsafe_store(r, lw)
+                hp.unsafe_store(r, score_t(lw))
         elif objective == FAIR:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var d = raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)
                 var denom = abs(d) + alpha
-                gp.unsafe_store(r, w * alpha * d / denom)
-                hp.unsafe_store(r, w * alpha * alpha / (denom * denom))
+                gp.unsafe_store(r, score_t(w * alpha * d / denom))
+                hp.unsafe_store(r, score_t(w * alpha * alpha / (denom * denom)))
         elif objective == POISSON:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var raw_r = raw_p.unsafe_load(r)
                 var mu = exp(raw_r)
-                gp.unsafe_store(r, w * (mu - tgt_p.unsafe_load(r)))
+                gp.unsafe_store(r, score_t(w * (mu - tgt_p.unsafe_load(r))))
                 hp.unsafe_store(
-                    r, w * exp(raw_r + _POISSON_MAX_DELTA_STEP)
+                    r, score_t(w * exp(raw_r + _POISSON_MAX_DELTA_STEP))
                 )
         elif objective == HUBER:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var diff = raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)
                 if abs(diff) <= alpha:
-                    gp.unsafe_store(r, w * diff)
+                    gp.unsafe_store(r, score_t(w * diff))
                 else:
-                    gp.unsafe_store(r, w * _sign(diff) * alpha)
-                hp.unsafe_store(r, w)
+                    gp.unsafe_store(r, score_t(w * _sign(diff) * alpha))
+                hp.unsafe_store(r, score_t(w))
         elif objective == QUANTILE:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var diff = raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)
                 if diff >= 0.0:
-                    gp.unsafe_store(r, w * (1.0 - alpha))
+                    gp.unsafe_store(r, score_t(w * (1.0 - alpha)))
                 else:
-                    gp.unsafe_store(r, w * -alpha)
-                hp.unsafe_store(r, w)
+                    gp.unsafe_store(r, score_t(w * -alpha))
+                hp.unsafe_store(r, score_t(w))
         elif objective == L1:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 gp.unsafe_store(
                     r,
-                    w * _sign(raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)),
+                    score_t(
+                        w * _sign(raw_p.unsafe_load(r) - tgt_p.unsafe_load(r))
+                    ),
                 )
-                hp.unsafe_store(r, w)
+                hp.unsafe_store(r, score_t(w))
         else:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 gp.unsafe_store(
-                    r, w * (raw_p.unsafe_load(r) - tgt_p.unsafe_load(r))
+                    r,
+                    score_t(
+                        w * (raw_p.unsafe_load(r) - tgt_p.unsafe_load(r))
+                    ),
                 )
-                hp.unsafe_store(r, w)
+                hp.unsafe_store(r, score_t(w))
 
     # A row here is a handful of flops on three sequential arrays, perhaps a
     # sixteenth of the cost of a histogram op's scattered read-modify-write,

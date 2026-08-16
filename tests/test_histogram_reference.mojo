@@ -47,7 +47,13 @@ from mojotrees.apple_cpu_policy import (
 from mojotrees.binning import bin_equal_width, BinnedMatrix
 from mojotrees.histogram import (
     build_histogram,
+    build_histogram_into_scratch,
     build_histogram_subset,
+    build_histogram_subset_into_scratch,
+    cnt_factor,
+    CONSTANT_HESSIAN,
+    derived_count,
+    score_t,
     subtract_histogram,
     Histogram,
 )
@@ -68,6 +74,44 @@ def _grads(n_rows: Int, seed: UInt64) -> List[Float64]:
     var g = List[Float64](capacity=n_rows)
     for r in range(n_rows):
         g.append(2.0 * _uniform(seed + UInt64(r)) - 1.0)
+    return g^
+
+
+def _pow2(e: Int) -> Float64:
+    """`2 ** e`, built by exact doublings so no library rounding enters."""
+    var v = 1.0
+    if e >= 0:
+        for _ in range(e):
+            v *= 2.0
+    else:
+        for _ in range(-e):
+            v *= 0.5
+    return v
+
+
+def _grads_spread(n_rows: Int, seed: UInt64) -> List[Float64]:
+    """Gradients spanning forty-one binary orders of magnitude.
+
+    `_grads` is uniform in [-1, 1] and, now that a per-row derivative is
+    rounded to Float32 before it is accumulated, a bin's Float64 sum of a few
+    hundred such values is frequently *exact*: 24 significand bits plus the
+    handful of carry bits a few hundred addends need still fits inside 53, so
+    reassociating the sum cannot change it. That is a real and welcome
+    property of the Float32 narrowing, and it is also a hazard for any test
+    whose point is that two summation orders differ -- the guard would go
+    quietly vacuous rather than fail.
+
+    So the fixtures that must *distinguish* orders use this instead: each row
+    is scaled by a power of two cycling over `2^-20 .. 2^20`, which forces the
+    running sum past 53 bits of dynamic range and makes the grouping visible
+    again. Every value is still exactly representable, so nothing here depends
+    on a rounding this file cannot state.
+    """
+    var g = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        g.append(
+            (2.0 * _uniform(seed + UInt64(r)) - 1.0) * _pow2(-20 + (r % 41))
+        )
     return g^
 
 
@@ -109,7 +153,52 @@ def _subset_plan(data: BinnedMatrix, n_sub: Int) raises -> AccumulationPlan:
     )
 
 
+def _full_plan(data: BinnedMatrix) raises -> AccumulationPlan:
+    """The plan a whole-dataset build takes. `rows_are_indirect` is False, and
+    since both builders block on one rule that no longer changes the block
+    count -- which is the point."""
+    return derive_accumulation_plan(
+        CpuProfile.detect(),
+        data.n_features,
+        data.n_features,
+        data.n_bins,
+        data.n_rows,
+        False,
+    )
+
+
+def _all_rows(n_rows: Int) -> List[Int]:
+    var rows = List[Int](capacity=n_rows)
+    for r in range(n_rows):
+        rows.append(r)
+    return rows^
+
+
 def _reference_full(
+    data: BinnedMatrix, grad: List[Float64], hess: List[Float64]
+) raises -> Histogram:
+    """Whichever order the planner selects for a whole-dataset build.
+
+    The whole-dataset builder used to be excluded from row blocking, and this
+    reference used to model the flat order unconditionally. Both changed
+    together: the two builders now block on one plan, so growing on a bag and
+    growing on the dataset of those rows are the same sequence of Float64
+    additions again.
+    """
+    var plan = _full_plan(data)
+    if plan.blocked():
+        return _reference_subset_blocked(
+            data,
+            grad,
+            hess,
+            _all_rows(data.n_rows),
+            plan.row_blocks,
+            plan.block_rows,
+        )
+    return _reference_full_flat(data, grad, hess)
+
+
+def _reference_full_flat(
     data: BinnedMatrix, grad: List[Float64], hess: List[Float64]
 ) raises -> Histogram:
     var size = data.n_features * data.n_bins
@@ -122,8 +211,8 @@ def _reference_full(
     for f in range(data.n_features):
         for r in range(data.n_rows):
             var b = f * data.n_bins + data.bin_at(r, f)
-            g[b] += grad[r]
-            h[b] += hess[r]
+            g[b] += score_t(grad[r])
+            h[b] += score_t(hess[r])
             c[b] += 1
     return Histogram.from_planes(g^, h^, c^, data.n_features, data.n_bins)
 
@@ -147,8 +236,8 @@ def _reference_subset_flat(
         for i in range(len(rows)):
             var r = rows[i]
             var b = f * data.n_bins + data.bin_at(r, f)
-            g[b] += grad[r]
-            h[b] += hess[r]
+            g[b] += score_t(grad[r])
+            h[b] += score_t(hess[r])
             c[b] += 1
     return Histogram.from_planes(g^, h^, c^, data.n_features, data.n_bins)
 
@@ -201,8 +290,8 @@ def _reference_subset_blocked(
             for i in range(r0, r1):
                 var r = rows[i]
                 var b = blk * nb + data.bin_at(r, f)
-                pg[b] += grad[r]
-                ph[b] += hess[r]
+                pg[b] += score_t(grad[r])
+                ph[b] += score_t(hess[r])
                 pc[b] += 1
         for b in range(nb):
             var sg = pg[b]
@@ -304,17 +393,56 @@ def test_full_matches_reference_parallel_odd_shape() raises:
     )
 
 
-def test_full_builder_never_blocks() raises:
-    """The full-dataset builder has no caller-owned scratch, so it keeps the
-    unblocked order at every size. Asserted on the planner rather than assumed
-    from the kernel, since that is where the decision is made."""
-    var plan = derive_accumulation_plan(
-        CpuProfile.detect(), 50, 50, 255, 1_000_000, False
+def test_both_builders_block_on_the_same_plan() raises:
+    """The whole-dataset builder and the subset builder must plan the same
+    blocks for the same rows.
+
+    This is a correctness property and not a speed one. While only the subset
+    builder blocked, `test_bagged_tree_equals_tree_on_subset_dataset` was
+    false by four ulp on a leaf value: the bagged tree reached the subset
+    builder and folded row blocks while its reference summed flat. Asserted on
+    the planner, which is where the decision is made.
+    """
+    _clear_env()
+    var m = CpuProfile.detect()
+    var indirect = derive_accumulation_plan(m, 50, 50, 255, 1_000_000, True)
+    var direct = derive_accumulation_plan(m, 50, 50, 255, 1_000_000, False)
+    assert_true(indirect.row_blocks > 1)
+    assert_equal(direct.row_blocks, indirect.row_blocks)
+    assert_equal(direct.block_rows, indirect.block_rows)
+    assert_equal(direct.block_cells, indirect.block_cells)
+    assert_equal(direct.fold_ops, indirect.fold_ops)
+
+
+def test_full_and_subset_builders_agree_bit_for_bit() raises:
+    """The same rows through both builders, to the bit.
+
+    The fixture is chosen so the plan blocks -- asserted, not assumed -- and
+    so the blocked order is *distinguishable* from the flat one on this data,
+    which `_differs_somewhere` establishes. Without that second check the
+    assertion would pass whichever kernel ran.
+    """
+    _clear_env()
+    var n_rows = 20_000
+    var n_features = 6
+    var data = _make_data(n_rows, n_features, 32, UInt64(4242))
+    var grad = _grads_spread(n_rows, UInt64(20_000_001))
+    var hess = _hessians(n_rows, UInt64(20_000_002))
+    var plan = _full_plan(data)
+    assert_true(plan.blocked())
+    assert_equal(plan.row_blocks, _subset_plan(data, n_rows).row_blocks)
+
+    var rows = _all_rows(n_rows)
+    var flat = _reference_subset_flat(data, grad, hess, rows)
+    var blocked = _reference_subset_blocked(
+        data, grad, hess, rows, plan.row_blocks, plan.block_rows
     )
-    assert_equal(plan.row_blocks, 1)
-    assert_equal(plan.block_cells, 0)
-    assert_equal(plan.block_ops, 0)
-    assert_equal(plan.fold_ops, 0)
+    assert_true(_differs_somewhere(flat, blocked))
+
+    var full = build_histogram(data, grad, hess)
+    var subset = build_histogram_subset(data, grad, hess, rows)
+    _assert_same(full, subset)
+    _assert_same(full, blocked)
 
 
 def test_subset_matches_reference_serial_and_parallel() raises:
@@ -472,10 +600,11 @@ def test_row_block_rule_arithmetic() raises:
     var narrow = derive_accumulation_plan(m, 4, 4, 8, 4_000_000, True)
     assert_equal(narrow.row_blocks, MAX_ROW_BLOCKS)
 
-    # The full-dataset builder, and a degenerate shape.
+    # The full-dataset builder plans the identical count, and a degenerate
+    # shape.
     assert_equal(
         derive_accumulation_plan(m, 50, 50, 255, 1_000_000, False).row_blocks,
-        1,
+        54,
     )
     assert_equal(derive_accumulation_plan(m, 50, 50, 0, 100, True).row_blocks, 1)
     assert_equal(derive_accumulation_plan(m, 50, 50, 255, 0, True).row_blocks, 1)
@@ -572,7 +701,7 @@ def test_blocked_path_runs_and_matches_the_blocked_reference() raises:
     """
     _clear_env()
     var data = _blocked_fixture()
-    var grad = _grads(BLK_ROWS, UInt64(21_000_000))
+    var grad = _grads_spread(BLK_ROWS, UInt64(21_000_000))
     var hess = _hessians(BLK_ROWS, UInt64(22_000_000))
     var rows = _stride_rows(BLK_ROWS, 2)
     assert_equal(len(rows), BLK_SUB)
@@ -607,7 +736,7 @@ def test_blocked_counts_are_exact_and_planes_agree() raises:
     not."""
     _clear_env()
     var data = _blocked_fixture()
-    var grad = _grads(BLK_ROWS, UInt64(23_000_000))
+    var grad = _grads_spread(BLK_ROWS, UInt64(23_000_000))
     var hess = _hessians(BLK_ROWS, UInt64(24_000_000))
     var rows = _stride_rows(BLK_ROWS, 2)
     var flat = _reference_subset_flat(data, grad, hess, rows)
@@ -634,7 +763,7 @@ def test_blocked_bits_identical_across_workers_and_task_counts() raises:
     """
     _clear_env()
     var data = _blocked_fixture()
-    var grad = _grads(BLK_ROWS, UInt64(25_000_000))
+    var grad = _grads_spread(BLK_ROWS, UInt64(25_000_000))
     var hess = _hessians(BLK_ROWS, UInt64(26_000_000))
     var rows = _stride_rows(BLK_ROWS, 2)
 
@@ -902,6 +1031,305 @@ def test_blocked_sibling_subtraction_stays_exact() raises:
     # which is the claim `_subtract_histogram_arrays` makes.
     var derived3 = subtract_histogram(parent, child, False)
     _assert_same(derived, derived3)
+    _clear_env()
+
+
+# ---------------------------------------------------------------------------
+# The LightGBM cell: interleaved, Float32 derivatives, and a derived count
+# ---------------------------------------------------------------------------
+
+comptime _POISON = -1.5e300
+"""A value no accumulation can produce, written into every float of the
+caller-owned scratch before a build so that "was this slot written" is an
+observable fact rather than an assumption."""
+
+
+def _poisoned(n: Int) -> List[Float64]:
+    var p = List[Float64](capacity=n)
+    p.resize(n, _POISON)
+    return p^
+
+
+def _blocked_subset_fixture() raises -> BinnedMatrix:
+    return _make_data(20_000, 6, 32, UInt64(515_151))
+
+
+def test_gathered_pair_buffer_holds_two_float32_per_row() raises:
+    """The gather is one Float64 word per row holding two Float32, which is
+    LightGBM's `score_t` precision and half the bytes the pair used to cost.
+
+    Read back through the same bitcast the kernel uses. This is a layout
+    assertion, not a value assertion: it fails if the buffer goes back to two
+    Float64 per row even though every histogram cell would still be correct.
+    """
+    _clear_env()
+    var data = _blocked_subset_fixture()
+    var n_rows = data.n_rows
+    var grad = _grads(n_rows, UInt64(31_000_001))
+    var hess = _hessians(n_rows, UInt64(31_000_002))
+    var rows = _stride_rows(n_rows, 1)
+    var plan = _subset_plan(data, len(rows))
+    assert_true(plan.blocked())
+
+    var pairs = _poisoned(len(rows) + plan.block_scratch_floats())
+    var out = Histogram.zeroed(data.n_features, data.n_bins)
+    build_histogram_subset_into_scratch(
+        out, pairs, data, grad, hess, rows, 0, len(rows)
+    )
+
+    var p32 = pairs.unsafe_ptr().unsafe_bitcast[Float32]()
+    for i in range(len(rows)):
+        var r = rows[i]
+        assert_equal(p32.unsafe_load(2 * i), Float32(grad[r]))
+        assert_equal(p32.unsafe_load(2 * i + 1), Float32(hess[r]))
+        # And the word it lives in is no longer the poison, which is what
+        # proves the gather ran at all.
+        assert_not_equal(pairs[i].to_bits(), Float64(_POISON).to_bits())
+
+
+def test_constant_hessian_private_cell_is_lightgbm_sixteen_bytes() raises:
+    """The marker for the interleaved cell, and it is a *layout* marker.
+
+    Under the constant-hessian specialization a private block cell is two
+    Float64 -- gradient, then a count in the slot LightGBM aliases as
+    `hist_cnt_t` -- so the kernel addresses two thirds of the three slots the
+    scratch reserves per cell. The reserved third stays poisoned. Run the same
+    fixture without the declaration and every slot is written instead, which
+    is what makes this assertion distinguish the two strides rather than
+    merely observe that some scratch went untouched.
+
+    The scratch is reserved at three slots per cell either way, on purpose:
+    the block count is derived from the byte budget and must not depend on
+    `const_hessian`, or a fit that turned the specialization off would fold a
+    different number of partials.
+    """
+    _clear_env()
+    var data = _blocked_subset_fixture()
+    var n_rows = data.n_rows
+    var grad = _grads(n_rows, UInt64(32_000_001))
+    var flat = _constant(n_rows, CONSTANT_HESSIAN)
+    var rows = _stride_rows(n_rows, 1)
+    var plan = _subset_plan(data, len(rows))
+    assert_true(plan.blocked())
+
+    var part_off = len(rows)
+    var region = plan.block_cells * 3
+    var total = part_off + plan.block_scratch_floats()
+    assert_equal(plan.block_scratch_floats(), plan.row_blocks * region)
+
+    var two = _poisoned(total)
+    var out_two = Histogram.zeroed(data.n_features, data.n_bins)
+    build_histogram_subset_into_scratch(
+        out_two, two, data, grad, flat, rows, 0, len(rows), [], True
+    )
+
+    var three = _poisoned(total)
+    var out_three = Histogram.zeroed(data.n_features, data.n_bins)
+    build_histogram_subset_into_scratch(
+        out_three, three, data, grad, flat, rows, 0, len(rows), [], False
+    )
+
+    var survived_two = 0
+    var survived_three = 0
+    var written_two = 0
+    for blk in range(plan.row_blocks):
+        var base = part_off + blk * region
+        # Slots the two-float cell reaches.
+        for i in range(base, base + plan.block_cells * 2):
+            if two[i].to_bits() != Float64(_POISON).to_bits():
+                written_two += 1
+        # The third slot of every cell, which it does not.
+        for i in range(base + plan.block_cells * 2, base + region):
+            if two[i].to_bits() == Float64(_POISON).to_bits():
+                survived_two += 1
+            if three[i].to_bits() == Float64(_POISON).to_bits():
+                survived_three += 1
+
+    var reserved_third = plan.row_blocks * plan.block_cells
+    assert_equal(survived_two, reserved_third)
+    assert_equal(survived_three, 0)
+    assert_true(written_two > 0)
+
+    # And the two arms still produce the identical histogram, which is the
+    # whole contract the specialization is allowed to keep.
+    _assert_same(out_two, out_three)
+
+
+def test_derived_count_is_lightgbm_round_int() raises:
+    """`derived_count` is `Common::RoundInt`, which is `static_cast<int>(x +
+    0.5f)` -- add a half, truncate toward zero -- and `cnt_factor` is
+    `num_data / sum_hessian`. Stated as a table so the rule is readable
+    without the C++ open next to it."""
+    var xs = [0.0, 0.4, 0.5, 0.6, 1.0, 1.49, 1.5, 2.5, 9.5, 1000.0]
+    for k in range(len(xs)):
+        assert_equal(derived_count(xs[k], 1.0), Int(xs[k] + 0.5))
+    # The factor multiplies before the round, as it does in LightGBM.
+    assert_equal(derived_count(4.0, 2.5), 10)
+    assert_equal(derived_count(3.0, 0.5), 2)
+    assert_equal(cnt_factor(100, 50.0), 2.0)
+    # Under the constant-hessian specialization the factor is exactly 1.0,
+    # which is the whole reason the derived count is exact there.
+    assert_equal(cnt_factor(7, CONSTANT_HESSIAN * 7.0), 1.0)
+    assert_equal(cnt_factor(0, 0.0), 0.0)
+
+
+def test_derived_count_is_exact_under_constant_hessian() raises:
+    """A count recovered from a constant-hessian sum is the count, exactly,
+    with no tolerance anywhere.
+
+    The sum of `n` copies of 1.0 is `Float64(n)` because every partial is an
+    exactly representable integer below 2^53, so the recovery is
+    `Int(Float64(n) + 0.5)` and truncates back to `n`. Checked as arithmetic
+    over a wide range of n, and then on a real blocked build whose counts must
+    match the serial reference integer for integer.
+    """
+    _clear_env()
+    var ns = [0, 1, 2, 3, 255, 4096, 100_003, 1 << 30]
+    for k in range(len(ns)):
+        var n = ns[k]
+        assert_equal(derived_count(Float64(n), 1.0), n)
+
+    var data = _blocked_subset_fixture()
+    var n_rows = data.n_rows
+    var grad = _grads(n_rows, UInt64(33_000_001))
+    var flat = _constant(n_rows, CONSTANT_HESSIAN)
+    var rows = _stride_rows(n_rows, 1)
+    assert_true(_subset_plan(data, len(rows)).blocked())
+    var built = build_histogram_subset(data, grad, flat, rows, [], True)
+    var want = _reference_subset(data, grad, flat, rows)
+    var total = 0
+    for i in range(data.n_features * data.n_bins):
+        assert_equal(built.count_at(i), want.count_at(i))
+        # And the hessian plane is `Float64(count)` to the bit, which is what
+        # the count slot held.
+        assert_equal(
+            built.hess_at(i).to_bits(), Float64(built.count_at(i)).to_bits()
+        )
+        total += built.count_at(i)
+    assert_equal(total, data.n_features * len(rows))
+
+
+def test_general_hessian_keeps_an_exact_count() raises:
+    """Where the hessian varies per row, a count is not a function of the
+    hessian sum, so this package keeps an exact one rather than taking
+    LightGBM's estimate.
+
+    The divergence is deliberate and this is what it buys: on a fixture whose
+    hessians are drawn per row, the derived estimate is checked to be *wrong*
+    somewhere -- otherwise the exact slot would be paying eight bytes a cell
+    for nothing -- while the stored count matches the reference exactly.
+    """
+    _clear_env()
+    var data = _blocked_subset_fixture()
+    var n_rows = data.n_rows
+    var grad = _grads(n_rows, UInt64(34_000_001))
+    var hess = _hessians(n_rows, UInt64(34_000_002))
+    var rows = _stride_rows(n_rows, 1)
+    assert_true(_subset_plan(data, len(rows)).blocked())
+    var built = build_histogram_subset(data, grad, hess, rows)
+    var want = _reference_subset(data, grad, hess, rows)
+
+    var sum_h = 0.0
+    for i in range(data.n_bins):
+        sum_h += built.hess_at(i)
+    var factor = cnt_factor(len(rows), sum_h)
+
+    var estimate_wrong = False
+    for i in range(data.n_features * data.n_bins):
+        assert_equal(built.count_at(i), want.count_at(i))
+        if derived_count(built.hess_at(i), factor) != built.count_at(i):
+            estimate_wrong = True
+    assert_true(estimate_wrong)
+
+
+def _bits_of(h: Histogram) -> List[UInt64]:
+    var out = List[UInt64](capacity=3 * h.n_features * h.n_bins)
+    for i in range(h.n_features * h.n_bins):
+        out.append(UInt64(h.grad_at(i).to_bits()))
+        out.append(UInt64(h.hess_at(i).to_bits()))
+        out.append(UInt64(h.count_at(i)))
+    return out^
+
+
+def _assert_bits_equal(a: List[UInt64], b: List[UInt64]) raises:
+    assert_equal(len(a), len(b))
+    for i in range(len(a)):
+        assert_equal(a[i], b[i])
+
+
+def test_interleaved_cell_is_deterministic_across_workers() raises:
+    """Identical bits at one, three and eight workers, and across the task
+    counts those imply, on both builders and on both hessian arms.
+
+    The blocked kernel's unit is a `(block, group)` pair and the fold is
+    dispatched over active slots, so both dispatches are cut differently at
+    every worker count; what cannot move is the block count, the block
+    boundaries and the ascending fold order, which come from the shape alone.
+    This is the central assertion of the lane.
+    """
+    _clear_env()
+    var data = _blocked_subset_fixture()
+    var n_rows = data.n_rows
+    var grad = _grads(n_rows, UInt64(35_000_001))
+    var hess = _hessians(n_rows, UInt64(35_000_002))
+    var flat = _constant(n_rows, CONSTANT_HESSIAN)
+    var rows = _stride_rows(n_rows, 1)
+    assert_true(_subset_plan(data, len(rows)).blocked())
+    assert_true(_full_plan(data).blocked())
+
+    var workers = ["1", "3", "8"]
+    var base_sub = List[UInt64]()
+    var base_full = List[UInt64]()
+    var base_ch = List[UInt64]()
+    for k in range(len(workers)):
+        _ = setenv("MOJOTREES_NUM_WORKERS", workers[k])
+        # Also move the task grain, so this is not merely a worker-count
+        # sweep at one fixed number of tasks.
+        _ = setenv("MOJOTREES_CPU_TASKS_PER_CORE", "1" if k == 0 else "4")
+        var sub = _bits_of(build_histogram_subset(data, grad, hess, rows))
+        var full = _bits_of(build_histogram(data, grad, hess))
+        var ch = _bits_of(
+            build_histogram_subset(data, grad, flat, rows, [], True)
+        )
+        if k == 0:
+            base_sub = sub^
+            base_full = full^
+            base_ch = ch^
+        else:
+            _assert_bits_equal(base_sub, sub)
+            _assert_bits_equal(base_full, full)
+            _assert_bits_equal(base_ch, ch)
+    _clear_env()
+
+
+def test_full_builder_scratch_is_reused_not_reallocated() raises:
+    """`build_histogram_into_scratch` grows the caller's buffer once and
+    returns the same histogram the allocating form returns.
+
+    The whole-dataset builder blocks now, so it needs private histograms it
+    used to have no home for. This is the home; `build_histogram_into` passes
+    a fresh empty list, which is the allocate-per-call behaviour every
+    unwired caller keeps.
+    """
+    _clear_env()
+    var data = _blocked_subset_fixture()
+    var n_rows = data.n_rows
+    var grad = _grads(n_rows, UInt64(36_000_001))
+    var hess = _hessians(n_rows, UInt64(36_000_002))
+    var plan = _full_plan(data)
+    assert_true(plan.blocked())
+
+    var scratch = List[Float64]()
+    var reused = Histogram.zeroed(data.n_features, data.n_bins)
+    build_histogram_into_scratch(reused, scratch, data, grad, hess)
+    var grown = len(scratch)
+    assert_equal(grown, plan.block_scratch_floats())
+    _assert_same(reused, build_histogram(data, grad, hess))
+
+    # A second build reuses the allocation rather than growing it again.
+    build_histogram_into_scratch(reused, scratch, data, grad, hess)
+    assert_equal(len(scratch), grown)
+    _assert_same(reused, build_histogram(data, grad, hess))
     _clear_env()
 
 
