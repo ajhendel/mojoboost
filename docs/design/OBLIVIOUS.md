@@ -53,8 +53,18 @@ GPU (resident plane, `gpu_resident_round.mojo`, `gpu_split_search.mojo`,
 `gpu_active_rows.mojo`):
 - Level histogram pass: the frontier IS the level; the existing range
   histogram family builds all leaves' histograms per step already.
-- Search: a cross-leaf reduction kernel: per (f,b) sum gains over leaves,
-  then the same argmax the device search does now. One launch per level.
+- Search: a cross-leaf reduction, per (f,b) sum gains over leaves, then the
+  same argmax the device search does now. REQUIREMENT, not a suggestion: the
+  reduction is FUSED into an existing launch (the per-level search or
+  commit), never its own command buffer. Static census off the measured
+  per-step shape (GPU orchestrator, 2026-08-16): d=6 fused = 62 buffers per
+  tree (under the measured 64 knee by 2); d=6 as its own launch = 68 (over
+  by 4); d=5 is under either way (53/58); d=7 is over either way (71/78).
+  A lane told "one launch per level" will build the 68 version and it will
+  look correct. Two caveats: the 9-per-step figure is leaf-wise and an
+  oblivious level may cost more; and 64 is a knee (per-launch enqueue cost
+  roughly doubles past it), not a wall, so the argument weakens rather than
+  vanishes on the far side.
 - Partition: every leaf by the same split; the device partition already
   handles a frontier; A1 (physical compaction) is where CatBoost's segmented
   sort would come in and is optional.
