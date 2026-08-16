@@ -89,7 +89,6 @@ from .binning import (
     ctr_slot_columns,
     fit_bins,
 )
-from .ctr import check_ctr_model_support
 from .ctr_columns import (
     SimpleCtrConfig,
     build_ctr_train_columns,
@@ -1262,13 +1261,18 @@ struct Dataset(Copyable, Movable, Writable):
                 return True
         return False
 
-    def matches_binning(self, other: Dataset) -> Bool:
+    def matches_binning(self, other: Dataset) raises -> Bool:
         """Whether two datasets bin every value the same way, so that a bin
         index means the same thing in both.
 
         The mapper's own equality (see `BinMapper.matches`), plus the
         representation: a dense and a sparse dataset that bin identically
         still hold different matrix types, and no trainer reads both.
+
+        `raises` because `BinMapper.matches` does: it compares the fitted CTR
+        tables, which are walked and indexed. Both callers are tests and both
+        already raise, so this widens no contract. It was missing, and the
+        package did not elaborate with it missing.
         """
         if self.is_sparse != other.is_sparse:
             return False
@@ -1387,16 +1391,14 @@ def train_dataset(
     way: it serializes, loads, and predicts on dense rows identically.
     """
     _check_labels(dataset.label, dataset.n_rows)
-    # Catalog A19's refusal, and it is the one that still holds. The CTR
-    # columns build, reach the histogram and score a raw row, but the
-    # tables they score from are fitted model state and
-    # `serialize._write_mapper` has no section for them -- so a model
-    # produced here would save without them and load scoring wrong.
-    # Refusing to produce it is strictly better than producing one that
-    # cannot be saved honestly. `serialize.mojo` and the format version
-    # belong to the model-export lane (catalog A29); when it lands, this
-    # call is what it deletes.
-    check_ctr_model_support(dataset.has_ctr())
+    # Catalog A19's trainer refusal USED TO STAND HERE. It is gone because
+    # the reason for it is: `serialize.mojo`'s v5 `ctr` section writes and
+    # reads the fitted tables, a loaded CTR model is `matches`-equal to the
+    # one that was saved, and its tree topology is validated against
+    # `n_total_features()`. A model produced here therefore saves and loads
+    # without losing state. What still refuses is named where it applies --
+    # `serialize.check_ctr_dataset_serializable` at the prepared-table
+    # writer, and `ctr.check_ctr_model_support` at the model dump.
     var booster: Booster
     if dataset.is_sparse:
         if device == GPU_DEVICE:
@@ -1480,16 +1482,14 @@ def train_dataset_multiclass(
     and reporting a run that sampled.
     """
     _check_labels(dataset.label, dataset.n_rows)
-    # Catalog A19's refusal, and it is the one that still holds. The CTR
-    # columns build, reach the histogram and score a raw row, but the
-    # tables they score from are fitted model state and
-    # `serialize._write_mapper` has no section for them -- so a model
-    # produced here would save without them and load scoring wrong.
-    # Refusing to produce it is strictly better than producing one that
-    # cannot be saved honestly. `serialize.mojo` and the format version
-    # belong to the model-export lane (catalog A29); when it lands, this
-    # call is what it deletes.
-    check_ctr_model_support(dataset.has_ctr())
+    # Catalog A19's trainer refusal USED TO STAND HERE. It is gone because
+    # the reason for it is: `serialize.mojo`'s v5 `ctr` section writes and
+    # reads the fitted tables, a loaded CTR model is `matches`-equal to the
+    # one that was saved, and its tree topology is validated against
+    # `n_total_features()`. A model produced here therefore saves and loads
+    # without losing state. What still refuses is named where it applies --
+    # `serialize.check_ctr_dataset_serializable` at the prepared-table
+    # writer, and `ctr.check_ctr_model_support` at the model dump.
     if len(dataset.init_score) != 0:
         raise Error(
             "init_score is not supported for multiclass training: one offset"
@@ -1565,16 +1565,14 @@ def train_dataset_ranker(
     holds the per-query row counts. CPU only, as `ranking.fit_ranker` is,
     and dense only: `train_ranker` reads a `BinnedMatrix`."""
     _check_labels(dataset.label, dataset.n_rows)
-    # Catalog A19's refusal, and it is the one that still holds. The CTR
-    # columns build, reach the histogram and score a raw row, but the
-    # tables they score from are fitted model state and
-    # `serialize._write_mapper` has no section for them -- so a model
-    # produced here would save without them and load scoring wrong.
-    # Refusing to produce it is strictly better than producing one that
-    # cannot be saved honestly. `serialize.mojo` and the format version
-    # belong to the model-export lane (catalog A29); when it lands, this
-    # call is what it deletes.
-    check_ctr_model_support(dataset.has_ctr())
+    # Catalog A19's trainer refusal USED TO STAND HERE. It is gone because
+    # the reason for it is: `serialize.mojo`'s v5 `ctr` section writes and
+    # reads the fitted tables, a loaded CTR model is `matches`-equal to the
+    # one that was saved, and its tree topology is validated against
+    # `n_total_features()`. A model produced here therefore saves and loads
+    # without losing state. What still refuses is named where it applies --
+    # `serialize.check_ctr_dataset_serializable` at the prepared-table
+    # writer, and `ctr.check_ctr_model_support` at the model dump.
     if dataset.is_sparse:
         raise Error(
             "LambdaRank has no sparse trainer: train_ranker reads a dense"
@@ -1621,16 +1619,14 @@ def train_dataset_ranker_advanced(
     if not advanced_ranking_requested(rank_params, positions):
         return train_dataset_ranker(dataset, params, rank_params.base, bagging)
     _check_labels(dataset.label, dataset.n_rows)
-    # Catalog A19's refusal, and it is the one that still holds. The CTR
-    # columns build, reach the histogram and score a raw row, but the
-    # tables they score from are fitted model state and
-    # `serialize._write_mapper` has no section for them -- so a model
-    # produced here would save without them and load scoring wrong.
-    # Refusing to produce it is strictly better than producing one that
-    # cannot be saved honestly. `serialize.mojo` and the format version
-    # belong to the model-export lane (catalog A29); when it lands, this
-    # call is what it deletes.
-    check_ctr_model_support(dataset.has_ctr())
+    # Catalog A19's trainer refusal USED TO STAND HERE. It is gone because
+    # the reason for it is: `serialize.mojo`'s v5 `ctr` section writes and
+    # reads the fitted tables, a loaded CTR model is `matches`-equal to the
+    # one that was saved, and its tree topology is validated against
+    # `n_total_features()`. A model produced here therefore saves and loads
+    # without losing state. What still refuses is named where it applies --
+    # `serialize.check_ctr_dataset_serializable` at the prepared-table
+    # writer, and `ctr.check_ctr_model_support` at the model dump.
     if dataset.is_sparse:
         raise Error(
             "LambdaRank has no sparse trainer: train_ranker reads a dense"
@@ -1696,16 +1692,14 @@ def update_dataset(
             " this one is binned differently"
         )
     _check_labels(dataset.label, dataset.n_rows)
-    # Catalog A19's refusal, and it is the one that still holds. The CTR
-    # columns build, reach the histogram and score a raw row, but the
-    # tables they score from are fitted model state and
-    # `serialize._write_mapper` has no section for them -- so a model
-    # produced here would save without them and load scoring wrong.
-    # Refusing to produce it is strictly better than producing one that
-    # cannot be saved honestly. `serialize.mojo` and the format version
-    # belong to the model-export lane (catalog A29); when it lands, this
-    # call is what it deletes.
-    check_ctr_model_support(dataset.has_ctr())
+    # Catalog A19's trainer refusal USED TO STAND HERE. It is gone because
+    # the reason for it is: `serialize.mojo`'s v5 `ctr` section writes and
+    # reads the fitted tables, a loaded CTR model is `matches`-equal to the
+    # one that was saved, and its tree topology is validated against
+    # `n_total_features()`. A model produced here therefore saves and loads
+    # without losing state. What still refuses is named where it applies --
+    # `serialize.check_ctr_dataset_serializable` at the prepared-table
+    # writer, and `ctr.check_ctr_model_support` at the model dump.
     return train_more(
         model.booster,
         dataset.data,
@@ -1754,16 +1748,14 @@ def update_dataset_multiclass(
             " this one is binned differently"
         )
     _check_labels(dataset.label, dataset.n_rows)
-    # Catalog A19's refusal, and it is the one that still holds. The CTR
-    # columns build, reach the histogram and score a raw row, but the
-    # tables they score from are fitted model state and
-    # `serialize._write_mapper` has no section for them -- so a model
-    # produced here would save without them and load scoring wrong.
-    # Refusing to produce it is strictly better than producing one that
-    # cannot be saved honestly. `serialize.mojo` and the format version
-    # belong to the model-export lane (catalog A29); when it lands, this
-    # call is what it deletes.
-    check_ctr_model_support(dataset.has_ctr())
+    # Catalog A19's trainer refusal USED TO STAND HERE. It is gone because
+    # the reason for it is: `serialize.mojo`'s v5 `ctr` section writes and
+    # reads the fitted tables, a loaded CTR model is `matches`-equal to the
+    # one that was saved, and its tree topology is validated against
+    # `n_total_features()`. A model produced here therefore saves and loads
+    # without losing state. What still refuses is named where it applies --
+    # `serialize.check_ctr_dataset_serializable` at the prepared-table
+    # writer, and `ctr.check_ctr_model_support` at the model dump.
     if len(dataset.init_score) != 0:
         raise Error(
             "init_score is not supported for multiclass training: one offset"

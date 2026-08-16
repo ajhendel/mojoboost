@@ -191,6 +191,7 @@ chosen. Building it would be building a gate that cannot open.
 | A28 | `MultiRMSE` (`error_functions.h:191-218` `TMultiRMSEError`; `approx_dimension.cpp`; `online_predictor.cpp` `CalcDeltaNewtonMulti`; `hessian.cpp` `TDiagonalHessian::SolveNewtonEquation`; multi-dim score accumulation `catboost/private/libs/algo/scoring.cpp:741-767`; metric `metric.cpp:474-515`) -- **verified from source**, see the A28 note | Multi-target regression. **T label columns per row**, approx dimension T, diagonal hessian, `der[i] = w*(y[i] - p[i])`, `der2[i] = -w`. **One tree per iteration with a vector leaf value** (`model.h:118`, `LeafValues[leafId * ApproxDimension + dim]`), and the split score is the **sum over dimensions into one accumulator** | New objective **and a new tree shape** | The derivatives and the metric yes. The tree shape is `multiclass_tree_count` again, and this time it is not a cosmetic difference: see the A28 note | CPU (`multi_target.mojo`), tree shape unowned (`tree.mojo`, `histogram.mojo`) | (3) when selected. **The shared tree structure is the entire modeling content of MultiRMSE**; without it the objective degenerates into T independent RMSE fits |
 | A29 | Model save/load and interchange export (`catboost/libs/model/model_export/`: `cbm`, `json`, `onnx`, `coreml`, `python`, `cpp`) | CatBoost saves every fitted artifact the model needs to score, CTR tables and text dictionaries included, and can additionally emit an ONNX `ai.onnx.ml` tree ensemble | No. Nothing here changes a trained model; the whole rule is that a reloaded model scores **bit-identically** | Yes, and it is bucket C: an arm we cannot save is an arm nobody can ship, and an export that silently drops fitted state is a wrong comparison that looks fine | `serialize.mojo` (mine), `onnx_export.mojo` (new, mine) | A29 note. **Enumeration is the deliverable.** Format: NO version bump needed for A8/A11-A16; ONNX exporter BUILT for the numerical/expressible subset and REFUSES the rest by name |
 | A30 | CTR feature combinations: `max_ctr_complexity`, `ctr_leaf_count_limit`, `TreeCtrs` (`greedy_tensor_search.cpp::AddTreeCtrs`, `index_hash_calcer.cpp::CalcHashes` and `ComputeReindexHash`, `ctr_helper.h::GetCtrInfo`) -- **verified from source**, see the A30 note | A projection of several categorical columns plus float and one-hot splits, hashed to one bucket per row and fed to A19's ordered machinery. Candidates are **grown from the splits already in the tree**, one feature at a time -- NOT exhaustive to depth 4 -- and `max_ctr_complexity` silently resolves to **1**, not 4, whenever the iteration count is under 200 | Yes when on | Built, off by default, reached by nothing. **CatBoost's default of 4 is not affordable at 1M rows** (about 1.6e9 element ops and 1.1 GB of CTR columns per tree, against 3e8 for a 50-feature histogram build), so record the 4 and wire 1 | CPU (`ctr_combinations.mojo`, beside `ctr.mojo`) | (3) when on |
+| A31 | Persisting the fitted CTR tables in the model file (`catboost/libs/model/model_export/model_exporter.cpp`, `catboost/libs/model/ctr_data.h`, `catboost/libs/model/online_ctr.h::TModelCtr`; `CalcFinalCtrsAndSaveToModel` in `catboost/private/libs/algo/full_model_saver.cpp`) -- **CatBoost's behavior verified from source only to the extent A19 already verified it**: that `.cbm` carries `TCtrValueTable` per `TModelCtrBase` and that inference reads it through `TModelCtr::Calc`. The `.cbm` binary layout itself was NOT read, and nothing here imitates it | The model format's section for A19's model state. A fitted `CtrTables` is read off the target, so it is model state and not configuration; a file without it loads a model that keeps every tree referencing a CTR column and bins that column from different numbers | No. A reloaded model must score **bit-identically**, which is the whole test | Yes, and it is the gate on A19 being reachable at all: an arm that cannot be saved is an arm nobody can ship, and A19's own trainer refusal named this as the blocker | `serialize.mojo` (v5 `ctr` section), `ctr_columns.mojo` (the guards), `model_dump.mojo` (the remaining refusal) | A31 note. **BUILT and REACHED.** Format **v5**, conditional: a model with no ctr tables and no linear leaves still writes v4. Floats round-trip exactly because the whole format stores IEEE-754 bit patterns. Prepared tables, the model dump and every Python entry point still REFUSE, each by its own reason |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -4592,3 +4593,178 @@ lines. So the honest scope is: **one border, ten lines, unblocks the default
 comparison; all borders, one DP mode, ~seventy lines.** Neither is 500. It
 belongs to whichever lane owns `binning.mojo`'s `check_border_type`, which is
 not this one, and the `BORDER_MIN_ENTROPY` refusal is left standing here.
+
+### A31 note: the model file's `ctr` section, and what it does not settle
+
+**Status.** Built and reached, 2026-08-16. `serialize.save_model` /
+`load_model` and `save_multiclass_model` / `load_multiclass_model` carry a
+fitted `ctr_columns.CtrTables` across a save. `trainset.train_dataset*` no
+longer refuses a CTR dataset. Cross-referenced rather than repeated: A19 is
+the mechanism and owns every claim about what a CTR *is*, A29 is the
+save/load row this extends, and A30 is the complexity bound that keeps this
+at simple projections.
+
+#### 1. What was actually wrong, stated once
+
+A19 built the columns and A19's own guards said so: `ctr_columns.CtrTables`
+was model state with no place in the file, so `check_ctr_model_support`
+refused at six `trainset.train_dataset*` entry points and
+`check_ctr_serializable` refused at all three writers. The failure being
+prevented is worth naming precisely, because it is not "the model fails to
+load". It is that the model **loads** -- the trees are all there, the mapper
+is all there, `BinMapper.transform` still appends CTR columns because the
+column count comes from the tables and the tables are empty, so the appended
+columns are absent and every tree that split on one reads a different
+column's bin. Wrong scores, no error.
+
+#### 2. The format, and the two things it deliberately does not store
+
+Version **5**, and the bump is conditional: `_model_version` declares v5 only
+when the model carries one of the two v5 sections (`linear`, from A29's
+linear-tree work, or `ctr`). A model with neither writes v4 byte for byte,
+so nothing that did not gain a section moved. The `ctr` section opens with
+its own tag and carries its own revision (`CTR_SECTION_REVISION = 1`), the
+same arrangement `LINEAR_SECTION_REVISION` uses, so a later change to what a
+CTR table stores does not need a third model-format version.
+
+It is written inside the mapper, immediately after `categorical`, and read
+inside `_read_mapper`. That placement is the point: the tables are the
+mapper's, and no loader can reconstruct one without the other.
+
+Two things are **not** in the file.
+
+- `CtrColumn.shift`, `norm` and `scale`. They are `CalcNormalization`
+  (`online_ctr.cpp:102`) applied to `prior` and `ctr_border_count`, both of
+  which are stored, so the reader runs the same constructor on the same two
+  inputs and gets the same bits.
+- `CtrTables.predict_lut` and `predict_lut_offsets`, the bucket -> bin
+  lookup. They are a materialization of `ctr_predict_bin` over the counts,
+  so `rebuild_ctr_predict_lut` rebuilds them on load.
+
+Both omissions are the same argument `read_linear_section` makes about a
+linear leaf's intercept: a fact stored twice is a fact that can disagree with
+itself. The cost of the second omission is a guard --
+`check_ctr_serializable` now rebuilds the lookup at save time and refuses if
+the copy in hand is not the one the counts imply, which is what a table set
+planned by `plan_ctr_columns` and never fitted looks like.
+
+#### 3. Floating point round-trips exactly, and this was checked rather than assumed
+
+`serialize.mojo` stores every Float64 as its IEEE-754 bit pattern in decimal
+(`_f64_to_token` calls `Float64.to_bits`, `_parse_f64` bitcasts a checked
+`UInt64` back). There is no decimal formatting anywhere in the format, so
+there is no precision to be insufficient: a prior, a `prior_denom` and a
+`BinarizedTargetMeanValue` sum come back as the same 64 bits they went in as.
+`_parse_u64` refuses a token that would overflow, so a corrupt file is an
+error rather than an arbitrary Float64. This is the reason the round trip
+can be asserted with `==` and not a tolerance.
+
+#### 4. The tree topology check, which was the second half of the bug
+
+A CTR column is a column of the **binned** matrix. `BinMapper.n_features`
+counts base features; the binned width is `n_total_features()`. So a tree
+grown on a CTR dataset splits on ids in `[n_features, n_total_features())`,
+and `_read_trees` was validating every tree's feature ids against
+`n_features`. A CTR model would have been refused by its own loader.
+`load_model` and `load_multiclass_model` now pass `mapper.n_total_features()`
+to `_read_trees`; feature names and monotone signs stay base-width, because a
+CTR column has neither.
+
+#### 5. Both directions across the version boundary
+
+- **v5 reader, v4 file.** The `ctr` section is recognized by its tag and
+  gated on the version, so a v4 file yields `CtrTables.none()`. That is what
+  its absence means, and it is what the mapper of a model trained without
+  CTRs holds anyway.
+- **v4 reader, v5 file.** The dangerous direction, and it refuses. A build
+  that predates linear trees refuses on the version token. A build that has
+  linear trees accepts the `v5` token (it already used it), reads the mapper
+  and the `categorical` section, then peeks for `monotone`, does not find it,
+  and calls `_read_trees`, whose first act is to require the token `trees`.
+  It finds `ctr` and raises `expected 'trees'`. It does not mis-parse and it
+  does not produce a model. The message is about the wrong token rather than
+  about the version, which is a wart in the older binary that cannot be fixed
+  from here; it is recorded rather than glossed.
+
+#### 6. What still refuses, and why each one is real
+
+Every one of these is a refusal rather than an accept-and-ignore, and each
+names its own cause rather than pointing at this lane.
+
+- **Prepared tables** (`save_dataset`), via
+  `ctr_columns.check_ctr_dataset_serializable`. The blocker here is the
+  matrix, not the tables. A CTR dataset's `BinnedMatrix` holds the **ordered
+  training** columns, so it is `n_base + n_ctr` wide while its mapper counts
+  the base features; `load_dataset` reads through
+  `Dataset.from_binned_dense`, whose first check refuses that pair. The file
+  also carries no `SimpleCtrConfig`, which is what `Dataset.ctr` records.
+- **The model dump** (`model_dump._build`), via
+  `ctr.check_ctr_model_support`, which is that function's only remaining
+  caller. Every field of the inspection schema is sized by
+  `mapper.n_features`; `_build_features` would describe none of the CTR
+  columns and `threshold_value` would index `mapper.edge_offsets` past its
+  end.
+- **Every Python entry point.** `bindings/_mojotrees.mojo` contains no CTR
+  symbol at all, so no Python fit can turn the bundle on; `sklearn.py`'s
+  refusal at `max_ctr_complexity=1` stands, with its stated reason corrected
+  (see `CTR_WIRE.md`).
+- **The parameter string** (`params.mojo`). `max_ctr_complexity` still only
+  bounds the arity and still does not turn CTRs on. The bundle a dataset
+  takes is `ctr_columns.SimpleCtrConfig`, a Mojo-API argument.
+- **`ctr.check_ctr_trainer_support`**, whose reason changed rather than
+  cleared: an enabled `ctr.CtrParams` reaches no trainer, because `CtrParams`
+  is A19's original bundle and nothing consumes it.
+
+#### 7. Consumers that are not CTR-aware, named rather than left to be found
+
+Anything that walks features by `mapper.n_features` and then indexes by a
+tree's `feature[i]` reads past its own arrays on a CTR model. The model dump
+is guarded above. These are not, and they are in files this lane does not
+own; `CTR_WIRE.md` gives the exact guard each one needs.
+
+    contrib.mojo:507, :519        predict_contrib / interaction, sized n_features
+    onnx_export.mojo:191, :302    refuses feature >= n_features, message is wrong
+    model_editing.mojo:357, :391  refit paths
+    lgbm_model_io.mojo:2459       max_feature_idx = n_features - 1
+    efb.mojo:808                  feature range check
+
+Two of these (`onnx_export`, `efb`) already raise on an out-of-range feature,
+so they fail rather than corrupt; the message names the wrong cause. The
+others are the ones worth doing first.
+
+#### 8. The per-tree fold draw, NOT implemented
+
+CatBoost redraws the learn permutation per tree (`train.cpp:208`, and
+`ctr.ctr_fold_index` is the mojotrees counterpart, built and unreached).
+mojotrees draws **one** permutation per `Dataset`, at construction, because a
+`Dataset` is built once and trained on many times: the columns it carries are
+a property of the dataset and not of a round. That is a real difference from
+CatBoost and it is recorded here rather than hidden.
+
+What it would change: the ordered CTR column values would move per tree, so
+every tree would see a different quantization of the same category. What it
+would cost: rebuilding `4 * C` columns of `n` bytes per tree, which A19
+prices at about `6 * C * n` element operations **per tree** instead of once
+per dataset -- the same factor A19 called "the whole difference between
+complexity 1 here and CatBoost's per-tree recomputation". It also requires a
+place to put the redraw, which is inside the round loop and therefore in
+`boosting.mojo`, and it requires the training columns to be rebuildable from
+the dataset, which today they are not (the base matrix is transformed while
+the mapper is bare, and the appended columns overwrite nothing that is kept).
+
+It was left out because the serialization was this lane's deliverable and the
+fold draw is a round-loop change in a file this lane does not own. The
+determinism requirement is stated so the next lane does not have to derive
+it: the redraw must be keyed on `(seed, tree)` through a counter-based
+stream with its own domain constant, exactly as `ctr_train_permutation`
+keys its block sort, and must not be a sequential draw off a running stream
+-- otherwise the columns stop being identical across `MOJOTREES_NUM_WORKERS`
+and across machines, which A19 promised.
+
+#### 9. What is NOT claimed
+
+Nothing here was measured. No benchmark was run, no CatBoost comparison was
+made, and the `.cbm` binary layout was not read -- this is mojotrees' own
+text format gaining a section, not an interchange format. Whether a CTR model
+is *better* on any dataset is untested; A19's own row says `bench/real_data`
+runs no categorical CatBoost scenario, and that is still true.

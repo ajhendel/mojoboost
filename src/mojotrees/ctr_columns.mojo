@@ -4,8 +4,16 @@ Catalog A19 (the mechanism) and A30 (the complexity bound). `ctr.mojo` holds the
 arithmetic, the four ordered loops, the four static tables and the readers over
 them, all verified against CatBoost `master` on 2026-08-16 and all reached by
 nothing. This module is the layer that turns a *categorical column of a binned
-matrix* into *numeric columns of that same matrix*, and it is the piece A19's
-`check_ctr_trainer_support` says is missing.
+matrix* into *numeric columns of that same matrix*.
+
+As of 2026-08-16 the columns are reachable end to end on the dense CPU path: a
+`Dataset` built with an active `SimpleCtrConfig` trains, the resulting `Model`
+saves and loads through format v5's `ctr` section (`serialize._write_ctr` /
+`_read_ctr`), and it predicts on raw rows through `BinMapper.bin_row`. What
+still refuses, by name and with the reason: the *prepared table* writer
+(`check_ctr_dataset_serializable`), the model dump schema
+(`ctr.check_ctr_model_support`, called from `model_dump._build`), and every
+Python entry point, none of which can turn the bundle on at all.
 
 Scope, and it is deliberately narrow
 ------------------------------------
@@ -597,11 +605,19 @@ struct CtrTables(Copyable, Movable):
     the target, so a model that lost it is a model that scores wrong -- silently,
     because the trees still reference the columns and the columns still get
     values. `CalcFinalCtrsAndSaveToModel` is where CatBoost puts the same thing
-    (`online_ctr.h`), and CatBoost's `.cbm` carries it. mojotrees' text format
-    does not yet: `serialize._write_mapper` writes edges, offsets, `n_features`,
-    `n_bins` and the missing-bin table and nothing else, so a mapper carrying
-    these would round-trip without them. `check_ctr_serializable` refuses by
-    name, and `binning.BinMapper.attach_ctr` documents where the call has to go.
+    (`online_ctr.h`), and CatBoost's `.cbm` carries it.
+
+    mojotrees' text format carries it too, as of format **v5**:
+    `serialize._write_ctr` writes an optional `ctr` section immediately after
+    the mapper's `categorical` section, and `serialize._read_ctr` reads it back
+    inside `_read_mapper`, so a mapper's tables travel with its edges. A v4 file
+    has no section and loads to `CtrTables.none()`, which is what its absence
+    means. Everything below is written except `predict_lut` /
+    `predict_lut_offsets`, which are derived and are rebuilt on load by
+    `rebuild_ctr_predict_lut`; `check_ctr_serializable` is what makes sure the
+    copy being saved is the one those counts imply. The *prepared table* writer
+    is a separate case and still refuses: see
+    `check_ctr_dataset_serializable`.
 
     Layout. Tables are indexed by **slot**, which is a position in
     `source_features` (the categorical base features that earned CTRs, ascending)
@@ -786,33 +802,94 @@ def _int_lists_equal(a: List[Int], b: List[Int]) -> Bool:
 
 
 def check_ctr_serializable(tables: CtrTables) raises:
-    """Refuses to let fitted CTR state reach a writer that would drop it.
+    """Refuses to let CTR state reach a model writer that would drop part of it.
 
-    The tables above are read off the target and a model without them scores
-    wrong rather than failing, which is the one outcome worth refusing loudly
-    for. `serialize._write_mapper` writes `n_features`, `n_bins`, the edges,
-    the edge offsets and the missing-bin table; `_write_categorical` writes the
-    category tables. Neither writes a CTR section, and neither reader reads one,
-    so a saved CTR model would load with `CtrTables.none()`, keep every tree that
-    references a CTR column, and bin those columns as if they were absent.
+    **What this used to refuse, and no longer does.** Until the v5 `ctr` section
+    landed, this raised for *any* active table, because `serialize.mojo` had no
+    place to put one: a saved CTR model loaded with `CtrTables.none()`, kept
+    every tree that referenced a CTR column, and binned those columns as if the
+    feature were absent -- a wrong answer that looked like a right one.
+    `serialize._write_ctr` / `_read_ctr` now carry the whole of this struct, so
+    the blanket refusal would be refusing a case that works.
 
-    **This lane cannot install the call.** `serialize.mojo` belongs to the
-    model-export lane (catalog A29), which is the lane that has to add the
-    section, bump the format version, and put this call at the top of
-    `save_model`, `save_multiclass_model` and `save_dataset`. Until it does, the
-    refusal that actually holds is `ctr.check_ctr_trainer_support` at the trainer
-    boundary in `trainset.mojo`, which stops a CTR-carrying model from being
-    produced at all. This function is here so that the export lane has the exact
-    guard to call and so that the requirement is written down in the file that
-    owns the state.
+    **What it refuses instead.** Everything in `CtrTables` except
+    `predict_lut` / `predict_lut_offsets` is primary state; those two are
+    *derived*, and the file leaves them out so that a reload rebuilds them with
+    `rebuild_ctr_predict_lut` rather than trusting a second copy. That is only
+    lossless while the copy in hand agrees with what the primary tables imply.
+    A table whose lookup was never built (planned by `plan_ctr_columns` and not
+    fitted by `fit_ctr_tables`) or was edited afterwards would round-trip into a
+    *different* set of inference bins, silently, which is the same failure mode
+    the old refusal existed to prevent. So the writer rebuilds the lookup from
+    the primary tables and refuses if it does not match what it was handed.
+
+    Cost is one `ctr_predict_bin` per (column, bucket), which is at most
+    `n_columns * max_bin` and is paid once per `save_model`.
+    """
+    if not tables.is_active():
+        return
+    if tables.n_columns() == 0 or tables.n_slots() == 0:
+        raise Error(
+            "a ctr table set that is active must carry at least one slot and"
+            " one column; `plan_ctr_columns` returns `CtrTables.none()` rather"
+            " than an active empty one, so this is a hand-built state the"
+            " model format cannot describe"
+        )
+    var probe = tables.copy()
+    rebuild_ctr_predict_lut(probe)
+    var same = len(probe.predict_lut) == len(tables.predict_lut) and len(
+        probe.predict_lut_offsets
+    ) == len(tables.predict_lut_offsets)
+    if same:
+        for i in range(len(probe.predict_lut)):
+            if probe.predict_lut[i] != tables.predict_lut[i]:
+                same = False
+                break
+    if same:
+        for i in range(len(probe.predict_lut_offsets)):
+            if probe.predict_lut_offsets[i] != tables.predict_lut_offsets[i]:
+                same = False
+                break
+    if not same:
+        raise Error(
+            "these ctr tables cannot be saved without changing them: their"
+            " bucket -> bin lookup is not the one their own counts imply."
+            " The model file carries the counts and rebuilds the lookup"
+            " (`rebuild_ctr_predict_lut`), so a reload would score these"
+            " columns differently. A table set planned by `plan_ctr_columns`"
+            " and never fitted by `fit_ctr_tables` looks exactly like this"
+        )
+
+
+def check_ctr_dataset_serializable(tables: CtrTables) raises:
+    """Refuses fitted CTR state at the *prepared table* writer, which is a
+    different writer from the model one and is still not wired.
+
+    `serialize.save_model` carries these tables now. `serialize.save_dataset`
+    cannot, and the reason is the matrix rather than the tables. A CTR dataset's
+    `BinnedMatrix` holds the **ordered training** columns
+    (`build_ctr_train_columns`), so it is `n_base_features + n_columns` wide
+    while its mapper's `n_features` counts the base features only. On the way
+    back in, `serialize.load_dataset` hands the matrix to
+    `trainset.Dataset.from_binned_dense`, whose first check is
+    `data.n_features != mapper.n_features` -- so the file could not be read even
+    if it were written. The prepared table also carries no `SimpleCtrConfig`,
+    which is what `Dataset.ctr` records the columns were built from.
+
+    Writing the section anyway and letting the reader fail would be worse than
+    this: the failure would land on whoever tried to load the file rather than
+    on whoever wrote it, and the message would be about a feature count.
     """
     if tables.is_active():
         raise Error(
-            "a model carrying fitted CTR tables cannot be saved: the tables are"
-            " model state read off the target (catalog A19), and the mojotrees"
-            " text format has no ctr section, so the file would load without"
-            " them and score wrong. The model-export lane (catalog A29) owns"
-            " serialize.mojo and the format version"
+            "a prepared table carrying ctr columns cannot be written: its"
+            " binned matrix is n_base_features + n_ctr_columns wide while its"
+            " mapper counts the base features only, and"
+            " `Dataset.from_binned_dense` (which `load_dataset` reads through)"
+            " refuses a matrix and a mapper that disagree on the feature count."
+            " The file also carries no SimpleCtrConfig. Save the fitted model"
+            " instead, which does carry its ctr tables (format v5), or build"
+            " the dataset again from raw values"
         )
 
 
@@ -1073,11 +1150,45 @@ def fit_ctr_tables(
         tables.counter_offsets.append(len(tables.counter_counts))
 
     # The bucket -> bin lookup, built last because it reads every table above.
-    # A CTR column's inference bin is a function of the category bucket alone --
-    # the tables are static, which is the whole difference from the training
-    # side -- so the answer for every bucket can be taken once here instead of
-    # once per scored row. It changes no value; `ctr_predict_bin` is the
-    # definition and this is a materialization of it.
+    rebuild_ctr_predict_lut(tables)
+
+
+def rebuild_ctr_predict_lut(mut tables: CtrTables) raises:
+    """Fill `predict_lut` and `predict_lut_offsets` from the tables above them.
+
+    A CTR column's inference bin is a function of the category bucket alone --
+    the tables are static, which is the whole difference from the training side
+    -- so the answer for every bucket can be taken once here instead of once per
+    scored row. It changes no value; `ctr_predict_bin` is the definition and
+    this is a materialization of it.
+
+    Called by `fit_ctr_tables` at the end of a fit and by
+    `serialize._read_ctr` at the end of a load, which is why it is a function
+    rather than a block inside the fit. The file therefore does not carry the
+    lookup: it carries what the lookup is derived from, and the two cannot
+    disagree because there is only one of them. `serialize.read_linear_section`
+    leaves a linear leaf's intercept out of the file for exactly this reason.
+
+    **Refuses a table set that has not been fitted.** `plan_ctr_columns` fills
+    the layout and leaves every count empty, and `ctr_predict_bin` slices
+    `class_offsets[s : s + 2]` without checking, so calling this on a planned
+    set indexes an empty list -- a crash rather than an error, in the one
+    place a writer reaches when it is deciding whether a save would be
+    lossless. Checked here so both callers get it.
+    """
+    var n_slots = tables.n_slots()
+    if (
+        len(tables.slot_buckets) != n_slots
+        or len(tables.class_offsets) != n_slots + 1
+        or len(tables.mean_offsets) != n_slots + 1
+        or len(tables.counter_offsets) != n_slots + 1
+        or len(tables.counter_denominator) != n_slots
+    ):
+        raise Error(
+            "these ctr tables have not been fitted: `fit_ctr_tables` fills the"
+            " class, mean and counter offsets and the bucket -> bin lookup is"
+            " a function of them. `plan_ctr_columns` returns the layout only"
+        )
     var lut = List[UInt8]()
     var lut_offsets = List[Int]()
     lut_offsets.append(0)

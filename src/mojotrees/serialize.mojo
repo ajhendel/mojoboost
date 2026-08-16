@@ -75,9 +75,34 @@ Version history
   always did. Names are stored one whitespace-free token each, with the five
   characters that would break the token stream escaped (see `_escape_name`).
 
-v1, v2, v3, and v4 files all load and predict identically. What an older
-file cannot carry shows up as an absence a consumer can test for (no gains,
-no covers, no names) rather than as a wrong number.
+- v5: two optional sections, either of which makes a file declare v5 and
+  neither of which is implied by it. `linear` (linear_tree.mojo) sits after
+  the trees. `ctr` (ctr_columns.mojo) sits inside the mapper, right after
+  `categorical`, and holds the fitted ordered-target-statistic tables: the
+  slot layout, the produced column list, and the class / mean / counter
+  counts a model scores its CTR columns from. Those counts are read off the
+  target, so a model that lost them would keep every tree referencing a CTR
+  column and bin that column as if the feature were absent -- which is why
+  the section exists and why writing one used to be refused outright.
+
+  A model with neither section still writes v4. A v4 file read by this build
+  loads to `CtrTables.none()` and an inactive linear sidecar, which is what
+  their absence means. A v5 file read by a v4 build is *refused*: the reader
+  there accepted the `v5` token (linear trees already used it) but then hits
+  `ctr` where it expects `trees` and raises `expected 'trees'`, so it stops
+  rather than mis-parsing. A build older than that refuses on the version
+  token itself.
+
+  What the `ctr` section deliberately does not carry is `predict_lut` and
+  `predict_lut_offsets`. They are derived from the counts, and
+  `ctr_columns.rebuild_ctr_predict_lut` rebuilds them on load, so the file
+  cannot hold a lookup that disagrees with the table it was built from --
+  the same reason `read_linear_section` recovers a linear leaf's intercept
+  from `Tree.value` instead of storing it twice.
+
+v1 through v5 files all load and predict identically. What an older file
+cannot carry shows up as an absence a consumer can test for (no gains, no
+covers, no names, no CTR tables) rather than as a wrong number.
 
 Training-time knobs that only shaped which trees were grown (num_leaves,
 regularization, interaction constraints, subsampling) are deliberately absent:
@@ -91,13 +116,21 @@ nothing downstream can rederive.
 from std.memory import bitcast
 
 from .binning import MAX_BINS, BinMapper, BinnedMatrix, no_missing_bins
-# The CTR serialization guard. A fitted CTR table is MODEL STATE -- it is
-# built from the target -- and this format has no section for it, so a
-# CTR-carrying model written today would load with empty tables, keep
-# every tree referencing its CTR columns, and bin those columns as if the
-# feature were absent. That is a wrong answer that looks right. Refusing
-# to write beats writing something that loads.
-from .ctr_columns import check_ctr_serializable
+# The CTR state and its two writer guards. A fitted CTR table is MODEL STATE
+# -- it is built from the target -- so a model that lost it keeps every tree
+# referencing its CTR columns and bins those columns as if the feature were
+# absent: a wrong answer that looks right. `_write_ctr` / `_read_ctr` below
+# are the v5 section that carries it for a *model*;
+# `check_ctr_serializable` guards that path against the one part of the
+# struct the file leaves out, and `check_ctr_dataset_serializable` still
+# refuses at the *prepared table* writer, which is not wired.
+from .ctr_columns import (
+    CtrColumn,
+    CtrTables,
+    check_ctr_dataset_serializable,
+    check_ctr_serializable,
+    rebuild_ctr_predict_lut,
+)
 from .categorical import CAT_BITSET_WORDS, CategoricalSpec
 from .boosting import Booster, MulticlassBooster
 from .linear_tree import (
@@ -115,12 +148,14 @@ from .validation import check_loaded_tree, check_tree_count, check_tree_header
 
 comptime _MAGIC = "mojotrees"
 comptime _VERSION = "v4"
-# A model with linear leaves (linear_tree.mojo) carries one more section,
-# `linear`, after the trees, and declares v5 so an older reader refuses it
-# rather than predicting the constant fallback. A model without linear
-# leaves still writes v4, byte for byte what it wrote before; see
-# `linear_tree.linear_model_format_version`.
-comptime _LINEAR_VERSION = "v5"
+# v5 is declared by a model that carries either of the two optional sections
+# an older reader cannot survive: `linear` (linear_tree.mojo), after the
+# trees, and `ctr` (ctr_columns.mojo), inside the mapper. Neither is implied
+# by the version -- both are recognized by their own opening token, so a v5
+# file may hold one, the other, or both. A model with neither still writes
+# v4, byte for byte what it wrote before; see
+# `linear_tree.linear_model_format_version` and `_model_version`.
+comptime _VERSION_5 = "v5"
 
 # Prepared tables are a different kind of file and say so in their first
 # token, so no loader can be handed one and start reading it as a model.
@@ -130,10 +165,15 @@ comptime _LINEAR_VERSION = "v5"
 comptime _DATASET_MAGIC = "mojotrees-dataset"
 comptime _DATASET_VERSION = "d1"
 
-# The version this build writes, as the integer `_read_version` returns.
-# `MODEL_FORMAT_VERSION` in model_dump.mojo reports this number to a dump
-# consumer and has to track it.
-comptime CURRENT_FORMAT_VERSION = 4
+# The highest version this build writes and reads, as the integer
+# `_read_version` returns. A file declares this only when it carries a
+# section that needs it (`_model_version`); the base version below is what a
+# model with neither optional section declares, and it is the number
+# `MODEL_FORMAT_VERSION` in model_dump.mojo reports to a dump consumer.
+# `linear_tree.LINEAR_MODEL_FORMAT_VERSION` is the same 5 named from the
+# other side.
+comptime CURRENT_FORMAT_VERSION = 5
+comptime _BASE_FORMAT_VERSION = 4
 
 
 def _f64_to_token(x: Float64) -> String:
@@ -491,6 +531,234 @@ def _write_categorical(mut out: String, cats: CategoricalSpec):
     out += "\n"
 
 
+# The `ctr` section's own revision, carried in the section rather than in the
+# file version for the reason `linear_tree.LINEAR_SECTION_REVISION` gives: a
+# later change to what a CTR table stores does not need another model-format
+# bump, and a reader that meets a revision it does not know refuses by number
+# instead of reading the wrong fields.
+comptime _CTR_SECTION_TAG = "ctr"
+comptime CTR_SECTION_REVISION = 1
+
+
+def _write_ctr(mut out: String, tables: CtrTables) raises:
+    """v5: the optional `ctr` section, or nothing at all when the mapper
+    carries no fitted tables.
+
+    Skipping it is what keeps a model without CTRs writing exactly the bytes
+    it wrote before the section existed, and what lets `_model_version` keep
+    declaring v4 for one.
+
+    Field order is the struct's, counts before arrays, one array per line,
+    which is `_write_categorical`'s shape. Every float goes through
+    `_f64_to_token`, so it travels as its IEEE-754 bit pattern and comes back
+    as the same Float64 -- there is no decimal rounding anywhere in this
+    format to lose a prior or a target-mean sum to.
+
+    Three of `CtrColumn`'s ten fields are not written. `shift`, `norm` and
+    `scale` are what `CtrColumn.__init__` computes from `prior` and
+    `ctr_border_count` (`CalcNormalization`, `online_ctr.cpp:102`), so the
+    reader runs the same constructor on the same two inputs and gets the same
+    bits. `predict_lut` is left out for the same reason at table scope; see
+    `ctr_columns.rebuild_ctr_predict_lut`.
+    """
+    if not tables.is_active():
+        return
+    # The lookup this section omits has to be the one the counts imply, or the
+    # round trip changes the model. Checked here rather than trusted.
+    check_ctr_serializable(tables)
+    var n_slots = tables.n_slots()
+    var n_columns = tables.n_columns()
+    out += (
+        _CTR_SECTION_TAG
+        + " "
+        + String(CTR_SECTION_REVISION)
+        + " "
+        + String(tables.n_base_features)
+        + " "
+        + String(tables.n_classes)
+        + " "
+        + _f64_to_token(tables.prior_denom)
+        + " "
+        + String(n_slots)
+        + " "
+        + String(n_columns)
+        + " "
+        + String(len(tables.class_table))
+        + " "
+        + String(len(tables.mean_counts))
+        + " "
+        + String(len(tables.counter_counts))
+        + "\n"
+    )
+    _write_int_list(out, tables.source_features)
+    _write_int_list(out, tables.slot_buckets)
+    _write_int_list(out, tables.counter_denominator)
+    for c in range(n_columns):
+        ref col = tables.columns[c]
+        out += String(col.slot) + " "
+        out += String(col.source_feature) + " "
+        out += String(col.ctr_type) + " "
+        out += String(col.target_border_idx) + " "
+        out += String(col.prior_index) + " "
+        out += _f64_to_token(col.prior) + " "
+        out += String(col.ctr_border_count) + "\n"
+    _write_int_list(out, tables.class_offsets)
+    _write_int_list(out, tables.class_table)
+    _write_int_list(out, tables.mean_offsets)
+    for i in range(len(tables.mean_sums)):
+        out += _f64_to_token(tables.mean_sums[i]) + " "
+    out += "\n"
+    _write_int_list(out, tables.mean_counts)
+    _write_int_list(out, tables.counter_offsets)
+    _write_int_list(out, tables.counter_counts)
+
+
+def _check_ctr_offsets(
+    offsets: List[Int], total: Int, name: String
+) raises:
+    """One slot-offset array as `_read_categorical` checks its own: starts at
+    zero, never goes backwards, and ends exactly at the array it indexes.
+
+    Without this a corrupt file reaches `ctr_predict_bin`, which slices
+    `table[offsets[s] : offsets[s + 1]]`, with offsets that name rows the file
+    does not contain.
+    """
+    if len(offsets) == 0 or offsets[0] != 0:
+        raise Error("corrupt ctr section: ", name, " offsets do not start at 0")
+    for i in range(1, len(offsets)):
+        if offsets[i] < offsets[i - 1]:
+            raise Error(
+                "corrupt ctr section: ", name, " offsets are not ascending"
+            )
+    if offsets[len(offsets) - 1] != total:
+        raise Error(
+            "corrupt ctr section: ",
+            name,
+            " offsets end at ",
+            offsets[len(offsets) - 1],
+            " for a table of ",
+            total,
+        )
+
+
+def _read_ctr(mut r: _TokenReader, version: Int) raises -> CtrTables:
+    """Read the optional `ctr` section. Absent -- every file before v5, and
+    every v5 model whose mapper carries no fitted tables -- means
+    `CtrTables.none()`, which is what a mapper without CTR columns holds.
+
+    Read inside `_read_mapper`, so the tables arrive attached to the mapper
+    that produced them and no caller can forget to reunite the two.
+    `BinMapper.attach_ctr` then re-checks the two facts that relate them: the
+    base feature count, and that every CTR column's buckets fit `n_bins`.
+    """
+    if version < CURRENT_FORMAT_VERSION or r.peek() != _CTR_SECTION_TAG:
+        return CtrTables.none()
+    _ = r.next()
+    var revision = r.next_int()
+    if revision != CTR_SECTION_REVISION:
+        raise Error(
+            "unsupported ctr section revision ",
+            revision,
+            "; this build reads revision ",
+            CTR_SECTION_REVISION,
+        )
+    var tables = CtrTables()
+    tables.active = True
+    tables.n_base_features = r.next_int()
+    tables.n_classes = r.next_int()
+    tables.prior_denom = r.next_f64()
+    var n_slots = r.next_int()
+    var n_columns = r.next_int()
+    var n_class = r.next_int()
+    var n_mean = r.next_int()
+    var n_counter = r.next_int()
+    if tables.n_base_features < 1 or tables.n_classes < 1:
+        raise Error("corrupt ctr section: nonpositive header count")
+    if n_slots < 1 or n_columns < 1:
+        raise Error(
+            "corrupt ctr section: an active section carries at least one slot"
+            " and one column"
+        )
+    if n_class < 0 or n_mean < 0 or n_counter < 0:
+        raise Error("corrupt ctr section: negative table length")
+
+    tables.source_features = _read_int_list(r, n_slots)
+    for s in range(n_slots):
+        var f = tables.source_features[s]
+        if f < 0 or f >= tables.n_base_features:
+            raise Error("corrupt ctr section: source feature out of range")
+        # `ctr_source_features` emits them ascending and `ctr_slot_columns`
+        # reads slots by position, so a file that lost the order would read a
+        # different column's category codes into a slot's table.
+        if s > 0 and f <= tables.source_features[s - 1]:
+            raise Error(
+                "corrupt ctr section: source features are not ascending"
+            )
+    tables.slot_buckets = _read_int_list(r, n_slots)
+    for s in range(n_slots):
+        if tables.slot_buckets[s] < 1:
+            raise Error("corrupt ctr section: nonpositive bucket count")
+    tables.counter_denominator = _read_int_list(r, n_slots)
+
+    for _ in range(n_columns):
+        var slot = r.next_int()
+        if slot < 0 or slot >= n_slots:
+            raise Error("corrupt ctr section: column slot out of range")
+        var source = r.next_int()
+        if source != tables.source_features[slot]:
+            raise Error(
+                "corrupt ctr section: a column's source feature disagrees with"
+                " its slot"
+            )
+        var ctr_type = r.next_int()
+        var target_border_idx = r.next_int()
+        var prior_index = r.next_int()
+        var prior = r.next_f64()
+        var border_count = r.next_int()
+        # `n_buckets` is `border_count + 1` and every one of them is a bin
+        # index stored in a byte, exactly as the mapper's ceiling above. The
+        # lookup is materialized as `UInt8` before `attach_ctr` gets a chance
+        # to compare it against `n_bins`, so the byte bound is checked here.
+        if border_count < 1 or border_count >= MAX_BINS:
+            raise Error(
+                "corrupt ctr section: ctr_border_count must be in [1, ",
+                MAX_BINS - 1,
+                "]; a ctr bucket is stored in a byte",
+            )
+        tables.columns.append(
+            CtrColumn(
+                slot,
+                source,
+                ctr_type,
+                target_border_idx,
+                prior_index,
+                prior,
+                border_count,
+            )
+        )
+
+    tables.class_offsets = _read_int_list(r, n_slots + 1)
+    _check_ctr_offsets(tables.class_offsets, n_class, "class")
+    tables.class_table = _read_int_list(r, n_class)
+    tables.mean_offsets = _read_int_list(r, n_slots + 1)
+    _check_ctr_offsets(tables.mean_offsets, n_mean, "mean")
+    var sums = List[Float64](capacity=n_mean)
+    for _ in range(n_mean):
+        sums.append(r.next_f64())
+    tables.mean_sums = sums^
+    tables.mean_counts = _read_int_list(r, n_mean)
+    tables.counter_offsets = _read_int_list(r, n_slots + 1)
+    _check_ctr_offsets(tables.counter_offsets, n_counter, "counter")
+    tables.counter_counts = _read_int_list(r, n_counter)
+
+    # Derived state, rebuilt rather than read. This is also the last
+    # structural check the section gets: `ctr_predict_bin` raises on an
+    # unknown CTR type, on a target border index the type does not have, and
+    # on a bucket the slot's table is too short for.
+    rebuild_ctr_predict_lut(tables)
+    return tables^
+
+
 def _write_monotone(mut out: String, monotone: MonotoneConstraints):
     """Write the monotonic constraint vector, or nothing at all when the model
     carries none. Skipping the section keeps unconstrained models' files
@@ -543,7 +811,7 @@ def save_model(
     var out = String("")
     out += _MAGIC
     out += " "
-    out += _model_version(model.booster.linear)
+    out += _model_version(model.booster.linear, model.mapper.ctr)
     out += "\n"
 
     _write_feature_names(out, feature_names)
@@ -555,6 +823,7 @@ def save_model(
 
     _write_mapper(out, model.mapper)
     _write_categorical(out, model.mapper.cats)
+    _write_ctr(out, model.mapper.ctr)
     _write_monotone(out, model.booster.monotone)
     _write_trees(out, model.booster.trees)
     out += linear_section_text(model.booster.linear)
@@ -563,12 +832,39 @@ def save_model(
         f.write(out)
 
 
-def _model_version(linear: LinearEnsemble) -> String:
-    """The version token a model file declares: v5 with linear leaves, v4
-    without."""
-    if linear.is_active():
-        return String(_LINEAR_VERSION)
+def _model_version(linear: LinearEnsemble, ctr: CtrTables) -> String:
+    """The version token a model file declares: v5 when it carries either
+    optional v5 section, v4 when it carries neither.
+
+    Keeping the bump conditional is the point, and it is the same point
+    `linear_tree.linear_model_format_version` makes: a model with constant
+    leaves and no CTR tables stays readable by a build that knows about
+    neither, so the version is a statement about the file rather than about
+    the binary that wrote it.
+    """
+    if linear.is_active() or ctr.is_active():
+        return String(_VERSION_5)
     return String(_VERSION)
+
+
+def _mapper_section_version(mapper: BinMapper) -> Int:
+    """The revision of the mapper section a prepared table holds.
+
+    A prepared table reuses the model format's mapper section verbatim and
+    records which revision of it the file carries, so the number has to
+    follow what was actually written and not what this build is capable of
+    writing. A mapper with fitted CTR tables would need v5; every other
+    mapper writes the v4 section unchanged, and a build that predates v5
+    keeps reading the tables it writes today.
+
+    `save_dataset` refuses a CTR mapper outright
+    (`check_ctr_dataset_serializable`), so the v5 arm is unreachable from
+    there right now. It is written as the condition rather than as the
+    constant 4 so that wiring the dataset path is one change and not two.
+    """
+    if mapper.has_ctr():
+        return CURRENT_FORMAT_VERSION
+    return _BASE_FORMAT_VERSION
 
 
 def save_multiclass_model(
@@ -583,7 +879,7 @@ def save_multiclass_model(
     var out = String("")
     out += _MAGIC
     out += " "
-    out += _model_version(model.booster.linear)
+    out += _model_version(model.booster.linear, model.mapper.ctr)
     out += "\n"
 
     _write_feature_names(out, feature_names)
@@ -598,6 +894,7 @@ def save_multiclass_model(
 
     _write_mapper(out, model.mapper)
     _write_categorical(out, model.mapper.cats)
+    _write_ctr(out, model.mapper.ctr)
     _write_monotone(out, model.booster.monotone)
     _write_trees(out, model.booster.trees)
     out += linear_section_text(model.booster.linear)
@@ -665,9 +962,16 @@ def _read_mapper(mut r: _TokenReader, version: Int) raises -> BinMapper:
                 raise Error("corrupt mapper: missing bin out of range")
             missing_bin[f] = mb
     var cats = _read_categorical(r, n_features, n_bins)
-    return BinMapper(
+    var mapper = BinMapper(
         edges^, offsets^, n_features, n_bins, cats^, missing_bin^,
     )
+    # v5: the fitted CTR tables, which are part of the mapper and are read
+    # here so that no loader can reconstruct one without the other.
+    # `attach_ctr` is what relates the two: it checks that the tables were
+    # planned for this feature count and that their buckets fit these bins.
+    var ctr = _read_ctr(r, version)
+    mapper.attach_ctr(ctr^)
+    return mapper^
 
 
 def _read_categorical(
@@ -847,10 +1151,15 @@ def _read_trees(
 
 
 def _read_version(mut r: _TokenReader) raises -> Int:
-    """Check the magic and return the format version as an integer. v1, v2,
-    v3, and the current v4 are all readable: v1 files carry no missing-value
-    routing, neither v1 nor v2 carries node covers, and none before v4
-    carries split gains or feature names."""
+    """Check the magic and return the format version as an integer.
+
+    v1 through v5 are all readable: v1 files carry no missing-value routing,
+    neither v1 nor v2 carries node covers, none before v4 carries split gains
+    or feature names, and none before v5 carries linear leaves or CTR tables.
+    An unknown token is refused here rather than read as the nearest known
+    version, which is what stops a file written by a newer build from being
+    partly parsed by this one.
+    """
     if r.next() != _MAGIC:
         raise Error("not a mojotrees model file")
     var token = r.next()
@@ -861,8 +1170,10 @@ def _read_version(mut r: _TokenReader) raises -> Int:
     if token == "v3":
         return 3
     if token == "v4":
-        return 4
-    if token == _LINEAR_VERSION:
+        return _BASE_FORMAT_VERSION
+    if token == _VERSION_5:
+        # The same 5 `linear_tree` names from its side; asserted by use so the
+        # two constants cannot drift apart unnoticed.
         return LINEAR_MODEL_FORMAT_VERSION
     raise Error("unsupported model format version")
 
@@ -958,7 +1269,15 @@ def load_model(path: String) raises -> Model:
     var mapper = _read_mapper(r, version)
     _check_feature_names(names, mapper.n_features)
     var monotone = _read_monotone(r, mapper.n_features)
-    var trees = _read_trees(r, mapper.n_features, version, mapper.n_bins)
+    # A tree splits on a column of the *binned* matrix, which is
+    # `n_total_features()` wide: base features plus the CTR columns
+    # `BinMapper.bin_row` appends. Equal to `n_features` for every model
+    # without CTR tables, so this widens the topology check only where the
+    # wider ids are real; feature names and monotone signs stay base-width,
+    # because a CTR column has neither.
+    var trees = _read_trees(
+        r, mapper.n_total_features(), version, mapper.n_bins
+    )
     var linear = _read_linear(r, version, trees, mapper.n_features)
     var booster = Booster(
         trees^, base_score, learning_rate, objective, monotone^, linear^
@@ -1006,7 +1325,10 @@ def load_multiclass_model(path: String) raises -> MulticlassModel:
     var mapper = _read_mapper(r, version)
     _check_feature_names(names, mapper.n_features)
     var monotone = _read_monotone(r, mapper.n_features)
-    var trees = _read_trees(r, mapper.n_features, version, mapper.n_bins)
+    # The binned width, exactly as in `load_model`; see the note there.
+    var trees = _read_trees(
+        r, mapper.n_total_features(), version, mapper.n_bins
+    )
     if len(trees) % n_classes != 0:
         raise Error("corrupt model file: tree count not divisible by classes")
     var linear = _read_linear(r, version, trees, mapper.n_features)
@@ -1118,10 +1440,14 @@ def save_dataset(dataset: Dataset, path: String) raises:
     values it was fitted from, so `Dataset.has_raw()` is false on it and
     `subset` raises. Use `Dataset.subset` before saving, not after loading.
     """
-    check_ctr_serializable(dataset.mapper.ctr)
+    # A model carries its CTR tables as of v5; a prepared table still cannot,
+    # and the blocker is the matrix rather than the tables. The guard names
+    # it, so the refusal lands on the writer instead of on whoever later
+    # tries to read the file back.
+    check_ctr_dataset_serializable(dataset.mapper.ctr)
     var out = String("")
     out += _DATASET_MAGIC + " " + _DATASET_VERSION + " "
-    out += String(CURRENT_FORMAT_VERSION) + "\n"
+    out += String(_mapper_section_version(dataset.mapper)) + "\n"
     out += "dataset "
     out += String(dataset.n_rows) + " "
     out += String(dataset.n_features) + " "
@@ -1188,7 +1514,11 @@ def load_dataset(path: String) raises -> Dataset:
     if r.next() != _DATASET_VERSION:
         raise Error("unsupported prepared dataset format version")
     # The mapper section's revision, which is a model-format version because
-    # the section is the model format's.
+    # the section is the model format's. `save_dataset` writes the revision
+    # the section it produced actually needs (`_mapper_section_version`), so
+    # a table written today still declares 4 and an older build still reads
+    # it; the upper bound moves with `CURRENT_FORMAT_VERSION` so that a
+    # future v5 table is not rejected by the build that can read it.
     var mapper_version = r.next_int()
     if mapper_version < 2 or mapper_version > CURRENT_FORMAT_VERSION:
         raise Error(
