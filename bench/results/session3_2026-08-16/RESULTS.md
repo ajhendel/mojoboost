@@ -172,9 +172,72 @@ the next session, and the prediction registered here, before that data, is that
 the ratio moves **further** in our favor, because our arm improves with clock
 state and LightGBM does not use the GPU at all.
 
-## Still open
+---
 
-- S1 is still two shapes short: the resident plane at 250,000 and at 50,000.
+## S1, closed. The resident plane becomes the default GPU plane.
+
+Taken in a fast window (load 2.15, nothing else running), alternating processes,
+five pairs each. These are the two shapes S1 has been short of since the plane
+landed.
+
+**250,000 x 50**
+
+| pair | resident ON | resident OFF |
+|---|---|---|
+| 1 | 1.095 | 1.963 |
+| 2 | 1.113 | 2.006 |
+| 3 | 1.126 | 2.010 |
+| 4 | 1.150 | 2.061 |
+| 5 | 1.158 | 2.016 |
+| **median** | **1.126** | **2.010** |
+
+**0.88 seconds, 44 percent.** Resolved by M0 by a wide margin: the delta is more
+than ten times the wider arm's spread, and every pair agrees.
+
+**50,000 x 50**
+
+| pair | resident ON | resident OFF |
+|---|---|---|
+| 1 | 0.792 | 1.733 |
+| 2 | 0.795 | 1.721 |
+| 3 | 0.793 | 1.713 |
+| 4 | 0.779 | 1.726 |
+| 5 | 0.788 | 1.727 |
+
+Median 0.789 against 1.724: **2.2x faster**, resolved, with arm spreads under
+0.02. S1 asked only for "no regression at 50,000". It is the largest relative
+win of the three shapes.
+
+**The gate was proved open rather than assumed.** `MOJOTREES_GPU_TREE_RESIDENT_
+TRACE=1` reports `plane=device-resident status=budget_spent commits=30 leaves=31
+root_rows=50000` at 50k and `root_rows=250000` at 250k, so these compare the
+plane against the shipping loop and not the fallback against itself. That check
+exists because a test written earlier in this project ran six fixtures entirely
+below the gate and verified nothing.
+
+### S1's three conditions
+
+| condition | verdict |
+|---|---|
+| trees node-identical to the host plane | satisfied, `tests/test_gpu_tree_resident.mojo`, no tolerance |
+| faster at 250,000 **and** 1,000,000 | 44% and 24%, both resolved |
+| no regression at 50,000 | 2.2x faster |
+
+**All three hold. Under S1 the resident plane becomes the default GPU plane.**
+
+### And it retires the crossover gate's premise
+
+`M4_MIN_NORMALIZED_WORK = 50,000,000` exists to route small shapes to the host
+scan, because the device search used to lose below it: this repository's own
+record says the device path "beats host scan at 250k rows, loses at 50k". At
+50,000 the normalized work is 2,500,000, a twentieth of the gate.
+
+The resident plane wins there by 2.2x. So the gate's premise is falsified at
+precisely the shape it was built to protect, and re-deriving or deleting it is
+now a live question rather than a tuning exercise. That is a **reduction** in the
+number of paths, not an addition of a small-data path.
+
+## Still open
 - The parallel-grain check at the host-scan shape (M2.5), untaken.
 - M2.3 re-taken in a fast window.
 - Whether tonight's machine state is thermal, clock, or something else. Nothing
