@@ -70,6 +70,30 @@ snapshot and none is offered to it. So "the grower reads nothing per node" is
 asserted is the accumulation-planning half, which is the half the poison can
 see.
 
+The other two variables the grower reads, and why they needed a second poison
+--------------------------------------------------------------------------
+`MOJOTREES_CPU_FEATURE_GROUP` cannot see the constant-hessian reads at all.
+`histogram._resolve_const_hessian` calls `const_hessian_allowed()`, and a
+build that resolves to on then calls `const_hessian_verify()`, so a
+squared-error round -- where the declaration is on -- read
+`MOJOTREES_CONST_HESSIAN` and `MOJOTREES_CONST_HESSIAN_VERIFY` on **every**
+histogram build and **every** sibling subtraction, twice per node, straight
+past whatever snapshot the same call was carrying. Neither read touches the
+feature-group ladder, so every test above stayed green through all of it, and
+the section heading "a whole tree through a snapshot reads nothing" was
+narrower than it sounded.
+
+Those two have no raising poison: `parallel._env_int` swallows an unparsable
+value and returns the default, so setting garbage in either one is invisible.
+`MOJOTREES_CONST_HESSIAN=0` is invisible for a different reason -- the
+specialization is documented to produce a bit-identical histogram, so turning
+it off changes no value a test can assert. The one observable is
+`MOJOTREES_CONST_HESSIAN_VERIFY=1` against a fixture that declares a constant
+hessian it does not have: a live read makes `_check_constant_hessian` walk the
+array and raise, a snapshot read does not. That is the instrument the
+constant-hessian section at the bottom of this file uses, with the same shape
+of positive control.
+
 Nothing here is timed. The node counts below are counts, not durations, and
 no line of this file may be read as evidence that any of it is faster.
 """
@@ -79,6 +103,7 @@ from std.testing import assert_equal, assert_true, TestSuite
 
 from mojotrees.binning import BinnedMatrix, bin_equal_width
 from mojotrees.cegb import CegbLedger
+from mojotrees.histogram import CONSTANT_HESSIAN, ConstHessianSettings
 from mojotrees.parallel import DispatchSettings
 from mojotrees.phase_profile import PhaseProfile
 from mojotrees.tree import (
@@ -131,6 +156,12 @@ def _reset_env():
     _ = setenv("MOJOTREES_CPU_TASKS_PER_CORE", "")
     _ = setenv("MOJOTREES_CPU_CORE_POOL", "")
     _ = setenv("MOJOTREES_CPU_COMPACT_MIN_ROWS", "")
+    # The grower reads these two as well, once per histogram build and once
+    # per subtraction before `ConstHessianSettings` existed, so a run of this
+    # file that inherited either of them from its environment would be
+    # measuring a different grower. See the constant-hessian section below.
+    _ = setenv("MOJOTREES_CONST_HESSIAN", "")
+    _ = setenv("MOJOTREES_CONST_HESSIAN_VERIFY", "")
 
 
 def _data() raises -> BinnedMatrix:
@@ -525,6 +556,188 @@ def test_every_feature_group_width_grows_the_same_tree() raises:
         # of the scratch whatever the environment does next.
         _ = setenv("MOJOTREES_CPU_FEATURE_GROUP", "")
         _assert_same_tree(_grow(scratch, data, grad, hess), base)
+    _reset_env()
+
+
+# ---------------------------------------------------------------------------
+# Node-array reservation: capacity only, never contents
+# ---------------------------------------------------------------------------
+
+def test_reserving_the_node_arrays_changes_nothing_about_the_tree() raises:
+    """`Tree.reserve_nodes` sizes the ten per-node arrays and touches nothing
+    else.
+
+    `_add_node` appends into ten separately allocated lists, each doubling on
+    its own schedule, so `grow_tree_leaves_profiled` now reserves the whole
+    node budget once. A reservation that resized, truncated, or reordered
+    anything would be a silent corruption of every tree in the package, so it
+    is asserted directly rather than inferred from the trees still looking
+    right: a grown tree is copied, reserved far beyond its size, and compared
+    to itself field for field.
+    """
+    _reset_env()
+    var data = _data()
+    var grad = _grad()
+    var hess = _hess()
+    var scratch = GrowScratch(_N_FEATURES, _N_BINS)
+    var grown = _grow(scratch, data, grad, hess)
+    assert_equal(grown.n_leaves, _NUM_LEAVES)
+
+    var reference = grown.copy()
+    grown.reserve_nodes(64 * len(reference.feature))
+    _assert_same_tree(grown, reference)
+    assert_equal(len(grown.feature), len(reference.feature))
+
+    # Reserving below the current size is a no-op, not a truncation.
+    grown.reserve_nodes(1)
+    _assert_same_tree(grown, reference)
+    # And a nonpositive budget is refused before it reaches any list.
+    grown.reserve_nodes(0)
+    grown.reserve_nodes(-5)
+    _assert_same_tree(grown, reference)
+    _reset_env()
+
+
+# ---------------------------------------------------------------------------
+# The constant-hessian snapshot, which the feature-group poison cannot see
+# ---------------------------------------------------------------------------
+
+comptime _VERIFY_POISON = "1"
+"""`MOJOTREES_CONST_HESSIAN_VERIFY=1`. Unlike the feature-group poison this
+one is not an illegal value; it is a legal setting whose effect -- a walk of
+the hessian array that raises unless every entry is exactly
+`CONSTANT_HESSIAN` -- is observable against a fixture that does not satisfy
+it. That is what makes one environment read into one event."""
+
+
+def _hess_not_constant() -> List[Float64]:
+    """Hessians that are uniform but are **not** `CONSTANT_HESSIAN`.
+
+    Uniform so the tree is well formed and growth reaches the leaf budget;
+    not 1.0 so that `histogram._check_constant_hessian` raises the moment it
+    runs. The grower is then handed `const_hessian=True`, which is a
+    deliberately false declaration -- exactly the mistake
+    `MOJOTREES_CONST_HESSIAN_VERIFY` exists to catch, which is why it is the
+    only setting of it that has an observable effect at all.
+    """
+    var h = List[Float64](capacity=_N_ROWS)
+    for _ in range(_N_ROWS):
+        h.append(CONSTANT_HESSIAN + 1.0)
+    return h^
+
+
+def _grow_declaring_constant_hessian(
+    mut scratch: GrowScratch,
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    var env: ConstHessianSettings,
+) raises -> Tree:
+    var profile = PhaseProfile()
+    var leaves = LeafMembership()
+    var ledger = CegbLedger.none()
+    return grow_tree_leaves_profiled(
+        profile, leaves, ledger, scratch, data, grad, hess, _params(),
+        const_hessian=True,
+        const_hessian_env=env^,
+    )
+
+
+def test_a_grower_without_a_constant_hessian_snapshot_reads_verify() raises:
+    """The positive control: with the sentinel, the verify flag is read and
+    the poison is observed.
+
+    Without this the completion below would prove nothing, because nothing on
+    the path would ever have read the variable. It also pins where the read
+    happens: `grow_tree_leaves_profiled` resolves the sentinel once at the top
+    of the tree, so the poison set before the call is seen and the first
+    histogram build raises.
+    """
+    _reset_env()
+    var data = _data()
+    var grad = _grad()
+    var hess = _hess_not_constant()
+
+    _ = setenv("MOJOTREES_CONST_HESSIAN_VERIFY", _VERIFY_POISON)
+    var raised = False
+    try:
+        var scratch = GrowScratch(_N_FEATURES, _N_BINS)
+        _ = _grow_declaring_constant_hessian(
+            scratch, data, grad, hess, ConstHessianSettings.unresolved()
+        )
+    except:
+        raised = True
+    _ = setenv("MOJOTREES_CONST_HESSIAN_VERIFY", "")
+    assert_true(raised)
+    _reset_env()
+
+
+def test_growing_a_whole_tree_through_a_constant_hessian_snapshot() raises:
+    """A whole tree grown under the verify poison, through a
+    `ConstHessianSettings` resolved before it. Completion is the proof.
+
+    Each node performs one histogram build, and each split one sibling
+    subtraction, and every one of those sites called
+    `const_hessian_allowed()` and `const_hessian_verify()` before the snapshot
+    was threaded. If any single one of them still passed the sentinel, this
+    test raises on the first node, exactly as the control above does.
+
+    The tree is then compared to one grown on a clean environment, field for
+    field. Growth cannot observe a variable it never read, so the two must be
+    the same tree; a difference would mean something on the path read the
+    environment and quietly changed a plan instead of raising.
+    """
+    _reset_env()
+    var data = _data()
+    var grad = _grad()
+    var hess = _hess_not_constant()
+
+    var clean = GrowScratch(_N_FEATURES, _N_BINS)
+    var reference = _grow_declaring_constant_hessian(
+        clean, data, grad, hess, ConstHessianSettings.resolve()
+    )
+    assert_equal(reference.n_leaves, _NUM_LEAVES)
+
+    # Resolved while the environment is clean; the poison is set afterwards.
+    var snapshot = ConstHessianSettings.resolve()
+    assert_true(snapshot.resolved)
+    assert_true(snapshot.allowed)
+    assert_true(not snapshot.verify)
+
+    var scratch = GrowScratch(_N_FEATURES, _N_BINS)
+    _ = setenv("MOJOTREES_CONST_HESSIAN_VERIFY", _VERIFY_POISON)
+    var grown = _grow_declaring_constant_hessian(
+        scratch, data, grad, hess, snapshot^
+    )
+    _ = setenv("MOJOTREES_CONST_HESSIAN_VERIFY", "")
+
+    _assert_same_tree(grown, reference)
+    _reset_env()
+
+
+def test_the_constant_hessian_snapshot_ignores_a_later_setenv() raises:
+    """The divergence property on the value itself: a snapshot resolved
+    before a `setenv` still holds what it held, while one resolved after sees
+    the new value. Without the second half the first would pass because
+    `setenv` did nothing."""
+    _reset_env()
+    var before = ConstHessianSettings.resolve()
+    assert_true(before.allowed)
+    assert_true(not before.verify)
+
+    _ = setenv("MOJOTREES_CONST_HESSIAN", "0")
+    _ = setenv("MOJOTREES_CONST_HESSIAN_VERIFY", "1")
+    assert_true(before.allowed)
+    assert_true(not before.verify)
+
+    var after = ConstHessianSettings.resolve()
+    assert_true(not after.allowed)
+    assert_true(after.verify)
+
+    # The sentinel is the live read, which is what every unwired call site
+    # still does and what the staged parameter has to stay compatible with.
+    var sentinel = ConstHessianSettings.unresolved()
+    assert_true(not sentinel.resolved)
     _reset_env()
 
 

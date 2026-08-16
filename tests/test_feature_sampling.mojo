@@ -8,6 +8,7 @@ bit, different seeds give different models, invalid fractions raise, and
 importance follows the features a tree was actually allowed to use.
 """
 
+from std.os import setenv
 from std.testing import assert_almost_equal, assert_equal, assert_true, TestSuite
 
 from mojotrees.binning import bin_equal_width
@@ -22,8 +23,34 @@ from mojotrees.sampling import (
     selection_count,
 )
 from mojotrees.split import find_best_split
-from mojotrees.tree import TreeParams, grow_tree
+from mojotrees.tree import Tree, TreeParams, grow_tree
 from support import _make_features, _uniform
+
+
+def _bits(v: Float64) -> UInt64:
+    return v.to_bits().cast[DType.uint64]()
+
+
+def _assert_same_tree(a: Tree, b: Tree) raises:
+    """Two trees, field for field, floats as bits. No tolerance: the changes
+    this file guards are supposed to move nothing at all, so a one-ulp
+    difference is a defect and not a rounding difference to absorb."""
+    assert_equal(a.n_leaves, b.n_leaves)
+    assert_equal(len(a.feature), len(b.feature))
+    for i in range(len(a.feature)):
+        assert_equal(a.feature[i], b.feature[i])
+        assert_equal(a.threshold_bin[i], b.threshold_bin[i])
+        assert_equal(a.left[i], b.left[i])
+        assert_equal(a.right[i], b.right[i])
+        assert_equal(_bits(a.value[i]), _bits(b.value[i]))
+        assert_equal(_bits(a.split_gain[i]), _bits(b.split_gain[i]))
+        assert_equal(Int(a.default_left[i]), Int(b.default_left[i]))
+        assert_equal(a.missing_bin[i], b.missing_bin[i])
+        assert_equal(a.cat_offset[i], b.cat_offset[i])
+        assert_equal(_bits(a.count[i]), _bits(b.count[i]))
+    assert_equal(len(a.cat_bitset), len(b.cat_bitset))
+    for i in range(len(a.cat_bitset)):
+        assert_equal(a.cat_bitset[i], b.cat_bitset[i])
 
 
 def _target(features: List[Float64], n_rows: Int, n_features: Int) -> List[Float64]:
@@ -517,6 +544,183 @@ def test_importance_only_credits_selected_features() raises:
             if sub.trees[t].feature[node] >= 0:
                 node_total += sub.trees[t].split_gain[node]
     assert_almost_equal(summed, node_total, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# The undrawn node: an empty node feature list is the complete one
+# ---------------------------------------------------------------------------
+#
+# `tree.grow_tree` no longer materializes a per-node feature list when no
+# fraction narrows it. At `feature_fraction = 1.0` the tree's own set is every
+# feature, and with both inner fractions at 1.0 the two copies
+# `select_split_features` would make are copies of that same complete set --
+# which is exactly what the empty list already means to `find_best_split`, to
+# `cegb.prepare_cegb_node` and to the profile's cell count. The list is
+# therefore not built.
+#
+# The claim under test is that this is the *same selection*, not merely a
+# selection that happens to fit as well. The two arms below are built so that
+# one takes the undrawn path and the other materializes a node list that is
+# provably the complete set, and the trees must agree bit for bit.
+
+
+comptime _COMPLETE_DRAW_FRACTION = 0.99
+"""A bylevel fraction below 1.0 -- which is what makes `grow_tree` draw at all
+-- whose `selection_count` at this fixture's width is still every feature, so
+the materialized list is `[0, n_features)`. `test_the_undrawn_node_...` asserts
+that arithmetic rather than trusting it: if `selection_count` ever changed its
+rounding, this constant would silently start comparing two different draws and
+the test would become a test of nothing."""
+
+
+def _signal_grad(
+    features: List[Float64], n_rows: Int
+) raises -> List[Float64]:
+    """Gradients with real structure in the first two features, so growth
+    reaches the leaf budget instead of stopping at a stump. A stump would make
+    "the two trees agree" a claim about one node."""
+    var grad = _grad(n_rows)
+    for r in range(n_rows):
+        grad[r] += 3.0 * features[r] - 2.0 * features[n_rows + r]
+    return grad^
+
+
+def test_the_undrawn_node_grows_the_tree_a_complete_draw_grows() raises:
+    """An undrawn node and a node whose draw is the complete feature set must
+    grow the identical tree.
+
+    Arm A is the default: `feature_fraction`, `feature_fraction_bylevel` and
+    `feature_fraction_bynode` all 1.0, so no node draws and every node's list
+    is empty. Arm B sets the bylevel fraction below 1.0, which is the whole
+    of the condition `grow_tree` gates on, so every node materializes a list;
+    the assertions below prove that list is `[0, n_features)`, so the two arms
+    differ in whether the list exists and in nothing else.
+
+    Both halves of the gate are proved rather than assumed. `selection_count`
+    is asserted to return every feature at arm B's fraction, and
+    `select_tree_features` at 1.0 is asserted to be the ascending complete
+    list, which is the other half of `grow_tree`'s condition.
+    """
+    var n_rows = 400
+    var n_features = 10
+    var n_bins = 16
+    var features = _make_features(n_rows, n_features)
+    var data = bin_equal_width(features, n_rows, n_features, n_bins)
+    var grad = _signal_grad(features, n_rows)
+    var hess = _hess(n_rows)
+
+    # The gate, both halves, as arithmetic.
+    assert_true(_COMPLETE_DRAW_FRACTION < 1.0)
+    assert_equal(
+        selection_count(n_features, _COMPLETE_DRAW_FRACTION), n_features
+    )
+    var tree_set = select_tree_features(n_features, 1.0, 11, 0)
+    assert_equal(len(tree_set), n_features)
+    for f in range(n_features):
+        assert_equal(tree_set[f], f)
+
+    var undrawn = TreeParams(
+        16, 5, 1.0, 1e-3, 0.0,
+        feature_fraction=1.0,
+        feature_fraction_bynode=1.0,
+        feature_fraction_seed=11,
+        feature_fraction_bylevel=1.0,
+    )
+    var complete_draw = TreeParams(
+        16, 5, 1.0, 1e-3, 0.0,
+        feature_fraction=1.0,
+        feature_fraction_bynode=1.0,
+        feature_fraction_seed=11,
+        feature_fraction_bylevel=_COMPLETE_DRAW_FRACTION,
+    )
+    for tree_index in range(3):
+        var a = grow_tree(data, grad, hess, undrawn, [], tree_index)
+        var b = grow_tree(data, grad, hess, complete_draw, [], tree_index)
+        assert_true(a.n_leaves > 1)
+        _assert_same_tree(a, b)
+
+
+def test_the_undrawn_node_is_identical_at_one_three_and_eight_workers() raises:
+    """Determinism across `MOJOTREES_NUM_WORKERS` for the undrawn path.
+
+    The crossover is forced to zero so the parallel path is actually taken at
+    this fixture's size, rather than all three arms falling serial and quietly
+    measuring the same schedule.
+    """
+    _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "1")
+    var n_rows = 400
+    var n_features = 10
+    var features = _make_features(n_rows, n_features)
+    var data = bin_equal_width(features, n_rows, n_features, 16)
+    var grad = _signal_grad(features, n_rows)
+    var hess = _hess(n_rows)
+    var params = TreeParams(16, 5, 1.0, 1e-3, 0.0)
+
+    _ = setenv("MOJOTREES_NUM_WORKERS", "1")
+    var base = grow_tree(data, grad, hess, params)
+    assert_true(base.n_leaves > 1)
+
+    var workers: List[String] = ["3", "8"]
+    for i in range(len(workers)):
+        _ = setenv("MOJOTREES_NUM_WORKERS", workers[i])
+        _assert_same_tree(grow_tree(data, grad, hess, params), base)
+
+    _ = setenv("MOJOTREES_NUM_WORKERS", "")
+    _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "")
+
+
+def test_a_complete_feature_list_excludes_nothing_however_it_is_ordered() raises:
+    """`histogram._zero_excluded` short-circuits on a strictly ascending list
+    that names every feature, and takes the full masked path on any other
+    list. Both sides of that gate must produce the same histogram.
+
+    The gate is chosen deliberately: `_check_features` validates range only
+    and accepts repeats, so `len(features) == n_features` alone would not
+    establish that nothing is excluded. A permuted complete list is the case
+    that proves the short-circuit is not being reached by length alone -- it
+    is complete, it is the same length, and it is not ascending, so it takes
+    the long path and must still leave every slice written.
+    """
+    var n_rows = 300
+    var n_features = 8
+    var n_bins = 16
+    var features = _make_features(n_rows, n_features)
+    var data = bin_equal_width(features, n_rows, n_features, n_bins)
+    var grad = _grad(n_rows)
+    var hess = _hess(n_rows)
+
+    var full = build_histogram(data, grad, hess)
+
+    var ascending = List[Int]()
+    for f in range(n_features):
+        ascending.append(f)
+    # Complete, same length, not ascending: the long path.
+    var permuted = List[Int]()
+    for f in range(n_features):
+        permuted.append(n_features - 1 - f)
+
+    var by_ascending = build_histogram(data, grad, hess, ascending)
+    var by_permuted = build_histogram(data, grad, hess, permuted)
+    for i in range(n_features * n_bins):
+        assert_equal(_bits(full.grad_at(i)), _bits(by_ascending.grad_at(i)))
+        assert_equal(_bits(full.hess_at(i)), _bits(by_ascending.hess_at(i)))
+        assert_equal(full.count_at(i), by_ascending.count_at(i))
+        assert_equal(_bits(full.grad_at(i)), _bits(by_permuted.grad_at(i)))
+        assert_equal(_bits(full.hess_at(i)), _bits(by_permuted.hess_at(i)))
+        assert_equal(full.count_at(i), by_permuted.count_at(i))
+
+    # And a repeated id is still accepted by the range check, which is why the
+    # short-circuit tests ascendingness and not just length: this list has
+    # `n_features` entries and excludes all but one feature.
+    var repeated = List[Int]()
+    for _ in range(n_features):
+        repeated.append(0)
+    var by_repeated = build_histogram(data, grad, hess, repeated)
+    for b in range(n_bins):
+        assert_equal(_bits(full.grad_at(b)), _bits(by_repeated.grad_at(b)))
+    for f in range(1, n_features):
+        for b in range(n_bins):
+            assert_equal(by_repeated.count_at(f * n_bins + b), 0)
 
 
 def main() raises:

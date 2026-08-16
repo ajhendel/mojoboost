@@ -201,7 +201,14 @@ struct InteractionConstraints(Copyable, Movable):
 def extend_branch(branch: List[Int], feature: Int) -> List[Int]:
     """The branch feature set of both children of a node split on `feature`.
     Kept duplicate-free so the containment scans stay short; duplicates would
-    be harmless but not free."""
+    be harmless but not free.
+
+    This allocates unconditionally -- it has no view of the constraint set --
+    so a grower must not call it when `InteractionConstraints.is_empty()`.
+    An unconstrained `allowed_features` returns the empty mask for every
+    branch, so the set it would build is never read, and building it costs a
+    list copy per split for nothing. `tree.grow_tree` gates on that; see the
+    `constrained` flag there."""
     var out = branch.copy()
     for i in range(len(out)):
         if out[i] == feature:

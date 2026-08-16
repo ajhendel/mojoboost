@@ -133,9 +133,22 @@ def _stream(seed: Int, tree_index: Int, tag: Int) -> UInt64:
     return splitmix64(h ^ UInt64(tag & 0x7FFFFFFFFFFFFFFF))
 
 
+def _fraction_in_range(fraction: Float64) -> Bool:
+    """`check_feature_fraction`'s predicate without its name.
+
+    The name is a `String` parameter, and every spelling a caller passes here
+    -- `"feature_fraction_bylevel"` is 24 characters -- is longer than the
+    small-string buffer, so materializing it is a heap allocation. The name
+    is only ever read to phrase the error, so a per-node caller tests the
+    range with this and calls `check_feature_fraction` only on the path that
+    is about to raise. Same accepted range, same error text, no allocation on
+    the path that succeeds."""
+    return fraction > 0.0 and fraction <= 1.0
+
+
 def check_feature_fraction(fraction: Float64, name: String) raises:
     """Validate one fraction; LightGBM's accepted range is (0, 1]."""
-    if not (fraction > 0.0 and fraction <= 1.0):
+    if not _fraction_in_range(fraction):
         raise Error(String(name, " must be in (0, 1]"))
 
 
@@ -268,7 +281,10 @@ def select_node_features(
     """The ascending feature ids one node may split on, drawn from the
     tree's own set so per-node selection composes with per-tree selection.
     Returns the tree's set unchanged when the fraction is 1.0."""
-    check_feature_fraction(fraction, "feature_fraction_bynode")
+    # Called once per node, so the name is built only when it will be read;
+    # see `_fraction_in_range`.
+    if not _fraction_in_range(fraction):
+        check_feature_fraction(fraction, "feature_fraction_bynode")
     if fraction >= 1.0:
         return tree_features.copy()
     return sample_without_replacement(
@@ -298,7 +314,10 @@ def select_level_features(
     from the tree's own set so per-level selection composes with per-tree
     selection. Returns the tree's set unchanged when the fraction is 1.0,
     which is what keeps the default path bit identical."""
-    check_feature_fraction(fraction, "feature_fraction_bylevel")
+    # Called once per node, so the name is built only when it will be read;
+    # see `_fraction_in_range`.
+    if not _fraction_in_range(fraction):
+        check_feature_fraction(fraction, "feature_fraction_bylevel")
     if depth < 0:
         raise Error("depth must be nonnegative")
     if fraction >= 1.0:
