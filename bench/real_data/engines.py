@@ -45,6 +45,13 @@ import measure
 import scenarios
 
 
+#: How many per-feature bin counts a record carries in full. Every scenario
+#: in this suite is far below it except sparse_highdim, whose `large` tier
+#: declares 500,000 features. Chosen so that the standard tier of every
+#: scenario, sparse included at 50,000, records its whole vector.
+BIN_COUNT_LIST_LIMIT = 65_536
+
+
 class EngineError(RuntimeError):
     """Raised when an engine cannot run a scenario at all. The runner turns
     this into a recorded skip with the reason, not a crash."""
@@ -76,13 +83,21 @@ def _bin_profile(dataset, n_features):
     binning alignment by measurement instead of by reading scenarios.py and
     believing it, which is why it is worth the loop.
 
-    The counts themselves are not stored. A run with half a million
-    features would put half a million integers in every record, so what is
-    stored is the shape of the distribution plus a digest of the exact
-    vector: two records with the same digest binned identically, and two
-    that differ can be re-derived from their jobs. The digest goes through
-    measure.digest so there is one hashing convention in this harness
-    rather than two.
+    The counts themselves are stored, and they were not. Storing only the
+    shape and a digest cost a lane an hour tonight: diagnosing an accuracy
+    gap, it had to reconstruct the per-feature counts by arithmetic over a
+    recorded total, and the list would have answered the question by being
+    read. It is a few hundred bytes on every scenario in this suite except
+    the sparse one, and records are not committed.
+
+    The reason the list was dropped is still real at one shape: the sparse
+    `large` tier declares 500,000 features, and half a million integers in
+    every record is a different proposition from fifty. So the list is
+    stored whole up to `BIN_COUNT_LIST_LIMIT` features and truncated with a
+    marker above it, and the digest is always taken over the entire vector,
+    so two records with the same digest binned identically whether or not
+    either list was truncated. The digest goes through measure.digest so
+    there is one hashing convention in this harness rather than two.
 
     The loop runs after every timed phase and is not inside any of them.
 
@@ -101,14 +116,25 @@ def _bin_profile(dataset, n_features):
         )
     if counts.size == 0:
         return measure.unavailable("the Dataset reports no features")
-    return {
+    profile = {
         "n_features": int(counts.size),
         "total": int(counts.sum()),
         "max": int(counts.max()),
         "min": int(counts.min()),
         "mean": float(counts.mean()),
         "sha256": measure.digest(counts),
+        "counts": [int(c) for c in counts[:BIN_COUNT_LIST_LIMIT]],
     }
+    if counts.size > BIN_COUNT_LIST_LIMIT:
+        profile["counts_truncated"] = True
+        profile["counts_truncated_reason"] = (
+            f"{int(counts.size)} features; `counts` holds the first "
+            f"{BIN_COUNT_LIST_LIMIT} in feature order. `sha256` is over all "
+            "of them"
+        )
+    else:
+        profile["counts_truncated"] = False
+    return profile
 
 
 #: mojotrees's side of the same field. It builds histograms feature-major
@@ -116,9 +142,10 @@ def _bin_profile(dataset, n_features):
 #: docs/LIGHTGBM_PARITY.md records in its force_col_wise / force_row_wise
 #: row. Recorded rather than left absent so that a LightGBM record's
 #: builder has something to be compared against, and because the pair being
-#: compared is not the same strategy on both sides once LightGBM is forced
-#: row-wise. What varies on this side is thread dispatch, which is
-#: MOJOTREES_PARALLEL_MIN_OPS and lives in the environment block.
+#: compared is not the same strategy on both sides: LightGBM now picks its
+#: own builder by timing and mojotrees has one. What varies on this side is
+#: thread dispatch, which is MOJOTREES_PARALLEL_MIN_OPS and lives in the
+#: environment block.
 MOJOTREES_HISTOGRAM_BUILDER = {
     "requested": "feature_major",
     "resolved": "feature_major",
@@ -136,14 +163,22 @@ def _histogram_builder(params):
     This belongs in the record more than most parameters do. Row-wise and
     col-wise are two different algorithms over the same bins rather than
     two tunings of one, so a training time without the builder next to it
-    is not a reproducible measurement. `LIGHTGBM_ALIGNMENT` forces
-    row-wise, and a reader who does not know that cannot repeat the run.
+    is not a reproducible measurement.
+
+    Since C9 the comparator sets neither force flag, so this reports
+    `auto` and an unresolved value on every LightGBM cell. That is a real
+    loss of information and it is the price of the rule: forcing row-wise
+    was this repository choosing the comparator's algorithm for it, and
+    `bench/results/INSTRUCTION_AUDIT.md` carried the resulting row-versus-col
+    caveat on every LightGBM margin in the tree. Stock LightGBM times both
+    strategies on the first iterations and keeps the winner, so the
+    comparator now runs whichever of its own builders it decides is faster,
+    which is both what a user gets and the harder thing to beat.
 
     What is knowable: the request always. The resolution only when the
-    request settles it, which is when either force flag is set. With
-    neither set LightGBM times both strategies on the first iterations and
-    keeps the winner in the tree learner's share state; 4.7 exposes no
-    getter for it on the Booster, on the Dataset, or in the model text,
+    request settles it, which is when either force flag is set. LightGBM
+    4.7 keeps the auto choice in the tree learner's share state and exposes
+    no getter for it on the Booster, on the Dataset, or in the model text,
     and the one report of it is a log line this harness silences with
     verbosity -1. So the auto case records a null and that reason rather
     than echoing back the request as though it were an answer.
@@ -211,6 +246,17 @@ class MojoTreesEngine:
         self.module = mojotrees
         self.import_phase = phase
         self.version = getattr(mojotrees, "__version__", "unknown")
+        # Every record this engine writes names the comparator it will be
+        # read against. worker.py copies `notes` into the record's caveats,
+        # so the configuration travels with the number instead of living in
+        # a README somebody has to find.
+        self.notes.append(
+            f"comparator {scenarios.comparator_id()}: "
+            f"{scenarios.COMPARATOR_LABEL}. This arm answers nothing to "
+            "LightGBM's deterministic: mojotrees is reproducible across "
+            "thread counts with no parameter and no cost, which is why that "
+            "is the setting the comparator carries."
+        )
         if self.device in ("gpu", "auto") and not mojotrees.gpu_available():
             raise EngineError(
                 "device='gpu' was requested and mojotrees.gpu_available() is "
@@ -432,14 +478,25 @@ class LightGBMEngine:
         self.module = lightgbm
         self.import_phase = phase
         self.version = lightgbm.__version__
+        # Before anything is fitted. LightGBM logs "Unknown parameter"
+        # instead of refusing one, and this harness runs at a verbosity
+        # that suppresses the line, so an unguarded old build would ignore
+        # `deterministic` and record itself as stock+det anyway.
+        try:
+            scenarios.check_lightgbm_version(self.version)
+        except RuntimeError as exc:
+            raise EngineError(str(exc)) from exc
+        self.notes.append(
+            f"comparator {scenarios.comparator_id()}: "
+            f"{scenarios.COMPARATOR_LABEL}, registered at "
+            f"{scenarios.COMPARATOR_REGISTERED}"
+        )
         return self
 
     def warmup(self, spec):
         x, y, group, n_classes = _tiny_like(spec)
         extra = {"num_class": n_classes} if n_classes else None
-        params = scenarios.lightgbm_params(
-            spec, self.threads, dict(extra or {}, bin_construct_sample_cnt=len(y))
-        )
+        params = scenarios.lightgbm_params(spec, self.threads, extra)
         params["n_estimators"] = 1
 
         def _fit():
@@ -450,8 +507,14 @@ class LightGBMEngine:
         return phase
 
     def run(self, spec, train, test, repeats=1):
-        n_rows = train["X"].shape[0]
-        extra = {"bin_construct_sample_cnt": int(n_rows)}
+        # No `bin_construct_sample_cnt` here. It used to be raised to the
+        # training row count, which made the comparator fit its bin edges
+        # from every row while mojotrees fit them from a 200000-row
+        # subsample: strictly more binning work on the comparator's side,
+        # and every binning ratio measured under it is wrong in our favor.
+        # Both engines are at LightGBM's stock 200000 now.
+        # `scenarios.lightgbm_params` refuses the parameter by name.
+        extra = {}
         if spec["task"] == "multiclass":
             extra["num_class"] = int(
                 train.get("n_classes") or (np.max(train["y"]) + 1)

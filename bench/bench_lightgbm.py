@@ -26,11 +26,16 @@ the same resolved-versus-indistinguishable verdict every other arm gets.
 `__name__` guard: importing this module must generate no data and train
 nothing.
 
-The parameter alignment is not restated here. It is imported from
-bench/real_data/scenarios.py, which is where every entry is justified next
-to the reason it exists, so the two comparisons in this repository cannot
-drift apart by one of them being edited. One entry is dropped rather than
-inherited and `SPEED_EXCLUDED_ALIGNMENT` says which and why.
+The comparator is not restated here. It is imported whole from
+bench/real_data/scenarios.py, where every entry is justified next to the
+reason it exists, so the two comparisons in this repository cannot drift
+apart by one of them being edited. Nothing is dropped on the way in: this
+file used to exclude one entry and that is what made the two comparisons
+two comparators.
+
+That comparator is **LightGBM at stock defaults plus `deterministic=true`**,
+labelled `stock+det`, and `params_summary` puts its id in the parameter
+line of every result so a number cannot travel without it.
 
 Usage: python bench/bench_lightgbm.py [--rows N] [--features N]
        [--objective reg|binary] [--threads N] [--repeats N] [--rounds N]
@@ -70,17 +75,22 @@ scenarios = _load_scenarios()
 MASK = np.uint64(0xFFFFFFFFFFFFFFFF)
 INV_2_53 = 1.0 / 9007199254740992.0
 
-#: Alignment keys deliberately not inherited from scenarios.LIGHTGBM_ALIGNMENT.
+#: Nothing is excluded from scenarios.LIGHTGBM_ALIGNMENT any more, and that
+#: is the point.
 #:
-#: `deterministic` is a reproducibility setting, and LightGBM's own
-#: documentation records that it can slow training down. The real_data
-#: differential wants it because a repeat run there has to be a repeat run of
-#: the same fit. Here the measured quantity *is* the wall time, so switching
-#: on a setting whose cost lands entirely on the comparator's side of the
-#: comparison would hand mojotrees an advantage that came from the harness
-#: rather than from the code. The fit is still pinned by `seed`, which is
-#: inherited and costs nothing.
-SPEED_EXCLUDED_ALIGNMENT = ("deterministic",)
+#: This file used to drop `deterministic`, because LightGBM's own
+#: documentation says it can slow training down and the cost would have
+#: landed entirely on the comparator's side of a speed comparison. The
+#: consequence was that this repository ran two LightGBM configurations
+#: under one name: a speed figure from here and an accuracy figure from
+#: bench/real_data were not taken against the same engine.
+#:
+#: C9 allows exactly one comparator and `deterministic` is now what it is
+#: **for**, so the exclusion is gone rather than inverted. The reasoning
+#: moved with it: the mojotrees arms are reproducible across thread counts
+#: at no cost, so the flag is what lets the comparator's repeats mean the
+#: same thing ours do, not a handicap laid on it. The wall time it costs is
+#: paid deliberately and in the open.
 
 #: The name each mojotrees default arrives under from the Mojo harness,
 #: against the canonical `scenarios.BASE_PARAMS` key it has to equal.
@@ -154,11 +164,21 @@ def make_data(n_rows: int, n_features: int, objective: str, seed: int = 0):
 
 
 def lgbm_params(objective: str, threads: int, n_rows: int) -> dict:
-    """The parameter dict, aligned to mojotrees's defaults.
+    """The parameter dict: the one comparator, and the shared parameters.
 
-    The shared values come from `scenarios.BASE_PARAMS` and the settings
-    that exist to remove a difference come from
-    `scenarios.LIGHTGBM_ALIGNMENT`, minus `SPEED_EXCLUDED_ALIGNMENT`.
+    The shared values come from `scenarios.BASE_PARAMS` and the comparator
+    comes whole from `scenarios.LIGHTGBM_ALIGNMENT`, with nothing dropped
+    and nothing added here. That is what makes a speed figure from this
+    file and an accuracy figure from `bench/real_data` figures about the
+    same engine.
+
+    `n_rows` is accepted and unused. It is kept in the signature because
+    both callers pass it and because its former use is the thing worth
+    naming: it set `bin_construct_sample_cnt` to the row count, which made
+    the comparator fit its bin edges from every row while mojotrees fit
+    them from a 200000-row subsample. Every binning number recorded under
+    that pin describes a constraint this repository imposed on LightGBM,
+    not the stock comparison, and it ran in our favor.
 
     `threads` of 0 leaves `num_threads` unset, which is LightGBM's own
     default of one thread per physical core. Any other value pins it. The
@@ -166,6 +186,12 @@ def lgbm_params(objective: str, threads: int, n_rows: int) -> dict:
     MOJOTREES_NUM_WORKERS does on the mojotrees side; nothing here can
     check it, which is why the resolved number is printed.
     """
+    # Before the dict is built, not after it is trained on. An old
+    # LightGBM logs "Unknown parameter" and trains without the setting, and
+    # this arm runs at verbosity -1 where that line never appears, so the
+    # guard is the only thing between a stale environment and a comparator
+    # that records itself as stock+det and was not.
+    scenarios.check_lightgbm_version(lgb.__version__)
     base = scenarios.BASE_PARAMS
     params = {
         "objective": "binary" if objective == "binary" else "regression",
@@ -178,23 +204,8 @@ def lgbm_params(objective: str, threads: int, n_rows: int) -> dict:
         "lambda_l2": base["lambda_l2"],
         "max_bin": base["max_bin"],
         "use_missing": base["use_missing"],
-        # mojotrees has no feature bundling; keep the comparison honest.
-        # This one is in the alignment too, restated because it is the
-        # single largest structural difference between the two engines.
-        "enable_bundle": False,
-        "verbose": -1,
     }
-    for key, value in scenarios.LIGHTGBM_ALIGNMENT.items():
-        if key in SPEED_EXCLUDED_ALIGNMENT:
-            continue
-        params[key] = value
-    # `bin_construct_sample_cnt` is deliberately NOT set. It used to be
-    # raised to the row count because LightGBM sampled 200000 rows and
-    # mojotrees binned every one of them; mojotrees's default is LightGBM's
-    # 200000 now, so both engines sample and setting it would pin LightGBM
-    # to a fit mojotrees is not doing. Every binning number recorded under
-    # the old pin was measured against a constraint this repository imposed
-    # and does not describe the stock comparison.
+    params.update(scenarios.LIGHTGBM_ALIGNMENT)
     if threads > 0:
         params["num_threads"] = int(threads)
     return params
@@ -207,8 +218,15 @@ def params_summary(params: dict) -> str:
     recorded was taken under a parameter set that was written down in one
     file and read from another, and the only defense against that is the
     run stating what it actually used.
+
+    `comparator` leads the line, in the same key=value shape as the rest,
+    because the parameters say what was passed and the comparator id says
+    which agreed configuration they are. A result whose parameter string
+    carries no comparator was taken before C9 and is not comparable with
+    one that does.
     """
-    return " ".join(f"{k}={params[k]}" for k in sorted(params))
+    resolved = dict(params, comparator=scenarios.comparator_id())
+    return " ".join(f"{k}={resolved[k]}" for k in sorted(resolved))
 
 
 def check_alignment(mojo_defaults: dict) -> None:

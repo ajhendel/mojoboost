@@ -1,68 +1,139 @@
-"""The six scenarios, and the parameter alignment between the two engines.
+"""The six scenarios, and the one comparator both benchmarks run against.
 
 A differential benchmark is only worth reading if the two libraries were
-asked for the same model. That is not the same as passing the same
-parameter dict, because the defaults differ, some parameters exist on one
-side only, and a few of LightGBM's defaults silently change the data rather
-than the model. This module is where every one of those is pinned down, in
-one place, with the reason written next to it.
+asked for the same model, and if a reader can tell from the result which
+configuration produced it. This module holds both: the scenarios, and the
+comparator, in one place, with the reason written next to every entry.
 
-The alignment, and why each entry is here:
+## The comparator
 
-- `lambda_l2 = 1.0`. mojotrees defaults to 1.0 and LightGBM to 0.0, so this
-  has to be set explicitly on both sides or the comparison is between two
-  different regularisers. The rest of bench/ uses 1.0 and so does this.
-- `enable_bundle = false` for LightGBM. Exclusive feature bundling merges
-  sparse features before binning. mojotrees has no EFB, so leaving it on
-  compares two different feature spaces.
-- `feature_pre_filter = false` for LightGBM. **The last binning pin, and
-  the only one left.** On by default, it deletes features that cannot
-  satisfy `min_data_in_leaf` at Dataset construction time, which removes
-  them from the matrix, from the pool `feature_fraction` samples, and from
-  every feature index. That is a data change, not a training change, and
-  mojotrees does not do it, so leaving it on compares two different feature
-  spaces -- the same reason `enable_bundle` is pinned. It comes out the day
-  mojotrees implements the filter and not before.
-- `bin_construct_sample_cnt` is **not** pinned any more. mojotrees's own
-  default is LightGBM's 200000 as of the stock-defaults change, so both
-  libraries now fit their edges from a 200000-row subsample and neither is
-  binning rows the other is not. They do not draw the *same* 200000 rows
-  (different streams, see the `bin_construct_sample_cnt` row of
-  docs/LIGHTGBM_PARITY.md), so above 200000 rows the two fit different
-  edges from equally sized samples; that is a real and stated difference
-  and it is not fixable by a parameter.
+Registered as section C9 of `bench/results/PROFILE_PROTOCOL.md` on
+2026-08-16, before any measurement was taken under it:
 
-  **This pin is not in this module.** It is injected per call by the engine
-  adapters, `bench/real_data/engines.py` (two sites: the LightGBM Dataset
-  path and the LightGBM estimator path, both spelling
-  `bin_construct_sample_cnt` from the row count), and by
-  `bench/bench_lightgbm.py`. Removing it there is what makes the paragraph
-  above true; until it is removed, LightGBM is binning every row while
-  mojotrees bins 200000, which is the pin inverted rather than dropped.
-  `bench/real_data/selfcheck.py` passes its own count and is a self-check,
-  not a measurement, so it may keep one.
-- `zero_as_missing = false`. Both engines' default, restated because the
-  sparse scenario is exactly where the other setting would be tempting.
-  A stored zero and an absent entry are both the value zero on both sides.
-- `min_data_in_bin` is **not** pinned any more either. It used to be
-  forced to 1 because mojotrees had no minimum-population rule; mojotrees
-  now defaults to LightGBM's 3 and honors it in both branches of
-  `GreedyFindBin` (`src/mojotrees/binning.mojo`, and the `min_data_in_bin`
-  row of `docs/LIGHTGBM_PARITY.md`), so both libraries merge the same rare
-  levels and there is nothing left to remove. Note the direction this
-  moved in: the old pin made the timing comparison stricter against us,
-  and dropping it makes it laxer, so a binning or histogram number taken
-  before this change is not comparable with one taken after it.
-- `force_row_wise = true` for LightGBM. Without it LightGBM spends the
-  first iterations timing both histogram strategies, which lands in the
-  training measurement as a one-off cost that has nothing to do with the
-  steady state.
-- `deterministic = true` and a fixed `seed` for LightGBM, so a repeat run
-  is a repeat run.
-- Threads are matched by count, not by parameter name: LightGBM reads
-  `num_threads`, mojotrees reads the MOJOTREES_NUM_WORKERS environment
-  variable, and the runner sets both from one number before either library
-  is imported.
+**There is exactly one comparator, LightGBM at stock defaults plus
+`deterministic=true`, labelled `stock+det`.** One arm, one label. No other
+LightGBM configuration is published, and speed and accuracy are always
+reported together against it.
+
+`deterministic=true` is the only deviation from pure stock that is not a
+feature-space pin, and a reader will ask why it is there, so the answer
+belongs next to it rather than in a commit message. **It is on because our
+arm is reproducible across thread counts at no cost, so it is the setting
+that makes the two sides comparable rather than one that handicaps
+either.** A comparator whose repeats move is a comparator whose repeat
+spread is partly its own nondeterminism, and the differential check reads
+one repeat as the cell.
+
+It does not fully succeed, and that belongs beside the claim rather than
+arriving as a surprise: **in the first real-data run LightGBM produced two
+distinct prediction digests across three repeats on `sparse_highdim`, with
+`deterministic=true` already set and a fixed seed**, while the mojotrees
+arm was bit-identical across all three. So the flag is on to give the
+comparator its best chance at reproducibility, and the best chance is not
+a guarantee. `thresholds.json` gates the LightGBM side of the determinism
+check as non-gating for that reason.
+
+Everything else LightGBM does is left at its own default, and
+`LIGHTGBM_STOCK_DEFAULTS` records what those defaults are and where they
+were read, so a result can state what ran without anyone having to open
+the LightGBM source to find out.
+
+Every deviation from stock now has to be declared in
+`LIGHTGBM_DEVIATIONS_FROM_STOCK` with a reason and an exit condition, and
+`selfcheck.check_params` fails if the resolved dict deviates anywhere that
+dict does not name. That is the structural part: a pin can no longer be
+added by editing one dict.
+
+## What came out, and why the direction matters
+
+The comparator used to carry six more settings, every one of them chosen
+to match mojotrees or to match this harness rather than to match a user.
+All six are gone:
+
+- `min_data_in_bin = 1`, which forced LightGBM onto our old binner's
+  no-minimum-population rule. mojotrees now defaults to LightGBM's 3
+  (`src/mojotrees/binning.mojo`, and the `min_data_in_bin` row of
+  `docs/LIGHTGBM_PARITY.md`), so both merge the same rare levels.
+- `bin_construct_sample_cnt` at the training row count, which forced
+  LightGBM to fit its bin edges from every row while mojotrees fit them
+  from a 200000-row subsample. That is the pin *inverted*: the comparator
+  was doing strictly more binning work than we were, and every binning
+  ratio measured under it is wrong in our favor. mojotrees's default is
+  LightGBM's 200000 now, so neither library bins rows the other does not.
+  They do not draw the *same* 200000 rows (different streams, see the
+  `bin_construct_sample_cnt` row of `docs/LIGHTGBM_PARITY.md`), so above
+  200000 rows the two fit different edges from equally sized samples. That
+  is a real difference, it is stated, and no parameter fixes it.
+- `force_row_wise = true`, which chose LightGBM's histogram builder for
+  it. Stock LightGBM times both on the first iterations and keeps the
+  winner, which is what a user gets, so the comparator now runs against
+  whichever builder LightGBM itself decides is faster. That is the
+  strongest honest comparator and it retires the largest open caveat in
+  `bench/results/INSTRUCTION_AUDIT.md`. The cost is that the resolved
+  builder is no longer recoverable from a record; `engines._histogram_builder`
+  records that as a null with the reason rather than echoing the request.
+
+  **One open question comes with it, and it is not settled here.**
+  LightGBM's own documentation for `deterministic` says "you should also
+  set `force_col_wise=true` or `force_row_wise=true`", so dropping the
+  forced builder drops the companion setting its determinism advice names.
+  The evidence above is that the pairing did not deliver reproducibility
+  anyway: the `sparse_highdim` repeats that disagreed were taken with
+  `force_row_wise=true` and `deterministic=true` both set. Choosing the
+  comparator's algorithm for it is the larger distortion of the two, so
+  the builder pin goes and the observation is recorded in
+  `comparator_block()` where a reader meets it.
+- `zero_as_missing`, `min_gain_to_split` and `boost_from_average`, which
+  restated LightGBM's own defaults. They are recorded in
+  `LIGHTGBM_STOCK_DEFAULTS` instead of passed, which documents the same
+  fact without putting three parameters in every result's parameter
+  string that the comparator did not need.
+
+All four made the comparison easier for us in at least one respect, so a
+number taken before this change is not comparable with one taken after it
+and both benchmarks' old figures are marked "pinned configuration,
+superseded" rather than deleted.
+
+## What is still set, and what it would take to unset it
+
+- `deterministic = true`. The comparator itself, framed above.
+- `lambda_l2 = 1.0`, in `BASE_PARAMS` and therefore on both sides.
+  mojotrees defaults to 1.0 and LightGBM to 0.0, so it is set explicitly
+  on both or the comparison is between two different regularisers.
+- `feature_pre_filter = false`. On by default, it deletes features that
+  cannot satisfy `min_data_in_leaf` at Dataset construction time, which
+  removes them from the matrix, from the pool `feature_fraction` samples,
+  and from every feature index. That is a data change, not a training
+  change, and mojotrees does not do it, so leaving it on compares two
+  engines fitting different feature spaces. It comes out the day mojotrees
+  implements the filter and not before; a lane is on it.
+- `enable_bundle = false`, for the same reason and not for a different
+  one. Exclusive feature bundling merges mutually exclusive sparse
+  features before binning, which is again a change to the feature space.
+  mojotrees's EFB is reachable from Python now
+  (`bindings/_mojotrees.mojo` parses `enable_bundle`), so this is closer
+  to coming out than it was, but it cannot come out yet: the ranking
+  trainer does not apply a bundling plan at all and refuses an active
+  switch by name (`efb.check_bundling_honored`), so turning bundling on
+  for both engines would raise on one of the six scenarios rather than
+  compare it.
+- `verbosity = -1` and a fixed `seed`. Neither changes the model or the
+  work. The first keeps LightGBM's log out of the harness's stdout, which
+  the backend-proof parser reads; the second makes a repeat a repeat.
+
+Threads are matched by count, not by parameter name: LightGBM reads
+`num_threads`, mojotrees reads the MOJOTREES_NUM_WORKERS environment
+variable, and the runner sets both from one number before either library
+is imported.
+
+## What is NOT in the comparator
+
+`use_quantized_grad`. C9 was first registered as stock plus
+`use_quantized_grad=true`, with every mojotrees arm quantized, and that
+version was withdrawn the same day and before any measurement was taken
+under it. The amendment is at the top of C9. Nothing here sets it, on
+either side, and the CPU quantized-gradient lane continues on its own
+merits without gating publication of anything.
 
 Where a scenario cannot be aligned, it says so in `caveats` and the caveat
 is copied into every result record it produces. Silence about a known
@@ -86,22 +157,136 @@ BASE_PARAMS = {
     "use_missing": True,
 }
 
-#: LightGBM-only parameters that exist to remove a difference, not to tune.
-#: Every one is justified in the module docstring.
+#: The comparator's identity, carried by every run and every published
+#: table. Bump `COMPARATOR_VERSION` when the resolved dict changes in a way
+#: that makes two numbers non-comparable, which is any change to
+#: `LIGHTGBM_ALIGNMENT` other than a comment.
+COMPARATOR_ID = "stock+det"
+COMPARATOR_VERSION = 1
+COMPARATOR_LABEL = "LightGBM at stock defaults plus deterministic=true"
+COMPARATOR_REGISTERED = (
+    "bench/results/PROFILE_PROTOCOL.md section C9, as amended 2026-08-16"
+)
+
+#: Where every LightGBM default quoted in this module was read, so that a
+#: reader can check the table rather than trust it.
+LIGHTGBM_DEFAULTS_SOURCE = (
+    "microsoft/LightGBM include/LightGBM/config.h and docs/Parameters.rst, "
+    "checked at tag v4.7.0 and at master on 2026-08-16"
+)
+
+#: The minimum LightGBM this harness will run as the comparator.
 #:
-#: Two entries left here when mojotrees's binning defaults became LightGBM's
-#: stock defaults: `min_data_in_bin`, because both sides are 3 now, and
-#: `bin_construct_sample_cnt`, which was never in this dict but was injected
-#: per call by the engine adapters. Only `feature_pre_filter` remains of the
-#: binning pins, and only because the filter is not implemented on our side.
+#: LightGBM does not reject a parameter it does not know: it logs "Unknown
+#: parameter" and trains anyway, and this harness runs at verbosity -1
+#: where that line never appears. A build predating `deterministic` would
+#: therefore run nondeterministically and record itself as `stock+det`.
+#: 4.0 is also the floor for `Dataset.feature_num_bin`, which `_bin_profile`
+#: needs. Both adapters check before anything is fitted.
+LIGHTGBM_MIN_VERSION = (4, 0)
+
+#: What the comparator is: LightGBM's stock defaults, plus one switch.
+#:
+#: Five entries and no more. Every one of them is either the switch C9
+#: names, a deviation declared in `LIGHTGBM_DEVIATIONS_FROM_STOCK` with an
+#: exit condition, or a harness setting that changes neither the model nor
+#: the work. `selfcheck.check_comparator` fails if this dict grows an entry
+#: that is none of those, which is what stops a seventh setting from
+#: arriving as a one-line edit the way the previous six did.
 LIGHTGBM_ALIGNMENT = {
-    "enable_bundle": False,
-    "feature_pre_filter": False,
-    "zero_as_missing": False,
-    "force_row_wise": True,
     "deterministic": True,
+    "feature_pre_filter": False,
+    "enable_bundle": False,
     "verbosity": -1,
     "seed": 190019,
+}
+
+#: The three entries above that differ from LightGBM's stock default, each
+#: with the condition that removes it.
+LIGHTGBM_DEVIATIONS_FROM_STOCK = {
+    "deterministic": {
+        "stock": False,
+        "here": True,
+        "why": (
+            "the comparator itself, and the only deviation that is not a "
+            "feature-space pin. The mojotrees arm is reproducible across "
+            "thread counts at no cost, so this is the setting that makes the "
+            "two sides comparable rather than one that handicaps either. It "
+            "does not fully succeed: in the first real-data run LightGBM "
+            "produced two distinct prediction digests across three repeats "
+            "on sparse_highdim with this already set and a fixed seed, while "
+            "the mojotrees arm was bit-identical across all three"
+        ),
+        "removed_when": (
+            "never, while it is the comparator. LightGBM's documentation "
+            "records that it may slow training down, which is a cost on the "
+            "comparator's side and is accepted deliberately in exchange for "
+            "repeats that are repeats"
+        ),
+    },
+    "feature_pre_filter": {
+        "stock": True,
+        "here": False,
+        "why": (
+            "on by default it deletes features that cannot satisfy "
+            "min_data_in_leaf at Dataset construction, removing them from "
+            "the matrix, from the pool feature_fraction samples, and from "
+            "every feature index. That is a data change mojotrees does not "
+            "make, so leaving it on compares two engines fitting different "
+            "feature spaces. This is a load-bearing pin and not a leftover "
+            "from the pinned configuration that was just removed"
+        ),
+        "removed_when": (
+            "mojotrees implements the pre-filter, which a concurrent lane is "
+            "doing. Not before"
+        ),
+    },
+    "enable_bundle": {
+        "stock": True,
+        "here": False,
+        "why": (
+            "exclusive feature bundling merges mutually exclusive sparse "
+            "features before binning, which is the same kind of feature-space "
+            "change"
+        ),
+        "removed_when": (
+            "mojotrees's EFB is applied by every trainer this harness "
+            "reaches. It is reachable from Python now, but the ranking "
+            "trainer refuses an active bundling switch by name "
+            "(efb.check_bundling_honored), so turning it on for both engines "
+            "would raise on the ranking scenario rather than compare it"
+        ),
+    },
+}
+
+#: Entries that are in the dict but are not a deviation from anything: they
+#: change what the run reports, not what it computes.
+LIGHTGBM_HARNESS_SETTINGS = {
+    "verbosity": (
+        "keeps LightGBM's log out of the stdout stream run.py parses for "
+        "backend proof. The cost is that LightGBM's own report of which "
+        "histogram builder it chose is suppressed with it"
+    ),
+    "seed": "pins the fit so a repeat is a repeat",
+}
+
+#: LightGBM parameters this harness deliberately does NOT set, with the
+#: default it will therefore use. Recorded rather than passed. Two reasons:
+#: a parameter set to its own default is noise in every result's parameter
+#: string, and a reader still needs to know what ran. Every value here was
+#: read at LIGHTGBM_DEFAULTS_SOURCE.
+#:
+#: `use_quantized_grad` is in this table on purpose. C9 was first
+#: registered with it turned on and that version was withdrawn the same
+#: day, so a reader who has seen the first text needs to be able to
+#: confirm from the run itself that the comparator is not quantized.
+LIGHTGBM_STOCK_DEFAULTS = {
+    "use_quantized_grad": False,
+    "bin_construct_sample_cnt": 200000,
+    "min_data_in_bin": 3,
+    "force_row_wise": False,
+    "force_col_wise": False,
+    "zero_as_missing": False,
     "min_gain_to_split": 0.0,
     "boost_from_average": True,
 }
@@ -173,6 +358,116 @@ RANKING_PARAMS = {
 #: is never reported as a benchmark; `standard` is the default; `large` is
 #: opt-in and is the only tier that supports a scaling claim.
 TIERS = ("smoke", "standard", "large")
+
+
+def comparator_id():
+    """The one-line identity of the comparator, for a table header, a
+    parameter summary, or a CSV column."""
+    return f"{COMPARATOR_ID}@v{COMPARATOR_VERSION}"
+
+
+def comparator_block():
+    """Everything a published table has to state about what it was measured
+    against, as a dict, from the same constants the run uses.
+
+    This exists because the alternative is a convention. Four
+    comparator-configuration incidents in three days, three of them caught
+    only after a number had been published, all shared one property: the
+    result recorded the number and not the configuration that produced it.
+    A margin against a throttled comparator, a binning ratio against a
+    comparator forced to bin every row, a speculation figure that was a
+    tautology over a conditioned subset, and a gain form invalid under L1.
+    Every one of those numbers was real and every one was quoted for a
+    question it could not answer.
+
+    So the runner writes this into the manifest, into `records.json`, and
+    into a column of every CSV row, and prints it before the first cell
+    runs. A results file without it is missing a field rather than missing
+    a convention.
+
+    `reproducibility` is the field to read second. `deterministic=true` is
+    the whole of the deviation from stock that is not a feature-space pin,
+    and it is on because it costs the mojotrees arm nothing and gives the
+    comparator its best chance at repeats that are repeats. It is not a
+    guarantee, and the evidence that it is not is recorded here rather than
+    left to be rediscovered.
+    """
+    return {
+        "id": COMPARATOR_ID,
+        "version": COMPARATOR_VERSION,
+        "label": COMPARATOR_LABEL,
+        "registered": COMPARATOR_REGISTERED,
+        "one_line": comparator_id(),
+        "lightgbm_passed": dict(LIGHTGBM_ALIGNMENT),
+        "lightgbm_deviations_from_stock": copy.deepcopy(
+            LIGHTGBM_DEVIATIONS_FROM_STOCK
+        ),
+        "lightgbm_harness_settings": dict(LIGHTGBM_HARNESS_SETTINGS),
+        "lightgbm_left_at_stock": dict(LIGHTGBM_STOCK_DEFAULTS),
+        "lightgbm_defaults_source": LIGHTGBM_DEFAULTS_SOURCE,
+        "lightgbm_min_version": ".".join(str(p) for p in LIGHTGBM_MIN_VERSION),
+        "reproducibility": {
+            "why_deterministic": (
+                "the mojotrees arm is reproducible across thread counts at "
+                "no cost, so deterministic=true is the setting that makes "
+                "the two sides comparable rather than one that handicaps "
+                "either"
+            ),
+            "known_limit": (
+                "it does not fully succeed. In the first real-data run "
+                "LightGBM produced two distinct prediction digests across "
+                "three repeats on sparse_highdim, with deterministic=true "
+                "already set and a fixed seed, while the mojotrees arm was "
+                "bit-identical across all three"
+            ),
+            "documented_companion_setting_not_used": (
+                "LightGBM's documentation for deterministic says to set "
+                "force_col_wise or force_row_wise as well. This comparator "
+                "sets neither, because choosing the comparator's histogram "
+                "algorithm for it is the larger distortion. The digests that "
+                "disagreed above were taken with force_row_wise set, so the "
+                "pairing was not delivering reproducibility either"
+            ),
+            "gating": (
+                "thresholds.json gates the LightGBM side of the repeat "
+                "determinism check as non-gating, so a repeat that moves is "
+                "reported and not failed. The mojotrees side is gating"
+            ),
+        },
+        "like_for_like": True,
+        "like_for_like_reason": (
+            "both engines fit the same feature space, from the same bins, "
+            "with the same shared parameters, and neither runs quantized "
+            "gradients. A speed ratio and an accuracy differential taken "
+            "against this arm are comparable quantities, reported together"
+        ),
+    }
+
+
+def check_lightgbm_version(version):
+    """Raise unless this LightGBM is new enough to be the comparator.
+
+    LightGBM does not reject a parameter it does not know: it logs
+    "Unknown parameter" and trains anyway, and this harness runs at
+    verbosity -1 where that line never appears. An unguarded old build
+    would therefore ignore `deterministic`, train nondeterministically, and
+    record itself as `stock+det`. Called before anything is fitted.
+    """
+    parts = []
+    for piece in str(version).split(".")[:2]:
+        digits = "".join(c for c in piece if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 2:
+        parts.append(0)
+    if tuple(parts) < LIGHTGBM_MIN_VERSION:
+        want = ".".join(str(p) for p in LIGHTGBM_MIN_VERSION)
+        raise RuntimeError(
+            f"the comparator is {COMPARATOR_LABEL} and this harness needs "
+            f"LightGBM {want} or newer. This environment has {version}, "
+            "which would log 'Unknown parameter' at a verbosity this harness "
+            "suppresses and then train without it, producing a comparator "
+            "that records itself as stock+det and was not."
+        )
 
 
 def _scenario(**kw):
@@ -379,12 +674,26 @@ def shared_params(spec, extra=None):
 
 def lightgbm_params(spec, threads, extra=None):
     """`shared_params` translated into a LightGBM parameter dict, plus the
-    alignment settings.
+    comparator.
 
-    `bin_construct_sample_cnt` is filled in by the caller through `extra`
-    once the training row count is known, because it has to be at least
-    that count for LightGBM to bin from every row the way mojotrees does.
+    `extra` carries what the scenario cannot know, which after the C9
+    change is `num_class` and nothing else. It used to carry
+    `bin_construct_sample_cnt` at the training row count, injected by both
+    engine adapters, which forced LightGBM to fit its bin edges from every
+    row while mojotrees fit them from a 200000-row subsample. Both
+    injection sites are gone. A caller that puts it back is pinning the
+    comparator to a fit mojotrees is not doing, in the direction that
+    flatters us, so the two binning parameters are refused by name here
+    rather than merely not passed. A refusal is the only form of this rule
+    that survives somebody adding a third call site.
     """
+    for refused in ("bin_construct_sample_cnt", "min_data_in_bin"):
+        if refused in (extra or {}):
+            raise ValueError(
+                f"{refused} was passed to the comparator. Both are stock in "
+                f"{COMPARATOR_LABEL} and pinning either compares two "
+                "different binnings: see LIGHTGBM_STOCK_DEFAULTS and C9."
+            )
     shared = shared_params(spec, extra)
     params = {
         "objective": shared["objective"],
@@ -423,6 +732,11 @@ def mojotrees_params(spec, device, extra=None):
     MOJOTREES_NUM_WORKERS, which the runner sets in the environment before
     the extension is imported, and a parameter here would suggest there are
     two ways to set it.
+
+    Nothing on this side answers the comparator's `deterministic`, and
+    that is the point of the setting rather than an omission: mojotrees is
+    reproducible across thread counts with no parameter and no cost, so
+    there is nothing here to turn on.
     """
     shared = shared_params(spec, extra)
     params = {

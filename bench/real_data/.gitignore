@@ -18,8 +18,14 @@ data/
 # ignored directory". A path cannot be re-included once a parent directory
 # is excluded, so the run directories have to be un-excluded first and their
 # contents excluded separately.
+#
+# `RESULTS_TEMPLATE.md` is tracked for the same kind of reason: it is what
+# a published table is written from, including the comparator block that a
+# table has to carry, so it belongs beside the results rather than in
+# somebody's habits.
 results/*
 !results/README.md
+!results/RESULTS_TEMPLATE.md
 !results/*/
 results/*/*
 !results/*/summary.json

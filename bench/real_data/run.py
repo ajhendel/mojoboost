@@ -23,7 +23,25 @@ What this writes, under `results/<run_id>/`:
 Nothing in this directory is committed. `results/README.md` says why.
 
 The exit code reports whether the matrix ran, not whether the results were
-good. Quality is verify.py's decision and speed is nobody's.
+good. Quality is verify.py's decision and speed is nobody's. That
+separation is deliberate and is not what the exit codes below changed.
+
+    0   every cell that was meant to run produced a result
+    2   at least one cell produced NO RESULT AT ALL
+
+Two is an infrastructure failure and it is a different thing from a red
+verdict. It comes from an incident: `bench/real_data` had never been run,
+the first attempt produced 44 cells of which 27 failed, every mojotrees row
+died on `cannot import name '_mojotrees'` because nothing in the run path
+builds the extension, and the run was read as having happened. A cell that
+produced no result is now counted by a positive test rather than by a list
+of known-bad statuses, printed in a block that names every failed cell, and
+reported through an exit code that is not the one verify.py uses for a
+quality failure.
+
+Exit code 1 is deliberately unused here, so that a caller which only
+distinguishes zero from non-zero still fails, and a caller which reads the
+number can tell "the matrix did not run" from "the results were bad".
 """
 
 import argparse
@@ -43,6 +61,20 @@ import envinfo  # noqa: E402
 import scenarios  # noqa: E402
 
 DEFAULT_RESULTS = os.path.join(HERE, "results")
+
+#: Exit code for "at least one cell produced no result". Not 1, because
+#: verify.py returns 1 for a quality failure and the two are different
+#: findings: this one says the matrix did not run, and says nothing at all
+#: about whether the cells that did run were any good.
+EXIT_INFRASTRUCTURE = 2
+
+#: Substrings that mean the extension was never built. The first is what 27
+#: cells printed in the incident that produced these exit codes.
+MISSING_EXTENSION_MARKERS = (
+    "cannot import name '_mojotrees'",
+    "No module named 'mojotrees'",
+    "No module named '_mojotrees'",
+)
 
 #: Thread-count environment for a run. Every library that might spin up its
 #: own pool is pinned to the same number, so a background BLAS pool cannot
@@ -213,7 +245,8 @@ def run_job(job, run_dir, run_id, timeout):
 
 
 CSV_COLUMNS = (
-    "run_id", "scenario", "tier", "task", "data_kind", "dataset", "pinned",
+    "run_id", "comparator", "scenario", "tier", "task", "data_kind",
+    "dataset", "pinned",
     "engine", "engine_version", "device_requested", "device_used",
     "backend_proof", "threads",
     "histogram_builder", "repeat", "status", "primary_metric",
@@ -277,6 +310,11 @@ def _flat(record):
     bins = bins if isinstance(bins, dict) else {}
     return {
         "run_id": record.get("run_id"),
+        # On every row rather than once per file. A spreadsheet gets
+        # filtered, sorted, and pasted into somewhere else one row at a
+        # time, and a row that has left its file still has to say what it
+        # was measured against.
+        "comparator": scenarios.comparator_id(),
         "scenario": record.get("scenario"),
         "tier": record.get("tier"),
         "task": record.get("task"),
@@ -319,9 +357,108 @@ def _flat(record):
     }
 
 
+def comparator_banner():
+    """The comparator on the console, before the first cell runs.
+
+    Short enough to read and specific enough to check: the id, the label,
+    every parameter the comparator passes, and the one deviation from stock
+    that is not a feature-space pin, with the reason it is there. The full
+    block goes into the manifest and into records.json.
+    """
+    block = scenarios.comparator_block()
+    passed = " ".join(
+        f"{key}={value}" for key, value in sorted(block["lightgbm_passed"].items())
+    )
+    return (
+        f"comparator {block['one_line']}: {block['label']}\n"
+        f"  registered: {block['registered']}\n"
+        f"  lightgbm gets: {passed}\n"
+        f"  everything else is LightGBM's own default "
+        f"({block['lightgbm_defaults_source']})\n"
+        f"  deterministic=true: {block['reproducibility']['why_deterministic']}\n"
+        f"  and: {block['reproducibility']['known_limit']}"
+    )
+
+
+def _cell_error(record):
+    """One failed cell as (label, type, message)."""
+    error = record.get("error") or {}
+    name = record.get("label") or ".".join(
+        str(record.get(key))
+        for key in ("scenario", "engine", "device_requested", "threads")
+    )
+    return (
+        name,
+        error.get("type") or f"status={record.get('status')!r}",
+        (error.get("message") or "").strip().splitlines()[0][:200]
+        if error.get("message")
+        else "no error block; the record simply is not an ok result",
+    )
+
+
+def report_infrastructure_failure(failed, attempted, run_dir):
+    """Print the block that the incident this exists for did not have.
+
+    Every failed cell by name, the count against what was attempted, the
+    distinct causes once each, and the build hint when the cause is the one
+    that has actually happened. Written to stdout and to stderr, because a
+    long matrix scrolls and the last thing a reader sees should not be
+    "wrote records.json".
+    """
+    lines = [
+        "",
+        "=" * 72,
+        f"INFRASTRUCTURE FAILURE: {len(failed)} of {attempted} cells produced "
+        "no result.",
+        "=" * 72,
+        "",
+        "This is not a quality verdict. These cells did not run, so there is "
+        "nothing",
+        "for verify.py to judge and nothing in this run to quote. Anything "
+        "written",
+        f"under {run_dir} is a partial matrix.",
+        "",
+    ]
+    for name, kind, message in (_cell_error(r) for r in failed):
+        lines.append(f"  {name}: {kind}: {message}")
+    causes = sorted({kind for _, kind, _ in (_cell_error(r) for r in failed)})
+    lines.append("")
+    lines.append("distinct causes: " + ", ".join(causes))
+    blob = " ".join(str(_cell_error(r)) for r in failed)
+    if any(marker in blob for marker in MISSING_EXTENSION_MARKERS):
+        lines += [
+            "",
+            "The mojotrees extension is not importable, which is the failure "
+            "that produced",
+            "27 of 44 dead cells the first time this harness ran. Nothing in "
+            "this run path",
+            "builds it. Build it and run the matrix again:",
+            "",
+            "    pixi run build-python",
+            "",
+        ]
+    lines.append("=" * 72)
+    text = "\n".join(lines)
+    print(text)
+    print(text, file=sys.stderr)
+
+
 def write_outputs(run_dir, run_id, records, manifest):
     with open(os.path.join(run_dir, "records.json"), "w") as handle:
-        json.dump({"run_id": run_id, "records": records}, handle, indent=2, default=str)
+        json.dump(
+            {
+                "run_id": run_id,
+                # Beside the records, not only in the manifest. A records
+                # file that travels on its own still says which comparator
+                # produced it, which is the whole of the lesson from four
+                # comparator-configuration incidents in three days.
+                "comparator": scenarios.comparator_block(),
+                "records": records,
+            },
+            handle,
+            indent=2,
+            default=str,
+        )
         handle.write("\n")
     with open(os.path.join(run_dir, "records.csv"), "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(CSV_COLUMNS))
@@ -397,6 +534,11 @@ def main(argv=None):
         "run_id": run_id,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "arguments": vars(args),
+        # Not optional and not a convention. Every published table has to
+        # say which comparator produced it, so the runner writes the whole
+        # configuration into the manifest, into records.json, into a column
+        # of every CSV row, and onto the console before the first cell.
+        "comparator": scenarios.comparator_block(),
         "environment": envinfo.collect(),
         "jobs": jobs,
         "sequential": True,
@@ -409,6 +551,7 @@ def main(argv=None):
     runnable = [job for job in jobs if "skip" not in job]
     skipped = [job for job in jobs if "skip" in job]
     print(f"run {run_id}: {len(runnable)} runs, {len(skipped)} skipped")
+    print(comparator_banner())
     for job in skipped:
         print(f"  skip {label(job)}: {job['skip']}")
 
@@ -420,6 +563,7 @@ def main(argv=None):
         return 0
 
     records = []
+    runnable_records = []
     for job in runnable:
         print(f"  {label(job)} ... ", end="", flush=True)
         try:
@@ -435,12 +579,22 @@ def main(argv=None):
                 "repeat": job["repeat"],
                 "error": {"type": "Timeout", "message": f"exceeded {args.timeout}s"},
             }
+        record.setdefault("label", label(job))
         records.append(record)
+        # Held separately from the skips, because a skip is a decision the
+        # matrix made with a reason and a failure is a cell that was meant
+        # to produce a number and did not. Only this list is judged.
+        runnable_records.append(record)
         state = record.get("status")
         detail = ""
         if state == "ok":
             metric = record.get("primary_metric")
-            detail = f"{metric}={record['quality'].get(metric):.6g}"
+            value = (record.get("quality") or {}).get(metric)
+            # Formatted defensively. A cell that came back ok with a null
+            # metric used to raise TypeError here, which killed the runner
+            # in the middle of the matrix and threw away every record it
+            # had not written yet.
+            detail = f"{metric}={value:.6g}" if isinstance(value, float) else f"{metric}={value}"
         else:
             detail = (record.get("error") or {}).get("message", "")[:120]
         print(f"{state} {detail}")
@@ -456,14 +610,23 @@ def main(argv=None):
         )
 
     write_outputs(run_dir, run_id, records, manifest)
-    failed = [r for r in records if r.get("status") in ("error", "timeout")]
     print(f"\nwrote {run_dir}/records.json")
-    print(
-        "next: `python bench/real_data/verify.py "
-        f"{os.path.join(run_dir, 'records.json')}` for the correctness "
-        "verdict, then report.py for the timings."
-    )
-    return 1 if failed else 0
+
+    # A positive test, not a list of known-bad statuses. A record with no
+    # `status` field at all, or with a status nobody has thought of yet,
+    # used to fall through the old `status in ("error", "timeout")` filter
+    # and be counted as a cell that ran.
+    failed = [r for r in runnable_records if r.get("status") != "ok"]
+    if not failed:
+        print(
+            "next: `python bench/real_data/verify.py "
+            f"{os.path.join(run_dir, 'records.json')}` for the correctness "
+            "verdict, then report.py for the timings."
+        )
+        return 0
+
+    report_infrastructure_failure(failed, len(runnable_records), run_dir)
+    return EXIT_INFRASTRUCTURE
 
 
 if __name__ == "__main__":

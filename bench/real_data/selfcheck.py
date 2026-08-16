@@ -287,6 +287,167 @@ def check_params():
         check(mb["device"] == "cpu", f"{name}: mojotrees device did not survive translation")
 
 
+def check_comparator():
+    """The comparator is what it says it is, and cannot quietly grow.
+
+    There is exactly one comparator, `stock+det`: LightGBM at its own
+    defaults plus `deterministic=true`. Everything else it is passed has to
+    be declared, either as a deviation from stock with a reason and an exit
+    condition, or as a harness setting that changes neither the model nor
+    the work.
+
+    The failure this guards is not hypothetical and it is not slow to
+    happen. The previous comparator carried six settings that had accreted
+    one at a time, each defensible on its own, and together they described
+    an engine no user runs. Every one of them made the comparison easier
+    for us in at least one respect. A pin added by editing one dict now
+    fails here, in a check that trains nothing and takes a second.
+    """
+    import json
+
+    import scenarios
+
+    declared = set(scenarios.LIGHTGBM_DEVIATIONS_FROM_STOCK) | set(
+        scenarios.LIGHTGBM_HARNESS_SETTINGS
+    )
+    for key, value in scenarios.LIGHTGBM_ALIGNMENT.items():
+        check(
+            key in declared,
+            f"the comparator passes {key}={value!r} and declares it nowhere. "
+            "Add it to LIGHTGBM_DEVIATIONS_FROM_STOCK with a reason and a "
+            "removed_when, or to LIGHTGBM_HARNESS_SETTINGS if it changes "
+            "neither the model nor the work, or take it out",
+        )
+        check(
+            key not in scenarios.LIGHTGBM_STOCK_DEFAULTS,
+            f"{key} is both passed by the comparator and listed as left at "
+            "LightGBM's default. It cannot be both",
+        )
+
+    for key, entry in scenarios.LIGHTGBM_DEVIATIONS_FROM_STOCK.items():
+        check(
+            key in scenarios.LIGHTGBM_ALIGNMENT,
+            f"{key} is declared as a deviation from stock and is not passed",
+        )
+        check(
+            scenarios.LIGHTGBM_ALIGNMENT.get(key) == entry["here"],
+            f"{key} is declared as {entry['here']!r} and passed as "
+            f"{scenarios.LIGHTGBM_ALIGNMENT.get(key)!r}",
+        )
+        check(
+            entry["stock"] != entry["here"],
+            f"{key} is declared as a deviation from stock and its declared "
+            "stock value is what it passes, so it is not a deviation",
+        )
+        check(
+            bool(entry.get("why")) and bool(entry.get("removed_when")),
+            f"{key} deviates from stock without both a reason and the "
+            "condition that removes it",
+        )
+
+    spec = scenarios.resolve("dense_regression", "standard")
+    resolved = scenarios.lightgbm_params(spec, 4)
+    check(
+        resolved.get("deterministic") is True,
+        "the comparator is stock+det and the resolved dict does not set "
+        "deterministic",
+    )
+    check(
+        resolved.get("feature_pre_filter") is False,
+        "feature_pre_filter is load-bearing until mojotrees implements the "
+        "filter, and the resolved dict does not pin it off",
+    )
+    for absent in (
+        "bin_construct_sample_cnt",
+        "min_data_in_bin",
+        "force_row_wise",
+        "force_col_wise",
+        "use_quantized_grad",
+    ):
+        check(
+            absent not in resolved,
+            f"the resolved comparator sets {absent}={resolved.get(absent)!r}. "
+            "It is stock in stock+det: see LIGHTGBM_STOCK_DEFAULTS",
+        )
+
+    block = scenarios.comparator_block()
+    for field in (
+        "id", "label", "registered", "one_line", "lightgbm_passed",
+        "lightgbm_left_at_stock", "lightgbm_defaults_source",
+        "reproducibility", "like_for_like",
+    ):
+        check(field in block, f"comparator_block has no {field!r}")
+    try:
+        json.dumps(block)
+    except (TypeError, ValueError) as exc:
+        FAILURES.append(
+            f"comparator_block does not serialise, so no run can record it: {exc}"
+        )
+    check(
+        block.get("lightgbm_passed") == scenarios.LIGHTGBM_ALIGNMENT,
+        "comparator_block reports a different dict from the one the engines "
+        "are passed",
+    )
+
+
+def check_no_row_count_injection():
+    """No caller rebuilds the binning pin that was just removed.
+
+    `scenarios.lightgbm_params` refuses `bin_construct_sample_cnt` and
+    `min_data_in_bin` by name, which catches any call site at runtime. This
+    catches it before a run: `check_params` builds its dict from
+    `scenarios.lightgbm_params` and cannot see what an adapter adds to the
+    dict afterwards, and the two adapters are exactly where the row-count
+    injection lived. So the adapters' own source is read.
+
+    The source is parsed rather than grepped. Both files explain at length
+    why the parameter is not set, in comments and in docstrings, and that
+    explanation is the thing most worth keeping; a text search finds the
+    explanation and calls it the offence. What is looked for is the name
+    used as a value: a dict key, a subscript, or a keyword argument.
+    """
+    import ast
+
+    targets = {
+        "bench/real_data/engines.py": os.path.join(HERE, "engines.py"),
+        "bench/bench_lightgbm.py": os.path.join(
+            os.path.dirname(HERE), "bench_lightgbm.py"
+        ),
+    }
+    pinned = ("bin_construct_sample_cnt", "min_data_in_bin")
+    for name, path in targets.items():
+        try:
+            with open(path) as handle:
+                tree = ast.parse(handle.read(), filename=path)
+        except (OSError, SyntaxError) as exc:
+            FAILURES.append(f"{name} could not be parsed for the pin check: {exc}")
+            continue
+        prose = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                prose.add(id(node.value))
+        for node in ast.walk(tree):
+            hit = None
+            if isinstance(node, ast.keyword) and node.arg in pinned:
+                hit = node.arg
+            elif (
+                isinstance(node, ast.Constant)
+                and node.value in pinned
+                and id(node) not in prose
+            ):
+                hit = node.value
+            if hit is None:
+                continue
+            FAILURES.append(
+                f"{name}:{getattr(node, 'lineno', 0)} sets {hit} in code. "
+                "Both are stock in stock+det and both engines run the same "
+                "value; pinning either here makes the comparator bin "
+                "differently from us for a reason this repository imposed, "
+                "and the row-count form of it made the comparator do "
+                "strictly more binning work than mojotrees does"
+            )
+
+
 def check_metrics():
     import numpy as np
 
@@ -385,6 +546,8 @@ def main():
     if not FAILURES:
         check_registry(documents)
         check_params()
+        check_comparator()
+        check_no_row_count_injection()
         check_metrics()
         check_generators_are_pure()
         check_outputs()
