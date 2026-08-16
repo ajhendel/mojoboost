@@ -223,6 +223,21 @@ idempotent and every read site in this file applies it, which is what keeps
 the gathered path and the direct path adding identical Float64s -- and
 therefore keeps `compact_rows`, a policy decision, from moving a bin.
 
+**That is the default and not the only setting.** `derivative_precision`
+(`MOJOTREES_DERIVATIVE_PRECISION`) selects `float32`, everything above, or
+`float64`, which keeps per-row derivatives at full Float64 through the
+objective and every read site. It exists because the narrowing was a
+*measured* trade rather than a free win -- four orders of magnitude of
+CPU-versus-device agreement on `dense_regression`, and 9.4 percent of
+average precision on `imbalanced_binary` -- and this project ships a
+measured trade behind a switch. `DERIVATIVE_PRECISION_FLOAT32` and
+`DERIVATIVE_PRECISION_FLOAT64` carry the numbers and the mechanism;
+`docs/NUMERICS.md` section 1.6 carries the decision. The mechanism is a
+compile-time `NARROW` parameter on every kernel that reads a derivative, so
+the default arm's row loops are the instruction stream they were before the
+switch existed, and the `float64` arm gives up the gathered pair buffer and
+the row-blocked histograms because both are Float32 shapes.
+
 **A private histogram cell is an interleaved `(gradient, hessian)` pair.**
 `include/LightGBM/bin.h` has `typedef double hist_t`, `kHistEntrySize = 2 *
 sizeof(hist_t)`, `GET_GRAD(hist, i) = hist[(i) << 1]` and `GET_HESS(hist, i) =
@@ -288,6 +303,7 @@ device path does have a multiply and it is an Int32 one, argued in
 """
 
 from std.math import round
+from std.os import getenv
 from std.sys.info import simd_width_of
 from std.sys.intrinsics import PrefetchOptions, prefetch
 from std.time import perf_counter_ns
@@ -423,9 +439,37 @@ options say the same thing.
 
 
 @always_inline
+def derivative[narrow: Bool](v: Float64) -> Float64:
+    """One per-row derivative at the precision `derivative_precision` selected.
+
+    `narrow` is a **compile-time** parameter, and that is the whole mechanism
+    of the switch. At `True` this is `score_t` below and the emitted code is
+    the `fcvt`-pair the accumulate kernels have always had; at `False` it is
+    the identity and the compiler emits nothing at all. There is no runtime
+    test in any row loop, so the default path's instruction stream is
+    unchanged rather than merely-probably-unchanged, which is the property
+    this lane is required to hold and cannot measure.
+
+    The cost is paid in instantiations instead: every kernel that reads a
+    derivative carries `NARROW` alongside its interleave width, so the
+    accumulate ladder is compiled twice. See `DERIVATIVE_PRECISION_FLOAT32`
+    for the whole argument and for what `float64` gives up.
+    """
+    comptime if narrow:
+        return Float64(Float32(v))
+    else:
+        return v
+
+
+@always_inline
 def score_t(v: Float64) -> Float64:
     """One per-row derivative rounded to single precision, which is the
     precision LightGBM carries derivatives in.
+
+    `derivative[True]`, under the name the rest of the package (and four
+    tests) already import. Callers that have to honor `derivative_precision`
+    call `derivative[NARROW]` instead; this name means the narrowing
+    unconditionally and is what the `float32` default does everywhere.
 
     `include/LightGBM/meta.h` defines `typedef float score_t` unless
     `SCORE_T_USE_DOUBLE` is set, and every gradient and hessian in LightGBM
@@ -450,7 +494,122 @@ def score_t(v: Float64) -> Float64:
     `CONSTANT_HESSIAN` is 1.0, which is exactly representable in Float32, so
     the constant-hessian guarantee survives this untouched.
     """
-    return Float64(Float32(v))
+    return derivative[True](v)
+
+
+comptime DERIVATIVE_PRECISION_FLOAT32 = String("float32")
+"""The default `derivative_precision`, and LightGBM's precision profile.
+
+A per-row gradient and hessian is a Float32 quantity, narrowed at the
+objective (`boosting.fill_grad_hess`) and re-narrowed at every read site
+here, in `histogram_sparse.mojo` and in the row-major kernels. The
+re-narrowing is not redundant: `goss.apply_goss_scaling` and a weighted fit
+multiply a stored derivative into a value that is no longer
+Float32-representable, so a read site that trusted the store would be
+reading a Float64 the gather could not reproduce.
+
+**What the default costs, measured, and why it is still the default.** The
+first real-data run after the narrowing landed moved two things in opposite
+directions. Agreement between this package's own CPU and accelerator arms
+improved by four orders of magnitude on `dense_regression` (RMSE
+differential 1.6e-04 to 7.9e-09). Accuracy on `imbalanced_binary` fell on
+the CPU arm alone: average precision 0.0136 to 0.0123, a 9.4 percent
+relative drop, and AUC 0.7339 to 0.7279. The decision recorded in
+`docs/NUMERICS.md` is that Float32 stays the default because it is
+LightGBM's own profile and it puts this package at LightGBM's numbers,
+which is the parity the project is aiming at -- but a measured trade
+becomes a switch, and this is the switch.
+
+`DERIVATIVE_PRECISION_FLOAT64` restores full Float64 derivatives end to
+end. It is opt-in, it moves bits by design, and it is slower: see there.
+"""
+
+comptime DERIVATIVE_PRECISION_FLOAT64 = String("float64")
+"""`derivative_precision = "float64"`: per-row derivatives stay Float64.
+
+The objective stores what it computed and every read site reads it, so no
+derivative is rounded anywhere between the loss and the histogram cell.
+
+**Three things it gives up, all of them stated rather than hidden.**
+
+- **The gathered pair buffer.** `_gather_pairs` packs a row's `(gradient,
+  hessian)` into one Float64 word as two Float32 halves, which is exactly
+  the thing this setting refuses. Under `float64` the gather does not run
+  and every read goes through the row id, so a node pays two indirect loads
+  per row instead of one sequential one.
+- **The row-blocked private histograms.** The blocked kernel's only row
+  source is that pair buffer on the subset arm, so blocking is off under
+  `float64` in *both* builders. Both, deliberately: while only one of them
+  blocked, "growing on a bag is growing on the dataset of those rows" was
+  false by four ulp on a leaf value (see `_accumulate_full`), and turning
+  blocking off on one side only would reintroduce exactly that.
+- **Speed, therefore.** This arm is a correctness and accuracy instrument,
+  not a performance configuration, and a timing taken under it is not a
+  timing of this package's CPU path.
+
+What it does *not* give up: determinism across `MOJOTREES_NUM_WORKERS`,
+which the unblocked kernels hold more simply than the blocked ones do
+(every feature's summation stays inside one task at every task count, in
+row order).
+"""
+
+
+def derivative_precision_narrows() -> Bool:
+    """Whether per-row derivatives are narrowed to Float32, read from
+    `MOJOTREES_DERIVATIVE_PRECISION`.
+
+    `float64` selects Float64 derivatives; `float32`, unset, and anything
+    else select the narrowing default. It does not raise, because two of its
+    three callers sit in contexts that cannot
+    (`boosting._fill_softmax_grad_hess` is reached from
+    `boosting_rf._multiclass_rf_gradients`, which is not this lane's file to
+    add a `raises` to). A typo is diagnosed by
+    `check_derivative_precision` instead, which is called from every entry
+    that can raise; see there for the one gap that leaves and the one word
+    that closes it.
+
+    Read **once per fit** at `ConstHessianSettings.resolve()` and once per
+    round at `boosting.fill_grad_hess`. Never per node and never per row.
+    """
+    return getenv("MOJOTREES_DERIVATIVE_PRECISION") != (
+        DERIVATIVE_PRECISION_FLOAT64
+    )
+
+
+def check_derivative_precision() raises:
+    """Raise unless `MOJOTREES_DERIVATIVE_PRECISION` names a real setting.
+
+    A value that is neither `float32` nor `float64` nor unset is a typo, and
+    a typo that silently selected the default is precisely how an A/B runs
+    one arm under the other's label -- which has happened in this repository
+    once, and is why `const_hessian_allowed` above states the same rule.
+    Refusing is the package's rule; falling back is not.
+
+    Called from `ConstHessianSettings.resolve()` (once per fit) and from
+    `boosting.fill_grad_hess` (once per round). **The one path it does not
+    cover** is a multiclass or random-forest fit that resolves no snapshot
+    and never reaches `fill_grad_hess`, because its only derivative site is
+    `boosting._fill_softmax_grad_hess`, which cannot raise while
+    `boosting_rf._multiclass_rf_gradients` does not declare `raises`. That
+    is a one-word change in a file this lane does not own, and the report
+    names it.
+    """
+    var s = getenv("MOJOTREES_DERIVATIVE_PRECISION")
+    if (
+        s.byte_length() == 0
+        or s == DERIVATIVE_PRECISION_FLOAT32
+        or s == DERIVATIVE_PRECISION_FLOAT64
+    ):
+        return
+    raise Error(
+        "MOJOTREES_DERIVATIVE_PRECISION must be '",
+        DERIVATIVE_PRECISION_FLOAT32,
+        "' or '",
+        DERIVATIVE_PRECISION_FLOAT64,
+        "', got '",
+        s,
+        "'",
+    )
 
 
 @always_inline
@@ -584,6 +743,18 @@ struct ConstHessianSettings(Copyable, Movable):
     with the rest. It is a separate type only because `parallel.mojo` belongs
     to another owner this round, and a per-tree resolve was reachable without
     it. See the report for the field this would fold into.
+
+    **It is now misnamed, and knowingly so.** `narrow` below is
+    `derivative_precision`, which has nothing to do with the hessian plane.
+    It is here because this is the snapshot that already reaches every
+    histogram builder from every trainer that resolves one, and adding a
+    second parameter to those signatures would have meant editing
+    `tree.mojo`, which this lane does not own -- while adding a *field*
+    changes only `resolve()`, which this file owns, and every existing
+    threading site picks it up for free. The right name for the type is
+    `HistogramSettings`, or it folds into `DispatchSettings` with the rest;
+    both are renames across files this lane cannot touch, and the report
+    names them.
     """
 
     var allowed: Bool
@@ -593,22 +764,61 @@ struct ConstHessianSettings(Copyable, Movable):
     """`const_hessian_verify()`, i.e. `MOJOTREES_CONST_HESSIAN_VERIFY != 0`."""
 
     var resolved: Bool
-    """False for `unresolved()`, which sends every reader back to the live
-    environment read. The two fields above are then not consulted at all."""
+    """False for `unresolved()`, which sends the two const-hessian readers
+    back to the live environment read. Those two fields are then not
+    consulted at all. `narrow` is the exception and says why."""
+
+    var narrow: Bool
+    """`derivative_precision_narrows()`, i.e. `float32` rather than `float64`.
+
+    **Read from the snapshot unconditionally, even under the sentinel**,
+    which is the one place this type's semantics differ per field, so it is
+    worth stating exactly why rather than leaving it to be discovered.
+
+    The const-hessian fields read live under the sentinel because the read
+    is skipped entirely on the common path: `_resolve_const_hessian` returns
+    before touching the environment whenever the caller did not declare a
+    constant hessian, which is every multiclass, DART, random-forest, sparse
+    and distributed build. A derivative precision has no such early out --
+    every build needs it -- so a live read under the sentinel would put one
+    `getenv` and one `String` on **every histogram build** of exactly those
+    trainers. That is the per-node environment read `ConstHessianSettings`
+    was created to remove and the allocation class the alloc-churn lane
+    removed 42,300 of; paying it back to support an opt-in diagnostic is not
+    a trade this lane is willing to make.
+
+    So the sentinel means `float32`, the documented default, and
+    `derivative_precision` is honored wherever a fit resolves a snapshot --
+    which is every trainer that threads one, and any caller that hands one
+    in. A direct builder call that passes the sentinel while the environment
+    says `float64` is **not** a silently wrong answer: the objective stored
+    an un-narrowed Float64, the read site narrows it, and
+    `Float64(Float32(g))` at the read is bit for bit the value the store
+    would have written. Such a build produces the `float32` histogram, which
+    is what the sentinel says it produces.
+    """
 
     @staticmethod
-    def resolve() -> ConstHessianSettings:
-        """One read of each of the two variables."""
+    def resolve() raises -> ConstHessianSettings:
+        """One read of each of the three variables, once per fit, and the
+        one place a mistyped `MOJOTREES_DERIVATIVE_PRECISION` is refused on
+        the trainer paths that resolve a snapshot."""
+        check_derivative_precision()
         return ConstHessianSettings(
-            const_hessian_allowed(), const_hessian_verify(), True
+            const_hessian_allowed(),
+            const_hessian_verify(),
+            True,
+            derivative_precision_narrows(),
         )
 
     @staticmethod
     def unresolved() -> ConstHessianSettings:
-        """The sentinel: no `getenv`, three integer stores. `allowed` is set
+        """The sentinel: no `getenv`, four integer stores. `allowed` is set
         to the default the live read would return so that a misuse that
-        ignored `resolved` would still fail safe, but no reader ignores it."""
-        return ConstHessianSettings(True, False, False)
+        ignored `resolved` would still fail safe, but no reader ignores it;
+        `narrow` is set to the `float32` default and every reader *does*
+        consult it, for the reason its docstring gives."""
+        return ConstHessianSettings(True, False, False, True)
 
 
 def _resolve_const_hessian(
@@ -639,6 +849,17 @@ def _resolve_const_hessian_verify(
     if env.resolved:
         return env.verify
     return const_hessian_verify()
+
+
+@always_inline
+def _resolve_narrow(
+    env: ConstHessianSettings = ConstHessianSettings.unresolved(),
+) -> Bool:
+    """`derivative_precision` for one build: one field read, no branch on
+    `resolved`, no environment read. `ConstHessianSettings.narrow` carries
+    the whole argument for why this one field is not a live read under the
+    sentinel."""
+    return env.narrow
 
 
 @fieldwise_init
@@ -921,6 +1142,7 @@ def build_histogram(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises -> Histogram:
     """Build a full-dataset histogram from per-row gradients and hessians.
     With a non-empty `features`, only those features are accumulated and the
@@ -933,7 +1155,8 @@ def build_histogram(
     """
     var out = Histogram.zeroed(data.n_features, data.n_bins)
     build_histogram_into(
-        out, data, grad, hess, features, const_hessian, settings
+        out, data, grad, hess, features, const_hessian, settings,
+        const_hessian_env,
     )
     return out^
 
@@ -1008,10 +1231,21 @@ def build_histogram_into_scratch(
     # The three output buffers are passed as separate `mut` lists rather than
     # reached through `out`: a pointer taken from a struct field carries that
     # field's origin, which a worker closure cannot capture.
-    _accumulate_full(
-        out._grad, out._hess, out._count, scratch, data, grad, hess, features,
-        const_h, settings,
-    )
+    #
+    # The one runtime test the switch costs, taken once per build and never
+    # inside a loop: it selects between two compile-time instantiations of
+    # the whole accumulate, so neither arm's row loop contains a branch that
+    # the other arm put there.
+    if _resolve_narrow(const_hessian_env):
+        _accumulate_full[True](
+            out._grad, out._hess, out._count, scratch, data, grad, hess,
+            features, const_h, settings,
+        )
+    else:
+        _accumulate_full[False](
+            out._grad, out._hess, out._count, scratch, data, grad, hess,
+            features, const_h, settings,
+        )
 
 
 def _plan_accumulation(
@@ -1040,7 +1274,9 @@ def _plan_accumulation(
     )
 
 
-def _accumulate_full(
+def _accumulate_full[
+    NARROW: Bool
+](
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
     mut out_count: List[Int],
@@ -1066,7 +1302,17 @@ def _accumulate_full(
         n_features, n_bins, features, plan.excluded_ops, settings,
     )
 
-    if plan.blocked():
+    # Blocking is a `float32` shape. The subset builder's blocked kernel has
+    # the packed Float32 pair buffer as its only row source, so it cannot run
+    # under `float64`; and the two builders have to block *together* or not at
+    # all, because the four-ulp defect the paragraph below records is exactly
+    # what one-sided blocking produces. `DERIVATIVE_PRECISION_FLOAT64` states
+    # this as one of the three things that arm gives up.
+    var may_block = False
+    comptime if NARROW:
+        may_block = plan.blocked()
+
+    if may_block:
         # The full-dataset builder blocks on the same plan the subset builder
         # blocks on, which is a correctness requirement and not a speed one.
         # While it did not, "growing on a bag is growing on the dataset of
@@ -1105,27 +1351,27 @@ def _accumulate_full(
     # exactly.
     var group = plan.group_width
     if group >= 16:
-        _accumulate_full_at[16](
+        _accumulate_full_at[16, NARROW](
             out_grad, out_hess, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     elif group >= 8:
-        _accumulate_full_at[8](
+        _accumulate_full_at[8, NARROW](
             out_grad, out_hess, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     elif group >= 4:
-        _accumulate_full_at[4](
+        _accumulate_full_at[4, NARROW](
             out_grad, out_hess, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     elif group >= 2:
-        _accumulate_full_at[2](
+        _accumulate_full_at[2, NARROW](
             out_grad, out_hess, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
     else:
-        _accumulate_full_at[1](
+        _accumulate_full_at[1, NARROW](
             out_grad, out_hess, out_count, data, grad, hess, features,
             n_active, plan.group_count, plan.active_ops, const_h, settings,
         )
@@ -1186,7 +1432,7 @@ def _accumulate_full_blocked(
 
 
 def _accumulate_full_at[
-    GROUP: Int
+    GROUP: Int, NARROW: Bool
 ](
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
@@ -1343,7 +1589,7 @@ def _accumulate_full_at[
                 # construction, so the accumulation carries no information the
                 # count does not.
                 for r in range(n_rows):
-                    var g = score_t(grad_p.unsafe_load(r))
+                    var g = derivative[NARROW](grad_p.unsafe_load(r))
                     comptime for k in range(GROUP):
                         if k < owned:
                             var b = Int(base[k]) + Int(
@@ -1356,8 +1602,8 @@ def _accumulate_full_at[
                     # Contiguous: the whole dataset is one ascending walk, so
                     # the gradients, the hessians, and all `GROUP` binned
                     # columns are sequential streams.
-                    var g = score_t(grad_p.unsafe_load(r))
-                    var h = score_t(hess_p.unsafe_load(r))
+                    var g = derivative[NARROW](grad_p.unsafe_load(r))
+                    var h = derivative[NARROW](hess_p.unsafe_load(r))
                     comptime for k in range(GROUP):
                         if k < owned:
                             var b = Int(base[k]) + Int(
@@ -1407,6 +1653,7 @@ def build_histogram_subset(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises -> Histogram:
     """Build a histogram over a subset of rows (one tree node's rows). With a
     non-empty `features`, only those features are accumulated and the rest of
@@ -1418,7 +1665,7 @@ def build_histogram_subset(
     var out = Histogram.zeroed(data.n_features, data.n_bins)
     build_histogram_subset_into(
         out, data, grad, hess, rows, 0, len(rows), features, const_hessian,
-        settings,
+        settings, const_hessian_env,
     )
     return out^
 
@@ -1434,6 +1681,7 @@ def build_histogram_subset_into(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """`build_histogram_subset` over the window `rows[row_start :
     row_start + row_count]`, into a caller-owned buffer every cell of which
@@ -1452,7 +1700,7 @@ def build_histogram_subset_into(
     var pairs = List[Float64]()
     build_histogram_subset_into_scratch(
         out, pairs, data, grad, hess, rows, row_start, row_count, features,
-        const_hessian, settings,
+        const_hessian, settings, const_hessian_env,
     )
 
 
@@ -1522,11 +1770,21 @@ def build_histogram_subset_into_scratch(
     if const_h and _resolve_const_hessian_verify(const_hessian_env):
         _check_constant_hessian(hess, data.n_rows)
 
-    _accumulate_subset(
-        out._grad, out._hess, out._count, pairs,
-        data, grad, hess, rows, row_start, row_count, features, const_h,
-        settings,
-    )
+    # One runtime test per build, selecting between two compile-time
+    # instantiations; see `build_histogram_into_scratch` for why it is here
+    # and not inside a row loop.
+    if _resolve_narrow(const_hessian_env):
+        _accumulate_subset[True](
+            out._grad, out._hess, out._count, pairs,
+            data, grad, hess, rows, row_start, row_count, features, const_h,
+            settings,
+        )
+    else:
+        _accumulate_subset[False](
+            out._grad, out._hess, out._count, pairs,
+            data, grad, hess, rows, row_start, row_count, features, const_h,
+            settings,
+        )
 
 
 def _gather_pairs(
@@ -1563,6 +1821,14 @@ def _gather_pairs(
     `Float32(x)` -- and every un-gathered read site applies the same
     `score_t`, which is what keeps `compact_rows`, a policy decision, from
     changing a bin.
+
+    **This function has no `NARROW` parameter and never runs under
+    `derivative_precision = "float64"`.** The packing *is* the narrowing: a
+    Float64 derivative does not fit in half a Float64 word, so there is no
+    version of this that carries one. `_accumulate_subset` and
+    `_accumulate_subset_row_major` therefore leave `use_pairs` False on that
+    arm, and `DERIVATIVE_PRECISION_FLOAT64` records losing the gather as one
+    of the three things that setting costs.
     """
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
@@ -1578,7 +1844,9 @@ def _gather_pairs(
     dispatch_rows_with(settings, fill_pairs, n_sub, gather_ops)
 
 
-def _accumulate_subset(
+def _accumulate_subset[
+    NARROW: Bool
+](
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
     mut out_count: List[Int],
@@ -1623,11 +1891,22 @@ def _accumulate_subset(
     # gather to be a rounding error against its own accumulation. It cannot
     # move a bin: the gather and the direct read deliver the same Float64,
     # because `score_t` is idempotent and both apply it.
-    var use_pairs = plan.compact_rows or plan.blocked()
+    #
+    # Both of those are `float32` shapes and neither runs under `float64`.
+    # The gather's whole point is that the word it writes is two Float32, so
+    # a Float64 derivative cannot survive it; and the blocked kernel's only
+    # row source on this arm *is* that buffer. `DERIVATIVE_PRECISION_FLOAT64`
+    # states both, and `_accumulate_full` states why blocking has to go off
+    # in both builders together rather than in one.
+    var use_pairs = False
+    var blocked = False
+    comptime if NARROW:
+        use_pairs = plan.compact_rows or plan.blocked()
+        blocked = plan.blocked()
     if use_pairs:
         ensure_pair_capacity(pairs, n_sub)
     var part_off = n_sub if use_pairs else 0
-    if plan.blocked():
+    if blocked:
         var wanted = part_off + plan.block_scratch_floats()
         if len(pairs) < wanted:
             pairs.resize(wanted, 0.0)
@@ -1638,7 +1917,7 @@ def _accumulate_subset(
             settings,
         )
 
-    if plan.blocked():
+    if blocked:
         # The same ladder, over the blocked kernel. `plan.row_blocks` is a
         # value decision and not a scheduling one, so it is taken here and
         # never re-derived inside the kernel.
@@ -1678,35 +1957,35 @@ def _accumulate_subset(
     # The ladder, dispatched as in `_accumulate_full` above.
     var group = plan.group_width
     if group >= 16:
-        _accumulate_subset_at[16](
+        _accumulate_subset_at[16, NARROW](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     elif group >= 8:
-        _accumulate_subset_at[8](
+        _accumulate_subset_at[8, NARROW](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     elif group >= 4:
-        _accumulate_subset_at[4](
+        _accumulate_subset_at[4, NARROW](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     elif group >= 2:
-        _accumulate_subset_at[2](
+        _accumulate_subset_at[2, NARROW](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
             const_h, settings,
         )
     else:
-        _accumulate_subset_at[1](
+        _accumulate_subset_at[1, NARROW](
             out_grad, out_hess, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
@@ -1715,7 +1994,7 @@ def _accumulate_subset(
 
 
 def _accumulate_subset_at[
-    GROUP: Int
+    GROUP: Int, NARROW: Bool
 ](
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
@@ -1828,7 +2107,7 @@ def _accumulate_subset_at[
                 else:
                     for i_row in range(n_sub):
                         var r = rows_p.unsafe_load(i_row)
-                        var g = score_t(grad_p.unsafe_load(r))
+                        var g = derivative[NARROW](grad_p.unsafe_load(r))
                         comptime for k in range(GROUP):
                             if k < owned:
                                 var b = Int(base[k]) + Int(
@@ -1856,8 +2135,8 @@ def _accumulate_subset_at[
                 # row ids as they always were.
                 for i_row in range(n_sub):
                     var r = rows_p.unsafe_load(i_row)
-                    var g = score_t(grad_p.unsafe_load(r))
-                    var h = score_t(hess_p.unsafe_load(r))
+                    var g = derivative[NARROW](grad_p.unsafe_load(r))
+                    var h = derivative[NARROW](hess_p.unsafe_load(r))
                     comptime for k in range(GROUP):
                         if k < owned:
                             var b = Int(base[k]) + Int(
@@ -2138,6 +2417,13 @@ def _accumulate_blocked_at[
                                 )
                         i_row += 1
                 else:
+                    # `score_t` and not `derivative[NARROW]`, on purpose:
+                    # this kernel carries no `NARROW` parameter because it
+                    # runs only under `float32`. Blocking is off under
+                    # `float64` (`_accumulate_full` and `_accumulate_subset`
+                    # both say why), so the narrowing here is unconditional
+                    # because the setting that would switch it cannot reach
+                    # this code.
                     while i_row < r1:
                         var g = score_t(grad_p.unsafe_load(i_row))
                         comptime for k in range(GROUP):
@@ -2197,6 +2483,8 @@ def _accumulate_blocked_at[
                                 )
                         i_row += 1
                 else:
+                    # Unconditional for the reason the `const_h` arm above
+                    # gives: this kernel is `float32`-only.
                     while i_row < r1:
                         var g = score_t(grad_p.unsafe_load(i_row))
                         var h = score_t(hess_p.unsafe_load(i_row))
@@ -2916,6 +3204,7 @@ def build_histogram_subset_row_major(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises -> Histogram:
     """`build_histogram_subset` over the row-major view of the same data.
 
@@ -2928,7 +3217,7 @@ def build_histogram_subset_row_major(
     var pairs = List[Float64]()
     build_histogram_subset_row_major_into_scratch(
         out, pairs, data, grad, hess, rows, 0, len(rows), features,
-        const_hessian, settings,
+        const_hessian, settings, const_hessian_env,
     )
     return out^
 
@@ -2945,6 +3234,7 @@ def build_histogram_subset_row_major_into_scratch(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises:
     """The row-major twin of `build_histogram_subset_into_scratch`.
 
@@ -2967,18 +3257,27 @@ def build_histogram_subset_row_major_into_scratch(
             " set MOJOTREES_CPU_ROW_MAJOR=1 to have fit-time binning build it"
         )
     _check_features(features, data.n_features)
-    var const_h = _resolve_const_hessian(const_hessian)
-    if const_h and const_hessian_verify():
+    var const_h = _resolve_const_hessian(const_hessian, const_hessian_env)
+    if const_h and _resolve_const_hessian_verify(const_hessian_env):
         _check_constant_hessian(hess, data.n_rows)
 
-    _accumulate_subset_row_major(
-        out._grad, out._hess, out._count, pairs,
-        data, grad, hess, rows, row_start, row_count, features, const_h,
-        settings,
-    )
+    if _resolve_narrow(const_hessian_env):
+        _accumulate_subset_row_major[True](
+            out._grad, out._hess, out._count, pairs,
+            data, grad, hess, rows, row_start, row_count, features, const_h,
+            settings,
+        )
+    else:
+        _accumulate_subset_row_major[False](
+            out._grad, out._hess, out._count, pairs,
+            data, grad, hess, rows, row_start, row_count, features, const_h,
+            settings,
+        )
 
 
-def _accumulate_subset_row_major(
+def _accumulate_subset_row_major[
+    NARROW: Bool
+](
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
     mut out_count: List[Int],
@@ -3031,11 +3330,22 @@ def _accumulate_subset_row_major(
     # error against its own accumulation. It cannot move a bin -- `score_t` is
     # idempotent and both the gather and the direct read apply it, so the two
     # deliver the same Float64.
-    var use_pairs = plan.compact_rows or plan.blocked()
+    #
+    # Both are off under `float64`, for the reasons `_accumulate_subset`
+    # gives: the gathered word is two Float32, and this kernel's blocked arm
+    # reads nothing else -- `_accumulate_subset_row_major_blocked` is not even
+    # handed `grad` and `hess`. So the `float64` arm is the unblocked,
+    # ungathered ladder, exactly as on the feature-major side, which is what
+    # keeps the two layouts producing the same histogram under either setting.
+    var use_pairs = False
+    var blocked = False
+    comptime if NARROW:
+        use_pairs = plan.compact_rows or plan.blocked()
+        blocked = plan.blocked()
     if use_pairs:
         ensure_pair_capacity(pairs, n_sub)
 
-    if not plan.blocked():
+    if not blocked:
         if use_pairs:
             _gather_pairs(
                 pairs, grad, hess, rows, row_start, n_sub, plan.gather_ops,
@@ -3043,35 +3353,35 @@ def _accumulate_subset_row_major(
             )
         var group = plan.group_width
         if group >= 16:
-            _accumulate_subset_row_major_at[16](
+            _accumulate_subset_row_major_at[16, NARROW](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
                 settings,
             )
         elif group >= 8:
-            _accumulate_subset_row_major_at[8](
+            _accumulate_subset_row_major_at[8, NARROW](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
                 settings,
             )
         elif group >= 4:
-            _accumulate_subset_row_major_at[4](
+            _accumulate_subset_row_major_at[4, NARROW](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
                 settings,
             )
         elif group >= 2:
-            _accumulate_subset_row_major_at[2](
+            _accumulate_subset_row_major_at[2, NARROW](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
                 settings,
             )
         else:
-            _accumulate_subset_row_major_at[1](
+            _accumulate_subset_row_major_at[1, NARROW](
                 out_grad, out_hess, out_count, pairs, data, grad, hess,
                 rows, row_start, row_count, features, use_pairs,
                 n_active, plan.group_count, plan.active_ops, const_h,
@@ -3144,7 +3454,7 @@ def _zero_active_slices(
 
 
 def _accumulate_subset_row_major_at[
-    GROUP: Int
+    GROUP: Int, NARROW: Bool
 ](
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
@@ -3264,7 +3574,7 @@ def _accumulate_subset_row_major_at[
                     for i_row in range(n_sub):
                         var r = rows_p.unsafe_load(i_row)
                         var rec = r * stride
-                        var g = score_t(grad_p.unsafe_load(r))
+                        var g = derivative[NARROW](grad_p.unsafe_load(r))
                         comptime for k in range(GROUP):
                             if k < owned:
                                 var raw = Int(
@@ -3295,8 +3605,8 @@ def _accumulate_subset_row_major_at[
                 for i_row in range(n_sub):
                     var r = rows_p.unsafe_load(i_row)
                     var rec = r * stride
-                    var g = score_t(grad_p.unsafe_load(r))
-                    var h = score_t(hess_p.unsafe_load(r))
+                    var g = derivative[NARROW](grad_p.unsafe_load(r))
+                    var h = derivative[NARROW](hess_p.unsafe_load(r))
                     comptime for k in range(GROUP):
                         if k < owned:
                             var raw = Int(
@@ -3665,6 +3975,7 @@ def build_histogram_subset_by_layout_into_scratch(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises -> Int:
     """Build one node's histogram in the requested layout, and **return the
     layout that actually ran**.
@@ -3685,12 +3996,12 @@ def build_histogram_subset_by_layout_into_scratch(
     if chosen == BIN_LAYOUT_ROW_MAJOR:
         build_histogram_subset_row_major_into_scratch(
             out, pairs, data, grad, hess, rows, row_start, row_count,
-            features, const_hessian, settings,
+            features, const_hessian, settings, const_hessian_env,
         )
         return BIN_LAYOUT_ROW_MAJOR
     build_histogram_subset_into_scratch(
         out, pairs, data, grad, hess, rows, row_start, row_count, features,
-        const_hessian, settings,
+        const_hessian, settings, const_hessian_env,
     )
     return BIN_LAYOUT_FEATURE_MAJOR
 

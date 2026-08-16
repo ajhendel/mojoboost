@@ -20,8 +20,32 @@
     "LightGBM on the primary metric. Being better is not capped, but being",
     "much better is checked too: `implausible_better` catches the case where",
     "the two engines were not actually given the same problem, which looks",
-    "like a win and is a bug."
+    "like a win and is a bug.",
+    "",
+    "An absolute limit is only meaningful next to the size of the metric it",
+    "bounds. A limit larger than the metric cannot fail, and a gate that",
+    "cannot fail is worse than no gate because a green suite is read as",
+    "evidence. `_audit` below is the sweep that checks that, and it is worth",
+    "re-running whenever a scenario gains a variant: the failure it found was",
+    "not a wrong number, it was one number covering two variants whose metric",
+    "values differ by fifty times."
   ],
+  "_audit": {
+    "date": "2026-08-16",
+    "question": "For every absolute limit in this file, how large is it against the metric's typical value on every variant of its scenario?",
+    "method": "Metric values taken from the two stored runs (results/20260815T014842Z, results/20260815T023123Z, which carry the real variant of every scenario except ranking) and, for the synthetic variants those runs do not carry, from the generator's construction in generators.py. Ratio is limit divided by LightGBM's metric value, so a ratio near or above 1 is a gate that cannot fail.",
+    "findings": [
+      "imbalanced_binary / average_precision / primary: 0.02 absolute against 0.6814 real (2.9%) and against ~0.0136 synthetic (147%). BROKEN on the synthetic variant, and the implausible_better of 0.05 was worse (368%). FIXED in this commit by changing the kind to relative; see the scenario's changed/why_these_numbers/known_risk fields.",
+      "imbalanced_binary / auc / secondary: 0.005 absolute against 0.9510 real (0.5%). AUC is bounded near 1 on both variants and cannot collapse the way average precision does at a 0.5 percent positive rate, so an absolute band is the right kind here. Unchanged.",
+      "multiclass / accuracy / secondary: 0.01 absolute against 0.8572 real (1.2%). The synthetic variant is a softmax over seven skewed classes, so accuracy stays well above the 0.01 band. Unchanged.",
+      "ranking / ndcg@10 / primary: 0.02 absolute against 0.9914 (2.0%), and ndcg@5 0.025 against 0.9824 (2.5%). NDCG is bounded in [0, 1] and this scenario runs synthetic only, where every query is graded 0 to 4 so the metric cannot sit near zero. implausible_better of 0.05 is 5.0% and is if anything conservative for a bounded metric. Unchanged.",
+      "categorical_missing / auc / adult override: 0.01 absolute against 0.9274 (1.1%). Unchanged.",
+      "sparse_highdim / auc / primary: 0.01 absolute against 0.9938 (1.0%), and average_precision secondary 0.03 against 0.9937 (3.0%). Checked specifically because a sparse high-dimensional problem is where a rare positive class would be expected: it is not one. generators.sparse_highdim draws labels from logistic(1.5 * standardized latent), which is a balanced problem, so average precision sits near AUC on both variants. Unchanged.",
+      "defaults / device_agreement / max_abs_prediction_diff: 1e-3 absolute, but it bounds a per-ROW prediction difference rather than a metric, and verify.py already refuses to fail on it alone. Its companion primary_metric_relative of 0.005 is relative and is the gate that actually holds. Not a metric limit and not in scope. Worth recording that this is the gate that caught the Float32 average-precision regression the imbalanced_binary entry above describes, because its band was relative: it is doing its job and is deliberately untouched.",
+      "Baselines were checked separately and are a different shape: absolute_floor (0.65 auc, 0.85 auc, 0.70 auc) and absolute_improvement (0.05 ndcg) bound the metric itself rather than a difference between two metrics, so 'larger than the quantity it bounds' does not apply. None was changed."
+    ],
+    "conclusion": "One broken gate, in two fields of one entry, both fixed by changing the kind to relative. Nothing else in the file has an absolute limit within an order of magnitude of its metric's value on any variant. Nothing was loosened."
+  },
   "version": 1,
   "defaults": {
     "determinism": {
@@ -74,10 +98,13 @@
     "imbalanced_binary": {
       "primary_metric": "average_precision",
       "differential": {
-        "kind": "absolute",
-        "max_worse": 0.02,
-        "implausible_better": 0.05,
-        "rationale": "Average precision on a rare class is dominated by the ordering of a few hundred rows at the top of the ranking, so it is noisier than AUC on the same model. Two percentage points absolute is the noise band; more than that is a difference in the trees."
+        "kind": "relative",
+        "max_worse": 0.025,
+        "implausible_better": 0.07,
+        "rationale": "Average precision on a rare class is dominated by the ordering of a few hundred rows at the top of the ranking, so it is noisier than AUC on the same model. The band is relative because this metric's VALUE differs by fifty times between this scenario's two variants: bank_marketing sits near 0.68 and the synthetic variant, at a 0.5 percent positive rate, sits near 0.013. A relative band means the same thing on both.",
+        "changed": "2026-08-16, tightened. This gate could not fail on the synthetic variant and had to be replaced rather than adjusted. Previous value: {kind: absolute, max_worse: 0.02, implausible_better: 0.05}, with the rationale 'Two percentage points absolute is the noise band; more than that is a difference in the trees.' Two points absolute is 154 percent of a metric whose value is 0.013, so the limit was larger than the quantity it bounded and no result could cross it: a 9.4 percent relative regression on the CPU arm (average precision 0.0136 to 0.0123, when per-row derivatives went to Float32) sat comfortably inside it and was caught only because device_agreement's relative band happened to be watching. The old value was written for a metric near 1 and was never wrong there, which is why the fix is a change of KIND and not a smaller number.",
+        "why_these_numbers": "0.025 relative is TIGHTER than the value it replaces at every average precision below 0.8, and therefore on both variants: at bank_marketing's LightGBM value of 0.6814 it is 0.0170 absolute against the old 0.0200, and on the synthetic variant it is 0.00034 absolute against the old 0.0200, which is 59 times tighter. It fails the 9.4 percent regression above by a factor of 3.8 and leaves 7.9 times headroom over the only mojotrees-versus-LightGBM differential ever recorded on this metric (0.318 percent relative, 20260815T014842Z and 20260815T023123Z). implausible_better moves the same way for the same reason: 0.07 relative is 0.0477 absolute at bank_marketing against the old 0.05. Both are tightenings, which is the direction this file's preamble permits without a re-argument.",
+        "known_risk": "No mojotrees-versus-LightGBM differential has ever been RECORDED on this scenario's synthetic variant; both stored runs carry the real variant only. 0.025 is therefore derived from the real variant's measured differential and from the size of the regression it must catch, not from the synthetic variant's own noise. If the synthetic variant turns out to disagree with LightGBM by more than this for a reason that is not a regression, the number needs revisiting in a commit that says so. It does not need revisiting by being quietly raised on the morning it first goes red."
       },
       "secondary": {
         "auc": {"kind": "absolute", "max_worse": 0.005},

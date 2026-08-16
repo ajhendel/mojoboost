@@ -919,6 +919,64 @@ def monotone_method_name(method: Int) raises -> String:
 
 
 # ---------------------------------------------------------------------------
+# Derivative precision
+# ---------------------------------------------------------------------------
+
+comptime DERIV_PRECISION_FLOAT32 = 0
+"""`derivative_precision = "float32"`, the default: LightGBM's `score_t`.
+
+A per-row gradient and hessian is a Float32 quantity, narrowed at the
+objective and re-narrowed at every histogram read site. The whole argument,
+including the measured accuracy trade that made this a switch rather than a
+constant, is in `histogram.DERIVATIVE_PRECISION_FLOAT32` and in
+`docs/NUMERICS.md`.
+
+The codes are spelled here rather than imported from `histogram` because
+`binning` imports this module and `histogram` imports `binning`, so the
+import edge only goes one way. They are two integers and a pair of names,
+and `histogram.derivative_precision_narrows` is the single decision point
+that both sides agree with.
+"""
+
+comptime DERIV_PRECISION_FLOAT64 = 1
+"""`derivative_precision = "float64"`: per-row derivatives stay Float64.
+
+Opt-in, moves bits by design, and gives up the gathered pair buffer and the
+row-blocked histograms with it -- see
+`histogram.DERIVATIVE_PRECISION_FLOAT64`.
+"""
+
+
+def parse_derivative_precision(name: String) raises -> Int:
+    """The code for a `derivative_precision` value, refusing anything else.
+
+    Two names and no more. `double`, `f64`, `64` and the rest are not
+    LightGBM's spelling of anything and are not accepted, on the same rule
+    `parse_monotone_method` applies: a name that is not the parameter's name
+    is a mistake, and a mistake that resolved to the default would run one
+    arm of an A/B under the other's label.
+    """
+    if name == "float32":
+        return DERIV_PRECISION_FLOAT32
+    if name == "float64":
+        return DERIV_PRECISION_FLOAT64
+    raise Error(
+        "unknown derivative_precision '",
+        name,
+        "'; expected float32 or float64",
+    )
+
+
+def derivative_precision_name(precision: Int) raises -> String:
+    """The name for a precision code, for reporting."""
+    if precision == DERIV_PRECISION_FLOAT32:
+        return "float32"
+    if precision == DERIV_PRECISION_FLOAT64:
+        return "float64"
+    raise Error("unknown derivative_precision code ", precision)
+
+
+# ---------------------------------------------------------------------------
 # Forced splits
 # ---------------------------------------------------------------------------
 
@@ -1417,6 +1475,14 @@ struct ExtraTreeParams(Copyable, Movable):
     # step (`boosting._estimate_leaf_values`); iteration 1 is never recomputed,
     # so 1 and "absent" are the same code path and the same bits.
     var leaf_estimation_iterations: Int
+    # `derivative_precision`, the precision per-row gradients and hessians
+    # are carried at. `float32` is the default and is LightGBM's profile;
+    # `float64` is the opt-in arm of a measured trade. Not a LightGBM
+    # parameter name -- LightGBM makes this choice at compile time with
+    # `SCORE_T_USE_DOUBLE` -- and it is here rather than as an environment
+    # override only because it changes a fit's numbers, which is the line
+    # this package draws between a parameter and a `MOJOTREES_*` knob.
+    var derivative_precision: Int
 
     def __init__(out self):
         self.min_gain_to_split = 0.0
@@ -1436,6 +1502,7 @@ struct ExtraTreeParams(Copyable, Movable):
         self.quant_train_renew_leaf = False
         self.stochastic_rounding = True
         self.leaf_estimation_iterations = DEFAULT_LEAF_ESTIMATION_ITERATIONS
+        self.derivative_precision = DERIV_PRECISION_FLOAT32
 
     @staticmethod
     def default() -> ExtraTreeParams:
@@ -1471,6 +1538,7 @@ struct ExtraTreeParams(Copyable, Movable):
             or not self.forced.is_empty()
             or self.random_strength > 0.0
             or self.use_quantized_grad
+            or self.derivative_precision != DERIV_PRECISION_FLOAT32
         )
 
     def random_score_stdev(self) -> Float64:
@@ -1557,6 +1625,7 @@ struct ExtraTreeParams(Copyable, Movable):
         self.check_random_strength()
         self.check_quantized_grad()
         self.check_leaf_estimation()
+        self.check_derivative_precision()
         if self.monotone_method != MONOTONE_BASIC:
             raise Error(
                 "monotone_constraints_method '",
@@ -1722,6 +1791,52 @@ struct ExtraTreeParams(Copyable, Movable):
                 " integer accumulation exists and is reachable directly"
                 " through"
                 " quantized_gradient.build_histogram_subset_quantized_into_scratch"
+            )
+
+    def check_derivative_precision(self) raises:
+        """Range-check `derivative_precision`, and refuse `float64` by name
+        rather than ignoring it.
+
+        Runs whether or not it is set, so a nonsense code is reported when it
+        is set rather than when it is first used, which is the rule
+        `check_quantized_grad` states and this mirrors.
+
+        **`float64` is refused here, and the refusal is about wiring rather
+        than about the setting.** The switch itself is built and live: every
+        read site in `histogram.mojo`, `histogram_sparse.mojo` and the
+        row-major kernels honors it, and so does the objective in
+        `boosting.fill_grad_hess`. What is missing is the one hop from this
+        field to the fit -- `tree.mojo` would have to put
+        `params.extra.derivative_precision` on the `ConstHessianSettings` it
+        resolves, and `tree.mojo` is not this lane's file. Until that lands,
+        a value set here would train a Float32 model that reported success,
+        which is the silent downgrade this package refuses everywhere else.
+
+        The working entry is the environment: `MOJOTREES_DERIVATIVE_PRECISION
+        =float64` is read once per fit by `ConstHessianSettings.resolve()`
+        and once per round by `boosting.fill_grad_hess`, and reaches every
+        site the parameter would.
+        """
+        if (
+            self.derivative_precision != DERIV_PRECISION_FLOAT32
+            and self.derivative_precision != DERIV_PRECISION_FLOAT64
+        ):
+            raise Error(
+                "derivative_precision must be float32 or float64, got code ",
+                self.derivative_precision,
+            )
+        if self.derivative_precision != DERIV_PRECISION_FLOAT32:
+            raise Error(
+                "derivative_precision='",
+                derivative_precision_name(self.derivative_precision),
+                "' is recognized and the histogram and objective paths honor"
+                " it, but no trainer carries it from the parameters onto the"
+                " per-fit settings snapshot in this build, so setting it here"
+                " would train a float32 model that silently ignored it. Set"
+                " MOJOTREES_DERIVATIVE_PRECISION=float64 instead, which"
+                " reaches every site; the wiring that lifts this refusal is"
+                " one field on the ConstHessianSettings that tree.mojo"
+                " resolves",
             )
 
     def check(

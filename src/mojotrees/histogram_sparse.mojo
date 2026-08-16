@@ -25,7 +25,7 @@ two agree to floating-point rounding (counts agree exactly), the same
 trade-off the dense path already makes for sibling subtraction.
 """
 
-from .histogram import Histogram, _check_features, score_t
+from .histogram import Histogram, _check_features, derivative
 from .parallel import dispatch_features
 from .sparse import SparseBinnedMatrix
 
@@ -40,22 +40,44 @@ struct NodeTotals(Copyable, Movable):
 
 
 def sum_rows(
-    grad: List[Float64], hess: List[Float64], rows: List[Int]
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    narrow: Bool = True,
 ) -> NodeTotals:
+    """`narrow` is `histogram.derivative_precision`; True is the default and
+    the loop it selects is the one that shipped, instruction for
+    instruction. Two loops rather than one loop with a test in it, which is
+    the shape `histogram._accumulate_subset_at` uses for `compact` and for
+    the same reason: a branch that is constant for the whole call has no
+    business being re-evaluated once per row."""
     var g = 0.0
     var h = 0.0
-    for i in range(len(rows)):
-        g += score_t(grad[rows[i]])
-        h += score_t(hess[rows[i]])
+    if narrow:
+        for i in range(len(rows)):
+            g += derivative[True](grad[rows[i]])
+            h += derivative[True](hess[rows[i]])
+    else:
+        for i in range(len(rows)):
+            g += derivative[False](grad[rows[i]])
+            h += derivative[False](hess[rows[i]])
     return NodeTotals(g, h, len(rows))
 
 
-def sum_all(grad: List[Float64], hess: List[Float64]) -> NodeTotals:
+def sum_all(
+    grad: List[Float64], hess: List[Float64], narrow: Bool = True
+) -> NodeTotals:
+    """`sum_rows` over every row; `narrow` means what it means there."""
     var g = 0.0
     var h = 0.0
-    for r in range(len(grad)):
-        g += score_t(grad[r])
-        h += score_t(hess[r])
+    if narrow:
+        for r in range(len(grad)):
+            g += derivative[True](grad[r])
+            h += derivative[True](hess[r])
+    else:
+        for r in range(len(grad)):
+            g += derivative[False](grad[r])
+            h += derivative[False](hess[r])
     return NodeTotals(g, h, len(grad))
 
 
@@ -207,8 +229,41 @@ def build_histogram_sparse_node(
     node: SparseNodeEntries,
     totals: NodeTotals,
     features: List[Int] = [],
+    narrow: Bool = True,
 ) raises -> Histogram:
     """Histogram of one tree node from its grouped entry ranges.
+
+    `narrow` is `histogram.derivative_precision`, and the one runtime test
+    it costs is taken here, once per build, to select between two
+    compile-time instantiations of the accumulation. Neither arm's entry
+    loop contains a branch the other put there; at the default the emitted
+    loop is the one that shipped. `totals` must have been summed at the same
+    setting (`sum_rows(..., narrow)`), because the leftover assigned to the
+    default bin is `totals` minus what the stored entries accumulated, and a
+    mismatch would put the rounding difference of the whole node into one
+    bin.
+    """
+    if narrow:
+        return _build_histogram_sparse_node_at[True](
+            data, grad, hess, order, node, totals, features
+        )
+    return _build_histogram_sparse_node_at[False](
+        data, grad, hess, order, node, totals, features
+    )
+
+
+def _build_histogram_sparse_node_at[
+    NARROW: Bool
+](
+    data: SparseBinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    order: SparseEntryOrder,
+    node: SparseNodeEntries,
+    totals: NodeTotals,
+    features: List[Int] = [],
+) raises -> Histogram:
+    """`build_histogram_sparse_node` at one derivative precision.
 
     `totals` must be the node's summed gradient, hessian, and row count; the
     leftover after the stored entries is what lands in each feature's default
@@ -256,8 +311,8 @@ def build_histogram_sparse_node(
             var e = order_p.unsafe_load(i)
             var r = entry_row_p.unsafe_load(e)
             var b = base + Int(entry_bin_p.unsafe_load(e))
-            var gr = score_t(grad_p.unsafe_load(r))
-            var he = score_t(hess_p.unsafe_load(r))
+            var gr = derivative[NARROW](grad_p.unsafe_load(r))
+            var he = derivative[NARROW](hess_p.unsafe_load(r))
             gp.unsafe_store(b, gp.unsafe_load(b) + gr)
             hp.unsafe_store(b, hp.unsafe_load(b) + he)
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
@@ -284,8 +339,12 @@ def build_histogram_sparse(
     grad: List[Float64],
     hess: List[Float64],
     features: List[Int] = [],
+    narrow: Bool = True,
 ) raises -> Histogram:
-    """Full-dataset sparse histogram."""
+    """Full-dataset sparse histogram. `narrow` is
+    `histogram.derivative_precision` and reaches the totals and the
+    accumulation together, which is the pairing
+    `build_histogram_sparse_node` requires."""
     var order = SparseEntryOrder(data.nnz())
     return build_histogram_sparse_node(
         data,
@@ -293,8 +352,9 @@ def build_histogram_sparse(
         hess,
         order,
         SparseNodeEntries.root(data),
-        sum_all(grad, hess),
+        sum_all(grad, hess, narrow),
         features,
+        narrow,
     )
 
 
@@ -304,8 +364,33 @@ def build_histogram_sparse_subset(
     hess: List[Float64],
     rows: List[Int],
     features: List[Int] = [],
+    narrow: Bool = True,
 ) raises -> Histogram:
     """Sparse histogram over an arbitrary row subset.
+
+    `narrow` is `histogram.derivative_precision`; see
+    `build_histogram_sparse_node`. It reaches the node totals as well as the
+    accumulation, which is the part that has to agree.
+    """
+    if narrow:
+        return _build_histogram_sparse_subset_at[True](
+            data, grad, hess, rows, features
+        )
+    return _build_histogram_sparse_subset_at[False](
+        data, grad, hess, rows, features
+    )
+
+
+def _build_histogram_sparse_subset_at[
+    NARROW: Bool
+](
+    data: SparseBinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    features: List[Int] = [],
+) raises -> Histogram:
+    """`build_histogram_sparse_subset` at one derivative precision.
 
     Filters each feature's whole column against a row-membership mask, so it
     costs O(nnz) regardless of subset size. Tree growth instead keeps the
@@ -340,7 +425,7 @@ def build_histogram_sparse_subset(
     var c = List[Int](capacity=size)
     c.resize(size, 0)
 
-    var totals = sum_rows(grad, hess, rows)
+    var totals = sum_rows(grad, hess, rows, NARROW)
     var gp = g.unsafe_ptr()
     var hp = h.unsafe_ptr()
     var cp = c.unsafe_ptr()
@@ -369,8 +454,8 @@ def build_histogram_sparse_subset(
             if member_p.unsafe_load(r) == 0:
                 continue
             var b = base + Int(entry_bin_p.unsafe_load(e))
-            var gr = score_t(grad_p.unsafe_load(r))
-            var he = score_t(hess_p.unsafe_load(r))
+            var gr = derivative[NARROW](grad_p.unsafe_load(r))
+            var he = derivative[NARROW](hess_p.unsafe_load(r))
             gp.unsafe_store(b, gp.unsafe_load(b) + gr)
             hp.unsafe_store(b, hp.unsafe_load(b) + he)
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)

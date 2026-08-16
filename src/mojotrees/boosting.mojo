@@ -86,8 +86,10 @@ from .objective_registry import (
 from .cegb import CegbLedger, check_cegb_continued_training
 from .histogram import (
     ConstHessianSettings,
+    check_derivative_precision,
+    derivative,
+    derivative_precision_narrows,
     objective_has_constant_hessian,
-    score_t,
 )
 from .linear_tree import (
     LinearEnsemble,
@@ -489,6 +491,20 @@ def fill_grad_hess(
     1.0, exactly representable in Float32, and the unweighted arms of
     `SQUARED_ERROR`, `L1`, `HUBER` and `QUANTILE` still write exactly it.
 
+    **`derivative_precision` decides whether it narrows at all.** The
+    narrowing is the default and is what the paragraphs above describe;
+    `float64` stores what the objective computed. The setting is read here,
+    from the environment, **once per call** -- which is once per round, not
+    once per node and not once per row -- and it then selects between two
+    compile-time instantiations of the row loops below, so neither arm's
+    loop carries a test the other put there. This is the objective side of
+    the switch; `histogram.ConstHessianSettings.narrow` is the read side,
+    and it is a snapshot field rather than a live read for the reason
+    stated there.
+
+    Reading it live here is what makes the setting reach a fit that never
+    resolves a snapshot: this entry is on every trainer's path.
+
     Public because it is the gradient-generation stage the CPU profiler times
     (bench/bench_profile.mojo); training calls it through the same entry.
     """
@@ -501,12 +517,20 @@ def fill_grad_hess(
         grad.resize(n, 0.0)
     if len(hess) != n:
         hess.resize(n, 0.0)
-    _fill_grad_hess_into(
-        grad, hess, raw, target, objective, weights, alpha, n, settings
-    )
+    check_derivative_precision()
+    if derivative_precision_narrows():
+        _fill_grad_hess_into[True](
+            grad, hess, raw, target, objective, weights, alpha, n, settings
+        )
+    else:
+        _fill_grad_hess_into[False](
+            grad, hess, raw, target, objective, weights, alpha, n, settings
+        )
 
 
-def _fill_grad_hess_into(
+def _fill_grad_hess_into[
+    NARROW: Bool
+](
     mut grad: List[Float64],
     mut hess: List[Float64],
     raw: List[Float64],
@@ -535,11 +559,11 @@ def _fill_grad_hess_into(
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var p = _sigmoid(raw_p.unsafe_load(r))
-                gp.unsafe_store(r, score_t(w * (p - tgt_p.unsafe_load(r))))
+                gp.unsafe_store(r, derivative[NARROW](w * (p - tgt_p.unsafe_load(r))))
                 var h = p * (1.0 - p)
                 if h < 1e-16:
                     h = 1e-16
-                hp.unsafe_store(r, score_t(w * h))
+                hp.unsafe_store(r, derivative[NARROW](w * h))
         elif objective == GAMMA:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
@@ -548,8 +572,8 @@ def _fill_grad_hess_into(
                 var y_over_mu = tgt_p.unsafe_load(r) * exp(
                     -raw_p.unsafe_load(r)
                 )
-                gp.unsafe_store(r, score_t(w * (1.0 - y_over_mu)))
-                hp.unsafe_store(r, score_t(w * y_over_mu))
+                gp.unsafe_store(r, derivative[NARROW](w * (1.0 - y_over_mu)))
+                hp.unsafe_store(r, derivative[NARROW](w * y_over_mu))
         elif objective == TWEEDIE:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
@@ -559,10 +583,10 @@ def _fill_grad_hess_into(
                 # 2 - rho > 0 and the hessian below stays nonnegative.
                 var e1 = exp((1.0 - alpha) * raw_r)
                 var e2 = exp((2.0 - alpha) * raw_r)
-                gp.unsafe_store(r, score_t(w * (-y * e1 + e2)))
+                gp.unsafe_store(r, derivative[NARROW](w * (-y * e1 + e2)))
                 hp.unsafe_store(
                     r,
-                    score_t(
+                    derivative[NARROW](
                         w * (-y * (1.0 - alpha) * e1 + (2.0 - alpha) * e2)
                     ),
                 )
@@ -574,63 +598,63 @@ def _fill_grad_hess_into(
                 # a relative one, which is what MAPE measures.
                 var lw = w * _mape_label_weight(y)
                 gp.unsafe_store(
-                    r, score_t(lw * _sign(raw_p.unsafe_load(r) - y))
+                    r, derivative[NARROW](lw * _sign(raw_p.unsafe_load(r) - y))
                 )
-                hp.unsafe_store(r, score_t(lw))
+                hp.unsafe_store(r, derivative[NARROW](lw))
         elif objective == FAIR:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var d = raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)
                 var denom = abs(d) + alpha
-                gp.unsafe_store(r, score_t(w * alpha * d / denom))
-                hp.unsafe_store(r, score_t(w * alpha * alpha / (denom * denom)))
+                gp.unsafe_store(r, derivative[NARROW](w * alpha * d / denom))
+                hp.unsafe_store(r, derivative[NARROW](w * alpha * alpha / (denom * denom)))
         elif objective == POISSON:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var raw_r = raw_p.unsafe_load(r)
                 var mu = exp(raw_r)
-                gp.unsafe_store(r, score_t(w * (mu - tgt_p.unsafe_load(r))))
+                gp.unsafe_store(r, derivative[NARROW](w * (mu - tgt_p.unsafe_load(r))))
                 hp.unsafe_store(
-                    r, score_t(w * exp(raw_r + _POISSON_MAX_DELTA_STEP))
+                    r, derivative[NARROW](w * exp(raw_r + _POISSON_MAX_DELTA_STEP))
                 )
         elif objective == HUBER:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var diff = raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)
                 if abs(diff) <= alpha:
-                    gp.unsafe_store(r, score_t(w * diff))
+                    gp.unsafe_store(r, derivative[NARROW](w * diff))
                 else:
-                    gp.unsafe_store(r, score_t(w * _sign(diff) * alpha))
-                hp.unsafe_store(r, score_t(w))
+                    gp.unsafe_store(r, derivative[NARROW](w * _sign(diff) * alpha))
+                hp.unsafe_store(r, derivative[NARROW](w))
         elif objective == QUANTILE:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var diff = raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)
                 if diff >= 0.0:
-                    gp.unsafe_store(r, score_t(w * (1.0 - alpha)))
+                    gp.unsafe_store(r, derivative[NARROW](w * (1.0 - alpha)))
                 else:
-                    gp.unsafe_store(r, score_t(w * -alpha))
-                hp.unsafe_store(r, score_t(w))
+                    gp.unsafe_store(r, derivative[NARROW](w * -alpha))
+                hp.unsafe_store(r, derivative[NARROW](w))
         elif objective == L1:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 gp.unsafe_store(
                     r,
-                    score_t(
+                    derivative[NARROW](
                         w * _sign(raw_p.unsafe_load(r) - tgt_p.unsafe_load(r))
                     ),
                 )
-                hp.unsafe_store(r, score_t(w))
+                hp.unsafe_store(r, derivative[NARROW](w))
         else:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 gp.unsafe_store(
                     r,
-                    score_t(
+                    derivative[NARROW](
                         w * (raw_p.unsafe_load(r) - tgt_p.unsafe_load(r))
                     ),
                 )
-                hp.unsafe_store(r, score_t(w))
+                hp.unsafe_store(r, derivative[NARROW](w))
 
     # A row here is a handful of flops on three sequential arrays, perhaps a
     # sixteenth of the cost of a histogram op's scattered read-modify-write,
@@ -2479,7 +2503,33 @@ def _fill_softmax_grad_hess(
     LightGBM's derivatives are `float`, the histogram kernels narrow every
     derivative they read anyway, and narrowing at the source is what keeps
     this class's numbers the same whichever accumulation path a node takes.
+
+    `derivative_precision` reaches this the same way it reaches
+    `fill_grad_hess`: read once per call, which is once per class per round,
+    and used to select a compile-time instantiation of the row loop.
     """
+    if derivative_precision_narrows():
+        _fill_softmax_grad_hess_at[True](
+            prob, labels, k, n_classes, weights, grad, hess
+        )
+    else:
+        _fill_softmax_grad_hess_at[False](
+            prob, labels, k, n_classes, weights, grad, hess
+        )
+
+
+def _fill_softmax_grad_hess_at[
+    NARROW: Bool
+](
+    prob: List[Float64],
+    labels: List[Int],
+    k: Int,
+    n_classes: Int,
+    weights: List[Float64],
+    mut grad: List[Float64],
+    mut hess: List[Float64],
+):
+    """`_fill_softmax_grad_hess` at one derivative precision."""
     grad.clear()
     hess.clear()
     var factor = Float64(n_classes) / Float64(n_classes - 1)
@@ -2487,7 +2537,7 @@ def _fill_softmax_grad_hess(
         var p = prob[r * n_classes + k]
         var y = 1.0 if labels[r] == k else 0.0
         var w = weights[r] if len(weights) > 0 else 1.0
-        grad.append(score_t(w * (p - y)))
+        grad.append(derivative[NARROW](w * (p - y)))
         # LightGBM softmax hessian: (k / (k - 1)) * p * (1 - p), floored
         # (multiclass_objective.hpp, factor_). At two classes the factor is
         # 2, which is where the old hardcoded 2.0 came from; at seven
@@ -2498,7 +2548,7 @@ def _fill_softmax_grad_hess(
         var h = factor * p * (1.0 - p)
         if h < 1e-16:
             h = 1e-16
-        hess.append(score_t(w * h))
+        hess.append(derivative[NARROW](w * h))
 
 
 def _multiclass_goss_select(
