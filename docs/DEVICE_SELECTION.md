@@ -224,6 +224,7 @@ raises on it and `"auto"` takes the CPU:
 | `MOJOTREES_CONST_HESSIAN_VERIFY=1` | `const-hessian-verify` | the audit walks the host hessian array, which only the CPU builders do; `_check_gpu_const_hessian_verify` there |
 | `boosting_type='ordered'` | `ordered-boosting` | the per-permutation rung planes are built in `src/mojotrees/ordered_boosting.mojo` and advanced by `boosting.train`; no device trainer builds them. Trainer halves: `_check_gpu_booster_params` and `_refuse_unhonored` in `train_gpu_sparse.mojo` |
 | `score_function` other than `L2` | `score-function` | the device split search computes `G^2/(H+lambda)` only, which is CatBoost's `score_function=L2`; no accelerator path evaluates the Cosine ratio |
+| `random_strength` above zero | `random-strength` | the per-candidate noise is scaled by a per-tree standard deviation over the round's gradients, and no accelerator round loop computes it; the trainers refuse it too, but only from inside the grower, after a backend has already been chosen |
 
 The four before the last two arrived together on 2026-08-16 from the refusal
 sweep, and each of them was, until that day, accepted and silently not
@@ -392,10 +393,24 @@ measurement.
 
 **The table is native, not Python.** It lives in
 `crossover_rules()` in `src/mojotrees/device_policy.mojo`, carries
-`POLICY_VERSION = 7`, and holds two rules. Version 7 added two blocks and
-moved no rule, so the table is unchanged from version 6; the bump exists
-because a request that sets `boosting_type='ordered'` or a non-L2
-`score_function` gets a different answer than it did under 6. The Python module no longer
+`POLICY_VERSION = 8`, and holds two rules. Versions 7 and 8 added blocks and
+moved no rule, so the table is unchanged from version 6; the bumps exist
+because a request that sets `boosting_type='ordered'`, a non-L2
+`score_function`, or `random_strength` above zero gets a different answer than
+it did before.
+
+**Version 8 is also the first block added to preserve a FALLBACK rather than to
+add a refusal, and the distinction is the rule to carry forward.** The trainers
+already refused `random_strength` on every accelerator path. What they did not
+do was refuse it *in time*: they raise from inside the grower, after `auto` has
+already chosen the accelerator on shape, so the fit died where it should have
+been routed. A block does two jobs -- it refuses a configuration, and it is
+often the only thing making `auto` route instead of fail. **So a block may be
+retired only when no downstream refusal would still fire for the same fit.**
+Retiring `BLOCK_SCORE_FUNCTION` when the device learns Cosine, with nothing
+here for `random_strength`, would have turned the shipped default from a
+working CPU fit into a raising one -- not by anybody introducing a bug, but as
+a consequence of doing the scheduled thing. The Python module no longer
 defines `RULES_VERSION`, `CROSSOVER_RULES`, or a `CrossoverRule` type at
 all: it formats the native decision and adds nothing to it, so a rule that
 existed only in Python would be a rule the Mojo API, the CLI, and the C API

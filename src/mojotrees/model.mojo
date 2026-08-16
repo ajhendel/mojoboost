@@ -428,6 +428,7 @@ def fit[
         objective,
         ordered_boosting=params.ordered.enabled,
         score_function=params.tree.extra.score_function,
+        random_strength=params.tree.extra.random_strength,
     )
     var mapper = fit_bins(
         features,
@@ -550,6 +551,7 @@ def fit_multiclass[
         n_classes,
         ordered_boosting=params.ordered.enabled,
         score_function=params.tree.extra.score_function,
+        random_strength=params.tree.extra.random_strength,
     )
     var mapper = fit_bins(
         features,

@@ -462,7 +462,26 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # fit, and is merely BLIND to the parameter it would refuse on. Both halves of
 # this version were found that way and neither was found by the lane that
 # built the feature.
-comptime POLICY_VERSION = 7
+#
+# VERSION 8, 2026-08-16 evening. `BLOCK_RANDOM_STRENGTH`. `random_strength`
+# was an UNROUTED refusal, which is a third shape beside the two above: the
+# bindings refused it on the GPU at `_mojotrees.mojo`, no policy block
+# existed, and `Workload` had no field for it -- so `device='auto'` selected
+# the accelerator on shape and the fit then raised inside the grower, which is
+# the one outcome `auto` exists to prevent.
+#
+# **Read this before retiring any block in this file.** A block does two jobs.
+# It refuses a configuration, and it is often the ONLY thing making `auto`
+# route to the CPU rather than fail. So a block may be retired only when no
+# downstream refusal would still fire for the same fit. This one exists
+# because of that rule rather than in spite of it: the shipped default is
+# `score_function=cosine` AND `random_strength=1`, `BLOCK_SCORE_FUNCTION` is
+# scheduled for retirement the moment the device learns Cosine, and retiring
+# it with no block here would have left the default selecting the GPU on shape
+# and raising in the grower on `ExtraTreeParams.is_active()`. The capability
+# landing is not sufficient grounds to remove the gate; the absence of every
+# other reason to refuse the same fit is.
+comptime POLICY_VERSION = 8
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -574,6 +593,7 @@ comptime BLOCK_FORCED_SPLITS = 15
 comptime BLOCK_CONST_HESSIAN_VERIFY = 16
 comptime BLOCK_ORDERED_BOOSTING = 17
 comptime BLOCK_SCORE_FUNCTION = 18
+comptime BLOCK_RANDOM_STRENGTH = 19
 
 
 def block_reason_name(code: Int) -> String:
@@ -613,6 +633,8 @@ def block_reason_name(code: Int) -> String:
         return String("ordered-boosting")
     if code == BLOCK_SCORE_FUNCTION:
         return String("score-function")
+    if code == BLOCK_RANDOM_STRENGTH:
+        return String("random-strength")
     return String("unknown-block")
 
 
@@ -1125,6 +1147,7 @@ struct DeviceRequest(Copyable, Movable):
     var forced_splits: Bool
     var ordered_boosting: Bool
     var score_function: Int
+    var random_strength: Float64
 
     def __init__(
         out self,
@@ -1143,6 +1166,7 @@ struct DeviceRequest(Copyable, Movable):
         forced_splits: Bool = False,
         ordered_boosting: Bool = False,
         score_function: Int = SCORE_L2,
+        random_strength: Float64 = 0.0,
     ):
         self.requested_device = requested_device
         self.n_rows = n_rows
@@ -1159,6 +1183,7 @@ struct DeviceRequest(Copyable, Movable):
         self.forced_splits = forced_splits
         self.ordered_boosting = ordered_boosting
         self.score_function = score_function
+        self.random_strength = random_strength
 
     def cells(self) -> Int:
         """`n_rows * n_features`, the size measure the crossover rules and
@@ -2363,6 +2388,44 @@ def _collect_blocks(
             ),
         )
 
+    if request.random_strength > 0.0:
+        # `> 0.0` rather than `!= 0.0`: a negative value is not a weaker
+        # request, it is invalid, and `check_random_strength` is the thing that
+        # says so with the right message. This gate answers "would the device
+        # be asked to do something it cannot" and a negative number is not a
+        # device question.
+        #
+        # WHY THIS BLOCK EXISTS AT ALL, since the trainers already refuse.
+        # They refuse by RAISING, from inside the grower, after a backend has
+        # been chosen. `ExtraTreeParams.is_active()` names `random_strength`,
+        # `_check_device_search_supported` raises on `is_active()`, and the
+        # bindings refuse it at every entry point but the dense CPU `fit`. All
+        # correct, and none of them is reached in time: without this block
+        # `device='auto'` selects the accelerator on shape and the fit then
+        # dies in the grower, which is precisely the outcome `auto` exists to
+        # prevent. A refusal that arrives after the routing decision is not a
+        # routing input.
+        #
+        # WHAT IT IS NOT. It is not a claim that the noise cannot be computed
+        # on a device. It can, and the plane and its consumption are already
+        # built and tested. Two things are missing and they are different in
+        # kind: the per-tree SCALE is not computed by any GPU round loop, and
+        # on the device-gradient arm it cannot be cheaply, because
+        # `GpuObjectiveState.magnitude_sums` reduces L1 where the scale needs
+        # L2. That second one is an arithmetic bound rather than a wiring gap,
+        # so when this block is narrowed it narrows to that arm and is not
+        # deleted.
+        blocks.add(
+            BLOCK_RANDOM_STRENGTH,
+            String(
+                "random_strength scales its per-candidate noise by a per-tree"
+                " standard deviation taken over the round's gradients, and no"
+                " accelerator round loop computes it; a device fit would"
+                " either refuse in the grower or, if the scale were defaulted,"
+                " train an unregularized model that reported success"
+            ),
+        )
+
     if not gpu_supports_outputs(request.n_outputs):
         blocks.add(
             BLOCK_OUTPUT_LIMIT,
@@ -2761,6 +2824,9 @@ struct DeviceDecision(Copyable, Movable):
         )
         out += String(
             "score_function=", self.request.score_function, "\n"
+        )
+        out += String(
+            "random_strength=", self.request.random_strength, "\n"
         )
 
         out += String(
@@ -3174,6 +3240,7 @@ def resolve_device(
     objective: Int = OBJECTIVE_UNSPECIFIED,
     ordered_boosting: Bool = False,
     score_function: Int = SCORE_L2,
+    random_strength: Float64 = 0.0,
 ) raises -> Int:
     """Resolve a requested device to the backend that will actually run:
     `CPU_DEVICE` or `GPU_DEVICE`, never `AUTO_DEVICE`.
@@ -3240,6 +3307,7 @@ def resolve_device(
         # the position that mistake happens in.
         ordered_boosting=ordered_boosting,
         score_function=score_function,
+        random_strength=random_strength,
     )
     var caps = DeviceCapabilities.detect()
     var decision = decide_device(request, caps)
@@ -3352,6 +3420,7 @@ def decide_device_report(
     forced_splits: Bool = False,
     ordered_boosting: Bool = False,
     score_function: Int = SCORE_L2,
+    random_strength: Float64 = 0.0,
 ) raises -> String:
     """The whole contract across a flat boundary: workload in, serialized
     decision out.
@@ -3390,6 +3459,7 @@ def decide_device_report(
         forced_splits,
         ordered_boosting=ordered_boosting,
         score_function=score_function,
+        random_strength=random_strength,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     return decide_device(request, caps).serialize()
@@ -3420,6 +3490,7 @@ def decide_device_report_reported(
     forced_splits: Bool = False,
     ordered_boosting: Bool = False,
     score_function: Int = SCORE_L2,
+    random_strength: Float64 = 0.0,
 ) raises -> String:
     """`decide_device_report` for a caller that has read the device.
 
@@ -3445,6 +3516,7 @@ def decide_device_report_reported(
         forced_splits,
         ordered_boosting=ordered_boosting,
         score_function=score_function,
+        random_strength=random_strength,
     )
     var caps = capabilities_from_reported(
         reported_api,
@@ -3476,6 +3548,7 @@ def resolve_device_full(
     forced_splits: Bool = False,
     ordered_boosting: Bool = False,
     score_function: Int = SCORE_L2,
+    random_strength: Float64 = 0.0,
 ) raises -> Int:
     """Resolve a fully described workload to `CPU_DEVICE` or `GPU_DEVICE`,
     raising the refusal when it cannot run.
@@ -3510,6 +3583,7 @@ def resolve_device_full(
         forced_splits,
         ordered_boosting=ordered_boosting,
         score_function=score_function,
+        random_strength=random_strength,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     var decision = decide_device(request, caps)

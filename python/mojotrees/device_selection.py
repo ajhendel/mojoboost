@@ -295,6 +295,7 @@ class Workload:
         has_eval_set=False,
         ordered_boosting=False,
         score_function=SCORE_L2,
+        random_strength=0.0,
     ):
         self.n_rows = int(n_rows)
         self.n_features = int(n_features)
@@ -316,6 +317,7 @@ class Workload:
         self.has_eval_set = bool(has_eval_set)
         self.ordered_boosting = bool(ordered_boosting)
         self.score_function = int(score_function)
+        self.random_strength = float(random_strength)
         if self.n_rows < 1 or self.n_features < 1:
             raise ValueError(
                 "a workload needs at least one row and one feature; got "
@@ -695,6 +697,7 @@ class _FullNativePolicy:
                 "uses_validation": 1 if workload.has_eval_set else 0,
                 "ordered_boosting": 1 if workload.ordered_boosting else 0,
                 "score_function": int(workload.score_function),
+                "random_strength": float(workload.random_strength),
             },
         )
         return _parse_decision(str(text))

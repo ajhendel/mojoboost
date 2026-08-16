@@ -2738,6 +2738,14 @@ class _Base(_ParamsMixin):
                 score_function=_score_function_code(
                     getattr(self, "score_function", None)
                 ),
+                # `or 0.0` because the estimator's default is None, and the
+                # same expression already builds the params dict below, so the
+                # gate and the fit read the parameter the same way. A value
+                # this gate could not see would be the defect it exists to
+                # close.
+                random_strength=float(
+                    getattr(self, "random_strength", None) or 0.0
+                ),
             )
             # DeviceUnavailableError is a RuntimeError subclass carrying the
             # native refusal text, so it propagates as what this method has
