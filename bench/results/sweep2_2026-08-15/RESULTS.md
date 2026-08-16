@@ -121,3 +121,58 @@ plane actually ran, rather than assuming a configuration reaches it.
   would have caught the tree-resident failure earlier had it been collected
   first.
 - The two-million-row CPU figure, at 35.6 percent spread, is not reliable.
+
+## Addendum: the path taken, which the sweep above failed to record
+
+The table above has no column for which split-search path each arm took, and it
+should have. `normalized_split_work` is `n_rows * active_features * (n_bins/255)
+* (num_leaves/31)` and the automatic policy sends anything below 50,000,000 to
+the host scan. So 250,000 x 50 is 12.5 million and **both GPU arms took the host
+scan there**, while 1,000,000 and 2,000,000 took the device search. The three
+points of each GPU arm are not measurements of one configuration.
+
+Forcing the device search at 250,000, five repeats each:
+
+| arm at 250,000 x 50 | automatic (host scan) | device search forced |
+|---|---|---|
+| GPU leaf-wise | 1.967 | 2.268 |
+| GPU depth-wise | 1.909 | **1.214** |
+
+**The gate is right for leaf-wise and wrong for depth-wise.** Leaf-wise is 15
+percent worse on the device search at this size, which is what the threshold
+exists to prevent. Depth-wise is **37 percent better**, because it batches a
+level into one search and the host-scan path cannot batch a 153 KB download and
+a synchronization per node away.
+
+So the gate costs depth-wise 0.70 seconds at 250,000 rows, and it costs it
+because `normalized_split_work` does not know which growth policy it is deciding
+for. The threshold was measured for leaf-wise and is applied to both.
+
+That does not overturn the fixed-cost reading, but it does qualify it. Corrected
+for path, the depth-wise points are 1.214 / 2.587 / 5.417, fitting 1.83 us per
+row from 250,000 to 1,000,000 and 2.83 from 1,000,000 to 2,000,000. Still
+nonlinear, so something other than the gate remains unexplained in that arm.
+
+It also moves the practical answer. Depth-wise on the device search at 250,000
+is 1.214 against LightGBM's 1.023, so **1.19x behind rather than 1.87x**. It
+does not beat LightGBM there, but the claim "the GPU loses below a million rows"
+was substantially the gate's doing rather than the hardware's.
+
+**Every future sweep records the path taken per arm per shape.** The backend
+proof and the sync count are already collected by the harness; not putting them
+in the table is what let three points of two different configurations be fitted
+as one line.
+
+## The correction that matters most, from the same numbers
+
+Our GPU's marginal cost per row equals LightGBM's **on ten CPU cores**. Taken
+with the intercepts, the arithmetic is unforgiving: remove the whole one second
+of excess fixed cost and 1,000,000 rows lands near 2.8 seconds, which is
+**parity, not a win**.
+
+Depth-wise beat that number, so it did not only remove fixed cost. Level-batched
+histograms also fill the GPU better, which moves the **slope**. That reframes the
+plan: the histogram kernel is not a phase two behind the control plane, it is
+**the entire margin**. A GPU whose per-row cost equals a laptop CPU's is leaving
+a large multiple on the table by the layout arithmetic, and closing the control
+plane alone reaches parity and stops.
