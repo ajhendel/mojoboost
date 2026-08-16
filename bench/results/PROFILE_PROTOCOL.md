@@ -856,6 +856,37 @@ So:
   harness supports both. Interleaving makes drift common-mode; alternating
   processes turns a neighbour's build into your result.
 
+## A3b. Let the compiler enumerate, not the reader. Measured at 30x.
+
+Not a measurement rule, but it belongs beside them because it is the same
+discipline applied to code: **when a change has an unknown number of call sites,
+make the old form fail to compile rather than grepping for it.**
+
+The evidence, from the CPU campaign's `Histogram` field migration on 2026-08-16.
+A careful hand survey by two orchestrators found "about eight couplings". Making
+the fields private and letting the build fail found **233 direct reads across 35
+files**, plus a ninth file-level coupling nobody had listed. **A factor of
+thirty.**
+
+Three details worth carrying, because each defeats a different hand method:
+
+- **Most of the hand list was false positives.** Eight modules that looked like
+  couplings read `Tree.count`, `QuantizedHistogram.grad`, `FeatureTotals.grad` or
+  `PackedHistogram.count` -- different structs that share the field names and
+  nothing else. Grepping a field name finds the wrong set in both directions.
+- **Five test files read a plane without ever naming the type**, because the
+  value comes back from a builder with an inferred type. `grep Histogram tests/`
+  misses all five.
+- **The compiler-driven pass still made ten errors**, in the direction reading
+  cannot catch: it converted `local.grad[b]` where `local` was a different struct
+  with plain fields. A false positive compiles until it does not, and the suite
+  caught it.
+
+The limit, stated so nobody over-trusts it: Mojo has no field privacy, so a
+positional constructor still compiles and the single-chokepoint constructor is
+convention rather than a compiler guarantee. That gap closes at the storage
+change, which necessarily alters the signature.
+
 ## A4. What this says about the protocol as a whole
 
 It is working, and the evidence is that every one of these defects was found by
