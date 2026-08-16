@@ -5820,3 +5820,77 @@ FAIL the CatBoost-mode arm BUILT without CatBoost's read-back. It must refuse by
 ```
 
 Revert Edit D. All four are one-line edits and none of them needs a fit.
+
+#### 8. What is verified, what is not, and the two divergences this surfaced
+
+Split into three lists on purpose. The first shrank a lot between the first
+version of this entry and this one; the second and third did not.
+
+**Verified by running it.**
+
+- `selfcheck.py` passes in the `bench` environment in 0.42 seconds. Note that
+  it does NOT pass in a bare interpreter: the categorical-encoder fixture needs
+  pandas, which arrives in that environment as a CatBoost dependency rather
+  than as a declared one. `pixi.toml` lists pandas under `feature.pytest` and
+  not under `feature.bench`. That is a latent gap in somebody else's file and
+  is recorded here rather than fixed here.
+- The gate goes red on purpose and green on restore. Edit B from section 7 was
+  applied against the landed code: six failures, the predicted message, both
+  key names and both values in it.
+- The ordering holds. Dry runs at one repeat and at two show rounds preserved
+  and every CatBoost cell ahead of every CatBoost-mode cell inside its round.
+- Scheduling the CatBoost-mode arm without `catboost` produces a skip with the
+  reason, not a raising cell.
+
+**A trap worth knowing about, found the hard way while testing the gate.**
+Editing `"l2_leaf_reg": 3` to `4` and back changes neither the file's size nor,
+within one second, its mtime, so CPython reuses the cached bytecode and
+`selfcheck` reports the OLD verdict. It reported six failures on a restored
+file. Clear `bench/real_data/__pycache__` between two runs that differ by a
+single character, or the answer is from the previous edit.
+
+**Not verified, and each of these is a thing somebody will find out.**
+
+- **`CATBOOST_LEFT_AT_STOCK` is still a transcription** at the moment this is
+  written. `check_catboost_readback` compares it against a live
+  `get_all_params()` and writes the result into every CatBoost record as
+  `engine_resolved_params_drift`, so the first real run answers it.
+- **`mojotrees_catboost_mode_resolved` mirrors the adapter.** It re-adds
+  `n_estimators` and the Dataset params because
+  `engines.MojoTreesEngine._run_dense` adds them after translation. Nothing in
+  `scenarios.py` can assert against a call site; both places name each other
+  and that is the whole mitigation.
+- **`catboost_readback_key` uses `variant_requested`, not the loaded variant.**
+  If `auto` ever resolved differently between two cells of one run they would
+  share a key while holding different data. Never observed and nothing catches
+  it.
+- **`leaf_estimation_method` is a believed match with no evidence.** CatBoost
+  resolves Newton and mojotrees has no such parameter anywhere in
+  `python/mojotrees`, `bindings/` or `docs/PARAMETER_NAMING.md`. A comment at
+  `python/mojotrees/sklearn.py:2150` says our `leaf_estimation_iterations`
+  takes Newton steps, which is a reading of a comment about a neighbouring
+  parameter. Recorded as unmatchable with exactly that caveat.
+
+**Two divergences the map surfaced that nobody had written down.**
+
+- **`one_hot_max_size`, CLOSED.** CatBoost resolves 2 and our
+  `max_cat_to_onehot` default is 4, so the two arms crossed the one-hot cutoff
+  at different cardinalities. Now set in `MOJOTREES_CATBOOST_MODE`. It is inert
+  on all three scenarios this arm runs, which is why nothing had noticed, and
+  is why `required_when_scenarios` now demands that a MATCHED key with that
+  field be NAMED in the mode dict rather than agreeing by default: a match by
+  coincidence is one default change away from a silent divergence.
+- **The seed, CLOSED for the draws that are reachable and OPEN for one that is
+  not.** CatBoost and LightGBM were both pinned to 190019 and
+  `mojotrees_params` passed no seed at all, so the three arms ran from two
+  different constants. `SHARED_SEED` is now referenced by all three
+  translators. What that does NOT reach is the split-score noise: it is keyed
+  on `ExtraTreeParams.random_strength_seed`, which
+  `tree_parameters_extra.mojo:1612` sets to `DEFAULT_RANDOM_STRENGTH_SEED` and
+  which `bindings/_mojotrees.mojo` never parses, so no Python surface can set
+  it. The CatBoost-mode arm's noise therefore runs from a native constant
+  whatever the harness passes.
+  `CATBOOST_UNMATCHABLE["split_scoring"]` was already true because the two
+  engines draw from different streams by construction; it is now true for a
+  second and more embarrassing reason, which is that ours is not reachable.
+  **Closing that is a `bindings/` change and this lane did not make it.**
