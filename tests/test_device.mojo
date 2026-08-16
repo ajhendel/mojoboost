@@ -64,6 +64,11 @@ from mojotrees.device_policy import (
     DeviceRequest,
     EVIDENCE_ENV,
     EVIDENCE_EXPLICIT,
+    M4_MULTICLASS_EVIDENCE_ID,
+    M4_MULTICLASS_MEASURED_ON,
+    M4_MULTICLASS_MIN_FEATURES,
+    M4_MULTICLASS_MIN_OUTPUTS,
+    M4_MULTICLASS_RULE_NAME,
     M4_TRAINING_EVIDENCE_ID,
     M4_TRAINING_MAX_OUTPUTS,
     M4_TRAINING_MEASURED_ON,
@@ -283,9 +288,10 @@ def _m3_profile() -> GpuProfile:
 
 def test_crossover_rules_carry_their_evidence() raises:
     var rules = crossover_rules()
-    # One rule. A second one arriving without this test being edited means
-    # somebody installed a threshold and did not think about its scope.
-    assert_equal(len(rules), 1)
+    # Two rules: one single output, one multiclass. A third arriving without
+    # this test being edited means somebody installed a threshold and did not
+    # think about its scope.
+    assert_equal(len(rules), 2)
 
     var rule = rules[0].copy()
     assert_equal(rule.name, M4_TRAINING_RULE_NAME)
@@ -313,6 +319,47 @@ def test_crossover_rules_carry_their_evidence() raises:
     # The citation names both the record and the device.
     assert_true(rule.cite().find(M4_TRAINING_EVIDENCE_ID) >= 0)
     assert_true(rule.cite().find("Apple M4") >= 0)
+
+    # The multiclass rule, pinned the same way. Its evidence is one record
+    # (`bench/results/profile_2026-08-15/RESULTS.md`, 465,000 x 54 over 7
+    # classes, GPU 15.30 s against CPU 25.47 s), and its scope differs from
+    # the rule above in three places, each of which is a decision:
+    #
+    #   - `objective` does not constrain, and `min_outputs` does. Trees per
+    #     round is what the trainers branch on and it is what every
+    #     multiclass entry point declares; three of the four declare no
+    #     objective at all, so an objective-scoped rule would have been
+    #     unreachable from them.
+    #   - `max_outputs` does not constrain, so the class count is bounded
+    #     below and not above. Capping it at the measured seven would send a
+    #     ten-class fit to the CPU while a seven-class fit of the same shape
+    #     went to the device.
+    #   - `min_features` is 54, the feature count the record was taken at,
+    #     and deliberately not rounded down to the other rule's 50.
+    #
+    # Any of the three changing without this test being edited is a rule
+    # quietly widening or narrowing past its record.
+    var mc = rules[1].copy()
+    assert_equal(mc.name, M4_MULTICLASS_RULE_NAME)
+    assert_equal(mc.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
+    assert_equal(mc.measured_on, M4_MULTICLASS_MEASURED_ON)
+    assert_equal(mc.api, API_METAL)
+    assert_equal(mc.apple_generation, APPLE_GEN_M4)
+    assert_equal(mc.objective, OBJECTIVE_UNSPECIFIED)
+    assert_equal(mc.min_outputs, M4_MULTICLASS_MIN_OUTPUTS)
+    assert_equal(mc.max_outputs, 0)
+    assert_equal(mc.min_rows, AUTO_GPU_MIN_ROWS)
+    assert_equal(mc.min_features, M4_MULTICLASS_MIN_FEATURES)
+    assert_equal(mc.min_cells, 0)
+    assert_equal(M4_MULTICLASS_MIN_FEATURES, 54)
+    assert_equal(M4_MULTICLASS_MIN_OUTPUTS, 2)
+    assert_true(mc.cite().find(M4_MULTICLASS_EVIDENCE_ID) >= 0)
+    assert_true(mc.cite().find("Apple M4") >= 0)
+
+    # The two rules are complementary on trees per round, which is what
+    # makes them disjoint: no request can match both, so installing the
+    # multiclass rule cannot move a single-output fit.
+    assert_true(rule.max_outputs < mc.min_outputs)
 
     # And the constructor still refuses a rule with nothing under it.
     with assert_raises():
@@ -368,7 +415,7 @@ def test_a_selected_gpu_says_what_measured_it() raises:
     var wire = decision.serialize()
     assert_true(wire.find("decision=auto-gpu-evidence\n") >= 0)
     assert_true(wire.find("validated=true\n") >= 0)
-    assert_true(wire.find("crossover_rules_installed=1\n") >= 0)
+    assert_true(wire.find("crossover_rules_installed=2\n") >= 0)
     assert_true(
         wire.find(String("crossover_rule=", decision.crossover_citation, "\n"))
         >= 0
@@ -421,8 +468,17 @@ def test_auto_declines_beside_the_measured_shape() raises:
     # Same cell count, a tenth of the features: a different ratio of
     # per-node cost to per-node work, and unmeasured.
     _declines(_request(AUTO_DEVICE, 5_000_000, 10), caps)
-    # Multiclass grows one tree per class per round through another
-    # trainer. Unmeasured.
+    # Multiclass grows one tree per class per round through another trainer
+    # and is out of THIS rule's scope (`max_outputs=1`). It is no longer
+    # unmeasured, which is what this comment used to say: it has a rule of
+    # its own, and the two shapes below are on the wrong side of that rule
+    # rather than uncovered by any rule.
+    #
+    # 50 features is one such shape, and the reason is worth spelling out
+    # because otherwise this assertion passes for a reason nobody wrote
+    # down: `M4_MULTICLASS_MIN_FEATURES` is 54, the feature count the
+    # multiclass record was taken at, so a 50-feature softmax fit is below
+    # the multiclass scope even though it clears the single-output one.
     _declines(
         _request(
             AUTO_DEVICE,
@@ -432,6 +488,32 @@ def test_auto_declines_beside_the_measured_shape() raises:
         ),
         caps,
     )
+    # And at the multiclass rule's own feature count, one row under the
+    # shared floor. This is the assertion that would fail if the multiclass
+    # rule stopped gating on rows, which the one above cannot see.
+    _declines(
+        _request(
+            AUTO_DEVICE,
+            AUTO_GPU_MIN_ROWS - 1,
+            M4_MULTICLASS_MIN_FEATURES,
+            3,
+        ),
+        caps,
+    )
+    # The control for both: same fixture, same class count, at the shape the
+    # multiclass rule does cover. Without this the two declines above could
+    # both be passing because no multiclass request ever reaches a rule.
+    var covered = decide_device(
+        _request(
+            AUTO_DEVICE,
+            AUTO_GPU_MIN_ROWS,
+            M4_MULTICLASS_MIN_FEATURES,
+            3,
+        ),
+        caps,
+    )
+    assert_equal(covered.selected_device, GPU_DEVICE)
+    assert_equal(covered.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
     # Another objective, and an undeclared one.
     _declines(
         _request(
@@ -685,7 +767,14 @@ def test_fit_multiclass_device_selection() raises:
     var labels = _labels(features, n_rows, 3)
     var params = BoosterParams(5, 0.1, TreeParams.default())
 
-    # auto resolves to the CPU while the size heuristic ships disabled.
+    # 300 x 4 is three orders of magnitude under `AUTO_GPU_MIN_ROWS` and
+    # under the multiclass rule's feature scope, so auto resolves to the CPU
+    # here. That is a statement about this shape and not about multiclass:
+    # since `apple-m4-metal-dense-multiclass` was installed, `auto` reaches
+    # `train_multiclass_gpu` above the floor, and
+    # `tests/test_gpu_auto_reaches_multiclass.mojo` proves it does so by the
+    # model bits. What this test is for is that `fit_multiclass` dispatches
+    # on the backend it resolved at all.
     var model = fit_multiclass(
         features, n_rows, n_features, labels, 3, params, device=AUTO_DEVICE
     )
