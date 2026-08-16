@@ -494,11 +494,24 @@ def check_catboost_arm():
     in this section, and `peers` is checked to be a key beside them rather
     than a replacement for any of them.
 
-    **The two rows are matched.** "Matched tree count and matched learning
-    rate" is checked against the resolved dicts rather than asserted in a
-    docstring, because CatBoost picks its own learning rate from the budget
-    when it is not given one, and an arm that silently stopped passing it
-    would still produce a number.
+    **The tree count is matched and the learning rate deliberately is not.**
+    The first is checked against the resolved dicts rather than asserted in a
+    docstring. The second is checked as a NEGATIVE: `learning_rate` must not
+    be passed to CatBoost and must not have a static value on our side,
+    because `cb-shipped` runs each engine at its own resolved rate and a
+    reinstated pin would silently turn the row back into `cb-default` under
+    the new label.
+
+    **The two resolved dicts agree key by key.** This is the check that
+    changed on 2026-08-16 and the reason this function is worth having.
+    Before that date it compared `MOJOTREES_CATBOOST_MODE` against a dict
+    built from `MOJOTREES_CATBOOST_MODE`, which proves the translator does not
+    DROP a key -- a real thing to prove, and it caught `grow_policy` -- and
+    which cannot tell whether any value in the dict is RIGHT. It now walks
+    `scenarios.CATBOOST_PARAM_MAP` and fails on any key claimed matchable
+    whose two resolved values differ, on any key CatBoost resolves that
+    nothing classifies, and on any unmatchable claim that does not name a live
+    `CATBOOST_UNMATCHABLE` entry.
 
     **The arm cannot grow a setting.** Same rule as `check_comparator`:
     everything CatBoost is passed is either a declared deviation from stock
@@ -584,8 +597,109 @@ def check_catboost_arm():
             "is what it passes, so it is not a deviation",
         )
 
-    # 3. Matched tree count and matched learning rate, on the resolved
-    #    dicts, on every scenario the arm runs.
+    # 2b. The learning rate is deliberately NOT matched, and the shape of
+    #     that decision is checked rather than trusted.
+    #
+    #     Every clause below is a way the pin could come back without anybody
+    #     meaning it to: through CATBOOST_MATCHED, through CATBOOST_ALIGNMENT,
+    #     through `extra` at a call site, or through a static value in
+    #     MOJOTREES_CATBOOST_MODE. cb-shipped and cb-default compute different
+    #     models, so a silent reversion is a published number under the wrong
+    #     label.
+    check(
+        "learning_rate" not in scenarios.CATBOOST_MATCHED,
+        "learning_rate is back in CATBOOST_MATCHED. cb-shipped runs each "
+        "engine at its own resolved rate; see CATBOOST_DELIBERATE_DIVERGENCE",
+    )
+    check(
+        "learning_rate" not in scenarios.CATBOOST_ALIGNMENT,
+        "learning_rate is passed to CatBoost through CATBOOST_ALIGNMENT, "
+        "which makes the arm cb-default under cb-shipped's label",
+    )
+    check(
+        "learning_rate" in scenarios.CATBOOST_REFUSED_PARAMS,
+        "learning_rate is not refused by name. It was PASSED until "
+        "2026-08-16, so 'not currently passed' is not enough: a caller "
+        "handing it through `extra` would restore the old model silently",
+    )
+    check(
+        "learning_rate" in scenarios.CATBOOST_DELIBERATE_DIVERGENCE,
+        "the learning rate is unmatched and CATBOOST_DELIBERATE_DIVERGENCE "
+        "does not say so, so a reader of a CatBoost accuracy number has "
+        "nothing telling them the two engines ran different rates",
+    )
+    check(
+        "learning_rate" in scenarios.CATBOOST_RESOLVED_PER_FIT,
+        "learning_rate has no CATBOOST_RESOLVED_PER_FIT entry, so nothing "
+        "records that its value cannot be known without a read-back",
+    )
+    check(
+        "learning_rate" not in scenarios.CATBOOST_LEFT_AT_STOCK,
+        "CATBOOST_LEFT_AT_STOCK carries a learning_rate. That table holds "
+        "constants and CatBoost derives this one from the dataset, so any "
+        "value there is false on every shape but the one it was read on",
+    )
+    check(
+        "learning_rate" not in scenarios.MOJOTREES_CATBOOST_MODE,
+        "MOJOTREES_CATBOOST_MODE carries a static learning_rate. It has to "
+        "come from CatBoost's own read-back for the same cell: a constant "
+        "here is a hand-written belief about a value that moves with the "
+        "dataset. See MOJOTREES_CATBOOST_MODE_FROM_READBACK",
+    )
+    check(
+        "learning_rate" in scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK,
+        "learning_rate is not declared as coming from the read-back, so "
+        "nothing makes the CatBoost-mode arm take CatBoost's resolved rate",
+    )
+    for _key in scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK:
+        check(
+            _key in scenarios.MOJOTREES_CATBOOST_MODE_REASONS,
+            f"{_key} comes from the read-back with no reason recorded beside "
+            "it in MOJOTREES_CATBOOST_MODE_REASONS",
+        )
+        check(
+            _key not in scenarios.MOJOTREES_CATBOOST_MODE,
+            f"{_key} is both a static entry of MOJOTREES_CATBOOST_MODE and a "
+            "read-back entry. It cannot be both, and the static value would "
+            "win or lose depending on dict order",
+        )
+    check(
+        scenarios.CATBOOST_ARM_ID != "cb-default",
+        "the arm id is still cb-default while the arm no longer pins the "
+        "learning rate. Two materially different models must not share an id",
+    )
+    check(
+        bool(getattr(scenarios, "CATBOOST_ARM_SUPERSEDES", "")),
+        "the arm does not record what it supersedes, so a reader holding a "
+        "cb-default number has nothing telling them it is stale",
+    )
+    # The arm REFUSES rather than falling back. Checked by calling it, not by
+    # reading the source, because the fallback this guards against is exactly
+    # the kind that looks correct in a diff.
+    _spec = scenarios.resolve(
+        scenarios.MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS[0], "standard"
+    )
+    try:
+        scenarios.mojotrees_catboost_mode_params(_spec, "cpu", None)
+    except scenarios.CatBoostReadbackMissing:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        FAILURES.append(
+            "the CatBoost-mode arm built without a read-back failed with the "
+            f"wrong error type: {type(exc).__name__}: {exc}"
+        )
+    else:
+        FAILURES.append(
+            "the CatBoost-mode arm BUILT without CatBoost's read-back. It "
+            "must refuse by name: every key in "
+            "MOJOTREES_CATBOOST_MODE_FROM_READBACK has no static value, so "
+            "whatever it used for the learning rate is a guess, and a guess "
+            "of 0.1 against CatBoost's resolved 0.43 is the largest single "
+            "error this arm can make"
+        )
+
+    # 3. Matched tree count, on the resolved dicts, on every scenario the arm
+    #    runs.
     for name in scenarios.SCENARIOS:
         spec = scenarios.resolve(name, "standard")
         runs, reason = scenarios.catboost_supports(spec)
@@ -601,6 +715,52 @@ def check_catboost_arm():
                 f"{name} does not run the CatBoost arm and gives no reason",
             )
             continue
+        # The CatBoost side first, and unconditionally. These used to sit
+        # below the CatBoost-mode gate and stopped running the moment that arm
+        # was parked, which would have taken the refusal list offline at the
+        # same time as the arm it protects.
+        extra = {"num_class": 3} if spec["task"] == "multiclass" else None
+        cb = scenarios.catboost_params(spec, 4, dict(extra or {}))
+        check(
+            cb["iterations"] == scenarios.BASE_PARAMS["n_estimators"],
+            f"{name}: the CatBoost arm is not at the matched tree count, "
+            f"{cb['iterations']!r} against "
+            f"{scenarios.BASE_PARAMS['n_estimators']!r}",
+        )
+        check(
+            "learning_rate" not in cb,
+            f"{name}: the resolved CatBoost dict passes learning_rate="
+            f"{cb.get('learning_rate')!r}. cb-shipped lets CatBoost resolve "
+            "its own; passing one is cb-default",
+        )
+        check(
+            cb["thread_count"] == 4,
+            f"{name}: catboost thread count did not survive translation",
+        )
+        # Nothing binning-shaped, and nothing on the refusal list, reached
+        # CatBoost. `thread_count` is on that list because it must not arrive
+        # from a caller, not because it must be absent: catboost_params sets
+        # it itself from the runner's number, exactly as num_threads is set on
+        # the LightGBM side.
+        for absent in scenarios.CATBOOST_REFUSED_PARAMS:
+            if absent == "thread_count":
+                continue
+            check(
+                absent not in cb,
+                f"{name}: the resolved CatBoost dict sets {absent}="
+                f"{cb.get(absent)!r}. It is stock in "
+                f"{scenarios.CATBOOST_ARM_LABEL}",
+            )
+        for refused in scenarios.CATBOOST_REFUSED_PARAMS:
+            try:
+                scenarios.catboost_params(spec, 4, {refused: 1})
+            except ValueError:
+                pass
+            else:
+                FAILURES.append(
+                    f"{name}: catboost_params accepted {refused}, which is "
+                    "the CatBoost shape of the row-count binning pin"
+                )
         # The CatBoost-mode arm pairs with the CatBoost arm wherever it can,
         # and where it cannot it must say so by name. Until the arm carried
         # row sampling this was an unconditional check and it was right to be
@@ -623,52 +783,95 @@ def check_catboost_arm():
             f"scenario's engine list says "
             f"{'runs' if mode_listed else 'skipped'}",
         )
-        if not mode_listed:
-            check(
-                bool(mode_reason),
-                f"{name} runs the CatBoost arm with no mojotrees "
-                "CatBoost-mode arm beside it and gives no reason, so 'us in "
-                "CatBoost mode' has no row and nothing says why",
-            )
+        check(
+            mode_listed or bool(mode_reason),
+            f"{name} runs the CatBoost arm with no mojotrees "
+            "CatBoost-mode arm beside it and gives no reason, so 'us in "
+            "CatBoost mode' has no row and nothing says why",
+        )
+
+    # 3b. THE PARITY GATE. Our arm's resolved parameters against CatBoost's,
+    #     key by key, on every scenario in
+    #     MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS.
+    #
+    #     Run over that tuple rather than over the currently-scheduled cells
+    #     on purpose. The scheduling table can park the arm -- it is parked
+    #     right now, waiting on the read-back wiring -- and a gate that goes
+    #     quiet whenever the thing it guards is in flux is not a gate. This
+    #     one keeps checking the parameters of an arm that is not running, so
+    #     that unparking it is a one-line edit rather than a re-audit.
+    for name in scenarios.MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS:
+        check(
+            name in scenarios.SCENARIOS,
+            f"MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS names {name!r}, which "
+            "is not a scenario",
+        )
+        if name not in scenarios.SCENARIOS:
             continue
+        spec = scenarios.resolve(name, "standard")
         extra = {"num_class": 3} if spec["task"] == "multiclass" else None
-        cb = scenarios.catboost_params(spec, 4, dict(extra or {}))
         mb = scenarios.mojotrees_params(spec, "cpu", extra)
-        cm = scenarios.mojotrees_catboost_mode_params(spec, "cpu", extra)
-        check(
-            cb["iterations"] == scenarios.BASE_PARAMS["n_estimators"],
-            f"{name}: the CatBoost arm is not at the matched tree count, "
-            f"{cb['iterations']!r} against "
-            f"{scenarios.BASE_PARAMS['n_estimators']!r}",
+        stand_in = scenarios._READBACK_STANDIN(spec)
+        cm = scenarios.mojotrees_catboost_mode_resolved(
+            spec, "cpu", extra, stand_in
         )
-        check(
-            cb["learning_rate"] == mb["learning_rate"] == cm["learning_rate"],
-            f"{name}: the three arms are not at the matched learning rate, "
-            f"catboost {cb['learning_rate']!r}, mojotrees "
-            f"{mb['learning_rate']!r}, catboost-mode {cm['learning_rate']!r}. "
-            "CatBoost picks its own rate from the budget when it is not "
-            "given one, so an unmatched rate is two different models",
-        )
-        check(
-            cb["thread_count"] == 4,
-            f"{name}: catboost thread count did not survive translation",
-        )
-        # The CatBoost-mode arm differs from the plain one only where
-        # MOJOTREES_CATBOOST_MODE says, and it carries every entry of it.
-        #
-        # Two assertions rather than one equality. A mode entry whose value
-        # happens to equal the shared default (lambda_l1 is 0.0 on both
-        # sides) produces no diff and must not fail, and a mode entry that
-        # the translator silently dropped produces no diff either and must.
-        # The first version of this check used one equality and could not
-        # tell those apart; it did catch grow_policy being dropped, which is
-        # why the two are now separate.
+        rows = scenarios.catboost_parity_rows(spec, "cpu", extra)
+        for message in scenarios.catboost_parity_failures(rows):
+            FAILURES.append(f"{name}: {message}")
+        # Every row's verdict is well formed, which is what stops a key being
+        # dropped by giving it a shape nothing enforces.
+        for row in rows:
+            entry = scenarios.CATBOOST_PARAM_MAP.get(row["catboost"], {})
+            if row["status"] == "unmatchable":
+                check(
+                    row.get("unmatchable_key")
+                    in scenarios.CATBOOST_UNMATCHABLE,
+                    f"{name}: {row['catboost']} is declared unmatchable "
+                    f"against CATBOOST_UNMATCHABLE"
+                    f"[{row.get('unmatchable_key')!r}], which does not exist. "
+                    "An unmatchable key has to point at the reason, or it is "
+                    "a key that was dropped with a label on it",
+                )
+            if row["status"] in ("unmatchable", "not_reached"):
+                check(
+                    bool(row.get("detail")),
+                    f"{name}: {row['catboost']} is {row['status']} with no "
+                    "reason. Every key this arm does not match carries the "
+                    "reason it does not",
+                )
+            # A not_reached key that names the scenarios which WOULD reach it
+            # must not have any of them scheduled for this arm. This is the
+            # coupling that stops `one_hot_max_size` staying unset the day
+            # somebody turns a categorical scenario back on.
+            for reachable in entry.get("required_when_scenarios", ()):
+                live = (
+                    scenarios.MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT.get(
+                        reachable, "skipped"
+                    )
+                    is None
+                )
+                check(
+                    not live,
+                    f"{row['catboost']} is declared not_reached because no "
+                    f"scenario this arm runs reaches it, and {reachable} now "
+                    "runs it. Either set the matching key in "
+                    "MOJOTREES_CATBOOST_MODE and move this row to matched, or "
+                    "record why the two arms may differ on it",
+                )
+        # The old teeth, kept. A mode entry the translator drops produces no
+        # diff against the plain arm and must still fail: the parity table
+        # would catch it only for keys CatBoost also resolves, and
+        # MOJOTREES_CATBOOST_MODE holds keys it does not (min_child_hess,
+        # lambda_l1).
         moved = {k for k in set(mb) | set(cm) if mb.get(k) != cm.get(k)}
+        declared_moves = set(scenarios.MOJOTREES_CATBOOST_MODE) | set(
+            scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK
+        ) | {"n_estimators", "max_bin", "use_missing"}
         check(
-            moved <= set(scenarios.MOJOTREES_CATBOOST_MODE),
+            moved <= declared_moves,
             f"{name}: the CatBoost-mode arm differs from the plain mojotrees "
-            f"arm in {sorted(moved - set(scenarios.MOJOTREES_CATBOOST_MODE))}, "
-            "which MOJOTREES_CATBOOST_MODE does not name",
+            f"arm in {sorted(moved - declared_moves)}, which "
+            "MOJOTREES_CATBOOST_MODE does not name",
         )
         for key, value in scenarios.MOJOTREES_CATBOOST_MODE.items():
             check(
@@ -684,30 +887,107 @@ def check_catboost_arm():
                 f"MOJOTREES_CATBOOST_MODE sets {key} with no reason recorded "
                 "beside it",
             )
-        # Nothing binning-shaped reached CatBoost. `thread_count` is on the
-        # refusal list because it must not arrive from a caller, not
-        # because it must be absent: catboost_params sets it itself from
-        # the runner's number, exactly as num_threads is set on the
-        # LightGBM side.
-        for absent in scenarios.CATBOOST_REFUSED_PARAMS:
-            if absent == "thread_count":
+        # Every key CatBoost resolves is classified. The loop above only
+        # produces rows for keys the map knows; this is the other direction.
+        declared = scenarios.catboost_resolved_declared(spec, None, extra)
+        for key, value in sorted(declared.items()):
+            classified = (
+                key in scenarios.CATBOOST_PARAM_MAP
+                or key in scenarios.CATBOOST_PARAM_NOT_MAPPED
+            )
+            check(
+                classified,
+                f"{name}: CatBoost resolves {key}={value!r} and neither "
+                "CATBOOST_PARAM_MAP nor CATBOOST_PARAM_NOT_MAPPED says "
+                "whether this arm matches it. A key nobody classified is the "
+                "hand-written belief this table exists to remove",
+            )
+            entry = scenarios.CATBOOST_PARAM_NOT_MAPPED.get(key)
+            if entry is None:
                 continue
             check(
-                absent not in cb,
-                f"{name}: the resolved CatBoost dict sets {absent}="
-                f"{cb.get(absent)!r}. It is stock in "
-                f"{scenarios.CATBOOST_ARM_LABEL}",
+                bool(entry.get("why")),
+                f"{key} is excluded from the parity diff with no reason",
             )
-        for refused in scenarios.CATBOOST_REFUSED_PARAMS:
-            try:
-                scenarios.catboost_params(spec, 4, {refused: 1})
-            except ValueError:
-                pass
-            else:
-                FAILURES.append(
-                    f"{name}: catboost_params accepted {refused}, which is "
-                    "the CatBoost shape of the row-count binning pin"
+            holds = entry.get("holds_while")
+            if holds is not None:
+                check(
+                    scenarios._parity_equal(holds, value),
+                    f"{name}: {key} is excluded from the parity diff on the "
+                    f"grounds that it is inert at {holds!r}, and CatBoost now "
+                    f"resolves {value!r}. The exclusion's premise is gone: "
+                    "either the key is matchable and belongs in "
+                    "CATBOOST_PARAM_MAP, or the reason in "
+                    "CATBOOST_PARAM_NOT_MAPPED has to be rewritten for the "
+                    "new value",
                 )
+
+    # 3c. The parity map itself is well formed, independent of any scenario.
+    for key, entry in scenarios.CATBOOST_PARAM_MAP.items():
+        check(
+            entry.get("verdict") in ("matched", "unmatchable", "not_reached"),
+            f"CATBOOST_PARAM_MAP[{key!r}] has verdict "
+            f"{entry.get('verdict')!r}; expected matched, unmatchable or "
+            "not_reached",
+        )
+        check(
+            entry.get("translate", "identity")
+            in scenarios._PARITY_TRANSLATORS,
+            f"CATBOOST_PARAM_MAP[{key!r}] names translation "
+            f"{entry.get('translate')!r}, which _PARITY_TRANSLATORS does not "
+            "define",
+        )
+        check(
+            key not in scenarios.CATBOOST_PARAM_NOT_MAPPED,
+            f"{key} is both mapped and declared not mapped. It cannot be both",
+        )
+        if entry.get("verdict") == "matched":
+            check(
+                bool(entry.get("ours")),
+                f"CATBOOST_PARAM_MAP[{key!r}] is matched and names no key on "
+                "our side",
+            )
+    check(
+        set(scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK.values())
+        <= set(scenarios.CATBOOST_PARAM_MAP),
+        "a read-back key is not in the parity map, so nothing checks that the "
+        "value the arm took is the value CatBoost ran",
+    )
+    for _ours, _theirs in scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK.items():
+        check(
+            scenarios.CATBOOST_PARAM_MAP.get(_theirs, {}).get("static", True)
+            is False,
+            f"{_theirs} comes from the read-back and CATBOOST_PARAM_MAP does "
+            "not mark it static: False, so the static diff would compare it "
+            "against a value this file cannot honestly hold",
+        )
+    # The parity block a published table carries is the same table the gate
+    # saw, and it serializes.
+    parity = scenarios.resolved_parity_block()
+    for name, entry in parity.items():
+        check(
+            "error" not in entry,
+            f"the resolved parity table could not be built for {name}: "
+            f"{entry.get('error')}",
+        )
+        # The same failures the gate above already reported, seen through the
+        # field a published record carries. Both are checked because they can
+        # come apart: the gate walks catboost_parity_rows directly and this
+        # walks the block catboost_arm_block writes, so a bug that drops the
+        # rows on their way into the record shows up here and only here.
+        check(
+            not entry.get("failures"),
+            f"{name}: the parity table recorded in every manifest carries "
+            f"{len(entry.get('failures') or ())} failing key(s): "
+            f"{entry.get('failures')}",
+        )
+    try:
+        json.dumps(parity)
+    except (TypeError, ValueError) as exc:
+        FAILURES.append(
+            f"resolved_parity_block does not serialize, so no record can "
+            f"carry it: {exc}"
+        )
 
     # 4. The wiring the runner needs.
     for engine in scenarios.PEER_ENGINES:

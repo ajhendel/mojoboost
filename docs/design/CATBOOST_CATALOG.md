@@ -447,6 +447,7 @@ from Python it is always "unset", which is CatBoost's own default and the
 configuration `sampling.check_mvs_reg` argues is the only sensible one.
 | A35 | Persisting the fitted CTR tables in the model file (`catboost/libs/model/model_export/model_exporter.cpp`, `catboost/libs/model/ctr_data.h`, `catboost/libs/model/online_ctr.h::TModelCtr`; `CalcFinalCtrsAndSaveToModel` in `catboost/private/libs/algo/full_model_saver.cpp`) -- **CatBoost's behavior verified from source only to the extent A19 already verified it**: that `.cbm` carries `TCtrValueTable` per `TModelCtrBase` and that inference reads it through `TModelCtr::Calc`. The `.cbm` binary layout itself was NOT read, and nothing here imitates it | The model format's section for A19's model state. A fitted `CtrTables` is read off the target, so it is model state and not configuration; a file without it loads a model that keeps every tree referencing a CTR column and bins that column from different numbers | No. A reloaded model must score **bit-identically**, which is the whole test | Yes, and it is the gate on A19 being reachable at all: an arm that cannot be saved is an arm nobody can ship, and A19's own trainer refusal named this as the blocker | `serialize.mojo` (v5 `ctr` section), `ctr_columns.mojo` (the guards), `model_dump.mojo` (the remaining refusal) | A35 note. **BUILT and REACHED.** Format **v5**, conditional: a model with no ctr tables and no linear leaves still writes v4. Floats round-trip exactly because the whole format stores IEEE-754 bit patterns. Prepared tables, the model dump and every Python entry point still REFUSE, each by its own reason |
 | A36 | **CTR REPLACEMENT of a raw categorical column, and `random_strength` at the trainer the benchmark uses.** Two reachability edges, not two new mechanisms: A19/A30 own the CTR arithmetic and A3 owns the noise. CatBoost's own fork is `one_hot_max_size` (A16): a column at or under the cutoff becomes one-hot and every wider column is REPLACED by its CTR columns, so its split search never meets a category. **CatBoost's behavior here is RELAYED from the A16, A19 and A30 notes, not independently re-verified: there is no CatBoost checkout in this worktree** | Replacement is what the word says. A CTR that is *added* beside the raw column leaves the categorical in the matrix, so `tree._check_oblivious` still refuses the level and nothing has been built. The noise edge is narrower: the per-split draw exists on both backends, and what is scarce is the per-tree scale, which exactly two round loops compute | Yes for the CTR half (new columns, and one column removed). No for the noise half beyond what A3 already moves | The noise half YES and **BUILT**. The CTR half **BLOCKED**, four traced reasons, see the A36 note | `bindings/_mojotrees.mojo` (both), `bench/real_data/scenarios.py`; the CTR half would need `ctr_columns.mojo`, `binning.mojo`, `trainset.mojo` plus two files this lane does not own | A36 note. (3) when set. `random_strength` is deterministic across `MOJOTREES_NUM_WORKERS` and across machines, established by reading the code and written out in the note |
+| A37 | **The RESOLVED parameter list as the source of truth for the comparison arm**, and the removal of the CatBoost learning-rate pin. `CatBoost.get_all_params()` on the fitted model, which is CatBoost's own answer rather than a transcription of its documentation. **Nothing about CatBoost was verified from source in this lane and nothing was run: no CatBoost checkout, no fit, no `selfcheck`.** Every CatBoost claim is RELAYED from `CATBOOST_DEFAULTS_SOURCE`, the A16/A19/A30/A31 notes, and the measured learning-rate figures already recorded at `scenarios.py:355-362` | Not a CatBoost mechanism. It is the difference between what a library RESOLVES and what a harness BELIEVES it resolves. `MOJOTREES_CATBOOST_MODE` was a hand-written dict of somebody's belief about CatBoost's defaults, and `selfcheck.check_catboost_arm` checked it against a dict built from itself, so no wrong value in it could ever fail a gate | Yes, and by a lot on one key. The CatBoost arm no longer passes `learning_rate`, so CatBoost resolves its own -- about 0.4273 at 100 iterations on a 20,000 by 20 shape against the 0.1 it used to be pinned to | The arm identity moves from `cb-default@v1` to `cb-shipped@v1` and every published CatBoost number is SUPERSEDED. The `mojotrees_catboost_mode` arm is PARKED pending the read-back wiring, which is four call-site edits in three files this lane did not own | `bench/real_data/scenarios.py`, `bench/real_data/selfcheck.py`; the wiring is in `WIRE_NOTE_resolved_param_parity.md` for `engines.py`, `worker.py` and `run.py` | A37 note. (2) bit-moving on the CatBoost arm, deliberately. Gate: `selfcheck.check_catboost_arm`'s new key-by-key diff, which has never been watched fail and whose failing edit is written out in the note |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -5528,3 +5529,282 @@ no categorical column, so all three reach `boosting.train` and none can meet
 key is safe rather than hopeful, and it is a property of the support table: if
 a categorical scenario is ever re-enabled for this arm, this key has to be
 re-examined at the same time.
+
+### A37 note: the resolved parameter list, and the pin that came out with it
+
+Lane `lane/resolved-param-parity`, 2026-08-16. **Nothing was compiled and
+nothing was run.** No `mojo`, no `pixi`, no `selfcheck.py`, no benchmark, no
+lock taken; another session was measuring on the box for the whole of it.
+Every claim below is a claim about code that has been read, and every claim
+about CatBoost is relayed rather than re-verified: there is no CatBoost
+checkout in this worktree and no fit was performed.
+
+#### 1. The defect, stated exactly
+
+`MOJOTREES_CATBOOST_MODE` is the dict that makes the `mojotrees_catboost_mode`
+row "us in CatBoost's shape". Every value in it was hand-written from somebody
+reading CatBoost's defaults. `selfcheck.check_catboost_arm` then asserted that
+`mojotrees_catboost_mode_params` carried every entry of that dict through to
+its resolved output.
+
+That check is worth having and it caught a real bug once (`grow_policy` being
+dropped by the translator). What it cannot do is notice that a value in the
+dict is **wrong**, because the value it compares against is the same value.
+The gate could not fail on the thing the arm most needed a gate for.
+
+`CATBOOST_LEFT_AT_STOCK` is the other half and it was already better: it was
+transcribed from `CatBoost.get_all_params()` after a real fit, which is the
+library's own answer. Nothing compared the two tables to each other.
+
+#### 2. What was built
+
+A key-by-key map, `CATBOOST_PARAM_MAP`, from CatBoost's parameter name to ours,
+with a verdict per key that `selfcheck` enforces:
+
+- **matched** -- our resolved value must equal CatBoost's resolved value after
+  a declared translation, or the check fails.
+- **unmatchable** -- no parameter closes it, and the entry must name a live
+  `CATBOOST_UNMATCHABLE` key.
+- **not_reached** -- we have the knob, this arm does not set it, and no cell it
+  runs reaches it. Must name the scenarios that WOULD reach it, so turning one
+  on fails the check.
+
+Plus `CATBOOST_PARAM_NOT_MAPPED` for keys deliberately excluded, each with the
+value its exclusion rests on (`holds_while`), so that a CatBoost upgrade moving
+`model_shrink_rate` off 0 fails the check rather than passing silently.
+
+Every key in the resolved CatBoost dict must be in one table or the other.
+There is no way to drop a key quietly any more; an unclassified key is a
+failure with its own message.
+
+#### 3. The learning rate, which is the whole of the bit-moving change
+
+The lane was briefed with a claim: that CatBoost's auto learning rate was well
+above our 0.1 and that this explained most of the dense row's RMSE gap. **The
+claim was wrong and the file already said so.** `BASE_PARAMS["learning_rate"]`
+was passed explicitly to CatBoost through `CATBOOST_MATCHED`, so CatBoost's
+derivation never fired and both sides trained at 0.1. Somebody had thought
+about this before and written down why they pinned it, complete with the
+measurement: 0.5 at 2 iterations, **0.4273 at 100**, 0.06573 at 1000, on 20,000
+rows by 20 features.
+
+Andrew then decided to remove the pin. So:
+
+- The CatBoost arm passes `iterations`, `thread_count` and `random_seed`, plus
+  the loss function, which is the problem statement, plus two declared
+  non-model harness pins (`logging_level`, so CatBoost's progress table stays
+  out of the stdout stream `run.py` parses; `allow_writing_files`, so a
+  `catboost_info` write stays out of the timed region). Nothing else.
+- `learning_rate` moved from `CATBOOST_MATCHED` into a new
+  `CATBOOST_DELIBERATE_DIVERGENCE`, which is the opposite table from
+  `CATBOOST_UNMATCHABLE`: not a difference no parameter can close, but a
+  difference somebody chose.
+- The arm id changed from `cb-default` to `cb-shipped`, and
+  `CATBOOST_ARM_SUPERSEDES` records that every `cb-default@v1` number,
+  `bench/results/COMPARISON_RUN_2026-08-16.md` included, is stale.
+
+#### 4. The design tension, named rather than resolved, and the sentence that has to travel with the column
+
+Two comparisons were available and only one can be the row.
+
+**Like-for-like on model shape.** Both engines pinned to one learning rate, so
+a metric difference is tree shape, regularization and split scoring. That is
+what this arm was.
+
+**As shipped.** Each engine at its own resolved default at a matched tree
+budget, so the row is what a user gets out of the box. That is what this arm
+is, by decision.
+
+Both are defensible and they measure different things. The honest risk of the
+second is specific, and it is the sentence the column must carry:
+
+> At a fixed 100-tree budget, an engine training at 0.4273 walks much further
+> down its loss curve than one training at 0.1. CatBoost's accuracy column can
+> therefore improve substantially against `cb-default@v1` without a single line
+> of CatBoost running faster or fitting better. **That movement is a learning
+> rate multiplied by a budget and it is not evidence that CatBoost's engine is
+> more accurate than either arm beside it.** Read it as an out-of-the-box
+> claim, which is what it is: a user who asks CatBoost for 100 trees gets about
+> 0.43 and a user who asks LightGBM for 100 trees gets 0.1.
+
+That sentence is in `CATBOOST_DELIBERATE_DIVERGENCE["learning_rate"]
+["how_to_misread_it"]`, it is printed by `peer_banner()` before the first cell
+runs, and it travels into the manifest and into `records.json`. A table that
+prints the CatBoost accuracy column without it is inviting the misreading.
+
+#### 5. Why the CatBoost-mode arm is parked, and why that is the right failure
+
+CatBoost's resolved learning rate is a function of the row count, the feature
+count and the iteration count. There is no constant that is correct on more
+than one scenario. `0.4273` is a demonstration that the value MOVES, not a
+number to look up: it was measured on 20,000 by 20, and `dense_regression` at
+the standard tier is 200,000 by 50, so that scenario's rate is not 0.4273 and
+nobody knows what it is.
+
+So the CatBoost-mode arm cannot be built from a static file. It needs the
+CatBoost cell for the same scenario, tier and variant to have run first and to
+have left its `get_all_params()` where the mojotrees cell can read it. The
+mechanism is built (`catboost_readback_key`, `catboost_readback_entry`,
+`load_catboost_readback`, `append_catboost_readback`) and the four call-site
+edits are in `WIRE_NOTE_resolved_param_parity.md`, in `engines.py`, `worker.py`
+and `run.py`, none of which this lane owned.
+
+Until those land the arm **refuses by name** with
+`CatBoostReadbackMissing`, and the three scenarios that ran it are **parked**
+in `MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT` rather than left to raise. Both
+choices are deliberate:
+
+- **Refuse rather than fall back.** A fallback to
+  `BASE_PARAMS["learning_rate"]` would be a hand-written belief about CatBoost's
+  resolution, wrong by roughly a factor of four, in the one parameter that
+  moves a metric most. That is the defect this whole entry exists to remove;
+  reintroducing it as an error path would be worse than never having found it.
+- **Park rather than raise.** A raising cell is an infrastructure failure, and
+  `run.py` withholds the quality verdict for the entire matrix on one of those.
+  Three unbuildable cells would have suppressed the verdict on every cell that
+  did run.
+
+The parity gate deliberately does **not** read the scheduling table. It runs
+off `MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS`, so it keeps checking the
+parameters of an arm that is not currently running, and unparking is one edit
+rather than a re-audit. A gate that goes quiet at the moment the thing it
+guards is in flux is not a gate.
+
+#### 6. What is unverified, and it is a lot
+
+- **The check has never been watched fail.** It cannot be, from here. Section 7
+  below is the exact edit that should make it fail and the message it should
+  print, so that somebody with the box can confirm it before trusting it. This
+  repository has shipped inert gates this week; treat this one as inert until
+  it has been seen red.
+- **Nothing was run.** `selfcheck.py` was not executed, so a syntax error or a
+  wrong assumption about a dict key would show up on the first run and not
+  before.
+- **CatBoost's resolved values are relayed.** Every value in
+  `CATBOOST_LEFT_AT_STOCK` is somebody else's transcription of
+  `get_all_params()`. `check_catboost_readback` is the function that will
+  contradict it from a live fit, and it has never contradicted anything because
+  it has never run.
+- **`leaf_estimation_method` is a believed match with no evidence.** CatBoost
+  resolves Newton and mojotrees has no such parameter anywhere in
+  `python/mojotrees`, `bindings/` or `docs/PARAMETER_NAMING.md`. A comment at
+  `python/mojotrees/sklearn.py:2150` says our `leaf_estimation_iterations`
+  takes Newton steps, which is a reading of a comment about a neighbouring
+  parameter. Recorded as unmatchable with exactly that caveat.
+- **`one_hot_max_size` is an open divergence, parked.** CatBoost resolves 2 and
+  our `max_cat_to_onehot` default is 4. Neither categorical scenario runs this
+  arm, so today no cell reaches it. It was NOT added to
+  `MOJOTREES_CATBOOST_MODE`, because the last key added to that dict without a
+  run behind it was `max_bin` and it killed the smoke pass, and this lane could
+  not run one. `required_when_scenarios` makes the omission fail loudly the
+  moment either categorical scenario is re-enabled.
+- **`random_seed` is a second open divergence.** CatBoost and LightGBM are both
+  pinned to 190019 and the mojotrees arms are pinned to nothing:
+  `mojotrees_params` passes no seed. That cost nothing while the arm was
+  deterministic and costs something now that `random_strength=1.0` makes split
+  scores depend on a seed. Matching the number would not match the draws
+  (`CATBOOST_UNMATCHABLE["split_scoring"]`), so it is recorded rather than set.
+- **`mojotrees_catboost_mode_resolved` mirrors the adapter.** It re-adds
+  `n_estimators` and the Dataset params because
+  `engines.MojoTreesEngine._run_dense` adds them after translation. If that
+  call site changes, the parity table checks a dict the run did not use, and
+  nothing from `scenarios.py` can assert against a call site. Both places name
+  each other; that is the whole mitigation.
+
+#### 7. The exact edit that makes the gate fail, and what it should print
+
+Nobody has watched this check go red. Before trusting it, make it go red.
+
+**Edit A, one character, in `bench/real_data/scenarios.py`.** In
+`MOJOTREES_CATBOOST_MODE`, change
+
+```python
+    "max_depth": 6,
+```
+
+to
+
+```python
+    "max_depth": 8,
+```
+
+Then `python3 bench/real_data/selfcheck.py`. It should exit 1 and print, among
+other lines, one of these per scenario in
+`MOJOTREES_CATBOOST_MODE_PARITY_SCENARIOS`:
+
+```
+FAIL dense_regression: depth -> max_depth: CatBoost resolves depth=6 and this arm resolves max_depth=8. CATBOOST_PARAM_MAP calls this key matched, so the two arms are running different models under one heading. Fix the arm's value, or move the key into CATBOOST_UNMATCHABLE with a reason traced in our code
+```
+
+plus, from the recorded-block check, one of
+
+```
+FAIL dense_regression: the parity table recorded in every manifest carries 1 failing key(s): [...]
+```
+
+Nine lines in total across three scenarios and two checks, then
+`9 problems`. **If it prints `harness self-check passed`, the gate is inert and
+nothing in this entry should be believed.**
+
+**Edit B, which is the one that matters, because Edit A could be caught by the
+old check too.** Revert Edit A, then in `CATBOOST_LEFT_AT_STOCK` change
+
+```python
+    "l2_leaf_reg": 3,
+```
+
+to
+
+```python
+    "l2_leaf_reg": 4,
+```
+
+This is a wrong belief about CatBoost with the arm untouched, which is exactly
+the failure the old check could not see: `MOJOTREES_CATBOOST_MODE` still says
+`lambda_l2: 3.0` and still reaches the resolved dict, so every pre-A37 check
+passes. It should now print:
+
+```
+FAIL dense_regression: l2_leaf_reg -> lambda_l2: CatBoost resolves l2_leaf_reg=4 and this arm resolves lambda_l2=3.0. CATBOOST_PARAM_MAP calls this key matched, so the two arms are running different models under one heading. Fix the arm's value, or move the key into CATBOOST_UNMATCHABLE with a reason traced in our code
+```
+
+**Edit C, the classification gate.** Revert Edit B, then add a key to
+`CATBOOST_LEFT_AT_STOCK` that nothing classifies:
+
+```python
+    "diffusion_temperature": 0,
+```
+
+It should print:
+
+```
+FAIL dense_regression: CatBoost resolves diffusion_temperature=0 and neither CATBOOST_PARAM_MAP nor CATBOOST_PARAM_NOT_MAPPED says whether this arm matches it. A key nobody classified is the hand-written belief this table exists to remove
+```
+
+and, from `catboost_parity_rows`:
+
+```
+FAIL dense_regression: diffusion_temperature -> None: CatBoost resolves diffusion_temperature and nothing in CATBOOST_PARAM_MAP or CATBOOST_PARAM_NOT_MAPPED says whether this arm matches it. Classify it: a key nobody decided about is the hand-written belief this table removes
+```
+
+**Edit D, the refusal.** Revert Edit C, then in
+`mojotrees_catboost_mode_params` replace
+
+```python
+    params.update(catboost_readback_values(spec, catboost_readback))
+```
+
+with
+
+```python
+    params.setdefault("learning_rate", BASE_PARAMS["learning_rate"])
+```
+
+which is the fallback this entry exists to forbid, written the way somebody
+would actually write it. It should print:
+
+```
+FAIL the CatBoost-mode arm BUILT without CatBoost's read-back. It must refuse by name: every key in MOJOTREES_CATBOOST_MODE_FROM_READBACK has no static value, so whatever it used for the learning rate is a guess, and a guess of 0.1 against CatBoost's resolved 0.43 is the largest single error this arm can make
+```
+
+Revert Edit D. All four are one-line edits and none of them needs a fit.
