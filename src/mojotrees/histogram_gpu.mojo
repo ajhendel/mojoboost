@@ -104,6 +104,23 @@ a batched histogram covers exactly the rows the single-leaf build would have
 covered. The slot stamp, the per-item scale table, and the multi-slot download
 all come from `gpu_leaf_batching` rather than being written again here.
 
+The constant-hessian plane
+--------------------------
+Four of the built-in objectives put the same hessian into every row when the
+fit carries no sample weights, and `set_constant_hessian` is how a caller
+declares that. The range histogram kernels in `gpu_active_rows.mojo` then stop
+accumulating that plane and reconstruct it as `hq_const * count`, which is the
+exact Int32 they would have accumulated; that kernel's docstring carries the
+argument and this module's `histogram_from_host` says why the download is
+unaffected.
+
+It reaches the single-leaf and resident-frontier builds, which are the ones
+that run through `enqueue_leaf`. It does **not** reach the batched multi-leaf
+path: those kernels live in `gpu_leaf_batching.mojo`, are never handed the
+flag, and therefore keep accumulating three planes. That is a difference in
+work and not in output, since both paths write the same three planes into the
+same layout, and a build is free to take either.
+
 Batching is off unless it is asked for and the launch policy agrees, and
 both halves of that are existing code rather than a new switch.
 `MOJOTREES_GPU_HIST_SPECIALIZATION=batched` (`apple_histogram_policy`) is the
@@ -625,6 +642,36 @@ struct GpuHistogramBuilder(Movable):
     def feature_group(self) -> Int:
         """The launch shape `set_feature_group` last chose."""
         return self.rows.feature_group
+
+    def set_constant_hessian(mut self, on: Bool):
+        """Declare that this round's objective guarantees a per-row hessian
+        of exactly `histogram.CONSTANT_HESSIAN`, so the histogram kernels may
+        stop accumulating that plane and reconstruct it from the count.
+
+        The declaration and its hazards belong to
+        `GpuActiveRows.set_constant_hessian`, which this forwards to; the
+        predicate that answers it correctly is
+        `histogram.objective_has_constant_hessian`, and it is false for every
+        weighted fit and every GOSS round whatever the objective code says.
+        `MOJOTREES_CONST_HESSIAN=0` refuses the declaration outright, and
+        `constant_hessian` below reports what was actually adopted rather
+        than what was asked for.
+
+        Held on the builder rather than passed per node because it is a
+        property of the round, exactly like `g_scale` and `h_scale`. A
+        trainer should set it once where it computes this round's gradients
+        and clear it when it does anything -- weights, GOSS, a different
+        objective, a softmax class -- that breaks the guarantee. Nothing in
+        this package calls it yet.
+        """
+        self.rows.set_constant_hessian(on)
+
+    def constant_hessian(self) -> Bool:
+        """Whether the constant-hessian specialization is actually in force
+        for the next build: the declaration ANDed with the environment's
+        permission. A benchmark arm should read this rather than assume its
+        request was honored."""
+        return self.rows.constant_hessian
 
     def synchronize(self) raises:
         """Block until every enqueued device operation has completed."""
@@ -1158,6 +1205,22 @@ struct GpuHistogramBuilder(Movable):
         serial exactly as it did before. Forcing workers is how the parallel
         arm is reached at that shape. Moving the grain is a measured
         decision and is not taken here.
+
+        **The constant-hessian specialization does not reach this
+        conversion, and it is worth saying so rather than leaving it to be
+        inferred.** When the hessian plane is elided, it is elided from the
+        *accumulation*: the kernels stop accumulating it and refill it in
+        device memory before this function ever sees the buffer. The
+        download therefore still moves three planes and this loop still
+        converts three, unchanged, byte for byte. It could not be otherwise
+        without changing the device-side layout of `out_dev`, which
+        `gpu_split_search.mojo` scans in place across all three planes and
+        which the resident pool in `gpu_leaf_batching.mojo` strides by, and
+        neither is this lane's to change. The hessian plane also sits in the
+        middle of `[grad | hess | count]`, so even skipping it in the copy
+        would need two transfers rather than one, against the "one host
+        synchronization per node, not one per plane" rule `download_raw`
+        exists to keep.
         """
         var hist_size = self.n_features * self.n_bins
         var g = _zeroed_f64(hist_size)
@@ -1267,6 +1330,7 @@ struct GpuHistogramBuilder(Movable):
             self.g_scale,
             self.h_scale,
             self.active,
+            self.rows.constant_hessian,
         )
 
     def readback_range(
