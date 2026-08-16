@@ -303,7 +303,6 @@ from .parallel import (
     dispatch_feature_ranges,
     dispatch_feature_rows,
     dispatch_features,
-    dispatch_rows,
 )
 from .rng import GOLDEN, uniform
 from .tree_parameters_extra import ForcedSplits
@@ -1222,121 +1221,10 @@ def all_features(n_features: Int) -> List[Int]:
     for f in range(n_features):
         out.append(f)
     return out^
-comptime ROW_MAJOR_PACK_MAX_BINS = 16
-"""Most bins a feature may use and still be stored in half a byte.
-
-Two features per byte, `(n + 1) / 2` bytes for `n` packable features. A bin id
-is a small integer, so packing is lossless by construction: 16 bins are the
-ids 0..15 and a nibble holds exactly those. A feature that reaches 17 bins
-needs id 16, which does not fit, and stays a whole byte.
-"""
-
-comptime ROW_MAJOR_TILE_BYTES = 32 * 1024
-"""Row-record bytes one transpose tile writes before moving on.
-
-The transpose reads a column contiguously and writes it with a `row_stride`
-stride, so the tile is sized by its *write* window: `tile_rows * row_stride`
-bytes stay hot across the whole feature loop, and each of those bytes is
-fetched once rather than once per feature. 32 KiB is a conservative floor for
-a private L1, chosen on the same grounds as
-`apple_cpu_policy.ASSUMED_L1D_BYTES`: too small costs some locality, too large
-thrashes. Untuned, and no measurement here justifies a different number.
-"""
-
-
-def env_row_major_bins() -> Bool:
-    """`MOJOTREES_CPU_ROW_MAJOR`: build the row-major view at fit time.
-
-    **Off by default, and that is a decision rather than an oversight.** The
-    view is one extra copy of the binned matrix (see
-    `BinnedMatrix.row_major_bytes`, and the memory paragraph on the struct),
-    and nothing in this round has measured it. A default that doubles a user's
-    bin-matrix footprint on the strength of an unmeasured argument is exactly
-    the kind of thing this campaign refuses; the orchestrator's timed arms
-    decide whether it becomes one.
-    """
-    return _env_int("MOJOTREES_CPU_ROW_MAJOR", 0) != 0
-
-
-def _row_major_widths(
-    bins: List[UInt8], n_rows: Int, n_features: Int, mut width_of: List[Int]
-) raises:
-    """Each feature's observed bin count into `width_of[f]`, one parallel max
-    per column.
-
-    A free function rather than a method because the caller is `mut self` and
-    a closure capturing a pointer whose origin is `self.bins` while `self` is
-    mutable is a borrow Mojo will not carry into a parallel task. Taking the
-    column array as its own argument gives the pointer its own origin.
-    """
-    var width_p = width_of.unsafe_ptr()
-    var bins_p = bins.unsafe_ptr()
-
-    def scan_feature(f: Int) {imm}:
-        var col = f * n_rows
-        var hi = 0
-        for r in range(n_rows):
-            var v = Int(bins_p.unsafe_load(col + r))
-            if v > hi:
-                hi = v
-        width_p.unsafe_store(f, hi + 1)
-
-    dispatch_features(scan_feature, n_features, n_features * n_rows)
-
-
-def _row_major_fill(
-    bins: List[UInt8],
-    n_rows: Int,
-    n_features: Int,
-    stride: Int,
-    byte_of: List[Int],
-    shift_of: List[Int],
-    mut rm: List[UInt8],
-) raises:
-    """The transpose itself, into a `rm` already sized and zeroed.
-
-    Row-tiled so the strided writes stay inside one hot window across the
-    whole feature loop; see `BinnedMatrix.build_row_major` for why the window
-    is sized by `ROW_MAJOR_TILE_BYTES` and why this is a second pass rather
-    than a fusion into the binning tile.
-    """
-    var bins_p = bins.unsafe_ptr()
-    var rm_p = rm.unsafe_ptr()
-    var byte_p = byte_of.unsafe_ptr()
-    var shift_p = shift_of.unsafe_ptr()
-    var tile = ROW_MAJOR_TILE_BYTES // stride
-    if tile < 1:
-        tile = 1
-
-    def fill_rows(start: Int, end: Int) {imm}:
-        var t0 = start
-        while t0 < end:
-            var t1 = t0 + tile
-            if t1 > end:
-                t1 = end
-            for f in range(n_features):
-                var col = f * n_rows
-                var bo = byte_p.unsafe_load(f)
-                var sh = shift_p.unsafe_load(f)
-                # The record starts zeroed and a byte is written by at most
-                # two features of the same row, and a row's record belongs to
-                # exactly one task, so the OR that merges a pair of nibbles
-                # needs no atomic. An unpacked feature has `sh == 0` and owns
-                # its byte outright, so one store covers both cases with no
-                # branch in the row loop.
-                for r in range(t0, t1):
-                    var v = Int(bins_p.unsafe_load(col + r))
-                    var idx = r * stride + bo
-                    rm_p.unsafe_store(
-                        idx, rm_p.unsafe_load(idx) | UInt8(v << sh)
-                    )
-            t0 = t1
-
-    dispatch_rows(fill_rows, n_rows, n_rows * n_features)
 
 
 struct BinnedMatrix(Copyable, Movable):
-    """Binned feature matrix, in one or two layouts of the same bytes.
+    """Column-major binned feature matrix.
 
     Bin for (row r, feature f) is stored at `bins[f * n_rows + r]`. `cats`
     records which features are categorical, so split finding knows to search
@@ -1351,45 +1239,6 @@ struct BinnedMatrix(Copyable, Movable):
     -- the same reason `map_forced_splits` exists. The columns are *not*
     renumbered: a filtered feature keeps its id, its column, and its slot in an
     importance vector.
-    The row-major view
-    ------------------
-    `build_row_major` adds a second copy of the same bin ids laid out the
-    other way round: one fixed-width **record** per row, `row_stride` bytes,
-    holding every feature's bin for that row. Feature f's bin lives in byte
-    `row_byte[f]` of the record, in the nibble selected by `row_shift[f]` and
-    `row_mask[f]`. `row_bin_at(r, f) == bin_at(r, f)` for every cell; the two
-    arrays are the same information and neither is authoritative.
-
-    This is LightGBM's `MultiValBin`, the layout behind `force_row_wise`. It
-    exists because a histogram build over a node's row list reads every
-    feature of one row: feature-major that is one cache line per (row,
-    feature), row-major it is one line per row for all of them.
-
-    **Which builder reads which, and this paragraph is here for the GPU
-    reader.** `histogram.build_histogram*` and every `_accumulate_subset*`
-    kernel except the `_row_major` ones read `bins`, the feature-major array,
-    and always have. Only `histogram.build_histogram_subset_row_major*` reads
-    `row_bins`. **Every GPU path reads `bins`.** The device histogram kernels
-    upload and scatter the feature-major array, `train_gpu`'s resident data
-    plane holds the feature-major array, and nothing on the device has ever
-    been handed `row_bins` -- a device scatter wants the coalesced column, not
-    the record. So a GPU lane considering a group-major or feature-blocked
-    device layout is deciding a *separate* question from this one, and turning
-    `MOJOTREES_CPU_ROW_MAJOR` on cannot change a device result. It costs the
-    device fit the memory below and nothing else.
-
-    **Memory cost, stated in bytes because a user with a ceiling needs to find
-    it without reading the source.** The row-major view is one extra copy of
-    the bin matrix, `n_rows * row_stride` bytes, against the feature-major
-    `n_rows * n_features` bytes it does not replace. At the headline shape,
-    **1,000,000 rows by 50 features: 50 MB feature-major, plus 50 MB
-    row-major with no feature packable, plus as little as 25 MB when every
-    feature fits in 4 bits** -- so a fit's bin-matrix footprint goes from 50 MB
-    to between 75 MB and 100 MB. Packing recovers half a byte per packable
-    feature per row and nothing else: it does not shrink `bins`. `row_stride`
-    and `row_major_bytes()` report the realized figure for a given dataset,
-    and `build_row_major` is opt-in (`MOJOTREES_CPU_ROW_MAJOR`) precisely
-    because this is a cost a user must choose.
     """
 
     var bins: List[UInt8]
@@ -1399,43 +1248,6 @@ struct BinnedMatrix(Copyable, Movable):
     var cats: CategoricalSpec
     var missing_bin: List[Int]
     var usable: List[Int]
-
-    var row_bins: List[UInt8]
-    """The record array, `n_rows * row_stride` bytes. Empty until
-    `build_row_major` runs."""
-
-    var row_stride: Int
-    """Bytes in one row's record, 0 when the view is not built."""
-
-    var row_byte: List[Int]
-    """Byte offset of feature f inside a record."""
-
-    var row_shift: List[Int]
-    """Right shift applied to that byte for feature f: 0 for a whole byte or
-    a low nibble, 4 for a high nibble."""
-
-    var row_mask: List[Int]
-    """Mask applied after the shift: 255 for a whole byte, 15 for a
-    nibble."""
-
-    var feature_bins: List[Int]
-    """Bins feature f actually uses, `max observed bin + 1`.
-
-    Observed from the data rather than declared by the mapper, so a feature
-    that reserves 255 bins and uses four is compacted like a four-bin feature
-    and packs like one. It is a function of `bins` alone, so two matrices with
-    the same bytes always get the same layout.
-    """
-
-    var bin_offset: List[Int]
-    """Cumulative `feature_bins`, length `n_features + 1`.
-
-    LightGBM's `group_bin_boundaries_` idea: feature f's cells in a *compact*
-    histogram start at `bin_offset[f]`, so a private accumulator costs
-    `sum_f feature_bins[f]` cells rather than `n_features * n_bins`. Only the
-    row-major blocked kernel's private partials use it; the output histogram
-    keeps its `f * n_bins + b` shape, which every other file indexes with.
-    """
 
     def __init__(
         out self,
@@ -1451,13 +1263,6 @@ struct BinnedMatrix(Copyable, Movable):
         self.cats = CategoricalSpec.none()
         self.missing_bin = no_missing_bins(n_features)
         self.usable = all_features(n_features)
-        self.row_bins = []
-        self.row_stride = 0
-        self.row_byte = []
-        self.row_shift = []
-        self.row_mask = []
-        self.feature_bins = []
-        self.bin_offset = []
 
     def __init__(
         out self,
@@ -1483,13 +1288,6 @@ struct BinnedMatrix(Copyable, Movable):
             self.usable = usable^
         else:
             self.usable = all_features(n_features)
-        self.row_bins = []
-        self.row_stride = 0
-        self.row_byte = []
-        self.row_shift = []
-        self.row_mask = []
-        self.feature_bins = []
-        self.bin_offset = []
 
     def bin_at(self, row: Int, feature: Int) -> Int:
         return Int(self.bins[feature * self.n_rows + row])
@@ -1504,154 +1302,6 @@ struct BinnedMatrix(Copyable, Movable):
         prefiltered, and passing every feature is the same draw as passing
         nothing."""
         return self.usable.copy()
-    def has_row_major(self) -> Bool:
-        """Whether the row-major view is built and the right size.
-
-        The size check is not paranoia: a `BinnedMatrix` is copied and
-        serialized in several places, and a kernel that indexed a stale record
-        array would read garbage bins rather than fail.
-        """
-        return (
-            self.row_stride > 0
-            and self.n_rows > 0
-            and self.n_features > 0
-            and len(self.row_bins) == self.n_rows * self.row_stride
-            and len(self.row_byte) == self.n_features
-            and len(self.row_shift) == self.n_features
-            and len(self.row_mask) == self.n_features
-            and len(self.feature_bins) == self.n_features
-            and len(self.bin_offset) == self.n_features + 1
-        )
-
-    def row_bin_at(self, row: Int, feature: Int) -> Int:
-        """The bin at (row, feature), read from the record array.
-
-        Equal to `bin_at(row, feature)` for every cell of a built view. This
-        is the reference the tests compare the kernels against; the kernels
-        inline the same three operations with the per-feature constants
-        hoisted out of the row loop.
-        """
-        var raw = Int(self.row_bins[row * self.row_stride + self.row_byte[feature]])
-        return (raw >> self.row_shift[feature]) & self.row_mask[feature]
-
-    def row_major_bytes(self) -> Int:
-        """Bytes the row-major view occupies, 0 when it is not built. The
-        number the memory paragraph above is about, for this dataset."""
-        return len(self.row_bins)
-
-    def packed_feature_count(self) -> Int:
-        """Features stored in half a byte. 0 when the view is not built."""
-        var n = 0
-        for f in range(len(self.row_mask)):
-            if self.row_mask[f] == 15:
-                n += 1
-        return n
-
-    def compact_bin_count(self) -> Int:
-        """`sum_f feature_bins[f]`, the cell count of a compact histogram over
-        every feature. 0 when the view is not built."""
-        if len(self.bin_offset) != self.n_features + 1:
-            return 0
-        return self.bin_offset[self.n_features]
-
-    def build_row_major(mut self) raises:
-        """Build (or rebuild) the row-major record array from `bins`.
-
-        Three passes, none of which touches a Float64 and none of which can
-        change a bin id:
-
-        1. **Widths.** Each feature's observed bin count, one parallel max
-           over its column. Derived from the data rather than from the
-           `BinMapper`, so a `BinnedMatrix` assembled by `efb`, by
-           `serialize`, or by a test gets the same treatment as one that came
-           out of `transform`, and so a feature that reserves many bins and
-           uses few is packed on what it uses.
-        2. **Layout.** Features needing more than `ROW_MAJOR_PACK_MAX_BINS`
-           bins take a whole byte each, in ascending feature order, at the
-           front of the record; the rest take half a byte each, two to a byte,
-           in ascending feature order, after them. `row_stride` is
-           `unpacked + (packable + 1) / 2`. Splitting the record this way
-           rather than interleaving keeps the assignment a two-line rule and
-           costs nothing: a record is read through `row_byte[f]`, so nothing
-           downstream cares what order the bytes are in, and at any feature
-           count where the record spans more than a cache line the packed half
-           is the dense half either way.
-        3. **Transpose.** Row-tiled, `ROW_MAJOR_TILE_BYTES` of record window
-           at a time, feature-major inside the tile so the *reads* stay
-           sequential down each column and the *writes* stay inside a window
-           that is still hot when the next feature arrives. Dispatched over
-           disjoint ascending row ranges; a row's record is written by exactly
-           one task, so the two features sharing a byte are written by the
-           same task and the OR that merges them needs no atomic.
-
-        The fused alternative -- writing the record inside `transform`'s
-        binning tile -- was rejected on write traffic, and the arithmetic is
-        worth keeping: that loop is dispatched per (feature, row range), so a
-        fixed feature walks the whole record array with a `row_stride` stride.
-        At 1,000,000 rows by 50 features the array is 50 MB and a 128-byte
-        line holds two of that feature's bytes, so each of the 50 features
-        pulls ~25 MB of lines, ~1.25 GB of read-for-ownership traffic against
-        the 100 MB (one read of `bins`, one write of `row_bins`) the tiled
-        pass moves. A second pass that moves a twelfth of the traffic is not a
-        second pass worth fusing away.
-        """
-        var nf = self.n_features
-        var nr = self.n_rows
-        var byte_of = List[Int]()
-        var shift_of = List[Int]()
-        var mask_of = List[Int]()
-        var width_of = List[Int]()
-        var offsets = List[Int]()
-        var rm = List[UInt8]()
-        var stride = 0
-
-        if nf > 0 and nr > 0 and len(self.bins) == nr * nf:
-            width_of.resize(nf, 1)
-            _row_major_widths(self.bins, nr, nf, width_of)
-
-            byte_of.resize(nf, 0)
-            shift_of.resize(nf, 0)
-            mask_of.resize(nf, 255)
-            var whole = 0
-            for f in range(nf):
-                if width_of[f] > ROW_MAJOR_PACK_MAX_BINS:
-                    byte_of[f] = whole
-                    whole += 1
-            var packed = 0
-            for f in range(nf):
-                if width_of[f] <= ROW_MAJOR_PACK_MAX_BINS:
-                    byte_of[f] = whole + (packed >> 1)
-                    shift_of[f] = 4 if (packed & 1) == 1 else 0
-                    mask_of[f] = 15
-                    packed += 1
-            stride = whole + ((packed + 1) >> 1)
-
-            offsets.append(0)
-            for f in range(nf):
-                offsets.append(offsets[f] + width_of[f])
-
-            rm.resize(nr * stride, UInt8(0))
-            _row_major_fill(
-                self.bins, nr, nf, stride, byte_of, shift_of, rm
-            )
-
-        self.row_bins = rm^
-        self.row_stride = stride
-        self.row_byte = byte_of^
-        self.row_shift = shift_of^
-        self.row_mask = mask_of^
-        self.feature_bins = width_of^
-        self.bin_offset = offsets^
-
-    def drop_row_major(mut self):
-        """Release the row-major view and its `row_major_bytes()`."""
-        self.row_bins = []
-        self.row_stride = 0
-        self.row_byte = []
-        self.row_shift = []
-        self.row_mask = []
-        self.feature_bins = []
-        self.bin_offset = []
 
 
 struct BinMapper(Copyable, Movable):
@@ -1926,7 +1576,7 @@ struct BinMapper(Copyable, Movable):
             n_rows,
             n_features * n_rows * (1 + _log2_ceil(self.n_bins)),
         )
-        var out = BinnedMatrix(
+        return BinnedMatrix(
             bins^,
             n_rows,
             n_features,
@@ -1935,15 +1585,6 @@ struct BinMapper(Copyable, Movable):
             self.missing_bin.copy(),
             self.usable.copy(),
         )
-        # The row-major view, at fit time, off unless asked for. Its widths
-        # come from the bins this call just wrote, so it is built here rather
-        # than fused into the tile above: the packing decision needs each
-        # feature's realized bin count, which does not exist until the last
-        # tile has run. See `BinnedMatrix.build_row_major` for the write
-        # traffic that makes the second pass the cheap way round anyway.
-        if env_row_major_bins():
-            out.build_row_major()
-        return out^
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
         """Bin one example (length n_features) for prediction."""
