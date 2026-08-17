@@ -51,16 +51,20 @@ whether it was built alone or in a batch of thirty, and the batch size is a
 launch decision that no result can observe. That is the invariant the whole
 lane rests on.
 
-The same invariant is what makes every knob on `_plan_hist_kernel` free of
-numeric consequence. That kernel is the device-plan path's third accumulation
-arm, default off behind `plan_lean_requested`, and it carries the two ideas
-this project took from CatBoost's histogram kernel -- private threadgroup
-accumulators instead of one contended shared histogram, and a feature group
-so a row's gradient pair is read once and spent several times -- together with
-a per-item row split that follows the item's own count rather than the tree's
-row bound. All of them move where an integer is added and none of them changes
-which integers are added, so they select traffic, contention and parallelism
-and never a number.
+A THIRD ACCUMULATION ARM WAS BUILT ON THAT INVARIANT, MEASURED, AND REMOVED.
+`_plan_hist_kernel` carried the two ideas this project took from CatBoost's
+histogram kernel -- private threadgroup accumulators instead of one contended
+shared histogram, and a feature group so a row's gradient pair is read once and
+spent several times -- together with a per-item row split that follows the
+item's own count rather than the tree's row bound, and a pair-indexed grid for
+the subtracting level build removed the no-op threadgroups the staged item grid
+dispatches. All of them moved where an integer is added and none of them changed
+which integers are added, so every arm was bit-identical, and every arm measured
+null or worse on 2026-08-17 at 200,000 rows x 90 features, 60 trees, symmetric
+depth 6, GPU. All four switches and both kernels were removed the same day under
+`bench/results/LANE_RULES.md` rule 6. The numbers are in
+`docs/design/DECLINED_OPTIMIZATIONS.md` rows E10 to E13; read them before
+rebuilding any of it.
 
 Where the leaves come from
 --------------------------
@@ -719,159 +723,12 @@ def _batch_copy_back_zero_subtract_kernel(
         out_hist[unsafe_offset = left_slot * cells + r] = Int32(0)
 
 
-# --- The pre-quantized gradient source, on the batched family -------------
-#
-# WHAT THE OBLIVIOUS LEVEL BUILD WAS DOING, AND WHY IT IS THE SLOW ARM
-# --------------------------------------------------------------------
-# The three kernels below take `grad` and `hess` as Float32 planes and form
-# `Int32(round(g * g_scale))` and its hessian twin INSIDE the row loop, which
-# is once per (row, feature) visit. `grid.x` is the feature axis, so every one
-# of the `n_slots` threadgroups covering a row's tile repeats the same two
-# gathers, the same two Float32 multiplies and the same two rounds on the same
-# row. At the 90-feature real benchmark that is ninety redundant evaluations of
-# an expression whose operands do not depend on the feature.
-#
-# `gpu_active_rows` fixed this on the single-leaf range family and the fix
-# never reached here: `_quantize_grad_hess_kernel` writes one interleaved
-# `Int32` pair per row, once per round, and the range kernels gather the pair
-# instead of the two Float32 words. This section is that source, on the
-# batched family.
-#
-# WHY IT CANNOT MOVE A BIT
-# ------------------------
-# 1. **The scale is global per round on the path that matters, and it is
-#    checked rather than assumed.** `stage_device_plan` takes ONE `g_scale`
-#    and ONE `h_scale` and writes that pair into every item's row of
-#    `scales_dev`; its only caller, `histogram_gpu.stage_desc_level_plan`,
-#    passes the builder's own `g_scale`/`h_scale`, which are the round's. So
-#    within a staged plan the pair is uniform over items, uniform over
-#    features (the kernels never index scales by feature), and constant over
-#    the tree's levels, because `stage_device_plan` runs once per tree. The
-#    quantized source is offered only on the device-plan arms for exactly
-#    that reason; `enqueue_batch` stages a per-item scale list that a
-#    multiclass batch may vary, so it keeps the Float32 arm and passes
-#    `use_quant = 0`.
-# 2. **The value is the same expression.** `_batch_quantize_kernel` evaluates
-#    `Int32(round(grad[r] * g_scale))` -- the same Float32 multiply, the same
-#    `round`, the same device compiler -- and stores it. Hoisting an
-#    expression out of a loop whose other operands it does not depend on
-#    cannot change its value.
-# 3. **The accumulation is unchanged.** The same Int32 lands in the same
-#    threadgroup bin through the same atomic, and Int32 addition is
-#    associative and commutative, so nothing about ORDER was ever load
-#    bearing and nothing about it moves here.
-#
-# WHAT IT COSTS, STATED SO IT IS NOT DISCOVERED
-# ---------------------------------------------
-# One streaming launch over `n_rows` per TREE, not per level: `stage_device
-# _plan` invalidates the buffer and the first accumulation of the tree
-# rebuilds it. `gpu_resident_round.oblivious_launch_census(6)` is 62 command
-# buffers and the Metal queue on the measured machine is 64 deep, so this
-# takes a depth-6 tree to **63**, still under the knee -- but it is one of the
-# two, and it is the reason this arm is default off rather than default on
-# like its range-family twin. Folding the pass into
-# `_batch_copy_back_zero_kernel`, which already launches per level and could
-# run it on the level-zero pass alone, would take the census back to 62; that
-# is a follow-up and not this edit.
-#
-# The buffer is `2 * n_planes * n_rows` Int32, which at 463,715 rows and one
-# plane is 3.7 MB.
-
-comptime BATCH_QUANT_VAR = "MOJOTREES_GPU_BATCH_QUANT"
-"""Whether the batched family gathers the pre-quantized Int32 pairs.
-
-`1` selects it, anything else leaves the Float32 planes in force, and `0`
-additionally declines the buffer's allocation so a fit that will never use it
-does not carry 3.7 MB. Default off because it moves the launch census by one
-and no benchmark has priced either half yet; the identity argument above is
-complete, so under `bench/results/LANE_RULES.md` rule 5 a measured win flips
-this in the session that measures it."""
-
 comptime BATCH_CONST_HESSIAN_VAR = "MOJOTREES_CONST_HESSIAN"
 """The same withdrawal switch `GpuActiveRows` reads, and it is deliberately
 the same name. Constant hessian is a DECLARATION ABOUT THE OBJECTIVE that the
 trainer owns; an environment variable may only take the permission away, never
 grant it, so `0` here refuses `set_constant_hessian(True)` and nothing else
 turns it on."""
-
-
-comptime BATCH_CONST_HESSIAN_FORWARD_VAR = "MOJOTREES_GPU_BATCH_CONST_HESS"
-"""`1` forwards the trainer's constant-hessian DECLARATION to the batcher, so
-the batched kernels actually elide the hessian plane.
-
-A separate name from `BATCH_CONST_HESSIAN_VAR` above and it is not a
-duplicate. That one is the withdrawal switch, which only ever takes the
-permission away. This one exists because the declaration never ARRIVED:
-`GpuHistogramBuilder.set_constant_hessian` forwarded it to `self.rows` and
-stopped, so `GpuLeafBatcher.constant_hessian` was False on every fit that ever
-ran and the elision inside `_batch_hist_atomic_kernel` and its two siblings has
-never executed on the oblivious level build. Verified by reading both setters
-and every caller, 2026-08-17.
-
-It is a switch rather than a plain fix so that the elision can be measured
-against the arm that has been shipping. When true the declaration cannot move
-a bit -- the plane it stops accumulating is rebuilt as `hq_const * vc`, the
-exact Int32 the accumulation would have left there, argued at
-`_batch_hist_atomic_kernel` -- so under `bench/results/LANE_RULES.md` rule 5 a
-measured win flips this in the session that measures it. When the declaration
-is FALSE this switch does nothing whatever, because it forwards a false."""
-
-
-def _batch_quant_allowed() -> Bool:
-    """Whether this batcher allocates the quantized buffer at all."""
-    return getenv(BATCH_QUANT_VAR) != "0"
-
-
-def batch_const_hessian_forward_requested() -> Bool:
-    """`MOJOTREES_GPU_BATCH_CONST_HESS=1`. See the constant above."""
-    return getenv(BATCH_CONST_HESSIAN_FORWARD_VAR) == "1"
-
-
-def batch_quantized_grads_requested() -> Bool:
-    """`MOJOTREES_GPU_BATCH_QUANT=1`. The arm's initial state; a benchmark
-    holding both arms in one process moves it with
-    `GpuLeafBatcher.set_quantized_gradients` instead of re-execing, for the
-    reason `GpuActiveRows.set_feature_group` gives at length."""
-    return getenv(BATCH_QUANT_VAR) == "1"
-
-
-def _batch_quantize_kernel(
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    gq: MutPointer[Int32, MutAnyOrigin],
-    plane_base: Int32,
-    n_rows: Int32,
-    g_scale: Float32,
-    h_scale: Float32,
-):
-    """One plane's gradients and hessians, quantized once, interleaved.
-
-    `gpu_active_rows._quantize_grad_hess_kernel` plus the plane offset a
-    batched item carries in `ITEM_PLANE`. A separate symbol rather than an
-    import for the reason the header gives about `_plan_env_int`: this module
-    owns its own launches, and the scales are launch arguments rather than
-    table reads because the pair is global to the staged plan. The section
-    above carries the check that establishes that.
-
-    One thread per row of one plane, two Float32 multiplies, two rounds, two
-    stores, and no read of the item table at all, so it does not have to be
-    ordered after anything the plan writes.
-
-    `gq[2 * (plane_base + r)]` and its odd twin are exactly the two integers
-    the histogram row loop would otherwise have formed for row `r`, so a
-    histogram accumulated from this buffer is the same word for word. The
-    argument is in the section above rather than here, in one place, because
-    three kernels rest on it.
-    """
-    var r = Int(global_idx.x)
-    if r < Int(n_rows):
-        var i = Int(plane_base) + r
-        gq[unsafe_offset = 2 * i] = Int32(
-            round(grad[unsafe_offset=i][0] * g_scale)
-        )
-        gq[unsafe_offset = 2 * i + 1] = Int32(
-            round(hess[unsafe_offset=i][0] * h_scale)
-        )
 
 
 def _batch_hist_partial_kernel(
@@ -994,7 +851,6 @@ def _batch_hist_atomic_kernel(
     rows: MutPointer[Int32, MutAnyOrigin],
     grad: MutPointer[Float32, MutAnyOrigin],
     hess: MutPointer[Float32, MutAnyOrigin],
-    gq: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
     items: MutPointer[Int32, MutAnyOrigin],
     scales: MutPointer[Float32, MutAnyOrigin],
@@ -1005,7 +861,6 @@ def _batch_hist_atomic_kernel(
     n_bins: Int32,
     hist_size: Int32,
     feat_stride: Int32,
-    use_quant: Int32,
     const_hess: Int32,
 ):
     """The same batched accumulation, folding each partial straight into its
@@ -1019,13 +874,18 @@ def _batch_hist_atomic_kernel(
     within an item it is exactly the same. Integer atomics make the result
     order-independent, so this path is bit-identical to the tiled one.
 
-    **`use_quant` selects the pre-quantized source.** With it set the row loop
-    reads the interleaved Int32 pair `_batch_quantize_kernel` wrote for the
-    round instead of the two Float32 planes, which moves two multiplies and
-    two rounds off the inner loop and halves the derivative gather. The
-    integers are the same integers; the argument is at that kernel and in the
-    section above it. `gq` is never dereferenced while `use_quant` is clear,
-    so a caller with no such buffer passes any pointer it likes.
+    **A PRE-QUANTIZED GRADIENT SOURCE WAS BUILT HERE AND MEASURED NULL.** The
+    row loop below forms `Int32(round(grad[r] * g_scale))` and its hessian twin
+    per (row, feature) visit, and `MOJOTREES_GPU_BATCH_QUANT=1` used to gather
+    an interleaved Int32 pair written once per round instead, which is fewer
+    multiplies and a narrower gather for a bit-identical result. At
+    200,000 rows x 90 features, 60 trees, symmetric depth 6, GPU, it measured
+    1.053 s against a 1.072 s baseline, which is 1.018x and inside this
+    machine's drift band, so it is a null. The arm, its buffer and its
+    quantization launch were removed on 2026-08-17 under
+    `bench/results/LANE_RULES.md` rule 6. See
+    `docs/design/DECLINED_OPTIMIZATIONS.md` row E10; do not rebuild it without
+    a new reason.
 
     **`const_hess` elides the hessian plane.** With it set the caller has
     declared that every row's hessian this round is exactly
@@ -1076,10 +936,9 @@ def _batch_hist_atomic_kernel(
         meta[unsafe_offset=5] = items[unsafe_offset = base + ITEM_PLANE][0]
         meta[unsafe_offset=6] = items[unsafe_offset = base + ITEM_OUT][0]
 
-    # Both flags are block-uniform launch scalars, so every branch below on
-    # either of them is taken by the whole threadgroup together and no
-    # barrier is reached by a subset of it.
-    var quant = Int(use_quant) != 0
+    # A block-uniform launch scalar, so every branch below on it is taken by
+    # the whole threadgroup together and no barrier is reached by a subset of
+    # it.
     var celide = Int(const_hess) != 0
 
     var b = tid
@@ -1118,20 +977,14 @@ def _batch_hist_atomic_kernel(
     while j < tile_end:
         var r = Int(rows[unsafe_offset = begin + j][0])
         var bin = Int(bins[unsafe_offset = col + r])
-        var gqv = Int32(0)
+        var gqv = Int32(
+            round(grad[unsafe_offset = plane_base + r][0] * g_scale)
+        )
         var hqv = Int32(0)
-        if quant:
-            gqv = gq[unsafe_offset = 2 * (plane_base + r)][0]
-            if not celide:
-                hqv = gq[unsafe_offset = 2 * (plane_base + r) + 1][0]
-        else:
-            gqv = Int32(
-                round(grad[unsafe_offset = plane_base + r][0] * g_scale)
+        if not celide:
+            hqv = Int32(
+                round(hess[unsafe_offset = plane_base + r][0] * h_scale)
             )
-            if not celide:
-                hqv = Int32(
-                    round(hess[unsafe_offset = plane_base + r][0] * h_scale)
-                )
         _ = Atomic.fetch_add(sg.unsafe_offset(bin), gqv)
         if not celide:
             _ = Atomic.fetch_add(sh.unsafe_offset(bin), hqv)
@@ -1165,7 +1018,6 @@ def _batch_hist_atomic_subtract_kernel(
     rows: MutPointer[Int32, MutAnyOrigin],
     grad: MutPointer[Float32, MutAnyOrigin],
     hess: MutPointer[Float32, MutAnyOrigin],
-    gq: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
     items: MutPointer[Int32, MutAnyOrigin],
     scales: MutPointer[Float32, MutAnyOrigin],
@@ -1176,7 +1028,6 @@ def _batch_hist_atomic_subtract_kernel(
     n_bins: Int32,
     hist_size: Int32,
     feat_stride: Int32,
-    use_quant: Int32,
     const_hess: Int32,
 ):
     """`_batch_hist_atomic_kernel` over half a level's items, folding the
@@ -1186,12 +1037,11 @@ def _batch_hist_atomic_subtract_kernel(
     threadgroup accumulation, and the identical global fold. Two things are
     added and nothing is taken away.
 
-    `use_quant` and `const_hess` mean exactly what they mean on
-    `_batch_hist_atomic_kernel` and are argued there. The subtraction is
-    unaffected by either: it folds the NEGATION of the cells this block just
-    added, so whichever integer reached the built child's slot reaches the
-    derived sibling's with its sign flipped, and `hq_const * vc` is one such
-    integer like any other.
+    `const_hess` means exactly what it means on `_batch_hist_atomic_kernel` and
+    is argued there. The subtraction is unaffected by it: it folds the NEGATION
+    of the cells this block just added, so whichever integer reached the built
+    child's slot reaches the derived sibling's with its sign flipped, and
+    `hq_const * vc` is one such integer like any other.
 
     **One: an item builds only if it is the smaller child of its pair.** Thread
     zero already resolves this block's tile to its item; it now also resolves
@@ -1319,8 +1169,7 @@ def _batch_hist_atomic_subtract_kernel(
             meta[unsafe_offset=6] = items[unsafe_offset = base + ITEM_OUT][0]
             meta[unsafe_offset=7] = Int32(sub_slot)
 
-    # Block-uniform launch scalars, exactly as on the non-subtracting twin.
-    var quant = Int(use_quant) != 0
+    # A block-uniform launch scalar, exactly as on the non-subtracting twin.
     var celide = Int(const_hess) != 0
 
     var b = tid
@@ -1362,20 +1211,14 @@ def _batch_hist_atomic_subtract_kernel(
     while j < tile_end:
         var r = Int(rows[unsafe_offset = begin + j][0])
         var bin = Int(bins[unsafe_offset = col + r])
-        var gqv = Int32(0)
+        var gqv = Int32(
+            round(grad[unsafe_offset = plane_base + r][0] * g_scale)
+        )
         var hqv = Int32(0)
-        if quant:
-            gqv = gq[unsafe_offset = 2 * (plane_base + r)][0]
-            if not celide:
-                hqv = gq[unsafe_offset = 2 * (plane_base + r) + 1][0]
-        else:
-            gqv = Int32(
-                round(grad[unsafe_offset = plane_base + r][0] * g_scale)
+        if not celide:
+            hqv = Int32(
+                round(hess[unsafe_offset = plane_base + r][0] * h_scale)
             )
-            if not celide:
-                hqv = Int32(
-                    round(hess[unsafe_offset = plane_base + r][0] * h_scale)
-                )
         _ = Atomic.fetch_add(sg.unsafe_offset(bin), gqv)
         if not celide:
             _ = Atomic.fetch_add(sh.unsafe_offset(bin), hqv)
@@ -1406,964 +1249,6 @@ def _batch_hist_atomic_subtract_kernel(
                 out_hist.unsafe_offset(sub_base + 2 * hs + b), -vc
             )
         b += block_dim.x
-
-
-# --- The pair-indexed grid ------------------------------------------------
-#
-# `_batch_hist_atomic_subtract_kernel` above dispatches ONE THREADGROUP PER
-# STAGED ITEM PER TILE PER FEATURE SLOT and then elects, inside the kernel,
-# which of a pair is built. Two multipliers of waste follow and neither is
-# data dependent, so both can be removed on the host:
-#
-# - Half the LIVE items are the derived sibling and return without
-#   accumulating. That is the election, and it is the half the docstring
-#   above describes.
-# - Every item past the live prefix is dead and also returns. That half is
-#   not described anywhere and it is the larger one: the plan is staged at
-#   `1 << max_depth` items for the whole tree (`stage_device_plan`, called
-#   once from `histogram_gpu.stage_desc_level_plan` with `budget`), while a
-#   level at depth `l` fills only `2 << l` of them. At depth 6 that is 64
-#   staged rows against 2 filled ones at level zero.
-#
-# Multiply them out over a depth-6 tree that skips the last level's build:
-# levels 0 to 4 dispatch `5 * 64 = 320` item-slots' worth of threadgroups and
-# build `1 + 2 + 4 + 8 + 16 = 31` of them, which is **9.3 threadgroups that
-# do nothing for every one that does**. That ratio was measured independently
-# by an earlier lane before this arithmetic was written down, which is the
-# reason it is quoted here rather than derived and left at that.
-#
-# The fix is to index `grid.y` BY PAIR. At a level of width `2L` there are
-# exactly `L` pairs and exactly one built child per pair, always; only WHICH
-# child depends on the data, and that is a lookup and not a count. So the
-# host launches `L * tiles` rows of grid instead of `plan_items * tiles`, the
-# kernel resolves its pair by division, and the election that decides which
-# member of the pair to build is performed EXACTLY where and how it was
-# before. Nothing about the answer moves; see the kernel's docstring.
-
-
-comptime PAIR_GRID_VAR = "MOJOTREES_GPU_HIST_PAIR_GRID"
-"""`1` launches the subtracting level build over a pair-indexed grid.
-
-Default off, and off it changes nothing at all: the same kernel symbol, the
-same grid, the same launch count. On it selects
-`_batch_hist_pair_subtract_kernel` at `grid.y = pairs * tiles`, which is
-bit-identical output over between 2x and 64x fewer threadgroups depending on
-the level. Still ONE launch, so
-`gpu_resident_round.oblivious_launch_census(6)` is 62 either way, which is a
-precondition of this plane and not a happy result."""
-
-comptime PAIR_TILES_VAR = "MOJOTREES_GPU_HIST_PAIR_TILES"
-"""Row tiles per item on the pair-indexed arm, zero meaning the staged
-geometry. `MOJOTREES_GPU_HIST_ROW_SPLIT` for that kernel, named separately so
-the two arms can be swept in one process without either one's sweep moving
-the other's control.
-
-The occupancy argument is `plan_row_split_requested`'s, word for word, and
-the reason it is worth re-offering here is that the pair grid is what makes
-it affordable: raising the tile count on the item-indexed grid multiplies the
-dead threadgroups by the same factor it multiplies the live ones."""
-
-
-def _batch_hist_pair_subtract_kernel(
-    bins: MutPointer[UInt8, MutAnyOrigin],
-    rows: MutPointer[Int32, MutAnyOrigin],
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    gq: MutPointer[Int32, MutAnyOrigin],
-    feat_ids: MutPointer[Int32, MutAnyOrigin],
-    items: MutPointer[Int32, MutAnyOrigin],
-    scales: MutPointer[Float32, MutAnyOrigin],
-    out_hist: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
-    n_items: Int32,
-    n_slots: Int32,
-    n_bins: Int32,
-    hist_size: Int32,
-    feat_stride: Int32,
-    tiles_per_item: Int32,
-    split_rows: Int32,
-    use_quant: Int32,
-    const_hess: Int32,
-):
-    """`_batch_hist_atomic_subtract_kernel` over a grid indexed by PAIR.
-
-    The identical row loop, the identical threadgroup accumulation, the
-    identical fused flush, and the identical election. What changes is the
-    meaning of `block_idx.y` and therefore how many threadgroups the level
-    dispatches; what does not change is which item is built, from which rows,
-    into which slot, by which arithmetic.
-
-    WHY THE OUTPUT IS BIT-IDENTICAL, AND THE ELECTION IS THE WHOLE OF IT
-    --------------------------------------------------------------------
-    1. **The election is unmoved.** The shipping kernel resolves a block's
-       item `k`, finds its partner (`k + L` when `k < L`, else `k - L`), and
-       builds when `n_self < n_other` for a left child and when
-       `n_self <= n_other` for a right child. Exactly one member of a pair
-       satisfies its own test: the left child builds iff `n_left < n_right`,
-       and the right child builds iff `not (n_left < n_right)`, ties
-       included, because `n_right <= n_left` is the negation of
-       `n_left < n_right` over Int32. This kernel evaluates that single
-       predicate once, `build_left = n_left < n_right`, and takes the same
-       branch. **Ties still go to the right child**, which is the case
-       `_batch_copy_back_zero_subtract_kernel` prepared the slots for and the
-       one place a disagreement would be silent rather than loud.
-    2. **The work is unmoved.** The elected item's `ITEM_BEGIN`,
-       `ITEM_COUNT`, `ITEM_PLANE`, `ITEM_OUT`, its feature id, its scales and
-       its partner's `ITEM_OUT` are the same words read from the same table.
-    3. **The tiles are unmoved.** `stage_device_plan` gives every item the
-       same `tiles` and writes `ITEM_TILE_BEGIN = k * tiles`, so the shipping
-       kernel's `t = g_tile - ITEM_TILE_BEGIN[k]` ranges over `[0, tiles)`
-       for the elected item and this kernel's `t = g_tile - p * tiles` ranges
-       over the same interval once. The set of `(item, tile)` pairs that run
-       is identical, so the multiset of row contributions is identical, and
-       every accumulator on both arms is exact integer.
-    4. **The blocks that stop stopping earlier changes nothing.** A block
-       whose pair is past the live prefix, or whose elected child holds no
-       rows, would on the shipping arm have zeroed a threadgroup histogram,
-       reached the flush, found every `sc[b]` zero and stored nothing. Here
-       it returns before the allocation instead. `_plan_hist_kernel` already
-       makes the same removal for the same reason.
-
-    THE ROOT, AND WHY IT NEEDS NO CASE
-    ----------------------------------
-    The root's histogram never reaches this kernel. It is built once per tree
-    by `GpuHistogramBuilder.enqueue_leaf(0, resident_slot=0)` on the
-    single-leaf path, before the level loop opens, and every batch this
-    kernel serves is a batch of a level's CHILDREN. The shallowest batch is
-    the root's own split, which is `L = 1` pair and two children, and one
-    pair is a legal grid. There is no level with zero pairs: a level that
-    committed nothing kills the whole plan, `_live_item_pairs` answers zero,
-    and every block returns at the first comparison, which is the same thing
-    `ITEM_DEAD` already buys the shipping arm.
-
-    AN ODD WIDTH CANNOT ARISE
-    -------------------------
-    `_commit_level_kernel` writes `2L` items as `L` left children followed by
-    `L` right children, so the live prefix is even by construction;
-    `enqueue_device_plan_batch_fused_subtracting` refuses an odd staged width
-    outright; and `_live_item_pairs` floors, so an odd prefix would drop its
-    last item here exactly as it already does on the shipping arm. No
-    behavior is invented for a state that cannot occur.
-
-    `tiles_per_item` and `split_rows` are `_plan_hist_kernel`'s two, with the
-    same meanings and the same neutral values: `split_rows = 0` keeps the
-    staged tile LENGTH, which reproduces the shipping geometry when the
-    staged tile count is one. `use_quant` and `const_hess` mean what they
-    mean on `_batch_hist_atomic_kernel` and are argued there."""
-    var tid = thread_idx.x
-    var nb = Int(n_bins)
-    var nr = Int(n_rows)
-    var hs = Int(hist_size)
-    var slot = Int(block_idx.x)
-    var tpi = Int(tiles_per_item)
-    if tpi < 1:
-        tpi = 1
-
-    # The PAIR and the local tile, by division rather than by search. Both
-    # are functions of `block_idx.y` alone, so every thread of the block gets
-    # the same answer and none of what follows needs threadgroup memory or a
-    # barrier to publish it.
-    var g_tile = Int(block_idx.y)
-    var p = g_tile // tpi
-    var t = g_tile - p * tpi
-
-    # Run redundantly by every thread rather than by thread zero: six loads
-    # from one cache line, every thread reading the same address, against a
-    # barrier and eight words of threadgroup memory on the shipping arm. The
-    # same trade `_plan_hist_kernel` already makes.
-    var n_pairs = _live_item_pairs(items, Int(n_items))
-    if p >= n_pairs:
-        return
-
-    var lbase = p * ITEM_WORDS
-    var rbase = (p + n_pairs) * ITEM_WORDS
-    var n_left = Int(items[unsafe_offset = lbase + ITEM_COUNT][0])
-    var n_right = Int(items[unsafe_offset = rbase + ITEM_COUNT][0])
-    # The one predicate. Ties go to the right child; see the docstring.
-    var build_left = n_left < n_right
-    var k = p if build_left else p + n_pairs
-    var partner = (p + n_pairs) if build_left else p
-    var base = k * ITEM_WORDS
-    var count = n_left if build_left else n_right
-    if count <= 0:
-        return
-
-    var out_slot = Int(items[unsafe_offset = base + ITEM_OUT][0])
-    var sub_slot = Int(
-        items[unsafe_offset = partner * ITEM_WORDS + ITEM_OUT][0]
-    )
-
-    var rpt = Int(items[unsafe_offset = base + ITEM_ROWS_PER_TILE][0])
-    if Int(split_rows) != 0:
-        rpt = (count + tpi - 1) // tpi
-    if rpt < 1:
-        rpt = 1
-    var tile_begin = t * rpt
-    if tile_begin >= count:
-        return
-    var tile_end = tile_begin + rpt
-    if tile_end > count:
-        tile_end = count
-
-    var begin = Int(items[unsafe_offset = base + ITEM_BEGIN][0])
-    var plane_base = Int(items[unsafe_offset = base + ITEM_PLANE][0]) * nr
-    var f = Int(feat_ids[unsafe_offset = k * Int(feat_stride) + slot][0])
-    var g_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_G][0]
-    var h_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_H][0]
-    # `Float32(1.0) * h_scale` is exactly `h_scale`; see the shipping twin.
-    var hq_const = Int32(round(Float32(1.0) * h_scale))
-    var quant = Int(use_quant) != 0
-    var celide = Int(const_hess) != 0
-
-    var sg = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sh = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sc = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-
-    var b = tid
-    while b < nb:
-        sg[unsafe_offset=b] = 0
-        if not celide:
-            sh[unsafe_offset=b] = 0
-        sc[unsafe_offset=b] = 0
-        b += block_dim.x
-    barrier()
-
-    var col = f * nr
-    var j = tile_begin + tid
-    while j < tile_end:
-        var r = Int(rows[unsafe_offset = begin + j][0])
-        var bin = Int(bins[unsafe_offset = col + r])
-        var gqv = Int32(0)
-        var hqv = Int32(0)
-        if quant:
-            gqv = gq[unsafe_offset = 2 * (plane_base + r)][0]
-            if not celide:
-                hqv = gq[unsafe_offset = 2 * (plane_base + r) + 1][0]
-        else:
-            gqv = Int32(
-                round(grad[unsafe_offset = plane_base + r][0] * g_scale)
-            )
-            if not celide:
-                hqv = Int32(
-                    round(hess[unsafe_offset = plane_base + r][0] * h_scale)
-                )
-        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gqv)
-        if not celide:
-            _ = Atomic.fetch_add(sh.unsafe_offset(bin), hqv)
-        _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
-        j += block_dim.x
-    barrier()
-
-    var slice_base = out_slot * N_PLANES * hs + f * nb
-    var sub_base = sub_slot * N_PLANES * hs + f * nb
-    b = tid
-    while b < nb:
-        if sc[unsafe_offset=b][0] != 0:
-            var vg = sg[unsafe_offset=b][0]
-            var vc = sc[unsafe_offset=b][0]
-            var vh = hq_const * vc if celide else sh[unsafe_offset=b][0]
-            _ = Atomic.fetch_add(out_hist.unsafe_offset(slice_base + b), vg)
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(slice_base + hs + b), vh
-            )
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(slice_base + 2 * hs + b), vc
-            )
-            _ = Atomic.fetch_add(out_hist.unsafe_offset(sub_base + b), -vg)
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(sub_base + hs + b), -vh
-            )
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(sub_base + 2 * hs + b), -vc
-            )
-        b += block_dim.x
-
-
-# --- The lean device-plan kernel, and its three knobs ---------------------
-#
-# `_batch_hist_atomic_kernel` and its subtracting twin above are the SHIPPING
-# accumulation for the oblivious level build. This is one kernel that
-# subsumes both and adds three orthogonal knobs, each behind its own
-# environment switch and each default off, so the orchestrator can measure
-# them separately and together against the pair above.
-#
-# Everything here is exact integer arithmetic over the same fixed-point
-# planes, so no knob and no combination of knobs can move a bit. The argument
-# is written out leg by leg in the kernel's docstring rather than asserted.
-
-comptime PLAN_LEAN_VAR = "MOJOTREES_GPU_HIST_LEAN"
-"""Selects this kernel with every knob neutral, which isolates the three
-STRICTLY-LESS-WORK removals it makes against the shipping pair: no
-threadgroup `meta` block and no barrier to publish it, no binary search for
-the item, and an early return that happens BEFORE the shared histogram is
-zeroed rather than after it. See `_plan_hist_kernel`."""
-
-comptime PLAN_PRIVATE_VAR = "MOJOTREES_GPU_HIST_PRIVATE"
-"""Private (replicated) threadgroup accumulators. `1` asks for as many copies
-as the shipping kernel's own threadgroup footprint already pays for, which is
-`(MAX_BINS + PLAN_COPY_SLACK) / (n_bins + 1)` floored and is therefore FREE;
-an explicit integer above one asks for that many copies and spends threadgroup
-memory to get them."""
-
-comptime PLAN_ROW_SPLIT_VAR = "MOJOTREES_GPU_HIST_ROW_SPLIT"
-"""Row tiles per plan item, derived from the ITEM'S OWN row count on the
-device instead of from the tree's row bound on the host. The shallow-depth
-occupancy multiplier; see `plan_row_split_requested` for why the host cannot
-compute this number and why the shipping geometry leaves most of its tiles
-empty at depth."""
-
-comptime PLAN_GROUP_VAR = "MOJOTREES_GPU_HIST_GROUP"
-"""Feature slots one threadgroup owns. `1` is the shipping shape. Above one,
-the row's gradient and hessian are read once and spent for every feature in
-the group, which is the same `GROUP` parameter
-`gpu_active_rows._range_hist_atomic_kernel` already carries on the SINGLE-LEAF
-path and that the batched path has never had."""
-
-comptime PLAN_MAX_GROUP = 4
-"""Feature slots one threadgroup may own here.
-
-Four rather than the single-leaf family's sixteen, and the bound is
-threadgroup memory rather than taste: a group of `G` features holding `C`
-private copies needs `G * C * 3 * (n_bins + 1)` Int32, which at 256 bins and
-one copy is about 3.1 KB per feature. Four is 12.4 KB, still under the 16 KB
-`gpu_tiling.FALLBACK_SHARED_MEMORY_PER_BLOCK` a device that reports nothing
-is assumed to have. Eight would be 24.8 KB, which the measured M4 has and a
-conservative device may not, so it is a one-line extension behind a
-capability check rather than a default."""
-
-comptime PLAN_COPY_SLACK = 8
-"""Spare bins per plane in a unit, so that padding the copy stride does not
-cost a copy.
-
-**The pad word on the copy stride is load-bearing and is the difference
-between replication working and replication buying nothing.** Threadgroup
-memory is banked in 32 four-byte banks on every backend this project targets.
-With an unpadded stride the copies of bin `b` sit `n_bins` words apart, and
-`n_bins` is a multiple of 32 at every bin count this package uses, so every
-copy of bin `b` would land in the SAME bank: the replication would convert an
-atomic conflict into a bank conflict and serialize just as hard. At stride
-`n_bins + 1` the copies of a bin walk the banks one at a time.
-
-The slack is what stops that pad from eating a whole copy at the wide bin
-counts, and eight is the smallest value that does it for every ladder entry
-this package bins at. Without it a unit is `MAX_BINS + 1 = 257` bins wide and
-two 128-bin copies want 258, so 128 bins would get ONE copy and the switch
-would silently do nothing there. With it a unit is 264 bins wide and the free
-copy counts are 1 at 256 bins, 2 at 128, 4 at 64, 8 at 32 and 15 at 16, which
-is `264 / (n_bins + 1)` floored."""
-
-comptime PLAN_UNIT_CELLS = N_PLANES * (MAX_BINS + PLAN_COPY_SLACK)
-"""Int32 cells one accumulator unit occupies: three planes, each as wide as
-the largest bin count plus `PLAN_COPY_SLACK`.
-
-A *unit* is one three-plane histogram for one (feature-in-group, copy) pair.
-792 cells, 3,168 bytes."""
-
-comptime PLAN_UNITS_NARROW = 1
-comptime PLAN_UNITS_WIDE = 4
-"""The two threadgroup budgets this kernel is instantiated at, in units.
-
-Two rather than a ladder. `PLAN_UNITS_NARROW` is 3,168 bytes against the
-3,104 the shipping kernel already allocates (three `MAX_BINS` Int32 planes at
-3,072, plus its eight-word `meta` block at 32), so the narrow instantiation is
-footprint-neutral to within 64 bytes and every free replication lives inside
-it. `PLAN_UNITS_WIDE` is 12,672 bytes, still under the 16,384
-`gpu_tiling.FALLBACK_SHARED_MEMORY_PER_BLOCK` a device that reports nothing is
-assumed to have, and it is the one that trades residency for either a wider
-feature group or more copies than the bin count leaves room for."""
-
-
-def _plan_env_int(name: String, default: Int) -> Int:
-    """`parallel._env_int`, restated here rather than imported: `parallel`
-    is a CPU module and this file is on the device side of the backend."""
-    var s = getenv(name)
-    if s.byte_length() == 0:
-        return default
-    try:
-        var n = Int(s)
-        if n < 0:
-            return default
-        return n
-    except:
-        return default
-
-
-def plan_group_requested() -> Int:
-    """`MOJOTREES_GPU_HIST_GROUP` as a feature-group width, one meaning the
-    shipping one-feature-per-threadgroup shape.
-
-    WHY THIS IS THE LARGEST OF THE THREE, BY COUNTING BYTES
-    ------------------------------------------------------
-    A threadgroup owning one feature slot reads, per row of its tile, four
-    bytes of row index, four of gradient, four of hessian and one bin byte, so
-    a `(row, feature)` visit costs 13 bytes of load traffic. Twelve of those
-    thirteen bytes are re-read by every other feature's threadgroup, because
-    `grid.x` is the feature axis and the gradient plane does not depend on the
-    feature. A group of `G` slots reads them once and spends them `G` times,
-    so a visit costs `1 + 12 / G` bytes: 7 at `G = 2`, 4 at `G = 4`. That is
-    a factor of 3.25 off the traffic at `G = 4` and it is arithmetic over the
-    loads in the row loop, not a prediction.
-
-    What it costs is residency: `G * 3 * (n_bins + 1)` Int32 of threadgroup
-    memory instead of `3 * (n_bins + 1)`, so 12.3 KB instead of 3.1 KB at 256
-    bins, which is roughly four times fewer resident threadgroups per core.
-    Whether the traffic or the residency wins is exactly what an interleaved
-    A/B settles and is why this is a switch rather than a default.
-
-    The same parameter on the SINGLE-LEAF kernel
-    (`gpu_active_rows._range_hist_atomic_kernel`, comptime `GROUP`) was
-    measured at **1.17x for group 2 over group 1** on an Apple M4, and that
-    kernel's docstring records that groups 8 and 16 have never been launched.
-    The batched kernels this file ships have never had the parameter at all,
-    which is why the oblivious level build reads its gradients `n_slots` times
-    per level and the leaf-wise path does not."""
-    var n = _plan_env_int(PLAN_GROUP_VAR, 1)
-    if n < 1:
-        return 1
-    return n
-
-
-def plan_row_split_requested() -> Int:
-    """`MOJOTREES_GPU_HIST_ROW_SPLIT` as row tiles per item, zero meaning the
-    shipping geometry.
-
-    THE SHALLOW-DEPTH OCCUPANCY MULTIPLIER, AND WHAT IT IS REALLY FIXING
-    -------------------------------------------------------------------
-    `stage_device_plan` fixes one tile geometry for the whole tree, because it
-    runs once per tree and the host never learns a level's row counts without
-    a synchronization. It derives it from `derive_tiling` against the ROW BOUND
-    with `n_slots` features already occupying `grid.x`, and
-    `gpu_tiling.row_tile_floor` then asks for `ceil(target_blocks / n_slots)`
-    tiles. On the ten-core M4 `target_blocks` is 80, so **at any feature count
-    at or above 80 that term is 1**: every item gets exactly one tile whose
-    length is the whole row bound, and one threadgroup per feature scans a
-    whole leaf however many rows it holds.
-
-    Two consequences, and the second is the one worth the switch.
-
-    - At depth the item is small and the tile is the size of the ROOT, so the
-      single tile is mostly empty and the level's parallelism is `built_items *
-      n_slots` threadgroups. That grows with depth, so the SHALLOWEST level is
-      the thin one: at level zero with sibling subtraction there is exactly one
-      built child, and the level is `n_slots` threadgroups wide.
-    - The level's latency is set by the LARGEST built child, not by the average
-      one, because each child is one threadgroup per feature. Oblivious splits
-      are lopsided by construction, so a level whose total work is spread over
-      thirty-two children can still wait on one of them.
-
-    This switch splits every item into `T` tiles of `ceil(count / T)` rows
-    each, with `count` read from the plan on the device, so the split follows
-    the item's own size at every depth instead of the root's. `T = 1` is the
-    control arm: it reproduces the shipping geometry exactly whenever the
-    staged tile count is one, which on this machine at 50 or more features it
-    is.
-
-    **The honest expectation, stated before the measurement rather than after
-    it.** At 100 features `n_slots` alone already puts 100 threadgroups of 256
-    threads on a ten-core device, which is 25,600 threads, and the shipping
-    threadgroup footprint of 3.0 KB admits about ten blocks per core, so the
-    grid is already resident in roughly one wave. The multiplier therefore has
-    NO occupancy to win on that shape and what remains is wave quantization
-    and the largest-child term above. It is expected to pay where `n_slots` is
-    small -- a narrow real-data frame, or `feature_fraction` well below one --
-    and to be a null or a small loss at 100 features, where the extra tiles
-    are extra threadgroups over the same rows. That is the arithmetic; the
-    clock is the orchestrator's."""
-    return _plan_env_int(PLAN_ROW_SPLIT_VAR, 0)
-
-
-def pair_grid_requested() -> Bool:
-    """Whether the subtracting level build takes the pair-indexed grid.
-
-    Read here rather than taken as a parameter, for the reason
-    `oblivious_subtract_requested` gives: the decision belongs beside the
-    kernels it selects between. Default off under this package's rule for a
-    path no benchmark has priced, and it is bit-identical, so LANE_RULES rule
-    5 flips it the moment a measurement says so. See `PAIR_GRID_VAR` and
-    `_batch_hist_pair_subtract_kernel`."""
-    return getenv(PAIR_GRID_VAR) == "1"
-
-
-def pair_grid_tiles() -> Int:
-    """`MOJOTREES_GPU_HIST_PAIR_TILES` as row tiles per item, zero meaning
-    the staged tile count and the staged tile LENGTH.
-
-    `plan_row_split_requested` for the pair-indexed arm, and the occupancy
-    argument is that function's word for word. It has its own name so a sweep
-    of one arm cannot move the other arm's control."""
-    return _plan_env_int(PAIR_TILES_VAR, 0)
-
-
-def plan_private_copies_requested(n_bins: Int) -> Int:
-    """`MOJOTREES_GPU_HIST_PRIVATE` as a count of private accumulator copies,
-    one meaning the shipping single shared histogram.
-
-    `1` asks for the free answer: as many copies as fit in the threadgroup
-    footprint the shipping kernel ALREADY pays, which allocates three
-    `MAX_BINS`-wide planes whatever the dataset's bin count is. At 64 bins that
-    is four copies for nothing; at 256 bins it is one, and the switch is a
-    no-op. An explicit integer above one asks for that many and spends
-    threadgroup memory, which the caller resolves against `PLAN_UNITS_WIDE`.
-
-    WHAT THIS REMOVES, AND WHAT IT HONESTLY DOES NOT
-    ------------------------------------------------
-    CatBoost accumulates per-warp private histograms with no atomics at all
-    and reduces them afterwards. **We cannot reach zero atomics and the reason
-    is a language fact rather than a design choice.** Zero atomics requires one
-    private copy per thread that can collide, Mojo 1.0 has no warp primitives
-    at all (only `block`), so the smallest unit whose threads this file can
-    reason about is the whole threadgroup, and a copy per thread at 256 threads
-    and 256 bins is 3.1 KB times 256, which is 786 KB of threadgroup memory
-    against a 32 KB budget. So this knob REDUCES contention by the replication
-    factor; it does not eliminate the atomic.
-
-    The contention it reduces is real and is worst exactly where the
-    replication is free. With a 32-lane group accumulating into `n_bins` bins,
-    the expected number of lanes sharing a bin scales as `32 / n_bins`, so a
-    16-bin categorical feature has an average multiplicity of two and a
-    worst-case run far above that, while a 256-bin continuous feature is mostly
-    conflict-free. A 16-bin dataset gets fifteen free copies out of the
-    footprint already allocated.
-
-    WHY IT CANNOT MOVE A BIT, LEG BY LEG
-    ------------------------------------
-    1. A row's contribution to a bin is `Int32(round(grad[r] * g_scale))`,
-       `Int32(round(hess[r] * h_scale))` and `1`. All three are functions of
-       the row and of the tree's two fixed-point scales alone. Which copy a
-       thread accumulates into is not an argument to any of them.
-    2. Every visit is accumulated exactly once, into exactly one copy, by
-       exactly the thread that gathered it. The copies partition the block's
-       threads (`tid % copies`), so no visit is duplicated and none is dropped.
-    3. The flush sums the copies of a bin with Int32 addition. Integer addition
-       is associative and commutative, so the sum over copies of the sums
-       within copies is the sum over visits, whatever order either takes. This
-       is the same property the shipping kernels already rely on to claim that
-       a batched build equals a single-leaf one and that an atomic fold equals
-       a tiled reduction.
-    4. The `vc != 0` flush guard has the same meaning it had: counts are
-       non-negative, so the summed count is zero exactly when no visit landed
-       in that bin, which is exactly when the shipping kernel's `sc[b]` is
-       zero.
-    5. Overflow is no nearer. Every partial sum here is a sub-sum of a value
-       the shipping kernel already forms in one accumulator, and Int32 addition
-       agrees modulo 2^32 however it is grouped, so even a hypothetical
-       overflow would land on the same bits.
-
-    So this switch selects an amount of threadgroup contention and never a
-    number. Under LANE_RULES rule 5 that means a measured win flips it in the
-    session that measures it."""
-    var s = getenv(PLAN_PRIVATE_VAR)
-    if s.byte_length() == 0 or s == "0":
-        return 1
-    var stride = n_bins + 1
-    var free_copies = PLAN_UNIT_CELLS // (N_PLANES * stride)
-    if free_copies < 1:
-        free_copies = 1
-    if s == "1":
-        return free_copies
-    var n = _plan_env_int(PLAN_PRIVATE_VAR, 1)
-    if n < 1:
-        return 1
-    return n
-
-
-def plan_lean_requested() -> Bool:
-    """Whether the device-plan build runs `_plan_hist_kernel` rather than the
-    shipping `_batch_hist_atomic_kernel` pair.
-
-    True when `MOJOTREES_GPU_HIST_LEAN=1`, and also true whenever any of the
-    three knobs is asked for, so that a caller setting one knob does not also
-    have to know that the knob lives on a different kernel. All four are
-    default off, which is this package's rule for work no benchmark has priced
-    yet; the flip is rule 5's and belongs to the session that measures it."""
-    if getenv(PLAN_LEAN_VAR) == "1":
-        return True
-    if plan_row_split_requested() > 0:
-        return True
-    if plan_group_requested() > 1:
-        return True
-    var p = getenv(PLAN_PRIVATE_VAR)
-    return p.byte_length() != 0 and p != "0"
-
-
-def _plan_hist_kernel[
-    UNITS: Int
-](
-    bins: MutPointer[UInt8, MutAnyOrigin],
-    rows: MutPointer[Int32, MutAnyOrigin],
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    gq: MutPointer[Int32, MutAnyOrigin],
-    feat_ids: MutPointer[Int32, MutAnyOrigin],
-    items: MutPointer[Int32, MutAnyOrigin],
-    scales: MutPointer[Float32, MutAnyOrigin],
-    out_hist: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
-    n_items: Int32,
-    n_slots: Int32,
-    n_bins: Int32,
-    hist_size: Int32,
-    feat_stride: Int32,
-    tiles_per_item: Int32,
-    split_rows: Int32,
-    n_copies: Int32,
-    group_width: Int32,
-    subtract: Int32,
-    use_quant: Int32,
-    const_hess: Int32,
-):
-    """One accumulation kernel for the device-written plan, with the two
-    CatBoost ideas and the sibling subtraction as knobs rather than as arms.
-
-    It replaces both `_batch_hist_atomic_kernel` and
-    `_batch_hist_atomic_subtract_kernel` on the device-plan path and produces
-    bit-for-bit what either of them produces, at every setting of every knob.
-
-    WHAT IT REMOVES UNCONDITIONALLY, WHICH IS WHY `MOJOTREES_GPU_HIST_LEAN=1`
-    IS A MEASURABLE ARM ON ITS OWN
-    ------------------------------------------------------------------------
-    Three removals, all of them strictly less work for the identical result,
-    all of them available because a device-written plan gives every item the
-    SAME number of tiles (`stage_device_plan` writes `ITEM_TILE_BEGIN = k *
-    tiles` and `ITEM_TILES = tiles` for every `k`).
-
-    1. **No binary search for the item.** With uniform tiles the owning item
-       is `block_idx.y / tiles_per_item` and the local tile is the remainder.
-       `_item_for_tile` costs six dependent Int32 loads at the 64-item width
-       this mode stages; a division costs no loads at all. The shipping kernels
-       need the search because `_stage_plan` may write non-uniform tile counts
-       from the host, and that path still uses them.
-    2. **No threadgroup `meta` block and no barrier to publish it.** The
-       shipping kernels have thread zero resolve the item into eight words of
-       threadgroup memory because the search was expensive enough to be worth
-       doing once. A division is not, so every thread resolves it redundantly
-       from block-uniform values, which are broadcast loads.
-    3. **The early return happens BEFORE the shared histogram is zeroed.**
-       This is the largest of the three and the count is the argument. An
-       oblivious level plan is staged at `1 << max_depth` items and a level
-       fills only `2 * L` of them, so at depth 6 the levels leave 62, 60, 56,
-       48, 32 and 0 items dead, which is **258 dead item-slots per tree**;
-       with sibling subtraction on, half of the live items are derived rather
-       than built, which is 63 more. Every one of those blocks currently zeroes
-       three `n_bins`-wide planes and walks the whole flush loop before
-       discovering it had nothing to do, because the shipping kernels place
-       their return after the barrier "so a derived item's block costs
-       precisely what a dead item's block already costs today". That sentence
-       is true and prices the wrong thing: the dead block's cost was never
-       free. At 100 feature slots that is 32,100 threadgroups per tree zeroing
-       3.0 KB apiece to accumulate nothing. Here they return on their first
-       comparison, before the `stack_allocation` is touched.
-
-    The return is still block-uniform, which is the property that matters: it
-    is taken on `block_idx.y`, `n_slots`, and words of the item table that
-    every thread of the block reads identically, so the whole threadgroup
-    leaves together and no barrier below is reached by a subset of it.
-
-    THE THREE KNOBS
-    ---------------
-    `n_copies` replicates the threadgroup accumulator to cut atomic
-    contention; see `plan_private_copies_requested`, which also states plainly
-    that this reduces atomics rather than removing them and why Mojo 1.0
-    cannot remove them.
-
-    `tiles_per_item` with `split_rows` set derives each item's row tile from
-    the ITEM'S own count rather than from the tree's row bound, which is the
-    shallow-depth occupancy multiplier; see `plan_row_split_requested`. With
-    `split_rows` clear the row tile is read from `ITEM_ROWS_PER_TILE` and the
-    geometry is the shipping one.
-
-    `group_width` gives one threadgroup several feature slots so a row's
-    gradient pair is read once and spent for all of them; see
-    `plan_group_requested` for the byte arithmetic.
-
-    THE SHARED LAYOUT
-    -----------------
-    One flat allocation of `UNITS * PLAN_UNIT_CELLS` Int32. A *unit* is one
-    three-plane histogram for one (feature-in-group, copy) pair, and unit
-    `u = gi * copies + c` starts at `u * N_PLANES * stride` with
-    `stride = n_bins + 1`. The pad word per plane is what keeps the copies of
-    a bin out of one memory bank; `PLAN_UNIT_CELLS` argues it. The caller
-    guarantees `group_width * n_copies * N_PLANES * stride <= UNITS *
-    PLAN_UNIT_CELLS` and raises rather than clamping, because a silent clamp
-    would drop a feature's accumulation and produce a wrong histogram with no
-    symptom.
-
-    WHY NO KNOB AND NO COMBINATION OF KNOBS CAN MOVE A BIT
-    -----------------------------------------------------
-    Leg by leg, and every leg is exact integer arithmetic.
-
-    1. A visit's three contributions are `Int32(round(grad[r] * g_scale))`,
-       `Int32(round(hess[r] * h_scale))` and `1`. Every one is a function of
-       the row and of the tree's two scales, and no knob is an argument to any
-       of them. The two floating-point products are the only floating-point
-       operations in the kernel and they are written exactly as the shipping
-       kernels write them, in the same order, with no multiply moved relative
-       to an add, so there is no FMA contraction difference to argue about.
-       **`use_quant` moves WHERE those two products are evaluated and not
-       WHAT they evaluate to**: `_batch_quantize_kernel` forms the identical
-       expression once per row per round instead of once per (row, feature)
-       visit, and hoisting an expression out of a loop whose other operands
-       it does not depend on cannot change its value. **`const_hess`
-       reconstructs the second of the three as `hq_const * vc`**, which is
-       exact because `1.0f * h_scale` is `h_scale` and Int32 addition and
-       multiplication agree modulo 2^32; the declaration that every hessian
-       is 1.0 belongs to the caller and `set_constant_hessian` says so.
-    2. **Every visit happens exactly once.** Over the feature axis: block
-       `block_idx.x` owns slots `[bx * G, bx * G + G)` clamped to `n_slots`, so
-       the blocks partition the slots and a tail block owns only what remains.
-       Over the row axis: tiles `t = 0 .. T-1` cover `[t * rpt, min((t+1) *
-       rpt, count))`, and `rpt = ceil(count / T)` gives `T * rpt >= count`, so
-       the tiles partition `[0, count)` exactly -- no row twice, none dropped,
-       at any `T`. Within a tile, thread `tid` takes `tile_begin + tid` and
-       every `block_dim.x`-th row after it, which is the shipping walk. Over
-       the copies: a visit goes into copy `tid % copies`, decided by the thread
-       that gathered it.
-    3. The reduction is Int32 addition, which is associative and commutative,
-       so summing copies then folding into global gives the same word as
-       folding every visit into global directly. This is the property the
-       shipping kernels already stand on.
-    4. **The subtraction is exact and its election is the same election.**
-       With `subtract` set, a block builds only the smaller child of its pair
-       and folds the negation of every cell it adds into the sibling's slot,
-       under the same guard, with the same integer atomics. The election is
-       `n_self < n_other` for a left child and `n_self <= n_other` for a right
-       child, which is ties-to-the-right and is character for character the
-       rule `_batch_copy_back_zero_subtract_kernel` prepared the pair under.
-       The two children of an oblivious split partition the parent's rows
-       exactly (`gpu_tree_tables._commit_level_kernel` routes rows by the same
-       rule it derived the counts from), so `parent - built` is the exact
-       integer sum over the derived child's own rows. The full argument is at
-       `_batch_hist_atomic_subtract_kernel` and is not restated.
-    5. An item with `count <= 0` returns before doing anything, and that is
-       correct rather than merely cheap: `ITEM_DEAD` is negative and must not
-       be touched at all, and a live leaf holding no rows has an all-zero
-       histogram which the zeroing pass has already written. A derived
-       sibling's block returns for the same reason it returns on the shipping
-       arm.
-    6. An empty tail tile (`tile_begin >= count`, which `split_rows` makes
-       reachable whenever `count < T`) returns having added nothing and
-       subtracted nothing. On the shipping arm such a block zeroes, gathers
-       nothing, and flushes nothing because its counts are all zero, so the
-       two are the same store-for-store.
-
-    So every knob selects an amount of traffic, contention, or parallelism,
-    and never a number.
-    """
-    var tid = Int(thread_idx.x)
-    var nthreads = Int(block_dim.x)
-    var nb = Int(n_bins)
-    var nr = Int(n_rows)
-    var hs = Int(hist_size)
-    var stride = nb + 1
-    var tpi = Int(tiles_per_item)
-    if tpi < 1:
-        tpi = 1
-
-    # The item and the local tile, by division rather than by search. Both
-    # are functions of `block_idx.y` alone, so every thread of the block gets
-    # the same pair and no threadgroup memory is needed to share it.
-    var g_tile = Int(block_idx.y)
-    var k = g_tile // tpi
-    var t = g_tile - k * tpi
-    var base = k * ITEM_WORDS
-
-    # Removal three: this comparison is reached before the `stack_allocation`
-    # below is touched. `ITEM_DEAD` is negative and a live-but-empty leaf's
-    # histogram was already written by the zeroing pass.
-    var count = Int(items[unsafe_offset = base + ITEM_COUNT][0])
-    if count <= 0:
-        return
-
-    var out_slot = Int(items[unsafe_offset = base + ITEM_OUT][0])
-    var sub_slot = 0
-    var subtracting = Int(subtract) != 0
-    if subtracting:
-        # The same pair resolution and the same ties-to-the-right election
-        # `_batch_hist_atomic_subtract_kernel` performs, and the same one
-        # `_batch_copy_back_zero_subtract_kernel` prepared the slots under.
-        # Run redundantly by every thread: six loads from one cache line, all
-        # threads reading the same address, against a barrier and eight words
-        # of threadgroup memory on the shipping arm.
-        var n_pairs = _live_item_pairs(items, Int(n_items))
-        if k >= 2 * n_pairs:
-            return
-        var partner = k + n_pairs if k < n_pairs else k - n_pairs
-        var n_other = Int(
-            items[unsafe_offset = partner * ITEM_WORDS + ITEM_COUNT][0]
-        )
-        var build = (
-            (count < n_other) if k < n_pairs else (count <= n_other)
-        )
-        if not build:
-            return
-        sub_slot = Int(
-            items[unsafe_offset = partner * ITEM_WORDS + ITEM_OUT][0]
-        )
-
-    # The row tile. `split_rows` is the occupancy multiplier: the tile follows
-    # the item's own count, so all `tpi` tiles of every item carry rows at
-    # every depth instead of one tile carrying them and `tpi - 1` sitting
-    # empty because the length was derived from the root's row bound.
-    var rpt = Int(items[unsafe_offset = base + ITEM_ROWS_PER_TILE][0])
-    if Int(split_rows) != 0:
-        rpt = (count + tpi - 1) // tpi
-    if rpt < 1:
-        rpt = 1
-    var tile_begin = t * rpt
-    if tile_begin >= count:
-        return
-    var tile_end = tile_begin + rpt
-    if tile_end > count:
-        tile_end = count
-
-    # The feature slots this block owns.
-    var ns = Int(n_slots)
-    var gw = Int(group_width)
-    if gw < 1:
-        gw = 1
-    if gw > PLAN_MAX_GROUP:
-        gw = PLAN_MAX_GROUP
-    var slot0 = Int(block_idx.x) * gw
-    if slot0 >= ns:
-        return
-    var owned = ns - slot0
-    if owned > gw:
-        owned = gw
-
-    var copies = Int(n_copies)
-    if copies < 1:
-        copies = 1
-    if copies > nthreads:
-        copies = nthreads
-
-    var begin = Int(items[unsafe_offset = base + ITEM_BEGIN][0])
-    var plane_base = Int(items[unsafe_offset = base + ITEM_PLANE][0]) * nr
-    var g_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_G][0]
-    var h_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_H][0]
-
-    # The two sources, both block-uniform launch scalars, and the elided
-    # plane's one quantized value. `Float32(1.0) * h_scale` is exactly
-    # `h_scale`, so `hq_const` is `Int32(round(h_scale))` formed by this
-    # device compiler from this launch's own argument. Never read while
-    # `celide` is clear.
-    var quant = Int(use_quant) != 0
-    var celide = Int(const_hess) != 0
-    var hq_const = Int32(round(Float32(1.0) * h_scale))
-
-    # One global feature id per owned slot, read once and spent for every row.
-    # `PLAN_MAX_GROUP` and not `owned`, because a `stack_allocation` needs a
-    # comptime extent; the unowned entries are never read.
-    var fid = stack_allocation[PLAN_MAX_GROUP, Scalar[DType.int32]]()
-    var fbase = k * Int(feat_stride) + slot0
-    for gi in range(owned):
-        fid[unsafe_offset=gi] = feat_ids[unsafe_offset = fbase + gi][0]
-
-    var shm = stack_allocation[
-        UNITS * PLAN_UNIT_CELLS,
-        Scalar[DType.int32],
-        address_space = AddressSpace.SHARED,
-    ]()
-    var unit_cells = N_PLANES * stride
-    var live_cells = owned * copies * unit_cells
-    var z = tid
-    while z < live_cells:
-        shm[unsafe_offset=z] = Int32(0)
-        z += nthreads
-    barrier()
-
-    # This thread's copy, and the step from one feature's copy to the next
-    # feature's same-numbered copy. Unit `gi * copies + c`.
-    var my_unit = tid % copies
-    var ubase = my_unit * unit_cells
-    var ustep = copies * unit_cells
-
-    var j = tile_begin + tid
-    while j < tile_end:
-        var r = Int(rows[unsafe_offset = begin + j][0])
-        var gqv = Int32(0)
-        var hqv = Int32(0)
-        if quant:
-            gqv = gq[unsafe_offset = 2 * (plane_base + r)][0]
-            if not celide:
-                hqv = gq[unsafe_offset = 2 * (plane_base + r) + 1][0]
-        else:
-            gqv = Int32(
-                round(grad[unsafe_offset = plane_base + r][0] * g_scale)
-            )
-            if not celide:
-                hqv = Int32(
-                    round(hess[unsafe_offset = plane_base + r][0] * h_scale)
-                )
-        var u = ubase
-        for gi in range(owned):
-            var bin = Int(
-                bins[unsafe_offset = Int(fid[unsafe_offset=gi][0]) * nr + r]
-            )
-            _ = Atomic.fetch_add(shm.unsafe_offset(u + bin), gqv)
-            if not celide:
-                _ = Atomic.fetch_add(shm.unsafe_offset(u + stride + bin), hqv)
-            _ = Atomic.fetch_add(
-                shm.unsafe_offset(u + 2 * stride + bin), Int32(1)
-            )
-            u += ustep
-        j += nthreads
-    barrier()
-
-    # The flush: sum this feature's copies, then fold into the output slice
-    # exactly as the shipping kernels do, with the subtraction fused when the
-    # block built the smaller child of a pair.
-    var slot_cells = N_PLANES * hs
-    for gi in range(owned):
-        var f = Int(fid[unsafe_offset=gi][0])
-        var slice_base = out_slot * slot_cells + f * nb
-        var sub_base = sub_slot * slot_cells + f * nb
-        var ug = gi * ustep
-        var b = tid
-        while b < nb:
-            var vg = Int32(0)
-            var vh = Int32(0)
-            var vc = Int32(0)
-            var u = ug
-            for _ in range(copies):
-                vg += shm[unsafe_offset = u + b][0]
-                if not celide:
-                    vh += shm[unsafe_offset = u + stride + b][0]
-                vc += shm[unsafe_offset = u + 2 * stride + b][0]
-                u += unit_cells
-            # The refill, after the copies are summed: `vc` copies of
-            # `hq_const` added together is `hq_const * vc`. The hessian plane
-            # of `shm` is still zeroed above and simply not read, because the
-            # zeroing here is one flat loop over `live_cells` and splitting it
-            # per plane would cost a division in the loop to save a store.
-            if celide:
-                vh = hq_const * vc
-            if vc != 0:
-                _ = Atomic.fetch_add(
-                    out_hist.unsafe_offset(slice_base + b), vg
-                )
-                _ = Atomic.fetch_add(
-                    out_hist.unsafe_offset(slice_base + hs + b), vh
-                )
-                _ = Atomic.fetch_add(
-                    out_hist.unsafe_offset(slice_base + 2 * hs + b), vc
-                )
-                if subtracting:
-                    _ = Atomic.fetch_add(
-                        out_hist.unsafe_offset(sub_base + b), -vg
-                    )
-                    _ = Atomic.fetch_add(
-                        out_hist.unsafe_offset(sub_base + hs + b), -vh
-                    )
-                    _ = Atomic.fetch_add(
-                        out_hist.unsafe_offset(sub_base + 2 * hs + b), -vc
-                    )
-            b += nthreads
 
 
 def _batch_reduce_kernel(
@@ -3539,31 +2424,6 @@ struct GpuLeafBatcher(Movable):
     var plan_items: Int
     var plan_tiles_per_item: Int
     var plan_slots: Int
-    # Pairs the NEXT subtracting level batch may hold, or zero for "unknown".
-    # A hint and never a fact: it only ever narrows the grid the pair-indexed
-    # arm launches, and the kernel reads the item table for the real count.
-    # Written by `set_level_pairs`, which is called from the one level-commit
-    # site that knows the depth; see that method for why an upper bound is
-    # sufficient and why zero is always safe.
-    var plan_level_pairs: Int
-    # The interleaved pre-quantized gradient buffer, `2 * n_planes * n_rows`
-    # Int32, or one word when `MOJOTREES_GPU_BATCH_QUANT=0` declined it. Only
-    # the staged plan's own plane is ever written; see `_ensure_quantized`.
-    var gq_dev: DeviceBuffer[DType.int32]
-    var quant_capacity: Int
-    # Whether the next accumulation gathers that buffer, and whether it
-    # currently holds THIS tree's round. `stage_device_plan` clears the
-    # second, which is the only invalidation there is: the gradients cannot
-    # move inside a tree and that method runs once per tree.
-    var quant_grads: Bool
-    var quant_valid: Bool
-    # The staged plan's scales and plane, kept host side so the quantization
-    # pass needs no readback. Written by `stage_device_plan` and by nothing
-    # else, which is also the proof that the pair is uniform over the plan's
-    # items: that method writes one pair into every item's row.
-    var plan_g_scale: Float32
-    var plan_h_scale: Float32
-    var plan_plane: Int
     # The caller's declaration that every row's hessian this round is exactly
     # `histogram.CONSTANT_HESSIAN`, and the environment's power to withdraw
     # the permission but never to grant it. See `set_constant_hessian`.
@@ -3617,12 +2477,6 @@ struct GpuLeafBatcher(Movable):
         self.plan_items = 0
         self.plan_tiles_per_item = 0
         self.plan_slots = 0
-        self.plan_level_pairs = 0
-        self.plan_g_scale = Float32(0.0)
-        self.plan_h_scale = Float32(0.0)
-        self.plan_plane = 0
-        self.quant_grads = batch_quantized_grads_requested()
-        self.quant_valid = False
         # `MOJOTREES_CONST_HESSIAN=0` withdraws the permission, so a later
         # `set_constant_hessian(True)` is refused rather than silently
         # ignored. The same reading `GpuActiveRows` makes of the same name.
@@ -3646,16 +2500,6 @@ struct GpuLeafBatcher(Movable):
         if part_size < 1:
             part_size = 1
         self.part_dev = self.ctx.enqueue_create_buffer[DType.int32](part_size)
-        # One interleaved Int32 pair per row per gradient plane. Allocated
-        # unless the environment declined it outright, so a benchmark can move
-        # `set_quantized_gradients` between repeats in one process rather than
-        # re-execing; at 463,715 rows and one plane it is 3.7 MB.
-        self.quant_capacity = 1
-        if _batch_quant_allowed():
-            self.quant_capacity = 2 * n_planes * n_rows
-        self.gq_dev = self.ctx.enqueue_create_buffer[DType.int32](
-            self.quant_capacity
-        )
         self.stage_items = self.ctx.enqueue_create_host_buffer[DType.int32](
             max_items * ITEM_WORDS
         )
@@ -3677,38 +2521,6 @@ struct GpuLeafBatcher(Movable):
 
     def synchronize(self) raises:
         self.ctx.synchronize()
-
-    def set_quantized_gradients(mut self, on: Bool) raises:
-        """Whether the device-plan accumulation gathers the pre-quantized
-        Int32 pairs instead of quantizing per (row, feature) visit.
-
-        An argument as well as an environment variable, for the reason
-        `GpuActiveRows.set_feature_group` gives: an A/B that reads its arm
-        from the environment can run one arm under the other's label, which
-        has happened in this repository once, so a benchmark holding both
-        arms in one process passes the arm in rather than re-execing.
-
-        Raises rather than silently leaving the Float32 arm selected when
-        `MOJOTREES_GPU_BATCH_QUANT=0` declined the buffer's allocation, for
-        the same reason `set_scan_primitives` raises at an unsupported width:
-        a benchmark told to run this arm must not quietly measure the other
-        one.
-
-        Takes effect on the next device-plan accumulation, and it cannot
-        change a histogram. The buffer is rebuilt on the next launch either
-        way, because turning the arm on mid-tree leaves `quant_valid` clear.
-        """
-        if on and self.quant_capacity < 2 * self.n_planes * self.n_rows:
-            raise Error(
-                "the quantized gradient buffer was not allocated;"
-                " MOJOTREES_GPU_BATCH_QUANT=0 declined it for this session"
-            )
-        self.quant_grads = on
-        self.quant_valid = False
-
-    def quantized_gradients_on(self) -> Bool:
-        """Whether the next device-plan accumulation gathers Int32 pairs."""
-        return self.quant_grads
 
     def set_constant_hessian(mut self, on: Bool):
         """Declare that every row's hessian this round is exactly
@@ -3748,37 +2560,29 @@ struct GpuLeafBatcher(Movable):
 
     def staged_gradient_bytes_per_visit(self) -> Int:
         """Bytes of staged derivative one (row, feature) VISIT costs the
-        batched family, at the arms currently set.
+        batched family.
 
         `GpuActiveRows.staged_gradient_bytes_per_row` is the range family's
         figure and the two were not comparable, because the two families do
         not spend the derivative the same way. The range family gathers a
         row's derivative once per threadgroup and spends it over a feature
         GROUP, so its per-visit share is its per-row width divided by the
-        group. The batched family has no group at all on the shipping arms
-        (`grid.x` is the feature axis, one slot per threadgroup), so a visit
-        pays the whole per-row width and this number IS the per-row width,
-        divided by the lean kernel's group when that arm is selected.
+        group. The batched family has no group at all (`grid.x` is the feature
+        axis, one slot per threadgroup), so a visit pays the whole per-row
+        width and this number IS the per-row width. The feature group that
+        would have divided it lived on `_plan_hist_kernel`, which measured null
+        and was removed on 2026-08-17; see
+        `docs/design/DECLINED_OPTIMIZATIONS.md` row E11.
 
-        Four on the Float32 arm under a constant hessian and eight otherwise;
-        the same four or eight on the quantized arm, the pair being one load
-        either way. What the quantized arm buys at equal width is the two
-        multiplies and two rounds, not the bytes -- so a trace comparing the
-        two families must read this beside
-        `_plan_hist_kernel`'s group width and not on its own.
+        Four under a constant hessian and eight otherwise.
         """
-        var wide = 4 if self.constant_hessian else 8
-        var gw = plan_group_requested() if plan_lean_requested() else 1
-        if gw < 1:
-            gw = 1
-        return wide // gw if wide >= gw else 1
+        return 4 if self.constant_hessian else 8
 
     def staged_gradient_bytes_per_row(self) -> Int:
         """The per-row width, spelled as `GpuActiveRows` spells it, so the two
         families can be read off a trace side by side without either reader
         recomputing the other's convention. Four under a constant hessian and
-        eight otherwise, on both the Float32 and the quantized arm; this
-        module has no Int16 staging arm."""
+        eight otherwise; this module has no Int16 staging arm."""
         return 4 if self.constant_hessian else 8
 
     def hist_size(self) -> Int:
@@ -4005,11 +2809,8 @@ struct GpuLeafBatcher(Movable):
                 block_dim=threads,
             )
         else:
-            # Both new arms are OFF on the host-staged path, and neither is an
-            # oversight. The quantized source rests on the scale pair being
-            # global to the plan, which `_stage_plan` does not guarantee -- it
-            # takes a per-item list precisely so a multiclass batch can vary
-            # it -- and the hessian elision would have to be carried through
+            # The hessian elision is OFF on the host-staged path and that is
+            # not an oversight: it would have to be carried through
             # `_batch_hist_partial_kernel` and `_batch_reduce_kernel` as well
             # to cover the tiled strategy this path can also resolve to. So
             # this launch is the shipping one, statement for statement.
@@ -4018,7 +2819,6 @@ struct GpuLeafBatcher(Movable):
                 rows,
                 grad,
                 hess,
-                self.gq_dev.unsafe_ptr(),
                 self.feat_dev.unsafe_ptr(),
                 self.items_dev.unsafe_ptr(),
                 self.scales_dev.unsafe_ptr(),
@@ -4029,7 +2829,6 @@ struct GpuLeafBatcher(Movable):
                 Int32(self.n_bins),
                 Int32(hs),
                 Int32(self.n_features),
-                Int32(0),
                 Int32(0),
                 grid_dim=(plan.n_slots, plan.total_tiles),
                 block_dim=threads,
@@ -4208,42 +3007,7 @@ struct GpuLeafBatcher(Movable):
         self.plan_items = n_items
         self.plan_tiles_per_item = tiles
         self.plan_slots = n_slots
-        # Cleared per tree with the rest of the plan's host half: a hint left
-        # over from the previous tree's last level would narrow this tree's
-        # first grid. Zero is the safe value and means "use the staged width".
-        self.plan_level_pairs = 0
-        # The round's scales and plane, kept host side for the quantization
-        # pass, and the invalidation that makes that pass once per tree. This
-        # is the only place the pair is written, which is what makes "the
-        # scale is global to the plan" a property of the code rather than an
-        # assumption: the loop above stores the SAME `g_scale` and `h_scale`
-        # into every item's row of `scales_dev`.
-        self.plan_g_scale = g_scale
-        self.plan_h_scale = h_scale
-        self.plan_plane = plane
-        self.quant_valid = False
         return total_tiles
-
-    def set_level_pairs(mut self, pairs: Int):
-        """Tell the next subtracting level batch how many pairs its level can
-        hold at most. Zero, the initial value, means "assume the staged
-        width".
-
-        **An upper bound is all this has to be, and that is what makes it a
-        host-side number rather than a readback.** An oblivious level at depth
-        `l` commits `1 << l` parents and `2 << l` children, so the caller that
-        knows `l` knows the pair count exactly whenever the level committed at
-        all; and when growth stopped, `_kill_level_plan` kills the WHOLE staged
-        width, `_live_item_pairs` answers zero on the device, and every block
-        of whatever grid was launched returns at its first comparison. So the
-        bound is exact when it matters and harmlessly large when it does not.
-        Too LARGE only costs threadgroups that return; too SMALL would drop a
-        child's histogram, which is why the launch clamps this into
-        `[1, plan_items / 2]` rather than trusting it.
-
-        Read by the pair-indexed arm alone. Every other arm launches the
-        staged geometry and cannot see this value at all."""
-        self.plan_level_pairs = pairs if pairs > 0 else 0
 
     def device_plan_staged(self) -> Bool:
         """Whether `stage_device_plan` has run on this batcher.
@@ -4254,64 +3018,8 @@ struct GpuLeafBatcher(Movable):
         calling that a pass."""
         return self.plan_items > 0
 
-    def _quant_flag(self) -> Int32:
-        """`use_quant` for a device-plan launch: on only when the arm is
-        selected AND the buffer holds this tree's round."""
-        var on = self.quant_grads and self.quant_valid
-        return Int32(1) if on else Int32(0)
-
     def _const_hess_flag(self) -> Int32:
         return Int32(1) if self.constant_hessian else Int32(0)
-
-    def _ensure_quantized[
-        grad_origin: MutOrigin,
-        hess_origin: MutOrigin, //
-    ](
-        mut self,
-        grad: MutPointer[Float32, grad_origin],
-        hess: MutPointer[Float32, hess_origin],
-    ) raises:
-        """Rebuild the interleaved quantized buffer unless it already holds
-        this tree's round. One streaming launch over the staged plane's rows,
-        ordered before the accumulation that reads it by the queue.
-
-        **Once per tree and not once per level.** `stage_device_plan` is the
-        only invalidation and it runs once per tree, and the gradients cannot
-        move inside a tree because a round computes them once. So a depth-6
-        tree pays this on the level-zero enqueue and on no other:
-        `gpu_resident_round.oblivious_launch_census(6)` goes from 62 command
-        buffers to 63, under the measured 64-deep queue by one instead of by
-        two. That is the cost, it is the reason the arm is default off, and
-        folding the pass into `_batch_copy_back_zero_kernel` on the level-zero
-        pass would take it back to 62.
-
-        Enqueues only. Nothing here waits, because unlike the Int16 staging
-        arm in `gpu_active_rows` there is no bound to read back: Int32 holds
-        every value the Float32 arm would have formed.
-
-        Called at the top of every device-plan accumulation, so a caller that
-        never turns the arm on pays one Bool test per level.
-        """
-        if not self.quant_grads or self.quant_valid:
-            return
-        if self.plan_items < 1:
-            raise Error(
-                "the quantized gradient source needs a staged plan: its"
-                " scales and plane come from stage_device_plan"
-            )
-        var threads = self.block_threads
-        self.ctx.enqueue_function[_batch_quantize_kernel](
-            grad,
-            hess,
-            self.gq_dev.unsafe_ptr(),
-            Int32(self.plan_plane * self.n_rows),
-            Int32(self.n_rows),
-            self.plan_g_scale,
-            self.plan_h_scale,
-            grid_dim=_ceil_div(self.n_rows, threads),
-            block_dim=threads,
-        )
-        self.quant_valid = True
 
     def enqueue_device_plan_batch[
         bins_origin: MutOrigin,
@@ -4326,9 +3034,7 @@ struct GpuLeafBatcher(Movable):
         hess: MutPointer[Float32, hess_origin],
     ) raises:
         """Build every item of the device-written plan. **Two launches,
-        whatever the plan holds**, plus the one quantization pass a tree pays
-        on its first level when the quantized source is on. Does not stage,
-        transfer, or synchronize.
+        whatever the plan holds.** Does not stage, transfer, or synchronize.
 
         This is `enqueue_batch` with the staging removed and the strategy
         fixed, and it reads `items_dev` exactly as that path's kernels do, so
@@ -4340,12 +3046,9 @@ struct GpuLeafBatcher(Movable):
 
         This paragraph used to end "there is one accumulation kernel and one
         zeroing kernel in this module and both arms launch those", which stopped
-        being true when the subtracting pair and then `_plan_hist_kernel` were
-        added. The inspection argument is unchanged and now rests on naming the
-        two kernels rather than on there being only two; under
-        `plan_lean_requested` this arm launches `_plan_hist_kernel` instead,
-        whose own docstring carries the identity argument leg by leg. Corrected
-        2026-08-17.
+        being true when the subtracting pair was added. The inspection argument
+        is unchanged and now rests on naming the two kernels rather than on
+        there being only two. Corrected 2026-08-17.
 
         The zeroing is unconditional here, where `enqueue_batch` reasons about
         whether it is needed. It always is: this arm is always the atomic
@@ -4361,9 +3064,6 @@ struct GpuLeafBatcher(Movable):
         var threads = self.block_threads
         var hs = self.hist_size()
 
-        # No-op unless the quantized source is on and the buffer is stale,
-        # which is once per tree; see `_ensure_quantized`.
-        self._ensure_quantized(grad, hess)
         var cells = n_items * N_PLANES * hs
         self.ctx.enqueue_function[_batch_zero_kernel](
             self.out_dev.unsafe_ptr(),
@@ -4373,15 +3073,11 @@ struct GpuLeafBatcher(Movable):
             grid_dim=_ceil_div(cells, threads),
             block_dim=threads,
         )
-        if plan_lean_requested():
-            self._launch_plan_hist(bins, rows, grad, hess, False)
-            return
         self.ctx.enqueue_function[_batch_hist_atomic_kernel](
             bins,
             rows,
             grad,
             hess,
-            self.gq_dev.unsafe_ptr(),
             self.feat_dev.unsafe_ptr(),
             self.items_dev.unsafe_ptr(),
             self.scales_dev.unsafe_ptr(),
@@ -4392,171 +3088,10 @@ struct GpuLeafBatcher(Movable):
             Int32(self.n_bins),
             Int32(hs),
             Int32(self.n_features),
-            self._quant_flag(),
             self._const_hess_flag(),
             grid_dim=(self.plan_slots, total_tiles),
             block_dim=threads,
         )
-
-    def plan_lean_geometry(self, subtract: Bool) raises -> List[Int]:
-        """The lean kernel's resolved launch geometry, as
-        `[grid_x, total_tiles, tiles_per_item, split_rows, n_copies,
-        group_width, units, subtract]`.
-
-        Split out from the launch so a test can assert what the switches
-        resolved to without launching anything, which is the only way to prove
-        a knob's gate opened rather than assume it. Raises rather than clamping
-        when the requested group and copy counts do not fit threadgroup memory,
-        because a clamp would silently drop a feature's accumulation.
-        """
-        if self.plan_items < 1 or self.plan_slots < 1:
-            raise Error(
-                "no device-written plan is staged; call stage_device_plan"
-                " before asking for a lean plan geometry"
-            )
-        var nb = self.n_bins
-        var stride = nb + 1
-        var threads = self.block_threads
-
-        var split = plan_row_split_requested()
-        var tpi = self.plan_tiles_per_item
-        var split_rows = 0
-        if split > 0:
-            tpi = split
-            split_rows = 1
-        if tpi < 1:
-            tpi = 1
-
-        var gw = plan_group_requested()
-        if gw > PLAN_MAX_GROUP:
-            gw = PLAN_MAX_GROUP
-        if gw > self.plan_slots:
-            gw = self.plan_slots
-        if gw < 1:
-            gw = 1
-
-        var copies = plan_private_copies_requested(nb)
-        if copies > threads:
-            copies = threads
-        if copies < 1:
-            copies = 1
-
-        # The two budgets, in cells. The group is resolved first and the
-        # copies give way to it, because the group's win is a traffic argument
-        # over bytes and the copies' is a contention argument this file cannot
-        # price. Neither is clamped silently past that point.
-        var wide = PLAN_UNITS_WIDE * PLAN_UNIT_CELLS
-        var narrow = PLAN_UNITS_NARROW * PLAN_UNIT_CELLS
-        var need = gw * copies * N_PLANES * stride
-        if need > wide:
-            copies = wide // (gw * N_PLANES * stride)
-            if copies < 1:
-                copies = 1
-            need = gw * copies * N_PLANES * stride
-        if need > wide:
-            raise Error(
-                "a lean plan batch cannot fit its feature group in"
-                " threadgroup memory: lower MOJOTREES_GPU_HIST_GROUP"
-            )
-        var units = PLAN_UNITS_WIDE
-        if need <= narrow:
-            units = PLAN_UNITS_NARROW
-
-        var total_tiles = self.plan_items * tpi
-        if total_tiles > MAX_GRID_DIM_Y:
-            raise Error(
-                "a lean plan batch's packed tile axis exceeds the portable"
-                " grid.y bound: lower MOJOTREES_GPU_HIST_ROW_SPLIT"
-            )
-        var out = List[Int]()
-        out.append(_ceil_div(self.plan_slots, gw))
-        out.append(total_tiles)
-        out.append(tpi)
-        out.append(split_rows)
-        out.append(copies)
-        out.append(gw)
-        out.append(units)
-        out.append(1 if subtract else 0)
-        return out^
-
-    def _launch_plan_hist[
-        bins_origin: MutOrigin,
-        rows_origin: MutOrigin,
-        grad_origin: MutOrigin,
-        hess_origin: MutOrigin, //
-    ](
-        mut self,
-        bins: MutPointer[UInt8, bins_origin],
-        rows: MutPointer[Int32, rows_origin],
-        grad: MutPointer[Float32, grad_origin],
-        hess: MutPointer[Float32, hess_origin],
-        subtract: Bool,
-    ) raises:
-        """`_plan_hist_kernel` at the geometry the switches resolved.
-
-        The zeroing pass is the caller's, unchanged: this replaces only the
-        accumulation launch, so both arms are still two launches per level and
-        `gpu_resident_round.oblivious_launch_census(6)` is still 62. That is a
-        precondition of the whole plane and not a happy result; see
-        `enqueue_device_plan_batch_fused_subtracting`.
-        """
-        var g = self.plan_lean_geometry(subtract)
-        var hs = self.hist_size()
-        var threads = self.block_threads
-        if g[6] == PLAN_UNITS_NARROW:
-            self.ctx.enqueue_function[_plan_hist_kernel[PLAN_UNITS_NARROW]](
-                bins,
-                rows,
-                grad,
-                hess,
-                self.gq_dev.unsafe_ptr(),
-                self.feat_dev.unsafe_ptr(),
-                self.items_dev.unsafe_ptr(),
-                self.scales_dev.unsafe_ptr(),
-                self.out_dev.unsafe_ptr(),
-                Int32(self.n_rows),
-                Int32(self.plan_items),
-                Int32(self.plan_slots),
-                Int32(self.n_bins),
-                Int32(hs),
-                Int32(self.n_features),
-                Int32(g[2]),
-                Int32(g[3]),
-                Int32(g[4]),
-                Int32(g[5]),
-                Int32(g[7]),
-                self._quant_flag(),
-                self._const_hess_flag(),
-                grid_dim=(g[0], g[1]),
-                block_dim=threads,
-            )
-        else:
-            self.ctx.enqueue_function[_plan_hist_kernel[PLAN_UNITS_WIDE]](
-                bins,
-                rows,
-                grad,
-                hess,
-                self.gq_dev.unsafe_ptr(),
-                self.feat_dev.unsafe_ptr(),
-                self.items_dev.unsafe_ptr(),
-                self.scales_dev.unsafe_ptr(),
-                self.out_dev.unsafe_ptr(),
-                Int32(self.n_rows),
-                Int32(self.plan_items),
-                Int32(self.plan_slots),
-                Int32(self.n_bins),
-                Int32(hs),
-                Int32(self.n_features),
-                Int32(g[2]),
-                Int32(g[3]),
-                Int32(g[4]),
-                Int32(g[5]),
-                Int32(g[7]),
-                self._quant_flag(),
-                self._const_hess_flag(),
-                grid_dim=(g[0], g[1]),
-                block_dim=threads,
-            )
 
     def enqueue_device_plan_batch_fused[
         bins_origin: MutOrigin,
@@ -4612,11 +3147,6 @@ struct GpuLeafBatcher(Movable):
         var threads = self.block_threads
         var hs = self.hist_size()
 
-        # No-op unless the quantized source is on and the buffer is stale,
-        # which is once per tree; see `_ensure_quantized`. It is ahead of the
-        # zeroing pass so that the level-zero enqueue is quantize, zero,
-        # accumulate, and the two later launches are unmoved.
-        self._ensure_quantized(grad, hess)
         var cells = n_items * N_PLANES * hs
         var blocks = _ceil_div(cells, threads)
         if copy_back_blocks > blocks:
@@ -4632,15 +3162,11 @@ struct GpuLeafBatcher(Movable):
             grid_dim=blocks,
             block_dim=threads,
         )
-        if plan_lean_requested():
-            self._launch_plan_hist(bins, rows, grad, hess, False)
-            return
         self.ctx.enqueue_function[_batch_hist_atomic_kernel](
             bins,
             rows,
             grad,
             hess,
-            self.gq_dev.unsafe_ptr(),
             self.feat_dev.unsafe_ptr(),
             self.items_dev.unsafe_ptr(),
             self.scales_dev.unsafe_ptr(),
@@ -4651,7 +3177,6 @@ struct GpuLeafBatcher(Movable):
             Int32(self.n_bins),
             Int32(hs),
             Int32(self.n_features),
-            self._quant_flag(),
             self._const_hess_flag(),
             grid_dim=(self.plan_slots, total_tiles),
             block_dim=threads,
@@ -4722,9 +3247,6 @@ struct GpuLeafBatcher(Movable):
         var threads = self.block_threads
         var hs = self.hist_size()
 
-        # No-op unless the quantized source is on and the buffer is stale,
-        # which is once per tree; see `_ensure_quantized`.
-        self._ensure_quantized(grad, hess)
         var cells = n_items * N_PLANES * hs
         var blocks = _ceil_div(cells, threads)
         if copy_back_blocks > blocks:
@@ -4740,18 +3262,11 @@ struct GpuLeafBatcher(Movable):
             grid_dim=blocks,
             block_dim=threads,
         )
-        if plan_lean_requested():
-            self._launch_plan_hist(bins, rows, grad, hess, True)
-            return
-        if pair_grid_requested():
-            self._launch_pair_hist(bins, rows, grad, hess)
-            return
         self.ctx.enqueue_function[_batch_hist_atomic_subtract_kernel](
             bins,
             rows,
             grad,
             hess,
-            self.gq_dev.unsafe_ptr(),
             self.feat_dev.unsafe_ptr(),
             self.items_dev.unsafe_ptr(),
             self.scales_dev.unsafe_ptr(),
@@ -4762,86 +3277,6 @@ struct GpuLeafBatcher(Movable):
             Int32(self.n_bins),
             Int32(hs),
             Int32(self.n_features),
-            self._quant_flag(),
-            self._const_hess_flag(),
-            grid_dim=(self.plan_slots, total_tiles),
-            block_dim=threads,
-        )
-
-    def _launch_pair_hist[
-        bins_origin: MutOrigin,
-        rows_origin: MutOrigin,
-        grad_origin: MutOrigin,
-        hess_origin: MutOrigin, //
-    ](
-        mut self,
-        bins: MutPointer[UInt8, bins_origin],
-        rows: MutPointer[Int32, rows_origin],
-        grad: MutPointer[Float32, grad_origin],
-        hess: MutPointer[Float32, hess_origin],
-    ) raises:
-        """`_batch_hist_pair_subtract_kernel` at the pair-indexed geometry.
-
-        The zeroing pass is the caller's, unchanged, so this replaces only the
-        accumulation launch and both arms are still two launches per level:
-        `gpu_resident_round.oblivious_launch_census(6)` is still 62. That is a
-        precondition of this plane and not a happy result; see
-        `enqueue_device_plan_batch_fused_subtracting`.
-
-        THE GRID, AND THE ONE DIRECTION THE CLAMP PROTECTS
-        --------------------------------------------------
-        `grid.y` is `pairs * tiles` where `pairs` is the level's own pair
-        count when a caller supplied it (`set_level_pairs`) and half the
-        staged width otherwise. Half the staged width is the ALWAYS-CORRECT
-        answer and is what this falls back to, because a level can never hold
-        more pairs than the plan was staged for; the hint only narrows it. A
-        hint that was too large would cost threadgroups that return at their
-        first comparison, and a hint that was too small would silently drop a
-        child's histogram, so the clamp is written in that direction and the
-        hint is never trusted upward."""
-        var threads = self.block_threads
-        var hs = self.hist_size()
-
-        var tpi = self.plan_tiles_per_item
-        var split_rows = 0
-        var req = pair_grid_tiles()
-        if req > 0:
-            tpi = req
-            split_rows = 1
-        if tpi < 1:
-            tpi = 1
-
-        var pairs = self.plan_items // 2
-        if self.plan_level_pairs > 0 and self.plan_level_pairs < pairs:
-            pairs = self.plan_level_pairs
-        if pairs < 1:
-            pairs = 1
-
-        var total_tiles = pairs * tpi
-        if total_tiles > MAX_GRID_DIM_Y:
-            raise Error(
-                "a pair-indexed batch's packed tile axis exceeds the portable"
-                " grid.y bound: lower MOJOTREES_GPU_HIST_PAIR_TILES"
-            )
-        self.ctx.enqueue_function[_batch_hist_pair_subtract_kernel](
-            bins,
-            rows,
-            grad,
-            hess,
-            self.gq_dev.unsafe_ptr(),
-            self.feat_dev.unsafe_ptr(),
-            self.items_dev.unsafe_ptr(),
-            self.scales_dev.unsafe_ptr(),
-            self.out_dev.unsafe_ptr(),
-            Int32(self.n_rows),
-            Int32(self.plan_items),
-            Int32(self.plan_slots),
-            Int32(self.n_bins),
-            Int32(hs),
-            Int32(self.n_features),
-            Int32(tpi),
-            Int32(split_rows),
-            self._quant_flag(),
             self._const_hess_flag(),
             grid_dim=(self.plan_slots, total_tiles),
             block_dim=threads,

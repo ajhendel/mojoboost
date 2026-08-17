@@ -827,6 +827,191 @@ declined, because a labelled number still gets quoted without its label."*
 
 **Class.** A reporting decline, not a speed one. Survives.
 
+### The 2026-08-17 symmetric histogram switch sweep, E10 to E14
+
+Five rows follow and they share one run, so the shape is stated once here
+rather than five times below. **Synthetic 200,000 rows by 90 features, 60
+trees, symmetric depth 6, GPU, `learning_rate=0.1`, `lambda_l2=1.0`, best of
+three, all arms on one machine inside one time window, 2026-08-17.** Baseline
+**1.072 s**. Every arm was verified bit-identical to the baseline by comparing
+predictions with `np.array_equal`, so nothing below is an accuracy trade and
+every figure is pure speed.
+
+Two arms came in above 1.000x, at 1.6 and 1.8 percent. This machine's
+documented drift between time windows is 2x to 3x, so both are nulls and
+neither is recorded as a win. Under `bench/results/LANE_RULES.md` rule 6 a
+switch that outlives its measurement is a defect, so all eight switches and the
+two experimental kernels behind them were deleted the same day, the shipping
+path kept in every case. **These are the strongest evidence class this file
+has. Most rows above are ASSERTED; these are MEASURED, on one machine, in one
+window, against a stated baseline, with bit-identity checked.** Rule 10 asks
+that a speed figure travel with its run, and a negative result needs that as
+much as a positive one, which is why the shape is written out rather than
+implied.
+
+### E10. `MOJOTREES_GPU_BATCH_QUANT`, the pre-quantized gradient source on the batched family. MEASURED null, removed
+
+**Where.** `src/mojotrees/gpu_leaf_batching.mojo`, `_batch_hist_atomic_kernel`,
+*"A PRE-QUANTIZED GRADIENT SOURCE WAS BUILT HERE AND MEASURED NULL"*. The
+deleted code was `_batch_quantize_kernel`, `_ensure_quantized`, the `gq_dev`
+buffer and the `use_quant` parameter on both surviving kernels.
+
+**Declined.** Hoisting `Int32(round(grad[r] * g_scale))` and its hessian twin
+out of the row loop into one streaming pass per round, so the accumulation
+gathers an interleaved Int32 pair instead of two Float32 words. At 90 features
+the row loop evaluated the same expression ninety times per row.
+
+**Stated reason, before the measurement.** *"Default off because it moves the
+launch census by one and no benchmark has priced either half yet."*
+
+**Class.** MEASURED. **1.053 s, 1.018x, bit-identical.** A null.
+
+**Price.** The arm removed two Float32 multiplies, two rounds and half the
+derivative gather from every (row, feature) visit, and it bought 1.8 percent,
+which is inside drift. The inner loop's derivative arithmetic is therefore not
+what the level build is waiting on. It also cost one command buffer per tree,
+taking `oblivious_launch_census(6)` from 62 to 63 against a 64-deep queue, and
+a `2 * n_planes * n_rows` Int32 buffer, 3.7 MB at 463,715 rows.
+
+**Survives.** Yes, and the arm is gone. Do not rebuild it without a new reason.
+
+### E11. `MOJOTREES_GPU_HIST_LEAN`, `..._PRIVATE`, `..._GROUP`, the lean device-plan kernel. MEASURED null, removed
+
+**Where.** `src/mojotrees/gpu_leaf_batching.mojo`, module docstring, *"A THIRD
+ACCUMULATION ARM WAS BUILT ON THAT INVARIANT, MEASURED, AND REMOVED"*. The
+deleted code was `_plan_hist_kernel`, `plan_lean_geometry`, `_launch_plan_hist`
+and the `PLAN_*` constants.
+
+**Declined.** One kernel subsuming both shipping arms, with three unconditional
+strictly-less-work removals (no threadgroup `meta` block and no barrier to
+publish it, no binary search for the item, an early return before the shared
+histogram is zeroed rather than after it) and two CatBoost ideas as knobs,
+private replicated threadgroup accumulators and a feature group so a row's
+gradient pair is read once and spent several times.
+
+**Stated reason, before the measurement.** *"All four are default off, which is
+this package's rule for work no benchmark has priced yet."*
+
+**Class.** MEASURED, three arms. **`LEAN=1` alone 1.124 s, 0.954x.
+`PRIVATE=1` 1.097 s, 0.977x. `GROUP=1` 1.070 s, 1.002x.** All bit-identical.
+Null at best and a 4.6 percent loss at worst.
+
+**Price.** The feature-group arithmetic in `plan_group_requested` was sound on
+its face, 13 bytes of load traffic per visit falling to 7 at group 2 and 4 at
+group 4, a factor of 3.25. It measured 1.002x. The traffic the group removes is
+not the constraint, and the residency it spends is real. The three
+strictly-less-work removals measured a LOSS, which is the sharper result of the
+two, because removing work is supposed to be free.
+
+**Survives.** Yes, and the kernel is gone.
+
+### E12. `MOJOTREES_GPU_HIST_ROW_SPLIT`, the per-item row split. MEASURED LOSS, removed
+
+**Where.** Same kernel as E11 and deleted with it.
+`src/mojotrees/gpu_leaf_batching.mojo`, `plan_row_split_requested`, *"THE
+SHALLOW-DEPTH OCCUPANCY MULTIPLIER, AND WHAT IT IS REALLY FIXING"*.
+
+**Declined.** Splitting every plan item into `T` tiles of `ceil(count / T)`
+rows, with `count` read from the plan on the device, so the split follows the
+item's own size at every depth instead of the tree's row bound.
+
+**Stated reason, before the measurement.** Its own docstring registered the
+honest expectation in advance, which is the part worth keeping. *"The
+multiplier therefore has NO occupancy to win on that shape and what remains is
+wave quantization ... It is expected to pay where `n_slots` is small ... and to
+be a null or a small loss at 100 features."*
+
+**Class.** MEASURED. **`ROW_SPLIT=8` 1.574 s, 0.681x, bit-identical.** The
+largest measured loss of the eight.
+
+**Price.** A 32 percent loss, which is a great deal worse than the "null or a
+small loss" the docstring predicted at this feature count. The prediction was
+directionally right and badly under-sized, and the pre-registration is what
+makes that visible. Extra tiles over the same rows are extra threadgroups over
+the same rows.
+
+**Survives.** Yes. This one was never close.
+
+### E13. `MOJOTREES_GPU_HIST_PAIR_GRID` and `..._PAIR_TILES`, the pair-indexed grid. MEASURED null, and this is the row to read first
+
+**Where.** `src/mojotrees/histogram_gpu.mojo`, `stage_desc_level_plan`, *"THE
+GRID THIS SIZES IS DELIBERATELY OVERSIZED, AND THE OVERSIZING IS MEASURED
+FREE."* The deleted code was
+`gpu_leaf_batching._batch_hist_pair_subtract_kernel`, `_launch_pair_hist`,
+`set_level_pairs` and the `plan_level_pairs` field.
+
+**Declined.** Indexing `grid.y` by PAIR instead of by staged item, so a level of
+width `2L` dispatches `L * tiles` rows of grid instead of `plan_items * tiles`.
+
+**THE DEFECT IT AIMED AT IS REAL, WHICH IS THE WHOLE POINT OF THIS ROW.**
+`stage_desc_level_plan` sizes the plan from `1 << max_depth` for the whole tree,
+so every level dispatches a full 64 items' worth of threadgroups at depth 6
+whatever the level's real width is. Over levels 0 to 4 that is 5 x 64 = 320
+item-slots dispatched against 1 + 2 + 4 + 8 + 16 = 31 built, which is **9.32
+no-op threadgroups for every working one**, each reserving about 3 KB of
+threadgroup memory. That ratio was reproduced independently to two digits from
+two directions before the arm was built, once by measurement and once by
+arithmetic.
+
+**Class.** MEASURED. **`PAIR_GRID=1` 1.081 s, 0.992x, bit-identical.
+`PAIR_TILES=4` 1.078 s, 0.995x. `PAIR_TILES=8` 1.119 s, 0.958x.
+`PAIR_TILES=16` 1.239 s, 0.866x.**
+
+**Price, and it is a finding about where the time is NOT.** Removing 9.32 out of
+every 10.32 dispatched threadgroups changed the fit by nine tenths of one
+percent, in the wrong direction. **A verified, correctly diagnosed, two-digit
+waste turned out to cost nothing, so the symmetric level build is not
+threadgroup-dispatch bound and it is not threadgroup-memory-reservation bound.**
+Anything whose whole argument is "this level dispatches threadgroups that do no
+work" is answered by this row and should stop here. Widening the tiles on top of
+the pair grid made it monotonically worse, which says the same thing from the
+other side.
+
+**The defect was deliberately left in place.** Since removing the dead
+threadgroups buys nothing, the grid sizing stays as it is and the note at
+`stage_desc_level_plan` records that it is known, measured and free. This item
+has already cost two lanes.
+
+**Survives.** Yes. This is the most valuable of the five and the one a future
+reader should hit before opening a lane on grid sizing.
+
+### E14. `MOJOTREES_GPU_BATCH_CONST_HESS`, forwarding the constant-hessian declaration to the batcher. MEASURED null, removed
+
+**Where.** `src/mojotrees/histogram_gpu.mojo`, `set_constant_hessian`, *"THE
+BATCHER IS DELIBERATELY LEFT OUT, AND THAT IS WHY THE BATCHED ELISION DOES NOT
+RUN."* The deleted code was the switch and the two forwarding call sites, one
+in `set_constant_hessian` and one in `enqueue_desc_level_children`.
+
+**Declined.** Forwarding the round's constant-hessian declaration from
+`GpuHistogramBuilder` to `GpuLeafBatcher`, so the batched kernels would perform
+two shared atomics per visit instead of three, zero two threadgroup planes
+instead of three, and rebuild the global hessian plane as `hq_const * vc`.
+
+**Stated reason, before the measurement.** *"It is a switch rather than a plain
+fix so that the elision can be measured against the arm that has been
+shipping."* Which is exactly right, and the measurement is what follows.
+
+**Class.** MEASURED. **1.056 s, 1.016x, bit-identical.** A null.
+
+**Price.** A third fewer shared atomics and a third less shared zeroing in the
+hottest loop in the symmetric fit bought 1.6 percent, which is inside drift.
+Read beside E10, which removed different work from the same loop and also
+measured null, the pair says the row loop's arithmetic and its shared-memory
+traffic are not the constraint either.
+
+**Left behind on purpose, and this is a deliberate exception.** Only the SWITCH
+and its two forwards were deleted. The `celide` arm inside
+`_batch_hist_atomic_kernel` and its subtracting twin stays, along with
+`GpuLeafBatcher.set_constant_hessian`, `constant_hessian_on` and the
+`MOJOTREES_CONST_HESSIAN` withdrawal switch, which is a different switch and is
+not one of the eight. The elision is exact, argued leg by leg, and mirrors the
+specialization `GpuActiveRows` already ships on the single-leaf path, so it has
+value independent of the automatic forward that measured null. The consequence
+is honest and is recorded in the code, the batcher's declaration now arrives
+only if a caller sets it directly, and no caller in this package does.
+
+**Survives.** Yes, as a decline of the forward and not of the elision.
+
 ## Group F. CPU
 
 ### F1. `MOJOTREES_CPU_CORE_POOL=performance`. KNOWN

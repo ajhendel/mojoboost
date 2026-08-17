@@ -258,14 +258,15 @@ struct SharedHistogramLayout(Copyable, Movable):
     kernel would use, so the offsets are stated once here rather than
     recomputed at each of the three use sites (zero, accumulate, flush).
 
-    "A specialized kernel WOULD use" became "one does" on 2026-08-17:
-    `gpu_leaf_batching._plan_hist_kernel` takes one flat allocation of
-    `units * 3 * (n_bins + 1)` cells so that a threadgroup can hold several
-    feature slots and several private copies of each. Its plane stride carries
-    a PAD word this struct does not, which is deliberate rather than a
-    divergence: without it the copies of one bin all land in one memory bank.
-    So this layout still describes the single-copy case exactly and is not the
-    replicated one.
+    "A specialized kernel WOULD use" became "one does" on 2026-08-17 and then
+    became "none does" again the same day. `gpu_leaf_batching._plan_hist_kernel`
+    took one flat allocation of `units * 3 * (n_bins + 1)` cells so that a
+    threadgroup could hold several feature slots and several private copies of
+    each, with a PAD word on the plane stride that this struct does not carry,
+    without which the copies of one bin all land in one memory bank. That kernel
+    measured null or worse on every arm and was removed; see
+    `docs/design/DECLINED_OPTIMIZATIONS.md` rows E11 and E12. So this layout
+    describes the single-copy case, which is the only case there is.
     """
 
     var capacity: Int
@@ -628,17 +629,20 @@ struct KernelFeatures(Copyable, Movable):
     knowing before this flag is trusted as a reach test.**
     `gpu_leaf_batching.admit_frontier_batch` refuses a HOST-staged frontier
     batch without it. The DEVICE-written plan the oblivious level build runs
-    (`GpuLeafBatcher.enqueue_device_plan_batch_fused` and its subtracting and
-    lean arms, reached from `histogram_gpu.enqueue_desc_level_children`) does
+    (`GpuLeafBatcher.enqueue_device_plan_batch_fused` and its subtracting arm,
+    reached from `histogram_gpu.enqueue_desc_level_children`) does
     not consult it at all, so `batched_leaf_kernel = False` does not mean a fit
     ran no batched kernel. Recorded 2026-08-17 by the GPU histogram lane rather
     than corrected, because making the device path consult the flag would
     change what a symmetric fit can run and is not a docstring's decision.
 
-    `gpu_leaf_batching.plan_lean_requested` selects a third accumulation kernel
-    on that same device-plan path, default off behind
-    `MOJOTREES_GPU_HIST_LEAN`, `..._PRIVATE`, `..._ROW_SPLIT` and `..._GROUP`.
-    It is the same family and is not separately flagged here."""
+    Two further accumulation kernels lived on that same device-plan path for
+    part of 2026-08-17, `_plan_hist_kernel` behind `MOJOTREES_GPU_HIST_LEAN`,
+    `..._PRIVATE`, `..._ROW_SPLIT` and `..._GROUP`, and a pair-indexed
+    subtracting kernel behind `MOJOTREES_GPU_HIST_PAIR_GRID`. Both were
+    bit-identical to the shipping pair and both measured null or worse, so both
+    were removed the same day. See `docs/design/DECLINED_OPTIMIZATIONS.md` rows
+    E11 to E13."""
 
     @staticmethod
     def none() -> KernelFeatures:

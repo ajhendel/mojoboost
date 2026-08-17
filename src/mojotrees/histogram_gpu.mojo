@@ -203,7 +203,6 @@ from .gpu_histogram_specializations import (
 from .gpu_leaf_batching import (
     DEFAULT_MAX_ITEMS,
     GpuLeafBatcher,
-    batch_const_hessian_forward_requested,
     oblivious_subtract_requested,
     plan_batch,
     slots_for_budget,
@@ -1379,26 +1378,22 @@ struct GpuHistogramBuilder(Movable):
         this package calls it yet.
         """
         self.rows.set_constant_hessian(on)
-        # **THE BATCHER USED TO BE LEFT OUT, AND THAT IS WHY THE BATCHED
-        # ELISION HAS NEVER RUN.** This method forwarded to `self.rows` and
-        # stopped, so `GpuLeafBatcher.constant_hessian` stayed False for the
-        # life of every fit and the `celide` arm of `_batch_hist_atomic_kernel`,
-        # of its subtracting twin, and of `_plan_hist_kernel` was dead code on
-        # the oblivious level build. Behind `MOJOTREES_GPU_BATCH_CONST_HESS=1`
-        # so the elision is measured against the arm that has been shipping
-        # rather than arriving inside somebody else's number.
+        # **THE BATCHER IS DELIBERATELY LEFT OUT, AND THAT IS WHY THE BATCHED
+        # ELISION DOES NOT RUN.** This method forwards to `self.rows` and stops,
+        # so `GpuLeafBatcher.constant_hessian` is False for the life of every
+        # fit and the `celide` arm of `_batch_hist_atomic_kernel` and of its
+        # subtracting twin does not execute on the oblivious level build.
         #
-        # Not sufficient on its own and not meant to be: `train_gpu` makes the
-        # declaration at fit setup, before `open_resident` has allocated any
-        # batcher, so `self.batcher` is usually empty here and this line does
-        # nothing. `enqueue_desc_level_children` repeats it where the batcher
-        # certainly exists, and that is the forward that reaches a kernel.
-        #
-        # `self.constant_hessian()` and not `on`: what is forwarded is what
-        # `GpuActiveRows` ADOPTED, so `MOJOTREES_CONST_HESSIAN=0` withdraws the
-        # permission from both sides at once and the two cannot disagree.
-        if len(self.batcher) > 0 and batch_const_hessian_forward_requested():
-            self.batcher[0].set_constant_hessian(self.constant_hessian())
+        # A forward WAS built, behind `MOJOTREES_GPU_BATCH_CONST_HESS=1`, and it
+        # measured 1.056 s against a 1.072 s baseline at 200,000 rows x 90
+        # features, 60 trees, symmetric depth 6, GPU, predictions bit-identical
+        # by `np.array_equal`. That is 1.016x, inside this machine's drift band,
+        # so it is a null and the switch was removed on 2026-08-17 under
+        # `bench/results/LANE_RULES.md` rule 6. The elision itself is kept
+        # because it is exact and `set_constant_hessian` on the batcher is still
+        # the way to reach it; what was removed is the switch that forwarded the
+        # declaration automatically. See `docs/design/DECLINED_OPTIMIZATIONS.md`
+        # row E14.
 
     def constant_hessian(self) -> Bool:
         """Whether the constant-hessian specialization is actually in force
@@ -2986,6 +2981,25 @@ struct GpuHistogramBuilder(Movable):
         the first level's. Every level fills or kills the same width; see
         `gpu_tree_tables._kill_level_plan` for why the killing has to cover the
         whole staged width and not just the level's own prefix.
+
+        **THE GRID THIS SIZES IS DELIBERATELY OVERSIZED, AND THE OVERSIZING IS
+        MEASURED FREE. Do not open a lane on it.** Because the plan is staged at
+        `1 << max_depth` items for the whole tree, every level dispatches a full
+        `1 << max_depth` items' worth of threadgroups whatever the level's real
+        width is. Over a depth-6 tree that skips the last level's build, levels
+        0 to 4 dispatch 5 x 64 = 320 item-slots and build 1 + 2 + 4 + 8 + 16 =
+        31 of them, which is **9.32 no-op threadgroups for every working one**,
+        each reserving about 3 KB of threadgroup memory. The defect is real and
+        was reproduced to two digits from two directions. A pair-indexed grid
+        that removed those threadgroups was built, verified bit-identical by
+        `np.array_equal` on the predictions, and measured 1.081 s against a
+        1.072 s baseline at 200,000 rows x 90 features, 60 trees, symmetric
+        depth 6, GPU, on 2026-08-17. That is 0.992x. **Removing 9.32 out of
+        every 10.32 threadgroups bought nothing, which means the level build is
+        not threadgroup-dispatch bound and this is where the time is NOT.** The
+        kernel and its switch were removed the same day under
+        `bench/results/LANE_RULES.md` rule 6 and the grid sizing was left
+        exactly as it is. See `docs/design/DECLINED_OPTIMIZATIONS.md` row E13.
         """
         if not self.has_gradients:
             raise Error("call upload_gradients before staging a level plan")
@@ -3054,23 +3068,12 @@ struct GpuHistogramBuilder(Movable):
                 "no device-written plan is staged; call"
                 " stage_desc_level_plan before committing a level"
             )
-        # The pair count the batch that follows this commit may hold, for the
-        # pair-indexed grid alone. A level at depth `l` commits `1 << l`
-        # parents and `2 << l` children (`_commit_level_kernel` writes `2L`
-        # items as `L` left children then `L` right ones), so this is exact
-        # whenever the level commits and an over-estimate when growth already
-        # stopped, which is the only direction that is safe and is the
-        # direction `GpuLeafBatcher.set_level_pairs` clamps in. Zero for an
-        # implausible depth, which means "assume the staged width" and is what
-        # every arm but the pair-indexed one does unconditionally.
-        #
-        # Written here rather than passed to `enqueue_desc_level_children`
-        # because this is the one call in the level loop that is told the
-        # depth, and the file that runs that loop belongs to another lane.
-        var level_pairs = 0
-        if level_depth >= 0 and level_depth < 30:
-            level_pairs = 1 << level_depth
-        self.batcher[0].set_level_pairs(level_pairs)
+        # A per-level pair-count hint used to be published to the batcher here,
+        # for a pair-indexed accumulation grid that narrowed `grid.y` from the
+        # staged width to the level's own pair count. That arm measured 0.992x
+        # and was removed on 2026-08-17; see
+        # `docs/design/DECLINED_OPTIMIZATIONS.md` row E13 and the note at
+        # `stage_desc_level_plan`. Nothing reads a pair hint now.
         self.resident_tables[0].enqueue_level(
             rec_i,
             rec_f,
@@ -3156,17 +3159,18 @@ struct GpuHistogramBuilder(Movable):
         figure. Neither reading has been withdrawn, so reconciling them is
         another lane's item and no single multiple is quoted here.
 
-        **A third arm exists behind its own switches and is default off.**
-        `gpu_leaf_batching.plan_lean_requested` routes the accumulation to
-        `_plan_hist_kernel` instead of either kernel above, which is the same
-        integer accumulation with private threadgroup accumulators
-        (`MOJOTREES_GPU_HIST_PRIVATE`), a per-item row split
-        (`MOJOTREES_GPU_HIST_ROW_SPLIT`), and a feature group
-        (`MOJOTREES_GPU_HIST_GROUP`) as knobs, plus three unconditional
-        strictly-less-work removals reachable on their own with
-        `MOJOTREES_GPU_HIST_LEAN=1`. It is still two launches per level, so the
-        census does not move. Nothing it does can move a bit and the argument is
-        leg by leg at that kernel.
+        **THERE ARE TWO ARMS AND THERE IS NO THIRD.** A third accumulation
+        kernel, `gpu_leaf_batching._plan_hist_kernel`, carried private
+        threadgroup accumulators, a per-item row split and a feature group as
+        knobs behind `MOJOTREES_GPU_HIST_PRIVATE`, `..._ROW_SPLIT`, `..._GROUP`
+        and `..._LEAN`, and a fourth kernel indexed the subtracting grid by
+        pair behind `MOJOTREES_GPU_HIST_PAIR_GRID`. Every one of them was
+        bit-identical and every one of them measured null or worse on
+        2026-08-17 at 200,000 rows x 90 features, 60 trees, symmetric depth 6,
+        GPU, at 1.002x, 0.977x, 0.681x, 0.954x and 0.992x against a 1.072 s
+        baseline. All four switches and both kernels were removed the same day
+        under `bench/results/LANE_RULES.md` rule 6. See
+        `docs/design/DECLINED_OPTIMIZATIONS.md` rows E11 to E13.
 
         The copy-back is carried inside the zeroing pass the batch has to launch
         anyway (`gpu_leaf_batching._batch_copy_back_zero_kernel`, or
@@ -3188,15 +3192,13 @@ struct GpuHistogramBuilder(Movable):
             )
         if len(self.batcher) == 0:
             raise Error("no resident histogram pool is open")
-        # The round's constant-hessian declaration, forwarded to the batcher
-        # where the batcher certainly exists. THIS IS THE FORWARD THAT REACHES
-        # A KERNEL; the one inside `set_constant_hessian` runs at fit setup,
-        # before any pool is open, and does nothing on every path this package
-        # actually takes. A host field assignment per level, six per tree, no
-        # launch and no allocation. See `set_constant_hessian` for why the
-        # forward is a switch and why it cannot move a bit when it is true.
-        if batch_const_hessian_forward_requested():
-            self.batcher[0].set_constant_hessian(self.constant_hessian())
+        # The round's constant-hessian declaration used to be forwarded to the
+        # batcher here, behind `MOJOTREES_GPU_BATCH_CONST_HESS=1`. It measured
+        # 1.016x, which is a null, and the switch was removed on 2026-08-17;
+        # see `set_constant_hessian` and
+        # `docs/design/DECLINED_OPTIMIZATIONS.md` row E14. The batcher's own
+        # `set_constant_hessian` still reaches the elision for a caller that
+        # wants it.
         var blocks = self.rows.copy_back_debt_blocks()
         var rows_ptr = self.rows.rows_dev.copy()
         var scratch_ptr = self.rows.scratch_dev.copy()
