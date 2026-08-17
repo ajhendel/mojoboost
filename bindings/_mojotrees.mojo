@@ -9,14 +9,34 @@ matrices) and keeps them alive for the duration of each call. Copies into
 Mojo Lists happen here, so no Python buffer is retained after a call
 returns. Trained models are returned as opaque handles owned by Python.
 
-Prediction comes in two shapes. The row-at-a-time entry points
-(`predict`, `predict_range`, `predict_leaf`, and their multiclass and
-sparse siblings) walk the trees on the host and are unchanged. The `_batch`
-entry points below them take a device, hand the whole matrix to
-`Model.predict_batch`, and reach the device walk in gpu_predict.mojo; they
-report which backend ran rather than leaving a caller to assume. Where a
-prediction runs is still decided in one place, `resolve_device` in
-device.mojo, and nothing here decides it.
+Every dense prediction entry point bins the whole matrix once and then walks
+the trees over row blocks. `predict_range` and `predict_proba_range`, which
+predate the device vocabulary, do it by calling `Model.predict_batch` and
+`MulticlassModel.predict_batch` with an explicit `CPU_DEVICE`; the `_batch`
+entry points below them call the same two with the device the caller named,
+reach the device walk in gpu_predict.mojo, and report which backend ran
+rather than leaving a caller to assume. So there is one dense prediction
+path, and where it runs is decided in one place, `resolve_device` in
+device.mojo, which nothing here second-guesses.
+
+Nothing that can raise may appear inside a parallel block: `dispatch_rows`
+takes a non-raising `def (Int, Int) -> None`. `BinMapper.bin_row` raises,
+and `Model.predict_range` and `Model.predict_raw_range` inherit it because
+binning is their first statement, so a loop that bins per row cannot be
+parallelized at all. Binning the matrix up front is what makes the fan-out
+legal, and it keeps the validation rather than dropping it: `transform`
+checks the whole matrix's shape once where `bin_row` checked each row's
+shape `n_rows` times, which is the same question because every row of a
+column-major matrix has `n_features` entries by construction.
+
+The row axis is the only axis any of them splits, and that is a
+correctness statement rather than a preference. A row reads the ensemble,
+which no block writes, and writes its own output slots, which no other row
+touches; nothing is accumulated across rows, so the per-row body runs on
+exactly the values it ran on serially and the outputs are bit-identical at
+every block count and at every `MOJOTREES_NUM_WORKERS`. Splitting the TREE
+axis instead would reassociate a row's Float64 sum over trees and move the
+last bits, so it is not done anywhere here.
 """
 
 from std.os import abort
@@ -223,6 +243,7 @@ from mojotrees.trainset import (
 )
 from mojotrees.binning import BinnedMatrix
 from mojotrees.ctr_columns import (
+    CTR_SOURCE_ONE_HOT_MAX_SIZE,
     CTR_TARGET_BORDER_MIN_ENTROPY,
     CTR_TARGET_BORDER_MULTICLASS,
     SimpleCtrConfig,
@@ -262,6 +283,7 @@ from mojotrees.alternate_boosting import (
     BOOSTING_DART,
     BOOSTING_RF,
     AlternateBoostingParams,
+    boosting_name,
     fit_boosting,
     parse_boosting,
 )
@@ -283,6 +305,7 @@ from mojotrees.model_sparse import (
 from mojotrees.model import fit_custom as mojo_fit_custom
 from mojotrees.model import fit_multiclass as mojo_fit_multiclass
 from mojotrees.objective import mean_label
+from mojotrees.parallel import dispatch_rows
 from mojotrees.ranking_advanced import (
     AdvancedRankParams,
     LabelGain,
@@ -755,6 +778,7 @@ def _parse_params(
     auto_lr_objective: Int = _CUSTOM_OBJECTIVE,
     catboost_defaults_objective: Int = _NO_CATBOOST_DEFAULTS,
     ctr_ok: Bool = False,
+    boosting_ok: Bool = False,
 ) raises -> BoosterParams:
     """The `BoosterParams` a fit runs under, from the params mapping.
 
@@ -1009,11 +1033,17 @@ def _parse_params(
       `fit_ranker`, `fit_custom`, the three `*_with_metrics` fits and
       `distributed_train_local` all bin a raw matrix through `binning.fit_bins`
       and take no `SimpleCtrConfig`. The `train_dataset*` and `booster_update*`
-      entry points are False for the opposite reason -- their dataset was
-      binned before they were called, so its bundle is already decided and a
-      `ctr` key in the train params would be a second answer arriving too late.
-      `Dataset(params={"ctr": ...})` is where those set it, and that door is
-      unchanged.
+      entry points are a different case, and until 2026-08-17 they were wrongly
+      lumped in with the ones above. Their dataset was binned before they were
+      called, so its bundle is already decided -- but "already decided" is not
+      "absent", and the question `ctr_ok` asks is whether the CTR columns EXIST
+      for this fit, not whether this entry point built them. `train_dataset`
+      therefore passes `ctr_ok=d[].ctr.is_active()`: True when the dataset it
+      was handed really carries the columns, which is exactly when honoring the
+      key is truthful. A `ctr` key that disagrees with the dataset's own rule
+      is a second answer arriving too late and gets its own refusal at that
+      call site naming both rules. `Dataset(params={"ctr": ...})` remains where
+      the rule is set, and that door is unchanged.
 
       **A mode default is only ever applied where the value can be honored.**
       `leaf_estimation_iterations` resolves through
@@ -1061,6 +1091,55 @@ def _parse_params(
     # from nowhere else -- `params.mojo` refuses the key on the string
     # surface for exactly the reason handled here, that a string reaches
     # trainers that do not implement it.
+    # `boosting`, refused here rather than silently dropped. Added 2026-08-17.
+    #
+    # THE DEFECT THIS CLOSES. `params["boosting"]` was read at exactly one
+    # place in this file, inside `_parse_boosting`, whose only caller is `fit`.
+    # Every other entry point, `train_dataset`, `train_dataset_multiclass`,
+    # `train_dataset_ranker`, `booster_update` and `booster_update_multiclass`,
+    # took the key on the wire and dispatched no alternate loop, so
+    # `mojotrees.train({'boosting': 'dart'}, ds)` trained a plain gbdt model
+    # and said nothing about it.
+    #
+    # `rf` was worse than dart, because two wrongs did not cancel. The
+    # estimator layer forces `learning_rate = 1.0` under `rf`, which is correct
+    # for a forest and wrong for anything else, so a dropped `rf` left a
+    # BOOSTED fit running at rate 1.0. Neither the mode the caller asked for
+    # nor the rate they would have chosen survived.
+    #
+    # This is the route `bench/real_data` trains through. No arm sets
+    # `boosting` today, so no published number is affected, which is luck
+    # rather than design and is exactly the kind of luck this refusal removes.
+    #
+    # Refusing rather than dispatching, deliberately: five trainers have no
+    # dart or forest loop at all, so wiring the mode here would mean building
+    # five loops, while refusing it costs nothing and cannot mistrain anybody.
+    # The rule is `docs/COMPATIBILITY_POLICY.md` and the shape is the
+    # `derivative_precision` refusal below: a value the caller TYPED is
+    # refused, never accepted and ignored.
+    #
+    # `fit` is unaffected. It calls `_parse_boosting` itself and passes
+    # `boosting_ok=True`, so the one entry point that honors the key keeps
+    # honoring it.
+    if not boosting_ok:
+        var boost_mode = parse_boosting(String(py=params["boosting"]))
+        if boost_mode == BOOSTING_DART or boost_mode == BOOSTING_RF:
+            raise Error(
+                "boosting='",
+                boosting_name(boost_mode),
+                "' is not honored by ",
+                who,
+                ": the dart and forest round loops live in"
+                " alternate_boosting.fit_boosting, which only the estimator"
+                " entry point reaches. This entry point would have trained a"
+                " plain gbdt model and reported nothing, and under 'rf' it"
+                " would also have kept the learning_rate of 1.0 that the"
+                " estimator layer sets for a forest. Use"
+                " MojoTreesRegressor(boosting='",
+                boosting_name(boost_mode),
+                "') or MojoTreesClassifier, which reach that loop, or drop"
+                " the key to train the gbdt model this entry point builds",
+            )
     var extra = extra_params_from_mapping(params, n_features)
     # CatBoost mode resolves this per objective; `lossguide` does not resolve
     # it at all. `catboost_defaults` is 1 when the estimator's grow policy is
@@ -1140,14 +1219,68 @@ def _parse_params(
     # bin can carry one. `_parse_ctr` turns the same key into the bundle.
     #
     # The mode default is resolved in the estimator rather than here, and that
-    # is the one difference from `leaf_estimation_iterations`: `ctr` crosses
-    # the wire as a RULE NAME and not as a number, so "auto" arriving from a
-    # CatBoost-mode default and "auto" typed by a caller are the same six
-    # bytes. What keeps that honest is that both are refused identically --
-    # there is no value of this key an entry point may honor halfway -- so the
-    # provenance a mode default would need is not read by anything.
+    # used to be the one difference from `leaf_estimation_iterations`: `ctr`
+    # crosses the wire as a RULE NAME and not as a number, so "auto" arriving
+    # from a CatBoost-mode default and "auto" typed by a caller were the same
+    # six bytes, and the paragraph that stood here argued the provenance was
+    # therefore not worth carrying because "both are refused identically".
+    #
+    # **THAT ARGUMENT WAS WRONG, AND IT COST EVERY CATBOOST-MODE FIT THAT DOES
+    # NOT GO THROUGH `fit`.** Refusing both identically is exactly what a mode
+    # default must not do, and the rule is already written down two parameters
+    # up and in `sklearn.py:3195-3202`, for `random_strength`: "an inherited
+    # default an entry point cannot honor must decline rather than refuse."
+    # `random_strength` obeys it by sending `random_strength_set` and letting
+    # this function apply the mode default only where the flag says the caller
+    # was silent. `ctr` did not send that flag, so `grow_policy='symmetrictree'`
+    # resolved `ctr='catboost'` in the estimator, every entry point but `fit`
+    # read it as a request, and the fit raised. Measured 2026-08-17 on
+    # `bench/real_data`, which trains through `mojotrees.train(params, Dataset)`
+    # exclusively: the `mojotrees_catboost_mode` arm raised on 100 percent of
+    # cells, on numeric scenarios with no categorical column and so with no CTR
+    # to build in the first place. This is `random_strength_ok`'s defect a
+    # second time, in the parameter directly below it, and the docstring above
+    # already names that class: "A flag set at the one call site somebody
+    # looked at is the same defect wearing a different name."
+    #
+    # THREE ANSWERS NOW, AND THEY DIFFER BY PROVENANCE AND BY THE DATASET.
+    #
+    # `ctr_named` is the estimator's `IsSet` flag, and it defaults to 1 rather
+    # than 0. That direction is deliberate and it is the opposite of the
+    # reachability flags above: those default to "refuse" so a forgotten ENTRY
+    # POINT declines, and this defaults to "the caller asked" so a forgotten
+    # CALLER is refused loudly instead of having its request dropped. A caller
+    # that sends `ctr` without `ctr_set` is the C API, the CLI, or a hand-built
+    # dict, none of which has a mode-defaults layer, so for all of them a
+    # non-off rule really is a request.
+    # WHAT DECLINING IS, MECHANICALLY, AND THE INVARIANT THAT MAKES IT FREE.
+    # It is doing nothing. On every entry point that passes `ctr_ok=False`
+    # there is no downstream reader of the `ctr` key at all, so the mode
+    # default lapses by not being consulted rather than by being overwritten:
+    # `_parse_ctr` has exactly two callers, `fit` (lines 2155, 2164, 2285),
+    # which passes `ctr_ok=True`, and `dataset_create` (line 4659), which is
+    # the binning door itself and is where the bundle is supposed to be set.
+    # Nothing is assigned here because assigning would be dead code, and dead
+    # code that looks like it enforces something is worse than a comment that
+    # says what actually holds.
+    #
+    # **THE INVARIANT A NEW ENTRY POINT MUST NOT BREAK: if you pass
+    # `ctr_ok=False` and then call `_parse_ctr(params)`, you will build the
+    # bundle this guard just declined.** Pass the rule you intend to a
+    # `trainset.Dataset` instead, or pass `ctr_ok=True` and mean it.
+    #
+    # Declining is SAFE, and not merely quiet. A CTR column is a column, so a
+    # fit that built none is the fit this package shipped for its whole life,
+    # bit for bit. What declining can still produce is a refusal further down,
+    # and that is the point rather than a leak: the symmetric grower rejects a
+    # matrix that still offers it a categorical column (`tree.mojo:1874`), so a
+    # categorical fit through one of these routes fails with the grower's own
+    # sentence naming the real problem, instead of with a sentence about a
+    # parameter the caller never typed. `sklearn.py`'s `_CATBOOST_CTR` comment
+    # has the measurement behind that grower refusal.
     var ctr_rule = String(py=params.get("ctr", PythonObject("off")))
-    if ctr_rule != "off" and not ctr_ok:
+    var ctr_named = Int(py=params.get("ctr_set", PythonObject(1))) != 0
+    if ctr_rule != "off" and not ctr_ok and ctr_named:
         raise Error(
             "ctr='",
             ctr_rule,
@@ -1158,9 +1291,11 @@ def _parse_params(
             " point bins without a ctr_columns.SimpleCtrConfig. The routes"
             " that carry one are a dense single-output fit, and"
             " mojotrees.Dataset(params={'ctr': ...}) followed by"
-            " mojotrees.train(params, dataset). ctr='off' is what every fit"
-            " made before this parameter existed did and is the default under"
-            " every grow policy but symmetrictree",
+            " mojotrees.train(params, dataset) -- and on that second route the"
+            " bundle has to be on the DATASET, because by the time the train"
+            " params are read the matrix is already binned. ctr='off' is what"
+            " every fit made before this parameter existed did and is the"
+            " default under every grow policy but symmetrictree",
         )
 
     # LightGBM's and CatBoost's `boost_from_average`, and the one parameter
@@ -1917,6 +2052,13 @@ def fit(
         nf,
         cpu=device == CPU_DEVICE,
         entry=String("fit"),
+        # THE ONE ENTRY POINT THAT HONORS `boosting`. It calls
+        # `_parse_boosting` itself, twenty lines below, and forks into
+        # `alternate_boosting.fit_boosting` for dart and rf. Every other entry
+        # point took the key on the wire and dispatched no alternate loop, so
+        # `_parse_params` refuses it for them; see the refusal there for what
+        # that silence cost.
+        boosting_ok=True,
         ordered_ok=device == CPU_DEVICE,
         # Same condition and the same reason: `model.fit` routes a CPU
         # run to `boosting.train`, whose round loop is the one that
@@ -3399,6 +3541,43 @@ def _iteration_slice(
     return IterationRange.slice(n_iterations, Int(py=start), Int(py=stop))
 
 
+# How much work one row of a host prediction is worth, in the histogram-op
+# equivalents `parallel.plan_tasks` compares against its grain: one indirect
+# load plus a dependent walk down the tree, which is several loads deep for a
+# 31-leaf tree.
+#
+# This is the same quantity as `_TRAVERSAL_ROW_OPS` in
+# src/mojotrees/boosting.mojo and carries the same value. It is written out
+# again rather than imported because that name is module-private there and
+# this lane does not own that file; if the two ever have to move together,
+# they are found by grepping for the number and for both names. Neither has
+# been measured.
+#
+# It is a scheduling estimate and nothing more. Every block below writes only
+# its own output slots, so the values are the same at one task and at sixty,
+# and this can be retuned without changing an output.
+comptime _PREDICT_TRAVERSAL_ROW_OPS = 8
+
+
+def _predict_row_ops(n_rows: Int, n_features: Int, n_walks: Int) -> Int:
+    """The work estimate the host row walks hand `dispatch_rows`.
+
+    `n_walks` is the number of trees one row is walked through, which is the
+    iteration count for a single-output model and the iteration count times
+    the class count for a multiclass one. `n_features` is charged once per row
+    for the bin reads the walk makes, which is the same term
+    `Booster.predict_batch_range` charges for its gather; the binning itself
+    is not in here, because it happens once for the whole matrix before the
+    fan-out and is `dispatch_feature_rows`'s own workload with its own
+    estimate.
+
+    Only the leaf walks use this now. It is a scheduling estimate, so
+    overstating or understating it moves no value; understating merely keeps a
+    small batch on the serial path.
+    """
+    return n_rows * (n_features + n_walks * _PREDICT_TRAVERSAL_ROW_OPS)
+
+
 def predict_range(
     model: PythonObject,
     x_addr: PythonObject,
@@ -3411,22 +3590,60 @@ def predict_range(
 ) raises -> PythonObject:
     """Single-output predictions from the boosting iterations in
     `[start, stop)` into a preallocated float64 buffer: raw scores when
-    `raw_score` is nonzero, the response scale otherwise."""
+    `raw_score` is nonzero, the response scale otherwise.
+
+    One matrix, binned once, then the ensemble walk over row blocks. Both
+    halves are `Model.predict_batch`'s, which this now calls with an explicit
+    `CPU_DEVICE`, so the row-at-a-time entry point and the batch entry point
+    are one path rather than two.
+
+    WHY IT IS NOT A PER-ROW LOOP ANY MORE, which is a correctness argument
+    before it is a speed one. `dispatch_rows` takes a NON-RAISING
+    `def (Int, Int) -> None`, so nothing that can raise may appear inside a
+    parallel block. `BinMapper.bin_row` raises (it checks the row's length),
+    and `Model.predict_range` and `Model.predict_raw_range` inherit that
+    because binning is their first statement. So a per-row loop that bins
+    inside the block cannot be parallelized at all, whatever it is handed.
+    Binning the whole matrix first moves the only raising call out, and it
+    moves it to a place where it still runs: `BinMapper.transform` performs
+    the same length validation once for the matrix that `bin_row` performed
+    once per row, and it raises from here, on the caller's stack, rather than
+    from inside a worker.
+
+    THE MOVE IS LOOP INVARIANT, and this is the part worth stating rather
+    than assuming. `bin_row` validates `len(row) == n_features`; every row of
+    a column-major matrix has exactly `n_features` entries by construction,
+    so the per-row check answered the same question `n_rows` times and
+    `transform`'s `len(features) == n_rows * n_features` is that same
+    question asked once. Nothing else in the per-row body depended on the
+    row: the ensemble walk reads the bins and the trees, and the trees do not
+    change between rows.
+
+    Bit-identity. A row's bins are the same values either way (`transform`'s
+    padded search and `bin_value`'s plain one are documented to agree, and
+    `transform` appends the same CTR columns `bin_row` appends), and the walk
+    is `Booster.predict_batch_range`, which computes each row's tree sum in
+    ascending tree order exactly as `predict_raw_bins_range` did here. The
+    row axis is the only axis split, so no Float64 sum is reassociated.
+
+    The one consequence a caller should know: the binned matrix is now
+    materialized, `n_rows * n_features` bytes of it, where the per-row loop
+    held one row at a time. That is the same footprint `predict_batch` has
+    always had on this input, and `build_view=False` inside
+    `Model.predict_batch` keeps it to one copy rather than two.
+    """
     var m = model.downcast_value_ptr[Model]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
     var raw = Int(py=raw_score) != 0
     var features = f64_view(Int(py=x_addr), nr * nf)
-    var out = Pointer[Float64, MutUntrackedOrigin](
-        unsafe_from_address=Int(py=out_addr)
-    )
-    for r in range(nr):
-        var row = _row(features, nr, nf, r)
-        if raw:
-            out.unsafe_store(r, m[].predict_raw_range(row, rng))
-        else:
-            out.unsafe_store(r, m[].predict_range(row, rng))
+    # `CPU_DEVICE` explicitly, not `AUTO_DEVICE`: this entry point predates
+    # the device vocabulary and has always run on the host, and
+    # `decide_device` answers an explicit CPU request with CPU at every shape
+    # on every machine, so routing through `predict_batch` cannot move a
+    # legacy caller onto an accelerator behind its back.
+    _store(m[].predict_batch(features, nr, rng, raw, CPU_DEVICE), out_addr)
     return PythonObject(None)
 
 
@@ -3443,26 +3660,24 @@ def predict_proba_range(
     """Multiclass output over `[start, stop)`, row-major
     `[r * n_classes + k]`, into a preallocated float64 buffer of size
     n_rows * n_classes: raw per-class scores when `raw_score` is nonzero,
-    softmax probabilities otherwise."""
+    softmax probabilities otherwise.
+
+    One matrix, binned once, then the walk over row blocks, on exactly the
+    terms `predict_range` sets out: this calls
+    `MulticlassModel.predict_batch` with an explicit `CPU_DEVICE`, because a
+    parallel block may not contain the raising `bin_row` and binning is
+    loop invariant with respect to the walk.
+
+    `MulticlassBooster.predict_batch_range` writes the same row-major
+    `[r * n_classes + k]` layout this buffer expects, and it takes each row's
+    softmax over that row's own scores, so nothing crosses a row boundary."""
     var m = model.downcast_value_ptr[MulticlassModel]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
     var raw = Int(py=raw_score) != 0
     var features = f64_view(Int(py=x_addr), nr * nf)
-    var out = Pointer[Float64, MutUntrackedOrigin](
-        unsafe_from_address=Int(py=out_addr)
-    )
-    var k = m[].booster.n_classes
-    for r in range(nr):
-        var row = _row(features, nr, nf, r)
-        var values: List[Float64]
-        if raw:
-            values = m[].predict_raw_range(row, rng)
-        else:
-            values = m[].predict_proba_range(row, rng)
-        for c in range(k):
-            out.unsafe_store(r * k + c, values[c])
+    _store(m[].predict_batch(features, nr, rng, raw, CPU_DEVICE), out_addr)
     return PythonObject(None)
 
 
@@ -3476,23 +3691,53 @@ def _leaf_host[
     rng: IterationRange,
     out_addr: PythonObject,
 ) raises:
-    """The host leaf walk for a single-output model, one row at a time.
+    """The host leaf walk for a single-output model, over row blocks.
 
     Split out of `predict_leaf` so the device-aware entry point below can
-    fall back to exactly this code rather than to a second copy of it."""
+    fall back to exactly this code rather than to a second copy of it.
+
+    Two things are hoisted out of the fan-out, and both have to be. The
+    ordinal tables are a property of the trees, not of any row. The BINNING
+    is hoisted because it must be: `dispatch_rows` takes a non-raising
+    closure and `BinMapper.bin_row` raises on a row of the wrong length, a
+    check that is loop invariant here because every row of a column-major
+    matrix has `n_features` entries by construction. `transform` asks that
+    same question once, for the whole matrix, from this stack.
+
+    `Tree.leaf_index_row` is the bins-in variant of `leaf_index_bins` reading
+    `data.bin_at(r, f)`, which is the value a gathered row would have held,
+    so the node reached is the same one and the ordinal read out of the same
+    table is the same ordinal. `build_view=False` because this matrix is
+    scored and never histogrammed.
+
+    Every row writes its own `n_cols` output slots and reads nothing another
+    row wrote, so the ordinals are the same at every task count."""
     var m = model.downcast_value_ptr[Model]()
     var n_cols = rng.n_iterations()
-    var out = Pointer[Float64, MutUntrackedOrigin](
-        unsafe_from_address=Int(py=out_addr)
-    )
+    var out_base = Int(py=out_addr)
     # One ordinal table per tree in the range, built once and shared by every
     # row: the mapping from node id to leaf ordinal is a property of the tree.
     var tables = m[].booster.leaf_ordinals_range(rng)
-    for r in range(n_rows):
-        var bins = m[].mapper.bin_row(_row(features, n_rows, n_features, r))
-        for i in range(n_cols):
-            var node = m[].booster.trees[rng.start + i].leaf_index_bins(bins)
-            out.unsafe_store(r * n_cols + i, Float64(tables[i][node]))
+    var data = m[].mapper.transform(features, n_rows, build_view=False)
+    # Built here and captured, which is the shape `Booster.predict_batch_range`
+    # uses. `MutUntrackedOrigin` carries no origin, so it cannot alias any of
+    # the immutable captures, and constructing it outside keeps the closure to
+    # calls that are known not to raise.
+    var out = Pointer[Float64, MutUntrackedOrigin](
+        unsafe_from_address=out_base
+    )
+
+    def apply(row_start: Int, row_end: Int) {imm}:
+        for r in range(row_start, row_end):
+            for i in range(n_cols):
+                var node = m[].booster.trees[
+                    rng.start + i
+                ].leaf_index_row(data, r)
+                out.unsafe_store(r * n_cols + i, Float64(tables[i][node]))
+
+    dispatch_rows(
+        apply, n_rows, _predict_row_ops(n_rows, n_features, n_cols)
+    )
 
 
 def _leaf_multiclass_host[
@@ -3505,24 +3750,34 @@ def _leaf_multiclass_host[
     rng: IterationRange,
     out_addr: PythonObject,
 ) raises:
-    """The host leaf walk for a multiclass model (see `_leaf_host`)."""
+    """The host leaf walk for a multiclass model (see `_leaf_host`), over row
+    blocks on the same terms and hoisting the same two things for the same two
+    reasons."""
     var m = model.downcast_value_ptr[MulticlassModel]()
     var k = m[].booster.n_classes
     var n_rounds = rng.n_iterations()
     var n_cols = n_rounds * k
-    var out = Pointer[Float64, MutUntrackedOrigin](
-        unsafe_from_address=Int(py=out_addr)
-    )
+    var out_base = Int(py=out_addr)
     var tables = m[].booster.leaf_ordinals_range(rng)
-    for r in range(n_rows):
-        var bins = m[].mapper.bin_row(_row(features, n_rows, n_features, r))
-        for i in range(n_rounds):
-            for c in range(k):
-                var tree = (rng.start + i) * k + c
-                var node = m[].booster.trees[tree].leaf_index_bins(bins)
-                out.unsafe_store(
-                    r * n_cols + i * k + c, Float64(tables[i * k + c][node])
-                )
+    var data = m[].mapper.transform(features, n_rows, build_view=False)
+    var out = Pointer[Float64, MutUntrackedOrigin](
+        unsafe_from_address=out_base
+    )
+
+    def apply(row_start: Int, row_end: Int) {imm}:
+        for r in range(row_start, row_end):
+            for i in range(n_rounds):
+                for c in range(k):
+                    var tree = (rng.start + i) * k + c
+                    var node = m[].booster.trees[tree].leaf_index_row(data, r)
+                    out.unsafe_store(
+                        r * n_cols + i * k + c,
+                        Float64(tables[i * k + c][node]),
+                    )
+
+    dispatch_rows(
+        apply, n_rows, _predict_row_ops(n_rows, n_features, n_cols)
+    )
 
 
 def predict_leaf(
@@ -3592,7 +3847,19 @@ def predict_contrib(
     The last column of each row is the expected value, so a row's entries sum
     to its raw score over the same range. One explainer serves the whole
     batch: it holds the path scratch and validates the ensemble's node covers
-    once rather than per row."""
+    once rather than per row.
+
+    Still serial, and it is the one prediction-shaped loop in this file that
+    is. The rows are as independent here as they are anywhere, and the same
+    bit-identity argument is available to it, since a per-block explainer
+    would run each row's TreeSHAP recursion on exactly the values a shared one
+    runs it on. What stops it here is only that `explainer` and `row_out` are
+    shared MUTABLE scratch, so each block needs its own
+    `ContribExplainer.for_booster` and its own `row_out`, and that
+    reconstruction re-walks every tree's node covers once per block. That is
+    cheap and it is worth doing; it was left out of this lane to keep the
+    change that closes the measured prediction gap as small as it could be.
+    Not an oversight: measured, and next."""
     var m = model.downcast_value_ptr[Model]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
@@ -3670,10 +3937,13 @@ def predict_contrib_multiclass(
 # the reason from `gpu_predict_support`; it is never quietly served by the
 # CPU.
 #
-# The established path is untouched. `predict_range`,
-# `predict_proba_range`, `predict_leaf`, and `predict_leaf_multiclass` keep
-# their signatures and their host walk, so an estimator that has not moved
-# over behaves exactly as before. (The older whole-model `predict`,
+# The established path keeps its values and its signatures. `predict_range`,
+# `predict_proba_range`, `predict_leaf`, and `predict_leaf_multiclass` are
+# unchanged from a caller's side, so an estimator that has not moved over
+# behaves exactly as before. Underneath, the first two now CALL
+# `Model.predict_batch` and `MulticlassModel.predict_batch` with an explicit
+# `CPU_DEVICE` and the second two bin up front and walk over row blocks; both
+# are scheduling changes and not numerical ones (see the module docstring). (The older whole-model `predict`,
 # `predict_raw`, and `predict_proba` entries, full-range twins of the
 # `_range` forms that Python had stopped calling, were removed in the
 # consolidation round.)
@@ -4687,6 +4957,78 @@ def train_dataset(
     # `train_gpu._train_gpu_rounds` compute it now, so the device is no longer
     # what decides; `train_gpu_sparse` still does not, so `is_sparse` still is.
     var scale_is_computed = not d[].is_sparse
+    # CatBoost's ordered target statistics. **THE VERDICT IS THE DATASET'S, NOT
+    # THIS ENTRY POINT'S NAME.** The refusal in `_parse_params` advertises this
+    # route as one of the two that can carry a bundle, and until 2026-08-17 it
+    # could not, because the flag was a constant False here and the guard read
+    # the train params without ever asking the dataset what it had built. So
+    # `Dataset(params={"ctr": "catboost"})` followed by `train(params, dataset)`
+    # raised, on the route its own error message tells the caller to use.
+    #
+    # `d[].ctr` is the honest answer and its docstring (`trainset.mojo:711`)
+    # says why: it records what HAPPENED, not what was offered, and is set back
+    # to `disabled()` when the policy declined. So `is_active()` True means the
+    # CTR columns are IN the binned matrix this fit is about to train on, which
+    # is precisely the condition `ctr_ok` names. Training then honors them by
+    # construction, because they are columns and the grower sees columns.
+    #
+    # The inverse reading is what makes this narrow rather than a blanket
+    # True: `is_active()` False on a numeric matrix means the bundle built
+    # nothing, so there is nothing for this route to honor and an EXPLICIT
+    # request should still be told so. That case is the guard's, not ours.
+    var ctr_on_dataset = d[].ctr.is_active()
+    # A dataset binned under one source rule and trained under another is a
+    # distinct error from either, so it gets its own sentence naming both
+    # rather than falling through to a message about entry points. It can only
+    # be reached deliberately, since both values have to be non-off and
+    # different, and the two rules select DIFFERENT COLUMNS
+    # (`ctr_columns.mojo:426`): CatBoost's `one_hot_max_size` boundary against
+    # our `bin overflow` one. The model would carry inference tables for the
+    # columns the dataset built while the caller believed it asked for others.
+    #
+    # **GUARDED ON THE CALLER HAVING NAMED IT, for the same reason the guard in
+    # `_parse_params` is.** A dense `Dataset` built with no `ctr` key takes
+    # `SimpleCtrConfig.auto()`, which is `CTR_SOURCE_BIN_OVERFLOW`, and a
+    # `symmetrictree` fit resolves the mode default to
+    # `CTR_SOURCE_ONE_HOT_MAX_SIZE`. Those differ, so without this guard every
+    # categorical fit through `Dataset` + `train` under the shipped default
+    # would raise on a mismatch between two values the caller never typed. When
+    # the caller named neither, the DATASET'S rule stands and stands silently:
+    # it is the one that actually built the columns, and per the invariant
+    # documented at `_parse_params`'s ctr guard nothing on this route reads the
+    # train params' rule to contradict it.
+    if ctr_on_dataset and Int(py=params.get("ctr_set", PythonObject(1))) != 0:
+        var asked = _parse_ctr(params)
+        if asked.is_active() and asked.source_rule != d[].ctr.source_rule:
+            # Named rather than printed as the raw code. The two rules are
+            # `comptime` Ints and a message reading "source rule 0" tells a
+            # caller nothing it can act on.
+            var built = (
+                String("CTR_SOURCE_ONE_HOT_MAX_SIZE")
+                if d[].ctr.source_rule == CTR_SOURCE_ONE_HOT_MAX_SIZE
+                else String("CTR_SOURCE_BIN_OVERFLOW")
+            )
+            var wanted = (
+                String("CTR_SOURCE_ONE_HOT_MAX_SIZE")
+                if asked.source_rule == CTR_SOURCE_ONE_HOT_MAX_SIZE
+                else String("CTR_SOURCE_BIN_OVERFLOW")
+            )
+            raise Error(
+                "this dataset was binned with ctr source rule ",
+                built,
+                " and the train params ask for ",
+                wanted,
+                ": the CTR columns are built while the dataset is binned, so"
+                " the rule in the train params arrives after the columns"
+                " exist and cannot change them. The two rules select"
+                " different categorical columns"
+                " (ctr_columns.CTR_SOURCE_ONE_HOT_MAX_SIZE is CatBoost's"
+                " one_hot_max_size boundary, CTR_SOURCE_BIN_OVERFLOW is the"
+                " columns the category table could not hold), so this fit"
+                " would train on one set and report the other. Pass the rule"
+                " you want to mojotrees.Dataset(params={'ctr': ...}), or drop"
+                " it from the train params and let the dataset's stand",
+            )
     var model = mojo_train_dataset(
         d[],
         Int(py=params["objective"]),
@@ -4695,6 +5037,7 @@ def train_dataset(
             d[].num_feature(),
             cpu=device == CPU_DEVICE,
             entry=String("a Dataset fit"),
+            ctr_ok=ctr_on_dataset,
             score_function_ok=True,
             random_strength_ok=scale_is_computed,
             # CatBoost's `leaf_estimation_iterations` and, on the same flag,

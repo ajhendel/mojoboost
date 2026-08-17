@@ -203,6 +203,7 @@ from .gpu_histogram_specializations import (
 from .gpu_leaf_batching import (
     DEFAULT_MAX_ITEMS,
     GpuLeafBatcher,
+    oblivious_subtract_requested,
     plan_batch,
     slots_for_budget,
     subtraction_stamp,
@@ -2969,6 +2970,34 @@ struct GpuHistogramBuilder(Movable):
             raise Error("call upload_gradients before staging a level plan")
         if len(self.batcher) == 0:
             raise Error("no resident histogram pool is open")
+        # The batcher's feature table, and WITHOUT THIS LINE THE OBLIVIOUS
+        # DEVICE PATH RETURNS A WRONG ANSWER whenever `feature_fraction < 1`.
+        # Fixed 2026-08-17, found by an audit of declined optimizations rather
+        # than by a test, which is the part worth remembering.
+        #
+        # `GpuLeafBatcher.feat_dev` is written in exactly three places: the
+        # constructor, which fills it with the identity; `set_shared_features`,
+        # whose only other caller is the host path's `_build_leaves_batched`;
+        # and `set_item_features`, which has no caller at all. The oblivious
+        # level build reaches `enqueue_device_plan_batch_fused` through none of
+        # them, so `_batch_hist_atomic_kernel` read `f == slot` and both read
+        # column `slot` and wrote slice `slot`. Meanwhile the split searcher's
+        # own table IS set from `tree_features`, so the searcher read slice
+        # `active[slot]` of a histogram written at slice `slot`, and the root,
+        # built through this builder's table, disagreed with its own children.
+        # At `feature_fraction = 1.0` the identity is correct and nothing shows.
+        #
+        # No refusal made this unreachable. `oblivious_device_supported` refuses
+        # `feature_fraction_bylevel` and `feature_fraction_bynode` and never the
+        # per-tree `feature_fraction`, and `select_tree_features` returns the
+        # identity only at `fraction >= 1.0`.
+        #
+        # Here rather than in the level loop because this runs once per tree,
+        # the feature set cannot move inside a tree (the docstring above says
+        # so and the geometry depends on it), and this point is already before
+        # anything is in flight, so the drain inside `set_shared_features` costs
+        # a wait that is already paid.
+        self.batcher[0].set_shared_features(self.active)
         return self.batcher[0].stage_device_plan(
             n_items,
             max_rows,
@@ -3036,22 +3065,47 @@ struct GpuHistogramBuilder(Movable):
         )
 
     def enqueue_desc_level_children(mut self) raises:
-        """Build every child of the level from its own rows. **Two launches,
-        whatever the level holds**, and they also pay the partition's deferred
-        copy-back.
+        """Build the level's children. **Two launches, whatever the level
+        holds**, and they also pay the partition's deferred copy-back.
 
         This is the call `enqueue_desc_child` is replaced by, and the two are
         alternatives rather than stages: that one builds the smaller child of one
         parent and derives the larger by subtraction, which is two launches per
-        parent and 126 per depth-6 tree; this one accumulates all `2^(l+1)`
-        children of a level directly from the windows the level commit wrote,
-        which is two launches per level and 12 per tree. Both accumulate the same
+        parent and 126 per depth-6 tree; this one covers all `2^(l+1)` children
+        of a level from the windows the level commit wrote, which is two
+        launches per level and 12 per tree. Both accumulate the same
         per-`(row, feature)` quantized value into the same bin of the same slot
         in fixed-point Int32, so they are bit-identical where they overlap; see
         the plan-writing block of `gpu_tree_tables._pick_and_commit_kernel`.
 
+        TWO ARMS, AND LOW LAUNCH COUNT IS NOT WHAT DECIDES BETWEEN THEM
+        ---------------------------------------------------------------
+        This docstring used to say "build every child of the level from its own
+        rows" and to present that as the price of two launches per level. The
+        two are not exclusive and the trade as stated was badly priced. At
+        every level the children partition the active rows, so building all of
+        them from their own rows reads EVERY active row once per level,
+        permanently, while sibling subtraction reads at most half of them and
+        derives the rest by exact integer arithmetic over the parent. The
+        launches that bought were worth roughly 1.1 ms against a tree measured
+        at 170 to 312 ms, and histogram construction is 86 percent of a
+        symmetric fit (`bench/results`, the Aug 17 symmetric diagnosis).
+
+        `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1` selects the subtracting arm, which
+        accumulates only the smaller child of each pair and derives the sibling
+        inside the same two launches:
+        `GpuLeafBatcher.enqueue_device_plan_batch_fused_subtracting`, whose
+        kernels fold the subtraction into the accumulation and the lopsided
+        case's parent copy into the zeroing. Default off, because no benchmark
+        has priced it; the numbers above say where the loss is, not that this
+        removes it. The two arms leave the pool holding the same words, and the
+        argument is written leg by leg at
+        `gpu_leaf_batching._batch_hist_atomic_subtract_kernel`.
+
         The copy-back is carried inside the zeroing pass the batch has to launch
-        anyway (`gpu_leaf_batching._batch_copy_back_zero_kernel`), and paying it
+        anyway (`gpu_leaf_batching._batch_copy_back_zero_kernel`, or
+        `_batch_copy_back_zero_subtract_kernel` on the arm above, which carries
+        it in the same statements), and paying it
         anywhere else would cost a third partition launch per level -- six per
         depth-6 tree, which is exactly the margin between 62 command buffers and
         68. `GpuActiveRows.mark_copy_back_fused` is the bookkeeping half and is
@@ -3072,15 +3126,33 @@ struct GpuHistogramBuilder(Movable):
         var rows_ptr = self.rows.rows_dev.copy()
         var scratch_ptr = self.rows.scratch_dev.copy()
         var desc_ptr = self.rows.step_dev.copy()
-        self.batcher[0].enqueue_device_plan_batch_fused(
-            self.bins_dev.unsafe_ptr(),
-            rows_ptr.unsafe_ptr(),
-            scratch_ptr.unsafe_ptr(),
-            desc_ptr.unsafe_ptr(),
-            self.grad_dev.unsafe_ptr(),
-            self.hess_dev.unsafe_ptr(),
-            blocks,
-        )
+        # The branch is here rather than inside the batcher, so that only an
+        # oblivious level plan can reach the subtracting arm. A leaf-wise
+        # two-item plan also goes through `enqueue_device_plan_batch_fused`,
+        # and its commit reassigns the PARENT's slot to one child and hands the
+        # other the lowest free slot, so the slot relationship the subtracting
+        # kernels rest on does not hold there. See
+        # `gpu_leaf_batching.oblivious_subtract_requested`.
+        if oblivious_subtract_requested():
+            self.batcher[0].enqueue_device_plan_batch_fused_subtracting(
+                self.bins_dev.unsafe_ptr(),
+                rows_ptr.unsafe_ptr(),
+                scratch_ptr.unsafe_ptr(),
+                desc_ptr.unsafe_ptr(),
+                self.grad_dev.unsafe_ptr(),
+                self.hess_dev.unsafe_ptr(),
+                blocks,
+            )
+        else:
+            self.batcher[0].enqueue_device_plan_batch_fused(
+                self.bins_dev.unsafe_ptr(),
+                rows_ptr.unsafe_ptr(),
+                scratch_ptr.unsafe_ptr(),
+                desc_ptr.unsafe_ptr(),
+                self.grad_dev.unsafe_ptr(),
+                self.hess_dev.unsafe_ptr(),
+                blocks,
+            )
         self.rows.mark_copy_back_fused()
 
     def download_desc_tables(mut self) raises -> TreeTablesSnapshot:

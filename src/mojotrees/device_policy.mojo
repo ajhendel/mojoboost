@@ -2484,16 +2484,43 @@ def _collect_blocks(
         # `train_gpu._device_search_unsupported_reason`. Over-refusing a
         # CTR-replaced column costs a fit the accelerator it could have used;
         # under-refusing costs a tree scored by two functionals.
+        # THE MESSAGE IS THE NARROWED REASON AND NOT THE WIDE ONE, and the old
+        # text was wrong twice rather than once.
+        #
+        # (1) Until 2026-08-17 this string said the device accepted Cosine and
+        # silently dropped it, which was true of the WIDE refusal this arm is
+        # the remnant of. The guard narrowed to `and request.categorical` at
+        # 820c06b and the text did not move, so a user with a categorical
+        # column was told the accelerator ignores the setting, when the
+        # accelerator applies it and the PAIR is what cannot be scored. A
+        # refusal that misnames its cause sends the reader to the wrong knob:
+        # the old text invites "wait for the device to implement Cosine",
+        # which is already done.
+        #
+        # (2) It also ended "the CPU backend applies it", and the CPU does
+        # not. `split.mojo:843` raises on exactly this pair with exactly this
+        # reason, so `device='cpu'` is not an exit and telling a user it was
+        # sent them to a fit that raises. This is a device-policy block, so it
+        # never fires for a CPU request and nothing here ever caught that.
+        #
+        # The only real exits are the two named below, and CTR replacement is
+        # the one CatBoost uses: a replaced column is not OFFERED to the scan,
+        # which is what both refusals actually test.
         blocks.add(
             BLOCK_SCORE_FUNCTION,
             String(
-                "score_function=Cosine is accepted by no accelerator path"
-                " that applies it. The device kernels evaluate the Cosine"
-                " ratio and a fit configured for it trains, but MEASURED"
-                " against the same fit on the CPU the device model is"
-                " bit-identical to an L2 one, so the setting is accepted and"
-                " dropped. Refused until a fit shows the device model moving"
-                " when the setting moves; the CPU backend applies it"
+                "score_function=Cosine cannot be combined with a categorical"
+                " column, on either backend. The device kernels do evaluate"
+                " the Cosine ratio, but a categorical candidate is a category"
+                " SET chosen by a partition search that scores with the L2"
+                " gain, so honoring the pair would put two functionals inside"
+                " one argmax: the partition search's winner chosen under L2,"
+                " then compared against numerical candidates scored under"
+                " Cosine. Replace the categorical column with its CTR"
+                " columns, which makes it numerical and is what CatBoost"
+                " itself does, or set score_function=L2. Selecting"
+                " device='cpu' does NOT lift this: split.find_best_split"
+                " raises on the same pair for the same reason"
             ),
         )
 
@@ -2538,18 +2565,29 @@ def _collect_blocks(
         # `> 0.0` rather than `!= 0.0`: a negative value is not a weaker
         # request, it is invalid, and `check_random_strength` is the thing
         # that says so with the right message.
+        # Rewritten 2026-08-17 for the reasons given in full at the
+        # `BLOCK_SCORE_FUNCTION` arm above, which had the identical defect in
+        # the identical two ways. The old text claimed the device accepts the
+        # noise and drops it, which described the WIDE refusal that c775959
+        # narrowed, and it closed with "the CPU backend applies it", which is
+        # false beside a categorical column: `split.mojo:816` raises on this
+        # pair with this reason. Both halves are corrected here.
         blocks.add(
             BLOCK_RANDOM_STRENGTH,
             String(
-                "random_strength is accepted by no accelerator path that"
-                " applies it. The noise plane, its draw and the per-tree"
-                " scale are all built and a fit configured for it trains, but"
-                " MEASURED against the same fit on the CPU the device model"
-                " is bit-identical to an unnoised one, so the setting is"
-                " accepted and dropped -- the unregularized model reporting"
-                " success this block exists to prevent. Refused until a fit"
-                " shows the device model moving when the setting moves; the"
-                " CPU backend applies it"
+                "random_strength cannot be combined with a categorical"
+                " column, on either backend. The noise plane, its draw and"
+                " the per-tree scale are all built and the device applies"
+                " them to numerical candidates, but a categorical candidate"
+                " is a category SET chosen by a partition search, and only"
+                " that search's single winner would be noised while every"
+                " numerical feature had every candidate noised. That is a"
+                " different regularizer wearing this parameter's name."
+                " Replace the categorical column with its CTR columns, which"
+                " makes it numerical and is what CatBoost itself does, or set"
+                " random_strength=0. Selecting device='cpu' does NOT lift"
+                " this: split.find_best_split raises on the same pair for the"
+                " same reason"
             ),
         )
 

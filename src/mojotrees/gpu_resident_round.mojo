@@ -699,27 +699,63 @@ def resident_round_enabled() -> Bool:
     caller has no reason to want one without the other and two variables
     would only make it possible to set them inconsistently.
 
-    The stale duplicate, which is a live hazard
-    -------------------------------------------
-    `gpu_tree_tables.tree_resident_requested` reads the same variable and
-    still spells it `== "1"`. It is **not** consulted by anything: nothing in
-    `train_gpu.mojo` calls it and only `tests/test_gpu_tree_tables.mojo`
-    imports it, which is why the default could move here without moving
-    there and without a test failing anywhere. That is exactly what makes it
-    dangerous. Two predicates over one variable now disagree about that
-    variable's default, and the next caller to reach for the one in
-    `gpu_tree_tables` gets the pre-flip answer with no warning.
+    The duplicate that was a live hazard, and is not one any more
+    ------------------------------------------------------------
+    **THIS SECTION SAID SOMETHING ELSE UNTIL 2026-08-17 AND THE HAZARD IT
+    DESCRIBED IS CLOSED.** It read that
+    `gpu_tree_tables.tree_resident_requested` "reads the same variable and
+    still spells it `== "1"`", so two predicates over one variable disagreed
+    about that variable's default and the next caller to reach for the one in
+    `gpu_tree_tables` would get the pre-flip answer with no warning. It asked
+    whoever owned that file to delete it rather than fix it.
 
-    It should be deleted and its callers pointed here. It was left standing
-    only because the lane that flipped this default did not own that file at
-    the time. Anyone who does own it: delete it, do not "fix" it, because a
-    second predicate that agrees is still a second predicate that can drift.
+    That file's owner took the middle course and it is sound. `gpu_tree_tables`
+    now holds the single source of truth for both questions,
+    `tree_resident_enabled` spelled `!= "0"` and
+    `tree_resident_explicitly_requested` spelled `== "1"`, over one
+    `comptime TREE_RESIDENT_VAR`; `tree_resident_requested` survives as a
+    one-line deprecated alias for the DIAGNOSTIC one and reads no environment
+    variable of its own, so it can no longer disagree with anything. It is kept
+    only because `tests/test_gpu_tree_tables.mojo:106` and `:581` import and
+    call it by name and that lane could not edit the test. Deleting the alias,
+    the import and the call in one commit is still the right end state.
+
+    What is NOT done, so nobody reads this as finished. The delegation was
+    meant to run in the other direction too, and has not landed. This function
+    and `resident_round_explicitly_requested` below each still call `getenv`
+    for themselves, so the package holds four reader bodies over one variable
+    and not two. They agree today, one spelling each, which is why this is a
+    cleanup and no longer a hazard, but a second body that agrees is still a
+    second body that can drift. The two here should become one-line
+    delegations to the two in `gpu_tree_tables`; that module cannot import this
+    one back, so the direction is forced.
 
     Enabled is not the same as taken. `resident_round_supported` still
     refuses by name every configuration this plane cannot express, and
     `train_gpu` still falls back to the shipping loop for those; the default
     flip changes which plane runs where the plane is *admissible*, and
     changes nothing about what is admissible.
+
+    Which growers it gates
+    ----------------------
+    **One of three, and this predicate governs the leaf-wise route only.**
+
+    - Leaf-wise: gated here. `=0` sends the fit to
+      `train_gpu._device_search_resident`.
+    - Depth-wise: never reaches this plane at all, gated out one layer up by
+      `gpu_tree_tables.tree_resident_supported`, which answers
+      `TREE_RESIDENT_DEPTHWISE` for any policy that is not leaf-wise. So `=0`
+      changes nothing for a depth-wise fit, which was already on the shipping
+      loop.
+    - Symmetric: `train_gpu._grow_tree_gpu_device_search` routes
+      `grow_policy = oblivious` to `grow_tree_device_oblivious` WITHOUT
+      consulting this predicate, so `=0` does not move a symmetric fit either.
+      That is deliberate and is the only defensible reading: there is no second
+      symmetric GPU grower to fall back to, so honoring `=0` here could only
+      turn a working fit into an error. What it means is that the escape-hatch
+      half of this variable -- "where a run goes that hits a fault in this
+      plane" -- does not exist for the symmetric plane. A symmetric fault has
+      `device='cpu'` and nothing else.
     """
     return getenv("MOJOTREES_GPU_TREE_RESIDENT") != "0"
 
@@ -907,7 +943,40 @@ The off arm exists because a window has to be able to hold the two against each
 other in one process without a rebuild -- this machine drifts two- to
 threefold between time windows and a rebuild would put a different compile and
 a different thermal state on either side of the comparison -- and because it is
-where a run goes that hits a fault in the fused kernel."""
+where a run goes that hits a fault in the fused kernel.
+
+WHICH GROWERS READ IT, WHICH DO NOT, AND WHY NOT
+------------------------------------------------
+One of three, and the other two are STRUCTURAL rather than unported. Written
+out because a switch that silently reaches one growth policy is a switch a
+benchmark measures on the other two and reports a null for.
+
+- **Leaf-wise, `grow_tree_device_resident`: reads it.** That is the one call to
+  `partition_fusion_enabled()`, and this is the plane the arm was built for.
+
+- **Symmetric, `grow_tree_device_oblivious`: IGNORES IT AND MUST.** That loop
+  calls `builder.rows.set_partition_fusion(True)` outright, and it is not a
+  preference. Its child build is
+  `GpuHistogramBuilder.enqueue_desc_level_children`, which ends in an
+  unconditional `GpuActiveRows.mark_copy_back_fused()`, and that method RAISES
+  when no debt is outstanding: "no descriptor partition copy-back is
+  outstanding, so nothing was fused". So an unfused level partition would pay
+  its own copy-back and the batch behind it would then be told to mark a debt
+  nobody incurred, which is a refusal and not a slower arm. Setting this
+  variable to 0 could therefore only turn a symmetric fit into an error, so the
+  loop does not ask. The one exception is
+  `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD`, which unfuses exactly the last
+  level, and only because the batch that would have paid that level's debt is
+  the launch being removed.
+
+- **Depth-wise, `train_gpu._device_search_resident`: cannot express it.** That
+  loop does not use the descriptor partition at all. It partitions through
+  `GpuHistogramBuilder.apply_split`, which calls `GpuActiveRows.partition`, a
+  different entry point with no descriptor, no deferred copy-back and no debt
+  to fold. There is nothing for the fusion to fuse, so the variable is not
+  unported there, it is inapplicable. Depth-wise gets the fusion when and only
+  when the device-owned plane learns to grow a depth-wise tree, which is
+  `gpu_tree_tables.TREE_RESIDENT_DEPTHWISE`."""
 
 
 def partition_fusion_enabled() -> Bool:
@@ -919,6 +988,234 @@ def partition_fusion_enabled() -> Bool:
     and reading one inside a loop that is supposed to contain no host work at
     all is how such a loop quietly becomes slow."""
     return getenv(PARTITION_FUSION_VAR) != "0"
+
+
+comptime OBLIVIOUS_SKIP_LAST_BUILD_VAR = (
+    "MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD"
+)
+"""`1` stops a symmetric tree from building the histograms of its last
+level's children. Anything else, including unset, builds them, which is what
+ships.
+
+**Off by default, spelled as an equality against "1", because nothing has
+measured it.** That is the same spelling `MOJOTREES_GPU_SPECULATION` carries
+and for the same reason.
+
+WHAT IT REMOVES, AND WHY THE EXISTING NOTE UNDER-PRICED IT
+----------------------------------------------------------
+`grow_tree_device_oblivious`'s docstring and `oblivious_schedule_launches`
+both record that the last level's children are built and never searched,
+because a leaf at `max_depth` is never split, and both then decline to skip
+the build on the grounds that skipping it "would move the cost rather than
+remove it": the batched build is what pays the descriptor partition's
+deferred copy-back, so a schedule without it has to pay that debt in a launch
+of its own.
+
+That reasoning is correct about **command buffers** and says nothing about
+**work**, and the two are not the same size here. Read against the kernels
+(`gpu_leaf_batching.enqueue_device_plan_batch_fused`,
+`gpu_active_rows._copy_back_kernel`):
+
+- the batch is a zeroing pass over `2^max_depth` slots of
+  `3 * n_features * n_bins` Int32 apiece, followed by an accumulation pass
+  over every active row times every active feature;
+- the copy-back is one grid-strided pass over `n_active` Int32.
+
+So the trade the note declines is: pay one more command buffer and one
+`O(n_active)` copy, and drop one `O(n_active * n_features)` accumulation plus
+the largest zeroing pass in the tree. At depth 6 the last level owns 64 of the
+126 slots a tree zeroes, so this is roughly half of all the zeroing traffic
+and one sixth of all the accumulation.
+
+Counted, not measured, and the distinction is the whole reason this is a
+switch rather than a default. **Nothing has timed it**, and this machine
+drifts two- to threefold between windows, so only an interleaved A/B decides
+it (`bench/results/PROFILE_PROTOCOL.md` M0).
+
+THE OTHER TWO GROWERS, AND WHY "STRUCTURAL" WAS HALF RIGHT
+----------------------------------------------------------
+This was read as structural to a symmetric tree on the grounds that only a
+fixed-depth tree has a known last level whose children are never searched.
+What the removal actually needs is not a known last LEVEL but a known terminal
+CHILD, and `train_gpu._device_search_resident` has one for every split it
+enqueues, under every growth policy: `_apply_shape_rules` refuses a child at
+`max_depth` or below `2 * min_data_in_leaf` rows, and both inputs are exact
+integers off the parent's record before anything is enqueued. So the leaf-wise
+and depth-wise twin is `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`, which removes
+the search as well as the build and catches small children mid-tree as well as
+the last level. Off by default and unmeasured, exactly as this one was.
+
+It is genuinely absent from the DEVICE-OWNED leaf-wise plane
+(`grow_tree_device_resident`), and the reason is structural to that plane
+rather than a gap in it. That loop builds a terminal child's histogram too --
+`enqueue_desc_child` accumulates whichever child the commit named, and the
+commit's depth and row rules are applied at PICK time, so a leaf refused later
+still had its histogram built when it was created. What the plane cannot do is
+decide otherwise on the host: it never learns a child's depth or row count,
+which is the whole of what "the host does not see the frontier" buys it. The
+decision would have to move into `gpu_tree_tables`, as a device-side test at
+the point the step descriptor is written, and that is a kernel change in a file
+this one does not own.
+
+WHAT IT CANNOT CHANGE
+---------------------
+Not a single bit of the tree, and the argument is short enough to check.
+Those histograms are read by exactly one thing, a search of the level below
+them, and there is no level below `max_depth`: the loop ends, and the
+trailing commit is handed `level_depth == max_depth`, which
+`gpu_tree_tables._commit_level_kernel` answers with `TREE_BUDGET_SPENT`
+before it reads a record. The slots themselves are never read stale either,
+because every level's batch zeroes the slots it is about to accumulate into
+and `enqueue_leaf` zeroes slot 0 at the top of the next tree, so a slot left
+holding this tree's last-level contents is overwritten before anything reads
+it. The row permutation is untouched: the last level's **partition** still
+runs, and it must, because `_publish_level_row_ranges` and
+`GpuHistogramBuilder.update_raw_device` both read the final leaves' windows.
+
+The one thing the switch does change besides the launches is the partition
+arm for that last level, from fused to unfused, and it has to:
+`GpuActiveRows.set_partition_fusion(True)` defers a copy-back that only a
+following descriptor histogram can discharge, and this schedule removes the
+following descriptor histogram. `mark_copy_back_fused` refuses to absorb a
+debt nothing paid, and `begin_tree` refuses to start the next tree while one
+is outstanding, so an implementation that forgot this would fail loudly at
+the next tree rather than corrupt a permutation."""
+
+
+def oblivious_skip_last_build_requested() -> Bool:
+    """Whether the last level's child histograms are skipped.
+
+    Read once per tree, next to the trace and census sinks, for the reason
+    stated at `resident_trace_sink`: a variable does not change inside a fit,
+    and reading one inside a loop that is supposed to contain no host work at
+    all is how such a loop quietly becomes slow."""
+    # DEFAULT ON since 2026-08-17, so this variable is now an escape hatch that
+    # restores the last level's discarded build rather than a switch that skips
+    # it. Measured that day, 799,110 x 100 x 100 trees, symmetric depth 6, M4,
+    # three round-robin cycles interleaved with the baseline: 22.76 s to 18.06 s
+    # alone, 1.26x, and part of the 2.20x combined arm. rmse 2.439382420 in
+    # every cycle of every arm, unchanged to nine decimals.
+    #
+    # Flipped under LANE_RULES rule 5, added the same day. Nothing reads the
+    # histograms this skips, which makes building them a defect rather than a
+    # trade, and the switch was always about the strength of the proof rather
+    # than about a cost worth paying. Per that rule the variable survives ONE
+    # round as an off switch and is then deleted, and the way to retire it for
+    # good is stated in this function's docstring: state the invariant beside
+    # the refusals it currently rests on, then prove the two arms produce
+    # byte-identical models.
+    return getenv(OBLIVIOUS_SKIP_LAST_BUILD_VAR) != "0"
+
+
+comptime OBLIVIOUS_NOISE_HOIST_VAR = "MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST"
+"""`1` draws and uploads every level's `random_strength` noise plane once per
+tree instead of once per level. Anything else, including unset, keeps the
+per-level staging that ships.
+
+**Off by default and an equality against "1", because nothing has measured
+it.**
+
+WHAT IT REMOVES
+---------------
+`GpuSplitSearcher._copy_noise` is an `enqueue_copy`, and on Metal an
+`enqueue_copy` is a synchronous full-queue drain in both directions
+(**measured** by disassembly, `docs/GPU_PORTABILITY.md` section 6.1). The
+shipped level loop calls it once per level, so a depth-6 tree whose fit sets
+`random_strength` makes six of them, and the CatBoost-mode default set does
+set it (`params.CATBOOST_RANDOM_STRENGTH` is 1.0, written at
+`params._apply_catboost_mode_defaults` whenever the caller named no
+`random_strength` and the fit is not multiclass). **That sentence was true when
+it was written, was false for one day, and is true again**, which is worth a
+line because it is the kind of thing a reader checks against a stale checkout
+and concludes the wrong thing about. The write carried a
+`config.device == CPU_DEVICE` condition from 2026-08-16 to 2026-08-17, so for
+that window a defaulted CatBoost-mode GPU fit really did keep 0.0 and really
+did make zero of these drains. The device condition was removed as a bug with
+no switch, because it made one parameter string build two different models; see
+`docs/design/RANDOM_STRENGTH_UNITS.md` section 2. Either way the measured arms
+were unaffected, since `bench`'s `MOJOTREES_CATBOOST_MODE` passes
+`random_strength: 1.0` explicitly and so skips the mode default entirely. Each
+one sits between the
+previous level's batched child build and this level's search, which is the
+worst position a drain can occupy: the host blocks until every kernel of the
+previous level has retired, so it cannot run even one command buffer ahead
+and the device idles from the moment the previous level finishes until the
+host wakes and enqueues.
+
+That is a different claim from the one section 6.1.1 withdrew. What 6.1.1
+took back was the reading that made each of thirteen **per-tree** copies
+worth a synchronization constant; those drained a queue that held nothing,
+and draining a queue that holds nothing costs nothing. These six drain a
+queue holding a whole level of work. The count is read from the source; the
+**time** is unmeasured, which is why this is off.
+
+WHAT IT CANNOT CHANGE
+---------------------
+No bit of any tree. The hoist gives each level its own search record instead
+of sharing one, and moves the draw and the upload above the loop. A noise
+plane's values are a pure function of `(stdev, seed, tree_index, depth,
+global feature id, bin)` and of nothing else (`oblivious_score_plane`), so
+which record row a level's plane is staged into cannot change a number in it.
+The other four per-record tables are staged identically for every record
+before the loop -- `_stage_params` and `_stage_hist_base` run over
+`max_records` in a loop, and `set_features` stages the same feature set and
+the same allow mask into every record -- and the device-side restaging
+(`enqueue_desc_stage_level_search`) writes only the leaf records
+`[leaf_base, leaf_base + budget)`, which the level records sit above. So a
+level searched from record `budget + l` reads the same words it read from
+record `max_records - 1`.
+
+The hoist needs `max_depth` records above the leaf budget rather than one, so
+it is conditional on the searcher actually holding them
+(`train_gpu._search_record_slots` asks for them under the same switch). A
+searcher that does not falls back to the per-level path rather than indexing
+past its tables.
+
+WHICH GROWERS READ IT: ONE OF THREE, AND THE OTHER TWO ARE UNPORTED RATHER
+THAN EXEMPT
+--------------------------------------------------------------------------
+Recorded here rather than left to be discovered, because the leaf-wise plane
+pays MORE of exactly the drain this removes and has no arm to remove it with.
+
+- **Symmetric, `grow_tree_device_oblivious`: reads it.** Six `_copy_noise`
+  drains per depth-6 tree, collapsed to one.
+
+- **Leaf-wise, `grow_tree_device_resident`: ACCIDENTAL, not structural, and
+  the bigger case.** `_launch_child_search` calls `_copy_noise(scratch_l, 2)`
+  on every growth step, so a tree at the default budget of 31 leaves makes
+  **30** of these where the symmetric tree makes 6, and each one moves two
+  records' worth of plane rather than one. Counted off the source, not timed.
+  Nothing structural blocks the same hoist: the draw is a pure function of
+  (stdev, seed, tree_index, node id, global feature id, bin), and every node id
+  the tree will use is known before the first launch --
+  `resident_child_node_base(step)` is `2 * step + 1`, derived and not guessed.
+  Both device entry points this loop uses take their record indices as
+  arguments (`enqueue_desc_stage_search`, `enqueue_desc_copy_records`,
+  `_launch_child_search`), so a per-step record pair needs no kernel change.
+  What it costs is capacity: `2 * (num_leaves - 1)` records above the leaf
+  budget instead of the two scratch records, which is 91 records rather than 33
+  at the default, and a noise buffer of `records * n_features * n_bins` Float32
+  -- about 9 MB at 100 features and 256 bins. Not built, and the reason is
+  reach rather than difficulty: the leaf-wise noise path is off in both shipped
+  default sets, since CatBoost mode is symmetric and lossguide mode mirrors
+  LightGBM, which has no `random_strength`. It is worth building for whoever
+  measures leaf-wise CatBoost-style regularization, and it is worth nothing
+  before that.
+
+- **Depth-wise, `train_gpu._device_search_resident`: does not arise.** That
+  loop stages its noise inside `GpuSplitSearcher.enqueue_frontier`, which
+  already stages a whole batch before any table crosses, so a depth-wise level
+  pays one staging pass per level and not one per split. Its problem was never
+  the drain count; it was that the loop supplied no node id and therefore
+  raised. Fixed 2026-08-17; see `train_gpu._enqueue_resident_split`."""
+
+
+def oblivious_noise_hoist_requested() -> Bool:
+    """Whether every level's noise plane is drawn and uploaded once per tree.
+
+    Read once per tree, next to the trace and census sinks, for the reason
+    stated at `resident_trace_sink`."""
+    return getenv(OBLIVIOUS_NOISE_HOIST_VAR) == "1"
 
 
 def speculation_census_sink() -> String:
@@ -1917,6 +2214,21 @@ def _launch_child_search(
         searcher.wide_scan,
         searcher.use_primitives,
         noisy=noisy,
+        # WITHOUT THESE TWO THE LEAF-WISE DEVICE PATH SILENTLY SCORED WITH L2
+        # whatever the caller asked for. Fixed 2026-08-17. `_launch_search`
+        # defaults `score_function` to `SCORE_L2` and `gain_form` to
+        # `DEFAULT_GAIN_FORM`, and this call named neither, so a fit asking for
+        # Cosine got L2 and no warning. The parameter stopped being refused on
+        # the device on the strength of the OBLIVIOUS launch passing it, and
+        # this plane was never updated to match. The searcher already carries
+        # both codes, so the fix is to stop dropping them on the floor.
+        #
+        # `gain_form` is included for symmetry rather than to fix a second
+        # wrong answer: it is harmless today only because `DEFAULT_GAIN_FORM`
+        # is already what the searcher initializes to, which is exactly the
+        # kind of accident that becomes a bug when a default moves.
+        score_function=searcher.score_function_code,
+        gain_form=searcher.gain_form_code,
     )
 
 
@@ -2781,7 +3093,9 @@ pass it launches anyway. That is the whole margin; see
 
 
 def oblivious_schedule_launches(
-    max_depth: Int, batch_max_items: Int = OBLIVIOUS_MAX_ITEMS
+    max_depth: Int,
+    batch_max_items: Int = OBLIVIOUS_MAX_ITEMS,
+    skip_last_build: Bool = False,
 ) -> Int:
     """Command buffers **the schedule below actually enqueues** between waits,
     counted statically off `grow_tree_device_oblivious`.
@@ -2809,18 +3123,32 @@ def oblivious_schedule_launches(
     runs at a bound the census calls the knee is a build whose registered
     argument no longer describes it.
 
-    What is deliberately not counted here, exactly as the census does not count
-    it: the last level's children. Those histograms are built and never
-    searched, because a leaf at `max_depth` is never split. Skipping them would
-    be worth two launches and is **not** taken, because the batched build is
-    also what pays the partition's deferred copy-back, and a schedule that
-    skipped it would have to pay that debt in a launch of its own -- the same
-    two buffers, moved. Recorded so nobody re-derives the saving.
+    What is deliberately not counted here at `skip_last_build = False`,
+    exactly as the census does not count it: the last level's children. Those
+    histograms are built and never searched, because a leaf at `max_depth` is
+    never split. Skipping them is worth two launches and costs one, since the
+    batched build is also what pays the partition's deferred copy-back and a
+    schedule without it has to pay that debt in a launch of its own.
+
+    `skip_last_build = True` is that schedule and is what
+    `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` selects. The count moves by one,
+    56 to **55** at depth 6, which is deliberately the least interesting thing
+    about it: the reason to take it is the accumulation pass and the zeroing
+    pass the two dropped buffers were carrying, which this function does not
+    count and `OBLIVIOUS_SKIP_LAST_BUILD_VAR` prices. Recorded here as a
+    launch count so that a profile charged from this function still describes
+    the schedule that ran.
     """
     if max_depth < 1:
         return 0
     var total = 7 + max_depth * OBLIVIOUS_LEVEL_LAUNCHES + 1
     for l in range(max_depth):
+        if skip_last_build and l == max_depth - 1:
+            # No batch at all, and the partition pays its own copy-back
+            # rather than deferring it, so this level costs one launch more
+            # than `OBLIVIOUS_LEVEL_LAUNCHES` and no batch launches.
+            total += 1
+            continue
         var children = 1 << (l + 1)
         if batch_max_items < 1:
             total += 2 * children
@@ -2977,6 +3305,27 @@ def grow_tree_device_oblivious(
     Round trips: **one per tree**, the download at the end, exactly as the
     leaf-wise plane. Nothing in the loop below reads a device answer.
 
+    **Round trips are not the whole wait count and this loop is where the
+    difference shows.** Counted in source on 2026-08-17: the loop makes one
+    `enqueue_copy` per level, `GpuSplitSearcher._copy_noise`, whenever
+    `random_strength` is positive, and an `enqueue_copy` on Metal is a
+    synchronous full-queue drain (**measured** by disassembly,
+    `docs/GPU_PORTABILITY.md` section 6.1). Those are not round trips -- no
+    host decision here reads a device answer -- but unlike the per-tree copies
+    section 6.1.1 measured as null, each one drains a queue holding a whole
+    level of work, so the host cannot run a command buffer ahead and the
+    device idles between the level that finished and the level the host has
+    not enqueued yet. The CatBoost-mode default set turns `random_strength`
+    on, on **either** backend, so the shipped symmetric fit makes six of them
+    per tree. The `params` write that supplies it carried a
+    `config.device == CPU_DEVICE` condition for one day, 2026-08-16 to
+    2026-08-17, which would have made this count zero for a defaulted GPU fit;
+    it was removed as a bug and `OBLIVIOUS_NOISE_HOIST_VAR` above records the
+    whole episode. Every measured symmetric arm names `random_strength`
+    explicitly and was never on either side of it.
+    `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST` collapses them to one, above the
+    loop, and is off until something times it.
+
     What is enqueued past the end of growth
     ---------------------------------------
     Every level is enqueued whether or not growth has already stopped, for the
@@ -2996,10 +3345,19 @@ def grow_tree_device_oblivious(
     `enqueue_desc_step` below the leaf-wise loop.
 
     The last level's children are built and never searched, which is two
-    launches of real work spent on histograms nothing reads. It is deliberate:
-    that batch is also what pays the partition's deferred copy-back, so skipping
-    it would move the cost rather than remove it. See
-    `oblivious_schedule_launches`.
+    launches of real work spent on histograms nothing reads. That was called
+    deliberate on the grounds that the batch is also what pays the partition's
+    deferred copy-back, so skipping it moves the cost rather than removing it.
+    **That is true of the launch count and false of the work**, and
+    `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` is the arm that takes the other
+    side: the copy-back is one `O(n_active)` pass and the batch is the largest
+    zeroing pass of the tree plus a full `O(n_active * n_features)`
+    accumulation. Off by default and unmeasured. See
+    `OBLIVIOUS_SKIP_LAST_BUILD_VAR` and `oblivious_schedule_launches`.
+
+    Six of the per-tree copies are the `random_strength` noise planes, one per
+    level, and `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST` collapses them to one.
+    Also off by default. See `OBLIVIOUS_NOISE_HOIST_VAR`.
 
     Not instrumented, traceable
     ---------------------------
@@ -3031,37 +3389,21 @@ def grow_tree_device_oblivious(
             " histogram the next pick reads on a miss. See"
             " OBLIVIOUS_SPECULATION"
         )
-    # ---- random_strength, refused here and wired on the leaf-wise plane ----
-    #
-    # Refused by name rather than dropped, and refused for a reason that is
-    # about the *rule* and not about wiring, which is why it is here and not on
-    # a list of things a later lane connects.
-    #
-    # `random_strength` draws one normal per (seed, tree, **node**, feature,
-    # bin) and adds it to that candidate's gain. An oblivious level does not
-    # have a node. `_scan_slot_oblivious_kernel` scores one candidate by
-    # summing its gain over every leaf of the level, and the single answer that
-    # comes back is the level's split; the leaf records it reads carry a
-    # histogram base and nothing else. So there is no node id to key the draw
-    # by, and every id the level *does* hold -- the lowest node of the level,
-    # the leaf ordinal, the level index -- would be a synthetic key: the draw
-    # would be deterministic and reproducible and keyed to the wrong thing,
-    # which is worse than no noise because it would look correct and would put
-    # the two backends on different numbers.
-    #
-    # There is also nothing to add it to. `_launch_oblivious_search` takes no
-    # noise plane at all (`gpu_split_search.mojo`), and adding one means adding
-    # a term inside the cross-leaf sum, which is that kernel's gain arithmetic
-    # and belongs to whoever owns it -- and the placement question there is a
-    # real one, since noising per (leaf, candidate) and noising per candidate
-    # once are different regularizers with the same name.
-    #
-    # And the refusal is the whole answer for this configuration, not a slower
-    # path: `train_gpu._grow_tree_gpu_device_search` routes `grow_policy =
-    # oblivious` here unconditionally, without consulting the AUTO split-search
-    # decision, because no other grower on this backend builds a symmetric
-    # tree. So this names the CPU backend, as the other oblivious refusals do.
     # ---- CatBoost's `random_strength` on a symmetric level ----
+    #
+    # DELETED FROM ABOVE THIS LINE ON 2026-08-17. A thirty-line paragraph
+    # headed "random_strength, refused here and wired on the leaf-wise plane"
+    # stood here, directly above the paragraph below that retires it, and the
+    # two contradicted each other line for line. Its load-bearing claim was
+    # that "`_launch_oblivious_search` takes no noise plane at all", which is
+    # false. There are two overloads of that function; the no-noise one is at
+    # `gpu_split_search.mojo:6137` and this loop does not call it. The call
+    # below passes `searcher.noise_dev` and `searcher.noise_stdev > 0.0`, so it
+    # binds the noise overload at `:6218`. Its other claim, that a level has no
+    # id to key the draw by, is answered by the level DEPTH in its own hash
+    # domain, which the paragraph below states. Deleted rather than annotated
+    # because a retired refusal sitting above its own retirement is read as the
+    # live rule by whoever gets there first.
     #
     # **THE REFUSAL THAT STOOD HERE IS RETIRED, AND BOTH OF ITS REASONS ARE
     # GONE FOR DIFFERENT REASONS.**
@@ -3103,6 +3445,33 @@ def grow_tree_device_oblivious(
     # (`GpuSplitSearcher.enqueue_oblivious_level` refuses the overlap).
     var leaf_base = 0
     var level_record = searcher.max_records - 1
+    # --- one level record, or one per level -------------------------------
+    #
+    # `level_record_base` and `level_records` are the whole of the noise
+    # hoist's state, and at the shipped default they are the single record the
+    # line above names. `OBLIVIOUS_NOISE_HOIST_VAR` carries the argument that
+    # spreading the levels over their own records changes no bit; what is here
+    # is the guard that keeps it from indexing past the tables.
+    #
+    # Three conditions and every one of them is necessary. The switch, because
+    # the arm is unmeasured. A positive standard deviation, because with the
+    # noise off there is no copy to hoist and no reason to move a record
+    # index. And the capacity, because a level record must sit above the leaf
+    # records `[leaf_base, leaf_base + budget)` that the scan reads while it
+    # writes the level record, which needs `max_records >= budget +
+    # max_depth`. `train_gpu._search_record_slots` asks for exactly that under
+    # the same switch and can still be clamped below it by
+    # `MAX_LEVEL_TABLE_CELLS` on a very wide dataset, so this tests the
+    # searcher it was handed rather than trusting the switch.
+    var level_records = 1
+    var level_record_base = level_record
+    if (
+        oblivious_noise_hoist_requested()
+        and searcher.random_score_stdev() > 0.0
+        and searcher.max_records >= budget + params.max_depth
+    ):
+        level_records = params.max_depth
+        level_record_base = searcher.max_records - params.max_depth
     if searcher.max_records < oblivious_records_needed(params):
         raise Error(
             String(
@@ -3126,11 +3495,21 @@ def grow_tree_device_oblivious(
         widest = len(tree_features)
     var trace = resident_trace_sink()
     var trace_steps = trace != "" and resident_trace_steps_requested()
+    # Read once per tree, above the loop, for the reason `resident_trace_sink`
+    # states: a variable does not change inside a fit, and a `getenv` inside a
+    # loop whose whole claim is that it does no host work is how such a loop
+    # quietly becomes slow.
+    var skip_last_build = oblivious_skip_last_build_requested()
     # Not optional here, where it is merely the default on the leaf-wise plane:
     # the level's batched build is the only thing that pays the partition's
     # copy-back, and it pays it by fusion. With the fusion off the partition
     # would launch its own copy-back and the batch would then be told there is
     # no debt, which `mark_copy_back_fused` refuses rather than absorbs.
+    #
+    # `skip_last_build` is the one schedule that turns it off, and only for the
+    # last level, where the build that would have paid the debt is the launch
+    # being removed. It is turned off at that level rather than here, so that
+    # every level with a build behind it keeps the fusion.
     builder.rows.set_partition_fusion(True)
     var folds_before = builder.rows.copy_back_folds
     var row_bound = n_root if n_root > 0 else 1
@@ -3171,16 +3550,45 @@ def grow_tree_device_oblivious(
         searcher._stage_hist_base(r, Int32(0))
     searcher._copy_tables()
 
+    # Every level's noise plane, drawn and uploaded here instead of one per
+    # level, when the hoist is armed. `level_records > 1` is exactly the
+    # condition that a level record was reserved per level, so nothing here
+    # needs to re-ask the switch.
+    #
+    # One `_copy_noise` over `[level_record_base, + max_depth)` and not
+    # `max_depth` of them: the records are contiguous by construction above,
+    # and `_copy_noise` takes a window of contiguous records precisely so a
+    # caller with several can move them in one transfer. That is the drain
+    # this arm exists to remove; see `OBLIVIOUS_NOISE_HOIST_VAR`.
+    #
+    # Placed after `_copy_tables` and before the loop deliberately. The draw
+    # is host work and the queue at this point holds the root histogram build
+    # and the table reset, so the draw overlaps device work that is already in
+    # flight, and the copy's drain waits on a queue holding one histogram
+    # rather than on a queue holding a whole level.
+    if level_records > 1:
+        for l in range(params.max_depth):
+            searcher.stage_random_score_level(level_record_base + l, l)
+        searcher._check_noise_staged(level_record_base, params.max_depth)
+        searcher._copy_noise(level_record_base, params.max_depth)
+
     # --- Growth, one level at a time ---------------------------------------
     for level in range(params.max_depth):
         var n_leaves = 1 << level
+        # This level's record. One shared record at the default, one per level
+        # under the hoist; `level_records` is 1 in the first case and
+        # `max_depth` in the second, so this is the same number the line above
+        # the loop computed whenever nothing was hoisted.
+        var this_record = level_record_base + (
+            level if level_records > 1 else 0
+        )
         # Point this level's leaf records at this level's pool slots. Reads the
         # device frontier, so it is right on a level the host never saw.
         builder.enqueue_desc_stage_level_search(
             searcher.node_dev, slot_cells, leaf_base, budget
         )
         # The level search: the cross-leaf scan and the ordinary cross-feature
-        # reduction, two launches, into `level_record`.
+        # reduction, two launches, into `this_record`.
         # `_launch_oblivious_search` directly rather than
         # `enqueue_oblivious_level`, for the reason `_launch_child_search`
         # bypasses `enqueue_frontier`: the per-record histogram base was written
@@ -3204,10 +3612,20 @@ def grow_tree_device_oblivious(
         # device produced a model bit-identical to an unnoised one while the
         # same fit on the CPU moved by 1.078. `_check_noise_staged` below is
         # what turns that silence into a refusal if this is ever skipped.
-        if searcher.random_score_stdev() > 0.0:
-            searcher.stage_random_score_level(level_record, level)
-        searcher._check_noise_staged(level_record, 1)
-        searcher._copy_noise(level_record, 1)
+        #
+        # Skipped entirely when the hoist above already drew and uploaded
+        # every level's plane, which is what `level_records > 1` means. The
+        # check is deliberately NOT skipped with it: it costs nothing when the
+        # noise is off, it is the guard that turns a missing plane into a
+        # refusal rather than a silent zero, and a hoist that staged the wrong
+        # record is exactly the mistake it exists to catch.
+        if level_records == 1:
+            if searcher.random_score_stdev() > 0.0:
+                searcher.stage_random_score_level(this_record, level)
+            searcher._check_noise_staged(this_record, 1)
+            searcher._copy_noise(this_record, 1)
+        else:
+            searcher._check_noise_staged(this_record, 1)
         _launch_oblivious_search(
             searcher.ctx,
             builder.batcher[0].out_dev,
@@ -3229,7 +3647,7 @@ def grow_tree_device_oblivious(
             searcher.n_features * searcher.n_bins,
             searcher.n_features,
             widest,
-            level_record,
+            this_record,
             leaf_base,
             n_leaves,
             split_params.min_data_in_leaf,
@@ -3251,25 +3669,63 @@ def grow_tree_device_oblivious(
             # The root's own Newton value. Level 0's record is a level of one
             # leaf, so its `FREC_PARENT_VALUE` is the root's totals and nothing
             # else; the leaf-wise plane seeds the same word from record 0.
-            builder.enqueue_desc_seed_root(searcher.rec_f_dev, level_record)
+            builder.enqueue_desc_seed_root(searcher.rec_f_dev, this_record)
         # Apply the level's split to every leaf of the level: node ids, child
         # values, windows, slot pool, frontier, plan, step descriptor.
         builder.enqueue_desc_level(
             searcher.rec_i_dev,
             searcher.rec_f_dev,
             searcher.fparam_dev,
-            level_record,
+            this_record,
             level,
             params.max_depth,
             searcher.gain_form_code,
         )
+        # Whether this level's children are built at all, which is the last
+        # level and the switch and nothing else. See
+        # `OBLIVIOUS_SKIP_LAST_BUILD_VAR` for why those histograms are read by
+        # nothing, and `oblivious_schedule_launches` for what the count
+        # becomes.
+        var build_children = not (
+            skip_last_build and level == params.max_depth - 1
+        )
+        if not build_children:
+            # The partition below has to pay its own copy-back, because the
+            # launch that would have carried it is the one being removed.
+            # Safe to switch arms here and nowhere else in the loop: an arm
+            # change is refused while a debt is outstanding, and at this point
+            # the previous level's batch has already discharged the previous
+            # level's debt (`mark_copy_back_fused`), while this level's
+            # partition has not yet run. At `max_depth == 1` there is no
+            # previous level and no debt has ever been incurred, which is the
+            # same state.
+            builder.rows.set_partition_fusion(False)
         # One stable partition of the whole prefix by the level's one rule,
         # which produces the entire next level. Two launches; the copy-back is
-        # deferred to the batch below.
+        # deferred to the batch below. Three when the batch below is skipped,
+        # and then nothing is deferred.
         builder.enqueue_desc_partition(row_bound)
-        # Every child of the level, each from its own rows, in two launches,
-        # with the deferred copy-back paid inside the first of them.
-        builder.enqueue_desc_level_children()
+        # Every child of the level, in two launches, with the deferred
+        # copy-back paid inside the first of them.
+        #
+        # "Each from its own rows" is the SHIPPED ARM only, and this line said
+        # it unqualified until `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1` existed.
+        # Under that switch the level accumulates only the smaller child of
+        # each pair from rows and derives its sibling from the parent by exact
+        # Int32 subtraction. Still two launches, so nothing here or in
+        # `oblivious_schedule_launches` moves, and still the same histograms
+        # bit for bit; what changes is how many rows are read per level.
+        # `gpu_leaf_batching.oblivious_subtract_requested` owns that decision
+        # and this call site does not ask, which is why the switch is invisible
+        # here and has to be named instead.
+        #
+        # It composes with `skip_last_build` on a different axis: this switch
+        # halves the width of every level that runs, that one removes the last
+        # level's generation entirely. `train_gpu.mojo`'s `node_hists` block
+        # tabulates all four combinations, because the two have never been
+        # measured on together.
+        if build_children:
+            builder.enqueue_desc_level_children()
         if trace_steps:
             var mid = builder.download_desc_tables()
             _resident_trace_emit(
@@ -3286,11 +3742,24 @@ def grow_tree_device_oblivious(
                 ),
             )
 
+    # The fusion arm, back where the tree found it, so that a builder handed
+    # to anything else is not left holding this schedule's exception. Cannot
+    # raise here: the last level either paid its debt through its batch or ran
+    # unfused and incurred none, so nothing is outstanding either way.
+    if skip_last_build:
+        builder.rows.set_partition_fusion(True)
+
     # --- The launch that ends growth rather than performing it -------------
     #
     # `level_depth == max_depth` is a depth the commit cannot take, so this
     # writes `TREE_BUDGET_SPENT` and nothing else. See the docstring; it is the
     # same argument as the leaf-wise loop's trailing `enqueue_desc_step`.
+    #
+    # `level_record` and not `this_record`, which is out of scope here and
+    # would be the same number anyway: under the hoist the level records run
+    # `[max_records - max_depth, max_records)`, so `max_records - 1` is the
+    # last level's record, which is the record this commit read before the
+    # hoist existed. It reads it and discards it in either case.
     builder.enqueue_desc_level(
         searcher.rec_i_dev,
         searcher.rec_f_dev,

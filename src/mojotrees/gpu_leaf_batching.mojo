@@ -153,6 +153,7 @@ from std.atomic import Atomic
 from std.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
 from std.math import round
 from std.memory import stack_allocation
+from std.os import getenv
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
@@ -452,6 +453,200 @@ def _item_for_tile(
     return lo
 
 
+def oblivious_subtract_requested() -> Bool:
+    """`MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1`, the switch for sibling
+    subtraction inside the oblivious level build.
+
+    Off unless asked for, which is this package's rule for a path no benchmark
+    has priced, and the rule holds here even though the expected win is the
+    largest one on this plane's board. The shipped level build accumulates
+    every child of the level from its own rows, so it reads every active row
+    once per level; the subtracting arm accumulates only the SMALLER child of
+    each pair and derives the sibling from the parent, so it reads at most half
+    of them and usually fewer. Both arms are two launches per level and
+    `gpu_resident_round.oblivious_launch_census(6)` is 62 either way, which is
+    a precondition of this arm rather than a happy result -- see
+    `GpuLeafBatcher.enqueue_device_plan_batch_fused_subtracting`.
+
+    **Nothing about the answer moves.** Every accumulator is fixed-point Int32
+    under one pair of scales for the whole tree, the two children of a split
+    partition the parent's rows exactly, and the quantization of a row is a
+    function of the row alone, so the derived sibling is bit-for-bit the
+    histogram a direct accumulation would have produced. The argument is
+    written out leg by leg at `_batch_hist_atomic_subtract_kernel`. So this
+    switch selects an amount of memory traffic and never a number.
+
+    The default flips when a run says so and not before, which is the same
+    sentence `gpu_split_search.oblivious_wide_scan_requested` carries.
+
+    Read here rather than taken as a parameter for the same reason that switch
+    is: the decision belongs beside the kernels it selects between. The one
+    dispatch site is `GpuHistogramBuilder.enqueue_desc_level_children` over in
+    `histogram_gpu`, which is the only oblivious-only entry point either arm
+    has, and the branch is written there rather than inside
+    `enqueue_device_plan_batch_fused` so that a two-item leaf-wise plan cannot
+    reach the subtracting arm by having the environment set. That is not a
+    style preference: a leaf-wise commit reassigns the PARENT's slot to one of
+    the children and hands the other the lowest free slot, so the slot
+    relationship this arm rests on does not hold there at all.
+    """
+    # DEFAULT ON since 2026-08-17, and the variable is now an escape hatch that
+    # turns the subtraction OFF rather than a switch that turns it on. Measured
+    # the day it was written, 799,110 x 100 x 100 trees, symmetric depth 6, M4,
+    # three round-robin cycles against an interleaved baseline: 22.76 s to
+    # 14.39 s alone, and 10.36 s combined with the skip-last-build and wide-scan
+    # arms, which is 2.20x. Every arm of every cycle returned rmse 2.439382420,
+    # identical to nine decimals, so the exact-integer identity argument in this
+    # function's docstring holds in measurement as well as on paper.
+    #
+    # Flipped under LANE_RULES rule 5, added the same day. A bit-identical
+    # change cannot alter any user's output, so flipping its default changes
+    # the clock and nothing else, and a proven win left switched off is not a
+    # conservative position, it is an unshipped one. Per that rule this variable
+    # survives ONE round as an off switch and is then deleted.
+    return getenv("MOJOTREES_GPU_OBLIVIOUS_SUBTRACT") != "0"
+
+
+@always_inline
+def _live_item_pairs(
+    items: MutPointer[Int32, MutAnyOrigin], n_items: Int
+) -> Int:
+    """Half the number of live items at the head of the plan, which for a
+    committed oblivious level is the level's parent count `L`.
+
+    A level commit fills items `[0, 2L)` and kills everything from `2L` to the
+    staged width (`gpu_tree_tables._commit_level_kernel`, and
+    `_kill_level_plan` for why the kill covers the whole width and not just the
+    level's own prefix). So `ITEM_COUNT >= 0` holds on a prefix and
+    `ITEM_COUNT == ITEM_DEAD` on the rest, and the boundary is an ordinary
+    binary search, six loads at the 64-item width this mode is staged at.
+
+    Derived on the device rather than passed from the host, and the reason is
+    not only that the host would need a synchronization to learn it. A level
+    whose commit stopped growth kills the WHOLE plan, so the live prefix is
+    zero and every arm below does nothing; a host that passed `1 << level`
+    instead would zero and copy slots for a level the tree never grew. The
+    table is the authority in both cases.
+
+    Returns zero on a dead plan, and the callers below are written so that
+    zero means "this launch does nothing", exactly as `ITEM_DEAD` already does
+    for the shipping arm."""
+    var lo = 0
+    var hi = n_items
+    while lo < hi:
+        var mid = (lo + hi) >> 1
+        if items[unsafe_offset = mid * ITEM_WORDS + ITEM_COUNT][0] >= Int32(0):
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo >> 1
+
+
+def _batch_copy_back_zero_subtract_kernel(
+    out_hist: MutPointer[Int32, MutAnyOrigin],
+    items: MutPointer[Int32, MutAnyOrigin],
+    n_items: Int32,
+    hist_size: Int32,
+    rows: MutPointer[Int32, MutAnyOrigin],
+    scratch: MutPointer[Int32, MutAnyOrigin],
+    desc: MutPointer[Int32, MutAnyOrigin],
+):
+    """`_batch_copy_back_zero_kernel` for the subtracting level build: the same
+    deferred copy-back, and a second half that prepares each PAIR of children
+    rather than zeroing each child.
+
+    **The slot relationship this rests on, stated first because everything else
+    depends on it.** `gpu_tree_tables._commit_level_kernel` pins slot index to
+    leaf index, gives the left child of parent `j` leaf index `j` and the right
+    child leaf index `j + L`, and the parent itself was leaf index `j` of the
+    previous level and therefore already owns slot `j`. So **the parent's
+    histogram is sitting in the left child's destination slot** when this
+    kernel runs, and the level's `2L` plan items are the `L` left children at
+    `[0, L)` followed by the `L` right children at `[L, 2L)`, item `k` writing
+    slot `ITEM_OUT[k]`. That is read out of the item table where it can be
+    (`ITEM_OUT`, `ITEM_COUNT`) and assumed where it cannot: no table records
+    which slot holds the parent, so if that pinning is ever relaxed this arm
+    computes wrong histograms silently. It is checked by nothing here and is
+    the first precondition to re-read if this arm ever disagrees with the
+    shipping one.
+
+    **What the pair needs before the build.** The build accumulates the
+    smaller child into its own slot and subtracts it out of the sibling's slot,
+    so the sibling's slot has to hold the parent and the built child's slot has
+    to hold zeros. Two cases, and the built child is the smaller one:
+
+    - *The right child is built* (`n_right <= n_left`). The parent is already
+      in the left child's slot, which is where the derived left child belongs.
+      Zero the right child's slot and touch nothing else. This is the cheap
+      case and it is why ties build the right child.
+    - *The left child is built* (`n_left < n_right`). The derived right child
+      belongs in the right child's slot, so the parent is copied there first
+      and the left child's slot is then zeroed. One extra slot-sized read and
+      write for the pair, in the pass that was already writing both slots.
+
+    Both cases are one thread per `(pair, cell)`, and in the copying case the
+    same thread reads the parent cell and then zeroes it, so no thread reads a
+    cell another thread writes and the copy needs no launch of its own. That
+    is the whole reason a per-pair choice is affordable: the alternative to the
+    copy is building a FIXED child of each pair, which is accuracy-neutral and
+    reads more rows whenever a split is lopsided the other way.
+
+    The copy moves `N_PLANES * n_features * n_bins` cells; building the
+    sibling instead would visit `count * n_features` bins and read a gradient
+    and a hessian at each, so the copy is the cheaper of the two once a child
+    holds more than roughly `n_bins` rows. That is a comparison of counts read
+    off the two loops and not a measurement; no timing of either arm has been
+    taken by this lane.
+
+    The copy-back half is `_batch_copy_back_zero_kernel`'s verbatim, guard and
+    stride and all, and carries the same debt for the same census reason. The
+    `barrier()` between the halves is reached by every thread of the block --
+    there is no return above it -- and exists only to publish the pair count
+    one thread resolved."""
+    var stride = Int(block_dim.x) * Int(grid_dim.x)
+    var s_pairs = stack_allocation[
+        1, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    if thread_idx.x == 0:
+        s_pairs[unsafe_offset=0] = Int32(_live_item_pairs(items, Int(n_items)))
+
+    # Half one: the partition's deferred copy-back, `_copy_back_kernel`'s
+    # descriptor arm verbatim.
+    if desc[unsafe_offset=STEP_LIVE][0] != Int32(0):
+        var b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
+        var n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+        var j = Int(global_idx.x)
+        while j < n:
+            var i = b + j
+            rows[unsafe_offset=i] = scratch[unsafe_offset=i][0]
+            j += stride
+
+    barrier()
+
+    # Half two: one thread per (pair, cell). A dead plan has no pairs and this
+    # half does nothing, which is what `ITEM_DEAD` buys the shipping arm.
+    var n_pairs = Int(s_pairs[unsafe_offset=0][0])
+    var cells = N_PLANES * Int(hist_size)
+    var i2 = Int(global_idx.x)
+    if i2 >= n_pairs * cells:
+        return
+    var p = i2 // cells
+    var r = i2 - p * cells
+    var lbase = p * ITEM_WORDS
+    var rbase = (p + n_pairs) * ITEM_WORDS
+    var n_left = items[unsafe_offset = lbase + ITEM_COUNT][0]
+    var n_right = items[unsafe_offset = rbase + ITEM_COUNT][0]
+    var left_slot = Int(items[unsafe_offset = lbase + ITEM_OUT][0])
+    var right_slot = Int(items[unsafe_offset = rbase + ITEM_OUT][0])
+    if n_right <= n_left:
+        out_hist[unsafe_offset = right_slot * cells + r] = Int32(0)
+    else:
+        out_hist[unsafe_offset = right_slot * cells + r] = out_hist[
+            unsafe_offset = left_slot * cells + r
+        ][0]
+        out_hist[unsafe_offset = left_slot * cells + r] = Int32(0)
+
+
 def _batch_hist_partial_kernel(
     bins: MutPointer[UInt8, MutAnyOrigin],
     rows: MutPointer[Int32, MutAnyOrigin],
@@ -681,6 +876,224 @@ def _batch_hist_atomic_kernel(
             _ = Atomic.fetch_add(
                 out_hist.unsafe_offset(slice_base + 2 * hs + b),
                 sc[unsafe_offset=b][0],
+            )
+        b += block_dim.x
+
+
+def _batch_hist_atomic_subtract_kernel(
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    items: MutPointer[Int32, MutAnyOrigin],
+    scales: MutPointer[Float32, MutAnyOrigin],
+    out_hist: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    n_items: Int32,
+    n_slots: Int32,
+    n_bins: Int32,
+    hist_size: Int32,
+    feat_stride: Int32,
+):
+    """`_batch_hist_atomic_kernel` over half a level's items, folding the
+    sibling subtraction into the same flush.
+
+    The identical argument list, the identical row loop, the identical
+    threadgroup accumulation, and the identical global fold. Two things are
+    added and nothing is taken away.
+
+    **One: an item builds only if it is the smaller child of its pair.** Thread
+    zero already resolves this block's tile to its item; it now also resolves
+    the item to its pair (`_live_item_pairs` for the level's width `L`, then
+    `k` and `k + L` or `k - L`), compares the two `ITEM_COUNT`s, and publishes
+    `-1` in `meta[0]` when this block's item is the one that will be DERIVED
+    rather than built. The whole block then returns after the barrier it was
+    already paying. Ties go to the right child, which is the pair the zeroing
+    pass can prepare without copying the parent; see
+    `_batch_copy_back_zero_subtract_kernel`.
+
+    An item outside the live prefix returns the same way, exactly as
+    `ITEM_DEAD` already makes it accumulate nothing on the shipping arm. The
+    return sits AFTER the barrier and after the shared histogram is zeroed, so
+    a derived item's block costs precisely what a dead item's block already
+    costs today and no more. Moving it earlier would need every thread to redo
+    the two binary searches, which is the trade this deliberately does not
+    make.
+
+    **Two: the flush subtracts what it adds from the sibling's slot.** The same
+    thread that folds a cell into `slice_base` folds its negation into
+    `sub_base`, under the same `sc[b] != 0` guard, with the same integer
+    atomics. `gpu_active_rows._range_hist_atomic_kernel`'s `do_sub` arm is this
+    statement for statement, and this is the batched form of the fusion
+    `histogram_gpu.enqueue_resident_leaf_subtracting` already ships: a
+    standalone subtraction would be a launch that reads and writes every cell
+    of two whole slots, and the census has no room for it.
+
+    WHY THE DERIVED HISTOGRAM IS BIT-IDENTICAL TO A BUILT ONE
+    ---------------------------------------------------------
+    Leg by leg, and every leg is exact integer arithmetic:
+
+    1. Every cell of every histogram in this pool is fixed-point Int32. A
+       row's contribution is `Int32(round(grad[r] * g_scale))`, `Int32(round(
+       hess[r] * h_scale))` and `1`, all three functions of the row and of the
+       tree's scales alone, and neither the node a row lands in nor the block
+       that visits it can change them.
+    2. Integer addition is associative and commutative, so a histogram cell is
+       the exact sum of its rows' contributions whatever order the tiles and
+       the atomics fold them in. That is the same property that lets the
+       shipping arm claim a batched build equals a single-leaf one.
+    3. The level's partition is total and disjoint over the parent's window:
+       `_commit_level_kernel` derives `n_left` and `n_right` from the parent's
+       own histogram with `_row_goes_left` written over bins, and the scatter
+       routes by the same rule over rows, so the two children's row sets
+       partition the parent's exactly and share no row.
+    4. Therefore, cell by cell, `parent = left + right` exactly, and the
+       derived child `parent - built` is exactly the sum over the derived
+       child's own rows: bit for bit the histogram a direct accumulation would
+       have written. No rounding, no reassociation of floating point, nothing
+       to tolerance.
+    5. The cells the fusion never touches are cells where the built child
+       contributed nothing, and there the parent's word IS the sibling's word.
+       That covers the bins a small child put no rows in and, when the feature
+       set is narrowed, the whole inactive slices -- which are zero in the
+       parent because the parent was itself zeroed and accumulated under the
+       same active set. A tree that narrowed its features BETWEEN levels would
+       break that last clause; this plane refuses `feature_fraction_bylevel`,
+       and that refusal is now load-bearing here as well as where it is
+       written.
+    6. Overflow is no nearer than it already is. The minuend is a parent cell
+       the shipping arm already accumulates, and the difference is a sum over a
+       subset of the same rows, so every intermediate here is a value the
+       shipping arm also holds.
+
+    So the arm moves no bits, and the only thing it changes is how many rows
+    the level reads."""
+    var tid = thread_idx.x
+    var nb = Int(n_bins)
+    var nr = Int(n_rows)
+    var hs = Int(hist_size)
+    var slot = Int(block_idx.x)
+    var g_tile = Int(block_idx.y)
+
+    var meta = stack_allocation[
+        8, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sg = stack_allocation[
+        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sh = stack_allocation[
+        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sc = stack_allocation[
+        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+
+    if tid == 0:
+        var n_pairs = _live_item_pairs(items, Int(n_items))
+        var k = _item_for_tile(items, Int(n_items), g_tile)
+        var base = k * ITEM_WORDS
+        # Which of the pair this item is, and whether it is the one built.
+        # `meta[0] = -1` is "this block has nothing to do", and it covers both
+        # the derived sibling and any item past the live prefix.
+        var build = False
+        var sub_slot = 0
+        if k < 2 * n_pairs:
+            var partner = k + n_pairs if k < n_pairs else k - n_pairs
+            var n_self = items[unsafe_offset = base + ITEM_COUNT][0]
+            var n_other = items[
+                unsafe_offset = partner * ITEM_WORDS + ITEM_COUNT
+            ][0]
+            # The right child of the pair takes ties, for the reason the
+            # zeroing pass gives.
+            if k < n_pairs:
+                build = n_self < n_other
+            else:
+                build = n_self <= n_other
+            sub_slot = Int(
+                items[unsafe_offset = partner * ITEM_WORDS + ITEM_OUT][0]
+            )
+        if not build:
+            meta[unsafe_offset=0] = Int32(-1)
+        else:
+            meta[unsafe_offset=0] = Int32(k)
+            meta[unsafe_offset=1] = items[unsafe_offset = base + ITEM_BEGIN][0]
+            meta[unsafe_offset=2] = items[unsafe_offset = base + ITEM_COUNT][0]
+            meta[unsafe_offset=3] = items[
+                unsafe_offset = base + ITEM_ROWS_PER_TILE
+            ][0]
+            meta[unsafe_offset=4] = Int32(
+                g_tile - Int(items[unsafe_offset = base + ITEM_TILE_BEGIN][0])
+            )
+            meta[unsafe_offset=5] = items[unsafe_offset = base + ITEM_PLANE][0]
+            meta[unsafe_offset=6] = items[unsafe_offset = base + ITEM_OUT][0]
+            meta[unsafe_offset=7] = Int32(sub_slot)
+
+    var b = tid
+    while b < nb:
+        sg[unsafe_offset=b] = 0
+        sh[unsafe_offset=b] = 0
+        sc[unsafe_offset=b] = 0
+        b += block_dim.x
+    barrier()
+
+    var k = Int(meta[unsafe_offset=0][0])
+    # Uniform across the block: `meta[0]` is one word one thread wrote and
+    # every thread reads, so the whole threadgroup leaves together and no
+    # barrier below is reached by a subset of it.
+    if k < 0:
+        return
+    var begin = Int(meta[unsafe_offset=1][0])
+    var count = Int(meta[unsafe_offset=2][0])
+    var rows_per_tile = Int(meta[unsafe_offset=3][0])
+    var t = Int(meta[unsafe_offset=4][0])
+    var plane_base = Int(meta[unsafe_offset=5][0]) * nr
+    var out_slot = Int(meta[unsafe_offset=6][0])
+    var sub_slot = Int(meta[unsafe_offset=7][0])
+
+    var f = Int(feat_ids[unsafe_offset = k * Int(feat_stride) + slot][0])
+    var g_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_G][0]
+    var h_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_H][0]
+
+    var tile_begin = t * rows_per_tile
+    var tile_end = tile_begin + rows_per_tile
+    if tile_end > count:
+        tile_end = count
+
+    var col = f * nr
+    var j = tile_begin + tid
+    while j < tile_end:
+        var r = Int(rows[unsafe_offset = begin + j][0])
+        var bin = Int(bins[unsafe_offset = col + r])
+        var gq = Int32(round(grad[unsafe_offset = plane_base + r][0] * g_scale))
+        var hq = Int32(round(hess[unsafe_offset = plane_base + r][0] * h_scale))
+        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
+        _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
+        _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
+        j += block_dim.x
+    barrier()
+
+    var slice_base = out_slot * N_PLANES * hs + f * nb
+    var sub_base = sub_slot * N_PLANES * hs + f * nb
+    b = tid
+    while b < nb:
+        if sc[unsafe_offset=b][0] != 0:
+            var vg = sg[unsafe_offset=b][0]
+            var vh = sh[unsafe_offset=b][0]
+            var vc = sc[unsafe_offset=b][0]
+            _ = Atomic.fetch_add(out_hist.unsafe_offset(slice_base + b), vg)
+            _ = Atomic.fetch_add(
+                out_hist.unsafe_offset(slice_base + hs + b), vh
+            )
+            _ = Atomic.fetch_add(
+                out_hist.unsafe_offset(slice_base + 2 * hs + b), vc
+            )
+            _ = Atomic.fetch_add(out_hist.unsafe_offset(sub_base + b), -vg)
+            _ = Atomic.fetch_add(
+                out_hist.unsafe_offset(sub_base + hs + b), -vh
+            )
+            _ = Atomic.fetch_add(
+                out_hist.unsafe_offset(sub_base + 2 * hs + b), -vc
             )
         b += block_dim.x
 
@@ -2508,6 +2921,105 @@ struct GpuLeafBatcher(Movable):
             block_dim=threads,
         )
         self.ctx.enqueue_function[_batch_hist_atomic_kernel](
+            bins,
+            rows,
+            grad,
+            hess,
+            self.feat_dev.unsafe_ptr(),
+            self.items_dev.unsafe_ptr(),
+            self.scales_dev.unsafe_ptr(),
+            self.out_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            Int32(n_items),
+            Int32(self.plan_slots),
+            Int32(self.n_bins),
+            Int32(hs),
+            Int32(self.n_features),
+            grid_dim=(self.plan_slots, total_tiles),
+            block_dim=threads,
+        )
+
+    def enqueue_device_plan_batch_fused_subtracting[
+        bins_origin: MutOrigin,
+        rows_origin: MutOrigin,
+        scratch_origin: MutOrigin,
+        desc_origin: MutOrigin,
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin, //
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        rows: MutPointer[Int32, rows_origin],
+        scratch: MutPointer[Int32, scratch_origin],
+        desc: MutPointer[Int32, desc_origin],
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+        copy_back_blocks: Int = 0,
+    ) raises:
+        """`enqueue_device_plan_batch_fused` with sibling subtraction, for an
+        oblivious level's plan. **Still two launches, and the same two grids.**
+
+        The identical argument list and the identical launch geometry as the
+        arm it replaces, so the only difference between the two is which two
+        kernel symbols the queue receives. That is a precondition rather than a
+        happy result: `gpu_resident_round.oblivious_launch_census(6)` is 62
+        command buffers with two per level here, the Metal queue on the
+        measured machine is 64 deep and does not raise when overrun, and a
+        third launch per level would put a depth-6 tree at 68. A standalone
+        subtraction pass is exactly that third launch, which is why the
+        subtraction is folded into the accumulation instead
+        (`_batch_hist_atomic_subtract_kernel`) and the parent copy the lopsided
+        case needs is folded into the zeroing
+        (`_batch_copy_back_zero_subtract_kernel`). The deferred copy-back is
+        carried in the same pass and by the same statements as before, so the
+        partition still costs two.
+
+        **This arm is for an oblivious LEVEL plan and for nothing else**, and
+        the reason is a slot relationship rather than a shape:
+        `gpu_tree_tables._commit_level_kernel` pins slot index to leaf index,
+        which puts the parent's histogram in the left child's destination slot
+        and lays the level's items out as `L` left children then `L` right
+        children. A leaf-wise two-item plan satisfies neither, so the caller
+        selects this arm at the one oblivious call site rather than the
+        environment selecting it inside the shipping one. See
+        `oblivious_subtract_requested`.
+
+        What reaches the pool afterwards is bit-for-bit what the shipping arm
+        would have left there; the argument is at the accumulation kernel.
+        Enqueues only: no transfer and no synchronization.
+        """
+        if self.plan_items < 1:
+            raise Error(
+                "no device-written plan is staged; call stage_device_plan"
+                " before enqueueing a plan batch"
+            )
+        if self.plan_items % 2 != 0:
+            raise Error(
+                "a subtracting level batch needs an even item width: the"
+                " level's children come in pairs and the plan is staged at"
+                " 1 << max_depth"
+            )
+        var n_items = self.plan_items
+        var total_tiles = n_items * self.plan_tiles_per_item
+        var threads = self.block_threads
+        var hs = self.hist_size()
+
+        var cells = n_items * N_PLANES * hs
+        var blocks = _ceil_div(cells, threads)
+        if copy_back_blocks > blocks:
+            blocks = copy_back_blocks
+        self.ctx.enqueue_function[_batch_copy_back_zero_subtract_kernel](
+            self.out_dev.unsafe_ptr(),
+            self.items_dev.unsafe_ptr(),
+            Int32(n_items),
+            Int32(hs),
+            rows,
+            scratch,
+            desc,
+            grid_dim=blocks,
+            block_dim=threads,
+        )
+        self.ctx.enqueue_function[_batch_hist_atomic_subtract_kernel](
             bins,
             rows,
             grad,

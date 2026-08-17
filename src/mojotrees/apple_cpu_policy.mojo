@@ -529,8 +529,23 @@ def env_tasks_per_core() -> Int:
 
 
 def env_core_pool() -> Int:
-    """Which cores auto mode counts. Anything unrecognized means `all`, so a
-    typo loses the experiment rather than the parallelism."""
+    """Which cores auto mode COUNTS. Anything unrecognized means `all`, so a
+    typo loses the experiment rather than the parallelism.
+
+    **Counts, not runs on, and the difference decides what an experiment with
+    this variable is allowed to conclude.** The only consumer is
+    `dispatch_cores`, which feeds `max_auto_tasks`, so `performance` lowers
+    the task ceiling from `tasks_per_core * physical` to
+    `tasks_per_core * performance` and does nothing else. It sets no
+    affinity, no QoS class and no pinning; this module's header states that
+    none is used and none is assumed to exist. The scheduler is still free to
+    place any of the remaining tasks on an efficiency core.
+
+    So a `performance` arm answers "does a smaller fan-out run faster", which
+    is a real question and the one the header poses. It does NOT answer "is
+    the efficiency cluster what makes ten workers slower than four", because
+    the arm cannot keep work off that cluster. Reading the first result as an
+    answer to the second is the failure this docstring exists to prevent."""
     var s = getenv("MOJOTREES_CPU_CORE_POOL")
     if s == "performance" or s == "PERFORMANCE" or s == "p":
         return CORE_POOL_PERFORMANCE

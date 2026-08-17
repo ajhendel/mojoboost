@@ -2293,8 +2293,19 @@ def _tree_leaf_values(
 
     A leaf is a node with `feature[node] < 0`, the same test the predictor and
     the renewal use. Single-output trees only, so the stride is 1; the
-    multiclass loops do not call this (see `_boost_rounds_multiclass`, which
-    takes no bootstrap bundle at all).
+    multiclass loops do not call this.
+
+    **The reason given here for that was stale and has been corrected.** It
+    read "see `_boost_rounds_multiclass`, which takes no bootstrap bundle at
+    all". That loop does take one and does draw it -- it calls
+    `bootstrap_round` once per round and shares the weights across the round's
+    `K` trees. What it cannot do is DERIVE the lambda, so it never needs the
+    previous tree's leaf values: `sampling.check_mvs_reg_is_set` refuses
+    `bootstrap_type='mvs'` without an explicit `mvs_reg` for the softmax loops
+    by name, because a CatBoost multiclass iteration is one tree holding a
+    `K`-vector per leaf while a round here is `K` unrelated trees, so the
+    `[dim][leaf]` rectangle `CalculateLastIterMeanLeafValue` reads does not
+    exist. The conclusion is unchanged; the reason was not.
     """
     values.clear()
     for node in range(len(tree.feature)):

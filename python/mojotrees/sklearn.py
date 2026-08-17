@@ -638,6 +638,43 @@ class _Base(_ParamsMixin):
     reaches the numerical scan, so the two functionals would end up inside
     one argmax.
 
+    `random_strength` is CatBoost's score-noise regularizer: a seeded normal
+    is added to every candidate's score before the argmax, so the winner
+    comes from among the near-ties instead of always being the exact
+    maximum. Its standard deviation is
+    `random_strength * RMS(this round's per-row derivatives) * n / (n +
+    exp(iteration * learning_rate))`, read from CatBoost's `CalcScoreStDev`,
+    so the noise is proportional to how badly the ensemble currently fits and
+    decays to nothing as the ensemble matures. `0.0`, the default under
+    `lossguide`, turns it off exactly and is LightGBM's behavior; unset under
+    `grow_policy="symmetrictree"` it resolves to CatBoost's own `1.0`. The
+    draw is keyed by (seed, tree, node or level depth, feature, bin) and by
+    nothing else, so it is the same value at every `MOJOTREES_NUM_WORKERS`
+    and on either device. It is honored on the dense single-output fit on
+    **both** devices and refused by name elsewhere (multiclass and sparse
+    round loops compute no per-tree scale; the device split search refuses it
+    beside a categorical feature, because a category set is scored by a
+    partition search and only that search's winner would be noised).
+
+    **A `random_strength` of 1.0 here does not mean CatBoost's 1.0 unless you
+    also set `score_function="Cosine"`, and read this before porting a value
+    across.** CatBoost calibrates the noise against Cosine, whose value for
+    one node is `G / sqrt(H + l2)`. This library's default score is
+    `G**2 / (H + reg_lambda)`, which is that quantity SQUARED, and the same
+    standard deviation is added to it unchanged -- which is exactly what
+    CatBoost does under its own `score_function=L2`, so the pairing is not
+    wrong, it is differently calibrated. Perturbing a squared quantity by
+    `sigma` is a weaker act than perturbing the quantity by `sigma`, by a
+    factor of about `2 * G / sqrt(H + reg_lambda)`, which on a level of a
+    hundred thousand rows is in the hundreds. **So the same value means two
+    different strengths inside this library**: the shipped symmetric mode
+    scores with Cosine and gets CatBoost's intended strength, and a
+    `lossguide` fit that sets `random_strength` scores with L2 and gets a
+    much gentler regularizer than the number suggests. Nothing rescales it
+    for you. If you want CatBoost's strength, set `score_function="Cosine"`
+    as well; if you want a comparable amount of noise under `"L2"`, expect to
+    raise the number, and tune it rather than transferring it.
+
     `derivative_precision` selects the precision a per-row gradient and
     hessian is CARRIED at between the objective and the histogram cell:
     `"float32"` (the default) is LightGBM's own profile, and `"float64"`
@@ -3207,6 +3244,32 @@ class _Base(_ParamsMixin):
             # policy but `symmetrictree`, and `"off"` is what every fit made
             # before this key existed did.
             "ctr": ctr_rule,
+            # Whether the CALLER named `ctr`, which is a different question
+            # from what it resolved to and is the only thing that lets the
+            # native side tell a mode default from a request.
+            #
+            # **This key was missing until 2026-08-17 and its absence was the
+            # whole defect.** `_resolve_ctr` applies `_CATBOOST_CTR` under
+            # `grow_policy='symmetrictree'`, so a caller who typed nothing sent
+            # `ctr='catboost'` indistinguishably from a caller who typed
+            # `ctr='on'`, and `_mojotrees.mojo`'s guard refused both on every
+            # entry point but `fit`. `bench/real_data` trains through
+            # `mojotrees.train(params, Dataset)` and nothing else, so its
+            # CatBoost-mode arm raised on 100 percent of cells, including on
+            # purely numeric scenarios where no CTR column would have been
+            # built at all.
+            #
+            # The rule this restores is the one the `random_strength_set`
+            # comment above states: an inherited default an entry point cannot
+            # honor must decline rather than refuse. Note the asymmetry with
+            # `random_strength_set`, which is deliberate: there the native side
+            # applies the mode default, while here Python still resolves it and
+            # this flag only carries the provenance. That split is kept because
+            # the four positive fits in
+            # `python/tests/test_catboost_mode_categorical.py` pin the resolved
+            # value on the `fit` door, and moving the resolution native would
+            # move those without a rebuild to check them.
+            "ctr_set": int(self.ctr is not None),
             # CatBoost's `target_binarization` pair (catalog A40), sent on
             # every fit whether or not a CTR is on: `_parse_ctr` reads them
             # only on a non-`off` rule, so an off bundle pays two dict entries

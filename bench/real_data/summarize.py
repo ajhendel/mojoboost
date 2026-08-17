@@ -174,34 +174,51 @@ def assess(manifest, records):
     return {"state": state, "reason": reason, "counts": counts}
 
 
-def project_engine_name(records):
-    """The name this project's engine went by in these records.
+#: Every name this project's engine has run under, so that a summary of a
+#: pre-rename run still finds its subject. `verify.SUBJECT_ENGINES` is the
+#: authority for the current names.
+_SUBJECT_NAMES = tuple(verify.SUBJECT_ENGINES) + FORMER_PROJECT_ENGINE_NAMES
 
-    Returns None when no such record is present. Raises when two different
-    non-LightGBM engine names appear, which would mean two libraries were
-    measured under one run id and no comparison in the file means anything.
+
+def project_engine_name(records):
+    """The name this project's headline engine went by in these records.
+
+    Returns None when no subject record is present. Until 2026-08-17 this
+    raised when more than one non-LightGBM engine name appeared, on the
+    theory that a second name meant a second library. It no longer does,
+    because the harness has since grown peer engines (catboost, xgboost) and
+    subject variants (`mojotrees_depthwise`, `mojotrees_catboost_mode`) as
+    ordinary rows of one run, and the summarizer refused every such run
+    outright. The subject set is `verify.SUBJECT_ENGINES` and this returns
+    the plain `mojotrees` name when it ran, else the first subject name
+    present, so a run of only variants still names its subject.
     """
     names = {
         record.get("engine")
         for record in records
-        if record.get("engine") and record.get("engine") != REFERENCE_ENGINE
+        if record.get("engine") in _SUBJECT_NAMES
     }
     if not names:
         return None
-    if len(names) > 1:
-        raise ValueError(
-            f"records name more than one non-{REFERENCE_ENGINE} engine: "
-            f"{sorted(names)}"
-        )
-    return names.pop()
+    for preferred in (PROJECT_ENGINE,) + FORMER_PROJECT_ENGINE_NAMES:
+        if preferred in names:
+            return preferred
+    return sorted(names)[0]
 
 
 def _cell_key(record):
     """The same key report.py and verify.py group by, so a cell in the
-    summary is the same cell they talk about."""
+    summary is the same cell they talk about.
+
+    The second field is the ARM and not the engine, since 2026-08-17, for the
+    same reason those two files changed on that date: on an `--arms` run one
+    engine name is dozens of arms and an engine key folded them into one
+    cell whose "repeats" were different configurations. On a run without
+    `--arms` the arm is the engine name and nothing about the output moves.
+    """
     return (
         record["scenario"],
-        record["engine"],
+        verify._arm_of(record),
         record.get("device_used") or record.get("device_requested"),
         record["threads"],
     )
@@ -417,14 +434,18 @@ def build_cells(ok_records):
     for key in sorted(groups):
         group = sorted(groups[key], key=lambda r: r.get("repeat") or 0)
         first = group[0]
-        scenario, engine, device, threads = key
+        scenario, arm, device, threads = key
         cells.append(
             {
                 "scenario": scenario,
                 "scenario_title": first.get("scenario_title"),
                 "task": first.get("task"),
                 "tier": first.get("tier"),
-                "engine": engine,
+                "engine": first.get("engine"),
+                # Equal to `engine` on a run without `--arms`; the arm id on
+                # one with it. This is what makes two cells of one engine two
+                # cells here rather than one cell with many "repeats".
+                "arm": arm,
                 "engine_version": first.get("engine_version"),
                 "device_requested": first.get("device_requested"),
                 # A label the Python side resolved, not evidence. The
@@ -534,14 +555,17 @@ def build_differential(ok_records, config, project_engine):
     cells = {}
     for record in ok_records:
         device = record.get("device_used") or record.get("device_requested")
+        # By ARM, as `verify.check_differential` is: this pairs the two PLAIN
+        # cells, and under an engine key an `--arms` run handed `mine[0]`
+        # whichever mojotrees arm was recorded first.
         cells.setdefault((record["scenario"], record["threads"]), {}).setdefault(
-            (record["engine"], device), []
+            (verify._arm_of(record), device), []
         ).append(record)
 
     out = []
-    for (scenario, threads), by_engine in sorted(cells.items()):
-        mine = by_engine.get((project_engine, "cpu"))
-        theirs = by_engine.get((REFERENCE_ENGINE, "cpu"))
+    for (scenario, threads), by_arm in sorted(cells.items()):
+        mine = by_arm.get((project_engine, "cpu"))
+        theirs = by_arm.get((REFERENCE_ENGINE, "cpu"))
         if not mine or not theirs:
             continue
         a, b = mine[0], theirs[0]
@@ -637,15 +661,22 @@ def build_device_agreement(ok_records, project_engine):
     """
     cells = {}
     for record in ok_records:
-        if record.get("engine") != project_engine:
+        # Every SUBJECT engine, keyed by ARM: the same two fixes
+        # `verify.check_device_agreement` took on 2026-08-17. Keyed by the one
+        # project engine and by (scenario, threads), this pooled every arm of
+        # that engine into one cpu-versus-device pair and ignored the subject
+        # variants entirely, so a summary could pair one arm's gpu row with a
+        # different arm's cpu row and call the digests "identical" or not on
+        # a comparison that meant nothing.
+        if record.get("engine") not in _SUBJECT_NAMES:
             continue
         device = record.get("device_used") or record.get("device_requested")
-        cells.setdefault((record["scenario"], record["threads"]), {}).setdefault(
-            device, record
-        )
+        cells.setdefault(
+            (record["scenario"], record["threads"], verify._arm_of(record)), {}
+        ).setdefault(device, record)
 
     out = []
-    for (scenario, threads), by_device in sorted(cells.items()):
+    for (scenario, threads, arm), by_device in sorted(cells.items()):
         cpu = by_device.get("cpu")
         for device, record in sorted(by_device.items()):
             if device == "cpu" or cpu is None:
@@ -657,6 +688,7 @@ def build_device_agreement(ok_records, project_engine):
                 {
                     "scenario": scenario,
                     "threads": threads,
+                    "arm": arm,
                     "device": device,
                     "primary_metric": metric,
                     "value": {device: got, "cpu": want},
@@ -901,7 +933,7 @@ def build_flags(payload):
             flags.append(
                 {
                     "flag": "repeats_not_identical",
-                    "scope": f"{cell['scenario']}/{cell['engine']}/{cell['device_used']}",
+                    "scope": f"{cell['scenario']}/{cell['arm']}/{cell['device_used']}",
                     "detail": (
                         f"{len(cell['predictions']['sha256_distinct'])} distinct "
                         f"prediction digests across {cell['repeats']} repeats"
@@ -920,7 +952,7 @@ def build_flags(payload):
             flags.append(
                 {
                     "flag": "device_digest_equals_cpu",
-                    "scope": f"{entry['scenario']}/{entry['device']}",
+                    "scope": f"{entry['scenario']}/{entry['arm']}/{entry['device']}",
                     "detail": (
                         f"the {entry['device']} arm and the cpu arm produced the "
                         "same prediction digest"

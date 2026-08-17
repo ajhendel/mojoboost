@@ -1159,7 +1159,7 @@ At the magnitude-sum scale, every row's quantized magnitude is
 `|g_r| * 2^30 / sum|g|`, so the sum of absolute quantized values over *all*
 bins of a feature is bounded by `2^30`, and no single bin can exceed that.
 Int32 holds `2^31 - 1`. The headroom is a factor of two, plus the rounding
-residue that `quantized_gradient.mojo` already bounds at `:1053` as
+residue that `quantized_gradient.mojo::accumulation_bound` already bounds as
 `FIXED_ONE + rows * residue_per_row(mode)`. The scale was chosen at `2^30`
 rather than `2^31` for precisely this reason.
 
@@ -1678,8 +1678,8 @@ burden. Section 8 states the consequence of the current decision plainly.
 "Because the flag is off, the per-site conventions in section 5 are
 load-bearing rather than belt-and-braces. There is no global setting standing
 behind them." The project is currently carrying an explicit `fma` call at
-`boosting.mojo:1201` and a host-side multiply at
-`gpu_objectives_native.mojo:1102` whose entire justification is preserving
+`boosting.mojo::_add_by_leaf` and a host-side multiply at
+`gpu_objectives_native.mojo::GpuObjectiveState.update_raw` whose entire justification is preserving
 bits that no longer need preserving, plus a documented rule that every
 contributor must reason about contraction at every site. That is a
 permanent tax paid for a property that has been retired. **This is not a

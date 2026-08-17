@@ -41,17 +41,171 @@ largest first. The wave window *measures* these; it does not *decide* them.
 group widths, layouts -- anything that moves work rather than removing it.
 It is A/B'd in the window before it becomes a default.
 
-**3. Moves bits: TAKE THE REAL-DATA GATE.** `bench/real_data` against
-stock+det, before the change is believed.
+**3. Moves bits: TAKE THE REAL-DATA GATE.** `bench/real_data`, before the
+change is believed.
+
+**The gate is OUR OWN accuracy, and it stopped being a peer comparison on
+2026-08-17.** The old rule was "within 1 percent relative of the better of
+CatBoost as shipped and LightGBM stock+det". It was replaced because it fails
+in BOTH directions, and the second one is why it was unsafe rather than merely
+awkward.
+
+- It blocked changes that cost nothing. The leaf-wise arm improved from 1.043 s
+  to 0.839 s that day on bit-identical work, and the frontier table would not
+  rank the arm at all, because it sits 1.42 percent behind CatBoost.
+- **It permitted real accuracy loss whenever we were ahead.** The symmetric arm
+  beats CatBoost at 799k, 0.303271 against 0.303468, so under a peer-anchored
+  1 percent bar it could give away about 1.07 percent of its OWN accuracy and
+  still pass. A rule that lets you lose accuracy because a competitor is weak
+  is not an accuracy rule.
+- The bar moved when somebody else shipped. A CatBoost release could fail our
+  gate with no change to our code.
+
+So: **our own accuracy is the gate, and competitors are the scoreboard.** A
+change that moves bits is judged by what it costs US, on the same arm and the
+same scenario, against a recorded reference. Peer numbers are reported beside
+every result, always, and gate nothing. We still want to know we are 1.42
+percent behind CatBoost. That is a column, not a verdict.
+
+**The reference is an ABSOLUTE ANCHOR, not the previous run**, and that
+distinction is the whole design rather than a detail. Anchoring on the previous
+run gives a ratchet: lose 0.9 percent ten times, pass every time, end up nine
+percent worse with no gate ever firing. The anchor is recorded per arm and per
+scenario, it lives in a file, and it moves only by a deliberate act that shows
+up in a diff, so drift accumulates against a fixed point.
+
+Two consequences worth stating because they are easy to get wrong. A
+bit-identical change costs zero of our accuracy by construction, so it passes
+this gate trivially and rule 5 flips its default on measurement. And the
+tolerance here is a DIFFERENT quantity from the old peer-relative 1 percent,
+so reusing that number without an argument for it would be a mistake.
 
 **4. An item closes ONLY when proven zero or proven impossible**, with the
 evidence recorded. **Nothing is dropped for being small.** "Under one percent"
 is not a reason to skip a category-1 change; it is a reason to rank it lower
 and still do it.
 
-The CPU path is the fallback for small data, for every configuration the
-device refuses, and for every machine without Metal, so its floor is a
-product floor.
+**5. A SWITCH IS A TEMPORARY STATE, NOT A RESTING PLACE.** Added 2026-08-17
+after this rule set was audited against what it actually produced. Rule 2 says
+a trade is A/B'd in the window "before it becomes a default", and nothing in
+this document ever made that second half happen, so the tree accumulated
+measured, proven wins that shipped to nobody. On the day this rule was written
+the library carried a 4.5 percent scan rewrite, an exact-integer sibling
+subtraction worth 1.78x, a skipped last-level build and a hoisted noise copy,
+all measured, all bit-identical, all default off.
+
+So: **when an A/B resolves faster and identity holds, the default flips in the
+same session as the measurement.** The switch then inverts, surviving one round
+as an escape hatch to turn the new behavior OFF, and is deleted after that. A
+switch that outlives a positive measurement is a defect and is reported as one.
+
+The reasoning is worth stating because it removes the thing that felt like
+caution. **A bit-identical change cannot alter any user's output.** Not the
+model, not a prediction, not a digest. Flipping its default changes the clock
+and nothing else, so there is no risk to weigh, and "measured faster, identity
+proven, default off" is not a conservative position, it is an unshipped one.
+For a change that MOVES bits, rule 3 stands unchanged and the accuracy budget
+is the gate, because that one is a real trade.
+
+**6. A DECLINE MUST CARRY A PRICE.** Also 2026-08-17, and this is the rule that
+would have caught the biggest defect in the codebase. A comment that declines an
+optimization must state what the decline costs, with the arithmetic, or be
+labeled as ASSERTED. **An asserted decline is an open item under rule 4, not a
+closed one**, however confidently it is written. Two declines were falsified on
+one day: the oblivious level batch declined sibling subtraction to save about
+1.1 ms of launches while paying about 125 ms of doubled traffic, an error of
+roughly a hundred to one, and it framed launch count and subtraction as
+exclusive when a fused subtraction costing no launch already existed thirty
+lines away. Separately, the last level's histograms were built and never read
+because skipping them was said to move a copy-back cost, which confused command
+buffers with work. Both read as settled engineering. **When you decline
+something, price it, and when you find a decline you cannot price, that is a
+finding and not a footnote.**
+
+**8. THE IDENTITY BUG: WHEN NOTHING FAILS, SUSPECT THE KEY.** Added 2026-08-17,
+after a single day produced eleven instances of one defect. Every one was
+internally consistent code with a wrong IDENTITY, and not one of them failed a
+test. They come in two mirrored forms.
+
+**An identity carrying a dimension it should not.** `frontier.py` put the device
+inside the arm id, so a cpu cell and its gpu cell were different arms and a
+351-job run produced ZERO oracle cells while every accelerator row reported "no
+cpu twin". `verify.py` keyed a cell on the engine rather than the arm, so forty
+arms collapsed into one verdict comparing whichever two records were written
+last, at different tree counts. Four device and host tables were sized from
+`num_leaves`, which does not bind under oblivious growth, so a depth-6 symmetric
+tree met a table built for 31 leaves; two of those raised and two under-reserved
+in silence.
+
+**An identity missing a dimension it needs.** A role test compared an
+ENGINE-name list against an arm id, matched nothing, and emitted no lines at
+all, so the accuracy scoreboard simply vanished from every `--arms` run. An arm
+recorded without the parameters that make it that arm is the same shape, which
+is why resolved parameters travel in the record.
+
+The rule that follows. **A gate that emits nothing is indistinguishable from a
+gate that passes**, so silence is a finding and not a clean bill. When a check
+is green, confirm it compared the things you meant, on the rows you meant, at
+the identity you meant. `verify.py::check_coverage` is the mechanical form of
+this: every subject cell must be NAMED by at least one gate, and a cell no gate
+mentions is a WARN. Prefer that shape wherever a gate can be given one.
+
+And when you find one instance, sweep for the rest, because this defect breeds.
+Of the eleven, one was found by looking and ten were found by asking where else
+the same identity was assembled.
+
+**7. A STALE CLAIM IS A DEFECT, AND FINDING ONE OBLIGATES YOU TO FIX IT.**
+Added 2026-08-17 (Andrew: "we need to always update if we find something
+wrong"). This codebase documents itself heavily, which is a strength and is
+exactly why a wrong comment is expensive: it reads as settled engineering and
+gets believed instead of checked. Several of the largest wins of that day came
+from falsifying a confident comment, and several near-misses came from
+believing one.
+
+So: **if you find a claim that is wrong, correcting it is part of your lane, not
+a note for somebody else.** If the claim is in a file you own, fix it in the
+same pass. If it is in a file another lane owns, quote the exact replacement
+text in your report so the orchestrator can apply it verbatim, and say plainly
+that it is a CORRECTION rather than a suggestion, so it is not triaged as an
+improvement and deferred. A corrected claim records what it used to say and
+when it changed, rather than quietly reading as though it always said the new
+thing, because the next reader needs to know a belief moved.
+
+This applies to measured RESULTS as much as to prose. A recorded number whose
+arm never reached the code is not a small number, it is a NULL, and leaving it
+filed as a result means it will be believed again. On the day this rule was
+written, `MOJOTREES_CPU_LAYOUT_BY_NODE` was recorded as measuring "neutral" on
+the symmetric CPU grower, and the switch had never reached that grower at all.
+The conclusion drawn from it, that per-node layout is not where the symmetric
+CPU cost lives, was unsupported for weeks.
+
+**VERIFY BEFORE YOU CORRECT, because a correction applied on a stale premise
+installs a new false claim.** An audit lane that day was handed four confident
+corrections and found one of them already fixed in the working tree by another
+lane hours earlier. Applying it would have re-asserted a condition the code no
+longer has, and would have narrowed a finding that in fact still stands. A
+correction is a claim like any other and takes the same standard of proof.
+
+**CITE BY NAME, NOT BY LINE NUMBER.** This is the single most common form of rot
+in this repository and it is a mechanical consequence of how we work: many lanes
+edit the same files on the same day, so a line number is stale within hours
+while the substance stays true. Every drifted citation found in that audit had
+correct content and a wrong pointer, which is the worst combination because the
+reader concludes the claim is wrong rather than the pointer. So anchor on
+`file.function`, or quote the line of code you mean, and keep line numbers only
+as a convenience beside a durable anchor. A document whose numbers have already
+drifted should say so at the top rather than be half renumbered, because a
+partly refreshed table is less trustworthy than a uniformly stale one.
+
+The CPU path is the correctness ORACLE and the portability floor. It is not
+optimized (2026-08-17 ruling). `device_agreement` and `backend_proof` in
+`bench/real_data/verify.py` are built on it actually running, and on
+2026-08-17 `device_agreement` caught a live noise-hash divergence in the
+shipped defaults, so it earns its keep as a gate rather than as a product
+claim. It is also genuinely faster than the device below roughly 150,000 rows,
+and it is the only backend our CI can execute at all. What changed is where
+engineering effort goes, not whether the path exists: speed lanes are GPU
+lanes, and a CPU speed lane needs a reason beyond the number being improvable.
 
 ## What you may run. This is a hard limit.
 

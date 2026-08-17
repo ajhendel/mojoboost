@@ -61,8 +61,11 @@ availability, so nothing downstream can read "the code exists" as "the code
 works". `MemoryEndpoint` remains a fake, named as one, and is not a transport.
 """
 
+# No `getenv` here, deliberately. This module reads no environment variable.
+# The seven MOJOTREES_DIST_* names it used to read were deleted on 2026-08-17,
+# see the tombstone above `require_transport`. A `RuntimeSpec` is built from
+# arguments or not at all.
 from std.memory import bitcast
-from std.os import getenv
 from std.ffi import external_call
 from std.sys.info import CompilationTarget
 from std.time import perf_counter_ns, sleep
@@ -2688,9 +2691,13 @@ struct RuntimeSpec(Copyable, Movable):
     the machine list indexed by rank, which is the rank assignment itself.
 
     Nothing here describes the data, the objective, or the model. That
-    separation is what lets a launcher build this from an environment before it
-    has read a row, and what keeps the training entry point in
+    separation is what lets a launcher build this from its own configuration
+    before it has read a row, and what keeps the training entry point in
     `distributed.mojo` from growing a second copy of the wire configuration.
+
+    "Its own configuration" is arguments, and only arguments. This module
+    reads no environment variable and has read none since 2026-08-17; the
+    builders are `local_runtime` and `transport_runtime`.
     """
 
     var mode: Int
@@ -2849,67 +2856,46 @@ def transport_runtime(
     return spec^
 
 
-def _env_int(name: String, default: Int) -> Int:
-    var s = getenv(name)
-    if s.byte_length() == 0:
-        return default
-    try:
-        return Int(s)
-    except:
-        return default
-
-
-def runtime_from_env() raises -> RuntimeSpec:
-    """The spec a launcher put in this process's environment.
-
-    Read once, here, so that a rank id never comes from the order processes
-    happened to start:
-
-        MOJOTREES_DIST_MODE        local (default) or transport
-        MOJOTREES_DIST_WORLD_SIZE  ranks in the world, local mode only
-        MOJOTREES_DIST_RANK        this process's rank, transport mode only
-        MOJOTREES_DIST_MACHINES    the machine list text, host:port entries
-                                   separated by whitespace or newlines
-        MOJOTREES_DIST_JOB_ID      the job id every frame carries
-        MOJOTREES_DIST_TIMEOUT_S   per-collective deadline in seconds
-
-    In transport mode the world size comes from the machine list rather than
-    from a variable, so the two cannot disagree.
-    """
-    var mode_text = getenv("MOJOTREES_DIST_MODE")
-    var mode = RUNTIME_LOCAL
-    if mode_text.byte_length() > 0:
-        mode = parse_runtime_mode(mode_text)
-    var job_raw = _env_int("MOJOTREES_DIST_JOB_ID", 0)
-    if job_raw < 0:
-        raise transport_error(
-            TRANSPORT_CONFIG_INVALID, -1, "MOJOTREES_DIST_JOB_ID is negative"
-        )
-    var job_id = UInt64(job_raw)
-    if mode == RUNTIME_LOCAL:
-        return local_runtime(_env_int("MOJOTREES_DIST_WORLD_SIZE", 1), job_id)
-    var machines = getenv("MOJOTREES_DIST_MACHINES")
-    if machines.byte_length() == 0:
-        raise transport_error(
-            TRANSPORT_CONFIG_INVALID,
-            -1,
-            "transport mode needs MOJOTREES_DIST_MACHINES",
-        )
-    var timeout_s = _env_int("MOJOTREES_DIST_TIMEOUT_S", 300)
-    if timeout_s <= 0:
-        raise transport_error(
-            TRANSPORT_CONFIG_INVALID,
-            -1,
-            "MOJOTREES_DIST_TIMEOUT_S must be positive",
-        )
-    return transport_runtime(
-        machines,
-        _env_int("MOJOTREES_DIST_RANK", -1),
-        job_id,
-        30 * NS_PER_SECOND,
-        timeout_s * NS_PER_SECOND,
-        _env_int("MOJOTREES_DIST_RESTART_EPOCH", 0),
-    )
+# TOMBSTONE, 2026-08-17. `runtime_from_env` and its `_env_int` helper were
+# deleted here, and with them the only reader of seven environment variables,
+# MOJOTREES_DIST_MODE, MOJOTREES_DIST_WORLD_SIZE, MOJOTREES_DIST_RANK,
+# MOJOTREES_DIST_MACHINES, MOJOTREES_DIST_JOB_ID, MOJOTREES_DIST_TIMEOUT_S,
+# and MOJOTREES_DIST_RESTART_EPOCH. They configured a launcher-driven
+# multi-process run and none of them ever reached a fit. `runtime_from_env`
+# had no caller in src/, bindings/, tests/, capi/, cli/ or python/, and the
+# `RuntimeSpec` consumer it would have fed, `distributed.run_distributed`, has
+# no caller either and is not exported from `mojotrees/__init__.mojo`. Seven
+# names read as a supported configuration surface, so they were worse than
+# nothing while the surface behind them was unreachable.
+#
+# Nothing else was removed. `RuntimeSpec`, `local_runtime`,
+# `transport_runtime`, `require_transport`, `open_local_collective`,
+# `open_transport_collective`, `open_socket_collective` and `connect_world`
+# all stand, unchanged, and they take their configuration as arguments. A
+# launcher can build a spec today; what it cannot do is have one built for it
+# out of the environment.
+#
+# What would have to exist for the variables to come back, in order.
+#   1. A launcher, or a `run_distributed` call site that ships. The variables
+#      only mean something to a process that somebody else started with them
+#      set, and this repository starts no such process.
+#   2. `transport_validated()` returning True, which needs the two-process
+#      procedure in docs/DISTRIBUTED_TRANSPORT.md section 7 to have been run.
+#      Until then `MOJOTREES_DIST_MODE=transport` can only configure a run
+#      that has never happened.
+#   3. A test that sets the variables and asserts the spec that comes out.
+#      There was none, which is how all seven stayed dead without notice.
+# Restoring them means restoring the reader in this position, next to the two
+# explicit-argument builders it wraps, so the two cannot drift.
+#
+# Status of the feature at the time of deletion, verified and cited.
+# docs/distributed.md line 3 says "Status: design plus CPU prototype. Not a
+# shipped feature". README.md says "this is a prototype rather than a
+# feature". docs/LIGHTGBM_PARITY.md rates the distributed transport "partial"
+# and the machine-list parameters "deferred", and states "no process has
+# connected to another". python/mojotrees/dask.py has `.fit(...)` raise
+# `DistributedNotAvailable` before it touches the cluster. And no CI workflow
+# runs a distributed fit.
 
 
 def require_transport(spec: RuntimeSpec) raises:

@@ -215,9 +215,53 @@ number of categorical bins, and `max_bin` is not the limit it looks like.**
 max_bin)` -- a **disjunction**, with `cut_cnt` set at 99 percent row coverage.
 So `max_bin` is a **lower** bound on categorical bins, not an upper one, and
 LightGBM keeps taking categories until coverage is satisfied however many that
-is. On this scenario it runs roughly **991 and 19,801 categorical bins against
-our 254.** LightGBM's own loader documentation concedes the point in passing:
-`max_bin` "may be ignored with a large number of categories".
+is. LightGBM's own loader documentation concedes the point in passing, saying
+that `max_bin` "may be ignored with a large number of categories".
+
+**The bin counts here were an estimate and are now MEASURED, 2026-08-17. The
+estimate was wrong in three ways and the correction makes the cause stronger,
+not weaker.** What stood here said LightGBM "runs roughly 991 and 19,801
+categorical bins against our 254", which named two columns and guessed both
+counts. Every record in this harness carries the per-feature bin counts in
+`model.bins.counts`, so this never needed estimating. Read off
+`bench/real_data/results/20260817T102725Z-cat1m/records.json`, on the five
+categorical columns at cardinalities 8, 64, 1000, 20,000 and 200,000:
+
+| arm | bins on the five categorical columns |
+|---|---|
+| mojotrees | 9, 65, **255, 255, 255** |
+| LightGBM | 9, 65, **989, 19,433, 15,952** |
+| CatBoost | 1, 1, 1, 1, 1 (each becomes a CTR numeric column) |
+
+So **three** of our columns are truncated, not two; the counts are 989 and
+19,433 rather than 991 and 19,801; and the 200,000-level column gets **15,952**
+bins from LightGBM, not "roughly 100,000" as `bench/real_data/thresholds.json`
+still says. That last number matters for the remedy, because LightGBM never exceeds
+`UInt16` on this scenario either, so an argument against widening our bin index
+on the ground that 200,000 exceeds `UInt16` is arguing against a target nobody
+is at. In row-coverage terms we resolve 26.5, 1.8 and 10.8 percent of rows on
+the three wide columns where LightGBM resolves 98.9, 98.1 and 44.5 percent.
+
+**And the size of the cause is now computed rather than asserted.** Because this
+scenario's target is an explicit sum of per-level effects, an oracle can be
+built for any binning. Give every resolved level its exact effect, give every
+dropped level the count-weighted mean of the pool it fell into, keep everything
+else perfect. Fitted on the train split, scored on the test split, with this
+harness's own `quality.average_precision`:
+
+| | average precision |
+|---|---|
+| oracle, full latent | 0.563319 |
+| oracle at LightGBM's bin counts | **0.552770** |
+| oracle at our 254 bins | **0.442548** |
+| oracle with the three wide columns contributing nothing | 0.419854 |
+| measured, LightGBM | 0.479591 |
+| measured, mojotrees | 0.421925 |
+
+**The bin ceiling costs 19.9 percent of oracle average precision where the
+measured gap is 12.02 percent, so the named cause more than fully accounts for
+the failure and nothing else has to be invoked.** Full working in
+`docs/design/ACCURACY_GAP.md` section 7.
 
 **That changes what this row means.** It is not "our categorical accuracy is
 worse"; it is "we resolved 254 categories where the comparator resolved
@@ -227,6 +271,20 @@ identified beside it: CTRs computed from the binned bucket rather than from raw
 category codes, which is why a lane measured our CTRs as null in both
 directions. The speed win in this row was partly bought with resolution, and the
 next measurement of it should not be read against this one.
+
+**One caution on the CTR remedy, added 2026-08-17 and measured.** The raw-code
+CTR source landed and this row did not move by a single bit, because our shipped
+`lossguide` default sends `ctr="off"` on every policy but `symmetrictree`
+(`python/mojotrees/sklearn.py`), so the scenario never called the fixed path.
+More importantly, **CatBoost runs CTRs here and scores 0.440563 average
+precision, which is 8.1 percent behind LightGBM and barely above our own
+254-bin oracle of 0.442548.** A CTR resolves every level, but as a noisy
+one-dimensional statistic in 255 numeric bins; thousands of set-splittable
+categorical bins resolve fewer levels as a partition the tree can cut
+arbitrarily, and on this generator the second is worth more. **So a CTR default
+is unlikely to clear the 10 percent gate on its own.** Widening the categorical
+bin ceiling is the fix for this row. `docs/design/ACCURACY_GAP.md` section 7.4
+ranks the three candidates.
 
 The CatBoost-mode arm has **no row here**: `grow_policy=oblivious` is
 implemented for numerical thresholds only, and a level of an oblivious tree

@@ -151,6 +151,65 @@ which environment variables are in effect, and whether a GPU path was
 compiled into the build, which is decided on the build machine and cannot be
 recovered from anything else.
 
+## Why this exists
+
+All three mature GBDT libraries accelerate training on the GPU, and all three
+mean an NVIDIA GPU.
+
+- **XGBoost** accelerates with `device="cuda"`. Its binary packages support
+  the GPU algorithm on machines with NVIDIA GPUs, and current releases
+  require CUDA 12 or newer.
+  ([GPU support](https://xgboost.readthedocs.io/en/stable/gpu/index.html))
+- **CatBoost** accelerates with `task_type="GPU"`, which requires an NVIDIA
+  driver of version 450.80.02 or higher and a device with CUDA compute
+  capability 3.5 or above.
+  ([Training on GPU](https://catboost.ai/docs/en/features/training-on-gpu))
+- **LightGBM** does have an OpenCL GPU backend, and it is the one people
+  reach for when they assume a Mac is covered. The installation guide states
+  that the GPU version is available for Windows and Linux only, and building
+  it on macOS is not a supported configuration.
+  ([Installation guide](https://lightgbm.readthedocs.io/en/stable/Installation-Guide.html),
+  [Apple Silicon GPU issue](https://github.com/microsoft/LightGBM/issues/6189))
+
+So on a Mac all three train on the CPU while the GPU sits idle.
+
+That gap is narrow and specific, because Apple GPU compute is otherwise a
+solved problem. Deep learning on Apple silicon has several maintained paths,
+including Apple's own
+[PyTorch MPS backend](https://developer.apple.com/metal/pytorch/),
+[MLX](https://github.com/ml-explore/mlx), and the
+[ExecuTorch MLX delegate](https://pytorch.org/blog/running-pytorch-models-on-apple-silicon-gpus-with-the-executorch-mlx-delegate/).
+Neural networks reach the GPU in a Mac without difficulty. The three
+established gradient boosting libraries, still the workhorse for tabular
+data, do not.
+
+## What runs where, and what has been proven
+
+These are two different claims and this project keeps them apart on purpose.
+
+**Supported.** One source, no vendor forks. The CPU path builds and is
+exercised in CI on x86-64 and ARM64 Linux as well as Apple silicon. The GPU
+path is a single portable backend rather than separate OpenCL and CUDA ones,
+written against a fixed set of six device primitives that Metal, CUDA, and
+HIP all specify, with no vendor intrinsic, no subgroup operation, no
+cooperative group, and no float atomic. See
+[docs/GPU_PORTABILITY.md](docs/GPU_PORTABILITY.md),
+[docs/NVIDIA_GPU.md](docs/NVIDIA_GPU.md), and
+[docs/AMD_GPU.md](docs/AMD_GPU.md).
+
+**Validated.** One device. Every kernel measurement in this repository was
+taken on a single Apple M4 running Metal. No NVIDIA or AMD device has ever
+executed this code, and no number from either should be quoted until one
+does. [docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md) marks every row
+`validated`, `tested`, `designed`, or `unsupported`, and
+`packaging/matrix/validate_matrix.py` rejects a `validated` row that names no
+evidence file.
+
+What separates those two columns is access to hardware, not portability work.
+If you have an NVIDIA or AMD machine and are willing to run the suite on it,
+[docs/HARDWARE_CONTRIBUTORS.md](docs/HARDWARE_CONTRIBUTORS.md) is the fastest
+way to move a row.
+
 ## Why Mojo
 
 LightGBM and XGBoost are excellent, mature C++ libraries. The bet here is

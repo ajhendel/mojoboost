@@ -1,17 +1,34 @@
-"""The accuracy-budget frontier: a PLAN and its arms. Nothing here measures.
+"""The speed and accuracy frontier: a PLAN and its arms. Nothing here measures.
 
     python bench/real_data/frontier.py              # the plan, as a table
     python bench/real_data/frontier.py --json p.json # the same, machine-readable
     python bench/real_data/frontier.py --skips      # only the declared skips
 
-The standing directive this exists to serve: accuracy within 1 percent
-relative on the primary metric, against the BETTER of CatBoost-as-shipped and
-LightGBM stock+det AT A MATCHED TREE COUNT, is a BUDGET, and it is to be spent
-for speed. The frontier is the set of configurations that spend it. The
-question it answers is one question, "what is the fastest configuration still
-inside the accuracy budget", and the recommendation it produces is
-DOCUMENTED and never applied: `report.py` names the fastest inside-budget
-point and nothing in this repository reads that name back into a default.
+WHAT THIS FILE IS FOR CHANGED ON 2026-08-17, AND THE ARMS DID NOT. The plan
+below, every arm in it and every skip it declares, is unchanged. What changed
+is which accuracy the frontier spends.
+
+The directive this was written to serve, and it is recorded here as it stood
+because a document that quietly rewrites its own premise is worth less than
+one that shows where it moved: accuracy within 1 percent relative on the
+primary metric, against the BETTER of CatBoost-as-shipped and LightGBM
+stock+det AT A MATCHED TREE COUNT, is a BUDGET to be spent for speed, and the
+frontier is the set of configurations that spend it.
+
+The directive now, Andrew 2026-08-17: "it should be about trading OUR accuracy
+for speed. not tied to whatever lightgbm or catboost is fucking doing." So the
+budget being spent is OUR OWN accuracy against our own recorded anchor, and
+the peer distance is a scoreboard column that gates nothing. The old rule
+failed in both directions at once: it blocked a change that cost no accuracy
+at all, and it permitted a real 1.07 percent loss on any arm that happened to
+be ahead of CatBoost. `verify.py`'s THE TWO ACCURACY AXES block carries the
+full argument.
+
+What survives unchanged is the shape of the question: "what is the fastest
+configuration whose accuracy we are willing to pay for", answered at ONE tree
+count, and the recommendation is DOCUMENTED and never applied. `report.py`
+names the fastest of our arms and nothing in this repository reads that name
+back into a default.
 
 THIS FILE RUNS NOTHING. It enumerates arms, declares which of them cannot run
 and why, counts cells, and estimates wall clock from timings already recorded
@@ -222,8 +239,13 @@ SHIPPED_N_ESTIMATORS = {"symmetrictree": 360, "lossguide": 72}
 #: questions. A reader who merges them gets a win that is not one, so they are
 #: separated by the DATA STRUCTURE and not by a caption: `block` is a field on
 #: every arm, `report.py` renders one table per block per tree count, and
-#: `verify.check_accuracy_budget` computes each verdict against competitors at
-#: that row's own count with no fallback of any kind.
+#: `verify.check_accuracy_peer` computes each scoreboard line against
+#: competitors at that row's own count with no fallback of any kind. (That
+#: function was `check_accuracy_budget` and was the accuracy GATE until
+#: 2026-08-17, when the gate moved to `verify.check_accuracy_anchor`, which
+#: compares an arm against our own recorded accuracy and involves no
+#: competitor. The matched-tree-count rule described here is unchanged; only
+#: what the number gates changed, and it now gates nothing.)
 #:
 #: **A cross-count comparison is therefore impossible rather than
 #: discouraged.** There is no code path that puts a 360-tree arm and a
@@ -356,40 +378,30 @@ BASES = {
         "id": "A",
         "label": "the shipped defaults: symmetric depth 6, 360@auto, MVS 0.8, Cosine",
         "engine": "mojotrees",
-        # Both are ENUMERATED and the accelerator leg is entirely skipped,
-        # rather than the leg being absent. A backend this base cannot use is
-        # a fact a reader has to be able to see; nine arms that were never
-        # written down look like nine arms nobody thought of.
+        # Both are ENUMERATED. Until 2026-08-17 the accelerator leg was
+        # entirely skipped rather than absent, because a backend this base
+        # cannot use is a fact a reader has to be able to see; nine arms that
+        # were never written down look like nine arms nobody thought of.
         "devices": ("cpu", "gpu"),
         "device_reason": (
-            "CPU on every scenario, for two independent refusals AT THIS "
-            "HEAD, and the two have different futures. (1) MVS: `model.fit` "
-            "raises \"bootstrap_type is not implemented on the GPU: "
-            "train_gpu takes no bootstrap bundle and its round loop never "
-            "draws one\". Nothing in flight changes that. (2) symmetric "
-            "trees under Cosine: `train_gpu` raises \"grow_policy=oblivious "
-            "cannot be grown on this device\" because "
-            "`ExtraTreeParams.is_active()` is true under `score_function != "
-            "SCORE_L2` and `oblivious_device_supported` declines on it. "
-            "**That one is being closed on branches that have not merged**, "
-            "`lane/cosine-device` (the device split search evaluating "
-            "Cosine) and `lane/oblivious-cosine` (a level's Cosine score as "
-            "one ratio rather than a sum of ratios). When they land, refusal "
-            "(2) goes and refusal (1) still keeps this arm on the CPU, so "
-            "the answer does not change and only the count of reasons does"
+            "Both legs schedule since 2026-08-17. Until then this base was CPU "
+            "on every scenario for two independent refusals, MVS on the GPU "
+            "and symmetric trees under Cosine on the GPU, and both are gone at "
+            "head: see CAPABILITIES_AT_HEAD and CAPABILITIES_CHECKED_AT for "
+            "what was read and where. The GPU leg has never been RUN under "
+            "this plan, only unrefused, so its first run is read for the "
+            "device_agreement verdict and the backend proof before its timing"
         ),
         "device_divergence_if_cosine_lands": (
-            "read this before scheduling a symmetric accelerator row later. "
-            "`random_strength` is a mode default that DECLINES on the GPU "
-            "(`_apply_catboost_mode_defaults` supplies 1.0 only when "
-            "`config.device == CPU_DEVICE`, because the per-tree scale is "
-            "computed by the dense CPU round loops and by nothing else). So "
-            "a symmetric GPU fit would carry `random_strength = 0.0` where "
-            "the CPU fit carries 1.0: same arm name, different regularizer, "
-            "different trees. That is a configuration difference and not a "
-            "backend difference, and a cpu-vs-gpu row that did not say so "
-            "would be comparing two arms while claiming to compare two "
-            "backends"
+            "RESOLVED 2026-08-17 by reading params.mojo: "
+            "`_apply_catboost_mode_defaults` no longer tests the device, so "
+            "the mode default random_strength=1.0 is supplied on the GPU as on "
+            "the CPU, and `ExtraTreeParams.device_unsupported_reason` refuses "
+            "it only beside a categorical column. So a symmetric GPU fit "
+            "carries the same regularizer as its CPU twin and the "
+            "cpu-versus-gpu row compares two backends, which is what its label "
+            "says. Kept under its old key so a reader who saw the warning "
+            "finds the resolution beside it"
         ),
         "params": {
             "grow_policy": "symmetrictree",
@@ -426,7 +438,12 @@ BASES = {
                 "CatBoost's per-objective count with the small-run stomp; 1 "
                 "under RMSE, which is what both dense rows are"
             ),
-            "random_strength": "1.0, on the CPU only",
+            "random_strength": (
+                "1.0 on both backends since 2026-08-17 (c775959 stages and "
+                "reads the plane on the oblivious device path); it read "
+                "\"on the CPU only\" before that and the entry above records "
+                "the resolution"
+            ),
             "max_depth": "6 when unnamed; this base names it anyway",
         },
         "not_set": (
@@ -531,9 +548,17 @@ AXES = {
         "note": (
             "a Dataset parameter, not a training one: `dataset_params` owns "
             "it and `mojotrees_params` refuses it. Base A's base value is "
-            "254, CatBoost's border_count, which is the same granularity as "
-            "255 bins and is not one of the three axis values, so all three "
-            "are variations from it"
+            "max_bin=254, which is 254 BINS in this repository's vocabulary "
+            "(binning.mojo, and scenarios.CATBOOST_PARAM_MAP['border_count'] "
+            "with translate=borders_to_bins: 254 borders is 255 bins, +1 and "
+            "not identity). It is therefore ONE BIN FEWER than CatBoost's "
+            "default of 254 borders and than the 255-bin axis value, not the "
+            "same granularity, which this note claimed until 2026-08-17. It "
+            "is not one of the three axis values, so all three are variations "
+            "from it; whether the base itself should be 255 to mirror "
+            "CatBoost is a plan decision left open, because 255 is an axis "
+            "value and `base_arms` folds an axis value equal to the base "
+            "into the base point"
         ),
     },
     "precision": {
@@ -717,7 +742,20 @@ def _block_of(base_id, axis, n_estimators, rate):
 
 def _arm(row, base_id, device, axis, value, params, dataset_params, env,
          n_estimators, learning_rate, skip=None):
-    parts = [FRONTIER_ID, row["row"], f"base{base_id}", device, axis, str(value)]
+    # THE DEVICE IS NOT IN THE ARM ID, since 2026-08-17. It was, and that made
+    # every cpu/gpu twin pairing in the harness impossible under `--arms
+    # frontier`: `run._oracle_key`, `verify._oracle_cell_key`,
+    # `verify.check_device_agreement`, `verify.check_backend_proof` and
+    # `summarize.build_device_agreement` all pair by arm id WITHOUT the
+    # device, so a cpu cell named `...baseB.cpu...` and a gpu cell named
+    # `...baseB.gpu...` were two arms, no cpu cell was ever an oracle (351
+    # jobs, zero oracle cells), every base cpu cell ran the full repeat count
+    # and was ranked in the speed story, and every gpu row was "an
+    # accelerator row with no cpu twin". The arm is the CONFIGURATION; the
+    # device is the backend it ran on and lives in the job's `device` field
+    # and in `run.label`, which appends it, so filenames stay unique. No
+    # recorded id changes, because the frontier had never run.
+    parts = [FRONTIER_ID, row["row"], f"base{base_id}", axis, str(value)]
     return {
         "block": _block_of(base_id, axis, n_estimators, learning_rate),
         "id": ".".join(parts),
@@ -773,26 +811,51 @@ def _apply_subsample(params, fraction, kind):
 
 #: What the trainer can do, at the head this file was last checked against.
 #:
-#: Two of these are FALSE and are expected to become true, which is why they
-#: are flags and not sentences. Andrew has ruled that the frontier does not
-#: run until a symmetric-tree accelerator row can exist, so the plan has two
-#: cell counts -- what it is at this head, and what it becomes when the two
-#: merges land -- and both are computed from this dict rather than estimated.
-#: Re-check them after any rebase; `CAPABILITIES_CHECKED_AT` says against
-#: what.
+#: Both were FALSE until 2026-08-17 and are flags rather than sentences so
+#: that the plan can be computed under either answer. Andrew has ruled that
+#: the frontier does not run until a symmetric-tree accelerator row can exist,
+#: so the plan has two cell counts, what it is at this head and what it is
+#: when both capabilities hold, and both are computed from this dict rather
+#: than estimated. At head the two dicts now agree. Re-check them after any
+#: rebase; `CAPABILITIES_CHECKED_AT` says against what.
 CAPABILITIES_AT_HEAD = {
-    "gpu_bootstrap": False,
-    "gpu_oblivious_cosine": False,
+    # Both flipped to True on 2026-08-17 after reading the trainer at head,
+    # not the branch list. gpu_bootstrap: `model.mojo::fit` now passes the
+    # bundle to `train_gpu` by keyword (`bootstrap=bootstrap`) instead of
+    # raising, and `train_gpu.mojo` draws it per round through
+    # `sampling.bootstrap_round` (MVS, host-gradient arm) or the device weight
+    # plane (Bayesian); the one refusal left is an explicit
+    # `objective_source=device` beside MVS, which no Base A arm sets. The
+    # multiclass path (`model.mojo::fit_multiclass`) still refuses, and no
+    # frontier row is multiclass. gpu_oblivious_cosine:
+    # `gpu_resident_round.mojo::oblivious_device_supported` and
+    # `train_gpu.mojo::_check_device_search_supported` both read
+    # `tree_parameters_extra.mojo::ExtraTreeParams.device_unsupported_reason`
+    # rather than `is_active()`, and that function refuses `score_function`
+    # and `random_strength` ONLY beside a categorical column (Base A is
+    # already skipped on the categorical rows for a different reason).
+    #
+    # "No longer refused" is not "runs". Neither flag was verified by a fit;
+    # both were verified by reading the gates, and this repository has one
+    # recorded case (the same function's own comment) of a gate retired on a
+    # correct reading while the device applied nothing. So the FIRST --arms
+    # run must be read for Base A's GPU leg specifically: its device_agreement
+    # verdict against the cpu twin, and its backend proof, before any Base A
+    # GPU timing is quoted.
+    "gpu_bootstrap": True,
+    "gpu_oblivious_cosine": True,
 }
 
 CAPABILITIES_CHECKED_AT = (
-    "1624647, 2026-08-16. `model.fit` still raises \"bootstrap_type is not "
-    "implemented on the GPU\", and `lane/cosine-device` and "
-    "`lane/oblivious-cosine` are both unmerged (checked with `git merge-base "
-    "--is-ancestor`). The mode-defaults merge at ad6c2b6 did fix the defect "
-    "where symmetric mode raised on every fit for want of a depth bound, and "
-    "that fix does not move either of these two: it made the mode usable at "
-    "all, on the backend that already had it"
+    "2026-08-17, working tree at c775959 plus uncommitted lane work, by "
+    "reading src/mojotrees: `model.mojo::fit` hands `bootstrap=` to "
+    "`train_gpu` and `train_gpu.mojo` draws it (`bootstrap_round`, "
+    "`refresh_bayesian_bootstrap`, `gpu_bootstrap_resolution`); "
+    "`gpu_resident_round.mojo::oblivious_device_supported` reads "
+    "`ExtraTreeParams.device_unsupported_reason`, which excludes "
+    "score_function and random_strength by name except beside a categorical "
+    "column. Not verified by a fit; see the comment on the dict. The previous "
+    "entry, 1624647 on 2026-08-16, recorded both as refused"
 )
 
 #: Everything true when both merges land. Not a prediction about when.
@@ -925,10 +988,12 @@ def competitor_arms(row):
     """CatBoost as shipped and LightGBM stock+det, at every tree count any
     mojotrees arm uses.
 
-    They exist so that the inside-1-percent verdict has something to stand on
-    AT A MATCHED TREE COUNT. A competitor row missing at a tree count is not
-    a smaller comparison, it is no comparison: `verify.check_accuracy_budget`
-    abstains rather than substituting another count.
+    They exist so that the inside-1-percent SCOREBOARD line has something to
+    stand on AT A MATCHED TREE COUNT. A competitor row missing at a tree count
+    is not a smaller comparison, it is no comparison:
+    `verify.check_accuracy_peer` abstains rather than substituting another
+    count. That comparison stopped gating anything on 2026-08-17; it is still
+    reported on every run and it is still worth running these rows for.
     """
     out = []
     for engine in ("catboost", "lightgbm"):
@@ -1118,13 +1183,15 @@ def estimate(all_arms=None):
 
 
 def projected():
-    """The plan once the two accelerator merges land, computed not guessed.
+    """The plan under both capability dicts, computed not guessed.
 
     **This is the count Andrew will actually run**, because the frontier is
     sequenced not to start until a symmetric-tree accelerator row can exist.
     The arms are the same arms: only `CAPABILITIES_AT_HEAD` moves, so the
     difference between the two counts is exactly the set of cells the two
-    merges unblock and nothing else.
+    capabilities unblock and nothing else. Since 2026-08-17 the two dicts
+    agree at head and the difference is zero; the function is kept so that
+    a rebase which re-refuses either capability shows up here as a count.
 
     Note what does NOT come back. Base A on the categorical row stays skipped
     on three unconditional refusals, and `float64` on the accelerator stays
@@ -1148,20 +1215,21 @@ def projected():
         "unblocked_arms": merged["arms"] - head["arms"],
         "still_skipped": merged["skipped"],
         "waits_on": (
-            "bootstrap_type on the accelerator (the other campaign's, in "
-            "flight) and score_function=Cosine on the device split search "
-            "plus a level's Cosine score as one ratio (`lane/cosine-device` "
-            "and `lane/oblivious-cosine`, both unmerged). Base A needs both; "
-            "Base B's two MVS arms need the first alone"
+            "nothing at head, since 2026-08-17: bootstrap_type on the "
+            "accelerator and score_function=Cosine under oblivious growth on "
+            "the device are both unrefused (CAPABILITIES_CHECKED_AT says what "
+            "was read). Until then Base A needed both and Base B's two MVS "
+            "arms needed the first alone, which is why the two dicts exist"
         ),
         "unpriced_warning": (
-            "the arms this unblocks are Base A on the accelerator, and "
-            "MEASURED_TRAIN_S_AT_100 has no entry for that cell because it "
-            "has never run. They are counted and NOT priced, so the "
-            "when_merged wall clock is a floor rather than an estimate. What "
-            "is knowable is a bound in the wrong direction: Base A on the "
-            "CPU is the slowest arm in the plan, and a device symmetric "
-            "grower exists to be faster than it"
+            "Base A on the accelerator is priced by `_train_seconds` at the "
+            "Base A CPU proxy, because MEASURED_TRAIN_S_AT_100 has no "
+            "accelerator entry for a symmetric arm: it has never run. So that "
+            "leg's wall clock is a placeholder, and probably an over-estimate, "
+            "since a device symmetric grower exists to be faster than the "
+            "slowest CPU arm in the plan. Corrected 2026-08-17; this used to "
+            "say the arms were counted and not priced, which `_train_seconds` "
+            "never did"
         ),
     }
 
@@ -1458,16 +1526,16 @@ def plan():
             "the fastest point named is the fastest AMONG THESE ARMS, which "
             "is weaker than the fastest configuration: a better point two "
             "axes away from both bases is invisible here",
-            "AT THIS HEAD there is no symmetric-tree accelerator row, so "
-            "'both grow policies on both backends' is answered for lossguide "
-            "only. This is the one gap with a scheduled exit: the run is "
-            "sequenced behind the two merges that close it, and `projected()` "
-            "counts what they unblock. It is a gap in the plan's timing "
-            "rather than in its design",
-            "the four axes are read on the CPU for the symmetric policy and "
-            "on both backends for lossguide, so an axis effect that is "
-            "backend-specific under symmetric growth is invisible until "
-            "those merges land and the arms are re-costed",
+            "the symmetric-tree accelerator row is UNREFUSED at head "
+            "(2026-08-17, CAPABILITIES_AT_HEAD) and has never been run, so "
+            "'both grow policies on both backends' is a question this plan "
+            "now schedules and has not yet answered; the first run's Base A "
+            "GPU leg is read for its device_agreement verdict and backend "
+            "proof before its timing counts",
+            "the symmetric-policy accelerator arms are priced by the Base A "
+            "proxy at CPU cost (`_train_seconds`), because no symmetric GPU "
+            "timing has ever been recorded here, so the wall clock for that "
+            "leg is a placeholder and not an estimate",
             "the wall clock in this plan is estimated from ONE battery-powered "
             "window on one machine, and this repository has measured the "
             "same benchmark drifting two to three times between windows",

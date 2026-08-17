@@ -320,27 +320,43 @@ def decide_split_search(
 ) -> SplitSearchDecision:
     """Choose the automatic split-search path and retain the reason.
 
-    The rule, as arithmetic, after eligibility and hardware have passed:
+    **THIS DOCSTRING DESCRIBED A RULE THE BODY NO LONGER HAS. Corrected
+    2026-08-17.** It stated two work thresholds, "device iff
+    work >= 50,000,000" for leaf-wise and a lower depth-wise floor of
+    "n_rows >= 250,000 and active_features >= 50 and work >= 12,500,000", and
+    it stated that nothing threads `TreeParams.grow_policy` in yet so the
+    depth-wise rule was "built, tested and unreached until a caller passes
+    it". Neither survives a read of the code. Both thresholds were withdrawn on
+    2026-08-16 by the four-shape interleaved sweep recorded above
+    `split_reason_name`, and `SPLIT_POLICY_VERSION` was bumped to 3 for exactly
+    that; and `train_gpu.split_search_decision_for` passes
+    `params.grow_policy` on every AUTO call. A reader asking "does depth-wise
+    route to the device today" got the wrong answer from the text above, which
+    is why it is quoted here rather than merely replaced.
 
-        leaf-wise, or a caller that did not name a growth policy
-            device iff work >= 50,000,000
+    The rule at head, in the order the body asks it. There is no arithmetic
+    left in it.
 
-        depth-wise
-            device iff (n_rows >= 250,000 and active_features >= 50
-                        and work >= 12,500,000)
-                    or work >= 50,000,000
+        HOST, `SPLIT_REASON_UNSUPPORTED`        if not semantics_supported
+        HOST, `SPLIT_REASON_RESIDENT_MEMORY`    if not resident_frontier_fits
+        HOST, `SPLIT_REASON_UNKNOWN_HARDWARE`   if not observed M4
+        DEVICE_RESIDENT, `SPLIT_REASON_VALIDATED_WORKLOAD`   otherwise
 
-    where `work` is `normalized_split_work`. The depth-wise condition is a
-    superset of the leaf-wise one, so making the gate policy-aware moves
-    shapes onto the device search and never off it.
+    So every eligible shape on measured hardware takes the device search,
+    under every growth policy, at every size. `n_rows`, `active_features`,
+    `n_bins` and `num_leaves` are still parameters because
+    `normalized_split_work` is still computed and REPORTED on the decision; no
+    branch reads it.
 
-    `grow_policy` is last and defaults to `SPLIT_GROW_UNSPECIFIED` so that
-    callers written against version 1 keep exactly the behavior they had.
-    That default is also the current state of the tree: nothing threads
-    `TreeParams.grow_policy` in yet, so rule 2 is built, tested and
-    unreached until a caller passes it. `MOJOTREES_GPU_SPLIT_STRATEGY` is
-    resolved before this function is called and is unaffected in both
-    directions; an explicitly named path never consults either rule.
+    `grow_policy` is likewise carried and not read. It is last and defaults to
+    `SPLIT_GROW_UNSPECIFIED` so that callers written against version 1 keep the
+    behavior they had, and it selected which of the two thresholds a fit was
+    weighed against until those thresholds were deleted. It now travels onto
+    the returned `SplitSearchDecision` for the record and decides nothing, so a
+    caller that omits it loses a field of provenance and cannot change a route.
+    `MOJOTREES_GPU_SPLIT_STRATEGY` is resolved before this function is called
+    and is unaffected either way; an explicitly named path never reaches here
+    at all.
     """
     var work = normalized_split_work(
         n_rows, active_features, n_bins, num_leaves

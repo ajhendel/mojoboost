@@ -135,12 +135,21 @@ bootstrap's are, and more strongly: see `mvs_varies_hessian` and
 
 **The wire is `BootstrapParams` and `bootstrap_round`.** The two bundles are
 paired into one `bootstrap_type` argument and one per-round entry point, in
-`goss.goss_round`'s shape and in `goss_round`'s place in a round loop:
-`boosting._boost_rounds` and `boosting.train_with_valid` call it immediately
-after the gradient fill. `BootstrapParams.check_hessian_declaration` is how a
-trainer proves it withdrew the constant-hessian declaration, and
-`check_bootstrap_honored` is what a trainer without the call in its loop uses
-instead of ignoring the bundle.
+`goss.goss_round`'s shape and in `goss_round`'s place in a round loop,
+immediately after the gradient fill. Seven round loops call it, counted in
+source on 2026-08-17 and listed rather than summarized, because the list is
+what `check_bootstrap_honored`'s message has to stay in step with:
+`boosting._boost_rounds`, `boosting.train_with_valid`,
+`boosting._boost_rounds_multiclass`, `boosting_sparse.train_sparse`,
+`boosting_sparse.train_sparse_with_valid`,
+`boosting_sparse.train_multiclass_sparse`, and
+`train_gpu._train_gpu_rounds`. The last of those is on the GPU and honors the
+bundle on both of its arms; see the device note under
+`catboost_default_bootstrap_type` for which arm each sampler lands on.
+`BootstrapParams.check_hessian_declaration` is how a trainer proves it
+withdrew the constant-hessian declaration, and `check_bootstrap_honored` is
+what a trainer without the call in its loop uses instead of ignoring the
+bundle.
 
 **Read `check_mvs_reg` before touching the regularizer.** MVS's lambda is
 `mvs_reg` and has nothing to do with `lambda_l2`; it is the only floor under a
@@ -150,13 +159,23 @@ number, and setting it to 0 in CatBoost can silently train a tree on no rows.
 Row sets and the GPU
 --------------------
 A sampled row set is an ascending, duplicate-free list of row indices, and
-an empty list means "every row" everywhere in mojotrees. `contiguous_ranges`
-turns such a list into half-open `[start, end)` ranges and `row_mask` into a
-dense mask, which is what a device-side active-row pass consumes;
-`expand_row_scale` turns a (rows, scale) pair such as GOSS produces into a
-dense per-row multiplier that is zero off the sample, so a kernel that
-multiplies gradients by it reproduces the sampled histogram without gathering
-rows first.
+an empty list means "every row" everywhere in mojotrees. `check_row_set` is
+what enforces that, and it is the one function of this group with a
+production caller: `tree.grow_tree_leaves_profiled` validates the bag with it
+before the root's row list is built, and `bootstrap_round` builds its kept
+set to the same shape.
+
+**The other three row-set forms have no production caller today, and saying
+so is the point of this paragraph rather than a note to add later.**
+`contiguous_ranges` turns a row list into half-open `[start, end)` ranges,
+`row_mask` into a dense mask, and `expand_row_scale` turns a (rows, scale)
+pair such as GOSS produces into a dense per-row multiplier that is zero off
+the sample. Each is exercised by tests/test_sampling.mojo and by nothing
+else. What the device path actually consumes is the row LIST, unconverted:
+`GpuActiveRows.begin_tree(bag)` stages the bag's ids and seeds the root
+range with `len(bag)`, so no ranges and no mask are built anywhere on the
+device. A kernel that multiplied gradients by `expand_row_scale`'s vector
+would reproduce a sampled histogram without gathering rows first; none does.
 """
 
 from std.math import log, sqrt, isfinite
@@ -1858,8 +1877,14 @@ def check_bootstrap_honored(params: BootstrapParams, where: String) raises:
             where,
             ": the MVS and Bayesian draws are per-round work and this entry"
             " point's loop does not call sampling.bootstrap_round, so the fit"
-            " would be unsampled. Use boosting.train, boosting.train_more or"
-            " boosting.train_with_valid, or drop bootstrap_type",
+            " would be unsampled. The loops that do call it are the dense CPU"
+            " ones (boosting.train, train_more, train_with_valid and their"
+            " train_multiclass_* twins), the sparse CPU ones"
+            " (boosting_sparse.train_sparse, train_sparse_with_valid,"
+            " train_multiclass_sparse) and the dense single-output GPU one"
+            " (train_gpu.train_gpu); see the module docstring of sampling.mojo"
+            " for the counted list. Reach one of those, or drop"
+            " bootstrap_type",
         )
 
 
@@ -1967,10 +1992,27 @@ def catboost_default_bootstrap_type(objective: Int) raises -> Int:
     neither is a property of the objective and this function takes only the
     objective:
 
-    - `TaskType == ETaskType::CPU`. The device is the caller's, and every
-      device trainer in this package refuses a bootstrap by name. A caller
-      that resolved to the GPU asks for no bootstrap at all rather than for a
-      different one.
+    - `TaskType == ETaskType::CPU`. The device is the caller's, and the
+      caller's device does not change which type CatBoost would install: a
+      GPU-resolved fit that wants CatBoost's default wants the same MVS
+      bundle, not a different one.
+
+      **THE SENTENCE THAT STOOD HERE WAS STALE AND SAID THE OPPOSITE OF THE
+      CODE.** It read "every device trainer in this package refuses a
+      bootstrap by name. A caller that resolved to the GPU asks for no
+      bootstrap at all rather than for a different one." That was true until
+      2026-08-16 and is not true now. `train_gpu` takes a `BootstrapParams`
+      and `train_gpu._train_gpu_rounds` honors it on both arms: MVS routes to
+      the host-gradient arm, where `bootstrap_round` draws it exactly and the
+      trees still grow on the device, and the Bayesian bootstrap goes into the
+      device objective state's weight plane. `model.fit`,
+      `trainset.train_dataset` and `trainset.update_dataset` all pass the
+      bundle across. What still refuses by name is narrower and is a list, not
+      a rule: `train_multiclass_gpu`, `train_gpu_sparse` and
+      `train_multiclass_gpu_sparse` take no bundle, and `model.fit_multiclass`,
+      `model_sparse.fit_csc`, `model_sparse.fit_multiclass_csc` and
+      `trainset.train_dataset_multiclass` raise on their GPU arms rather than
+      training unsampled. Verified in source on 2026-08-17.
     - `SamplingUnit == ESamplingUnit::Object`. Per-object is the only unit
       implemented here; group sampling does not exist in
       `MvsBootstrapParams`, so the conjunct is constantly true.
@@ -2115,9 +2157,17 @@ struct BootstrapRequest(Copyable, Movable):
 
         A named request is handed on unchanged even when `honored` is False,
         so the refusal the user reads is the trainer's own -- "bootstrap_type
-        is not implemented on the GPU: train_gpu takes no bootstrap bundle..."
-        beats `check_bootstrap_honored`'s generic sentence, and duplicating
-        the routing knowledge at the boundary is how the two drift apart.
+        is not implemented on the GPU: train_multiclass_gpu takes no bootstrap
+        bundle and its round loop never draws one..." beats
+        `check_bootstrap_honored`'s generic sentence, and duplicating the
+        routing knowledge at the boundary is how the two drift apart.
+
+        **The example quoted here used to name `train_gpu`, and that was
+        stale.** `train_gpu` takes a bundle and honors it, so no such refusal
+        exists on that trainer any more; the surviving GPU refusals are
+        `model.fit_multiclass`, `model_sparse.fit_csc`,
+        `model_sparse.fit_multiclass_csc` and
+        `trainset.train_dataset_multiclass`, whose sentence is the one above.
 
         A defaulted bundle is dropped here instead, because deferring it would
         let the trainer raise on a default, and a default must never raise.
@@ -2405,8 +2455,12 @@ def contiguous_ranges(rows: List[Int], n_rows: Int) raises -> List[Int]:
     An empty `rows` is the "every row" convention and yields the single range
     `[0, n_rows)`, so a caller never has to special-case unsampled training.
     A row set that is already contiguous yields exactly one range, which is
-    the case a device-side active-row pass can iterate without an index
+    the case a device-side active-row pass could iterate without an index
     indirection at all.
+
+    **No production caller today**; tests/test_sampling.mojo is the only one.
+    The device path consumes the row list unconverted through
+    `GpuActiveRows.begin_tree`. See the module docstring.
     """
     check_row_set(rows, n_rows)
     var ranges = List[Int]()
@@ -2442,7 +2496,9 @@ def ranges_row_count(ranges: List[Int]) raises -> Int:
 
 def row_mask(rows: List[Int], n_rows: Int) raises -> List[Bool]:
     """The sampled rows as a dense mask over all `n_rows` rows. An empty
-    `rows` means every row, so the mask is all true."""
+    `rows` means every row, so the mask is all true.
+
+    **No production caller today**; see the module docstring."""
     check_row_set(rows, n_rows)
     var mask = List[Bool](capacity=n_rows)
     mask.resize(n_rows, len(rows) == 0)
@@ -2461,7 +2517,12 @@ def expand_row_scale(
     multiplying gradients and hessians by this vector over every row builds
     exactly the histogram the sample builds: the amplification and the
     exclusion travel together in one buffer, which is what a device-resident
-    kernel needs when it cannot afford to gather rows first.
+    kernel would need if it could not afford to gather rows first.
+
+    **No production caller today**; see the module docstring. The GPU trainers
+    reach a GOSS round through the host arm, where `goss.apply_goss_scaling`
+    has already folded the multiplier into `grad`/`hess` before
+    `upload_gradients`, so no dense multiplier vector is ever built.
 
     An empty `rows` is the "every row" convention and yields all ones. An
     empty `scale` with a non-empty `rows` means an unweighted sample, as

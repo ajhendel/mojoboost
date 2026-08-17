@@ -14,10 +14,65 @@ round that plain GBDT does not have.
        never rebuilds a prediction it already had.
 
 Everything is expressed over `(trees, weights, raw)`, the state a boosting
-loop already carries, plus one weight per tree that the current model
-representation does not yet have. That missing weight is the whole reason
-DART is not reachable from any public entry point; see "Model state" below
-and docs/DART.md section 10.
+loop already carries, plus one weight per tree that `Booster` does not carry.
+See "Why a weight per tree" below for what that costs and
+docs/DART.md section 10.
+
+REACHABILITY, CORRECTED 2026-08-17
+----------------------------------
+
+**Until this date the two paragraphs above and below said DART "is not
+reachable from any public entry point" and "must not be reachable from `fit`"
+until `Booster` and `serialize.mojo` carried a weight vector. Both statements
+are false at head and were false before this file was last edited.** They are
+recorded here rather than deleted because the belief they encode is the
+opposite of the shipped behavior, and a reader who remembers the old text
+needs to know it moved.
+
+What actually happens is that the weight vector never reaches a `Booster` at
+all. `alternate_boosting.fold_weights_into_trees` multiplies each tree's node
+values by that tree's weight once, at the end of the fit, and the returned
+`Booster` carries a shrinkage factor of exactly 1.0. That is LightGBM's own
+representation (`Tree::Shrinkage` scales `leaf_value_` in place and a model
+file records already-shrunk leaves), so no format bump and no weight vector on
+the model were ever needed. The route, link by link:
+
+    MojoTreesRegressor(boosting_type="dart", drop_rate=..., ...)
+      -> sklearn._params writes "boosting" and the six drop_* wire keys
+      -> bindings/_mojotrees.mojo:_parse_boosting builds DartParams.enable
+      -> bindings/_mojotrees.mojo:fit, the dart/rf fork
+      -> alternate_boosting.fit_boosting -> train_boosting -> train_dart
+      -> _dart_rounds, which calls select_drop / dart_begin_round /
+         dart_commit_round in this module
+      -> fold_weights_into_trees, then an ordinary Booster at rate 1.0
+
+It is exercised by `tests/test_alternate_boosting.mojo` (five cases, dart and
+rf, single-output and multiclass, including a save/load round trip) and by
+`python/tests/test_params.py::test_dart_and_rf_train_through_the_estimator`,
+which asserts a dart fit is not the gbdt fit. So DART is reachable, honored
+and run on the dense single-output CPU path under all three grow policies
+(`tree.grow_tree` dispatches leaf-wise, depth-wise and oblivious internally),
+and refused by name everywhere else.
+
+What is genuinely NOT reachable, per docs/design/BOOSTING_MODE_REACH.md:
+
+- Everything in this module that only `train_dart_with_valid`,
+  `train_dart_multiclass*` or `train_dart_more` reads. Those exist and are
+  correct; no binding calls them, and `sklearn._refuse_alternate_boosting`
+  refuses dart beside `eval_set`, a multiclass classifier, sparse input, a
+  callable objective, `tree_learner` and the ranker. `DartBestState`,
+  `dart_record_best`, `dart_restore_best`, `dart_advance_scores`,
+  `dart_recompute_raw` and `dart_uniform_weights` are therefore CPU-Mojo-API
+  reachable and Python-unreachable.
+- `dart_weights_are_uniform` has NO caller anywhere in the repository, tests
+  included. The fold above is why. No serializer ever sees a weight vector, so
+  nothing needs to ask whether one is informative. See its own docstring.
+
+Worth recording, because it says where the drift was. `docs/DART.md`'s status
+line has said "reachable from the estimators, from `_mojotrees.fit`, and from
+`alternate_boosting.fit_boosting`" since 2026-08-15. The prose document was
+right and this module's own header was wrong, for two days, about the module's
+own reachability.
 
 Why a weight per tree
 ---------------------
@@ -32,11 +87,18 @@ DART breaks that invariant on purpose. When a round drops k iterations, the
 new tree enters at a reduced weight and each dropped iteration is scaled
 down so that the dropped group plus the newcomer weigh about what the
 dropped group weighed alone. After one such round the ensemble holds trees
-with at least two distinct factors, and no single scalar reproduces it. So a
-DART model is not representable by today's `Booster`, cannot be written by
-today's `serialize.mojo`, and must not be reachable from `fit` until both
-carry a weight vector. This module therefore takes and returns the weight
-list explicitly rather than pretending a `Booster` could hold one.
+with at least two distinct factors, and no single scalar reproduces it
+**while the run is in progress**. This module therefore takes and returns the
+weight list explicitly rather than pretending a `Booster` could hold one.
+
+The reconciliation happens once, after the last round, and it is not this
+module's job: `alternate_boosting.fold_weights_into_trees` multiplies the
+factor into each tree's node values, which leaves a `Booster` at rate 1.0 that
+evaluates the same products. So the weight vector is training state and never
+model state. That is the whole of what "a DART model needs a weight vector"
+came to, and the version of this paragraph that concluded a DART fit had to be
+unreachable until the model format grew one was wrong; see "REACHABILITY,
+CORRECTED 2026-08-17" above.
 
 Determinism
 -----------
@@ -66,22 +128,46 @@ iteration with a probability proportional to what it currently weighs.
 That rule needs the weight vector, which is exactly the state this module
 already carries, so it costs one argument and no new bookkeeping.
 
+`uniform_drop=False` is LightGBM's default and it is NOT the default a Python
+caller gets, which is a divergence rather than a bug in this module; see the
+note on `DEFAULT_UNIFORM_DROP` below.
+
 What is deliberately refused
 ----------------------------
 
-Ranking, GPU training, and GOSS, for the reasons in
-`check_dart_supported`. Nothing about the drop rule itself is refused any
-more.
+`check_dart_supported` refuses ranking, GPU training and GOSS, with the reason
+in each case. Nothing about the drop rule itself is refused any more.
+
+Above this module, `sklearn._refuse_alternate_boosting` refuses dart beside
+sparse input, `eval_set`, a callable objective, `tree_learner`, a multiclass
+classifier and the ranker, and `bindings/_mojotrees.mojo`'s dart/rf fork
+refuses it beside `boosting_type='ordered'`, `random_strength`,
+`leaf_estimation_iterations`, `boost_from_average=false`, `ctr`, `linear_tree`
+and a non-CPU device. `params.mojo` refuses the mode outright in a parameter
+string, so the CLI and the C API cannot select it.
 
 Model state
 -----------
 
-A DART model needs, beyond what a GBDT model needs, one Float64 weight per
-tree. Prediction, iteration slicing, continued training, and serialization
-all have to read it. `dart_weights_are_uniform` exists so a consumer can
-tell a DART model that happens to be uniform (every round skipped) from one
-that is not, and so a serializer can keep writing the compact scalar form
-when the vector carries no information.
+A DART **run** needs, beyond what a GBDT run needs, one Float64 weight per
+tree, held for the duration of the fit. A DART **model** needs nothing extra,
+because `alternate_boosting.fold_weights_into_trees` folds the weights into
+the node values before the `Booster` is built. Prediction, iteration slicing
+and serialization therefore read an ordinary ensemble.
+
+Continued training is the one consumer that does need the vector and cannot
+recover it, which is why `train_dart_more` rebuilds a uniform one at rate 1.0
+(`dart_uniform_weights`) and documents that `50 + 50` rounds is not `100`.
+
+**Corrected 2026-08-17.** This section previously said a DART model needs the
+weight vector and that prediction, slicing, continued training and
+serialization all have to read it, and justified
+`dart_weights_are_uniform` as the test a serializer would use to keep the
+compact scalar form. The fold makes all four of those false, and
+`dart_weights_are_uniform` has no caller anywhere in the repository as a
+result. It is left in place rather than deleted because deleting a public
+symbol is the owner's call, not a lane's; it is dead, and this is the record
+saying so.
 """
 
 from .binning import BinnedMatrix
@@ -94,6 +180,21 @@ from .tree import Tree
 # seed, so two samplers in one run never share a stream. `uniform_drop`
 # defaults to False as it does in LightGBM: the drop probability is
 # proportional to what an iteration currently weighs (`select_drop`).
+#
+# **DEFAULT_UNIFORM_DROP IS NOT THE DEFAULT ANY PYTHON FIT RUNS UNDER, and
+# `tools/check_parity.py` gates on it as though it were.** Recorded
+# 2026-08-17. `check_parity.STOCK_COMPTIME_DEFAULTS` pairs this constant with
+# LightGBM's stock `uniform_drop: False` and passes, while
+# `python/mojotrees/sklearn.py` ships `uniform_drop=True` in the estimator
+# signature and `bindings/_mojotrees.mojo:_parse_boosting` passes that value
+# explicitly on every fit. So the constant is never read by a Python fit, the
+# gate's green light is about a value no user meets, and the divergence has no
+# entry in `check_parity.STOCK_DIVERGENCES` where `enable_bundle`'s lives. The
+# estimator docstring does state it ("uniform_drop defaults to True here"), so
+# this is an ungated divergence rather than an undocumented one. Neither
+# sklearn.py nor check_parity.py is this lane's file; the exact replacement
+# text is in this round's report and in
+# docs/design/BOOSTING_MODE_REACH.md.
 comptime DEFAULT_DROP_RATE = 0.1
 comptime DEFAULT_MAX_DROP = 50
 comptime DEFAULT_SKIP_DROP = 0.5
@@ -680,14 +781,20 @@ def dart_recompute_raw(
 
 
 def dart_weights_are_uniform(weights: List[Float64]) -> Bool:
-    """Whether every tree carries the same weight, so the ensemble is
-    representable by today's single-scalar `Booster`.
+    """Whether every tree carries the same weight.
 
     A DART run whose every round skipped lands here, and so does a
-    zero-round or one-round ensemble. A serializer uses this to keep writing
-    the compact scalar form when the vector carries nothing, and a loader of
-    an older file uses the converse: a v4 model is a uniform-weight model
-    whose scalar is its `learning_rate`.
+    zero-round or one-round ensemble.
+
+    **DEAD AT HEAD, verified 2026-08-17: no caller anywhere in the
+    repository, tests included.** The docstring this replaced said a
+    serializer uses it to keep writing the compact scalar form when the
+    vector carries nothing. No serializer does, and none can:
+    `alternate_boosting.fold_weights_into_trees` runs before the `Booster` is
+    built, so `serialize.save_model` never sees a weight vector at all and
+    the question this function answers has no asker. Kept rather than deleted
+    because removing a public symbol is the owner's decision; reported as
+    dead in docs/design/BOOSTING_MODE_REACH.md.
     """
     if len(weights) <= 1:
         return True

@@ -21,14 +21,22 @@
     "primary_metric": {"type": "string"},
     "threads": {"type": "integer", "minimum": 1},
     "engine": {
-      "enum": ["mojotrees", "lightgbm", "catboost", "mojotrees_catboost_mode"],
-      "description": "Four names, two rows. `mojotrees` against `lightgbm` is the comparator row and is the only one anything is gated on. `catboost` is a peer arm reported beside it, and `mojotrees_catboost_mode` is the mojotrees side of the second peer row, differing from `mojotrees` by exactly scenarios.MOJOTREES_CATBOOST_MODE. engines.ENGINE_ARM maps each name to subject, comparator, peer or peer_subject."
+      "enum": ["mojotrees", "lightgbm", "catboost", "mojotrees_catboost_mode", "xgboost", "mojotrees_depthwise", "mojotrees_symmetric_colsample", "mojotrees_cosine_leafwise"],
+      "description": "Eight names, and the list has been short twice: `mojotrees_depthwise` and `xgboost` were both writing records under an enum that did not admit them until 2026-08-17, which is why selfcheck.check_correctness_arms now asserts this enum equals engines.ENGINES rather than leaving it to be noticed. `mojotrees` against `lightgbm` is the comparator row and is the only one anything is gated on. `catboost` is a peer arm reported beside it and `mojotrees_catboost_mode` is our side of that pairing, differing from `mojotrees` by exactly scenarios.MOJOTREES_CATBOOST_MODE. `xgboost` is the second peer arm and `mojotrees_depthwise` is our side of that pairing, differing from `mojotrees` by exactly scenarios.MOJOTREES_DEPTHWISE, which as of 2026-08-17 is XGBoost's resolved defaults in our parameter names; a record written under that name BEFORE that date is a different arm, a one-key growth-order isolation, and the two must not be put in one series. The last two are CORRECTNESS arms added 2026-08-17 and they are a different kind of thing from every name before them: they have no peer column and are not read against anything external, because their whole product is verify.check_device_agreement comparing their own gpu row against their own cpu twin. Each covers a configuration under which a live wrong answer was found the same day, feature_fraction < 1 on the oblivious device path and score_function=Cosine under leaf-wise growth, and neither was catchable here before because no arm set either parameter off its default. engines.ENGINE_ARM maps each name to subject, subject_variant, comparator, peer or peer_subject."
     },
     "engine_version": {"type": ["string", "null"]},
     "device_requested": {"enum": ["cpu", "gpu", "auto"]},
     "device_used": {
       "type": ["string", "null"],
       "description": "What the engine resolved to, which can differ from what was asked for. The sparse path is cpu whatever was requested. A label, not evidence: it is Booster.device_, which the Python side sets from its own policy resolution while the trainer resolves the device again natively. See backend_proof."
+    },
+    "cell_role": {
+      "enum": ["measured", "oracle"],
+      "description": "What this cell is FOR, as distinct from what it is. `measured` is the default and is every cell this harness has ever produced up to 2026-08-17. `oracle` is a mojotrees arm on the cpu in a run that ALSO ran that same arm on an accelerator: it exists so that verify.py's device_agreement can compare an accelerator row against its own cpu twin row by row, and so that backend_proof's condition C has a twin digest to compare against, and it may carry fewer repeats than the measured cells because one cpu prediction per cell is all either check needs (run.py --oracle-repeats, default 1). An oracle row is timed and printed like any other and is deliberately kept out of the SPEED story: report.py leaves it out of the accuracy budget frontier ranking and out of the headline ratio table, because the GPU is the product and the cpu backend is kept as a correctness oracle and as the portability floor rather than optimized. A cpu row with no accelerator row beside it is NOT an oracle, it is the measurement. A record with no `cell_role` at all predates the field and is `measured`."
+    },
+    "cell_role_note": {
+      "type": ["string", "null"],
+      "description": "The whole oracle rule in prose, written onto every oracle record so that a results file read on its own explains why one cpu row sits beside three accelerator rows. Null on a measured cell. run.ORACLE_CELL_NOTE is the source; verify.py's ORACLE CELL block is the rule itself."
     },
     "backend_proof": {
       "type": "object",
@@ -68,6 +76,17 @@
         },
         "generator": {"type": "string"},
         "generator_kwargs": {"type": "object"},
+        "bayes_floor": {
+          "type": "object",
+          "required": ["metric", "value", "mse", "applies_to"],
+          "properties": {
+            "metric": {"type": "string"},
+            "value": {"type": "number"},
+            "mse": {"type": "number"},
+            "applies_to": {"type": "string"},
+            "source": {"type": "string"}
+          }
+        },
         "split": {"type": "object"},
         "source": {"type": "object"},
         "categorical_feature": {"type": "array", "items": {"type": "integer"}},

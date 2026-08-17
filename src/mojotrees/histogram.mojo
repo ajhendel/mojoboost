@@ -554,11 +554,20 @@ derivative is rounded anywhere between the loss and the histogram cell.
 
 **Three things it gives up, all of them stated rather than hidden.**
 
-- **The gathered pair buffer.** `_gather_pairs` packs a row's `(gradient,
-  hessian)` into one Float64 word as two Float32 halves, which is exactly
-  the thing this setting refuses. Under `float64` the gather does not run
-  and every read goes through the row id, so a node pays two indirect loads
-  per row instead of one sequential one.
+- **The PACKED gathered pair buffer, and by default the gather with it.**
+  `_gather_pairs` packs a row's `(gradient, hessian)` into one Float64 word
+  as two Float32 halves, which is exactly the thing this setting refuses.
+  So the packed *word* is genuinely unavailable here. The GATHER is not,
+  and treating the two as the same thing was a mistake worth naming,
+  because it made this the most expensive line item in a CPU fit rather
+  than a rounding error. The cost is not the one sequential pass forgone:
+  with no gather, the un-gathered row loops read both derivative arrays
+  through the row id once per (row, FEATURE GROUP), so at 100 active
+  features and width 8 a node pays **13** random-access passes over both
+  arrays, and every worker pays its own. `MOJOTREES_CPU_FLOAT64_GATHER`
+  gathers into two unconverted Float64 words per row instead, which makes
+  the other 12 sequential and cannot move a bit; it is off by default only
+  until it is measured. See `float64_gather_arm`.
 - **The row-blocked private histograms.** The blocked kernel's only row
   source is that pair buffer on the subset arm, so blocking is off under
   `float64` in *both* builders. Both, deliberately: while only one of them
@@ -1213,14 +1222,23 @@ def _check_features(features: List[Int], n_features: Int) raises:
             raise Error("feature index out of range")
 
 
-def ensure_pair_capacity(mut pairs: List[Float64], n_rows: Int):
-    """Size a gradient/hessian pair buffer for a node of `n_rows` rows.
+def ensure_pair_capacity(mut pairs: List[Float64], n_words: Int):
+    """Grow a gradient/hessian pair buffer to hold `n_words` Float64 words.
 
-    One Float64 word per row, not two. The word holds the row's `(gradient,
-    hessian)` as two Float32 halves, which is LightGBM's `score_t` precision
-    and half the bytes the pair used to cost; `score_t` above is the whole
-    argument and `_gather_pairs` is where the packing happens. The buffer
-    stays typed `List[Float64]` because its type is fixed by
+    **The caller decides how many words a row costs, because that now depends
+    on the derivative precision.** The parameter was named `n_rows` while there
+    was only one answer; it is a word count, and the two answers are:
+
+    - Packed, the shipped Float32 default: **one** word per row, holding the
+      row's `(gradient, hessian)` as two Float32 halves. This is LightGBM's
+      `score_t` precision and half the bytes the pair used to cost; `score_t`
+      above is the whole argument and `_gather_pairs` is where the packing
+      happens. Callers pass `n_sub`.
+    - Float64, behind `MOJOTREES_CPU_FLOAT64_GATHER`: **two** words per row,
+      the derivatives unconverted, because a Float64 does not fit in half a
+      word. Callers pass `2 * n_sub`.
+
+    The buffer stays typed `List[Float64]` because its type is fixed by
     `tree.GrowScratch.pairs` and by three signatures `tree.mojo` owns, and a
     Float64 word is exactly two Float32 slots.
 
@@ -1229,8 +1247,8 @@ def ensure_pair_capacity(mut pairs: List[Float64], n_rows: Int):
     later node reuses that allocation: the buffer is written before it is
     read, so stale contents beyond the current node are never observed.
     """
-    if len(pairs) < n_rows:
-        pairs.resize(n_rows, 0.0)
+    if len(pairs) < n_words:
+        pairs.resize(n_words, 0.0)
 
 
 def _zero_excluded(
@@ -2004,7 +2022,9 @@ def build_histogram_subset_into_scratch(
         )
 
 
-def _gather_pairs(
+def _gather_pairs[
+    NARROW: Bool = True
+](
     mut pairs: List[Float64],
     grad: List[Float64],
     hess: List[Float64],
@@ -2039,24 +2059,56 @@ def _gather_pairs(
     `score_t`, which is what keeps `compact_rows`, a policy decision, from
     changing a bin.
 
-    **This function has no `NARROW` parameter and never runs under
-    `derivative_precision = "float64"`.** The packing *is* the narrowing: a
-    Float64 derivative does not fit in half a Float64 word, so there is no
-    version of this that carries one. `_accumulate_subset` and
-    `_accumulate_subset_row_major` therefore leave `use_pairs` False on that
-    arm, and `DERIVATIVE_PRECISION_FLOAT64` records losing the gather as one
-    of the three things that setting costs.
+    **`NARROW` selects the word, and the two arms cost different buffers.**
+    This function used to have no parameter, on the argument that the packing
+    *is* the narrowing: a Float64 derivative does not fit in half a Float64
+    word, so there was no version of this that carried one. The first half of
+    that is still true and the conclusion was too strong. It does not fit in
+    half a word, so under `NARROW = False` it takes a **whole** word and the
+    pair takes two, `[0, 2 * n_sub)` instead of `[0, n_sub)`. Nothing about the
+    packed form changes.
+
+    - `NARROW = True`, the shipped default: one Float64 word per row holding
+      `(gradient, hessian)` as two Float32, as described above.
+    - `NARROW = False`, behind `MOJOTREES_CPU_FLOAT64_GATHER`: two Float64
+      words per row, the derivatives stored unconverted. See
+      `float64_gather_arm` for why the gather is worth having on that arm at
+      all, which is the 12 redundant random-access passes over the derivative
+      arrays that `use_pairs = False` costs, not the one pass it saves.
+
+    **Neither arm can move a bin.** The packed arm applies `score_t`, which is
+    idempotent and which every un-gathered read site also applies. The Float64
+    arm applies nothing, and `derivative[False]` is the identity, so a stored
+    and reloaded Float64 is bit-equal to the direct read it replaces. That is
+    what keeps `compact_rows`, a policy decision, from changing a bin on either
+    arm.
+
+    `_accumulate_subset_row_major` stays packed-only and passes `True`
+    explicitly: it is not the default layout, it was measured slower, and
+    widening it here would buy nothing.
+
+    ONE pointer into `pairs`, with the Float32 view taken inside the closure
+    from that same pointer. Two pointers carrying one origin into a parallel
+    closure is an aliasing error Mojo refuses to compile, which
+    `_accumulate_blocked_at` documents and works around the same way. Only one
+    arm of the `comptime if` is emitted, so the compiled closure holds a single
+    live view either way.
     """
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
-    var pairs_p = pairs.unsafe_ptr().unsafe_bitcast[Float32]()
+    var pairs_p = pairs.unsafe_ptr()
 
     def fill_pairs(start: Int, end: Int) {imm}:
+        var p32 = pairs_p.unsafe_bitcast[Float32]()
         for i in range(start, end):
             var r = rows_p.unsafe_load(i)
-            pairs_p.unsafe_store(2 * i, Float32(grad_p.unsafe_load(r)))
-            pairs_p.unsafe_store(2 * i + 1, Float32(hess_p.unsafe_load(r)))
+            comptime if NARROW:
+                p32.unsafe_store(2 * i, Float32(grad_p.unsafe_load(r)))
+                p32.unsafe_store(2 * i + 1, Float32(hess_p.unsafe_load(r)))
+            else:
+                pairs_p.unsafe_store(2 * i, grad_p.unsafe_load(r))
+                pairs_p.unsafe_store(2 * i + 1, hess_p.unsafe_load(r))
 
     dispatch_rows_with(settings, fill_pairs, n_sub, gather_ops)
 
@@ -2108,27 +2160,63 @@ def _accumulate_subset[
     # move a bin: the gather and the direct read deliver the same Float64,
     # because `score_t` is idempotent and both apply it.
     #
-    # Both of those are `float32` shapes and neither runs under `float64`.
-    # The gather's whole point is that the word it writes is two Float32, so
-    # a Float64 derivative cannot survive it; and the blocked kernel's only
-    # row source on this arm *is* that buffer. `DERIVATIVE_PRECISION_FLOAT64`
-    # states both, and `_accumulate_full` states why blocking has to go off
-    # in both builders together rather than in one.
+    # BLOCKING is a `float32` shape and does not run under `float64`: the
+    # blocked kernel's only row source on this arm *is* the packed buffer, and
+    # its two derivative reads go through a Float32 view unconditionally
+    # (`_accumulate_blocked_at`'s `g32`, and the direct arm's `score_t` applied
+    # with a comment saying the setting that would switch it cannot reach that
+    # code). `DERIVATIVE_PRECISION_FLOAT64` states it, and `_accumulate_full`
+    # states why blocking has to go off in both builders together rather than
+    # in one. That is unchanged here and `blocked` stays False below.
+    #
+    # THE GATHER IS A DIFFERENT QUESTION AND IT WAS ANSWERED WRONG. It was off
+    # under `float64` for the same reason blocking is, and the reason does not
+    # transfer: blocking needs the packed word, the gather only needs *a*
+    # contiguous buffer. Under `float64` the pair takes two Float64 words
+    # instead of half of one, and everything else about the gather holds. What
+    # leaving it off actually cost is not the one saved pass it looks like:
+    # with `use_pairs` False, `_accumulate_subset_at`'s un-gathered row loops
+    # read `grad_p.unsafe_load(r)` and `hess_p.unsafe_load(r)` through the row
+    # id once per (row, FEATURE GROUP), so at 100 active features and width 8
+    # that is 13 random-access passes over both derivative arrays per node,
+    # repeated by every worker. Gathering once makes the other 12 sequential.
+    #
+    # Behind `MOJOTREES_CPU_FLOAT64_GATHER`, default off, and off means the
+    # previous behavior exactly. `float64_gather_arm` carries the argument for
+    # why this cannot move a bin and why the read is once per node rather than
+    # in `DispatchSettings`. The read is inside the `else` arm of a comptime
+    # branch, so the shipped Float32 path does not even pay the `getenv`.
     var use_pairs = False
     var blocked = False
     comptime if NARROW:
         use_pairs = plan.compact_rows or plan.blocked()
         blocked = plan.blocked()
+    else:
+        use_pairs = plan.compact_rows and float64_gather_arm()
     if use_pairs:
-        ensure_pair_capacity(pairs, n_sub)
-    var part_off = n_sub if use_pairs else 0
+        # Words, not rows, and the two arms differ: one packed word per row
+        # against two unconverted Float64 words. See `ensure_pair_capacity`.
+        comptime if NARROW:
+            ensure_pair_capacity(pairs, n_sub)
+        else:
+            ensure_pair_capacity(pairs, 2 * n_sub)
+    # Where the row-blocked private histograms start, past whatever the gather
+    # occupies. Inert on the `float64` arm because `blocked` is False there and
+    # nothing else reads it, but kept correct rather than left at `n_sub` so a
+    # future blocked Float64 path does not silently overlap the gather.
+    var part_off = 0
+    if use_pairs:
+        comptime if NARROW:
+            part_off = n_sub
+        else:
+            part_off = 2 * n_sub
     if blocked:
         var wanted = part_off + plan.block_scratch_floats()
         if len(pairs) < wanted:
             pairs.resize(wanted, 0.0)
 
     if use_pairs:
-        _gather_pairs(
+        _gather_pairs[NARROW](
             pairs, grad, hess, rows, row_start, n_sub, plan.gather_ops,
             settings,
         )
@@ -2264,11 +2352,19 @@ def _accumulate_subset_at[
     var hess_p = hess.unsafe_ptr()
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
     var bins_all_p = data.bins.unsafe_ptr()
-    var pairs_p = pairs.unsafe_ptr().unsafe_bitcast[Float32]()
+    # ONE pointer into `pairs`, typed as the list is, with the Float32 view
+    # taken inside the closure from this same pointer. That is
+    # `_accumulate_blocked_at`'s shape and it is taken for its reason: two
+    # pointers carrying one origin into a parallel closure is an aliasing error
+    # Mojo refuses to compile. It also lets one closure serve both gather
+    # layouts, since `NARROW` selects the view at compile time and only the
+    # selected arm is emitted.
+    var pp = pairs.unsafe_ptr()
     var feat_p = features.unsafe_ptr()
     comptime W = SIMD_LANES
 
     def accumulate_groups(g_start: Int, g_end: Int) {imm}:
+        var g32 = pp.unsafe_bitcast[Float32]()
         for grp in range(g_start, g_end):
             var slot0 = grp * GROUP
             var owned = n_active - slot0
@@ -2314,8 +2410,16 @@ def _accumulate_subset_at[
                     for i_row in range(n_sub):
                         var r = rows_p.unsafe_load(i_row)
                         # The gather still interleaves (g, h); only the
-                        # gradient half is read here.
-                        var g = Float64(pairs_p.unsafe_load(2 * i_row))
+                        # gradient half is read here. The slot index is the
+                        # same on both arms because both store the pair at
+                        # `2 * i_row` and `2 * i_row + 1`; only the element
+                        # type differs, so `NARROW` selects the view and not
+                        # the arithmetic.
+                        var g = 0.0
+                        comptime if NARROW:
+                            g = Float64(g32.unsafe_load(2 * i_row))
+                        else:
+                            g = pp.unsafe_load(2 * i_row)
                         comptime for k in range(GROUP):
                             if k < owned:
                                 var b = Int(base[k]) + Int(
@@ -2339,9 +2443,19 @@ def _accumulate_subset_at[
             elif compact:
                 for i_row in range(n_sub):
                     var r = rows_p.unsafe_load(i_row)
-                    # Adjacent, so one cache line carries both.
-                    var g = Float64(pairs_p.unsafe_load(2 * i_row))
-                    var h = Float64(pairs_p.unsafe_load(2 * i_row + 1))
+                    # Adjacent, so one cache line carries both. One width-2
+                    # load rather than two scalar loads, which is the shape
+                    # `_accumulate_blocked_at`'s `STRIDE == 3` arm already
+                    # uses on the packed view; it reads the same two values in
+                    # the same order, so it cannot move a bin.
+                    var gh = SIMD[DType.float64, 2](0.0)
+                    comptime if NARROW:
+                        var p32 = g32.unsafe_load[width=2](2 * i_row)
+                        gh = SIMD[DType.float64, 2](
+                            Float64(p32[0]), Float64(p32[1])
+                        )
+                    else:
+                        gh = pp.unsafe_load[width=2](2 * i_row)
                     comptime for k in range(GROUP):
                         if k < owned:
                             var b = Int(base[k]) + Int(
@@ -2349,9 +2463,7 @@ def _accumulate_subset_at[
                             )
                             var p = b << 1
                             ghp.unsafe_store(
-                                p,
-                                ghp.unsafe_load[width=2](p)
-                                + SIMD[DType.float64, 2](g, h),
+                                p, ghp.unsafe_load[width=2](p) + gh
                             )
                             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
             else:
@@ -2496,6 +2608,19 @@ def serial_kernel_arm() -> Int:
     An unrecognized value is the default rather than an error, because this
     variable is a measurement knob and a benchmark that dies three hours into
     a window on a typo is worse than one that runs the shipped kernel.
+
+    **Where it reaches, and the two places it does not.** The only caller is
+    `_accumulate_blocked_at`, and that kernel is the ROW-BLOCKED
+    FEATURE-MAJOR one,
+    reached from `_accumulate_full_blocked` and from `_accumulate_subset`'s
+    blocked ladder. All three growth policies reach it on the same terms.
+    It does not reach the unblocked ladder (`_accumulate_full_at`,
+    `_accumulate_subset_at`), which is what a node below the amortization
+    floor runs, so at 255 bins and the shipped 8/1 ratio a node under 8,160
+    rows measures nothing here. It does not reach either row-major kernel
+    either. An arm swept over a shape whose nodes are mostly small, or swept
+    with `MOJOTREES_CPU_BIN_LAYOUT=row`, is measuring the shipped kernel on
+    both sides of the comparison.
     """
     var s = getenv("MOJOTREES_CPU_SERIAL_KERNEL")
     if s == "base":
@@ -2505,6 +2630,65 @@ def serial_kernel_arm() -> Int:
     if s == "packed":
         return SERIAL_KERNEL_PACKED
     return SERIAL_KERNEL_FULL
+
+
+def float64_gather_arm() -> Bool:
+    """Whether the Float64 derivative path gathers its pairs once per node,
+    from `MOJOTREES_CPU_FLOAT64_GATHER`. Off unless set to `1`.
+
+    **What it fixes.** Under `derivative_precision = "float64"` the gather is
+    off, because the gather's word is two Float32 and a Float64 derivative does
+    not fit in half of one (`_gather_pairs`). Losing it is recorded as one of
+    the costs of that setting. But the cost is larger than "one pass saved":
+    with `use_pairs` False, `_accumulate_subset_at`'s un-gathered row loop
+    reads `grad_p.unsafe_load(r)` and `hess_p.unsafe_load(r)` through the row
+    id **once per (row, feature group)**. At 100 active features and group
+    width 8 that is 13 random-access passes over both derivative arrays per
+    node, and every worker makes its own. Gathering once into a contiguous
+    two-Float64-per-row buffer makes the other 12 passes sequential.
+
+    **It cannot move a bin, which is what separates it from the row-blocking
+    knobs beside it.** `env_row_block_amortize` moves bits and says so, because
+    a block count is a summation order. This changes no order and no value: the
+    same rows are visited in the same sequence, the same groups accumulate in
+    the same sequence, and a Float64 stored and loaded back is the same Float64
+    (`derivative[False]` is the identity, so the gathered and un-gathered reads
+    deliver bit-equal values). It is therefore a pure performance A/B and needs
+    no golden regeneration, and the default is off only so that nothing
+    published moves before it is measured.
+
+    Read once per accumulation, which is once per node histogram build, and
+    never inside a row loop. The cost argument and the reason this is not
+    carried in `DispatchSettings` are `serial_kernel_arm`'s directly above,
+    unchanged and for the same reasons: a field there would touch every
+    construction of `ResolvedCpuPolicy`, in files other lanes are in. Under
+    Float32 this function is not called at all, because that arm's gather
+    decision is a comptime `NARROW` branch that never reaches here, so the
+    shipped default pays not even the read.
+
+    An unrecognized value is off rather than an error, matching
+    `serial_kernel_arm`: this is a measurement knob and a window that dies on a
+    typo is worse than one that runs the shipped path.
+
+    **Where it reaches, stated so that a null is not read as a result.** One
+    call site, `_accumulate_subset`'s `else` arm, which is the FEATURE-MAJOR
+    subset builder under `float64`. It is the same on all three growth
+    policies, because every grower reaches that builder through
+    `tree._hist_subset`. It does not reach two other builds and cannot.
+
+    - **The row-major subset builder.** `_accumulate_subset_row_major` has no
+      `else` arm at all, so under `float64` its `use_pairs` is unconditionally
+      False. Setting this variable together with
+      `MOJOTREES_CPU_BIN_LAYOUT=row`, or with
+      `MOJOTREES_CPU_LAYOUT_BY_NODE=1` on a node that does not block, changes
+      nothing about that node's build. Nothing is wrong with those histograms;
+      the switch is simply inert there.
+    - **The whole-dataset builder.** `_accumulate_full` never gathers on
+      either precision, because it reads the derivative arrays sequentially
+      and has no row ids to gather through, so the root of an unbagged tree is
+      outside this switch on every policy.
+    """
+    return getenv("MOJOTREES_CPU_FLOAT64_GATHER") == "1"
 
 
 def serial_kernel_arm_name(arm: Int) -> String:
@@ -3924,12 +4108,29 @@ def _accumulate_subset_row_major[
     # idempotent and both the gather and the direct read apply it, so the two
     # deliver the same Float64.
     #
-    # Both are off under `float64`, for the reasons `_accumulate_subset`
-    # gives: the gathered word is two Float32, and this kernel's blocked arm
-    # reads nothing else -- `_accumulate_subset_row_major_blocked` is not even
-    # handed `grad` and `hess`. So the `float64` arm is the unblocked,
-    # ungathered ladder, exactly as on the feature-major side, which is what
-    # keeps the two layouts producing the same histogram under either setting.
+    # Both are off under `float64`. Blocking is off for the reason
+    # `_accumulate_subset` gives and that reason still holds, since the
+    # gathered word is two Float32 and this kernel's blocked arm reads
+    # nothing else. `_accumulate_subset_row_major_blocked` is not even handed
+    # `grad` and `hess`.
+    #
+    # THE GATHER IS NO LONGER THE SAME ON BOTH SIDES, and this comment used to
+    # say it was. `_accumulate_subset` now consults
+    # `MOJOTREES_CPU_FLOAT64_GATHER` in its `else` arm and will gather under
+    # `float64` when asked; the `comptime if NARROW` below has no `else`, so
+    # this layout never does, at any setting of that variable. That is a
+    # deliberate scope and not an oversight: row-major is not the shipped
+    # layout, forcing it measured slower on this machine, and its kernels read
+    # a Float32 view unconditionally, so the gathered word would have to be
+    # retyped here before the switch could mean anything.
+    #
+    # **The two layouts still produce the same histogram under either
+    # setting**, which is the property this paragraph exists to protect, and
+    # it no longer rests on the two arms agreeing about the gather. It rests
+    # on the gather being unable to move a cell at all: gathered and direct
+    # reads deliver the same Float64, so a build that gathers and a build that
+    # does not add the same value into the same bin. `float64_gather_arm`
+    # carries that argument in full.
     var use_pairs = False
     var blocked = False
     comptime if NARROW:
@@ -3940,7 +4141,14 @@ def _accumulate_subset_row_major[
 
     if not blocked:
         if use_pairs:
-            _gather_pairs(
+            # `True` explicitly, not by default. The row-major layout stays
+            # packed-only: it is not the shipped layout, forcing it measured
+            # slower on this machine, and its kernel reads a Float32 view
+            # unconditionally. `use_pairs` is False here under `float64`
+            # anyway, so this arm is unreachable on that precision; the
+            # parameter is spelled so that a later change to `_gather_pairs`'s
+            # default cannot quietly retype this buffer.
+            _gather_pairs[True](
                 pairs, grad, hess, rows, row_start, n_sub, plan.gather_ops,
                 settings,
             )
@@ -3989,8 +4197,9 @@ def _accumulate_subset_row_major[
     if len(pairs) < wanted:
         pairs.resize(wanted, 0.0)
     # After the resize, so the gather is not written into a buffer that is
-    # about to be reallocated.
-    _gather_pairs(
+    # about to be reallocated. `True` explicitly for the reason given at the
+    # other row-major gather above: this layout is packed-only.
+    _gather_pairs[True](
         pairs, grad, hess, rows, row_start, n_sub, plan.gather_ops, settings,
     )
     _accumulate_subset_row_major_blocked(

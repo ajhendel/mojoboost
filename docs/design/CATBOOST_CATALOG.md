@@ -5582,7 +5582,7 @@ enumeration, after this lane, with the routing that decides each:
 
 | line | entry point | routes to | verdict |
 |---|---|---|---|
-| ~1116 | `fit` | `model.fit` -> `boosting.train` on the CPU, `train_gpu` on the GPU | `device == CPU_DEVICE`, **unchanged**, plus two new named refusals for the forks below |
+| ~2021 | `fit` | `model.fit` -> `boosting.train` on the CPU, `train_gpu` on the GPU | **`True`, widened 2026-08-17.** This row read "~1116 ... `device == CPU_DEVICE`, **unchanged**" until then, plus two new named refusals for the forks below |
 | ~1285 | `distributed_train_local` | `distributed.train_local_world`; `distributed_strategies` calls `split.find_best_split` itself | False. Computes no scale |
 | ~1334 | `fit_custom` | `model.fit_custom` -> `objective.train_custom`'s own loop | False. Computes no scale |
 | ~1443 | `fit_with_metrics` | `custom_metric.fit_with_metrics`, a different loop from `boosting.train_with_valid` | False. Computes no scale |
@@ -5592,7 +5592,7 @@ enumeration, after this lane, with the routing that decides each:
 | ~2005 | `fit_csc` | `model_sparse.fit_csc` -> `boosting_sparse.train_sparse` | False. No sparse loop computes a scale |
 | ~2043 | `fit_multiclass_csc` | `model_sparse.fit_multiclass_csc` | False. Sparse and multiclass |
 | ~2209 | `fit_ranker` | `ranking` / `ranking_advanced` loops | False. Computes no scale |
-| ~3520 | `train_dataset` | `trainset.train_dataset`: sparse -> `train_sparse`; dense+GPU -> `train_gpu`; **dense+CPU -> `boosting.train`** | **CHANGED to `device == CPU_DEVICE and not d[].is_sparse`.** This is the entry `bench/real_data` trains through |
+| ~4978 | `train_dataset` | `trainset.train_dataset`: sparse -> `train_sparse`; dense+GPU -> `train_gpu`; **dense+CPU -> `boosting.train`** | **`scale_is_computed`, which is `not d[].is_sparse` and nothing else, widened 2026-08-17.** This row read "~3520 ... CHANGED to `device == CPU_DEVICE and not d[].is_sparse`" until then. This is the entry `bench/real_data` trains through |
 | ~3555 | `train_dataset_multiclass` | `trainset.train_dataset_multiclass` | False. Multiclass |
 | ~3581 | `train_dataset_ranker` | `trainset.train_dataset_ranker_advanced` | False. Ranking |
 | ~3610 | `booster_update` | `trainset.update_dataset` -> `boosting.train_more` -> `_boost_rounds` | **CHANGED to True.** Refuses sparse itself, takes no device |
@@ -5600,10 +5600,20 @@ enumeration, after this lane, with the routing that decides each:
 
 Two things in that table are worth more than the flags.
 
-**`train_dataset` needed a conjunction, not a device test.** A sparse dataset
-resolves its device to the CPU like any other, so `device == CPU_DEVICE` alone
-would have declared `boosting_sparse.train_sparse` honored. The fork is settled
-by `d[].is_sparse` as well.
+**`train_dataset` needed a sparse test, and the device half of it was wrong.**
+**This paragraph said something else until 2026-08-17.** It read that
+`train_dataset` "needed a conjunction, not a device test", because a sparse
+dataset resolves its device to the CPU like any other, so
+`device == CPU_DEVICE` alone would have declared
+`boosting_sparse.train_sparse` honored. The sparse half of that is right and
+still stands. The device half was a defect the same size as the one in
+`params.mojo`: `trainset.train_dataset`'s GPU arm is `train_gpu`, whose two
+round arms both compute `random_score_scale`, so the device test refused a
+parameter the accelerator honors. Both flags were widened on 2026-08-17, `fit`
+to `True` and `train_dataset` to `not d[].is_sparse`, and the reason is written
+at those call sites. `docs/design/RANDOM_STRENGTH_UNITS.md` section 2 records
+the same removal on the `params.mojo` side and names these two as the surfaces
+that had already retired the test.
 
 **`fit` was already too wide, and this lane narrowed it by refusal rather than
 by flag.** `fit` forks three ways on the CPU: `boosting='dart'`/`'rf'` go to

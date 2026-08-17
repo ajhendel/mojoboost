@@ -351,8 +351,11 @@ from .gpu_resident_round import (
     grow_tree_device_resident,
     oblivious_device_supported,
     oblivious_leaf_budget,
+    oblivious_noise_hoist_requested,
     oblivious_reason_name,
     oblivious_records_needed,
+    oblivious_schedule_launches,
+    oblivious_skip_last_build_requested,
     resident_round_enabled,
     resident_round_reason_name,
     resident_round_record_slots,
@@ -388,6 +391,7 @@ from .linear_tree import check_linear_tree_unconnected
 from .phase_profile import (
     PARTITION_LAUNCHES,
     PROF_CONVERT,
+    PROF_DEVICE_PLANE,
     PROF_GRAD_FILL,
     PROF_HISTOGRAM,
     PROF_HOST_SYNC,
@@ -429,6 +433,23 @@ from .sampling import (
     select_tree_features,
 )
 from .split import SCORE_L2, SplitInfo
+
+
+def _reachable_leaves(params: TreeParams) -> Int:
+    """The leaf count this fit can actually reach.
+
+    `num_leaves` is the leaf-wise and depth-wise bound and does NOT bind under
+    `grow_policy=oblivious`, where the shape fixes the count at `2^max_depth`.
+    `oblivious_leaf_budget` is the authority on that and `_state_max_nodes`
+    below is the node-count twin of this function; read its docstring for what
+    sizing a table from `num_leaves` cost.
+
+    Added 2026-08-17 for the reporting and policy sites, which took the raw
+    parameter and so described a symmetric depth-6 fit as having 31 leaves.
+    """
+    if params.grow_policy == GROW_OBLIVIOUS:
+        return oblivious_leaf_budget(params)
+    return params.num_leaves
 
 
 def _state_max_nodes(params: TreeParams) -> Int:
@@ -529,7 +550,10 @@ from .growth_policy import (
     LeafCandidate,
     check_grow_policy,
 )
-from .gpu_leaf_batching import OBLIVIOUS_MAX_ITEMS
+from .gpu_leaf_batching import (
+    OBLIVIOUS_MAX_ITEMS,
+    oblivious_subtract_requested,
+)
 from .tree import Tree, TreeParams, _leaf_value, _search, node_bounds
 from .tree_parameters_extra import ExtraTreeParams, model_size_decrease
 from std.math import sqrt
@@ -754,11 +778,19 @@ def split_search_decision_for(
         builder.n_rows,
         _estimated_active_features(params, builder.n_features),
         builder.n_bins,
-        params.num_leaves,
+        # The leaf count this fit can actually reach, not the parameter.
+        # `num_leaves` does not bind under oblivious growth, so a symmetric
+        # depth-6 fit reported and reasoned about 31 leaves for a 64-leaf tree.
+        # Corrected 2026-08-17. Trace-only in effect, because
+        # `grow_tree_gpu_profiled` routes GROW_OBLIVIOUS straight to
+        # `_grow_tree_gpu_device_search` and never consults this decision, but a
+        # resolved value that is wrong is a trap for the next reader and the
+        # sibling sites that WERE consulted raised.
+        _reachable_leaves(params),
         _device_search_semantics_supported(
             params, builder.cats.any_categorical()
         ),
-        builder.resident_frontier_fits(params.num_leaves),
+        builder.resident_frontier_fits(_reachable_leaves(params)),
         params.grow_policy,
     )
 
@@ -826,7 +858,7 @@ def describe_split_search(
         " bins=",
         builder.n_bins,
         " leaves=",
-        params.num_leaves,
+        _reachable_leaves(params),
     )
 
 
@@ -1148,6 +1180,22 @@ def _search_record_slots(params: TreeParams, n_features: Int) -> Int:
         # the leaf-wise branch's own comment warns about: a capacity decision
         # made from a different question than the routing decision.
         var want = oblivious_records_needed(params)
+        # One level record per level instead of one shared one, when the noise
+        # hoist is armed, so that every level's `random_strength` plane can be
+        # resident at once and cross in a single copy. `max_depth` more
+        # records and never fewer, since `oblivious_records_needed` is
+        # `budget + 1` and `max_depth >= 1`.
+        #
+        # Asked for here rather than folded into `oblivious_records_needed`
+        # deliberately: that function is the plane's *requirement*, checked by
+        # `_oblivious_route_reason` and again inside the grower, and a
+        # requirement that moved with an environment variable would make the
+        # switch able to refuse a fit. This is a capacity request, the clamps
+        # below may cut it back on a very wide dataset, and
+        # `grow_tree_device_oblivious` tests the searcher it was handed rather
+        # than the switch before it uses the extra records.
+        if oblivious_noise_hoist_requested():
+            want = oblivious_leaf_budget(params) + params.max_depth
         if want > MAX_LEVEL_RECORDS:
             want = MAX_LEVEL_RECORDS
         var ob_width = n_features if n_features > 0 else 1
@@ -1214,6 +1262,19 @@ struct _GpuPendingSplit(Movable):
     var right_bounds: OutputBounds
     var left_slot: Int
     var right_slot: Int
+    var left_rec: Int
+    """Which record of the batch's download holds the left child's answer, or
+    -1 when no search was staged for it.
+
+    -1 only under `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`, where a child the
+    shape rules will refuse anyway has no request in the batch. The pairing
+    used to be positional -- `recs[2 * k]` and `recs[2 * k + 1]` -- and a
+    positional pairing cannot survive a batch that skips a request, so the two
+    indices are carried explicitly and the shipped arm sets them to exactly the
+    positions the positional rule computed."""
+    var right_rec: Int
+    """The right child's position in the batch's download, or -1. See
+    `left_rec`."""
 
     def __init__(
         out self,
@@ -1228,6 +1289,8 @@ struct _GpuPendingSplit(Movable):
         var right_bounds: OutputBounds,
         left_slot: Int,
         right_slot: Int,
+        left_rec: Int = -1,
+        right_rec: Int = -1,
     ):
         self.index = index
         self.left_node = left_node
@@ -1240,6 +1303,8 @@ struct _GpuPendingSplit(Movable):
         self.right_bounds = right_bounds^
         self.left_slot = left_slot
         self.right_slot = right_slot
+        self.left_rec = left_rec
+        self.right_rec = right_rec
 
 
 def _apply_shape_rules(
@@ -1298,6 +1363,16 @@ def _search_leaf_device(
         builder.g_scale,
         builder.h_scale,
         bounds,
+        # **SUPPLIED, NOT DEFAULTED**, and the default was a raise rather than
+        # a wrong number. `GpuSplitSearcher.enqueue` stages this node's
+        # `random_strength` plane from this argument whenever the noise is on,
+        # and `stage_random_score` refuses a negative node id, so leaving it at
+        # its -1 default made every incremental-loop fit with `random_strength`
+        # set fail with "random_strength keys its draw by node id, which must
+        # be nonnegative". Read by that one rule and by nothing else
+        # (`SplitNodeRequest.node`), so passing it moves no bit of any fit that
+        # runs today with the noise off.
+        node=node,
     )
     var rec = searcher.download()
     _apply_shape_rules(rec, n_rows, depth, params)
@@ -1566,8 +1641,137 @@ def resident_frontier_disabled() -> Bool:
     the two device-search loops can be compared on one machine in one thermal
     state, which is the comparison the resident loop was written to win, and
     so a run that hits a slot-pool problem has somewhere to go that is not
-    "use the host scan". Unset, the resident loop runs wherever it fits."""
+    "use the host scan". Unset, the resident loop runs wherever it fits.
+
+    **It is read on the `grow_policy = oblivious` route as well, where there is
+    nothing to fall back to**, so `MOJOTREES_GPU_SPLIT_RESIDENT=0` does not
+    slow a symmetric GPU fit down, it fails it. See the refusal in
+    `_grow_tree_gpu_device_search`, which now names this variable rather than
+    reporting the pool it closed."""
     return getenv("MOJOTREES_GPU_SPLIT_RESIDENT") == "0"
+
+
+comptime SKIP_TERMINAL_CHILDREN_VAR = "MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN"
+"""`1` stops `_device_search_resident` from building and searching a child that
+the shape rules will refuse. Anything else, including unset, builds and
+searches every child, which is what ships.
+
+**Off by default, spelled as an equality against "1", because nothing has
+measured it.** That is the spelling this repository reserves for an unmeasured
+arm; the measured arms read as inequalities against "0".
+
+WHAT IT IS
+----------
+The general twin of `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD`, which is the
+same removal on the symmetric plane and measured **1.26x** there on
+2026-08-17. That switch is stated to be structural to a fixed-depth tree, on
+the grounds that only such a tree has a known last level whose children are
+never searched. Half of that is right. What is actually needed is not a known
+last LEVEL but a known terminal CHILD, and this loop has one for every split it
+enqueues, under every growth policy, before it enqueues anything:
+
+    `_apply_shape_rules` refuses a record when
+        `params.max_depth > 0 and depth >= params.max_depth`
+    or when
+        `n_rows < 2 * params.min_data_in_leaf or n_rows < 2`
+
+and every input to both tests is known at `_enqueue_resident_split` time. The
+depth is the parent's plus one; the two row counts are exact integers off the
+parent's record (`GpuSplitRecord.left.count`, `.right.count`), which is the
+same arithmetic `subtraction_builds_left` is already choosing the built child
+by. Nothing here is predicted or bounded.
+
+A child that fails either test is refused for the whole of the rest of the
+tree. `_apply_shape_rules` clears `found`, `LeafCandidate.eligible` is
+`rec.found and rec.gain > 0.0`, and every path through `GrowthSchedule` --
+`next_leaf` under leaf-wise, `rank_level` and `admit_level` under depth-wise --
+reads a candidate's `gain` only after its `eligible`. So the child's record is
+read for two words that are already decided, and its histogram is read by
+nothing at all: the only reader of a leaf's histogram slot is that leaf's own
+search.
+
+WHAT IT REMOVES
+---------------
+Per split, by case, where "built" is the smaller child
+(`subtraction_builds_left`) and "derived" is the sibling the subtraction folds
+out of the parent in the same kernel:
+
+- **both children terminal**: the histogram build goes entirely (a slot zeroing
+  and an accumulation over the built child's rows), the slot acquisition goes,
+  and both search records go. The parent's slot is released instead of being
+  reassigned, so the pool ends the split with two more free slots than it would
+  have had.
+- **one terminal**: the build stays, because the derived child still needs its
+  sibling accumulated to be subtracted from the parent, and one search record
+  goes.
+
+A batch whose every request was skipped enqueues no search launch pair and
+makes no `download_frontier`, which is one whole round trip removed. Under
+depth-wise growth with `max_depth` binding, that is exactly the last level: one
+of the seven round trips a depth-wise tree makes today, and the whole of the
+last level's histogram accumulation.
+
+WHAT IT CANNOT CHANGE
+---------------------
+Not a bit of any tree, and the argument has three legs.
+
+1. **The leaf values do not come from the child's record.**
+   `_commit_device_split` writes `tree.value[left_node]` and
+   `tree.value[right_node]` from the PARENT's `rec.left_value` and
+   `rec.right_value`. A child's own record supplies its split, and a terminal
+   child has none.
+2. **The decisions do not read the skipped words.** A skipped child is filed
+   with `GpuSplitRecord()`, which is documented as "the absence of a split,
+   with zero statistics" and carries `found = False`. `_apply_shape_rules` is
+   still applied to it, and would have set the same `found = False` on the real
+   record. Its `gain` is 0.0 where the real record's was some positive number,
+   and no reader reaches either: both schedules gate on `eligible` first.
+3. **The permutation does not move.** `builder.apply_split` still runs for
+   every split, so the row windows the trainer reads back to advance its raw
+   scores are the ones they always were. Only the histogram of a leaf nobody
+   searches is not built.
+
+The pool-slot numbers a later leaf is handed DO move, because the pool has
+different slots free. That is not a numeric change:
+`grow_tree_device_resident`'s claim 3 is that a histogram is the same histogram
+wherever it lives, and the search reads the slot it is told."""
+
+
+def skip_terminal_children_enabled() -> Bool:
+    """Whether a child the shape rules will refuse is skipped rather than built
+    and searched.
+
+    Read once per tree rather than per split, for the reason
+    `gpu_resident_round.resident_trace_sink` states: a variable does not change
+    inside a fit, and reading one inside a growth loop is how such a loop
+    quietly becomes slow."""
+    return getenv(SKIP_TERMINAL_CHILDREN_VAR) == "1"
+
+
+def _child_is_terminal(n_rows: Int, depth: Int, params: TreeParams) -> Bool:
+    """Whether `_apply_shape_rules` will clear `found` on this child's record
+    whatever the search returns.
+
+    **The same two tests, in the same order, over the same inputs**, and it is
+    written as a second function rather than by calling the first because the
+    first takes a record that does not exist yet.
+
+    **That is a duplication and it has a real drift hazard**, so the rule is
+    stated rather than left to be noticed: a condition added to
+    `_apply_shape_rules` belongs here in the same commit. The two directions
+    are not equally bad, which is worth saying because it decides which way to
+    err. A condition there and not here costs a build and a search that the
+    switch could have removed, which is a performance loss. A condition here
+    and not there would skip a child the schedule would have gone on to split,
+    which is a wrong tree. So this function must stay a subset of that one, and
+    it is `_apply_shape_rules` that has the final word: it still runs on every
+    record, including the synthesized ones.
+    """
+    if params.max_depth > 0 and depth >= params.max_depth:
+        return True
+    if n_rows < 2 * params.min_data_in_leaf or n_rows < 2:
+        return True
+    return False
 
 
 def _node_features(
@@ -1749,6 +1953,20 @@ struct GpuSplitSearcherCache(Movable):
             self.signs = signs.copy()
             self.signs_staged = True
         self.searchers[0].set_features(tree_features)
+        # The other half of the 2026-08-17 Cosine fix. `set_score_function`
+        # had NO production caller anywhere in the package, only one test, so
+        # `score_function_code` stayed at its constructed `SCORE_L2` and every
+        # leaf-wise device fit scored with L2 however it was configured. The
+        # matching half is in `gpu_resident_round._launch_child_search`, which
+        # was calling `_launch_search` without naming the argument and so took
+        # its `SCORE_L2` default. Both halves are needed: setting the code with
+        # nobody reading it, or reading a code nobody sets, each leaves the bug.
+        #
+        # Here rather than at construction because the searcher is reused
+        # across trees and only rebuilt when a shape changes, so a value set
+        # once at construction would survive a parameter change that this
+        # per-tree reset is supposed to pick up.
+        self.searchers[0].set_score_function(params.extra.score_function)
 
 
 def _oblivious_route_reason(
@@ -1871,37 +2089,60 @@ def _grow_tree_gpu_device_search(
     # the property to preserve: `set_random_score(0.0, ...)` would also be
     # correct but would walk `max_records` slots per tree for nothing.
     #
-    # **NOT REACHED BY ANY FIT TODAY, AND THAT IS DELIBERATE.**
-    # `_check_device_search_supported` above refuses `params.extra.is_active()`
-    # and `random_strength > 0.0` is one of its arms, so this line is dead
-    # until that gate is split into "needs a gain adjustment" and "the device
-    # search cannot express this", which is another session's edit. The order
-    # is not negotiable: the plane is wired first so the gate's removal is
-    # earnable, because a gate that stops declining before the plane is staged
-    # trains every default GPU fit with no split noise while the CPU trains
-    # with it -- no error, no record, two different models under one default.
-    # The second link this used to name as missing is now wired, and the note
-    # is kept rather than deleted because the ORDER it states is still the
-    # live constraint. It said no GPU round loop computes
-    # `ExtraTreeParams.random_score_scale`, so the product was zero on every
-    # fit. Both arms of `_train_gpu_rounds` compute it now: the host-gradient
-    # arm through `boosting._round_random_score_scale` from the round's
-    # user-weighted derivatives before any sampler rewrites them, and the
-    # device-gradient arm through `_device_round_random_score_scale` from
-    # `GpuObjectiveState.derivative_sum_squares`, reduced on the device.
+    # **REACHED. The "NOT REACHED BY ANY FIT TODAY" note that stood here was
+    # WRONG, and it was wrong about a gate that had already been split.**
     #
-    # So the product reaching this line is nonzero for a fit that sets
-    # `random_strength` -- but this line is STILL not reached, because
-    # `_check_device_search_supported` above refuses `params.extra.is_active()`
-    # and that gate has not been split yet. The plane is staged and the scale
-    # exists; what remains is the gate, which is the order this note demanded
-    # and the order that is now satisfiable rather than blocking.
+    # It said `_check_device_search_supported` above refuses
+    # `params.extra.is_active()` and that `random_strength > 0.0` is one of its
+    # arms, so this line was dead. Neither half survives a read of the call
+    # graph as it stands. Traced 2026-08-17, every link checked:
     #
-    # `ExtraTreeParams.check_scalars` still says "the device loops do not
-    # compute it and this refusal is correct for them". That sentence is now
-    # false and is on the list to correct with the gate split, not before:
-    # correcting a refusal's stated reason while the refusal still fires is
-    # what this file did twice today.
+    # 1. `_check_device_search_supported` no longer reads `is_active()` at all.
+    #    It calls `params.extra.check_scalars(min_data_in_leaf,
+    #    scale_computed_per_tree=True)` and then
+    #    `_device_search_unsupported_reason`.
+    # 2. `check_scalars` refuses a positive `random_strength` only beside a
+    #    zero scale AND `scale_computed_per_tree=False`. This caller passes
+    #    True, so it does not refuse.
+    # 3. `_device_search_unsupported_reason` delegates to
+    #    `ExtraTreeParams.device_unsupported_reason`, whose `random_strength`
+    #    arm is `if has_categorical and self.random_strength > 0.0`. With no
+    #    categorical column it returns the empty string.
+    # 4. `_device_search_semantics_supported` is the question form of the same
+    #    predicate, so AUTO routes such a fit ONTO the device search rather
+    #    than away from it.
+    # 5. Both arms of `_train_gpu_rounds` write `random_score_scale` onto the
+    #    round's own copy of the bundle before growth -- the host-gradient arm
+    #    through `boosting._round_random_score_scale` from the round's
+    #    user-weighted derivatives before any sampler rewrites them, the
+    #    device-gradient arm through `_device_round_random_score_scale` over
+    #    `GpuObjectiveState.derivative_sum_squares`. So the product below is
+    #    nonzero for a fit that sets the parameter.
+    #
+    # So a fit with `random_strength > 0`, `device='gpu'` and no categorical
+    # column reaches this line and stages the plane. That is the state
+    # `docs/design/OBLIVIOUS_WAIT_CENSUS.md` rests its
+    # `GpuSplitSearcher._copy_noise` finding on, and the census is right.
+    #
+    # `ExtraTreeParams.check_scalars` no longer says "the device loops do not
+    # compute it and this refusal is correct for them" either; its message now
+    # names both arms of `_train_gpu_rounds` as computing one. The note that
+    # stood here was stale on that too. What made all three sentences stale is
+    # what this file's own docstrings warn about: a comment about a refusal
+    # goes wrong when the refusal is retired somewhere else, and nothing
+    # re-reads it.
+    #
+    # WHAT IS STILL BROKEN, so this is not read as an all-clear. The staging
+    # below reaches the DEVICE-OWNED leaf-wise plane
+    # (`gpu_resident_round.grow_tree_device_resident`, whose
+    # `_launch_child_search` supplies a node id) and the symmetric plane
+    # (`grow_tree_device_oblivious`, keyed by level depth). Until 2026-08-17 it
+    # did NOT reach `_device_search_resident` or `_device_search_incremental`,
+    # which built every `SplitNodeRequest` without a node id: those two raised
+    # "random_strength keys its draw by node id, which must be nonnegative"
+    # rather than growing a tree, which took out every depth-wise GPU fit with
+    # the parameter set. Both now pass the node id they already hold. See
+    # `_enqueue_resident_split` and `_search_leaf_device`.
     if params.extra.random_score_stdev() > 0.0:
         cache.searchers[0].set_random_score(
             params.extra.random_score_stdev(),
@@ -1931,9 +2172,33 @@ def _grow_tree_gpu_device_search(
         # that arithmetic lives and `tree._check_oblivious` says the same thing
         # on the host.
         var budget = oblivious_leaf_budget(params)
+        # **`MOJOTREES_GPU_SPLIT_RESIDENT=0` DOES NOT SLOW A SYMMETRIC FIT
+        # DOWN, IT FAILS IT**, and it is named here rather than being reported
+        # as the pool it closed. That variable's stated job is to force the
+        # incremental loop where the resident one would have fit, which is a
+        # measurement handle on the leaf-wise route. There is no incremental
+        # symmetric grower to force, so on this route it only removes the one
+        # grower there is: `opened` comes back False, `_oblivious_route_reason`
+        # answers `RESIDENT_NO_POOL`, and the caller was handed "no resident
+        # pool or tree tables" for a pool that was never asked to open.
+        #
+        # Reported rather than ignored. A bench operator sweeping arms across
+        # growth policies sets this variable once and gets a hard failure on
+        # one arm, and the difference between a message that names the variable
+        # and one that names a pool is the difference between a thirty-second
+        # fix and an afternoon. Whether this route should ignore the variable
+        # outright is a behavior change and therefore a measured decision;
+        # this is not one.
+        if resident_frontier_disabled():
+            raise Error(
+                "MOJOTREES_GPU_SPLIT_RESIDENT=0 closes the resident slot pool,"
+                " and grow_policy=oblivious has no other grower on this"
+                " backend to fall back to: the variable forces the incremental"
+                " split loop, which grows leaf-wise trees only. Unset it for a"
+                " symmetric GPU fit, or pass device='cpu'"
+            )
         var opened = (
-            not resident_frontier_disabled()
-            and budget >= 2
+            budget >= 2
             and builder.open_resident(budget, OBLIVIOUS_MAX_ITEMS)
             and builder.open_resident_tables(budget)
         )
@@ -1975,6 +2240,100 @@ def _grow_tree_gpu_device_search(
         # round trip per tree, `download_desc_tables` at the end, and no clock
         # inside a loop whose whole claim is that it does not wait.
         profile.charge(PROF_TRANSFER, n_root, 0, syncs=1)
+        # AND TIMED AS ONE OPAQUE PHASE, which is new on 2026-08-17 and is a
+        # correction to what the previous bracket let a reader conclude.
+        #
+        # The previous bracket charged the transfer above and nothing else, so
+        # the tree's whole wall time landed in the report's `unattributed_ns`
+        # remainder and the totals line read `nodes=0 dispatches=0`. A reader
+        # then concluded from a real 17-second device fit that no kernels were
+        # launched, because a zero that means "the instrument cannot see this"
+        # is indistinguishable from a zero that means "this did not happen".
+        # It is not a small gap: `oblivious_schedule_launches` says this
+        # schedule enqueues 56 command buffers per tree at depth 6.
+        #
+        # `oblivious_schedule_launches` is CALLED rather than copied, and that
+        # is the point of using it. `phase_profile.mojo`'s own warning about
+        # its structural launch constants is that they go stale silently when
+        # the thing they count is restructured, and a second copy of this
+        # arithmetic here would be exactly that failure. The plane owns its
+        # launch model; this bracket asks it.
+        #
+        # Guarded by `enabled()` because the call is a loop over the depth and
+        # an off profile must pay nothing, which is the same guard the leaf-wise
+        # grower puts on `histogram_plan(...).gpu_launches()`.
+        #
+        # It buys no breakdown and does not pretend to. See
+        # `PROF_DEVICE_PLANE`: the plane's internal phases are device phases,
+        # separating them needs fences this backend cannot provide without
+        # measuring the instrument, and `create_event()` raises here. What it
+        # buys is that the time is named and the launches are counted.
+        var plane_launches = 0
+        if profile.enabled():
+            # The schedule's own arms, asked of the schedule. `skip_last_build`
+            # is `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` and it moves both
+            # numbers below, so it is read once here and passed to both rather
+            # than assumed off in one of them.
+            var skip_last = oblivious_skip_last_build_requested()
+            plane_launches = oblivious_schedule_launches(
+                params.max_depth, OBLIVIOUS_MAX_ITEMS, skip_last
+            )
+            # Node histograms this tree built FROM ROWS, which is what this
+            # field counts and is worth saying before the arithmetic: a
+            # histogram derived by subtracting two exact integer histograms is
+            # a real and correct histogram that no row was read for.
+            #
+            # **On the shipped arm** a symmetric tree accumulates every child
+            # of every level from that child's own rows, so level `l` builds
+            # `2^(l+1)` of them and the total is `2^(max_depth+1) - 2`, 126 at
+            # depth 6. That used to be stated here as
+            # `enqueue_desc_level_children`'s "documented no-subtraction
+            # design", which is now the description of one arm rather than of
+            # the plane: `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1` accumulates only
+            # the smaller child of each pair and derives its sibling by exact
+            # Int32 subtraction, so level `l` builds `2^l` and the depth-6
+            # total is `2^max_depth - 1`, 63. Two launches per level either
+            # way, which is why `plane_launches` above does not ask.
+            #
+            # Safe to derive here where a launch count was not, because the
+            # shape is a property of a symmetric tree rather than of the
+            # schedule that grows it: no restructuring of the plane can change
+            # how many children a level of a depth-`d` oblivious tree has.
+            # `note_nodes` refuses the leaf-wise case for the opposite reason.
+            # What the two switches change is not the shape but how many of
+            # those children a row is ever read for.
+            #
+            # THREE ARMS AND FOUR COMBINATIONS, written out rather than left to
+            # be inferred, because the two switches have never been on together
+            # and the interleaved runs will put them on together:
+            #
+            #   subtract  skip_last   row builds          depth 6
+            #   off       off         2^(d+1) - 2         126
+            #   off       on          2^d - 2              62
+            #   on        off         2^d - 1              63
+            #   on        on          2^(d-1) - 1          31
+            #
+            # `skip_last` drops the last level's whole generation, so it
+            # truncates whichever series is running one level early;
+            # `subtract` halves the width of every level that does run. They
+            # compose exactly because they act on different axes, and at
+            # `max_depth == 1` the last two rows are 0, which `note_nodes`
+            # ignores rather than reporting as a tree that built nothing.
+            var node_hists = (1 << (params.max_depth + 1)) - 2
+            if skip_last:
+                node_hists = (1 << params.max_depth) - 2
+            if oblivious_subtract_requested():
+                node_hists = (1 << params.max_depth) - 1
+                if skip_last:
+                    node_hists = (1 << (params.max_depth - 1)) - 1
+            profile.note_nodes(node_hists)
+        profile.charge(
+            PROF_DEVICE_PLANE,
+            n_root,
+            oblivious_started,
+            dispatches=plane_launches,
+            slots_per_row=len(tree_features),
+        )
         profile.end_tree(oblivious_started)
         return symmetric^
     if (
@@ -2060,6 +2419,37 @@ def _grow_tree_gpu_device_search(
                     n_root,
                 )
                 profile.charge(PROF_TRANSFER, n_root, 0, syncs=1)
+                # Timed as one opaque phase, for the reason written at the
+                # oblivious bracket above: the tree's whole wall time used to
+                # land in the report's unattributed remainder beside a totals
+                # line reading `dispatches=0`, and a reader cannot tell that
+                # zero from a measured absence of launches.
+                #
+                # **NO LAUNCH COUNT IS CHARGED HERE, AND THE ASYMMETRY WITH THE
+                # OBLIVIOUS BRACKET IS DELIBERATE.** The symmetric schedule has
+                # `oblivious_schedule_launches`, a pure function counted
+                # statically off the loop it describes, so that bracket can ask
+                # for a number somebody derived and maintains. The leaf-wise
+                # resident plane has no counterpart: `OBLIVIOUS_LEVEL_LAUNCHES`
+                # is the only named launch constant in
+                # `gpu_resident_round.mojo`, and `oblivious_launch_census` is a
+                # model of the leaf-wise phase list rather than a count of what
+                # `grow_tree_device_resident` enqueues. Charging a number
+                # derived here would put a fourth launch model in a third file,
+                # which is the staleness `phase_profile.mojo` warns about, and
+                # charging a guess would be worse than charging nothing because
+                # a wrong count reads exactly like a right one.
+                #
+                # So this reports zero launches and the report's `opaque` line
+                # says the phase is not a breakdown. The follow-up that closes
+                # it is a `resident_schedule_launches` beside the oblivious one,
+                # owned by whoever owns that file.
+                profile.charge(
+                    PROF_DEVICE_PLANE,
+                    n_root,
+                    resident_started,
+                    slots_per_row=len(tree_features),
+                )
                 profile.end_tree(resident_started)
                 return grown^
             if tree_index == 0:
@@ -2369,6 +2759,25 @@ def _device_search_resident(
     The caller has already opened the tree (`begin_tree`), narrowed the
     feature set, staged the searcher's monotone vector, and confirmed with
     `builder.open_resident` that the pool is deep enough for `num_leaves`.
+
+    **This is the only GPU grower a depth-wise fit can reach**, because
+    `gpu_tree_tables.tree_resident_supported` answers
+    `TREE_RESIDENT_DEPTHWISE` for any policy that is not leaf-wise and the
+    device-owned plane refuses on it. So every optimization that lives only in
+    `gpu_resident_round.grow_tree_device_resident` is invisible to depth-wise
+    growth, and the two that this loop can express in its own right are:
+
+    - `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`, the general twin of the symmetric
+      plane's `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD`. Off by default and
+      unmeasured. See `SKIP_TERMINAL_CHILDREN_VAR` for what it removes, which
+      under depth-wise growth with `max_depth` binding is the whole last
+      level's histogram accumulation and one of the tree's round trips.
+    - The node id on every `SplitNodeRequest`, without which `random_strength`
+      did not fail quietly on this path, it raised. Fixed 2026-08-17; see
+      `_enqueue_resident_split`.
+
+    `docs/design/GROWTH_POLICY_REACH.md` is the matrix of which switch reaches
+    which policy and which of the gaps are structural.
     """
     # A tree's slots die with it: the next tree repartitions every row, so no
     # histogram here is readable by it. Releasing on the way in as well as on
@@ -2389,6 +2798,10 @@ def _device_search_resident(
     # here: either instrument asking for a fence gets one, and neither
     # changes the tree.
     var fence = phase_trace or profile.fenced()
+    # Read once per tree, above every launch, for the reason
+    # `gpu_resident_round.resident_trace_sink` states. Off at the shipped
+    # default, where everything below is byte for byte the loop it was.
+    var skip_terminal = skip_terminal_children_enabled()
     var n_slots = len(builder.active)
     profile.begin_tree(n_root, builder.n_rows)
     var profile_t0 = profile.clock()
@@ -2436,6 +2849,11 @@ def _device_search_resident(
             _node_features(params, tree_features, tree_index, root),
             params.constraints.allowed_features(root_branch),
             OutputBounds.unbounded(),
+            # The root's node id, supplied for the reason the two child
+            # requests below supply theirs: `random_strength` keys its draw by
+            # it and `stage_random_score` refuses the -1 default. `root` is
+            # `tree._add_node`'s first id and is 0.
+            root,
         )
     )
     # The searcher shares the builder's context, so these kernels queue
@@ -2561,6 +2979,7 @@ def _device_search_resident(
                     t_partition,
                     t_hist,
                     fence,
+                    skip_terminal,
                 )
 
             search_t0 = perf_counter_ns()
@@ -2571,33 +2990,61 @@ def _device_search_resident(
             # difference is exactly what a depth-wise comparison would read
             # off the `dispatches` column.
             var batch_search_started = profile.clock()
-            searcher.enqueue_frontier(
-                builder.batcher[0].out_dev,
-                batch,
-                split_params,
-                builder.g_scale,
-                builder.h_scale,
-            )
-            profile.charge(
-                PROF_SPLIT_SEARCH,
-                batch_rows,
-                batch_search_started,
-                dispatches=SPLIT_SEARCH_DEVICE_LAUNCHES,
-                cells=len(batch) * builder.n_features * builder.n_bins,
-            )
-            # The batch's one wait, and what upholds the staging contracts on
-            # both sides: the batcher's pinned item table and the searcher's
-            # pinned node tables are only restaged after this returns.
-            var batch_dl_started = profile.clock()
-            var recs = searcher.download_frontier(len(batch))
-            profile.charge(
-                PROF_TRANSFER, batch_rows, batch_dl_started, syncs=1
-            )
+            # **A batch can be empty, and only under
+            # `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`.** When every child of
+            # every split in the batch is one the shape rules will refuse,
+            # there is nothing to search and nothing to bring home, so the
+            # launch pair and the round trip both go. Under depth-wise growth
+            # with `max_depth` binding that is precisely the last level, which
+            # is one of the seven round trips such a tree makes. On the shipped
+            # arm `batch` always holds two requests per split and this branch
+            # is never taken.
+            var recs = List[GpuSplitRecord]()
+            if len(batch) > 0:
+                searcher.enqueue_frontier(
+                    builder.batcher[0].out_dev,
+                    batch,
+                    split_params,
+                    builder.g_scale,
+                    builder.h_scale,
+                )
+                profile.charge(
+                    PROF_SPLIT_SEARCH,
+                    batch_rows,
+                    batch_search_started,
+                    dispatches=SPLIT_SEARCH_DEVICE_LAUNCHES,
+                    cells=len(batch) * builder.n_features * builder.n_bins,
+                )
+                # The batch's one wait, and what upholds the staging contracts
+                # on both sides: the batcher's pinned item table and the
+                # searcher's pinned node tables are only restaged after this
+                # returns.
+                var batch_dl_started = profile.clock()
+                recs = searcher.download_frontier(len(batch))
+                profile.charge(
+                    PROF_TRANSFER, batch_rows, batch_dl_started, syncs=1
+                )
             t_search += Float64(perf_counter_ns() - search_t0) / 1e9
 
             for k in range(len(pending)):
-                var left_rec = recs[2 * k].copy()
-                var right_rec = recs[2 * k + 1].copy()
+                # `left_rec`/`right_rec` index the download rather than being
+                # `2 * k` and `2 * k + 1`, because a skipped child stages no
+                # request and a positional pairing cannot survive that. On the
+                # shipped arm they ARE `2 * k` and `2 * k + 1`, assigned as
+                # `len(batch)` at the moment each request was appended.
+                #
+                # A skipped child is filed with the default record, which
+                # `GpuSplitRecord.__init__` documents as "the absence of a
+                # split, with zero statistics" and which carries
+                # `found = False`. That is the same `found` the shape rules
+                # below would have written onto the real record, and no reader
+                # gets past it to the gain. See `SKIP_TERMINAL_CHILDREN_VAR`.
+                var left_rec = GpuSplitRecord()
+                var right_rec = GpuSplitRecord()
+                if pending[k].left_rec >= 0:
+                    left_rec = recs[pending[k].left_rec].copy()
+                if pending[k].right_rec >= 0:
+                    right_rec = recs[pending[k].right_rec].copy()
                 _apply_shape_rules(
                     left_rec, pending[k].n_left, pending[k].depth, params
                 )
@@ -2665,6 +3112,7 @@ def _enqueue_resident_split(
     mut t_partition: Float64,
     mut t_hist: Float64,
     fence: Bool,
+    skip_terminal: Bool = False,
 ) raises:
     """Commit one split of `frontier[index]` into `tree` and enqueue the
     device work its two children need, without waiting for any of it.
@@ -2681,6 +3129,14 @@ def _enqueue_resident_split(
     another call in the same batch has written: nothing here writes
     `frontier` at all, which is what makes that true by construction rather
     than by reading the loop.
+
+    `skip_terminal` is `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`, off by default
+    and read once per tree by the caller. See `SKIP_TERMINAL_CHILDREN_VAR` for
+    what it removes and for the three-leg argument that it removes nothing the
+    tree depends on. What it changes here is which of the two children get a
+    `SplitNodeRequest`, and whether the histogram is built at all when neither
+    does; `_GpuPendingSplit.left_rec` and `.right_rec` carry the answer to the
+    caller, which used to pair records positionally.
     """
     var parent_node = frontier[index].node
     var parent_slot = frontier[index].slot
@@ -2737,12 +3193,33 @@ def _enqueue_resident_split(
         signs,
     )
 
+    # Both children inherit the same branch feature set, so they share one
+    # allow mask, and both sit one edge below the leaf that split.
+    var branch = extend_branch(frontier[index].branch, split.feature)
+    var allowed = params.constraints.allowed_features(branch)
+    var child_depth = frontier[index].depth + 1
+    # Which children the schedule can still split, decided before any of their
+    # device work is enqueued. Both are True on the shipped arm, so everything
+    # below reads exactly as it did. See `SKIP_TERMINAL_CHILDREN_VAR`.
+    var left_live = True
+    var right_live = True
+    if skip_terminal:
+        left_live = not _child_is_terminal(n_left, child_depth, params)
+        right_live = not _child_is_terminal(n_right, child_depth, params)
+
     # The subtraction trick, device side, folded into the build. The built
     # child gets a fresh slot; the derived one takes over the parent's,
     # which is what keeps the pool at one slot per live leaf rather than one
     # per node. The subtraction rides along inside the histogram kernel, so
     # a split spends one launch here rather than two and never makes a
     # slot-sized pass over the pool to do it.
+    #
+    # **Skipped entirely when neither child can be split**, which is the whole
+    # of what the switch buys on the histogram side. One child alive is not
+    # enough to skip it: the derived child is derived FROM the built one, so a
+    # live derived child still needs its sibling accumulated even when that
+    # sibling is terminal, and building the live child directly would read more
+    # rows than building the smaller one and subtracting.
     var build_left = subtraction_builds_left(n_left, n_right)
     var built_node = left_node if build_left else right_node
     var derived_node = right_node if build_left else left_node
@@ -2750,65 +3227,90 @@ def _enqueue_resident_split(
     var built_rows = n_left if build_left else n_right
     var derived_rows = n_right if build_left else n_left
     var hist_started = profile.clock()
-    var built_slot = builder.acquire_resident(built_node)
-    if built_slot < 0:
-        raise Error(
-            "the resident histogram pool ran out mid-tree; it is sized"
-            " for num_leaves slots, so this means the pool and the leaf"
-            " budget disagree"
+    var left_slot = -1
+    var right_slot = -1
+    if left_live or right_live:
+        var built_slot = builder.acquire_resident(built_node)
+        if built_slot < 0:
+            raise Error(
+                "the resident histogram pool ran out mid-tree; it is sized"
+                " for num_leaves slots, so this means the pool and the leaf"
+                " budget disagree"
+            )
+        builder.enqueue_resident_leaf_subtracting(
+            built_node, built_slot, parent_slot
         )
-    builder.enqueue_resident_leaf_subtracting(
-        built_node, built_slot, parent_slot
-    )
-    builder.reown_resident(parent_slot, derived_node)
-    if fence:
-        builder.ctx.synchronize()
-    var hist_launches = 0
-    if profile.enabled():
-        hist_launches = builder.histogram_plan(built_rows).gpu_launches()
-    profile.note_node()
-    profile.charge(
-        PROF_HISTOGRAM,
-        built_rows,
-        hist_started,
-        dispatches=hist_launches,
-        syncs=1 if fence else 0,
-        slots_per_row=len(builder.active),
-        cells=builder.n_features * builder.n_bins,
-    )
-    # The sibling subtraction rides inside that same kernel here rather than
-    # costing a launch of its own, which is why it is charged with no time,
-    # no launch, and only a `calls` entry at the derived child's size. That
-    # zero is the finding: on the host path this phase is a whole per-cell
-    # pass and on this path it is free, and the two profiles put those side
-    # by side under one name.
-    profile.note_node()
-    profile.charge(PROF_SUBTRACT, derived_rows, 0, cells=0)
+        builder.reown_resident(parent_slot, derived_node)
+        if fence:
+            builder.ctx.synchronize()
+        var hist_launches = 0
+        if profile.enabled():
+            hist_launches = builder.histogram_plan(built_rows).gpu_launches()
+        profile.note_node()
+        profile.charge(
+            PROF_HISTOGRAM,
+            built_rows,
+            hist_started,
+            dispatches=hist_launches,
+            syncs=1 if fence else 0,
+            slots_per_row=len(builder.active),
+            cells=builder.n_features * builder.n_bins,
+        )
+        # The sibling subtraction rides inside that same kernel here rather
+        # than costing a launch of its own, which is why it is charged with no
+        # time, no launch, and only a `calls` entry at the derived child's
+        # size. That zero is the finding: on the host path this phase is a
+        # whole per-cell pass and on this path it is free, and the two profiles
+        # put those side by side under one name.
+        profile.note_node()
+        profile.charge(PROF_SUBTRACT, derived_rows, 0, cells=0)
+        left_slot = built_slot if build_left else parent_slot
+        right_slot = parent_slot if build_left else built_slot
+    else:
+        # Nothing will read the parent's slot again either, so it goes back to
+        # the pool rather than being reassigned to a leaf that is finished.
+        # Charged as a node with no time and no launch, in the same style the
+        # subtraction above is charged, so a profile of this arm shows the
+        # builds it did not make rather than showing a shorter tree.
+        builder.release_resident(parent_slot)
+        profile.note_node()
+        profile.charge(PROF_HISTOGRAM, built_rows, 0, cells=0)
     t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
-    var left_slot = built_slot if build_left else parent_slot
-    var right_slot = parent_slot if build_left else built_slot
 
-    # Both children inherit the same branch feature set, so they share one
-    # allow mask, and both sit one edge below the leaf that split.
-    var branch = extend_branch(frontier[index].branch, split.feature)
-    var allowed = params.constraints.allowed_features(branch)
-    var child_depth = frontier[index].depth + 1
-    batch.append(
-        SplitNodeRequest(
-            left_slot,
-            _node_features(params, tree_features, tree_index, left_node),
-            allowed.copy(),
-            children.left.copy(),
+    # `node=` is supplied on both requests, and it was not before. It is read
+    # by `random_strength` alone (`SplitNodeRequest.node`), which draws its
+    # noise plane keyed by node id and whose `stage_random_score` REFUSES the
+    # -1 default. So every fit that reached this loop with the parameter set
+    # raised rather than growing a tree, which is every depth-wise GPU fit with
+    # it set, since the device-owned plane refuses depth-wise growth. The ids
+    # are the ones `tree._add_node` just assigned, which is the numbering the
+    # CPU grower and `gpu_resident_round.resident_child_node_base` both use, so
+    # the three backends draw from one stream. No effect at all with the noise
+    # off, which is every fit that runs today.
+    var left_rec = -1
+    var right_rec = -1
+    if left_live:
+        left_rec = len(batch)
+        batch.append(
+            SplitNodeRequest(
+                left_slot,
+                _node_features(params, tree_features, tree_index, left_node),
+                allowed.copy(),
+                children.left.copy(),
+                left_node,
+            )
         )
-    )
-    batch.append(
-        SplitNodeRequest(
-            right_slot,
-            _node_features(params, tree_features, tree_index, right_node),
-            allowed^,
-            children.right.copy(),
+    if right_live:
+        right_rec = len(batch)
+        batch.append(
+            SplitNodeRequest(
+                right_slot,
+                _node_features(params, tree_features, tree_index, right_node),
+                allowed.copy(),
+                children.right.copy(),
+                right_node,
+            )
         )
-    )
     pending.append(
         _GpuPendingSplit(
             index,
@@ -2822,6 +3324,8 @@ def _enqueue_resident_split(
             children.right.copy(),
             left_slot,
             right_slot,
+            left_rec,
+            right_rec,
         )
     )
 
@@ -3652,10 +4156,20 @@ def _train_gpu_rounds[
             # the range update and allocates nothing extra.
             var router = List[GpuTreeRouter]()
             if route_all_rows and bagging_enabled(bagging):
+                # Sized through `_state_max_nodes` rather than from
+                # `num_leaves` directly, fixed 2026-08-17. `num_leaves` DOES
+                # NOT BIND under `grow_policy=oblivious`, so at the default 31
+                # this router held 62 nodes against a depth-6 symmetric tree's
+                # 127, and a bagged symmetric fit on this arm raised "tree has
+                # more nodes than the router was constructed for".
+                #
+                # This is the third table in this file to be sized from a
+                # parameter that does not govern it. `_state_max_nodes` exists
+                # because the node-value table had the identical defect, and
+                # its docstring is the argument. Read that rather than
+                # rederiving this one.
                 router.append(
-                    GpuTreeRouter(
-                        builder.ctx, n, 2 * params.tree.num_leaves
-                    )
+                    GpuTreeRouter(builder.ctx, n, _state_max_nodes(params.tree))
                 )
             # One estimator per fit, and only when a fit actually asked for
             # extra Newton steps: it owns three `n_rows` Float32 planes, which
@@ -3664,9 +4178,14 @@ def _train_gpu_rounds[
             # nothing.
             var estimator = List[GpuLeafEstimator]()
             if params.tree.extra.leaf_estimation_active():
+                # Same `_state_max_nodes` fix as the router above, same reason,
+                # found in the same 2026-08-17 audit. `num_leaves` does not bind
+                # under `grow_policy=oblivious`, so a symmetric fit asking for
+                # extra Newton steps sized this estimator for 62 nodes against
+                # a 127-node tree.
                 estimator.append(
                     GpuLeafEstimator(
-                        builder.ctx, n, 2 * params.tree.num_leaves
+                        builder.ctx, n, _state_max_nodes(params.tree)
                     )
                 )
             var dev_bag = List[Int]()

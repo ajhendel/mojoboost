@@ -221,6 +221,33 @@ module, opens no `DeviceContext`, and names nothing only a device has.
 host fit, and the rest are the same phases both growers walk. Which entry
 points are wired is recorded on the report's `label` and in this lane's
 commit message, not asserted here.
+
+What this instrument cannot see on Metal, and why that is a property of the
+backend rather than of this module
+----------------------------------------------------------------------------
+**Per-kernel device time is not reachable on this machine by any route, and
+that is verified rather than assumed.** `docs/GPU_PORTABILITY.md` section 1
+records, from disassembly and from execution on an M4: `create_event()` raises
+`eventCreate is not supported on this device` and every `MTLSharedEvent` and
+`MTLFence` selector has zero load sites; `DeviceContext.create_stream()`
+raises, so there is no second queue to time against; `DeviceGraph.create`
+raises `createGraphBuilder() not supported on this device context` and
+`MetalDeviceGraphBuilder.cpp` is absent from a driver set that ships the CUDA
+and HIP equivalents; and `DeviceContext` exposes no queue, command buffer, or
+native handle, so no vendor shim can hook one. There is therefore no timestamp
+a kernel can be bracketed with.
+
+So the only device-time instrument available anywhere in this repository is
+host wall time closing over a drain, which is exactly what `PROFILE_FENCED`
+is, and it costs two host synchronizations per split to get. That is why this
+module offers `fenced` and does not offer anything finer, and why no field in
+this report is named `device_nanos`: naming one would be inventing a number
+whose ingredients do not exist. A reader who wants device attribution needs a
+Metal timeline captured from outside the process.
+
+`PROF_DEVICE_PLANE` is the consequence of that limit made explicit rather than
+left as a remainder. See its own docstring, and the two brackets in
+`train_gpu.mojo` that charge it.
 """
 
 from std.os import getenv
@@ -293,7 +320,39 @@ row count, and its own phase because a full-tree traversal per row per round
 is a cost that belongs to no node and would otherwise disappear into the
 unattributed remainder."""
 
-comptime N_PROFILE_PHASES = 10
+comptime PROF_DEVICE_PLANE = 10
+"""A whole tree grown inside a device plane that the host does not step, and
+therefore the one phase that is deliberately NOT a breakdown.
+
+**Read this before reading a report that has a large number on this line.**
+`gpu_resident_round.grow_tree_device_oblivious` and
+`grow_tree_device_resident` enqueue an entire tree and wait once at the end.
+They take no `PhaseProfile` and, per the argument at `train_gpu.mojo`'s two
+brackets, they should not: their internal phases are device phases, and
+separating device phases needs fences, which on this backend would measure the
+instrument rather than the plane. So the host has no vantage point from which
+to divide that time up.
+
+Before this phase existed, that time went into the report's `unattributed_ns`
+remainder, and the practical consequence was a wrong conclusion rather than a
+missing one. A reader looking at a device fit saw `nodes=0` and
+`dispatches=0` on the totals line and concluded that no nodes were built and
+no kernels were launched, when in truth 56 command buffers per tree were
+enqueued by a body the instrument could not see
+(`gpu_resident_round.oblivious_schedule_launches(6, 64)`). A zero that means
+"not instrumented" and a zero that means "measured none" are different facts
+and this phase is what keeps them apart: time and launches land HERE, named,
+where a remainder nobody reads was letting them land nowhere.
+
+What a number on this line licenses: the plane ran, for this long, enqueuing
+this many command buffers. What it does not license: any statement about which
+part of the plane the time went to. `MOJOTREES_GPU_TREE_RESIDENT=0` returns
+the fully instrumented host-stepped loop, whose report does divide the time,
+and `MOJOTREES_GPU_TREE_RESIDENT_TRACE` is the plane's own per-step trace.
+Those two are the instruments for the question this phase refuses to answer.
+"""
+
+comptime N_PROFILE_PHASES = 11
 
 
 def profile_phase_name(phase: Int) -> String:
@@ -317,6 +376,8 @@ def profile_phase_name(phase: Int) -> String:
         return String("grad_fill")
     if phase == PROF_SCORE_UPDATE:
         return String("score_update")
+    if phase == PROF_DEVICE_PLANE:
+        return String("device_plane")
     return String("unknown")
 
 
@@ -721,6 +782,31 @@ struct PhaseProfile(Copyable, Movable):
             return
         self.nodes += 1
 
+    def note_nodes(mut self, count: Int):
+        """`note_node` `count` times, for a caller that knows the count without
+        having visited the nodes.
+
+        This exists for exactly one situation and should not spread past it. A
+        device plane grows a whole tree without the host seeing a single node,
+        so the host cannot call `note_node` per node; but for a SYMMETRIC tree
+        the number of node histograms built is fixed by the depth and not by
+        the plane's implementation, because every child of every level is built
+        from its own rows. A caller in that position knows the true count and
+        the alternative is reporting zero, which reads as "no nodes were built".
+
+        Not for a leaf-wise caller. There the node count depends on which
+        splits were taken and on `min_data_in_leaf` pruning, so a host-side
+        derivation would be a guess, and a wrong count in this field reads
+        exactly like a right one.
+
+        A negative or zero `count` is ignored rather than raising, on the same
+        principle as `classify_node`'s out-of-range handling: an instrument that
+        can abort a fit is worse than one that declines a nonsensical input.
+        """
+        if self.mode == PROFILE_OFF or count <= 0:
+            return
+        self.nodes += count
+
     def charge(
         mut self,
         phase: Int,
@@ -1002,6 +1088,24 @@ struct PhaseProfile(Copyable, Movable):
         out += " dispatches=" + String(self.total_dispatches())
         out += " syncs=" + String(self.total_syncs())
         out += " calls=" + String(self.total_calls()) + "\n"
+        # The one line in this report that exists to stop a reader drawing a
+        # conclusion. `PROF_DEVICE_PLANE` time is attributed but not divided,
+        # so a reader who takes the phase table as a breakdown of the fit is
+        # right about every other line and wrong about this one. Printed
+        # unconditionally, including as a zero, because a line that appears
+        # only when it is large is a line nobody learns to look for, and the
+        # zero is itself the useful reading on a host fit or a host-stepped
+        # device loop.
+        var opaque = self.phase_nanos(PROF_DEVICE_PLANE)
+        out += "phase_profile opaque device_plane_ns=" + String(opaque)
+        out += " device_plane_pct=" + String(_pct(opaque, self.wall_nanos))
+        out += " device_plane_dispatches=" + String(
+            self.phase_dispatches(PROF_DEVICE_PLANE)
+        )
+        out += (
+            " note=time_inside_a_device_plane_the_host_does_not_step;"
+            "_not_a_breakdown;_set_MOJOTREES_GPU_TREE_RESIDENT=0_for_one\n"
+        )
         out += "phase_profile end\n"
         return out^
 

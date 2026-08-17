@@ -265,6 +265,22 @@ all three arrived in one round and only one pair composes.
 - The **blocked layout** is refused for the reason it was already refused by
   the packed one: two rearrangements of one matrix, one pointer.
 
+There is one further arm inside this one, `set_compact_flag_read` and
+`MOJOTREES_GPU_COMPACT_FLAG_READ`, and it is off by default like everything
+else here. It points the *partition's own* flag pass at the compacted plane:
+position `j` of the range reads `cbins[f * n_rows + begin + j]` rather than
+`bins[f * n_rows + rows[begin + j]]`, which under the invariant is the same
+byte and is therefore bit-identical for the same reason the histogram's
+compacted launch is. What it removes is the paragraph above's own admission
+that the bin load is "the one random-access read of the partition", plus the
+permutation load that feeds it. It is a second switch rather than part of the
+first because the compaction A/B has to be able to price the physical reorder
+against the gather it removes from the *histogram* before it prices it against
+two stages at once; an arm that changed both at the same time could not say
+which half paid. `compact_flag_read_live` is the predicate and it conjoins
+`row_compaction_live`, so this arm is inert whenever the planes are not the
+ones the histogram is already reading.
+
 One warning for whoever edits these kernels next, because it cost this lane a
 debugging session and it *compiles*. `_scatter_kernel` and its two copies have
 carried a local named `packed` since the partition was written -- the packed
@@ -1057,6 +1073,7 @@ def _flag_scan_kernel(
     tiles: Int32,
     desc: MutPointer[Int32, MutAnyOrigin],
     use_desc: Int32,
+    compacted: Int32,
 ):
     """Stage one of the stable partition: flag each row of the range and scan
     the flags within each threadgroup.
@@ -1130,6 +1147,21 @@ def _flag_scan_kernel(
 
     Whether the extra threadgroups are cheap enough to pay for the readback
     they remove is UNMEASURED: no benchmark of this arm has been run.
+
+    The compacted read
+    ------------------
+    With `compacted`, `bins` is the compacted plane rather than the dataset's
+    and the bin of range position `j` is at `feature * n_rows + row_begin + j`
+    instead of at `feature * n_rows + rows[row_begin + j]`. The two are the
+    same byte, by the invariant `_compact_build_kernel` establishes and
+    `_compact_scatter_kernel` maintains, so every flag, every prefix, every
+    packed offset and every block sum below is unchanged value for value.
+    What changes is that consecutive threads read consecutive bytes and the
+    permutation is not read at all. The host decides it in
+    `GpuActiveRows.compact_flag_read_live`, which will not set it unless the
+    compacted planes are live, and this kernel never checks: a launch that
+    passed `compacted` against the dataset's own `bins` would route by the
+    bins of the wrong rows and nothing here could tell.
     """
     var tid = thread_idx.x
     var nthreads = block_dim.x
@@ -1180,14 +1212,19 @@ def _flag_scan_kernel(
         address_space = AddressSpace.SHARED,
     ]()
 
+    # Block-uniform: one test here rather than one per row.
+    var dense = Int(compacted) != 0
+
     var carry = Int32(0)
     for t in range(Int(tiles)):
         var j = base + t * nthreads + tid
 
         var flag = Int32(0)
         if j < n:
-            var row = rows[unsafe_offset = row_begin + j][0]
-            var bin = Int32(bins[unsafe_offset = col + Int(row)])
+            var at = col + row_begin + Int(j)
+            if not dense:
+                at = col + Int(rows[unsafe_offset = row_begin + j][0])
+            var bin = Int32(bins[unsafe_offset=at])
             if _row_goes_left(
                 bin, thr, miss, dleft, iscat, c0, c1, c2, c3
             ):
@@ -1247,6 +1284,7 @@ def _flag_scan_prim_kernel[block_size: Int](
     tiles: Int32,
     desc: MutPointer[Int32, MutAnyOrigin],
     use_desc: Int32,
+    compacted: Int32,
 ):
     """Stage one, scanned with `block.prefix_sum` instead of by hand.
 
@@ -1306,6 +1344,13 @@ def _flag_scan_prim_kernel[block_size: Int](
     are called once per tile whether or not the tile owns any element, so an
     empty block that ran the loop would pay `tiles` prefix sums and `tiles`
     broadcasts to sum a column of zeros.
+
+    `compacted` is the compacted read and it means here exactly what it means
+    in `_flag_scan_kernel`: read that kernel's docstring for the invariant it
+    rests on and for why the flags it produces are the same flags. The two
+    arms have to agree byte for byte on `offsets` and `block_sums` whichever
+    way the bin was addressed, and they do, because the addressing changes
+    which pointer holds the byte and not which byte it is.
     """
     var tid = thread_idx.x
     var n = Int(count)
@@ -1344,14 +1389,19 @@ def _flag_scan_prim_kernel[block_size: Int](
             block_sums[unsafe_offset = Int(block_idx.x)] = Int32(0)
         return
 
+    # Block-uniform: one test here rather than one per row.
+    var dense = Int(compacted) != 0
+
     var carry = Int32(0)
     for t in range(Int(tiles)):
         var j = base + t * block_size + tid
 
         var flag = Int32(0)
         if j < n:
-            var row = rows[unsafe_offset = row_begin + j][0]
-            var bin = Int32(bins[unsafe_offset = col + Int(row)])
+            var at = col + row_begin + Int(j)
+            if not dense:
+                at = col + Int(rows[unsafe_offset = row_begin + j][0])
+            var bin = Int32(bins[unsafe_offset=at])
             if _row_goes_left(
                 bin, thr, miss, dleft, iscat, c0, c1, c2, c3
             ):
@@ -1422,6 +1472,12 @@ def _scatter_kernel(
     has been measured, and the bound is an argument about counts, not a
     timing.
 
+    Only the blocks that own an element pay it. A block whose chunk lies
+    wholly past the end of the range returns before the scan, which is what
+    keeps `enqueue_partition_desc`'s deliberately over-provisioned grid from
+    charging a full prefix sum per idle threadgroup; the exemption and the
+    reason block 0 is excluded from it are stated at the return itself.
+
     The scatter itself. A left-going row at local index `j` lands at its
     global left rank `p`; a right-going one lands after every left-going row,
     at `grand + (j - p)`, where `j - p` is its rank among the right-going
@@ -1463,6 +1519,19 @@ def _scatter_kernel(
             return
         b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
         n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+
+    # A block whose whole chunk lies past the end of the range writes nothing
+    # and so does not need the head scan. Block-uniform, so the whole
+    # threadgroup leaves together and no barrier below is reached by part of a
+    # block, which is the same early exit `_flag_scan_kernel` already takes.
+    # Block 0 is exempt because it stores `total` and `carry` is only correct
+    # after the scan; while `n > 0` its chunk starts at zero and it never
+    # qualifies anyway. Nothing written changes: the returning blocks stored
+    # nothing, and the head scan only reads `block_sums`. See
+    # `_scatter_prim_kernel` for why the descriptor grid makes this worth
+    # having.
+    if me != 0 and me * Int(tiles) * Int(nthreads) >= n:
+        return
 
     var s = stack_allocation[
         SCAN_MAX_THREADS,
@@ -1572,6 +1641,27 @@ def _scatter_prim_kernel[block_size: Int](
             return
         b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
         n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+
+    # A block whose whole chunk lies past the end of the range writes nothing,
+    # so it does not need the head scan either. `me`, `tiles` and `n` are all
+    # block-uniform, so the entire threadgroup leaves together and no
+    # collective below is reached by part of a block -- which matters more on
+    # this arm than on the hand-rolled one, because these are collectives and
+    # not bare barriers. Block 0 is exempt unconditionally: it is the block
+    # that stores `total`, and `carry` is only correct after the scan. It is
+    # never the block that skips anyway while `n > 0`, since its chunk starts
+    # at zero.
+    #
+    # This cannot change a written value. The blocks it returns early store
+    # nothing in either branch, and the head scan reads `block_sums` without
+    # modifying it, so a block that does not compute the scan removes no input
+    # from any block that does. It exists because
+    # `enqueue_partition_desc` launches a grid sized to the whole active
+    # prefix, so a short window leaves most of the grid owning nothing, and
+    # before this every one of those blocks ran a full prefix sum over the
+    # block sums to discover it.
+    if me != 0 and me * Int(tiles) * block_size >= n:
+        return
 
     var carry = Int32(0)
     var mine = Int32(0)
@@ -1966,6 +2056,14 @@ def _compact_scatter_kernel(
             return
         b = Int(desc[unsafe_offset=STEP_ROW_BEGIN][0])
         n = Int(desc[unsafe_offset=STEP_ROW_COUNT][0])
+
+    # A block whose whole chunk lies past the end of the range writes nothing
+    # and so does not need the head scan. Block-uniform, so the whole
+    # threadgroup leaves together. Unlike `_scatter_kernel` there is no block
+    # 0 exemption, because this kernel writes no total: the docstring above
+    # says so and it is the reason the condition here is the simpler one.
+    if me * Int(tiles) * Int(nthreads) >= n:
+        return
 
     var s = stack_allocation[
         SCAN_MAX_THREADS,
@@ -5547,6 +5645,13 @@ struct GpuActiveRows(Movable):
     # run), `compact_scatters` counts incremental maintenance (one per split).
     var compact_builds: Int
     var compact_scatters: Int
+    # Whether the partition's flag pass reads the compacted plane instead of
+    # gathering. Requested here, but only *live* when the compacted planes are
+    # live as well; see `compact_flag_read_live`. Off by default, and it is a
+    # second arm inside a default-off arm on purpose: the compaction A/B has to
+    # be able to price the physical reorder on its own before it prices the
+    # reorder plus the gather it removes from this stage.
+    var compact_flag_read: Bool
 
     def __init__(
         out self,
@@ -5780,6 +5885,14 @@ struct GpuActiveRows(Movable):
         self.ident_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
         self.compact_builds = 0
         self.compact_scatters = 0
+        # `MOJOTREES_GPU_COMPACT_FLAG_READ=1`, off by default, and inert on its
+        # own: it changes nothing at all unless the compaction arm above is
+        # also on. Read here once rather than per launch, the way
+        # `scan_primitives` is, and overridable in process through
+        # `set_compact_flag_read` so one benchmark can hold both arms.
+        self.compact_flag_read = (
+            _env_int("MOJOTREES_GPU_COMPACT_FLAG_READ", 0) != 0
+        )
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -6681,6 +6794,65 @@ struct GpuActiveRows(Movable):
             and self.compact_packed == self.packed_gradients
         )
 
+    def set_compact_flag_read(mut self, on: Bool):
+        """Turn the compacted flag read on or off in process.
+
+        The in-process handle for `MOJOTREES_GPU_COMPACT_FLAG_READ`, on the
+        footing `set_scan_primitives` is the handle for
+        `MOJOTREES_GPU_SCAN_PRIMITIVES`: the variable decides the default and
+        this overrides it, so one benchmark process can alternate the arms
+        instead of re-execing and hoping the label matched the arm.
+
+        No refusal and no `raises`, because there is no state this can put the
+        instance into that a launch would then have to cope with.
+        `compact_flag_read_live` conjoins this with `row_compaction_live`, so
+        asking for it while the compaction arm is off, or while its planes are
+        stale, simply reaches the gathering flag pass that every fit before
+        this arm existed reached.
+
+        Takes effect on the next partition. Nothing is invalidated, because
+        this changes which plane a *read* comes from and writes nothing.
+        """
+        self.compact_flag_read = on
+
+    def compact_flag_read_requested(self) -> Bool:
+        """Whether the arm was asked for. Not whether a partition will take it;
+        see `compact_flag_read_live`."""
+        return self.compact_flag_read
+
+    def compact_flag_read_live(self) -> Bool:
+        """Whether the next partition's flag pass reads the compacted plane.
+
+        The arm has to be on and the compacted planes have to be live, and the
+        second conjunct is the load-bearing one. `row_compaction_live` is the
+        predicate the histogram launch already tests, so this arm engages on
+        exactly the launches the histogram's identity-index arm engages on and
+        on no others.
+
+        **Why the read is bit-identical, which is the whole argument.** The
+        compaction invariant is `cbins[f * n_rows + j] == bins[f * n_rows +
+        rows[j]]` for every position `j` of the row buffer, established by
+        `_compact_build_kernel` and maintained across every split by
+        `_compact_scatter_kernel` applying the row scatter's own permutation.
+        The flag pass computes, for position `row_begin + j` of the range, the
+        routing of `bins[feature * n_rows + rows[row_begin + j]]`. Under the
+        invariant that byte *is* `cbins[feature * n_rows + row_begin + j]`, so
+        the arm substitutes one spelling of one byte for another. The flag it
+        derives, the prefix that flag feeds, the packed offset, the block sums,
+        the permutation and therefore every histogram downstream are unchanged
+        value for value. This is the same form of argument the histogram's own
+        compacted launch rests on, and it is an argument about addresses rather
+        than about the order of a sum.
+
+        **What it is worth, and it is a count and not a timing.** The module
+        docstring calls the bin load "the one random-access read of the
+        partition". Under this arm the flag pass reads `cbins` at
+        `row_begin + j` for consecutive `j`, which is a dense run, and it does
+        not read `rows` at all: two loads per row, one of them a scattered
+        byte, become one contiguous byte. Nothing here has been measured.
+        """
+        return self.compact_flag_read and self.row_compaction_live()
+
     def compaction_packed_gradients(self) -> Bool:
         """Which staged gradient width the compacted planes currently hold.
 
@@ -7144,9 +7316,18 @@ struct GpuActiveRows(Movable):
                     # width that slipped through producing correct rows.
                     scanned = False
 
+        # The compacted flag read, on the fallback arm. Resolved here for the
+        # same reason `_enqueue_scan_primitives` resolves it at its own launch;
+        # computed unconditionally so the two arms cannot disagree about which
+        # plane they read.
+        var flag_bins = _any_origin_u8(bins)
+        var dense = self.compact_flag_read_live()
+        if dense:
+            flag_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
+
         if not scanned:
             self.ctx.enqueue_function[_flag_scan_kernel](
-                bins,
+                flag_bins,
                 self.rows_dev.unsafe_ptr(),
                 self.offsets_dev.unsafe_ptr(),
                 self.block_sums_dev.unsafe_ptr(),
@@ -7172,6 +7353,7 @@ struct GpuActiveRows(Movable):
                 # partition's own.
                 self.step_dev.unsafe_ptr(),
                 Int32(0),
+                Int32(1) if dense else Int32(0),
                 grid_dim=blocks,
                 block_dim=threads,
             )
@@ -7256,8 +7438,20 @@ struct GpuActiveRows(Movable):
         # speculation armed it, so the host arm's pointer is the one it has
         # always been passed.
         var desc = self._desc_buffer()
+        # --- the compacted flag read ---
+        # Resolved here rather than passed in, for the reason `_any_origin_u8`
+        # is spelled the way it is and the reason the histogram resolves its
+        # own three pointers at the launch: this method holds `mut self`, so a
+        # pointer into a field cannot be handed down from the caller, and the
+        # caller's `bins` and `self.cbins_dev` carry different origins that
+        # nothing widens implicitly. `compact_flag_read_live` is the one
+        # predicate, so the pointer and the flag cannot come apart.
+        var flag_bins = _any_origin_u8(bins)
+        var dense = self.compact_flag_read_live()
+        if dense:
+            flag_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
         self.ctx.enqueue_function[_flag_scan_prim_kernel[width]](
-            bins,
+            flag_bins,
             self.rows_dev.unsafe_ptr(),
             self.offsets_dev.unsafe_ptr(),
             self.block_sums_dev.unsafe_ptr(),
@@ -7276,6 +7470,7 @@ struct GpuActiveRows(Movable):
             Int32(tiles),
             desc.unsafe_ptr(),
             use_desc,
+            Int32(1) if dense else Int32(0),
             grid_dim=blocks,
             block_dim=width,
         )
@@ -7736,9 +7931,16 @@ struct GpuActiveRows(Movable):
                 else:
                     scanned = False
 
+        # The compacted flag read; see `enqueue_partition` for why the pointer
+        # is resolved at the launch and not handed down.
+        var flag_bins = _any_origin_u8(bins)
+        var dense = self.compact_flag_read_live()
+        if dense:
+            flag_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
+
         if not scanned:
             self.ctx.enqueue_function[_flag_scan_kernel](
-                bins,
+                flag_bins,
                 self.rows_dev.unsafe_ptr(),
                 self.offsets_dev.unsafe_ptr(),
                 self.block_sums_dev.unsafe_ptr(),
@@ -7757,6 +7959,7 @@ struct GpuActiveRows(Movable):
                 Int32(tiles),
                 desc.unsafe_ptr(),
                 Int32(1),
+                Int32(1) if dense else Int32(0),
                 grid_dim=blocks,
                 block_dim=threads,
             )

@@ -147,15 +147,49 @@ only, both listed on `to_booster`: iteration ranges, and the base score a
 continuation needs. Neither is repairable without a flag on the model saying
 "average these trees"; see docs/RANDOM_FOREST_MODE.md section 6.
 
-Reachability
-------------
-`src/mojotrees/alternate_boosting.mojo` imports `train_rf` and
-`train_rf_more`, so a Mojo caller can train a forest today. Nothing above
-that reaches it: `boosting=rf` is still rejected by params.mojo and by the
-Python estimators, `average_output` is still refused by lgbm_model_io.mojo,
-and no parameter string or keyword turns the mode on. This module
-deliberately does not half-wire any of that: an accepted `boosting=rf` that
-trained a summed ensemble would be worse than one that is rejected.
+Reachability, CORRECTED 2026-08-17
+----------------------------------
+**This section previously said "Nothing above that reaches it: `boosting=rf`
+is still rejected by params.mojo and by the Python estimators ... and no
+parameter string or keyword turns the mode on." Half of that is false at
+head.** The old text is quoted rather than deleted because it reads as a
+settled design decision and would be believed.
+
+What is true. `params.mojo` still rejects `boosting_type=rf` in a parameter
+string, so the CLI and the C API cannot select it, and
+`lgbm_model_io.mojo` still refuses to READ a LightGBM model whose header
+carries `average_output`.
+
+What is false. The Python estimators accept it. `boosting_type="rf"` (or
+`boosting`, or `booster`) resolves in `sklearn._resolve_boosting`, travels as
+the `"boosting"` wire key, and `bindings/_mojotrees.mojo:_parse_boosting` turns
+it into `AlternateBoostingParams.rf()`, which the dart/rf fork of
+`_mojotrees.fit` routes to `alternate_boosting.fit_boosting` and so to
+`train_rf` here. `sklearn._params` also forces `learning_rate = 1.0` under
+`rf`, so `check_rf_learning_rate` never has to fire on that route. It is
+exercised by `tests/test_alternate_boosting.mojo` and by
+`python/tests/test_params.py::test_dart_and_rf_train_through_the_estimator`.
+
+So a forest is reachable, honored and run on the dense single-output CPU path,
+under all three grow policies (`tree.grow_tree` dispatches leaf-wise,
+depth-wise and oblivious internally), and refused by name everywhere else:
+`device="gpu"`, sparse input, `eval_set`, a callable objective,
+`tree_learner`, a multiclass classifier and the ranker.
+
+What is genuinely unreachable from Python, per
+docs/design/BOOSTING_MODE_REACH.md, is the second layer of this module:
+`train_forest`, `train_forest_more`, `train_forest_with_valid`,
+`train_forest_multiclass`, `train_forest_multiclass_with_valid`, `RfBooster`
+and `RfMulticlassBooster`, together with the two configurations that only they
+accept (a forest randomized by GOSS, and one randomized by
+`pos_bagging_fraction` / `neg_bagging_fraction`). `train_rf_more` is
+unreachable too: `booster_update` never reads the `boosting` key. Those are
+Mojo-API reachable and Python-unreachable, and the missing piece in every case
+is a binding, not an algorithm.
+
+This module deliberately does not half-wire any of that: an accepted
+`boosting=rf` that trained a summed ensemble would be worse than one that is
+rejected.
 """
 
 from std.math import log

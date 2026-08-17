@@ -35,6 +35,7 @@ from .gpu_predict import (
     predict_raw_multiclass_gpu,
 )
 from .objective import GradHessFn, train_custom
+from .predict import oblivious_plan, predict_oblivious_batch
 from .sampling import BootstrapParams, check_bootstrap_honored
 from .train_gpu import train_gpu, train_multiclass_gpu
 
@@ -169,6 +170,23 @@ struct Model(Copyable, Movable, Writable):
             if raw_score:
                 return predict_raw_gpu(self.booster, data, rng)
             return predict_gpu(self.booster, data, rng)
+        # A symmetric ensemble is evaluated without a traversal: see
+        # predict.mojo. The plan is built once per call, before any fan-out,
+        # and it verifies the STRUCTURE of every tree in the range rather
+        # than trusting the grow policy the model was trained under. An
+        # ensemble it cannot verify -- leaf-wise, depth-wise, ragged, too
+        # deep, or carrying linear leaves -- leaves the plan inactive and
+        # falls through to the generic walker below.
+        #
+        # No switch, because there is nothing to choose between: the two arms
+        # reach the same leaf of the same tree and sum the same Float64
+        # values in the same order, so which one runs cannot be observed in
+        # an output. The argument is written out in predict.mojo.
+        var plan = oblivious_plan(self.booster, rng, data.n_rows)
+        if plan.active:
+            return predict_oblivious_batch(
+                self.booster, plan, data, rng, raw_score
+            )
         # One prediction per row, over row blocks. The per-row body used to
         # live here and now lives in `Booster.predict_batch_range`, which is
         # the same gather of `bins[f * n_rows + r]` followed by the same

@@ -594,17 +594,41 @@ def extra_threshold_index(
 #    `Gumbel` type drops it and changes the distribution, and is not
 #    implemented here.
 #
-# Units, which the summary does not mention and which matter. CatBoost's
-# default CPU score function is `Cosine`, whose value is
-# sum(leafOut * sumDelta) / sqrt(sum(leafOut^2 * sumWeight)), dimensionally a
-# gradient, so noise scaled by a gradient RMS is dimensionally consistent
-# with it. mojotrees's gain is the second-order gain, dimensionally
-# gradient^2 / hessian, which is CatBoost's `score_function=L2` shape. The
-# scaling below is applied to that gain unchanged, which is CatBoost's own
-# behavior under `score_function=L2` -- CatBoost applies one scoreStDev to
-# whichever score function is configured -- but it is not the pairing
-# CatBoost ships by default, and the useful range of `random_strength` on a
-# gain is therefore not the useful range CatBoost documents.
+# UNITS, AND THE ONE NUMBER THIS SECTION USED TO LEAVE UNSAID
+# ----------------------------------------------------------
+# CatBoost's default CPU score function is `Cosine`, whose value is
+# sum(leafOut * sumDelta) / sqrt(sum(leafOut^2 * sumWeight)). For one node
+# that is `G / sqrt(H + lambda)`, dimensionally a gradient over a root
+# hessian, so noise scaled by a gradient RMS is dimensionally consistent with
+# it. mojotrees's gain is the second-order gain `G^2 / (H + lambda)`, which is
+# CatBoost's `score_function=L2` shape. The scaling below is applied to that
+# gain unchanged, which is CatBoost's own behavior under `score_function=L2`
+# -- CatBoost applies one scoreStDev to whichever score function is configured
+# -- but it is not the pairing CatBoost ships by default.
+#
+# **The two are not merely different units, they are a square**, and that is
+# the fact the old wording ("a different size") left the reader to work out.
+# For one node, `L2 = Cosine^2` exactly. So perturbing a Cosine score by
+# `sigma` is the same act as perturbing an L2 gain by `2 * Cosine * sigma`,
+# and adding the same `sigma` to the L2 gain instead is weaker by a factor of
+# about `2 * Cosine`. `Cosine` at a node of `n` rows whose split separates
+# gradients of typical magnitude `d` is about `d * sqrt(n / h_row)`, so on the
+# dense regression scenario -- 128k training rows, unit hessians, first-round
+# derivative RMS near the label spread -- the factor is in the hundreds.
+#
+# DERIVED, NOT MEASURED. `L2 = Cosine^2` is algebra on the two expressions in
+# this package (`_split_gain` and `_cosine_score` in `split.mojo`) and is
+# exact for a single node before the parent subtraction; the SIZE of the
+# factor is an order-of-magnitude estimate from the scenario's shape and has
+# not been measured. What follows from either reading is the same and is the
+# part a user has to be told: **a `random_strength` of 1.0 in this library
+# under `score_function=l2` is not the 1.0 CatBoost documents**, and the same
+# 1.0 means two different strengths inside this library, because the shipped
+# symmetric mode scores with Cosine and the leaf-wise mode scores with L2.
+# `docs/design/RANDOM_STRENGTH_UNITS.md` carries the derivation, the two ways
+# to make the knob mean one thing, and what each costs. Nothing here has been
+# rescaled: doing so moves bits on every noisy fit and is a measured decision,
+# not a reading.
 #
 # Where the draw is keyed, and why it is not CatBoost's keying. CatBoost
 # seeds one RNG per candidate *task* (`SetBestScore(randSeed + taskIdx, ...)`)

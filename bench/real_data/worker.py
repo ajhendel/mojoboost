@@ -183,6 +183,21 @@ def build_data(spec, variant, allow_unpinned):
             "a fallback, it is the only variant. A record from it is a "
             "synthetic-data result and must not be quoted as a real-data one"
         )
+    # The known Bayes floor, on the record, for the generator variant only.
+    # `scenarios.bayes_floor` returns None for every scenario that declares
+    # none, and this branch is the synthetic one by construction, so a real
+    # record never carries the field. Readers fall back to the same helper for
+    # records written before 2026-08-17.
+    floor = scenarios.bayes_floor(spec["id"], "synthetic", spec["generator_kwargs"])
+    if floor:
+        # Both floors: the population value the scenario declares and the
+        # noise REALIZED on these held-out rows, which is what the excess is
+        # measured against. `generators.with_realized_floor` is the one place
+        # that knows how to reproduce the second, so a reader of an old record
+        # and the writer of a new one cannot disagree about it.
+        meta["bayes_floor"] = generators.with_realized_floor(
+            floor, spec["generator_kwargs"], meta["split"]
+        )
     for key in ("categorical_feature", "n_classes", "sparse"):
         if key in train:
             meta[key] = train[key] if key != "sparse" else True
@@ -395,6 +410,13 @@ def run_job(job):
         "axis": job.get("axis"),
         "axis_value": job.get("axis_value"),
         "arm_block": job.get("arm_block"),
+        # What this cell is FOR, as distinct from what it is. `measured` or
+        # `oracle`; run.py's `_mark_oracle_cells` decides, because the decision
+        # is a property of the whole matrix and this process sees one job. The
+        # note travels with it so that a single record file, read on its own,
+        # says why one cpu row sits beside three gpu rows.
+        "cell_role": job.get("cell_role") or "measured",
+        "cell_role_note": job.get("cell_role_note"),
         # What the arm actually asked to move, beside the resolved dicts
         # below. A record that carried only the resolved parameters could not
         # say which of them the arm CHOSE and which the translator supplied.
@@ -473,6 +495,10 @@ def main(argv=None):
             "engine": job.get("engine"),
             "arm": job.get("arm") or job.get("engine"),
             "axis": job.get("axis"),
+            # Written on the error record too (2026-08-17), so every record
+            # kind carries the arm's declared block beside its arm id.
+            "arm_block": job.get("arm_block"),
+            "cell_role": job.get("cell_role") or "measured",
             "device_requested": job.get("device"),
             "threads": job.get("threads"),
             "error": {

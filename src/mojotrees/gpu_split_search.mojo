@@ -295,6 +295,12 @@ from .monotone import (
     MONOTONE_INCREASING,
     OutputBounds,
 )
+# For the host noise plane only, which is drawn per feature slot on the CPU.
+# `parallel` imports `.apple_cpu_policy` and nothing else from the package, and
+# neither module names this one, so this adds no cycle; the `efb` ->
+# `binning` -> `tree_parameters_extra` cycle this repository has already been
+# bitten by is the reason that is checked rather than assumed.
+from .parallel import dispatch_features
 from .rng import GOLDEN, splitmix64, uniform
 
 # `SCORE_L2` and `SCORE_COSINE` are re-exported by `split.mojo` and defined
@@ -1273,17 +1279,24 @@ def gpu_split_gain(
 #
 # WHICH GAIN, AND WHICH SCORE FUNCTION
 # ------------------------------------
-# The noise is added to `gpu_split_gain`'s value: LightGBM's second-order
-# gain `G^2/(H+lambda)`, which is CatBoost's `score_function=L2` shape, not
-# CatBoost's default `Cosine`. CatBoost scales one `scoreStDev` by a
-# derivative RMS, which is dimensionally a gradient and therefore pairs with
-# `Cosine`; against a second-order gain (gradient^2/hessian) the same number
-# is a different size, so the useful range of `random_strength` here is not
-# the range CatBoost documents. That is CatBoost's own behavior under
-# `score_function=L2` and it is the pairing `tree_parameters_extra.mojo`
-# chose; this module reproduces the host's choice rather than making a
-# second one. If a `Cosine` variant lands on the host, it lands here as
-# another `gpu_split_gain` arm and the noise term below does not move.
+# Whichever the fit configured. On the L2 arm the noise is added to
+# `gpu_split_gain`'s value, the second-order gain `G^2/(H+lambda)`; on the
+# Cosine arm it is added to `gpu_cosine_score(...) - level_parent` after the
+# single ratio. **This paragraph said "not CatBoost's default Cosine" and
+# ended by supposing a Cosine variant might one day land; it landed on
+# 2026-08-17** and the oblivious kernels below take it, so the supposition is
+# now a description of the code.
+#
+# What did not change is the SCALE, and it is the part to read twice.
+# CatBoost scales one `scoreStDev` by a derivative RMS, which pairs with
+# `Cosine`, and for one node `L2 = Cosine^2` exactly. So the same
+# `random_strength` is a much smaller perturbation on the L2 arm than on the
+# Cosine arm -- weaker by about `2 * Cosine`, which on a 128k-row level is in
+# the hundreds. That is CatBoost's own behavior under `score_function=L2` and
+# it is the pairing `tree_parameters_extra.mojo` chose; this module reproduces
+# the host's choice rather than making a second one, which is the only rule
+# that keeps the two backends electing the same split. See
+# `docs/design/RANDOM_STRENGTH_UNITS.md`.
 #
 # The noise is **independent of the gain form.** It is added to whatever
 # `gpu_split_gain` returned, so `GAIN_FORM_CROSS` and
@@ -1521,15 +1534,67 @@ def random_score_plane(
             "random_strength keys its draw by node id, which must be"
             " nonnegative; a grower that cannot supply one cannot use it"
         )
-    var out = List[Float32](capacity=len(features) * n_bins)
-    for slot in range(len(features)):
-        var f = features[slot]
+    var n_slots = len(features)
+    if not noise_stage_parallel_requested():
+        # The serial path, kept verbatim as the A/B arm and as the definition
+        # the parallel arm is checked against. `MOJOTREES_GPU_NOISE_STAGE_
+        # PARALLEL=0` selects it.
+        var serial_out = List[Float32](capacity=n_slots * n_bins)
+        for slot in range(n_slots):
+            var f = features[slot]
+            for b in range(n_bins):
+                serial_out.append(
+                    host_random_score_noise(
+                        stdev, seed, tree_index, node, f, b, domain
+                    )
+                )
+        return serial_out^
+
+    # PARALLEL OVER FEATURE SLOTS, AND THE PLANE IS IDENTICAL, NOT MERELY
+    # EQUIVALENT. Every entry is `host_random_score_noise` of its own six
+    # arguments and nothing else, so an entry cannot observe the order the
+    # others were written in. See `noise_stage_parallel_requested` for the full
+    # argument and for why `MOJOTREES_NUM_WORKERS` is therefore not an input to
+    # the model.
+    #
+    # The slot is the parallel dimension rather than the bin because a slot
+    # owns a contiguous `n_bins` run of the plane, so two workers never touch
+    # the same cache line at a boundary, and because `dispatch_features` is
+    # already the dispatch shaped for a per-feature body.
+    #
+    # Written by index into a pre-sized list rather than appended, because
+    # `append` is a running length and two workers appending is a data race on
+    # exactly the state this function no longer needs to keep.
+    var out = List[Float32](length=n_slots * n_bins, fill=Float32(0.0))
+    var dst = out.unsafe_ptr()
+    # A pointer rather than a copy of the list. `var feats = features` is an
+    # implicit `List` copy, which Mojo 1.0 refuses outright
+    # (`List[Int]` does not conform to `ImplicitlyCopyable`), and `.copy()`
+    # would allocate an `n_slots` list per plane, which is per level per tree.
+    # The body only READS the feature ids, and `dst` two lines up is already a
+    # borrowed pointer into a list that outlives this closure, so this is the
+    # same lifetime argument the destination already relies on: `features` is
+    # the caller's and outlives `dispatch_features` returning.
+    var feats = features.unsafe_ptr()
+
+    def draw_slot(slot: Int) {imm}:
+        var f = feats[slot]
+        var row = slot * n_bins
         for b in range(n_bins):
-            out.append(
+            dst.unsafe_store(
+                row + b,
                 host_random_score_noise(
                     stdev, seed, tree_index, node, f, b, domain
-                )
+                ),
             )
+
+    # The op estimate is the number of draws, and a draw is a splitmix fold
+    # plus a `log` and a `sqrt`, so it is a much heavier op than the row copies
+    # `PARALLEL_MIN_OPS` was calibrated on. Reporting the true count is the
+    # conservative direction: it under-claims the work per op, so the auto rule
+    # keeps a small plane serial, which is right, since a level with a handful
+    # of active features cannot repay a pool wake.
+    dispatch_features(draw_slot, n_slots, n_slots * n_bins)
     return out^
 
 
@@ -1765,7 +1830,28 @@ comptime REDUCE_SLOT_THREADS = 64
 multiple on every supported backend (it is `gpu_tiling.WARP_GRANULARITY`),
 which is what `block.max` and `block.min` want; the collectives allocate
 their own threadgroup scratch, one word per warp, so this kernel reserves no
-shared memory of its own and raises no device floor."""
+shared memory of its own and raises no device floor.
+
+**The width is not the problem with this launch; the launch is.** On the
+leaf-wise device-resident plane the reduction is launched at
+`grid_dim=n_records`, and `n_records` there is **two**, the pair of children of
+the step's committed split. So one whole command buffer carries two
+threadgroups reducing `widest_slots` records each -- 200 slot records at the
+1,000,000 x 100 reference shape -- and `gpu_resident_round`'s own census puts
+the step at nine command buffers. That is **one launch in nine for something
+under a percent of the step's arithmetic**, on a queue measured flat at 6 to 7
+microseconds per enqueue through 64 and 14 to 17 beyond it, which this plane is
+past for most of every tree.
+
+Widening or narrowing this constant cannot touch that. What can is folding the
+cross-slot reduction into the kernel that consumes it, which is
+`gpu_tree_tables`'s record filing: it runs in the very next command buffer, it
+already knows the two record slots, and reducing 2 x `widest_slots` slot
+records is trivial work for the one threadgroup it already launches. That is
+the same shape of fold as the partition copy-back into the histogram's slot
+zeroing, which shipped and took the tree from 308 command buffers to 278. It is
+**not built here**, because the consuming kernel is in another file. Counted,
+it is 30 command buffers per tree and roughly 3,000 per hundred-tree fit."""
 
 
 def split_primitives_requested() -> Bool:
@@ -1790,6 +1876,55 @@ def split_primitives_requested() -> Bool:
     handle that overrides it.
     """
     return getenv("MOJOTREES_GPU_SPLIT_PRIMITIVES") != "0"
+
+
+def noise_stage_parallel_requested() -> Bool:
+    """Whether a noise plane is drawn straight into the staging buffer, in
+    parallel over feature slots, rather than into a fresh `List[Float32]` that
+    is then copied in serially.
+
+    `MOJOTREES_GPU_NOISE_STAGE_PARALLEL=0` forces the old path. Default on,
+    because this is the category of change that gets built rather than gated:
+    strictly less work, and exact.
+
+    WHY IT IS EXACT, WHICH IS THE ONLY REASON IT MAY DEFAULT ON. A plane entry
+    is `host_random_score_noise(stdev, seed, tree, site, feature, bin)`
+    (:1444), a pure function of its six arguments. It reads no accumulator, no
+    running generator and no other entry, which is the property
+    `gpu_oblivious_score_stream` was written to have and says so in as many
+    words. So the value written at (slot, bin) does not depend on how many
+    other entries have been written, on the order they were written in, or on
+    which worker wrote them. Splitting the slot loop across workers permutes
+    the writes and changes no written value, and `MOJOTREES_NUM_WORKERS` is
+    therefore not an input to the model. That is a stronger statement than the
+    usual float-reassociation caveat and it holds because nothing here is
+    summed: every entry is an independent draw stored once.
+
+    WHAT IT REMOVES, MEASURED IN WORK RATHER THAN IN SECONDS. The old path
+    allocated a `slots * n_bins` `List[Float32]` per level, filled it serially
+    on one thread, then copied it element by element into `noise_stage`. At the
+    shipped symmetric default that is 100 trees x 6 levels = 600 planes of
+    25,500 entries: 15.3M serial draws, each with a `log` and a `sqrt`, plus
+    15.3M staging copies, plus 600 allocations, all on one thread sitting
+    between each level and the launch that searches it.
+
+    This switch moves the 15.3M DRAWS across workers, which is the part that
+    carries the `log` and the `sqrt` and therefore the part worth moving. Be
+    precise about what it does not do: the intermediate list still exists and
+    the staging copy still happens, it is merely a pointer copy now rather than
+    a bounds-checked `List.__setitem__` per entry. Writing the draw straight
+    into `noise_stage` would remove the list too, and is not done here because
+    the stager holds `mut self` and handing a closure a pointer into a field of
+    it is a bigger change than this switch is asking for. The remaining copy is
+    a Float32 move per entry with no libm call in it, so it is not the cost the
+    profile pointed at.
+
+    WHAT IT DOES NOT FIX, STATED SO THE NEXT READER DOES NOT OVERCREDIT IT.
+    Stage B still runs on the host, and it has to; see the stage A / stage B
+    argument at :1239. This makes the host draw parallel and single-pass. It
+    does not move the draw to the device, and it does not touch the upload.
+    """
+    return getenv("MOJOTREES_GPU_NOISE_STAGE_PARALLEL") != "0"
 
 
 def table_upload_hoisting_requested() -> Bool:
@@ -2362,6 +2497,22 @@ def _scan_slot_kernel(
 # Threads per threadgroup in the wide ordinal scan. A warp multiple on every
 # supported backend (it is `gpu_tiling.WARP_GRANULARITY`), and the width the
 # shared-memory budget below is stated at.
+#
+# Why 64 and not more, asked and answered 2026-08-17 by arithmetic rather than
+# by a run, and labelled as such. The scan splits `n_bins` chunkwise across the
+# threadgroup, so at the 256-bin ceiling 64 threads walk **four bins each**
+# while the block-level work around them is fixed: three chunk-sum reductions,
+# three exclusive prefixes and three maxima over the full width. Widening to
+# 128 halves an already four-step walk and pays a wider reduction for it, which
+# moves the kernel further into the part of itself that does not scale with the
+# data. Narrowing to 32 is the other direction and is **not to be retried**: a
+# 32-wide scan block was built and measured on the oblivious plane inside the
+# noise and reverted, and `block.prefix_sum` carries `constrained` "Block size
+# must be a multiple of warp size" against a `WARP_GRANULARITY` of 64 in this
+# repository anyway.
+#
+# So the tail is not where the leaf-wise search's time is, and the reason to
+# reach for this arm is the `block_dim=1` scan it replaces, not this constant.
 comptime WIDE_SCAN_THREADS = 64
 
 # Threadgroup memory `_scan_slot_wide_kernel` reserves: twelve
@@ -2378,14 +2529,44 @@ def wide_scan_requested() -> Bool:
     Off unless asked for, which is this package's rule for a path no
     benchmark has priced rather than a doubt about the result: the wide
     kernel returns the serial kernel's records bit for bit (see
-    `_scan_slot_wide_kernel`) and `tests/parallel/test_gpu_split_search.mojo`
+    `_scan_slot_wide_kernel`) and `tests/test_gpu_split_search.mojo`
     asserts that, so what is unmeasured is only whether it is faster. The
     scan is a small share of a split's cost on the one device this
     repository has run on -- `bench-launch-cost` prices a split's fixed
     overhead at roughly 280us -- so the honest expectation is a small win,
     and the default flips when a run says so and not before.
+
+    **The prior moved on 2026-08-17 and this arm is still the one that has not
+    been run.** `oblivious_wide_scan_requested` is the same widening of the
+    same `block_dim=1` scan on the oblivious plane, and it measured **4.5
+    percent, resolved and bit-identical**. So the shipped leaf-wise default is
+    now the only scan in this file still running one lane per (leaf, feature)
+    while its own sibling has a measured win. The two shapes are not the same
+    workload -- the oblivious launch scans a level at once and this one scans
+    two children -- so the number does not transfer, and this stays off until
+    an interleaved pair says so. What has changed is that "unmeasured" is no
+    longer the same thing as "unpromising".
     """
-    return getenv("MOJOTREES_GPU_SPLIT_WIDE") == "1"
+    # MEASURED AND FLIPPED THE SAME DAY, 2026-08-17. The interleaved pair the
+    # docstring above asked for was run, three round-robin cycles, 799,110 x 100
+    # continuous features, leaf-wise at the shared defaults (31 leaves,
+    # unbounded depth, learning rate 0.1), 100 trees, M4. Narrow 3.922 / 3.874 /
+    # 3.932 seconds, wide 3.220 / 3.196 / 3.231. The ranges are DISJOINT, so it
+    # is M0 resolved rather than consistent, and rmse was 6.116601511 in all six
+    # runs. 1.21x, and the paragraph above was wrong to expect a small win: this
+    # is four times what the oblivious arm got, on a plane where the scan is a
+    # larger share of the work because it scans two children rather than a whole
+    # level.
+    #
+    # So the default is ON and this variable is now an escape hatch restoring
+    # the narrow kernel. Flipped under LANE_RULES rule 5, and per that rule it
+    # survives ONE round as an off switch and is then deleted.
+    #
+    # One thing to know before re-measuring. `wide_scan_for` ANDs this request
+    # with "no categorical features", so a categorical dataset measures the
+    # NARROW kernel on both arms and reports a null. The measurement above was
+    # taken on continuous data for that reason.
+    return getenv("MOJOTREES_GPU_SPLIT_WIDE") != "0"
 
 
 def wide_scan_for(has_categorical: Bool) -> Bool:
@@ -3633,12 +3814,20 @@ def _scan_slot_oblivious_kernel(
     strict `>`. That holds with the noise **off**, which is the default and
     every LightGBM-mode fit. With it on, `0.0 + noise` beats `0.0` whenever
     the draw is positive, so such a candidate can win a level in which nothing
-    admissible was found. That is not a defect introduced here: it is what
-    `_scan_slot_kernel` does at the same initial `best_gain`, and it is what
-    `find_best_split_shared` does at its own `f_gain = 0.0`, so all three
-    agree. It is also CatBoost's own shape -- `bestScoreInstance` starts at
-    `MINIMAL_SCORE` and every candidate it compares is already noised. The
-    property the two backends must share is that they share it, and they do."""
+    admissible was found. For a candidate the host also enumerates that is not
+    a divergence: `_scan_slot_kernel` does it at the same initial `best_gain`,
+    `find_best_split_shared` does it at its own `f_gain = 0.0`, and it is
+    CatBoost's own shape, whose `bestScoreInstance` starts at `MINIMAL_SCORE`
+    with every candidate already noised.
+
+    **This paragraph used to end there and it was wrong about one candidate,
+    2026-08-17.** It said all three scans agree. They agree on every candidate
+    the host enumerates, and until the `n_top` bound below existed this kernel
+    enumerated one more: with no missing row in the level, the LAST ordinary
+    bin puts every row left and the host's level scan stops before it
+    (`split.mojo:1596`). Refused by every leaf, that candidate scored an exact
+    `0.0`, which the noise then turned into a winner the CPU could not elect.
+    The bound is at `n_top`; the argument is written out there."""
     var slot = Int(block_idx.x)
     var record = Int(level_record)
     var nt = record * NODE_WORDS
@@ -3858,6 +4047,61 @@ def _scan_slot_oblivious_kernel(
             mis_h[unsafe_offset=l] = Int32(0)
             mis_c[unsafe_offset=l] = Int32(0)
 
+    # Whether ANY leaf of the level has a row in the missing bin. Hoisted out
+    # of the direction loop below, where it used to be recomputed once per bin
+    # over the identical values, because the top-threshold bound needs it too
+    # and because it is a level-wide constant.
+    var any_missing = False
+    for l in range(nl):
+        if mis_c[unsafe_offset=l][0] > Int32(0):
+            any_missing = True
+
+    # THE TOP THRESHOLD, WHICH THIS KERNEL SCANNED AND THE HOST DOES NOT.
+    #
+    # `split.find_best_split_shared` takes `n_top = n_scan if level_miss_c > 0
+    # else n_scan - 1` and returns when that is not positive
+    # (`split.mojo:1596`), and the three per-NODE kernels in this file all
+    # break out of the same bin with `if b == n_scan - 1 and miss_c == 0`
+    # (`_scan_slot_kernel`, `_scan_slot_wide_kernel`,
+    # `_scan_slot_wide_primitive_kernel`), which is `find_best_split`'s own
+    # `break`. The two OBLIVIOUS kernels were the only scans in the package
+    # without it: they walked `range(n_scan)`, so with no missing row anywhere
+    # in the level they scored one candidate the host never sees -- every
+    # ordinary bin left, an empty right child.
+    #
+    # **It was inert with the noise off and it is a live CPU/GPU divergence
+    # with the noise on**, which is why it survived: that candidate is refused
+    # by every leaf (`tc - lc == 0 < min_data_in_leaf`), so each leaf
+    # contributes its unsplit terms, `total` comes out of the ratio as exactly
+    # `level_parent - level_parent == 0.0`, and `0.0 > best_gain` is false at
+    # a `best_gain` that starts at `0.0`. Add `random_strength`'s draw and the
+    # same candidate scores `0.0 + noise`, which WINS on any positive draw
+    # that beats the slot's real candidates -- and it then reports
+    # `IREC_LEFT_COUNT = 0` while routing every row left, because `cand_c` was
+    # never incremented on a candidate no leaf accepted. The host cannot elect
+    # it at all. The docstring above claimed all three scans "agree" on this
+    # candidate; they agree on every candidate except this one, and this one
+    # only exists here.
+    #
+    # ONE MORE CASE, smaller and also a divergence, and it is the reason the
+    # bound is written as the host's rule rather than as "skip the zero-score
+    # candidate". `min_data_in_leaf` is only required to be NONNEGATIVE
+    # (`validation.check_booster_ranges`), so at `min_data_in_leaf = 0` beside
+    # `min_child_hess = 0` the empty right child passes both legality tests
+    # and the candidate is scored for real. Its score is the level's own,
+    # minus the level's own, which is about zero but is not exactly zero in
+    # Float32, so it could win a level in which nothing else scored positive
+    # even with the noise off. The host still never enumerates it. Dropping
+    # the candidate is the correct behavior in both cases, so this is a fix
+    # and not a switch; it is bit-identical for every fit with the noise off
+    # AND `min_data_in_leaf >= 1` or `min_child_hess > 0`, which is every
+    # shipped configuration.
+    var n_top = n_scan
+    if not any_missing:
+        n_top = n_scan - 1
+    if n_top < 1:
+        return
+
     # ONE ratio for the whole level, which is CatBoost's `numScoreBlocks = 1`,
     # taken here over the accumulators the leaf loop folded and subtracted from
     # every candidate below. `find_best_split_shared` computes `level_parent`
@@ -3880,7 +4124,7 @@ def _scan_slot_oblivious_kernel(
     var best_left_hf = Float32(0.0)
     var found = False
 
-    for b in range(n_scan):
+    for b in range(n_top):
         # Each leaf's prefix advances by this bin, in record order.
         for l in range(nl):
             var lb = Int(base_of[unsafe_offset=l][0])
@@ -3918,11 +4162,8 @@ def _scan_slot_oblivious_kernel(
                 # actually missing; with none, the two candidates are the same
                 # split and scoring both would let the second win a tie the
                 # first should have kept. The test is over the level, since the
-                # candidate is.
-                var any_missing = False
-                for l in range(nl):
-                    if mis_c[unsafe_offset=l][0] > Int32(0):
-                        any_missing = True
+                # candidate is, and it is `any_missing` above -- the same
+                # values, read once for the whole slot instead of once per bin.
                 if not any_missing:
                     continue
             var total = Float32(0.0)
@@ -4050,6 +4291,777 @@ def _scan_slot_oblivious_kernel(
     out_f[unsafe_offset = fo + FREC_LEFT_HESS] = best_left_hf
     out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = level_g - best_left_gf
     out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = level_h - best_left_hf
+
+
+# --- grow_policy = oblivious: the WIDE cross-leaf scan ---------------------
+#
+# `_scan_slot_oblivious_kernel` above runs on ONE thread per feature slot. Its
+# docstring says a wide form "is possible and is deliberately not written,
+# because it would have to agree with the CPU lane about a tree-reduction order
+# before it could be bit-identical to anything, and no such agreement exists."
+# **That sentence is true of one sum in the kernel and was applied to the whole
+# kernel.** The distinction is the whole of why this kernel can exist:
+#
+#   - The CROSS-LEAF sum is Float32 (`total`, or `cos_num`/`cos_den`). Float32
+#     addition is not associative, the accuracy gate for this mode is
+#     node-identity against the CPU oblivious grower with NO tolerance, and the
+#     host walks the level's leaves ascending. So that sum must stay serial in
+#     ascending leaf order. It does, below, and the invariant is stated in the
+#     kernel: nothing here sums a Float32 across threads, and nothing may.
+#   - The CROSS-BIN prefix is `run_g`/`run_h`/`run_c`, declared
+#     `Scalar[DType.int32]` at the narrow kernel's per-leaf state. Integer
+#     addition IS associative, so a block collective and a serial low-index
+#     first walk agree word for word. `_scan_slot_wide_primitive_kernel` makes
+#     exactly this argument for exactly this quantity at its own
+#     `block.prefix_sum` calls, and this kernel reuses it per leaf.
+#
+# So the parallel dimension is the CANDIDATE, not the leaf. A thread owns a
+# contiguous chunk of bins, and for each of its candidates it walks every leaf
+# ascending in its own registers. Two threads never combine a Float32.
+#
+# THE MEASURED DEFECT THIS EXISTS FOR. Per tree at 800k x 100 on an M4:
+# CatBoost 32 ms, our leaf-wise GPU path 77 ms, our CPU symmetric path 130 ms,
+# our symmetric GPU path 312 ms. The symmetric shape is the shipped default, so
+# the accelerator is currently a 2.4x loss against our own CPU on the
+# configuration users get. The narrow kernel's inner work is
+# `n_scan * 2 * n_leaves` gain evaluations plus `n_leaves * n_bins` setup
+# reads, which at 255 bins and 64 leaves is roughly 65,000 sequential steps in
+# a single thread while the other 63 lanes of the threadgroup idle.
+#
+# WHY CATBOOST IS THE REFERENCE AND WHAT IT DOES. CatBoost grows the same
+# oblivious shape and ships 32 ms per tree, so its decomposition is the target
+# rather than an alternative. Two facts about it are already transcribed in this
+# file and both point the same way as the design here:
+# `greedy_search_helper.cpp` keeps `numScoreBlocks = 1` for `SymmetricTree`
+# because a level's Cosine score is one ratio over accumulators summed across
+# every leaf (cited at `gpu_cosine_level_terms` above), and
+# `tensor_search_helpers.cpp`'s `SetBestScore` noises
+# `scores[binFeatureIdx]`, which is ALREADY the level-summed score, once per
+# (feature, bin) before the argmax (cited in the narrow kernel's docstring).
+# Both say the same thing about shape: CatBoost's unit of parallel work for a
+# symmetric level is the CANDIDATE, with the leaves summed inside it, which is
+# the decomposition below. **What is READ is those two source citations, which
+# this repository transcribed earlier and which I re-read rather than
+# re-derived. What is INFERRED is that CatBoost's CUDA scoring kernel assigns a
+# candidate to a thread**: CatBoost is not vendored in this checkout, so the
+# thread mapping of `catboost/cuda/methods/greedy_subsets_searcher` was not
+# read and is not claimed. The inference is not load-bearing, because the
+# ordering constraint that forces this shape is ours: it comes from our
+# no-tolerance identity gate against our own CPU grower, and it would force
+# candidate-parallel decomposition whatever CatBoost does.
+#
+# WHAT IS NOT COPIED FROM CATBOOST, DELIBERATELY. CatBoost applies
+# `min_data_in_leaf` only to `Depthwise` and `Lossguide` and `SymmetricTree`
+# carries no such constraint, which the narrow kernel's docstring establishes
+# and dates. So the per-leaf legality tests and the zero-contribution rule are
+# ours, they are reproduced here statement for statement from the narrow
+# kernel, and they are not defended by appeal to CatBoost.
+
+
+#: Threads per feature slot in the wide oblivious scan. The same 64 as
+#: `WIDE_SCAN_THREADS`, and the same number for the same two reasons: it is the
+#: block size every `block.*` collective in this file is instantiated at, so a
+#: second size would be a second set of instantiations, and the Metal command
+#: queue is 64 deep (`docs/GPU_PORTABILITY.md` 6.2) so the threadgroup shape
+#: that has been exercised is the one to reuse.
+comptime OBLIVIOUS_WIDE_THREADS = WIDE_SCAN_THREADS
+
+#: The most bins one thread of the wide oblivious scan can own, which bounds
+#: its private per-candidate accumulators at compile time.
+#:
+#: `binning.MAX_BINS` is 256 and `n_scan` is at most `n_bins`, so
+#: `ceil(256 / 64) = 4` and no thread ever owns a fifth bin. Two candidates a
+#: bin, missing-left and missing-right, so eight candidate slots. The
+#: accumulators have to persist across the leaf loop -- the leaf loop is
+#: OUTSIDE the bin loop here, which is the one structural inversion against the
+#: narrow kernel -- so they are private arrays rather than registers indexed by
+#: a constant, and their size has to be a compile-time bound rather than `per`.
+comptime OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD = 4
+comptime OBLIVIOUS_WIDE_MAX_CANDIDATES = 2 * OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD
+
+
+def oblivious_wide_scan_requested() -> Bool:
+    """`MOJOTREES_GPU_OBLIVIOUS_WIDE=1`, the switch for the wide oblivious scan.
+
+    Off unless asked for, which is this package's rule for a path no benchmark
+    has priced, and the rule is being followed here even though the expected
+    win is large. `_scan_slot_oblivious_wide_kernel` returns the narrow
+    kernel's records bit for bit and the argument for each step is written at
+    that kernel, but "bit-identical" and "faster" are different claims and only
+    the first has been established by reading. The measured 312 ms per tree
+    against a leaf-wise 77 says where the loss is; it does not say this removes
+    it, because this kernel trades roughly 65,000 sequential arithmetic steps
+    for roughly 1,000 per thread plus `3 * n_leaves` block collectives per
+    feature slot, and the collectives are barriers. **The collective count is
+    the honest risk in this change** and is the first thing a measurement
+    should look at: at 64 leaves that is 192 `block.prefix_sum` calls per slot
+    per level. If they dominate, the fix is to tile the leaves and amortize the
+    prefix over a tile, which costs threadgroup memory the design note at
+    `OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD` deliberately avoids spending.
+
+    The default flips when a run says so and not before, which is the same
+    sentence `wide_scan_requested` carries for the leaf-wise plane.
+    """
+    # DEFAULT ON since 2026-08-17, so this variable now restores the narrow
+    # `block_dim=1` scan rather than selecting the wide one. Measured twice that
+    # day. On a quiet box, alternating passes of three repeats, 20.40 s narrow
+    # against 19.49 s wide with the ranges fully disjoint, a resolved 4.5
+    # percent. Later, on a loaded box in a three-cycle round robin, 22.76 s
+    # against 21.28 s, 1.07x, and part of the 2.20x combined arm. rmse
+    # 2.439382420 in all of it, so the bit-identity argument written at
+    # `_scan_slot_oblivious_wide_kernel` holds in measurement.
+    #
+    # The honest reading of the size of this win is that it is small and that
+    # the smallness is the finding: cutting roughly 65,000 sequential steps per
+    # thread to roughly 1,000 bought 4.5 percent, which is what proves the scan
+    # was never this plane's bottleneck. The histogram was, and the subtracting
+    # arm is what collects that.
+    #
+    # Flipped under LANE_RULES rule 5, added the same day. Per that rule this
+    # variable survives ONE round as an off switch and is then deleted.
+    return getenv("MOJOTREES_GPU_OBLIVIOUS_WIDE") != "0"
+
+
+def _scan_slot_oblivious_wide_kernel(
+    hist: MutPointer[Int32, MutAnyOrigin],
+    node_tab: MutPointer[Int32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    allow: MutPointer[Int32, MutAnyOrigin],
+    missing: MutPointer[Int32, MutAnyOrigin],
+    cat_n: MutPointer[Int32, MutAnyOrigin],
+    mono: MutPointer[Int32, MutAnyOrigin],
+    fparams: MutPointer[Float32, MutAnyOrigin],
+    noise: MutPointer[Float32, MutAnyOrigin],
+    out_i: MutPointer[Int32, MutAnyOrigin],
+    out_f: MutPointer[Float32, MutAnyOrigin],
+    n_bins: Int32,
+    hist_size: Int32,
+    level_record: Int32,
+    leaf_base: Int32,
+    n_leaves: Int32,
+    feat_stride: Int32,
+    min_data_in_leaf: Int32,
+    constrained: Int32,
+    gain_form: Int32,
+    score_function: Int32,
+    noisy: Int32,
+):
+    """`_scan_slot_oblivious_kernel` on `OBLIVIOUS_WIDE_THREADS` threads per
+    feature slot instead of one, returning its records bit for bit.
+
+    Same grid, same arguments, same output cells. Read the narrow kernel first:
+    every rule about candidate order, ties, per-leaf legality, the Cosine
+    accumulation shape, the illegal-leaf substitution, the level's unsplit
+    subtraction and where `random_strength` enters is specified there and is
+    reproduced here rather than restated. This docstring covers only what
+    changes, which is the decomposition and the argument that it changes no
+    number.
+
+    THE DECOMPOSITION
+    -----------------
+    A thread owns one contiguous chunk of `n_scan` bins, `per` wide, which is
+    `_scan_slot_wide_primitive_kernel`'s partition exactly: `per` is the same
+    for every thread so a chunk's start is its thread index times it, and the
+    partition is a function of `n_scan` alone. The loops are then INVERTED
+    against the narrow kernel: leaves outermost, this thread's bins inside
+    them, and the two routing directions innermost. The narrow kernel runs bins
+    outermost because it carries one prefix per leaf in threadgroup memory and
+    advances all of them together; a thread that starts in the middle of the
+    bin range cannot do that, so it takes one leaf at a time and gets that
+    leaf's chunk-start prefix from a collective.
+
+    The inversion is what forces the per-candidate accumulators to persist,
+    which is the only new state in this kernel: eight Float32 slots for the L2
+    total or the Cosine numerator, eight more for the Cosine denominator, and
+    eight each for the candidate's left count, gradient and hessian. They are
+    private, `OBLIVIOUS_WIDE_MAX_CANDIDATES` long, and bounded at compile time
+    because `binning.MAX_BINS` is 256 and 256 over 64 threads is 4 bins.
+
+    BIT-IDENTITY, STEP BY STEP
+    --------------------------
+    **1. The per-leaf setup is Int32 and is moved, not reordered.** One leaf per
+    thread sums that leaf's `n_bins` histogram cells into `tot_g`/`tot_h`/
+    `tot_c`. Those are fixed-point Int32 accumulations over a fixed range in
+    ascending bin order, identical to the narrow kernel's, and they are private
+    to a leaf so no two threads touch one. `n_leaves` is at most
+    `OBLIVIOUS_MAX_LEAVES`, which is 64, which is `OBLIVIOUS_WIDE_THREADS`, so
+    one leaf per thread covers a level exactly and threads past the level's
+    width idle. The per-leaf Float32 CONSTANTS derived from those sums --
+    `par_score`, `node_ss`, `cross_off`, and Cosine's `un_num`/`un_den` -- are
+    each a pure function of one leaf's own totals, so computing them on
+    different threads changes nothing.
+
+    **2. The level's Float32 sums are recomputed redundantly, in order, by
+    every thread.** `level_g`, `level_h`, `p_num` and `p_den` are cross-leaf
+    Float32 sums, so they may not come from a collective. Each thread folds
+    them itself from the shared per-leaf table, ascending, which is the narrow
+    kernel's order and the host's. Every thread therefore holds the identical
+    value, no broadcast is needed, and `n_leaves` extra adds is the whole cost.
+    `level_c` is Int32 and would have been safe either way.
+
+    **3. The cross-bin prefix comes from `block.prefix_sum[exclusive=True]` and
+    is exact.** For each leaf, a thread sums its own chunk's cells and the
+    collective turns those chunk sums into the thread's chunk-start prefix.
+    Fixed-point Int32, so the collective's tree and the serial low-index-first
+    walk it replaces agree word for word. This is the same substitution
+    `_scan_slot_wide_primitive_kernel` makes and its own docstring argues; the
+    only difference is that it is made once per leaf here rather than once.
+
+    **4. The cross-leaf Float32 sum stays serial and ascending, inside one
+    thread.** For a given candidate, the leaf loop adds leaf 0's contribution,
+    then leaf 1's, and so on, into a slot this thread alone owns. The addition
+    order for every candidate is therefore ascending leaf record order, exactly
+    the narrow kernel's, and **no Float32 is ever combined across threads**.
+    That is the invariant `_scan_slot_wide_primitive_kernel` states for itself
+    and it is the one this kernel must not break. The illegal-leaf
+    substitution, the `min_data_in_leaf` and `min_child_hess` tests, the
+    monotone rejection and the Cosine terms are the narrow kernel's
+    expressions, unedited, so each leaf contributes the same bits it did.
+
+    **5. The single Cosine ratio and the `level_parent` subtraction happen
+    after the leaf loop has closed over the whole level**, per candidate, which
+    is where the narrow kernel takes them. The noise is added after that and
+    immediately before the argmax, which is the one place it may enter; see the
+    narrow kernel's `random_strength` section for why never into `cos_num` or
+    `cos_den`. The noise is keyed by BIN and not by scan position, which is what
+    lets a thread starting in the middle of the range read the number a serial
+    walk would have reached that bin with -- the property
+    `_scan_slot_wide_primitive_kernel` also relies on and names.
+
+    **6. The argmax reproduces "first candidate of the lowest bin holding the
+    maximum".** A thread scores its own candidates in ascending ordinal order
+    under a strict `>`, so it holds the first of its own. Across threads,
+    `block.max` on the gain then `block.min` on the ordinal picks the lowest
+    ordinal among those holding the maximum, and candidate ordinals are unique
+    across threads because the chunks are disjoint bin ranges. Ordinal is
+    `2 * bin + (0 if missing-left else 1)`, so missing-left still wins an exact
+    tie within a bin and a lower bin still wins across bins. The narrow
+    kernel's `best_gain` starts at `0.0` and only a strictly greater candidate
+    replaces it, so a maximum of zero means the threadgroup found nothing,
+    which is its `found == False`.
+
+    **7. `runner_gain` is the second largest counted with multiplicity**, folded
+    as `_scan_slot_wide_primitive_kernel` folds it and for the reason it gives:
+    one occurrence of the maximum is exactly the winning thread's best, so
+    excluding that thread from a second maximum and folding in the largest
+    per-thread runner-up gives the serial merge's answer.
+
+    **8. The winner's level-left statistics are broadcast through threadgroup
+    memory**, because they are Float32 sums the winning thread accumulated and
+    cannot be recomputed by thread 0 without redoing the leaf loop. Exactly one
+    thread satisfies both halves of the winner test, so exactly one writes.
+
+    UNIFORMITY, WHICH THE COLLECTIVES REQUIRE
+    -----------------------------------------
+    Every early return here is decided by the grid position, the node table, or
+    a per-feature table, never by `tid`, so a threadgroup takes each one whole
+    and no collective is reached by a subset of it. That is the rule
+    `_scan_slot_wide_primitive_kernel` states and it is why `allow`, the
+    categorical test and `n_scan < 1` are tested before the leaf loop rather
+    than inside it. The leaf loop bound is `n_leaves`, which is uniform, and the
+    three `block.prefix_sum` calls sit at the top of its body ahead of any
+    `tid`-dependent branch, so a thread whose chunk is empty still reaches them
+    and contributes a zero chunk sum. `barrier()` follows the two phases that
+    write the shared per-leaf table.
+
+    COST
+    ----
+    Launches per tree are UNCHANGED, which is a precondition of this mode
+    rather than a happy result: this is the same two-launch level search, the
+    same `_reduce_slots_kernel` over one record, and
+    `gpu_resident_round.oblivious_launch_census(6)` is still 62 command buffers
+    for a depth-6 tree. Threadgroup memory is unchanged too, because the three
+    `run_*` arrays the narrow kernel keeps per leaf are gone -- a thread's
+    prefix lives in its own registers now -- and nothing was added. What this
+    kernel spends instead is `3 * n_leaves` block collectives per feature slot
+    per level, 192 at depth 6, and that is the number a measurement should
+    interrogate first; `oblivious_wide_scan_requested` says what to do if they
+    dominate."""
+    var tid = Int(thread_idx.x)
+    var slot = Int(block_idx.x)
+    var record = Int(level_record)
+    var nt = record * NODE_WORDS
+    if slot >= Int(node_tab[unsafe_offset = nt + NODE_SLOTS][0]):
+        return
+    var stride = Int(feat_stride)
+    var table = record * stride
+    var f = Int(feat_ids[unsafe_offset = table + slot][0])
+    var nb = Int(n_bins)
+    var hs = Int(hist_size)
+    var io = (table + slot) * SPLIT_IWORDS
+    var fo = (table + slot) * SPLIT_FWORDS
+    var pf = record * PF_WORDS
+    var noise_base = (table + slot) * nb
+    var nl = Int(n_leaves)
+    if nl > OBLIVIOUS_MAX_LEAVES:
+        nl = OBLIVIOUS_MAX_LEAVES
+
+    # The per-leaf table, the narrow kernel's minus `run_g`/`run_h`/`run_c`.
+    # Those three are a thread's own scan state here and live in registers, so
+    # the wide form uses strictly LESS threadgroup memory than the narrow one.
+    var base_of = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tot_g = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tot_h = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tot_c = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var mis_g = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var mis_h = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var mis_c = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var par_score = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var node_ss = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var cross_off = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var un_num = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var un_den = stack_allocation[
+        OBLIVIOUS_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    # The winning thread's level-left statistics, which thread 0 cannot
+    # recompute without redoing the leaf loop. Two Float32 sums and one Int32
+    # count, the shape `_scan_slot_wide_primitive_kernel`'s `won` has for the
+    # same purpose.
+    var won_f = stack_allocation[
+        2,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var won_i = stack_allocation[
+        1,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var g_inv = fparams[unsafe_offset = pf + PF_G_INV][0]
+    var h_inv = fparams[unsafe_offset = pf + PF_H_INV][0]
+    var lambda_l2 = fparams[unsafe_offset = pf + PF_LAMBDA_L2][0]
+    var lambda_l1 = fparams[unsafe_offset = pf + PF_LAMBDA_L1][0]
+    var min_child_hess = fparams[unsafe_offset = pf + PF_MIN_CHILD_HESS][0]
+    var bound_lo = fparams[unsafe_offset = pf + PF_BOUND_LO][0]
+    var bound_hi = fparams[unsafe_offset = pf + PF_BOUND_HI][0]
+    var form = gpu_resolve_gain_form(gain_form, lambda_l1)
+    var cosine = score_function == Int32(SCORE_COSINE)
+
+    # The record belongs to thread 0 throughout, as it does in the leaf-wise
+    # wide kernel: nothing else in the threadgroup writes `out_i` or `out_f`.
+    if tid == 0:
+        for i in range(SPLIT_IWORDS):
+            out_i[unsafe_offset = io + i] = Int32(0)
+        for i in range(SPLIT_FWORDS):
+            out_f[unsafe_offset = fo + i] = Float32(0.0)
+        out_i[unsafe_offset = io + IREC_FEATURE] = Int32(-1)
+        out_i[unsafe_offset = io + IREC_BIN] = Int32(-1)
+        out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(-1)
+
+    # Step 1: one leaf per thread. Int32 sums over that leaf's own bins in
+    # ascending order, then the Float32 constants that are pure functions of
+    # them. `nl <= OBLIVIOUS_MAX_LEAVES == OBLIVIOUS_WIDE_THREADS`, so a level
+    # is covered exactly and wider threads idle here.
+    if tid < nl:
+        var l = tid
+        var lnt = (Int(leaf_base) + l) * NODE_WORDS
+        var lb = (
+            Int(node_tab[unsafe_offset = lnt + NODE_HIST_BASE][0]) + f * nb
+        )
+        base_of[unsafe_offset=l] = Int32(lb)
+        var tg = Int32(0)
+        var th = Int32(0)
+        var tc = Int32(0)
+        for b in range(nb):
+            tg += hist[unsafe_offset = lb + b][0]
+            th += hist[unsafe_offset = hs + lb + b][0]
+            tc += hist[unsafe_offset = 2 * hs + lb + b][0]
+        tot_g[unsafe_offset=l] = tg
+        tot_h[unsafe_offset=l] = th
+        tot_c[unsafe_offset=l] = tc
+        var tgf = tg.cast[DType.float32]() * g_inv
+        var thf = th.cast[DType.float32]() * h_inv
+        par_score[unsafe_offset=l] = gpu_leaf_score(
+            tgf, thf, lambda_l1, lambda_l2
+        )
+        var ns = gpu_cross_node_s(thf, lambda_l2)
+        node_ss[unsafe_offset=l] = ns
+        cross_off[unsafe_offset=l] = gpu_cross_offset(
+            tgf, thf, lambda_l1, lambda_l2, lambda_l2, ns
+        )
+        if cosine:
+            var ut = gpu_cosine_unsplit(tgf, thf, lambda_l1, lambda_l2)
+            un_num[unsafe_offset=l] = ut[0]
+            un_den[unsafe_offset=l] = ut[1]
+        # The missing-bin row, written in the same pass rather than in a second
+        # one, because it is this leaf's own cell and needs the same barrier.
+        var missing_bin_setup = Int(missing[unsafe_offset=f][0])
+        if missing_bin_setup >= 0:
+            mis_g[unsafe_offset=l] = hist[
+                unsafe_offset = lb + missing_bin_setup
+            ][0]
+            mis_h[unsafe_offset=l] = hist[
+                unsafe_offset = hs + lb + missing_bin_setup
+            ][0]
+            mis_c[unsafe_offset=l] = hist[
+                unsafe_offset = 2 * hs + lb + missing_bin_setup
+            ][0]
+        else:
+            mis_g[unsafe_offset=l] = Int32(0)
+            mis_h[unsafe_offset=l] = Int32(0)
+            mis_c[unsafe_offset=l] = Int32(0)
+    barrier()
+
+    # Step 2: the level's cross-leaf Float32 sums, folded ascending by EVERY
+    # thread from the shared table. Not a collective, because they are Float32;
+    # not a broadcast, because recomputing them costs `nl` adds and every
+    # thread then holds the identical bits.
+    var p_num = Float32(0.0)
+    var p_den = Float32(0.0)
+    var level_g = Float32(0.0)
+    var level_h = Float32(0.0)
+    var level_c = Int32(0)
+    for l in range(nl):
+        var tgf = tot_g[unsafe_offset=l][0].cast[DType.float32]() * g_inv
+        var thf = tot_h[unsafe_offset=l][0].cast[DType.float32]() * h_inv
+        if cosine:
+            p_num += un_num[unsafe_offset=l][0]
+            p_den += un_den[unsafe_offset=l][0]
+        level_g += tgf
+        level_h += thf
+        level_c += tot_c[unsafe_offset=l][0]
+    if tid == 0:
+        out_f[unsafe_offset = fo + FREC_TOTAL_GRAD] = level_g
+        out_f[unsafe_offset = fo + FREC_TOTAL_HESS] = level_h
+        out_i[unsafe_offset = io + IREC_TOTAL_COUNT] = level_c
+
+    # Uniform returns, taken by the whole threadgroup, ahead of every
+    # collective below.
+    if allow[unsafe_offset = table + slot][0] == Int32(0):
+        return
+    if Int(cat_n[unsafe_offset=f][0]) >= 2:
+        return
+
+    var sign = Int32(MONOTONE_FREE)
+    if constrained != Int32(0):
+        sign = mono[unsafe_offset=f][0]
+    var is_constrained = constrained != Int32(0)
+
+    var missing_bin = Int(missing[unsafe_offset=f][0])
+    var n_scan = missing_bin if missing_bin >= 0 else nb
+    if n_scan < 1:
+        return
+
+    # The narrow kernel hoists this to the same place and for the same two
+    # reasons: it is bin-independent, and the top-threshold bound below needs
+    # it.
+    var any_missing = False
+    for l in range(nl):
+        if mis_c[unsafe_offset=l][0] > Int32(0):
+            any_missing = True
+
+    # THE TOP THRESHOLD, dropped here exactly as `_scan_slot_oblivious_kernel`
+    # drops it, because this kernel's whole contract is that it returns that
+    # kernel's records bit for bit. See the long note there: with no missing
+    # row in the level the last ordinary bin puts every row left, the host
+    # level scan never enumerates it, and with `random_strength` on it scores
+    # `0.0 + noise` and can win.
+    #
+    # This narrows `n_scan` BEFORE the partition below, so the two kernels
+    # also agree on which thread owns which candidate. That is safe for the
+    # identity argument this kernel rests on: every cross-leaf Float32 sum is
+    # private to the thread that owns the candidate, the cross-bin prefix is
+    # Int32 and therefore partition-independent, and the winner is chosen by
+    # `block.min` over the ascending ORDINAL rather than by thread index.
+    #
+    # The return is uniform across the threadgroup -- `n_scan`, `any_missing`
+    # and `missing_bin` are all per-slot constants -- and it sits ahead of
+    # every collective, which is the precondition the `n_scan < 1` return
+    # above already relies on.
+    if not any_missing:
+        n_scan -= 1
+        if n_scan < 1:
+            return
+
+    var level_parent = Float32(0.0)
+    if cosine:
+        level_parent = gpu_cosine_score(p_num, p_den)
+
+    # One contiguous chunk of the scan per thread, `_scan_slot_wide_primitive_
+    # kernel`'s partition exactly.
+    var per = (
+        n_scan + OBLIVIOUS_WIDE_THREADS - 1
+    ) // OBLIVIOUS_WIDE_THREADS
+    var lo = tid * per
+    if lo > n_scan:
+        lo = n_scan
+    var hi = lo + per
+    if hi > n_scan:
+        hi = n_scan
+
+    # This thread's per-candidate accumulators, private and compile-time
+    # bounded. `acc_a` is the L2 total or the Cosine numerator, `acc_b` the
+    # Cosine denominator; the three `cand_*` arrays are the candidate's level
+    # left statistics. Indexed `2 * (b - lo) + d`.
+    var acc_a = stack_allocation[
+        OBLIVIOUS_WIDE_MAX_CANDIDATES, Scalar[DType.float32]
+    ]()
+    var acc_b = stack_allocation[
+        OBLIVIOUS_WIDE_MAX_CANDIDATES, Scalar[DType.float32]
+    ]()
+    var acc_c = stack_allocation[
+        OBLIVIOUS_WIDE_MAX_CANDIDATES, Scalar[DType.int32]
+    ]()
+    var acc_gf = stack_allocation[
+        OBLIVIOUS_WIDE_MAX_CANDIDATES, Scalar[DType.float32]
+    ]()
+    var acc_hf = stack_allocation[
+        OBLIVIOUS_WIDE_MAX_CANDIDATES, Scalar[DType.float32]
+    ]()
+    for k in range(OBLIVIOUS_WIDE_MAX_CANDIDATES):
+        acc_a[unsafe_offset=k] = Float32(0.0)
+        acc_b[unsafe_offset=k] = Float32(0.0)
+        acc_c[unsafe_offset=k] = Int32(0)
+        acc_gf[unsafe_offset=k] = Float32(0.0)
+        acc_hf[unsafe_offset=k] = Float32(0.0)
+
+    # Steps 3 and 4: leaves outermost so the cross-leaf Float32 sum for each of
+    # this thread's candidates is built in ascending leaf order in a slot this
+    # thread alone owns.
+    for l in range(nl):
+        var lb = Int(base_of[unsafe_offset=l][0])
+        var cg = Int32(0)
+        var ch = Int32(0)
+        var cc = Int32(0)
+        for i in range(lo, hi):
+            cg += hist[unsafe_offset = lb + i][0]
+            ch += hist[unsafe_offset = hs + lb + i][0]
+            cc += hist[unsafe_offset = 2 * hs + lb + i][0]
+        # Exclusive prefix over the chunk sums, for THIS leaf. Fixed-point
+        # Int32, so the collective and the serial walk agree word for word.
+        # Reached by the whole threadgroup: the loop bound is uniform and this
+        # sits ahead of every `tid`-dependent branch in the body.
+        var rg = block.prefix_sum[
+            block_size=OBLIVIOUS_WIDE_THREADS, exclusive=True
+        ](cg)
+        var rh = block.prefix_sum[
+            block_size=OBLIVIOUS_WIDE_THREADS, exclusive=True
+        ](ch)
+        var rc = block.prefix_sum[
+            block_size=OBLIVIOUS_WIDE_THREADS, exclusive=True
+        ](cc)
+
+        var tg = tot_g[unsafe_offset=l][0]
+        var th = tot_h[unsafe_offset=l][0]
+        var tc = tot_c[unsafe_offset=l][0]
+        var tgf = tg.cast[DType.float32]() * g_inv
+        var thf = th.cast[DType.float32]() * h_inv
+        var l_mis_g = mis_g[unsafe_offset=l][0]
+        var l_mis_h = mis_h[unsafe_offset=l][0]
+        var l_mis_c = mis_c[unsafe_offset=l][0]
+        var l_un_num = un_num[unsafe_offset=l][0]
+        var l_un_den = un_den[unsafe_offset=l][0]
+
+        for b in range(lo, hi):
+            rg += hist[unsafe_offset = lb + b][0]
+            rh += hist[unsafe_offset = hs + lb + b][0]
+            rc += hist[unsafe_offset = 2 * hs + lb + b][0]
+            for d in range(2):
+                var want_default_left = d == 0
+                if want_default_left and missing_bin < 0:
+                    continue
+                if not want_default_left and missing_bin >= 0:
+                    if not any_missing:
+                        continue
+                var k = 2 * (b - lo) + d
+                var lg = rg
+                var lh = rh
+                var lc = rc
+                if want_default_left:
+                    lg += l_mis_g
+                    lh += l_mis_h
+                    lc += l_mis_c
+                var lhf = lh.cast[DType.float32]() * h_inv
+                var rhf = gpu_right_sum(thf, lhf, th, lh, h_inv, form)
+                var lgf = lg.cast[DType.float32]() * g_inv
+                var rgf = gpu_right_sum(tgf, lgf, tg, lg, g_inv, form)
+                if (
+                    lc < min_data_in_leaf
+                    or tc - lc < min_data_in_leaf
+                    or lhf < min_child_hess
+                    or rhf < min_child_hess
+                ):
+                    if cosine:
+                        acc_a[unsafe_offset=k] = (
+                            acc_a[unsafe_offset=k][0] + l_un_num
+                        )
+                        acc_b[unsafe_offset=k] = (
+                            acc_b[unsafe_offset=k][0] + l_un_den
+                        )
+                    continue
+                if cosine:
+                    var ct = gpu_cosine_level_terms(
+                        gpu_soft_threshold_l1(lgf, lambda_l1),
+                        lhf,
+                        gpu_soft_threshold_l1(rgf, lambda_l1),
+                        rhf,
+                        lambda_l2,
+                        sign,
+                        bound_lo,
+                        bound_hi,
+                        is_constrained,
+                        SIMD[DType.float32, 2](l_un_num, l_un_den),
+                    )
+                    acc_a[unsafe_offset=k] = acc_a[unsafe_offset=k][0] + ct[0]
+                    acc_b[unsafe_offset=k] = acc_b[unsafe_offset=k][0] + ct[1]
+                else:
+                    acc_a[unsafe_offset=k] = acc_a[unsafe_offset=k][
+                        0
+                    ] + gpu_split_gain(
+                        gpu_soft_threshold_l1(lgf, lambda_l1),
+                        lhf,
+                        gpu_soft_threshold_l1(rgf, lambda_l1),
+                        rhf,
+                        lambda_l2,
+                        par_score[unsafe_offset=l][0],
+                        sign,
+                        bound_lo,
+                        bound_hi,
+                        is_constrained,
+                        node_ss[unsafe_offset=l][0],
+                        cross_off[unsafe_offset=l][0],
+                        form,
+                    )
+                acc_c[unsafe_offset=k] = acc_c[unsafe_offset=k][0] + lc
+                acc_gf[unsafe_offset=k] = acc_gf[unsafe_offset=k][0] + lgf
+                acc_hf[unsafe_offset=k] = acc_hf[unsafe_offset=k][0] + lhf
+
+    # Step 5 and this thread's half of step 6: the ratio, the subtraction, the
+    # noise, then an ascending-ordinal argmax over this thread's own candidates
+    # under a strict `>`, which is the narrow kernel's rule on a subrange.
+    var best_gain = Float32(0.0)
+    var runner_gain = Float32(0.0)
+    var best_ordinal = -1
+    var best_left_c = Int32(0)
+    var best_left_gf = Float32(0.0)
+    var best_left_hf = Float32(0.0)
+    for b in range(lo, hi):
+        var bin_noise = Float32(0.0)
+        if noisy != Int32(0):
+            bin_noise = noise[unsafe_offset = noise_base + b][0]
+        for d in range(2):
+            var want_default_left = d == 0
+            if want_default_left and missing_bin < 0:
+                continue
+            if not want_default_left and missing_bin >= 0:
+                if not any_missing:
+                    continue
+            var k = 2 * (b - lo) + d
+            var total = acc_a[unsafe_offset=k][0]
+            if cosine:
+                total = (
+                    gpu_cosine_score(
+                        acc_a[unsafe_offset=k][0], acc_b[unsafe_offset=k][0]
+                    )
+                    - level_parent
+                )
+            if noisy != Int32(0):
+                total += bin_noise
+            if total > best_gain:
+                runner_gain = best_gain
+                best_gain = total
+                best_ordinal = 2 * b + (0 if want_default_left else 1)
+                best_left_c = acc_c[unsafe_offset=k][0]
+                best_left_gf = acc_gf[unsafe_offset=k][0]
+                best_left_hf = acc_hf[unsafe_offset=k][0]
+            elif total > runner_gain:
+                runner_gain = total
+
+    # Step 6 across threads, then 7 and 8. Mirrors
+    # `_scan_slot_wide_primitive_kernel`'s tail statement for statement.
+    var top = block.max[block_size=OBLIVIOUS_WIDE_THREADS](best_gain)
+    if top <= Float32(0.0):
+        return
+    var my_ordinal = NO_CANDIDATE
+    if best_gain == top:
+        my_ordinal = Int32(best_ordinal)
+    var win_ordinal = block.min[block_size=OBLIVIOUS_WIDE_THREADS](my_ordinal)
+    var is_winner = best_gain == top and Int32(best_ordinal) == win_ordinal
+    if is_winner:
+        won_f[unsafe_offset=0] = best_left_gf
+        won_f[unsafe_offset=1] = best_left_hf
+        won_i[unsafe_offset=0] = best_left_c
+
+    var excluding_winner = best_gain
+    if is_winner:
+        excluding_winner = Float32(0.0)
+    var other_best = block.max[block_size=OBLIVIOUS_WIDE_THREADS](
+        excluding_winner
+    )
+    var best_runner = block.max[block_size=OBLIVIOUS_WIDE_THREADS](runner_gain)
+    # The collectives fence threadgroup memory themselves, but the writes to
+    # `won_f` and `won_i` above are this kernel's own and are spelled out.
+    barrier()
+    if tid != 0:
+        return
+
+    var m2 = other_best if other_best > best_runner else best_runner
+    var ordinal = Int(win_ordinal)
+    var flags = Int32(FLAG_FOUND)
+    if ordinal % 2 == 0:
+        flags += Int32(FLAG_DEFAULT_LEFT)
+    var won_left_c = won_i[unsafe_offset=0][0]
+    var won_left_gf = won_f[unsafe_offset=0][0]
+    var won_left_hf = won_f[unsafe_offset=1][0]
+    out_i[unsafe_offset = io + IREC_FEATURE] = Int32(f)
+    out_i[unsafe_offset = io + IREC_BIN] = Int32(ordinal // 2)
+    out_i[unsafe_offset = io + IREC_FLAGS] = flags
+    out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(ordinal)
+    out_i[unsafe_offset = io + IREC_LEFT_COUNT] = won_left_c
+    out_i[unsafe_offset = io + IREC_RIGHT_COUNT] = level_c - won_left_c
+    out_f[unsafe_offset = fo + FREC_GAIN] = top
+    out_f[unsafe_offset = fo + FREC_RUNNER_GAIN] = m2
+    out_f[unsafe_offset = fo + FREC_LEFT_GRAD] = won_left_gf
+    out_f[unsafe_offset = fo + FREC_LEFT_HESS] = won_left_hf
+    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = level_g - won_left_gf
+    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = level_h - won_left_hf
 
 
 def _reduce_slots_kernel(
@@ -4871,12 +5883,31 @@ def _launch_search(
     principle. A window rather than a fresh buffer because this is a
     per-launch path and it must not allocate.
 
-    **`gpu_resident_round`'s device-resident loop lands here, so
-    `random_strength` does not reach that path.** That is a wiring gap and
-    not a semantic one: the resident loop already holds the searcher, so it
-    would pass `searcher.noise_dev` and `searcher.noise_stdev > 0.0` to the
-    overload below and stage a plane per node the way `enqueue` does. It is
-    left alone here because that file belongs to another lane this round.
+    **CORRECTED 2026-08-17: `gpu_resident_round`'s device-resident loop no
+    longer lands here.** This docstring used to say it did, and used that to
+    say `random_strength` could not reach the leaf-wise resident plane. Both
+    halves are now stale: `_launch_child_search` stages a plane per node and
+    calls the overload below with `noisy=noisy`, so `random_strength` reaches
+    that path and the plane is read. Verified by reading the call, not
+    remembered.
+
+    **What is still dropped there is `score_function`, and that one is live.**
+    `_launch_child_search` names `wide_scan`, `use_primitives` and `noisy` and
+    stops, so `score_function` and `gain_form` both take the defaults in this
+    signature. `gain_form` is harmless today only because
+    `DEFAULT_GAIN_FORM` is what a searcher resolves to unless
+    `MOJOTREES_GPU_SPLIT_GAIN_FORM=subtractive` says otherwise;
+    `score_function` is not harmless, because `SCORE_L2` is the default here
+    and `SCORE_COSINE` is a setting a fit can ask for. Two edits outside this
+    file close it, and both are needed: `train_gpu` never calls
+    `GpuSplitSearcher.set_score_function` at all, and
+    `gpu_resident_round._launch_child_search` never passes it. Until both
+    land, a leaf-wise `device='gpu'` fit with `score_function='Cosine'` is
+    accepted -- `tree_parameters_extra.device_unsupported_reason` stopped
+    refusing it on 2026-08-17 on the strength of the *oblivious* launch
+    passing it -- and scored with the L2 functional. That is the exact failure
+    that predicate's own comment records as the standing bar: a kernel
+    existing is not a kernel reached.
     """
     var unread = fparam.create_sub_buffer[DType.float32](0, 1)
     _launch_search(
@@ -5323,32 +6354,97 @@ def _launch_oblivious_search(
                 " per leaf, which need not agree, so there is no single"
                 " prefix to walk"
             )
-        ctx.enqueue_function[_scan_slot_oblivious_kernel](
-            hist.unsafe_ptr(),
-            node.unsafe_ptr(),
-            feat.unsafe_ptr(),
-            allow.unsafe_ptr(),
-            missing.unsafe_ptr(),
-            catn.unsafe_ptr(),
-            mono.unsafe_ptr(),
-            fparam.unsafe_ptr(),
-            noise.unsafe_ptr(),
-            slot_i.unsafe_ptr(),
-            slot_f.unsafe_ptr(),
-            Int32(n_bins),
-            Int32(hist_size),
-            Int32(level_record),
-            Int32(leaf_base),
-            Int32(n_leaves),
-            Int32(feat_stride),
-            Int32(min_data_in_leaf),
-            Int32(1) if constrained else Int32(0),
-            Int32(gain_form),
-            Int32(score_function),
-            Int32(1) if noisy else Int32(0),
-            grid_dim=widest_slots,
-            block_dim=1,
-        )
+        # The scan's width. Read from the environment here rather than taken as
+        # a parameter, because the only caller is `gpu_resident_round`'s level
+        # loop and threading a flag through it would put a second copy of this
+        # decision in a file that does not otherwise make one. That is the same
+        # placement `noise_stage_parallel_requested` has, and it keeps the two
+        # kernels' selection in the file that owns both of them.
+        #
+        # Both arms take the identical argument list and write the identical
+        # records, so the only difference at the call is the kernel symbol and
+        # the block dimension. See `_scan_slot_oblivious_wide_kernel` for the
+        # bit-identity argument and `oblivious_wide_scan_requested` for why the
+        # default is off.
+        if oblivious_wide_scan_requested():
+            # The private accumulator arrays are sized at compile time from
+            # `binning.MAX_BINS`, so a bin count past what that bound assumed
+            # would have a thread write past the end of them. That is an
+            # unsafe store rather than a wrong number, so it is refused here
+            # and not clamped: 06's asymmetry applies, an allocation guard
+            # that mispredicts costs memory safety while a refusal costs a
+            # message. The narrow kernel has no such bound and still serves
+            # this dataset correctly, which is what makes refusing the wide
+            # arm rather than the fit the right shape.
+            if n_bins > OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD * (
+                OBLIVIOUS_WIDE_THREADS
+            ):
+                raise Error(
+                    String(
+                        "the wide oblivious scan reserves ",
+                        OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD,
+                        " bins per thread across ",
+                        OBLIVIOUS_WIDE_THREADS,
+                        " threads, which covers binning.MAX_BINS of 256, and"
+                        " this dataset carries ",
+                        n_bins,
+                        "; unset MOJOTREES_GPU_OBLIVIOUS_WIDE to use the"
+                        " narrow scan, which has no per-thread bound",
+                    )
+                )
+            ctx.enqueue_function[_scan_slot_oblivious_wide_kernel](
+                hist.unsafe_ptr(),
+                node.unsafe_ptr(),
+                feat.unsafe_ptr(),
+                allow.unsafe_ptr(),
+                missing.unsafe_ptr(),
+                catn.unsafe_ptr(),
+                mono.unsafe_ptr(),
+                fparam.unsafe_ptr(),
+                noise.unsafe_ptr(),
+                slot_i.unsafe_ptr(),
+                slot_f.unsafe_ptr(),
+                Int32(n_bins),
+                Int32(hist_size),
+                Int32(level_record),
+                Int32(leaf_base),
+                Int32(n_leaves),
+                Int32(feat_stride),
+                Int32(min_data_in_leaf),
+                Int32(1) if constrained else Int32(0),
+                Int32(gain_form),
+                Int32(score_function),
+                Int32(1) if noisy else Int32(0),
+                grid_dim=widest_slots,
+                block_dim=OBLIVIOUS_WIDE_THREADS,
+            )
+        else:
+            ctx.enqueue_function[_scan_slot_oblivious_kernel](
+                hist.unsafe_ptr(),
+                node.unsafe_ptr(),
+                feat.unsafe_ptr(),
+                allow.unsafe_ptr(),
+                missing.unsafe_ptr(),
+                catn.unsafe_ptr(),
+                mono.unsafe_ptr(),
+                fparam.unsafe_ptr(),
+                noise.unsafe_ptr(),
+                slot_i.unsafe_ptr(),
+                slot_f.unsafe_ptr(),
+                Int32(n_bins),
+                Int32(hist_size),
+                Int32(level_record),
+                Int32(leaf_base),
+                Int32(n_leaves),
+                Int32(feat_stride),
+                Int32(min_data_in_leaf),
+                Int32(1) if constrained else Int32(0),
+                Int32(gain_form),
+                Int32(score_function),
+                Int32(1) if noisy else Int32(0),
+                grid_dim=widest_slots,
+                block_dim=1,
+            )
         if primitives:
             ctx.enqueue_function[_reduce_slots_block_kernel](
                 slot_i.unsafe_ptr(),
@@ -6273,8 +7369,14 @@ struct GpuSplitSearcher(Movable):
             self.n_bins,
         )
         var base = record * self.n_features * self.n_bins
+        # Pointer copy rather than `self.noise_stage[base + i] = plane[i]`.
+        # Same bytes; what goes away is a bounds-checked `List.__setitem__` per
+        # entry on a path that runs `slots * n_bins` times per node or level.
+        # At the shipped symmetric default that loop ran 15.3M times per fit.
+        var stage_p = self.noise_stage.unsafe_ptr()
+        var plane_p = plane.unsafe_ptr()
         for i in range(slots * self.n_bins):
-            self.noise_stage[base + i] = plane[i]
+            stage_p.unsafe_store(base + i, plane_p.unsafe_load(i))
         self.noise_node[record] = node
 
     def stage_random_score_level(
@@ -6322,8 +7424,14 @@ struct GpuSplitSearcher(Movable):
             self.n_bins,
         )
         var base = record * self.n_features * self.n_bins
+        # Pointer copy rather than `self.noise_stage[base + i] = plane[i]`.
+        # Same bytes; what goes away is a bounds-checked `List.__setitem__` per
+        # entry on a path that runs `slots * n_bins` times per node or level.
+        # At the shipped symmetric default that loop ran 15.3M times per fit.
+        var stage_p = self.noise_stage.unsafe_ptr()
+        var plane_p = plane.unsafe_ptr()
         for i in range(slots * self.n_bins):
-            self.noise_stage[base + i] = plane[i]
+            stage_p.unsafe_store(base + i, plane_p.unsafe_load(i))
         self.noise_node[record] = depth
 
     def _record_features(self, record: Int) -> List[Int]:

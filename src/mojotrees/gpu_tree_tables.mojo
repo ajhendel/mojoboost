@@ -31,14 +31,26 @@ The end state that removes it is a device that picks the leaf and commits the
 split itself, so the host waits once per tree instead of once per split. This
 module builds two thirds of that: the tables the device needs in order to
 hold a frontier and a tree, and the single kernel that reduces the frontier
-to a winner and commits it. It wires none of it. Nothing in
-`train_gpu.mojo` calls anything here, `MOJOTREES_GPU_TREE_RESIDENT` is off by
-default, and no shipping fit changes in any way.
+to a winner and commits it.
 
-**No speedup is claimed and none was measured.** This lane ran no benchmark
-and no training run. What it can claim is an equivalence, and only that: the
-kernel below reaches the same decision, and writes the same split, as the
-host path in `train_gpu._device_search_resident` reaches and writes, over the
+**This paragraph used to say the module was unwired and the switch off by
+default. Both halves were true when they were written and both are now
+false, and correcting them is what the gate section below exists for.**
+`gpu_resident_round.mojo` arrived and drives these kernels;
+`histogram_gpu.GpuHistogramBuilder.open_resident_tables` constructs
+`DeviceTreeTables` and is called from `train_gpu.mojo:1975` and
+`train_gpu.mojo:2150`; and on 2026-08-16 `MOJOTREES_GPU_TREE_RESIDENT`
+flipped to **on by default** on the S1 evidence in
+`bench/results/session3_2026-08-16/RESULTS.md`. A shipping GPU fit reaches
+this module. Read every "nothing calls this" sentence below with that date
+attached.
+
+**What this module still does not claim is a speedup of its own.** The
+measured figures belong to the plane in `gpu_resident_round.mojo`, not to
+these tables, and this module ran no benchmark. What it claims is an
+equivalence, and only that: the kernel below reaches the same decision, and
+writes the same split, as the host path in
+`train_gpu._device_search_resident` reaches and writes, over the
 configurations named under "What the device can and cannot decide".
 
 What a device mirror is, and what it is not
@@ -339,24 +351,133 @@ from .split import SplitInfo
 from .tree import Tree, TreeParams
 
 
-# --- The gate -------------------------------------------------------------
+# --- The gate ---------------------------------------------------------------
+#
+# ONE VARIABLE, TWO QUESTIONS, AND THIS IS THE ONLY PLACE EITHER IS ASKED.
+#
+# What was wrong here until this edit. `MOJOTREES_GPU_TREE_RESIDENT` had three
+# readers across two modules and each one called `getenv` for itself.
+#
+#     gpu_resident_round.resident_round_enabled              != "0"   the gate
+#     gpu_resident_round.resident_round_explicitly_requested == "1"   diagnostic
+#     gpu_tree_tables.tree_resident_requested                == "1"   stale
+#
+# The first two ask genuinely different questions and are both correct. The
+# third asked the *gate's* question with the *diagnostic's* spelling, so it
+# reported the pre-2026-08-16 default. Unset meant off here and on there, over
+# one variable, with nothing that would fail if a caller reached for the wrong
+# one. `resident_round_enabled`'s own docstring calls that a live hazard and
+# asks whoever owns this file to fix it. This is that fix.
+#
+# WHY THE SINGLE SOURCE OF TRUTH LANDS HERE AND NOT IN `gpu_resident_round`.
+# Not preference. `gpu_resident_round` imports this module (its import block
+# names `DeviceTreeTables` among others), so this module cannot import it back
+# without a cycle. The lower layer is therefore the only cycle-free home for a
+# predicate both layers can call, and `gpu_resident_round`'s two predicates
+# should become one-line delegations to the two below, because a delegation
+# cannot drift from what it delegates to.
+#
+# **THE DELEGATION HAS NOT LANDED, and the line here that said otherwise was
+# corrected on 2026-08-17.** It read "until that delegation lands there are
+# still three function bodies, but only these two `getenv` calls", and the
+# second half of that is false. `gpu_resident_round.resident_round_enabled`
+# and `gpu_resident_round.resident_round_explicitly_requested` each still call
+# `getenv` on the variable themselves, so the package holds FOUR reader bodies
+# and FOUR `getenv` calls over one variable, not three and two. What the fix
+# below did accomplish is real and is the reason this is a cleanup rather than
+# a hazard: the one reader that had the wrong SPELLING for the question it
+# asked no longer reads the variable at all, so the four surviving readers all
+# agree. Retiring the other two is owed to whoever next opens
+# `gpu_resident_round`.
+#
+# THE SPELLING CARRIES MEANING, as of 2026-08-17. A switch whose default is ON
+# is spelled `!= "0"` and is described as an escape hatch; a switch whose
+# default is OFF is spelled `== "1"`. Four switches were flipped to default-on
+# under that convention on the same day, so the two spellings below are not
+# stylistic and a reader may take the polarity from the operator. Both compare
+# against a literal rather than testing truthiness, so that an unset variable
+# and a variable set to something unrecognized both land on the default rather
+# than on whatever a permissive parser makes of them.
+
+
+comptime TREE_RESIDENT_VAR = "MOJOTREES_GPU_TREE_RESIDENT"
+"""The variable name, written once.
+
+Two predicates read it and neither spells the string itself. A renamed
+variable that reached only one of two string literals is the same defect one
+level down from the one this section fixes, and a `comptime` makes it a
+compile error instead of a silent half-rename."""
+
+
+def tree_resident_enabled() -> Bool:
+    """**THE GATE.** On, unless `MOJOTREES_GPU_TREE_RESIDENT=0`.
+
+    The device-owned growth plane is the default GPU growth plane. It landed
+    opt-in behind `=1`, to be measured before it was believed, and rule S1 in
+    `bench/results/PROFILE_PROTOCOL.md` was answered in
+    `bench/results/session3_2026-08-16/RESULTS.md`. Trees node-identical to
+    the host plane, **measured** 44 percent faster at 250,000 rows and 24
+    percent at 1,000,000, and **measured** 2.2x faster at 50,000 where the
+    rule asked only for no regression. Those three figures are measurements
+    rather than fits or bounds, they were taken interleaved in one thermal
+    window because that is the only comparison this machine supports, and
+    they are the entire reason this predicate reads the way it does.
+
+    `=0` forces the shipping incremental loop (`_device_search_resident`) in
+    the same binary. That is a standing requirement rather than a courtesy,
+    because only interleaved arms compare here, so an A/B has to be reachable
+    without a rebuild. It is also where a run goes that hits a fault in the
+    plane.
+
+    Enabled is not the same as taken. `tree_resident_supported` below still
+    refuses by name every configuration the device tables cannot express, and
+    the caller falls back to the incremental loop for those. The default
+    decides which plane runs where the plane is *admissible* and changes
+    nothing about what is admissible.
+
+    `gpu_resident_round.resident_round_enabled` is the same question and
+    should call this rather than read the variable again; see the section
+    comment above for why the delegation runs in that direction.
+    """
+    return getenv(TREE_RESIDENT_VAR) != "0"
+
+
+def tree_resident_explicitly_requested() -> Bool:
+    """**NOT THE GATE.** `MOJOTREES_GPU_TREE_RESIDENT=1` was typed by hand.
+
+    A different question from `tree_resident_enabled`, and the only thing it
+    is for is deciding whether a refusal prints. While the plane was opt-in,
+    "you asked for the resident plane and did not get it" was worth one line
+    per fit, because the only way to see it was to have asked. On by default,
+    the same line would print on every GPU fit with monotone constraints,
+    depth-wise growth, a categorical column, or any other refused shape, none
+    of which asked for anything and all of which are behaving correctly. A
+    fallback that is correct and expected must be silent.
+
+    Do not route a routing decision through this. It answers "did an operator
+    opt in", never "should the plane run", and the two answers differ for
+    every fit that names nothing, which is nearly all of them.
+    """
+    return getenv(TREE_RESIDENT_VAR) == "1"
 
 
 def tree_resident_requested() -> Bool:
-    """`MOJOTREES_GPU_TREE_RESIDENT=1`, and off for every other value.
+    """Deprecated alias for `tree_resident_explicitly_requested`. Do not call.
 
-    Default off, and off means off: no shipping code path consults this, and
-    nothing in `train_gpu.mojo` imports this module at all. It exists so that
-    the wiring lane that eventually does has a switch already agreed on, and
-    so that the test file can name the contract it is testing.
+    Kept only because `tests/test_gpu_tree_tables.mojo` imports it by name and
+    this lane may not edit that file. It answers the diagnostic question, which
+    is what its name has always literally said and what its `== "1"` body has
+    always actually done; what was wrong was the docstring around it, which
+    described it as the gate and stated the wrong default. It now reads no
+    environment variable of its own, so it can no longer disagree with anything.
 
-    Spelled as an equality against "1" rather than as a truthiness test, for
-    the same reason `MOJOTREES_GPU_SPLIT_RESIDENT` is spelled as an equality
-    against "0": an unset variable and a variable set to something
-    unrecognized must land on the default, not on whatever a permissive
-    parser makes of them.
+    **Delete this, and the import and the call in
+    `tests/test_gpu_tree_tables.mojo:106` and `:581`, in one commit.** The
+    assertion there (`assert_false(tree_resident_requested())` with the
+    variable unset) stays true through this change, so nothing is load-bearing
+    on the alias beyond the name.
     """
-    return getenv("MOJOTREES_GPU_TREE_RESIDENT") == "1"
+    return tree_resident_explicitly_requested()
 
 
 comptime TREE_RESIDENT_OK = 0
@@ -2648,12 +2769,14 @@ struct DeviceTreeTables(Movable):
     tables are exercisable on their own, which is what the test file uses.
 
     Nothing here reads an environment variable to decide **whether to work**.
-    `tree_resident_requested` is the gate and it is the caller's to consult; a
+    `tree_resident_enabled` is the gate and it is the caller's to consult; a
     struct that silently did nothing when a variable was unset would be much
     harder to test than one that always works and is simply never
     constructed. Two variables do choose between arms that produce identical
     tables, `MOJOTREES_GPU_TABLE_RESET` and `MOJOTREES_GPU_PACKED_DOWNLOAD`,
-    and they are read once in the constructor to seed a field that
+    each read by exactly one `getenv` in the package and each spelled `!= "0"`
+    because both arms default on, and they are read once in the constructor to
+    seed a field that
     `set_reset_on_device` and `set_packed_download` then override. That is
     the shape `GpuActiveRows.set_constant_hessian` uses and it is here for the
     same reason it is there: the in-process setter is what a benchmark needs,

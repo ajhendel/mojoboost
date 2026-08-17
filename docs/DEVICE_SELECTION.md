@@ -223,10 +223,25 @@ raises on it and `"auto"` takes the CPU:
 | A forced-split document | `forced-splits` | applied by `tree.grow_tree` and nothing else; `_check_gpu_forced_splits` in `src/mojotrees/train_gpu.mojo` |
 | `MOJOTREES_CONST_HESSIAN_VERIFY=1` | `const-hessian-verify` | the audit walks the host hessian array, which only the CPU builders do; `_check_gpu_const_hessian_verify` there |
 | `boosting_type='ordered'` | `ordered-boosting` | the per-permutation rung planes are built in `src/mojotrees/ordered_boosting.mojo` and advanced by `boosting.train`; no device trainer builds them. Trainer halves: `_check_gpu_booster_params` and `_refuse_unhonored` in `train_gpu_sparse.mojo` |
-| `score_function` other than `L2` | `score-function` | the device split search computes `G^2/(H+lambda)` only, which is CatBoost's `score_function=L2`; no accelerator path evaluates the Cosine ratio |
-| `random_strength` above zero | `random-strength` | the per-candidate noise is scaled by a per-tree standard deviation over the round's gradients, and no accelerator round loop computes it; the trainers refuse it too, but only from inside the grower, after a backend has already been chosen |
+| `score_function` neither `L2` nor `Cosine` | `score-function` | an unknown selector: the device scan kernels test for Cosine and treat every other code as L2, so an accelerator would answer under the wrong functional's name |
+| `score_function=Cosine` **beside a categorical column** | `score-function` | the category partition search scores with the L2 gain, so the pair puts two functionals inside one argmax. `device='cpu'` does not lift it either; `split.find_best_split` raises on the same pair |
+| `random_strength` above zero **beside a categorical column** | `random-strength` | only the partition search's single winner would be noised while every numerical feature had every candidate noised. `device='cpu'` does not lift it either |
 
-The four before the last two arrived together on 2026-08-16 from the refusal
+**Both of the last two were WIDE refusals and were narrowed on 2026-08-17,
+and the two rows above are what remains.** They used to read "`score_function`
+other than `L2`" and "`random_strength` above zero", because no accelerator
+path evaluated the Cosine ratio and no accelerator round loop computed the
+noise's per-tree scale. Both capabilities landed that day: the device scan
+kernels evaluate Cosine (`820c06b`), the oblivious level launch stages and
+reads the noise plane (`c775959`), and both arms of
+`train_gpu._train_gpu_rounds` compute `random_score_scale` per tree. The
+CatBoost-mode default set is `score_function=cosine` **and**
+`random_strength=1`, so before the narrowing the shipped symmetric default
+could not use the accelerator at all. Narrowed against the standing rule in
+`device_policy.mojo` rather than against the capability alone: a block may be
+retired only when no downstream refusal would still fire for the same fit.
+
+The four before those arrived together on 2026-08-16 from the refusal
 sweep, and each of them was, until that day, accepted and silently not
 applied. The enumeration that found them is the next section.
 
@@ -242,14 +257,19 @@ So the audit has two halves, not one -- is there code that reads this setting,
 **and** is there a gate that should refuse this combination, and can it see the
 parameter it would refuse on.
 
-Note on `score_function`: the block is written `!= SCORE_L2` rather than
-`== SCORE_COSINE`, so a third selector added later refuses the device instead
-of silently receiving an L2 answer. It is **not** waived when Cosine and L2
-provably agree. They have the same argmax at `lambda_l2 = 0`, but that identity
-is per node and per parent, and it breaks under a positive `lambda_l2` (the
+Note on `score_function`: the surviving unknown-selector arm is written
+`!= SCORE_L2 and != SCORE_COSINE` rather than as a whitelist of one, so a
+third selector added later refuses the device instead of silently receiving
+an L2 answer. Cosine itself is no longer refused, and the reason the WIDE
+refusal was not waived on "Cosine and L2 provably agree" is still worth
+carrying, because the same argument will be offered again about some other
+pair: they have the same argmax at `lambda_l2 = 0`, but that identity is per
+node and per parent, and it breaks under a positive `lambda_l2` (the
 CatBoost-mode arm uses 3), under a leaf-wise queue comparing gains across
-parents, and beside `random_strength`, whose units Cosine changes. This gate
-sees none of those three.
+parents, and beside `random_strength`, whose units Cosine changes. That last
+one is not symmetric and is now user-visible: see
+`docs/design/RANDOM_STRENGTH_UNITS.md`. **A `random_strength` value does not
+transfer between `score_function=L2` and `score_function=Cosine`.**
 
 **The middle one is met on a default fit**, which is the part that keeps
 getting lost: `lossguide` is the stock `grow_policy` and `lossguide` is the
@@ -321,7 +341,7 @@ ignored and this release refuses it.
 | `min_gain_to_split`, `monotone_penalty`, `feature_contri` | honoured | `split.find_best_split`, which reads `extra` directly |
 | `max_delta_step`, `path_smooth` | honoured | `_leaf_value` in the GPU grower; `grower_applies_extra=True` |
 | `extra_trees`, `extra_seed` | honoured | keyed by node id and tree index, both passed |
-| `random_strength`, `random_score_scale`, `random_strength_seed` | honoured | `split.mojo`'s per-candidate noise |
+| `random_strength`, `random_score_scale`, `random_strength_seed` | honoured on both backends, refused beside a categorical column | `split.mojo`'s per-candidate noise on the host; the host-drawn Float32 plane the device scan kernels add on the device (`gpu_split_search.random_score_plane`, `oblivious_score_plane`). The per-tree scale is computed by `boosting._round_random_score_scale` and by `train_gpu._device_round_random_score_scale`, so **both devices resolve the same value from the same parameters**. `params.mojo` supplied CatBoost mode's `random_strength=1.0` on `device=cpu` only until 2026-08-17, which made one parameter string build two different models |
 | `monotone_method` (non-`basic`) | refused | `ExtraTreeParams.check_scalars` |
 | `cegb_penalty_split` / `cegb_tradeoff` | honoured | reconstructed in `find_best_split` when the grower carries no ledger |
 | `cegb_penalty_feature_coupled` / `_lazy` | refused | `cegb.check_cegb_grower_support` |
@@ -360,12 +380,19 @@ everything else, plus the two GPU knobs the sweep found inert.
 | `MOJOTREES_LEAF_SCORE_UPDATE` | ignored, and **not** refused | `boosting.mojo` only. It selects between two ways of advancing raw scores that produce the same numbers, so ignoring it costs a GPU fit nothing observable, and refusing it would break an interleaved CPU/GPU benchmark that sets it once for the process. Classified, deliberately not refused. |
 | `MOJOTREES_OBLIVIOUS_TRACE` | ignored | `tree._grow_oblivious_levels` only; the device oblivious plane has its own trace under `MOJOTREES_GPU_TREE_RESIDENT_TRACE` |
 | `MOJOTREES_CPU_*` (bin layout, feature group, row blocks, row-major, compaction floor, quant grad and scale) | ignored, correctly | the prefix declares the scope |
-| `MOJOTREES_DIST_*`, `MOJOTREES_DISTRIBUTED_*`, `MOJOTREES_DASK_BACKEND` | not on any training path here | `distributed_transport.mojo` |
+| `MOJOTREES_DISTRIBUTED_*`, `MOJOTREES_DASK_BACKEND` | not on any training path here | `python/mojotrees/_dask_runtime.py` |
 
-Three knobs in that last group are inert on **both** backends, which is a
+`MOJOTREES_DIST_*` used to head that last row and no longer exists. The seven
+names were deleted from `distributed_transport.mojo` on 2026-08-17 along with
+their only reader, `runtime_from_env`, because nothing called it and the
+multi-process feature they configured does not ship. Setting one now does
+nothing at all, which is what it did before, with the difference that the
+repository no longer advertises them. See
+[docs/design/DEAD_SWITCH_RESOLUTION.md](design/DEAD_SWITCH_RESOLUTION.md).
+
+Two knobs in that last group are inert on **both** backends, which is a
 different defect and belongs to whoever owns those modules rather than to
-the device policy: `MOJOTREES_GPU_GRAD_LAYOUT` has no caller anywhere,
-`MOJOTREES_CPU_BIN_LAYOUT`'s reader chain ends at
+the device policy: `MOJOTREES_CPU_BIN_LAYOUT`'s reader chain ends at
 `histogram.choose_bin_layout_timed`, which nothing calls, and
 `MOJOTREES_CPU_QUANT_GRAD` / `MOJOTREES_CPU_QUANT_SCALE` end at
 `quantized_gradient.decide_cpu_histogram` / `cpu_quant_params`, whose only
@@ -373,6 +400,14 @@ caller is a test. Likewise `quant_train_renew_leaf` and
 `stochastic_rounding` on `ExtraTreeParams` have no reader in the package at
 all; they are moot only because `use_quantized_grad` is refused ahead of
 them.
+
+A third used to be listed here, `MOJOTREES_GPU_GRAD_LAYOUT`. It was deleted
+from `gpu_gradient_stream.mojo` on 2026-08-17 with its reader
+`env_grad_layout`, for the same reason. No caller consumed the layout
+constant it returned, so the variable could not move a run onto the
+interleaved derivative plane. The interleaved implementation is untouched and
+is selected by calling `enqueue_leaf_interleaved`, which is a call-site
+decision rather than a configuration one, and which nothing calls yet.
 
 ## Environment variables
 

@@ -345,9 +345,10 @@ so far.
 
   Two things the audit found about that file, so the next reader does not
   over-trust it. `environment.observed` is a **string-literal scan, not a read
-  scan** (`tools/api_snapshot.py:839`), so membership is not evidence a variable
+  scan** (`tools/api_snapshot.py::environment_block`), so membership is not evidence a variable
   does anything — one of the 68, `MOJOTREES_STARTUP_REPORT_FD`, is read by
-  nothing at all and says so at `src/mojotrees/initialization.mojo:114`. And
+  nothing at all and says so in `src/mojotrees/initialization.mojo`'s module
+  docstring (a TOMBSTONE there since 2026-08-17). And
   `ENV_SCAN_DIRS` excludes `bench/`, so the best-evidenced knobs in the
   repository, the `MOJOTREES_UM_*` family behind
   `apple_m4_unified_memory_2026-08-15.md`, are not in it. See
@@ -694,7 +695,7 @@ scenario and **the CPU's move to Float32 derivatives is refuted as the cause.**
 
 **The flag did take effect** -- checked rather than assumed, because this is the
 sixth place in this campaign where a measurement could have failed to reach the
-code it was about. `bench/real_data/run.py:193` builds the child environment as
+code it was about. `bench/real_data/run.py::run_job` builds the child environment as
 `dict(os.environ)`, so `MOJOTREES_DERIVATIVE_PRECISION` propagates into the
 subprocess. (The CPU campaign separately found the flag *was* a silent no-op on
 sparse and distributed fits, and fixed it; dense is the path here.)

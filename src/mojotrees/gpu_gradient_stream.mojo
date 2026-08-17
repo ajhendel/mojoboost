@@ -64,10 +64,20 @@ from here take whole buffers. The single fused pass is the part that does
 not need it; the handoff names the sub-range copy as the follow-up.
 
 No edit to the shipped histogram kernels. The interleaved path below is
-additive and off by default, so the split-plane path it competes with is
-byte for byte the one that shipped, and the two can be run against each
-other on one build. That is a requirement of measuring them, not only a
-courtesy to the lane that owns those files.
+additive and unreached, so the split-plane path it competes with is byte
+for byte the one that shipped, and the two can be run against each other on
+one build. That is a requirement of measuring them, not only a courtesy to
+the lane that owns those files.
+
+"Unreached" is exact, and it used to be softer. There was an
+`env_grad_layout` here that turned MOJOTREES_GPU_GRAD_LAYOUT into a layout
+constant, and it read as the way to select this path. It was not. No caller
+ever asked it for the constant, so the variable moved no run onto the
+interleaved plane and could not have, because the branch would have to be
+taken in another lane's file. It was deleted on 2026-08-17 rather than left
+standing as an inert knob. The way in is `enqueue_leaf_interleaved`, called
+in place of `builder.enqueue_leaf`, and nothing in this repository calls it
+yet.
 
 Precision
 ---------
@@ -88,7 +98,10 @@ from std.atomic import Atomic
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import isfinite, round
 from std.memory import stack_allocation
-from std.os import getenv
+
+# No `getenv` here, deliberately. This module read MOJOTREES_GPU_GRAD_LAYOUT
+# until 2026-08-17 and nothing consumed the answer; see the tombstone above
+# `stream_layout_name`. The layout is a call-site choice now, and only that.
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
@@ -113,20 +126,40 @@ from .histogram_gpu import GpuHistogramBuilder
 
 # Which layout the derivative planes are in when a histogram reads them.
 # SPLIT is the shipped one, two Float32 planes indexed by row. INTERLEAVED
-# is the pair layout below. The default is SPLIT: the interleaved path is
-# unmeasured, and this module's contract is that nothing changes until a
-# benchmark says it should.
+# is the pair layout below. Every histogram in this repository reads SPLIT,
+# and there is no switch. A caller selects INTERLEAVED by calling
+# `enqueue_leaf_interleaved` instead of `builder.enqueue_leaf`, which is a
+# call-site choice and not a configuration one.
 comptime LAYOUT_SPLIT = 0
 comptime LAYOUT_INTERLEAVED = 1
 
-
-def env_grad_layout() -> Int:
-    """`MOJOTREES_GPU_GRAD_LAYOUT` as a layout constant. Anything other
-    than `interleaved` is the shipped split layout, so an unset or
-    misspelled variable cannot silently move a run onto the new path."""
-    if getenv("MOJOTREES_GPU_GRAD_LAYOUT") == "interleaved":
-        return LAYOUT_INTERLEAVED
-    return LAYOUT_SPLIT
+# TOMBSTONE, 2026-08-17. `env_grad_layout` was deleted here, and with it the
+# only reader of MOJOTREES_GPU_GRAD_LAYOUT. It returned LAYOUT_INTERLEAVED
+# for the text "interleaved" and LAYOUT_SPLIT otherwise, and no caller ever
+# asked. `env_grad_layout` had zero callers in src/, bindings/, tests/, capi/,
+# cli/ or python/, and neither did `stream_layout_name`, so the value it
+# computed was never compared against anything. Setting the variable changed
+# nothing about a run, which made it a documented performance knob that was
+# inert, and that reads as a supported feature.
+#
+# The interleaved path itself was NOT deleted, and nothing about it changed.
+# `_pack_gh_kernel`, `_range_hist_partial_gh_kernel`,
+# `_range_hist_atomic_gh_kernel`, `enqueue_range_histogram_interleaved`,
+# `InterleavedGradients` and `enqueue_leaf_interleaved` all stand. They are a
+# complete, reachable implementation; what was missing was never the kernels,
+# it was a caller.
+#
+# What would have to exist for the variable to come back. A call site in the
+# GPU trainer that actually branches on the layout, which means an edit in
+# histogram_gpu.mojo, gpu_active_rows.mojo or train_gpu.mojo. Those files
+# belong to other lanes, which is precisely why this path was written
+# additively and why the switch here could never have reached them. A variable
+# read in this module cannot steer a kernel launched from another. When that
+# branch lands, the layout should be a parameter threaded from the trainer's
+# own configuration, not re-read from the environment in two places. A
+# measurement is owed as well, and the interleaved path has none. The
+# transaction-count halving argument in the banner below is arithmetic, not a
+# timing, and the banner says so.
 
 
 def stream_layout_name(layout: Int) -> String:

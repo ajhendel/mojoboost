@@ -26,20 +26,38 @@ travelling further than it deserves:
 - The histogram construction each engine ran is printed under the table,
   because two engines building histograms by different strategies is a
   fact about what the timings mean rather than a footnote.
+- An ORACLE row is printed and is labelled. From 2026-08-17 a subject arm on
+  the cpu, in a run that also ran that arm on an accelerator, is an oracle
+  rather than a competitor, because it exists so verify.py can compare an
+  accelerator row against its own cpu twin. Its number stays in the per-engine table,
+  because a reader should be able to see it, and it is out of the frontier
+  ranking and out of the headline ratio, because the GPU is the product and the
+  cpu backend is no longer optimized. `verify.py`'s ORACLE CELL block is the
+  rule; this file only renders it.
 
 There is no summary line, no headline speedup, and no "x faster" anywhere
 in this file. If a headline is wanted, a person writes it, having read the
 distribution and named the conditions.
 
 The one place this file names a single arm is the frontier block, and it is
-the exception that proves the rule rather than a retreat from it. The
-accuracy budget makes "fastest" a well-defined question -- fastest AMONG the
-arms inside the budget, AT one tree count -- so the answer is an ordering
+the exception that proves the rule rather than a retreat from it. One tree
+count makes "fastest" a well-defined question, so the answer is an ordering
 this file can compute rather than a headline it would have to write. It is
 still a DOCUMENTED recommendation and nothing applies it: no file in this
-repository reads that name back into a default. See `_frontier` for the three
-structural rules it follows, and `bench/real_data/frontier.py` for what a
-one-axis sweep cannot see.
+repository reads that name back into a default. See `_frontier` for the rules
+it follows, and `bench/real_data/frontier.py` for what a one-axis sweep cannot
+see.
+
+SPEED AND ACCURACY ARE TWO AXES HERE AND NEITHER SUPPRESSES THE OTHER, from
+2026-08-17. Until that date the frontier ranked only arms inside the accuracy
+budget, which meant an arm outside it had no published speed at all, which
+meant a 1.24x improvement on bit-identical work went unreported because the
+arm was 1.7 percent behind CatBoost. Speed is now ranked for every arm in
+every table. The constraint that replaced the suppression is the one rule this
+file must not lose: EVERY SPEED FIGURE CARRIES ITS ACCURACY FIGURE IN THE SAME
+ROW, and any ranking spanning arms of differing accuracy says so above itself
+in `RANKING_CAVEAT`. A table of seconds with no metric column is a defect in
+this file, not a simplification of it.
 """
 
 import argparse
@@ -51,7 +69,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import engines  # noqa: E402
 import envinfo  # noqa: E402
+import quality  # noqa: E402
 import verify  # noqa: E402
 
 
@@ -79,9 +99,19 @@ def phase_value(record, name, field="elapsed_s"):
 
 
 def cell_key(record):
+    """The cell a record belongs to: scenario, ARM, device, threads.
+
+    The second field was the engine name until 2026-08-17, and on an
+    `--arms` run that folded every arm of one engine into a single table
+    row: forty frontier cells at different tree counts and bin counts
+    rendered as one `mojotrees` row with `reps 40` and a median taken
+    ACROSS ARMS, which is not a measurement of anything. `verify._arm_of`
+    is the engine name on a run without `--arms`, so that shape of report
+    renders exactly what it always did.
+    """
     return (
         record["scenario"],
-        record["engine"],
+        verify._arm_of(record),
         record.get("device_used") or record.get("device_requested"),
         record["threads"],
     )
@@ -143,11 +173,32 @@ def _ms(value):
     return None if value is None else value * 1000.0
 
 
+def role_of(record, accelerator_keys):
+    """What this cell is FOR, as one word.
+
+    `oracle` wins over everything else, because it is the label that changes
+    how the row may be read. Otherwise this is `engines.ENGINE_ARM`, which
+    already names the role of every engine in the comparison (subject,
+    subject_variant, comparator, peer, peer_subject) and is the authority
+    `selfcheck.py` asserts against. No new vocabulary is invented here. A
+    reader who has seen one of those words anywhere else in the harness has
+    already seen this column.
+    """
+    if verify.is_oracle(record, accelerator_keys):
+        return verify.ORACLE_CELL_ROLE
+    return engines.ENGINE_ARM.get(record.get("engine"), "unknown")
+
+
 def build_cells(records, warn_spread):
+    ok = [r for r in records if r.get("status") == "ok"]
+    # Computed once over the whole file, because whether a cpu row is an
+    # oracle is a property of the run and not of the row. Records written on
+    # or after 2026-08-17 answer for themselves through `cell_role`; this is
+    # what lets an older results file be read under the new labels too.
+    accelerator_keys = verify.accelerator_cells(ok)
+
     cells = {}
-    for record in records:
-        if record.get("status") != "ok":
-            continue
+    for record in ok:
         cells.setdefault(cell_key(record), []).append(record)
 
     out = {}
@@ -160,8 +211,11 @@ def build_cells(records, warn_spread):
         first = group[0]
         out[key] = {
             "records": group,
+            "engine": first["engine"],
             "repeats": len(group),
             "summary": summary,
+            "role": role_of(first, accelerator_keys),
+            "oracle": verify.is_oracle(first, accelerator_keys),
             "model_bytes": ((first.get("model") or {}).get("size") or {}).get("string_bytes"),
             "num_trees": (first.get("model") or {}).get("num_trees"),
             "quality": first.get("quality"),
@@ -214,13 +268,24 @@ def render(records, config, out):
                 f"{(data.get('train') or {}).get('features')} features, "
                 f"primary metric {first['primary_metric']}\n"
             )
-            out("\n| engine | device | threads | reps | " + " | ".join(
+            # `role` is beside `device` and not at the end, because it
+            # qualifies the device. A cpu row of one of our arms is a
+            # different kind of thing depending on whether an accelerator row
+            # sits beside it, and a reader scanning the two timing columns has
+            # to meet that word before the numbers rather than after them.
+            # The `arm` column appears only when a row's arm is not simply
+            # its engine name, which is every `--arms` run and no other, so a
+            # plain run's table is byte-for-byte what it was before the cell
+            # key grew the arm dimension.
+            show_arm = any(key[1] != cell["engine"] for key, cell in rows.items())
+            out("\n| engine | " + ("arm | " if show_arm else "")
+                + "device | role | threads | reps | " + " | ".join(
                 label for _, label, _ in FIELDS
             ) + " | peak rss | model | metric |")
-            out("| --- " * (7 + len(FIELDS)) + "|")
+            out("| --- " * (8 + int(show_arm) + len(FIELDS)) + "|")
             for key in sorted(rows):
                 cell = rows[key]
-                _, engine, device, threads = key
+                _, arm, device, threads = key
                 values = " | ".join(
                     fmt_time(cell["summary"][name], warn_spread) for name, _, _ in FIELDS
                 )
@@ -228,13 +293,16 @@ def render(records, config, out):
                 peak = cell["summary"]["peak_rss"]
                 shown = "n/a" if metric is None else f"{metric:.6g}"
                 out(
-                    f"| {engine} | {device} | {threads} | {cell['repeats']} | "
+                    f"| {cell['engine']} | " + (f"{arm} | " if show_arm else "")
+                    + f"{device} | {cell['role']} | {threads} | "
+                    f"{cell['repeats']} | "
                     f"{values} | {fmt_bytes(peak['median'] if peak else None)} | "
                     f"{fmt_bytes(cell['model_bytes'])} | {shown} |"
                 )
 
             out("\nMedian across repeats, with [min, max]. A `!` marks a cell whose "
                 f"spread exceeds {warn_spread:.0%} of its median.\n")
+            _oracle_caption(rows, out)
             out(
                 "The two `par eff` columns are CPU seconds over wall seconds "
                 "for that phase, so they read as the average number of cores "
@@ -261,6 +329,33 @@ def render(records, config, out):
             }
             for reason in sorted(unavailable):
                 out(f"\nHost-to-device transfer time was not measured: {reason}\n")
+
+
+def _oracle_caption(rows, out):
+    """Say what `oracle` in the role column means, under the table it means it
+    in. Printed only when a row carries it, so a cpu-only run reads exactly as
+    it always did."""
+    oracles = sorted(
+        {f"{key[1]} on {key[2]}" for key, cell in rows.items() if cell["oracle"]}
+    )
+    if not oracles:
+        return
+    out(
+        "Rows marked `oracle` in the role column are "
+        + ", ".join(f"`{name}`" for name in oracles)
+        + ". An oracle row is one of our own arms on the cpu in a run that "
+        "also ran that arm on the accelerator. It is measured and timed the "
+        "same way every other row is and its number is printed here on "
+        "purpose, because the cpu backend is real and a reader should be able "
+        "to see it. It is NOT part of the speed story below. It is out of the "
+        "frontier ranking and out of the headline ratio, because the GPU is "
+        "the product and the cpu backend is kept as a correctness oracle and "
+        "as the portability floor rather than optimized. It runs at "
+        "`--oracle-repeats` repeats rather than `--repeats`, so its `reps` "
+        "column is normally lower than the accelerator row beside it and its "
+        "spread is normally narrower for that reason rather than because the "
+        "machine was quieter.\n"
+    )
 
 
 def _builders(rows, out):
@@ -332,21 +427,150 @@ def _bins(rows, out):
         out("")
 
 
+#: THE HEADLINE LABEL. One string, in one place, and it is the sentence in
+#: this repository a reader could most easily be misled by, so it is written
+#: out rather than assembled and it is not to be paraphrased by whoever next
+#: edits the table around it.
+#:
+#: RE-POINTED 2026-08-17, and the meaning changed. This table used to be our
+#: cpu against LightGBM's cpu, which was like-for-like on the backend and is
+#: no longer the product. Andrew's ruling that day, in his words: "the entire
+#: point is that WE USE THE GPU. We should be comparing us with gpu and
+#: without gpu to catboost, and same for lightgbm." So the headline row is now
+#: our accelerator, and the cpu row stays below it marked `oracle`.
+#:
+#: EVERY CLAUSE BELOW WAS CHECKED AGAINST THE CODE THAT MAKES IT TRUE rather
+#: than copied from a summary, and the three refusals it names are the three
+#: skip reasons this harness already prints, reused word for word in substance
+#: so that a reader who sees both cannot find a difference between them:
+#:
+#:   LightGBM      run.py `_engine_skip_reason`, "LightGBM runs on the CPU in
+#:                 this harness".
+#:   CatBoost      run.py `_engine_skip_reason` and
+#:                 `engines.CatBoostEngine.load`, "border_count is capped at
+#:                 255 on GPU against 65535 on CPU".
+#:   XGBoost       run.py `_engine_skip_reason` and
+#:                 `engines.XGBoostEngine.load`, CUDA only, Apple silicon, a
+#:                 CPU conda build, and a 3.4.0 fit handed device='cuda'
+#:                 trains on the cpu with a warning rather than failing.
+#:                 Verified 2026-08-17 and recorded in that docstring.
+#:
+#: What this label deliberately does NOT say is that we beat anybody's GPU.
+#: Two of the three peers have a GPU trainer. Neither could be used here.
+HEADLINE_LABEL = (
+    "**The headline row is our accelerator against LightGBM's cpu, and that "
+    "is not a like-for-like backend pairing.** It is each library's BEST "
+    "AVAILABLE BACKEND ON THIS MACHINE, which is a different claim, and it is "
+    "the claim this table makes. None of the three competitor arms in this "
+    "harness can use this GPU. LightGBM runs on the cpu here. CatBoost's GPU "
+    "training is a different quantization, border_count capped at 255 on GPU "
+    "against 65535 on cpu, so a CatBoost GPU row would be a different "
+    "measurement rather than a faster one, and CatBoostEngine.load refuses it "
+    "by name. XGBoost's only accelerator backend is CUDA and this machine is "
+    "Apple silicon, the installed package is the cpu build, and a fit handed "
+    "device='cuda' on 3.4.0 trains on the cpu with a warning instead of "
+    "failing, so XGBoostEngine.load refuses the device by name. Cpu is the "
+    "ceiling for all three of them here. mojotrees is a GPU-first product and "
+    "the accelerator is what it ships, so this is a product comparison. What "
+    "it is NOT is a statement about anybody's GPU path, because two of the "
+    "three peers have one and neither of those could be used on this machine."
+)
+
+#: The crossover, and why the oracle row is worth reading rather than skipping.
+#:
+#: These figures were handed to this lane on 2026-08-17 as medians of three
+#: and were NOT taken by it, so they are recorded here as orientation and not
+#: as a result of any run this file renders. At 200,000 rows by 50 features and
+#: 100 trees: leaf-wise 1.046 s cpu against 1.043 s gpu, depth-wise 1.301 cpu
+#: against 1.704 gpu, symmetric 1.768 cpu against 3.346 gpu. At 799,110 by 100:
+#: leaf-wise 7.479 cpu against 3.659 gpu. So the accelerator only pays above a
+#: few hundred thousand rows, the two leaf-wise arms are a tie at 200k, and the
+#: other two arms are faster on the cpu there. A table that showed only the
+#: accelerator row would hide that, which is one of the two reasons the oracle
+#: row is printed rather than dropped.
+CROSSOVER_NOTE = (
+    "The `oracle` row below the headline is our own cpu backend against the "
+    "same comparator. It is kept because it is a real number and a reader "
+    "should be able to see it, and it is marked because it is not the "
+    "headline. The cpu backend is maintained as a correctness oracle and as "
+    "the portability floor and is no longer optimized. It is also where "
+    "the crossover shows. Our accelerator does not pay at every size. Measured "
+    "on 2026-08-17 at 200,000 rows by 50 features and 100 trees, the leaf-wise "
+    "arm was a tie between the two backends and the depth-wise and symmetric "
+    "arms were both FASTER on the cpu, while at 799,110 by 100 the leaf-wise "
+    "arm was about two times faster on the accelerator. Those figures are "
+    "orientation carried in this file's `CROSSOVER_NOTE`, not results of this "
+    "run. Read both rows."
+)
+
+
 def _ratios(rows, min_repeats, out):
-    """mojotrees against lightgbm at matched device and thread count."""
+    """Our best available backend against LightGBM's, at a matched thread count.
+
+    **Not matched on DEVICE, and that is the change.** Until 2026-08-17 this
+    paired cpu with cpu and gpu with gpu, and since LightGBM never has a gpu
+    row in this harness the second pairing never existed and the table was our
+    cpu against theirs. That is a backend-matched comparison of a product whose
+    backend is the accelerator, so it measured the thing we do not ship.
+
+    Now the pairing is by thread count alone, our accelerator row is the
+    headline, and our cpu row stays underneath marked `oracle`. `HEADLINE_LABEL`
+    carries the argument for why an unmatched pairing is the honest comparison
+    here rather than a flattering one, clause by clause with the code that
+    makes each clause true.
+
+    A run with no accelerator row falls back to the old shape exactly. The cpu
+    row is then the measurement rather than an oracle, the pairing is
+    like-for-like, and the label says so instead of claiming an accelerator
+    that did not run.
+    """
+    # Matched on the two PLAIN arms, `mojotrees` and `lightgbm`, which is
+    # what `cell_key`'s arm field yields on every run without `--arms`. On an
+    # `--arms` run the frontier arms carry their own ids and never match
+    # these two names, so this table does not render for them; the frontier
+    # section below ranks those at a matched tree count, which is the only
+    # ranking they can honestly appear in. Until 2026-08-17 the key here was
+    # the engine and, on such a run, `comparator[threads]` was whichever
+    # lightgbm arm was written last.
+    comparator = {}
+    for (scenario, arm, device, threads), cell in rows.items():
+        if arm == "lightgbm" and device == "cpu":
+            comparator[threads] = cell
     pairs = []
-    for key, cell in rows.items():
-        scenario, engine, device, threads = key
-        if engine != "mojotrees":
+    for (scenario, arm, device, threads), cell in rows.items():
+        if arm != "mojotrees":
             continue
-        other = rows.get((scenario, "lightgbm", device, threads))
+        other = comparator.get(threads)
         if other:
-            pairs.append((device, threads, cell, other))
+            pairs.append((threads, device, cell, other))
     if not pairs:
         return
-    out("\n| device | threads | train mojotrees / lightgbm | binning | predict |")
-    out("| --- | --- | --- | --- | --- |")
-    for device, threads, mine, theirs in sorted(pairs, key=lambda p: (p[0], p[1])):
+
+    # Oracle rows last inside a thread count, so the headline is the row a
+    # reader's eye lands on first. `cell["oracle"]` sorts False before True.
+    pairs.sort(key=lambda p: (p[0], p[2]["oracle"], p[1]))
+    any_accelerator = any(not cell["oracle"] and device != "cpu"
+                          for _t, device, cell, _o in pairs)
+
+    # The column is `row` and not `role`, deliberately, even though one of its
+    # two values also appears in the per-engine table's `role` column. `oracle`
+    # means the same thing in both places. `HEADLINE` does not belong to that
+    # vocabulary at all. It is a statement about which line of THIS table is
+    # the published one, and putting it under `role` beside `comparator` and
+    # `peer` would read as a fourth engine role, which it is not.
+    # THE ACCURACY COLUMNS ARE NOT DECORATION, added 2026-08-17. This table
+    # published three speed ratios and no accuracy figure anywhere near them,
+    # which is the shape a speed number must never be quoted in: fewer trees,
+    # fewer bins or a coarser learning rate buy any of these ratios outright.
+    # A reader could take "0.72x train" out of here with nothing beside it. Now
+    # both engines' primary metric sits in the same row as their ratio.
+    out(
+        "\n| threads | mojotrees on | row | lightgbm on | "
+        "train mojotrees / lightgbm | binning | predict | "
+        "metric | mojotrees | lightgbm | accuracy gap |"
+    )
+    out("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for threads, device, mine, theirs in pairs:
         cols = []
         for name in ("train", "binning", "predict_batch"):
             a, b = mine["summary"][name], theirs["summary"][name]
@@ -357,9 +581,93 @@ def _ratios(rows, min_repeats, out):
                 cols.append("n/a")
             else:
                 cols.append(f"{a['median'] / b['median']:.2f}x")
-        out(f"| {device} | {threads} | " + " | ".join(cols) + " |")
+        which = "oracle" if mine["oracle"] else "HEADLINE"
+        metric = mine["primary_metric"]
+        ours = (mine["quality"] or {}).get(metric)
+        their_value = (theirs["quality"] or {}).get(metric)
+        # The gap is computed through verify._worse_by so that its DIRECTION
+        # comes from the metric rather than from this file. A hand-rolled
+        # subtraction here would read backwards on every higher-is-better
+        # metric and would do it silently.
+        if (
+            ours is None or their_value is None
+            or theirs["primary_metric"] != metric
+        ):
+            gap = "n/a"
+        else:
+            worse = verify._worse_by(metric, ours, their_value, "relative")
+            gap = (
+                f"{abs(worse) * 100:.2f}% "
+                + ("behind" if worse > 0 else "ahead")
+            )
+            # The excess lens beside the raw one, on the generator variant of
+            # a scenario with a declared Bayes floor and nowhere else. See
+            # verify.bayes_floor_of; the two cells share a data block by
+            # construction of the pairing, so our record's floor is theirs.
+            excess = verify.excess_worse_by(
+                metric, ours, their_value,
+                verify.bayes_floor_of(mine["records"][0]),
+            )
+            if excess is not None:
+                gap += (
+                    f", excess over floor {abs(excess) * 100:.1f}% "
+                    + ("behind" if excess > 0 else "ahead")
+                )
+                root = verify.excess_root_worse_by(
+                    metric, ours, their_value,
+                    verify.bayes_floor_of(mine["records"][0]),
+                )
+                if root is not None:
+                    gap += f" ({abs(root) * 100:.1f}% as excess rmse)"
+        out(
+            f"| {threads} | {device} | {which} | cpu | " + " | ".join(cols)
+            + f" | {metric} | "
+            + ("n/a" if ours is None else f"{ours:.6g}") + " | "
+            + ("n/a" if their_value is None else f"{their_value:.6g}")
+            + f" | {gap} |"
+        )
+
+    out("")
     out(
-        f"\nRatios are medians over at least {min_repeats} repeats, and read as "
+        "**Every speed ratio in that table carries the accuracy it was bought "
+        "at, in the same row, and it is to be quoted that way or not at all.** "
+        "A training time is purchasable with accuracy in either direction, so a "
+        "ratio without its metric is not a result about either library. The "
+        "`accuracy gap` column is this arm against LightGBM on the primary "
+        "metric, relative, with the direction taken from the metric itself. "
+        "Where it also reads `excess over floor`, the scenario's generator "
+        "adds noise of a known scale, the raw metric is mostly that noise, "
+        "and the second figure is the same gap taken on the error the model "
+        "is responsible for (rmse squared minus the floor MSE), which is the "
+        "figure that moves when a mechanism moves. Real-data rows have no "
+        "known floor and show the raw gap alone.\n"
+    )
+    if any_accelerator:
+        out(HEADLINE_LABEL + "\n")
+        out(CROSSOVER_NOTE + "\n")
+        out(
+            "An `oracle` row often reads n/a across every column, and that is "
+            f"by design rather than a fault. A ratio needs at least "
+            f"{min_repeats} repeats on both sides and `run.py "
+            "--oracle-repeats` defaults to 1, so the oracle cell usually has "
+            "fewer. Its absolute timings are in the per-engine table above, "
+            "which does not have that floor. Pass a higher --oracle-repeats "
+            "to get the ratio as well, at the cost the argument's help text "
+            "names.\n"
+        )
+    else:
+        out(
+            "**No accelerator row ran, so this table is cpu against cpu**, "
+            "which is like-for-like on the backend. It is not the headline "
+            "shape, because mojotrees is a GPU-first product and the "
+            "comparison it publishes is our accelerator against each "
+            "competitor's best available backend. Run with `--device gpu` on "
+            "a machine that has one to get that table. The cpu row here is the "
+            "measurement rather than an oracle, because it is the only backend "
+            "that ran.\n"
+        )
+    out(
+        f"Ratios are medians over at least {min_repeats} repeats, and read as "
         "mojotrees divided by lightgbm, so below 1.00 is mojotrees being "
         "quicker. They describe this machine on this day under the conditions "
         "named above. Nothing here is a claim about either library in general.\n"
@@ -397,50 +705,219 @@ def _frontier_group(record):
 
 
 def _frontier_verdicts(records, config):
-    """The inside-budget verdict per (arm, group), from verify.py.
+    """The two accuracy verdicts per row, from verify.py, as two maps.
 
     Recomputed here rather than read from a verdict file so that a report and
-    a verdict cannot disagree about which arms were inside the budget: there
-    is one implementation of the rule and this calls it.
+    a verdict cannot disagree: there is one implementation of each rule and
+    this calls it.
+
+    TWO MAPS SINCE 2026-08-17, because there are now two accuracy questions and
+    they are keyed differently. The anchor gate is keyed by
+    `verify._anchor_key`, which has no thread count in it; the peer scoreboard
+    is keyed by scenario/arm/device/threads/trees. Collapsing them into one map
+    would need one of the two keys to be wrong.
     """
     verdict = verify.Verdict()
     ok = [r for r in records if r.get("status") == "ok"]
-    verify.check_accuracy_budget(ok, config, verdict)
-    out = {}
+    verify.check_accuracy_peer(ok, config, verdict)
+    verify.check_accuracy_anchor(ok, config, verdict)
+    peer, anchor = {}, {}
     for check in verdict.checks:
-        if check["check"] != "accuracy_budget":
+        if check["check"] == "accuracy_peer":
+            peer[check["scope"]] = check
+        elif check["check"] == "accuracy_anchor":
+            anchor[check["scope"]] = check
+    return peer, anchor
+
+
+def _peer_cell(check, is_competitor):
+    """The `vs best peer` cell. Never a reason to leave a row out of a rank."""
+    if is_competitor:
+        return "the bar"
+    if check is None:
+        return "no verdict"
+    if check["status"] == verify.SKIP:
+        return "not compared"
+    worse = check.get("worse_relative")
+    if worse is None:
+        return "not compared"
+    direction = "behind" if worse > 0 else "ahead of"
+    text = f"{abs(worse) * 100:.2f}% {direction} {check.get('peer')}"
+    if not check.get("inside_band"):
+        text += ", outside 1%"
+    # The excess lens, beside the raw one, only when verify.py found a Bayes
+    # floor for this cell (generator variant of a scenario that declares one).
+    # A cell without the field prints exactly what it printed before.
+    excess = check.get("excess_worse_relative")
+    if excess is not None:
+        text += (
+            f"; excess over floor {abs(excess) * 100:.1f}% "
+            + ("behind" if excess > 0 else "ahead")
+        )
+        root = check.get("excess_root_worse_relative")
+        if root is not None:
+            text += f" ({abs(root) * 100:.1f}% as excess rmse)"
+    return text
+
+
+def _anchor_cell(check, is_competitor):
+    """The `vs anchor` cell, which is the only accuracy GATE in the harness."""
+    if is_competitor:
+        return "not ours"
+    if check is None:
+        return "no verdict"
+    if check["status"] == verify.SKIP:
+        return "not compared"
+    if not check.get("anchored"):
+        return "NO ANCHOR"
+    worse = check.get("worse_relative") or 0.0
+    where = "worse" if worse > 0 else "better"
+    size = f"{abs(worse) * 100:.3f}% {where}"
+    if check["status"] == verify.FAIL:
+        return f"REGRESSION, {size}"
+    if check["status"] == verify.WARN:
+        return f"CHECK THIS, {size}"
+    return f"held, {size}"
+
+
+def _pareto(rows, metric):
+    """Which ranked rows are not dominated, by the definition Andrew named.
+
+    An arm is dominated only if another arm is BOTH strictly faster AND at
+    least as accurate. Nothing else counts, and in particular an arm is not
+    dominated by something merely more accurate, because this is a speed table
+    and a slower more accurate arm answers a different question.
+
+    Two answers come out of this that a single ranking cannot hold at once:
+    the fastest arm overall and the fastest arm that nothing beats on both
+    axes. Both are true and they are frequently different rows.
+
+    Rows with no speed or no metric are not judged and not used as
+    dominators. A row that cannot be compared must not be able to eliminate
+    one that can.
+    """
+    higher_better = quality.HIGHER_IS_BETTER.get(metric)
+    out = {}
+    usable = [
+        row for row in rows
+        if row["speed"] is not None and row["metric_value"] is not None
+    ]
+    for row in rows:
+        if row not in usable or higher_better is None:
+            out[row["arm"]] = None
             continue
-        out[check["scope"]] = check
+        dominators = []
+        for other in usable:
+            if other is row or other["speed"] >= row["speed"]:
+                continue
+            at_least_as_accurate = (
+                other["metric_value"] >= row["metric_value"] if higher_better
+                else other["metric_value"] <= row["metric_value"]
+            )
+            if at_least_as_accurate:
+                dominators.append(other["arm"])
+        out[row["arm"]] = dominators
     return out
 
 
+#: THE SENTENCE A READER MAY NOT MISS, printed above every frontier table.
+#:
+#: It is here rather than inline because it is the load-bearing caveat of the
+#: whole section and it must not drift table by table. Registered 2026-08-17
+#: with the separation of the two axes.
+#:
+#: The separation created a real hazard and this sentence is the mitigation.
+#: Before it, an arm outside the accuracy budget was not ranked at all, so a
+#: seconds column could not be read without its accuracy having already been
+#: judged. Now every arm is ranked, which is right, and the cost is that a
+#: reader can take a rank out of this table on its own. Speed is trivially
+#: purchasable with accuracy -- fewer trees, fewer bins, a coarser learning
+#: rate -- so a rank without the metric beside it is not a result.
+RANKING_CAVEAT = (
+    "**These rows are ranked on seconds alone and they do not all have the "
+    "same accuracy.** Speed here is purchasable with accuracy: fewer trees, "
+    "fewer bins or a coarser learning rate make any arm in this table faster. "
+    "So a rank is a claim about seconds and about nothing else, and it is only "
+    "readable together with the metric column beside it. Quote the two "
+    "columns together or quote neither."
+)
+
+
 def _frontier(records, config, out):
-    """The frontier block: inside-budget arms ranked by speed, per tree count.
+    """The frontier block: every arm ranked by speed, with both accuracy
+    columns beside it, per tree count.
 
-    Three rules, and each of them is structural rather than editorial.
+    REBUILT 2026-08-17, AND THE MEANING CHANGED. Read this before reading a
+    table from before that date against one from after, because the same
+    section now answers a different question.
 
-    **Ranked within one tree count only.** `_frontier_group` puts the count in
-    the key, so nothing here can order a 360-tree arm against a 100-tree one
-    or against a 100-tree competitor.
+    **What it was.** "The accuracy budget frontier": only arms INSIDE the
+    1-percent-of-CatBoost-or-LightGBM budget were ranked, everything else
+    printed as `OUTSIDE, not ranked`. The budget did not label an arm, it
+    suppressed it.
 
-    **Only arms that earned a PASS are ranked.** An arm outside the budget has
-    no speed worth quoting, because the budget is what its speed was to be
-    bought with. An arm that ABSTAINED -- no competitor row at its tree count
-    -- is listed separately as unjudged and is not ranked at all, since
-    ranking it would be the cross-count comparison arriving through a missing
-    row instead of through a layout.
+    **What broke.** On 2026-08-17 the leaf-wise GPU arm improved from 1.043 s
+    to 0.839 s, a 1.24x from work that was bit-identical and could not have
+    touched accuracy, and that improvement appeared NOWHERE in this section,
+    because the arm sits outside the budget. We hid our own best result from
+    ourselves. Andrew: "maybe we need to get rid of this linkage between speed
+    and accuracy and just focus on them separately it is causing confusion and
+    preventing us from enabling things."
 
-    **The fastest inside-budget row is named as a DOCUMENTED recommendation
-    and nothing applies it.** No file in this repository reads this name back
-    into a default; changing a shipped default is a person's decision, taken
-    with this table in front of them.
+    **The rule now, and it is the one rule this function exists to hold.**
+    SPEED IS RANKED ALWAYS, FOR EVERY ARM. No arm is ever left out of the speed
+    ranking for an accuracy reason. Accuracy is reported in its own columns
+    beside the rank, never instead of it. A reader must be able to see in one
+    row both that an arm is fastest and how accurate it is.
+
+    **The constraint that survives, and it is not negotiable.** Speed is
+    trivially purchasable with accuracy, so a speed figure with no accuracy
+    figure beside it is not a result. Every row here carries its metric, both
+    accuracy verdicts sit in the same row, and `RANKING_CAVEAT` says above
+    every table that the ranking spans arms of differing accuracy. A table of
+    seconds with no metric column would be a defect in this function.
+
+    **Two accuracy columns, because there are two questions.** `vs anchor` is
+    the GATE: our accuracy against our own recorded accuracy for this arm. `vs
+    best peer` is the SCOREBOARD: how far from CatBoost or LightGBM, gating
+    nothing. `verify.py`'s THE TWO ACCURACY AXES block is the rule; this file
+    renders it.
+
+    **Pareto, because "fastest" has two true answers.** An arm is dominated
+    only if another arm is both strictly faster and at least as accurate. That
+    surfaces "fastest overall" and "fastest that nothing beats on both axes" as
+    two different rows, which is honest in a way a single ordering cannot be.
+
+    **What did NOT change.**
+
+    Ranked within one tree count only. `_frontier_group` puts the count in the
+    key, so nothing here can order a 360-tree arm against a 100-tree one.
+
+    ORACLE rows are printed and are not ranked. That exclusion is NOT an
+    accuracy exclusion and it survives the separation untouched: a subject arm
+    on the cpu beside an accelerator cell exists so `verify.py` can compare an
+    accelerator row against its own cpu twin, the GPU is the product, and the
+    cpu backend is no longer optimized. Its accuracy columns ARE filled in,
+    which is new: the separation cuts both ways, and a row kept out of the
+    speed story has no reason to be kept out of the accuracy one.
+
+    COMPETITOR ROWS ARE NOW RANKED, which IS a change. They were `the bar` and
+    unranked, and the reason given was that the budget is measured against them
+    rather than applied to them. That is a statement about the ACCURACY axis
+    and it was being used to remove them from the SPEED axis, which is the
+    exact conflation this rebuild removes. Their accuracy cell still reads `the
+    bar`. Their seconds are ranked with everybody else's, and the consequence
+    is that "the fastest thing in this table" is frequently a competitor, which
+    is true and was previously unsayable here.
+
+    The DOCUMENTED recommendation still names one of our own arms and nothing
+    applies it. No file in this repository reads that name back into a default.
     """
     ok = [r for r in records if r.get("status") == "ok"]
     if not ok:
         return
-    verdicts = _frontier_verdicts(records, config)
-    if not verdicts:
-        return
+    peer_verdicts, anchor_verdicts = _frontier_verdicts(records, config)
+    accelerator_keys = verify.accelerator_cells(ok)
 
     groups = {}
     for record in ok:
@@ -449,13 +926,45 @@ def _frontier(records, config, out):
         cell = groups.setdefault(group, {})
         cell.setdefault(arm, []).append(record)
 
-    out("\n## The accuracy budget frontier\n")
+    out("\n## The speed and accuracy frontier\n")
+    out(
+        "Called `the accuracy budget frontier` until 2026-08-17, when the two "
+        "axes were separated. It ranked only arms inside the accuracy budget "
+        "and printed the rest as `OUTSIDE, not ranked`, which hid a real 1.24x "
+        "speed improvement on an arm whose accuracy the work could not have "
+        "touched. Speed is now ranked for every arm and accuracy is reported "
+        "beside it. Tables from before that date are not the same table.\n"
+    )
     out(
         "One table per tree count, and that is the only grouping there is. A "
         "row is ranked against the rows beside it and against nothing else; "
         "there is no ordering in this section that spans two tree counts, "
         "and no arm appears in a table with a competitor it was not compared "
         "against.\n"
+    )
+    out(
+        "Two accuracy columns, because there are two questions and one of them "
+        "used to swallow the other. `vs anchor` is the GATE: this arm against "
+        "OUR OWN recorded accuracy for it, from "
+        "`bench/real_data/accuracy_anchors.json`. `vs best peer` is the "
+        "SCOREBOARD: the distance to the better of CatBoost-as-shipped and "
+        "LightGBM stock+det at this tree count, which gates nothing at all. An "
+        "arm can be behind every peer and perfectly healthy, and it can be "
+        "ahead of every peer and have just regressed against itself. On the "
+        "generator variant of a scenario whose noise scale is known "
+        "(`scenarios.bayes_floor`), the same cell also carries `excess over "
+        "floor`: the gap on the error the model is responsible for, rmse "
+        "squared minus the floor MSE, which is the number a mechanism moves. "
+        "A 1.7 percent raw gap on dense_regression is a 28.8 percent excess "
+        "gap. Real-data rows have no floor and show the raw gap alone.\n"
+    )
+    out(
+        "One kind of row is printed and not ranked, and the reason is not "
+        "accuracy. One of our own arms on the cpu, in a run that also ran it "
+        "on the accelerator, reads `oracle` in the rank column, because the "
+        "GPU is the product and the cpu backend is a correctness oracle and "
+        "the portability floor rather than something we optimize. Its accuracy "
+        "columns are filled in like everybody else's.\n"
     )
 
     recommendations = []
@@ -465,84 +974,228 @@ def _frontier(records, config, out):
             continue
         rows = []
         unjudged = []
-        for arm, group_records in groups[group].items():
+        metric = None
+        for arm, group_records in sorted(groups[group].items()):
             summary = summarise(
                 [phase_value(r, FRONTIER_RANK_FIELD) for r in group_records]
             )
             first = group_records[0]
-            scope = (
-                f"{scenario}/{arm}/{device}/t{threads}/n{trees}"
+            metric = metric or first.get("primary_metric")
+            peer_scope = f"{scenario}/{arm}/{device}/t{threads}/n{trees}"
+            peer_check = peer_verdicts.get(peer_scope)
+            anchor_check = anchor_verdicts.get(verify._anchor_key(first))
+            # `xgboost` joined the list on 2026-08-17 with the peer arm. It is
+            # a competitor library, so without it an XGBoost row would be
+            # labeled "arm" and then reported as having no accuracy verdict,
+            # which is the treatment a mojotrees arm gets and is wrong here: a
+            # competitor is not judged against our anchor and is not compared
+            # to itself as a peer. `verify.DEFAULT_ACCURACY_PEER` decides which
+            # competitors the scoreboard is taken from, and that is a separate
+            # question from whether a row is a competitor at all.
+            #
+            # `arm_block` joined the chain on 2026-08-17 and it is a FIX, not
+            # a widening. `frontier_block` is a field no writer in this
+            # repository has ever produced; `worker.py` writes the arm's
+            # declared block under the name `arm_block`. So a frontier plan
+            # row that declared itself "Base A" was rendered "arm" here, and
+            # the block column of a sweep table said nothing. The old name is
+            # kept first so that a record which does carry it still wins.
+            #
+            # Whether a row is a competitor is a property of its ENGINE and is
+            # read from the engine, since 2026-08-17. Until then it was read
+            # from the ARM id against three literal names, which is the
+            # opposite of the keying mistake fixed in verify.py the same day
+            # and just as wrong: on an `--arms` run a lightgbm arm is named
+            # `frontier.<row>.lightgbm.cpu.trees.100`, matches none of the
+            # three, and only escaped being ranked as one of OUR arms because
+            # `frontier.py` also happens to write `arm_block: competitor`.
+            # `verify.SUBJECT_ENGINES` is every engine that is ours, so its
+            # complement is every competitor, under any arm id.
+            competitor_engine = first.get("engine") not in verify.SUBJECT_ENGINES
+            block = first.get("frontier_block") or first.get("arm_block") or (
+                "competitor" if competitor_engine else "arm"
             )
-            check = verdicts.get(scope)
-            block = first.get("frontier_block") or (
-                "competitor" if arm in ("catboost", "lightgbm") else "arm"
-            )
-            if check is None:
-                if block != "competitor":
-                    unjudged.append((arm, block, "no budget verdict for this row"))
-                rows.append((None, arm, block, summary, first, "bar"))
-                continue
-            if check["status"] == verify.SKIP:
-                unjudged.append((arm, block, check["detail"]))
-                continue
-            if check["status"] == verify.PASS:
-                rows.append(
-                    (summary["median"] if summary else None, arm, block,
-                     summary, first, "inside")
-                )
-            else:
-                rows.append((None, arm, block, summary, first, "outside"))
+            is_competitor = block == "competitor" or competitor_engine
+            if peer_check is not None and peer_check["status"] == verify.SKIP:
+                unjudged.append((arm, "peer", peer_check["detail"]))
+            if anchor_check is not None and anchor_check["status"] == verify.SKIP:
+                unjudged.append((arm, "anchor", anchor_check["detail"]))
+            rows.append({
+                "arm": arm,
+                "block": block,
+                "summary": summary,
+                "speed": summary["median"] if summary else None,
+                "metric_value": (first.get("quality") or {}).get(
+                    first.get("primary_metric")
+                ),
+                "oracle": verify.is_oracle(first, accelerator_keys),
+                "competitor": is_competitor,
+                "peer": peer_check,
+                "anchor": anchor_check,
+            })
 
-        inside = sorted(
-            [r for r in rows if r[5] == "inside" and r[0] is not None],
-            key=lambda r: r[0],
-        )
-        others = [r for r in rows if r[5] != "inside" or r[0] is None]
-        if not inside and not others and not unjudged:
+        if not rows:
             continue
 
-        metric = (
-            (groups[group][next(iter(groups[group]))][0]).get("primary_metric")
-        )
+        # THE RANKING. Every row that is not an oracle, ordered on seconds and
+        # on nothing else. No accuracy verdict is read anywhere in these three
+        # lines, and that is the whole change.
+        rankable = [r for r in rows if not r["oracle"] and r["speed"] is not None]
+        rankable.sort(key=lambda r: r["speed"])
+        for index, row in enumerate(rankable, start=1):
+            row["rank"] = index
+        for row in rows:
+            row.setdefault("rank", "oracle" if row["oracle"] else "no timing")
+
+        front = _pareto(rankable, metric)
+
         out(
             f"\n**{scenario} / {kind} / {device} / t{threads} / "
             f"{trees} trees**, ranked on median train seconds, primary "
             f"metric {metric}.\n"
         )
-        if inside or others:
-            out("| rank | arm | block | train s | primary metric | budget |")
-            out("| --- | --- | --- | --- | --- | --- |")
-        for index, (_speed, arm, block, summary, first, _state) in enumerate(
-            inside, start=1
-        ):
-            value = (first.get("quality") or {}).get(metric)
+        out(RANKING_CAVEAT + "\n")
+        out(
+            f"| rank | arm | block | train s | {metric} | vs anchor | "
+            "vs best peer | pareto |"
+        )
+        out("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        ordered = sorted(
+            rows,
+            key=lambda r: (
+                r["rank"] if isinstance(r["rank"], int) else 10_000,
+                r["arm"],
+            ),
+        )
+        for row in ordered:
+            value = row["metric_value"]
+            dominators = front.get(row["arm"])
+            # `n/a (oracle)` and not `not ranked`. The phrase "not ranked" was
+            # the old accuracy suppression's label and it must not survive
+            # anywhere in a table row, even attached to a different and
+            # legitimate exclusion, because a reader who sees it in a row will
+            # read it as the thing it used to mean.
+            if row["oracle"]:
+                pareto = "n/a (oracle)"
+            elif row["speed"] is None:
+                pareto = "n/a (no timing)"
+            elif dominators is None:
+                pareto = "n/a"
+            elif dominators:
+                pareto = f"dominated by {', '.join(sorted(set(dominators)))}"
+            else:
+                pareto = "frontier"
             out(
-                f"| {index} | {arm} | {block} | "
-                f"{fmt_time(summary, 0.25)} | "
-                f"{'n/a' if value is None else f'{value:.6g}'} | inside |"
+                f"| {row['rank']} | {row['arm']} | {row['block']} | "
+                f"{fmt_time(row['summary'], 0.25)} | "
+                f"{'n/a' if value is None else f'{value:.6g}'} | "
+                f"{_anchor_cell(row['anchor'], row['competitor'])} | "
+                f"{_peer_cell(row['peer'], row['competitor'])} | {pareto} |"
             )
-        for _speed, arm, block, summary, first, state in others:
-            value = (first.get("quality") or {}).get(metric)
-            label = "the bar" if state == "bar" else "OUTSIDE, not ranked"
+
+        has_oracle = any(row["oracle"] for row in rows)
+        out(
+            "\n`pareto` reads `frontier` when no arm in this table is both "
+            "strictly faster and at least as accurate. A `dominated by` row is "
+            "beaten on both axes at once and needs an argument other than "
+            "speed to justify it."
+            + (
+                " Oracle rows are neither, because they are not in the "
+                "ranking." if has_oracle else ""
+            )
+            + "\n"
+        )
+        if has_oracle:
             out(
-                f"| -- | {arm} | {block} | {fmt_time(summary, 0.25)} | "
-                f"{'n/a' if value is None else f'{value:.6g}'} | {label} |"
+                "`oracle` in the rank column is one of our own arms on the "
+                "cpu, in a run that also ran that arm on the accelerator. It "
+                "is timed and its number is above; it is out of the RANKING "
+                "because the GPU is the product and the cpu backend is kept as "
+                "a correctness oracle and as the portability floor rather than "
+                "optimized. That is not an accuracy judgment, and since "
+                "2026-08-17 its accuracy columns are filled in like every "
+                "other row's. Its accelerator twin is ranked in the "
+                "accelerator table for this same scenario and tree count.\n"
             )
-        if inside:
-            fastest = inside[0]
-            recommendations.append((group, fastest[1], fastest[3]))
+
+        # THE THREE ANSWERS. They are frequently three different arms and every
+        # one of them is true. Printing only one of them is how this section
+        # came to hide a 1.24x.
+        if rankable:
+            fastest = rankable[0]
+            shown = (
+                "n/a" if fastest["metric_value"] is None
+                else f"{fastest['metric_value']:.6g}"
+            )
+            # The competitor clause is conditional on there BEING a competitor
+            # row in this group. A gpu table has none, because none of the
+            # three peers can use this accelerator, and claiming the ranking
+            # "includes the competitors" there would be a false reassurance
+            # about the one comparison a reader most wants.
+            has_competitor = any(r["competitor"] for r in rankable)
             out(
-                f"\nFastest inside the budget at {trees} trees: "
-                f"**{fastest[1]}**. That is a DOCUMENTED recommendation for "
-                "the shipped defaults and nothing applies it: no file here "
-                "reads this name back into a default, and it is the fastest "
-                "AMONG THE ARMS THAT RAN rather than the fastest "
-                "configuration, because this is a one-axis sweep and not a "
-                "grid. See bench/real_data/frontier.py for what it cannot "
-                "see.\n"
+                f"Fastest in this table at {trees} trees: **{fastest['arm']}** "
+                f"at {fastest['speed']:.3f} s, {metric} {shown}."
+                + (
+                    " That includes the competitor rows, which are ranked on "
+                    "speed here alongside our own arms."
+                    if has_competitor else
+                    " There is no competitor row in this table, so this is the "
+                    "fastest of OUR arms and not the fastest arm measured on "
+                    "this scenario. The competitors are in the cpu table for "
+                    "the same scenario and tree count, because none of the "
+                    "three can use this accelerator."
+                )
+                + "\n"
             )
-        for arm, block, why in unjudged:
-            out(f"\nUNJUDGED, not ranked: `{arm}` ({block}). {why}\n")
+        ours = [r for r in rankable if not r["competitor"]]
+        if ours:
+            best = ours[0]
+            recommendations.append((group, best["arm"], best["summary"]))
+            regressed = (
+                best["anchor"] is not None
+                and best["anchor"]["status"] in (verify.FAIL, verify.WARN)
+                and best["anchor"].get("anchored")
+            )
+            line = (
+                f"Fastest of OUR arms at {trees} trees: **{best['arm']}** at "
+                f"{best['speed']:.3f} s, {metric} "
+                + ("n/a" if best["metric_value"] is None
+                   else f"{best['metric_value']:.6g}")
+                + f", {_peer_cell(best['peer'], False)}, anchor "
+                f"{_anchor_cell(best['anchor'], False)}. That is a DOCUMENTED "
+                "recommendation for the shipped defaults and nothing applies "
+                "it: no file here reads this name back into a default, and it "
+                "is the fastest AMONG THE ARMS THAT RAN rather than the "
+                "fastest configuration, because this is a one-axis sweep and "
+                "not a grid. See bench/real_data/frontier.py for what it "
+                "cannot see."
+            )
+            if regressed:
+                line += (
+                    " **AND ITS ACCURACY GATE IS NOT CLEAN.** Read the anchor "
+                    "column before taking this recommendation anywhere: a "
+                    "fastest arm that just moved against its own recorded "
+                    "accuracy is a trade somebody has to agree to, not a "
+                    "result."
+                )
+            out(line + "\n")
+        clean = [r for r in ours if not r["competitor"] and not front.get(r["arm"])]
+        if clean:
+            out(
+                "On the Pareto frontier among our arms, meaning nothing in "
+                "this table is both faster and at least as accurate: "
+                + ", ".join(f"`{r['arm']}`" for r in clean)
+                + ".\n"
+            )
+        for arm, which, why in unjudged:
+            out(
+                f"\nRANKED ON SPEED, NO {which.upper()} ACCURACY VERDICT: "
+                f"`{arm}`. {why}. Its seconds are in the table above and its "
+                "rank is real; what is missing is one of the two accuracy "
+                "columns, and a missing accuracy verdict is not a reason to "
+                "drop a measured time.\n"
+            )
 
     if recommendations:
         out(

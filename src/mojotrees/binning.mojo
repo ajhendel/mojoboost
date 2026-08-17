@@ -273,6 +273,19 @@ and `quantile_boundary_indices` on which boundaries exist at all. The dense
 fast path, the dense sort path, and `sparse.fit_bins_csc` all go through
 both, so there is one rule rather than three copies of it.
 
+Border rules
+------------
+Two exist. `BORDER_QUANTILE`, the default, is the LightGBM `GreedyFindBin`
+port everything above describes. `border_type` additionally selects four of
+CatBoost's border-selection algorithms (`catboost_borders`), of which
+`BORDER_GREEDY_LOG_SUM` is CatBoost's own default. **No caller passes
+`border_type` and none should**: the CatBoost rules are unreachable from every
+trainer entry point, and a lane that scoped making one reachable closed the
+item as NOT RECOMMENDED on 2026-08-17. Both rules read the values' RANKS and
+place a border at the midpoint of two adjacent levels, so neither can be
+separated from the other by skew, only by ties; the section header above
+`BORDER_QUANTILE` has the arithmetic and the verdict.
+
 Forced splits
 -------------
 `map_forced_splits` turns a parsed forced-split tree (see
@@ -346,6 +359,34 @@ comptime MAX_EDGE = 1e300
 # a `BinMapper` has to hold the ceiling, because `BinMapper.transform`
 # narrows to `UInt8` while `BinMapper.bin_value` returns an `Int`: above it
 # the two disagree silently, by a whole leaf rather than by a rounding step.
+#
+# **For a CATEGORICAL column this ceiling is a measured accuracy failure and
+# not only a limit**, and it is scoped in
+# `docs/design/CATEGORICAL_BIN_CEILING.md` (2026-08-17). The short form, so
+# that a reader here knows whether to open it. On
+# `bench/real_data`'s `high_cardinality_categorical` we bin three columns at
+# 255 where LightGBM bins them at 989, 19,433 and 15,952, covering 26.5, 1.8
+# and 10.8 percent of the rows against its 98.9, 98.1 and 44.5; our average
+# precision is 0.421925 against its 0.479591, a 12.02 percent gap against a
+# 10 percent gate, and an oracle over the generator's per-level effects scores
+# 0.552770 at LightGBM's widths against 0.442548 at ours. So the ceiling more
+# than fully accounts for the failure (all QUOTED from the lane that measured
+# it, nothing here was measured or run).
+#
+# What this constant is NOT, and this is the part worth carrying. It is one of
+# six places 256 is written down, and it is the only one that binds
+# unavoidably for a categorical feature, because routing a row needs that
+# row's category identity and an identity from more than 256 values does not
+# fit in a byte. The node's split SET does not need 256 bits
+# (`categorical.cat_side_cap` caps a set at `max_cat_threshold`, 32 at stock,
+# whatever the category count, so a sorted id list is smaller at every width
+# above 256); the distributed candidate wire and the four-scalar device ABI
+# follow the set rather than the bin id; the device already refuses
+# `n_bins > 256` outright; and `CategoricalSpec` is 64-bit and has no ceiling
+# at all. The constraint that actually prices a global widening out is not in
+# this file: `histogram.Histogram` is RECTANGULAR, `n_features * n_bins` at
+# one global `n_bins`, so widening one column widens every column, 76x on that
+# scenario. The design note prices three ways out.
 comptime MAX_BINS = 256
 
 comptime DEFAULT_MIN_DATA_IN_BIN = 3
@@ -578,9 +619,73 @@ def emit_quantile_edges(
 # The one fact worth carrying in your head. CatBoost's `border_count` counts
 # THRESHOLDS and this repo's `max_bin` counts BINS, so CatBoost's default 254
 # and our 255 are the same 255-bin budget, and `max_borders` below is
-# `n_ordinary - 1`. Given that, `GreedyLogSum` and our quantile fit produce
-# the SAME NUMBER of borders, `min(max_borders, distinct - 1)`, and differ
-# only in where they sit. The catalog shows why there is no third outcome.
+# `n_ordinary - 1`.
+#
+# CORRECTION, 2026-08-17, and it is the one thing in this header that was
+# wrong. This block used to say that `GreedyLogSum` and our quantile fit
+# "produce the SAME NUMBER of borders, `min(max_borders, distinct - 1)`, and
+# differ only in where they sit". The first half of that is CatBoost's count
+# and is right about CatBoost. It is NOT right about us. `GreedyLogSum` always
+# spends its whole budget while any bin still holds two levels; our rule
+# derives its borders from equally spaced RANKS and then collapses every
+# boundary that lands inside one run of equal values, so a tie-heavy column
+# comes out UNDER budget. Simulated (pure-Python port of both rules, not a
+# mojotrees run, 160,000 rows, `max_bin` 255): a Zipf-ish integer column with
+# 5,000 levels gets 254 borders from `GreedyLogSum` and 232 from ours, and a
+# column that is 40 percent one atom gets 254 against 154. So the two rules
+# differ in COUNT as well as in position, and the difference is entirely about
+# ties.
+#
+# What follows from that, because it decides where this mode can possibly
+# matter and the earlier framing pointed the wrong way. Both rules read only
+# the RANKS of the values: `_cb_update_best` looks at nothing but `cum`, and
+# `quantile_boundary_indices` is arithmetic on `n_valid`. Both then place a
+# border at the midpoint of two adjacent levels. So both are invariant to any
+# monotone transform of the column, and SKEW ALONE CANNOT SEPARATE THEM -- the
+# same simulation gives bit-identical grids for a lognormal, a Pareto and a
+# uniform column of the same size, and identical border sets outright at
+# `max_bin = 32`, where 31 borders is a dyadic recursion that lands exactly on
+# the equal-frequency ranks. What separates them is ties, nothing else.
+#
+# And on a column with no ties our rule is not an approximation of theirs, it
+# is the optimum of their objective. `Penalty<MaxSumLog>` sums to
+# `sum(log(population))` over the bins, which is maximized at EQUAL
+# populations; the greedy reaches it only when the budget is a power of two,
+# and at 255 bins it leaves populations spanning 625 to 1250 where the
+# equal-frequency fit spans 627 to 628 (same simulation, 160,000 distinct
+# values). Turning this mode on for a continuous column is therefore expected
+# to cost a little accuracy by CatBoost's own criterion, not buy any.
+#
+# VERDICT, 2026-08-17: MAKING `GreedyLogSum` REACHABLE IS **NOT RECOMMENDED**,
+# and this is the closing note on the item rather than a pause. It was scoped
+# as the last unexplained term in the CatBoost-mode accuracy gap. It is a real
+# term -- a parallel lane attributed 55.7 percent of the standard-tier gap to
+# where the borders sit -- and it is still not worth taking, for three reasons
+# that each stand on their own.
+#
+# 1. The premise that motivated it does not hold on this data. The synthetic
+#    dense features are uniform[0, 1); only the label noise is normal
+#    (verified numerically by that lane, and independently here: every column
+#    of `bench/real_data/generators.dense_regression` comes from `_stream`,
+#    which is uniform). The tail-density argument for why a recursive median
+#    should beat equal frequency needs a distribution neither generator has.
+# 2. The effect REVERSES with dataset size. Our placement lands worse than
+#    CatBoost's at the standard tier and BETTER at the large tier
+#    (5.96e-04 against their 6.69e-04). A mechanism does not change sign with
+#    the sample size; a lottery ticket does. The term hangs on whether one
+#    border happens to fall beside `x4 = 0.7`, the single discontinuity in the
+#    synthetic target, and the real dataset has no analogue.
+# 3. The rule we already run is not what holds us back. LightGBM is the WORST
+#    arm on this same term at both tiers (41 and 39 percent of its excess
+#    MSE), and our binner is a port of LightGBM's.
+#
+# So it would be a bit-moving change to every fit, re-anchored against our own
+# accuracy gate under LANE_RULES rule 3, bought with a different ticket in the
+# same lottery. The five implemented modes stay exactly as they are: reachable
+# by argument, unreached by any caller, and correct as far as source reading
+# and simulation can establish. Nothing here is deleted, because the port is
+# the only executable statement of what CatBoost actually does and the next
+# person to ask this question should find it answered rather than reopened.
 # --------------------------------------------------------------------------
 
 comptime BORDER_QUANTILE = 0
@@ -2279,6 +2384,15 @@ struct BinnedMatrix(Copyable, Movable):
     `sum_f feature_bins[f]` cells rather than `n_features * n_bins`. Only the
     row-major blocked kernel's private partials use it; the output histogram
     keeps its `f * n_bins + b` shape, which every other file indexes with.
+
+    That last sentence is also the blocker for the categorical bin ceiling, so
+    it is worth reading as a statement about what does not exist yet rather
+    than only about who uses this table. A per-feature width table is here and
+    is correct; the OUTPUT histogram is rectangular at one global `n_bins`, so
+    a single wide categorical column would widen every column with it, 76x on
+    `high_cardinality_categorical`. See
+    `docs/design/CATEGORICAL_BIN_CEILING.md`, part 2 R6, for the arithmetic
+    and for the two designs that avoid it.
     """
 
     def __init__(
@@ -2614,6 +2728,19 @@ def append_ctr_columns(
     and no target, so it *cannot* evaluate the training formula. That is the
     train/predict separation enforced by what the type owns rather than by a
     comment.
+
+    **This function is also the machinery a categorical bin-ceiling fix would
+    reuse, and that is the cheapest design on the table.** A column with more
+    categories than bins can be SHARDED into several ordinary categorical
+    columns of at most `max_bins - 1` categories each, every one of which is
+    legal under every ceiling in the tree, on both backends, with no change to
+    the bin plane, the 256-bit split set, the distributed wire, the device ABI
+    or the model format. The append is this one; what it needs beside it is a
+    sibling of `ctr_extend_cats` that appends CODE TABLES rather than
+    `False` flags, because a shard is categorical where a CTR column is
+    numeric. Costs and the two semantic changes it forces (`feature_fraction`
+    would sample shards, and importance spreads over them) are priced in
+    `docs/design/CATEGORICAL_BIN_CEILING.md`, part 3 design C.
     """
     if n_ctr_columns < 1:
         return
@@ -3229,6 +3356,13 @@ def fit_bins[
     if feature_pre_filter and min_data_in_leaf < 0:
         raise Error("min_data_in_leaf must be nonnegative")
 
+    # The categorical ceiling is set HERE, by the `max_bins` this call passes:
+    # `fit_categorical_spec` keeps `max_bins - 1` codes per column and drops
+    # the rest into bin 0, where they can never be isolated. That is one
+    # expression (`_keep_most_frequent`) and it is the whole of the fit-side
+    # ceiling, because `CategoricalSpec` itself is 64-bit and unbounded. Any
+    # widening starts by giving this call a per-feature cap instead of one
+    # number; see `docs/design/CATEGORICAL_BIN_CEILING.md`.
     var cats = fit_categorical_spec(
         features, n_rows, n_features, categorical_features, max_bins
     )

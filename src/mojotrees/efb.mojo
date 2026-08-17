@@ -11,15 +11,49 @@ recoverable from the bundled bin.
 
 This module holds the EFB core -- conflict measurement, plan construction,
 encoding, decoding, and the bundled matrix -- and the dense CPU integration
-that makes it reachable.
+that makes it reachable. The sparse CPU integration is
+`boosting_sparse.prepare_bundling_csc`, which is built on this module's
+`fit_bundles` and `bundle_csc`.
 
 Where it is live, and how it avoids the model entirely
 ------------------------------------------------------
-`enable_bundle` is off by default (`DEFAULT_ENABLE_BUNDLE`) and, when it is
-set, it applies to the **dense CPU trainers in boosting.mojo** and to nothing
-else. `BoosterParams.bundling` carries the switch, `prepare_bundling` fits the
-plan once per training call, and `tree.grow_tree` takes the resulting
+`enable_bundle` is off by default (`DEFAULT_ENABLE_BUNDLE`).
+`BoosterParams.bundling` carries the switch, `prepare_bundling` fits the plan
+once per training call, and `tree.grow_tree` takes the resulting
 `BundledMatrix`.
+
+**Where it is honored, enumerated 2026-08-17.** This paragraph used to say the
+switch "applies to the dense CPU trainers in boosting.mojo and to nothing
+else", and that was already false when it was written: it understated the reach
+by four trainers, which under LANE_RULES rule 7 is the direction that leaves a
+capability a user already has undocumented. Every `prepare_bundling` /
+`prepare_bundling_csc` call site at head:
+
+- dense CPU boosted, single-output and multiclass, fresh and continued.
+  `boosting.mojo` lines 2441, 3238, 3857, 4278.
+- DART, single-output and multiclass, fresh, continued, and with a validation
+  set. `alternate_boosting.mojo` lines 483, 798, 925, 1194.
+- random forest, single-output and multiclass. `boosting_rf.mojo` lines 723,
+  1406.
+- sparse CPU on the CSC matrix, boosted and multiclass.
+  `boosting_sparse.prepare_bundling_csc`, reached from `model_sparse.mojo`
+  lines 122 and 205.
+
+Refused by name, never dropped: the GPU dense and sparse trainers
+(`check_bundling_honored` in `train_gpu.mojo:1576` and
+`train_gpu_sparse.mojo:185`, with `device_policy.BLOCK_FEATURE_BUNDLING`
+keeping `device="auto"` off the accelerator before any shape is compared), and
+the six entry points that declare `unbundled=` to `_parse_params` in
+`bindings/_mojotrees.mojo` -- `fit_custom`, `fit_with_metrics`,
+`fit_multiclass_with_metrics`, `fit_ranker_with_metrics`, `fit_ranker`,
+`train_dataset_ranker`.
+
+The honest short version is that **every CPU trainer taking a `BoosterParams`
+honors it, and every trainer that does not refuses it by name.** One comment
+still carries the old claim, at `device_policy.mojo:2373` ("enable_bundle is
+applied by the dense CPU trainers in boosting.mojo"), which is not this lane's
+file; the replacement text is in this round's report and in
+docs/design/BOOSTING_MODE_REACH.md.
 
 The integration rests on one decision: **a bundle is a histogram layout and
 never leaves the grower**. Concretely, inside `grow_tree`:
@@ -44,13 +78,20 @@ matrix, one pass over it, and one O(#features x #bins) expansion per node --
 the same order as the sibling subtraction the grower already does -- and buys
 a fit that no downstream consumer can tell apart.
 
-The sparse path is a different question. `bundle_csc` and the sparse plan
-below still exist for it, and a sparse integration that bundles the *stored*
-matrix would face exactly the model-plumbing problem
-`handoffs/task13_efb.md` sections 4, 6, and 10 describe (a `FeatureBundling`
-on `Model`, a v4 section, the reader in `python/mojotrees/inspection.py`),
-because the sparse predictors route rows by column. Nothing here does that
-and nothing here enables it.
+The sparse path is a different question, **and it has since been answered
+rather than left open.** This paragraph used to end "Nothing here does that and
+nothing here enables it", which was true of this module and false of the
+library: `boosting_sparse.prepare_bundling_csc` fits a plan with
+`efb.fit_bundles`, applies it with `efb.bundle_csc`, and hands the trainer the
+bundled CSC matrix, so a sparse `fit` bundles today. It avoids the
+model-plumbing problem the same way the dense path does and not by a new
+mechanism: the plan stays inside the fit, the trees name original features and
+original bins, and no `FeatureBundling` reaches `Model`. What
+`handoffs/task13_efb.md` sections 4, 6 and 10 describe is what a bundling plan
+that had to SCORE would need, and no path needs that.
+
+`bundle_csc` and the sparse plan below are therefore live code with a caller,
+not spare parts.
 
 What the dense path does not do
 -------------------------------
@@ -89,10 +130,14 @@ What the dense path does not do
   to come first and cheaply -- `count_nondefault_dense` alone, or a cheaper
   mode estimate -- so that a dense matrix pays one pass and stops, and the
   two remaining passes are paid only by a matrix that might use them.
-- The sparse, GPU, distributed, ranking, custom-objective, and custom-metric
-  trainers do not honor the switch. They are not in this lane's ownership;
-  `check_bundling_honored` is the one-line refusal they need so that an
-  ignored setting is reported rather than silently dropped.
+- The GPU, distributed, ranking, custom-objective and custom-metric trainers
+  do not honor the switch, and every one of them refuses it by name through
+  `check_bundling_honored` or through `_parse_params`'s `unbundled=`
+  declaration, so an ignored setting is reported rather than silently dropped.
+  **The sparse trainers were on this list and no longer belong on it**
+  (corrected 2026-08-17): `boosting_sparse.prepare_bundling_csc` honors the
+  switch on the CSC matrix. See the table under "Where it is live" above for
+  the full honored / refused split.
 
 What "exclusive" means here
 ---------------------------
@@ -242,24 +287,36 @@ comptime DEFAULT_ENABLE_BUNDLE = False
 
 
 def check_bundling_supported(enable_bundle: Bool, cpu: Bool = True) raises:
-    """Accept a bundling request the dense CPU trainers can actually honor.
+    """Accept a bundling request a CPU trainer can actually honor.
 
     `enable_bundle=false` is LightGBM's own default spelled out and is always
-    accepted. `enable_bundle=true` is accepted for a CPU run, which is where
-    `boosting.mojo` applies it; asking for it on another device is refused by
+    accepted. `enable_bundle=true` is accepted for a CPU run, dense or sparse,
+    which is where it is applied; asking for it on another device is refused by
     name rather than ignored, because a silently unbundled fit is a correct
     model, just not the one that was asked for, and nothing in the metrics
     would show it.
+
+    The device test is the whole test, deliberately. Whether the individual
+    trainer behind this CPU run honors the switch is not knowable here (this is
+    called from `params._validate`, before an entry point is chosen), and the
+    trainers that do not honor it refuse it themselves through
+    `check_bundling_honored`. A second, narrower gate here would refuse
+    configurations that work.
+
+    **Corrected 2026-08-17: "the dense CPU trainers only" was wrong in the
+    docstring and in the message.** The sparse CPU trainers honor it too
+    (`boosting_sparse.prepare_bundling_csc`), so a sparse caller was being told
+    their input was the problem when the device was.
     """
     if not enable_bundle:
         return
     if cpu:
         return
     raise Error(
-        "'enable_bundle' is implemented for the dense CPU trainers only; the"
-        " GPU trainer builds its histograms from the dense BinnedMatrix"
-        " directly and never sees a bundled column. Set device=cpu, or leave"
-        " enable_bundle at its default of false"
+        "'enable_bundle' is implemented for the CPU trainers only, dense and"
+        " sparse; the GPU trainers build their histograms from the binned"
+        " matrix directly and never see a bundled column. Set device=cpu, or"
+        " leave enable_bundle at its default of false"
     )
 
 
@@ -375,18 +432,31 @@ struct EfbSettings(Copyable, Movable):
 def check_bundling_honored(settings: EfbSettings, trainer: String) raises:
     """Refuse an active bundling request in a trainer that does not apply it.
 
-    `boosting.mojo`'s dense trainers honor `BoosterParams.bundling`; the
-    sparse, GPU, distributed, ranking, custom-objective, and custom-metric
-    trainers do not. Each of those should call this on entry so that a caller
-    who set the switch is told which trainer dropped it, rather than getting
-    an unbundled fit that looks exactly like a bundled one.
+    Every CPU trainer that takes a `BoosterParams` honors
+    `BoosterParams.bundling`: the dense boosted loops in `boosting.mojo`, the
+    DART loops in `alternate_boosting.mojo`, the forest loops in
+    `boosting_rf.mojo`, and the sparse loops through
+    `boosting_sparse.prepare_bundling_csc`. The GPU, distributed, ranking,
+    custom-objective and custom-metric trainers do not. Each of those calls
+    this on entry so that a caller who set the switch is told which trainer
+    dropped it, rather than getting an unbundled fit that looks exactly like a
+    bundled one.
+
+    **Corrected 2026-08-17.** The docstring and the message below both listed
+    "the sparse" trainers among those that do not honor it, and named
+    `boosting.mojo` as the only place that does. Both were false:
+    `boosting_sparse` has bundled the CSC matrix since
+    `prepare_bundling_csc` landed, and three other modules honor the switch.
+    The message a user reads had been telling them to set `device=cpu` and
+    densify for a capability they already had on their sparse input.
     """
     if not settings.enabled:
         return
     raise Error(
-        "'enable_bundle' is applied by the dense CPU trainers in"
-        " boosting.mojo (train, train_more, train_with_valid,"
-        " train_multiclass*); ",
+        "'enable_bundle' is applied by every CPU trainer that takes a"
+        " BoosterParams -- boosting.mojo (train, train_more,"
+        " train_with_valid, train_multiclass*), alternate_boosting.mojo"
+        " (dart), boosting_rf.mojo (rf), and boosting_sparse.mojo (CSC); ",
         trainer,
         " builds its histograms another way and would ignore it. Leave"
         " enable_bundle at its default of false for this trainer",

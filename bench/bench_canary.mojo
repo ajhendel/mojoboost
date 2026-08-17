@@ -245,7 +245,46 @@ def main() raises:
     # disagree is a baseline taken in a window that was not the quiet one it
     # claims to be, and it will make every subsequent ratio wrong in a
     # direction nobody can see.
-    var noisy = cpu_spread > 0.03 or (have_gpu and gpu_spread > 0.03)
+    #
+    # RAISED FROM 3 TO 5 PERCENT BY ANDREW, 2026-08-17, AND THE REASON IS THAT
+    # 3 PERCENT WAS UNREACHABLE ON THIS MACHINE RATHER THAN THAT 5 IS BETTER.
+    # The box is a 10-core M4 laptop that the person reading these numbers also
+    # works on, so WindowServer, an editor and an agent session are ambient and
+    # waiting does not remove them. Measured the same morning, seven repeats:
+    # 15.9 percent CPU with a browser and a chat client open, and 3.2 percent
+    # CPU with 3.9 percent GPU once those were quit, against a bar of 3. The
+    # second window was the quietest this machine gets while remaining usable,
+    # and it still refused itself, so no baseline could ever be recorded and
+    # every regime ratio stayed unavailable. A bar nothing can pass is not a
+    # strict bar, it is an absent one.
+    #
+    # WHAT THE WIDER BAR COSTS, STATED SO A LATER READER DOES NOT HAVE TO
+    # REDERIVE IT. A 5 percent window cannot resolve a difference smaller than
+    # about 5 percent, so any pair that close is `indistinguishable` under M0
+    # and must be reported as such rather than ranked. That was checked against
+    # the run this change was made for and not assumed: the closest pair in the
+    # 2026-08-17 dense decision row is CatBoost at 3.224 s against our GPU at
+    # 3.616 s, 12.2 percent apart, so every comparison in that table survives
+    # the wider bar. A future table with two arms inside 5 percent of each other
+    # gets no verdict from this box at this bar, and the honest response is to
+    # say so rather than to narrow the bar back to a number nothing can meet.
+    #
+    # This value is the CALIBRATION bar, which is a different question from the
+    # `drift_threshold_pct` written into the baseline file below. That one asks
+    # whether a later window has drifted from the recorded baseline and has been
+    # 5.0 since the file existed. The two now agree, which they did not before,
+    # and there was never a reason for the entry gate to be stricter than the
+    # drift gate it feeds.
+    #
+    # `PROFILE_PROTOCOL.md` registers the quiet-box precondition and still says
+    # 3 percent. It is the registered rule and this file is only its
+    # instrument, so the document is the thing that has to be amended for this
+    # change to be legitimate rather than a local override.
+    comptime CALIBRATION_SPREAD_BAR = 0.05
+    var noisy = (
+        cpu_spread > CALIBRATION_SPREAD_BAR
+        or (have_gpu and gpu_spread > CALIBRATION_SPREAD_BAR)
+    )
     if repeats < 3:
         print(
             "calibration_warning: fewer than 3 repeats cannot show whether"
@@ -253,17 +292,19 @@ def main() raises:
         )
     elif noisy:
         print(
-            "calibration_warning: the repeats disagree by more than 3 percent,"
+            "calibration_warning: the repeats disagree by more than 5 percent,"
             " so this window is not the quiet one a baseline has to come from."
             " Do not record these numbers. Find out what else is running and"
             " take it again."
         )
     else:
         print(
-            "calibration_note: repeat spread is under 3 percent, which is"
-            " consistent with a quiet window but does not prove one. The"
-            " evidence that nothing else was running belongs in the file"
-            " below, written by whoever checked."
+            "calibration_note: repeat spread is under 5 percent, which is"
+            " consistent with a quiet window but does not prove one, and which"
+            " is wide enough that two readings inside 5 percent of each other"
+            " are indistinguishable rather than ranked. The evidence that"
+            " nothing else was running belongs in the file below, written by"
+            " whoever checked."
         )
 
     # A ready-to-paste file body. Values that were measured are filled in;

@@ -131,8 +131,18 @@ thresholds.json       the correctness tolerances, with the reasoning for each
 verify.py             the gate: applies thresholds, exits non-zero on a failure
 report.py             the timings: prints distributions, decides nothing
 summarize.py          one run reduced to the one file that is committed
+decompose.py          bias and variance of a run's stored predictions against the regenerated noiseless signal (ACCURACY_GAP.md section 2); regenerates, trains nothing
 schema.json           JSON Schema for a result record
 ```
+
+On the generator variant of a scenario whose noise scale is known
+(`scenarios.bayes_floor`, today `dense_regression` and
+`ordered_boosting_small`), every accuracy gap between arms is printed twice:
+raw, and as the EXCESS over the Bayes floor (rmse squared minus the noise
+realized on the held-out rows), which is the part of the error the model is
+responsible for and the only part a mechanism can move. A 1.7 percent RMSE gap
+on dense_regression is a 70 percent excess-MSE gap. Real-data rows have no
+known floor and show the raw gap alone.
 
 ## What makes it a differential harness rather than two benchmarks
 

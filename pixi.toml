@@ -169,6 +169,51 @@ pandas = "*"
 # record that states defaults nobody checked is worse than one that states
 # none. See bench/real_data/scenarios.py, CATBOOST_MIN_VERSION.
 catboost = ">=1.2"
+# The XGBoost peer arm of bench/real_data, added 2026-08-17. It is a peer
+# column reported beside the comparator and never instead of it, exactly as
+# catboost is: the one comparator is LightGBM at stock defaults plus
+# deterministic=true and nothing is gated on XGBoost.
+#
+# WHY IT WAS ADDED. The `mojotrees_depthwise` arm had nothing external to be
+# read against. `grow_policy` with the values depthwise and lossguide is
+# XGBoost's parameter, and LightGBM 4.7.0 has no growth-policy switch at all
+# (verified three ways: no Python file in the installed package mentions it,
+# the compiled dylib contains none of the three strings, and
+# src/mojotrees/growth_policy.mojo says so). XGBoost is the library whose
+# DEFAULT growth order is the one that arm grows, so it is the only honest
+# external reference for it.
+#
+# 2.0 is the floor, and the reason is that this arm's honesty depends on
+# Booster.save_config() returning the RESOLVED configuration. That is what
+# lets the arm record what XGBoost actually ran instead of a transcription of
+# its documentation, and it is also where every value in
+# scenarios.XGBOOST_RESOLVED_DEFAULTS came from, including the ones our
+# mojotrees_depthwise arm mirrors. The `device` parameter is the second
+# reason: a record naming a backend has to mean one thing across every version
+# this floor admits. See bench/real_data/scenarios.py, XGBOOST_MIN_VERSION.
+#
+# INSTALLED as of 2026-08-17, at 3.4.0, and this paragraph used to say the
+# opposite. It said the dependency was DECLARED BUT NOT INSTALLED because the
+# environment had not been solved for it, which was true for a few hours on
+# the day the arm was written and was left in place after the solve. Three
+# things were read out of the installed package rather than assumed, and each
+# corrects something this file or the harness had claimed:
+#
+#   - tree_method resolves to the string "auto", NOT to "hist". The histogram
+#     algorithm is what runs and the evidence is the resolved updater,
+#     grow_quantile_histmaker. An earlier version of this comment said the
+#     floor of 2.0 guaranteed a tree_method of hist; what it guarantees is the
+#     updater, and a reader checking the algorithm has to look there.
+#   - the conda build is the CPU one (libxgboost-3.4.0-cpu_*), and on this
+#     Apple silicon machine a fit passed device="cuda" TRAINS ANYWAY, warning
+#     that it changed the device to CPU and resolving `device` to "cpu". So a
+#     GPU XGBoost cell would have been a CPU measurement wearing a GPU label,
+#     which is why XGBoostEngine.load refuses the device by name rather than
+#     leaving the library to refuse it.
+#   - XGBRegressor().get_params() returns None for every tree parameter on
+#     3.4.0, so the sklearn wrapper is not a source for a default and a fitted
+#     booster is the only one.
+xgboost = ">=2.0"
 
 [feature.bench.tasks]
 bench-lgbm = "python bench/bench_lightgbm.py"

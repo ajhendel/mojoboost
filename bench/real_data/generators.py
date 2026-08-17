@@ -83,15 +83,90 @@ def dense_regression(n_rows=200_000, n_features=50, seed=1901, noise=0.30):
     both trivially optimal.
     """
     x = _stream(seed, 1, n_rows * n_features).reshape(n_features, n_rows).T.copy()
-    signal = (
+    y = dense_regression_signal(x) + dense_regression_noise(n_rows, seed, noise)
+    return {"X": np.ascontiguousarray(x), "y": y}
+
+
+#: The columns of `dense_regression` that carry signal, in order. Everything
+#: from column 6 on is pure noise. `decompose.py` reads this to know which
+#: features to condition on.
+DENSE_REGRESSION_SIGNAL_COLUMNS = (0, 1, 2, 3, 4, 5)
+
+
+def dense_regression_signal(x):
+    """The NOISELESS target of `dense_regression` as a function of its
+    features, split out on 2026-08-17 so that a reader holding a stored
+    prediction array can regenerate the true conditional mean and measure
+    the model's distance from it (`decompose.py`). Any change here changes
+    the scenario's data and its digest; the same expression is what
+    `dense_regression` adds noise to, there is no second copy."""
+    return (
         3.0 * x[:, 0]
         + 2.0 * x[:, 1] * x[:, 2]
         + 1.5 * np.sin(6.0 * x[:, 3])
         - 2.0 * (x[:, 4] > 0.7).astype(np.float64)
         + 0.8 * x[:, 5] ** 2
     )
-    y = signal + noise * _normal(seed, 11, n_rows)
-    return {"X": np.ascontiguousarray(x), "y": y}
+
+
+def dense_regression_noise(n_rows, seed=1901, noise=0.30):
+    """Exactly the noise `dense_regression` adds to its signal, `noise` times
+    a standard normal on stream tag 11 of `seed`, so a reader can reproduce
+    the irreducible error of the held-out rows without the features."""
+    return noise * _normal(seed, 11, n_rows)
+
+
+def realized_noise_floor(generator_kwargs, split=None):
+    """The mean squared noise on the HELD-OUT rows of a `dense_regression`
+    dataset built from `generator_kwargs` and split by `split` (the record's
+    `data.split` block; hash split, train_fraction 0.8, seed 1900 when
+    absent). This is what the Bayes-optimal predictor scores on that test
+    set, so it is the floor an excess error is measured against.
+
+    Population and realized floors differ enough to matter. At the standard
+    tier the noise scale is 0.30 (MSE 0.09) and the held-out rows realize
+    0.298252 (MSE 0.088954); the 0.001046 between them is a quarter of a
+    typical arm's excess, so subtracting the population value would overstate
+    every arm's excess by that much and distort every ratio between arms.
+    ACCURACY_GAP.md section 1 quotes the realized value, and this is it.
+    """
+    kwargs = dict(generator_kwargs or {})
+    n_rows = int(kwargs.get("n_rows", 200_000))
+    seed = int(kwargs.get("seed", 1901))
+    noise = float(kwargs.get("noise", 0.30))
+    split = split or {}
+    if split.get("kind", "hash") != "hash":
+        raise ValueError(f"unknown split kind {split.get('kind')!r}")
+    keep = _hash_split(
+        n_rows, split.get("train_fraction", 0.8), split.get("seed", 1900)
+    )
+    held_out = dense_regression_noise(n_rows, seed, noise)[~keep]
+    return float(np.mean(held_out ** 2))
+
+
+#: How to reproduce the noise a generator REALIZED on the held-out rows, per
+#: generator, from a record's `generator_kwargs` and `split`. A generator absent
+#: from this map keeps the population floor its scenario declares.
+REALIZED_FLOORS = {"dense_regression": realized_noise_floor}
+
+
+def with_realized_floor(floor, generator_kwargs, split):
+    """A scenario's `bayes_floor` declaration with `realized_mse` and
+    `realized_value` filled in for the held-out rows of the dataset that
+    `generator_kwargs` and `split` describe, or unchanged when the record
+    already carries them or the generator is not in `REALIZED_FLOORS`.
+    worker.py stamps this on every synthetic record; verify.py computes it
+    for records written before 2026-08-17."""
+    floor = dict(floor)
+    if "realized_mse" in floor:
+        return floor
+    reproduce = REALIZED_FLOORS.get(floor.get("generator"))
+    if reproduce is None:
+        return floor
+    realized = reproduce(generator_kwargs, split)
+    floor["realized_mse"] = realized
+    floor["realized_value"] = realized ** 0.5
+    return floor
 
 
 def imbalanced_binary(

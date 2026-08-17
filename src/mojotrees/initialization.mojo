@@ -111,8 +111,33 @@ parallel.mojo, gpu_tiling.mojo, and gpu_runtime.mojo:
   much kernel creation a caller front-loads before the first fit. `off`
   reproduces today's behavior exactly, where every kernel is created on
   the launch that first needs it.
-- `MOJOTREES_STARTUP_REPORT_FD`: reserved, unread here. See the handoff;
-  emitting the report is a call-site decision, not this module's.
+
+Those two are the whole contract. There is no third.
+
+TOMBSTONE, 2026-08-17. A third bullet used to name
+`MOJOTREES_STARTUP_REPORT_FD` as "reserved, unread here", and it was
+removed. Nothing read it. No `getenv` call anywhere in the repository named
+it, in this module or any other, so it was a documented switch with no
+implementation behind it rather than a switch that had been turned off. A
+reader who set it got silence, which is the worst of the three possible
+answers.
+
+What would have to exist for it to come back. An emitter, first, because
+this module measures phases and renders nothing, and writing a report to a
+file descriptor needs a serializer for `StartupTrace` plus a `write(2)`
+through FFI, neither of which is here. A call site second, since the
+original note was right that emitting is a call-site decision, and there
+was no call site. And a format third, agreed with
+`python/mojotrees/diagnostics.py`, which already owns the phase-name schema
+(`phase_name` says so) and would have to parse whatever came out of the
+descriptor. Until all three exist, a caller who wants startup numbers reads
+them through the phase contract the bindings already expose, and the
+descriptor is not a second way in.
+
+`python/mojotrees/diagnostics.py` still lists the name in `WATCHED_ENV`,
+which is a list of variables whose presence changes what a measurement
+means. That file is outside this lane's write scope; the name should come
+out of that tuple too.
 """
 
 from std.os import getenv

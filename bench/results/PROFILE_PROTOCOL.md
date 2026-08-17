@@ -996,6 +996,40 @@ which is correct behavior and not a gap to be closed by filling in a plausible
 number. A fabricated baseline in a regime detector does not fail loudly; it
 mislabels every session afterwards in a form that reads as data.
 
+### The calibration bar is 5 percent, raised from 3 on 2026-08-17
+
+**Amended by Andrew, and the reason is that 3 percent was unreachable on this
+machine rather than that 5 is a better number.** This is the registered rule
+and `bench/bench_canary.mojo` is only its instrument, so the two are changed
+together or the change is not legitimate.
+
+Measured the same morning, seven repeats each. With a browser and a chat client
+open, 15.9 percent CPU spread. With those quit, leaving the editor the operator
+reads these numbers in and the agent session producing them, **3.2 percent CPU
+and 3.9 percent GPU**. That second window is the quietest this machine gets
+while remaining usable, and under a 3 percent bar it refused itself, so no
+baseline could ever be recorded and the regime ratio stayed permanently
+unavailable. A bar that nothing can pass is not a strict bar. It is an absent
+one, and it had already cost this campaign every absolute-seconds claim.
+
+**What the wider bar gives up, stated here so no later reader has to rederive
+it.** A 5 percent window cannot resolve a difference smaller than about 5
+percent. Any pair that close is **indistinguishable** under M0 and must be
+reported with that word rather than ranked. This was checked against the run it
+was changed for rather than asserted: in the 2026-08-17 dense decision row the
+closest pair is CatBoost at 3.224 s against our GPU at 3.616 s, 12.2 percent
+apart, so every comparison in that table survives the wider bar. A future table
+with two arms inside 5 percent of each other gets no verdict from this box at
+this bar, and the honest response is to say so rather than to narrow the bar
+back to a number nothing can meet.
+
+The bar changed is the **calibration** bar, which decides whether a window may
+produce a baseline at all. It is a different question from
+`drift_threshold_pct` in `canary_baseline.json`, which asks whether a later
+window has drifted from a recorded baseline and has been 5.0 since that file
+existed. The two now agree, and there was never a reason for the entry gate to
+be stricter than the drift gate it feeds.
+
 And per A4: **this has never been run in anger.** The probe constants were
 sized from an estimate, no baseline exists, and no session has yet carried a
 canary line. Treat it as suspect until someone does.
@@ -1168,3 +1202,342 @@ benchmark configuration its default is optimizing for the benchmark.
 
 Accuracy against the quantized comparator is established by a real-data run
 **before any speed number is quoted**, not after.
+
+---
+
+# C10. The oracle cell, and what the headline ratio is a ratio of
+
+Registered 2026-08-17, before any measurement is taken under it. It changes
+what a CPU row of one of our own arms MEANS and it changes what the published
+speed ratio compares. It changes no threshold, no gate verdict and no number.
+
+## The ruling
+
+**The GPU is the product.** The CPU backend is kept as a correctness oracle and
+as the portability floor, and it is no longer optimized. Andrew, 2026-08-17.
+
+## What an oracle cell is
+
+An **oracle cell** is one of our own arms on the cpu, in a run that also
+scheduled that same arm on an accelerator. It is still scheduled, still run,
+still timed and still printed. It is not part of the speed story.
+
+A cpu cell of one of our arms in a run with **no** accelerator cell for that
+arm is **not** an oracle. It is the only backend that ran, so it is the
+measurement, and nothing about it changes.
+
+A **competitor** cell on the cpu is never an oracle. The cpu is LightGBM's,
+CatBoost's and XGBoost's best available backend on this machine, so their cpu
+rows are competitor rows and they stay in every ranking they were already in.
+
+## Why the oracle cell is scheduled at all, which is not a matter of taste
+
+Two correctness gates in `bench/real_data/verify.py` are built on it, and
+neither of them fails when it is missing. They go quiet.
+
+- `check_device_agreement` compares every accelerator prediction against its
+  own cpu twin, row by row. On 2026-08-17 that comparison caught a noise hash
+  domain divergence between the cpu and gpu symmetric growers in the shipped
+  defaults. Without the twin the loop skipped the cell in silence; from this
+  date it records a WARN naming the missing twin instead.
+- `check_backend_proof` condition C is "this accelerator row's prediction
+  digest equals its own cpu twin's". It is one of three conditions whose
+  conjunction refuses a cpu fit wearing a gpu label, which this campaign has
+  caught once for real. Without the twin the condition degrades to "no cpu arm
+  to compare against" and the conjunction can never fire.
+
+**Deleting the cpu cells to save time disarms both.** That is why the saving is
+taken as fewer repeats rather than as fewer cells.
+
+## The repeat rule
+
+`run.py --oracle-repeats`, **default 1**. It applies only to a subject arm on
+the cpu that has an accelerator cell beside it in the same run. Both gates
+above need one cpu prediction per cell and no more.
+
+**What one repeat gives up, stated rather than glossed.** `check_determinism`
+needs two rows of a cell to compare, so at one repeat there is no cpu
+bit-identity verdict for that arm. That is a real loss and not a restatement of
+the accelerator verdict, because bit-identity is a property of each backend
+separately. The accelerator cell keeps the full `--repeats` count and is still
+checked. The skip line names the knob on the row rather than reading as a short
+run. **Pass `--oracle-repeats 2` when the run is about cpu determinism.**
+
+Zero is refused by the parser rather than clamped. Running without the cpu cell
+is a `--device` decision, made where the reason is visible.
+
+## The headline ratio, re-pointed
+
+The published table was `train mojotrees / lightgbm`, our cpu against their
+cpu. From this date the headline row is **our accelerator against LightGBM's
+cpu**, with our cpu row kept below it marked `oracle`.
+
+**This is not a like-for-like backend pairing and the label says so in those
+words.** It is each library's best available backend on this machine. Every
+clause of that claim was checked against the code that enforces it rather than
+asserted, and each is listed below with the code that makes it true.
+
+- **LightGBM** runs on the cpu in this harness.
+  `run._engine_skip_reason` refuses the gpu cell.
+- **CatBoost** GPU training is a different quantization, `border_count` capped
+  at 255 on GPU against 65535 on CPU, so a CatBoost GPU row would be a
+  different measurement rather than a faster one.
+  `engines.CatBoostEngine.load` refuses it by name.
+- **XGBoost** has CUDA as its only accelerator backend, this machine is Apple
+  silicon, and the installed package is the CPU conda build. That is worse
+  than an absent backend, because a 3.4.0 fit handed `device="cuda"` trains on
+  the cpu with a warning instead of failing, so an unguarded cell would have
+  been a CPU measurement under a GPU label. `engines.XGBoostEngine.load`
+  refuses the device by name. Verified 2026-08-17.
+
+So cpu is the ceiling for all three of them here, and the comparison is a real
+product comparison. **What the label must never be trimmed to is "our GPU
+against their CPU" with the reasons removed.** Two of the three peers do have a
+GPU trainer; neither could be used on this machine, and that is the whole
+argument. `selfcheck.check_oracle_cells` asserts the label still names all
+three refusals, so trimming it fails the self-check.
+
+## What the accelerator does not do, kept in the table on purpose
+
+The accelerator does not pay at every size, and the oracle row is where a
+reader sees which side of the crossover a run is on. Handed to the harness lane
+on 2026-08-17 as medians of three, orientation rather than a result of any run
+under this section. At 200,000 rows by 50 features and 100 trees the leaf-wise
+arm was a tie between the backends (1.046 s cpu, 1.043 s gpu) and the depth-wise
+and symmetric arms were both faster on the cpu (1.301 against 1.704, and 1.768
+against 3.346); at 799,110 by 100 the leaf-wise arm was about two times faster
+on the accelerator (7.479 cpu, 3.659 gpu).
+
+A table that printed only the accelerator row would hide that. The oracle row
+is printed for that reason as much as for the gates.
+
+## Where this is enforced
+
+- `verify.py`, the ORACLE CELL block above `ORACLE_CELL_ROLE`: the rule, and
+  the two gates that depend on it.
+- `run.py`, `_mark_oracle_cells` and `--oracle-repeats`: the label and the
+  repeat reduction, written onto every job.
+- `worker.py`: `cell_role` and `cell_role_note` onto every record, so a
+  results directory read on its own explains its own shape.
+- `report.py`, `HEADLINE_LABEL` and `_frontier`: oracle rows out of the
+  ranking, out of the headline, labeled everywhere they appear.
+- `selfcheck.check_oracle_cells`: the cpu cell must still be SCHEDULED, the
+  repeats must be what the flag says, the comparator must not be reduced, and
+  the headline label must still carry all three refusals.
+
+---
+
+# C11. Speed and accuracy are two axes, and our own accuracy is the gate
+
+Registered 2026-08-17. It changes what the frontier table means, it changes
+which accuracy figure may stop a change from being adopted, and it changes the
+severity of one verdict. It changes no timing, no measured value and no
+correctness gate.
+
+## The two rulings
+
+**Separate the axes.** Andrew, 2026-08-17: "maybe we need to get rid of this
+linkage between speed and accuracy and just focus on them separately it is
+causing confusion and preventing us from enabling things."
+
+**Self-anchor the accuracy rule.** Andrew, the same day: "i think we may need to
+modify our rule re adopting things... it should be about trading OUR accuracy
+for speed. not tied to whatever lightgbm or catboost is fucking doing."
+
+## What was wrong, and it was wrong in three ways at once
+
+Until this date one number did two jobs. The accuracy budget, within 1 percent
+relative of the better of CatBoost-as-shipped and LightGBM stock+det at a
+matched tree count, both LABELLED an arm and SUPPRESSED it: `report.py` ranked
+only arms inside the budget and printed the rest as `OUTSIDE, not ranked`.
+
+1. **It hid our own results.** The leaf-wise GPU arm went from 1.043 s to
+   0.839 s on bit-identical work, a real 1.24x that could not have touched
+   accuracy, and the improvement appeared nowhere in the frontier table because
+   the arm sits behind CatBoost. A speed result was suppressed by an accuracy
+   figure the speed work did not move.
+2. **It permitted real accuracy loss whenever we were ahead.** The symmetric arm
+   beats CatBoost at 799k, 0.303271 against 0.303468 rmse. Under a 1 percent bar
+   anchored on CatBoost that arm could give away about 1.07 percent of its OWN
+   accuracy and still pass. The gate was measuring the wrong quantity in both
+   directions.
+3. **The bar moved when somebody else shipped.** A CatBoost release could fail
+   our gate with no change to our code, and a CatBoost regression could hand us
+   headroom we did not earn.
+
+## The rule now
+
+**Speed is ranked always, for every arm, in every frontier table.** No arm is
+ever excluded from a speed ranking for an accuracy reason. Competitor rows are
+ranked too, from this date, because "the budget is measured against them" is a
+statement about the accuracy axis and it was being used to remove them from the
+speed axis. The consequence is that the fastest row in a cpu table is usually
+CatBoost, which is true and was previously unsayable there.
+
+**One exclusion survives and it is not about accuracy.** An oracle cell, one of
+our own arms on the cpu beside an accelerator cell, stays out of the SPEED
+ranking under C10. From this date its accuracy columns are filled in like every
+other row's. The separation cuts both ways.
+
+**Accuracy is reported in two columns beside the rank, never instead of it.**
+
+- `vs anchor` is the GATE. This arm against OUR OWN recorded accuracy for the
+  same arm, scenario, tier, dataset, tree count and device. No peer appears in
+  it. `verify.check_accuracy_anchor`.
+- `vs best peer` is the SCOREBOARD. The distance to the better of
+  CatBoost-as-shipped and LightGBM stock+det at a matched tree count. Same
+  arithmetic as the old budget, unchanged, gating nothing.
+  `verify.check_accuracy_peer`.
+
+**And the constraint that replaces the suppression, which is not negotiable.**
+Speed is trivially purchasable with accuracy: fewer trees, fewer bins, a coarser
+learning rate, and any library looks fast. So **every speed figure carries its
+accuracy figure in the same row**, and **any ranking that spans arms of
+differing accuracy says so above itself** in a sentence a reader cannot miss
+(`report.RANKING_CAVEAT`). A table of seconds with no metric column is a defect.
+The headline ratio table gained a metric and an accuracy-gap column on this date
+for exactly that reason; it had been publishing three speed ratios with no
+accuracy anywhere near them.
+
+**Pareto, because "fastest" has two true answers.** An arm is dominated only if
+another arm is both strictly faster and at least as accurate. "Fastest overall"
+and "fastest that nothing beats on both axes" are different rows and both are
+printed.
+
+## The anchor, and how the ratchet is designed out
+
+A reference that is "the previous run" ratchets: lose 0.9 percent ten times,
+pass ten times, end nine percent worse, with every individual step defensible
+and the total invisible. So the reference is an **absolute recorded value** in
+`bench/real_data/accuracy_anchors.json`.
+
+**No code path writes that file.** `verify.py` only reads it.
+`verify.py --propose-anchors <path>` writes a CANDIDATE somewhere else, and a
+person reads it, fills in `recorded_at`, `recorded_by` and `why`, and moves the
+entries in, in a commit that says what they were adopted for. The deliberate
+half of the deliberate act is done by a human, and the old and the new number
+appear together in a diff. Drift accumulates against a fixed point, which means
+it does not accumulate.
+
+**It is not thresholds.json** because that file holds policy, numbers somebody
+chose with an argument attached, and an anchor is a measurement, a number a run
+produced with provenance attached. The precedent is `checksums.lock.json` beside
+`sources.json`. The TOLERANCE does live in thresholds.json, under
+`defaults.accuracy_anchor`, because a tolerance is policy.
+
+**An improvement does not move an anchor either.** Same procedure, both
+directions. `verify.check_differential` already treats a large unexplained
+improvement as evidence that the two sides were not given the same problem;
+auto-adopting one would auto-adopt exactly that class of fault. A large
+improvement against our own anchor is a WARN, not a promotion.
+
+**A new arm with no anchor WARNS.** Not PASS, because silently passing is how a
+bad number becomes the anchor: the first run of a new arm would establish
+whatever it happened to produce as correct. Not FAIL, because a legitimately new
+arm would then fail every run until somebody blessed it. The precedent is C10's
+missing-cpu-twin WARN: a check that cannot run is dangerous because it is
+silent, so it says so.
+
+**Only the primary metric gates.** The full metric set is recorded in the anchor
+entry, so a later decision to gate a secondary costs no re-run.
+
+**A regression on a different machine is a WARN and not a FAIL.** The anchor
+records the arch and the cpu model. "We got worse" and "we got worse on hardware
+the anchor was never taken on" are different claims and only the first should
+stop a run. Note that this key is deliberately NOT `envinfo.comparable_key`,
+which holds the git commit: an anchor exists to be compared across commits.
+
+## The tolerance, which is a different quantity from the old 1 percent
+
+0.25 percent relative, `defaults.accuracy_anchor.max_worse_relative`. Reusing
+the old 1 percent would have been wrong: that was a standing DISTANCE TO A
+COMPETITOR, and this is HOW MUCH OF OUR OWN ACCURACY ONE ADOPTED CHANGE MAY
+SILENTLY COST. At 1 percent a single commit could give away the whole
+competitive gap.
+
+**Measured**, in this repository: our arms are bit-identical across repeats at a
+fixed configuration (`check_determinism` gates it) and the generators are pure
+and seeded, so this comparison has no noise floor for a subject arm. Any
+tolerance above zero is a deliberate allowance and not headroom for noise.
+
+**Measured**, nearest evidence for the size: thresholds.json's dense_regression
+differential rationale records that tie breaking and floating-point summation
+order move RMSE in the third decimal place. That is about two DIFFERENT engines,
+so it is an upper bound on the movement being allowed for, not a measurement of
+it.
+
+**Inferred, and nobody has measured it**: a change that only reassociates a
+reduction should move the metric by less than 0.25 percent, which on an rmse of
+0.31 is the fourth decimal place. If a legitimate reassociation trips this gate,
+the finding is that this number is wrong. Move it in thresholds.json with the
+measurement that justified moving it.
+
+**Tripping the gate is not a refusal to make the change.** It is a refusal to
+make it silently. The remedy is a deliberate anchor refresh.
+
+## The severity change, made deliberately
+
+An out-of-budget accuracy result used to be a WARN. It is now a `note`, a fifth
+verdict status added on this date.
+
+The other four statuses are all judgments about the RUN: something failed,
+something is missing or unverified, something declined to run, something passed.
+"We are 1.7 percent behind CatBoost" is none of those. It is a fact about a
+design choice, it is true on every run, and colouring it yellow for years
+teaches a reader to skip yellow. `note` never affects the exit code, exactly as
+`warn` never did.
+
+Both branches of the peer comparison are `note`, inside the band and outside it,
+because a scoreboard that reports green for one arm and yellow for another is a
+gate wearing a different word.
+
+**What deserves a WARN instead is a REGRESSION against a recorded reference**,
+and that is now `check_accuracy_anchor`, which WARNs on a missing anchor and
+FAILs on a regression. Before this date no such thing could be built: there was
+no accuracy history anywhere in the harness. `check_baseline` looks self-anchored
+and is not the same pattern; its reference is the trivial model recomputed
+in-run from the same record, so it has no recorded value and no ratchet problem
+to solve. Checked in the code rather than assumed.
+
+## Populating the anchors, which has not happened
+
+`accuracy_anchors.json` ships with an EMPTY `anchors` object, so every subject
+arm reads `NO ANCHOR` and the accuracy gate covers nothing. That is the honest
+state and it is loud: one WARN per arm-cell plus a note naming the procedure.
+
+**The initial contents were deliberately not written from a single run by the
+lane that built this.** An anchor is the fixed point everything else is measured
+from and adopting one is Andrew's act, not a side effect of a refactor. The
+proposed procedure:
+
+1. Take a run on a quiet box under the C-ops conditions, at the tier and tree
+   counts the anchors are meant to cover.
+2. `python bench/real_data/verify.py <run> --propose-anchors <path>`.
+3. Read every entry. Check each value against what that arm is expected to
+   score; an anchor adopted without being read is a gate measured from a number
+   nobody looked at.
+4. Fill in `recorded_at`, `recorded_by` and `why`, move the entries into
+   `bench/real_data/accuracy_anchors.json`, and commit with what they were
+   adopted for.
+
+Until step 4 the accuracy gate is unarmed, and `verify.py` says so on every run.
+
+## Where this is enforced
+
+- `verify.py`, THE TWO ACCURACY AXES block: the ruling and the two checks.
+- `verify.check_accuracy_anchor` and `accuracy_anchors.json`: the gate and its
+  fixed point. `verify.propose_anchors`: the only writer, and it writes
+  elsewhere.
+- `verify.NOTE` and `verify.STATUSES`: the severity change.
+- `thresholds.json`, `defaults.accuracy_anchor` and `defaults.accuracy_peer`:
+  the policy numbers and their arguments.
+- `report._frontier` and `report.RANKING_CAVEAT`: speed ranked for every arm,
+  both accuracy columns beside it, the caveat above every table.
+- `report._ratios`: the headline ratio table now carries the metric and the
+  accuracy gap in the same row as the ratio.
+- `selfcheck.check_accuracy_axes`: the fastest arm in a fixture where it is also
+  the LEAST accurate must be ranked 1, no table row may say `not ranked` for an
+  accuracy reason, the caveat must be above the table, both accuracy columns
+  must exist, the peer check must be incapable of failing, the anchor check must
+  FAIL a regression without naming a competitor, and no code path may open the
+  live anchors file for writing.

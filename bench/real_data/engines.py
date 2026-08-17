@@ -56,6 +56,7 @@ exactly those additions, and a record that understates what ran is worse
 than no record, because it reads like evidence.
 """
 
+import json
 import os
 import tempfile
 
@@ -905,7 +906,7 @@ def _catboost_categorical_frame(part, cat_indices, form=CATBOOST_CATEGORICAL_FOR
             raise CatBoostError("'data' is numpy array of floating point
             numerical type, it means no categorical features, ...")
 
-    read at catboost 1.2.10, core.py:804. The check is on `dtype.kind`, so
+    read at catboost 1.2.10, catboost/core.py:804. The check is on `dtype.kind`, so
     it is not a check about the values and no value the harness could put in
     a float64 array passes it. The array has to change type, and only the
     categorical block can: the numeric columns are genuinely real-valued.
@@ -1288,21 +1289,28 @@ class CatBoostEngine:
         # that would make this arm stop being CatBoost at stock.
         #
         # The arm's BINNING overrides are REFUSED rather than translated.
-        # CatBoost's counterpart of `max_bin` is `border_count`, its default
-        # is 65535 against LightGBM's 255, and the two are not a rename of
-        # each other: a max_bin axis measured by moving one library's budget
-        # and leaving the other's at a different stock number is a comparison
-        # of two different sweeps. `scenarios.CATBOOST_REFUSED_PARAMS` refuses
-        # `max_bin` at the call below anyway; the message here says why rather
-        # than leaving a reader with a KeyError-shaped one.
+        # CatBoost's counterpart of `max_bin` is `border_count`, and the two
+        # are not a rename of each other: border_count counts THRESHOLDS where
+        # max_bin counts BINS (scenarios.CATBOOST_PARAM_MAP["border_count"],
+        # translate borders_to_bins, +1 and not identity), so a max_bin axis
+        # measured by moving one library's number and not the other's is a
+        # comparison of two different sweeps. Corrected 2026-08-17: this
+        # comment and the message below said the default was 65535. That is
+        # CatBoost's MAXIMUM (GetMaxBinCount, the CPU ceiling; 255 on GPU);
+        # the CPU default is 254 borders, which is 255 bins and the same
+        # granularity budget as LightGBM's max_bin=255.
+        # `scenarios.CATBOOST_REFUSED_PARAMS` refuses `max_bin` at the call
+        # below anyway; the message here says why rather than leaving a
+        # reader with a KeyError-shaped one.
         arm_binning = _arm(self, "arm_dataset_params")
         if arm_binning:
             raise EngineError(
                 "the CatBoost arm takes no per-arm binning overrides "
                 f"({', '.join(sorted(arm_binning))}). CatBoost's bin budget "
-                "is border_count, whose default is 65535 against LightGBM's "
-                "255, so moving max_bin on one arm and not the other is two "
-                "sweeps rather than one axis. See "
+                "is border_count, which counts thresholds where max_bin "
+                "counts bins (CPU default 254 borders = 255 bins; 65535 is "
+                "its ceiling, not its default), so moving max_bin on one arm "
+                "and not the other is two sweeps rather than one axis. See "
                 "scenarios.CATBOOST_REFUSED_PARAMS and "
                 "scenarios.CATBOOST_LEFT_AT_STOCK"
             )
@@ -1383,14 +1391,23 @@ class CatBoostEngine:
         # report field.
         #
         # SUPPRESSED ON A VARIANT ROW, and this is the collision the sidecar
-        # made reachable. `catboost_lossguide` inherits this whole method and
-        # would write under the same cell key, because the key is
-        # (scenario, tier, variant) and not the engine. Its resolved dict is
-        # NOT the one the CatBoost-mode arm is shaped after: it pins
-        # grow_policy=Lossguide and max_leaves=31 over CatBoost's defaults, so
-        # whichever of the two rows happened to run last would decide what "us
-        # in CatBoost's shape" meant. The default row is the only one that
-        # answers that question, so the variant row does not answer it at all.
+        # made reachable. A subclass that pins parameters over CatBoost's
+        # defaults inherits this whole method and would write under the same
+        # cell key, because the key is (scenario, tier, variant) and not the
+        # engine. Such a row's resolved dict is NOT the one the CatBoost-mode
+        # arm is shaped after, so whichever of the two rows happened to run
+        # last would decide what "us in CatBoost's shape" meant. The default
+        # row is the only one that answers that question.
+        #
+        # THE ARM THAT MOTIVATED THIS GUARD IS GONE as of 2026-08-17. It was
+        # `catboost_lossguide`, CatBoost pinned to grow_policy=Lossguide and
+        # max_leaves=31, and Andrew removed it because it answered a question
+        # about CatBoost's tree shape that he is not asking. The guard stays,
+        # and deliberately: `variant_params` is still the extension point a
+        # future CatBoost variant row would use, and the collision it prevents
+        # is a silently wrong learning rate in the CatBoost-mode arm rather
+        # than a visible failure. A guard whose only caller was deleted is
+        # cheap; rediscovering this collision is not.
         readback_entry = None
         if not self.variant_params:
             readback_entry = scenarios.catboost_readback_entry(
@@ -1509,89 +1526,636 @@ class CatBoostEngine:
         }
 
 
-class CatBoostLossguideEngine(CatBoostEngine):
-    """CatBoost grown leaf-wise instead of symmetric. The second CatBoost row.
+class MojoTreesDepthwiseEngine(MojoTreesEngine):
+    """mojotrees wearing XGBoost's shipped defaults. The XGBoost mirror row.
 
-    Everything is inherited; the only difference is `variant_params`, so the
-    two CatBoost rows run through identical code and the difference between
-    two records is exactly that dict.
+    Everything is inherited. The only difference from the plain arm is the
+    translator, which applies `scenarios.MOJOTREES_DEPTHWISE` over the shared
+    parameters, so the two arms run through identical code and the difference
+    between two records is exactly that dict.
 
-    **What this row is for.** The `catboost` row is CatBoost at its own
-    defaults, which means SymmetricTree at depth 6 -- a shape neither of the
-    other two engines grows. That makes it a fair reading of CatBoost and a
-    poor reading of the growth policy: any gap between it and the leaf-wise
-    arms mixes CatBoost's engine with CatBoost's tree shape, and nothing in
-    the record separates them. Lossguide at `max_leaves` 31 is CatBoost
-    growing the same shape LightGBM and mojotrees grow by default, so the two
-    CatBoost rows read together isolate the tree shape inside one engine.
+    **WHAT THIS ARM IS CHANGED ON 2026-08-17, AND ITS NAME DID NOT.** It was a
+    growth-ORDER isolation row: `{"grow_policy": "depthwise"}` and nothing
+    else, read against the plain mojotrees arm, existing to price the growth
+    order by itself. Andrew redirected it the same day, in these words: "make
+    our depthwise params match xgboost". It now carries XGBoost 3.4.0's
+    resolved defaults in our parameter names and is read against the `xgboost`
+    peer column. The name stayed because it is the cell key, the record field,
+    the output filename, and what `verify.py` and `report.py` group on, so
+    renaming it would orphan every record already written under it.
+    `scenarios.MOJOTREES_DEPTHWISE` and `scenarios.MOJOTREES_DEPTHWISE_CLAIMS`
+    carry the correction, and the claims string travels into the record so a
+    reader is told rather than left to infer the arm from its name.
 
-    **Why 31.** It is LightGBM's `num_leaves` default and this harness's
-    shared value, so this row's leaf budget matches the comparator's rather
-    than matching the 64 that CatBoost's depth 6 resolves to. The intent is
-    one variable, and the variable is the growth policy.
+    **A RECORD WRITTEN BEFORE 2026-08-17 IS A DIFFERENT ARM UNDER THIS NAME**
+    and the two must not be put in one series.
 
-    **It is a separate engine name** for the reason
-    `MojoTreesCatBoostModeEngine` gives: the harness's unit of comparison is
-    an engine name -- what `verify.py` pairs on, what `report.py` groups on,
-    what a CSV row carries -- so two differently-shaped CatBoost models must
-    not share a column.
+    It is a separate engine name rather than a flag on the existing one for
+    the reason `MojoTreesCatBoostModeEngine` gives: the harness's unit of
+    comparison is an engine name, it is what `verify.py` pairs on, what
+    `report.py` groups on and what a CSV row carries, so two differently
+    shaped models must not share a column.
 
-    **It is not a clean isolation and the record must not claim it is.**
-    Verified by a 3-iteration fit on 2026-08-16: CatBoost accepts the pair
-    and `get_all_params()` reads back `grow_policy=Lossguide`,
-    `max_leaves=31`, with `score_function=Cosine` and `bootstrap_type=MVS`
-    still stock, which is the intent. But it also reads back **`depth=6`**.
-    CatBoost keeps its depth default as an active cap under Lossguide, where
-    LightGBM's `max_depth` default is -1, unlimited. So this row is leaf-wise
-    up to 31 leaves AND depth-capped at 6, and a leaf-wise tree that wanted a
-    deeper path does not get it. Whether 31 leaves ever reaches past depth 6
-    on these scenarios is not established here. The cap is left in place
-    rather than overridden, because pinning `depth` would make this a row
-    with three changed parameters instead of two.
+    **WHY IT IS NOT A PEER ARM.** `scenarios.PEER_ENGINES` members are
+    asserted by `selfcheck.py` to carry an `ENGINE_ARM` beginning with
+    "peer", and a peer is a competitor library reported beside the
+    comparator. This is mojotrees, so it is a subject, and it is recorded as
+    `subject_variant` rather than plain `subject` because it is NOT the
+    headline row either. The headline is the plain mojotrees arm against
+    `stock+det` and nothing here changes that. Being a subject is also what
+    keeps it inside `verify.SUBJECT_ENGINES`, and so inside the backend proof
+    and the cpu-versus-gpu agreement check, which a peer column does not get.
 
-    **If CatBoost refuses the combination**, that is what the row records.
-    CatBoost resolves `score_function` and several sampling defaults itself
-    and some of those resolutions are policy-dependent, so this arm passes
-    exactly two parameters and lets the library raise if it will not accept
-    them. The failure is reported as a failure. It is NOT to be papered over
-    by pinning a third parameter until the fit succeeds: that would quietly
-    turn this into a row comparing two things at once, which is the defect
-    the row exists to remove.
+    **WHAT IT IS FOR, IN TWO PARTS NOW.** The first is unchanged and still
+    unmeasured: the device path batches a level into one host wait instead of
+    one wait per split (`train_gpu._device_search_resident`, with
+    `train_gpu.mojo::_search_record_slots` sizing a level's worth of records for exactly this
+    mode), while leaf-wise growth cannot batch at all because its next pick
+    depends on the frontier the current split just changed
+    (`growth_policy.mojo` module docstring, "What a batched level is, and
+    what it is not"), so a depth-wise fit is EXPECTED to pay
+    fewer host waits per tree. The second is why the arm was widened: it is our
+    side of the XGBoost pairing, the same relationship
+    `mojotrees_catboost_mode` has to the `catboost` column, and a competitor
+    column is only interpretable beside an arm of ours wearing the same shape.
+
+    **WHAT IS NO LONGER AVAILABLE.** The growth order can no longer be priced
+    on its own, because no arm now differs from the plain one in the order
+    alone. That was a real measurement and it is gone; restoring it means
+    restoring an arm, which costs a column of cells in every scenario, tier and
+    backend.
+
+    **NO CROSS-CELL DEPENDENCY**, unlike the CatBoost-mode arm, which cannot be
+    built until the `catboost` cell for the same cell key has written the
+    learning rate CatBoost derived. XGBoost's defaults are static, so this arm
+    reads nothing from another cell and can run alone. It is still ranked in
+    `run.CELL_ORDER` behind the peers, and that comment says why.
+
+    **WHAT IT MAY NOT CLAIM** is in `scenarios.MOJOTREES_DEPTHWISE_CLAIMS`,
+    which travels into the record. In short: read it against the xgboost peer
+    column and not against the comparator; it is not a LightGBM parity row,
+    because LightGBM has no growth policy at all; the tree it grows is a
+    different tree from every other arm's, so an accuracy difference is a
+    property of the shape rather than a defect; and on the categorical and
+    ranking scenarios there is no xgboost column at all, so those cells have no
+    peer to be read against.
     """
 
-    name = "catboost_lossguide"
-    variant_params = {"grow_policy": "Lossguide", "max_leaves": 31}
+    name = "mojotrees_depthwise"
+    params_fn = staticmethod(scenarios.mojotrees_depthwise_params)
 
     def load(self):
         super().load()
-        self.notes.append(
-            "arm 'CatBoost lossguide': the CatBoost peer arm with "
-            f"{self.variant_params} applied over its defaults, so it grows "
-            "leaf-wise like LightGBM and mojotrees instead of its default "
-            "SymmetricTree at depth 6. Read it against the 'catboost' row to "
-            "separate CatBoost's engine from CatBoost's tree shape; read "
-            "neither instead of the comparator "
-            f"{scenarios.comparator_id()}. Everything else is stock, "
-            "including score_function and the MVS bootstrap, so this row "
-            "still carries every entry in scenarios.CATBOOST_UNMATCHABLE "
-            "except tree_shape. tree_shape is NARROWED here, not closed: "
-            "CatBoost keeps depth=6 as an active cap under Lossguide where "
-            "LightGBM's max_depth default is unlimited, so this arm is "
-            "leaf-wise to 31 leaves AND depth-capped at 6. Read the "
-            "resolved parameters in this record rather than assuming the "
-            "growth policy is the only difference left."
-        )
+        self.notes.append(scenarios.MOJOTREES_DEPTHWISE_CLAIMS)
         return self
 
 
+class MojoTreesSymmetricColsampleEngine(MojoTreesEngine):
+    """mojotrees growing SYMMETRIC trees under per-tree column sampling.
+
+    A CORRECTNESS arm, which is a third kind of arm in this file and the
+    first of it. The other two mojotrees variants are MIRRORS:
+    `mojotrees_depthwise` wears XGBoost's defaults and
+    `mojotrees_catboost_mode` wears CatBoost's, and each is read against a
+    peer column. This one is read against NOTHING external. Its product is
+    `verify.check_device_agreement`, which compares its gpu predictions
+    against its own cpu twin's row by row, and the pair is the whole reason
+    the arm has cells.
+
+    **WHY IT EXISTS.** On 2026-08-17 the oblivious GPU path was found
+    returning a wrong answer whenever `feature_fraction < 1`, because
+    `GpuLeafBatcher.feat_dev` was never set by the level build, so the
+    histogram wrote feature slice `slot` while the split searcher read slice
+    `active[slot]` and the root disagreed with its own children. It was found
+    by reading code. It could not have been found here, because every
+    scenario in `scenarios.py` runs `feature_fraction = 1.0`, where the
+    feature table is the identity and the wrong read is the right one. The
+    fix is compiled into the extension this arm runs against, so this arm is
+    expected to be GREEN; a green row is the statement that the fix is still
+    in, and that is what a regression detector is.
+
+    Everything is inherited except the translator, which applies
+    `scenarios.MOJOTREES_SYMMETRIC_COLSAMPLE` over the shared parameters, so
+    this arm and the plain one run identical code and the difference between
+    two records is exactly that dict.
+
+    **A SEPARATE ENGINE NAME rather than a flag**, for the reason
+    `MojoTreesCatBoostModeEngine` gives and for one more that is specific to
+    this arm. The general reason: the harness's unit of comparison is an
+    engine name, it is what `verify.py` pairs on and what a CSV row carries,
+    so two differently shaped models must not share a column. The specific
+    one, AS IT STOOD when this arm was written: `verify.check_device_agreement`
+    keyed on `(scenario, threads, engine)` and NOT on `arm`, so two arms of
+    one engine on one scenario overwrote each other in its inner dict and it
+    would compare one arm's gpu predictions against a different arm's cpu
+    predictions. An `--arms` cell would therefore have been wired into the
+    very check this arm exists to feed, and wired wrong. That is recorded here
+    because it is the reason a frontier-style arm was not used and it is not
+    obvious from either file. LATER ON 2026-08-17 that check, and every other
+    per-cell key in verify.py, report.py and summarize.py, moved to the arm
+    (`verify._arm_of`), so an `--arms` cell now feeds it correctly too. The
+    separate engine name stays, for the general reason above and because the
+    engine name is still what thresholds.json, `ENGINE_ARM` and
+    `SUBJECT_ENGINES` are keyed by.
+
+    **`subject_variant`, so it stays inside `verify.SUBJECT_ENGINES`**, which
+    is what gets it the backend proof and the cpu-versus-gpu agreement check
+    that a peer column does not get. For this arm that is not a nice-to-have,
+    it is the arm.
+
+    **WHAT IT MAY NOT CLAIM** is in
+    `scenarios.MOJOTREES_SYMMETRIC_COLSAMPLE_CLAIMS`, which travels into the
+    record. In short: there is no peer column and none is coming; the metric
+    is not comparable with any arm at `feature_fraction = 1.0`, because
+    column sampling is a regularizer; and the tree is symmetric at depth 6,
+    which is a different tree from the plain arm's.
+    """
+
+    name = "mojotrees_symmetric_colsample"
+    params_fn = staticmethod(scenarios.mojotrees_symmetric_colsample_params)
+
+    def load(self):
+        super().load()
+        self.notes.append(scenarios.MOJOTREES_SYMMETRIC_COLSAMPLE_CLAIMS)
+        return self
+
+
+class MojoTreesCosineLeafwiseEngine(MojoTreesEngine):
+    """mojotrees scoring splits with Cosine under LEAF-WISE growth.
+
+    The second CORRECTNESS arm. Read
+    `MojoTreesSymmetricColsampleEngine`'s docstring first: everything it says
+    about what a correctness arm is, why it is a separate engine name rather
+    than an `--arms` cell, and why it is `subject_variant`, is true of this
+    one word for word and is not repeated.
+
+    **WHY IT EXISTS.** On 2026-08-17 `score_function='Cosine'` was found to
+    be silently ignored on every leaf-wise GPU fit.
+    `GpuSplitSearcher.set_score_function` had no production caller anywhere
+    in the package, so `score_function_code` stayed at its constructed
+    `SCORE_L2`, and `gpu_resident_round._launch_child_search` called
+    `_launch_search` without naming the argument and took the same default.
+    Both halves were needed and both are fixed.
+
+    **WHY THIS HARNESS DID NOT CATCH IT, which is the part worth keeping.**
+    One arm here does set Cosine: `mojotrees_catboost_mode`. It also sets
+    `grow_policy='symmetrictree'`, so it goes down the oblivious device path
+    and never reaches the leaf-wise one the bug lived on. A parameter being
+    covered by an arm is therefore not the same as the code path being
+    covered, and the difference was invisible from a green suite. That is why
+    this arm names `grow_policy='lossguide'` explicitly even though it is
+    already the estimator's default: the arm's value is which path it
+    reaches, so it must say which path.
+
+    **WHAT IT MAY NOT CLAIM** is in
+    `scenarios.MOJOTREES_COSINE_LEAFWISE_CLAIMS`. In short: no peer column,
+    because no competitor here ships leaf-wise Cosine; and it moves TWO
+    parameters, because `lambda_l2=3.0` is carried to get off the point where
+    Cosine degenerates to `sqrt` of the L2 score, so this row does not price
+    the score function on its own.
+    """
+
+    name = "mojotrees_cosine_leafwise"
+    params_fn = staticmethod(scenarios.mojotrees_cosine_leafwise_params)
+
+    def load(self):
+        super().load()
+        self.notes.append(scenarios.MOJOTREES_COSINE_LEAFWISE_CLAIMS)
+        return self
+
+
+class XGBoostEngine:
+    """XGBoost at its own shipped defaults. The third peer column.
+
+    Added 2026-08-17 on Andrew's instruction, and it exists because the
+    `mojotrees_depthwise` arm had nothing external to be read against:
+    `grow_policy=depthwise` is XGBoost's parameter and LightGBM has no growth
+    policy at all. See `scenarios.MOJOTREES_DEPTHWISE_CLAIMS` for the
+    three-way verification of that. Later the same day that arm was pointed at
+    XGBoost's defaults outright, so this column is now the thing our depthwise
+    row is read against rather than merely the nearest relative of it.
+
+    Built on the same discipline as `CatBoostEngine` and deliberately not on
+    the sklearn wrapper: the native `DMatrix` plus `xgboost.train` path is
+    what `scenarios.xgboost_params` translates into, so exactly three things
+    reach the library that are not the problem statement, and
+    `XGBOOST_REFUSED_PARAMS` refuses by name anything that would make the arm
+    not-stock. The wrapper is also not a source for a DEFAULT on this version:
+    `XGBRegressor().get_params()` returns None for every tree parameter in
+    3.4.0, checked rather than assumed.
+
+    **THE RESOLVED CONFIGURATION IS READ BACK, AND IT IS BOTH RECORDED AND
+    CHECKED.** `Booster.save_config()` after the fit is XGBoost's own answer to
+    what ran, and it is the authority: it lands in
+    `engine_resolved_params` on every record. Beside it,
+    `scenarios.check_xgboost_readback` re-reads the handful of values the
+    `mojotrees_depthwise` mirror arm was built from and records any drift in
+    `engine_resolved_params_drift`, which is the CatBoost arm's structure and
+    exists for the reason that one does: a mirror whose target nothing reads
+    back cannot be shown to have gone wrong.
+
+    This paragraph used to say the arm asserted NO defaults at all, on the
+    grounds that `xgboost` was not installed when it was written so nothing
+    could be read. That was true for a few hours and is not now. See
+    `scenarios.XGBOOST_DEFAULTS_SOURCE` for the read and
+    `scenarios.XGBOOST_RESOLVED_DEFAULTS` for the table.
+
+    **CPU ONLY, and the reason differs from CatBoost's.** CatBoost is refused
+    a GPU row here because its GPU training quantizes differently and so is
+    not the same measurement. XGBoost is CPU-only here for a blunter reason,
+    and it is worse than an absent backend: asking for one does not fail. The
+    installed conda package is the CPU build (`libxgboost-3.4.0-cpu_*`) and
+    the machine is Apple silicon with no CUDA device, and a fit passed
+    `device="cuda"` on 3.4.0 TRAINED ANYWAY, warning "Device is changed from
+    GPU to CPU as we couldn't find any available GPU on the system" and
+    resolving `device` to `cpu`. Verified on 2026-08-17. So a GPU XGBoost cell
+    would not have been a failed cell, it would have been a CPU measurement
+    labeled GPU, which is the exact defect this harness's backend proof exists
+    to catch. `load` refuses the device by name instead.
+
+    Either way the record says which backend ran, which is what Andrew's
+    directive requires: our accelerator is published beside a competitor's best
+    AVAILABLE backend, and CPU is the ceiling for all three competitors here.
+
+    **NO SEPARATE BINNING PHASE.** Handed a plain `DMatrix`, XGBoost quantizes
+    inside `train`, which is the same position CatBoost is in.
+    `QuantileDMatrix` would separate it and is deliberately not used, because
+    building one is a different ingestion path from the one a default XGBoost
+    user takes. See `scenarios.XGBOOST_UNMATCHABLE['binning_phase']`.
+    """
+
+    name = "xgboost"
+
+    arm_params = None
+    arm_dataset_params = None
+
+    def __init__(self, threads, device="cpu"):
+        self.threads = int(threads)
+        self.device = device
+        self.module = None
+        self.version = None
+        self.import_phase = None
+        self.notes = []
+
+    def load(self):
+        if self.device != "cpu":
+            raise EngineError(
+                "this harness runs XGBoost on the CPU only, and unlike the "
+                "CatBoost refusal beside it this is not a quantization "
+                "argument: XGBoost's only accelerator backend is CUDA, this "
+                "machine is Apple silicon, and the installed package is the "
+                "CPU conda build. The refusal is here rather than left to the "
+                "library because the library does NOT refuse: on 3.4.0 a fit "
+                "passed device='cuda' trains on the CPU with a warning and "
+                "resolves device to 'cpu', so an unguarded GPU cell would "
+                "produce a CPU measurement under a GPU label. CPU is this "
+                "engine's ceiling here and the record says so"
+            )
+        phase = measure.Phase("import")
+        try:
+            with phase:
+                import xgboost
+        except ImportError as exc:
+            # Named rather than left as a bare ImportError, the same treatment
+            # the GPU refusal above gets and for the same reason: a cell that
+            # dies is an infrastructure failure, and this harness answers one
+            # by withholding the quality verdict for the WHOLE matrix. So the
+            # message has to tell whoever reads the failed run what to do,
+            # not merely that a module was missing.
+            #
+            # INSTALLED as of 2026-08-17: the `bench` environment carries
+            # xgboost 3.4.0 and every measurement and default in this arm was
+            # read from it. This branch used to say the opposite, because for
+            # a few hours the dependency was declared and unsolved, and it was
+            # left saying so after the solve. A message that names a cause
+            # which is no longer the cause is worse than a bare ImportError,
+            # because whoever reads it stops looking.
+            #
+            # So it now says what is true and what to check, and the two most
+            # likely causes are named in the order they should be checked: the
+            # wrong environment, and an environment that has drifted from the
+            # manifest.
+            raise EngineError(
+                "xgboost could not be imported. It IS declared in pixi.toml "
+                "under [feature.bench.dependencies] and it WAS installed in "
+                "the bench environment on 2026-08-17 at version 3.4.0, so "
+                "this is an environment problem rather than a missing "
+                "declaration. Check that this process is running under "
+                "`pixi run -e bench`, then that the environment matches the "
+                "manifest with `pixi install -e bench`. Until it imports, "
+                f"this arm cannot run and no {scenarios.XGBOOST_ARM_ID} row "
+                "exists. Original error: " + str(exc)
+            ) from exc
+        self.module = xgboost
+        self.import_phase = phase
+        self.version = xgboost.__version__
+        try:
+            scenarios.check_xgboost_version(self.version)
+        except RuntimeError as exc:
+            raise EngineError(str(exc)) from exc
+        self.notes.append(
+            f"peer arm {scenarios.xgboost_arm_id()}: "
+            f"{scenarios.XGBOOST_ARM_LABEL}. Reported beside the comparator "
+            f"{scenarios.comparator_id()} and never instead of it. "
+            f"{scenarios.XGBOOST_ARM_REGISTERED}"
+        )
+        self.notes.append(
+            "XGBoost determinism is "
+            f"{scenarios.XGBOOST_DETERMINISM['status']}: "
+            f"{scenarios.XGBOOST_DETERMINISM['flag']}. "
+            f"{scenarios.XGBOOST_DETERMINISM['what_is_pinned']}. "
+            f"{scenarios.XGBOOST_DETERMINISM['observed']}"
+        )
+        self.notes.append(
+            "XGBoost defaults are NOT transcribed by this harness: "
+            + scenarios.XGBOOST_DEFAULTS_SOURCE
+        )
+        return self
+
+    def warmup(self, spec):
+        x, y, _group, n_classes = _tiny_like(spec)
+        extra = {"num_class": n_classes} if n_classes else None
+        params = scenarios.xgboost_params(spec, self.threads, extra)
+
+        def _fit():
+            dtrain = self.module.DMatrix(x, label=y)
+            return self.module.train(params, dtrain, num_boost_round=1)
+
+        _, phase = measure.timed(_fit)
+        return phase
+
+    def _predict(self, booster, task, dmatrix):
+        """Predictions in the same shape the other engines return.
+
+        Regression is the raw value, binary is the positive-class
+        probability, which `binary:logistic` already returns as a 1-D array,
+        and multiclass is the (n, k) matrix `multi:softprob` returns. So no
+        conversion is needed and none is done, which is worth stating because
+        the CatBoost adapter beside this one does convert and pays for it
+        inside its timed call.
+        """
+        out = booster.predict(dmatrix)
+        if task == "multiclass":
+            return np.asarray(out)
+        return np.asarray(out)
+
+    def _model_size(self, booster):
+        """Model size, computed here rather than through `measure.model_size`.
+
+        `measure.model_size` calls `model_to_string()` and writes a
+        `model.txt`. XGBoost's Booster has no `model_to_string`, and its
+        `save_model` requires a `.json` or `.ubj` extension from 2.0, so both
+        halves of the shared helper would record an exception string instead
+        of a number. `save_raw()` is XGBoost's own serialization and is the
+        honest counterpart, so this arm reports that and says which format it
+        is rather than reporting two errors.
+        """
+        out = {"string_bytes": None, "file_bytes": None, "error": None}
+        try:
+            raw = booster.save_raw(raw_format="ubj")
+            out["file_bytes"] = len(raw)
+            out["format"] = "save_raw(raw_format='ubj')"
+        except Exception as exc:  # pragma: no cover - engine-dependent
+            out["error"] = f"save_raw: {type(exc).__name__}: {exc}"
+        out["string_bytes_unavailable_reason"] = (
+            "XGBoost's Booster has no model_to_string(); save_raw is its "
+            "serialization and is reported as file_bytes"
+        )
+        return out
+
+    def run(self, spec, train, test, repeats=1):
+        runs, reason = scenarios.xgboost_supports(spec)
+        if not runs:
+            raise EngineError(
+                f"the XGBoost peer arm does not run {spec['id']}: {reason}"
+            )
+        if train.get("categorical_feature"):
+            raise EngineError(
+                "the XGBoost arm is not wired for a categorical column. It "
+                "needs enable_categorical and a pandas categorical dtype, "
+                "which is a third categorical container in this harness "
+                "beside LightGBM's index list and CatBoost's mixed frame, and "
+                "each container needs its own proof that it did not change a "
+                "value. See scenarios.XGBOOST_SCENARIO_SUPPORT"
+            )
+        arm_binning = _arm(self, "arm_dataset_params")
+        if arm_binning:
+            raise EngineError(
+                "the XGBoost arm takes no per-arm binning overrides "
+                f"({', '.join(sorted(arm_binning))}). Its bin budget is "
+                "max_bin, which may not be the same quantity as this "
+                "harness's bin count, so moving one and leaving the other "
+                "at a different stock number is two sweeps rather than one "
+                "axis. See scenarios.XGBOOST_UNMATCHABLE['bin_budget']"
+            )
+        # The class count, off the LOADED DATA and not off the spec.
+        #
+        # THIS WAS A BUG and it killed every multiclass cell of this arm. It
+        # read `spec.get("n_classes")`, and a scenario carries its class count
+        # inside `generator_sizes[tier]`, never at the top level of the spec,
+        # so the read was always None, `extra` stayed None, and
+        # `scenarios.xgboost_params` died on `KeyError: 'num_class'` for the
+        # multiclass task. The two adapters beside this one both read it off
+        # the training data with a fallback computed from the labels
+        # (`LightGBMEngine.run`, `CatBoostEngine.run`), which is the form that
+        # is right for a real dataset as well as a generated one, so this is
+        # now the same line they run.
+        extra = None
+        if spec["task"] == "multiclass":
+            extra = {
+                "num_class": int(
+                    train.get("n_classes") or (np.max(train["y"]) + 1)
+                )
+            }
+        arm_training = _arm(self, "arm_params")
+        if arm_training:
+            extra = dict(extra or {})
+            extra.update(arm_training)
+        params = scenarios.xgboost_params(spec, self.threads, extra)
+        # The backend, set here rather than in the translator for the reason
+        # `XGBOOST_REFUSED_PARAMS['device']` gives: one source for it, so a
+        # record cannot name a backend the fit did not use. `load` has already
+        # refused anything but cpu.
+        params["device"] = "cpu"
+        # The matched tree count. `num_boost_round` is an argument to
+        # `xgboost.train` rather than a member of the parameter dict, which is
+        # why `XGBOOST_MATCHED` maps the argument name to the `BASE_PARAMS`
+        # key instead of the translator emitting it.
+        #
+        # Resolved by `scenarios.xgboost_rounds` from the SAME `extra` the
+        # parameter dict was built from, rather than assembled here. Two
+        # reasons and the second is why it moved out of this method. It goes
+        # through `shared_params`, which is the merge the CatBoost arm reads
+        # its `iterations` from, so a scenario-level `params` entry moves this
+        # arm's budget and the comparator's together instead of one of them;
+        # asking a competitor for a different budget from the comparator is
+        # not a comparison. And reading `BASE_PARAMS` at a call site is the
+        # defect `MojoTreesEngine._n_estimators`'s docstring records, where the
+        # one parameter a frontier sweep moves first was the one no caller
+        # could override.
+        rounds = scenarios.xgboost_rounds(spec, extra)
+
+        dtrain, ingest = measure.timed(
+            lambda: self.module.DMatrix(train["X"], label=train["y"])
+        )
+        booster, training = measure.timed(
+            lambda: self.module.train(params, dtrain, num_boost_round=rounds)
+        )
+
+        task = spec["task"]
+        dtest = self.module.DMatrix(test["X"])
+        predictions, predict_batch = measure.repeat(
+            lambda: self._predict(booster, task, dtest), repeats
+        )
+        row_matrix = test["X"][:1]
+        if not train.get("sparse"):
+            row_matrix = np.ascontiguousarray(row_matrix)
+        drow = self.module.DMatrix(row_matrix)
+        _, predict_row = measure.repeat(
+            lambda: self._predict(booster, task, drow), 20, warmup=2
+        )
+
+        # The library's own resolved configuration. This is the ONLY place a
+        # record can say what this arm ran, because this harness deliberately
+        # transcribes no XGBoost default. Recorded rather than raised on
+        # failure, for the reason the CatBoost read-back is: a version moving
+        # a default is a thing to learn from a record, not a reason to lose a
+        # cell.
+        try:
+            raw_resolved = json.loads(booster.save_config())
+            resolved = scenarios.xgboost_readback_for_record(raw_resolved)
+            resolved_note = (
+                "xgboost.Booster.save_config() on the fitted booster, parsed "
+                "as JSON. This is XGBoost's resolved configuration and not a "
+                "restatement of what was passed. One field is replaced by its "
+                "digest rather than carried: see "
+                "scenarios.XGBOOST_READBACK_DROPPED"
+            )
+        except Exception as exc:  # pragma: no cover - engine-dependent
+            raw_resolved = None
+            resolved = None
+            resolved_note = (
+                f"save_config() failed: {type(exc).__name__}: {exc}"
+            )
+
+        # Where a LIVE fit disagrees with scenarios.XGBOOST_RESOLVED_DEFAULTS,
+        # which is the table `MOJOTREES_DEPTHWISE` was built from. Checked
+        # against the RAW read-back rather than the trimmed one, because the
+        # trim is a reporting step and a check that runs on a reduced input is
+        # checking something other than what ran.
+        #
+        # Recorded rather than raised, for the reason the CatBoost read-back
+        # is: an XGBoost upgrade moving a default is a thing to find out about
+        # from a record, not a reason to lose a measured cell and with it the
+        # whole matrix's quality verdict.
+        readback_drift = (
+            scenarios.check_xgboost_readback(raw_resolved)
+            if raw_resolved is not None
+            else ["save_config() produced nothing: " + str(resolved_note)]
+        )
+
+        try:
+            num_trees = int(booster.num_boosted_rounds())
+        except Exception:  # pragma: no cover - engine-dependent
+            num_trees = None
+
+        return {
+            "engine": self.name,
+            "engine_version": self.version,
+            "device_requested": self.device,
+            "device_used": "cpu",
+            "path": "dmatrix",
+            "phases": {
+                "import": self.import_phase.as_dict(),
+                "ingest": ingest.as_dict(),
+                "encode": None,
+                "encode_unavailable_reason": (
+                    "this arm does not run a categorical scenario, so there "
+                    "is nothing to re-encode. See "
+                    "scenarios.XGBOOST_SCENARIO_SUPPORT"
+                ),
+                "binning": None,
+                "binning_unavailable_reason": (
+                    scenarios.XGBOOST_UNMATCHABLE["binning_phase"]
+                ),
+                "train": training.as_dict(),
+                "predict_batch": predict_batch,
+                "predict_row": predict_row,
+            },
+            "params_used": params,
+            "dataset_params_used": None,
+            "dataset_params_unavailable_reason": (
+                "XGBoost's DMatrix takes the data and train() takes the "
+                "parameters. The binning settings are training parameters "
+                "and are left at XGBoost's own defaults, so they appear in "
+                "engine_resolved_params rather than in params_used"
+            ),
+            "engine_resolved_params": resolved,
+            "engine_resolved_params_source": resolved_note,
+            # Empty means a live fit resolved every value in
+            # scenarios.XGBOOST_RESOLVED_DEFAULTS to what that table asserts. A
+            # non-empty one means XGBoost has moved or the table was
+            # transcribed wrongly, and either way the mojotrees_depthwise row
+            # beside this one is mirroring something this version does not do.
+            #
+            # This used to be the empty list unconditionally, with a comment
+            # saying a drift list is meaningless because the arm asserts no
+            # defaults. That was true for the few hours before xgboost was
+            # installed.
+            "engine_resolved_params_drift": readback_drift,
+            "num_boost_round": rounds,
+            "model": {
+                "num_trees": num_trees,
+                "current_iteration": num_trees,
+                "num_bin": None,
+                "num_bin_unavailable_reason": (
+                    "XGBoost exposes no per-feature bin count on the Booster. "
+                    "The resolved max_bin is in engine_resolved_params, which "
+                    "is a budget rather than the count actually produced"
+                ),
+                "size": self._model_size(booster),
+            },
+            "data_encoding": None,
+            "categorical_features": None,
+            "transfers": measure.unavailable("cpu-only path"),
+            "peak_rss_bytes": measure.peak_rss_bytes(),
+            "notes": list(self.notes),
+            "predictions": predictions,
+        }
+
+
+# `MojoTreesXGBoostModeEngine` WAS HERE AND IS GONE, 2026-08-17. It was a
+# second mojotrees arm, `mojotrees_xgboost_mode`, carrying XGBoost's defaults
+# while `MojoTreesDepthwiseEngine` stayed a one-key growth-order isolation.
+# Andrew collapsed the pair into one arm the same day ("make our depthwise
+# params match xgboost"), because an arm is a column of benchmark cells in
+# every scenario, tier and backend, and this suite runs on one laptop under a
+# timing lock. Its whole content is now on `MojoTreesDepthwiseEngine`, which
+# was already the identical class under another name;
+# `scenarios.MOJOTREES_XGBOOST_MODE WAS HERE` records what the collapse cost.
+
 ENGINES = {
     "mojotrees": MojoTreesEngine,
+    # A mojotrees SUBJECT variant, not a peer: same engine, a different
+    # parameter set, so it is selectable and never default. As of 2026-08-17
+    # that set is XGBoost's resolved defaults and the name understates it; see
+    # the class docstring.
+    "mojotrees_depthwise": MojoTreesDepthwiseEngine,
+    # The two CORRECTNESS arms, 2026-08-17. Subject variants like the one
+    # above, and never default: `run.py`'s default --engine list is
+    # ["mojotrees", "lightgbm"], so these cost nothing until asked for by
+    # name. Each exists to give verify.check_device_agreement a cpu-versus-gpu
+    # pair on a configuration that had none, and each covers a parameter under
+    # which a live wrong answer was found by reading code on the day they were
+    # added. See scenarios.CORRECTNESS_ARMS.
+    "mojotrees_symmetric_colsample": MojoTreesSymmetricColsampleEngine,
+    "mojotrees_cosine_leafwise": MojoTreesCosineLeafwiseEngine,
     "lightgbm": LightGBMEngine,
     # Peer arms, reported beside the comparator. Adding them here is what
     # makes worker.py able to run them without a change: it builds an engine
     # by name from this table.
     "catboost": CatBoostEngine,
-    "catboost_lossguide": CatBoostLossguideEngine,
+    "xgboost": XGBoostEngine,
     "mojotrees_catboost_mode": MojoTreesCatBoostModeEngine,
 }
 
@@ -1601,9 +2165,34 @@ ENGINES = {
 #: without knowing the engine names by heart.
 ENGINE_ARM = {
     "mojotrees": "subject",
+    # Not plain "subject": it is mojotrees, so it is not a peer, and
+    # it is not the headline row either. See the class docstring.
+    #
+    # It stayed "subject_variant" when it became the XGBoost mirror on
+    # 2026-08-17, and that was a decision. "peer_subject" is what
+    # `mojotrees_catboost_mode` carries and would have described the pairing
+    # just as well, but it also takes an engine OUT of `verify.SUBJECT_ENGINES`
+    # in the reader's mind and, more importantly, into
+    # `scenarios.PEER_ENGINES`, whose members `selfcheck.py` requires to be
+    # peers. This arm runs GPU cells and needs the backend proof and the
+    # cpu-versus-gpu agreement check that subject arms get, so it stays a
+    # subject and the pairing is recorded in the claims string instead.
+    "mojotrees_depthwise": "subject_variant",
+    # "subject_variant" and not a new role, deliberately. A fourth value would
+    # have to be taught to every reader of this mapping, and what these two
+    # arms are -- ours, not the headline -- is exactly what the existing value
+    # means. What makes them CORRECTNESS arms rather than mirror arms is that
+    # they have no peer column, and that is recorded where it can be acted on:
+    # in scenarios.CORRECTNESS_ARMS, which selfcheck walks, and in each arm's
+    # claims string, which travels into the record. Being a subject is also
+    # what keeps them inside verify.SUBJECT_ENGINES, and for these two that is
+    # not a side effect, it is the arm: the cpu-versus-gpu agreement check is
+    # the only thing they produce.
+    "mojotrees_symmetric_colsample": "subject_variant",
+    "mojotrees_cosine_leafwise": "subject_variant",
     "lightgbm": "comparator",
     "catboost": "peer",
-    "catboost_lossguide": "peer",
+    "xgboost": "peer",
     "mojotrees_catboost_mode": "peer_subject",
 }
 

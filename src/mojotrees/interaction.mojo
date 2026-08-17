@@ -58,6 +58,48 @@ Constraints are a training-time restriction on split search, not part of a
 fitted model: they change which trees get grown, never how a grown tree is
 evaluated. Serialized models therefore carry no constraint record, the same
 way they carry no `num_leaves` or `min_data_in_leaf`.
+
+Reach
+-----
+A restriction is only worth what its reach is, and a grower that accepted a
+constraint set and ignored it would return an unrestricted model under a
+restricted label. Recorded 2026-08-17 by the constraint-reach sweep, which
+read each consuming site; `docs/design/CONSTRAINT_REACH.md` carries the same
+table for the rest of the constraint family.
+
+Every path either HONORS the groups or REFUSES them by name. No path accepts
+a group set and drops it.
+
+Honored, through `allowed_features` and `extend_branch`:
+
+- `tree.grow_tree`, leaf-wise and depth-wise.
+- `tree._grow_oblivious_levels`, the symmetric CPU grower. Its mask is the
+  INTERSECTION over the level's leaves rather than one leaf's mask, because
+  the shared split lands in every branch, so a feature any one leaf forbids
+  is forbidden for the level. That is a redefinition the rule above does not
+  state and it is the faithful one, because an intersection is the only mask under
+  which the invariant "every root-to-leaf path's feature set is a subset of
+  some group" survives a split applied to leaves with different branches.
+- `tree_sparse.grow_tree_sparse`.
+- `train_gpu`'s host-scan grower.
+- `train_gpu._device_search_resident` and `_device_search_incremental`. The
+  branch chain and the mask stay on the host and the mask is staged per
+  record with `GpuSplitSearcher.set_allowed`, so the device scan skips a
+  forbidden feature rather than scoring it.
+- `train_gpu_sparse.grow_tree_gpu_sparse`.
+
+Refused by name:
+
+- `gpu_tree_tables.tree_resident_supported` returns
+  `TREE_RESIDENT_INTERACTION`, because a child's mask comes from its ancestor
+  feature chain and nothing on the device tracks one. The caller falls back
+  to `_device_search_resident`, which honors it, so this is a fallback and
+  not a failure.
+- `gpu_resident_round.oblivious_device_supported` returns
+  `OBLIVIOUS_TABLES`, and the symmetric GPU route raises, because that
+  backend has no second symmetric grower.
+- The parameter-string surface lists `interaction_constraints` in
+  `params._MOJO_API_ONLY`, so a string cannot set it and is told why.
 """
 
 

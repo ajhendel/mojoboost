@@ -23,11 +23,35 @@ LightGBM semantics, matched here:
 - Sampling is skipped for the first `int(1 / learning_rate)` rounds
   (LightGBM's GOSS warmup); `warmup_rounds` overrides that.
 
-Coverage follows row bagging exactly: every trainer that takes a `bagging`
-parameter takes a `goss` one too, on the CPU and on the GPU, and the two
-are mutually exclusive. The trainers that take neither are the
-custom-objective ones, which grow every tree on every row, and the ranker,
-which samples whole queries rather than rows.
+Coverage, counted in source on 2026-08-17 rather than summarized, because
+the sentence that stood here was wrong in both directions. It read "every
+trainer that takes a `bagging` parameter takes a `goss` one too, on the CPU
+and on the GPU ... The trainers that take neither are the custom-objective
+ones, which grow every tree on every row, and the ranker, which samples whole
+queries rather than rows."
+
+The two are mutually exclusive wherever both are arguments (`_check_goss`),
+and that part holds. What does not:
+
+- **Two families of trainer take `bagging` and no `goss`.**
+  `boosting_rf.train_rf` and `train_rf_more` take the uniform argument set,
+  which has no `GossParams`; a gradient-sampled forest is
+  `boosting_rf.train_forest` with `RfParams.goss` set, and
+  `alternate_boosting.AlternateBoostingParams.validate` refuses an enabled
+  bundle under `boosting='rf'` by name rather than dropping it. The rankers
+  (`ranking.train_ranker`, `train_ranker_with_valid`, `fit_ranker`,
+  `ranking_advanced.train_ranker_advanced`, `fit_ranker_advanced`, and
+  `custom_metric`'s three ranker entry points) take a `bagging` parameter
+  that samples whole QUERIES, not rows, and take no `goss`;
+  `ranking.check_query_bagging` is the validator and
+  `ranking_advanced.refresh_query_bag` the draw, neither of which is
+  `bagging.refresh_bag`.
+- **The custom-objective trainers take neither, which is the one half of the
+  old sentence that was right.** `objective.train_custom`,
+  `objective.train_custom_with_valid`, `train_gpu.train_custom_gpu`,
+  `custom_metric.train_custom_with_metrics` and
+  `custom_metric.train_custom_with_builtin_metrics` grow every tree on every
+  row.
 
 RNG
 ---

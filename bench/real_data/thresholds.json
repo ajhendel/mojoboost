@@ -48,6 +48,17 @@
   },
   "version": 1,
   "defaults": {
+    "accuracy_anchor": {
+      "max_worse_relative": 0.0025,
+      "implausible_better_relative": 0.05,
+      "gating": true,
+      "rationale": "Registered 2026-08-17, replacing the peer-anchored accuracy budget as the accuracy gate. This bounds how much of OUR OWN accuracy one adopted change may silently cost, measured against a value recorded in accuracy_anchors.json for the same arm, scenario, tree count and device. It is a DIFFERENT QUANTITY from the 1 percent we quote against CatBoost and LightGBM, which was a standing distance to a competitor rather than a per-change allowance, so the number is not reused. Measured basis: our arms are bit-identical across repeats (check_determinism gates it) and the generators are pure and seeded, so this comparison has no noise floor for a subject arm and any tolerance above zero is a deliberate allowance rather than headroom. Nearest recorded evidence for the size is this file's dense_regression differential rationale, which records that tie breaking and floating-point summation order move RMSE in the third decimal place; that observation is about two different engines, so it is an upper bound on the movement being allowed for and not a measurement of it. INFERRED and not measured by anyone here: a change that only reassociates a reduction should move the metric less than 0.25 percent, which on an rmse of 0.31 is the fourth decimal place. If a legitimate reassociation trips this, the finding is that this number is wrong; move it here with the measurement that justified moving it. Tripping the gate is not a refusal to make the change, it is a refusal to make it silently: the remedy is a deliberate anchor refresh, which puts the old and the new number in one diff. implausible_better_relative exists for the reason the differential's does, in that check's words, 'Better than this is not a win, it is a sign the two engines were not actually given the same problem'; set tighter than the differential's 10 percent because this compares an arm against itself. Also inferred."
+    },
+    "accuracy_peer": {
+      "max_worse_relative": 0.01,
+      "competitors": ["catboost", "lightgbm"],
+      "rationale": "The scoreboard, and it GATES NOTHING. Andrew's standing directive of within 1 percent relative of the better of CatBoost-as-shipped and LightGBM stock+det at a matched tree count, kept unchanged in arithmetic and demoted from a gate on 2026-08-17. His words: the adoption rule 'should be about trading OUR accuracy for speed. not tied to whatever lightgbm or catboost is fucking doing'. Three reasons it could not stay a gate: it blocked changes that cost no accuracy at all, since the leaf-wise GPU arm's 1.043 to 0.839 second improvement was bit-identical work and the frontier would not rank it; it PERMITTED real accuracy loss whenever we were ahead, since the symmetric arm beating CatBoost at 799k could give away about 1.07 percent of its own accuracy and still pass; and the bar moved when somebody else shipped. Every line it writes is a note. There is deliberately no gating key here: after that ruling there is no run for which turning it back into a gate is the right thing to do."
+    },
     "determinism": {
       "mojotrees": {
         "require_identical_predictions": true,

@@ -575,6 +575,48 @@ def grow_tree_sparse(
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
 
+    # THIS GROWER DOES NOT APPLY FORCED SPLITS, and until 2026-08-17 it did
+    # not say so, it just grew an unforced tree and returned it under a forced
+    # label. The identifier `forced` appeared nowhere in this file.
+    #
+    # Refusing rather than implementing, because a silent wrong answer and a
+    # missing feature are different problems and only the first is urgent. What
+    # made this worth finding is that FIVE layers made it look covered and TWO
+    # steered into it:
+    #
+    #  - `ExtraTreeParams.check` validates the document against the feature
+    #    count and the leaf and depth budget, then nobody reads it. So a BAD
+    #    document is reported and a CORRECT one is dropped, which is the
+    #    opposite of the useful behavior.
+    #  - `check_scalars` refuses only an UNMAPPED document, and a mapped one is
+    #    the only kind a correct caller holds.
+    #  - this call site passes `grower_applies_extra=True`, so `_search`'s
+    #    `needs_grower_support()` guard does not fire. That flag is true of the
+    #    four other members it covers and was false of this one.
+    #  - `device_policy` BLOCK_FORCED_SPLITS routes `device='auto'` to the CPU
+    #    as "the backend that can honor it". Its sentence is literally true,
+    #    forced splits are applied by `tree.grow_tree` and by no other grower,
+    #    and that is exactly why the conclusion is wrong: routing picks a
+    #    DEVICE, and the CPU device has two growers.
+    #  - `train_gpu_sparse._check_gpu_forced_splits_sparse` tells the caller to
+    #    train on the CPU, so the refusal offered the grower that drops the
+    #    document.
+    #
+    # Reachable from Python: the estimator accepts `forced_splits` and `fit`
+    # accepts SciPy sparse input without densifying it.
+    #
+    # No correct fit changes behavior. A fit that reaches here with a forced
+    # document was already not honoring it, and now fails loudly instead.
+    if not params.extra.forced.is_empty():
+        raise Error(
+            "forced splits are not applied by the sparse grower: this fit's"
+            " data is sparse and grow_tree_sparse does not read"
+            " params.extra.forced, so the tree it grows would ignore the"
+            " document rather than honor it. Densify the matrix to reach"
+            " tree.grow_tree, which is the only grower that applies forced"
+            " splits, or drop forced_splits from this fit"
+        )
+
     var bundles: SparseBundling
     if bundling.resolved():
         bundling.check_matrix(data)

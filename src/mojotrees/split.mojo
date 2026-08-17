@@ -204,6 +204,7 @@ from .tree_parameters_extra import (
     check_score_function,
     extra_threshold_index,
     finish_leaf_output,
+    oblivious_score_noise,
     passes_min_gain,
     random_score_noise,
 )
@@ -1871,7 +1872,49 @@ def find_best_split_shared(
                 # what lets a CPU draw and a device draw be compared as equal
                 # values for the same candidate at the same level. Do not
                 # "improve" this back into a running generator.
-                noise = random_score_noise(
+                #
+                # `oblivious_score_noise` AND NOT `random_score_noise`, AND
+                # THE DIFFERENCE IS NOT A SPELLING. The two wrappers take the
+                # same six arguments in the same order and differ only in
+                # which domain constant they fold into the seed:
+                # `random_score_noise` uses `_RANDOM_SCORE_DOMAIN` and
+                # `oblivious_score_noise` uses `_OBLIVIOUS_SCORE_DOMAIN`
+                # (`tree_parameters_extra.mojo:669` and `:685`). The constant
+                # is mixed in BEFORE the first `splitmix64`, so the two
+                # streams are disjoint by construction: at the identical
+                # (seed, tree_index, depth, feature, bin) they return
+                # unrelated draws rather than nearby ones.
+                #
+                # This line called the node-domain wrapper until 2026-08-17,
+                # and the device path has drawn in the oblivious domain since
+                # `gpu_split_search._scan_slot_oblivious_kernel` landed
+                # (`gpu_split_search.mojo:1312`,
+                # `gpu_resident_round.mojo:3073`). So a symmetric fit was
+                # noising the same candidate by two unrelated amounts
+                # depending on which backend ran it, while both models
+                # trained and both reported success. It was found by reading
+                # rather than by a test, and no test in the suite could see
+                # it: `oblivious_score_noise`'s own docstring names THIS
+                # function as one of the two places that add the level noise,
+                # and this function did not call it.
+                #
+                # The defect had two halves and only one was fixed before.
+                # The site INDEX was corrected earlier -- `depth` is passed
+                # here where `find_best_split` passes `node` -- and the domain
+                # was left behind. `WIRE_NOTE_oblivious_level_noise.md`
+                # specifies both halves; this is the second.
+                #
+                # SCOPE, because it decides whose bits move. This wrapper
+                # swap is confined to `grow_policy=oblivious` by the shape of
+                # the call graph and needs no policy test to keep it there:
+                # this function IS the level search, its only production
+                # caller is `tree.grow_tree`'s oblivious level loop
+                # (`tree.mojo:2393`), and leaf-wise and depth-wise growth
+                # reach `find_best_split` instead, whose draw at
+                # `split.mojo:1080` keeps the node domain and does not change.
+                # A node candidate belongs to a node; a level candidate
+                # belongs to a level.
+                noise = oblivious_score_noise(
                     noise_stdev, noise_seed, tree_index, depth, f, b
                 )
             if score_left:

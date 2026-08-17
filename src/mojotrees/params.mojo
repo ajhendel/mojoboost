@@ -746,19 +746,45 @@ def _validate(
     # The data-independent half of the remaining tree controls. The per-
     # feature vectors are checked against the dataset later, in
     # `tree.grow_tree`, because a parameter string cannot carry one.
-    # `scale_computed_per_tree` on the CPU arm only: the dense CPU round
-    # loops compute `random_score_scale` per tree onto their own copy of
-    # the bundle, so a positive `random_strength` beside a zero scale is
-    # legitimate HERE and a defect anywhere else. The device and
-    # distributed loops do not compute it, so they keep the refusal.
+    # `scale_computed_per_tree`: does the round loop this configuration will
+    # reach compute `random_score_scale` per tree onto its own copy of the
+    # bundle? If it does, a positive `random_strength` beside a zero scale is
+    # legitimate HERE and a defect anywhere else.
     #
-    # Known narrow gap, and it is a refusal rather than a silent drop: a
-    # CPU MULTICLASS fit passes this and then raises at `split.mojo`'s
-    # noise read mid-fit, because `_boost_rounds_multiclass` is not
-    # wired. A dedicated refusal here would give a better message.
+    # **THE PREDICATE IS THE TRAINER, NOT THE DEVICE, AND IT WAS THE DEVICE
+    # UNTIL 2026-08-17.** It read `config.device == CPU_DEVICE`, which was
+    # true of the package as it stood when it was written: only
+    # `boosting._boost_rounds` and `boosting.train_with_valid` computed the
+    # scale. Both arms of `train_gpu._train_gpu_rounds` compute it now -- the
+    # host-gradient arm through `boosting._round_random_score_scale` from the
+    # round's user-weighted derivatives, the device-gradient arm through
+    # `_device_round_random_score_scale` over
+    # `GpuObjectiveState.derivative_sum_squares` -- and
+    # `ExtraTreeParams.check_random_strength`'s own message has named both of
+    # them since that day. A device test here was refusing a value the device
+    # honors, and `_apply_catboost_mode_defaults` below was declining a mode
+    # default it could have supplied, so the same CatBoost-mode string built a
+    # DIFFERENT MODEL on `device=gpu` than on `device=cpu` without saying so.
+    # `bindings/_mojotrees.mojo` retired the identical device test at
+    # `random_strength_ok` on the same day; this surface was left behind.
+    #
+    # What replaces it is the routing question `model.fit` versus
+    # `model.fit_multiclass` actually answers, and it is NARROWER on the axis
+    # that matters: `boosting.train_multiclass`,
+    # `train_gpu.train_multiclass_gpu` and
+    # `boosting_sparse.train_multiclass_sparse` compute no scale, so a
+    # multiclass configuration with a positive `random_strength` is refused
+    # HERE by name instead of raising mid-fit at `split.mojo`'s noise read,
+    # which is the "known narrow gap" this comment used to record as open.
+    #
+    # Still not covered, and it cannot be from a parameter string: a SPARSE
+    # matrix resolves onto `boosting_sparse.train_sparse`, which computes no
+    # scale, and a string carries no data. That one is refused at the Python
+    # surface, where the dataset is known (`random_strength_ok` is
+    # `not d[].is_sparse` at `_train_dataset`).
     config.booster.tree.extra.check_scalars(
         config.booster.tree.min_data_in_leaf,
-        scale_computed_per_tree=(config.device == CPU_DEVICE),
+        scale_computed_per_tree=(not config.is_multiclass()),
     )
     # Exclusive feature bundling: the knobs are range-checked whether or not
     # the switch is on, so a bad value is named here rather than at the first
@@ -1194,13 +1220,25 @@ def parse_params(spec: String) raises -> TrainConfig:
                     " fit under 200 iterations, is accepted"
                 )
         # CatBoost's `random_strength`, the only name on this surface that is
-        # not LightGBM's. 0.0, the default, is LightGBM's behavior exactly. A
-        # positive value parses and then fails validation with a sentence
-        # naming what is missing (`ExtraTreeParams.check_random_strength`),
-        # which is the same refuse-rather-than-ignore path
-        # `use_quantized_grad` takes below: the noise needs a per-tree scale
-        # off the ensemble's gradients that no trainer computes in this
-        # build, and a split search cannot reconstruct it from a histogram.
+        # not LightGBM's. 0.0, the default, is LightGBM's behavior exactly.
+        #
+        # This comment said a positive value "parses and then fails
+        # validation" because "no trainer computes" the per-tree scale. That
+        # was true when it was written and is not true now: the dense
+        # single-output round loops on BOTH devices compute it, so a positive
+        # value here reaches a fit. It still fails validation on a
+        # configuration whose trainer does not -- multiclass -- and the
+        # sentence naming what is missing is
+        # `ExtraTreeParams.check_random_strength`'s. See the
+        # `scale_computed_per_tree` argument in `_validate` for the current
+        # predicate.
+        #
+        # **The units are not CatBoost's units under `score_function=l2`**,
+        # which is this surface's default. The noise is scaled by a derivative
+        # RMS, which pairs with the Cosine score CatBoost ships; our default
+        # gain is `G^2/(H+lambda)`, which is Cosine SQUARED, so the same
+        # number is a far smaller perturbation there. `docs/design/
+        # RANDOM_STRENGTH_UNITS.md` has the derivation and the size.
         elif key == "random_strength":
             saw_random_strength = True
             config.booster.tree.extra.random_strength = _parse_f64(key, value)
@@ -1658,10 +1696,27 @@ def _apply_catboost_mode_defaults(
       typed is refused by `_check_leaf_estimation_routing`.
     - `random_strength` -> **1.0**
       (`tree_parameters_extra.CATBOOST_RANDOM_STRENGTH`), replacing our 0.0.
-      Declines on the GPU and on multiclass, because the per-tree scale it
-      multiplies is computed by `boosting._boost_rounds` and by
-      `train_with_valid`'s loop and by nothing else, and `check_scalars` would
-      refuse an inherited value those loops cannot serve.
+      Declines on multiclass, because `boosting.train_multiclass` and
+      `train_gpu.train_multiclass_gpu` compute no per-tree scale and
+      `check_scalars` would refuse an inherited value they cannot serve.
+
+      **It used to decline on the GPU as well, and that was a defect rather
+      than a rule, corrected 2026-08-17.** The device test was written on
+      2026-08-16 (`e3cfb47`) when the accelerator genuinely could not honor
+      the parameter, and the capability landed the next day: both arms of
+      `train_gpu._train_gpu_rounds` compute the scale, the oblivious level
+      launch stages and reads the noise plane (`c775959`), and
+      `ExtraTreeParams.device_unsupported_reason`'s `random_strength` arm now
+      refuses only `random_strength` beside a CATEGORICAL feature. What the
+      stale test produced in the meantime is the thing a mode default must
+      never produce: the identical parameter string trained a DIFFERENT MODEL
+      on `device=gpu` (and on `device=auto`, which is not `CPU_DEVICE`
+      either) than on `device=cpu`, silently, and `bench/real_data`'s
+      `device_agreement` check would have reported the parameter difference as
+      a backend divergence. The mode default is now the same on every device,
+      and a device that cannot honor it refuses by name from
+      `_device_search_unsupported_reason` rather than being handed a quieter
+      model.
 
     `boost_from_average` is deliberately absent. CatBoost resolves it per loss
     and mojotrees's `false` is honored by the dense single-output round loops
@@ -1695,11 +1750,9 @@ def _apply_catboost_mode_defaults(
         config.booster.tree.extra.leaf_estimation_iterations = (
             _catboost_leaf_iterations_for(config)
         )
-    if (
-        not saw_random_strength
-        and config.device == CPU_DEVICE
-        and not config.is_multiclass()
-    ):
+    # No device test. See the `random_strength` bullet above: one was here
+    # until 2026-08-17 and it made the same string build two different models.
+    if not saw_random_strength and not config.is_multiclass():
         config.booster.tree.extra.random_strength = CATBOOST_RANDOM_STRENGTH
 
 

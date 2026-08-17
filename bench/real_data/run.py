@@ -30,6 +30,13 @@ What this writes, under `results/<run_id>/`:
 
 Nothing in this directory is committed. `results/README.md` says why.
 
+A run that asks for both backends produces two kinds of cell for each of our
+own arms. The accelerator cell is MEASURED. The cpu cell is an ORACLE, and it
+exists so that verify.py can compare an accelerator row against its own cpu
+twin. It runs `--oracle-repeats` times rather than `--repeats` times, and it is
+kept out of the speed story downstream. `verify.py`'s ORACLE CELL block holds
+the rule and `_mark_oracle_cells` below applies it.
+
 The exit code reports whether the matrix ran, not whether the results were
 good. Quality is verify.py's decision and speed is nobody's. That
 separation is deliberate and is not what the exit codes below changed.
@@ -72,6 +79,11 @@ import backend_proof  # noqa: E402
 import engines  # noqa: E402
 import envinfo  # noqa: E402
 import scenarios  # noqa: E402
+# Imported for `SUBJECT_ENGINES` and the oracle vocabulary, so that the runner
+# and the gate cannot disagree about which arms are ours. It costs nothing this
+# process was not already paying. verify's only heavy import is numpy, and
+# `engines` above has already loaded it.
+import verify  # noqa: E402
 
 DEFAULT_RESULTS = os.path.join(HERE, "results")
 
@@ -110,20 +122,39 @@ def default_threads():
     return cpu.get("physical_cores") or cpu.get("logical_cores") or 1
 
 
-#: Arm rank INSIDE a round, for arms one of which must run before another.
+#: Arm rank INSIDE a round, for arms one of which should run before another.
 #:
-#: One dependency today. `mojotrees_catboost_mode` cannot be built until the
+#: **One HARD dependency.** `mojotrees_catboost_mode` cannot be BUILT until the
 #: `catboost` cell for the same scenario, tier and variant has written its
 #: resolved parameters into the run's sidecar, because CatBoost derives its own
-#: learning rate and this arm takes that value rather than a constant. Every
-#: other arm is rank 0 and keeps build order.
+#: learning rate and this arm takes that value rather than a constant. Without
+#: the ordering that arm raises, which is why `_engine_skip_reason` also
+#: refuses the pairing outright when `catboost` is not in the run.
 #:
-#: This is composed UNDER the repeat sort, never in place of it. See the
-#: comment at the sort itself.
+#: **One SOFT ordering, added 2026-08-17, and it is deliberately not a
+#: dependency.** `mojotrees_depthwise` carries XGBoost's resolved defaults and
+#: is read against the `xgboost` peer column, so within a round the peer runs
+#: first and the mirror second. Nothing breaks if it does not: the mirror reads
+#: nothing from the peer's cell, XGBoost's defaults being static where
+#: CatBoost's rate is derived, and `mojotrees_depthwise` alone is a legal run.
+#: What the rank buys is that a run interrupted part way through has the peer
+#: column for every mirror row it produced, rather than mirror rows nothing can
+#: be read against. That is worth one integer.
+#:
+#: `xgboost` is listed at rank 0 explicitly, which changes nothing at all,
+#: because `.get(engine, 0)` already gives an absent engine that rank. It is
+#: here so the table names every arm that participates in an ordering rather
+#: than only the ones that had to be moved, which is what makes it readable as
+#: a statement of the intended order instead of a list of exceptions.
+#:
+#: This is composed UNDER the repeat sort, never in place of it, and the sort
+#: is stable, so arms sharing a rank keep build order. See the comment at the
+#: sort itself.
 CELL_ORDER = {
     "catboost": 0,
-    "catboost_lossguide": 0,
+    "xgboost": 0,
     "mojotrees_catboost_mode": 1,
+    "mojotrees_depthwise": 1,
 }
 
 
@@ -185,31 +216,21 @@ CELL_ORDER = {
 #: a predicate over what the harness ASKED FOR rather than a copy of
 #: `device_policy`: this table's job is to keep a cell off the schedule, and
 #: the native policy remains the authority on what a fit may do.
+#: RETIRED ENTRY, 2026-08-17: `random_strength`. The case above no longer
+#: holds at head. c775959 ("random_strength on the oblivious device path: the
+#: plane is staged and read") computes the per-tree scale on the device round,
+#: and `device_policy.mojo::BLOCK_RANDOM_STRENGTH` was narrowed the same day
+#: from "any positive value" to "beside a categorical column", which
+#: `_engine_skip_reason` already refuses by name before this table is read.
+#: With the entry in place every gpu cell of an arm NAMING random_strength (the
+#: CatBoost-mode arm, every MVS and randomness frontier arm) was skipped for a
+#: resolved-difference reason that was no longer true, which is a stale
+#: refusal wearing a rule. The rule stands; its first exhibit is retired. Text
+#: of the retired entry, for the record: device resolved 0.0 where the arm
+#: asked for a positive value because the per-tree scale was computed only by
+#: the dense CPU round loops (boosting._round_random_score_scale), exit "a
+#: device round loop that computes the scale would close it". It did.
 DEVICE_PARAMETER_DIVERGENCE = (
-    {
-        "parameter": "random_strength",
-        "device": "gpu",
-        "applies": lambda params: float(params.get("random_strength", 0.0)) > 0.0,
-        # A callable, because the value the arm asked for is the whole point
-        # of the sentence: "GPU resolves it to 0.0 where this arm asks for
-        # 1.0" is the skip a reader can act on, and "where this arm asks for
-        # the value it asked for" is not.
-        "cpu_value": lambda params: params.get("random_strength"),
-        "device_value": "0.0",
-        "why": (
-            "the per-split draw is staged on the device but its per-tree "
-            "SCALE is computed only by the dense CPU round loops "
-            "(boosting._round_random_score_scale), so `_parse_params` "
-            "declares random_strength_ok as `device == cpu and not sparse`. "
-            "A named value is refused there by name; a value inherited from "
-            "the symmetrictree mode default declines to 0.0 in silence. "
-            "Either way the GPU cell is not this arm"
-        ),
-        "exit": (
-            "a gap with an exit: a device round loop that computes the scale "
-            "would close it. Until one does, the CPU cell is the arm"
-        ),
-    },
     {
         "parameter": "derivative_precision",
         "device": "gpu",
@@ -322,6 +343,21 @@ def _engine_skip_reason(spec, scenario_id, engine, device, engines_in_run, tier)
         ok, reason = scenarios.catboost_tier_ok(spec, tier)
         if not ok:
             return reason
+    # The CORRECTNESS arms, added 2026-08-17. Capped for a reason unlike
+    # either of the two above: CatBoost's caps bound an arm that might not
+    # FINISH, and this one bounds an arm that finishes and buys nothing extra
+    # by finishing bigger. A correctness arm's product is a
+    # verify.check_device_agreement verdict, which compares a gpu row's
+    # predictions against its own cpu twin's row by row, and that comparison
+    # is not more true at 1,000,000 rows than at 200,000. It is a COST bound
+    # and it is declared rather than assumed: nothing about either arm fails
+    # at the large tier, and scenarios.CORRECTNESS_ARM_TIER_CAP names what the
+    # cap gives up, which is that the large tier routes to the device split
+    # search and so exercises a different device path.
+    if engine in scenarios.CORRECTNESS_ARMS:
+        ok, reason = scenarios.correctness_arm_tier_ok(tier)
+        if not ok:
+            return reason
     if device != "cpu":
         if device not in spec["devices"]:
             return f"{scenario_id} declares no {device} support"
@@ -346,27 +382,89 @@ def _engine_skip_reason(spec, scenario_id, engine, device, engines_in_run, tier)
                 "against 65535) and so is not the same measurement. "
                 "CatBoostEngine.load refuses it by name"
             )
-        # The pairing ground is stated first and the device block second, and
-        # the order is the point. This arm exists to be read against
-        # CatBoost, CatBoost is CPU-only above, so a GPU row here has nothing
-        # to pair against no matter what the device can compute.
-        # BLOCK_SCORE_FUNCTION is why it cannot run there today; the pairing
-        # is why it should not be scheduled there even after a lane teaches
-        # the device split search the Cosine ratio and the block goes away.
-        # Written this way so that landing Cosine on the device does not
-        # silently add a column to a comparison matrix.
+        # XGBoost, and the reason is BLUNTER than CatBoost's above. That one
+        # is a quantization argument: CatBoost has a GPU trainer and it bins
+        # differently, so a GPU CatBoost row would be a different measurement
+        # rather than an unavailable one. XGBoost's only accelerator backend
+        # is CUDA and this machine is Apple silicon, so there is no XGBoost
+        # GPU path in existence here to measure. Both refusals produce the
+        # same table shape and a reader should not have to guess which reason
+        # produced which row, so they are separate branches with separate
+        # sentences.
+        #
+        # This is what makes Andrew's directive the right comparison rather
+        # than an unfair one: CPU is the CEILING for all three competitor
+        # libraries on this machine, so our accelerator published beside their
+        # CPU is our best against their best available.
+        if engine in scenarios.XGBOOST_ENGINES:
+            return (
+                "XGBoost runs on the CPU in this harness, and not by choice: "
+                "its only accelerator backend is CUDA and this machine is "
+                "Apple silicon, so no XGBoost GPU path exists to measure. "
+                "CPU is this engine's ceiling here. XGBoostEngine.load "
+                "refuses a non-cpu device by name"
+            )
+        # REWRITTEN 2026-08-17, and both halves of what stood here changed.
+        # What it said was that a GPU row for this arm has "no counterpart to
+        # be read against" because CatBoost is CPU-only, and that this
+        # pairing argument would outlive BLOCK_SCORE_FUNCTION. Neither part
+        # survived the day.
+        #
+        # THE PAIRING ARGUMENT IS REJECTED, by Andrew, in these words: "the
+        # entire point is that WE USE THE GPU. We should be comparing us with
+        # gpu and without gpu to catboost, and same for lightgbm." CPU-only
+        # is CatBoost's CEILING in this harness rather than a missing
+        # counterpart -- its GPU training quantizes differently
+        # (border_count 255 against 65535), which is why the block above
+        # refuses a GPU CatBoost row -- and mojotrees is a GPU-first product,
+        # so our accelerator against their best available backend is the
+        # comparison rather than a category error. Both our cells are
+        # scheduled and both are published; the asymmetry belongs in the
+        # table's label, not in a dropped row.
+        #
+        # THE DEVICE BLOCK IS NO LONGER GENERAL. f9's 820c06b and c775959
+        # landed Cosine and random_strength on the oblivious device path, and
+        # device_policy.mojo::_collect_blocks narrowed BLOCK_SCORE_FUNCTION
+        # and BLOCK_RANDOM_STRENGTH from "any active setting" to "beside a
+        # categorical column". Neither fires on a numeric fit.
+        #
+        # WHAT STILL REFUSES, and it is the only reason left. Beside a
+        # categorical column all three of this arm's device-facing settings
+        # block, each in its own arm of device_policy.mojo::_collect_blocks:
+        # Cosine (BLOCK_SCORE_FUNCTION, because a category partition
+        # is scored with the L2 gain and the pair would put two functionals
+        # inside one argmax), random_strength (BLOCK_RANDOM_STRENGTH, because
+        # only the partition search's winner would be noised while every
+        # numerical candidate was), and the oblivious grow policy itself
+        # (BLOCK_GROW_POLICY, because
+        # a symmetric level commits one (feature, bin) split for the whole
+        # level and the device level search evaluates ordinal thresholds
+        # only). `scenario_has_categorical` fails closed and treats `auto` as
+        # both variants, which is what keeps `imbalanced_binary` on the CPU:
+        # its generator is numeric and its real dataset, bank_marketing, has
+        # ten categorical columns.
         #
         # DEVICE_PARAMETER_DIVERGENCE is checked AFTER this function returns
         # None, never before it, so a resolved-parameter divergence can never
-        # absorb this reason or reorder its two halves.
-        if engine == "mojotrees_catboost_mode":
+        # absorb this reason.
+        if engine == "mojotrees_catboost_mode" and scenarios.scenario_has_categorical(
+            spec
+        ):
             return (
-                "the CatBoost-mode arm is read against CatBoost, and "
-                "CatBoost is CPU-only in this harness, so a GPU row here has "
-                "no counterpart to be read against; separately, the arm sets "
-                "score_function=Cosine and the device split search computes "
-                "G^2/(H+lambda) only, so device_policy blocks it today "
-                "(BLOCK_SCORE_FUNCTION). The first reason outlives the second"
+                "the CatBoost-mode arm carries score_function=Cosine, "
+                "random_strength=1.0 and grow_policy=symmetrictree, and the "
+                "device refuses all three beside a categorical column: "
+                "Cosine and the L2-scored category partition would put two "
+                "functionals inside one argmax, the noise would reach only "
+                "the partition search's winner while every numerical "
+                "candidate was noised, and an oblivious level commits one "
+                "(feature, bin) split for a whole level while the device "
+                "level search evaluates ordinal thresholds only "
+                "(device_policy BLOCK_SCORE_FUNCTION, BLOCK_RANDOM_STRENGTH, "
+                "BLOCK_GROW_POLICY). This scenario can be handed a "
+                "categorical column, so the CPU is the backend that honors "
+                "the arm. On numeric scenarios this arm now RUNS on the GPU "
+                "and is published beside its own CPU cell"
             )
     return None
 
@@ -487,9 +585,103 @@ def build_matrix(args, arms=None):
                     engines_in_run,
                 )
             )
+    jobs = _mark_oracle_cells(jobs, int(getattr(args, "oracle_repeats", 1)))
+    # AFTER the oracle pass and never before it. `job_index` is the identity a
+    # record carries back, and a matrix that assigned indices and then dropped
+    # jobs would leave gaps that read as cells which failed to write a record.
     for index, job in enumerate(jobs):
         job["job_index"] = index
     return jobs
+
+
+#: THE ORACLE CELL. Written onto every job it applies to, so that the decision
+#: travels into `records.json` and into `records.csv` rather than living only in
+#: whichever tool happened to render the table.
+#:
+#: The rule and its whole justification are in `verify.py`, in the block above
+#: `verify.ORACLE_CELL_ROLE`. Not restated here, because two copies of a rule
+#: is how the two of them come to differ.
+ORACLE_CELL_NOTE = (
+    "ORACLE CELL, 2026-08-17. A subject arm on the cpu in a run that also "
+    "scheduled that arm on an accelerator. It runs, it is timed, and its "
+    "number is printed, but it is NOT part of the speed story. report.py "
+    "keeps it out of the frontier speed ranking and out of the "
+    "headline ratio, and labels it `oracle` wherever it appears. It runs "
+    "because verify.py's device_agreement and backend_proof checks both "
+    "compare an accelerator row against its own cpu twin and neither can run "
+    "without one, and it may run fewer repeats than the measured arms because "
+    "one cpu prediction per cell is all either check needs. Andrew's ruling "
+    "was that the GPU is the product, and that the CPU backend is a "
+    "correctness oracle and the portability floor rather than a competitor."
+)
+
+
+def _oracle_key(job):
+    """The cell a job belongs to, ignoring device and repeat.
+
+    `verify._oracle_cell_key` is the same key read off a RECORD, where the
+    resolved `data_kind` stands in for the `variant` this has. See its
+    docstring for why the two are the same discriminator and why the
+    `cell_role` field written here, rather than either key, is the authority.
+    """
+    return (
+        job["scenario"],
+        job["tier"],
+        job["variant"],
+        job.get("arm") or job["engine"],
+        job["threads"],
+    )
+
+
+def _mark_oracle_cells(jobs, oracle_repeats):
+    """Label the oracle cells and drop the repeats they do not need.
+
+    Two things happen here and they are separable on purpose. The LABEL is
+    unconditional. A cpu subject cell standing beside an accelerator cell of
+    the same arm is an oracle whatever the repeat count, and the label is what
+    keeps it out of the speed story downstream. The TRIM is what
+    `--oracle-repeats` controls, and at the default of 1 it is the whole
+    saving, because at the large tier the cpu subject cells were about 24
+    seconds of
+    every 40 second repeat, so three of them were most of the tier's cost
+    for a purpose that needs one.
+
+    A cpu subject cell with NO accelerator cell beside it is untouched, both
+    label and repeats. It is not an oracle, it is the only backend that ran,
+    and reducing it would reduce the measurement itself.
+
+    This is a POST-PASS over the whole matrix rather than a rule inside
+    `_cell`, and it has to be, because `_cell` builds one cell at a time and
+    the
+    question "is there an accelerator cell for this arm" is a property of the
+    matrix. A skipped accelerator cell does not count, because a skip is a cell
+    that will not run and the twin has to exist for the gates to have anything.
+    """
+    scheduled = [job for job in jobs if "skip" not in job]
+    accelerated = {
+        _oracle_key(job)
+        for job in scheduled
+        if job["device"] != "cpu" and job["engine"] in verify.SUBJECT_ENGINES
+    }
+    kept = []
+    for job in jobs:
+        if "skip" in job:
+            kept.append(job)
+            continue
+        oracle = (
+            job["device"] == "cpu"
+            and job["engine"] in verify.SUBJECT_ENGINES
+            and _oracle_key(job) in accelerated
+        )
+        if not oracle:
+            job["cell_role"] = verify.MEASURED_CELL_ROLE
+            kept.append(job)
+            continue
+        job["cell_role"] = verify.ORACLE_CELL_ROLE
+        job["cell_role_note"] = ORACLE_CELL_NOTE
+        if job["repeat"] < oracle_repeats:
+            kept.append(job)
+    return kept
 
 
 def _cell(spec, scenario_id, engine, device, args, arm, engines_in_run):
@@ -520,10 +712,20 @@ def _skip(scenario_id, engine, device, args, reason, arm=None):
         "engine": engine,
         "arm": arm["id"],
         "axis": arm["axis"],
+        "arm_block": arm["block"],
         "device": device,
         "threads": args.threads[0],
         "repeat": 0,
         "skip": reason,
+        # NO `cell_role`, on purpose, and said out loud since 2026-08-17. A
+        # skip is not a cell that ran, so it is neither `measured` nor
+        # `oracle`, and those two are the schema's whole enum for the field
+        # (`schema.json` reads a missing field as `measured`, which is what
+        # a pre-2026-08-17 record means and what a skip does not). Nothing
+        # reads the role off a skip: `_mark_oracle_cells` passes skips
+        # through untouched, and verify.is_oracle / report.role_of only ever
+        # see status-ok records. A None here is the declared shape, not a
+        # job a role-based filter dropped.
     }
 
 
@@ -645,6 +847,8 @@ def run_job(job, run_dir, run_id, timeout):
             "engine": job["engine"],
             "arm": job.get("arm") or job["engine"],
             "axis": job.get("axis"),
+            "arm_block": job.get("arm_block"),
+            "cell_role": job.get("cell_role"),
             "device_requested": job["device"],
             "threads": job["threads"],
             "repeat": job["repeat"],
@@ -682,7 +886,17 @@ CSV_COLUMNS = (
     # sorted on `engine` alone puts two arms of one engine in one block, which
     # is the collision the arm dimension exists to remove.
     "arm", "axis", "axis_value",
+    # The arm's declared block (frontier: defaults / matched / axis /
+    # competitor; None on a plain run), added 2026-08-17 so the sheet can be
+    # filtered on it the way report._frontier is.
+    "arm_block",
     "engine", "engine_version", "device_requested", "device_used",
+    # Beside the two device columns because it is a fact about the device this
+    # cell ran on. `oracle` means a cpu subject cell standing beside an
+    # accelerator cell of the same arm, so it is timed and recorded and it is
+    # not the speed story. A spreadsheet sorted on train_s has to be able to
+    # exclude it, which a caption cannot do.
+    "cell_role",
     "backend_proof", "threads",
     "histogram_builder", "repeat", "status", "primary_metric",
     "primary_value", "train_s", "train_cpu_s", "train_par_eff", "binning_s",
@@ -762,10 +976,18 @@ def _flat(record):
         "arm": record.get("arm") or record.get("engine"),
         "axis": record.get("axis"),
         "axis_value": record.get("axis_value"),
+        "arm_block": record.get("arm_block"),
         "engine": record.get("engine"),
         "engine_version": record.get("engine_version"),
         "device_requested": record.get("device_requested"),
         "device_used": record.get("device_used"),
+        # `measured` rather than an empty cell when the field is absent, so a
+        # record written before 2026-08-17 sorts with the measured rows in a
+        # spreadsheet instead of into a blank group of its own. That is the
+        # right default, because no run before that date reduced a cpu cell's
+        # repeats,
+        # so no row in one of those files is an oracle.
+        "cell_role": record.get("cell_role") or "measured",
         # Beside device_used on purpose. The first is what the Python side
         # resolved and the second is what the trainer emitted, and a reader
         # scanning the sheet should be able to see them disagree.
@@ -911,7 +1133,30 @@ def write_outputs(run_dir, run_id, records, manifest):
         handle.write("\n")
 
 
-def main(argv=None):
+def _oracle_manifest_block(jobs, oracle_repeats):
+    """What the oracle pass did, for the manifest.
+
+    `cells` is a sorted list of strings rather than a count, because a count
+    answers "how many" and the question a reader of a thin cpu column actually
+    has is "which ones", and because a list of keys survives being pasted into
+    a message where a number does not.
+    """
+    oracle_jobs = [
+        job for job in jobs if job.get("cell_role") == verify.ORACLE_CELL_ROLE
+    ]
+    return {
+        "repeats": int(oracle_repeats),
+        "cells": sorted({".".join(str(part) for part in _oracle_key(job))
+                         for job in oracle_jobs}),
+        "jobs": len(oracle_jobs),
+        "note": ORACLE_CELL_NOTE,
+    }
+
+
+def build_parser():
+    """The command line, as a function so `selfcheck.py` can read a default
+    off it rather than restate one. A default restated in a test is a default
+    that can be changed in one place and still pass."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--scenario", action="append", choices=sorted(scenarios.SCENARIOS),
@@ -938,6 +1183,20 @@ def main(argv=None):
     parser.add_argument(
         "--repeats", type=int, default=3,
         help="whole-process repeats per cell; 3 is the minimum that shows a spread",
+    )
+    parser.add_argument(
+        "--oracle-repeats", type=int, default=1,
+        help="repeats for an ORACLE cell, meaning a subject arm on the cpu in "
+             "a run that also schedules that arm on an accelerator. Default 1. "
+             "verify.py's device_agreement and backend_proof each need one cpu "
+             "prediction per cell and no more, and at the large tier the cpu "
+             "subject cells were about 24 seconds of every 40 second repeat. "
+             "What 1 gives up is verify.py's determinism check ON THE CPU "
+             "PATH, which needs two rows of a cell to compare; it says so by "
+             "name on the row rather than skipping quietly. Pass 2 when the "
+             "run is about cpu bit-identity. Does not apply to a cpu cell with "
+             "no accelerator cell beside it, which is the measurement rather "
+             "than an oracle and keeps --repeats",
     )
     parser.add_argument("--predict-repeats", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=7200, help="seconds per run")
@@ -968,7 +1227,24 @@ def main(argv=None):
         "--dry-run", action="store_true",
         help="write the matrix and the job files, run nothing",
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.oracle_repeats < 1:
+        # Refused rather than clamped. Zero oracle repeats is not a cheaper
+        # run, it is a run whose device_agreement and backend_proof checks have
+        # nothing to compare against, and both of those have each caught a real
+        # defect in this campaign. Dropping the cell is a --device decision and
+        # it is made with the reason visible, not through a repeat count.
+        raise SystemExit(
+            "--oracle-repeats must be at least 1. An oracle cell exists so "
+            "that verify.py's device_agreement and backend_proof have a cpu "
+            "twin to compare an accelerator row against, and zero of them "
+            "disarms both checks silently. To run without the cpu cell at all, "
+            "say so with --device gpu, where the missing twin is reported."
+        )
 
     args.scenario = args.scenario or sorted(scenarios.SCENARIOS)
     args.engine = args.engine or ["mojotrees", "lightgbm"]
@@ -1037,6 +1313,12 @@ def main(argv=None):
         # A records file that says "97 arms" and cannot say which plan they
         # came from is a table nobody can reproduce.
         "arms_source": arms_source,
+        # Which cells were oracles and what that means, in the file rather than
+        # only in the tool that renders it. A results directory has to be
+        # readable on its own. A reader who finds one cpu row where three gpu
+        # rows sit beside it should be able to see from here that it was a
+        # decision with a reason and not a run that died part way through.
+        "oracle": _oracle_manifest_block(jobs, args.oracle_repeats),
         "sequential": True,
         "arm_order": "round-interleaved",
         "note": (
@@ -1045,10 +1327,14 @@ def main(argv=None):
             "matrix in build order; execution is round-interleaved (all arms "
             "at repeat 0, then all arms at repeat 1, ...), so read the "
             "executed order off the records' repeat field, not off this list. "
-            "Inside a round, arms keep build order except that catboost runs "
-            "before mojotrees_catboost_mode, which cannot be built until "
-            "catboost has written its resolved learning rate into "
-            "catboost_readback.json: see run.CELL_ORDER. A job's `arm` is "
+            "Inside a round, arms keep build order except that the two peer "
+            "columns run before the two mojotrees arms that stand beside "
+            "them: catboost before mojotrees_catboost_mode, which cannot be "
+            "built until catboost has written its resolved learning rate into "
+            "catboost_readback.json, and xgboost before mojotrees_depthwise, "
+            "which mirrors XGBoost's defaults and reads better beside a peer "
+            "column that already exists. Only the first of the two is a "
+            "dependency; see run.CELL_ORDER. A job's `arm` is "
             "its identity within an engine and defaults to the engine name, "
             "so a matrix with no --arms carries arm == engine on every row "
             "and renders exactly the labels it always did."
@@ -1069,7 +1355,7 @@ def main(argv=None):
     # measurement, then every arm takes the next. Drift then lands on all arms
     # at once and shows up as spread across repeats, which is where it can be
     # read. Arm order inside a round is left fixed, matching the Mojo harness's
-    # `for rep: for arm:` at bench/bench_train_gpu.mojo:1772.
+    # `for rep: for arm:` in bench/bench_train_gpu.mojo::main.
     #
     # Ordering only; the set of jobs, their job_index, and their filenames are
     # exactly what build_matrix assigned.
@@ -1090,6 +1376,16 @@ def main(argv=None):
     skipped = [job for job in jobs if "skip" in job]
     print(f"run {run_id}: {len(runnable)} runs, {len(skipped)} skipped")
     print(comparator_banner())
+    oracle_block = manifest["oracle"]
+    if oracle_block["cells"]:
+        print(
+            f"  oracle cells: {len(oracle_block['cells'])} cpu subject cells "
+            f"at {oracle_block['repeats']} repeat(s) rather than "
+            f"{args.repeats}, standing beside an accelerator cell of the same "
+            "arm. They are timed and recorded and they are not the speed "
+            "story; verify.py's device_agreement and backend_proof need them. "
+            "See manifest.json's `oracle` block."
+        )
     for job in skipped:
         print(f"  skip {label(job)}: {job['skip']}")
 
@@ -1114,6 +1410,8 @@ def main(argv=None):
                 "engine": job["engine"],
                 "arm": job.get("arm") or job["engine"],
                 "axis": job.get("axis"),
+                "arm_block": job.get("arm_block"),
+                "cell_role": job.get("cell_role"),
                 "device_requested": job["device"],
                 "threads": job["threads"],
                 "repeat": job["repeat"],
@@ -1146,6 +1444,9 @@ def main(argv=None):
                 "scenario": job["scenario"], "engine": job["engine"],
                 "arm": job.get("arm") or job["engine"],
                 "axis": job.get("axis"),
+                # A skip job carries the arm's block since 2026-08-17 (see
+                # `_skip`), so a skipped competitor row says it is one.
+                "arm_block": job.get("arm_block"),
                 "device_requested": job["device"], "threads": job["threads"],
                 "repeat": 0, "skip_reason": job["skip"],
             }

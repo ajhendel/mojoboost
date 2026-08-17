@@ -1415,6 +1415,18 @@ def _env_layout_probe() -> Bool:
     its own terms. Behind a named switch it is reachable, it is measurable by
     anyone who wants to re-ask the question on a different machine or a
     different shape, and it cannot change what a fit does unless asked.
+
+    **Which growers it reaches, corrected 2026-08-17.** All three CPU growth
+    policies. `GrowScratch.resolve_layout_timed` is offered from
+    `grow_tree_leaves_profiled`'s per-split block, which serves leaf-wise and
+    depth-wise, and from `_grow_oblivious_levels`'s matching block, which was
+    added on that date. **Before it, a symmetric fit could not run the
+    probe.** The oblivious grower returns before the leaf-wise loop, so
+    `layout_pending` never cleared, `choose_bin_layout_timed` was never
+    called, and `bin_layout` stayed at the placeholder for the whole fit. The
+    consequence was not a wrong model, because the placeholder is the layout
+    that shipped, but an A/B that set this variable on a symmetric fit
+    compared the shipped layout with itself.
     """
     var s = getenv("MOJOTREES_CPU_BIN_LAYOUT_PROBE")
     if s.byte_length() == 0:
@@ -1484,6 +1496,32 @@ def _env_layout_by_node() -> Bool:
     It degrades to the fit's layout when the matrix has no row-major view,
     because `build_histogram_subset_by_layout_into_scratch` resolves the
     request against `data.has_row_major()` and reports what it ran.
+
+    **Which growers it reaches, and a correction dated 2026-08-17.** All
+    three CPU growth policies now. Leaf-wise and depth-wise reach it through
+    `grow_tree_leaves_profiled`'s per-split `built_layout`, and symmetric
+    through the matching line in `_grow_oblivious_levels`. **It did not reach
+    the symmetric grower before 2026-08-17.** That grower passed
+    `scratch.bin_layout` straight to both of its `_hist_subset` calls and
+    never called `_node_bin_layout`, so setting the variable selected an arm
+    the fit never ran, and the only per-node call a symmetric fit reached was
+    the bagged root, where the node is the whole sample and the small-node
+    rule cannot fire.
+
+    **Any symmetric measurement of this switch taken before that date is a
+    null by construction and is not evidence about per-node layout.** One
+    such reading exists, an Apple M4 symmetric run at 800,000 x 100 recorded
+    as "neutral", and neutral is what a switch that does not reach the code
+    always measures. The table above is a leaf-wise measurement and is not
+    affected. Nothing here has been re-measured on the symmetric grower since
+    the wiring; the honest state is UNMEASURED there, not neutral.
+
+    The table's own reasoning says why the symmetric grower was never
+    expected to be exempt. A level's leaves are the same scattered row
+    subsets a leaf-wise frontier holds, at the same sizes, and the two
+    classes the rule fires on are the classes a depth-6 tree spends its last
+    two levels in. What is genuinely different about a symmetric tree is
+    which SPLIT each level takes, and this switch decides no split.
     """
     var s = getenv("MOJOTREES_CPU_LAYOUT_BY_NODE")
     if s.byte_length() == 0:
@@ -2012,6 +2050,22 @@ def _hist_full(
     one the subset builder has relied on since the grower started holding
     this list across nodes; the histogram that comes out is the one the
     allocating form produced, cell for cell.
+
+    **This builder takes no `layout` argument and always reads the
+    feature-major matrix**, on every growth policy, which is worth stating
+    where a reader will find it rather than leaving it to be inferred from a
+    missing parameter. `histogram` has no whole-dataset row-major builder to
+    call, because the only by-layout entry is
+    `build_histogram_subset_by_layout_into_scratch`. So
+    `MOJOTREES_CPU_BIN_LAYOUT=row` and `MOJOTREES_CPU_LAYOUT_BY_NODE=1` reach
+    every node of a fit EXCEPT the root of a tree grown without bagging,
+    which is this call. That is one build per tree against the thousands
+    `_hist_subset` makes, and it is the one node where the question is least
+    interesting, because the root walks the identity row list and both
+    layouts read it sequentially. `GrowScratch.resolve_layout_timed` declines
+    the root for the same reason in its own words. It is a scope, not a
+    defect, and the cells are identical either way. It is recorded here so
+    that a layout A/B is not read as covering a build it does not reach.
     """
     if not bundled.active:
         build_histogram_into_scratch(
@@ -2131,6 +2185,29 @@ def _check_oblivious(params: TreeParams, data: BinnedMatrix) raises:
       read the ensemble ledger are charged per node. Both are refused by
       `find_best_split_shared` too; asked here so the message arrives before
       any work.
+
+    One parameter is REDEFINED rather than refused, which is the exception to
+    the rule above and is written here because a reader auditing this list
+    will otherwise assume the list is complete
+    ------------------------------------------------------------------------
+    **`feature_fraction_bynode` draws once per LEVEL under this policy, not
+    once per node.** `_grow_oblivious_levels` calls `select_split_features`
+    with the level's depth and the level's lowest node id, so every leaf of a
+    level is offered the same candidate set. There is no alternative that
+    keeps the mode's invariant, because the leaves of a level must agree on
+    one split, and they cannot agree on a candidate that some of them were
+    never offered.
+
+    It is redefined rather than refused because refusing it would make
+    `feature_fraction_bynode < 1` and `grow_policy=oblivious` mutually
+    exclusive for no gain, and because the level draw is the faithful
+    translation of "resample the candidates at each decision" into a mode
+    whose decision is a level. What a caller must not do is compare a
+    `bynode` fraction across policies and read the difference as a modeling
+    result. At depth 6 the leaf-wise fit takes 63 draws per tree and the
+    symmetric fit takes 6. `feature_fraction_bylevel` needs no such note,
+    since a level is already its unit, and `feature_fraction` is per tree on
+    every policy.
     """
     if params.max_depth <= 0:
         raise Error(
@@ -2281,6 +2358,16 @@ def _grow_oblivious_levels(
     var trace = ObliviousTrace.resolve()
     var max_delta_step = params.extra.max_delta_step
     var path_smooth = params.extra.path_smooth
+    # Active feature count for the per-node layout rule, the same expression
+    # and the same hoisting argument `grow_tree_leaves_profiled` uses for its
+    # own `tree_active`: it is the number `_plan_accumulation` derives a block
+    # count from, and it is constant across every node of one tree because the
+    # tree's draw does not change as the frontier grows. It is `tree_columns`
+    # and not `level_features` on purpose. The level draw narrows what the
+    # shared SEARCH scans; every build below accumulates the tree's columns.
+    var tree_active = (
+        len(tree_columns) if len(tree_columns) > 0 else data.n_features
+    )
     var n_leaves = len(frontier)
     var level_depth = 0
     if len(frontier) != 1:
@@ -2480,6 +2567,62 @@ def _grow_oblivious_levels(
             var derived_rows = (
                 len(right_rows) if builds_left else len(left_rows)
             )
+            # The layout probe, offered once per fit on the first child this
+            # grower builds directly, exactly as the leaf-wise loop offers it.
+            # It was missing here, which made `MOJOTREES_CPU_BIN_LAYOUT_PROBE`
+            # unreachable under `grow_policy=oblivious`. `layout_pending`
+            # never cleared, `choose_bin_layout_timed` never ran, and a
+            # symmetric fit that exported the variable measured the shipped
+            # layout twice.
+            #
+            # `built_rows > 0` is a guard the leaf-wise site now carries too. A
+            # decline CLEARS `layout_pending`, so an empty first child would
+            # otherwise consume the fit's one offer and answer nothing. Empty
+            # children are ordinary here rather than rare, because a
+            # level's shared split may send every row of some leaf one way,
+            # which this mode's own docstring states as a property and not a
+            # bug.
+            #
+            # Deliberately outside every `profile.clock()` window below, and
+            # not offered on the bundled arm, for the two reasons the
+            # leaf-wise site gives. A once-per-fit cost inside a per-node
+            # rate is a misattribution, and `efb` never builds a row-major
+            # view on `bundling.data`, so both arms of the probe would be one
+            # arm.
+            if not bundling.active and built_rows > 0:
+                if builds_left:
+                    scratch.resolve_layout_timed(
+                        data, grad, hess, left_rows, 0, built_rows,
+                        tree_features, const_hessian, const_h_env,
+                    )
+                else:
+                    scratch.resolve_layout_timed(
+                        data, grad, hess, right_rows, 0, built_rows,
+                        tree_features, const_hessian, const_h_env,
+                    )
+            # The layout this child reads its bin ids from. One call for both
+            # branches, because the argument is the BUILT child's row count and
+            # `built_rows` already is that whichever side won; the derived
+            # sibling reads no bin ids at all. Off by default, where it returns
+            # `scratch.bin_layout` and this is one Bool test per leaf of the
+            # level. See `_node_bin_layout`.
+            #
+            # This line is the fix for a switch that was dead on exactly this
+            # grower. Both `_hist_subset` calls below passed the fit-level
+            # `scratch.bin_layout` straight through, so the switch
+            # `MOJOTREES_CPU_LAYOUT_BY_NODE` selected an
+            # arm a symmetric fit never took. The per-node question is not
+            # meaningless for a symmetric tree: a level's leaves are the same
+            # scattered row subsets a leaf-wise frontier holds, and the two
+            # small classes the rule fires on are the classes a depth-6 tree
+            # spends its last levels in.
+            var built_layout = _node_bin_layout(
+                scratch.bin_layout,
+                scratch.layout_by_node,
+                data.n_bins,
+                tree_active,
+                built_rows,
+            )
             var alloc_started = profile.clock()
             var left_hist = scratch.pool.take()
             var right_hist = scratch.pool.take()
@@ -2503,7 +2646,7 @@ def _grow_oblivious_levels(
                         left_hist, bundle_scratch, scratch.pairs, data,
                         bundling, grad, hess, left_rows, 0, len(left_rows),
                         tree_features, tree_columns, const_hessian,
-                        scratch.settings, const_h_env, scratch.bin_layout,
+                        scratch.settings, const_h_env, built_layout,
                     )
                     profile.note_node()
                     profile.charge(
@@ -2534,7 +2677,7 @@ def _grow_oblivious_levels(
                     right_hist, bundle_scratch, scratch.pairs, data, bundling,
                     grad, hess, right_rows, 0, len(right_rows), tree_features,
                     tree_columns, const_hessian, scratch.settings, const_h_env,
-                    scratch.bin_layout,
+                    built_layout,
                 )
                 profile.note_node()
                 profile.charge(
@@ -3161,7 +3304,18 @@ def grow_tree_leaves_profiled(
     # leaves has 2L - 1 nodes, so this is an exact upper bound on what
     # `_add_node` will append. One reservation per tree in place of ten
     # independent doubling sequences; see `Tree.reserve_nodes`.
-    tree.reserve_nodes(2 * params.num_leaves - 1)
+    # Under oblivious growth `num_leaves` does not bind, so `2L - 1` UNDER
+    # reserves: a symmetric tree of depth `d` has `2^(d+1) - 1` nodes, which is
+    # 127 at depth 6 against the 61 this expression gives at the default 31, and
+    # 131071 at the maximum depth of 16. Corrected 2026-08-17, in the sweep that
+    # followed two GPU allocations sized the same wrong way. Performance only
+    # here, not a bug: `reserve_nodes` is a `List.reserve`, so the old value
+    # bought fewer doublings than intended rather than overflowing anything,
+    # which is exactly why nothing caught it. The two device sites raised.
+    var reserve = 2 * params.num_leaves - 1
+    if params.grow_policy == GROW_OBLIVIOUS:
+        reserve = (1 << (params.max_depth + 1)) - 1
+    tree.reserve_nodes(reserve)
 
     # The tree's own root row count is the denominator every node size class
     # in this tree is taken against (phase_profile.mojo). Under bagging or
@@ -3577,7 +3731,13 @@ def grow_tree_leaves_profiled(
         # position materializes a `List[Int]` of the child's rows, which at a
         # large node is hundreds of thousands of elements copied to choose
         # between two names.
-        if not bundling.active:
+        # `built_rows > 0` is the one addition since this block was written,
+        # and it is the same guard `_grow_oblivious_levels` carries. A decline
+        # clears `layout_pending`, so an empty built child would consume the
+        # fit's single offer and settle nothing. It cannot change a default
+        # fit, which never enters this block at all, and under the probe it
+        # only moves the offer to the next child that has rows to time.
+        if not bundling.active and built_rows > 0:
             if builds_left:
                 scratch.resolve_layout_timed(
                     data, grad, hess, left_rows, 0, built_rows,

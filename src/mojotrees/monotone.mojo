@@ -77,6 +77,64 @@ guaranteed monotone: a class's probability also depends on the other
 classes' raw scores, which move at their own rate. Constrain a multiclass
 model when the raw score is what carries the meaning, and do not read the
 probabilities as monotone.
+
+Reach, which is the part of the promise above that a reader cannot check here
+----------------------------------------------------------------------------
+Everything above is a property of one grower honoring the sign vector. The
+guarantee is only worth what the REACH is, so the reach is recorded here
+rather than left to be reconstructed from six files. Added 2026-08-17 by the
+constraint-reach sweep; `docs/design/CONSTRAINT_REACH.md` carries the same
+table for the rest of the constraint family and the citation per cell.
+
+Every path either HONORS the vector or REFUSES it by name. **No path accepts
+a constraint and drops it**, which is the property this section exists to
+assert rather than imply, and it was checked by reading each consuming site.
+
+Honored:
+
+- `tree.grow_tree`, leaf-wise and depth-wise. `grow_tree` resolves
+  `active_signs()` once per tree and threads it through `_search` and the
+  child-value clamp.
+- `tree._grow_oblivious_levels`, the symmetric CPU grower. The level search
+  takes the vector and one output interval per leaf of the level.
+- `tree_sparse.grow_tree_sparse`, leaf-wise and depth-wise.
+- `train_gpu`'s host-scan grower, all policies it serves. Selection runs on a
+  downloaded histogram through the same `_search`.
+- `train_gpu._device_search_resident` and `_device_search_incremental`, the
+  device-search loops, leaf-wise and depth-wise. Candidate rejection happens
+  inside the scan kernel from `GpuSplitSearcher.mono_dev`, and the
+  child-value clamp with the midpoint collapse stays on the host in
+  `_commit_device_split`, so the interval chain is Float64 on both backends.
+- `train_gpu_sparse.grow_tree_gpu_sparse`.
+
+Refused by name, with the CPU grower named in the message:
+
+- `gpu_tree_tables.tree_resident_supported`, the device-owned leaf-wise
+  plane, returns `TREE_RESIDENT_MONOTONE` and the caller falls back to
+  `_device_search_resident`, which honors it. A fallback and not a failure.
+- `gpu_resident_round.oblivious_device_supported` returns
+  `OBLIVIOUS_TABLES`, and the symmetric GPU route raises, because that
+  backend has no second symmetric grower to fall back to.
+- `linear_tree.check_monotone_compatible`. An affine leaf has no constant
+  output to clamp.
+- `distributed`'s growers.
+- The parameter-string surface lists `monotone_constraints` in
+  `params._MOJO_API_ONLY`, so a string cannot set it and is told why.
+
+`monotone_constraints_method` other than `basic` is refused by
+`ExtraTreeParams.check_scalars`, so the method field cannot select an
+unimplemented rule.
+
+One asymmetry that is NOT a silent drop but is a real divergence. A
+constrained CATEGORICAL feature is refused on both backends and at different
+scopes. `GpuSplitSearcher.set_monotone` refuses it once per tree over every
+declared feature; `split.find_best_split` refuses it inside the scan, over
+the features that node was actually offered. So a constrained categorical
+column that per-node feature sampling happens not to draw trains on the CPU
+and raises on the GPU, and on the CPU the raise depends on a draw. Both fail
+loudly, neither returns a wrong model, and the CPU side is the one worth
+moving, because the check belongs once per fit, beside `check_features`,
+rather than once per node.
 """
 
 comptime MONOTONE_FREE = 0

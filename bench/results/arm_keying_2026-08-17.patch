@@ -1,0 +1,726 @@
+--- a/bench/real_data/engines.py
++++ b/bench/real_data/engines.py
+@@ -1636,13 +1636,19 @@
+     this arm. The general reason: the harness's unit of comparison is an
+     engine name, it is what `verify.py` pairs on and what a CSV row carries,
+     so two differently shaped models must not share a column. The specific
+-    one: `verify.check_device_agreement` keys on `(scenario, threads,
+-    engine)` and NOT on `arm`, so two arms of one engine on one scenario
+-    overwrite each other in its inner dict and it would compare one arm's gpu
+-    predictions against a different arm's cpu predictions. An `--arms` cell
+-    would therefore have been wired into the very check this arm exists to
+-    feed, and wired wrong. That is recorded here because it is the reason a
+-    frontier-style arm was not used and it is not obvious from either file.
++    one, AS IT STOOD when this arm was written: `verify.check_device_agreement`
++    keyed on `(scenario, threads, engine)` and NOT on `arm`, so two arms of
++    one engine on one scenario overwrote each other in its inner dict and it
++    would compare one arm's gpu predictions against a different arm's cpu
++    predictions. An `--arms` cell would therefore have been wired into the
++    very check this arm exists to feed, and wired wrong. That is recorded here
++    because it is the reason a frontier-style arm was not used and it is not
++    obvious from either file. LATER ON 2026-08-17 that check, and every other
++    per-cell key in verify.py, report.py and summarize.py, moved to the arm
++    (`verify._arm_of`), so an `--arms` cell now feeds it correctly too. The
++    separate engine name stays, for the general reason above and because the
++    engine name is still what thresholds.json, `ENGINE_ARM` and
++    `SUBJECT_ENGINES` are keyed by.
+ 
+     **`subject_variant`, so it stays inside `verify.SUBJECT_ENGINES`**, which
+     is what gets it the backend proof and the cpu-versus-gpu agreement check
+--- a/bench/real_data/report.py
++++ b/bench/real_data/report.py
+@@ -99,9 +99,19 @@
+ 
+ 
+ def cell_key(record):
++    """The cell a record belongs to: scenario, ARM, device, threads.
++
++    The second field was the engine name until 2026-08-17, and on an
++    `--arms` run that folded every arm of one engine into a single table
++    row: forty frontier cells at different tree counts and bin counts
++    rendered as one `mojotrees` row with `reps 40` and a median taken
++    ACROSS ARMS, which is not a measurement of anything. `verify._arm_of`
++    is the engine name on a run without `--arms`, so that shape of report
++    renders exactly what it always did.
++    """
+     return (
+         record["scenario"],
+-        record["engine"],
++        verify._arm_of(record),
+         record.get("device_used") or record.get("device_requested"),
+         record["threads"],
+     )
+@@ -201,6 +211,7 @@
+         first = group[0]
+         out[key] = {
+             "records": group,
++            "engine": first["engine"],
+             "repeats": len(group),
+             "summary": summary,
+             "role": role_of(first, accelerator_keys),
+@@ -262,13 +273,19 @@
+             # different kind of thing depending on whether an accelerator row
+             # sits beside it, and a reader scanning the two timing columns has
+             # to meet that word before the numbers rather than after them.
+-            out("\n| engine | device | role | threads | reps | " + " | ".join(
++            # The `arm` column appears only when a row's arm is not simply
++            # its engine name, which is every `--arms` run and no other, so a
++            # plain run's table is byte-for-byte what it was before the cell
++            # key grew the arm dimension.
++            show_arm = any(key[1] != cell["engine"] for key, cell in rows.items())
++            out("\n| engine | " + ("arm | " if show_arm else "")
++                + "device | role | threads | reps | " + " | ".join(
+                 label for _, label, _ in FIELDS
+             ) + " | peak rss | model | metric |")
+-            out("| --- " * (8 + len(FIELDS)) + "|")
++            out("| --- " * (8 + int(show_arm) + len(FIELDS)) + "|")
+             for key in sorted(rows):
+                 cell = rows[key]
+-                _, engine, device, threads = key
++                _, arm, device, threads = key
+                 values = " | ".join(
+                     fmt_time(cell["summary"][name], warn_spread) for name, _, _ in FIELDS
+                 )
+@@ -276,7 +293,8 @@
+                 peak = cell["summary"]["peak_rss"]
+                 shown = "n/a" if metric is None else f"{metric:.6g}"
+                 out(
+-                    f"| {engine} | {device} | {cell['role']} | {threads} | "
++                    f"| {cell['engine']} | " + (f"{arm} | " if show_arm else "")
++                    + f"{device} | {cell['role']} | {threads} | "
+                     f"{cell['repeats']} | "
+                     f"{values} | {fmt_bytes(peak['median'] if peak else None)} | "
+                     f"{fmt_bytes(cell['model_bytes'])} | {shown} |"
+@@ -506,13 +524,21 @@
+     like-for-like, and the label says so instead of claiming an accelerator
+     that did not run.
+     """
++    # Matched on the two PLAIN arms, `mojotrees` and `lightgbm`, which is
++    # what `cell_key`'s arm field yields on every run without `--arms`. On an
++    # `--arms` run the frontier arms carry their own ids and never match
++    # these two names, so this table does not render for them; the frontier
++    # section below ranks those at a matched tree count, which is the only
++    # ranking they can honestly appear in. Until 2026-08-17 the key here was
++    # the engine and, on such a run, `comparator[threads]` was whichever
++    # lightgbm arm was written last.
+     comparator = {}
+-    for (scenario, engine, device, threads), cell in rows.items():
+-        if engine == "lightgbm" and device == "cpu":
++    for (scenario, arm, device, threads), cell in rows.items():
++        if arm == "lightgbm" and device == "cpu":
+             comparator[threads] = cell
+     pairs = []
+-    for (scenario, engine, device, threads), cell in rows.items():
+-        if engine != "mojotrees":
++    for (scenario, arm, device, threads), cell in rows.items():
++        if arm != "mojotrees":
+             continue
+         other = comparator.get(threads)
+         if other:
+@@ -929,14 +955,22 @@
+             # row that declared itself "Base A" was rendered "arm" here, and
+             # the block column of a sweep table said nothing. The old name is
+             # kept first so that a record which does carry it still wins.
+-            block = first.get("frontier_block") or first.get("arm_block") or (
+-                "competitor"
+-                if arm in ("catboost", "lightgbm", "xgboost")
+-                else "arm"
++            #
++            # Whether a row is a competitor is a property of its ENGINE and is
++            # read from the engine, since 2026-08-17. Until then it was read
++            # from the ARM id against three literal names, which is the
++            # opposite of the keying mistake fixed in verify.py the same day
++            # and just as wrong: on an `--arms` run a lightgbm arm is named
++            # `frontier.<row>.lightgbm.cpu.trees.100`, matches none of the
++            # three, and only escaped being ranked as one of OUR arms because
++            # `frontier.py` also happens to write `arm_block: competitor`.
++            # `verify.SUBJECT_ENGINES` is every engine that is ours, so its
++            # complement is every competitor, under any arm id.
++            competitor_engine = first.get("engine") not in verify.SUBJECT_ENGINES
++            block = first.get("frontier_block") or first.get("arm_block") or (
++                "competitor" if competitor_engine else "arm"
+             )
+-            is_competitor = block == "competitor" or arm in (
+-                "catboost", "lightgbm", "xgboost"
+-            )
++            is_competitor = block == "competitor" or competitor_engine
+             if peer_check is not None and peer_check["status"] == verify.SKIP:
+                 unjudged.append((arm, "peer", peer_check["detail"]))
+             if anchor_check is not None and anchor_check["status"] == verify.SKIP:
+--- a/bench/real_data/selfcheck.py
++++ b/bench/real_data/selfcheck.py
+@@ -2588,9 +2588,176 @@
+         ),
+         "a peer scoreboard line came back as PASS. Reporting green for one arm "
+         "and yellow for another is a gate wearing a different word",
++    )
++
++
++def check_arm_keying():
++    """Every per-cell key in the readers is the ARM, and every role test is
++    the ENGINE. Added 2026-08-17 after three instances in one day of the same
++    mistake: a check that looked green because it compared the wrong things.
++
++    An `--arms` run takes its cells from a module rather than from the engine
++    cross product, so one engine name covers dozens of arms at different tree
++    counts and bin counts, and every arm id differs from its engine name. That
++    is the shape under which the two directions of the mistake show:
++
++    - a CELL key on the engine folds all those arms into one cell. It made
++      `check_device_agreement` compare whichever cpu arm and whichever gpu arm
++      were written last and report green; it would have made `check_baseline`
++      check one arm of forty; `check_determinism` pool forty digests into one
++      cell; `check_backend_proof` look for a gpu row's twin among every arm's
++      cpu digest; and `report.build_cells` print one row with `reps 40`.
++    - a ROLE test on the arm id matches nothing. `check_accuracy_peer` tested
++      `engines_judged` and `competitors`, both lists of ENGINE names, against
++      the arm id, so on an `--arms` run it built no bar and judged no arm,
++      with no line saying so; `report._frontier` decided "competitor" from
++      three literal arm names.
++
++    The fixture below is that shape, in miniature: two mojotrees arms with a
++    cpu twin and a gpu row each, two lightgbm arms, no plain arm anywhere. It
++    runs no engine; the records are dicts.
++    """
++    import verify
++    import report
++    import summarize
++
++    def row(arm, engine, device, trees, rmse, sha, repeat=0):
++        return {
++            "status": "ok", "scenario": "dense_regression", "tier": "standard",
++            "engine": engine, "arm": arm, "threads": 4, "repeat": repeat,
++            "device_used": device, "device_requested": device,
++            "cell_role": (
++                "oracle" if device == "cpu" and engine == "mojotrees"
++                else "measured"
++            ),
++            "primary_metric": "rmse", "quality": {"rmse": rmse},
++            "baseline_quality": {"rmse": 1.0},
++            "params": {"num_boost_round": trees}, "predictions_sha256": sha,
++            "data": {"data_kind": "synthetic", "dataset": "generated:x",
++                     "train": {"digest": "d1"}, "test": {"digest": "d2"}},
++            "phases": {"train": {"elapsed_s": 1.0 + trees / 100}},
++            "environment": {"cpu": {"arch": "arm64", "model": "Test"}},
++            "backend_proof": None,
++        }
++
++    small, big = "F.r.mojotrees.trees.25", "F.r.mojotrees.trees.200"
++    records = [
++        row(small, "mojotrees", "cpu", 25, 0.50, "same-small"),
++        row(small, "mojotrees", "gpu", 25, 0.50, "same-small"),
++        row(big, "mojotrees", "cpu", 200, 0.30, "big-cpu"),
++        row(big, "mojotrees", "gpu", 200, 0.31, "big-gpu"),
++        row(big, "mojotrees", "gpu", 200, 0.31, "big-gpu", repeat=1),
++        row("F.r.lightgbm.trees.25", "lightgbm", "cpu", 25, 0.52, "l25"),
++        row("F.r.lightgbm.trees.200", "lightgbm", "cpu", 200, 0.29, "l200"),
++    ]
++    config = json.load(open(os.path.join(HERE, "thresholds.json")))
++    verdict = verify.Verdict()
++    verify.check_determinism(records, config, verdict)
++    verify.check_backend_proof(records, config, verdict)
++    verify.check_baseline(records, config, verdict)
++    verify.check_accuracy_peer(records, config, verdict)
++    verify.check_device_agreement(records, config, verdict, os.devnull)
++
++    def scopes(name):
++        return {c["scope"] for c in verdict.checks if c["check"] == name}
++
++    check(
++        {f"dense_regression/{small}/t4/rmse", f"dense_regression/{big}/t4/rmse"}
++        <= scopes("device_agreement"),
++        "check_device_agreement did not emit one metric verdict PER ARM on an "
++        "--arms-shaped run. It is keyed on the arm because an engine key "
++        f"folds every arm into one cell: {sorted(scopes('device_agreement'))}",
++    )
++    check(
++        any(
++            c["check"] == "device_agreement" and c["status"] == verify.FAIL
++            and big in c["scope"]
++            for c in verdict.checks
++        ) and not any(
++            c["check"] == "device_agreement" and c["status"] == verify.FAIL
++            and small in c["scope"]
++            for c in verdict.checks
++        ),
++        "device_agreement paired the wrong arms: the 200-tree arm disagrees "
++        "across devices and the 25-tree arm agrees, and the verdict must say "
++        "exactly that, per arm",
+     )
++    check(
++        f"dense_regression/{big}/gpu/t4" in scopes("determinism")
++        and any(
++            c["check"] == "determinism" and c["status"] == verify.PASS
++            and big in c["scope"]
++            for c in verdict.checks
++        ),
++        "check_determinism did not group repeats by ARM. Two arms of one "
++        "engine pooled into one cell have different digests by construction "
++        "and would fail a deterministic trainer for having been asked two "
++        "questions",
++    )
++    proof = {c["scope"]: c for c in verdict.checks if c["check"] == "backend_proof"}
++    check(
++        proof.get(f"dense_regression/{small}/gpu/t4", {}).get("status") == verify.FAIL
++        and proof.get(f"dense_regression/{big}/gpu/t4", {}).get("status") == verify.WARN,
++        "check_backend_proof did not look up each gpu row's cpu twin BY ARM. "
++        "The 25-tree arm's gpu digest equals its own cpu twin with no proof "
++        "(A, B and C: FAIL); the 200-tree arm's does not (WARN). Any other "
++        f"answer means the twins were pooled: {sorted(proof)}",
++    )
++    baseline = scopes("baseline")
++    check(
++        len(baseline) == 6,
++        "check_baseline did not check every arm. Keyed on the engine it kept "
++        "the FIRST record per engine and device and left the rest unchecked "
++        f"with no line: {sorted(baseline)}",
++    )
++    peer = [c for c in verdict.checks if c["check"] == "accuracy_peer"]
++    check(
++        len(peer) == 4 and all(c["status"] == verify.NOTE for c in peer),
++        "check_accuracy_peer judged nothing on an --arms-shaped run. "
++        "`engines_judged` and `competitors` are ENGINE names and must be "
++        "tested against record['engine'], not the arm id, or no arm is ever "
++        f"judged and no bar is ever built: {[(c['status'], c['scope']) for c in peer]}",
++    )
++    check(
++        all("F.r.lightgbm.trees" in c["detail"] for c in peer),
++        "the peer scoreboard did not find the lightgbm arm as the bar at the "
++        "matched tree count",
++    )
+ 
++    cells = report.build_cells(records, 0.2)
++    check(
++        len(cells) == 6 and cells[("dense_regression", big, "gpu", 4)]["repeats"] == 2,
++        "report.build_cells did not produce one cell PER ARM. An engine key "
++        f"prints one row with the arms as its repeats: {sorted(cells)}",
++    )
++    lines = []
++    report._frontier(records, config, lines.append)
++    check(
++        any("F.r.lightgbm.trees.200 | competitor" in line for line in lines)
++        and not any("F.r.mojotrees" in line and "| competitor |" in line for line in lines),
++        "report._frontier decided competitor status from the arm id rather "
++        "than the engine. A lightgbm arm under a frontier id is still a "
++        "competitor and a mojotrees arm never is",
++    )
++    agreement = summarize.build_device_agreement(records, "mojotrees")
++    check(
++        {entry["arm"] for entry in agreement} == {small, big},
++        "summarize.build_device_agreement did not pair BY ARM: "
++        f"{[(e['arm'], e['device']) for e in agreement]}",
++    )
++    peers_too = records + [row("catboost", "catboost", "cpu", 100, 0.3, "cb")]
++    try:
++        named = summarize.project_engine_name(peers_too)
++    except ValueError as exc:  # pragma: no cover - the failure being guarded
++        named = exc
++    check(
++        named == "mojotrees",
++        "summarize.project_engine_name refused or misnamed a run that carries "
++        "a peer engine. Peers and subject variants are ordinary rows of one "
++        f"run and the subject set is verify.SUBJECT_ENGINES: {named!r}",
++    )
+ 
++
+ def main():
+     check_compiles()
+     documents = check_json()
+@@ -2607,6 +2774,7 @@
+         check_correctness_arms()
+         check_oracle_cells()
+         check_accuracy_axes()
++        check_arm_keying()
+         check_outputs()
+ 
+     if FAILURES:
+--- a/bench/real_data/summarize.py
++++ b/bench/real_data/summarize.py
+@@ -174,34 +174,51 @@
+     return {"state": state, "reason": reason, "counts": counts}
+ 
+ 
++#: Every name this project's engine has run under, so that a summary of a
++#: pre-rename run still finds its subject. `verify.SUBJECT_ENGINES` is the
++#: authority for the current names.
++_SUBJECT_NAMES = tuple(verify.SUBJECT_ENGINES) + FORMER_PROJECT_ENGINE_NAMES
++
++
+ def project_engine_name(records):
+-    """The name this project's engine went by in these records.
++    """The name this project's headline engine went by in these records.
+ 
+-    Returns None when no such record is present. Raises when two different
+-    non-LightGBM engine names appear, which would mean two libraries were
+-    measured under one run id and no comparison in the file means anything.
++    Returns None when no subject record is present. Until 2026-08-17 this
++    raised when more than one non-LightGBM engine name appeared, on the
++    theory that a second name meant a second library. It no longer does,
++    because the harness has since grown peer engines (catboost, xgboost) and
++    subject variants (`mojotrees_depthwise`, `mojotrees_catboost_mode`) as
++    ordinary rows of one run, and the summarizer refused every such run
++    outright. The subject set is `verify.SUBJECT_ENGINES` and this returns
++    the plain `mojotrees` name when it ran, else the first subject name
++    present, so a run of only variants still names its subject.
+     """
+     names = {
+         record.get("engine")
+         for record in records
+-        if record.get("engine") and record.get("engine") != REFERENCE_ENGINE
++        if record.get("engine") in _SUBJECT_NAMES
+     }
+     if not names:
+         return None
+-    if len(names) > 1:
+-        raise ValueError(
+-            f"records name more than one non-{REFERENCE_ENGINE} engine: "
+-            f"{sorted(names)}"
+-        )
+-    return names.pop()
++    for preferred in (PROJECT_ENGINE,) + FORMER_PROJECT_ENGINE_NAMES:
++        if preferred in names:
++            return preferred
++    return sorted(names)[0]
+ 
+ 
+ def _cell_key(record):
+     """The same key report.py and verify.py group by, so a cell in the
+-    summary is the same cell they talk about."""
++    summary is the same cell they talk about.
++
++    The second field is the ARM and not the engine, since 2026-08-17, for the
++    same reason those two files changed on that date: on an `--arms` run one
++    engine name is dozens of arms and an engine key folded them into one
++    cell whose "repeats" were different configurations. On a run without
++    `--arms` the arm is the engine name and nothing about the output moves.
++    """
+     return (
+         record["scenario"],
+-        record["engine"],
++        verify._arm_of(record),
+         record.get("device_used") or record.get("device_requested"),
+         record["threads"],
+     )
+@@ -417,14 +434,18 @@
+     for key in sorted(groups):
+         group = sorted(groups[key], key=lambda r: r.get("repeat") or 0)
+         first = group[0]
+-        scenario, engine, device, threads = key
++        scenario, arm, device, threads = key
+         cells.append(
+             {
+                 "scenario": scenario,
+                 "scenario_title": first.get("scenario_title"),
+                 "task": first.get("task"),
+                 "tier": first.get("tier"),
+-                "engine": engine,
++                "engine": first.get("engine"),
++                # Equal to `engine` on a run without `--arms`; the arm id on
++                # one with it. This is what makes two cells of one engine two
++                # cells here rather than one cell with many "repeats".
++                "arm": arm,
+                 "engine_version": first.get("engine_version"),
+                 "device_requested": first.get("device_requested"),
+                 # A label the Python side resolved, not evidence. The
+@@ -534,14 +555,17 @@
+     cells = {}
+     for record in ok_records:
+         device = record.get("device_used") or record.get("device_requested")
++        # By ARM, as `verify.check_differential` is: this pairs the two PLAIN
++        # cells, and under an engine key an `--arms` run handed `mine[0]`
++        # whichever mojotrees arm was recorded first.
+         cells.setdefault((record["scenario"], record["threads"]), {}).setdefault(
+-            (record["engine"], device), []
++            (verify._arm_of(record), device), []
+         ).append(record)
+ 
+     out = []
+-    for (scenario, threads), by_engine in sorted(cells.items()):
+-        mine = by_engine.get((project_engine, "cpu"))
+-        theirs = by_engine.get((REFERENCE_ENGINE, "cpu"))
++    for (scenario, threads), by_arm in sorted(cells.items()):
++        mine = by_arm.get((project_engine, "cpu"))
++        theirs = by_arm.get((REFERENCE_ENGINE, "cpu"))
+         if not mine or not theirs:
+             continue
+         a, b = mine[0], theirs[0]
+@@ -637,15 +661,22 @@
+     """
+     cells = {}
+     for record in ok_records:
+-        if record.get("engine") != project_engine:
++        # Every SUBJECT engine, keyed by ARM: the same two fixes
++        # `verify.check_device_agreement` took on 2026-08-17. Keyed by the one
++        # project engine and by (scenario, threads), this pooled every arm of
++        # that engine into one cpu-versus-device pair and ignored the subject
++        # variants entirely, so a summary could pair one arm's gpu row with a
++        # different arm's cpu row and call the digests "identical" or not on
++        # a comparison that meant nothing.
++        if record.get("engine") not in _SUBJECT_NAMES:
+             continue
+         device = record.get("device_used") or record.get("device_requested")
+-        cells.setdefault((record["scenario"], record["threads"]), {}).setdefault(
+-            device, record
+-        )
++        cells.setdefault(
++            (record["scenario"], record["threads"], verify._arm_of(record)), {}
++        ).setdefault(device, record)
+ 
+     out = []
+-    for (scenario, threads), by_device in sorted(cells.items()):
++    for (scenario, threads, arm), by_device in sorted(cells.items()):
+         cpu = by_device.get("cpu")
+         for device, record in sorted(by_device.items()):
+             if device == "cpu" or cpu is None:
+@@ -657,6 +688,7 @@
+                 {
+                     "scenario": scenario,
+                     "threads": threads,
++                    "arm": arm,
+                     "device": device,
+                     "primary_metric": metric,
+                     "value": {device: got, "cpu": want},
+@@ -901,7 +933,7 @@
+             flags.append(
+                 {
+                     "flag": "repeats_not_identical",
+-                    "scope": f"{cell['scenario']}/{cell['engine']}/{cell['device_used']}",
++                    "scope": f"{cell['scenario']}/{cell['arm']}/{cell['device_used']}",
+                     "detail": (
+                         f"{len(cell['predictions']['sha256_distinct'])} distinct "
+                         f"prediction digests across {cell['repeats']} repeats"
+@@ -920,7 +952,7 @@
+             flags.append(
+                 {
+                     "flag": "device_digest_equals_cpu",
+-                    "scope": f"{entry['scenario']}/{entry['device']}",
++                    "scope": f"{entry['scenario']}/{entry['arm']}/{entry['device']}",
+                     "detail": (
+                         f"the {entry['device']} arm and the cpu arm produced the "
+                         "same prediction digest"
+--- a/bench/real_data/verify.py
++++ b/bench/real_data/verify.py
+@@ -283,19 +283,30 @@
+     accelerator_keys = accelerator_cells(ok)
+     cells = {}
+     for record in ok:
++        # KEYED BY ARM, not by engine, since 2026-08-17. Every cell key in
++        # this file that groups repeats has to be, and this one was not: on
++        # an `--arms` run one engine name covers dozens of arms at different
++        # tree counts and bin counts, and an engine key pooled all of them
++        # into one "cell" whose digests naturally differed, so this check
++        # would have FAILED a perfectly deterministic trainer for the crime
++        # of having been asked forty different questions. On a run without
++        # `--arms` the arm IS the engine name and nothing here changes.
++        # The threshold rule stays keyed by ENGINE, because thresholds.json
++        # is written per engine and every arm of one engine shares it.
+         key = (
+-            record["scenario"], record["engine"],
++            record["scenario"], _arm_of(record),
+             record.get("device_used") or record.get("device_requested"),
+             record["threads"],
+         )
+         cells.setdefault(key, []).append(record)
+     for key, group in sorted(cells.items()):
+-        scenario, engine, device, threads = key
++        scenario, arm, device, threads = key
++        engine = group[0]["engine"]
+         rule = config["defaults"]["determinism"].get(engine, {})
+         if not rule.get("require_identical_predictions"):
+             continue
+         gating = rule.get("gating", True)
+-        scope = f"{scenario}/{engine}/{device}/t{threads}"
++        scope = f"{scenario}/{arm}/{device}/t{threads}"
+         if len(group) < 2:
+             # An ORACLE cell reaching this branch is a DESIGN DECISION rather
+             # than a short run, and the two are indistinguishable from the
+@@ -382,13 +393,15 @@
+             continue
+         if _device_of(record) != "cpu":
+             continue
+-        # KEYED BY ENGINE TOO, same reason as `check_device_agreement`. The
+-        # digest set is the arm's OWN cpu twin, and pooling three subject arms
++        # KEYED BY ARM, same reason as `check_device_agreement`, and it was
++        # keyed by ENGINE until 2026-08-17 for the same insufficient reason.
++        # The digest set is the arm's OWN cpu twin, and pooling several arms
+         # into one set breaks condition C in both directions: a gpu row could
+-        # match a different arm's cpu digest and be refused for a coincidence,
+-        # or its own twin could be hidden among two others. Condition C only
+-        # means anything against the same arm on the other backend.
+-        key = (record["scenario"], record["threads"], record["engine"])
++        # match a DIFFERENT arm's cpu digest and be refused for a coincidence,
++        # or its own twin could be hidden among others. Condition C only means
++        # anything against the same arm on the other backend, and on an
++        # `--arms` run one engine name is dozens of arms.
++        key = (record["scenario"], record["threads"], _arm_of(record))
+         cpu_digests.setdefault(key, set()).add(record.get("predictions_sha256"))
+ 
+     for record in ok:
+@@ -401,7 +414,7 @@
+             continue
+ 
+         scope = (
+-            f"{record['scenario']}/{record['engine']}/{device}"
++            f"{record['scenario']}/{_arm_of(record)}/{device}"
+             f"/t{record['threads']}"
+         )
+         proved, reason = backend_proof.device_evidence(
+@@ -409,7 +422,7 @@
+         )
+         digest = record.get("predictions_sha256")
+         twin = cpu_digests.get(
+-            (record["scenario"], record["threads"], record["engine"]), set()
++            (record["scenario"], record["threads"], _arm_of(record)), set()
+         )
+         hash_matches = bool(digest) and digest in twin
+ 
+@@ -465,19 +478,35 @@
+     cells = {}
+     for record in ok:
+         device = record.get("device_used") or record.get("device_requested")
++        # KEYED BY ARM since 2026-08-17. This is the comparison of the two
++        # PLAIN cells, `mojotrees` as shipped against `lightgbm` stock+det,
++        # and the thresholds it applies were written for exactly that pair.
++        # Under an engine key an `--arms` run poured every mojotrees arm and
++        # every lightgbm arm into the two lists and `_representative` picked
++        # whichever came first, so a 25-tree frontier arm could be gated
++        # against a 200-tree lightgbm arm and reported as the differential
++        # verdict. Keying by arm means the two names below match only the
++        # plain cells, which are what the rule is about; a run that has no
++        # plain pair gets the SKIP line below rather than a made-up pair.
+         cells.setdefault(
+             (record["scenario"], record["threads"]), {}
+-        ).setdefault((record["engine"], device), []).append(record)
++        ).setdefault((_arm_of(record), device), []).append(record)
+ 
+-    for (scenario, threads), by_engine in sorted(cells.items()):
++    for (scenario, threads), by_arm in sorted(cells.items()):
+         if scenario in skip_scenarios:
+             verdict.add(SKIP, "differential", f"{scenario}/t{threads}", "inputs did not agree")
+             continue
+-        mine = by_engine.get(("mojotrees", "cpu"))
+-        theirs = by_engine.get(("lightgbm", "cpu"))
++        mine = by_arm.get(("mojotrees", "cpu"))
++        theirs = by_arm.get(("lightgbm", "cpu"))
+         scope = f"{scenario}/t{threads}"
+         if not mine or not theirs:
+-            verdict.add(SKIP, "differential", scope, "no mojotrees and lightgbm cpu pair")
++            verdict.add(
++                SKIP, "differential", scope,
++                "no plain mojotrees and lightgbm cpu pair. This check "
++                "compares the two shipped configurations and nothing else; "
++                "frontier arms of either engine are ranked by "
++                "check_accuracy_peer at a matched tree count instead",
++            )
+             continue
+         a, b = _representative(mine), _representative(theirs)
+         rules = scenario_rules(config, a)
+@@ -518,8 +547,13 @@
+     # verdict harder to read for no information.
+     cells = {}
+     for record in ok:
++        # KEYED BY ARM since 2026-08-17. `setdefault` keeps the FIRST record
++        # per key, so under an engine key an `--arms` run had exactly one of
++        # its forty mojotrees arms checked against the trivial model and the
++        # other thirty-nine published unchecked, with no line saying so.
++        # Every arm has to beat the baseline on its own.
+         key = (
+-            record["scenario"], record["engine"],
++            record["scenario"], _arm_of(record),
+             record.get("device_used") or record.get("device_requested"),
+             record["threads"],
+         )
+@@ -534,7 +568,7 @@
+         got = (record.get("quality") or {}).get(metric)
+         base = (record.get("baseline_quality") or {}).get(metric)
+         scope = (
+-            f"{record['scenario']}/{record['engine']}/"
++            f"{record['scenario']}/{_arm_of(record)}/"
+             f"{record.get('device_used') or record['device_requested']}"
+         )
+         if got is None or np.isnan(got):
+@@ -912,20 +946,30 @@
+     # The competitor index, keyed by cell and tree count. Built from the same
+     # representative records, so a competitor row that failed completeness is
+     # not in here and its absence abstains rather than passing quietly.
++    #
++    # MEMBERSHIP IS BY ENGINE, since 2026-08-17. `competitors` and
++    # `engines_judged` are lists of ENGINE names, which is what their names
++    # say, and until that date both were tested against the ARM id. On a run
++    # without `--arms` the two are equal and nothing showed. On an `--arms`
++    # run no arm id is an engine name, so no competitor bar was ever built and
++    # every one of our arms fell through `continue` below unjudged, WITH NO
++    # LINE SAYING SO: the scoreboard was simply absent from the verdict and
++    # from every frontier table that reads it. The reverse of the keying
++    # mistake in `check_device_agreement`, and the same silence.
+     bar = {}
+     for (cell, arm, _device, trees), record in cells.items():
+-        if arm not in competitors or trees is None:
++        if record.get("engine") not in competitors or trees is None:
+             continue
+         metric = record.get("primary_metric")
+         value = (record.get("quality") or {}).get(metric)
+         if value is None or np.isnan(value):
+             continue
+-        bar.setdefault((cell, trees), {})[arm] = (value, metric)
++        bar.setdefault((cell, trees), {})[arm] = (value, metric, record["engine"])
+ 
+     for (cell, arm, device, trees), record in sorted(
+         cells.items(), key=lambda item: str(item[0])
+     ):
+-        if arm not in judged:
++        if record.get("engine") not in judged:
+             continue
+         scenario, tier, data_kind, _dataset, threads = cell
+         scope = f"{scenario}/{arm}/{device}/t{threads}/n{trees}"
+@@ -946,7 +990,8 @@
+             continue
+ 
+         present = bar.get((cell, trees), {})
+-        missing = [name for name in competitors if name not in present]
++        present_engines = {engine for _v, _m, engine in present.values()}
++        missing = [name for name in competitors if name not in present_engines]
+         if not present:
+             verdict.add(
+                 SKIP, "accuracy_peer", scope,
+@@ -961,7 +1006,7 @@
+         # Direction comes from the metric, through `_worse_by`, and the
+         # BETTER competitor is the one that makes `worse` largest.
+         scored = []
+-        for name, (value, their_metric) in present.items():
++        for name, (value, their_metric, _engine) in present.items():
+             if their_metric != metric:
+                 # Two rows of one cell disagreeing about the primary metric
+                 # is a harness fault, not a close call, and comparing across
+@@ -1219,7 +1264,8 @@
+ 
+     cells = {}
+     for record in ok:
+-        if _arm_of(record) not in judged:
++        # By ENGINE: `engines_judged` names engines. See check_accuracy_peer.
++        if record.get("engine") not in judged:
+             continue
+         cells.setdefault(_anchor_key(record), record)
+ 
+@@ -1369,7 +1415,8 @@
+ 
+     cells = {}
+     for record in ok:
+-        if _arm_of(record) not in judged:
++        # By ENGINE: `engines_judged` names engines. See check_accuracy_peer.
++        if record.get("engine") not in judged:
+             continue
+         if _tree_count(record) is None:
+             continue
+@@ -1462,9 +1509,9 @@
+         cells.setdefault(
+             (record["scenario"], record["threads"], _arm_of(record)), {}
+         )[device] = record
+-    for (scenario, threads, engine), by_device in sorted(cells.items()):
++    for (scenario, threads, arm), by_device in sorted(cells.items()):
+         cpu, gpu = by_device.get("cpu"), by_device.get("gpu")
+-        scope = f"{scenario}/{engine}/t{threads}"
++        scope = f"{scenario}/{arm}/t{threads}"
+         if not cpu or not gpu:
+             # A missing cpu twin used to leave NO LINE AT ALL, which is the
+             # one shape of this check that a reader cannot tell from a pass:
