@@ -299,6 +299,52 @@ roofline", the "3.2 us/row" slope, both of which existed in no file and no commi
 -- came from the same act of stating a value in the same breath as the reasoning
 that motivated it, rather than reading it from the thing it describes.
 
+## A reported SHA carries its parent, and a status line names its held branches
+
+Agreed 2026-08-17, both orchestrators, after two failures on one day that look
+different and are the same failure.
+
+**A head SHA describes the checkout, not the reporter.** The two campaigns
+commit into one working tree, so `git commit` takes whatever `HEAD` is at that
+instant and a peer's merge silently becomes your commit's parent. `c61125a` was
+committed by the GPU campaign at 04:53 and its parent is `bd4911f`, the CPU
+campaign's `ctr` revert, merged minutes earlier. Neither report said so, and
+neither author knew. Both reports were true.
+
+The rule: **report the parent alongside the SHA whenever the parent is not your
+own commit.**
+
+    git log -1 --format='%h parent %p'
+
+**A head SHA also excludes everything held.** Twice on 2026-08-16 a campaign
+reasoned about a tree that did not contain a fix, because the fix sat on an
+unmerged branch nobody named -- once with a routing threshold, which decides
+which backend every fit takes. The rule: **every status line names the unmerged
+branches carrying a fix the plan depends on**, and says which are parked by
+design rather than pending.
+
+The two rules answer the same question from opposite ends. One says the SHA
+carries work you did not do; the other says it omits work you did.
+
+### The related trap, because it is the same instrument
+
+`git log` inside a worktree proves what that worktree can SEE, not what it
+produced. An agent worktree created from `HEAD` has a branch ref pointing at
+mainline `HEAD` with no commits of its own, and `git log -2` there shows a
+peer's commit at the top. That is how one orchestrator reported a peer's
+verified work as the off-brief output of a lane that had in fact produced
+nothing, and asked the peer to treat their own checked source claims as
+unverified.
+
+Check the ref against the head before attributing anything:
+
+    git rev-parse <branch>      # the same commit as `git log --oneline -1`?
+
+This is the mirror image of the rule above about `git log` on a SHA proving the
+object exists rather than being reachable. Same instrument, other end: one
+mistakes reachability for existence, the other mistakes visibility for
+authorship. `git merge-base --is-ancestor` settles both.
+
 ## A merge that is not only a merge cannot be bisected through
 
 Recorded because it will be met by whoever rebases. On `cpu-round-1`, commit
