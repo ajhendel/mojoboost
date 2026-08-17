@@ -431,6 +431,38 @@ from .sampling import (
 from .split import SCORE_L2, SplitInfo
 
 
+def _state_max_nodes(params: TreeParams) -> Int:
+    """Node-value table size for the largest tree this fit can grow.
+
+    **`num_leaves` DOES NOT BIND UNDER `grow_policy=oblivious`, and this is
+    the table that was still sized from it.** `oblivious_leaf_budget` says so
+    in arithmetic and lists what it governs -- the slot pool, the tree tables,
+    the searcher's records, the plan. The node-value table was missing from
+    that list, and it is the one every round writes through
+    `GpuObjectiveState.update_raw`.
+
+    The consequence was a fit that could not run at all. At the default
+    `num_leaves = 31` the table held `2 * 31 = 62` nodes; a symmetric tree of
+    depth 6 has 64 leaves and 127 nodes, so every `grow_policy='symmetrictree'`
+    fit with `device='gpu'` raised "tree has more nodes than the node-value
+    table holds" -- at any depth, at any tree count, and with a message that
+    names a table rather than the parameter that sized it wrong.
+
+    A symmetric tree of depth `d` has `2^(d+1) - 1` nodes, so `2 * leaves`
+    bounds it exactly as `2 * num_leaves` bounds the leaf-wise tree, and both
+    arms keep the same shape of expression on purpose.
+    """
+    if params.grow_policy == GROW_OBLIVIOUS:
+        var budget = oblivious_leaf_budget(params)
+        # `oblivious_leaf_budget` returns 0 for a depth below 1, which
+        # `oblivious_device_supported` refuses separately. Falling back to the
+        # leaf-wise bound keeps this function total rather than making the
+        # table's size depend on a refusal happening first.
+        if budget > 0:
+            return 2 * budget
+    return 2 * params.num_leaves
+
+
 def _device_search_unsupported_reason(
     params: TreeParams, has_categorical: Bool
 ) -> String:
@@ -1310,7 +1342,21 @@ def _check_device_search_supported(
     see `_device_search_unsupported_reason` for why the conservative side is
     the right one for a refusal guard.
     """
-    params.extra.check_scalars(params.min_data_in_leaf)
+    # `scale_computed_per_tree=True`: this trainer's round loops DO compute
+    # `random_score_scale`, on both arms, so a bundle arriving here with the
+    # scale still 0.0 is the ordinary state rather than an unwired caller.
+    # The host-gradient arm computes it through
+    # `boosting._round_random_score_scale` from the round's user-weighted
+    # derivatives; the device-gradient arm through
+    # `_device_round_random_score_scale` over the device sum of squares.
+    #
+    # This declaration was False until 2026-08-17 and correctly so -- neither
+    # arm computed one. It is the last of the layers that had to move
+    # together, and it moves last on purpose: a trainer that declares a scale
+    # it does not compute trains an unregularized model and reports success.
+    params.extra.check_scalars(
+        params.min_data_in_leaf, scale_computed_per_tree=True
+    )
     var why = _device_search_unsupported_reason(params, has_categorical)
     if why.byte_length() > 0:
         raise Error(
@@ -1420,56 +1466,6 @@ def _check_gpu_forced_splits(params: TreeParams, grower: String) raises:
         " this), or leave forced_splits unset",
     )
 
-
-def _check_device_gradient_random_strength(
-    extra: ExtraTreeParams, trainer: String
-) raises:
-    """Refuse `random_strength` on the DEVICE-GRADIENT arm, by name and with
-    the reason, rather than training unregularized.
-
-    CatBoost's `scoreStDev` is
-    `random_strength * derivativesStDevFromZero * modelSizeDecrease`, and the
-    middle factor (`CalcDerivativesStDevFromZero`) is the **root mean square**
-    of the round's derivatives: it needs `sum(g_i^2)` over the whole learn
-    set. The device-gradient arm never brings the gradient vector to the host
-    -- that is the point of it, and it is why a round there uploads nothing
-    per row -- so the sum has to be reduced on the device, and **the reduction
-    it would need does not exist.** `GpuObjectiveState.magnitude_sums` is the
-    only whole-vector gradient reduction on that plane and it sums `|g|`, an
-    L1 magnitude, because it exists to pick the fixed-point histogram scales.
-    An L1 sum is not an L2 sum and no arrangement of it becomes one; building
-    the sum-of-squares kernel beside it is a follow-up lane, not a line here.
-
-    So this arm has no scale it could compute, and the two alternatives to
-    refusing are both worse than refusing. Passing zero would be the silent
-    downgrade `ExtraTreeParams.check_random_strength` exists to prevent -- an
-    unregularized model reporting success. Substituting the L1 sum would be a
-    *different* standard deviation under CatBoost's parameter name, off by a
-    factor that depends on the gradient distribution, and no test would catch
-    it because the model would train and score plausibly.
-
-    The host-gradient arm has the vector in `List[Float64]` and computes the
-    scale exactly as `boosting._boost_rounds` does, so the message names it as
-    the way through: `objective_source=OBJECTIVE_SOURCE_HOST`, or
-    `MOJOTREES_GPU_OBJECTIVE=host`.
-    """
-    if not (extra.random_strength > 0.0):
-        return
-    raise Error(
-        "random_strength needs CatBoost's derivativesStDevFromZero, which is"
-        " the root mean square of the round's derivatives, and ",
-        trainer,
-        " generates its gradients on the device and never brings them to the"
-        " host. The only whole-vector gradient reduction on that plane is"
-        " GpuObjectiveState.magnitude_sums, which reduces the L1 magnitude"
-        " for the fixed-point histogram scales; an L2 sum-of-squares"
-        " reduction does not exist there and substituting the L1 one would be"
-        " a different standard deviation under the same parameter name. Use"
-        " objective_source=OBJECTIVE_SOURCE_HOST (or"
-        " MOJOTREES_GPU_OBJECTIVE=host), whose arm holds the gradients in"
-        " Float64 and computes the scale exactly as the CPU trainer does, or"
-        " set random_strength=0",
-    )
 
 
 def _check_gpu_const_hessian_verify(trainer: String) raises:
@@ -3638,16 +3634,25 @@ def _train_gpu_rounds[
         # which needs the gradients host-side to rank and sample rows, and so
         # does an explicit `objective_source=OBJECTIVE_SOURCE_HOST`.
         if device_grads:
-            # The arm with no gradient vector on the host, and therefore no
-            # way to compute CatBoost's `derivativesStDevFromZero`. Refused by
-            # name at the top of the arm rather than at the first tree, so a
-            # fit that cannot honor `random_strength` says so before it has
-            # allocated a device objective state.
-            _check_device_gradient_random_strength(
-                params.tree.extra, String("the GPU device-gradient round")
-            )
+            # **THE random_strength REFUSAL THAT STOOD HERE IS RETIRED.** It
+            # said this arm has no gradient vector on the host and therefore
+            # no way to compute CatBoost's `derivativesStDevFromZero`, and
+            # that the only whole-vector reduction on the device plane was
+            # `magnitude_sums`, which sums L1 magnitudes for the fixed-point
+            # histogram scales.
+            #
+            # That was the true state and it named the missing piece exactly,
+            # which is why it was cheap to close:
+            # `GpuObjectiveState.derivative_sum_squares` is the L2 reduction
+            # it said did not exist -- `_abs_sum_kernel`'s shape with one
+            # plane and `g*g` in place of `abs(g)`, its own buffer, and the
+            # same Float64 host fold. The loop below computes this round's
+            # scale from it.
+            #
+            # Retired because the thing it stood in for is written, which is
+            # the only reason a refusal in this package may be retired.
             var state = builder.objective_state(
-                target, sample_weight, 1, 2 * params.tree.num_leaves
+                target, sample_weight, 1, _state_max_nodes(params.tree)
             )
             state.init_raw(builder.ctx, [base_score])
             # One router per fit, never per tree: it holds the flattened
@@ -4931,7 +4936,10 @@ def _train_multiclass_gpu_rounds[
             for r in range(n):
                 labels_f.append(Float64(labels[r]))
             var state = builder.objective_state(
-                labels_f, sample_weight, n_classes, 2 * params.tree.num_leaves
+                labels_f,
+                sample_weight,
+                n_classes,
+                _state_max_nodes(params.tree),
             )
             state.init_raw(builder.ctx, base_scores)
 

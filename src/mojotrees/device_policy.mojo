@@ -311,7 +311,7 @@ from .histogram import const_hessian_verify, derivative_precision_narrows
 # `!= SCORE_L2` so that a selector added later refuses the device instead of
 # reaching it, which means the Cosine constant is never named here. Importing
 # it for symmetry would be an unused import that reads like a coupling.
-from .split import SCORE_L2
+from .split import SCORE_COSINE, SCORE_L2
 from .tree_parameters_extra import DERIV_PRECISION_FLOAT32
 
 # `GROW_OBLIVIOUS` imported rather than mirrored, on the same argument the
@@ -2434,108 +2434,119 @@ def _collect_blocks(
             ),
         )
 
-    if request.score_function != SCORE_L2:
-        # Deliberately `!= SCORE_L2` rather than `== SCORE_COSINE`. An unknown
-        # selector must refuse the device too: `check_score_function` raises
-        # on it, but only once a grower reads it, and the whole point of this
-        # gate is to answer before a backend has been chosen. Written the
-        # narrow way, a third score function added later would silently reach
-        # the device and get an L2 answer -- the exact defect this block was
-        # written to close, reintroduced by the shape of the test.
-        #
-        # WHY THIS IS NOT WAIVED WHEN THE TWO AGREE. Cosine and L2 have the
-        # same argmax at `lambda_l2 = 0`, provably (split.mojo: substituting
-        # the free Newton step makes numerator and denominator the same
-        # expression, so Cosine collapses to sqrt of the L2 score and sqrt is
-        # strictly increasing). It is tempting to let the device through on
-        # that identity. It must not: the identity holds for one node's argmax
-        # and the CatBoost-mode arm sets `lambda_l2 = 3`, a leaf-wise queue
-        # compares gains across parents, and `random_strength` adds noise in
-        # units Cosine has changed. Any one of those breaks it, and this gate
-        # cannot see `lambda_l2` or the growth policy.
-        #
-        # **THE REASON THIS BLOCK GIVES CHANGED ON 2026-08-17, AND THE BLOCK
-        # DID NOT.** It used to say "no accelerator path evaluates the Cosine
-        # ratio". That became FALSE when the Cosine lanes landed:
-        # `gpu_cosine_score` is defined at `gpu_split_search:986` and called
-        # at five sites, the per-node scans take it, and
-        # `_scan_slot_oblivious_kernel` carries the two cross-leaf
-        # accumulators and the single root a level's Cosine score needs --
-        # which is why `gpu_split_search:5271` records that `score_function`
-        # no longer refuses there.
-        #
-        # A capability landing falsified the stated reason while leaving the
-        # refusal correct for a DIFFERENT reason, and nothing checked the
-        # sentence because nothing ever checks a sentence. Right refusal,
-        # dead reason, is its own defect: it is what gets a block retired on
-        # the strength of an argument that is no longer the argument.
-        #
-        # What is actually left is narrow and is stated below: a Cosine fit
-        # with a categorical feature. The category partition search scores
-        # with the L2 gain (`GpuSplitSearcher.set_score_function`, and
-        # `split.find_best_split` before it), so allowing that pair puts two
-        # score functions inside one argmax. Everything else about Cosine now
-        # runs on the device.
-        #
-        # This block is therefore WIDER than its cause, deliberately and
-        # temporarily. Narrowing it to the categorical pair is item (3) and
-        # is gated on the same rule every retirement here is gated on: no
-        # downstream refusal may still fire for the same fit. Today
-        # `_device_search_semantics_supported` (train_gpu:548) still declines
-        # the device split search for any active `ExtraTreeParams`, which
-        # `score_function != L2` sets -- so narrowing this alone would route
-        # a Cosine fit to an accelerator that then scans on the host and
-        # reports device='gpu' truthfully. That gate has to ask per-parameter
-        # first.
+    # --- score_function, narrowed 2026-08-17 ---
+    #
+    # This refused every non-L2 selector. The device now evaluates the Cosine
+    # ratio directly: `gpu_cosine_score` at `gpu_split_search:986` with five
+    # call sites, per node, and `_scan_slot_oblivious_kernel` carrying a
+    # level's two cross-leaf accumulators and its single root. So the wide
+    # refusal was withdrawing a path that works.
+    #
+    # Retired against the standing rule and not against the capability alone:
+    # no downstream refusal still fires for the same fit.
+    # `_device_search_semantics_supported` used to decline any active
+    # `ExtraTreeParams`, which `score_function != L2` sets, so a narrowed
+    # block here would have routed a Cosine fit to an accelerator that then
+    # scanned on the host and reported `device='gpu'` truthfully. That gate
+    # asks per parameter now, which is what makes this narrowing earnable.
+    #
+    # TWO CONDITIONS SURVIVE, and they are different in kind.
+    if (
+        request.score_function != SCORE_L2
+        and request.score_function != SCORE_COSINE
+    ):
+        # An UNKNOWN selector, and this arm is why the old test was written
+        # `!= SCORE_L2` rather than `== SCORE_COSINE`. The scan kernels
+        # compute `var cosine = score_function == SCORE_COSINE` and treat
+        # everything else as L2, so a third selector added later and not
+        # taught to them would silently receive an L2 answer under its own
+        # label. `check_score_function` raises on it, but only once a grower
+        # reads it, and this gate answers before a backend is chosen.
         blocks.add(
             BLOCK_SCORE_FUNCTION,
             String(
                 "score_function selects which functional of the children's"
-                " sums is maximized. The device evaluates the Cosine ratio"
-                " directly, per node and across a symmetric level, but the"
-                " category partition search scores with the L2 gain, so a"
-                " Cosine fit with a categorical feature would put two score"
-                " functions inside one argmax; and the device split search"
-                " is declined outright for any active extra tree parameter,"
-                " which score_function != L2 is one of"
+                " sums is maximized, and this value is neither L2 nor Cosine."
+                " The device scan kernels test for Cosine and treat every"
+                " other code as L2, so an accelerator would answer under the"
+                " wrong functional's name rather than refuse"
+            ),
+        )
+    elif request.score_function == SCORE_COSINE and request.categorical:
+        # Cosine beside a categorical column. The category partition search
+        # scores with the L2 gain (`GpuSplitSearcher.set_score_function`, and
+        # `split.find_best_split` before it), so allowing the pair puts two
+        # score functions inside one argmax -- the winner of the partition
+        # search chosen under L2, compared against numerical candidates
+        # scored under Cosine.
+        #
+        # The declaration question rather than the searchable one, matching
+        # `train_gpu._device_search_unsupported_reason`. Over-refusing a
+        # CTR-replaced column costs a fit the accelerator it could have used;
+        # under-refusing costs a tree scored by two functionals.
+        blocks.add(
+            BLOCK_SCORE_FUNCTION,
+            String(
+                "score_function=Cosine cannot be combined with a categorical"
+                " feature on an accelerator: the category partition search"
+                " scores with the L2 gain, so one argmax would compare a"
+                " partition winner chosen under L2 against numerical"
+                " candidates scored under Cosine. The CPU backend scores both"
+                " the same way"
             ),
         )
 
-    if request.random_strength > 0.0:
+    # --- random_strength, narrowed 2026-08-17 ---
+    #
+    # This refused every positive `random_strength`. What it stood in for was
+    # the per-tree SCALE: the noise plane, its draw and its consumption were
+    # staged, but no GPU round loop computed the standard deviation the draw
+    # is multiplied by, so the product was zero on every fit and a device fit
+    # would either refuse in the grower or train an unregularized model that
+    # reported success.
+    #
+    # Both arms of `_train_gpu_rounds` compute it now -- the host-gradient arm
+    # from the round's user-weighted derivatives before any sampler rewrites
+    # them, the device-gradient arm from
+    # `GpuObjectiveState.derivative_sum_squares` -- so the thing this block
+    # stood in for is written, which is the only reason a refusal in this
+    # package may be retired.
+    #
+    # THE DOWNSTREAM REFUSALS THAT MADE THIS WIDE ARE GONE, EACH BY NAME,
+    # which is the standing rule rather than a summary of it:
+    #
+    #   the device split search declining any active ExtraTreeParams
+    #       -> `_device_search_unsupported_reason` asks per parameter.
+    #   the oblivious grower refusing a level draw
+    #       -> retired; the site is the level depth in its own hash domain
+    #          and the scale reaches the searcher before the route decision.
+    #   the device-gradient arm beside a Bayesian bootstrap
+    #       -> `ROUND_BAYESIAN_NOISE_SCALE` routes it to the host-gradient
+    #          arm rather than raising, so it is a resolution and not a
+    #          cliff this block was covering.
+    #
+    # ONE CONDITION SURVIVES.
+    if request.random_strength > 0.0 and request.categorical:
+        # `gpu_split_search` refuses the noise beside a categorical feature by
+        # name: a categorical candidate is a category SET chosen by a
+        # partition search, so only that search's winner would be noised
+        # while every numerical feature had every candidate noised. That is a
+        # different regularizer wearing the same parameter's name, which is
+        # the same class of error as scaling the noise by a sampler.
+        #
         # `> 0.0` rather than `!= 0.0`: a negative value is not a weaker
-        # request, it is invalid, and `check_random_strength` is the thing that
-        # says so with the right message. This gate answers "would the device
-        # be asked to do something it cannot" and a negative number is not a
-        # device question.
-        #
-        # WHY THIS BLOCK EXISTS AT ALL, since the trainers already refuse.
-        # They refuse by RAISING, from inside the grower, after a backend has
-        # been chosen. `ExtraTreeParams.is_active()` names `random_strength`,
-        # `_check_device_search_supported` raises on `is_active()`, and the
-        # bindings refuse it at every entry point but the dense CPU `fit`. All
-        # correct, and none of them is reached in time: without this block
-        # `device='auto'` selects the accelerator on shape and the fit then
-        # dies in the grower, which is precisely the outcome `auto` exists to
-        # prevent. A refusal that arrives after the routing decision is not a
-        # routing input.
-        #
-        # WHAT IT IS NOT. It is not a claim that the noise cannot be computed
-        # on a device. It can, and the plane and its consumption are already
-        # built and tested. Two things are missing and they are different in
-        # kind: the per-tree SCALE is not computed by any GPU round loop, and
-        # on the device-gradient arm it cannot be cheaply, because
-        # `GpuObjectiveState.magnitude_sums` reduces L1 where the scale needs
-        # L2. That second one is an arithmetic bound rather than a wiring gap,
-        # so when this block is narrowed it narrows to that arm and is not
-        # deleted.
+        # request, it is invalid, and `check_random_strength` is the thing
+        # that says so with the right message.
         blocks.add(
             BLOCK_RANDOM_STRENGTH,
             String(
-                "random_strength scales its per-candidate noise by a per-tree"
-                " standard deviation taken over the round's gradients, and no"
-                " accelerator round loop computes it; a device fit would"
-                " either refuse in the grower or, if the scale were defaulted,"
-                " train an unregularized model that reported success"
+                "random_strength cannot be combined with a categorical"
+                " feature on an accelerator: a categorical candidate is a"
+                " category set chosen by a partition search, so only that"
+                " search's winner would be noised while every numerical"
+                " feature had every candidate noised -- a different"
+                " regularizer under the same name. The CPU backend noises"
+                " both alike"
             ),
         )
 

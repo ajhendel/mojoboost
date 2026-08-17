@@ -1239,11 +1239,14 @@ def _parse_params(
             who,
             ": the per-split noise is added by split.find_best_split and"
             " staged on the device by GpuSplitSearcher, but its per-tree"
-            " scale is computed only by the dense CPU round loops"
-            " (boosting._round_random_score_scale). Multiclass, distributed"
-            " and the device loops do not compute one, so accepting it here"
-            " would train a model that silently ignored it. 0.0 is"
-            " LightGBM's behavior and mojotrees's, and is accepted.",
+            " scale is computed only by the DENSE round loops -- the CPU's"
+            " (boosting._round_random_score_scale) and, since 2026-08-17,"
+            " both arms of the GPU's (train_gpu._train_gpu_rounds, the"
+            " device-gradient arm reducing the squares on the device). The"
+            " sparse, multiclass and distributed loops do not compute one,"
+            " so accepting it here would train a model that silently ignored"
+            " it. 0.0 is LightGBM's behavior and mojotrees's, and is"
+            " accepted.",
         )
 
     # CatBoost's `score_function`, folded onto the same bundle for the same
@@ -1863,7 +1866,21 @@ def fit(
         # `ordered_ok` already takes: a flag wide enough for the entry point
         # and two named refusals for the branches that leave the honoring
         # trainer.
-        random_strength_ok=device == CPU_DEVICE,
+        # **WIDENED 2026-08-17: the GPU dense fork computes the scale too.**
+        # This was `device == CPU_DEVICE` because only the dense CPU round
+        # loop computed `random_score_scale`. Both arms of
+        # `train_gpu._train_gpu_rounds` compute it now -- the host-gradient
+        # arm through `boosting._round_random_score_scale` from the round's
+        # user-weighted derivatives, the device-gradient arm through
+        # `_device_round_random_score_scale` over
+        # `GpuObjectiveState.derivative_sum_squares`.
+        #
+        # `fit` is the DENSE SINGLE-OUTPUT entry, which is exactly the pair of
+        # forks that compute it. The sparse arm and the multiclass arm still
+        # do not, and they are refused at their own entry points rather than
+        # here -- widening this one does not widen those, which is the whole
+        # reason this is a per-entry flag rather than a device test.
+        random_strength_ok=True,
         leaf_estimation_ok=True,
         # Same fork, same shape: the plain CPU and GPU forks both thread
         # `boost_from_average` into `boosting._base_score`, and the dart, rf
@@ -4601,7 +4618,12 @@ def train_dataset(
     # so the declaration is the conjunction rather than the device test alone.
     # A sparse dataset resolves its device to the CPU like any other, so
     # testing the device by itself would have declared the sparse arm honored.
-    var scale_is_computed = device == CPU_DEVICE and not d[].is_sparse
+    # **The device test dropped 2026-08-17, the sparse test kept.** It read
+    # `device == CPU_DEVICE and not d[].is_sparse` because only the dense CPU
+    # round loop computed `random_score_scale`. Both arms of
+    # `train_gpu._train_gpu_rounds` compute it now, so the device is no longer
+    # what decides; `train_gpu_sparse` still does not, so `is_sparse` still is.
+    var scale_is_computed = not d[].is_sparse
     var model = mojo_train_dataset(
         d[],
         Int(py=params["objective"]),
