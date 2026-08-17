@@ -191,40 +191,72 @@ ACKNOWLEDGED = {
         "the same defect this tool exists to find",
     ),
     ("bootstrap_type", "src/mojotrees/model.mojo"): (
-        "DIVERGENCE",
-        "train_gpu takes no bootstrap bundle. Andrew's ruling 2026-08-17: "
-        "DIVERGENCE while f9's routing lane is in flight, and the intended "
-        "end state is that the default resolves to bootstrap_type=No on the "
-        "accelerator, recorded as OUR divergence and never a raise. "
-        "**READ THIS BEFORE RETIRING ANY BLOCK.** The verdict describes the "
-        "intended end state and NOT what the tree does today, and the two "
-        "differ in a way that is invisible from this row alone. Today there "
-        "is no BLOCK_BOOTSTRAP in device_policy at all -- verified by "
-        "enumerating the BLOCK_ names on 2026-08-17 -- so nothing routes on "
-        "this parameter. device='auto' reaches the CPU only because "
-        "BLOCK_SCORE_FUNCTION and BLOCK_RANDOM_STRENGTH fire FIRST on the "
-        "shipped default, and device='gpu' raises. So the fallback this "
-        "verdict names is not built; it is being stood in for by two "
-        "unrelated blocks. If those two are retired before bootstrap routing "
-        "lands, this row silently becomes BLOCKING in fact while still "
-        "reading DIVERGENCE here, and the failure appears as a raise on "
-        "every GPU fit of the shipped default. The dependency is recorded "
-        "here because no gate expresses it: retiring a block is not a local "
-        "change when another parameter's fallback was resting on it",
+        "BLOCKING",
+        "SPLIT ROW. The single-output DENSE path is fine and is not this "
+        "row: model.fit passes the bundle through to train_gpu and it is "
+        "honored on both backends (f9 verified the pass-through 2026-08-17; "
+        "my earlier DIVERGENCE entry treated the whole file as one answer "
+        "and it is two). What BLOCKS is fit_multiclass at model.mojo:580, "
+        "one of four guarded raises that all read `backend == GPU_DEVICE and "
+        "bootstrap.enabled()` -- the others are model_sparse.mojo:126 and "
+        ":209 and trainset.mojo:1744, each tracked in its own file's row. I "
+        "read all four rather than taking the list: the guard is "
+        "`bootstrap.enabled()`, which asks whether the bundle is ACTIVE and "
+        "not whether anyone NAMED it, so a mode-supplied MVS raises exactly "
+        "as a typed one does. That is the yield rule missing on the GPU "
+        "backend, and it is why this is BLOCKING rather than a divergence: "
+        "there is no fallback, only a raise. **MERGE-ORDER CONSTRAINT, "
+        "Andrew 2026-08-17: lane/defaults-release defaults bootstrap_type to "
+        "MVS at subsample 0.8, so the day it merges a multiclass or sparse "
+        "fit at the defaults that the policy sends to the accelerator raises "
+        "with nothing to catch it. It does not merge until these four sites "
+        "obey the yield rule on the GPU backend -- a DEFAULTED bundle yields "
+        "to unsampled with the reason recorded, a NAMED one still refuses -- "
+        "or those fits are routed. Adding a BLOCK_BOOTSTRAP is the WRONG "
+        "fix: it would refuse the dense single-output path that honors MVS "
+        "today.** And these fire under device='auto' as well as an explicit "
+        "request, because there is no BLOCK_BOOTSTRAP to route them; "
+        "device='auto' reaches the CPU on the shipped default only because "
+        "BLOCK_SCORE_FUNCTION and BLOCK_RANDOM_STRENGTH fire first. So "
+        "retiring either of those two, before the yield rule lands here, "
+        "turns this from a latent raise into every multiclass and sparse "
+        "GPU fit of the shipped default. Retiring a block is not a local "
+        "change when another parameter's only protection was resting on it",
+    ),
+    ("bootstrap_type", "src/mojotrees/model_sparse.mojo"): (
+        "BLOCKING",
+        "the same guard twice, at :126 (train_gpu_sparse) and :209 "
+        "(train_multiclass_gpu_sparse): `backend == GPU_DEVICE` and "
+        "`bootstrap.enabled()`, raising because neither round loop draws a "
+        "bundle, so the fit would be silently unsampled. Correct to refuse "
+        "rather than train something the caller did not ask for; wrong to "
+        "refuse a bundle nobody asked for. Same yield-rule build and the "
+        "same merge-order constraint as the model.mojo row, which carries "
+        "the full statement",
     ),
     ("bootstrap_type", "src/mojotrees/trainset.mojo"): (
-        "RESOLVED",
-        "the defaulted-bundle-yields rule covers it: a bundle the MODE "
-        "supplied yields on a path that cannot honor it, and a bundle the "
-        "user TYPED still refuses by name. VERIFIED 2026-08-17 by fitting: "
+        "BLOCKING",
+        "TWO ARMS, TWO ANSWERS, and the more severe one has to be the "
+        "verdict because a key carries one. **CPU arm: RESOLVED.** The "
+        "defaulted-bundle-yields rule holds -- a bundle the MODE supplied "
+        "yields on a path that cannot honor it, a bundle the user TYPED "
+        "still refuses by name. Verified 2026-08-17 by fitting: "
         "MojoTreesClassifier(grow_policy='symmetrictree', ctr='off') on a "
-        "three-class target succeeds with the defaulted MVS, where the old "
-        "reason predicted a raise. ctr='off' is set in that probe only to "
-        "isolate the bootstrap question from the separate CTR refusal on the "
-        "multiclass path; it does not affect the bootstrap answer. The old "
-        "reason ALSO claimed the sparse arm as a bootstrap failure, and that "
-        "was wrong -- see the grow_policy row for this file, where it now "
-        "lives",
+        "three-class target succeeds with the defaulted MVS, where the "
+        "reason before it predicted a raise. (ctr='off' only isolates the "
+        "bootstrap question from the separate CTR refusal on that path.) "
+        "**GPU arm: BLOCKING**, at :1744, which I did NOT reach with that "
+        "fit because device='auto' resolved to the CPU -- so the fit that "
+        "verified the CPU half is silent about this one, and I recorded "
+        "RESOLVED on the strength of it. Corrected on f9's site "
+        "verification, which I then read myself: the guard is `backend == "
+        "GPU_DEVICE and bootstrap.enabled()`, and `enabled()` asks whether "
+        "the bundle is ACTIVE, not whether anyone NAMED it, so the yield "
+        "rule that holds on the CPU arm has no counterpart here. One of the "
+        "four sites in that build; the model.mojo row carries the full "
+        "statement and the merge-order constraint on lane/defaults-release. "
+        "The old reason ALSO claimed the sparse arm as a bootstrap failure "
+        "and that was wrong -- see the grow_policy row for this file",
     ),
     ("grow_policy", "src/mojotrees/trainset.mojo"): (
         "DIVERGENCE",
