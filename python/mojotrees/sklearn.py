@@ -152,12 +152,14 @@ _CATBOOST_DEPTH = 6
 
 #: CatBoost mode's `ctr` rule when the caller names none.
 #:
-#: `"on"`: CatBoost's own source rule, `uniqueValues > one_hot_max_size` at 2,
-#: which REPLACES every categorical column above the cutoff with its CTR
-#: columns. Under `lossguide` the default is `"off"`, because a CTR is
-#: CatBoost's mechanism and `lossguide` mirrors LightGBM, which has none.
+#: `"auto"`, and that is a KNOWN GAP rather than the mirror. The rule this
+#: mode should mirror is `"on"`: CatBoost's own source rule,
+#: `uniqueValues > one_hot_max_size` at 2, which REPLACES every categorical
+#: column above the cutoff with its CTR columns. Under `lossguide` the default
+#: is `"off"`, because a CTR is CatBoost's mechanism and `lossguide` mirrors
+#: LightGBM, which has none.
 #:
-#: **This was `"auto"` and `"auto"` made the mode refuse on categorical data.**
+#: **What `"auto"` costs: the mode refuses on categorical data.**
 #: `"auto"` (`SimpleCtrConfig.auto()`) gives CTR columns only to the
 #: categorical columns that OVERFLOWED their category table, which is a
 #: different question and reads a different number. A column that did not
@@ -188,7 +190,38 @@ _CATBOOST_DEPTH = 6
 #: CatBoost. `symmetrictree` is mirroring CatBoost, where the replacement is
 #: not an optimization but the mechanism by which the tree can be grown at
 #: all.
-_CATBOOST_CTR = "on"
+#:
+#: **AND `"on"` CANNOT BE THE DEFAULT TODAY, because it breaks regression.**
+#: Everything above is still true and it is not sufficient. Measured on the
+#: same day, 300 rows, eight numeric columns, NO categorical column at all:
+#:
+#:     MojoTreesRegressor(grow_policy="symmetrictree")   ctr="auto"   OK
+#:     MojoTreesRegressor(grow_policy="symmetrictree")   ctr="on"     RAISES
+#:
+#: with "ctr target borders must be given explicitly for a target with more
+#: than two distinct values: the default ctr_target_border_count is 1 and its
+#: MinEntropy selection is only a midpoint when the target is two-valued".
+#: `SimpleCtrConfig.catboost_defaults()` is not inert on a dataset with no
+#: categorical columns, so this fires on ordinary regression -- the shipped
+#: default policy on the commonest task there is.
+#:
+#: There is no way to answer it from this surface: `ctr_target_border_count`
+#: is not an estimator parameter, so a caller cannot supply the borders and
+#: neither can this constant. Multiclass and sparse refuse any non-`"off"`
+#: rule too, but those refuse under `"auto"` as well and are therefore not
+#: this change's doing.
+#:
+#: So the default is `"auto"` and CatBoost mode does not yet mirror
+#: CatBoost's categorical handling. What must be BUILT, and it is a real
+#: build rather than a decision: `ctr_target_border_count` reachable from the
+#: estimator, or derived in CatBoost mode from the target the way CatBoost
+#: derives it. Until then `ctr="on"` is opt-in, it works, and the two
+#: refusals it clears stay named.
+#:
+#: This constant was `"on"` at 1985d92 for the length of one afternoon. The
+#: verification behind that commit was a categorical CLASSIFICATION fit, and
+#: a default is not verified by the case that motivated it.
+_CATBOOST_CTR = "auto"
 
 #: `ctr` spellings the estimator accepts and the rule name each resolves to.
 #:

@@ -1,4 +1,4 @@
-"""CatBoost mode takes a categorical column, because its CTRs replace one.
+"""CatBoost mode and categorical columns: what works, and what does not.
 
 `grow_policy="symmetrictree"` is our shipped default policy and it mirrors
 CatBoost, where a categorical column wider than `one_hot_max_size` is not
@@ -10,36 +10,35 @@ split while a category partition's order comes from one node's own
 statistics, and `split.mojo:778` refuses `random_strength`, because only a
 categorical search's winner reaches the loop that would add the noise.
 
-Both refusals are correct and neither should fire on the shipped default,
-because the shipped default replaces the column before either can see it.
+`ctr="on"` clears both, and it is OPT-IN. This file pins that, and pins why
+it is not the default.
 
-**This is a regression test for a default, not for a mechanism.** The
-mechanism worked the whole time. `_CATBOOST_CTR` was `"auto"`, and `"auto"`
-gives CTR columns only to the categorical columns that overflowed their
-category table -- a different question, reading a different number. A column
-narrower than the table kept its raw code, stayed inside `BinnedMatrix.usable`
-and was still offered to the search, so
-`MojoTreesClassifier(grow_policy="symmetrictree", categorical_feature=[...])`
-raised on every fit. One word, and the difference between a mode that handles
-categorical data the way CatBoost does and a mode that cannot take it at all.
+**The mode does not mirror CatBoost here yet, and these tests say so rather
+than asserting the mirror we want.** `_CATBOOST_CTR` was moved to `"on"` and
+moved back within one afternoon, because `SimpleCtrConfig.catboost_defaults()`
+is not inert on a dataset with no categorical columns: it needs target borders
+that only exist for a two-valued target, so `MojoTreesRegressor(
+grow_policy="symmetrictree")` on an ordinary continuous target raised. The
+default policy on the commonest task. `ctr_target_border_count` is not an
+estimator parameter, so nothing on this surface can supply them.
 
-The fixture is deliberately small and deliberately narrow: six levels, well
-under any category table, which is exactly the case `"auto"` declined to
-replace and therefore the case that failed.
+The tests below are therefore in two halves: what `ctr="on"` buys, and what
+stops it being free. If the second half starts failing, the build that closes
+the gap has landed and the default can move -- which is exactly when someone
+should be reading this file.
 """
 
 import numpy as np
 import pytest
 
-from mojotrees import MojoTreesClassifier
+from mojotrees import MojoTreesClassifier, MojoTreesRegressor
 
 
-def _frame(seed=0, n=400, levels=6):
+def _categorical_frame(seed=0, n=400, levels=6):
     """One numeric column and one categorical column that predicts the label.
 
-    The label reads BOTH columns, so a fit that dropped the categorical
-    information entirely would still fit and still be wrong; the accuracy
-    assertion below is what notices.
+    Six levels, well under any category table, which is the case
+    `ctr="auto"` declines to replace and therefore the case that fails.
     """
     rng = np.random.default_rng(seed)
     cat = rng.integers(0, levels, size=n)
@@ -50,47 +49,83 @@ def _frame(seed=0, n=400, levels=6):
 
 
 def _fit(**kwargs):
-    X, y = _frame()
+    X, y = _categorical_frame()
     kwargs.setdefault("n_estimators", 8)
     model = MojoTreesClassifier(categorical_feature=[1], **kwargs)
     return model.fit(X, y), X, y
 
 
-def test_symmetric_mode_fits_a_categorical_column_by_default():
-    """The load-bearing one. No `ctr` named, nothing but the policy."""
-    model, X, y = _fit(grow_policy="symmetrictree")
+# -- what ctr="on" buys ---------------------------------------------------
+
+
+def test_ctr_on_lets_the_symmetric_grower_take_a_categorical_column():
+    """The mechanism works. It is the default that does not."""
+    model, X, y = _fit(grow_policy="symmetrictree", ctr="on")
     assert model.score(X, y) > 0.5, (
         "the fit succeeded but learned nothing, which would mean the "
         "categorical information was dropped rather than replaced"
     )
 
 
-def test_symmetric_mode_fits_beside_random_strength():
-    """`random_strength=1.0` is in the shipped CatBoost-mode set, and its
-    refusal reads the same `usable` pool the grower's does. One replacement
-    clears both, so this fails separately if only one of them was cleared."""
-    model, X, y = _fit(grow_policy="symmetrictree", random_strength=1.0)
+def test_ctr_on_clears_random_strength_too():
+    """`random_strength=1.0` is in the shipped CatBoost-mode set and its
+    refusal reads the same `usable` pool the grower's does, so one
+    replacement clears both. This fails separately if only one cleared."""
+    model, X, y = _fit(
+        grow_policy="symmetrictree", random_strength=1.0, ctr="on"
+    )
     assert model.score(X, y) > 0.5
+
+
+# -- why it is not the default -------------------------------------------
+
+
+def test_the_default_still_refuses_a_categorical_column():
+    """The defect, pinned so it fails when it is fixed.
+
+    This is not the behavior anyone wants. It is the behavior, and a test
+    that asserted the mirror instead would be asserting an intention.
+    """
+    with pytest.raises(Exception) as caught:
+        _fit(grow_policy="symmetrictree")
+    assert "OFFERS a categorical column" in str(caught.value)
+
+
+def test_ctr_on_breaks_regression_which_is_why_it_is_not_the_default():
+    """The reason the default did not move, pinned in the same file.
+
+    No categorical column at all: `catboost_defaults()` is not inert without
+    one, and a continuous target has no two-valued midpoint to put a CTR
+    border on. When this stops raising, `ctr_target_border_count` has become
+    reachable (or CatBoost mode derives it), and `_CATBOOST_CTR` can be
+    `"on"`.
+    """
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(300, 8))
+    y = X[:, 0] + 0.5 * rng.normal(size=300)
+    with pytest.raises(Exception) as caught:
+        MojoTreesRegressor(
+            grow_policy="symmetrictree", n_estimators=6, ctr="on"
+        ).fit(X, y)
+    assert "ctr target borders" in str(caught.value)
+
+
+def test_regression_fits_under_the_shipped_default():
+    """The half that matters most and would have caught the mistake.
+
+    `MojoTreesRegressor(grow_policy="symmetrictree")` and nothing else. The
+    shipped default policy on the commonest task must fit.
+    """
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(300, 8))
+    y = X[:, 0] + 0.5 * rng.normal(size=300)
+    model = MojoTreesRegressor(grow_policy="symmetrictree", n_estimators=6)
+    model.fit(X, y)
+    assert model.predict(X).shape == (300,)
 
 
 def test_lossguide_is_untouched():
-    """`lossguide` mirrors LightGBM, which has no CTR, so its default stays
-    `"off"` and it searches the categorical column directly. It has always
-    been able to, and this asserts the change did not reach it."""
+    """`lossguide` mirrors LightGBM, which has no CTR, so its default is
+    `"off"` and it searches the categorical column directly."""
     model, X, y = _fit(grow_policy="lossguide")
     assert model.score(X, y) > 0.5
-
-
-@pytest.mark.parametrize("rule", ["off", "auto"])
-def test_a_named_rule_still_gets_that_rule(rule):
-    """A caller who NAMES a rule gets the rule and its consequence.
-
-    This is the half that makes the change a default rather than a special
-    case: `ctr="off"` and `ctr="auto"` leave a six-level column searchable,
-    the symmetric grower refuses, and it refuses with the sentence that says
-    why. If this ever starts passing, the mode has begun overriding what the
-    caller asked for.
-    """
-    with pytest.raises(Exception) as caught:
-        _fit(grow_policy="symmetrictree", ctr=rule)
-    assert "OFFERS a categorical column" in str(caught.value)
