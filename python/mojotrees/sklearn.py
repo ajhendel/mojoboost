@@ -1006,16 +1006,6 @@ class _Base(_ParamsMixin):
         # `lossguide` mirrors LightGBM, which has none.
         ctr=None,
         max_ctr_complexity=None,
-        # CatBoost's `target_binarization` pair, catalog A40. `None` means
-        # CatBoost's own defaults, `MinEntropy` and 1
-        # (`cat_feature_options.cpp:162`). They are separate keywords rather
-        # than a tuple because CatBoost spells them as two options and
-        # `ctr_target_border_count` is the one a caller reaches for; the type
-        # exists so the multiclass arm of `BuildTargetClassifier` is
-        # REACHABLE, which is the specific thing whose absence made the
-        # earlier refusal unanswerable from this surface.
-        ctr_target_border_count=None,
-        ctr_target_border_type=None,
         device="cpu",
         device_type=None,
         task_type=None,
@@ -1101,6 +1091,28 @@ class _Base(_ParamsMixin):
         diffusion_temperature=None,
         model_shrink_rate=None,
         model_shrink_mode=None,
+        # CatBoost's `target_binarization` pair, catalog A40. `None` means
+        # CatBoost's own defaults, `MinEntropy` and 1
+        # (`cat_feature_options.cpp:162`). Two keywords rather than a tuple
+        # because CatBoost spells them as two options and
+        # `ctr_target_border_count` is the one a caller reaches for; the type
+        # exists so the multiclass arm of `BuildTargetClassifier` is
+        # REACHABLE, which is the specific thing whose absence made the
+        # earlier refusal unanswerable from this surface.
+        #
+        # **AT THE END, and not beside `ctr` where they belong by subject.**
+        # This signature has 127 positional-or-keyword parameters and NO `*`
+        # marker, so every parameter after an insertion point shifts position
+        # for anyone passing positionally, and policy 11.2 prices a reorder
+        # as Breaking. These two landed at index 47 of 127, ahead of about
+        # eighty others. The snapshot cannot catch it -- it dumps with
+        # `sort_keys=True`, so declaration order is alphabetized away and
+        # both rows read as plain additions -- which is exactly why the
+        # placement has to be decided here rather than left to the gate.
+        # Appending costs a reader one lookup; inserting costs every
+        # positional caller silently.
+        ctr_target_border_count=None,
+        ctr_target_border_type=None,
     ):
         self.num_leaves = num_leaves
         self.max_leaves = max_leaves
