@@ -58,7 +58,10 @@ that quietly mis-routes such a model is worse than one that costs four word
 compares per level at plan time.
 """
 
-from .binning import BinnedMatrix
+from std.math import isnan
+from std.os import getenv
+
+from .binning import BinMapper, BinnedMatrix, POSITIVE_INF
 from .boosting import Booster, IterationRange
 from .categorical import CAT_BITSET_WORDS, cat_pool_contains
 from .parallel import dispatch_rows
@@ -221,6 +224,23 @@ struct ObliviousEnsemble(Copyable, Movable):
     var lvl_cat_words: List[UInt64]
     var leaf_value: List[Float64]
 
+    var raw_ready: Bool
+    """Whether `lvl_edge` and `lvl_nan_left` hold the raw-value rewrite of
+    every level, so the plan can be evaluated against the caller's Float64
+    matrix without binning it first. Filled by `oblivious_raw_plan`; false on
+    a plan built by `oblivious_plan` alone, which is bins-only."""
+
+    var lvl_edge: List[Float64]
+    """Per level slot, the bin EDGE `lvl_threshold` names. See
+    `_raw_split` for why `v <= lvl_edge[s]` selects the same branch as
+    `bin(v) <= lvl_threshold[s]` for every non-NaN `v`. Meaningless unless
+    `raw_ready`."""
+
+    var lvl_nan_left: List[Bool]
+    """Per level slot, the direction a NaN raw value takes: a constant,
+    because a NaN's bin is a constant of the feature. Meaningless unless
+    `raw_ready`."""
+
     def __init__(out self):
         """An inactive plan. The generic walker handles everything."""
         self.active = False
@@ -237,6 +257,9 @@ struct ObliviousEnsemble(Copyable, Movable):
         self.lvl_is_cat = []
         self.lvl_cat_words = []
         self.leaf_value = []
+        self.raw_ready = False
+        self.lvl_edge = []
+        self.lvl_nan_left = []
 
     @always_inline
     def _goes_left(self, slot: Int, bin: Int) -> Bool:
@@ -546,4 +569,679 @@ def predict_oblivious_batch(
     # gather to charge for because the plan reads the matrix in place. A
     # scheduling estimate only, like every other one handed to `dispatch_rows`.
     dispatch_rows(apply, n, n * plan.total_levels)
+    return out^
+
+
+# ---------------------------------------------------------------------------
+# Raw-value prediction: the same trees, walked against Float64 feature values
+# instead of against bin ids.
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. `Model.predict_batch` used to run `BinMapper.transform`
+# over the whole scoring matrix and then walk bin ids. That pays the entire
+# binning pipeline at inference time: one binary search per CELL (n_rows *
+# n_features of them), a full `BinnedMatrix` allocation, and a per-row gather
+# of every feature's bin whether or not any tree splits on it. LightGBM and
+# CatBoost do none of it -- they compare a raw feature value against a
+# Float64 threshold -- and that is the whole of the gap this file closes on
+# the leaf-wise path.
+#
+# THE BIT-IDENTITY ARGUMENT. It is the only thing that makes the substitution
+# legal, so it is written out rather than asserted, and `_raw_split` refuses
+# every shape it does not cover.
+#
+# The boundary convention, read off `BinMapper.bin_value` and the `BinMapper`
+# docstring. Feature f's edges are `edges[edge_offsets[f] : edge_offsets[f+1]]`,
+# STRICTLY INCREASING; call them e[0] < e[1] < ... < e[k-1]. `bin_value` runs
+# a binary search for the first index with `value <= edges[mid]` and returns
+# it minus the offset. Because the edges are strictly increasing that index is
+#
+#     bin(v) = #{ i : e[i] < v }                                          (1)
+#
+# so bin b is the interval (e[b-1], e[b]] -- HALF-OPEN ON THE LEFT, CLOSED ON
+# THE RIGHT. Bin 0 is everything at or below e[0], bin k is everything above
+# e[k-1], and a value sitting exactly ON an edge belongs to the bin BELOW it.
+# A feature with k edges therefore uses k + 1 ordinary bins, 0..k.
+#
+# The equivalence. For a threshold bin T with 0 <= T <= k-1,
+#
+#     bin(v) <= T   <=>   #{ i : e[i] < v } <= T   <=>   v <= e[T]        (2)
+#
+# Forward: if e[T] < v then e[0..T] are all < v, which is T+1 edges, so
+# bin(v) >= T+1 > T. Backward: if v <= e[T] then no i >= T has e[i] < v
+# (e[i] >= e[T] >= v), so the counted set is contained in {0..T-1} and has at
+# most T members. Both directions are exact, and the comparison on the right
+# is the SAME Float64 `<=` on the SAME two Float64 values the binary search
+# would have performed, so there is no rounding step anywhere in (2). The
+# comparison inherits the right-closed convention because `<=` IS that
+# convention.
+#
+# The four boundary cases the argument has to cover, all of them discharged
+# by (2) with no special case in the walk:
+#
+# - v BELOW the first edge: bin(v) = 0 <= T for every T >= 0, and v <= e[0]
+#   <= e[T]. Both go left. Agreed.
+# - v ABOVE the last edge: bin(v) = k > T for every T <= k-1, and v > e[k-1]
+#   >= e[T]. Both go right. Agreed.
+# - v exactly ON edge e[T]: (1) counts e[0..T-1] only, so bin(v) = T, and
+#   T <= T goes left; `v <= e[T]` is `e[T] <= e[T]`, which goes left too.
+#   Agreed. This is the case a `<` would have broken, and it is why the
+#   rewrite keeps `<=`.
+# - v infinite: -inf is below every finite edge and +inf is above every one,
+#   which are the two cases already covered; and if an edge were itself
+#   infinite, both arms still run the same `<=` on the same pair.
+#
+# T OUTSIDE [0, k-1]. `T >= k` cannot be beaten by any ordinary bin, since
+# bin(v) <= k <= T always, so the node sends every non-missing row left;
+# `POSITIVE_INF` as the edge reproduces that, because `v <= +inf` holds for
+# every v including +inf. `T < 0` on a numerical node is not a shape any
+# grower here produces (-1 is the leaf-and-categorical filler) and no finite
+# or infinite edge reproduces "always right" for v = -inf, so `_raw_split`
+# REFUSES it rather than guessing.
+#
+# MISSING VALUES. Two rules compose and both are handled before any compare.
+#
+# `bin_value` routes NaN first: to `missing_bin[f]` when the feature reserves
+# one, and otherwise it replaces the value with 0.0 and bins that. `fit_bins`
+# stores `n_out + 1` there, one PAST the last ordinary bin, so a reserved
+# missing bin is k + 1 and lies OUTSIDE [0, k]. `Tree.goes_left` then tests
+# `bin == missing_bin[node]` before the threshold and answers
+# `default_left[node]`.
+#
+# Two consequences, and the plan depends on both:
+#
+# - A NaN's bin is a CONSTANT of the feature, so the direction a NaN takes at
+#   a node is a constant of the node. `_raw_split` computes that bin exactly
+#   the way `bin_value` would, runs the node's own `goes_left` rule on it, and
+#   stores the answer as `nan_left`. The walk reads it instead of comparing,
+#   which it must: `NaN <= edge` is false in IEEE-754, so a NaN falling
+#   through to the compare would silently go right at every node.
+# - A NON-NaN value can never take the missing branch, because bin(v) is in
+#   [0, k] and a reserved missing bin is k + 1. So dropping the missing test
+#   from the compare path removes a branch that could not have fired. To keep
+#   that a fact rather than an assumption about who built the model,
+#   `_raw_split` refuses any node whose `missing_bin` is neither -1 nor the
+#   mapper's own reservation for that feature.
+#
+# NOT COVERED, and refused rather than approximated: categorical splits (a set
+# membership test on a category CODE, which is a table lookup and not a
+# threshold), CTR columns (their values are statistics of the training target
+# and are not present in the caller's matrix at all), and linear leaves. Each
+# leaves the plan inactive and the bins-and-walk path runs unchanged.
+
+
+# Below this many rows the raw plan is not built. Building costs one pass over
+# the ensemble's nodes; the saving is one binary search per cell of the
+# scoring matrix, which grows with the rows. Eight is where a 100-tree
+# ensemble's few thousand node conversions stop dominating.
+#
+# Like every other gate in this file it cannot change an output: both arms
+# reach the same leaf of the same tree and sum in the same order.
+comptime RAW_MIN_ROWS = 8
+
+
+# How much work one row's walk of one tree is worth in the histogram-op
+# equivalents `parallel.plan_tasks` compares against its grain. The same
+# number `boosting._TRAVERSAL_ROW_OPS` uses, for the same walk, minus the
+# gather that path pays and this one does not. A scheduling estimate only.
+comptime _RAW_WALK_OPS = 6
+
+
+def raw_predict_enabled() -> Bool:
+    """Whether batch prediction may walk raw feature values.
+
+    `MOJOTREES_RAW_PREDICT=0` forces the bin-and-walk path. Default ON, in the
+    `!= "0"` form this repository uses for a default-on switch (compare
+    `boosting._leaf_score_update_enabled`), because the two arms are
+    bit-identical by the argument above and there is nothing for a user to
+    choose between; the switch exists so the two can be measured against each
+    other in one process, and it should not outlive that measurement.
+    """
+    return getenv("MOJOTREES_RAW_PREDICT") != "0"
+
+
+# Why a raw plan was refused. Every refusal in this file records one of these
+# and every plan carries the FIRST one it hit, because "the number did not
+# move" is not a diagnosis: this whole path can decline silently, survive a
+# build, survive a bit-identity check, and survive two benchmark runs without
+# anyone learning which of a dozen conditions declined it. That happened. See
+# `PredictTrace`.
+comptime REFUSE_NONE = 0
+comptime REFUSE_CATEGORICAL_SPLIT = 1
+comptime REFUSE_FEATURE_OUT_OF_MATRIX = 2
+comptime REFUSE_CATEGORICAL_FEATURE = 3
+comptime REFUSE_NEGATIVE_THRESHOLD = 4
+comptime REFUSE_MISSING_BIN_IN_RANGE = 5
+comptime REFUSE_NODE_MISSING_BIN = 6
+comptime REFUSE_SWITCH_OFF = 10
+comptime REFUSE_TOO_FEW_ROWS = 11
+comptime REFUSE_EMPTY_RANGE = 12
+comptime REFUSE_LINEAR_LEAVES = 13
+comptime REFUSE_CTR_TABLES = 14
+comptime REFUSE_EMPTY_TREE = 15
+comptime REFUSE_BACKWARD_LINKS = 16
+comptime REFUSE_NOT_OBLIVIOUS = 17
+
+
+def refusal_text(code: Int) -> String:
+    """The refusal code as the sentence a person needs.
+
+    A code and not a `String` on the hot builder because `_raw_split` runs
+    once per NODE and a String there would allocate per node on a path whose
+    whole point is to allocate nothing.
+    """
+    if code == REFUSE_NONE:
+        return String("none")
+    if code == REFUSE_CATEGORICAL_SPLIT:
+        return String("categorical split: no threshold to convert")
+    if code == REFUSE_FEATURE_OUT_OF_MATRIX:
+        return String("split feature is not a column of the raw matrix")
+    if code == REFUSE_CATEGORICAL_FEATURE:
+        return String("split feature is categorical in the mapper")
+    if code == REFUSE_NEGATIVE_THRESHOLD:
+        return String("threshold_bin < 0 on a numerical node")
+    if code == REFUSE_MISSING_BIN_IN_RANGE:
+        return String("mapper missing bin is inside the ordinary bin range")
+    if code == REFUSE_NODE_MISSING_BIN:
+        return String("node missing bin disagrees with the mapper's")
+    if code == REFUSE_SWITCH_OFF:
+        return String("MOJOTREES_RAW_PREDICT=0")
+    if code == REFUSE_TOO_FEW_ROWS:
+        return String("fewer rows than RAW_MIN_ROWS")
+    if code == REFUSE_EMPTY_RANGE:
+        return String("empty iteration range")
+    if code == REFUSE_LINEAR_LEAVES:
+        return String("linear leaves")
+    if code == REFUSE_CTR_TABLES:
+        return String("CTR tables attached to the mapper")
+    if code == REFUSE_EMPTY_TREE:
+        return String("tree with no nodes")
+    if code == REFUSE_BACKWARD_LINKS:
+        return String("tree links do not point forward")
+    if code == REFUSE_NOT_OBLIVIOUS:
+        return String("no oblivious plan (ragged, too deep, or too few rows)")
+    return String("unknown")
+
+
+@fieldwise_init
+struct PredictTrace(Copyable, Movable):
+    """`MOJOTREES_PREDICT_TRACE=1`: one line per batch predict saying which
+    arm ran and, when a fast arm declined, the FIRST reason it declined.
+
+    This exists because of a specific failure and the docstring names it
+    rather than describing a feature. The raw arms shipped, built clean, and
+    passed a `np.array_equal` bit-identity check on both growth policies; the
+    symmetric arm's time then did not move, and there was no way to tell from
+    the outside whether the arm had declined, or had run and been no faster.
+    Those are opposite findings with opposite fixes, and separating them cost
+    a measuring session. One line of output settles it.
+
+    Off by default in the `== "1"` form this repository uses for a default-off
+    switch, and off it costs one `getenv` and a Bool test per predict call.
+    """
+
+    var on: Bool
+
+    @staticmethod
+    def resolve() -> PredictTrace:
+        var s = getenv("MOJOTREES_PREDICT_TRACE")
+        return PredictTrace(s == "1" or s == "true" or s == "TRUE")
+
+    def oblivious(self, plan: ObliviousEnsemble, n_rows: Int):
+        """Report the symmetric raw arm, which is asked first."""
+        if not self.on:
+            return
+        print(
+            "predict arm=oblivious_raw rows=",
+            n_rows,
+            " active=",
+            plan.active,
+            " raw_ready=",
+            plan.raw_ready,
+            " trees=",
+            plan.n_trees,
+            " levels=",
+            plan.total_levels,
+            " refused=",
+            refusal_text(plan.raw_refuse_code),
+            " at_level_slot=",
+            plan.raw_refuse_slot,
+            sep="",
+        )
+
+    def flat(self, sym: ObliviousEnsemble, plan: RawEnsemble, n_rows: Int):
+        """Report the general raw arm, and with it the symmetric arm that
+        declined ahead of it. Both halves matter: a reader needs to know the
+        symmetric arm was ASKED and why it said no, not only what ran."""
+        if not self.on:
+            return
+        print(
+            "predict arm=flat_raw rows=",
+            n_rows,
+            " oblivious_active=",
+            sym.active,
+            " oblivious_raw_ready=",
+            sym.raw_ready,
+            " oblivious_refused=",
+            refusal_text(sym.raw_refuse_code),
+            " | flat_active=",
+            plan.active,
+            " flat_trees=",
+            plan.n_trees,
+            " flat_refused=",
+            refusal_text(plan.refuse_code),
+            " at_tree=",
+            plan.refuse_tree,
+            " at_node=",
+            plan.refuse_node,
+            sep="",
+        )
+        if not plan.active:
+            print(
+                "predict arm=binned_fallback: both raw arms declined, so this"
+                " call pays BinMapper.transform"
+            )
+
+
+@fieldwise_init
+struct _RawSplit(Copyable, Movable):
+    """One node's split rewritten against raw Float64 values, or `ok` false.
+
+    `ok` false is not a failure to compute: it is a shape the rewrite is not
+    proved for, and every caller answers it by leaving the plan inactive.
+    `reason` is the `REFUSE_*` code, so a caller can say which shape.
+    """
+
+    var ok: Bool
+    var edge: Float64
+    var nan_left: Bool
+    var reason: Int
+
+
+def _raw_split(
+    mapper: BinMapper,
+    feature: Int,
+    threshold_bin: Int,
+    node_missing_bin: Int,
+    default_left: Bool,
+    cat_offset: Int,
+) -> _RawSplit:
+    """Rewrite one numerical node's routing against raw values.
+
+    Every refusal below is one of the shapes the module comment names as not
+    covered, and refusing is what keeps the covered case exact.
+    """
+    # A categorical node routes by set membership on a category CODE. There is
+    # no threshold to convert.
+    if cat_offset >= 0:
+        return _RawSplit(False, 0.0, False)
+    # A CTR column is not a column of the caller's matrix (see
+    # `BinMapper.n_total_features`), so no raw value exists to compare.
+    if feature < 0 or feature >= mapper.n_features:
+        return _RawSplit(False, 0.0, False)
+    if mapper.cats.is_cat(feature):
+        return _RawSplit(False, 0.0, False)
+    # "Always right" for every value including -inf is not something a
+    # threshold compare can express, and no grower here writes it.
+    if threshold_bin < 0:
+        return _RawSplit(False, 0.0, False)
+
+    var lo = mapper.edge_offsets[feature]
+    var k = mapper.edge_offsets[feature + 1] - lo
+    var mb = mapper.missing_bin[feature]
+    # The missing bin must be the one `fit_bins` reserves, one PAST the last
+    # ordinary bin, or no reservation at all. That is what makes "a non-NaN
+    # value never takes the missing branch" a fact about this model rather
+    # than an assumption about how it was made. `Tree.missing_bin` is the
+    # SPLIT FEATURE's missing bin, so it must agree with the mapper's or be
+    # the -1 that matches nothing.
+    if mb >= 0 and mb <= k:
+        return _RawSplit(False, 0.0, False)
+    if node_missing_bin >= 0 and node_missing_bin != mb:
+        return _RawSplit(False, 0.0, False)
+
+    # Equation (2) of the module comment, and its `T >= k` case.
+    var edge = POSITIVE_INF
+    if threshold_bin < k:
+        edge = mapper.edges[lo + threshold_bin]
+
+    # `bin_value(feature, NaN)`, statement for statement: the reserved bin
+    # when there is one, and otherwise the bin of 0.0.
+    var nan_bin = mb
+    if mb < 0:
+        nan_bin = mapper.bin_value(feature, 0.0)
+    # `Tree.goes_left` on that bin, with the categorical arm already excluded
+    # above, in the same order and with the same `<=`.
+    var nan_left: Bool
+    if nan_bin == node_missing_bin:
+        nan_left = default_left
+    else:
+        nan_left = nan_bin <= threshold_bin
+    return _RawSplit(True, edge, nan_left)
+
+
+struct RawEnsemble(Copyable, Movable):
+    """The trees of one iteration range in flat, raw-value form.
+
+    Structure of arrays, one entry per node, with child links already rebased
+    to absolute indices in the flat arrays, so a walk touches five contiguous
+    tables instead of chasing a `Tree` object per tree and ten `List`s per
+    node. `tree_root[t]` is tree t's root.
+
+    Deliberately NOT `gpu_predict.FlatEnsemble`, which was read first and does
+    not fit: it stores leaf values as **Float32**, which is right for a device
+    walk whose contract is already Float32 accumulation and is fatal here,
+    where the whole claim is that the Float64 sum is unchanged. It also keys
+    on `threshold_bin`, which is the quantity this path exists to stop
+    computing. The layout idea is borrowed; the widths are not.
+
+    `active` false is the caller's only precondition.
+    """
+
+    var active: Bool
+    var n_trees: Int
+    var tree_root: List[Int]
+    var nd_feature: List[Int]
+    var nd_edge: List[Float64]
+    var nd_nan_left: List[Bool]
+    var nd_left: List[Int]
+    var nd_right: List[Int]
+    var nd_value: List[Float64]
+
+    def __init__(out self):
+        """An inactive plan. The bin-and-walk path handles everything."""
+        self.active = False
+        self.n_trees = 0
+        self.tree_root = []
+        self.nd_feature = []
+        self.nd_edge = []
+        self.nd_nan_left = []
+        self.nd_left = []
+        self.nd_right = []
+        self.nd_value = []
+
+
+def raw_plan(
+    booster: Booster, mapper: BinMapper, rng: IterationRange, n_rows: Int
+) -> RawEnsemble:
+    """Flatten `booster`'s trees over `rng` into raw-value form, or return an
+    inactive plan.
+
+    All or nothing across the range: one node the rewrite is not proved for
+    and the whole plan is refused, because a mixed plan would need a per-node
+    branch in the hot walk and an ensemble is grown by one policy anyway.
+    """
+    var plan = RawEnsemble()
+    if not raw_predict_enabled():
+        return plan^
+    if n_rows < RAW_MIN_ROWS:
+        return plan^
+    if rng.stop <= rng.start:
+        return plan^
+    # `Tree.value` is not the whole leaf for a linear model; only
+    # linear_tree.mojo knows what is.
+    if booster.linear.is_active():
+        return plan^
+    # A CTR column is a statistic of the training target, not a column of the
+    # matrix the caller hands in. Those models keep the transform.
+    if mapper.ctr.is_active():
+        return plan^
+
+    var n = rng.stop - rng.start
+    for j in range(n):
+        # A reference, never `var tree = ...`: `Tree` holds twelve Lists and
+        # is `Copyable, Movable` rather than `ImplicitlyCopyable`.
+        ref tree = booster.trees[rng.start + j]
+        var n_nodes = len(tree.feature)
+        if n_nodes == 0:
+            return RawEnsemble()
+        var base = len(plan.nd_feature)
+        plan.tree_root.append(base)
+        for i in range(n_nodes):
+            var f = tree.feature[i]
+            if f < 0:
+                # A leaf. Only `nd_value` is ever read here, but every array
+                # keeps one entry per node so a single index addresses all of
+                # them.
+                plan.nd_feature.append(-1)
+                plan.nd_edge.append(0.0)
+                plan.nd_nan_left.append(False)
+                plan.nd_left.append(-1)
+                plan.nd_right.append(-1)
+                plan.nd_value.append(tree.value[i])
+                continue
+            # Links must point forward and stay in range. Every grower here
+            # appends a child after the node it splits, so this always holds
+            # for a grown or deserialized tree; checking it is what makes the
+            # `while` in the walk provably terminate, the same reason
+            # `gpu_predict._append_tree` checks it before a kernel walk.
+            var l = tree.left[i]
+            var r = tree.right[i]
+            if l <= i or r <= i or l >= n_nodes or r >= n_nodes:
+                return RawEnsemble()
+            var s = _raw_split(
+                mapper,
+                f,
+                tree.threshold_bin[i],
+                tree.missing_bin[i],
+                tree.default_left[i],
+                tree.cat_offset[i],
+            )
+            if not s.ok:
+                return RawEnsemble()
+            plan.nd_feature.append(f)
+            plan.nd_edge.append(s.edge)
+            plan.nd_nan_left.append(s.nan_left)
+            plan.nd_left.append(base + l)
+            plan.nd_right.append(base + r)
+            plan.nd_value.append(tree.value[i])
+
+    plan.n_trees = n
+    plan.active = True
+    return plan^
+
+
+def predict_raw_batch[
+    features_origin: ImmOrigin, //
+](
+    booster: Booster,
+    plan: RawEnsemble,
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    rng: IterationRange,
+    raw_score: Bool = False,
+) raises -> List[Float64]:
+    """One prediction per row of a RAW column-major matrix
+    (`features[f * n_rows + r]`), through `plan`.
+
+    The row-blocked counterpart of `Booster.predict_batch_range`, splitting
+    the same axis for the same reason: a row reads the plan, which no block
+    writes, and writes output slot `r`, which no other row touches. Nothing is
+    accumulated across rows, so the outputs are bit-identical to the serial
+    form at any block count.
+
+    Against the bin-and-walk path, the sum is `s = base` then one
+    `s += learning_rate * value` per tree in ascending range order, which is
+    `Booster.predict_raw_bins_range` statement for statement; the leaf each
+    tree contributes is the same leaf by the argument above this function.
+
+    `plan.active` is the caller's precondition.
+    """
+    var out = List[Float64](capacity=n_rows)
+    out.resize(n_rows, 0.0)
+    var out_p = out.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+    var base = booster.base_score
+    var lr = booster.learning_rate
+    var with_base = rng.includes_base()
+    var n_trees = plan.n_trees
+
+    var root_p = plan.tree_root.unsafe_ptr()
+    var nf_p = plan.nd_feature.unsafe_ptr()
+    var ed_p = plan.nd_edge.unsafe_ptr()
+    var lf_p = plan.nd_left.unsafe_ptr()
+    var rt_p = plan.nd_right.unsafe_ptr()
+    var vl_p = plan.nd_value.unsafe_ptr()
+
+    def apply(start: Int, end: Int) {imm}:
+        for r in range(start, end):
+            var s = base if with_base else 0.0
+            for t in range(n_trees):
+                var node = root_p.unsafe_load(t)
+                var f = nf_p.unsafe_load(node)
+                while f >= 0:
+                    var v = feat_p.unsafe_load(f * n_rows + r)
+                    var left: Bool
+                    if isnan(v):
+                        # Cold, and it has to be read rather than compared:
+                        # `NaN <= edge` is false, so a NaN would otherwise go
+                        # right at every node whatever the model says.
+                        left = plan.nd_nan_left[node]
+                    else:
+                        left = v <= ed_p.unsafe_load(node)
+                    if left:
+                        node = lf_p.unsafe_load(node)
+                    else:
+                        node = rt_p.unsafe_load(node)
+                    f = nf_p.unsafe_load(node)
+                s += lr * vl_p.unsafe_load(node)
+            if raw_score:
+                out_p.unsafe_store(r, s)
+            else:
+                out_p.unsafe_store(r, booster.response(s))
+
+    dispatch_rows(apply, n_rows, n_rows * n_trees * _RAW_WALK_OPS)
+    return out^
+
+
+def oblivious_raw_plan(
+    booster: Booster, mapper: BinMapper, rng: IterationRange, n_rows: Int
+) -> ObliviousEnsemble:
+    """`oblivious_plan` with every level rewritten against raw values.
+
+    The structural verification is `oblivious_plan`'s, unchanged and not
+    duplicated; this only adds `lvl_edge` and `lvl_nan_left` and sets
+    `raw_ready`. A plan whose levels cannot all be rewritten comes back with
+    `raw_ready` false and is still usable through `predict_oblivious_batch`,
+    so a refusal here costs the binning pass and never a wrong answer.
+    """
+    var plan = oblivious_plan(booster, rng, n_rows)
+    if not plan.active:
+        return plan^
+    if not raw_predict_enabled():
+        return plan^
+    if mapper.ctr.is_active():
+        return plan^
+    for s in range(plan.total_levels):
+        # A categorical level carries no threshold; `_raw_split` refuses it on
+        # `cat_offset`, which is what the 0/-1 below encodes.
+        var co = 0 if plan.lvl_is_cat[s] else -1
+        var rs = _raw_split(
+            mapper,
+            plan.lvl_feature[s],
+            plan.lvl_threshold[s],
+            plan.lvl_missing[s],
+            plan.lvl_default_left[s],
+            co,
+        )
+        if not rs.ok:
+            plan.lvl_edge = []
+            plan.lvl_nan_left = []
+            return plan^
+        plan.lvl_edge.append(rs.edge)
+        plan.lvl_nan_left.append(rs.nan_left)
+    plan.raw_ready = True
+    return plan^
+
+
+def predict_oblivious_raw_batch[
+    features_origin: ImmOrigin, //
+](
+    booster: Booster,
+    plan: ObliviousEnsemble,
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    rng: IterationRange,
+    raw_score: Bool = False,
+) raises -> List[Float64]:
+    """`predict_oblivious_batch` against a RAW column-major matrix, level
+    major within a row block.
+
+    The loop is turned inside out relative to the bins version, and that is
+    the point. An oblivious level asks ONE question of one feature, so a block
+    of rows evaluates it as a straight run over `features[f * n_rows + start
+    ..]`, which is contiguous in a column-major matrix, writing one bit each
+    into a small per-block index array. No traversal, no dependent load, and
+    the only data-dependent address in the whole thing is the leaf gather at
+    the end of each tree. That is the shape CatBoost's inference has.
+
+    Bit-identity has two halves and the transposition touches neither.
+
+    - Same leaf. Level `l`'s bit is `0` when the level's predicate says left,
+      packed at `1 << l`, which is `_leaf_slot_row_simple`'s pack and
+      `_fill_leaf_values`'s decode. The predicate is `_raw_split`'s rewrite of
+      the level's own `_goes_left`, exact by the argument above `RAW_MIN_ROWS`.
+    - Same sum. `out[r]` is seeded with the base score exactly when
+      `rng.includes_base()`, then takes one `+= learning_rate * value` per
+      tree in ASCENDING range order, because the tree loop is the outer one.
+      That is `Booster.predict_raw_bins_range`'s sequence of Float64
+      operations on the same values. Reordering the tree loop would break it;
+      reordering the row loop cannot, since rows share no accumulator.
+      Holding the running sum in `out` rather than in a register changes no
+      bit: an IEEE-754 Float64 add is exact for its inputs either way.
+
+    `plan.active and plan.raw_ready` is the caller's precondition.
+    """
+    var out = List[Float64](capacity=n_rows)
+    out.resize(n_rows, 0.0)
+    var out_p = out.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+    var lr = booster.learning_rate
+    var seed = booster.base_score if rng.includes_base() else 0.0
+
+    def apply(start: Int, end: Int) {imm}:
+        var w = end - start
+        if w <= 0:
+            return
+        # One block-sized index array, reused across trees; the same per-block
+        # reuse `Booster.predict_batch_range` gives its `bins` scratch.
+        var idx = List[Int](capacity=w)
+        idx.resize(w, 0)
+        var idx_p = idx.unsafe_ptr()
+        for i in range(w):
+            out_p.unsafe_store(start + i, seed)
+        for t in range(plan.n_trees):
+            var lo = plan.level_at[t]
+            var d = plan.depth[t]
+            for i in range(w):
+                idx_p.unsafe_store(i, 0)
+            for level in range(d):
+                var slot = lo + level
+                var col = plan.lvl_feature[slot] * n_rows + start
+                var edge = plan.lvl_edge[slot]
+                var nan_left = plan.lvl_nan_left[slot]
+                var bit = 1 << level
+                for i in range(w):
+                    var v = feat_p.unsafe_load(col + i)
+                    var left: Bool
+                    if isnan(v):
+                        left = nan_left
+                    else:
+                        left = v <= edge
+                    if not left:
+                        idx_p.unsafe_store(i, idx_p.unsafe_load(i) | bit)
+            var lat = plan.leaf_at[t]
+            for i in range(w):
+                out_p.unsafe_store(
+                    start + i,
+                    out_p.unsafe_load(start + i)
+                    + lr * plan.leaf_value[lat + idx_p.unsafe_load(i)],
+                )
+        if not raw_score:
+            for i in range(w):
+                out_p.unsafe_store(
+                    start + i, booster.response(out_p.unsafe_load(start + i))
+                )
+
+    dispatch_rows(apply, n_rows, n_rows * plan.total_levels)
     return out^

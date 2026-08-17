@@ -116,9 +116,28 @@ def test_every_depthwise_spelling_is_one_policy(regression, spelling):
 
 def test_the_three_policies_are_three_models(regression):
     """The guard on the spelling tests above: they would all pass if every
-    spelling resolved to one policy."""
+    spelling resolved to one policy.
+
+    **The leaf budget has to BIND, and that is the whole reason this
+    configuration is not the one beside it.** It read
+    `dict(n_estimators=10, max_depth=4)` and left `num_leaves` at 31. A
+    complete tree of depth 4 has 16 leaves, so the budget never bound, and
+    `lossguide` and `depthwise` differ only in the ORDER they spend a
+    budget: with none to spend, both split every splittable node and grow
+    the same tree, node for node. The two arms came back bit-identical and
+    the guard failed on a true statement about the parameters rather than
+    on anything about the policies. Corrected 2026-08-17.
+
+    `num_leaves=8` binds for both frontier orders (best-first picks eight
+    leaves by gain, a level at a time fills three complete levels) and is
+    ignored by the symmetric grower, which a level splits entirely or not
+    at all, so all three arms stay distinguishable for reasons the policy
+    names.
+    """
     X, y = regression
-    common = dict(n_estimators=10, max_depth=4)
+    common = dict(
+        n_estimators=10, max_depth=4, num_leaves=8, min_data_in_leaf=5
+    )
     fits = [
         _bits(_fit(X, y, grow_policy=p, **common), X)
         for p in ("lossguide", "depthwise", "symmetrictree")
@@ -147,11 +166,36 @@ def test_an_unknown_policy_names_all_three_canonical_values(regression):
         assert value in message
 
 
-def test_oblivious_requires_max_depth(regression):
-    """`max_depth` is the only bound on a symmetric tree, so leaving it
-    unlimited is refused rather than silently bounded by something else."""
+def test_oblivious_takes_catboosts_depth_when_none_is_named(regression):
+    """`max_depth` is the only bound on a symmetric tree, and an unset one
+    resolves to CatBoost's `depth` default of 6 rather than being refused.
+
+    This test asserted the refusal until 2026-08-17. The refusal is real and
+    still lives in `growth_policy` -- a symmetric grower will not run
+    unbounded -- but it stopped being reachable from this estimator, on
+    purpose: `grow_policy='symmetrictree'` is CatBoost mode, CatBoost mode
+    supplies CatBoost's own defaults, and `_CATBOOST_DEPTH = 6`
+    (`oblivious_tree_options.cpp:12`) is the one of them without which
+    `MojoTreesRegressor(grow_policy='symmetrictree')` and nothing else
+    raised on every fit. A shipped default that cannot fit is the defect
+    that change closed.
+
+    So the assertion is the substitution and not the absence of a refusal:
+    the unset fit is the depth-6 fit **bit for bit**. That is the claim a
+    silently different bound would fail, and it is a claim the old refusal
+    test could not make. `max_depth` is not one of CatBoost's four
+    learning-rate gate keys, so naming it changes nothing else in the
+    resolution and the two arms are comparable exactly.
+    """
     X, y = regression
-    with pytest.raises((ValueError, RuntimeError), match="max_depth"):
-        MojoTreesRegressor(
-            grow_policy="symmetrictree", n_estimators=2
-        ).fit(X, y)
+    unset = _fit(X, y, grow_policy="symmetrictree", n_estimators=2)
+    named = _fit(
+        X, y, grow_policy="symmetrictree", n_estimators=2, max_depth=6
+    )
+    np.testing.assert_array_equal(_bits(unset, X), _bits(named, X))
+    # -1 is the absence of a bound and not a depth, so it reads the same way
+    # rather than reaching the grower and being refused there.
+    explicit = _fit(
+        X, y, grow_policy="symmetrictree", n_estimators=2, max_depth=-1
+    )
+    np.testing.assert_array_equal(_bits(unset, X), _bits(explicit, X))

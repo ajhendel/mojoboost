@@ -553,13 +553,23 @@ def test_class_weight_validation(class_weight, error):
 
 def test_grow_policy_default_is_leafwise_and_names_resolve(regression):
     """The default trains the leaf-wise model exactly; XGBoost's alias
-    spellings resolve to it; depth-wise is a different, balanced model."""
+    spellings resolve to it; depth-wise is a different, balanced model.
+
+    The default VALUE is `"lossguide"` and not `"leafwise"`. The two are one
+    policy and always were; what changed is which spelling is canonical, on
+    2026-08-17, when `symmetrictree` joined and the three canonical values
+    became the three CatBoost/XGBoost spellings
+    (`sklearn._CANONICAL_GROW_POLICIES`,
+    and `test_grow_policy_oblivious.test_the_default_is_lossguide`, which
+    is the same claim from the other side). `leafwise` stays an accepted
+    alias, which the loop below is what proves.
+    """
     from mojotrees.inspection import dump_model
 
     X, y = regression
     kw = dict(num_leaves=8, n_estimators=5, min_data_in_leaf=5)
     plain = MojoTreesRegressor(**kw).fit(X, y)
-    assert plain.grow_policy == "leafwise"
+    assert plain.grow_policy == "lossguide"
     for alias in ("leafwise", "lossguide", "leaf_wise"):
         same = MojoTreesRegressor(grow_policy=alias, **kw).fit(X, y)
         np.testing.assert_array_equal(same.predict(X), plain.predict(X))

@@ -353,7 +353,14 @@ def test_ranker_accepts_the_objective_it_trains(objective):
         {"num_threads": 4},
         {"thread_count": 4},
         {"max_ctr_complexity": 4},
-        {"random_strength": 1.0},
+        # `random_strength=1.0` is NOT in this list any more, as of
+        # 2026-08-17. It is honored on the dense single-output CPU fit
+        # (`bindings/_mojotrees.fit` declares `random_strength_ok`), so it
+        # neither refuses nor states the current behavior -- it changes it,
+        # which is the third category this file's second list describes. Its
+        # home is test_catboost_reachability.py::
+        # test_random_strength_moves_the_fit. Keeping it here would have
+        # asserted it was ignored.
         # `score_function="Cosine"` is NOT in this list any more: it is
         # honored, and its tests are in test_catboost_reachability.py. An
         # unknown value still refuses by name, which is what belongs here.
@@ -379,10 +386,32 @@ def test_a_request_that_cannot_be_honored_is_refused_by_name(
     Each of these names a real thing that this build does not do. Accepting
     the value and training something else is the one outcome that must not
     happen, so each raises and the message says what it would take.
+
+    `Exception` rather than `(ValueError, RuntimeError)` since 2026-08-17,
+    and the reason is `score_function="NewtonCosine"`: its refusal is the
+    native `parse_score_function`'s, and a Mojo error crosses the binding as
+    itself. Nothing on the Python side wraps the fit call the way
+    `preflight` and `_resolve_device` wrap the readers they own, so the type
+    of a refusal here says which SIDE refused and nothing about whether the
+    refusal is right. What this test is for is that a refusal happened at
+    all, and the message assertion below is what keeps it honest: the
+    refusal has to be a refusal rather than a plumbing failure. A `TypeError`
+    would mean the constructor had never heard of the keyword, which is the
+    "unknown parameter" outcome this whole file exists to rule out, and it
+    would satisfy a bare `raises(Exception)` while proving the opposite of
+    the claim. The message is required to be a message and not empty.
+
+    The message is deliberately NOT required to contain the caller's
+    spelling. Two of these rows are aliases: `num_threads` and
+    `thread_count` resolve onto `n_jobs` before the refusal is written, and
+    naming the canonical parameter with the variable that does reach the
+    scheduler is the better message.
     """
     X, y = regression
-    with pytest.raises((ValueError, RuntimeError)):
+    with pytest.raises(Exception) as excinfo:
         MojoTreesRegressor(n_estimators=3, **kwargs).fit(X, y)
+    assert not isinstance(excinfo.value, (TypeError, AttributeError))
+    assert str(excinfo.value).strip()
 
 
 @pytest.mark.parametrize(

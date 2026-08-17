@@ -14,10 +14,16 @@ but does not reach the trainer passes a validation test and fails this one,
 which is the only difference that matters.
 
 `test_unreachable_catboost_parameters_refuse_by_name` is the other half and
-is the part meant to fail loudly later. It pins the four names that are still
+is the part meant to fail loudly later. It pins the names that are still
 refused. When someone wires one, this test fails, and fixing it means moving
 the name into the wired list above -- which is a smaller, louder step than
 noticing on your own that a merged mechanism was never connected.
+
+The table started with four rows and holds one. `score_function`,
+`bagging_temperature` and `random_strength` all left it by being wired, each
+with a moves-the-fit test written in its place; the comment block above the
+table records what each row's premise turned out to be. Only
+`max_ctr_complexity` above 1 is still genuinely unreachable.
 """
 
 import numpy as np
@@ -105,8 +111,8 @@ def test_squared_error_barely_moves_and_that_is_the_arithmetic():
     histogram was accumulated at, and this test is the record of why.
 
     Squared error's loss is *exactly* the quadratic a Newton step minimizes.
-    With `g_r = raw_r - y_r`, `h_r = 1` and `lambda_l2 = 0` (this library's
-    stock value since 2026-08-16), the first step writes `v = -sum(g)/n`;
+    With `g_r = raw_r - y_r`, `h_r = 1` and `lambda_l2 = 0`, the first step
+    writes `v = -sum(g)/n`;
     evaluating the leaf again at `raw + v` gives `sum(g') = sum(g) + n*v =
     0`, so every later step should add exactly zero. It adds a little more
     than zero because the two sums are not taken at the same width: the
@@ -120,20 +126,43 @@ def test_squared_error_barely_moves_and_that_is_the_arithmetic():
     predictions of mean magnitude 0.98. The assertion is the *ratio*, not
     either number, so it does not pin a tolerance that a later change to the
     accumulator width would falsify for the wrong reason.
+
+    **`lambda_l2=0.0` is now written down rather than inherited, and that is
+    a change of 2026-08-17 and not a weakening.** The unset default became
+    `1.0` that day, a declared divergence from LightGBM's stock 0.0 with
+    three measured accuracy artifacts behind it (`sklearn._LAMBDA_L2`,
+    `tools/check_parity.STOCK_DIVERGENCES`). At `lambda_l2 = 1` the
+    arithmetic above simply stops holding: the step is `-sum(g)/(n + 1)`, so
+    re-evaluating leaves `sum(g') = sum(g)/(n + 1)`, which is not zero, and
+    the later steps have real work to do. The four fits below therefore name
+    the value the derivation assumes, and
+    `test_lambda_l2_makes_the_extra_steps_do_work` asserts the other half:
+    at the shipped default the steps are NOT a no-op. Reading `< 1e-6` at
+    the shipped default would mean the mechanism had stopped running.
     """
     X, y = _regression()
-    one = MojoTreesRegressor(n_estimators=8, random_state=5).fit(X, y)
+    one = MojoTreesRegressor(
+        n_estimators=8, random_state=5, lambda_l2=0.0
+    ).fit(X, y)
     many = MojoTreesRegressor(
-        n_estimators=8, random_state=5, leaf_estimation_iterations=5
+        n_estimators=8,
+        random_state=5,
+        lambda_l2=0.0,
+        leaf_estimation_iterations=5,
     ).fit(X, y)
     moved = np.abs(one.predict(X) - many.predict(X)).max()
     scale = np.abs(one.predict(X)).mean()
     assert moved / scale < 1e-6
 
     Xb, yb = _binary()
-    lo = MojoTreesClassifier(n_estimators=8, random_state=5).fit(Xb, yb)
+    lo = MojoTreesClassifier(
+        n_estimators=8, random_state=5, lambda_l2=0.0
+    ).fit(Xb, yb)
     hi = MojoTreesClassifier(
-        n_estimators=8, random_state=5, leaf_estimation_iterations=5
+        n_estimators=8,
+        random_state=5,
+        lambda_l2=0.0,
+        leaf_estimation_iterations=5,
     ).fit(Xb, yb)
     logit_moved = np.abs(
         lo.predict(Xb, raw_score=True) - hi.predict(Xb, raw_score=True)
@@ -142,6 +171,27 @@ def test_squared_error_barely_moves_and_that_is_the_arithmetic():
     # Six orders of magnitude between "the accumulator is float32" and "the
     # mechanism ran". The measured gap is nine.
     assert logit_moved / logit_scale > 1e6 * (moved / scale)
+
+
+def test_lambda_l2_makes_the_extra_steps_do_work():
+    """The other half of the test above, and the reason it may pin
+    `lambda_l2=0.0` without losing anything.
+
+    The no-op is a property of the ZERO, not of squared error: with
+    `lambda_l2 > 0` the Newton step is `-sum(g)/(n + lambda_l2)`, which
+    undershoots the leaf's own minimizer by construction, so the second step
+    still has `sum(g') = sum(g) * lambda_l2/(n + lambda_l2)` left to spend
+    and the leaf keeps moving. `1.0` is the shipped default since
+    2026-08-17, so this is what a user who sets nothing gets, and it is the
+    arm a `< 1e-6` assertion at the default would have quietly demanded be
+    broken.
+    """
+    X, y = _regression()
+    one = MojoTreesRegressor(n_estimators=8, random_state=5).fit(X, y)
+    many = MojoTreesRegressor(
+        n_estimators=8, random_state=5, leaf_estimation_iterations=5
+    ).fit(X, y)
+    assert not np.array_equal(one.predict(X), many.predict(X))
 
 
 def test_leaf_estimation_iterations_refuses_an_eval_set_fit():
@@ -409,12 +459,29 @@ def test_score_function_value_is_case_insensitive(spelling):
 def test_unknown_score_function_is_refused_by_name():
     """An unknown value is refused rather than resolved to the default: a
     mistake that resolved to L2 would run one arm of an A/B under the
-    other's label."""
+    other's label.
+
+    `Exception` rather than `ValueError`, for the reason
+    `test_leaf_estimation_iterations_refuses_an_eval_set_fit` above gives:
+    **the refusal is the native layer's**. `parse_score_function`
+    (`tree_parameters_extra.mojo`) is the one resolver, reached from
+    `_parse_params`, and nothing on the Python side wraps the fit call the
+    way `preflight` and `_fit_args._check_objective_param` wrap the readers
+    they own, so the Mojo error arrives as itself. Written `ValueError` when
+    this test landed and never run until 2026-08-17.
+
+    The `match` is what carries the teeth, and it is stricter than it was:
+    the message must name the parameter AND the two values that are legal,
+    so a refusal that degenerated into a bare "unknown value" fails here.
+    """
     X, y = _regression(n_rows=120)
-    with pytest.raises(ValueError, match="score_function"):
+    with pytest.raises(Exception) as excinfo:
         MojoTreesRegressor(n_estimators=3, score_function="NewtonCosine").fit(
             X, y
         )
+    message = str(excinfo.value)
+    assert "score_function" in message
+    assert "L2" in message and "Cosine" in message
 
 
 # --------------------------------------------------------------------------
@@ -542,23 +609,79 @@ def test_a_bootstrap_configuration_that_names_two_things_is_refused(
     """A parameter that belongs to another `bootstrap_type` is refused by
     name with the reason, never accepted and dropped. CatBoost's own
     `TBootstrapConfig::Validate` misses one of these
-    (`bagging_temperature` beside MVS) and that divergence is deliberate."""
+    (`bagging_temperature` beside MVS) and that divergence is deliberate.
+
+    `Exception` rather than `(ValueError, RuntimeError)` since 2026-08-17,
+    because **these refusals do not all come from the same side**. Seven of
+    the eight are `_resolve_bootstrap`'s, in python/mojotrees/sklearn.py, and
+    are `ValueError`. The first is deliberately not: the estimator emits
+    `bagging_temperature` onto the wire and lets
+    `sampling.check_mvs_bagging_temperature` refuse it, so that the rule has
+    one authority, and a Mojo error crosses the binding as itself. The
+    `fragment` assertion is what this test has always been for and it is
+    unchanged: the message must name the parameter the user typed.
+    """
     X, y = _regression(n_rows=120)
-    with pytest.raises((ValueError, RuntimeError)) as excinfo:
+    with pytest.raises(Exception) as excinfo:
         MojoTreesRegressor(n_estimators=3, **kwargs).fit(X, y)
     assert fragment in str(excinfo.value)
 
 
-def test_bootstrap_type_refuses_on_a_multiclass_fit():
-    """Multiclass has no bootstrap and must say so. Neither
-    `boosting.train_multiclass` nor `train_multiclass_gpu` takes the bundle,
-    and CatBoost agrees about the shape of the hole: its own defaulting
-    block excludes the multiclass-only losses from the MVS default."""
+def test_bootstrap_type_moves_a_multiclass_fit():
+    """Multiclass HONORS the bootstrap on the CPU arm, and this test used to
+    assert it was refused.
+
+    The premise was `boosting.train_multiclass` taking no bundle. It takes
+    one: `boosting._boost_rounds_multiclass` draws once per round and every
+    class's tree of that round shares the draw (`fit_multiclass` in
+    bindings/_mojotrees.mojo, which passes `resolve_or_defer` rather than
+    `resolve` for exactly this reason). So the refusal did not narrow, it
+    ended, and the rule this file states -- **a name leaves the refused list
+    by being wired, never by being deleted** -- says the replacement is a
+    moves-the-fit assertion and not a smaller `raises`.
+
+    What is still refused, and is not asserted here because CI has no
+    accelerator, is the GPU arm: `model.fit_multiclass` names
+    `train_multiclass_gpu` rather than training a model that ignored the
+    setting.
+
+    BAYESIAN AND NOT MVS, and the reason is a refusal this test's first draft
+    walked straight into. `bootstrap_type='MVS'` with `mvs_reg` UNSET is still
+    refused on the multiclass trainers, and the refusal is correct rather than
+    a gap: CatBoost derives the MVS lambda from the previous tree's leaf
+    values (`TMvsSampler::GetLambda` reading
+    `CalculateLastIterMeanLeafValue`), which needs one tree holding one value
+    per output dimension per leaf. A softmax round is one tree PER CLASS with
+    unrelated structures, so that table does not exist and no substitute for
+    it would be CatBoost's number.
+
+    So the bootstrap that demonstrates the bundle is honored has to be one
+    that needs no such table. Bayesian is the honest choice twice over: it
+    needs no previous-tree statistic, and it is the type CatBoost ITSELF
+    defaults the multiclass-only losses to
+    (`catboost_default_bootstrap_type`). Naming `mvs_reg` explicitly would
+    also work and is the other documented exit.
+
+    Bayesian reweights rows rather than dropping them, so the multiclass round
+    sees the same rows with different weights and therefore a different
+    weighted gradient. Both arms are one seed on one dataset, so the draw is
+    the only thing that can differ.
+    """
     X, y = _regression(n_rows=180)
     labels = np.digitize(y, np.quantile(y, [0.33, 0.66]))
-    with pytest.raises((ValueError, RuntimeError)):
+    plain = MojoTreesClassifier(n_estimators=6, random_state=5).fit(X, labels)
+    bayes = MojoTreesClassifier(
+        n_estimators=6, random_state=5, bootstrap_type="Bayesian"
+    ).fit(X, labels)
+    assert not np.array_equal(plain.predict_proba(X), bayes.predict_proba(X))
+
+    # The MVS refusal is asserted rather than merely avoided, so that this
+    # test still fails if it silently becomes reachable without the lambda
+    # question being answered.
+    with pytest.raises(Exception, match="mvs_reg"):
         MojoTreesClassifier(
-            n_estimators=3, bootstrap_type="MVS", subsample=0.8
+            n_estimators=6, random_state=5,
+            bootstrap_type="MVS", subsample=0.8,
         ).fit(X, labels)
 
 
@@ -584,8 +707,14 @@ def test_bootstrap_type_no_is_bit_for_bit_the_default():
 #: value that triggers the refusal and the piece the message must name.
 #: A name leaves this table by being wired, never by being deleted.
 UNREACHABLE = [
-    ("random_strength", 1.0, "random_score_scale"),
-    ("max_ctr_complexity", 2, "ctr.mojo"),
+    # `ctr_combinations.mojo` and not `ctr.mojo`: the message names the file
+    # holding the projection enumeration that no grow loop drives, and that
+    # is the file a reader has to open. `ctr.mojo` was the right file when
+    # the whole CTR bundle was unreachable; it is reachable now (`ctr='on'`
+    # and `ctr='auto'`), so pointing there would send a reader to working
+    # code. The refusal itself did not move: `max_ctr_complexity` above 1 is
+    # still refused, by name, in `_check_catboost_only`.
+    ("max_ctr_complexity", 2, "ctr_combinations.mojo"),
 ]
 # `score_function` left this table by being wired, which is the only way a
 # row may leave it. Its moves-the-fit tests are
@@ -597,14 +726,60 @@ UNREACHABLE = [
 # changed is that the refusal is now about a missing companion parameter
 # rather than about a missing edge, so the row's premise was false. Its
 # moves-the-fit tests are the `bootstrap_type` section below.
+#
+# `random_strength` left it on 2026-08-17, by being wired, and the row's
+# premise was wrong in a way worth recording: the claim was that the per-tree
+# `random_score_scale` had no caller. It had callers
+# (`boosting._round_random_score_scale`); what it lacked was a route from
+# Python, because `_parse_params` declared `random_strength_ok` at one call
+# site. `bindings/_mojotrees.fit` declares it now, so a dense single-output
+# CPU fit honors the setting, and every entry point that computes no scale
+# still refuses by name rather than training a model that ignored it. Its
+# moves-the-fit test is `test_random_strength_moves_the_fit` below.
+
+
+def test_random_strength_moves_the_fit():
+    """`random_strength` reaches the split search, which is the assertion the
+    standing gate's row was replaced by.
+
+    CatBoost's score noise is a seeded normal added to each candidate's
+    score, scaled by the round's own derivative RMS, so it can elect a
+    different split at a node where two candidates are close, and every
+    later node of that tree sees a different partition. Both arms are one
+    estimator, one seed and one dataset, so the noise is the only thing that
+    can differ; `random_strength_seed` is its own seed and is left at its
+    default in both.
+
+    `1.0` is CatBoost's own default value, so this is also the arm a
+    CatBoost script gets by writing nothing.
+    """
+    X, y = _regression()
+    plain = MojoTreesRegressor(
+        n_estimators=8, num_leaves=15, random_state=5
+    ).fit(X, y)
+    noisy = MojoTreesRegressor(
+        n_estimators=8, num_leaves=15, random_state=5, random_strength=1.0
+    ).fit(X, y)
+    assert not np.array_equal(plain.predict(X), noisy.predict(X))
+
+
+def test_random_strength_zero_is_bit_for_bit_the_default():
+    """Naming the value a fit already runs at must not move it: 0.0 is no
+    noise, which is what every fit before the wiring did."""
+    X, y = _regression()
+    absent = MojoTreesRegressor(n_estimators=6, random_state=5).fit(X, y)
+    named = MojoTreesRegressor(
+        n_estimators=6, random_state=5, random_strength=0.0
+    ).fit(X, y)
+    np.testing.assert_array_equal(absent.predict(X), named.predict(X))
 
 
 @pytest.mark.parametrize("name,value,missing", UNREACHABLE)
 def test_unreachable_catboost_parameters_refuse_by_name(name, value, missing):
     """The refusal fires, and the message names the missing piece.
 
-    Naming the piece is not decoration. Each of these four is *implemented*
-    in Mojo and unreachable for a different structural reason, and a message
+    Naming the piece is not decoration. Each of these is *implemented* in
+    Mojo and unreachable for a different structural reason, and a message
     that said only "not implemented" is what let four of them sit merged and
     unused through a whole round. The `missing` string is the symbol a reader
     can grep for to find the one edge that is absent.

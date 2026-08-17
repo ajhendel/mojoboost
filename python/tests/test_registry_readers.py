@@ -47,12 +47,42 @@ def test_metric_registry_is_native_and_complete():
 
 
 def test_regressor_objective_literal_matches_registry():
+    """Every spelling the estimator accepts resolves to the registry's code
+    for it, through the registry or through the one documented bridge.
+
+    **The registry is LightGBM's vocabulary and the literal is four
+    vendors', and that is deliberate.** Until 2026-08-16 the literal held
+    LightGBM's spellings only and every one of them resolved natively, so
+    this test asked the registry directly. `objective="reg:squarederror"`,
+    `"rmse"`, `"quantile_loss"` and the rest arrived that day; the registry
+    was not taught them, because a name it does not know is a name the
+    parameter string and the Mojo API do not accept either, and teaching it
+    would widen three surfaces to serve one.
+
+    `_Base._registry_objective_name` is the bridge that exists for this and
+    names `reg:squarederror` in its own docstring: a vendor spelling is
+    looked up in `_OBJECTIVES` and reported as the first LightGBM alias of
+    the same code. It is what `_eval.default_metric` reads, so a fit with an
+    `eval_set` and no `eval_metric` under a vendor spelling depends on it.
+    Asserting through it is therefore stronger than the old direct lookup,
+    not weaker: it pins the codes AND the resolution a real fit takes.
+    """
     literal = MojoTreesRegressor._OBJECTIVES
     for spelling, code in literal.items():
-        assert _fit_args._objective_status(spelling) == "supported", spelling
-        assert _fit_args._objective_code_of_name(spelling) == code, spelling
+        bridged = MojoTreesRegressor(
+            objective=spelling
+        )._registry_objective_name()
+        assert _fit_args._objective_status(bridged) == "supported", spelling
+        assert _fit_args._objective_code_of_name(bridged) == code, spelling
+        # A spelling the registry knows is passed through unchanged, so the
+        # bridge cannot quietly relabel a LightGBM name as another objective.
+        if _fit_args._objective_status(spelling) == "supported":
+            assert bridged == spelling, spelling
+            assert _fit_args._objective_code_of_name(spelling) == code
     # Every registry spelling that resolves to a regression code is in the
-    # literal, so the contract is complete rather than a subset.
+    # literal, so the contract is complete in the direction that still holds:
+    # the estimator accepts everything the registry does. The other direction
+    # is the vendor aliases above and is checked through the bridge.
     regression_codes = set(literal.values())
     for spelling, code in ext.registry_objective_aliases():
         if int(code) in regression_codes:

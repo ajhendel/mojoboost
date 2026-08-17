@@ -1805,11 +1805,11 @@ struct Booster(Copyable, Movable):
         """One prediction per row of an already binned matrix, over row
         blocks.
 
-        The body is the per-row body `Model.predict_batch` ran serially, moved
-        here unchanged: gather the row's bins, then call the same
-        `predict_raw_bins_range` or `predict_bins_range` this ensemble has
-        always been asked. `data.bin_at(r, f)` is `bins[f * n_rows + r]`,
-        which is the value that loop gathered.
+        The body is the per-row body `Model.predict_batch` ran serially, with
+        the per-row bin gather taken out: it is `predict_raw_bins_range`
+        inlined over `Tree.predict_row`, which reads `data.bin_at(r, f)` where
+        the bins version read `bins[f]`. See the comment on the loop for why
+        that is the same Int at every node.
 
         Splitting it over blocks cannot change a number. A row reads the
         ensemble, which no block writes, and writes output slot `r`, which no
@@ -1829,19 +1829,35 @@ struct Booster(Copyable, Movable):
         out.resize(n, 0.0)
         var out_p = out.unsafe_ptr()
 
-        # Per block, not per row: the same reuse the serial loop had.
+        # THE GATHER IS GONE. This used to materialize a row's whole bin
+        # vector -- `bins.clear()` then one `append` per feature, so
+        # `n_rows * n_features` of them -- and hand it to
+        # `predict_raw_bins_range`. The trees then read at most `depth` of
+        # those entries per tree and ignored the rest, which on a 90-feature
+        # matrix is most of the work in this loop.
+        #
+        # So the walk reads the matrix in place instead. `Tree.predict_row` is
+        # `Tree.predict_bins` with `data.bin_at(row, f)` where the latter has
+        # `bins[f]`, and those are the same Int by the definition of the
+        # gather that used to run here, so every node takes the same branch.
+        # The sum around it is `predict_raw_bins_range` inlined, unchanged:
+        # the base score exactly when the range starts at iteration 0, then
+        # one `s += learning_rate * value` per tree in ascending range order.
+        # `response` is applied to the finished raw score, which is what
+        # `predict_bins_range` did. Bit-identical, and it allocates nothing
+        # per block.
         def apply(start: Int, end: Int) {imm}:
-            var bins = List[Int](capacity=n_features)
+            var base = self.base_score if rng.includes_base() else 0.0
             for r in range(start, end):
-                bins.clear()
-                for f in range(n_features):
-                    bins.append(data.bin_at(r, f))
-                if raw_score:
-                    out_p.unsafe_store(
-                        r, self.predict_raw_bins_range(bins, rng)
+                var s = base
+                for i in range(rng.start, rng.stop):
+                    s += self.learning_rate * self.trees[i].predict_row(
+                        data, r
                     )
+                if raw_score:
+                    out_p.unsafe_store(r, s)
                 else:
-                    out_p.unsafe_store(r, self.predict_bins_range(bins, rng))
+                    out_p.unsafe_store(r, self.response(s))
 
         dispatch_rows(
             apply,

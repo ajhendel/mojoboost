@@ -64,8 +64,17 @@ def test_unimplemented_option_gets_the_native_message():
     # `forcedsplits_filename` is the probe now. It names a real LightGBM
     # feature reachable from the Mojo API but not carryable in a parameter
     # string, which is what "unimplemented option" is for.
+    # The message does not say "not implemented" and must not: forced splits
+    # ARE implemented and ARE reachable, from the Mojo API, and what a
+    # parameter string cannot do is carry a document. That assertion was
+    # written on 2026-08-17 against the wording of the message this probe
+    # replaced and never ran. The teeth stay where they were -- the message
+    # has to name the option and the route that does work, which is exactly
+    # what a degraded "not implemented" would fail.
     message = preflight.unimplemented_option_message("forcedsplits_filename")
-    assert message is not None and "not implemented" in message
+    assert message is not None
+    assert "forcedsplits_filename" in message
+    assert "parse_forced_splits" in message
     assert preflight.unimplemented_option_message("num_leaves") is None
     # `feature_pre_filter` is no longer one of them. `false` is the behavior
     # mojotrees has, so it is accepted rather than refused; `true` is still

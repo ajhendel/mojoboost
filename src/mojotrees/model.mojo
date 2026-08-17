@@ -35,7 +35,14 @@ from .gpu_predict import (
     predict_raw_multiclass_gpu,
 )
 from .objective import GradHessFn, train_custom
-from .predict import oblivious_plan, predict_oblivious_batch
+from .predict import (
+    oblivious_plan,
+    oblivious_raw_plan,
+    predict_oblivious_batch,
+    predict_oblivious_raw_batch,
+    predict_raw_batch,
+    raw_plan,
+)
 from .sampling import BootstrapParams, check_bootstrap_honored
 from .train_gpu import train_gpu, train_multiclass_gpu
 
@@ -136,6 +143,45 @@ struct Model(Copyable, Movable, Writable):
         var resolved = resolve_device(
             device, n_rows, self.mapper.n_features, 1
         )
+        # THE BINNING PASS IS NOT PART OF PREDICTION, and this block is where
+        # that stopped being true. Everything below this used to begin with
+        # `transform`, which runs a binary search over the fitted edges for
+        # every CELL of the scoring matrix, allocates a whole `BinnedMatrix`,
+        # and only then walks bin ids down the trees. LightGBM and CatBoost
+        # compare a raw feature value against a Float64 threshold and allocate
+        # nothing, which is most of why we were the slowest library at
+        # inference while being the fastest at training.
+        #
+        # So a host walk asks first whether the model can be rewritten against
+        # raw values, and only bins when it cannot. The rewrite turns each
+        # node's `threshold_bin` into the bin EDGE it names, and
+        # `predict._raw_split` carries the proof that `v <= edge` selects the
+        # same branch as `bin(v) <= threshold_bin` for every value, edges and
+        # missing included. It refuses every shape the proof does not cover
+        # (categorical splits, CTR columns, linear leaves), and those models
+        # keep this path.
+        #
+        # The symmetric arm is asked first because it is strictly the better
+        # answer when it applies: an oblivious level is one compare per row
+        # with no traversal at all.
+        #
+        # Length is checked here because `transform` used to check it and no
+        # longer always runs; the message is the one it raised.
+        if len(features) != n_rows * self.mapper.n_features:
+            raise Error("features length must equal n_rows * n_features")
+        if resolved != GPU_DEVICE and not self.booster.linear.is_active():
+            var raw_sym = oblivious_raw_plan(
+                self.booster, self.mapper, rng, n_rows
+            )
+            if raw_sym.active and raw_sym.raw_ready:
+                return predict_oblivious_raw_batch(
+                    self.booster, raw_sym, features, n_rows, rng, raw_score
+                )
+            var raw_flat = raw_plan(self.booster, self.mapper, rng, n_rows)
+            if raw_flat.active:
+                return predict_raw_batch(
+                    self.booster, raw_flat, features, n_rows, rng, raw_score
+                )
         # `build_view=False`: this matrix is SCORED, never
         # histogrammed, so the row-major view would be a second full
         # copy of the bin ids that nothing ever reads. The view went

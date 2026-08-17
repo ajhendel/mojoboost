@@ -203,6 +203,41 @@ class _Config:
                     f"{key!r} describes the data, not the training run; pass "
                     f"it as {_DATASET_PARAMS[key]}"
                 )
+        # `feature_pre_filter` is refused by VALUE, not by name, and it has to
+        # be handled here because it is the one LightGBM training-params key
+        # that is neither a `_DATASET_PARAMS` redirect nor an estimator
+        # keyword. Without this, `train({"feature_pre_filter": False}, ...)`
+        # reached `MojoTreesRegressor(**given)`, which has no such keyword and
+        # no `**kwargs`, and died as "unknown or unsupported training
+        # parameter". That refused the exact LightGBM idiom a porting user
+        # types, on the Python surface only: the parameter STRING surface has
+        # accepted `false` since `tree_parameters_extra.check_feature_pre_filter`
+        # landed. Two surfaces disagreeing about one key is the defect.
+        #
+        # `false` IS mojotrees's behavior rather than an unimplemented option:
+        # the split search rejects the candidates LightGBM's prefilter would
+        # have dropped, as it scans. So a configuration that spells out the
+        # setting we match now ports across unchanged, which is the whole
+        # point.
+        #
+        # `true` is refused, and NOT because it is unimplemented.
+        # `binning.fit_bins` implements it fully. It is refused because by the
+        # time `train` is called the `Dataset` already exists, so the flag
+        # would be read and then ignored, and a setting this library reads and
+        # ignores is the one outcome it refuses outright. The remedy names the
+        # place it does work.
+        if "feature_pre_filter" in given:
+            requested = given.pop("feature_pre_filter")
+            if requested:
+                raise ValueError(
+                    "feature_pre_filter=True cannot be honored from train(): "
+                    "the prefilter runs when the bin edges are fit, and the "
+                    "Dataset handed to train() is already built. Pass it "
+                    "where the binning happens, or drop it: "
+                    "feature_pre_filter=False is what mojotrees does anyway, "
+                    "because the split search rejects the same candidates as "
+                    "it scans."
+                )
         objective = given.pop("objective", "regression")
         self.task = _task_of(objective)
         self.objective = objective

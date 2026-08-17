@@ -249,6 +249,16 @@ def test_a_fold_carries_every_column_the_source_had(regression):
     The row-shaped columns are sliced with the matrix and the
     column-shaped declarations are copied whole, because those describe the
     features rather than the rows.
+
+    The binning params are compared against the SOURCE's own resolved dict
+    rather than against a literal, which is what the claim in the name
+    actually is. The literal read `{"max_bin": 31, "use_missing": True}` and
+    went stale on 2026-08-17, when `basic._BINNING_DEFAULTS` gained `ctr`
+    (default `"off"`) and every `Dataset` began resolving three keys instead
+    of two. A literal here fails again on the next key a `Dataset` learns,
+    and it never tested the fold against the source in the first place.
+    `max_bin` is still asserted on its own, because it is the one key this
+    caller set and the one a copy could drop.
     """
     X, y = regression
     weight = np.linspace(0.5, 1.5, len(y))
@@ -270,7 +280,9 @@ def test_a_fold_carries_every_column_the_source_had(regression):
     np.testing.assert_array_equal(np.asarray(fold.get_data()), X[rows])
     assert fold.feature_name == ["a", "b", "c", "d"]
     assert fold.categorical_feature == [0]
-    assert fold.params == {"max_bin": 31, "use_missing": True}
+    assert fold.params == source.params
+    assert fold.params["max_bin"] == 31
+    assert fold.params["use_missing"] is True
 
 
 def test_a_frame_keeps_its_column_names_through_the_folds(regression):

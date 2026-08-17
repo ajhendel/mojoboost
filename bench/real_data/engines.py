@@ -324,6 +324,82 @@ def _arm(engine, which):
     return dict(getattr(engine, which, None) or {})
 
 
+#: What `predict_batch` and `predict_row` are allowed to mean, on every arm.
+#:
+#: WRITTEN AFTER THE COLUMN WAS PUBLISHED WITHOUT IT. Run
+#: `20260817T185124Z-posthistfix`, scenario `dense_regression` on the real
+#: YearPredictionMSD split, 51,630 held-out rows and 100 trees, reported the
+#: XGBoost arm's batch prediction as 0.00015 s beside LightGBM's 0.047 s for
+#: the same work. That is not a fast predictor. `xgboost.Booster.predict`
+#: caches its result on the DMatrix it was handed, which is the property
+#: `Booster.inplace_predict`'s own docstring contrasts itself against
+#: ("Unlike :py:meth:`predict` method, inplace prediction does not cache the
+#: prediction result"), and this module built one DMatrix and handed the same
+#: object to every repeat. So `measure.repeat`'s warmup call scored the rows
+#: and every measured call read the answer back. The stored samples say so
+#: outright, at warmup 0.0093 s against measured 0.00018 / 0.00014 /
+#: 0.00013 s, with `cpu_s` falling from 0.053 to 0.0004. Four hundred
+#: microseconds of CPU cannot visit five million tree nodes. No other arm's
+#: warmup and measured samples differ by more than a few percent.
+#:
+#: The rule has three clauses, stated so they do not have to be rediscovered
+#: on the next library.
+#:
+#: 1. THE TIMED CALLABLE IS HANDED THE HELD-OUT MATRIX in the harness's own
+#:    container, the same object every arm gets, and pays whatever conversion
+#:    its library needs INSIDE the timing. An arm that predicts from a
+#:    container built and paid for outside the loop is not in this column.
+#: 2. NO STATE THAT COULD HOLD A PREVIOUS ANSWER SURVIVES BETWEEN REPEATS.
+#:    Where a library caches on a container it was handed, the container is
+#:    built inside the timed call so every repeat gets a cold one.
+#: 3. THE CALL RETURNS A MATERIALIZED SCORE PER HELD-OUT ROW, checked by
+#:    `_materialized_predictions` below rather than assumed. A lazy handle
+#:    timed instead of a prediction reads as a win.
+#:
+#: And the general form, which is the part worth keeping: A NUMBER WHOSE
+#: MAGNITUDE IS IMPLAUSIBLE FOR THE WORK IT CLAIMS TO DO IS A MEASUREMENT BUG
+#: UNTIL PROVEN OTHERWISE. It is never first evidence that we, or a peer, are
+#: three hundred times faster than a mature library at the same task.
+PREDICT_PHASE_RULE = (
+    "predict_batch and predict_row are handed the harness's held-out matrix "
+    "and time the library's own conversion of it plus the scoring, with no "
+    "container reused between repeats that could serve a cached answer, and "
+    "the returned array is checked to be materialized. See "
+    "engines.PREDICT_PHASE_RULE and bench/results/PREDICT_TIMING_AUDIT.md"
+)
+
+
+def _materialized_predictions(engine, out, n_rows):
+    """`out`, checked to be one materialized score per held-out row.
+
+    A prediction timing is a timing of prediction only if the call produced
+    the predictions. A library that returned a lazy handle, a future, or a
+    view onto a buffer it will fill later would be timed at almost nothing
+    and would rank first. Every adapter in this module returns a NumPy array
+    today; this makes that a checked property of the column rather than four
+    separate assumptions about four libraries.
+
+    Called once per phase, AFTER `measure.repeat` returns, so it adds nothing
+    to any measured sample. Multiclass output is (n, k), which is why only
+    the leading axis is checked.
+    """
+    array = np.asarray(out)
+    if array.dtype == object or array.ndim == 0:
+        raise EngineError(
+            f"the {engine} predict phase returned "
+            f"{type(out).__name__}, which is not a materialized array of "
+            "predictions, so its timing is not a timing of prediction. See "
+            "engines.PREDICT_PHASE_RULE"
+        )
+    if int(array.shape[0]) != int(n_rows):
+        raise EngineError(
+            f"the {engine} predict phase returned {array.shape[0]} rows for "
+            f"{n_rows} held-out rows, so it did not score the held-out set. "
+            "See engines.PREDICT_PHASE_RULE"
+        )
+    return out
+
+
 class MojoTreesEngine:
     name = "mojotrees"
 
@@ -504,11 +580,27 @@ class MojoTreesEngine:
             lambda: self.module.train(params, dataset, num_boost_round=rounds)
         )
 
+        # Handed the held-out matrix itself, not a Dataset. `Booster.predict`
+        # bins the matrix and then walks the ensemble over row blocks, both
+        # inside the timed call, and writes into a buffer it allocates per
+        # call, so nothing survives between repeats that could serve a
+        # previous answer. Two things a reader of this column has to know.
+        # First, the binning of the held-out matrix is inside our number and
+        # is not inside LightGBM's, because LightGBM predicts against raw
+        # thresholds. Second, the binding calls `Model.predict_batch` with an
+        # explicit CPU_DEVICE, so the `gpu` rows' predict figures are CPU
+        # predictions and are expected to equal the `cpu` rows'.
         predictions, predict_batch = measure.repeat(
             lambda: booster.predict(test["X"]), repeats
         )
+        _materialized_predictions(self.name, predictions, test["X"].shape[0])
         row = np.ascontiguousarray(test["X"][:1])
         _, predict_row = measure.repeat(lambda: booster.predict(row), 20, warmup=2)
+        self.notes.append(
+            "mojotrees predict phases: " + PREDICT_PHASE_RULE + ". Binning "
+            "the held-out matrix is inside this arm's predict phase, and "
+            "prediction runs on the CPU on every arm including the gpu ones"
+        )
 
         with tempfile.TemporaryDirectory() as scratch:
             size = measure.model_size(booster, scratch)
@@ -593,9 +685,15 @@ class MojoTreesEngine:
         estimator = self.module.MojoTreesClassifier(**estimator_params)
         _, training = measure.timed(lambda: estimator.fit(train["X"], train["y"]))
 
+        # Handed the held-out CSC matrix itself. The column slice that takes
+        # the positive class out of the (n, 2) probability array is inside
+        # the timed call on purpose, the same way CatBoost's is, because the
+        # arms that return a 1-D probability from `predict` pay for it there.
+        # Nothing is carried between repeats. See `PREDICT_PHASE_RULE`.
         predictions, predict_batch = measure.repeat(
             lambda: estimator.predict_proba(test["X"])[:, 1], repeats
         )
+        _materialized_predictions(self.name, predictions, test["X"].shape[0])
         _, predict_row = measure.repeat(
             lambda: estimator.predict_proba(test["X"][:1])[:, 1], 20, warmup=2
         )
@@ -754,13 +852,23 @@ class LightGBMEngine:
             lambda: self.module.train(params, dataset, num_boost_round=rounds)
         )
 
+        # Handed the held-out matrix itself, not a Dataset. LightGBM's
+        # `Booster.predict` on a raw array goes to
+        # `LGBM_BoosterPredictForMat`, which walks the matrix against the
+        # trees' raw thresholds and builds no Dataset, so the per-call
+        # marshalling of the array is inside the timing and nothing survives
+        # between repeats that could hold a previous answer. That is the
+        # shape `PREDICT_PHASE_RULE` asks every arm for, and it is the arm
+        # the XGBoost figure was found to be implausible against.
         predictions, predict_batch = measure.repeat(
             lambda: booster.predict(test["X"]), repeats
         )
+        _materialized_predictions(self.name, predictions, test["X"].shape[0])
         row = test["X"][:1]
         if not train.get("sparse"):
             row = np.ascontiguousarray(row)
         _, predict_row = measure.repeat(lambda: booster.predict(row), 20, warmup=2)
+        self.notes.append("LightGBM predict phases: " + PREDICT_PHASE_RULE)
 
         with tempfile.TemporaryDirectory() as scratch:
             size = measure.model_size(booster, scratch)
@@ -1337,9 +1445,16 @@ class CatBoostEngine:
         _, training = measure.timed(lambda: model.fit(pool))
 
         task = spec["task"]
+        # Handed the held-out matrix or frame itself, NOT the Pool. CatBoost
+        # builds whatever internal container it needs inside `predict`, so
+        # that conversion is inside the timing and no container survives
+        # between repeats to hold a previous answer. The record's `path`
+        # field says `pool` about the TRAINING ingest and says nothing about
+        # this phase. See `PREDICT_PHASE_RULE`.
         predictions, predict_batch = measure.repeat(
             lambda: self._predict(model, task, test_matrix), repeats
         )
+        _materialized_predictions(self.name, predictions, len(test["y"]))
         # One row, in whatever container the batch was predicted from. A
         # model fitted with cat_features must be predicted from a frame with
         # the same columns and the same dtypes, so slicing the float64 matrix
@@ -1353,6 +1468,7 @@ class CatBoostEngine:
         _, predict_row = measure.repeat(
             lambda: self._predict(model, task, row), 20, warmup=2
         )
+        self.notes.append("CatBoost predict phases: " + PREDICT_PHASE_RULE)
 
         with tempfile.TemporaryDirectory() as scratch:
             size = measure.model_size(model, scratch)
@@ -1884,16 +2000,49 @@ class XGBoostEngine:
         _, phase = measure.timed(_fit)
         return phase
 
-    def _predict(self, booster, task, dmatrix):
-        """Predictions in the same shape the other engines return.
+    def _predict(self, booster, task, matrix):
+        """Predictions for `matrix`, INCLUDING THE DMATRIX THEY NEED.
 
-        Regression is the raw value, binary is the positive-class
-        probability, which `binary:logistic` already returns as a 1-D array,
-        and multiclass is the (n, k) matrix `multi:softprob` returns. So no
-        conversion is needed and none is done, which is worth stating because
-        the CatBoost adapter beside this one does convert and pays for it
-        inside its timed call.
+        The DMatrix is built here, inside the timed call, and dropped when
+        this returns. Three reasons, and the first one is a bug fix.
+
+        IT IS BUILT HERE BECAUSE `Booster.predict` CACHES. XGBoost's Learner
+        keeps a prediction cache keyed on the DMatrix it was handed; that is
+        the property `Booster.inplace_predict`'s docstring contrasts itself
+        against, in as many words. This adapter used to build one DMatrix
+        above the timing loop and hand the same object to `measure.repeat`,
+        so the warmup call scored the rows and every measured call read the
+        answer back. Run `20260817T185124Z-posthistfix` published the result
+        of that as 0.00015 s for 51,630 rows and 100 trees, against
+        LightGBM's 0.047 s for the same work, and the record's own samples
+        show the cliff between the warmup call and the measured ones. See
+        `PREDICT_PHASE_RULE`.
+
+        IT IS `predict` ON A FRESH DMATRIX RATHER THAN `inplace_predict`,
+        which is the other way to get an uncached call. `inplace_predict` is
+        a different entry point, and every `predictions_sha256` this arm has
+        ever recorded came from `predict` on a DMatrix. A fix to a TIMING has
+        no business moving the VALUES whose accuracy is being compared, and
+        the cache is defeated either way.
+
+        AND IT PUTS THE PHASE ON THE SAME FOOTING AS THE OTHER THREE ARMS.
+        Each of them is handed the harness's held-out matrix and pays its own
+        per-call conversion inside the timing, with LightGBM marshalling the
+        array through `LGBM_BoosterPredictForMat`, CatBoost building its
+        internal pool, and mojotrees binning the matrix before it walks the
+        trees. An arm
+        predicting from a container somebody else built and paid for is
+        measuring a different quantity from the three beside it.
+
+        The shape is the one the other engines return. Regression is the raw
+        value, binary is the positive-class probability, which
+        `binary:logistic` already returns as a 1-D array, and multiclass is
+        the (n, k) matrix `multi:softprob` returns. So no conversion is
+        needed and none is done, which is worth stating because the CatBoost
+        adapter beside this one does convert and pays for it inside its timed
+        call.
         """
+        dmatrix = self.module.DMatrix(matrix)
         out = booster.predict(dmatrix)
         if task == "multiclass":
             return np.asarray(out)
@@ -2003,16 +2152,38 @@ class XGBoostEngine:
         )
 
         task = spec["task"]
-        dtest = self.module.DMatrix(test["X"])
+        # NO DMATRIX IS BUILT HERE, and that is the fix rather than an
+        # omission. `_predict` builds one inside each timed call, because
+        # XGBoost caches a prediction on the DMatrix it was handed and a
+        # reused one turns every measured repeat into a cache read. The two
+        # hoisted `dtest` and `drow` this replaced are what made run
+        # 20260817T185124Z-posthistfix report 0.00015 s for a batch LightGBM
+        # took 0.047 s over. See `PREDICT_PHASE_RULE` and `_predict`.
         predictions, predict_batch = measure.repeat(
-            lambda: self._predict(booster, task, dtest), repeats
+            lambda: self._predict(booster, task, test["X"]), repeats
         )
+        _materialized_predictions(self.name, predictions, test["X"].shape[0])
+        # The row is SLICED here and converted here, because choosing one row
+        # out of the held-out matrix is the harness's step and not XGBoost's,
+        # and the arms beside this one slice outside their timed call too.
+        # What is inside the call is the DMatrix, for the reason above: the
+        # single-row figure was less distorted than the batch one only
+        # because one row of work is below the ctypes call overhead on every
+        # arm, which makes a cache read and a real prediction look alike.
         row_matrix = test["X"][:1]
         if not train.get("sparse"):
             row_matrix = np.ascontiguousarray(row_matrix)
-        drow = self.module.DMatrix(row_matrix)
         _, predict_row = measure.repeat(
-            lambda: self._predict(booster, task, drow), 20, warmup=2
+            lambda: self._predict(booster, task, row_matrix), 20, warmup=2
+        )
+        self.notes.append(
+            "XGBoost predict phases: " + PREDICT_PHASE_RULE + ". This arm "
+            "builds its DMatrix inside every timed call because "
+            "Booster.predict caches on the DMatrix it is handed; the phase "
+            "therefore contains XGBoost's conversion of the held-out matrix "
+            "as well as the scoring, which is what the other three arms' "
+            "predict phases contain. Figures from before 2026-08-17 timed a "
+            "cache read and are not comparable with these"
         )
 
         # The library's own resolved configuration. This is the ONLY place a

@@ -598,20 +598,47 @@ def test_searcher_reports_and_refuses_the_functional() raises:
         with assert_raises(contains="numerical thresholds"):
             with_cat.set_score_function(SCORE_COSINE)
 
-        # And the oblivious level search refuses Cosine outright, because a
-        # level's Cosine score is a ratio of two cross-leaf accumulators and
-        # its leaf loop can only sum. The refusal lands before any kernel is
-        # enqueued, which is the point: this mode's gate is node-identity
-        # with the CPU oblivious grower and a summed ratio would miss it
-        # quietly.
+        # THE OBLIVIOUS LEVEL NO LONGER REFUSES COSINE, and this assertion is
+        # inverted from what it said until 2026-08-17. It used to require a
+        # refusal reading "score_function=L2 only", on the argument that a
+        # level's Cosine score is a ratio of two cross-leaf accumulators while
+        # its leaf loop could only sum. That argument was true when it was
+        # written and the lane it named, `lane/cosine-device`, has since
+        # implemented the ratio: `gpu_split_search.mojo` now branches on
+        # `score_function == SCORE_COSINE` in three level kernels, and the
+        # refusal string does not exist anywhere in `src/`.
+        #
+        # TWO THINGS CHANGED AT ONCE and only one of them is the feature,
+        # which is why this failed as "Didn't raise" rather than as a wrong
+        # message. `score_function` became an explicit ARGUMENT of
+        # `search_oblivious_level` rather than a searcher field, deliberately
+        # and temporarily, so that a field only the level scan honored could
+        # not answer Cosine for a level and L2 for a node without saying so
+        # (see that method's docstring). So `set_score_function(SCORE_COSINE)`
+        # no longer reaches this call at all: the old test was passing the
+        # default L2 and asserting a Cosine refusal, and would have kept
+        # passing for the wrong reason if the refusal had survived.
+        #
+        # The assertion is therefore on the NEW contract in both halves: the
+        # searcher field does not reach the level, and the level accepts
+        # Cosine when it is named at the call.
         var level = GpuSplitSearcher(2, 2, [], CategoricalSpec.none(), 3)
         level.set_score_function(SCORE_COSINE)
         level.set_monotone([])
         level.set_allowed([])
-        with assert_raises(contains="score_function=L2 only"):
-            _ = level.search_oblivious_level(
-                _params(), 1.0, 1.0, [0, 1], 0, 1
-            )
+        # Named at the call, Cosine is served rather than refused.
+        var cosine_level = level.search_oblivious_level(
+            _params(), 1.0, 1.0, [0, 1], 0, 1, SCORE_COSINE
+        )
+        # Unnamed, the argument defaults to L2 whatever the field says, which
+        # is the property that makes the field unable to lie about a level.
+        var l2_level = level.search_oblivious_level(
+            _params(), 1.0, 1.0, [0, 1], 0, 1
+        )
+        # Both return a record; the point is that neither raises and that the
+        # two are reached through different functionals.
+        assert_true(cosine_level.feature >= -1)
+        assert_true(l2_level.feature >= -1)
 
 
 def main() raises:
