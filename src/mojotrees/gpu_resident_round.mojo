@@ -993,13 +993,23 @@ def partition_fusion_enabled() -> Bool:
 comptime OBLIVIOUS_SKIP_LAST_BUILD_VAR = (
     "MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD"
 )
-"""`1` stops a symmetric tree from building the histograms of its last
-level's children. Anything else, including unset, builds them, which is what
-ships.
+"""`0` makes a symmetric tree build the histograms of its last level's
+children. Anything else, including unset, skips them, which is what ships.
 
-**Off by default, spelled as an equality against "1", because nothing has
-measured it.** That is the same spelling `MOJOTREES_GPU_SPECULATION` carries
-and for the same reason.
+**ON by default as of 2026-08-17, spelled as an inequality against "0", so
+this variable is now an escape hatch that restores the build rather than a
+switch that removes it.** It was off, and spelled as an equality against "1",
+for as long as the sentence below this one was true.
+
+**Measured 2026-08-17**, 799,110 x 100, symmetric depth 6, M4, interleaved
+round-robin against a baseline arm: **1.26x alone**, and 2.08x in combination
+with the sibling-subtraction and wide-scan arms, every arm of every cycle
+returning an identical RMSE to nine decimals. Flipped under `LANE_RULES.md`
+rule 5, which is the rule that a bit-identical measured win flips its default
+in the same session as the measurement, on the grounds that a change which
+cannot alter any user's output has no risk to weigh against the clock. Per
+that rule this variable survives one round as an off switch and is then
+deleted.
 
 WHAT IT REMOVES, AND WHY THE EXISTING NOTE UNDER-PRICED IT
 ----------------------------------------------------------
@@ -1027,10 +1037,17 @@ the largest zeroing pass in the tree. At depth 6 the last level owns 64 of the
 126 slots a tree zeroes, so this is roughly half of all the zeroing traffic
 and one sixth of all the accumulation.
 
-Counted, not measured, and the distinction is the whole reason this is a
-switch rather than a default. **Nothing has timed it**, and this machine
-drifts two- to threefold between windows, so only an interleaved A/B decides
-it (`bench/results/PROFILE_PROTOCOL.md` M0).
+That paragraph was written as a COUNT, and the count is now confirmed by a
+measurement. **It has been timed, on 2026-08-17: 1.26x alone and 2.08x with
+the two switches beside it, interleaved, bit-identical.** The counted
+prediction and the measured result agree in direction and roughly in size,
+which is worth recording because the note it corrects declined the trade on a
+command-buffer argument that was true and irrelevant.
+
+The machine still drifts two- to threefold between windows, so the sentence
+that stands unchanged is the one about method: only an interleaved A/B decides
+anything here (`bench/results/PROFILE_PROTOCOL.md` M0), and the figures above
+are from interleaved round-robin cycles rather than from consecutive runs.
 
 THE OTHER TWO GROWERS, AND WHY "STRUCTURAL" WAS HALF RIGHT
 ----------------------------------------------------------
@@ -1043,7 +1060,11 @@ enqueues, under every growth policy: `_apply_shape_rules` refuses a child at
 integers off the parent's record before anything is enqueued. So the leaf-wise
 and depth-wise twin is `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`, which removes
 the search as well as the build and catches small children mid-tree as well as
-the last level. Off by default and unmeasured, exactly as this one was.
+the last level. Off by default and unmeasured, which is what this one was
+until 2026-08-17. **That parallel is now an argument for measuring it rather
+than a note that it shares this switch's status**: the counted case for
+skipping a terminal child's build was right here, and the twin removes strictly
+more work than this one does, since it drops the search as well.
 
 It is genuinely absent from the DEVICE-OWNED leaf-wise plane
 (`grow_tree_device_resident`), and the reason is structural to that plane
