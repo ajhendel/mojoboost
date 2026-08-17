@@ -65,17 +65,29 @@ and never a number.
 Where the leaves come from
 --------------------------
 The primitives here are worth exactly as much as the grower above them can
-feed them, and on the trainer's default path today that is one leaf per
-commit: `grow_tree_gpu` builds the smaller child and derives the sibling by
-subtraction, so a batch of one is all there is and this module is a no-op.
-`gpu_frontier.leaves_per_launch` computes the number for each of the four
-growers, and `handoffs/algorithm_22_leaf_batching.md` states the consequence
-plainly rather than burying it: batching is a change to the *grower*, and
-these kernels are the half of it that can be built and reasoned about first.
-The three growers that can offer more than one leaf are the device-search
-path (two children per commit), a speculative frontier (up to two per
-speculated commit, and speculation is semantically free, see
-gpu_frontier.mojo), and level-wise growth (a whole level, a separate lane).
+feed them. `gpu_frontier.leaves_per_launch` computes the number for each of the
+four growers, and `handoffs/algorithm_22_leaf_batching.md` states the
+consequence plainly rather than burying it: batching is a change to the
+*grower*, and these kernels are the half of it that can be built and reasoned
+about first. The three growers that can offer more than one leaf are the
+device-search path (two children per commit), a speculative frontier (up to two
+per speculated commit, and speculation is semantically free, see
+gpu_frontier.mojo), and level-wise growth (a whole level).
+
+**A LEVEL-WISE GROWER ARRIVED AND THIS MODULE IS NO LONGER A NO-OP ON A DEFAULT
+FIT. Corrected 2026-08-17.** This section read "on the trainer's default path
+today that is one leaf per commit: `grow_tree_gpu` builds the smaller child and
+derives the sibling by subtraction, so a batch of one is all there is and this
+module is a no-op", and it called level-wise growth "a separate lane" that had
+not landed. Both halves are false at head. The oblivious level build reaches
+`GpuLeafBatcher.enqueue_device_plan_batch_fused` and
+`enqueue_device_plan_batch_fused_subtracting` from
+`histogram_gpu.GpuHistogramBuilder.enqueue_desc_level_children`, with `2L` items
+in one plan, and the subtracting arm of that pair is what a default fit takes
+(`oblivious_subtract_requested`, `!= "0"` since 2026-08-17). The leaf-wise
+device-resident plane still commits one built child per split through
+`enqueue_desc_child`, so the old sentence describes THAT path and only that
+path.
 
 Histogram subtraction, on the device
 ------------------------------------
@@ -327,6 +339,25 @@ def _ceil_div(a: Int, b: Int) -> Int:
 
 
 # --- Kernels --------------------------------------------------------------
+#
+# A TERMINOLOGY CORRECTION, 2026-08-17, READ IT BEFORE THE KERNELS BELOW. It
+# covers every use of the phrase in this FILE, the batcher's methods included,
+# not only the kernels under this header.
+#
+# Several docstrings here say "the shipping arm" where they mean the
+# NON-SUBTRACTING level build, the one that accumulates every child of a level
+# from its own rows. That phrase was written while the subtracting arm was
+# opt-in behind `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1`. The predicate at
+# `oblivious_subtract_requested` is now `!= "0"`, so **the SUBTRACTING arm is
+# what a default GPU fit takes** and the arm those docstrings call "shipping" is
+# the one reached only by setting the variable to "0".
+#
+# The comparisons themselves are still correct and are deliberately not
+# reworded, because each one is an argument about two kernels rather than about
+# a default: read "the shipping arm" as "the non-subtracting arm" throughout.
+# This note exists because `bench/results/LANE_RULES.md` rule 5a records that
+# labelling the arm we no longer take as "the shipped arm" is the exact defect
+# that made a peer session withdraw a lane ranking.
 
 
 def _batch_zero_kernel(
@@ -477,10 +508,17 @@ def oblivious_subtract_requested() -> Bool:
     and the rule holds here even though the expected win is the largest one on
     this plane's board" -- which was true of the predicate `== "1"` this
     function used to carry and has been false since the flip comment below it
-    was written the same day. It has been priced twice since (1.78x, then 22.76
-    s to 14.39 s interleaved) and the numbers are in that comment. Corrected
-    2026-08-17 by the GPU histogram lane, which found the docstring and the
-    code disagreeing about the default.
+    was written the same day. It has been priced twice since and the numbers are
+    in that comment. Corrected 2026-08-17 by the GPU histogram lane, which found
+    the docstring and the code disagreeing about the default.
+
+    **Quote this arm's speedup as a RANGE of 1.58x to 1.78x, not as a single
+    number, until another lane reconciles the two readings.** The first reading
+    is recorded as 1.78x, 21.97 s to 12.34 s; the second is 22.76 s to 14.39 s
+    interleaved, which is 1.58x. Both are the same shape, 799,110 x 100 x 100
+    trees, symmetric depth 6, M4, and neither has been withdrawn, so picking one
+    here would be a choice dressed as a fact. Reconciliation is another lane's
+    item and this lane took no clock of its own.
 
     The shipped level build used to accumulate
     every child of the level from its own rows, so it read every active row
@@ -521,9 +559,17 @@ def oblivious_subtract_requested() -> Bool:
     # the day it was written, 799,110 x 100 x 100 trees, symmetric depth 6, M4,
     # three round-robin cycles against an interleaved baseline: 22.76 s to
     # 14.39 s alone, and 10.36 s combined with the skip-last-build and wide-scan
-    # arms, which is 2.20x. Every arm of every cycle returned rmse 2.439382420,
-    # identical to nine decimals, so the exact-integer identity argument in this
-    # function's docstring holds in measurement as well as on paper.
+    # arms. Every arm of every cycle returned rmse 2.439382420, identical to nine
+    # decimals, so the exact-integer identity argument in this function's
+    # docstring holds in measurement as well as on paper.
+    #
+    # QUOTE THE COMBINED ARM AS A RANGE, 2.08x TO 2.20x, UNTIL A LANE
+    # RECONCILES IT. This comment said "which is 2.20x", which is 22.76 / 10.36;
+    # `gpu_resident_round.OBLIVIOUS_SKIP_LAST_BUILD_VAR` says 2.08x for the same
+    # three arms in combination. Neither reading has been withdrawn and this lane
+    # took no clock, so the range stands and the reconciliation is another lane's
+    # item. The ALONE figure has the same problem and the range for it is 1.58x
+    # to 1.78x; see this function's docstring.
     #
     # Flipped under LANE_RULES rule 5, added the same day. A bit-identical
     # change cannot alter any user's output, so flipping its default changes

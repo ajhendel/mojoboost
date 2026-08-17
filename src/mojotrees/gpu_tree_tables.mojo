@@ -38,8 +38,13 @@ default. Both halves were true when they were written and both are now
 false, and correcting them is what the gate section below exists for.**
 `gpu_resident_round.mojo` arrived and drives these kernels;
 `histogram_gpu.GpuHistogramBuilder.open_resident_tables` constructs
-`DeviceTreeTables` and is called from `train_gpu.mojo:1975` and
-`train_gpu.mojo:2150`; and on 2026-08-16 `MOJOTREES_GPU_TREE_RESIDENT`
+`DeviceTreeTables` and is called twice from
+`train_gpu._grow_tree_gpu_device_search`, once on the leaf-wise route and once
+on the oblivious one (re-anchored by name on 2026-08-17: this sentence cited
+`train_gpu.mojo:1975` and `train_gpu.mojo:2150`, and both numbers had drifted
+several hundred lines off the call sites, which is the rot
+`bench/results/LANE_RULES.md` rule 7's CITE BY NAME paragraph describes); and
+on 2026-08-16 `MOJOTREES_GPU_TREE_RESIDENT`
 flipped to **on by default** on the S1 evidence in
 `bench/results/session3_2026-08-16/RESULTS.md`. A shipping GPU fit reaches
 this module. Read every "nothing calls this" sentence below with that date
@@ -237,11 +242,21 @@ This is the list a wiring lane needs, and it is deliberately conservative.
   split search already refuses for its own reasons
   (`train_gpu._check_device_search_supported`).
 
-So what a wiring lane gets from this module is the default configuration and
-nothing more: leaf-wise growth, no monotone constraints, no interaction
-constraints, no per-node feature draw. That covers the shipped defaults, and
-`tree_resident_supported` names the reason for every configuration it does
-not cover.
+The lists above are about `_pick_and_commit_kernel`, the LEAF-WISE pick, and
+`tree_resident_supported` is its gate: it refuses anything with
+`params.grow_policy != GROW_LEAFWISE`, monotone constraints, interaction
+constraints, a per-node feature draw, `TreeParams.extra`, or
+`feature_fraction_bylevel`, and names the reason for each.
+
+**`GROW_OBLIVIOUS` is not in that list of refusals for this module as a whole,
+and this paragraph used to imply it was.** It read "So what a wiring lane gets
+from this module is the default configuration and nothing more: leaf-wise
+growth ... That covers the shipped defaults." Corrected 2026-08-17: symmetric
+growth is served from this same module by the "grow_policy = oblivious: the
+level commit" section below, whose `_commit_level_kernel` applies one split to a
+whole level and whose gate is `gpu_resident_round.oblivious_device_supported`,
+NOT `tree_resident_supported`. Two kernels, two gates, one module. Depth-wise
+growth remains unattempted by either, which is the refusal directly above.
 
 Relationship to `_pick_best_record_kernel`
 -------------------------------------------
@@ -1634,14 +1649,21 @@ came from a truncated sum."""
 comptime OBLIVIOUS_PLAN_ITEMS = 2 * OBLIVIOUS_MAX_LEAVES
 """Item rows a level commit may fill in a batched-histogram plan.
 
-A level of `L` parents makes `2L` children and every one of them is built from
-its own rows, so the plan is twice as wide as the level. The widest level a
+A level of `L` parents makes `2L` children and the plan carries an item row for
+every one of them, so the plan is twice as wide as the level. The widest level a
 depth-6 tree commits is `L = 32`, giving 64 items -- which is exactly
 `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`, and that agreement is the sizing
 precondition of the whole census rather than a coincidence. The constant here
 is `2 * 64` because it bounds the *scratch* plan a caller may hand this struct
 without a batcher, and a caller that hands in a real batcher's `items_dev` is
-bounded by that batcher's own `max_items`."""
+bounded by that batcher's own `max_items`.
+
+The width is the same on both histogram arms and only the width is claimed here.
+This sentence read "every one of them is built from its own rows", which stopped
+being the shipped behavior on 2026-08-17 when
+`gpu_leaf_batching.oblivious_subtract_requested` flipped to default ON: that arm
+accumulates only the smaller child of each pair and derives the sibling from the
+parent, so `2L` item rows are filled while roughly `L` children are built."""
 
 
 @always_inline
@@ -2947,9 +2969,16 @@ struct DeviceTreeTables(Movable):
         # Both arms default to the device form, and each variable can only
         # move it back to the pre-lane form, which is the one direction that
         # is always safe: an unset variable, and a variable set to anything
-        # unrecognized, land on the default. Spelled as an equality against
-        # "0" for the reason `MOJOTREES_GPU_SPLIT_RESIDENT` is. See
-        # `set_reset_on_device` and `set_packed_download`.
+        # unrecognized, land on the default. Spelled as an INEQUALITY against
+        # "0" for the reason `MOJOTREES_GPU_SPLIT_RESIDENT` is, which under the
+        # 2026-08-17 spelling convention is what a default-ON switch reads and
+        # is what makes each variable an escape hatch rather than a selector.
+        # See `set_reset_on_device` and `set_packed_download`.
+        #
+        # Corrected 2026-08-17: this comment said "Spelled as an equality
+        # against "0"", which is not what the two lines below it read and would
+        # have told a reader the polarity backwards. The struct docstring above
+        # already said `!= "0"`, so the file disagreed with itself.
         self.reset_on_device = getenv("MOJOTREES_GPU_TABLE_RESET") != "0"
         self.packed_download = getenv("MOJOTREES_GPU_PACKED_DOWNLOAD") != "0"
 

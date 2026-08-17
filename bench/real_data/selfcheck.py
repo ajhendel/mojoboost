@@ -2529,11 +2529,13 @@ def check_accuracy_axes():
         # anchor is ANCHOR CURRENCY UNKNOWN and cannot pass or fail anything,
         # which is the behavior `check_stale_anchors` asserts separately.
         "configuration": {
-            "resolved": {
+            "passed": {"lambda_l2": None, "learning_rate": None},
+            "followed_default": ["lambda_l2", "learning_rate"],
+            "shipped_at_record": {
                 "lambda_l2": verify.shipped_constant("_LAMBDA_L2"),
                 "learning_rate": verify.shipped_constant("_LEARNING_RATE"),
             },
-            "followed_default": ["lambda_l2", "learning_rate"],
+            "grow_policy": "lossguide",
         },
         "recorded_from": {"run_id": "fixture", "git_commit": "0" * 40,
                           "recorded_at": "2026-08-17"},
@@ -2792,13 +2794,15 @@ def check_stale_anchors():
         "mechanism exists",
     )
 
-    def anchor(followed, recorded, value=0.40):
+    def anchor(followed, recorded, value=0.40, grow_policy="lossguide"):
         return {
             "primary_metric": "rmse", "value": value,
             "environment": {"arch": "arm64", "cpu_model": "Test"},
             "configuration": {
-                "resolved": {"lambda_l2": recorded},
+                "passed": {"lambda_l2": None if "lambda_l2" in followed else 0.0},
                 "followed_default": list(followed),
+                "shipped_at_record": {"lambda_l2": recorded},
+                "grow_policy": grow_policy,
             },
             "recorded_from": {"run_id": "fixture", "git_commit": "0" * 40,
                               "recorded_at": "2026-08-16"},
@@ -2837,6 +2841,91 @@ def check_stale_anchors():
         "an anchor recorded at exactly the value we ship was reported stale, so "
         "no anchor could ever be current and the gate would never run",
     )
+    # THE FALSE POSITIVE THIS DESIGN HAD TO AVOID, and it would have hit every
+    # plain mojotrees arm in the harness. `scenarios.mojotrees_params` copies
+    # `lambda_l2` and `learning_rate` out of BASE_PARAMS onto EVERY mojotrees
+    # arm, so an arm that names neither in its own overrides still PASSES both,
+    # and a default change cannot touch it. `followed_default` is therefore read
+    # off what was PASSED (None means unset) and not off the arm's override dict.
+    passed_not_unset = {
+        "primary_metric": "rmse", "value": 0.40,
+        "configuration": {
+            "passed": {"lambda_l2": moved},
+            "followed_default": [],
+            "shipped_at_record": {"lambda_l2": moved},
+            "grow_policy": "lossguide",
+        },
+    }
+    check(
+        verify.anchor_staleness(passed_not_unset) is None,
+        "an anchor whose harness PASSED a lambda_l2 value was reported stale "
+        "because the package default moved. BASE_PARAMS passes that key to every "
+        "mojotrees arm, so this would stale every plain arm in the harness for a "
+        "change that cannot have altered one of them",
+    )
+    # The same claim one level down, on the DERIVATION rather than on a
+    # hand-built dict, because the fixture above cannot catch
+    # `anchor_configuration` putting a passed key into `followed_default`.
+    def cfg(lambda_l2):
+        return verify.anchor_configuration({
+            "params": {"engine": {"lambda_l2": lambda_l2, "learning_rate": 0.1,
+                                  "grow_policy": "lossguide"}},
+            "arm_overrides": {"params": {}},
+        })
+
+    check(
+        cfg(0.0)["followed_default"] == []
+        and cfg(0.0)["passed"]["lambda_l2"] == 0.0,
+        "verify.anchor_configuration put a PASSED parameter into "
+        f"followed_default: {cfg(0.0)}. Only None means unset, and treating a "
+        "passed value as a followed default stales every arm the harness hands "
+        "BASE_PARAMS to, which is all of them",
+    )
+    check(
+        cfg(None)["followed_default"] == ["lambda_l2"],
+        "verify.anchor_configuration did not record an UNSET lambda_l2 as a "
+        f"followed default: {cfg(None)}. Then a default change would never be "
+        "detected and a stale anchor would gate silently, which is the whole "
+        "failure this mechanism exists for",
+    )
+    # THE PER-POLICY CONSTANT. A symmetric arm's unset lambda_l2 resolves from
+    # CatBoost's constant and not from _LAMBDA_L2 (`sklearn.py::_Base._params`,
+    # `l2_default = _CATBOOST_L2_LEAF_REG if catboost_mode else _LAMBDA_L2`), so
+    # pricing one against the other reports staleness that is not there.
+    catboost_l2 = verify.shipped_constant("_CATBOOST_L2_LEAF_REG")
+    check(
+        catboost_l2 is not None and catboost_l2 != shipped,
+        "_CATBOOST_L2_LEAF_REG is unreadable or equal to _LAMBDA_L2, so this "
+        "check cannot tell whether the per-policy branch is being taken",
+    )
+    check(
+        verify.stale_anchor_constant("lambda_l2", "symmetrictree")
+        == "_CATBOOST_L2_LEAF_REG"
+        and verify.stale_anchor_constant("lambda_l2", "lossguide")
+        == "_LAMBDA_L2",
+        "verify.stale_anchor_constant does not branch on the grow policy. An "
+        "unset lambda_l2 resolves from CatBoost's constant under symmetrictree "
+        "and from LightGBM's under every other policy, so one constant for both "
+        "prices a symmetric arm against a leaf-wise default",
+    )
+    if catboost_l2 is not None:
+        check(
+            verify.anchor_staleness(
+                anchor(["lambda_l2"], catboost_l2, grow_policy="symmetrictree")
+            ) is None,
+            "a SYMMETRIC arm's anchor recorded at CatBoost's l2_leaf_reg was "
+            "reported stale, which means it was compared against _LAMBDA_L2. "
+            "Every symmetric anchor would then be permanently stale and the "
+            "gate would never run on the arm the documented defaults name",
+        )
+    # And the derived rate, which has no constant to compare against at all.
+    check(
+        verify.stale_anchor_constant("learning_rate", "symmetrictree") is None,
+        "verify.stale_anchor_constant claims a constant for a symmetric arm's "
+        "learning rate. Under symmetrictree an unset rate is DERIVED per fit "
+        "from the row count, the iteration count and the loss, so there is no "
+        "literal to read and comparing one would invent a verdict",
+    )
     unknown = verify.anchor_staleness(
         {"primary_metric": "rmse", "value": 0.40}
     )
@@ -2848,8 +2937,10 @@ def check_stale_anchors():
     )
     declared = verify.anchor_staleness({
         "primary_metric": "rmse", "value": 0.40,
-        "configuration": {"resolved": {"lambda_l2": shipped},
-                          "followed_default": ["lambda_l2"]},
+        "configuration": {"passed": {"lambda_l2": None},
+                          "followed_default": ["lambda_l2"],
+                          "shipped_at_record": {"lambda_l2": shipped},
+                          "grow_policy": "lossguide"},
         "stale": {"since": "2026-08-17", "why": "retired by hand",
                   "cleared_by": "a run"},
     })

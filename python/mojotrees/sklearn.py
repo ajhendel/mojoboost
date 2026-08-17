@@ -140,8 +140,9 @@ _CATBOOST_LEARNING_RATE = 0.03
 #: own runs through `SetDefault` at `catboost_options.cpp:302`.
 #:
 #: Our `lambda_l2` is LightGBM's spelling of the same coefficient, so the mode
-#: default lands on the same member; `_LAMBDA_L2` (0.0) stays the value an
-#: unset `lambda_l2` resolves to under `lossguide`.
+#: default lands on the same member; `_LAMBDA_L2` (1.0 as of 2026-08-17, a
+#: declared divergence from LightGBM's stock 0.0) stays the value an unset
+#: `lambda_l2` resolves to under `lossguide`.
 _CATBOOST_L2_LEAF_REG = 3.0
 
 #: CatBoost's `random_strength`, the score-noise multiplier
@@ -3717,7 +3718,7 @@ class _Base(_ParamsMixin):
         # names, as every wire does; the values are resolved from the
         # canonical user-facing names the same way `_params` resolves them.
         # The two mode-dependent stock defaults, resolved exactly as `_params`
-        # resolves them. They have to agree: a callback that read 0.1 and 0.0
+        # resolves them. They have to agree: a callback that read 0.1 and 1.0
         # while the fit ran at CatBoost's 0.03 and 3.0 would be reporting a
         # configuration nothing trained under, and a callback that RESET one
         # of them would move the fit off the mode default without being asked

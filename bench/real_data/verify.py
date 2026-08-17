@@ -1375,9 +1375,22 @@ def _anchor_key(record):
 #: an UNKNOWN and it WARNS, on the precedent of C10's missing-cpu-twin and
 #: C11's missing anchor: a check that cannot run is dangerous precisely because
 #: it is silent, so it says so rather than passing.
+#: `constants` is keyed by GROW POLICY because the default an unset key resolves
+#: to is per policy, which is the standing mirroring rule: `symmetrictree`
+#: mirrors CatBoost and every other policy mirrors LightGBM. `sklearn.py`'s
+#: `_Base._params` branches on exactly that
+#: (`l2_default = _CATBOOST_L2_LEAF_REG if catboost_mode else _LAMBDA_L2`), so a
+#: single constant per parameter would price a symmetric arm against a
+#: leaf-wise default and report staleness that is not there. `None` means the
+#: value is not a constant at all and cannot be compared; the symmetric
+#: learning rate is DERIVED per fit from the row count, the iteration count and
+#: the loss, so there is nothing to read.
 STALE_ANCHOR_PARAMETERS = {
     "lambda_l2": {
-        "constant": "_LAMBDA_L2",
+        "constants": {
+            "default": "_LAMBDA_L2",
+            "symmetrictree": "_CATBOOST_L2_LEAF_REG",
+        },
         "why": (
             "the L2 leaf regularizer, and the denominator of every leaf value "
             "and every split gain. It moved from 0.0 to 1.0 on 2026-08-17 under "
@@ -1388,7 +1401,10 @@ STALE_ANCHOR_PARAMETERS = {
         ),
     },
     "learning_rate": {
-        "constant": "_LEARNING_RATE",
+        "constants": {
+            "default": "_LEARNING_RATE",
+            "symmetrictree": None,
+        },
         "why": (
             "the shrinkage rate. An arm that does not name it follows the "
             "policy's default, so a change to that default changes how much "
@@ -1396,6 +1412,18 @@ STALE_ANCHOR_PARAMETERS = {
         ),
     },
 }
+
+
+def stale_anchor_constant(name, grow_policy):
+    """The `sklearn.py` constant an unset `name` resolves to under
+    `grow_policy`, or None when there is no constant to read."""
+    rule = STALE_ANCHOR_PARAMETERS.get(name)
+    if rule is None:
+        return None
+    constants = rule["constants"]
+    if grow_policy in constants:
+        return constants[grow_policy]
+    return constants["default"]
 
 #: Where the live shipped value of each of those parameters is read from.
 #: The Python surface, because that is the surface `bench/real_data` fits
@@ -1438,39 +1466,55 @@ def shipped_constant(name):
 
 
 def anchor_configuration(record):
-    """The part of an arm's resolved configuration an anchor's validity depends
-    on, plus which of it the arm NAMED.
+    """The part of an arm's configuration an anchor's validity depends on.
 
-    `followed_default` is the load-bearing half. A value the arm typed is a
-    property of the arm and moving a package default cannot invalidate it; a
-    value the arm left unset is a property of the DEFAULT, and moving the default
-    replaces the model under the anchor's name. So staleness is decided on the
-    unset keys alone, which is why this records both.
+    Three fields and each answers a different question.
+
+    `passed` is what the HARNESS handed the estimator, off the record's resolved
+    engine parameters. **`None` there means UNSET and no other value does**,
+    because that is the only thing `sklearn.py::_Base._l2_named` and
+    `_learning_rate_named` read as "the caller did not name it".
+
+    `followed_default` is `passed`'s `None`s, and it is the load-bearing field. A
+    value the harness passed is a property of the ARM and moving a package
+    default cannot invalidate it; a value passed as `None` is a property of the
+    DEFAULT, and moving the default replaces the model under the anchor's name.
+    Note that this is deliberately read off what was PASSED and not off the arm's
+    own override dict: `scenarios.mojotrees_params` copies `learning_rate` and
+    `lambda_l2` out of `BASE_PARAMS` onto every mojotrees arm, so an arm that
+    names neither still passes both, and calling that "followed the default"
+    would report staleness on arms a default change cannot touch.
+
+    `shipped_at_record` is the value the relevant `sklearn.py` constant held when
+    this run was taken. Recording it is what makes staleness a comparison of two
+    recorded facts rather than an inference: `anchor_staleness` reads it against
+    the constant's value now, and no version history is needed.
     """
     resolved = (record.get("params") or {}).get("engine") or {}
-    named = set((record.get("arm_overrides") or {}).get("params") or {})
-    shared = (record.get("params") or {}).get("shared") or {}
-    tracked = {}
+    grow_policy = resolved.get("grow_policy")
+    passed = {}
     followed = []
+    shipped = {}
     for name in sorted(STALE_ANCHOR_PARAMETERS):
-        value = resolved.get(name, shared.get(name))
-        tracked[name] = None if value is None else float(value)
-        # The arm NAMED it when its own override dict names it with a value.
-        # `None` in an override dict is how this harness says "unset" (see
-        # `pairs.py`'s unset-key section), so a `None` there is not a naming.
-        override = ((record.get("arm_overrides") or {}).get("params") or {})
-        if name not in named or override.get(name) is None:
+        value = resolved.get(name)
+        passed[name] = None if value is None else float(value)
+        if value is None:
             followed.append(name)
+        constant = stale_anchor_constant(name, grow_policy)
+        shipped[name] = None if constant is None else shipped_constant(constant)
     return {
-        "resolved": tracked,
+        "passed": passed,
         "followed_default": followed,
-        "grow_policy": resolved.get("grow_policy"),
+        "shipped_at_record": shipped,
+        "grow_policy": grow_policy,
         "note": (
-            "`resolved` is what the fit ran at, off the record's resolved "
-            "engine parameters. `followed_default` names the subset the ARM did "
-            "not set, which is the subset a package default change can "
-            "invalidate. verify.anchor_staleness compares those against the "
-            "live value in python/mojotrees/sklearn.py"
+            "`passed` is what the harness handed the estimator, where None means "
+            "UNSET. `followed_default` is that subset, and it is the only subset "
+            "a package default change can invalidate. `shipped_at_record` is "
+            "what the matching sklearn.py constant held when this run was taken, "
+            "chosen per grow policy because symmetrictree resolves an unset key "
+            "from CatBoost's constant and every other policy from LightGBM's. "
+            "verify.anchor_staleness compares the two"
         ),
     }
 
@@ -1512,13 +1556,17 @@ def anchor_staleness(anchor):
             ),
         }
 
-    resolved = configuration.get("resolved") or {}
+    was_shipped = configuration.get("shipped_at_record") or {}
+    grow_policy = configuration.get("grow_policy")
     for name in configuration.get("followed_default") or ():
         rule = STALE_ANCHOR_PARAMETERS.get(name)
         if rule is None:
             continue
-        was = resolved.get(name)
-        now = shipped_constant(rule["constant"])
+        constant = stale_anchor_constant(name, grow_policy)
+        if constant is None:
+            continue
+        was = was_shipped.get(name)
+        now = shipped_constant(constant)
         if was is None or now is None:
             continue
         if float(was) != float(now):
@@ -1528,9 +1576,11 @@ def anchor_staleness(anchor):
                 "shipped_value": float(now),
                 "why": (
                     f"the arm this anchor was recorded from left `{name}` "
-                    f"UNSET, it resolved to {was:g} in the anchored run, and it "
-                    f"resolves to {now:g} now "
-                    f"(sklearn.py::{rule['constant']}). {rule['why']}"
+                    f"UNSET, so it took the default. That default was {was:g} "
+                    f"when the anchor was recorded and it is {now:g} now "
+                    f"(sklearn.py::{constant}, the constant an unset `{name}` "
+                    f"resolves to under grow_policy {grow_policy!r}). "
+                    f"{rule['why']}"
                 ),
                 "cleared_by": (
                     "a run of this arm on the current default, then "

@@ -1,9 +1,16 @@
 # Real-data differential harness
 
-A reproducible comparison of mojotrees against LightGBM across six problem
-shapes, on pinned public datasets or deterministic generators, measuring
-quality, time, memory, and model size, and separating the numbers that can
-fail a build from the numbers that cannot.
+A reproducible comparison of mojotrees against LightGBM, CatBoost and XGBoost
+across **eight** problem shapes, on pinned public datasets or deterministic
+generators, measuring quality, time, memory, and model size, and separating the
+numbers that can fail a build from the numbers that cannot.
+
+*Corrected 2026-08-17. This sentence read "against LightGBM across six problem
+shapes" while the table below it has been headed "The eight scenarios" for as
+long as there have been eight, and LightGBM stopped being the only comparator
+when the CatBoost peer arm landed on 2026-08-16 and the XGBoost one on
+2026-08-17. LightGBM is still the one COMPARATOR, `stock+det`, which is a
+narrower claim than being the only other library here; see `scenarios.py`.*
 
 **It has been run, on 2026-08-15, and one file from each complete run is
 committed.** The sentence here used to read "Nothing in this directory has
@@ -85,27 +92,33 @@ registered before they are.
 
 ## Running it
 
-```
-pixi run -e bench real-data-fetch --list          # what is registered, what is pinned
-pixi run -e bench real-data-fetch adult --pin     # download once, record the digest
-pixi run -e bench real-data --dry-run             # the job matrix, nothing executed
-pixi run -e bench real-data --tier smoke          # seconds, proves the wiring
-pixi run -e bench real-data                       # the standard tier
-pixi run -e bench real-data-verify results/<run_id>
-pixi run -e bench real-data-report results/<run_id>
-```
-
-The pixi tasks are not wired yet. `handoffs/task19_real_data.md` has the
-task and dependency entries to add, because this lane does not edit
-`pixi.toml`. Until they land, call the scripts directly:
+**There are no `real-data*` pixi tasks. Call the scripts.** Every command below
+is one that works today, under the `bench` environment, which is where
+lightgbm, catboost, xgboost and pandas live:
 
 ```
-python bench/real_data/run.py --dry-run
-python bench/real_data/run.py --tier standard --device cpu gpu
-python bench/real_data/verify.py results/<run_id>
-python bench/real_data/report.py results/<run_id>
-python bench/real_data/summarize.py results/<run_id>
+pixi run -e bench python bench/real_data/selfcheck.py                 # trains nothing, downloads nothing
+pixi run -e bench python bench/real_data/fetch.py --list              # what is registered, what is pinned
+pixi run -e bench python bench/real_data/fetch.py adult --pin         # download once, record the digest
+pixi run -e bench python bench/real_data/run.py --dry-run             # the job matrix, nothing executed
+pixi run -e bench python bench/real_data/run.py --tier smoke          # seconds, proves the wiring
+pixi run -e bench python bench/real_data/run.py --device cpu --device gpu
+pixi run -e bench python bench/real_data/verify.py results/<run_id>
+pixi run -e bench python bench/real_data/report.py results/<run_id>
+pixi run -e bench python bench/real_data/summarize.py results/<run_id>
 ```
+
+*Corrected 2026-08-17, three ways, and every one of the three would have cost
+somebody a minute or an hour.* This section led with seven `pixi run -e bench
+real-data*` commands and then said the tasks "are not wired yet", which is still
+true -- `pixi.toml` has no such task -- but a reader who copied the first block
+got "task not found" before reaching the sentence, so the block that works is
+now the only block. It pointed at `handoffs/task19_real_data.md` for the entries
+to add, and **that file does not exist**, which is the same dangling-pointer
+defect `PROFILE_PROTOCOL.md`'s amendment A1 records for the thermal script. And
+it showed `--device cpu gpu`, which **does not parse**: `--device` is
+`action="append"`, so a second value on the same flag exits with "unrecognized
+arguments: gpu". Repeat the flag.
 
 The last of those is the one that leaves something behind in the
 repository. Run it after `verify.py`, commit the `summary.json` it writes,
@@ -120,6 +133,10 @@ fetch.py              download, verify against the lock, or record a new pin
 loaders.py            pinned files into arrays, with the shape checked against the registry
 generators.py         deterministic data for every scenario, so the suite runs offline
 scenarios.py          the eight scenarios and the parameter alignment between the engines
+selfcheck.py          static checks on the harness itself; trains nothing, downloads nothing
+frontier.py           a PLAN: one axis at a time from two base points. `run.py --arms frontier`
+pairs.py              a PLAN: three mirror pairs and shipped-versus-shipped. `run.py --arms pairs`
+accuracy_anchors.json the recorded accuracy the gate measures against. Read by verify.py, written by nothing
 engines.py            one adapter per library, same phases measured on both
 quality.py            one implementation of every metric, applied to both engines
 measure.py            timing, peak memory, model size, digests
@@ -141,8 +158,54 @@ On the generator variant of a scenario whose noise scale is known
 raw, and as the EXCESS over the Bayes floor (rmse squared minus the noise
 realized on the held-out rows), which is the part of the error the model is
 responsible for and the only part a mechanism can move. A 1.7 percent RMSE gap
-on dense_regression is a 70 percent excess-MSE gap. Real-data rows have no
-known floor and show the raw gap alone.
+on dense_regression is a **28.8 percent gap in excess RMSE**, which is about 66
+percent in excess MSE. Real-data rows have no known floor and show the raw gap
+alone.
+
+*Corrected 2026-08-17. This read "a 70 percent excess-MSE gap", which named a
+different lens from the one the harness prints and from the one the analysis
+uses, so the two figures read as a contradiction. `report._peer_cell` prints
+`excess over floor` in RMSE and `docs/design/ACCURACY_GAP.md` section 1 is
+titled "1.7 percent of RMSE and 28.8 percent of the model's own error"; both are
+the RMSE lens. From that section's standard-tier table, excess RMSE 0.087419
+against CatBoost's 0.067886 is 1.2877x, so 28.8 percent, and squaring it gives
+65.8 percent in MSE. The two numbers were never in conflict; only the units
+were unstated.*
+
+## The two run shapes, and they answer different questions
+
+`run.py` with no `--arms` is the engine cross product: one arm per engine, one
+tier, one variant. Two plan modules replace that matrix with named arms, and
+each prints its own plan and cell count before anybody runs it:
+
+```
+python bench/real_data/frontier.py    # one axis at a time from two base points
+python bench/real_data/pairs.py       # three mirror pairs, plus shipped versus shipped
+```
+
+`frontier.py` asks "what is the fastest configuration whose accuracy we are
+willing to pay for". It moves ONE axis from each of two bases, so it can price
+`max_bin=63` and it cannot see an interaction.
+
+`pairs.py` asks two questions a sweep cannot, in one table with a `block` column
+separating them. **CLASS A** is three mirror pairs -- `lightgbm`/`mojotrees`,
+`xgboost`/`mojotrees_depthwise`, `catboost`/`mojotrees_catboost_mode` -- each
+holding everything constant but the implementation, with our arm wearing the
+competitor's resolved defaults. **CLASS B** is shipped versus shipped: each
+library at its own defaults against ours at ours, plus a `lambda_l2` axis to
+settle the value registered in `ACCURACY_GAP.md` section 5 R1.
+
+**Do not read a Class A row as our product.** Since 2026-08-17 the `mojotrees`
+arm on `BASE_PARAMS` pins `lambda_l2` to LightGBM's stock 0.0 to keep that pair a
+mirror, and our own default is 1.0. The two differ in exactly that one parameter
+and `selfcheck.check_pair_plan` fails if they ever differ in a second one or in
+none. Class B carries two of our rows and only one of them is our default:
+`B/ours-default` is `grow_policy=lossguide` with nothing set, and
+`B/ours-opt-in` is `symmetrictree`, which is opt in and flips the whole default
+set to CatBoost's when it is named. Every row in the run is at 100 trees, which
+is our own `n_estimators` default; the 360 and 72 budgets belong to a 2026-08-16
+decision that was recorded and never implemented and were settled out at
+`273504e`.
 
 ## What makes it a differential harness rather than two benchmarks
 

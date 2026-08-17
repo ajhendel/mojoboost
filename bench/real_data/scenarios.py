@@ -1322,18 +1322,42 @@ CATBOOST_DETERMINISM = {
 #: (`boosting._check_bootstrap`).
 #:
 #: **READ THIS BEFORE SCHEDULING A MATRIX.** `bootstrap_type` and `subsample`
-#: joined this dict on 2026-08-16 and are honored on the **dense,
-#: single-output, CPU** trainer only. Two of the six scenarios that run this
-#: arm do not go through that trainer and will RAISE rather than train:
-#: `multiclass` (`trainset.train_dataset_multiclass`, which takes no bundle)
-#: and `sparse_highdim` (`model_sparse.fit_csc`, likewise). Both refusals name
-#: the entry point and the reason, which is the intended behavior for a
-#: parameter that cannot be honored -- a silently unsampled multiclass row
-#: labelled "CatBoost mode" is the outcome this whole campaign exists to
-#: prevent -- but it means those two cells need either a per-scenario
-#: exclusion of these two keys or an MVS-capable multiclass and sparse
-#: trainer before the next full matrix runs. That decision belongs to whoever
-#: owns this harness; see CATBOOST_UNMATCHABLE["row_sampling"].
+#: joined this dict on 2026-08-16.
+#:
+#: **CORRECTED 2026-08-17, AND THE OLD VERSION UNDERSTATED THE TRAINER'S REACH
+#: WHILE STILL REACHING THE RIGHT SCHEDULING DECISION.** It said these two keys
+#: are "honored on the **dense, single-output, CPU** trainer only", that
+#: `multiclass` raises because "`trainset.train_dataset_multiclass` ... takes no
+#: bundle" and `sparse_highdim` because `model_sparse.fit_csc` "likewise", and
+#: that the two cells therefore needed "either a per-scenario exclusion of these
+#: two keys or an MVS-capable multiclass and sparse trainer before the next full
+#: matrix runs". `CATBOOST_UNMATCHABLE["row_sampling"]` asked for this
+#: correction by name.
+#:
+#: What is true at head, verified in source: the bundle reaches the DENSE
+#: SINGLE-OUTPUT trainer on BOTH backends (`train_gpu` takes it; MVS routes to
+#: the host-gradient arm where `sampling.bootstrap_round` draws exactly and the
+#: trees still grow on the device), and BOTH CPU multiclass loops and BOTH
+#: sparse loops call `bootstrap_round` too. So "dense, single-output, CPU only"
+#: is wrong in three directions.
+#:
+#: The two cells still raise, and for reasons that are NOT the missing-bundle
+#: reason:
+#:
+#: - `multiclass`: `sampling.check_mvs_reg_is_set` refuses a DERIVED `mvs_reg`
+#:   on a softmax round, because the derivation reads a one-tree
+#:   `[dim][leaf]` table that a round of K structurally different trees does not
+#:   have, and this arm names no `mvs_reg`. On the GPU, independently,
+#:   `train_multiclass_gpu` takes no bundle.
+#: - `sparse_highdim`: `random_strength`, not `bootstrap_type`. The sparse round
+#:   loop computes no per-tree score scale and the binding declares that
+#:   parameter honored only as `not d[].is_sparse`.
+#:
+#: The scheduling decision the old paragraph demanded HAS ALREADY BEEN TAKEN and
+#: needs nothing before the next matrix: both cells are declared skips in
+#: `MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT`, whose entries now carry these
+#: reasons. A silently unsampled multiclass row labelled "CatBoost mode" remains
+#: the outcome to prevent and no path to it exists.
 #:
 #: **DO NOT ADD boosting_type="Ordered" TO THIS DICT.** `boosting.mojo::_boost_rounds`
 #: refuses ordered boosting beside any bootstrap_type, because a dropped or
@@ -6282,23 +6306,53 @@ MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT = {
         "nothing to be read against"
     ),
     "multiclass": (
-        "MOJOTREES_CATBOOST_MODE sets bootstrap_type=MVS, and the multiclass "
-        "trainer takes no bootstrap bundle: trainset.train_dataset_multiclass "
-        "has no bootstrap argument, so the binding refuses it by name rather "
-        "than dropping it. CatBoost does not run MVS for multiclass either -- "
-        "its defaulting block excludes multiclass-only losses and falls back "
-        "to Bayesian -- so this cell would not have been the comparison it "
-        "claims to be even if our trainer accepted it. The plain mojotrees "
-        "arm and the CatBoost arm both still run this scenario; what is "
-        "missing is only the CatBoost-mode row"
+        "MOJOTREES_CATBOOST_MODE sets bootstrap_type=MVS and the cell raises. "
+        "CORRECTED 2026-08-17, AND THE REASON IS NOT THE ONE THIS ENTRY GAVE. "
+        "It read 'the multiclass trainer takes no bootstrap bundle: "
+        "trainset.train_dataset_multiclass has no bootstrap argument, so the "
+        "binding refuses it by name'. That is false at head and "
+        "CATBOOST_UNMATCHABLE['row_sampling'] asked for this correction by "
+        "name. `trainset.train_dataset_multiclass` DOES take a bundle and both "
+        "of its CPU arms honor it: `boosting._boost_rounds_multiclass` and "
+        "`boosting_sparse.train_multiclass_sparse` each call "
+        "`sampling.bootstrap_round` once per round, shared by every class's "
+        "tree. WHAT ACTUALLY REFUSES is `sampling.check_mvs_reg_is_set`: MVS "
+        "with a DERIVED lambda reads `lastIterValues[dim][leaf]`, one tree with "
+        "one value per output dimension per leaf, and a softmax round of K "
+        "structurally different trees has no such table, so a derived reg is "
+        "refused and this arm names no `mvs_reg`. On the GPU a second and "
+        "independent refusal stands: `train_multiclass_gpu` takes no bundle and "
+        "`model.fit_multiclass` and `trainset.train_dataset_multiclass` raise "
+        "on their GPU arms rather than training unsampled. Verified in source "
+        "2026-08-17. THE CONCLUSION IS UNCHANGED and dropping the keys for "
+        "multiclass would still be the less faithful choice: CatBoost's own "
+        "defaulting block excludes the multiclass-only losses from MVS and "
+        "falls back to Bayesian, so this cell would not have been the "
+        "comparison it claims to be even under a trainer that accepted it. The "
+        "plain mojotrees arm and the CatBoost arm both still run this scenario; "
+        "what is missing is only the CatBoost-mode row. EXIT: an explicit "
+        "`mvs_reg` on this arm would open the CPU cell, and it would then be a "
+        "value CatBoost does not use here, so it is a different arm rather than "
+        "this one unblocked"
     ),
     "sparse_highdim": (
-        "MOJOTREES_CATBOOST_MODE sets bootstrap_type=MVS, and the sparse "
-        "trainer refuses it by name at trainset.train_dataset's sparse arm "
-        "(sampling.check_bootstrap_honored, 'a sparse Dataset fit "
-        "(boosting_sparse)'). No sparse round loop calls bootstrap_round. "
-        "The plain mojotrees arm and the CatBoost arm both still run this "
-        "scenario"
+        "CORRECTED 2026-08-17, AND THE REFUSAL MOVED TO A DIFFERENT PARAMETER. "
+        "This entry read 'MOJOTREES_CATBOOST_MODE sets bootstrap_type=MVS, and "
+        "the sparse trainer refuses it by name at trainset.train_dataset's "
+        "sparse arm (sampling.check_bootstrap_honored) ... No sparse round loop "
+        "calls bootstrap_round', and CATBOOST_UNMATCHABLE['row_sampling'] asked "
+        "for this correction by name. Both halves are false at head: "
+        "`boosting_sparse.train_sparse` and "
+        "`boosting_sparse.train_multiclass_sparse` both call `bootstrap_round` "
+        "in the place the dense loops call it, and `trainset.train_dataset` "
+        "forwards the bundle to the sparse arm. So this cell no longer raises "
+        "on `bootstrap_type` at all. WHAT STOPS IT NOW is `random_strength`: "
+        "the sparse round loop computes no per-tree score scale and the binding "
+        "declares the parameter honored only as `not d[].is_sparse`, so a named "
+        "`random_strength` is refused there. This arm names it. Verified in "
+        "source 2026-08-17. The plain mojotrees arm and the CatBoost arm both "
+        "still run this scenario. EXIT: a sparse round loop that computes "
+        "`boosting._round_random_score_scale`"
     ),
 }
 

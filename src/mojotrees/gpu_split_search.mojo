@@ -1894,7 +1894,9 @@ def noise_stage_parallel_requested() -> Bool:
 
     WHY IT IS EXACT, WHICH IS THE ONLY REASON IT MAY DEFAULT ON. A plane entry
     is `host_random_score_noise(stdev, seed, tree, site, feature, bin)`
-    (:1444), a pure function of its six arguments. It reads no accumulator, no
+    (named rather than numbered on 2026-08-17; the pointer read `:1444`, which
+    had drifted off the function), a pure function of its six arguments. It
+    reads no accumulator, no
     running generator and no other entry, which is the property
     `gpu_oblivious_score_stream` was written to have and says so in as many
     words. So the value written at (slot, bin) does not depend on how many
@@ -1926,7 +1928,11 @@ def noise_stage_parallel_requested() -> Bool:
 
     WHAT IT DOES NOT FIX, STATED SO THE NEXT READER DOES NOT OVERCREDIT IT.
     Stage B still runs on the host, and it has to; see the stage A / stage B
-    argument at :1239. This makes the host draw parallel and single-pass. It
+    argument in this file's `random_strength: seeded noise on a candidate's
+    gain` section header, under WHAT IS BIT-IDENTICAL, AND WHAT CANNOT BE.
+    (Named rather than numbered on 2026-08-17; the pointer read `:1239`, which
+    had drifted into an unrelated docstring.) This makes the host draw parallel
+    and single-pass. It
     does not move the draw to the device, and it does not touch the upload.
     """
     return getenv("MOJOTREES_GPU_NOISE_STAGE_PARALLEL") != "0"
@@ -4418,7 +4424,11 @@ def oblivious_wide_scan_requested() -> Bool:
     # day. On a quiet box, alternating passes of three repeats, 20.40 s narrow
     # against 19.49 s wide with the ranges fully disjoint, a resolved 4.5
     # percent. Later, on a loaded box in a three-cycle round robin, 22.76 s
-    # against 21.28 s, 1.07x, and part of the 2.20x combined arm. rmse
+    # against 21.28 s, 1.07x, and part of a combined arm whose multiple is
+    # recorded two ways, 2.08x and 2.20x, and is quoted as that RANGE here until
+    # a lane reconciles it (this line said "the 2.20x combined arm"; see
+    # `gpu_leaf_batching.oblivious_subtract_requested`'s flip comment and
+    # `gpu_resident_round.OBLIVIOUS_SKIP_LAST_BUILD_VAR`). rmse
     # 2.439382420 in all of it, so the bit-identity argument written at
     # `_scan_slot_oblivious_wide_kernel` holds in measurement.
     #
@@ -6332,10 +6342,17 @@ def _launch_oblivious_search(
     happy result. The Cosine accumulation is the same leaf loop of the same
     scan kernel with a second accumulator beside the first, so a level still
     costs two command buffers and `oblivious_launch_census(6)` is still 62.
-    Three hundred and sixty trees of six levels is the shape this mode will be
-    run at; a correct kernel that cost a launch per leaf per level would be
-    360 * 126 extra command buffers and would have to be rewritten before it
-    could ship."""
+    One hundred trees of six levels is the shape this mode will be run at, the
+    shipped `n_estimators` default; a correct kernel that cost a launch per leaf
+    per level would be `100 * 126 = 12,600` extra command buffers and would have
+    to be rewritten before it could ship.
+
+    **Corrected 2026-08-17. This paragraph read "Three hundred and sixty trees
+    of six levels ... 360 * 126 extra command buffers".** 360 trees was a
+    proposed CatBoost-mode default that NEVER SHIPPED; `n_estimators` is 100 in
+    the code, in CatBoost mode and otherwise. Do not restore the 360 figure. The
+    conclusion does not depend on the tree count either way, since the per-tree
+    excess is 126 command buffers against a whole-tree census of 62."""
     comptime if not has_accelerator():
         raise Error(
             "the device split search needs an accelerator; this binary was"
@@ -6376,7 +6393,13 @@ def _launch_oblivious_search(
         # records, so the only difference at the call is the kernel symbol and
         # the block dimension. See `_scan_slot_oblivious_wide_kernel` for the
         # bit-identity argument and `oblivious_wide_scan_requested` for why the
-        # default is off.
+        # default is ON.
+        #
+        # Corrected 2026-08-17: this line read "for why the default is off",
+        # which described the pre-flip `== "1"` predicate. The predicate is
+        # `getenv("MOJOTREES_GPU_OBLIVIOUS_WIDE") != "0"`, so unset SELECTS the
+        # wide scan and the variable is an escape hatch back to the narrow one.
+        # The refusal below is written that way already and must stay that way.
         if oblivious_wide_scan_requested():
             # The private accumulator arrays are sized at compile time from
             # `binning.MAX_BINS`, so a bin count past what that bound assumed

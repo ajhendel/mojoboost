@@ -1931,11 +1931,24 @@ noise and signed the right way.**
 
 ### Two consequences that are NOT free, recorded because they are the cost
 
-**1. Every recorded accuracy anchor for a `lossguide` arm now describes a model
-we do not ship.** `bench/real_data/accuracy_anchors.json` and the `lossguide`
-rows of `bench/results/COMPARISON_RUN_2026-08-16.md` were measured at
-`lambda_l2 = 0`. They are stale, and **they must not be re-recorded by
-arithmetic.** Rule 3 of `LANE_RULES.md` anchors accuracy on an absolute
+**1. Every recorded `lossguide` accuracy number now describes a model we do not
+ship.** Every `lossguide` row of `bench/results/COMPARISON_RUN_2026-08-16.md`
+was measured at `lambda_l2 = 0`. Those rows are stale, and **they must not be
+re-recorded by arithmetic.**
+
+**Corrected 2026-08-17, and the correction matters more than the sentence it
+replaces.** This paragraph originally named
+`bench/real_data/accuracy_anchors.json` alongside those rows and said the
+lambda move made its entries stale. It did not, because **that file's `anchors`
+object is empty and has been empty since the concept landed.** No anchor has
+ever been adopted, so the move made nothing stale there and, more importantly,
+**the accuracy gate this document leans on has never gated a single run.** The
+staleness machinery for the anchors a future run will produce is
+`verify.anchor_staleness`, which compares the constant recorded at record time
+against the constant in force and therefore self-clears rather than needing a
+maintained list. Writing "they are stale" about an empty file read as coverage
+that existed and had lapsed, when the true state is coverage that was never
+established, and those two states have opposite remedies. Rule 3 of `LANE_RULES.md` anchors accuracy on an absolute
 recorded value precisely so that a later run cannot quietly become its own
 baseline, and editing an anchor to match a model nobody measured is how that
 ratchet gets installed. The anchors stay stale, and visibly so, until a run

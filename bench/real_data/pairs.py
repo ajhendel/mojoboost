@@ -52,31 +52,38 @@ claimed: `BASE_PARAMS` is the package's own constructor defaults key for key
 `sklearn.py::MojoTreesRegressor` on 2026-08-17, and `check_shipped_is_default`
 below fails if any of them drifts apart.
 
-WHAT "OUR SHIPPED DEFAULTS" MEANS HERE, AND IT IS NOT WHAT ONE DOCUMENT SAYS
-----------------------------------------------------------------------------
+WHAT "OUR SHIPPED DEFAULTS" MEANS HERE, SETTLED BY A RULING AND NOT BY THIS FILE
+-------------------------------------------------------------------------------
 
-Read from the code, not from the roadmap. `sklearn.py::MojoTreesRegressor`
-defaults `grow_policy="lossguide"` and `n_estimators=100`.
-`docs/LIGHTGBM_PARITY.md`'s "Decided 2026-08-16" block says `symmetrictree` is
-"the default policy" with budgets of 360 and 72, and **that is not in the
-code**; `ACCURACY_GAP.md` section 8.2 found the same thing independently and
-reported it rather than editing it.
+**Settled 2026-08-17 at `273504e`, "Settle 360 vs 100": the answer is that 360
+never existed.** `sklearn.py::MojoTreesRegressor` defaults
+`grow_policy="lossguide"` and `n_estimators=100`, `n_estimators=360` has never
+been an estimator default, and CatBoost mode does not raise the tree count --
+the mode supplies depth, rate, bootstrap, scoring and `l2_leaf_reg` and leaves
+the budget alone. The 360 and 72 figures are the tree counts of a 2026-08-16
+decision to ship symmetric growth that was recorded and never implemented, and
+they leaked out of that decision into arithmetic as though they were defaults.
+`docs/LIGHTGBM_PARITY.md`'s row has been corrected, `predict.mojo`'s leaf-table
+budget was recomputed at 100, and `ACCURACY_GAP.md` section 8.2 had found the
+same discrepancy from the other side.
 
-This file follows the CODE, because a benchmark row labelled "what we ship" has
-to be what a user gets, and it carries the symmetric set as a second Class B row
-so the documented intent is measured too:
+So the two Class B rows are, and the second one's label matters:
 
-    shipped.lossguide       the code's default policy, nothing overridden
-    shipped.symmetric       the CatBoost set, the documented default policy
+    shipped.lossguide       our DEFAULT: the code's default policy, nothing set
+    shipped.symmetric       our OPT-IN CatBoost mode at ITS own defaults
 
-**Both run at 100 trees**, which is the code's `n_estimators` default and is
-also every peer's count in this harness. That is a deliberate choice with a
-consequence worth stating: it means every Class B row is at a MATCHED tree count
-against every competitor row, so `verify.check_accuracy_peer` never abstains
-here, and no cross-count comparison is possible even by accident. Running the
-symmetric row at the documented 360 instead would have required three more
-competitor rows per scenario at 360 trees, for a budget that is not in the code.
-`TREE_BUDGET_DECISION` records the price.
+`symmetrictree` is an opt-in and is not the default policy. It is in Class B
+anyway, because selecting it flips the whole default set to CatBoost's
+(`sklearn.py` resolves `catboost_mode = grow_policy == "symmetrictree"`), so it
+is a shipped configuration a user can ask for by naming one parameter, and
+"shipped versus shipped" is incomplete without it.
+
+**Both run at 100 trees**, which is the code's own `n_estimators` default and is
+also every peer's count in this harness, so every Class B row is at a MATCHED
+tree count against every competitor row: `verify.check_accuracy_peer` never
+abstains here and no cross-count comparison is possible even by accident.
+`TREE_BUDGET_DECISION` records what that leaves unmatched, which is real and is
+the largest unmatched thing about the CatBoost comparison.
 
 THE `lambda_l2` AXIS, AND WHY IT HAS FIVE POINTS AND NOT THREE
 --------------------------------------------------------------
@@ -167,22 +174,30 @@ REPEATS = frontier.REPEATS
 #: the whole run is what makes every peer column in it a matched-count column.
 N_ESTIMATORS = scenarios.BASE_PARAMS["n_estimators"]
 
-#: Why 100 rather than the documented 360 and 72, priced.
+#: Why 100 and what it leaves unmatched, priced.
 TREE_BUDGET_DECISION = (
-    "Every row runs at 100 trees. `sklearn.py::MojoTreesRegressor` defaults "
-    "n_estimators to 100 under every grow policy, so 100 is what we ship; the "
-    "360 and 72 budgets in docs/LIGHTGBM_PARITY.md's 'Decided 2026-08-16' "
-    "block are documented and are not in the code, which "
-    "docs/design/ACCURACY_GAP.md section 8.2 also found and reported. WHAT "
-    "THIS GIVES UP, priced rather than glossed: if the 360/72 split is later "
-    "wired into the package, the symmetric row here is at 100 and is not that "
-    "product, and re-running it at 360 needs three competitor rows per "
-    "scenario at 360 as well, because verify.check_accuracy_peer abstains "
-    "without a matched count. That is 9 more cells per scenario row at 3 "
-    "repeats, and on the large dense row a 360-iteration CatBoost fit is about "
-    "3.6x its 100-iteration one. WHAT IT BUYS: every row in this run is at one "
-    "count, so no cross-count reading is possible and no row abstains on the "
-    "peer column."
+    "Every row runs at 100 trees, and this is a ruling rather than this plan's "
+    "choice. `sklearn.py::MojoTreesRegressor` defaults n_estimators to 100 "
+    "under every grow policy and CatBoost mode does not raise it, so 100 is "
+    "what we ship; 360 and 72 are the tree counts of an unimplemented "
+    "2026-08-16 decision and were settled out at 273504e. "
+    "WHAT THIS LEAVES UNMATCHED, and it is the largest unmatched thing about "
+    "the CatBoost comparison rather than a rounding: CatBoost ships 1000 "
+    "iterations. So `shipped.symmetric` gives a reader CatBoost's depth, rate, "
+    "bootstrap, scoring and l2_leaf_reg at a TENTH of CatBoost's tree budget, "
+    "and the `catboost` row beside it is CatBoost's own defaults at OUR count "
+    "rather than at its own (scenarios.CATBOOST_MATCHED). That is not a defect "
+    "in the mode, it is the shipped tree count, and a Class B reader has to "
+    "know it before reading the accuracy column: both libraries are asked for "
+    "100 trees and only one of them ships that number. "
+    "WHAT IT BUYS: every row in this run is at one count, so no cross-count "
+    "reading is possible and no row abstains on the peer column. "
+    "WHAT A DIFFERENT ANSWER WOULD COST: putting our symmetric row at some "
+    "other budget needs three competitor rows per scenario at that budget as "
+    "well, because verify.check_accuracy_peer abstains without a matched "
+    "count. That is 9 more cells per scenario row at 3 repeats, and a "
+    "1000-iteration CatBoost fit on the large dense row is about ten times its "
+    "100-iteration one."
 )
 
 #: The `lambda_l2` candidate set, as the UNION of two registered sets.
@@ -286,11 +301,24 @@ CLASSES = {
         "of a Class A pair and it is simultaneously that library's Class B "
         "product row, because those are the same fit. Scheduled once"
     ),
-    "B/ours-as-shipped": (
-        "CLASS B, OUR PRODUCT. mojotrees with nothing overridden that a user "
-        "would not also get: the package's own constructor defaults, read off "
-        "sklearn.py::MojoTreesRegressor. This is the row to quote as 'what "
-        "mojotrees does out of the box'"
+    "B/ours-default": (
+        "CLASS B, OUR PRODUCT AT ITS DEFAULTS. mojotrees with nothing "
+        "overridden that a user would not also get: the package's own "
+        "constructor defaults, read off sklearn.py::MojoTreesRegressor, which "
+        "means grow_policy lossguide, 100 trees, learning_rate 0.1 and "
+        "lambda_l2 1.0. **This is the only row in the run to quote as 'what "
+        "mojotrees does out of the box'.**"
+    ),
+    "B/ours-opt-in": (
+        "CLASS B, A SHIPPED CONFIGURATION A USER MUST ASK FOR. "
+        "grow_policy='symmetrictree', which is NOT the default policy and which "
+        "flips the whole default set to CatBoost's when it is named "
+        "(sklearn.py resolves catboost_mode from it). It belongs in a "
+        "shipped-versus-shipped table because one parameter reaches it and "
+        "because it is the arm the CatBoost comparison is really about, and it "
+        "must NOT be read as our default. The 2026-08-16 decision to make it "
+        "the default at 360 trees was recorded and never implemented; 273504e "
+        "settled that"
     ),
     "B/ours-l2-axis": (
         "CLASS B, THE lambda_l2 AXIS. Our shipped lossguide configuration with "
@@ -563,7 +591,14 @@ SHIPPED_LOSSGUIDE = {
     "lambda_l2": None,
 }
 
-#: Our documented default policy, the CatBoost set, at the code's tree count.
+#: Our OPT-IN CatBoost mode at its own defaults, at the code's tree count.
+#:
+#: NOT our default policy. `symmetrictree` is opt in; `sklearn.py` ships
+#: `grow_policy="lossguide"`, and the 2026-08-16 decision to make symmetric the
+#: shipped default at 360 trees was recorded and never implemented (settled at
+#: 273504e, corrected in docs/LIGHTGBM_PARITY.md). It is a Class B row anyway
+#: because naming this one parameter flips the whole default set to CatBoost's,
+#: so it is a shipped configuration a user can reach.
 #:
 #: The values are `frontier.BASES['A']['params']`'s, which is the registered
 #: definition of this shape, minus its 360-tree budget and plus the two `None`s
@@ -619,24 +654,34 @@ UNREACHABLE = {
         "carries the full reason). Exit: whatever that table's entry names"
     ),
     "symmetric_multiclass": (
-        "the symmetric shipped arm carries bootstrap_type=MVS and the "
-        "multiclass trainer takes no bootstrap bundle at all: "
-        "trainset.train_dataset_multiclass has no bootstrap argument, so the "
-        "binding refuses it by name rather than dropping it. This is the same "
-        "refusal scenarios.MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT declares "
-        "for the CatBoost-mode arm on this scenario, and it applies here for "
-        "the identical reason: the arm is the same shape under a different arm "
-        "id, so the skip has to be declared here too rather than inherited "
-        "from a table keyed by engine name. CatBoost does not run MVS for "
-        "multiclass either, so this cell would not have been the comparison it "
-        "claims to be even if our trainer accepted it. Exit: a multiclass "
-        "trainer that takes a bootstrap bundle"
+        "the symmetric shipped arm carries bootstrap_type=MVS with NO explicit "
+        "mvs_reg, and `sampling.check_mvs_reg_is_set` refuses a DERIVED mvs_reg "
+        "on a softmax round: CatBoost derives the lambda from "
+        "`lastIterValues[dim][leaf]`, one tree with one value per output "
+        "dimension per leaf, and a round of K structurally different trees has "
+        "no such table. This is the same refusal "
+        "scenarios.MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT declares for the "
+        "CatBoost-mode arm on this scenario, and it applies here for the "
+        "identical reason: the arm is the same shape under a different arm id, "
+        "so the skip has to be declared here too rather than inherited from a "
+        "table keyed by engine name. NOT the reason that entry USED to give, "
+        "which was that the multiclass trainer takes no bootstrap bundle; it "
+        "takes one and both CPU loops honor it, and both that entry and this "
+        "one were corrected against the source on 2026-08-17. CatBoost does not "
+        "run MVS for multiclass either -- its defaulting block excludes the "
+        "multiclass-only losses and keeps Bayesian -- so this cell would not "
+        "have been the comparison it claims to be even under an mvs_reg. Exit: "
+        "an explicit mvs_reg, which is then a value CatBoost does not use here, "
+        "so it is a different arm rather than this one unblocked"
     ),
     "symmetric_multiclass_gpu": (
-        "as `symmetric_multiclass`, and a second refusal sits behind it on the "
-        "accelerator: model.mojo::fit_multiclass refuses the bootstrap bundle "
-        "on the device independently of the host path "
-        "(frontier.CAPABILITIES_AT_HEAD records it). Exit: both"
+        "as `symmetric_multiclass`, and a second and INDEPENDENT refusal sits "
+        "behind it on the accelerator: `train_multiclass_gpu` takes no "
+        "bootstrap bundle, so `model.mojo::fit_multiclass` and "
+        "`trainset.mojo::train_dataset_multiclass` raise on their GPU arms "
+        "rather than training unsampled (frontier.CAPABILITIES_AT_HEAD records "
+        "it, and it is the one place the missing-bundle reason IS still true). "
+        "Exit: both"
     ),
 }
 
@@ -801,11 +846,11 @@ def class_b_arms(row):
     """
     out = []
     out.extend(
-        _ours(row, "shipped.lossguide", "B/ours-as-shipped", SHIPPED_LOSSGUIDE)
+        _ours(row, "shipped.lossguide", "B/ours-default", SHIPPED_LOSSGUIDE)
     )
     out.extend(
         _ours(
-            row, "shipped.symmetric", "B/ours-as-shipped", SHIPPED_SYMMETRIC,
+            row, "shipped.symmetric", "B/ours-opt-in", SHIPPED_SYMMETRIC,
             SHIPPED_SYMMETRIC_DATASET,
         )
     )
@@ -906,17 +951,20 @@ def check_shipped_is_default(problems):
                 "rather than None. This plan passes None to mean 'unset', "
                 "which only works while the signature default is None"
             )
-    # And the value an unset lambda_l2 resolves to, which is the divergence
-    # this whole run exists to settle. Named so that a run whose axis no longer
-    # contains the shipped value fails before it is scheduled.
-    found = re.search(r"^_LAMBDA_L2\s*=\s*([0-9.]+)\s*$", text, re.MULTILINE)
-    if found is None:
+    # And the value an unset lambda_l2 resolves to, which is the divergence this
+    # whole run exists to settle. Read through `verify.shipped_constant` rather
+    # than with a second regular expression over the same literal: two readers of
+    # one constant is how the two come to disagree, and the anchor staleness
+    # mechanism already needs this one.
+    import verify
+
+    shipped = verify.shipped_constant("_LAMBDA_L2")
+    if shipped is None:
         problems.append(
-            "sklearn.py::_LAMBDA_L2 is not a bare numeric literal any more, so "
-            "this plan cannot confirm which lambda_l2 we ship"
+            "verify.shipped_constant cannot read sklearn.py::_LAMBDA_L2, so this "
+            "plan cannot confirm which lambda_l2 we ship"
         )
         return
-    shipped = float(found.group(1))
     for key in ("num_leaves", "max_depth", "min_data_in_leaf",
                 "min_child_hess", "max_bin", "use_missing", "n_estimators"):
         if key not in scenarios.BASE_PARAMS:
@@ -1158,8 +1206,12 @@ def levers(all_arms=None):
     base = estimate(all_arms)["total"]["cells"]
 
     def without(predicate):
+        """The SIGNED change in cells from dropping these arms, so a saving
+        renders negative. Returned signed rather than as a magnitude because the
+        table also holds one entry that ADDS cells, and a column mixing
+        magnitudes with a cost is a column a reader has to interpret."""
         kept = [a for a in all_arms if not predicate(a)]
-        return base - estimate(kept)["total"]["cells"]
+        return estimate(kept)["total"]["cells"] - base
 
     return {
         "drop_dense_real": {

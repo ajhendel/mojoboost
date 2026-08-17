@@ -3106,11 +3106,17 @@ struct GpuHistogramBuilder(Movable):
         where the loss is, not that this removes it." Both halves stopped being
         true on 2026-08-17: the predicate at
         `gpu_leaf_batching.oblivious_subtract_requested` is `!= "0"`, and the arm
-        was priced at 1.78x and then at 22.76 s to 14.39 s over three
-        interleaved round-robin cycles at 799,110 x 100 x 100 trees, rmse
-        identical to nine decimals. Corrected 2026-08-17 by the GPU histogram
-        lane; the measurement is recorded at that function's flip comment and in
-        `docs/design/SWITCH_GRID.md`.
+        was priced twice, once at 21.97 s to 12.34 s and once at 22.76 s to
+        14.39 s over three interleaved round-robin cycles, both at
+        799,110 x 100 x 100 trees, rmse identical to nine decimals. Corrected
+        2026-08-17 by the GPU histogram lane; the measurement is recorded at that
+        function's flip comment and in `docs/design/SWITCH_GRID.md`.
+
+        **Quote the speedup as a RANGE of 1.58x to 1.78x.** This paragraph said
+        "priced at 1.78x and then at 22.76 s to 14.39 s", which reads as one
+        figure plus a detail when the second pair is 1.58x and is a second
+        figure. Neither reading has been withdrawn, so reconciling them is
+        another lane's item and no single multiple is quoted here.
 
         **A third arm exists behind its own switches and is default off.**
         `gpu_leaf_batching.plan_lean_requested` routes the accumulation to

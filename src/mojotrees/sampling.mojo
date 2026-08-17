@@ -1716,8 +1716,17 @@ def mvs_bootstrap_weights(
     # block, 2026-08-17. They used to be built inside the loop below --
     # `List[Float64](capacity=block_size)` plus a `.copy()` of it -- which is
     # two allocations of up to `8 * MVS_BLOCK_SIZE` = 64 KiB **per 8192-row
-    # block per tree**. At 800,000 rows that is 98 blocks, so 196 allocations
-    # per tree and 70,560 over a 360-tree fit, all of them the same two sizes.
+    # block per tree**. At 800,000 rows that is 98 blocks
+    # (`ceil(800000 / 8192)`), so 196 allocations per tree and, at the shipped
+    # `n_estimators` default of 100, `196 * 100 = 19,600` over a fit, all of
+    # them the same two sizes.
+    #
+    # **Corrected 2026-08-17. This comment used to quote "70,560 over a
+    # 360-tree fit", which is `196 * 360` and is arithmetic over a tree count
+    # that NEVER SHIPPED.** 360 trees was a proposed CatBoost-mode default that
+    # was never implemented; `n_estimators` is 100 in the code, in CatBoost mode
+    # and otherwise. Do not restore the 360 figure. If the default ever moves,
+    # move this multiplier with it and say so here.
     # Hoisting them is strictly less work for the identical result and takes no
     # measurement gate (LANE_RULES rule 1): every slot below `block_size` is
     # written before it is read, `_mvs_threshold` is handed `begin=0, end=
