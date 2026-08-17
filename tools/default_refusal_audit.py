@@ -177,7 +177,18 @@ ACKNOWLEDGED = {
         "-- a configuration that never reaches it. What MVS costs is the "
         "device derivative kernel, not the accelerator. Adding a "
         "device_policy block for it would refuse a working path, which is "
-        "the BLOCK_SCORE_FUNCTION mistake",
+        "the BLOCK_SCORE_FUNCTION mistake. "
+        "SECOND SITE IN THIS FILE, covered explicitly because this key is "
+        "per-file and would otherwise excuse it on an argument that does not "
+        "reach it: the raise on random_strength beside "
+        "bootstrap_type=Bayesian on the device-gradient arm. That one is "
+        "RESOLVED for a DIFFERENT reason -- the proposed default set is "
+        "bootstrap_type=MVS, not Bayesian, and MVS routes to the "
+        "host-gradient arm where the scale is computed before either "
+        "sampler. It would fire for a Bayesian fit that also set "
+        "random_strength, which the default set does not describe. Noting "
+        "both because an acknowledgement that covers less than it excuses is "
+        "the same defect this tool exists to find",
     ),
     ("bootstrap_type", "src/mojotrees/model.mojo"): (
         "DIVERGENCE",
@@ -933,21 +944,45 @@ def unmasked_by_removing(default_set, parameter):
     """
     params, rows = audit(default_set)
     policy = _read_source("src/mojotrees/device_policy.mojo")
-    device_rows, unrouted = [], []
+    device_rows, unrouted, excused = [], [], []
     for name in sorted(rows):
         if name == parameter:
             continue
-        hits = [
-            r
-            for r in rows[name]
-            if r["looks_like_refusal"] and r["file"] in DEVICE_FILES
-        ]
+        hits, skipped = [], []
+        for r in rows[name]:
+            if not (r["looks_like_refusal"] and r["file"] in DEVICE_FILES):
+                continue
+            # A site a human has read and ruled RESOLVED does not hold the
+            # gate shut. **RESOLVED only** -- BLOCKING and DIVERGENCE still
+            # count, because those say the refusal fires and the default is
+            # not ready, which is exactly what this gate is for.
+            #
+            # WHY THIS IS NOT A SUPPRESSION HATCH, which is the obvious
+            # objection and a fair one. Without it the gate can never go
+            # green: `bootstrap_type` is a permanent UNROUTED entry because
+            # the raise it matches is a defensive guard inside the
+            # device-gradient loop that the configuration never reaches, and
+            # a rule of the form "retire the block when this exits 0" is
+            # unusable against a check that cannot reach 0. A gate that can
+            # never pass gets bypassed, and then it gates nothing.
+            #
+            # The protections are that only RESOLVED excuses, that each
+            # excused site is PRINTED with its verdict and reason rather than
+            # dropped, and that an acknowledgement is an argument somebody
+            # wrote and signed rather than a name on a skip list.
+            verdict = ACKNOWLEDGED.get((name, r["file"]))
+            if verdict is not None and verdict[0] == "RESOLVED":
+                skipped.append((r, verdict))
+                continue
+            hits.append(r)
+        if skipped:
+            excused.append((name, skipped))
         if not hits:
             continue
         device_rows.append((name, hits))
         if not re.search(r"\b" + re.escape(name) + r"\b", policy):
             unrouted.append(name)
-    return device_rows, unrouted
+    return device_rows, unrouted, excused
 
 
 def _tree_state():
@@ -1015,9 +1050,22 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.removing:
-        device_rows, unrouted = unmasked_by_removing(args.set, args.removing)
+        device_rows, unrouted, excused = unmasked_by_removing(
+            args.set, args.removing
+        )
         print(f"Removing the block for {args.removing!r} unmasks:")
         print()
+        # Printed BEFORE the findings, not appended as a footnote. A gate that
+        # quietly drops sites reads as "nothing here" whether it found nothing
+        # or excused everything, and those are different answers.
+        for name, skipped in excused:
+            for site, verdict in skipped:
+                print(
+                    f"  EXCUSED  {name} at {site['file']}:{site['line']}"
+                    f" -- acknowledged {verdict[0]}"
+                )
+                print(f"      {verdict[1][:200]}")
+                print()
         for name, hits in device_rows:
             mark = "  UNROUTED" if name in unrouted else "  masked  "
             print(f"{mark} {name}")
