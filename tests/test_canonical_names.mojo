@@ -476,6 +476,14 @@ def test_catboost_only_names_state_or_refuse() raises:
     once (`_lower_ascii`) before `parse_score_function`, which takes
     canonical lowercase. An unknown value is still refused rather than
     resolved to the default.
+
+    `leaf_estimation_iterations` has since left the state-or-refuse family
+    entirely, which is a narrowing of this test rather than a loss. See the
+    comment on its arm below for what replaced the refusal and for the half
+    of it that still fires. The rule the family encodes is unchanged. A key
+    states or refuses for exactly as long as the surface cannot honor it, and
+    the honest response to a surface that can is to honor it and keep
+    refusing where it still cannot.
     """
     _ = parse_params(String("score_function=L2"))
     _ = parse_params(String("score_function=l2"))
@@ -498,18 +506,79 @@ def test_catboost_only_names_state_or_refuse() raises:
     _ = parse_params(String("max_ctr_complexity=1"))
     with assert_raises(contains="max_ctr_complexity"):
         _ = parse_params(String("max_ctr_complexity=4"))
-    # `random_strength` and `leaf_estimation_iterations` already had this
-    # shape and keep it.
+    # `random_strength` keeps this shape. `leaf_estimation_iterations` LEFT
+    # it on 2026-08-16 (`e3cfb47`), and it left for the reason that governs
+    # every entry in this file rather than in spite of it. A key states or
+    # refuses only while the surface cannot honor it, and this surface can
+    # now. CatBoost mode resolves the count per objective, so
+    # `grow_policy=oblivious objective=binary` is a shipped configuration
+    # whose CatBoost value is 10, and a string that refused every value above
+    # 1 could not express a default it is asked to port.
+    #
+    # The blanket refusal was replaced by a routing verdict rather than
+    # deleted, so the assertion moves rather than goes. A parameter string
+    # reaches exactly two trainers. `model.fit` runs the extra Newton steps
+    # on both backends, and `model.fit_multiclass` reads the field nowhere
+    # and still refuses BY NAME. Both halves are asserted here,
+    # because a regression that dropped the routing check would restore
+    # exactly the silent drop the original refusal existed to prevent, and an
+    # updated test that only checked that 5 parses would not notice it.
     _ = parse_params(String("random_strength=0.0"))
-    _ = parse_params(String("leaf_estimation_iterations=1"))
-    with assert_raises(contains="leaf_estimation_iterations"):
-        _ = parse_params(String("leaf_estimation_iterations=5"))
+    assert_equal(
+        parse_params(
+            String("leaf_estimation_iterations=1")
+        ).booster.tree.extra.leaf_estimation_iterations,
+        1,
+    )
+    # Honored rather than merely tolerated. A parser that accepted the key and
+    # left the field at its default would satisfy a bare `parse_params` call
+    # and fail this one.
+    assert_equal(
+        parse_params(
+            String("leaf_estimation_iterations=5")
+        ).booster.tree.extra.leaf_estimation_iterations,
+        5,
+    )
+    with assert_raises(contains="model.fit_multiclass"):
+        _ = parse_params(
+            String(
+                "objective=multiclass num_class=3"
+                " leaf_estimation_iterations=5"
+            )
+        )
 
 
 def test_a_vendor_alias_of_a_mojo_api_parameter_says_so() raises:
     """`subsample` and `rsm`-adjacent names that need the Mojo API get the
     sentence about the feature, not "unknown parameter": what the user needs
-    to be told is about the parameter, not about the spelling."""
+    to be told is about the parameter, not about the spelling.
+
+    The anchor used to be the literal `Mojo API only`, and it was matching the
+    wrong thing. That phrase is one wording of the answer and not the
+    property. `one_hot_max_size` grew a SECOND route on 2026-08-16
+    (`e3cfb47`), the scikit-learn estimator, so its sentence became "the
+    Mojo API and by the
+    scikit-learn estimator only" and the literal stopped matching a message
+    that had gotten more helpful rather than less. A test that goes red when a
+    refusal names one more way to get what you asked for is testing prose.
+
+    So the anchor is the property, in three parts, all of which a message has
+    to satisfy at once. It must refuse at all, which is what catches a key
+    that quietly starts parsing. It must NOT say "unknown parameter", which is
+    the whole distinction this test exists to draw and the one thing a
+    reworded message can never accidentally acquire. And it must name a
+    surface that does carry the feature, which is what makes it a sentence
+    about the parameter rather than a bare rejection. `Mojo API` is the
+    substring every one of those routes shares, because the Mojo API carries
+    all of them and the estimator is an addition to that list rather than a
+    replacement for it.
+
+    `params_names_mojo_api_only` is asserted beside each one because the
+    message and the predicate are two independent answers to the same
+    question, and a caller turning a rejected string into a status code reads
+    the predicate while a human reads the message. They are allowed to be
+    worded differently; they are not allowed to disagree.
+    """
     for spelling in [
         String("subsample=0.8"),
         String("subsample_freq=1"),
@@ -524,9 +593,34 @@ def test_a_vendor_alias_of_a_mojo_api_parameter_says_so() raises:
         String("rate_drop=0.2"),
         String("eval_metric=rmse"),
     ]:
-        with assert_raises(contains="Mojo API only"):
+        var message = String("")
+        try:
             _ = parse_params(spelling)
+        except e:
+            message = String(e)
+        assert_true(
+            message.byte_length() > 0,
+            String("expected a refusal, parsed instead: ", spelling),
+        )
+        assert_true(
+            message.find("unknown parameter") < 0,
+            String("a real feature was reported as a typo: ", message),
+        )
+        assert_true(
+            message.find("Mojo API") >= 0,
+            String("no surface that carries it was named: ", message),
+        )
         assert_true(params_names_mojo_api_only(spelling), spelling)
+
+    # `one_hot_max_size` is the one whose message widened, so the widening is
+    # pinned here rather than merely tolerated by the looser anchor above. If
+    # the estimator ever stops carrying the parameter and the sentence reverts
+    # to naming the Mojo API alone, this is what says so, and it says it at
+    # the key rather than at a phrase.
+    with assert_raises(contains="one_hot_max_size"):
+        _ = parse_params(String("one_hot_max_size=5"))
+    with assert_raises(contains="scikit-learn estimator"):
+        _ = parse_params(String("one_hot_max_size=5"))
 
 
 def test_unknown_parameter_is_still_unknown() raises:

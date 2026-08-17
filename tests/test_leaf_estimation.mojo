@@ -631,9 +631,39 @@ def test_multiclass_refuses_rather_than_ignoring() raises:
 
 
 def test_the_parameter_string_carries_the_name() raises:
-    """The name parses and 1 is inert. Above 1 is refused, because a parameter
-    string reaches trainers that do not implement it and would silently drop
-    it; the Mojo API route is the one that honors it."""
+    """The name parses, 1 is inert, and above 1 is expressible here now, but
+    only where the trainer this string routes to implements it.
+
+    The blanket refusal this test used to assert was right for as long as every
+    count above 1 was reachable from the Mojo API alone. It stopped being right
+    on 2026-08-16 (`e3cfb47`), and the reason is that a shipped default has to
+    hold on every surface. CatBoost mode resolves this parameter per objective,
+    so `grow_policy=oblivious objective=binary` is a configuration whose
+    CatBoost value is 10, and a string that could not express 10 could not
+    express the default it is asked to port.
+
+    What replaced the refusal is not permission, so the teeth here moved rather
+    than came out. `params._check_leaf_estimation_routing` takes the same
+    verdict `_parse_params` in `bindings/_mojotrees.mojo` takes, from the same
+    question -- which trainer is this configuration about to reach -- and a
+    parameter string reaches exactly two. `model.fit` runs the extra Newton
+    steps on both backends; `model.fit_multiclass` reads the field nowhere, and
+    that is the one the refusal narrowed to.
+
+    So the property under guard is the one it always was, *a parameter string
+    never silently drops this setting*, and it is now asserted in both
+    directions. The single-output string must carry the count onto the config,
+    which is what a regression that resolved the value and then ignored it
+    would fail; the multiclass string must still refuse by name, which is what
+    a regression that deleted the routing check along with the blanket one
+    would fail. Asserting only that the single-output string parses would leave
+    the second half unguarded, and the second half is where the silent drop
+    actually lives.
+
+    The range check is a different rule and did not narrow with the routing, so
+    it is asserted beside them. 0 is still an error at the surface it was typed
+    on rather than at the leaf that would first divide by it.
+    """
     var one = parse_params("objective=regression leaf_estimation_iterations=1")
     assert_equal(
         one.booster.tree.extra.leaf_estimation_iterations, 1
@@ -643,9 +673,31 @@ def test_the_parameter_string_carries_the_name() raises:
     # extra Newton steps touch no candidate and no gain.
     assert_false(one.booster.tree.extra.is_active())
 
-    with assert_raises():
-        _ = parse_params("objective=regression leaf_estimation_iterations=2")
-    with assert_raises():
+    # Above 1 on a single-output objective is carried onto the config rather
+    # than dropped, because `model.fit` honors it on both backends.
+    var two = parse_params("objective=regression leaf_estimation_iterations=2")
+    assert_equal(two.booster.tree.extra.leaf_estimation_iterations, 2)
+    assert_true(two.booster.tree.extra.leaf_estimation_active())
+    # And still not the split search's gate, at the count that actually fires.
+    assert_false(two.booster.tree.extra.is_active())
+
+    # Above 1 on multiclass is still refused, and refused BY NAME, because
+    # `boosting.train_multiclass`, `train_gpu.train_multiclass_gpu` and
+    # `boosting_sparse.train_multiclass_sparse` read the field nowhere. This is
+    # the assertion that used to cover every objective and now covers the one
+    # objective that still needs it.
+    with assert_raises(contains="model.fit_multiclass"):
+        _ = parse_params(
+            "objective=multiclass num_class=3 leaf_estimation_iterations=2"
+        )
+    # The same multiclass string at the default parses, which is what makes the
+    # refusal specific to the count rather than to the objective.
+    var multi = parse_params(
+        "objective=multiclass num_class=3 leaf_estimation_iterations=1"
+    )
+    assert_equal(multi.booster.tree.extra.leaf_estimation_iterations, 1)
+
+    with assert_raises(contains="at least 1"):
         _ = parse_params("objective=regression leaf_estimation_iterations=0")
 
 

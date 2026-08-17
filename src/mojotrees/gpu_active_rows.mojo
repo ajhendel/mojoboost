@@ -7263,144 +7263,154 @@ struct GpuActiveRows(Movable):
         is asserted here is only that three launches now do what four did,
         element for element.
         """
-        routing.check(self.n_features, self.n_bins)
-        if window.begin < 0 or window.end > self.n_rows:
-            raise Error("range escapes the row buffer")
-        var n = window.count()
-        if n <= 0:
-            return
-
-        var threads = self.block_threads
-        var grid = _partition_grid(n, threads, self.partition_block_cap)
-        var blocks = grid[0]
-        var tiles = grid[1]
-        # The copy back has no cross-block dependency, so it keeps the plain
-        # one-tile-per-block grid rather than the capped one the scan and the
-        # scatter share.
-        var copy_blocks = (n + threads - 1) // threads
-        var cat = routing.cat_bitset
-        var default_left = Int32(1) if routing.default_left else Int32(0)
-        var is_cat = Int32(1) if routing.is_categorical else Int32(0)
-
-        # The flag pass and the scatter, on whichever arm is selected. The
-        # primitive kernels are instantiated per width, so the dispatch is an
-        # if-chain over the menu rather than a runtime block size; the whole
-        # chain sits inside a `comptime if has_accelerator()` because a build
-        # with no accelerator target has no warp size for `block.prefix_sum`
-        # to constrain against, and pruning the branch is what keeps those
-        # instantiations out of a CPU-only extension build entirely.
-        var scanned = False
-        comptime if has_accelerator():
-            if self.scan_primitives:
-                scanned = True
-                if threads == 128:
-                    self._enqueue_scan_primitives[128](
-                        bins, window, routing, n, blocks, tiles
-                    )
-                elif threads == 256:
-                    self._enqueue_scan_primitives[256](
-                        bins, window, routing, n, blocks, tiles
-                    )
-                elif threads == 512:
-                    self._enqueue_scan_primitives[512](
-                        bins, window, routing, n, blocks, tiles
-                    )
-                elif threads == 1024:
-                    self._enqueue_scan_primitives[1024](
-                        bins, window, routing, n, blocks, tiles
-                    )
-                else:
-                    # `__init__` and `set_scan_primitives` both refuse to
-                    # select the arm at an uninstantiated width, so this is
-                    # unreachable; falling back rather than raising keeps a
-                    # width that slipped through producing correct rows.
-                    scanned = False
-
-        # The compacted flag read, on the fallback arm. Resolved here for the
-        # same reason `_enqueue_scan_primitives` resolves it at its own launch;
-        # computed unconditionally so the two arms cannot disagree about which
-        # plane they read.
-        var flag_bins = _any_origin_u8(bins)
-        var dense = self.compact_flag_read_live()
-        if dense:
-            flag_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
-
-        if not scanned:
-            self.ctx.enqueue_function[_flag_scan_kernel](
-                flag_bins,
-                self.rows_dev.unsafe_ptr(),
-                self.offsets_dev.unsafe_ptr(),
-                self.block_sums_dev.unsafe_ptr(),
-                Int32(self.n_rows),
-                Int32(window.begin),
-                Int32(n),
-                Int32(routing.feature),
-                Int32(routing.threshold_bin),
-                Int32(routing.missing_bin),
-                default_left,
-                is_cat,
-                cat[0],
-                cat[1],
-                cat[2],
-                cat[3],
-                Int32(tiles),
-                # Inert descriptor. The host chose this split and passed
-                # it as arguments, so `use_desc` is zero and the kernel
-                # never dereferences this pointer; a real buffer rather
-                # than a null keeps the argument well typed everywhere,
-                # and it must be a buffer this launch does not already
-                # pass, which is why it is `step_dev` and not one of the
-                # partition's own.
-                self.step_dev.unsafe_ptr(),
-                Int32(0),
-                Int32(1) if dense else Int32(0),
-                grid_dim=blocks,
-                block_dim=threads,
+        comptime if not has_accelerator():
+            raise Error(
+                "the device row partition needs an accelerator; this binary"
+                " was built without one, so partition rows through the CPU"
+                " backend instead"
             )
-            # Same width and the same tiling as the flag pass: the scatter
-            # looks its chunk up by `block_idx.x` and `tiles`, and the packed
-            # offsets it reads are chunk-relative.
-            self.ctx.enqueue_function[_scatter_kernel](
+        else:
+            routing.check(self.n_features, self.n_bins)
+            if window.begin < 0 or window.end > self.n_rows:
+                raise Error("range escapes the row buffer")
+            var n = window.count()
+            if n <= 0:
+                return
+
+            var threads = self.block_threads
+            var grid = _partition_grid(n, threads, self.partition_block_cap)
+            var blocks = grid[0]
+            var tiles = grid[1]
+            # The copy back has no cross-block dependency, so it keeps the
+            # plain one-tile-per-block grid rather than the capped one the
+            # scan and the scatter share.
+            var copy_blocks = (n + threads - 1) // threads
+            var cat = routing.cat_bitset
+            var default_left = Int32(1) if routing.default_left else Int32(0)
+            var is_cat = Int32(1) if routing.is_categorical else Int32(0)
+
+            # The flag pass and the scatter, on whichever arm is selected.
+            # The primitive kernels are instantiated per width, so the
+            # dispatch is an if-chain over the menu rather than a runtime
+            # block size; the whole chain sits inside a `comptime if
+            # has_accelerator()` because a build with no accelerator target
+            # has no warp size for `block.prefix_sum` to constrain against,
+            # and pruning the branch is what keeps those instantiations out
+            # of a CPU-only extension build entirely.
+            var scanned = False
+            comptime if has_accelerator():
+                if self.scan_primitives:
+                    scanned = True
+                    if threads == 128:
+                        self._enqueue_scan_primitives[128](
+                            bins, window, routing, n, blocks, tiles
+                        )
+                    elif threads == 256:
+                        self._enqueue_scan_primitives[256](
+                            bins, window, routing, n, blocks, tiles
+                        )
+                    elif threads == 512:
+                        self._enqueue_scan_primitives[512](
+                            bins, window, routing, n, blocks, tiles
+                        )
+                    elif threads == 1024:
+                        self._enqueue_scan_primitives[1024](
+                            bins, window, routing, n, blocks, tiles
+                        )
+                    else:
+                        # `__init__` and `set_scan_primitives` both refuse to
+                        # select the arm at an uninstantiated width, so this
+                        # is unreachable; falling back rather than raising
+                        # keeps a width that slipped through producing
+                        # correct rows.
+                        scanned = False
+
+            # The compacted flag read, on the fallback arm. Resolved here for
+            # the same reason `_enqueue_scan_primitives` resolves it at its
+            # own launch; computed unconditionally so the two arms cannot
+            # disagree about which plane they read.
+            var flag_bins = _any_origin_u8(bins)
+            var dense = self.compact_flag_read_live()
+            if dense:
+                flag_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
+
+            if not scanned:
+                self.ctx.enqueue_function[_flag_scan_kernel](
+                    flag_bins,
+                    self.rows_dev.unsafe_ptr(),
+                    self.offsets_dev.unsafe_ptr(),
+                    self.block_sums_dev.unsafe_ptr(),
+                    Int32(self.n_rows),
+                    Int32(window.begin),
+                    Int32(n),
+                    Int32(routing.feature),
+                    Int32(routing.threshold_bin),
+                    Int32(routing.missing_bin),
+                    default_left,
+                    is_cat,
+                    cat[0],
+                    cat[1],
+                    cat[2],
+                    cat[3],
+                    Int32(tiles),
+                    # Inert descriptor. The host chose this split and passed
+                    # it as arguments, so `use_desc` is zero and the kernel
+                    # never dereferences this pointer; a real buffer rather
+                    # than a null keeps the argument well typed everywhere,
+                    # and it must be a buffer this launch does not already
+                    # pass, which is why it is `step_dev` and not one of the
+                    # partition's own.
+                    self.step_dev.unsafe_ptr(),
+                    Int32(0),
+                    Int32(1) if dense else Int32(0),
+                    grid_dim=blocks,
+                    block_dim=threads,
+                )
+                # Same width and the same tiling as the flag pass: the
+                # scatter looks its chunk up by `block_idx.x` and `tiles`,
+                # and the packed offsets it reads are chunk-relative.
+                self.ctx.enqueue_function[_scatter_kernel](
+                    self.rows_dev.unsafe_ptr(),
+                    self.scratch_dev.unsafe_ptr(),
+                    self.offsets_dev.unsafe_ptr(),
+                    self.block_sums_dev.unsafe_ptr(),
+                    self.total_dev.unsafe_ptr(),
+                    Int32(window.begin),
+                    Int32(n),
+                    Int32(tiles),
+                    Int32(blocks),
+                    # Inert descriptor. The host chose this split and passed
+                    # it as arguments, so `use_desc` is zero and the kernel
+                    # never dereferences this pointer; a real buffer rather
+                    # than a null keeps the argument well typed everywhere,
+                    # and it must be a buffer this launch does not already
+                    # pass, which is why it is `step_dev` and not one of the
+                    # partition's own.
+                    self.step_dev.unsafe_ptr(),
+                    Int32(0),
+                    grid_dim=blocks,
+                    block_dim=threads,
+                )
+            self.ctx.enqueue_function[_copy_back_kernel](
                 self.rows_dev.unsafe_ptr(),
                 self.scratch_dev.unsafe_ptr(),
-                self.offsets_dev.unsafe_ptr(),
-                self.block_sums_dev.unsafe_ptr(),
-                self.total_dev.unsafe_ptr(),
                 Int32(window.begin),
                 Int32(n),
-                Int32(tiles),
-                Int32(blocks),
-                # Inert descriptor. The host chose this split and passed
-                # it as arguments, so `use_desc` is zero and the kernel
-                # never dereferences this pointer; a real buffer rather
-                # than a null keeps the argument well typed everywhere,
-                # and it must be a buffer this launch does not already
-                # pass, which is why it is `step_dev` and not one of the
-                # partition's own.
+                # Inert descriptor; see the flag pass above.
                 self.step_dev.unsafe_ptr(),
                 Int32(0),
-                grid_dim=blocks,
+                grid_dim=copy_blocks,
                 block_dim=threads,
             )
-        self.ctx.enqueue_function[_copy_back_kernel](
-            self.rows_dev.unsafe_ptr(),
-            self.scratch_dev.unsafe_ptr(),
-            Int32(window.begin),
-            Int32(n),
-            # Inert descriptor; see the flag pass above.
-            self.step_dev.unsafe_ptr(),
-            Int32(0),
-            grid_dim=copy_blocks,
-            block_dim=threads,
-        )
-        # The data twin of everything above, when the arm is on. It reads the
-        # same `offsets` and `block_sums` at the same `blocks` and `tiles`, so
-        # it applies the identical permutation to the compacted planes that
-        # the scatter just applied to the rows. Nothing here is conditional on
-        # which arm the scan took: both arms write the same offsets.
-        self._maintain_compaction(
-            window.begin, n, tiles, blocks, copy_blocks, Int32(0)
-        )
+            # The data twin of everything above, when the arm is on. It reads
+            # the same `offsets` and `block_sums` at the same `blocks` and
+            # `tiles`, so it applies the identical permutation to the
+            # compacted planes that the scatter just applied to the rows.
+            # Nothing here is conditional on which arm the scan took: both
+            # arms write the same offsets.
+            self._maintain_compaction(
+                window.begin, n, tiles, blocks, copy_blocks, Int32(0)
+            )
 
     def _enqueue_scan_primitives[
         width: Int, bins_origin: MutOrigin
@@ -7883,137 +7893,151 @@ struct GpuActiveRows(Movable):
         `_copy_back_zero_slot_kernel` for why the fold is exact and why the
         other two launches here cannot be folded into anything.
         """
-        self._refuse_copy_back_debt("a second descriptor partition")
-        var bound = self.ranges.begin_descriptor_partition(max_count)
-        var threads = self.block_threads
-        var grid = _partition_grid(bound, threads, self.partition_block_cap)
-        var blocks = grid[0]
-        var tiles = grid[1]
-        # Which descriptor this partition routes by. `DESC_STEP` for every
-        # caller that predates the K=1 speculation, which is every caller
-        # today apart from `gpu_resident_round`'s armed loop; see
-        # `set_descriptor_target`.
-        var desc = self._desc_buffer()
-
-        # The routing arguments are placeholders: `use_desc` is 1, so every
-        # kernel below reads the split out of `step_dev` and ignores them. A
-        # window of `[0, max_count)` is passed for the same reason, and is
-        # deliberately the widest legal one rather than an empty one, so that
-        # a wiring mistake that left `use_desc` at zero would partition a real
-        # range and be caught by a row check rather than silently do nothing.
-        var window = LeafRange(0, bound)
-        var routing = RowRouting.numerical(0, 0, -1, False)
-
-        var scanned = False
-        comptime if has_accelerator():
-            if self.scan_primitives:
-                scanned = True
-                if threads == 128:
-                    self._enqueue_scan_primitives[128](
-                        bins, window, routing, bound, blocks, tiles,
-                        Int32(1),
-                    )
-                elif threads == 256:
-                    self._enqueue_scan_primitives[256](
-                        bins, window, routing, bound, blocks, tiles,
-                        Int32(1),
-                    )
-                elif threads == 512:
-                    self._enqueue_scan_primitives[512](
-                        bins, window, routing, bound, blocks, tiles,
-                        Int32(1),
-                    )
-                elif threads == 1024:
-                    self._enqueue_scan_primitives[1024](
-                        bins, window, routing, bound, blocks, tiles,
-                        Int32(1),
-                    )
-                else:
-                    scanned = False
-
-        # The compacted flag read; see `enqueue_partition` for why the pointer
-        # is resolved at the launch and not handed down.
-        var flag_bins = _any_origin_u8(bins)
-        var dense = self.compact_flag_read_live()
-        if dense:
-            flag_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
-
-        if not scanned:
-            self.ctx.enqueue_function[_flag_scan_kernel](
-                flag_bins,
-                self.rows_dev.unsafe_ptr(),
-                self.offsets_dev.unsafe_ptr(),
-                self.block_sums_dev.unsafe_ptr(),
-                Int32(self.n_rows),
-                Int32(0),
-                Int32(bound),
-                Int32(0),
-                Int32(0),
-                Int32(-1),
-                Int32(0),
-                Int32(0),
-                UInt64(0),
-                UInt64(0),
-                UInt64(0),
-                UInt64(0),
-                Int32(tiles),
-                desc.unsafe_ptr(),
-                Int32(1),
-                Int32(1) if dense else Int32(0),
-                grid_dim=blocks,
-                block_dim=threads,
+        comptime if not has_accelerator():
+            raise Error(
+                "the descriptor-driven device row partition needs an"
+                " accelerator; this binary was built without one, so"
+                " partition rows through the CPU backend instead"
             )
-            self.ctx.enqueue_function[_scatter_kernel](
+        else:
+            self._refuse_copy_back_debt("a second descriptor partition")
+            var bound = self.ranges.begin_descriptor_partition(max_count)
+            var threads = self.block_threads
+            var grid = _partition_grid(
+                bound, threads, self.partition_block_cap
+            )
+            var blocks = grid[0]
+            var tiles = grid[1]
+            # Which descriptor this partition routes by. `DESC_STEP` for
+            # every caller that predates the K=1 speculation, which is every
+            # caller today apart from `gpu_resident_round`'s armed loop; see
+            # `set_descriptor_target`.
+            var desc = self._desc_buffer()
+
+            # The routing arguments are placeholders: `use_desc` is 1, so
+            # every kernel below reads the split out of `step_dev` and
+            # ignores them. A window of `[0, max_count)` is passed for the
+            # same reason, and is deliberately the widest legal one rather
+            # than an empty one, so that a wiring mistake that left
+            # `use_desc` at zero would partition a real range and be caught
+            # by a row check rather than silently do nothing.
+            var window = LeafRange(0, bound)
+            var routing = RowRouting.numerical(0, 0, -1, False)
+
+            var scanned = False
+            comptime if has_accelerator():
+                if self.scan_primitives:
+                    scanned = True
+                    if threads == 128:
+                        self._enqueue_scan_primitives[128](
+                            bins, window, routing, bound, blocks, tiles,
+                            Int32(1),
+                        )
+                    elif threads == 256:
+                        self._enqueue_scan_primitives[256](
+                            bins, window, routing, bound, blocks, tiles,
+                            Int32(1),
+                        )
+                    elif threads == 512:
+                        self._enqueue_scan_primitives[512](
+                            bins, window, routing, bound, blocks, tiles,
+                            Int32(1),
+                        )
+                    elif threads == 1024:
+                        self._enqueue_scan_primitives[1024](
+                            bins, window, routing, bound, blocks, tiles,
+                            Int32(1),
+                        )
+                    else:
+                        scanned = False
+
+            # The compacted flag read; see `enqueue_partition` for why the
+            # pointer is resolved at the launch and not handed down.
+            var flag_bins = _any_origin_u8(bins)
+            var dense = self.compact_flag_read_live()
+            if dense:
+                flag_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
+
+            if not scanned:
+                self.ctx.enqueue_function[_flag_scan_kernel](
+                    flag_bins,
+                    self.rows_dev.unsafe_ptr(),
+                    self.offsets_dev.unsafe_ptr(),
+                    self.block_sums_dev.unsafe_ptr(),
+                    Int32(self.n_rows),
+                    Int32(0),
+                    Int32(bound),
+                    Int32(0),
+                    Int32(0),
+                    Int32(-1),
+                    Int32(0),
+                    Int32(0),
+                    UInt64(0),
+                    UInt64(0),
+                    UInt64(0),
+                    UInt64(0),
+                    Int32(tiles),
+                    desc.unsafe_ptr(),
+                    Int32(1),
+                    Int32(1) if dense else Int32(0),
+                    grid_dim=blocks,
+                    block_dim=threads,
+                )
+                self.ctx.enqueue_function[_scatter_kernel](
+                    self.rows_dev.unsafe_ptr(),
+                    self.scratch_dev.unsafe_ptr(),
+                    self.offsets_dev.unsafe_ptr(),
+                    self.block_sums_dev.unsafe_ptr(),
+                    self.total_dev.unsafe_ptr(),
+                    Int32(0),
+                    Int32(bound),
+                    Int32(tiles),
+                    Int32(blocks),
+                    desc.unsafe_ptr(),
+                    Int32(1),
+                    grid_dim=blocks,
+                    block_dim=threads,
+                )
+            # The data twin, when the arm is on, and it is placed **above**
+            # the fusion's early return on purpose: the fusion defers the row
+            # copy-back and this pair is not part of that deferral, so a
+            # return taken before this would skip the compaction on every
+            # step of every device-resident tree and leave the planes
+            # describing the tree before the split. It reads neither
+            # `rows_dev` nor `scratch_dev`, so it is indifferent to which of
+            # the two currently holds the permutation and the deferral cannot
+            # reach it.
+            self._maintain_compaction(
+                0, bound, tiles, blocks, blocks, Int32(1)
+            )
+
+            # Under the fusion the copy-back is not a launch of its own: the
+            # next descriptor histogram folds it into its slot zeroing, which
+            # is a launch that has to happen anyway and is unordered with
+            # respect to this one. Nothing else is deferred and nothing is
+            # skipped -- the same stores are made, in the next command buffer
+            # instead of this one, and still before the accumulation that
+            # reads them.
+            if self.fuse_partition_tail:
+                self.copy_back_debt = True
+                self.copy_back_blocks = blocks
+                return
+
+            # The copy back runs on the capped grid here, not on the uncapped
+            # `ceil(count / threads)` one the host arm gives it, because a
+            # count this launch does not know cannot size a grid. It is
+            # grid-strided, so the same threads walk the range instead of one
+            # thread owning one element; see `_copy_back_kernel`.
+            self.ctx.enqueue_function[_copy_back_kernel](
                 self.rows_dev.unsafe_ptr(),
                 self.scratch_dev.unsafe_ptr(),
-                self.offsets_dev.unsafe_ptr(),
-                self.block_sums_dev.unsafe_ptr(),
-                self.total_dev.unsafe_ptr(),
                 Int32(0),
                 Int32(bound),
-                Int32(tiles),
-                Int32(blocks),
                 desc.unsafe_ptr(),
                 Int32(1),
                 grid_dim=blocks,
                 block_dim=threads,
             )
-        # The data twin, when the arm is on, and it is placed **above** the
-        # fusion's early return on purpose: the fusion defers the row
-        # copy-back and this pair is not part of that deferral, so a return
-        # taken before this would skip the compaction on every step of every
-        # device-resident tree and leave the planes describing the tree before
-        # the split. It reads neither `rows_dev` nor `scratch_dev`, so it is
-        # indifferent to which of the two currently holds the permutation and
-        # the deferral cannot reach it.
-        self._maintain_compaction(0, bound, tiles, blocks, blocks, Int32(1))
-
-        # Under the fusion the copy-back is not a launch of its own: the next
-        # descriptor histogram folds it into its slot zeroing, which is a
-        # launch that has to happen anyway and is unordered with respect to
-        # this one. Nothing else is deferred and nothing is skipped -- the same
-        # stores are made, in the next command buffer instead of this one, and
-        # still before the accumulation that reads them.
-        if self.fuse_partition_tail:
-            self.copy_back_debt = True
-            self.copy_back_blocks = blocks
-            return
-
-        # The copy back runs on the capped grid here, not on the uncapped
-        # `ceil(count / threads)` one the host arm gives it, because a count
-        # this launch does not know cannot size a grid. It is grid-strided, so
-        # the same threads walk the range instead of one thread owning one
-        # element; see `_copy_back_kernel`.
-        self.ctx.enqueue_function[_copy_back_kernel](
-            self.rows_dev.unsafe_ptr(),
-            self.scratch_dev.unsafe_ptr(),
-            Int32(0),
-            Int32(bound),
-            desc.unsafe_ptr(),
-            Int32(1),
-            grid_dim=blocks,
-            block_dim=threads,
-        )
 
     def enqueue_desc_histogram[
         bins_origin: MutOrigin,
@@ -8075,161 +8099,177 @@ struct GpuActiveRows(Movable):
         depends on which child won a comparison is a bound that has to be
         re-derived if that comparison ever changes.
         """
-        if n_slots < 1 or n_slots > self.n_features:
-            raise Error("active feature count out of range")
-        if pool_slots < 1:
-            raise Error("the resident pool must hold at least one slot")
-        if max_rows < 1:
-            raise Error("a descriptor histogram needs a positive row bound")
-        # This entry point is the device-resident growth plane: every
-        # histogram of every non-root node of every tree comes through here.
-        # A probe histogram reaching it would grow a whole tree out of
-        # garbage, and a subtraction chain would then carry the garbage into
-        # siblings that never ran the probe at all. See
-        # `set_histogram_atomic_probe`.
-        if self.histogram_probe_active():
+        comptime if not has_accelerator():
             raise Error(
-                "a histogram probe arm builds a wrong histogram and"
-                " must never reach the device-resident growth plane; turn it"
-                " off with set_histogram_atomic_probe(False, True) or"
-                " set_histogram_probe_mode(HIST_PROBE_OFF, True)"
+                "the descriptor-driven device histogram needs an accelerator;"
+                " this binary was built without one, so build histograms"
+                " through the CPU backend instead"
             )
-
-        # Which descriptor this build reads, and -- the same decision, not a
-        # second one -- whether it folds the sibling subtraction in. A
-        # speculative build must not: `DESC_SPEC` names a leaf that is still
-        # live, and deriving the larger child in place from that leaf's slot
-        # would destroy the histogram of the very leaf being speculated on,
-        # which on a miss is the histogram the next pick reads. The
-        # subtraction a consumed step owes is done later by
-        # `_spec_subtract_kernel`, once the commit has proved the leaf is a
-        # parent.
-        var desc = self._desc_buffer()
-        var do_sub = Int32(0) if self.desc_target == DESC_SPEC else Int32(1)
-
-        var hist_size = self.n_features * self.n_bins
-        var cells = 3 * hist_size
-        # The two tiling requests are passed here for the same reason
-        # `range_tiling` passes them: this is how the device-owned growth plane
-        # builds every non-root histogram, so omitting them made the row-tile
-        # arms reach the root and nothing else. Under the default resident
-        # plane that is 1 node of 61, which would have made the tile question
-        # look answered while being almost entirely unasked -- the same shape
-        # as a test that runs below the gate it is testing.
-        #
-        # Zero on both is byte-for-byte the previous behavior, so the default
-        # path is unchanged and only an explicitly requested arm moves.
-        var tiling = derive_tiling(
-            caps,
-            max_rows,
-            n_slots,
-            self.n_bins,
-            STRATEGY_ATOMIC,
-            self.part_capacity_unused(),
-            0,
-            self.min_tiles_request,
-            self.rows_per_tile_request,
-        )
-        var threads = tiling.block_threads
-
-        # The atomic flush is `Atomic.fetch_add` onto whatever the slot
-        # already holds, so the slot has to start at zero. Only the one slot
-        # the descriptor names is cleared, and only when the step is live;
-        # clearing a slot on a dead step would erase a live leaf's histogram.
-        var zero_blocks = (cells + threads - 1) // threads
-        if zero_blocks > pool_slots * 4:
-            zero_blocks = pool_slots * 4
-        if zero_blocks < 1:
-            zero_blocks = 1
-        if self.copy_back_debt:
-            # The partition immediately before this one deferred its
-            # copy-back, so this launch carries both halves. One command
-            # buffer where the step used to spend two, with every store
-            # unchanged; `_copy_back_zero_slot_kernel` argues that in full.
-            #
-            # The grid is the wider of the two the halves would have had.
-            # Neither half's answer depends on it -- both are grid-strided over
-            # distinct positions of their own range -- so this is a work
-            # distribution and not a correctness input. `threads` is the
-            # histogram's block width rather than the partition's; the same
-            # argument covers it.
-            var fused_blocks = zero_blocks
-            if self.copy_back_blocks > fused_blocks:
-                fused_blocks = self.copy_back_blocks
-            self.ctx.enqueue_function[_copy_back_zero_slot_kernel](
-                self.rows_dev.unsafe_ptr(),
-                self.scratch_dev.unsafe_ptr(),
-                pool,
-                Int32(cells),
-                desc.unsafe_ptr(),
-                grid_dim=fused_blocks,
-                block_dim=threads,
-            )
-            self.copy_back_debt = False
-            self.copy_back_folds += 1
         else:
-            self.ctx.enqueue_function[_zero_slot_desc_kernel](
-                pool,
-                Int32(cells),
-                desc.unsafe_ptr(),
-                grid_dim=zero_blocks,
-                block_dim=threads,
+            if n_slots < 1 or n_slots > self.n_features:
+                raise Error("active feature count out of range")
+            if pool_slots < 1:
+                raise Error("the resident pool must hold at least one slot")
+            if max_rows < 1:
+                raise Error(
+                    "a descriptor histogram needs a positive row bound"
+                )
+            # This entry point is the device-resident growth plane: every
+            # histogram of every non-root node of every tree comes through
+            # here. A probe histogram reaching it would grow a whole tree out
+            # of garbage, and a subtraction chain would then carry the
+            # garbage into siblings that never ran the probe at all. See
+            # `set_histogram_atomic_probe`.
+            if self.histogram_probe_active():
+                raise Error(
+                    "a histogram probe arm builds a wrong histogram and"
+                    " must never reach the device-resident growth plane; turn"
+                    " it off with set_histogram_atomic_probe(False, True) or"
+                    " set_histogram_probe_mode(HIST_PROBE_OFF, True)"
+                )
+
+            # Which descriptor this build reads, and -- the same decision,
+            # not a second one -- whether it folds the sibling subtraction in.
+            # A speculative build must not: `DESC_SPEC` names a leaf that is
+            # still live, and deriving the larger child in place from that
+            # leaf's slot would destroy the histogram of the very leaf being
+            # speculated on, which on a miss is the histogram the next pick
+            # reads. The subtraction a consumed step owes is done later by
+            # `_spec_subtract_kernel`, once the commit has proved the leaf is
+            # a parent.
+            var desc = self._desc_buffer()
+            var do_sub = Int32(
+                0
+            ) if self.desc_target == DESC_SPEC else Int32(1)
+
+            var hist_size = self.n_features * self.n_bins
+            var cells = 3 * hist_size
+            # The two tiling requests are passed here for the same reason
+            # `range_tiling` passes them: this is how the device-owned growth
+            # plane builds every non-root histogram, so omitting them made the
+            # row-tile arms reach the root and nothing else. Under the default
+            # resident plane that is 1 node of 61, which would have made the
+            # tile question look answered while being almost entirely unasked
+            # -- the same shape as a test that runs below the gate it is
+            # testing.
+            #
+            # Zero on both is byte-for-byte the previous behavior, so the
+            # default path is unchanged and only an explicitly requested arm
+            # moves.
+            var tiling = derive_tiling(
+                caps,
+                max_rows,
+                n_slots,
+                self.n_bins,
+                STRATEGY_ATOMIC,
+                self.part_capacity_unused(),
+                0,
+                self.min_tiles_request,
+                self.rows_per_tile_request,
             )
+            var threads = tiling.block_threads
 
-        var use_quant = Int32(QUANT_SOURCE_FLOAT)
-        if self.quantized_gradients:
-            self._ensure_quantized(grad, hess, g_scale, h_scale)
-            # Which *width* of the quantized buffer, read from the staging
-            # state rather than from the request, so the kernel is told the
-            # layout the buffer actually holds. `_ensure_quantized` has just
-            # made those agree, and reading the request here instead would be
-            # the one spelling that could disagree with it.
-            use_quant = Int32(
-                QUANT_SOURCE_PACKED16
-            ) if self.quant_packed else Int32(QUANT_SOURCE_INT32)
-        # The device-owned growth plane builds every non-root histogram
-        # through this entry point, so the re-layout has to be reachable from
-        # here as well as from the host-driven one; omitting it would leave
-        # the layout arm reaching the root and nothing else, which is the
-        # exact shape the row-tile arms were found in.
-        self._ensure_blocked(bins)
-        self._ensure_packed(bins)
-        # The compacted planes, if the arm is on. Placed after the zeroing
-        # branch above rather than before it, because under
-        # `set_partition_fusion(True)` that branch is what discharges the
-        # previous partition's deferred row copy-back, and a rebuild here
-        # reads `rows_dev`. Launches on one stream are ordered, so enqueuing
-        # after it is what makes the rebuild see the permutation the partition
-        # produced rather than the one before it.
-        self._ensure_compacted(bins)
-        var const_hess = Int32(1) if self.constant_hessian else Int32(0)
+            # The atomic flush is `Atomic.fetch_add` onto whatever the slot
+            # already holds, so the slot has to start at zero. Only the one
+            # slot the descriptor names is cleared, and only when the step is
+            # live; clearing a slot on a dead step would erase a live leaf's
+            # histogram.
+            var zero_blocks = (cells + threads - 1) // threads
+            if zero_blocks > pool_slots * 4:
+                zero_blocks = pool_slots * 4
+            if zero_blocks < 1:
+                zero_blocks = 1
+            if self.copy_back_debt:
+                # The partition immediately before this one deferred its
+                # copy-back, so this launch carries both halves. One command
+                # buffer where the step used to spend two, with every store
+                # unchanged; `_copy_back_zero_slot_kernel` argues that in
+                # full.
+                #
+                # The grid is the wider of the two the halves would have had.
+                # Neither half's answer depends on it -- both are grid-strided
+                # over distinct positions of their own range -- so this is a
+                # work distribution and not a correctness input. `threads` is
+                # the histogram's block width rather than the partition's; the
+                # same argument covers it.
+                var fused_blocks = zero_blocks
+                if self.copy_back_blocks > fused_blocks:
+                    fused_blocks = self.copy_back_blocks
+                self.ctx.enqueue_function[_copy_back_zero_slot_kernel](
+                    self.rows_dev.unsafe_ptr(),
+                    self.scratch_dev.unsafe_ptr(),
+                    pool,
+                    Int32(cells),
+                    desc.unsafe_ptr(),
+                    grid_dim=fused_blocks,
+                    block_dim=threads,
+                )
+                self.copy_back_debt = False
+                self.copy_back_folds += 1
+            else:
+                self.ctx.enqueue_function[_zero_slot_desc_kernel](
+                    pool,
+                    Int32(cells),
+                    desc.unsafe_ptr(),
+                    grid_dim=zero_blocks,
+                    block_dim=threads,
+                )
 
-        self._enqueue_atomic_family(
-            bins,
-            grad,
-            hess,
-            feat_ids,
-            pool,
-            n_slots,
-            hist_size,
-            tiling.rows_per_tile,
-            # Window, destination slot and subtraction offset all come out of
-            # the descriptor, so these three are placeholders the kernel
-            # overwrites. The subtraction is on for a real split, which always
-            # derives one child from the parent's slot, and off for a
-            # speculative one; see `do_sub` above.
-            0,
-            max_rows,
-            g_scale,
-            h_scale,
-            0,
-            do_sub,
-            use_quant,
-            const_hess,
-            tiling.n_tiles,
-            threads,
-            Int32(1),
-        )
+            var use_quant = Int32(QUANT_SOURCE_FLOAT)
+            if self.quantized_gradients:
+                self._ensure_quantized(grad, hess, g_scale, h_scale)
+                # Which *width* of the quantized buffer, read from the
+                # staging state rather than from the request, so the kernel
+                # is told the layout the buffer actually holds.
+                # `_ensure_quantized` has just made those agree, and reading
+                # the request here instead would be the one spelling that
+                # could disagree with it.
+                use_quant = Int32(
+                    QUANT_SOURCE_PACKED16
+                ) if self.quant_packed else Int32(QUANT_SOURCE_INT32)
+            # The device-owned growth plane builds every non-root histogram
+            # through this entry point, so the re-layout has to be reachable
+            # from here as well as from the host-driven one; omitting it would
+            # leave the layout arm reaching the root and nothing else, which
+            # is the exact shape the row-tile arms were found in.
+            self._ensure_blocked(bins)
+            self._ensure_packed(bins)
+            # The compacted planes, if the arm is on. Placed after the zeroing
+            # branch above rather than before it, because under
+            # `set_partition_fusion(True)` that branch is what discharges the
+            # previous partition's deferred row copy-back, and a rebuild here
+            # reads `rows_dev`. Launches on one stream are ordered, so
+            # enqueuing after it is what makes the rebuild see the permutation
+            # the partition produced rather than the one before it.
+            self._ensure_compacted(bins)
+            var const_hess = Int32(1) if self.constant_hessian else Int32(0)
+
+            self._enqueue_atomic_family(
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                pool,
+                n_slots,
+                hist_size,
+                tiling.rows_per_tile,
+                # Window, destination slot and subtraction offset all come out
+                # of the descriptor, so these three are placeholders the
+                # kernel overwrites. The subtraction is on for a real split,
+                # which always derives one child from the parent's slot, and
+                # off for a speculative one; see `do_sub` above.
+                0,
+                max_rows,
+                g_scale,
+                h_scale,
+                0,
+                do_sub,
+                use_quant,
+                const_hess,
+                tiling.n_tiles,
+                threads,
+                Int32(1),
+            )
 
     def part_capacity_unused(self) -> Int:
         """Zero, the "no preallocated partial buffer" value `derive_tiling`
@@ -8518,150 +8558,161 @@ struct GpuActiveRows(Movable):
         three output planes, so the same three conditions that force a
         zeroing pass force it here.
         """
-        if n_slots < 1 or n_slots > self.n_features:
-            raise Error("active feature count out of range")
-        if subtract and sub_offset == 0:
+        comptime if not has_accelerator():
             raise Error(
-                "a fused subtraction must name a slot other than the build's"
-            )
-        # A fused sibling subtraction means a tree is being grown: this node
-        # is a child and its sibling is about to be derived from it. A probe
-        # histogram there would corrupt a sibling that never ran the probe,
-        # which is worse than a wrong node -- it is a wrong node that looks
-        # like a correct one. See `set_histogram_atomic_probe`.
-        if subtract and self.histogram_probe_active():
-            raise Error(
-                "a histogram probe arm builds a wrong histogram and"
-                " must never feed a sibling subtraction; it is reachable"
-                " only on a from-scratch build of one node's rows"
-            )
-        var window = self.ranges.get(node)
-        var hist_size = self.n_features * self.n_bins
-        var threads = tiling.block_threads
-
-        # The reduction of the tiled path writes every active feature's
-        # slice, so that path only needs zeroing when some feature is
-        # inactive; the atomic path always does, and so does a node with no
-        # rows, whose histogram is entirely zeros.
-        if (
-            tiling.strategy != STRATEGY_TILED
-            or n_slots < self.n_features
-            or window.count() <= 0
-        ):
-            var cells = 3 * hist_size
-            var zero_blocks = (cells + threads - 1) // threads
-            self.ctx.enqueue_function[_zero_int32_kernel](
-                out_hist,
-                Int32(cells),
-                grid_dim=zero_blocks,
-                block_dim=threads,
-            )
-        if window.count() <= 0:
-            return
-
-        var do_sub = Int32(1) if subtract else Int32(0)
-
-        # One quantizing pass per tree per scale, ordered before the histogram
-        # that reads it by the queue. Every strategy and every group width
-        # reads the same buffer now, so this sits above the dispatch rather
-        # than inside one arm of it.
-        var use_quant = Int32(QUANT_SOURCE_FLOAT)
-        if self.quantized_gradients:
-            self._ensure_quantized(grad, hess, g_scale, h_scale)
-            # Which *width* of the quantized buffer, read from the staging
-            # state rather than from the request, so the kernel is told the
-            # layout the buffer actually holds. `_ensure_quantized` has just
-            # made those agree, and reading the request here instead would be
-            # the one spelling that could disagree with it.
-            use_quant = Int32(
-                QUANT_SOURCE_PACKED16
-            ) if self.quant_packed else Int32(QUANT_SOURCE_INT32)
-
-        # The bin re-layout, if one was asked for, on the same footing and in
-        # the same place: one enqueued pass ordered before the histogram that
-        # reads it, above the strategy branch because both strategies read the
-        # same buffer. It runs once per fit rather than once per tree, which
-        # is the whole reason it can be afforded at all.
-        self._ensure_blocked(bins)
-        self._ensure_packed(bins)
-
-        # And the compacted planes, on the same footing and in the same place,
-        # and after `_ensure_quantized` because it reads what that writes. A
-        # no-op unless the arm is on and the invariant has lapsed, which after
-        # the first histogram of a tree it has not.
-        self._ensure_compacted(bins)
-
-        var const_hess = Int32(1) if self.constant_hessian else Int32(0)
-        var hist_planes = 2 if self.constant_hessian else 3
-
-        if tiling.strategy == STRATEGY_TILED:
-            self._enqueue_partial_family(
-                bins,
-                grad,
-                hess,
-                feat_ids,
-                partials,
-                n_slots,
-                tiling.rows_per_tile,
-                window.begin,
-                window.count(),
-                g_scale,
-                h_scale,
-                use_quant,
-                const_hess,
-                tiling.n_tiles,
-                threads,
-            )
-            var n_cells = hist_planes * n_slots * self.n_bins
-            var blocks = (n_cells + threads - 1) // threads
-            self.ctx.enqueue_function[_range_reduce_kernel](
-                partials,
-                feat_ids,
-                out_hist,
-                Int32(n_slots),
-                Int32(self.n_bins),
-                Int32(hist_size),
-                Int32(tiling.n_tiles),
-                Int32(sub_offset),
-                do_sub,
-                h_scale,
-                const_hess,
-                # The decomposition probes, resolved the same way the
-                # accumulation launches resolve them. Only the empty arm has
-                # any effect here; see the kernel for why it has to.
-                (
-                    Int32(HIST_PROBE_NO_ATOMICS)
-                    if self.hist_atomic_probe
-                    else Int32(self.hist_probe_mode)
-                ),
-                grid_dim=blocks,
-                block_dim=threads,
+                "the device histogram of a node's rows needs an accelerator;"
+                " this binary was built without one, so build the histogram"
+                " through the CPU backend instead"
             )
         else:
-            self._enqueue_atomic_family(
-                bins,
-                grad,
-                hess,
-                feat_ids,
-                out_hist,
-                n_slots,
-                hist_size,
-                tiling.rows_per_tile,
-                window.begin,
-                window.count(),
-                g_scale,
-                h_scale,
-                sub_offset,
-                do_sub,
-                use_quant,
-                const_hess,
-                tiling.n_tiles,
-                threads,
-                # No descriptor: this arm's window and destination came
-                # from the host, so the kernel is told to ignore the
-                # descriptor buffer it is handed. See `step_dev`.
-                Int32(0),
-            )
+            if n_slots < 1 or n_slots > self.n_features:
+                raise Error("active feature count out of range")
+            if subtract and sub_offset == 0:
+                raise Error(
+                    "a fused subtraction must name a slot other than the"
+                    " build's"
+                )
+            # A fused sibling subtraction means a tree is being grown: this
+            # node is a child and its sibling is about to be derived from it.
+            # A probe histogram there would corrupt a sibling that never ran
+            # the probe, which is worse than a wrong node -- it is a wrong
+            # node that looks like a correct one. See
+            # `set_histogram_atomic_probe`.
+            if subtract and self.histogram_probe_active():
+                raise Error(
+                    "a histogram probe arm builds a wrong histogram and"
+                    " must never feed a sibling subtraction; it is reachable"
+                    " only on a from-scratch build of one node's rows"
+                )
+            var window = self.ranges.get(node)
+            var hist_size = self.n_features * self.n_bins
+            var threads = tiling.block_threads
+
+            # The reduction of the tiled path writes every active feature's
+            # slice, so that path only needs zeroing when some feature is
+            # inactive; the atomic path always does, and so does a node with
+            # no rows, whose histogram is entirely zeros.
+            if (
+                tiling.strategy != STRATEGY_TILED
+                or n_slots < self.n_features
+                or window.count() <= 0
+            ):
+                var cells = 3 * hist_size
+                var zero_blocks = (cells + threads - 1) // threads
+                self.ctx.enqueue_function[_zero_int32_kernel](
+                    out_hist,
+                    Int32(cells),
+                    grid_dim=zero_blocks,
+                    block_dim=threads,
+                )
+            if window.count() <= 0:
+                return
+
+            var do_sub = Int32(1) if subtract else Int32(0)
+
+            # One quantizing pass per tree per scale, ordered before the
+            # histogram that reads it by the queue. Every strategy and every
+            # group width reads the same buffer now, so this sits above the
+            # dispatch rather than inside one arm of it.
+            var use_quant = Int32(QUANT_SOURCE_FLOAT)
+            if self.quantized_gradients:
+                self._ensure_quantized(grad, hess, g_scale, h_scale)
+                # Which *width* of the quantized buffer, read from the
+                # staging state rather than from the request, so the kernel
+                # is told the layout the buffer actually holds.
+                # `_ensure_quantized` has just made those agree, and reading
+                # the request here instead would be the one spelling that
+                # could disagree with it.
+                use_quant = Int32(
+                    QUANT_SOURCE_PACKED16
+                ) if self.quant_packed else Int32(QUANT_SOURCE_INT32)
+
+            # The bin re-layout, if one was asked for, on the same footing
+            # and in the same place: one enqueued pass ordered before the
+            # histogram that reads it, above the strategy branch because both
+            # strategies read the same buffer. It runs once per fit rather
+            # than once per tree, which is the whole reason it can be
+            # afforded at all.
+            self._ensure_blocked(bins)
+            self._ensure_packed(bins)
+
+            # And the compacted planes, on the same footing and in the same
+            # place, and after `_ensure_quantized` because it reads what that
+            # writes. A no-op unless the arm is on and the invariant has
+            # lapsed, which after the first histogram of a tree it has not.
+            self._ensure_compacted(bins)
+
+            var const_hess = Int32(1) if self.constant_hessian else Int32(0)
+            var hist_planes = 2 if self.constant_hessian else 3
+
+            if tiling.strategy == STRATEGY_TILED:
+                self._enqueue_partial_family(
+                    bins,
+                    grad,
+                    hess,
+                    feat_ids,
+                    partials,
+                    n_slots,
+                    tiling.rows_per_tile,
+                    window.begin,
+                    window.count(),
+                    g_scale,
+                    h_scale,
+                    use_quant,
+                    const_hess,
+                    tiling.n_tiles,
+                    threads,
+                )
+                var n_cells = hist_planes * n_slots * self.n_bins
+                var blocks = (n_cells + threads - 1) // threads
+                self.ctx.enqueue_function[_range_reduce_kernel](
+                    partials,
+                    feat_ids,
+                    out_hist,
+                    Int32(n_slots),
+                    Int32(self.n_bins),
+                    Int32(hist_size),
+                    Int32(tiling.n_tiles),
+                    Int32(sub_offset),
+                    do_sub,
+                    h_scale,
+                    const_hess,
+                    # The decomposition probes, resolved the same way the
+                    # accumulation launches resolve them. Only the empty arm
+                    # has any effect here; see the kernel for why it has to.
+                    (
+                        Int32(HIST_PROBE_NO_ATOMICS)
+                        if self.hist_atomic_probe
+                        else Int32(self.hist_probe_mode)
+                    ),
+                    grid_dim=blocks,
+                    block_dim=threads,
+                )
+            else:
+                self._enqueue_atomic_family(
+                    bins,
+                    grad,
+                    hess,
+                    feat_ids,
+                    out_hist,
+                    n_slots,
+                    hist_size,
+                    tiling.rows_per_tile,
+                    window.begin,
+                    window.count(),
+                    g_scale,
+                    h_scale,
+                    sub_offset,
+                    do_sub,
+                    use_quant,
+                    const_hess,
+                    tiling.n_tiles,
+                    threads,
+                    # No descriptor: this arm's window and destination came
+                    # from the host, so the kernel is told to ignore the
+                    # descriptor buffer it is handed. See `step_dev`.
+                    Int32(0),
+                )
 
     def _launch_group(self, n_slots: Int) -> Int:
         """The group width this launch runs at.

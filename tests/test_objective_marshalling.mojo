@@ -238,16 +238,46 @@ def _workload(objective: Int, n_outputs: Int) raises -> PythonObject:
     does to a value on its way through, so the value has to actually go
     through it.
 
-    `ordered_boosting` and `score_function` are REQUIRED keys on this
-    mapping, not optional ones: `basic_bindings.mojo` reads them with no
-    default, deliberately, so that a stale sender cannot silently mean "L2,
-    plain boosting". This helper did not send them for the two hours after
-    they became required, and the consequence is worth recording, because it
-    is the reason three tests in this file failed at once: the missing key
-    raised a CPython `KeyError` inside `decide_device_workload`, so all
-    three died at the CALL and not one of their assertions ever ran. Every
-    assertion in them was true the whole time. A fixture is a claim about
-    the caller too.
+    `ordered_boosting`, `score_function`, `random_strength` and
+    `derivative_precision` are REQUIRED keys on this mapping, not optional
+    ones, because `basic_bindings.mojo` reads all four with no default,
+    deliberately, so a stale sender cannot silently mean "L2, plain boosting,
+    no split noise, float32". This helper did not send the first two for the
+    two hours after they became required, and the consequence is worth
+    recording, because it is the reason three tests in this file failed at
+    once. The missing key raised a CPython `KeyError` inside
+    `decide_device_workload`, so all three died at the CALL and not one of
+    their assertions ever ran. Every assertion in them was true the whole
+    time. A fixture is a claim about the caller too.
+
+    **It happened again, to the same three tests, and this time for 646
+    commits.** `73d808a` and `9d51e29` added `random_strength` and
+    `derivative_precision` to the required set; the branch they landed on ran
+    no continuous integration, so nothing said so until the branch was
+    promoted. The keys are added here with the values
+    `device_selection.py:296-299` sends by default, and that is the point. A
+    fixture is stale when it disagrees with the shipping sender, and the
+    shipping sender is the one that is right.
+
+    Both are the NEUTRAL values as well as the default ones, and that is a
+    second requirement rather than a coincidence. `_collect_blocks` gates the
+    accelerator on `derivative_precision != DERIV_PRECISION_FLOAT32`
+    (device_policy.mojo:2200), so a fixture that sent float64 to be
+    interesting would add a blocking reason to every workload here and the
+    tests above would be asserting about a run the policy had already refused
+    for an unrelated reason. `random_strength` reaches the same gate. The
+    fixture's job is to be complete and boring so that the assertions are
+    about the objective alone.
+
+    **The keys are still hand-maintained and that is the standing weakness.**
+    The sender builds its mapping as a dict literal inline inside
+    `_FullNativePolicy.decide` (device_selection.py:692-710), so there is
+    nothing this file can call to obtain the key set; deriving it means
+    extracting that literal into a function in `python/mojotrees/`, which is
+    proposed rather than done here. What IS done is `_decide` below, which
+    turns the next drift from an unnamed CPython `KeyError` at the call into a
+    failure that says the mapping went stale and lists what this fixture
+    sends.
     """
     var w = Python.import_module("builtins").dict()
     w["n_rows"] = PythonObject(1000)
@@ -261,7 +291,57 @@ def _workload(objective: Int, n_outputs: Int) raises -> PythonObject:
     w["uses_validation"] = PythonObject(0)
     w["ordered_boosting"] = PythonObject(0)
     w["score_function"] = PythonObject(0)  # split.SCORE_L2
+    w["random_strength"] = PythonObject(0.0)  # CatBoost's split noise, off
+    # tree_parameters_extra.DERIV_PRECISION_FLOAT32
+    w["derivative_precision"] = PythonObject(0)
     return w^
+
+
+def _decide(objective: Int, n_outputs: Int) raises -> String:
+    """The binding, called on the fixture, with the stale-fixture failure
+    named instead of arriving as a CPython `KeyError`.
+
+    Every key `decide_device_workload` reads is read with no default, on
+    purpose, so a mapping that has gone stale against the binding fails at the
+    CALL rather than at an assertion. That is the right failure and it has now
+    been produced twice; what it has never done is say what went wrong. Three
+    tests die together, the message is a bare key name from CPython, and
+    nothing points at the fixture as the thing that is behind rather than at
+    the decision as the thing that is wrong.
+
+    So the exception is caught only to be re-raised with that sentence
+    attached. Nothing is swallowed. The original message is carried through,
+    every test still fails, and they fail for the same reason they did before.
+    This is the in-file half of the fix. The other half, deriving the key set
+    from the sender instead of retyping it, needs a file this lane does not
+    own and is proposed in `_workload`'s docstring.
+
+    `"cpu"` for all three callers, because the boundary tests are about what
+    the marshaller does to the objective on the way through, and asking for a
+    device the runner may not have would put a capability detection in the
+    middle of that.
+    """
+    try:
+        return String(
+            py=decide_device_workload(
+                PythonObject("cpu"), _workload(objective, n_outputs)
+            )
+        )
+    except e:
+        raise Error(
+            "decide_device_workload did not accept the fixture mapping: ",
+            String(e),
+            ". Every key it reads is required and read with no default, so a"
+            " KeyError here means `_workload` has gone stale against"
+            " bindings/basic_bindings.mojo rather than that the decision is"
+            " wrong. `_workload` sends n_rows, n_features, n_outputs, n_bins,"
+            " objective, sparse, categorical, has_missing, uses_validation,"
+            " ordered_boosting, score_function, random_strength,"
+            " derivative_precision; compare that against the mapping"
+            " _FullNativePolicy.decide sends in"
+            " python/mojotrees/device_selection.py, which is the only real"
+            " sender and is the one that is right",
+        )
 
 
 def _field(report: String, key: String) raises -> String:
@@ -290,11 +370,7 @@ def test_python_boundary_preserves_the_multiclass_marker() raises:
     The assertion is on the objective the decision echoes back, because
     that is the request the engine actually gated on.
     """
-    var report = String(
-        py=decide_device_workload(
-            PythonObject("cpu"), _workload(MULTICLASS, 4)
-        )
-    )
+    var report = _decide(MULTICLASS, 4)
     assert_equal(_field(report, String("objective")), String("-1"))
     assert_equal(_field(report, String("objective_known")), String("true"))
 
@@ -304,43 +380,49 @@ def test_python_boundary_keeps_undeclared_distinguishable() raises:
     look like a declaration. A test that only checked `-1` would pass
     against a binding that had simply stopped normalizing anything, which
     would hand `-3` and `-99` to the engine as objective codes."""
-    var undeclared = String(
-        py=decide_device_workload(
-            PythonObject("cpu"), _workload(OBJECTIVE_UNSPECIFIED, 1)
-        )
-    )
+    var undeclared = _decide(OBJECTIVE_UNSPECIFIED, 1)
     assert_equal(_field(undeclared, String("objective")), String("-2"))
     assert_equal(
         _field(undeclared, String("objective_known")), String("false")
     )
 
     # Any other spelling of "I did not say" normalizes to the same one.
-    var far = String(
-        py=decide_device_workload(PythonObject("cpu"), _workload(-99, 1))
-    )
+    var far = _decide(-99, 1)
     assert_equal(_field(far, String("objective")), String("-2"))
     assert_equal(_field(far, String("objective_known")), String("false"))
 
 
 def test_python_boundary_carries_real_codes_unchanged() raises:
     """A nonnegative code is not a sentinel and nothing may touch it."""
-    var report = String(
-        py=decide_device_workload(
-            PythonObject("cpu"), _workload(BINARY_LOGISTIC, 1)
-        )
-    )
+    var report = _decide(BINARY_LOGISTIC, 1)
     assert_equal(_field(report, String("objective")), String("1"))
     assert_equal(_field(report, String("objective_known")), String("true"))
 
-    # The two keys the fixture stopped sending, asserted on the way back out.
-    # `_workload` had gone stale against a required key and the failure that
-    # produced was a CPython KeyError at the call, in three tests at once,
-    # with no assertion reached and nothing naming the key. These two lines
-    # are what turns the next such drift into a named, single failure: they
-    # read the echo of exactly the fields those keys feed, so a mapping that
-    # silently stopped carrying them fails here and says which.
+    # The four keys the fixture has at some point stopped sending, asserted on
+    # the way back out. `_workload` had gone stale against a required key and
+    # the failure that produced was a CPython KeyError at the call, in three
+    # tests at once, with no assertion reached and nothing naming the key.
+    # These lines are what turns the next such drift into a named, single
+    # failure. They read the echo of exactly the fields those keys feed, so a
+    # mapping that silently stopped carrying them fails here and says which.
     assert_equal(_field(report, String("ordered_boosting")), String("false"))
     assert_equal(_field(report, String("score_function")), String("0"))
+    # `random_strength` and `derivative_precision` joined the required set in
+    # `73d808a` and `9d51e29` and the fixture did not follow, which is what
+    # took these three tests down when the branch was promoted. Asserted the
+    # same way and for the same reason as the two above them, and NOT merely
+    # by sending the keys. A binding that accepted them and dropped them on
+    # the floor would satisfy the call and fail right here.
+    #
+    # `random_strength` is compared against `String(Float64(0.0))` rather than
+    # against a spelled-out "0.0", because the serializer writes the field by
+    # handing the Float64 to the same String conversion. Pinning the digits
+    # would be pinning Mojo's float formatting, which is not what this file is
+    # about and would go red on a change that moved no value.
+    assert_equal(
+        _field(report, String("random_strength")), String(Float64(0.0))
+    )
+    assert_equal(_field(report, String("derivative_precision")), String("0"))
 
 
 def main() raises:

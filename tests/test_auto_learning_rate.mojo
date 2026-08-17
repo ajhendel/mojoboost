@@ -401,7 +401,8 @@ def test_catboost_mode_turns_it_on_and_lossguide_does_not() raises:
 
 
 def test_catboost_mode_default_is_silent_on_a_closed_gate() raises:
-    """Unset means the key was not named, and a closed gate is not an error.
+    """Unset means the key was not named, a closed gate is not an error, and
+    the rate the run falls back to is CatBoost's constant rather than ours.
 
     The three parameters CatBoost's gate reads close it when the string
     names them (`options_helper.cpp:277-280`), and CatBoost keeps its
@@ -409,46 +410,141 @@ def test_catboost_mode_default_is_silent_on_a_closed_gate() raises:
     asked for, so there is nothing to refuse. An explicit
     `auto_learning_rate=true` beside the same key still raises, which is
     `test_parameter_string_refuses_the_contradictions` above.
+
+    **This test asserted 0.1 on every closed-gate case and that was our
+    number, not CatBoost's.** It was right until 2026-08-16 (`e3cfb47`), when
+    `_apply_catboost_mode_defaults` started supplying CatBoost's own
+    `learning_rate` of 0.03 (`boosting_options.cpp:10`, the only initializer
+    and unconditional on task type, objective or iteration count) to any
+    `grow_policy=oblivious` string that did not name the key. The standing rule
+    is that CatBoost mode mirrors CatBoost and every other grow policy mirrors
+    LightGBM, so the fallback under this policy is 0.03 and the 0.1 the old
+    assertions pinned was the value the mode had not finished replacing.
+
+    The literal 0.03 is deliberate rather than
+    `auto_learning_rate.CATBOOST_CONSTANT_LEARNING_RATE`. The number has an
+    external source, so a literal asserts against CatBoost; importing the
+    symbol would only assert that this package agrees with itself, and no test
+    anywhere else pins the constant.
+
+    **The teeth are not in the number, and they were not in 0.1 either.** A
+    closed gate has two failure modes and the constant only catches one. The
+    interesting one is the defect this whole layer was built to end. The mode
+    advertises a derived rate, a key silently closes the gate, and the run
+    ships a constant with nothing anywhere saying it did. So every case below
+    also asserts `auto_lr_note`, which is the record `e3cfb47` added for
+    exactly that, and asserts it names the KEY that closed the gate rather
+    than merely reporting that something did. Three keys, three different
+    notes, and the order they are tested in is CatBoost's own short-circuit
+    order, so a string that closes two is recorded against the one CatBoost
+    would have stopped at.
+
+    The other half is that a closed gate must not merely *differ from* the
+    derived rate, it must be the constant, and an open gate at the same shape
+    must still derive. Both are asserted against one another on strings that
+    differ by a single key, so a regression that disabled the derivation
+    everywhere would pass the closed-gate half and fail the open one.
     """
     var pinned = parse_params("grow_policy=oblivious learning_rate=0.03")
     assert_false(pinned.auto_learning_rate.enabled)
     assert_true(close(pinned.resolved_learning_rate(100000), 0.03))
+    assert_equal(pinned.auto_lr_note, "auto_lr_skipped:learning_rate")
 
     # Naming the rate closes the gate even at the value the parser would
     # have produced anyway. This is the whole difference between "unset" and
     # "equal to the default", and it is the reading CatBoost's
-    # `TOption::NotSet()` has (`option.h:80-85`).
+    # `TOption::NotSet()` has (`option.h:80-85`). 0.1 is now neither the
+    # mode's fallback nor the derived rate, which makes it the sharpest
+    # possible probe of that distinction, because only a string that named
+    # the key can produce it under this policy.
     var named_default = parse_params("grow_policy=oblivious learning_rate=0.1")
     assert_false(named_default.auto_learning_rate.enabled)
     assert_true(close(named_default.resolved_learning_rate(100000), 0.1))
+    assert_equal(named_default.auto_lr_note, "auto_lr_skipped:learning_rate")
 
-    var l2 = parse_params("grow_policy=oblivious lambda_l2=3")
+    # The A/B the constant alone cannot make. Two strings differing by one
+    # key. The gate key closes the derivation and the run falls back to
+    # CatBoost's 0.03, and without it the same string at the same row count
+    # derives. `test_catboost_mode_turns_it_on_and_lossguide_does_not`
+    # computes that expected rate from the coefficients independently.
+    var open_gate = parse_params("grow_policy=oblivious num_iterations=1000")
+    assert_true(open_gate.auto_learning_rate.enabled)
+    assert_equal(open_gate.auto_lr_note, "auto_lr_gate_open")
+    assert_true(
+        close(
+            open_gate.resolved_learning_rate(100000),
+            narrow_to_float32(0.084758),
+        )
+    )
+
+    var l2 = parse_params(
+        "grow_policy=oblivious num_iterations=1000 lambda_l2=3"
+    )
     assert_false(l2.auto_learning_rate.enabled)
+    assert_equal(l2.auto_lr_note, "auto_lr_skipped:l2_leaf_reg")
+    assert_true(close(l2.resolved_learning_rate(100000), 0.03))
+    # The same run, one key apart, is not the derived rate. A derivation that
+    # kept firing through a closed gate would satisfy the 0.03 check only by
+    # coincidence and this by nothing.
+    assert_false(
+        close(
+            l2.resolved_learning_rate(100000), narrow_to_float32(0.084758)
+        )
+    )
 
-    # The gate reads the KEY, and 1 is the only value this surface accepts:
-    # `leaf_estimation_iterations > 1` is refused by name (params.mojo), for
-    # the reason a parameter string also reaches the sparse,
-    # custom-objective, multiclass and ranking trainers, none of which
-    # implement extra Newton steps. This case was written as `=2` and so
-    # never reached its assertion at all; `parse_params` raised and the test
-    # failed on the call rather than on the claim.
+    # **The gate reads the KEY and not the value.** That is why both spellings
+    # are here. `=1` and `=2` are the same act as far as the derivation is
+    # concerned, and a gate that had been implemented as "the value differs
+    # from the default" would let `=1` through and be caught here.
+    #
+    # `=2` is also the case that used to raise. `e3cfb47` replaced the blanket
+    # refusal of `leaf_estimation_iterations > 1` on this surface with a
+    # routing verdict, because a string that could not express a count above 1
+    # could not express CatBoost mode's own per-objective default; the refusal
+    # narrowed to `model.fit_multiclass`, the one trainer a string can reach
+    # that reads the field nowhere. The narrowed refusal is asserted below, so
+    # it is not lost with the value that used to trip it.
     var leaves = parse_params(
         "grow_policy=oblivious leaf_estimation_iterations=1"
     )
     assert_false(leaves.auto_learning_rate.enabled)
-    assert_true(close(leaves.resolved_learning_rate(100000), 0.1))
+    assert_true(close(leaves.resolved_learning_rate(100000), 0.03))
+    assert_equal(
+        leaves.auto_lr_note, "auto_lr_skipped:leaf_estimation_iterations"
+    )
 
-    # And the refusal the original spelling ran into is kept as its own
-    # claim, rather than being deleted along with the value that tripped it.
-    # The gate is not a way in.
-    with assert_raises(contains="leaf_estimation_iterations"):
-        _ = parse_params("grow_policy=oblivious leaf_estimation_iterations=2")
+    var leaves_two = parse_params(
+        "grow_policy=oblivious leaf_estimation_iterations=2"
+    )
+    assert_equal(
+        leaves_two.booster.tree.extra.leaf_estimation_iterations, 2
+    )
+    assert_false(leaves_two.auto_learning_rate.enabled)
+    assert_true(close(leaves_two.resolved_learning_rate(100000), 0.03))
+    assert_equal(
+        leaves_two.auto_lr_note, "auto_lr_skipped:leaf_estimation_iterations"
+    )
 
-    # And an explicit false turns the mode default off, which is why
-    # "absent" and "auto_learning_rate=false" are tracked separately.
+    # The gate is still not a way in. What closing it cannot do is smuggle a
+    # count past the trainer that drops it, which is the claim the old
+    # unconditional refusal was carrying and the only part of it that was
+    # ever about this file.
+    with assert_raises(contains="model.fit_multiclass"):
+        _ = parse_params(
+            "grow_policy=oblivious objective=multiclass num_class=3"
+            " leaf_estimation_iterations=2"
+        )
+
+    # And an explicit false turns the derivation off, which is why "absent"
+    # and "auto_learning_rate=false" are tracked separately. It turns off the
+    # DERIVATION and not the mode, because `_apply_catboost_mode_defaults`
+    # runs before this branch and does not read it, so the run trains at
+    # CatBoost's 0.03 rather than LightGBM's 0.1. A reading of `false` as
+    # "leave CatBoost mode" would show up right here.
     var off = parse_params("grow_policy=oblivious auto_learning_rate=false")
     assert_false(off.auto_learning_rate.enabled)
-    assert_true(close(off.resolved_learning_rate(100000), 0.1))
+    assert_true(close(off.resolved_learning_rate(100000), 0.03))
+    assert_equal(off.auto_lr_note, "auto_lr_off:auto_learning_rate=false")
 
 
 def main() raises:
