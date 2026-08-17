@@ -510,26 +510,15 @@ def _device_search_unsupported_reason(
     else in `TreeParams.extra` has been moved into it or into the record it
     returns.
     """
-    if params.extra.min_gain_to_split > 0.0:
-        return String("min_gain_to_split")
-    if params.extra.max_delta_step > 0.0:
-        return String("max_delta_step")
-    if params.extra.path_smooth > 0.0:
-        return String("path_smooth")
-    if params.extra.extra_trees:
-        return String("extra_trees")
-    if params.extra.monotone_penalty > 0.0:
-        return String("monotone_penalty")
-    if params.extra.penalties.is_active():
-        return String("feature_contri or the CEGB costs")
-    if not params.extra.forced.is_empty():
-        return String("forced splits")
-    if params.extra.use_quantized_grad:
-        return String("use_quantized_grad")
-    if has_categorical and params.extra.random_strength > 0.0:
-        return String("random_strength beside a categorical feature")
-    if has_categorical and params.extra.score_function != SCORE_L2:
-        return String("score_function beside a categorical feature")
+    # Delegates rather than repeating the list. It lived here first and that
+    # was the mistake in miniature: `gpu_resident_round` and `gpu_tree_tables`
+    # ask the same question and could not import it from a trainer, so they
+    # kept reading `is_active()` and stayed wrong after this one was fixed.
+    var why = params.extra.device_unsupported_reason(has_categorical)
+    if why.byte_length() > 0:
+        return why
+    # `feature_fraction_bylevel` is a `TreeParams` field rather than an
+    # `ExtraTreeParams` one, so it is tested by the caller that owns it.
     if params.feature_fraction_bylevel != 1.0:
         return String("feature_fraction_bylevel")
     return String("")

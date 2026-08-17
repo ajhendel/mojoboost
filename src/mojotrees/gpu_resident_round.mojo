@@ -1650,7 +1650,10 @@ def oblivious_device_supported(
         params.monotone.is_active()
         or params.feature_fraction_bynode != 1.0
         or params.constraints.n_groups() > 0
-        or params.extra.is_active()
+        or params.extra.device_unsupported_reason(
+            builder.cats.any_categorical()
+        ).byte_length()
+        > 0
         or params.feature_fraction_bylevel != 1.0
     ):
         return OBLIVIOUS_TABLES

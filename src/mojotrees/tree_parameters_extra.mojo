@@ -1932,6 +1932,102 @@ struct ExtraTreeParams(Copyable, Movable):
             or self.score_function != SCORE_L2
         )
 
+    def device_unsupported_reason(self, has_categorical: Bool) -> String:
+        """Which member of this bundle an accelerator cannot score, or `""`.
+
+        **THE DEVICE QUESTION, WHICH `is_active()` IS NOT.** `is_active()`
+        answers "does the per-candidate gain need `split._feature_gain`'s
+        adjustment pass". Three separate device gates read it as though it
+        also answered "can the device kernel score this" --
+        `train_gpu._check_device_search_supported`,
+        `gpu_resident_round.oblivious_device_supported`, and
+        `gpu_tree_tables`. Those were the same answer while every member was
+        unimplemented on the device, and they stopped being the same answer
+        the moment a capability landed.
+
+        A predicate that becomes wrong because something else SUCCEEDED is not
+        one anybody re-reads, which is why this is a second function rather
+        than a widened first one. `is_active()` keeps its own meaning, intact
+        and unchanged, and the device gates ask this instead.
+
+        Two members are implemented on the device and are absent below:
+
+        - `score_function`. The per-node scans take it (`gpu_cosine_score`)
+          and `_scan_slot_oblivious_kernel` carries a level's two cross-leaf
+          accumulators and its single square root, which is a level's Cosine
+          score rather than a sum of per-leaf ratios.
+        - `random_strength`. The noise plane, its draw and its consumption are
+          staged, the leaf-wise draw is keyed by node and the oblivious one by
+          level depth in its own hash domain, and both arms of
+          `train_gpu._train_gpu_rounds` compute the per-tree scale.
+
+        Both stay refused beside a categorical column, because a category SET
+        is chosen by a partition search that scores with the L2 gain: only
+        that search's winner would be noised while every numerical feature had
+        every candidate noised, and `score_function` there would put two
+        functionals inside one argmax.
+
+        `feature_fraction_bylevel` is NOT here, deliberately: it lives on
+        `TreeParams` rather than on this bundle, so the caller that owns that
+        field tests it. Folding a field this struct does not own into a
+        predicate this struct exports is how the original conflation started.
+        """
+        if self.min_gain_to_split > 0.0:
+            return String("min_gain_to_split")
+        if self.max_delta_step > 0.0:
+            return String("max_delta_step")
+        if self.path_smooth > 0.0:
+            return String("path_smooth")
+        if self.extra_trees:
+            return String("extra_trees")
+        if self.monotone_penalty > 0.0:
+            return String("monotone_penalty")
+        if self.penalties.is_active():
+            return String("feature_contri or the CEGB costs")
+        if not self.forced.is_empty():
+            return String("forced splits")
+        if self.use_quantized_grad:
+            return String("use_quantized_grad")
+        # **REINSTATED UNCONDITIONALLY 2026-08-17, AFTER A MEASURED
+        # SILENT DIVERGENCE.** These two were narrowed to the categorical case
+        # on the strength of the kernels existing -- `gpu_cosine_score` with
+        # five call sites, `_scan_slot_oblivious_kernel` carrying a level's
+        # two accumulators and its root, the noise plane staged and its draw
+        # keyed by level depth, the per-tree scale computed on both arms. Every
+        # one of those readings was correct.
+        #
+        # The fit was not. Measured at 4,000 x 12, symmetric, depth 6,
+        # device='gpu', against the same fit on the CPU:
+        #
+        #   cpu  random_strength=1     max|diff vs plain| = 1.078
+        #   cpu  score_function=Cosine max|diff vs plain| = 1.142
+        #   gpu  random_strength=1     max|diff vs plain| = 0.000
+        #   gpu  score_function=Cosine max|diff vs plain| = 0.000
+        #
+        # Bit-identical to the plain fit on the device, on the
+        # `split_strategy=device-resident grow_policy=oblivious` path the
+        # trace confirms it takes. So the device accepted both settings and
+        # applied neither, which is the precise failure `train_gpu`'s own
+        # comment predicts for retiring a gate before the plane it guards is
+        # reached: "no error, no record, two different models under one
+        # default".
+        #
+        # **A KERNEL EXISTING IS NOT A KERNEL REACHED, and this is the
+        # counterexample that cost the least to get.** Six refusal layers were
+        # read, each one's stated reason checked against the code that would
+        # have to honor it, and all six were retired on arguments that were
+        # individually sound. No amount of reading the gates would have found
+        # this; one fit and one CPU comparison did, in under a minute.
+        #
+        # These stay refused until a fit shows the device model MOVING when
+        # the setting moves. That is the evidence the retirement always needed
+        # and never had, and it is now the standing bar for both.
+        if self.random_strength > 0.0:
+            return String("random_strength")
+        if self.score_function != SCORE_L2:
+            return String("score_function")
+        return String("")
+
     def random_score_stdev(self) -> Float64:
         """CatBoost's `scoreStDev`: the standard deviation of the noise added
         to one candidate's gain. 0.0 at the default, where no draw is taken.

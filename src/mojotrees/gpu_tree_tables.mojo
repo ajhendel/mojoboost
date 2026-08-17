@@ -424,7 +424,22 @@ def tree_resident_supported(params: TreeParams) raises -> Int:
         return TREE_RESIDENT_INTERACTION
     if params.grow_policy != GROW_LEAFWISE:
         return TREE_RESIDENT_DEPTHWISE
-    if params.extra.is_active() or params.feature_fraction_bylevel != 1.0:
+    # `device_unsupported_reason` rather than `is_active()`. The two agreed
+    # while every member of the bundle was unimplemented on the device; they
+    # stopped agreeing when the Cosine and random_strength kernels landed, and
+    # this gate went on refusing two settings the device can now score.
+    #
+    # `has_categorical=False` because this function takes no data, and that is
+    # sound rather than optimistic: the only behavioral caller,
+    # `gpu_resident_round.resident_round_supported`, tests
+    # `builder.cats.any_categorical()` on the very next line and returns
+    # `RESIDENT_CATEGORICAL`. The data question stays with the caller that
+    # holds the data, which is the same division `oblivious_device_supported`
+    # keeps.
+    if (
+        params.extra.device_unsupported_reason(False).byte_length() > 0
+        or params.feature_fraction_bylevel != 1.0
+    ):
         return TREE_RESIDENT_EXTRA
     return TREE_RESIDENT_OK
 

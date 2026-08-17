@@ -2472,7 +2472,7 @@ def _collect_blocks(
                 " wrong functional's name rather than refuse"
             ),
         )
-    elif request.score_function == SCORE_COSINE and request.categorical:
+    elif request.score_function == SCORE_COSINE:
         # Cosine beside a categorical column. The category partition search
         # scores with the L2 gain (`GpuSplitSearcher.set_score_function`, and
         # `split.find_best_split` before it), so allowing the pair puts two
@@ -2487,12 +2487,13 @@ def _collect_blocks(
         blocks.add(
             BLOCK_SCORE_FUNCTION,
             String(
-                "score_function=Cosine cannot be combined with a categorical"
-                " feature on an accelerator: the category partition search"
-                " scores with the L2 gain, so one argmax would compare a"
-                " partition winner chosen under L2 against numerical"
-                " candidates scored under Cosine. The CPU backend scores both"
-                " the same way"
+                "score_function=Cosine is accepted by no accelerator path"
+                " that applies it. The device kernels evaluate the Cosine"
+                " ratio and a fit configured for it trains, but MEASURED"
+                " against the same fit on the CPU the device model is"
+                " bit-identical to an L2 one, so the setting is accepted and"
+                " dropped. Refused until a fit shows the device model moving"
+                " when the setting moves; the CPU backend applies it"
             ),
         )
 
@@ -2526,7 +2527,7 @@ def _collect_blocks(
     #          cliff this block was covering.
     #
     # ONE CONDITION SURVIVES.
-    if request.random_strength > 0.0 and request.categorical:
+    if request.random_strength > 0.0:
         # `gpu_split_search` refuses the noise beside a categorical feature by
         # name: a categorical candidate is a category SET chosen by a
         # partition search, so only that search's winner would be noised
@@ -2540,13 +2541,15 @@ def _collect_blocks(
         blocks.add(
             BLOCK_RANDOM_STRENGTH,
             String(
-                "random_strength cannot be combined with a categorical"
-                " feature on an accelerator: a categorical candidate is a"
-                " category set chosen by a partition search, so only that"
-                " search's winner would be noised while every numerical"
-                " feature had every candidate noised -- a different"
-                " regularizer under the same name. The CPU backend noises"
-                " both alike"
+                "random_strength is accepted by no accelerator path that"
+                " applies it. The noise plane, its draw and the per-tree"
+                " scale are all built and a fit configured for it trains, but"
+                " MEASURED against the same fit on the CPU the device model"
+                " is bit-identical to an unnoised one, so the setting is"
+                " accepted and dropped -- the unregularized model reporting"
+                " success this block exists to prevent. Refused until a fit"
+                " shows the device model moving when the setting moves; the"
+                " CPU backend applies it"
             ),
         )
 
