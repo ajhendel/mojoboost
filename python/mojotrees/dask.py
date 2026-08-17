@@ -1542,10 +1542,13 @@ class _DaskMixin:
             needed.add("goss")
         if self.feature_fraction != 1.0 or self.feature_fraction_bynode != 1.0:
             needed.add("feature_fraction")
-        if str(self.device).lower() == "gpu" or (
-            self.device_type is not None
-            and str(self.device_type).lower() == "gpu"
-        ):
+        # Through `_requested_device` since 2026-08-17, which folds all THREE
+        # spellings. This site already read `device` and `device_type`, so it
+        # was not the dead-branch bug the multi-target boundary had, but it
+        # never consulted `task_type`, and `task_type="GPU"` is CatBoost's own
+        # spelling. A capability probe that misses a spelling reports that a
+        # cluster needs no GPU for a fit that asked for one.
+        if str(self._requested_device()).lower() == "gpu":
             needed.add("gpu")
         return needed
 

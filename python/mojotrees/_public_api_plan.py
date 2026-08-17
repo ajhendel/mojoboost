@@ -70,6 +70,7 @@ CURRENT_TOP_LEVEL = (
     "group_from_query_ids",
     "log_evaluation",
     "ndcg_score",
+    "port",
     "record_evaluation",
     "reset_parameter",
     "show_versions",

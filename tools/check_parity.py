@@ -1702,6 +1702,14 @@ STOCK_PYTHON_CONSTANTS = {
     # to check. `_LAMBDA_L2` was already read this way for the same shape of
     # reason.
     "_LEARNING_RATE": "learning_rate",
+    # `bagging_freq` joined these on 2026-08-17, third parameter to make the
+    # same trip for the same reason. Its signature default became `None` so
+    # that `bagging_freq=0` and `subsample_freq=0` mean the same thing, an
+    # alias contract that was broken and shipped as far as a release tag
+    # before CI first ran on the branch. `_BAGGING_FREQ` is the value an
+    # unset frequency resolves to at fit time, so it is the Python default
+    # this gate exists to check.
+    "_BAGGING_FREQ": "bagging_freq",
 }
 
 #: The THIRD copy of the stock leaf-regularization defaults, in
@@ -1738,7 +1746,13 @@ STOCK_PYTHON_SIGNATURE = {
     "min_child_hess": "min_sum_hessian_in_leaf",
     "max_bin": "max_bin",
     "bagging_fraction": "bagging_fraction",
-    "bagging_freq": "bagging_freq",
+    # `bagging_freq` is checked as `_BAGGING_FREQ` in STOCK_PYTHON_CONSTANTS
+    # above, not here, and for the same reason `learning_rate` moved: its
+    # signature default is now `None` so that an explicit 0 survives as a
+    # statement rather than being read as an omission. Removing it from this
+    # table without adding it there would have unchecked LightGBM's stock
+    # frequency on the surface bench/real_data fits, and this gate said so
+    # the moment the signature changed rather than after a release.
     "feature_fraction": "feature_fraction",
     "feature_fraction_bynode": "feature_fraction_bynode",
     "min_gain_to_split": "min_gain_to_split",

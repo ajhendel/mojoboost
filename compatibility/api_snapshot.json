@@ -1365,7 +1365,8 @@
       "dump_model",
       "trees_to_dataframe",
       "trees_to_records",
-      "get_split_value_histogram"
+      "get_split_value_histogram",
+      "port"
     ],
     "callbacks": {
       "all": [
@@ -2186,7 +2187,7 @@
     "shared_estimator_parameters": {
       "auto_learning_rate": null,
       "bagging_fraction": 1.0,
-      "bagging_freq": 0,
+      "bagging_freq": null,
       "bagging_seed": 3,
       "bagging_temperature": null,
       "boost_from_average": null,

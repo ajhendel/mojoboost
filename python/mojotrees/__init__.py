@@ -375,6 +375,9 @@ __all__ = [
     "trees_to_dataframe",
     "trees_to_records",
     "get_split_value_histogram",
+    # What we did with a vendor parameter dict, as a report a user can read
+    # and a program can inspect. See `mojotrees.port` below.
+    "port",
 ]
 
 from .callback import (  # noqa: E402 - after __all__ for readability
@@ -385,6 +388,22 @@ from .callback import (  # noqa: E402 - after __all__ for readability
     record_evaluation,
     reset_parameter,
 )
+
+# The porting report. Eager, not lazy, and the reason is the opposite of
+# every other decision in this file: `port.py` imports nothing at all except
+# the standard library, so importing it here costs a file read and no
+# dependency, and an eager import is a real edge in the module graph
+# `tools/connectivity_audit.py` walks. A lazy one would need a
+# `CLASSIFICATION` entry there to explain why the module is unreachable, and
+# it is not unreachable.
+#
+# `port` the function shadows `port` the submodule at this attribute, which
+# is the `cv` collision again and behaves the same way. `from mojotrees
+# import port` and `import mojotrees.port as p` both give the FUNCTION;
+# `from mojotrees.port import PortReport` still reaches the module, because
+# that form resolves through sys.modules rather than through this attribute.
+# The collision belongs in `_public_api_plan.NAME_COLLISIONS` beside `cv`'s.
+from .port import port  # noqa: E402 - after __all__ for readability
 
 # Buffer plumbing and input validation live in _arrays; these names are the
 # spellings the estimator code below has always used.

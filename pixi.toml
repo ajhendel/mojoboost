@@ -77,6 +77,10 @@ check-api = "python3 tools/api_snapshot.py --check"
 # Checks docs/LIGHTGBM_PARITY.md against the repository. Standard library
 # only, and it builds nothing, so it is cheap enough to run on every change.
 check-parity = "python3 tools/check_parity.py"
+# Checks docs/PORTING.md against `mojotrees.port`, which generates it. Both
+# the page and the runtime report come out of one `render()`, so this gate is
+# what keeps "generated" from decaying into "transcribed once".
+check-port-doc = "python3 tools/port_report.py --check"
 # Checks pixi.toml itself: every path a task names, every `-I` directory,
 # every suite handed to run_tests.sh, every depends-on, every environment.
 check-pixi = "python3 tools/check_pixi_tasks.py"

@@ -201,9 +201,45 @@ def wire_params(estimator):
         "min_child_hess", "min_sum_hessian_in_leaf", 1e-3, min_child_hess
     )
     lambda_l1 = alias("lambda_l1", "reg_alpha", 0.0)
-    lambda_l2 = alias("lambda_l2", "reg_lambda", 0.0)
-    lambda_l2 = alias("lambda_l2", "l2_leaf_reg", 0.0, lambda_l2)
+    # THREE DEFECTS FIXED HERE ON 2026-08-17, all of the same kind, and the
+    # docstring above named the kind before any of them was found: "Repeating
+    # the chains would be a second answer to a question that already has one."
+    # This function repeated them anyway, and the second answer drifted.
+    #
+    # 1. The stock was hardcoded 0.0 while `_LAMBDA_L2` moved to 1.0, so a
+    #    MULTI-OUTPUT fit trained at a different regularizer from the
+    #    single-output fit of the same estimator. Nothing said so.
+    # 2. `l2_regularization` was missing from the chain, so that spelling was
+    #    silently DROPPED on this surface and the fit ran at the default.
+    # 3. Symmetric mode was ignored: `_params` picks `_CATBOOST_L2_LEAF_REG`
+    #    under `symmetrictree` and `_LAMBDA_L2` otherwise, and this took
+    #    neither.
+    #
+    # Resolved the same way `_params` resolves it rather than copied, so the
+    # next move of either constant reaches both surfaces.
+    #
+    # Imported inside the function on purpose: `sklearn` imports THIS module,
+    # so a module-level import here is a cycle. The cost is one dict lookup
+    # per multi-output fit, which is not a per-round cost and not measurable
+    # beside a fit.
+    from .sklearn import _CATBOOST_L2_LEAF_REG, _LAMBDA_L2
+
+    l2_default = (
+        _CATBOOST_L2_LEAF_REG
+        if estimator._resolve_grow_policy() == "symmetrictree"
+        else _LAMBDA_L2
+    )
+    lambda_l2 = alias("lambda_l2", "reg_lambda", l2_default)
+    lambda_l2 = alias("lambda_l2", "l2_leaf_reg", l2_default, lambda_l2)
+    lambda_l2 = alias(
+        "lambda_l2", "l2_regularization", l2_default, lambda_l2
+    )
     max_depth = alias("max_depth", "depth", -1)
+    # Same defect as the lambda chain: `estimator.max_bin` was read RAW below,
+    # so `max_bins=` and `border_count=` were accepted by the constructor,
+    # validated, and then silently discarded on this surface only.
+    max_bin = alias("max_bin", "max_bins", 255)
+    max_bin = alias("max_bin", "border_count", 255, max_bin)
     return {
         "n_estimators": int(n_estimators),
         "learning_rate": float(learning_rate),
@@ -213,7 +249,7 @@ def wire_params(estimator):
         "lambda_l1": float(lambda_l1),
         "min_child_hess": float(min_child_hess),
         "max_depth": int(max_depth),
-        "max_bin": int(estimator.max_bin),
+        "max_bin": int(max_bin),
         "use_missing": int(bool(estimator.use_missing)),
         "with_missing_values": 0,
         "weight_addr": 0,

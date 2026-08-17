@@ -38,6 +38,14 @@ run_gate() {
     parity)       "$PY" tools/check_parity.py ;;
     defaults)     "$PY" tools/default_refusal_audit.py --check ;;
     pixi)         "$PY" tools/check_pixi_tasks.py ;;
+    # docs/PORTING.md is GENERATED from mojotrees.port, through the same
+    # render() the runtime report prints, so the page and the call cannot
+    # disagree about what we do with a vendor config. This gate is what makes
+    # "generated" true rather than aspirational: without it the page is a
+    # transcription that drifts the first time an alias or a declared
+    # divergence moves, which is precisely how LIGHTGBM_PARITY.md section 7
+    # ended up claiming lambda_l2 was still 0.0.
+    port)         "$PY" tools/port_report.py --check ;;
     connectivity) "$PY" tools/connectivity_audit.py ;;
     # --strict, so an unrecorded disconnection FAILS here rather than being
     # printed and passed over. Without it this gate exits 0 while printing
@@ -57,7 +65,7 @@ run_gate() {
   esac
 }
 
-ALL="api parity pixi connectivity integration tests"
+ALL="api parity pixi port connectivity integration tests"
 SELECTED="${*:-$ALL}"
 
 failed=""

@@ -735,12 +735,29 @@ def test_defaults_are_lightgbms_stock_values() raises:
     Float comparisons are on the bits. A default is a literal, not a
     computation, so there is no ulp to allow for, and a tolerance here would
     accept exactly the drift the test exists to catch.
+
+    ONE OF THESE IS NO LONGER LIGHTGBM'S, ON PURPOSE, and the test name is
+    therefore half a misnomer as of 2026-08-17. `lambda_reg` is a DECLARED
+    divergence: LightGBM's stock is 0.0 and ours is 1.0. The declaration lives
+    in `tools/check_parity.py` under `STOCK_DIVERGENCES`, which is the
+    mechanism for departing from stock deliberately, and it carries the reason
+    and the exit condition. So the assertion below is not "LightGBM's value",
+    it is "the value we declared", and the two are kept apart here rather than
+    quietly merged, because a test that says "stock" while asserting a
+    divergence teaches the next reader the wrong thing about every other row
+    in it.
+
+    This test failed in CI when the default moved and was not swept, which is
+    LANE_RULES rule 5a exactly: a flip is a sweep of the file, not an
+    annotation on the line. The sweep reached the Python surface and the docs
+    and missed the Mojo tests, because the branch had no CI to say so.
     """
     var tree = TreeParams.default()
     assert_equal(tree.num_leaves, 31)
     assert_equal(tree.min_data_in_leaf, 20)
     assert_equal(tree.max_depth, -1)
-    assert_equal(tree.lambda_reg.to_bits(), Float64(0.0).to_bits())
+    # DECLARED DIVERGENCE, not LightGBM's stock 0.0. See the docstring.
+    assert_equal(tree.lambda_reg.to_bits(), Float64(1.0).to_bits())
     assert_equal(tree.lambda_l1.to_bits(), Float64(0.0).to_bits())
     assert_equal(tree.min_child_hess.to_bits(), Float64(1e-3).to_bits())
     assert_equal(tree.feature_fraction.to_bits(), Float64(1.0).to_bits())
@@ -768,29 +785,39 @@ def test_defaults_are_lightgbms_stock_values() raises:
 
 
 def test_default_lambda_l2_reaches_the_leaf_formula() raises:
-    """The default is 0.0 *in the arithmetic*, not merely in the field.
+    """The default is 1.0 *in the arithmetic*, not merely in the field.
 
-    Asserting `lambda_reg == 0.0` proves the literal and nothing else. The
+    Asserting `lambda_reg == 1.0` proves the literal and nothing else. The
     parameter's whole job is to sit in the denominator of the Newton step,
     so this feeds the default through `raw_leaf_output` and checks the
-    unregularized value comes out: G = -4, H = 4, so -(-4) / (4 + 0) = 1.0
-    exactly, where the old default of 1.0 gave -(-4) / 5 = 0.8.
+    regularized value comes out: G = -4, H = 4, so -(-4) / (4 + 1) = 0.8
+    exactly, where the unregularized 0.0 gives -(-4) / 4 = 1.0.
 
     Both sides are single IEEE operations on exactly representable inputs,
     so each is the correctly rounded quotient and equals the literal it is
     compared against, 0.8 included. The comparison is on bits rather than
     within a tolerance because the difference this catches is 25 percent of
     the leaf, not an ulp of it.
+
+    UPDATED 2026-08-17 and the direction matters. This test has now been
+    written twice for two opposite defaults, so record which way it went: the
+    default was 1.0, was removed to 0.0 on 2026-08-16 as part of a comparator
+    change that turned out to be a defect, and was restored to 1.0 on
+    2026-08-17 as a declared divergence from LightGBM's stock. The two
+    assertions below are deliberately kept as a pair, the live default and the
+    other value, so that whichever way it moves next the size of the move
+    stays on the page instead of being inferred.
     """
     var tree = TreeParams.default()
     assert_equal(
         raw_leaf_output(-4.0, 4.0, tree.lambda_l1, tree.lambda_reg).to_bits(),
-        Float64(1.0).to_bits(),
+        Float64(0.8).to_bits(),
     )
-    # The value the same leaf had under the default this replaced, stated so
-    # that the size of the move is on the page rather than inferred.
+    # The value the same leaf has UNREGULARIZED, which is what LightGBM's
+    # stock 0.0 gives and what this default produced between 2026-08-16 and
+    # 2026-08-17. Stated so the size of the move is on the page.
     assert_equal(
-        raw_leaf_output(-4.0, 4.0, 0.0, 1.0).to_bits(), Float64(0.8).to_bits()
+        raw_leaf_output(-4.0, 4.0, 0.0, 0.0).to_bits(), Float64(1.0).to_bits()
     )
 
 

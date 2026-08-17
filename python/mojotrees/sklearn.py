@@ -11,6 +11,7 @@ from this file when they are not in `__init__.py`.
 """
 
 import array as _array
+import inspect as _inspect
 import json as _json
 import os as _os
 import tempfile as _tempfile
@@ -64,6 +65,19 @@ _MULTICLASS = -1
 #: `tools/check_parity.py` reads this constant instead, the way it already
 #: reads `_LAMBDA_L2`.
 _LEARNING_RATE = 0.1
+
+#: LightGBM's stock `bagging_freq`, which is 0, meaning bagging is off.
+#:
+#: A named constant for the same reason `_LEARNING_RATE` became one. The
+#: constructor now defaults `bagging_freq` to `None` so that an explicit 0 is
+#: distinguishable from an omission, which is what makes the alias
+#: `subsample_freq=0` and the primary `bagging_freq=0` mean the same thing.
+#: Once the signature holds `None`, the stock value has to live somewhere a
+#: reader and a gate can both find, or `tools/check_parity.py` loses sight of
+#: it and LightGBM's stock goes unchecked on the surface `bench/real_data`
+#: actually fits. That gate failed the moment the signature changed, which is
+#: the gate working, and this constant is the answer it asked for.
+_BAGGING_FREQ = 0
 
 # Defaults of the two regularization parameters, named so the constructor
 # signature and the alias resolution in `_params` cannot drift apart.
@@ -1072,7 +1086,14 @@ class _Base(_ParamsMixin):
         monotonic_cst=None,
         bagging_fraction=1.0,
         subsample=None,
-        bagging_freq=0,
+        # None rather than 0 since 2026-08-17, so that "the user did not name
+        # this" stays knowable at fit time. Its stock value is still 0 and
+        # `_resolve_alias` substitutes it; what changed is that an explicit
+        # `bagging_freq=0` is now distinguishable from an omission, which is
+        # what makes it behave identically to `subsample_freq=0`. An alias
+        # whose default TYPE differs from its canonical's is an alias that
+        # cannot be equivalent, and that inequivalence was a live bug.
+        bagging_freq=None,
         subsample_freq=None,
         bagging_seed=3,
         boosting="gbdt",
@@ -1793,6 +1814,51 @@ class _Base(_ParamsMixin):
             )
         return resolved
 
+    @classmethod
+    def _none_defaulted(cls):
+        """Constructor parameters whose SIGNATURE default is `None`.
+
+        Read off the signature rather than listed, because a list is a second
+        place to update and the failure mode of forgetting is silent. A
+        parameter in here treats `None` as "the user did not name this"; a
+        parameter outside it treats `None` as a value the user typed, which
+        then reaches validation and is refused there if it is not valid.
+
+        Cached per class in `cls.__dict__` and not merely on `cls`, so a
+        subclass that adds or drops a parameter computes its own set instead
+        of inheriting its parent's answer about a signature it does not have.
+
+        THE WHOLE MRO, not `cls.__init__`. The parameters are split across two
+        signatures: `MojoTreesRegressor.__init__` declares the ten that are
+        specific to the task and `_Base.__init__` declares the other hundred
+        and thirty six, `learning_rate` among them. Reading only the concrete
+        class's signature therefore returned a set that was missing almost
+        everything, and since a missing name means "None is a real value
+        here", the first fit died on `float(None)`. Found by running the
+        suite, not by reading it.
+        """
+        cached = cls.__dict__.get("_NONE_DEFAULTED_CACHE")
+        if cached is None:
+            names = set()
+            for klass in cls.__mro__:
+                init = klass.__dict__.get("__init__")
+                if init is None:
+                    continue
+                try:
+                    parameters = _inspect.signature(init).parameters
+                except (TypeError, ValueError):
+                    # A C-level or otherwise unintrospectable `__init__`
+                    # contributes nothing rather than taking the class down.
+                    continue
+                names.update(
+                    name
+                    for name, parameter in parameters.items()
+                    if parameter.default is None
+                )
+            cached = frozenset(names)
+            cls._NONE_DEFAULTED_CACHE = cached
+        return cached
+
     def _resolve_alias(self, primary, alias, default, folded=_UNSET):
         """The effective value of a parameter that has vendor aliases.
 
@@ -1836,7 +1902,15 @@ class _Base(_ParamsMixin):
         # value it was before, because the fold happens here rather than at
         # every reader: `_multi_target.wire_params` and `_callback_params`
         # call this function too and neither had to learn about it.
-        if primary_value is None:
+        # ...but ONLY for a parameter whose signature default really is None,
+        # which is what makes None mean "unset" rather than "the user typed
+        # None". Unconditional substitution here silently turned every
+        # explicitly passed None into the stock default for EVERY parameter,
+        # including the ones whose signature default is a real value. That is
+        # how `device=None` became `device="cpu"` instead of raising, which
+        # `test_device_invalid` asserts and which CI never reached because
+        # `test_bagging` aborted the file first. Corrected 2026-08-17.
+        if primary_value is None and primary in self._none_defaulted():
             primary_value = default
         if alias_value is None:
             return primary_value
@@ -2173,7 +2247,12 @@ class _Base(_ParamsMixin):
                 "once. Use subsample for the MVS rate, or drop "
                 "bootstrap_type."
             )
-        if int(self.bagging_freq) != 0 or self.subsample_freq is not None:
+        # Symmetric in the two spellings by construction, now that both carry
+        # None when unset. It was `int(self.bagging_freq) != 0 or
+        # self.subsample_freq is not None`, which asked a different question
+        # of each half of one alias pair and would raise TypeError on the
+        # None default besides.
+        if self.bagging_freq is not None or self.subsample_freq is not None:
             raise ValueError(
                 "subsample_freq is a row-bagging schedule and cannot be set "
                 f"beside bootstrap_type={self.bootstrap_type!r}: both MVS "
@@ -2825,7 +2904,7 @@ class _Base(_ParamsMixin):
             "bagging_fraction", "subsample", 1.0
         )
         bagging_freq = self._resolve_alias(
-            "bagging_freq", "subsample_freq", 0
+            "bagging_freq", "subsample_freq", _BAGGING_FREQ
         )
         min_gain_to_split = self._resolve_alias(
             "min_gain_to_split", "min_split_gain", 0.0
@@ -2888,14 +2967,32 @@ class _Base(_ParamsMixin):
         # It fires only when a fraction below 1 was actually asked for, so
         # no default configuration changes and no bits move on any fit that
         # does not name `subsample`/`bagging_fraction`.
-        # `subsample_freq` is distinguishable from unset (it defaults to
-        # None) and an explicit 0 there is honored. `bagging_freq` is not
-        # (0 is its stock default), and an explicit `bagging_freq=0`
-        # alongside a fraction below 1 is exactly the LightGBM no-op this
-        # fixes, so it takes the implied 1 too.
+        #
+        # BOTH SPELLINGS ARE TESTED, and that is the whole correction of
+        # 2026-08-17. This block used to read `int(bagging_freq) == 0 and
+        # self.subsample_freq is None`, which honored an explicit 0 through
+        # one spelling and overrode it through the other. Its own comment
+        # admitted the asymmetry and defended it on the grounds that
+        # `bagging_freq` could not be told apart from unset, since 0 was its
+        # signature default. That is a reason the parameter was wrong, not a
+        # reason the behavior could be: an ALIAS MUST BE INDISTINGUISHABLE
+        # FROM ITS CANONICAL, so `bagging_freq=0` has to mean exactly what
+        # `subsample_freq=0` means. The fix is upstream, at the signature,
+        # where `bagging_freq` now defaults to None like every other pair
+        # member that has to know whether the user named it (see
+        # `_resolve_alias` on `learning_rate` and `lambda_l2`, the same
+        # pattern for the same reason). CI caught this as
+        # `test_bagging`: it moved predictions by 0.257 on a configuration
+        # documented to be inert.
+        #
+        # So the implied 1 now requires that NEITHER spelling was named. An
+        # explicit 0 in either one disables bagging, because it is a
+        # statement and not an omission, and the user's last word wins over
+        # our opinion of LightGBM's no-op.
         if (
             float(bagging_fraction) < 1.0
             and int(bagging_freq) == 0
+            and self.bagging_freq is None
             and self.subsample_freq is None
         ):
             bagging_freq = 1
@@ -3369,6 +3466,32 @@ class _Base(_ParamsMixin):
             ),
         }
 
+    def _requested_device(self):
+        """The device the caller ASKED for, in any of its three spellings.
+
+        Not the device a fit will run on: `_resolve_device` decides that, and
+        this is one input to it. What this answers is "which of `device`,
+        `device_type` and `task_type` did the user name, and what did they
+        say", which is a question two callers need and which only one of them
+        used to ask correctly.
+
+        Extracted 2026-08-17 because the other caller had open-coded it as
+        `self.device if self.device is not None else self.device_type` at the
+        multi-target boundary. `device`'s signature default is the string
+        "cpu" and not None, so that condition was ALWAYS true and the `else`
+        was dead: on a multi-output fit `device_type="gpu"` was silently
+        ignored and trained on the CPU, while `device="gpu"` raised as it
+        should, and `task_type` was never consulted at all. One spelling of
+        one parameter refusing while its two aliases are discarded is the
+        alias contract broken in the worst direction, because the discarded
+        ones fail silently.
+
+        Found by `python/test_alias_equivalence.py`, which exists to make this
+        class of divergence a test failure rather than a discovery.
+        """
+        device = self._resolve_alias("device", "device_type", "cpu")
+        return self._resolve_alias("device", "task_type", "cpu", device)
+
     def _resolve_device(
         self,
         n_rows,
@@ -3412,8 +3535,7 @@ class _Base(_ParamsMixin):
         build whose `device_selection` cannot be imported and the reason
         the callers keep their own guards (see `_gpu_unsupported`).
         """
-        device = self._resolve_alias("device", "device_type", "cpu")
-        device = self._resolve_alias("device", "task_type", "cpu", device)
+        device = self._requested_device()
         # XGBoost's older switch names an algorithm and a device at once.
         # Only the two values that name the histogram algorithm mojotrees
         # implements resolve; `exact` and `approx` are different split
@@ -5230,9 +5352,7 @@ class MojoTreesRegressor(_Base):
         if sample_weight is not None:
             wb = _arrays.check_sample_weight(sample_weight, n_rows)
             params["weight_addr"] = _arrays.addr(wb)
-        device = _device_name(
-            self.device if self.device is not None else self.device_type
-        )
+        device = _device_name(self._requested_device())
         if device not in (None, "cpu", "auto"):
             raise ValueError(
                 "a multi-target fit runs on the CPU: train_gpu has no "

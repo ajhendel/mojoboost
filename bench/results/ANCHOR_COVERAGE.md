@@ -10,15 +10,18 @@ question could not be answered by reading, it says so and becomes a request.
 Repository state this was read at, because a citation to a line number is
 worthless without it.
 
-- branch `perf-round-2`, HEAD `9a113c8` "Five lanes land: a new plan kernel,
-  rule 9 amended twice, section 14 pre-registered"
-- **the working tree is DIRTY.** `git status --porcelain` reports modified
+- branch `perf-round-2`. The audit began at HEAD `9a113c8` "Five lanes land: a
+  new plan kernel, rule 9 amended twice, section 14 pre-registered" with a DIRTY
+  working tree, 473 insertions over 163 deletions across
   `bench/real_data/README.md`, `pairs.py`, `scenarios.py`, `selfcheck.py` and
-  `verify.py`, 473 insertions over 163 deletions. Line numbers below are
-  WORKING-TREE line numbers, not `9a113c8` line numbers, and the uncommitted
-  diff touches the anchor code (it adds `stale_anchor_constant` and rewrites
-  `anchor_configuration`). A reader checking these citations against the commit
-  will not find them where this says they are.
+  `verify.py`. **This is a shared checkout and a peer committed that work while
+  the audit was in progress**, at `bd46e62` "Land the run shape, sweep the lambda
+  flip, and correct stale switch prose", followed by `8a0ac3e` "Set version to
+  0.1.0a4 for the release". Every line citation below was re-verified against
+  `bd46e62` after the fact and every one still resolves, except that one Part 4
+  site was repaired by that commit and is marked as such.
+- `bench/real_data/accuracy_anchors.json` still has `anchors == {}` at `8a0ac3e`.
+  Re-checked after the peer commits. The finding survives them.
 
 ---
 
@@ -412,17 +415,17 @@ days and many commits old anyway.
 
 ### What section 14's veto requires
 
-Section 14 of `docs/design/ACCURACY_BUDGET.md` (line 1982 onward) pre-registers
-four cells over the shipped symmetric CatBoost-mode default's `bootstrap_type`.
-D is the control at MVS 0.8, A is MVS with noise off, B is Bayesian on the
-device round, C is the ship candidate at `bootstrap_type = 'No'`. Step 1 of the
-decision rule, at 2034 to 2039, is the veto.
+Section 14 of `docs/design/ACCURACY_BUDGET.md` (line 1995 onward at `bd46e62`,
+1982 at `9a113c8`) pre-registers four cells over the shipped symmetric
+CatBoost-mode default's `bootstrap_type`. D is the control at MVS 0.8, A is MVS
+with noise off, B is Bayesian on the device round, C is the ship candidate at
+`bootstrap_type = 'No'`. Step 1 of the decision rule, at line 2047, is the veto.
 
 > **The anchor gate comes FIRST and it is a veto, not a contribution.** A
 > candidate must be within the accuracy anchor's **0.25 percent per scenario**
 > before it is a candidate at all.
 
-And at 2050 to 2052.
+And at line 2064.
 
 > Either failing the 0.25 percent anchor on any scenario, or passing it on
 > `dense_regression` while failing on `imbalanced_binary` or `multiclass`
@@ -584,9 +587,10 @@ gets renegotiated at the moment it binds.
 
 ## Part 4. The over-claims
 
-Fifteen sites. For each one the quote, then one line on what would make it
-true. Nothing here was edited; the orchestrator applies these. All quotes
-VERIFIED by reading the cited line.
+Fifteen sites found, of which **one (site 5) was repaired by a peer at `bd46e62`
+while this audit ran, leaving fourteen open.** For each one the quote, then one
+line on what would make it true. Nothing here was edited; the orchestrator
+applies these. All quotes VERIFIED by reading the cited line.
 
 **1. `bench/results/LANE_RULES.md:47`**
 > **The gate is OUR OWN accuracy, and it stopped being a peer comparison on
@@ -620,21 +624,25 @@ strong argument for R3.
 
 Same defect as site 3, in the document that carries the pricing. Same repair.
 
-**5. `docs/design/ACCURACY_BUDGET.md:1934` to `1942`** (section 13, and this one
-is the sharpest)
+**5. `docs/design/ACCURACY_BUDGET.md`, section 13. ALREADY REPAIRED at `bd46e62`,
+by a peer, while this audit was running. Recorded here so nobody edits it
+twice.** The sentence this lane read at `9a113c8:1934` was
+
 > **1. Every recorded accuracy anchor for a `lossguide` arm now describes a
 > model we do not ship.** `bench/real_data/accuracy_anchors.json` and the
 > `lossguide` rows of `bench/results/COMPARISON_RUN_2026-08-16.md` were measured
 > at `lambda_l2 = 0`. They are stale, and **they must not be re-recorded by
 > arithmetic.**
 
-There are zero recorded anchors, so the count of stale ones is zero and the file
-named holds none of what the sentence attributes to it. The anchors file's own
-`_about` already contains the correction and names this exact passage. True if
-the sentence is scoped to the run artifacts under `bench/results` and drops
-`accuracy_anchors.json` from the list.
+There were zero recorded anchors, so the count of stale ones was zero and the
+file named held none of what the sentence attributed to it. At `bd46e62:1934` the
+passage is rewritten to name only the `COMPARISON_RUN` rows and it now carries an
+explicit correction that "that file's `anchors` object is empty and has been
+empty since the concept landed" and that "the accuracy gate this document leans
+on has never gated a single run". That is the right repair and it is the model for
+the fourteen sites that remain. VERIFIED at both commits.
 
-**6. `docs/design/ACCURACY_BUDGET.md:2034` to `2036`** (section 14 step 1)
+**6. `docs/design/ACCURACY_BUDGET.md:2047` to `2049`** (section 14 step 1)
 > A candidate must be within the accuracy anchor's **0.25 percent per scenario**
 > before it is a candidate at all.
 
@@ -642,7 +650,7 @@ No anchor exists for any scenario, so the veto has no reference value on any
 row. True when R3 lands. A pre-registered rule whose first step cannot execute
 should say so where it is registered.
 
-**7. `docs/design/ACCURACY_BUDGET.md:2050` to `2052`**
+**7. `docs/design/ACCURACY_BUDGET.md:2064` to `2066`**
 > Either failing the 0.25 percent anchor on any scenario, or passing it on
 > `dense_regression` while failing on `imbalanced_binary` or `multiclass`
 
@@ -741,7 +749,7 @@ places.
   docstring, which says a missing file "reads as 'nothing is covered yet' rather
   than as 'everything is fine'".
 
-The pattern across all fifteen false sites is one thing rather than fifteen.
+The pattern across the fifteen false sites is one thing rather than fifteen.
 **The code and the file that hold the mechanism are honest about being unarmed,
 and every document that CITES the mechanism as a constraint on a decision states
 it in the present tense.** A citation is where the over-claim lives, so a repair
@@ -764,7 +772,8 @@ Nothing below was performed by this lane.
   can reach. Andrew's budget decision, not a lane's.
 - **R4.** Rule on what section 14 means on `multiclass`, given that the
   symmetric arm is declared unreachable there. Free, and it must precede R3.
-- **R5.** Apply the fifteen Part 4 edits. Free.
+- **R5.** Apply the fourteen open Part 4 edits. Site 5 is already done at
+  `bd46e62`. Free.
 - **R6.** Consider whether `check_coverage`'s run-scope PASS should say that
   named by a check is not the same as gated by one. Free.
 
