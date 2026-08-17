@@ -63,10 +63,25 @@
   "environment": {
     "declared": [
       "MOJOTREES_AUTO_MIN_CELLS",
+      "MOJOTREES_CONST_HESSIAN",
+      "MOJOTREES_CONST_HESSIAN_VERIFY",
+      "MOJOTREES_CPU_COMPACT_MIN_ROWS",
+      "MOJOTREES_CPU_FEATURE_GROUP",
+      "MOJOTREES_CPU_ROW_BLOCKS",
+      "MOJOTREES_CPU_ROW_BLOCK_AMORTIZE",
       "MOJOTREES_DISABLE_GPU",
+      "MOJOTREES_GPU_BACKEND",
       "MOJOTREES_GPU_BLOCK_THREADS",
+      "MOJOTREES_GPU_FEATURE_GROUP",
       "MOJOTREES_GPU_HIST_STRATEGY",
+      "MOJOTREES_GPU_MIN_TILES",
+      "MOJOTREES_GPU_OBJECTIVE",
+      "MOJOTREES_GPU_PACKED_GRADS",
+      "MOJOTREES_GPU_ROW_COMPACTION",
       "MOJOTREES_GPU_ROW_TILE",
+      "MOJOTREES_GPU_STAGING_SLOTS",
+      "MOJOTREES_GPU_TRACE",
+      "MOJOTREES_GPU_VALID_SCORING",
       "MOJOTREES_NUM_WORKERS",
       "MOJOTREES_PARALLEL_MIN_OPS"
     ],
@@ -76,15 +91,18 @@
       "MOJOTREES_CONST_HESSIAN",
       "MOJOTREES_CONST_HESSIAN_VERIFY",
       "MOJOTREES_CPU_BIN_LAYOUT",
+      "MOJOTREES_CPU_BIN_LAYOUT_PROBE",
       "MOJOTREES_CPU_COMPACT_MIN_ROWS",
       "MOJOTREES_CPU_CORE_POOL",
       "MOJOTREES_CPU_FEATURE_GROUP",
+      "MOJOTREES_CPU_LAYOUT_BY_NODE",
       "MOJOTREES_CPU_QUANT_GRAD",
       "MOJOTREES_CPU_QUANT_SCALE",
       "MOJOTREES_CPU_ROW_BLOCKS",
       "MOJOTREES_CPU_ROW_BLOCK_AMORTIZE",
       "MOJOTREES_CPU_ROW_MAJOR",
       "MOJOTREES_CPU_ROW_MAJOR_MAX_MB",
+      "MOJOTREES_CPU_SERIAL_KERNEL",
       "MOJOTREES_CPU_TASKS_PER_CORE",
       "MOJOTREES_CPU_TASK_FLOOR",
       "MOJOTREES_DASK_BACKEND",
@@ -156,10 +174,13 @@
     "read_directly": [
       "MOJOTREES_AUTO_MIN_CELLS",
       "MOJOTREES_CPU_BIN_LAYOUT",
+      "MOJOTREES_CPU_BIN_LAYOUT_PROBE",
       "MOJOTREES_CPU_CORE_POOL",
       "MOJOTREES_CPU_FEATURE_GROUP",
+      "MOJOTREES_CPU_LAYOUT_BY_NODE",
       "MOJOTREES_CPU_ROW_BLOCK_AMORTIZE",
       "MOJOTREES_CPU_ROW_MAJOR",
+      "MOJOTREES_CPU_SERIAL_KERNEL",
       "MOJOTREES_CPU_TASK_FLOOR",
       "MOJOTREES_DASK_BACKEND",
       "MOJOTREES_DERIVATIVE_PRECISION",
@@ -200,18 +221,15 @@
     "stale": [],
     "undeclared": [
       "MOJOTREES_BINNING_SELECT_MIN_ROWS",
-      "MOJOTREES_CONST_HESSIAN",
-      "MOJOTREES_CONST_HESSIAN_VERIFY",
       "MOJOTREES_CPU_BIN_LAYOUT",
-      "MOJOTREES_CPU_COMPACT_MIN_ROWS",
+      "MOJOTREES_CPU_BIN_LAYOUT_PROBE",
       "MOJOTREES_CPU_CORE_POOL",
-      "MOJOTREES_CPU_FEATURE_GROUP",
+      "MOJOTREES_CPU_LAYOUT_BY_NODE",
       "MOJOTREES_CPU_QUANT_GRAD",
       "MOJOTREES_CPU_QUANT_SCALE",
-      "MOJOTREES_CPU_ROW_BLOCKS",
-      "MOJOTREES_CPU_ROW_BLOCK_AMORTIZE",
       "MOJOTREES_CPU_ROW_MAJOR",
       "MOJOTREES_CPU_ROW_MAJOR_MAX_MB",
+      "MOJOTREES_CPU_SERIAL_KERNEL",
       "MOJOTREES_CPU_TASKS_PER_CORE",
       "MOJOTREES_CPU_TASK_FLOOR",
       "MOJOTREES_DASK_BACKEND",
@@ -226,24 +244,18 @@
       "MOJOTREES_DIST_RESTART_EPOCH",
       "MOJOTREES_DIST_TIMEOUT_S",
       "MOJOTREES_DIST_WORLD_SIZE",
-      "MOJOTREES_GPU_BACKEND",
       "MOJOTREES_GPU_BACKEND_UNVALIDATED",
       "MOJOTREES_GPU_BATCH_SLOTS",
       "MOJOTREES_GPU_CLASS_BATCH",
       "MOJOTREES_GPU_CLASS_BATCH_BYTES",
       "MOJOTREES_GPU_COMPACTION_TRACE",
-      "MOJOTREES_GPU_FEATURE_GROUP",
       "MOJOTREES_GPU_FUSE_PARTITION_TAIL",
       "MOJOTREES_GPU_GRAD_LAYOUT",
       "MOJOTREES_GPU_HIST_SPECIALIZATION",
-      "MOJOTREES_GPU_MIN_TILES",
-      "MOJOTREES_GPU_OBJECTIVE",
       "MOJOTREES_GPU_PACKED_DOWNLOAD",
-      "MOJOTREES_GPU_PACKED_GRADS",
       "MOJOTREES_GPU_PHASE_TRACE",
       "MOJOTREES_GPU_QUANTIZED_GRADS",
       "MOJOTREES_GPU_READBACK",
-      "MOJOTREES_GPU_ROW_COMPACTION",
       "MOJOTREES_GPU_SCAN_PRIMITIVES",
       "MOJOTREES_GPU_SPARSE_SKIP_FREQ",
       "MOJOTREES_GPU_SPECULATION",
@@ -255,15 +267,12 @@
       "MOJOTREES_GPU_SPLIT_TABLE_PACK",
       "MOJOTREES_GPU_SPLIT_TRACE",
       "MOJOTREES_GPU_SPLIT_WIDE",
-      "MOJOTREES_GPU_STAGING_SLOTS",
       "MOJOTREES_GPU_TABLE_RESET",
-      "MOJOTREES_GPU_TRACE",
       "MOJOTREES_GPU_TRANSFER",
       "MOJOTREES_GPU_TRANSFER_UNPROVEN",
       "MOJOTREES_GPU_TREE_RESIDENT",
       "MOJOTREES_GPU_TREE_RESIDENT_TRACE",
       "MOJOTREES_GPU_TREE_RESIDENT_TRACE_STEPS",
-      "MOJOTREES_GPU_VALID_SCORING",
       "MOJOTREES_GPU_VERIFY_ROWS",
       "MOJOTREES_GPU_WARMUP",
       "MOJOTREES_LEAF_SCORE_UPDATE",
@@ -285,9 +294,13 @@
     "schema_version": 2,
     "source_commit": null,
     "status": "generated",
-    "tool_version": 1,
+    "tool_version": 2,
     "underived": [
-      "python.callbacks.integral_slots"
+      "python.parameter_aliases.eta.fallback_default",
+      "python.parameter_aliases.l2_leaf_reg.fallback_default",
+      "python.parameter_aliases.l2_regularization.fallback_default",
+      "python.parameter_aliases.reg_lambda.fallback_default",
+      "python.parameter_aliases.shrinkage_rate.fallback_default"
     ]
   },
   "mojo": {
@@ -1051,8 +1064,22 @@
         "check_weights"
       ]
     },
+    "objective_code_pin": {
+      "pinned": {
+        "COX": 16,
+        "MULTI_RMSE": -2,
+        "MULTI_RMSE_WITH_MISSING": -3,
+        "PAIR_LOGIT": 14,
+        "QUERY_RMSE": 13,
+        "SURVIVAL_AFT": 17,
+        "YETI_RANK": 15
+      },
+      "source": "tests/test_objective_reserved_codes.mojo"
+    },
     "objective_codes": {
       "BINARY_LOGISTIC": 1,
+      "CATBOOST_DEPTH": 6,
+      "CATBOOST_SMALL_ITERATION_COUNT": 200,
       "CLASS_WEIGHT_BINARY": 1,
       "CLASS_WEIGHT_MULTICLASS": 2,
       "CLASS_WEIGHT_NONE": 0,
@@ -1269,6 +1296,8 @@
       "quant_train_renew_leaf",
       "stochastic_rounding",
       "leaf_estimation_iterations",
+      "boost_from_average",
+      "ctr",
       "derivative_precision",
       "auto_learning_rate",
       "permutation_count",
@@ -1374,7 +1403,11 @@
           "min_delta": "required"
         }
       },
-      "integral_slots": [],
+      "integral_slots": [
+        "max_depth",
+        "min_data_in_leaf",
+        "num_leaves"
+      ],
       "module": "mojotrees.callback",
       "reset_aliases": {
         "colsample_bynode": "feature_fraction_bynode",
@@ -1603,6 +1636,7 @@
           "fair_c": 1.0,
           "loss": null,
           "loss_function": null,
+          "num_targets": null,
           "objective": "regression",
           "tweedie_variance_power": 1.5
         },
@@ -1892,7 +1926,8 @@
         1,
         2,
         3,
-        4
+        4,
+        5
       ]
     },
     "lazy_attributes": {
@@ -1906,8 +1941,10 @@
       "dask",
       "device_selection",
       "diagnostics",
+      "features",
       "inspection",
-      "lgbm_model_io"
+      "lgbm_model_io",
+      "onnx_export"
     ],
     "module": "mojotrees",
     "parameter_aliases": {
@@ -1953,7 +1990,7 @@
       },
       "eta": {
         "canonical": "learning_rate",
-        "fallback_default": 0.1,
+        "fallback_default": null,
         "sites": 2
       },
       "gamma": {
@@ -1973,12 +2010,12 @@
       },
       "l2_leaf_reg": {
         "canonical": "lambda_l2",
-        "fallback_default": 0.0,
+        "fallback_default": null,
         "sites": 2
       },
       "l2_regularization": {
         "canonical": "lambda_l2",
-        "fallback_default": 0.0,
+        "fallback_default": null,
         "sites": 2
       },
       "max_bins": {
@@ -2079,7 +2116,7 @@
       "random_seed": {
         "canonical": "random_state",
         "fallback_default": null,
-        "sites": 1
+        "sites": 2
       },
       "rate_drop": {
         "canonical": "drop_rate",
@@ -2093,7 +2130,7 @@
       },
       "reg_lambda": {
         "canonical": "lambda_l2",
-        "fallback_default": 0.0,
+        "fallback_default": null,
         "sites": 2
       },
       "rsm": {
@@ -2104,11 +2141,11 @@
       "seed": {
         "canonical": "random_state",
         "fallback_default": null,
-        "sites": 1
+        "sites": 2
       },
       "shrinkage_rate": {
         "canonical": "learning_rate",
-        "fallback_default": 0.1,
+        "fallback_default": null,
         "sites": 2
       },
       "subsample": {
@@ -2138,10 +2175,12 @@
       }
     },
     "shared_estimator_parameters": {
+      "auto_learning_rate": null,
       "bagging_fraction": 1.0,
       "bagging_freq": 0,
       "bagging_seed": 3,
       "bagging_temperature": null,
+      "boost_from_average": null,
       "booster": null,
       "boosting": "gbdt",
       "boosting_type": null,
@@ -2157,9 +2196,12 @@
       "cegb_tradeoff": 1.0,
       "colsample_bynode": null,
       "colsample_bytree": null,
+      "ctr": null,
       "depth": null,
+      "derivative_precision": null,
       "device": "cpu",
       "device_type": null,
+      "diffusion_temperature": null,
       "drop_rate": 0.1,
       "drop_seed": 4,
       "early_stopping_round": null,
@@ -2187,9 +2229,10 @@
       "l2_leaf_reg": null,
       "l2_regularization": null,
       "lambda_l1": 0.0,
-      "lambda_l2": 0.0,
+      "lambda_l2": null,
+      "langevin": null,
       "leaf_estimation_iterations": null,
-      "learning_rate": 0.1,
+      "learning_rate": null,
       "linear_lambda": 0.0,
       "linear_tree": false,
       "max_bin": 255,
@@ -2218,6 +2261,8 @@
       "min_samples_leaf": null,
       "min_split_gain": null,
       "min_sum_hessian_in_leaf": null,
+      "model_shrink_mode": null,
+      "model_shrink_rate": null,
       "monotone_constraints": null,
       "monotone_constraints_method": "basic",
       "monotone_constraints_penalty": null,
@@ -2241,6 +2286,7 @@
       "random_seed": null,
       "random_state": null,
       "random_strength": null,
+      "random_strength_seed": 0,
       "rate_drop": null,
       "reg_alpha": null,
       "reg_lambda": null,
@@ -2274,21 +2320,28 @@
       "python/pyproject.toml": "0.1.0"
     },
     "max_toolchain": ">=26.5.0,<27",
+    "model_format_base": 4,
     "model_format_dump_reports": 4,
     "model_format_python_reads": [
       1,
       2,
       3,
-      4
+      4,
+      5
     ],
     "model_format_readable": [
       1,
       2,
       3,
-      4
+      4,
+      5
     ],
-    "model_format_writer": 4,
+    "model_format_writer": 5,
     "model_format_writer_token": "v4",
+    "model_format_writer_tokens": [
+      "v4",
+      "v5"
+    ],
     "mojo_toolchain": ">=1.0.0,<2",
     "requires_python": ">=3.14",
     "snapshot_schema": 2
