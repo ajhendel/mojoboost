@@ -152,13 +152,43 @@ _CATBOOST_DEPTH = 6
 
 #: CatBoost mode's `ctr` rule when the caller names none.
 #:
-#: `"auto"`, not `"on"`: `"on"` is CatBoost's own source rule
-#: (`one_hot_max_size`, four numeric columns for nearly every categorical
-#: column) and `"auto"` gives CTR columns only to the categorical columns that
-#: overflowed their category table. Under `lossguide` the default is `"off"`,
-#: because a CTR is CatBoost's mechanism and `lossguide` mirrors LightGBM,
-#: which has none.
-_CATBOOST_CTR = "auto"
+#: `"on"`: CatBoost's own source rule, `uniqueValues > one_hot_max_size` at 2,
+#: which REPLACES every categorical column above the cutoff with its CTR
+#: columns. Under `lossguide` the default is `"off"`, because a CTR is
+#: CatBoost's mechanism and `lossguide` mirrors LightGBM, which has none.
+#:
+#: **This was `"auto"` and `"auto"` made the mode refuse on categorical data.**
+#: `"auto"` (`SimpleCtrConfig.auto()`) gives CTR columns only to the
+#: categorical columns that OVERFLOWED their category table, which is a
+#: different question and reads a different number. A column that did not
+#: overflow keeps its raw code, stays inside `BinnedMatrix.usable`, and is
+#: therefore still offered to the split search -- and the symmetric grower
+#: refuses any matrix that offers it one, because a level shares one split and
+#: a category partition's order comes from one node's own statistics. So
+#: `MojoTreesClassifier(grow_policy='symmetrictree', categorical_feature=[...])`
+#: raised on every fit with a categorical column narrower than the category
+#: table, which is nearly all of them.
+#:
+#: Measured 2026-08-17 on 400 rows, one 6-level categorical beside one
+#: numeric, `random_strength=1.0`: the default refused with the
+#: `grow_policy=oblivious ... still OFFERS a categorical column` message, and
+#: the same fit with `ctr='on'` succeeded. One word between a mode that
+#: handles categorical data the way CatBoost does and a mode that cannot take
+#: it at all.
+#:
+#: It also clears two refusals at once rather than one. `split.mojo:778`
+#: refuses `random_strength` beside a searchable categorical for the same
+#: reason `tree.mojo:1874` refuses the symmetric grower: both read what the
+#: matrix OFFERS. A replaced column is offered to neither.
+#:
+#: The argument for `"auto"` was real and it was an argument about a different
+#: default. Away from the overflow boundary, CTR columns cost histogram width
+#: without recovering anything the category table already holds -- true, and
+#: it is why `"auto"` remains the right rule for a mode that is not mirroring
+#: CatBoost. `symmetrictree` is mirroring CatBoost, where the replacement is
+#: not an optimization but the mechanism by which the tree can be grown at
+#: all.
+_CATBOOST_CTR = "on"
 
 #: `ctr` spellings the estimator accepts and the rule name each resolves to.
 #:
@@ -2242,11 +2272,14 @@ class _Base(_ParamsMixin):
         `Dataset(params={"ctr": ...})` takes, so this parameter reaches the
         existing mechanism instead of opening a second one.
 
-        The default is the mode's: `"auto"` under `symmetrictree`, because a
-        CTR is how CatBoost handles a categorical column at all, and `"off"`
-        under `lossguide` and `depthwise`, because those mirror LightGBM and
-        LightGBM has no CTR. `ctr="off"` is the behavior of every fit made
-        before this parameter existed, on either policy.
+        The default is the mode's: `"on"` under `symmetrictree`, because a CTR
+        is how CatBoost handles a categorical column at all -- and, more
+        sharply, because under `"auto"` a categorical column that did not
+        overflow its category table stays searchable and the symmetric grower
+        then refuses the fit outright. `"off"` under `lossguide` and
+        `depthwise`, because those mirror LightGBM and LightGBM has no CTR.
+        `ctr="off"` is the behavior of every fit made before this parameter
+        existed, on either policy. See `_CATBOOST_CTR` for what `"auto"` cost.
         """
         asked = self.ctr
         if asked is None:
