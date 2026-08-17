@@ -657,7 +657,7 @@ title = "GPU split policy"
 command = "pixi run test-cpu"
 requires_files = ["tests/test_gpu_split_policy.mojo"]
 provenance = "ci"
-proves = "That the host/device split-search decision gates on semantics and resident memory before profitability, stays on the host for unknown hardware, and reports the evidence id behind the M4 threshold. First run 2026-08-15: 6 passed."
+proves = "That the host/device split-search decision is ELIGIBILITY ONLY since 2026-08-16: it gates on semantics, resident memory and measured hardware, it declines no shape for its size, and the retired below-crossover reason code is reserved rather than reused. The two thresholds it used to weigh were withdrawn when the sweep they were owed found no crossover at any shape from 5.0M to 70.0M normalized work. First run 2026-08-15: 6 passed; rewritten 2026-08-16."
 
 [[job]]
 id = "native:lgbm-model-io"

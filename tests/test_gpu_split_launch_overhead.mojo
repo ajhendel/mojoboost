@@ -15,53 +15,47 @@ approximately.
      over a device-side range table instead of one launch per leaf. The
      reference arm is `update_raw_ranges_per_leaf`, which is the old launch
      shape, and the assertion is on the raw scores bit for bit.
-  3. The split-search decision is now reported rather than discarded, and the
-     50,000,000.0 crossover is pinned at the exact shape our headline
-     benchmark uses.
+  3. The split-search decision is now reported rather than discarded.
 
-On the third: `normalized_split_work(1_000_000, 50, 255, 31)` is exactly
-50,000,000.0, which is exactly `M4_MIN_NORMALIZED_WORK`, and the gate is
-`work < threshold`, so that shape takes the device path by floating-point
-equality and by nothing else. This file pins that arithmetic so a later
-change to the comparison, to the normalization, or to the threshold cannot
-move the benchmark's path in silence. It is a pin, not an endorsement: which
-side of that edge is faster is a measurement, and nothing here measures
-anything.
+On the third, and on what used to stand here. This file pinned the
+50,000,000 crossover at the exact shape our headline benchmark uses:
+`normalized_split_work(1_000_000, 50, 255, 31)` is exactly 50,000,000.0 and
+the gate was `work < threshold`, so that shape took the device path by
+floating-point equality and nothing else. Three tests held the edge still --
+the shape on it, a single row/feature/leaf either side of it, and the
+description that reported the margin.
 
-What makes that edge worth pinning is what falls off it. The host scan pays,
-per node, a full histogram download, a host synchronization, and a Float64
-conversion of `3 * n_features * n_bins` cells; the device-resident scan pays
-none of the three. One row, one feature, one leaf, or a `feature_fraction`
-of 0.99 moves a fit from one regime to the other, so each boundary case
-below asserts which regime it lands in as well as which path it names. That
-is also why this file is where the fourth change in this lane, the
-vectorization of `histogram_from_host`, is bounded: that function is on the
-host scan only, and the benchmark shape provably never calls it.
+**There is no edge. It was measured on 2026-08-16 and the crossover does not
+exist**: four shapes from 5.0M to 70.0M normalized work, the two arms
+interleaved in one process, five repeats each, device winning all four with
+disjoint ranges and winning by MORE at the smaller shapes (1.85x at 5.0M
+falling to 1.29x at 70.0M). Both thresholds were withdrawn and the three
+tests went with them; `tests/test_gpu_split_policy.mojo` carries the
+replacement assertion, which is that no shape is ever declined for its size.
 
-Deliberately not done here: no shape near the crossover is trained. A
-1,000,000 x 50 fit is a benchmark, and this lane runs none. The boundary is
-checked as host arithmetic over the pure policy, which is where the decision
-is actually made, and both split paths are exercised at a size a test can
-afford by naming them outright.
+What that removes from this file specifically is worth naming, because it was
+this file's stated job: the host scan's per-node histogram download, host
+block, and Float64 conversion of `3 * n_features * n_bins` cells were what
+falling off the edge cost, and they are what `histogram_from_host` does. The
+benchmark shape provably never called it, which is how a change to that
+function was bounded here. That bound is now trivial rather than argued --
+no shape calls it on the automatic path, at any size -- so the vectorization
+it bounded needs a different justification than this file.
+
+Deliberately not done here: no benchmark shape is trained. A 1,000,000 x 50
+fit is a benchmark, and this lane runs none. Both split paths are still
+exercised, at a size a test can afford, by naming them outright -- which is
+now the only way to reach the host scan on a test-sized fixture, since the
+automatic policy sends every shape to the device search.
 
 Skips (passing) when no accelerator is present, so the suite stays green on
-CPU-only machines. The policy tests need no device and always run.
+CPU-only machines.
 """
 
 from std.sys import has_accelerator
-from std.testing import assert_equal, assert_false, assert_true, TestSuite
+from std.testing import assert_equal, assert_true, TestSuite
 
 from mojotrees.binning import BinnedMatrix, bin_equal_width
-from mojotrees.gpu_split_policy import (
-    M4_MIN_NORMALIZED_WORK,
-    SPLIT_POLICY_DEVICE_RESIDENT,
-    SPLIT_POLICY_HOST,
-    SPLIT_REASON_BELOW_CROSSOVER,
-    SPLIT_REASON_VALIDATED_WORKLOAD,
-    SplitSearchDecision,
-    decide_split_search,
-    normalized_split_work,
-)
 from mojotrees.histogram_gpu import GpuHistogramBuilder
 from mojotrees.train_gpu import (
     SPLIT_SEARCH_DEVICE,
@@ -71,119 +65,6 @@ from mojotrees.train_gpu import (
 )
 from mojotrees.tree import Tree, TreeParams
 from support import _make_features, _uniform
-
-
-def _m4(
-    rows: Int,
-    features: Int,
-    bins: Int = 255,
-    leaves: Int = 31,
-) -> SplitSearchDecision:
-    """The headline benchmark's hardware profile with a variable shape."""
-    return decide_split_search(
-        "metal", "4-metal4", rows, features, bins, leaves, True, True
-    )
-
-
-def _dequantizes_per_node(decision: SplitSearchDecision) -> Bool:
-    """Whether this shape pays the host scan's per-node conversion.
-
-    `GpuHistogramBuilder.histogram_from_host` turns a downloaded
-    fixed-point histogram into a Float64 `Histogram`, once per node, and
-    the host scan is the only path that calls it: the device-resident
-    search scans the histogram where it lives and brings back a 136-byte
-    record instead. So "takes the host scan" and "pays a per-node
-    download, a host block, and a `3 * n_features * n_bins` conversion"
-    are the same statement, and `uses_device` decides both.
-
-    This is spelled out as a named predicate rather than left in a comment
-    because it is the reason the crossover deserves the visibility this
-    lane gave it: one row either way decides whether that cost is paid at
-    all.
-    """
-    return not decision.uses_device()
-
-
-def test_headline_shape_sits_exactly_on_the_crossover() raises:
-    """1,000,000 x 50 at 255 bins and 31 leaves normalizes to exactly the
-    threshold, and therefore takes the device path on equality alone."""
-    var work = normalized_split_work(1_000_000, 50, 255, 31)
-    assert_equal(work, 50_000_000.0)
-    assert_equal(work, M4_MIN_NORMALIZED_WORK)
-
-    var decision = _m4(1_000_000, 50)
-    assert_equal(decision.selected, SPLIT_POLICY_DEVICE_RESIDENT)
-    assert_equal(decision.reason, SPLIT_REASON_VALIDATED_WORKLOAD)
-    assert_true(decision.uses_device())
-    # The margin is the whole point: zero means one more subtraction in the
-    # normalization, or a `<=` where the `<` is, flips the benchmark's path.
-    assert_equal(decision.margin(), 0.0)
-    assert_true(decision.on_crossover_boundary())
-    assert_true(
-        decision.describe().find("boundary=exact-threshold") >= 0
-    )
-    # And therefore the benchmark never runs the host scan's per-node
-    # histogram download, block, and Float64 conversion. Anything done to
-    # `histogram_from_host` is invisible at this shape by construction.
-    assert_false(_dequantizes_per_node(decision))
-
-
-def test_one_step_off_the_boundary_falls_back_to_the_host_scan() raises:
-    """How wide the cliff is: one row, one feature, or one leaf either way.
-
-    Every case below is the same benchmark with a single input moved by the
-    smallest amount that input can move. Each one also asserts what falling
-    off the edge costs, which is the host scan's per-node download, host
-    block, and Float64 conversion; see `_dequantizes_per_node`.
-    """
-    # One row fewer.
-    var fewer_rows = _m4(999_999, 50)
-    assert_equal(fewer_rows.selected, SPLIT_POLICY_HOST)
-    assert_equal(fewer_rows.reason, SPLIT_REASON_BELOW_CROSSOVER)
-    assert_equal(fewer_rows.margin(), -50.0)
-    assert_false(fewer_rows.on_crossover_boundary())
-    assert_true(_dequantizes_per_node(fewer_rows))
-
-    # One feature fewer, which is also what any `feature_fraction` below 1
-    # produces once `_estimated_active_features` has rounded it down.
-    var fewer_features = _m4(1_000_000, 49)
-    assert_equal(fewer_features.selected, SPLIT_POLICY_HOST)
-    assert_equal(fewer_features.reason, SPLIT_REASON_BELOW_CROSSOVER)
-    assert_equal(fewer_features.margin(), -1_000_000.0)
-    assert_true(_dequantizes_per_node(fewer_features))
-
-    # One leaf fewer.
-    var fewer_leaves = _m4(1_000_000, 50, 255, 30)
-    assert_equal(fewer_leaves.selected, SPLIT_POLICY_HOST)
-    assert_true(fewer_leaves.margin() < 0.0)
-    assert_true(_dequantizes_per_node(fewer_leaves))
-
-    # And one row more, which is the same edge from the other side.
-    var more_rows = _m4(1_000_001, 50)
-    assert_equal(more_rows.selected, SPLIT_POLICY_DEVICE_RESIDENT)
-    assert_equal(more_rows.margin(), 50.0)
-    assert_false(more_rows.on_crossover_boundary())
-    assert_false(_dequantizes_per_node(more_rows))
-
-
-def test_reason_survives_to_a_description_a_user_can_read() raises:
-    """Every decision, including a refusal, describes itself; only a
-    decision that actually weighed a workload reports a margin."""
-    var below = _m4(50_000, 50)
-    var line = below.describe()
-    assert_true(line.find("split_strategy=host") >= 0)
-    assert_true(line.find("reason=below-crossover") >= 0)
-    assert_true(line.find("boundary=exact-threshold") < 0)
-
-    var unsupported = decide_split_search(
-        "metal", "4-metal4", 1_000_000, 50, 255, 31, False, True
-    )
-    assert_false(unsupported.weighed_workload())
-    assert_equal(unsupported.margin(), 0.0)
-    assert_false(unsupported.on_crossover_boundary())
-    assert_true(
-        unsupported.describe().find("reason=unsupported-parameters") >= 0
-    )
 
 
 def _fill_round_grad_hess(

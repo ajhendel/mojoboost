@@ -1,15 +1,40 @@
-"""Pure tests for workload-aware GPU split selection.
+"""Pure tests for GPU split selection, which is eligibility and nothing else.
 
-Two rules live in the policy and both are asserted here. Rule 1 is the
-leaf-wise threshold of 50,000,000 normalized work, unchanged since 2026-08-14.
-Rule 2 is the depth-wise floor of 12,500,000 added 2026-08-15, which is the
-single interleaved point measured at 250,000 x 50 on an Apple M4 and not a
-fitted curve; these tests pin where it applies, where it deliberately does not,
-and that it can only ever add a device selection rather than remove one.
+This file used to pin two thresholds. Rule 1 was the leaf-wise crossover of
+50,000,000 normalized work, installed 2026-08-14 from a single measured point
+with a ~2 percent margin. Rule 2 was the depth-wise floor of 12,500,000 added
+2026-08-15 from one interleaved point at 250,000 x 50. Seventeen tests held
+them still: where each applied, where it deliberately did not, that rule 2
+could only ever add a device selection, and that the headline benchmark shape
+sat on rule 1's edge by floating-point equality.
 
-Everything here is host arithmetic. No device is opened, nothing is timed, and
-no assertion in this file is evidence that either path is faster; the evidence
-is cited in the policy module and lives in `bench/results/`.
+**THE SWEEP THOSE RULES WERE OWED WAS RUN ON 2026-08-16 AND THERE IS NO
+CROSSOVER.** Four shapes, `gpu-host` against `gpu-device`, interleaved in one
+process, five repeats each, the box verified quiet at every shape boundary:
+5.0M work 1.695 s host against 0.918 s device, 25.0M 2.494 against 1.862,
+41.7M 3.041 against 2.309, 70.0M 4.041 against 3.128. Every shape resolved
+with disjoint ranges, and the device margin is LARGEST at the SMALLEST shape
+(1.85x falling to 1.29x) -- the signature of a per-node cost, and the exact
+inverse of what a profitability gate assumes. The range spans both retired
+thresholds, so neither is a boundary the sweep failed to bracket.
+
+So the tests that pinned a threshold are gone rather than retuned: there is no
+measured value to install and no evidence file to write. What replaces them is
+the *opposite* assertion, which is the one that can now regress -- that no
+shape, however small, is ever declined for its size. `test_no_shape_is_ever_
+declined_for_being_small` is the guard against a threshold being reintroduced
+from an argument, which is the thing this module exists to refuse.
+
+The three eligibility tests survive unchanged in substance, because
+eligibility is a different question from profitability: it asks whether the
+device search can serve a configuration at all, and that has the same answer
+at every size.
+
+Everything here is host arithmetic. No device is opened and nothing is timed.
+
+Scope, because it is easy to overstate: the sweep compared two GPU arms.
+Nothing here says anything about the CPU/GPU crossover, which is
+`device_policy.AUTO_GPU_MIN_ROWS` and is a separate gate.
 """
 
 # run_tests: cpu-safe -- host arithmetic only, opens no device.
@@ -18,12 +43,6 @@ from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from mojotrees.growth_policy import GROW_DEPTHWISE, GROW_LEAFWISE
 from mojotrees.gpu_split_policy import (
-    M4_DEPTHWISE_EVIDENCE_ID,
-    M4_DEPTHWISE_MIN_FEATURES,
-    M4_DEPTHWISE_MIN_NORMALIZED_WORK,
-    M4_DEPTHWISE_MIN_ROWS,
-    M4_EVIDENCE_ID,
-    M4_MIN_NORMALIZED_WORK,
     SPLIT_GROW_UNSPECIFIED,
     SPLIT_POLICY_DEVICE_RESIDENT,
     SPLIT_POLICY_HOST,
@@ -35,9 +54,8 @@ from mojotrees.gpu_split_policy import (
     SPLIT_REASON_VALIDATED_WORKLOAD,
     SplitSearchDecision,
     decide_split_search,
-    depthwise_floor_applies,
     normalized_split_work,
-    split_threshold_for,
+    split_reason_name,
 )
 
 
@@ -63,40 +81,118 @@ def _m4(
     )
 
 
-def test_small_m4_workload_stays_on_host() raises:
-    var decision = _m4(50_000)
-    assert_equal(decision.selected, SPLIT_POLICY_HOST)
-    assert_equal(decision.reason, SPLIT_REASON_BELOW_CROSSOVER)
-    assert_false(decision.uses_device())
+def test_no_shape_is_ever_declined_for_being_small() raises:
+    """The assertion that replaces both thresholds.
+
+    Five shapes spanning four orders of magnitude in rows, every one of them
+    below the retired 50,000,000 gate and four of them below the retired
+    12,500,000 one. All five must take the device search, and none may report
+    `below-crossover`.
+
+    This is deliberately the mirror image of the tests it replaces. Those
+    asserted that a small shape stayed on the host, which was the behavior a
+    measurement later contradicted; this asserts that no size is a reason,
+    which is what the measurement established. A future edit that
+    reintroduces a threshold from an argument rather than from a sweep fails
+    here, by name.
+    """
+    var shapes = [1_000, 10_000, 50_000, 100_000, 250_000]
+    for i in range(len(shapes)):
+        var decision = _m4(shapes[i])
+        assert_true(
+            decision.uses_device(),
+            String("rows=", shapes[i], " must reach the device search"),
+        )
+        assert_equal(decision.reason, SPLIT_REASON_VALIDATED_WORKLOAD)
+        assert_false(decision.reason == SPLIT_REASON_BELOW_CROSSOVER)
 
 
-def test_large_validated_m4_workload_uses_resident_device() raises:
-    var decision = _m4(1_000_000)
-    assert_equal(decision.selected, SPLIT_POLICY_DEVICE_RESIDENT)
-    assert_equal(decision.reason, SPLIT_REASON_VALIDATED_WORKLOAD)
-    assert_equal(decision.evidence_id, M4_EVIDENCE_ID)
+def test_the_smallest_shape_is_not_the_weakest_case() raises:
+    """100,000 x 50 is where the device plane won by the most (1.85x).
+
+    Pinned as its own case because it is the shape the retired rule was most
+    confident about: it normalizes to 5,000,000, one tenth of the threshold,
+    so the old policy sent it to the host scan by a wide margin. It is also
+    the shape the host scan lost by the widest measured margin. Both facts in
+    one test, so that a reader who reintroduces a gate has to explain this
+    one.
+    """
+    var work = normalized_split_work(100_000, 50, 255, 31)
+    assert_equal(work, 5_000_000.0)
+    var decision = _m4(100_000, features=50)
     assert_true(decision.uses_device())
 
 
-def test_unknown_hardware_is_conservative() raises:
-    var decision = decide_split_search(
-        "cuda", "sm_100", 5_000_000, 100, 255, 31, True, True
-    )
-    assert_equal(decision.selected, SPLIT_POLICY_HOST)
-    assert_equal(decision.reason, SPLIT_REASON_UNKNOWN_HARDWARE)
-
-
-def test_semantics_and_memory_gate_before_profitability() raises:
+def test_eligibility_still_gates_and_reports_its_own_reason() raises:
+    """The three tests that survive, because none of them is about size."""
     var unsupported = _m4(1_000_000, supported=False)
     assert_equal(unsupported.selected, SPLIT_POLICY_HOST)
     assert_equal(unsupported.reason, SPLIT_REASON_UNSUPPORTED)
+    assert_false(unsupported.uses_device())
 
     var too_wide = _m4(1_000_000, fits=False)
     assert_equal(too_wide.selected, SPLIT_POLICY_HOST)
     assert_equal(too_wide.reason, SPLIT_REASON_RESIDENT_MEMORY)
 
+    # And they gate a small shape exactly as they gate a large one, which is
+    # what makes them eligibility rather than profitability in disguise.
+    var small_unsupported = _m4(1_000, supported=False)
+    assert_equal(small_unsupported.reason, SPLIT_REASON_UNSUPPORTED)
 
-def test_normalization_accounts_for_bins_and_leaves() raises:
+
+def test_unmeasured_hardware_still_stays_on_the_host() raises:
+    """`_is_observed_m4` survives the threshold it used to scope.
+
+    It looks like the hardware scope of a deleted rule and is not. The sweep
+    ran on one machine, and nothing in this repository has ever run the
+    device split search on CUDA or HIP (`docs/GPU_VALIDATION.md` reads "not
+    run" for both). Routing unmeasured hardware to the device arm on the
+    strength of an M4 measurement would install a performance claim about a
+    machine nobody owns.
+
+    Asserted at a large shape and a small one, because if this ever became a
+    size question it would have stopped being this.
+    """
+    var cuda = decide_split_search(
+        "cuda", "sm_90", 1_000_000, 100, 255, 31, True, True
+    )
+    assert_equal(cuda.selected, SPLIT_POLICY_HOST)
+    assert_equal(cuda.reason, SPLIT_REASON_UNKNOWN_HARDWARE)
+
+    var small_cuda = decide_split_search(
+        "cuda", "sm_90", 1_000, 100, 255, 31, True, True
+    )
+    assert_equal(small_cuda.reason, SPLIT_REASON_UNKNOWN_HARDWARE)
+
+
+def test_growth_policy_is_reported_and_decides_nothing() raises:
+    """Rule 2 selected a threshold from the growth policy. Both are gone.
+
+    The same shape under leaf-wise, depth-wise and unspecified growth must now
+    produce the same selection and the same reason, and must still report the
+    policy it was given -- reporting it was always worth doing and is the half
+    that survives.
+    """
+    var leafwise = _m4(250_000, features=50, grow=GROW_LEAFWISE)
+    var depthwise = _m4(250_000, features=50, grow=GROW_DEPTHWISE)
+    var unspecified = _m4(250_000, features=50)
+
+    assert_equal(leafwise.selected, depthwise.selected)
+    assert_equal(leafwise.reason, depthwise.reason)
+    assert_equal(leafwise.selected, unspecified.selected)
+    assert_true(leafwise.uses_device())
+
+    assert_equal(leafwise.grow_policy, GROW_LEAFWISE)
+    assert_equal(depthwise.grow_policy, GROW_DEPTHWISE)
+    assert_equal(unspecified.grow_policy, SPLIT_GROW_UNSPECIFIED)
+
+    assert_true(leafwise.describe().find("grow_policy=leafwise") >= 0)
+    assert_true(depthwise.describe().find("grow_policy=depthwise") >= 0)
+    assert_true(unspecified.describe().find("grow_policy=unspecified") >= 0)
+
+
+def test_normalization_still_accounts_for_bins_and_leaves() raises:
+    """The measure survives the threshold, as a reported shape summary."""
     var baseline = normalized_split_work(1_000_000, 100, 255, 31)
     var fewer_bins = normalized_split_work(1_000_000, 100, 63, 31)
     var fewer_leaves = normalized_split_work(1_000_000, 100, 255, 15)
@@ -105,246 +201,50 @@ def test_normalization_accounts_for_bins_and_leaves() raises:
     assert_true(fewer_leaves < baseline)
 
 
-def test_description_carries_reason_work_threshold_and_evidence() raises:
+def test_description_reports_no_threshold_and_no_evidence() raises:
+    """A line that named a comparison must stop naming one.
+
+    Both halves are asserted. The positive half is that the path, the reason
+    and the shape are still there; the negative half is that `threshold=`,
+    `evidence=` and `boundary=` are not, because a reader who sees any of the
+    three will infer a boundary is nearby and there is no boundary.
+    """
     var line = _m4(1_000_000).describe()
     assert_true(line.find("split_strategy=device-resident") >= 0)
     assert_true(line.find("reason=validated-workload") >= 0)
-    assert_true(line.find("threshold=") >= 0)
-    assert_true(line.find(M4_EVIDENCE_ID) >= 0)
+    assert_true(line.find("normalized_work=") >= 0)
+
+    assert_true(line.find("threshold=") < 0)
+    assert_true(line.find("evidence=") < 0)
+    assert_true(line.find("boundary=") < 0)
 
 
-def test_policy_version_records_the_second_rule() raises:
-    """The version is bumped when a rule is added, not when a comment is."""
-    assert_equal(SPLIT_POLICY_VERSION, 2)
+def test_the_retired_reason_code_is_reserved_not_reused() raises:
+    """`SPLIT_REASON_BELOW_CROSSOVER` keeps its number and its name.
 
-
-def test_depthwise_floor_is_exactly_the_measured_point() raises:
-    """250,000 x 50 at 255 bins and 31 leaves is 12,500,000 normalized work.
-
-    That shape is the one the sweep II addendum forced both paths at, so the
-    floor is the measured point rather than a fraction or a multiple of it.
-    If `normalized_split_work` ever changes what it measures, this equality
-    breaks first and the threshold has to be re-derived rather than carried
-    over.
+    No decision returns it any more. It is not deleted and its number is not
+    recycled, so a trace line or a serialized decision written before
+    2026-08-16 reads back as what it was rather than as something else --
+    the same rule this repository applies to retired policy block codes.
     """
-    var measured = normalized_split_work(
-        M4_DEPTHWISE_MIN_ROWS, M4_DEPTHWISE_MIN_FEATURES, 255, 31
-    )
-    assert_equal(measured, 12_500_000.0)
-    assert_equal(measured, M4_DEPTHWISE_MIN_NORMALIZED_WORK)
-    assert_equal(M4_MIN_NORMALIZED_WORK, 50_000_000.0)
+    assert_equal(SPLIT_REASON_BELOW_CROSSOVER, 4)
+    assert_equal(split_reason_name(SPLIT_REASON_BELOW_CROSSOVER), "below-crossover")
+
+    # And nothing returns it, over a spread of shapes wide enough that the
+    # retired thresholds would both have fired somewhere in it.
+    var shapes = [1_000, 100_000, 250_000, 1_000_000, 5_000_000]
+    for i in range(len(shapes)):
+        assert_false(_m4(shapes[i]).reason == SPLIT_REASON_BELOW_CROSSOVER)
 
 
-def test_measured_depthwise_shape_takes_the_device_search() raises:
-    """The 0.70 second shape: 1.909 s automatic against 1.214 s forced.
+def test_policy_version_records_the_withdrawal() raises:
+    """The version is bumped when a rule is added OR withdrawn.
 
-    Under rule 1 this workload is a quarter of the threshold and takes the
-    host scan, which is what the measurement showed it doing and what the
-    addendum called the gate's cost. Under rule 2 it takes the device search,
-    cites the depth-wise record, and sits exactly on its own threshold.
+    Version 1 was one threshold, version 2 added the depth-wise floor,
+    version 3 withdrew both. A withdrawal changes what the policy decides
+    exactly as much as an addition does, so it costs a version.
     """
-    var decision = _m4(250_000, features=50, grow=GROW_DEPTHWISE)
-    assert_equal(decision.selected, SPLIT_POLICY_DEVICE_RESIDENT)
-    assert_equal(decision.reason, SPLIT_REASON_VALIDATED_WORKLOAD)
-    assert_equal(decision.threshold, M4_DEPTHWISE_MIN_NORMALIZED_WORK)
-    assert_equal(decision.evidence_id, M4_DEPTHWISE_EVIDENCE_ID)
-    assert_true(decision.used_depthwise_floor())
-    assert_equal(decision.margin(), 0.0)
-    assert_true(decision.on_crossover_boundary())
-
-
-def test_same_shape_leafwise_keeps_the_host_scan() raises:
-    """Leaf-wise was 15 percent worse on the device search at this shape, so
-    rule 1 is not touched and the same numbers resolve the other way."""
-    var decision = _m4(250_000, features=50, grow=GROW_LEAFWISE)
-    assert_equal(decision.selected, SPLIT_POLICY_HOST)
-    assert_equal(decision.reason, SPLIT_REASON_BELOW_CROSSOVER)
-    assert_equal(decision.threshold, M4_MIN_NORMALIZED_WORK)
-    assert_equal(decision.evidence_id, M4_EVIDENCE_ID)
-    assert_false(decision.used_depthwise_floor())
-    assert_equal(decision.margin(), -37_500_000.0)
-
-
-def test_unspecified_growth_keeps_version_one_behavior() raises:
-    """A caller that does not thread the growth policy gets rule 1.
-
-    This is every caller in the tree today, so this assertion is what says
-    the change is inert until somebody passes `TreeParams.grow_policy`
-    through. Unspecified resolves to the higher threshold, so an unknown
-    caller can only lose a device path it was never measured to want.
-    """
-    var decision = _m4(250_000, features=50)
-    assert_equal(decision.grow_policy, SPLIT_GROW_UNSPECIFIED)
-    assert_equal(decision.selected, SPLIT_POLICY_HOST)
-    assert_equal(decision.threshold, M4_MIN_NORMALIZED_WORK)
-    assert_true(decision.describe().find("grow_policy=unspecified") >= 0)
-
-
-def test_depthwise_floor_is_a_strict_gate_not_a_region() raises:
-    """The measured point clears rule 2 by floating-point equality alone.
-
-    One row more is fifty units of work over and takes the device search; a
-    leaf budget of 30 instead of 31 is under and takes the host scan, at a
-    shape still inside rule 2's measured rows and features. That is the same
-    knife edge rule 1 has at the headline 1,000,000 x 50 benchmark, in the
-    same direction, and it is reported rather than filed off.
-
-    Note which way the row count moves the answer. 250,001 rows stays under
-    rule 2 because the shape floor is a minimum; 249,999 rows leaves rule 2's
-    scope entirely and is weighed against rule 1 instead, which the fallback
-    test below asserts. The work comparison and the shape scope are separate
-    gates that happen to coincide at exactly the measured shape.
-    """
-    var above = _m4(250_001, features=50, grow=GROW_DEPTHWISE)
-    assert_equal(above.selected, SPLIT_POLICY_DEVICE_RESIDENT)
-    assert_equal(above.threshold, M4_DEPTHWISE_MIN_NORMALIZED_WORK)
-    assert_equal(above.margin(), 50.0)
-    assert_false(above.on_crossover_boundary())
-
-    var fewer_leaves = _m4(
-        250_000, features=50, leaves=30, grow=GROW_DEPTHWISE
-    )
-    assert_equal(fewer_leaves.selected, SPLIT_POLICY_HOST)
-    assert_equal(fewer_leaves.reason, SPLIT_REASON_BELOW_CROSSOVER)
-    assert_equal(fewer_leaves.threshold, M4_DEPTHWISE_MIN_NORMALIZED_WORK)
-    assert_true(fewer_leaves.margin() < 0.0)
-    assert_false(fewer_leaves.on_crossover_boundary())
-
-
-def test_depthwise_outside_the_measured_shape_falls_back_to_rule_one() raises:
-    """Same work, different shape, and the record says nothing about it.
-
-    12,500 rows by 1,000 features is also 12,500,000 normalized work and is a
-    completely different ratio of per-launch cost to per-launch work. So is
-    250,000 rows by 49 features, one feature under the measured width. Both
-    are weighed against rule 1, which is the conservative answer and the same
-    one they got before this rule existed.
-    """
-    var narrow_and_short = _m4(12_500, features=1_000, grow=GROW_DEPTHWISE)
-    assert_equal(
-        normalized_split_work(12_500, 1_000, 255, 31), 12_500_000.0
-    )
-    assert_equal(narrow_and_short.selected, SPLIT_POLICY_HOST)
-    assert_equal(narrow_and_short.threshold, M4_MIN_NORMALIZED_WORK)
-    assert_equal(narrow_and_short.evidence_id, M4_EVIDENCE_ID)
-    assert_false(narrow_and_short.used_depthwise_floor())
-
-    var one_feature_narrow = _m4(250_000, features=49, grow=GROW_DEPTHWISE)
-    assert_equal(one_feature_narrow.selected, SPLIT_POLICY_HOST)
-    assert_equal(one_feature_narrow.threshold, M4_MIN_NORMALIZED_WORK)
-
-    var one_row_short = _m4(249_999, features=50, grow=GROW_DEPTHWISE)
-    assert_equal(one_row_short.selected, SPLIT_POLICY_HOST)
-    assert_equal(one_row_short.threshold, M4_MIN_NORMALIZED_WORK)
-    assert_false(one_row_short.used_depthwise_floor())
-
-    assert_false(depthwise_floor_applies(GROW_DEPTHWISE, 12_500, 1_000))
-    assert_false(depthwise_floor_applies(GROW_DEPTHWISE, 250_000, 49))
-    assert_false(depthwise_floor_applies(GROW_LEAFWISE, 250_000, 50))
-    assert_false(
-        depthwise_floor_applies(SPLIT_GROW_UNSPECIFIED, 250_000, 50)
-    )
-    assert_true(depthwise_floor_applies(GROW_DEPTHWISE, 250_000, 50))
-
-
-def _assert_depthwise_is_at_least_as_device_selecting(
-    rows: Int, features: Int
-) raises:
-    """One shape's worth of the superset property, both policies."""
-    var leafwise = _m4(rows, features=features, grow=GROW_LEAFWISE)
-    var depthwise = _m4(rows, features=features, grow=GROW_DEPTHWISE)
-    assert_true(
-        depthwise.threshold <= leafwise.threshold,
-        "depth-wise must never be weighed against a higher bar",
-    )
-    if leafwise.uses_device():
-        assert_true(
-            depthwise.uses_device(),
-            "depth-wise declined a path leaf-wise took",
-        )
-
-
-def test_depthwise_never_declines_what_leafwise_would_take() raises:
-    """The policy awareness only ever adds device selection.
-
-    Rule 2's floor is strictly the lower of the two and its shape scope only
-    decides which threshold applies, so at every shape the depth-wise answer
-    is device wherever the leaf-wise answer is. Checked over a spread of
-    shapes including ones inside and outside rule 2's scope.
-    """
-    _assert_depthwise_is_at_least_as_device_selecting(10_000, 8)
-    _assert_depthwise_is_at_least_as_device_selecting(10_000, 100)
-    _assert_depthwise_is_at_least_as_device_selecting(250_000, 49)
-    _assert_depthwise_is_at_least_as_device_selecting(250_000, 50)
-    _assert_depthwise_is_at_least_as_device_selecting(250_000, 100)
-    _assert_depthwise_is_at_least_as_device_selecting(1_000_000, 50)
-    _assert_depthwise_is_at_least_as_device_selecting(5_000_000, 8)
-    _assert_depthwise_is_at_least_as_device_selecting(5_000_000, 100)
-
-
-def test_eligibility_still_precedes_the_depthwise_floor() raises:
-    """A depth-wise fit whose semantics or memory rule out the resident scan
-    is refused before any threshold is consulted, and the refusal still
-    reports the policy it was made for so a trace line is not ambiguous."""
-    var unsupported = _m4(
-        250_000, features=50, supported=False, grow=GROW_DEPTHWISE
-    )
-    assert_equal(unsupported.selected, SPLIT_POLICY_HOST)
-    assert_equal(unsupported.reason, SPLIT_REASON_UNSUPPORTED)
-    assert_equal(unsupported.grow_policy, GROW_DEPTHWISE)
-    assert_false(unsupported.weighed_workload())
-    assert_equal(unsupported.margin(), 0.0)
-    assert_false(unsupported.used_depthwise_floor())
-
-    var too_wide = _m4(
-        250_000, features=50, fits=False, grow=GROW_DEPTHWISE
-    )
-    assert_equal(too_wide.reason, SPLIT_REASON_RESIDENT_MEMORY)
-
-    var elsewhere = decide_split_search(
-        "cuda", "sm_100", 250_000, 50, 255, 31, True, True, GROW_DEPTHWISE
-    )
-    assert_equal(elsewhere.selected, SPLIT_POLICY_HOST)
-    assert_equal(elsewhere.reason, SPLIT_REASON_UNKNOWN_HARDWARE)
-
-
-def test_threshold_helper_answers_without_a_decision() raises:
-    """`split_threshold_for` is the same arithmetic the decision uses, so a
-    caller can ask which rule covers a shape without building one."""
-    assert_equal(
-        split_threshold_for(GROW_DEPTHWISE, 250_000, 50),
-        M4_DEPTHWISE_MIN_NORMALIZED_WORK,
-    )
-    assert_equal(
-        split_threshold_for(GROW_LEAFWISE, 250_000, 50),
-        M4_MIN_NORMALIZED_WORK,
-    )
-    assert_equal(
-        split_threshold_for(SPLIT_GROW_UNSPECIFIED, 5_000_000, 100),
-        M4_MIN_NORMALIZED_WORK,
-    )
-
-
-def test_description_and_citation_identify_which_rule_ran() raises:
-    """Two rules exist, so the line has to say which one decided."""
-    var line = _m4(250_000, features=50, grow=GROW_DEPTHWISE).describe()
-    assert_true(line.find("split_strategy=device-resident") >= 0)
-    assert_true(line.find("grow_policy=depthwise") >= 0)
-    assert_true(line.find(M4_DEPTHWISE_EVIDENCE_ID) >= 0)
-    assert_true(line.find("boundary=exact-threshold") >= 0)
-
-    var fallback = _m4(250_000, features=49, grow=GROW_DEPTHWISE).describe()
-    assert_true(fallback.find("grow_policy=depthwise") >= 0)
-    assert_true(fallback.find(M4_EVIDENCE_ID) >= 0)
-
-    var cite = _m4(250_000, features=50, grow=GROW_DEPTHWISE).cite()
-    assert_true(cite.find("sweep2_2026-08-15/RESULTS.md") >= 0)
-    assert_true(cite.find("Apple M4") >= 0)
-    assert_equal(
-        _m4(250_000, features=50, supported=False, grow=GROW_DEPTHWISE)
-        .cite(),
-        String("none"),
-    )
+    assert_equal(SPLIT_POLICY_VERSION, 3)
 
 
 def main() raises:

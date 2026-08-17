@@ -2117,23 +2117,30 @@ struct GpuHistogramBuilder(Movable):
         crosses, which is the whole point of that path. So this conversion
         is a cost of the host scan and of nothing else.
 
-        That matters for how a change here may be described, because our
-        headline benchmark does not take this path. At 1,000,000 rows, 50
-        features, 255 bins and 31 leaves `normalized_split_work` is exactly
-        50,000,000.0, which is not less than `M4_MIN_NORMALIZED_WORK`, so
-        `gpu_split_policy` resolves that shape to the device-resident
-        search and this function is never reached. Nothing done here can
-        move that number, and nothing here claims to.
+        That matters for how a change here may be described, and what it
+        used to say was that our headline benchmark sat one row away from
+        this cost: at 1,000,000 x 50, 255 bins and 31 leaves
+        `normalized_split_work` is exactly 50,000,000.0, which cleared the
+        crossover by floating-point equality, so one row fewer, one feature
+        fewer, or any `feature_fraction` below 1 fell back to the host scan
+        and started paying this per node.
 
-        What it does reach is everything on the other side of that
-        crossover, which is a knife edge rather than a broad margin: one
-        row fewer, one feature fewer, one leaf fewer, or any
-        `feature_fraction` below 1 all fall back to the host scan and start
-        paying this per node. `SplitSearchDecision.uses_device` is exactly
-        the predicate "this function is off the path"; `margin` and
-        `on_crossover_boundary` say how far a shape is from flipping it,
-        and `tests/test_gpu_split_launch_overhead.mojo` pins both at the
-        shapes either side of the edge.
+        **THAT KNIFE EDGE IS GONE, AND NOT BECAUSE IT MOVED.** The crossover
+        was measured on 2026-08-16 at four shapes from 5.0M to 70.0M
+        normalized work, arms interleaved, and it does not exist: the device
+        search wins at every one and wins by MORE at the smaller shapes
+        (1.85x at 5.0M against 1.29x at 70.0M). Both thresholds were
+        withdrawn, so `gpu_split_policy` sends every eligible shape on
+        measured hardware to the device search, and this function is off the
+        automatic path at every size rather than above one.
+
+        What still reaches it: a fit the policy declines for ELIGIBILITY --
+        `TreeParams.extra`, `feature_fraction_bylevel`, a resident frontier
+        that does not fit, or hardware nobody has measured -- plus
+        `train_gpu_sparse`, which has its own host scan, and
+        `distributed_gpu`, whose histogram exchange is host arithmetic by
+        construction. Those are the callers a change here should be weighed
+        against, and none of them is a size.
 
         On the host-scan path the cost is real. It covers
         `3 * n_features * n_bins` cells, and the (now deleted) hybrid

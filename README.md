@@ -788,19 +788,33 @@ For the built-in objectives without row sampling, gradients are generated on
 the device from device-resident labels and raw scores, and each grown tree
 advances those raw scores from its leaf ranges, so nothing per-row crosses
 the host/device boundary in a plain round; bagging and GOSS rank their
-samples host-side and keep the host gradient path. Split selection runs on
-the device, over a device-resident frontier, so that a split builds one
-histogram and subtracts for the sibling and a node's histogram never crosses
-the boundary: one 136-byte record per node comes back instead, with Float32
-gains that can flip a near-tie decision the CPU's Float64 gains resolve the
-other way, bit-deterministic run to run.
+samples host-side and keep the host gradient path. Per-node split selection
+runs on the host over downloaded histograms, which is what keeps CPU and GPU
+split decisions identical. `MOJOTREES_GPU_SPLIT_STRATEGY=device` moves the
+scan onto the device (one 136-byte record per node instead of the histogram,
+Float32 gains that can flip near-tie decisions, bit-deterministic run to
+run), growing over a device-resident frontier so that a split builds one
+histogram and subtracts for the sibling. Since 2026-08-16 the automatic
+policy selects that path for every **eligible** shape on an observed Apple
+M4, at any size: it used to require `normalized_split_work >= 50,000,000`,
+and that threshold and its depth-wise sibling were withdrawn when the sweep
+they were owed found no crossover anywhere from 5.0M to 70.0M, the device
+search winning at every shape and winning by more at the smaller ones.
 
-There is no host-scan alternative and no switch that picks between them. The
-GPU's host split scan, `MOJOTREES_GPU_SPLIT_STRATEGY`, and the profitability
-threshold that routed small shapes to the scan were all deleted on
-2026-08-16, after the scan lost to the device plane at every shape it was
-measured against it. [How it performs](#how-it-performs) carries that
-comparison and is the only place in this file that quotes it.
+**Eligibility, not size, is what routes a fit to the host scan now, and it is
+not a rare case.** `_device_search_semantics_supported` declines any fit whose
+`ExtraTreeParams` are active, which includes `random_strength > 0` and any
+`score_function` other than L2. The shipped CatBoost-mode defaults set both,
+so a defaulted fit takes the host scan today whatever its shape. The scan also
+runs for a resident frontier that does not fit, and on hardware nobody has
+measured.
+
+To repeat or refute any of that, run
+`pixi run bench-train-gpu 50000 100 reg 5 gpu-host,gpu-device`, which
+alternates the two arms inside one process and prints each arm's own spread
+next to the delta between them. Only adjacent samples are comparable on a
+machine that throttles, so the harness calls a gap narrower than that spread
+indistinguishable instead of reporting it as a number.
 Batched prediction can also run on the device through
 `Model.predict_batch(..., device=GPU_DEVICE)`; binning stays host-side, so
 both devices route every row to the same leaf.
@@ -1079,7 +1093,10 @@ On the GPU, half of the launch batching now ships: the device-resident split
 search commits a planned level and searches it in one launch pair, so a
 level costs one host wait instead of one per split. The row partition and
 the histogram build are still per node
-(`docs/design/GPU_LEVELWISE.md` describes what remains).
+(`docs/design/GPU_LEVELWISE.md` describes what remains). Batching only
+exists on the device split search, and since the size threshold was withdrawn
+on 2026-08-16 every eligible shape gets it; a fit the policy declines on
+eligibility grounds still does not.
 
 No speed claim travels with `depthwise`. The figures that used to carry one
 were taken before `lambda_l2` moved to LightGBM's stock 0.0 on 2026-08-16,

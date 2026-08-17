@@ -636,9 +636,15 @@ def describe_split_search(
 
     The accessor a benchmark prints in its header and a bug report quotes.
     It answers from the same call the trainer makes, so what it prints is
-    what a fit at that shape will do, and it includes the boundary marker
-    when the workload sits exactly on the measured crossover. Reading it
-    costs a policy evaluation and no device work.
+    what a fit at that shape will do. Reading it costs a policy evaluation
+    and no device work.
+
+    The `margin=` field is gone with the crossover it measured distance to
+    (2026-08-16). Nothing replaces it: a decision that compared no number to
+    no threshold has no distance to report, and printing a zero would invite
+    the reader to believe a boundary is nearby. The shape fields stay,
+    because "how big is this fit" is still a question a benchmark header
+    should answer.
     """
     var decision = split_search_decision_for(builder, params, strategy)
     return String(
@@ -651,8 +657,6 @@ def describe_split_search(
         builder.n_bins,
         " leaves=",
         params.num_leaves,
-        " margin=",
-        decision.margin(),
     )
 
 
