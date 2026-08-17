@@ -313,6 +313,13 @@ from .histogram import const_hessian_verify, derivative_precision_narrows
 # it for symmetry would be an unused import that reads like a coupling.
 from .split import SCORE_L2
 from .tree_parameters_extra import DERIV_PRECISION_FLOAT32
+
+# `GROW_OBLIVIOUS` imported rather than mirrored, on the same argument the
+# `SCORE_L2` note above makes: a mirrored code is a second definition that
+# nothing keeps equal to the first. `growth_policy` imports nothing from this
+# package, so this adds no cycle -- the constraint `cegb.mojo` learned the
+# hard way.
+from .growth_policy import GROW_LEAFWISE, GROW_OBLIVIOUS
 from .initialization import SessionState, warmup_level_name
 
 # The one table of objective facts. Imported rather than restated: this
@@ -596,6 +603,33 @@ comptime BLOCK_ORDERED_BOOSTING = 17
 comptime BLOCK_SCORE_FUNCTION = 18
 comptime BLOCK_RANDOM_STRENGTH = 19
 
+# --- The oblivious device route ---------------------------------------
+#
+# TWO CODES, ONE CONDITION, DELIBERATELY. Both of these fire only under
+# `grow_policy=oblivious`: the depth bound at `gpu_resident_round:1645`
+# (`params.max_depth < 1 or params.max_depth > 6 -> OBLIVIOUS_DEPTH`) exists
+# because the oblivious plane sizes every table from `1 << max_depth`, and
+# there is no depth bound at all on the leaf-wise or depth-wise device paths.
+# So `BLOCK_MAX_DEPTH` is a SUB-REASON of `BLOCK_GROW_POLICY` and not a
+# parallel one, and that is worth saying here rather than leaving to be
+# discovered when one is retired and the other silently stops firing.
+#
+# They are two codes anyway, because a fit refused for its depth should be
+# told about its depth. The shipped default sits exactly ON the bound at
+# `max_depth=6`, so the difference between "your depth is the problem" and
+# "your growth policy is the problem" is the difference between a user
+# changing one number and a user changing backends.
+#
+# WHY EITHER EXISTS, given train_gpu already refuses. It refuses by RAISING
+# (`train_gpu:1780`), and its own comment explains that it raises rather than
+# falls back because no other GPU grower implements a symmetric tree. That is
+# correct for the trainer and it is a CLIFF for `auto`: the CPU grower does
+# implement this mode, so `auto` has a working path it was never offered.
+# Under the standing ruling these route -- `auto` falls back to the CPU,
+# explicit `device='gpu'` raises -- and neither may silently decline.
+comptime BLOCK_GROW_POLICY = 20
+comptime BLOCK_MAX_DEPTH = 21
+
 
 def block_reason_name(code: Int) -> String:
     if code == BLOCK_NO_ACCELERATOR:
@@ -636,6 +670,10 @@ def block_reason_name(code: Int) -> String:
         return String("score-function")
     if code == BLOCK_RANDOM_STRENGTH:
         return String("random-strength")
+    if code == BLOCK_GROW_POLICY:
+        return String("grow-policy")
+    if code == BLOCK_MAX_DEPTH:
+        return String("max-depth")
     return String("unknown-block")
 
 
@@ -1150,6 +1188,12 @@ struct DeviceRequest(Copyable, Movable):
     var score_function: Int
     var random_strength: Float64
     var derivative_precision: Int
+    # `TreeParams.grow_policy` and `TreeParams.max_depth`. `max_depth` is
+    # carried unconditionally rather than only under the oblivious policy,
+    # because a request is a description of the fit and not a pre-filtered
+    # argument list; the block decides what to do with it.
+    var grow_policy: Int
+    var max_depth: Int
 
     def __init__(
         out self,
@@ -1170,6 +1214,8 @@ struct DeviceRequest(Copyable, Movable):
         score_function: Int = SCORE_L2,
         random_strength: Float64 = 0.0,
         derivative_precision: Int = DERIV_PRECISION_FLOAT32,
+        grow_policy: Int = GROW_LEAFWISE,
+        max_depth: Int = 0,
     ):
         self.requested_device = requested_device
         self.n_rows = n_rows
@@ -1188,6 +1234,8 @@ struct DeviceRequest(Copyable, Movable):
         self.score_function = score_function
         self.random_strength = random_strength
         self.derivative_precision = derivative_precision
+        self.grow_policy = grow_policy
+        self.max_depth = max_depth
 
     def cells(self) -> Int:
         """`n_rows * n_features`, the size measure the crossover rules and
@@ -2453,6 +2501,70 @@ def _collect_blocks(
             ),
         )
 
+    # --- The oblivious device route ---
+    #
+    # SCOPED TO WHAT THIS FUNCTION CAN SEE, AND NO WIDER. It is tempting to
+    # refuse every `grow_policy=oblivious` request here, since `train_gpu`
+    # raises on this route today. That would be wrong and it would be the
+    # `BLOCK_SCORE_FUNCTION` mistake again: `oblivious_device_supported`
+    # returns `OBLIVIOUS_OK` for a plain oblivious fit, so the device grows
+    # symmetric trees and refusing them all would withdraw a working path.
+    #
+    # So each block below mirrors ONE named reason from that predicate, and
+    # only the reasons a `DeviceRequest` actually carries.
+    if request.grow_policy == GROW_OBLIVIOUS and (
+        request.max_depth < 1 or request.max_depth > 6
+    ):
+        # `gpu_resident_round:1645`, `OBLIVIOUS_DEPTH`. The oblivious plane
+        # sizes every table it owns from `1 << max_depth` -- the slot pool,
+        # the tree tables, the searcher's records, the plan -- so the bound
+        # is an allocation fact rather than a policy choice, and there is no
+        # depth bound at all on the leaf-wise or depth-wise device paths.
+        #
+        # The shipped default is `max_depth=6`, which is INSIDE this bound
+        # and at its edge. So this block does not fire for the default; it
+        # fires the moment anyone moves the default depth, which is exactly
+        # when a cliff would otherwise appear.
+        blocks.add(
+            BLOCK_MAX_DEPTH,
+            String(
+                "grow_policy=oblivious sizes every device table from 1 <<",
+                " max_depth, so the device plane takes max_depth in [1, 6]",
+                " and this fit asks for ",
+                request.max_depth,
+                "; the CPU grower grows the same symmetric tree at any depth",
+            ),
+        )
+    if request.grow_policy == GROW_OBLIVIOUS and request.categorical:
+        # `gpu_resident_round:1647`, `OBLIVIOUS_CATEGORICAL`. Named
+        # separately from the depth bound because a fit refused for its data
+        # should not be told about its depth.
+        blocks.add(
+            BLOCK_GROW_POLICY,
+            String(
+                "grow_policy=oblivious cannot search a categorical column at"
+                " any node on the device: a symmetric level commits one"
+                " (feature, bin) split for the whole level and the device"
+                " level search evaluates ordinal thresholds only; the CPU"
+                " grower grows the same symmetric tree with categorical"
+                " splits",
+            ),
+        )
+    # WHAT IS STILL A CLIFF, NAMED RATHER THAN LEFT TO BE FOUND. The rest of
+    # `oblivious_device_supported`'s refusals -- monotone constraints,
+    # interaction constraints, `feature_fraction_bynode`,
+    # `feature_fraction_bylevel`, an active `ExtraTreeParams` bundle,
+    # speculative build, a level histogram that does not fit, and the record
+    # count -- are not fields of a `DeviceRequest`, so no block here can see
+    # them and `train_gpu:1780` still RAISES for them under `auto`.
+    #
+    # None of them is in the shipped default, and the two that were
+    # (`score_function`, `random_strength`, both through
+    # `ExtraTreeParams.is_active()`) have their own blocks above. So the
+    # default does not cliff. A fit that combines oblivious growth with a
+    # monotone constraint still does, and closing that means carrying those
+    # fields on the request rather than widening either block above.
+
     if not gpu_supports_outputs(request.n_outputs):
         blocks.add(
             BLOCK_OUTPUT_LIMIT,
@@ -2858,6 +2970,8 @@ struct DeviceDecision(Copyable, Movable):
         out += String(
             "derivative_precision=", self.request.derivative_precision, "\n"
         )
+        out += String("grow_policy=", self.request.grow_policy, "\n")
+        out += String("max_depth=", self.request.max_depth, "\n")
 
         out += String(
             "gpu_available=",
@@ -3272,6 +3386,8 @@ def resolve_device(
     score_function: Int = SCORE_L2,
     random_strength: Float64 = 0.0,
     derivative_precision: Int = DERIV_PRECISION_FLOAT32,
+    grow_policy: Int = GROW_LEAFWISE,
+    max_depth: Int = 0,
 ) raises -> Int:
     """Resolve a requested device to the backend that will actually run:
     `CPU_DEVICE` or `GPU_DEVICE`, never `AUTO_DEVICE`.
@@ -3340,6 +3456,8 @@ def resolve_device(
         score_function=score_function,
         random_strength=random_strength,
         derivative_precision=derivative_precision,
+        grow_policy=grow_policy,
+        max_depth=max_depth,
     )
     var caps = DeviceCapabilities.detect()
     var decision = decide_device(request, caps)
@@ -3454,6 +3572,8 @@ def decide_device_report(
     score_function: Int = SCORE_L2,
     random_strength: Float64 = 0.0,
     derivative_precision: Int = DERIV_PRECISION_FLOAT32,
+    grow_policy: Int = GROW_LEAFWISE,
+    max_depth: Int = 0,
 ) raises -> String:
     """The whole contract across a flat boundary: workload in, serialized
     decision out.
@@ -3494,6 +3614,8 @@ def decide_device_report(
         score_function=score_function,
         random_strength=random_strength,
         derivative_precision=derivative_precision,
+        grow_policy=grow_policy,
+        max_depth=max_depth,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     return decide_device(request, caps).serialize()
@@ -3526,6 +3648,8 @@ def decide_device_report_reported(
     score_function: Int = SCORE_L2,
     random_strength: Float64 = 0.0,
     derivative_precision: Int = DERIV_PRECISION_FLOAT32,
+    grow_policy: Int = GROW_LEAFWISE,
+    max_depth: Int = 0,
 ) raises -> String:
     """`decide_device_report` for a caller that has read the device.
 
@@ -3553,6 +3677,8 @@ def decide_device_report_reported(
         score_function=score_function,
         random_strength=random_strength,
         derivative_precision=derivative_precision,
+        grow_policy=grow_policy,
+        max_depth=max_depth,
     )
     var caps = capabilities_from_reported(
         reported_api,
@@ -3586,6 +3712,8 @@ def resolve_device_full(
     score_function: Int = SCORE_L2,
     random_strength: Float64 = 0.0,
     derivative_precision: Int = DERIV_PRECISION_FLOAT32,
+    grow_policy: Int = GROW_LEAFWISE,
+    max_depth: Int = 0,
 ) raises -> Int:
     """Resolve a fully described workload to `CPU_DEVICE` or `GPU_DEVICE`,
     raising the refusal when it cannot run.
@@ -3622,6 +3750,8 @@ def resolve_device_full(
         score_function=score_function,
         random_strength=random_strength,
         derivative_precision=derivative_precision,
+        grow_policy=grow_policy,
+        max_depth=max_depth,
     )
     var caps = DeviceCapabilities.detect(SessionState.from_env())
     var decision = decide_device(request, caps)

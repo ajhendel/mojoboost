@@ -439,6 +439,8 @@ def fit[
         score_function=params.tree.extra.score_function,
         random_strength=params.tree.extra.random_strength,
         derivative_precision=params.tree.extra.derivative_precision,
+        grow_policy=params.tree.grow_policy,
+        max_depth=params.tree.max_depth,
     )
     var mapper = fit_bins(
         features,
@@ -558,6 +560,8 @@ def fit_multiclass[
         score_function=params.tree.extra.score_function,
         random_strength=params.tree.extra.random_strength,
         derivative_precision=params.tree.extra.derivative_precision,
+        grow_policy=params.tree.grow_policy,
+        max_depth=params.tree.max_depth,
     )
     var mapper = fit_bins(
         features,
