@@ -428,7 +428,79 @@ from .sampling import (
     select_split_features,
     select_tree_features,
 )
-from .split import SplitInfo
+from .split import SCORE_L2, SplitInfo
+
+
+def _device_search_unsupported_reason(
+    params: TreeParams, has_categorical: Bool
+) -> String:
+    """Which setting keeps this fit off the device split search, or `""`.
+
+    **ONE QUESTION PER PARAMETER, WHICH `ExtraTreeParams.is_active()` IS NOT.**
+    That predicate answers "does the per-candidate gain need
+    `split._feature_gain`'s adjustment pass", and both gates here used to read
+    it as though it also answered "can the device kernel score this". Those
+    were the same answer when every member of the bundle was unimplemented on
+    the device. They stopped being the same answer the moment a capability
+    landed, and nothing noticed, because a predicate that becomes wrong by
+    something else SUCCEEDING is not a predicate anybody re-reads.
+
+    Two members are now implemented on the device and are no longer blanket
+    refusals here:
+
+    - `score_function`. The scans take it (`gpu_cosine_score`, five call
+      sites) and `_scan_slot_oblivious_kernel` carries a level's two
+      cross-leaf accumulators and its single root, which is why
+      `gpu_split_search:5271` records that the refusal there is retired.
+    - `random_strength`. The noise plane, its draw and its consumption are
+      staged (`GpuSplitSearcher.set_random_score`), and both arms of
+      `_train_gpu_rounds` now compute the per-tree scale the draw is
+      multiplied by.
+
+    Both are conditional on there being no categorical column, because a
+    category *set* is chosen by a partition search that scores with the L2
+    gain: `score_function` there would put two functionals inside one argmax,
+    and `random_strength` would noise only the partition search's winner while
+    every numerical feature had every candidate noised -- a different
+    regularizer wearing the same name. `gpu_split_search` refuses both pairs
+    by name and this is the routing-time twin of those refusals.
+
+    `has_categorical` is the DECLARATION question rather than the
+    searchability one, deliberately. This is a refusal guard, and 06's
+    asymmetry applies: a refusal guard that mispredicts costs a message, an
+    allocation guard that mispredicts costs an unsafe store. Over-refusing a
+    CTR-replaced column here sends a fit to the host scan that could have run
+    on the device, which is a performance loss and not a wrong tree.
+
+    Everything else in the bundle still refuses, and the reason is unchanged:
+    the kernel scores from `GpuSplitParams` alone, which carries the two
+    lambdas, the two child floors and the categorical parameters, and nothing
+    else in `TreeParams.extra` has been moved into it or into the record it
+    returns.
+    """
+    if params.extra.min_gain_to_split > 0.0:
+        return String("min_gain_to_split")
+    if params.extra.max_delta_step > 0.0:
+        return String("max_delta_step")
+    if params.extra.path_smooth > 0.0:
+        return String("path_smooth")
+    if params.extra.extra_trees:
+        return String("extra_trees")
+    if params.extra.monotone_penalty > 0.0:
+        return String("monotone_penalty")
+    if params.extra.penalties.is_active():
+        return String("feature_contri or the CEGB costs")
+    if not params.extra.forced.is_empty():
+        return String("forced splits")
+    if params.extra.use_quantized_grad:
+        return String("use_quantized_grad")
+    if has_categorical and params.extra.random_strength > 0.0:
+        return String("random_strength beside a categorical feature")
+    if has_categorical and params.extra.score_function != SCORE_L2:
+        return String("score_function beside a categorical feature")
+    if params.feature_fraction_bylevel != 1.0:
+        return String("feature_fraction_bylevel")
+    return String("")
 from .growth_policy import (
     GROW_DEPTHWISE,
     GROW_OBLIVIOUS,
@@ -602,16 +674,27 @@ def resolve_split_search(strategy: Int) -> Int:
     return SPLIT_SEARCH_HOST
 
 
-def _device_search_semantics_supported(params: TreeParams) -> Bool:
+def _device_search_semantics_supported(
+    params: TreeParams, has_categorical: Bool
+) -> Bool:
     """Question form of `_check_device_search_supported` for AUTO.
 
     Explicit device selection still calls the raising check and reports the
     exact unsupported setting.  AUTO needs a non-raising eligibility answer
     so it can retain the fully featured host scan instead of failing a fit.
+
+    Both forms now read `_device_search_unsupported_reason`, so the question
+    and the raise cannot drift apart: the sentence a user is shown and the
+    answer AUTO routes on come from one list. They used to be two hand-kept
+    copies of the same bundle test, and the raise's message had already
+    drifted -- it enumerated seven parameters and named neither
+    `score_function` nor `random_strength`, both of which
+    `ExtraTreeParams.is_active()` refused it for.
     """
     return (
-        not params.extra.is_active()
-        and params.feature_fraction_bylevel == 1.0
+        _device_search_unsupported_reason(params, has_categorical)
+        .byte_length()
+        == 0
     )
 
 
@@ -651,7 +734,9 @@ def split_search_decision_for(
         _estimated_active_features(params, builder.n_features),
         builder.n_bins,
         params.num_leaves,
-        _device_search_semantics_supported(params),
+        _device_search_semantics_supported(
+            params, builder.cats.any_categorical()
+        ),
         builder.resident_frontier_fits(params.num_leaves),
         params.grow_policy,
     )
@@ -1195,7 +1280,9 @@ def _search_leaf_device(
     return rec^
 
 
-def _check_device_search_supported(params: TreeParams) raises:
+def _check_device_search_supported(
+    params: TreeParams, has_categorical: Bool
+) raises:
     """Refuse a configuration the device split kernel cannot score.
 
     The kernel reads `GpuSplitParams`, which carries the two lambdas, the two
@@ -1206,25 +1293,32 @@ def _check_device_search_supported(params: TreeParams) raises:
     silently different tree. The host scan (the default) honors all of them.
 
     The range checks run first, so an out-of-range value is reported as the
-    bad number it is rather than as an unsupported strategy. `is_active` tests
-    for a value that would change a fit, which a negative one would not.
+    bad number it is rather than as an unsupported strategy.
+
+    **The message names the setting the caller actually set.** It used to
+    enumerate seven parameters and mention neither `score_function` nor
+    `random_strength`, both of which `ExtraTreeParams.is_active()` refused it
+    for -- so a user who set Cosine was handed a list that did not contain
+    Cosine. That is what a hand-written message beside an aggregate predicate
+    decays into, and it is why this now reports
+    `_device_search_unsupported_reason`'s answer rather than its own sentence.
+
+    `has_categorical` is the declaration question, matching the question form;
+    see `_device_search_unsupported_reason` for why the conservative side is
+    the right one for a refusal guard.
     """
     params.extra.check_scalars(params.min_data_in_leaf)
-    if params.extra.is_active():
+    var why = _device_search_unsupported_reason(params, has_categorical)
+    if why.byte_length() > 0:
         raise Error(
-            "the device split search does not implement min_gain_to_split,"
-            " max_delta_step, path_smooth, extra_trees, monotone_penalty,"
-            " feature_contri, or the CEGB costs; the kernel scores from"
-            " GpuSplitParams alone. Use the host split scan, which is the"
-            " default (MOJOTREES_GPU_SPLIT_STRATEGY=host, or"
-            " split_search=SPLIT_SEARCH_HOST)"
-        )
-    if params.feature_fraction_bylevel != 1.0:
-        raise Error(
-            "the device split search does not implement"
-            " feature_fraction_bylevel; the per-node draw it stages is taken"
-            " from the tree's feature set directly. Use the host split scan,"
-            " which is the default"
+            "the device split search cannot score ",
+            why,
+            ": the kernel scores from GpuSplitParams alone, which carries the"
+            " two lambdas, the two child floors and the categorical"
+            " parameters, and nothing else in TreeParams.extra has been moved"
+            " into it or into the record it returns. Use the host split scan"
+            " (MOJOTREES_GPU_SPLIT_STRATEGY=host, or"
+            " split_search=SPLIT_SEARCH_HOST), which honors all of them",
         )
 
 
@@ -1749,7 +1843,7 @@ def _grow_tree_gpu_device_search(
     trees that quietly ignore what the caller asked for, an active setting is
     refused here and the caller is pointed at the host scan, which honors all
     of it. `_check_device_search_supported` is that refusal."""
-    _check_device_search_supported(params)
+    _check_device_search_supported(params, builder.cats.any_categorical())
     check_grow_policy(params.grow_policy)
     params.constraints.check_features(builder.n_features)
     params.monotone.check_features(builder.n_features)
