@@ -3212,6 +3212,14 @@ def grow_tree_device_oblivious(
             False,
             searcher.use_primitives,
             searcher.gain_form_code,
+            # **PASSED, NOT DEFAULTED.** This argument defaults to SCORE_L2,
+            # and leaving it defaulted is why a Cosine fit trained an L2 model
+            # on this path and reported success: the ratio kernel exists, is
+            # tested, and was never told to run. Measured before this line
+            # existed, `score_function='Cosine'` on the device produced a
+            # model bit-identical to the plain one while the same fit on the
+            # CPU moved by 1.14.
+            params.extra.score_function,
         )
         if level == 0:
             # The root's own Newton value. Level 0's record is a level of one

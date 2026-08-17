@@ -2024,8 +2024,17 @@ struct ExtraTreeParams(Copyable, Movable):
         # and never had, and it is now the standing bar for both.
         if self.random_strength > 0.0:
             return String("random_strength")
-        if self.score_function != SCORE_L2:
-            return String("score_function")
+        # score_function: allowed again 2026-08-17, on EVIDENCE this time.
+        # The oblivious level launch now passes it instead of defaulting it
+        # (gpu_resident_round), and the measurement below is the bar this
+        # predicate's own comment set: the device model must MOVE when the
+        # setting moves. It does; the numbers are in the commit.
+        #
+        # Still refused beside a categorical column: the category partition
+        # search scores with the L2 gain, so the pair would put two
+        # functionals inside one argmax.
+        if has_categorical and self.score_function != SCORE_L2:
+            return String("score_function beside a categorical feature")
         return String("")
 
     def random_score_stdev(self) -> Float64:

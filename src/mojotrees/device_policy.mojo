@@ -2472,7 +2472,7 @@ def _collect_blocks(
                 " wrong functional's name rather than refuse"
             ),
         )
-    elif request.score_function == SCORE_COSINE:
+    elif request.score_function == SCORE_COSINE and request.categorical:
         # Cosine beside a categorical column. The category partition search
         # scores with the L2 gain (`GpuSplitSearcher.set_score_function`, and
         # `split.find_best_split` before it), so allowing the pair puts two
