@@ -354,18 +354,32 @@ ACKNOWLEDGED = {
     #    node's own statistics -- and together they mean the default set
     #    raises on exactly the datasets CatBoost exists for.
     ("grow_policy", "src/mojotrees/tree.mojo"): (
-        "BLOCKING",
-        "tree.mojo:1874 refuses grow_policy=oblivious beside ANY categorical "
-        "feature, and the set pairs symmetrictree with max_cat_to_onehot=2 "
-        "and CTRs on, so CatBoost's own headline combination raises on the "
-        "dense CPU path. What must be built is a level-shared categorical "
-        "search: today the partition order comes from one node's gradient "
-        "and hessian ratios inside find_best_categorical_split and there is "
-        "no one order to share across a level. The other four sites in this "
-        "file are fine at the default: :1859 wants max_depth > 0 and it is "
-        "6, :1866 caps at OBLIVIOUS_MAX_DEPTH = 16, :1881 wants forced "
-        "splits empty and they are, :1892 wants extra_trees and CEGB off "
-        "and they are",
+        "RESOLVED",
+        "the refusal is unchanged and correct, and the shipped default no "
+        "longer reaches it. tree.mojo:1874 refuses grow_policy=oblivious "
+        "beside any categorical feature the matrix still OFFERS, and it "
+        "earns that: the partition order comes from one node's gradient and "
+        "hessian ratios inside find_best_categorical_split, and a level "
+        "shares one split, so there is no one order to share. With "
+        "_CATBOOST_CTR = 'on' (default since 2026-08-17) the column above "
+        "one_hot_max_size is REPLACED by its CTR columns, is outside "
+        "BinnedMatrix.usable, and is offered to no search. VERIFIED by "
+        "fitting against a rebuilt extension at 2b2dadf: "
+        "MojoTreesClassifier(grow_policy='symmetrictree', "
+        "categorical_feature=[1], random_strength=1.0) fits, and so does the "
+        "regression case with a categorical beside a continuous target. "
+        "**SCOPE: dense single-output only.** Multiclass and sparse never "
+        "reach this site because they refuse EARLIER, at the CTR bundle "
+        "itself -- 'ctr is not honored by the multiclass trainers' and the "
+        "sparse (CSC) equivalent, assembled in bindings/_mojotrees.mojo:1150 "
+        "rather than in src/. That refusal predates the CTR default flip and "
+        "is a separate gap, tracked in the ctr rows. So this row is resolved "
+        "for the path the default takes, and a reader must not read it as "
+        "'symmetric growth handles categorical data everywhere'. The other "
+        "four sites in this file are fine at the default: :1859 wants "
+        "max_depth > 0 and it is 6, :1866 caps at OBLIVIOUS_MAX_DEPTH = 16, "
+        ":1881 wants forced splits empty and they are, :1892 wants "
+        "extra_trees and CEGB off and they are",
     ),
     ("grow_policy", "src/mojotrees/train_gpu.mojo"): (
         "BLOCKING",
@@ -646,15 +660,23 @@ ACKNOWLEDGED = {
         "caveat is recorded on the bootstrap_type bindings row",
     ),
     ("random_strength", "src/mojotrees/split.mojo"): (
-        "BLOCKING",
-        ":778 refuses random_strength beside ANY categorical feature: a "
-        "categorical candidate is a category SET searched inside "
-        "find_best_categorical_split, and only that search's winner reaches "
+        "RESOLVED",
+        "the twin of the tree.mojo row and resolved by the same change, "
+        "which is the part worth noticing: ONE replacement clears TWO "
+        "refusals because both read what the matrix OFFERS rather than what "
+        "the parameters say. :778 refuses random_strength beside any "
+        "categorical feature still offered to the search -- a categorical "
+        "candidate is a category SET scored inside "
+        "find_best_categorical_split and only that search's winner reaches "
         "the loop that would add the noise, so there is nothing to perturb "
-        "per candidate. The set pairs random_strength=1.0 with CTRs on and "
-        "max_cat_to_onehot=2. What must be built is the noise draw inside the "
-        "categorical search. :760 and :1417 are the scale guards, fine on the "
-        "dense CPU path",
+        "per candidate -- and with _CATBOOST_CTR = 'on' the column is "
+        "replaced and offered to neither. Verified in the same fit: "
+        "MojoTreesClassifier(grow_policy='symmetrictree', "
+        "categorical_feature=[1], random_strength=1.0) fits at 2b2dadf "
+        "against a rebuilt extension. Same SCOPE caveat as the tree.mojo "
+        "row: dense single-output, because multiclass and sparse refuse "
+        "earlier at the CTR bundle. :760 and :1417 are the scale guards and "
+        "are fine on the dense CPU path",
     ),
     ("random_strength", "src/mojotrees/gpu_split_search.mojo"): (
         "BLOCKING",
