@@ -451,38 +451,55 @@ def _gpu_leaf_matches(strategy: Int, narrow: Bool) raises:
     output planes, including the one it reconstructs, so the zeroing rule is
     unchanged; a narrowed set is where that would show if it were not.
     """
-    var n_rows = 30_011
-    var n_features = 6
-    var n_bins = 64
-    var data = _make_data(n_rows, n_features, n_bins, UInt64(53))
-    var grad = _grads(n_rows, UInt64(960_001))
-    var hess = _ones(n_rows)
+    # GUARDED 2026-08-17, and the mechanism is not the one it looks like.
+    # Every CALLER of this helper is already wrapped in
+    # `comptime if not has_accelerator()`, which ought to prune it, and does
+    # not. `TestSuite.discover_tests[__functions_in_module()]()` enumerates
+    # every function in this module, so each one is instantiated whether or
+    # not a live call reaches it, and this helper builds a
+    # `GpuHistogramBuilder`. On a CPU-only build that elaborates a GPU
+    # kernel and the compile dies with `Unknown GPU architecture detected`,
+    # taking the whole file with it.
+    #
+    # So in a test module the guard belongs on the HELPER and not only on
+    # the tests that call it. Guarding the callers is what every other CPU
+    # test in this suite does and it is sufficient there only because their
+    # helpers touch no device API.
+    comptime if not has_accelerator():
+        raise Error("this helper needs an accelerator")
+    else:
+        var n_rows = 30_011
+        var n_features = 6
+        var n_bins = 64
+        var data = _make_data(n_rows, n_features, n_bins, UInt64(53))
+        var grad = _grads(n_rows, UInt64(960_001))
+        var hess = _ones(n_rows)
 
-    var three = GpuHistogramBuilder(data, strategy)
-    var two = GpuHistogramBuilder(data, strategy)
-    two.set_constant_hessian(True)
-    assert_true(not three.constant_hessian())
-    assert_true(two.constant_hessian())
-    if narrow:
-        var features: List[Int] = [0, 2, 5]
-        three.set_features(features)
-        two.set_features(features)
+        var three = GpuHistogramBuilder(data, strategy)
+        var two = GpuHistogramBuilder(data, strategy)
+        two.set_constant_hessian(True)
+        assert_true(not three.constant_hessian())
+        assert_true(two.constant_hessian())
+        if narrow:
+            var features: List[Int] = [0, 2, 5]
+            three.set_features(features)
+            two.set_features(features)
 
-    three.upload_gradients(grad, hess)
-    two.upload_gradients(grad, hess)
-    three.begin_tree()
-    two.begin_tree()
+        three.upload_gradients(grad, hess)
+        two.upload_gradients(grad, hess)
+        three.begin_tree()
+        two.begin_tree()
 
-    var h3 = three.build_leaf(0)
-    var h2 = two.build_leaf(0)
-    _assert_same_bits(h3, h2)
+        var h3 = three.build_leaf(0)
+        var h2 = two.build_leaf(0)
+        _assert_same_bits(h3, h2)
 
-    # A split, so the comparison also covers a node that owns a strict subset
-    # of the rows and therefore a different launch geometry.
-    three.apply_split(0, n_bins // 2, 0, 1, 2)
-    two.apply_split(0, n_bins // 2, 0, 1, 2)
-    _assert_same_bits(three.build_leaf(1), two.build_leaf(1))
-    _assert_same_bits(three.build_leaf(2), two.build_leaf(2))
+        # A split, so the comparison also covers a node that owns a strict subset
+        # of the rows and therefore a different launch geometry.
+        three.apply_split(0, n_bins // 2, 0, 1, 2)
+        two.apply_split(0, n_bins // 2, 0, 1, 2)
+        _assert_same_bits(three.build_leaf(1), two.build_leaf(1))
+        _assert_same_bits(three.build_leaf(2), two.build_leaf(2))
 
 
 def test_gpu_atomic_strategy_is_bit_identical() raises:
