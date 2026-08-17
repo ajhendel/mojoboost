@@ -6741,14 +6741,37 @@ struct GpuActiveRows(Movable):
                 self.ident_dev = self.ctx.enqueue_create_buffer[DType.int32](
                     self.n_rows
                 )
-                var threads = self.block_threads
-                var blocks = (self.n_rows + threads - 1) // threads
-                self.ctx.enqueue_function[_iota_kernel](
-                    self.ident_dev.unsafe_ptr(),
-                    Int32(self.n_rows),
-                    grid_dim=blocks,
-                    block_dim=threads,
-                )
+                # Guarded 2026-08-17 for the same reason as `begin_tree`: on a
+                # CPU-only build any reachable `enqueue_function` elaborates a
+                # GPU kernel and fails the compile, whatever the kernel does.
+                # `__init__` reaches this whenever
+                # MOJOTREES_GPU_ROW_COMPACTION is set, so it is reachable from
+                # construction and not only from a caller who asked for the
+                # arm by name.
+                #
+                # Narrower than the whole-body wrap the four entry points use,
+                # and deliberately so. A `comptime if` with an `else` prunes
+                # the untaken branch at compile time wherever it sits, so
+                # wrapping the launch is sufficient to stop elaboration; the
+                # whole-body form exists because an EARLY RETURN does not
+                # prune, not because the wrap has to be maximal. Keeping it
+                # tight here leaves the allocation and bookkeeping above
+                # readable as one block.
+                comptime if not has_accelerator():
+                    raise Error(
+                        "row compaction needs an accelerator; this binary was"
+                        " built without one, so leave"
+                        " MOJOTREES_GPU_ROW_COMPACTION unset"
+                    )
+                else:
+                    var threads = self.block_threads
+                    var blocks = (self.n_rows + threads - 1) // threads
+                    self.ctx.enqueue_function[_iota_kernel](
+                        self.ident_dev.unsafe_ptr(),
+                        Int32(self.n_rows),
+                        grid_dim=blocks,
+                        block_dim=threads,
+                    )
                 self.compact_allocated = True
         self.row_compaction = on
         self.compact_valid = False
@@ -7174,62 +7197,85 @@ struct GpuActiveRows(Movable):
         simply not inside the root range: no sentinel leaf id, no filtering,
         and no cost per node for a row this tree ignores.
         """
-        if len(bag) > self.n_rows:
-            raise Error("bag is larger than the dataset")
-        # A tree boundary with a copy-back still owed means the previous tree's
-        # last partition was never paired with a histogram, which is a broken
-        # schedule and not something to reseed over.
-        self._refuse_copy_back_debt("starting a tree")
-        # A new tree may carry a new round's gradients; the quantized copy
-        # is rebuilt on the first histogram that asks for it.
-        self.quant_valid = False
-        # And so are the compacted planes, for two reasons at once: the
-        # permutation is about to be reseeded, and the gradients they hold are
-        # about to be stale. Rebuilt by `_ensure_compacted` on the first
-        # histogram of this tree, which is one full pass per tree and is the
-        # only scattered read the mechanism performs.
-        self.compact_valid = False
-        # The record, and the sink is looked up before the line is built so
-        # that the default path pays one `getenv` and no String. See
-        # `COMPACTION_TRACE_VAR` for why the record exists at all.
-        var sink = _compact_trace_sink()
-        if sink != "":
-            _compact_trace_emit(
-                sink,
-                String(
-                    "mojotrees.compaction tree arm=",
-                    "on" if self.row_compaction else "off",
-                    " builds=",
-                    self.compact_builds,
-                    " scatters=",
-                    self.compact_scatters,
-                    "\n",
-                ),
+        # GUARDED 2026-08-17, and this one was PREDICTED and left unguarded on
+        # purpose, which is worth recording because the prediction was right.
+        # The lane that guarded the four histogram and partition entry points
+        # observed that `_iota_kernel` elaborated fine on the failing CPU-only
+        # build, unlike the kernels that allocate shared memory, and reasoned
+        # that `begin_tree` therefore did not need a wrap. CI disagreed: the
+        # compiler emits ONE error stack and stops, so the first round of
+        # guards only revealed the next site rather than proving there were
+        # none. The chain CI named is
+        # `histogram_gpu.mojo:1929` -> `:1940` -> here -> the launch below.
+        #
+        # The general lesson, which costs a CI cycle every time it is
+        # relearned: on a CPU-only build ANY `enqueue_function` in a reachable
+        # body is a compile hazard, not only the ones whose kernels look
+        # expensive. An Apple machine can never reproduce it, so the rule has
+        # to be applied by construction rather than by testing.
+        comptime if not has_accelerator():
+            raise Error(
+                "seeding a tree's device rows needs an accelerator; this"
+                " binary was built without one, so grow the tree through the"
+                " CPU backend instead"
             )
-        if len(bag) == 0:
-            var blocks = (
-                self.n_rows + self.block_threads - 1
-            ) // self.block_threads
-            self.ctx.enqueue_function[_iota_kernel](
-                self.rows_dev.unsafe_ptr(),
-                Int32(self.n_rows),
-                grid_dim=blocks,
-                block_dim=self.block_threads,
-            )
-            self.ranges.reset_root(self.n_rows)
-            return
+        else:
+            if len(bag) > self.n_rows:
+                raise Error("bag is larger than the dataset")
+            # A tree boundary with a copy-back still owed means the previous
+            # tree's last partition was never paired with a histogram, which
+            # is a broken schedule and not something to reseed over.
+            self._refuse_copy_back_debt("starting a tree")
+            # A new tree may carry a new round's gradients; the quantized copy
+            # is rebuilt on the first histogram that asks for it.
+            self.quant_valid = False
+            # And so are the compacted planes, for two reasons at once: the
+            # permutation is about to be reseeded, and the gradients they hold
+            # are about to be stale. Rebuilt by `_ensure_compacted` on the
+            # first histogram of this tree, which is one full pass per tree and
+            # is the only scattered read the mechanism performs.
+            self.compact_valid = False
+            # The record, and the sink is looked up before the line is built so
+            # that the default path pays one `getenv` and no String. See
+            # `COMPACTION_TRACE_VAR` for why the record exists at all.
+            var sink = _compact_trace_sink()
+            if sink != "":
+                _compact_trace_emit(
+                    sink,
+                    String(
+                        "mojotrees.compaction tree arm=",
+                        "on" if self.row_compaction else "off",
+                        " builds=",
+                        self.compact_builds,
+                        " scatters=",
+                        self.compact_scatters,
+                        "\n",
+                    ),
+                )
+            if len(bag) == 0:
+                var blocks = (
+                    self.n_rows + self.block_threads - 1
+                ) // self.block_threads
+                self.ctx.enqueue_function[_iota_kernel](
+                    self.rows_dev.unsafe_ptr(),
+                    Int32(self.n_rows),
+                    grid_dim=blocks,
+                    block_dim=self.block_threads,
+                )
+                self.ranges.reset_root(self.n_rows)
+                return
 
-        for i in range(len(bag)):
-            if bag[i] < 0 or bag[i] >= self.n_rows:
-                raise Error("bag row index out of range")
-        # Any copy still reading the staging buffer has to finish before it
-        # is overwritten.
-        self.ctx.synchronize()
-        var dst = self.stage_rows.unsafe_ptr()
-        for i in range(len(bag)):
-            dst.unsafe_store(i, Int32(bag[i]))
-        self.ctx.enqueue_copy(dst_buf=self.rows_dev, src_ptr=dst)
-        self.ranges.reset_root(len(bag))
+            for i in range(len(bag)):
+                if bag[i] < 0 or bag[i] >= self.n_rows:
+                    raise Error("bag row index out of range")
+            # Any copy still reading the staging buffer has to finish before it
+            # is overwritten.
+            self.ctx.synchronize()
+            var dst = self.stage_rows.unsafe_ptr()
+            for i in range(len(bag)):
+                dst.unsafe_store(i, Int32(bag[i]))
+            self.ctx.enqueue_copy(dst_buf=self.rows_dev, src_ptr=dst)
+            self.ranges.reset_root(len(bag))
 
     def enqueue_partition[
         bins_origin: MutOrigin, //
