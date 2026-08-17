@@ -6398,3 +6398,193 @@ count, and the two are ANDed, so it returns the option value for a
 wide-and-short run CatBoost would stomp. One direction only -- it can return 10
 where CatBoost returns 1, never the reverse -- and the fix is a feature count,
 which the binding has and the string surface does not.
+
+### A40 note: the CTR target classifier, and why a bundle raised about data it never read
+
+Status: **verified from CatBoost source**, tag **`v1.2.10`** (the tag `pixi.lock`
+pins and the tag every parity read in this campaign is against), fetched
+2026-08-17 from `raw.githubusercontent.com/catboost/catboost/v1.2.10`. There is
+no CatBoost checkout on this machine; the only CatBoost on it is the compiled
+conda package `catboost-1.2.10-cpu_py314hd091206_0` in the rattler cache, which
+carries no C++. Files read, at that tag:
+
+- `catboost/private/libs/algo/target_classifier.cpp` -- `BuildTargetClassifier`,
+  `SelectBorders`, `GetMultiClassBorders`
+- `catboost/private/libs/algo/ctr_helper.cpp` -- the only caller, `:118-135`
+- `catboost/private/libs/options/cat_feature_options.cpp` -- `:162` and `:230`,
+  `TargetBinarization("target_binarization",
+  TBinarizationOptions(EBorderSelectionType::MinEntropy, 1))`
+- `catboost/private/libs/options/catboost_options.cpp` --
+  `ValidateCtrTargetBinarization`
+- `library/cpp/grid_creator/binarization.cpp` -- `BestSplit` (:136), the exact
+  DP `BestSplit<TWeightType, type>` (:192-668), the border emitter (:670-695),
+  `SplitWithGuaranteedOptimum` (:1022), `GroupAndSortValues` (:1613)
+
+#### 1. The two defects
+
+Both are in `grow_policy='symmetrictree'` with `ctr='on'`, which is the CatBoost
+mirror, and both are about a bundle reading the target before it knows whether
+it has any work.
+
+**(a) `SimpleCtrConfig` is not inert on a matrix with no categorical column.**
+`MojoTreesRegressor(grow_policy='symmetrictree', ctr='on')` on 300 rows of 8
+numeric columns raised
+
+    ctr target borders must be given explicitly for a target with more than
+    two distinct values ...
+
+There is no categorical column in that matrix. Nothing would have been built.
+The refusal is about the target of a fit whose feature side already decided the
+answer is "no columns".
+
+The cause is ordering in `trainset._build_ctr`. It resolves the descriptions,
+resolves the target borders and validates -- three steps that raise -- and only
+then calls `plan_ctr_columns`, which is where "did any column earn CTRs" is
+answered. But that answer is `ctr_source_features`, and `ctr_source_features`
+reads `(source_rule, one_hot_max_size, is_categorical, n_distinct, bin_budget)`
+and **nothing about the target**. It can be asked first.
+
+**(b) The target quantization refused every continuous target.**
+`default_target_borders` implemented only the two-distinct-value case and raised
+above it by name. So even with a categorical column present, CatBoost mode could
+not take a regression target -- and the estimator exposed neither
+`ctr_target_border_count` nor the border type, so no caller could work around it
+by supplying borders.
+
+#### 2. What CatBoost actually does, at v1.2.10
+
+`TCtrHelper::InitCtrHelper` (`ctr_helper.cpp:118-135`) reads the border count and
+the selection type straight off the `TargetBinarization` option and calls
+`BuildTargetClassifier` once per distinct `(binarization, targetId)` pair. It
+short-circuits to an empty classifier when `BorderCount == 0` and does nothing
+else conditional. The defaults are `MinEntropy` and **1**
+(`cat_feature_options.cpp:162`, and again on the second constructor at `:230`).
+
+`BuildTargetClassifier` (`target_classifier.cpp:39-118`) is a switch on the
+loss with exactly three arms:
+
+- **MultiClass / MultiClassOneVsAll** -> `GetMultiClassBorders(cnt)`, which is
+  `borders[i] = 0.5 + i` for `i` in `[0, cnt)` (`:10-16`). No target values are
+  read at all.
+- **every other supported loss**, RMSE and MAE and Quantile and Poisson and
+  Logloss and the rest of the list at `:60-96`, plus the two Python
+  user-defined objectives -> `SelectBorders(target, ...)`.
+- anything else -> `CB_ENSURE(false, ...)`.
+
+Before the switch it refuses an empty target and refuses a **constant** target
+unless `allowConstLabel` (`:52-57`).
+
+`SelectBorders` (`:18-37`) is `BestSplit(learnTarget, targetBorderCount,
+targetBorderType, /*filterNans=*/false)` into a `THashSet<float>` -- so borders
+are deduplicated -- then `CB_ENSURE(borders.ysize() > 0 || allowConstLabel, "0
+target borders")`, then sorted ascending.
+
+So **CatBoost runs its ordinary border selector over the raw continuous
+target.** There is no two-valued precondition anywhere on the path. That is the
+whole of (b).
+
+#### 3. The one-border collapse, re-derived at v1.2.10
+
+`MakeBinarizer(MinEntropy)` gives `TExactBinarizer<EPenaltyType::MinEntropy>`
+(`binarization.cpp:124-125`), whose `BestSplit` is `SplitWithGuaranteedOptimum`
+(`:1150-1162`). That groups the values -- `GroupAndSortValues` with
+`TRepeatIterator<float>(1.0f)` and `normalizeWeights=false` (`:1631-1639`), so
+the weight of a distinct value is its **count** -- and calls the exact DP with
+`mode = E_RLM2` (`:678`).
+
+At `maxBordersCount = 1`, `bins = 2`, and the DP has two exits:
+
+- **`wsize <= bins`, i.e. at most two distinct target values** (`:208-216`).
+  The main loop never runs. At `k = 2` this sets `thresholds[0] = 0`; at
+  `k = 1` it sets `thresholds[0] = wsize - 1 = 0`, and the emitter then drops
+  it because `t + 1 == values.size()` (`:683`), leaving an empty border set --
+  which is the `"0 target borders"` refusal in `SelectBorders`, agreeing with
+  the constant-target `CB_ENSURE` above it.
+- **`k > 2`.** `dsize = wsize - bins + 1 = k - 1`, the main loop
+  `for (l = 0; l < bins - 2; ++l)` does not execute, so `current_error[i]`
+  keeps its initialization `Penalty(W[i])` (`:232-234`), and the whole
+  computation is the "Last match" block (`:630-667`) in its non-`E_Base` arm
+  (`:645-653`) with `l = 0`, `j = dsize - 1 = k - 2`:
+
+        P(w)      = w * log(w + 1e-8)                              (:175-177)
+        threshold = argmin over i in [0, k-2] of P(W[i]) + P(W[k-1] - W[i])
+        ties keep the smallest i          (the comparison at :649 is strict `<`)
+
+  `thresholds[0] = bestIndex`; the backtrack loop `for (; l > 0; --l)` does not
+  run and the `+= l` adjustment adds zero.
+
+The border is then `(values[t] + values[t+1]) / 2` (`:691`), over the **distinct
+sorted** values.
+
+This is the same rule the A30 appendix wrote down against `master`. It is
+restated here because the appendix was a scoping estimate and this is a build,
+and because the line numbers are now the ones at the pinned tag.
+
+#### 4. What was built
+
+**`ctr_columns.select_target_borders(label, count, border_type)`** is the port.
+`CTR_TARGET_BORDER_MIN_ENTROPY` is CatBoost's default selection and
+`CTR_TARGET_BORDER_MULTICLASS` is `GetMultiClassBorders`, three lines, taken in
+the same pass because it is three lines. `SimpleCtrConfig` gains
+`target_border_count` (default 1, CatBoost's) and `target_border_type` (default
+MinEntropy, CatBoost's), and `resolve_target_borders` calls the selector with the
+bundle's own pair instead of hard-coding one. `default_target_borders` survives
+as `select_target_borders(label, 1, MIN_ENTROPY)` so its callers and its test do
+not move.
+
+**`count >= 2` is refused by name where it needs the DP**, and only there. The
+`wsize <= bins` exit is exact for any count, so a target with at most
+`count + 1` distinct values is answered exactly; above that the E_RLM2 band
+(`binarization.cpp:560-627`, roughly seventy lines) has not been ported and the
+refusal says so and says to pass `target_borders` explicitly. A refusal that
+names the missing DP is a different thing from a refusal that names the shape of
+the target.
+
+**Order in `_build_ctr` is now feature-side first.** The categorical flags, the
+distinct-code tables and `ctr_source_features` are computed before
+`resolve_descriptions` / `resolve_target_borders` / `validate`. When no column
+earns CTRs the function returns having read the label not at all, and sets the
+bundle disabled so `Dataset.ctr` records what happened rather than what was
+offered -- which is what that field's docstring already promised and what the
+policy arm already did.
+
+`Dataset.__init__`'s sparse arm gets the same treatment for the same reason: the
+sparse refusal is intrinsic (a CTR column is dense by construction) but it is a
+refusal about categorical columns, so it declines quietly when the mapper offers
+none.
+
+**`ctr_target_border_count` and `ctr_target_border_type` are estimator
+parameters**, threaded through `_fit_params` -> `_parse_ctr` like `ctr` itself.
+Unset means CatBoost's default. This is the "no way to answer it from this
+surface" the reverted commit's note complained about.
+
+#### 5. What deliberately did NOT change, and why
+
+**`ctr='auto'` still declines a target with more than two distinct values.**
+`can_derive_target_borders` keeps its two-value scan; only its docstring moved,
+from "would the derivation raise" to "what this POLICY accepts". The derivation
+would now succeed on any non-constant target, so the restriction is a policy and
+no longer a capability -- and lifting it is a measured decision, not a lane's.
+`auto` is `CTR_SOURCE_BIN_OVERFLOW`, our own opt-in rule, live under `lossguide`
+where the standing rule is to mirror LightGBM and LightGBM has no CTR at all;
+its one published measurement (average precision from 12.02 percent worse than
+LightGBM to 3.63 percent better, `docs/LIGHTGBM_PARITY.md`) was taken with it
+declining exactly where it declines now. Widening it would give CTR columns to
+every regression fit with an overflowing categorical column, which moves bits on
+a shipped default and belongs behind the real-data gate.
+
+**The multiclass border type is reachable, not automatic.** CatBoost picks
+`GetMultiClassBorders` off the LOSS, and the dataset door does not carry a loss.
+Selecting it from the estimator's resolved objective is a one-line addition to
+`_fit_params` and it is a behavior choice on a path this lane cannot measure, so
+the type ships reachable by name and the estimator does not choose it. Note
+that on a balanced K-class label the two rules agree at the default anyway: for
+classes `0..K-1` with equal counts the MinEntropy argmin is a tie, ties keep the
+smallest index, and the border is `0.5` -- which is `GetMultiClassBorders(1)`.
+
+**The brief's claim that "multiclass and sparse refuse any non-`off` ctr rule,
+and refuse under `auto` too" is wrong for multiclass.** There is no multiclass
+CTR refusal anywhere in `src/`. A multiclass label reached the *same*
+`default_target_borders` refusal as a regression label -- and under `auto` it did
+not refuse at all, it declined silently through `can_derive_target_borders`.
+Defect (b) is therefore the multiclass one as well.

@@ -94,6 +94,7 @@ from .ctr_columns import (
     SimpleCtrConfig,
     build_ctr_train_columns,
     can_derive_target_borders,
+    ctr_source_features,
     ctr_train_permutation,
     fit_ctr_tables,
     plan_ctr_columns,
@@ -452,6 +453,22 @@ def _is_categorical_flags(mapper: BinMapper) -> List[Bool]:
     return out^
 
 
+def _has_categorical(mapper: BinMapper) -> Bool:
+    """Whether ANY base feature is categorical, which is the weakest form of
+    "would a ctr bundle build anything".
+
+    It is weaker than `ctr_source_features` -- a categorical column may still
+    fall under the source rule -- and that is the point: this is asked on the
+    SPARSE arm, where the level counts a source rule needs would take a dense
+    scan the sparse path exists to avoid. False here is a proof that nothing
+    would be built under any rule, which is all the refusal needs to stand down.
+    """
+    for f in range(mapper.n_features):
+        if mapper.cats.is_cat(f):
+            return True
+    return False
+
+
 def _build_ctr[
     features_origin: ImmOrigin, //
 ](
@@ -466,9 +483,13 @@ def _build_ctr[
     The **only** place both halves of catalog A19 are called, and the order is
     the whole of the train/predict separation. It is not rearrangeable.
 
-    1. **Target borders** (`SimpleCtrConfig.resolve_target_borders`). First,
-       because the plan's shape depends on the class count: one border means two
-       classes and `Borders` emits `n_classes - 1` columns.
+    0. **Source columns** (`ctr_source_features`). FIRST, and before anything
+       that can raise, because it reads only the feature side -- which columns
+       are categorical and how wide each is -- and because a bundle with no
+       source column must be inert rather than opinionated about the target.
+    1. **Target borders** (`SimpleCtrConfig.resolve_target_borders`). Before the
+       plan, because the plan's shape depends on the class count: one border
+       means two classes and `Borders` emits `n_classes - 1` columns.
     2. **Plan** (`plan_ctr_columns`). Which categorical columns escape the
        one-hot cutoff, and which `(type, target border, prior)` column each one
        produces, in `AllocateCtrData` order. Four per column at CatBoost's CPU
@@ -502,27 +523,6 @@ def _build_ctr[
     """
     if not config.is_active():
         return
-    if config.is_policy() and len(config.target_borders) == 0:
-        if not can_derive_target_borders(label):
-            # A DEFAULT bundle declines on a target it cannot binarize rather
-            # than refusing. `default_target_borders` handles a two-valued
-            # label and raises by name on anything wider, which is every
-            # regression target; letting that reach a caller who asked for
-            # nothing would turn working fits into errors. A caller who named
-            # the bundle skips this branch and gets the refusal, which is
-            # where the instruction to pass `target_borders` lives.
-            return
-    # Before anything is planned, because the plan's shape depends on the class
-    # count: one target border means two classes, and `Borders` emits
-    # `n_classes - 1` columns. The config keeps what it resolved, so the dataset
-    # records the borders its columns were actually built from.
-    # Both of these fill in what a DEFAULT bundle could not: `auto()` is a
-    # default argument, Mojo forbids a raising call in one, and building the
-    # descriptions reaches `ctr.default_priors`, which raises. This is the
-    # first raising context they have.
-    config.resolve_descriptions()
-    config.resolve_target_borders(label)
-    config.validate()
     var n_rows = data.n_rows
     var flags = _is_categorical_flags(mapper)
 
@@ -546,6 +546,49 @@ def _build_ctr[
     for f in range(mapper.n_features):
         n_distinct.append(cat_off[f + 1] - cat_off[f])
 
+    # **THE FEATURE SIDE DECIDES FIRST, and that ordering is the whole of one
+    # defect.** `ctr_source_features` reads the source rule, the one-hot cutoff,
+    # which columns are categorical and how many levels each has. It reads
+    # nothing about the target. So it can be asked BEFORE the three steps below
+    # it that can raise -- and it must be, because until 2026-08-17 it was not:
+    # `resolve_target_borders` ran first, and
+    # `MojoTreesRegressor(grow_policy='symmetrictree', ctr='on')` on a matrix of
+    # eight NUMERIC columns raised about the number of distinct values in the
+    # target. There was no categorical column in that matrix. Nothing would have
+    # been built. A configuration that refuses over data it never reads is a
+    # defect independent of whether it is the default, and this early return is
+    # the fix: no target borders are required, no tables are planned and no
+    # bundle is validated when there is nothing for any of them to describe.
+    #
+    # The bundle is recorded DISABLED on the way out, which is what
+    # `Dataset.ctr`'s docstring already promises -- it records what happened and
+    # not what was offered -- and what the policy arm at the call site already
+    # did for itself.
+    if len(ctr_source_features(config, flags, n_distinct, mapper.n_bins)) == 0:
+        config = SimpleCtrConfig.disabled()
+        return
+
+    if config.is_policy() and len(config.target_borders) == 0:
+        if not can_derive_target_borders(label):
+            # A DEFAULT bundle declines on a target its own POLICY does not
+            # accept. It is a policy and not a capability: `select_target_borders`
+            # runs CatBoost's selector and succeeds on any non-constant target.
+            # `can_derive_target_borders` says why `auto` still stops at two
+            # distinct values and why widening it is a measured decision.
+            config = SimpleCtrConfig.disabled()
+            return
+    # Before anything is planned, because the plan's shape depends on the class
+    # count: one target border means two classes, and `Borders` emits
+    # `n_classes - 1` columns. The config keeps what it resolved, so the dataset
+    # records the borders its columns were actually built from.
+    # Both of these fill in what a DEFAULT bundle could not: `auto()` is a
+    # default argument, Mojo forbids a raising call in one, and building the
+    # descriptions reaches `ctr.default_priors`, which raises. This is the
+    # first raising context they have.
+    config.resolve_descriptions()
+    config.resolve_target_borders(label)
+    config.validate()
+
     # `mapper.n_bins` is the binning budget and is the ONLY place the bin cap
     # is read: the source rule compares against it and, below, the CTR's own
     # quantization is set from it. The mapper is still bare here, so this is
@@ -559,8 +602,11 @@ def _build_ctr[
 
     var tables = plan_ctr_columns(config, flags, n_distinct, mapper.n_bins)
     if not tables.is_active():
-        # No categorical column earned CTRs under this config's source rule.
-        # Nothing is attached and the dataset is the one it would have been.
+        # A source column was named above and the plan still emitted no column,
+        # which the description set can do (every description at zero target
+        # borders). Nothing is attached and the dataset is the one it would have
+        # been.
+        config = SimpleCtrConfig.disabled()
         return
 
     # The bucket tables the model will carry. Slot `s` takes its source
@@ -910,7 +956,13 @@ struct Dataset(Copyable, Movable, Writable):
         var sparse_data = _empty_sparse_binned(n_features)
         if is_sparse:
             if ctr.is_active():
-                if ctr.is_policy():
+                if ctr.is_policy() or not _has_categorical(mapper):
+                    # A named bundle with no categorical column to read is
+                    # inert on a sparse matrix for the same reason it is inert
+                    # on a dense one: there is nothing for it to replace, so
+                    # the densification this refusal exists to prevent cannot
+                    # happen. The refusal below is about categorical columns
+                    # and stands whenever there is one.
                     ctr = SimpleCtrConfig.disabled()
                 else:
                     raise Error(

@@ -222,7 +222,11 @@ from mojotrees.trainset import (
     update_dataset_multiclass as mojo_update_dataset_multiclass,
 )
 from mojotrees.binning import BinnedMatrix
-from mojotrees.ctr_columns import SimpleCtrConfig
+from mojotrees.ctr_columns import (
+    CTR_TARGET_BORDER_MIN_ENTROPY,
+    CTR_TARGET_BORDER_MULTICLASS,
+    SimpleCtrConfig,
+)
 from mojotrees.linear_tree import LinearParams
 from mojotrees.ordered_boosting import OrderedBoostingParams
 from mojotrees.device import (
@@ -1741,6 +1745,48 @@ def _parse_cat_params(params: PythonObject) raises -> CategoricalParams:
     )
 
 
+def _apply_ctr_target_binarization(
+    mut config: SimpleCtrConfig, params: PythonObject
+) raises:
+    """CatBoost's `target_binarization` pair, off the params dict onto a bundle.
+
+    Both keys are optional and both fall back to what the bundle already holds,
+    which is CatBoost's own default (`MinEntropy`, 1). `.get` rather than a
+    subscript for the reason `one_hot_max_size` uses it: a direct caller of
+    `dataset_create` that predates these keys must keep working.
+
+    The type is a STRING and not an integer, because it names a rule rather than
+    counting anything, which is the same argument `ctr` itself is passed as a
+    string on. `ctr_columns` owns the codes and this is the only place the two
+    spellings meet.
+    """
+    var count = Int(
+        py=params.get(
+            "ctr_target_border_count", PythonObject(config.target_border_count)
+        )
+    )
+    if count < 1:
+        raise Error(
+            "ctr_target_border_count must be positive; got ",
+            count,
+        )
+    config.target_border_count = count
+    var type_name = String(
+        py=params.get("ctr_target_border_type", PythonObject("minentropy"))
+    )
+    if type_name == "minentropy":
+        config.target_border_type = CTR_TARGET_BORDER_MIN_ENTROPY
+    elif type_name == "multiclass":
+        config.target_border_type = CTR_TARGET_BORDER_MULTICLASS
+    else:
+        raise Error(
+            "ctr_target_border_type must be 'minentropy' or 'multiclass'; got"
+            " '",
+            type_name,
+            "'",
+        )
+
+
 def _parse_ctr(params: PythonObject) raises -> SimpleCtrConfig:
     """The dataset's ordered-target-statistic bundle, catalog A19.
 
@@ -1775,16 +1821,33 @@ def _parse_ctr(params: PythonObject) raises -> SimpleCtrConfig:
     does not read it keeps `ctr_columns.CTR_ONE_HOT_MAX_SIZE` rather than
     recording a cutoff nothing consulted.
 
+    `ctr_target_border_count` and `ctr_target_border_type` are the two halves of
+    CatBoost's `target_binarization` option (`cat_feature_options.cpp:162`:
+    `TBinarizationOptions(EBorderSelectionType::MinEntropy, 1)`), and they are
+    read here for the same reason `one_hot_max_size` is: this is the door the
+    bundle is built at. Both are optional and both default to CatBoost's, so a
+    caller who names neither gets exactly what this function returned before
+    they existed. `ctr_target_border_type` takes `"minentropy"` (CatBoost's
+    default selection, run over the raw target) or `"multiclass"`
+    (`GetMultiClassBorders`, `borders[i] = 0.5 + i`, which reads no target
+    value). They are read on the `auto` arm too: `auto` differs from `catboost`
+    in which SOURCE columns it selects, not in how the target is quantized, and
+    a bundle that ignored a named option would be the silent-difference defect
+    the `is_policy` split exists to avoid.
+
     Anything else raises here rather than resolving to a default, so a typo is
     an error and not a silently different model.
     """
     var name = String(py=params.get("ctr", PythonObject("off")))
-    if name == "auto":
-        return SimpleCtrConfig.auto()
     if name == "off":
         return SimpleCtrConfig.disabled()
+    if name == "auto":
+        var auto_out = SimpleCtrConfig.auto()
+        _apply_ctr_target_binarization(auto_out, params)
+        return auto_out^
     if name == "catboost" or name == "on":
         var out = SimpleCtrConfig.catboost_defaults()
+        _apply_ctr_target_binarization(out, params)
         # `.get`, not a subscript: `Dataset` sends this key and the estimator
         # sends this key, but a direct caller of `dataset_create` predating
         # both does not, and a KeyError there would be a regression in a door

@@ -52,6 +52,8 @@ from mojotrees.ctr import (
 )
 from mojotrees.ctr_columns import (
     CTR_ONE_HOT_MAX_SIZE,
+    CTR_TARGET_BORDER_MIN_ENTROPY,
+    CTR_TARGET_BORDER_MULTICLASS,
     CtrTables,
     SimpleCtrConfig,
     build_ctr_train_columns,
@@ -65,6 +67,7 @@ from mojotrees.ctr_columns import (
     default_target_borders,
     fit_ctr_tables,
     plan_ctr_columns,
+    select_target_borders,
     target_classes,
 )
 
@@ -210,22 +213,139 @@ def test_the_default_target_border_is_the_midpoint_of_a_two_valued_label(
     assert_equal(classes[3], 0)
 
 
-def test_a_target_with_three_values_refuses_rather_than_guessing() raises:
-    # The general MinEntropy DP is catalog A15's and is about seventy lines;
-    # this lane implements the one case a default CTR fit needs and refuses the
-    # rest rather than inventing a border.
+def test_a_continuous_target_is_binarized_rather_than_refused() raises:
+    # This test asserted a REFUSAL until 2026-08-17, and the refusal was the
+    # defect: `BuildTargetClassifier` (`target_classifier.cpp:39-118`, v1.2.10)
+    # sends every non-multiclass loss to `SelectBorders`, which runs the border
+    # selector over the raw target. There is no two-valued precondition
+    # anywhere on that path.
+    #
+    # Three distinct values, counts 4 / 1 / 1, so the argmin is decided rather
+    # than tied. W = [4, 5, 6], total 6, P(w) = w*log(w + 1e-8):
+    #
+    #   i = 0:  P(4) + P(2) = 4*log4 + 2*log2 = 5.545 + 1.386 = 6.931
+    #   i = 1:  P(5) + P(1) = 5*log5 + 1*log1 = 8.047 + 0.000 = 8.047
+    #
+    # so t = 0 and the border is (0 + 10) / 2 = 5. A mid-scan two-value guess
+    # would have put it at 5 as well, which is why the counts are skewed: 5 is
+    # only reachable through the penalty when it beats i = 1.
     var label = List[Float64]()
     label.append(0.0)
+    label.append(0.0)
+    label.append(0.0)
+    label.append(0.0)
+    label.append(10.0)
+    label.append(20.0)
+    var borders = default_target_borders(label)
+    assert_equal(len(borders), 1)
+    assert_equal(borders[0], 5.0)
+
+    # The other side of the same argmin, on the mirrored label: counts
+    # 1 / 1 / 4 give W = [1, 2, 6], and
+    #   i = 0:  P(1) + P(5) = 0.000 + 8.047 = 8.047
+    #   i = 1:  P(2) + P(4) = 1.386 + 5.545 = 6.931
+    # so t = 1 and the border is (10 + 20) / 2 = 15. The two fixtures differ
+    # only in where the mass sits, so a rule that ignored the counts would
+    # answer the same number twice.
+    var mirrored = List[Float64]()
+    mirrored.append(0.0)
+    mirrored.append(10.0)
+    mirrored.append(20.0)
+    mirrored.append(20.0)
+    mirrored.append(20.0)
+    mirrored.append(20.0)
+    var mirrored_borders = default_target_borders(mirrored)
+    assert_equal(len(mirrored_borders), 1)
+    assert_equal(mirrored_borders[0], 15.0)
+
+
+def test_a_tie_keeps_the_smallest_index() raises:
+    # `binarization.cpp:649` compares with a strict `<`, so an equal score does
+    # not displace the incumbent and the SMALLEST index wins. Balanced class
+    # codes tie exactly, which makes this reachable rather than theoretical:
+    # for 0/1/2 at two rows each, W = [2, 4, 6] and
+    #   i = 0:  P(2) + P(4)
+    #   i = 1:  P(4) + P(2)
+    # are the same sum. t = 0, border = 0.5 -- which is also
+    # `GetMultiClassBorders(1)`, so the two arms agree on a balanced label.
+    var label = List[Float64]()
+    label.append(0.0)
+    label.append(0.0)
+    label.append(1.0)
     label.append(1.0)
     label.append(2.0)
-    with assert_raises():
-        _ = default_target_borders(label)
+    label.append(2.0)
+    var borders = default_target_borders(label)
+    assert_equal(len(borders), 1)
+    assert_equal(borders[0], 0.5)
 
+    var multi = select_target_borders(label, 1, CTR_TARGET_BORDER_MULTICLASS)
+    assert_equal(len(multi), 1)
+    assert_equal(multi[0], 0.5)
+
+
+def test_a_constant_target_still_refuses() raises:
+    # `SelectBorders`' `CB_ENSURE(borders.ysize() > 0 || allowConstLabel,
+    # "0 target borders")` (`:29`) and the `targetBounds.Min != targetBounds.Max`
+    # check above it (`:55-57`). `allowConstLabel` is false on every path that
+    # reaches here.
     var constant = List[Float64]()
     constant.append(1.0)
     constant.append(1.0)
     with assert_raises():
         _ = default_target_borders(constant)
+
+    var empty = List[Float64]()
+    with assert_raises():
+        _ = default_target_borders(empty)
+
+
+def test_more_borders_than_the_early_return_covers_are_refused_by_name(
+) raises:
+    # `wsize <= bins` (`binarization.cpp:208-216`) is exact at any count: with
+    # at most `count + 1` distinct values there is one border between every
+    # adjacent pair and no penalty is evaluated. Four distinct values at
+    # `count = 3` is that case.
+    var four = List[Float64]()
+    four.append(0.0)
+    four.append(1.0)
+    four.append(2.0)
+    four.append(4.0)
+    var borders = select_target_borders(four, 3)
+    assert_equal(len(borders), 3)
+    assert_equal(borders[0], 0.5)
+    assert_equal(borders[1], 1.5)
+    assert_equal(borders[2], 3.0)
+
+    # Above it the real banded DP is needed and is not ported, so this refuses
+    # rather than approximating. The refusal names the DP; it says nothing
+    # about the shape of the target, which is the difference from what it
+    # replaced.
+    var five = List[Float64]()
+    five.append(0.0)
+    five.append(1.0)
+    five.append(2.0)
+    five.append(4.0)
+    five.append(8.0)
+    with assert_raises():
+        _ = select_target_borders(five, 3)
+
+
+def test_the_multiclass_arm_reads_no_target_value() raises:
+    # `GetMultiClassBorders(cnt)` (`target_classifier.cpp:10-16`) is
+    # `borders[i] = 0.5 + i` and never touches the target, so a label whose
+    # MinEntropy border would be somewhere else entirely gets the class-code
+    # borders and nothing about the label changes them.
+    var label = List[Float64]()
+    label.append(0.0)
+    label.append(100.0)
+    label.append(200.0)
+    var borders = select_target_borders(
+        label, 2, CTR_TARGET_BORDER_MULTICLASS
+    )
+    assert_equal(len(borders), 2)
+    assert_equal(borders[0], 0.5)
+    assert_equal(borders[1], 1.5)
 
 
 def test_an_unresolved_target_border_is_refused_not_defaulted() raises:
