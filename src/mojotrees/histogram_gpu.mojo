@@ -203,6 +203,7 @@ from .gpu_histogram_specializations import (
 from .gpu_leaf_batching import (
     DEFAULT_MAX_ITEMS,
     GpuLeafBatcher,
+    batch_const_hessian_forward_requested,
     oblivious_subtract_requested,
     plan_batch,
     slots_for_budget,
@@ -1378,6 +1379,26 @@ struct GpuHistogramBuilder(Movable):
         this package calls it yet.
         """
         self.rows.set_constant_hessian(on)
+        # **THE BATCHER USED TO BE LEFT OUT, AND THAT IS WHY THE BATCHED
+        # ELISION HAS NEVER RUN.** This method forwarded to `self.rows` and
+        # stopped, so `GpuLeafBatcher.constant_hessian` stayed False for the
+        # life of every fit and the `celide` arm of `_batch_hist_atomic_kernel`,
+        # of its subtracting twin, and of `_plan_hist_kernel` was dead code on
+        # the oblivious level build. Behind `MOJOTREES_GPU_BATCH_CONST_HESS=1`
+        # so the elision is measured against the arm that has been shipping
+        # rather than arriving inside somebody else's number.
+        #
+        # Not sufficient on its own and not meant to be: `train_gpu` makes the
+        # declaration at fit setup, before `open_resident` has allocated any
+        # batcher, so `self.batcher` is usually empty here and this line does
+        # nothing. `enqueue_desc_level_children` repeats it where the batcher
+        # certainly exists, and that is the forward that reaches a kernel.
+        #
+        # `self.constant_hessian()` and not `on`: what is forwarded is what
+        # `GpuActiveRows` ADOPTED, so `MOJOTREES_CONST_HESSIAN=0` withdraws the
+        # permission from both sides at once and the two cannot disagree.
+        if len(self.batcher) > 0 and batch_const_hessian_forward_requested():
+            self.batcher[0].set_constant_hessian(self.constant_hessian())
 
     def constant_hessian(self) -> Bool:
         """Whether the constant-hessian specialization is actually in force
@@ -3033,6 +3054,23 @@ struct GpuHistogramBuilder(Movable):
                 "no device-written plan is staged; call"
                 " stage_desc_level_plan before committing a level"
             )
+        # The pair count the batch that follows this commit may hold, for the
+        # pair-indexed grid alone. A level at depth `l` commits `1 << l`
+        # parents and `2 << l` children (`_commit_level_kernel` writes `2L`
+        # items as `L` left children then `L` right ones), so this is exact
+        # whenever the level commits and an over-estimate when growth already
+        # stopped, which is the only direction that is safe and is the
+        # direction `GpuLeafBatcher.set_level_pairs` clamps in. Zero for an
+        # implausible depth, which means "assume the staged width" and is what
+        # every arm but the pair-indexed one does unconditionally.
+        #
+        # Written here rather than passed to `enqueue_desc_level_children`
+        # because this is the one call in the level loop that is told the
+        # depth, and the file that runs that loop belongs to another lane.
+        var level_pairs = 0
+        if level_depth >= 0 and level_depth < 30:
+            level_pairs = 1 << level_depth
+        self.batcher[0].set_level_pairs(level_pairs)
         self.resident_tables[0].enqueue_level(
             rec_i,
             rec_f,
@@ -3150,6 +3188,15 @@ struct GpuHistogramBuilder(Movable):
             )
         if len(self.batcher) == 0:
             raise Error("no resident histogram pool is open")
+        # The round's constant-hessian declaration, forwarded to the batcher
+        # where the batcher certainly exists. THIS IS THE FORWARD THAT REACHES
+        # A KERNEL; the one inside `set_constant_hessian` runs at fit setup,
+        # before any pool is open, and does nothing on every path this package
+        # actually takes. A host field assignment per level, six per tree, no
+        # launch and no allocation. See `set_constant_hessian` for why the
+        # forward is a switch and why it cannot move a bit when it is true.
+        if batch_const_hessian_forward_requested():
+            self.batcher[0].set_constant_hessian(self.constant_hessian())
         var blocks = self.rows.copy_back_debt_blocks()
         var rows_ptr = self.rows.rows_dev.copy()
         var scratch_ptr = self.rows.scratch_dev.copy()
