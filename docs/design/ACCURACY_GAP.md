@@ -796,6 +796,58 @@ three scenarios.
 
 ## 4. The breadth reading, tested against the real dataset, and rejected as a general claim
 
+**A CONFOUND IN THIS SECTION'S OWN TABLE, found and then RESOLVED on
+2026-08-17. Read this before the section, because the section's conclusion
+survives but its evidence did not support it as written.**
+
+The table below sorts arms into "low breadth" and "maximal breadth". Every
+low-breadth arm carries **31 leaves** and every maximal-breadth arm carries
+**64**, verified from `20260816T180302Z-decision`'s own records: `mojotrees`
+and `lightgbm` at `num_leaves = 31`, `mojotrees_catboost_mode` at
+`max_depth = 6` which is 64, and CatBoost at its own depth 6. So in this table
+BREADTH AND LEAF BUDGET ARE THE SAME AXIS and it cannot separate them. The
+section attributes the inverted ordering to "a property of the data" when a
+simpler rival was never examined: on a target where most features are noise, a
+64-leaf tree overfits more than a 31-leaf one. That is the same unmatched
+comparison this repository spent 2026-08-17 finding in its own harness keying.
+
+**So it was re-measured at MATCHED leaf budgets**, on the same real dataset,
+463,715 train by 90 features, 51,630 held out, 100 trees, GPU, with every other
+parameter pinned identically: `learning_rate = 0.1`, `lambda_l2 = 1.0`,
+`min_data_in_leaf = 20`, `max_bin = 255`, one seed. Pinning matters and is not
+decoration: `grow_policy='symmetrictree'` silently supplies CatBoost-mode
+defaults including `learning_rate = 0.03`, so an unpinned comparison measures
+the rate as much as the policy.
+
+    arm                     leaves    fit        rmse
+    lossguide                   31    1.991 s    9.10851
+    symmetric  depth 5          32    1.842 s    9.27566
+    lossguide                   64    2.997 s    9.05392
+    symmetric  depth 6          64    2.696 s    9.21316
+
+**THE CONCLUSION SURVIVES AND IS NOW BETTER SUPPORTED.** At a matched leaf
+budget symmetric is about 8 to 10 percent FASTER and 1.2 to 1.8 percent WORSE
+on rmse, in both pairs. Under rule 9 that trade fails badly: the exchange rate
+is at most about 1 percent of accuracy for at least 2x speed, and this is more
+accuracy for a tenth of the speed. **The leaf-wise default stands, and it now
+stands on a comparison that holds the leaf budget fixed rather than on one that
+confounded it.**
+
+Two further facts the re-measurement produced, both worth their own line.
+
+A SYNTHETIC PROBE POINTED THE OTHER WAY AND DID NOT TRANSFER. On synthetic
+200,000 rows by 90 features, symmetric beat lossguide on BOTH axes at matched
+leaves, 0.553 s and rmse 0.30760 against 0.648 s and 0.31562. On the real
+dataset the accuracy ordering reverses completely. Whatever the generator
+rewards, this dataset does not, and a defaults decision taken on the synthetic
+probe alone would have been wrong.
+
+`num_leaves = 64` IS MORE ACCURATE THAN 31 ON THIS DATASET under lossguide,
+9.05392 against 9.10851, for 1.5x the fit. That is a separate open question
+about our shipped `num_leaves = 31` and it is NOT settled here, because one
+dataset at one seed decides nothing about a default. It is recorded so that
+nobody reads the table above as evidence for 31.
+
 `docs/design/GPU_GROWTH_ATTRIBUTION.md` section 6.2 records that accuracy
 improves monotonically with growth breadth across four policies, offers a
 mechanism in the generator's interaction-heavy target, and closes by saying the
