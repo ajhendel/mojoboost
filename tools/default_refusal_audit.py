@@ -162,6 +162,23 @@ DEFAULT_SETS = {
 #: listed here is unreviewed, which is the state this table exists to make
 #: visible.
 ACKNOWLEDGED = {
+    ("bootstrap_type", "src/mojotrees/train_gpu.mojo"): (
+        "RESOLVED",
+        "NOT a refusal, and the one entry here that exists to stop a block "
+        "being written. MVS is honored on a GPU fit: device_gradients "
+        "reports ROUND_MVS_HOST_MAGNITUDES (gpu_fused_round.mojo:656) and "
+        "AUTO resolves it by taking the host-gradient arm, where "
+        "sampling.bootstrap_round draws the sampler exactly and the trees "
+        "still grow on the device. train_gpu.mojo:788 states it in its own "
+        "docstring and the reporting path at :885 emits honored=yes. The "
+        "raise at :3508 is a defensive guard INSIDE the device-gradient "
+        "loop, for a caller arriving there directly or for the eligibility "
+        "check being loosened later without this arm being taught the draw "
+        "-- a configuration that never reaches it. What MVS costs is the "
+        "device derivative kernel, not the accelerator. Adding a "
+        "device_policy block for it would refuse a working path, which is "
+        "the BLOCK_SCORE_FUNCTION mistake",
+    ),
     ("bootstrap_type", "src/mojotrees/model.mojo"): (
         "BLOCKING",
         "train_gpu takes no bootstrap bundle, so MVS as a default breaks "
@@ -706,16 +723,27 @@ def unmasked_by_removing(default_set, parameter):
     would still have been refused for.** The removal is correct, scheduled,
     and creates a cliff.
 
-    The live instance, which is why this exists. The proposed default set is
-    `score_function=cosine` **and** `random_strength=1`. Today
-    `BLOCK_SCORE_FUNCTION` fires and `auto` falls back to the CPU, so the fit
-    runs. When the device Cosine kernel lands and that block is removed on
-    schedule, the policy has nothing left to see: `auto` selects the GPU on
-    shape, and the fit **raises in the grower**, because
-    `ExtraTreeParams.is_active()` still carries `random_strength > 0.0`
-    (`tree_parameters_extra.mojo:1774`) while `device_policy` contains **zero**
-    occurrences of `random_strength`. A capability landing turns a working
-    default into a raising one.
+    The instance this was written for, now CLOSED, kept because the shape
+    recurs. The proposed default set is `score_function=cosine` **and**
+    `random_strength=1`. `BLOCK_SCORE_FUNCTION` fired, `auto` fell back to the
+    CPU, and the fit ran. Removing that block on schedule when the device
+    Cosine kernel landed would have left the policy nothing to see: `auto`
+    selects the GPU on shape and the fit **raises in the grower**, because
+    `ExtraTreeParams.is_active()` carries `random_strength > 0.0` while
+    `device_policy` then contained zero occurrences of `random_strength`. A
+    capability landing turning a working default into a raising one.
+
+    `BLOCK_RANDOM_STRENGTH` closed it, and `BLOCK_GROW_POLICY` /
+    `BLOCK_MAX_DEPTH` closed the two the same query surfaced next. **Do not
+    read the paragraph above as current state** -- it is the worked example,
+    and this docstring asserting a live `zero occurrences` was itself stale
+    within a day of being written, which is the failure this whole tool is
+    pointed at.
+
+    What generalizes is the query, not the example: before retiring any
+    block, ask which refusals the same fit still walks into. The answer
+    changes every time a lane lands a capability, so it is a question to
+    re-run rather than an answer to record.
 
     So the two halves reported here are:
 
@@ -843,7 +871,19 @@ def main(argv=None):
                 "UNROUTED means device_policy never names the parameter, so "
                 "no block\ncould route around it. After the removal, auto "
                 "selects the accelerator\non shape and the fit raises in the "
-                "grower. Add a block for each of\nthese BEFORE removing the "
+                "grower.\n"
+                "\n"
+                "THESE ARE LEADS, NOT A WORK LIST. Read each one before "
+                "writing a block\nfor it. This is a static name match: it "
+                "cannot tell a refusal the\nconfiguration REACHES from a "
+                "defensive raise it never arrives at, and it\ncannot see a "
+                "parameter that is honored by routing to a different arm.\n"
+                "On 2026-08-17 this list held three entries and one of them "
+                "was a working\npath -- bootstrap_type, where MVS is honored "
+                "by taking the host-gradient\narm. Writing that block would "
+                "have refused a fit that trains today.\n"
+                "Confirm each one against the code that would have to read "
+                "it, then add\nblocks for the survivors BEFORE removing the "
                 "one you named."
             )
         elif not device_rows:
