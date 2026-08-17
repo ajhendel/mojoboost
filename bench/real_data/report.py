@@ -34,6 +34,16 @@ travelling further than it deserves:
   ranking and out of the headline ratio, because the GPU is the product and the
   cpu backend is no longer optimized. `verify.py`'s ORACLE CELL block is the
   rule; this file only renders it.
+- **A SECONDS COLUMN THAT DOES NOT MEAN THE SAME THING ON EVERY ROW IS NEVER
+  THE COLUMN A TABLE IS RANKED ON.** Added 2026-08-17 after this report ranked
+  four engines on `train` while two of them bin inside their fit call and two
+  do not, which put three phases against two and published it as an ordering.
+  Every table that ranks now ranks on `fit s`, the whole fit, and prints
+  `train s` beside it with a per-row word saying where that row's binning ran.
+  Both figures are derived from the record's own phase keys and its
+  `<phase>_unavailable_reason` fields, per row, so an engine that moves its
+  binning moves this report by being re-run and not by being edited. See
+  `FIT_PHASES`, `fit_breakdown` and `FRONTIER_RANK_FIELD`.
 
 There is no summary line, no headline speedup, and no "x faster" anywhere
 in this file. If a headline is wanted, a person writes it, having read the
@@ -96,6 +106,167 @@ def phase_value(record, name, field="elapsed_s"):
         values = [s[field] for s in block["measured"] if s.get(field) is not None]
         return statistics.median(values) if values else None
     return None
+
+
+def _predict_speedup(record):
+    """Realized parallel speedup of batch prediction: one thread over many.
+
+    None, and therefore `n/a`, WHENEVER THE SINGLE-THREAD PHASE DID NOT PROVE
+    IT GOT ONE THREAD. A ratio computed against a phase whose thread knob
+    silently failed would read close to 1.0, which is the number that means
+    "this arm does not scale" -- so the failure mode of the measurement and
+    the finding it exists to report are the same value, and a reader could not
+    tell them apart. `engines._single_thread_predict` writes the verdict on
+    the row by checking the phase's own `parallel_efficiency`; this reads it
+    rather than re-deriving it, so there is one definition of "verified".
+    """
+    phases = record.get("phases") or {}
+    if phases.get("predict_batch_t1_verified") is not True:
+        return None
+    one = phase_value(record, "predict_batch_t1")
+    many = phase_value(record, "predict_batch")
+    if not one or not many:
+        return None
+    return one / many
+
+
+#: The phases a FIT is made of, in the order a fit runs them. These and no
+#: others are added up into the `fit s` column. `import` is deliberately not
+#: one of them: a process loads a library once and fits many times, and it
+#: has a column of its own already.
+#:
+#: **WHY THIS COLUMN EXISTS, and it is a reporting defect it was built to
+#: end.** `train` does not mean the same thing on every row of these tables.
+#: Two of the four engines expose binning as a step of their own and time it
+#: separately, and two bin inside the fit call, so those two carry inside
+#: their `train` figure the work their neighbours report outside it. A
+#: ranking on `train` alone therefore compares three phases against two while
+#: reading as though it compared like with like, and it flatters whichever
+#: engines bin separately, which includes ours. On run
+#: `20260817T195323Z-predict2`, medians of the repeats: our accelerator's
+#: boosting rounds are 1.589 s against CatBoost's 1.777 s, and the two fits a
+#: user actually waits on are 1.973 s against 1.840 s. The first ordering
+#: says we win and the second says we lose by about 1.07x, and only the
+#: second one is a comparison of the same quantity.
+#:
+#: `encode` and `ingest` are in the list because they are fit work that the
+#: two engines which expose them do before boosting, and leaving them out
+#: would rebuild the same asymmetry pointing the other way. They match
+#: `scenarios.PHASE_SHAPE[engine]["e2e"]` for every engine in this harness.
+FIT_PHASES = ("encode", "ingest", "binning", "train")
+
+#: The suffix an adapter writes beside a null phase to say WHERE that phase's
+#: cost went. Its presence is the record's own statement that the phase was
+#: not skipped but folded into another one, and it is the field this file
+#: reads to decide whether a fit total can be added up. See the `binning`
+#: and `train` entries of `engines.py`'s module docstring, which say the
+#: record "says so rather than leaving the two figures to be added".
+PHASE_UNAVAILABLE_SUFFIX = "_unavailable_reason"
+
+
+def fit_breakdown(record):
+    """What one record's end-to-end fit is made of, read from the record.
+
+    Returns `{"seconds", "parts", "folded", "undetermined"}`:
+
+    - `seconds` is the sum of every fit phase this record measured, or None
+      when the record cannot say what the fit cost.
+    - `parts` is the list of `(phase, seconds)` that went into it.
+    - `folded` is the list of `(phase, reason)` the record declares null WITH
+      a reason. Those add nothing, and the reason is why: either the work
+      happened inside a phase that IS counted, which is what CatBoost and
+      XGBoost record for `binning`, or there was none of it to do, which is
+      what every arm records for `encode` on a scenario with no categorical
+      features. Both cases add zero seconds, so the total does not depend on
+      telling them apart, and nothing here pretends to.
+    - `undetermined` is every phase this file could not resolve either way.
+      A non-empty list makes `seconds` None, because the alternative is
+      guessing which side of the line a number falls on, and guessing is the
+      defect this function replaces.
+
+    **The three cases, and none of them is hardcoded per engine.** A phase
+    present as a timed block is added. A phase present and null with a
+    `<phase>_unavailable_reason` beside it is folded, on the record's own
+    say-so. A phase present and null with NO reason is undetermined, and so
+    is a missing or unreadable `train`. A phase key that is ABSENT
+    ENTIRELY is a phase that engine does not have -- LightGBM and mojotrees
+    write no `ingest` key at all -- and contributes nothing, which is not a
+    guess about a number but a reading of which phases the adapter timed.
+    """
+    phases = record.get("phases") or {}
+    parts, folded, undetermined = [], [], []
+    for name in FIT_PHASES:
+        block = phases.get(name)
+        if isinstance(block, dict):
+            value = phase_value(record, name)
+            if value is None:
+                undetermined.append(name)
+            else:
+                parts.append((name, value))
+            continue
+        reason = phases.get(name + PHASE_UNAVAILABLE_SUFFIX)
+        if reason:
+            folded.append((name, str(reason)))
+        elif name in phases or name == "train":
+            # An explicit null with nothing beside it, or a fit with no
+            # boosting phase at all. Either way the record does not
+            # distinguish, and the cell has to say so.
+            undetermined.append(name)
+    seconds = None if undetermined else sum(value for _, value in parts)
+    return {
+        "seconds": seconds,
+        "parts": parts,
+        "folded": folded,
+        "undetermined": undetermined,
+    }
+
+
+def fit_seconds(record):
+    """The end-to-end fit in seconds, or None when the record cannot say."""
+    return fit_breakdown(record)["seconds"]
+
+
+def fit_shape(record):
+    """One line naming what this record's fit total contains, for a caption.
+
+    Derived from the record every time rather than looked up by engine name,
+    so an engine that changes where it bins changes this line by being
+    re-run, with no edit here.
+    """
+    breakdown = fit_breakdown(record)
+    if breakdown["undetermined"]:
+        return (
+            "not computable: this record does not say where "
+            + " or ".join(f"`{name}`" for name in breakdown["undetermined"])
+            + " went, so its fit total is left blank rather than guessed"
+        )
+    shape = " + ".join(name for name, _ in breakdown["parts"])
+    for name, reason in breakdown["folded"]:
+        # The recorded reason is quoted rather than summarized, and nothing
+        # here asserts WHERE the phase went. Two different things produce a
+        # null phase with a reason -- work that happened inside another timed
+        # phase, and work there was none of to do -- and both add nothing to
+        # the total, so the total is right either way and the prose does not
+        # have to choose. `binning` is the one phase whose placement the
+        # tables state, and `_binning_where` states it off the same field.
+        shape += f"; no separate `{name}` phase, {_first_sentence(reason)}"
+    return shape
+
+
+def _first_sentence(text, limit=200):
+    """The opening claim of a recorded reason, for a caption that has to fit
+    on a line. The whole reason stays in the record, which is where a reader
+    who wants the argument rather than the fact should be sent."""
+    # Several recorded reasons open with the literal word `null`, which is
+    # the cell's value and not its explanation, so it is dropped before the
+    # first sentence is taken.
+    body = str(text).strip()
+    if body.lower().startswith("null"):
+        body = body[4:].lstrip(". ")
+    first = body.split(". ")[0].rstrip(".")
+    if len(first) > limit:
+        first = first[:limit].rstrip() + "..."
+    return first
 
 
 def cell_key(record):
@@ -178,15 +349,73 @@ def fmt_bytes(value):
 #: thing. Both phases carry one because they are separately parallel, and
 #: an engine can be threaded in training and serial in prediction.
 FIELDS = (
+    # `fit s` FIRST, and ahead of `train s` on purpose. It is the only
+    # seconds column in this table that means the same thing on every row:
+    # everything a fit does, whichever phase each engine happens to do it in.
+    # `train s` beside it is boosting rounds on the engines that bin
+    # separately and boosting rounds PLUS binning on the engines that do not,
+    # so two `train s` cells are not always the same quantity and the caption
+    # under the table says which rows are which. A cell here reads `n/a` when
+    # the record does not distinguish, never a partial sum.
+    ("fit", "fit s", fit_seconds),
     ("train", "train s", lambda r: phase_value(r, "train")),
     ("cpu_ratio", "train par eff", lambda r: phase_value(r, "train", "parallel_efficiency")),
     ("binning", "bin s", lambda r: phase_value(r, "binning")),
-    ("predict_batch", "predict s", lambda r: phase_value(r, "predict_batch")),
+    # TWO PREDICTION SECONDS COLUMNS, AND EACH NAMES ITS DEVICE. The single
+    # column that preceded them was labeled `predict s` and was a CPU
+    # prediction on EVERY row, including the rows whose `device` column said
+    # `gpu`, because that column is the TRAINING device and the harness had
+    # no way to ask for a device prediction. A number under `gpu` that a
+    # reader had no reason to doubt was the accelerator's and was not: that
+    # is the whole reason these columns are spelled this way. The label
+    # carries the device, so the device column and the prediction column can
+    # never disagree again.
+    #
+    # `predict cpu s` is the like-for-like comparison and is the one to read
+    # against LightGBM, CatBoost and XGBoost, none of which can use this
+    # accelerator. `predict gpu s` is OURS ONLY: a competitor row has no such
+    # measurement and prints `n/a`, which `fmt_time` gives it for a missing
+    # summary, and never a blank or a zero. A blank in a seconds column reads
+    # as fast.
+    #
+    # The two are NOT interchangeable and the gpu one is not a candidate
+    # default on its timing: see `engines.GPU_PREDICT_RULE`. GPU prediction
+    # accumulates leaf values in Float32 where the host accumulates in
+    # Float64, so it can change a user's output, and the cpu-versus-gpu
+    # prediction crossover is unmeasured. Nothing here assumes the gpu column
+    # is the smaller one; on the sizes this harness runs it may well not be,
+    # and that is a publishable result rather than a problem.
+    ("predict_batch", "predict cpu s", lambda r: phase_value(r, "predict_batch")),
+    (
+        "predict_batch_gpu",
+        "predict gpu s",
+        lambda r: phase_value(r, "predict_batch_gpu"),
+    ),
     (
         "predict_batch_cpu_ratio",
-        "predict par eff",
+        "predict cpu par eff",
         lambda r: phase_value(r, "predict_batch", "parallel_efficiency"),
     ),
+    # THE SINGLE-THREAD PAIR, added 2026-08-17. `predict 1t s` is the same
+    # model over the same held-out matrix with the library held to one thread,
+    # and `predict speedup` is `predict 1t s` over `predict cpu s`: how much of
+    # the machine the arm actually converted into wall clock.
+    #
+    # They are here because the seconds column alone cannot separate a slow
+    # predictor from a badly scheduled one, and on run 20260817T195323Z-predict2
+    # it did not: our leaf-wise arm spent 0.252 CPU seconds against LightGBM's
+    # 0.409 for the same work and finished 1.6x later. Reading only the first
+    # column sends optimization at the walk, which is already the cheaper of
+    # the two. `engines.SINGLE_THREAD_PREDICT_RULE` holds the argument, and
+    # says why this pair is a diagnostic and must never become the headline:
+    # we win at one thread and lose on the machine, and the headline has to
+    # keep showing the loss a user actually gets.
+    (
+        "predict_batch_t1",
+        "predict 1t s",
+        lambda r: phase_value(r, "predict_batch_t1"),
+    ),
+    ("predict_speedup", "predict speedup", lambda r: _predict_speedup(r)),
     ("predict_row", "row ms", lambda r: _ms(phase_value(r, "predict_row"))),
     ("warmup", "warmup s", lambda r: (r.get("warmup") or {}).get("elapsed_s")),
     ("import", "import s", lambda r: phase_value(r, "import")),
@@ -334,6 +563,8 @@ def render(records, config, out):
 
             out("\nMedian across repeats, with [min, max]. A `!` marks a cell whose "
                 f"spread exceeds {warn_spread:.0%} of its median.\n")
+            _fit_caption(rows, out)
+            _predict_device_caption(rows, out)
             _oracle_caption(rows, out)
             out(
                 "The two `par eff` columns are CPU seconds over wall seconds "
@@ -361,6 +592,150 @@ def render(records, config, out):
             }
             for reason in sorted(unavailable):
                 out(f"\nHost-to-device transfer time was not measured: {reason}\n")
+
+
+#: THE ASYMMETRY, in one string, printed under every table that has a `fit s`
+#: column and above every ranking that could be read without one.
+#:
+#: It is a constant rather than three paragraphs written three times, for the
+#: same reason `HEADLINE_LABEL` is: it is a claim about what a number means,
+#: and a claim that is restated drifts.
+FIT_COLUMN_CAVEAT = (
+    "**`train s` is not the same quantity on every row, and `fit s` is.** "
+    "An engine that exposes binning as a step of its own reports it in `bin "
+    "s` and leaves it OUT of `train s`. An engine that bins inside its fit "
+    "call has no `bin s` to report and its `train s` already contains that "
+    "work. So comparing two `train s` cells across those two kinds of engine "
+    "compares more phases against fewer, and it FLATTERS EVERY ENGINE THAT "
+    "BINS SEPARATELY, WHICH INCLUDES OURS. `fit s` is every phase of the fit "
+    "on every row, so it is the column two engines can be read against each "
+    "other in. Neither column replaces the other: `train s` is the boosting "
+    "rounds this repository's optimization work actually targets, and it is "
+    "worth reading between two engines that split their phases the same way."
+)
+
+
+def _fit_caption(rows, out):
+    """Say what `fit s` contains ON EACH ROW, read off the records.
+
+    This is the part that has to survive a rerun. The asymmetry is not a fact
+    about four engine names, it is a fact about which phases each adapter
+    timed, and an adapter can move a phase. So the composition printed here
+    is derived per row from the record's own phase keys and its
+    `<phase>_unavailable_reason` fields, and an engine that starts or stops
+    exposing a separate binning pass changes this caption by being re-run.
+
+    A row whose record does not distinguish prints that it does not, in the
+    place its number would have been.
+    """
+    shapes, separable, folded = {}, set(), set()
+    for key, cell in sorted(rows.items()):
+        name = f"{key[3]} on {key[4]}"
+        for record in cell["records"]:
+            shapes.setdefault(name, set()).add(fit_shape(record))
+            breakdown = fit_breakdown(record)
+            if "binning" in dict(breakdown["parts"]):
+                separable.add(name)
+            if "binning" in dict(breakdown["folded"]):
+                folded.add(name)
+    if not shapes:
+        return
+    out(FIT_COLUMN_CAVEAT + "\n")
+    out("What `fit s` adds up, per row, read from the records:\n")
+    for name in sorted(shapes):
+        for shape in sorted(shapes[name]):
+            out(f"- {name}: {shape}")
+    out("")
+    # A row can only be in one of the two lists, because a phase is either a
+    # timed block or a null with a reason. A row in neither is one whose
+    # record does not distinguish, and its line above already says so.
+    separable, folded = sorted(separable - folded), sorted(folded - set(separable))
+    if separable and folded:
+        out(
+            "So a `train s` comparison between "
+            + ", ".join(f"`{name}`" for name in separable)
+            + " and " + ", ".join(f"`{name}`" for name in folded)
+            + " is NOT like for like, and the `fit s` column beside it is. A "
+            "`train s` comparison WITHIN either of those two lists is like "
+            "for like and is the sharper number of the two, because it holds "
+            "the binning pass constant instead of adding it to both sides.\n"
+        )
+
+
+def _predict_device_caption(rows, out):
+    """Say what the two prediction seconds columns are, under the table they
+    are in, and say what this harness has NOT answered about them.
+
+    Printed on every table that has them, unconditionally, because the
+    failure being prevented is a reader assuming which device a prediction
+    number came from and the assumption is just as available on a table with
+    no accelerator row in it.
+
+    The row-level cpu-versus-gpu gap is named here when a run recorded one,
+    as a MAGNITUDE and never as a pass or a fail. There is no threshold on it
+    anywhere and there should not be: the CPU backend is the correctness
+    oracle available for a device path, not the definition of the right
+    answer, and requiring the two to agree would forbid Float32 on the device
+    and forbid GPU inference with it. What the number is for is stated in the
+    caption, because a reader who meets a figure with no reason attached
+    will supply one.
+    """
+    gaps = []
+    for cell in rows.values():
+        for record in cell["records"]:
+            agreement = record.get("predict_device_agreement")
+            if agreement and agreement.get("max_abs_diff") is not None:
+                gaps.append(
+                    (verify._arm_of(record), agreement["max_abs_diff"])
+                )
+    out(
+        "`predict cpu s` and `predict gpu s` are the SAME fitted model "
+        "scored on the two backends, timed separately. `predict cpu s` is "
+        "the like-for-like column: it is what the competitor rows measure "
+        "too, since none of the three can use this accelerator, and a "
+        "competitor row reads `n/a` under `predict gpu s` because there is "
+        "no such measurement to make, not because it is fast. The `device` "
+        "column names the TRAINING device and says nothing about either "
+        "prediction column; a `gpu`-trained row still predicts on the CPU "
+        "in `predict cpu s`.\n"
+    )
+    if gaps:
+        worst = max(gap for _, gap in gaps)
+        arms = ", ".join(f"`{arm}`" for arm in sorted({arm for arm, _ in gaps}))
+        out(
+            "Largest row-level `|gpu - cpu|` prediction gap in this "
+            f"section: {worst:.3g}, over {arms}. **This is a reported "
+            "magnitude, not a pass or a fail.** The two are not expected to "
+            "be bit-identical: the device walk accumulates leaf values in "
+            "Float32 where the host accumulates in Float64, and both compare "
+            "against the same Float64 edges, so every row reaches the same "
+            "leaf and the accumulation is the only difference. A gap of "
+            "roughly 1e-7 relative is exactly that accumulation and is not a "
+            "defect. The number is carried anyway for two reasons. A real "
+            "defect on this path, a wrong leaf index or a row read at the "
+            "wrong offset, moves a prediction by 1e-1 or produces garbage, "
+            "so a defect cannot hide inside an expected difference and the "
+            "host is the only ground truth a device walk has. And a user who "
+            "trains where there is an accelerator and scores where there is "
+            "not is entitled to know the size of the difference rather than "
+            "be told it does not exist.\n"
+        )
+    out(
+        "The cpu-versus-gpu PREDICTION crossover is unmeasured, and nothing "
+        "here assumes which way it goes. Launch and transfer are fixed costs "
+        "that a batch has to be large enough to pay for, and prediction on "
+        "these sizes is already fast on the host: an M4 scores 51,630 rows "
+        "in about 0.008 s on the CPU with the symmetric arm. The "
+        "accelerator losing at every size this harness runs is a legitimate "
+        "result and would be worth reporting as one. No automatic device "
+        "choice is wired for prediction, and `device=\"cpu\"` remains the "
+        "prediction default everywhere: not because the CPU answer is the "
+        "correct one, but because GPU prediction returns a slightly "
+        "different number, so moving the default would change outputs that "
+        "existing callers already depend on and is a person's decision "
+        "rather than a benchmark's. When the crossover IS measured, record "
+        "the run id beside it and replace this paragraph with it.\n"
+    )
 
 
 def _oracle_caption(rows, out):
@@ -536,6 +911,65 @@ CROSSOVER_NOTE = (
 )
 
 
+def _fit_comparability(pairs, out):
+    """Say whether the `train` ratio beside the `fit` ratio is like for like,
+    by CHECKING the two records rather than by asserting it.
+
+    The mojotrees-against-LightGBM pairing this table renders is the one
+    pairing in the harness where a train ratio is sound, because both engines
+    expose binning as a separate step and both therefore exclude the same
+    phase from `train`. That is a property of two adapters, not a law, and
+    the sentence under this table used to be true only for as long as neither
+    adapter moved its binning. Now the sentence is computed: if a future run
+    ever pairs a row that bins separately with one that bins inside its fit,
+    this prints a warning instead of the reassurance.
+    """
+    # AGREEMENT is the test, not separability. Two engines that both time
+    # binning separately exclude the same phase from `train`; two that both
+    # bin inside their fit call INCLUDE the same phase in it. Either way the
+    # ratio is of one quantity. It is the mixture that is not.
+    verdicts = set()
+    for _threads, _device, mine, theirs in pairs:
+        for cell in (mine, theirs):
+            shapes = {
+                "binning" in dict(fit_breakdown(r)["parts"])
+                for r in cell["records"]
+            }
+            verdicts |= shapes
+    if verdicts == {False}:
+        out(
+            "The `train` column of that table is like for like on this run, "
+            "and it was checked rather than assumed: NEITHER engine in the "
+            "pairing times a separate binning phase, so both `train` figures "
+            "contain whatever binning each one does. It is a whole-fit "
+            "comparison under a narrower name, and `fit (e2e)` beside it is "
+            "the column to quote.\n"
+        )
+        return
+    if verdicts == {True}:
+        out(
+            "The `train` column of that table IS like for like, and this run "
+            "was checked rather than assumed: both engines in the pairing "
+            "expose binning as a separate timed step, so both exclude the "
+            "same phase from `train`. **That does not travel.** CatBoost and "
+            "XGBoost bin inside their fit call, so their `train` figure "
+            "contains a phase this one does not, and a ratio taken from this "
+            "table must not be carried across to either of them. The `fit "
+            "(e2e)` column is the one that compares against every engine in "
+            "the harness.\n"
+        )
+        return
+    out(
+        "**The `train` column of that table is NOT like for like on this "
+        "run.** The two engines in the pairing do not both expose binning as "
+        "a separate timed step, so one side's `train` contains a phase the "
+        "other side reports outside it, and the ratio compares more phases "
+        "against fewer. Read the `fit (e2e)` column, which is every phase of "
+        "the fit on both sides. The per-row composition is printed under the "
+        "per-engine table above.\n"
+    )
+
+
 def _ratios(rows, min_repeats, out):
     """Our best available backend against LightGBM's, at a matched thread count.
 
@@ -596,15 +1030,26 @@ def _ratios(rows, min_repeats, out):
     # fewer bins or a coarser learning rate buy any of these ratios outright.
     # A reader could take "0.72x train" out of here with nothing beside it. Now
     # both engines' primary metric sits in the same row as their ratio.
+    # THE FIT RATIO LEADS AND THE TRAIN RATIO FOLLOWS, since 2026-08-17. The
+    # train ratio in this particular table happens to be sound -- both sides
+    # of THIS pairing expose binning separately, so both exclude the same
+    # phase -- but it is sound by coincidence of which two engines are paired
+    # here rather than by construction, and nothing in the table said which.
+    # A reader who carried "0.63x train" from this table over to the CatBoost
+    # or XGBoost row of the frontier would be carrying it into a comparison
+    # where it does not hold, because those two bin inside their fit call.
+    # `_fit_comparability` checks the pairing against the records instead of
+    # asserting it in prose, and prints a warning under the table if a future
+    # run ever pairs two rows that split their phases differently.
     out(
         "\n| threads | mojotrees on | row | lightgbm on | "
-        "train mojotrees / lightgbm | binning | predict | "
+        "fit (e2e) mojotrees / lightgbm | train | binning | predict | "
         "metric | mojotrees | lightgbm | accuracy gap |"
     )
-    out("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    out("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for threads, device, mine, theirs in pairs:
         cols = []
-        for name in ("train", "binning", "predict_batch"):
+        for name in ("fit", "train", "binning", "predict_batch"):
             a, b = mine["summary"][name], theirs["summary"][name]
             if (
                 a is None or b is None or not b["median"]
@@ -660,6 +1105,7 @@ def _ratios(rows, min_repeats, out):
         )
 
     out("")
+    _fit_comparability(pairs, out)
     out(
         "**Every speed ratio in that table carries the accuracy it was bought "
         "at, in the same row, and it is to be quoted that way or not at all.** "
@@ -701,18 +1147,91 @@ def _ratios(rows, min_repeats, out):
     out(
         f"Ratios are medians over at least {min_repeats} repeats, and read as "
         "mojotrees divided by lightgbm, so below 1.00 is mojotrees being "
-        "quicker. They describe this machine on this day under the conditions "
-        "named above. Nothing here is a claim about either library in general.\n"
+        "quicker. `fit (e2e)` is the ratio of the two whole fits and is the "
+        "one to quote; `train` is the diagnostic beside it, and whether it "
+        "is like for like on this run is stated above the paragraph you are "
+        "reading, checked against the records. They describe this machine on this day "
+        "under the conditions named above. Nothing here is a claim about "
+        "either library in general.\n"
     )
 
 
-#: What a frontier row is ranked ON. Training seconds, median over repeats.
+#: What a frontier row is ranked ON. END-TO-END FIT SECONDS, median over
+#: repeats, since 2026-08-17. It was `train` until then, and the change is not
+#: a preference between two reasonable columns. It is a correction.
 #:
-#: Not end to end: the import, the data build and the prediction phases are
-#: the same work for every arm at one tree count, so including them would
-#: dilute exactly the difference the frontier is looking for. They are already
-#: in the tables above for anyone who wants them.
-FRONTIER_RANK_FIELD = "train"
+#: **The argument, and both candidates are legitimate, which is why it has to
+#: be argued rather than picked.**
+#:
+#: Ranking on boosting rounds alone isolates the phase almost all of this
+#: repository's optimization work targets, and inside one class of engine it
+#: is the sharper of the two numbers, because it holds the binning pass
+#: constant instead of adding the same seconds to both sides. That is a real
+#: argument and the column stays in the table for it.
+#:
+#: It loses on one point, and the point is decisive: `train` IS NOT THE SAME
+#: QUANTITY ON EVERY ROW OF THIS TABLE. LightGBM and mojotrees expose binning
+#: as a separate timed step and exclude it from `train`; CatBoost and XGBoost
+#: bin inside their fit call and cannot exclude it. So an ordering on `train`
+#: puts three phases against two and presents the result as an ordering. A
+#: table's ranking column is the one quantity every row in it has to share,
+#: and `train` is not that quantity here while `fit` is.
+#:
+#: It also loses on the second point, which is who the table is for. A rank is
+#: read as "which of these should I use", and what a user waits for is the
+#: fit, not the subset of the fit this repository finds most interesting.
+#: `CLAUDE.md` already says every published number is end to end, binning plus
+#: training, against the comparator. This makes the frontier obey the rule the
+#: rest of the harness was already written to.
+#:
+#: **What it costs, stated because it is a real cost.** A phase that is the
+#: same work on every one of our arms now sits inside the ranked number and
+#: dilutes the differences between them: our binning pass is about 0.38 s on
+#: run 20260817T195323Z-predict2, which is 19 percent of the leaf-wise
+#: accelerator arm's fit and moves none of the arms relative to each other.
+#: That is why `train s` keeps its own column beside the rank rather than
+#: being replaced by it. Read the rank to know which arm to run, and read
+#: `train s` beside it to know whether a boosting change did anything.
+FRONTIER_RANK_FIELD = "fit"
+
+#: How a ranked value is read off a record, per rank field, so that changing
+#: `FRONTIER_RANK_FIELD` is a one-line change and never a silent one. `fit`
+#: is a sum this file computes; a phase name is a phase.
+RANK_GETTERS = {
+    "fit": fit_seconds,
+    "train": lambda record: phase_value(record, "train"),
+}
+
+#: How the ranked column is labeled and named in prose, in one place, so that
+#: a caption cannot say the table is ranked on something it is not.
+RANK_LABELS = {
+    "fit": ("fit s (e2e)", "median end-to-end fit seconds"),
+    "train": ("train s", "median train seconds"),
+}
+
+
+def _binning_where(records):
+    """Where a row's binning ran, as one of three words, read from the records.
+
+    `separate` means the adapter timed a binning phase of its own, so this
+    row's `train s` excludes it. `inside train` means the record declares the
+    phase null WITH a reason, so this row's `train s` already contains it.
+    `not stated` is everything else, including a set of repeats that disagree
+    with each other, and it is printed rather than resolved: a row whose
+    phases cannot be placed must not be silently placed on one side.
+    """
+    placements = set()
+    for record in records:
+        breakdown = fit_breakdown(record)
+        if "binning" in dict(breakdown["parts"]):
+            placements.add("separate")
+        elif "binning" in dict(breakdown["folded"]):
+            placements.add("inside train")
+        else:
+            placements.add("not stated")
+    if len(placements) == 1:
+        return placements.pop()
+    return "not stated"
 
 
 def _frontier_group(record):
@@ -953,10 +1472,41 @@ RANKING_CAVEAT = (
     "columns together or quote neither."
 )
 
+#: WHICH SECONDS THE RANK IS, printed above every frontier table beside
+#: `RANKING_CAVEAT` and for the same reason: it is the sentence that decides
+#: whether the ordering above it means anything, and it must not drift.
+#:
+#: Registered 2026-08-17, with the move of the rank from `train` to `fit`.
+#: The argument for the move is on `FRONTIER_RANK_FIELD` and is not repeated
+#: here; what a reader of the table needs is the consequence.
+RANK_FIELD_CAVEAT = (
+    "**The rank is END-TO-END FIT, and the `train s` column beside it is "
+    "not rankable across these rows.** An engine that exposes binning as a "
+    "step of its own keeps it out of `train s`; an engine that bins inside "
+    "its fit call cannot, and its `train s` already contains that work. So "
+    "RANKING ON BOOSTING ROUNDS ALONE FLATTERS EVERY ENGINE THAT BINS "
+    "SEPARATELY, WHICH INCLUDES OURS, and it does so by a phase that is 19 "
+    "percent of our own fit. `fit s (e2e)` is every phase of the fit on "
+    "every row, which is what a user waits for and the one quantity these "
+    "rows share. `train s` is kept beside it because it is the phase this "
+    "repository's optimization work targets and it is the sharper number "
+    "BETWEEN TWO ROWS THAT SPLIT THEIR PHASES THE SAME WAY. Which rows those "
+    "are is printed under the per-engine table above, read off the records "
+    "rather than assumed."
+)
+
 
 def _frontier(records, config, out):
-    """The frontier block: every arm ranked by speed, with both accuracy
-    columns beside it, per tree count.
+    """The frontier block: every arm ranked by END-TO-END FIT SECONDS, with
+    the boosting-rounds figure and both accuracy columns beside it, per tree
+    count.
+
+    THE RANK MOVED FROM `train` TO `fit` ON 2026-08-17 and the argument is on
+    `FRONTIER_RANK_FIELD`. In one line: `train` is not the same quantity on
+    every row of this table, because two of the four engines bin inside their
+    fit call and two do not, so an ordering on it compared more phases against
+    fewer and read as an ordering. Both figures are printed on every row and
+    `RANK_FIELD_CAVEAT` sits above every table saying which is which.
 
     REBUILT 2026-08-17, AND THE MEANING CHANGED. Read this before reading a
     table from before that date against one from after, because the same
@@ -1088,24 +1638,44 @@ def _frontier(records, config, out):
         unjudged = []
         metric = None
         for arm, group_records in sorted(groups[group].items()):
+            # The ranked column, through `RANK_GETTERS` so that what the rank
+            # IS and what the caption SAYS it is cannot come apart.
             summary = summarise(
-                [phase_value(r, FRONTIER_RANK_FIELD) for r in group_records]
+                [RANK_GETTERS[FRONTIER_RANK_FIELD](r) for r in group_records]
+            )
+            # Boosting rounds, beside the rank rather than as the rank, since
+            # 2026-08-17. It is the phase this repository optimizes and it is
+            # the sharper of the two numbers between rows that split their
+            # phases the same way, and it is not rankable across rows that do
+            # not: see `RANK_FIELD_CAVEAT`.
+            train_summary = summarise(
+                [phase_value(r, "train") for r in group_records]
             )
             # Inference, beside training, since 2026-08-17. Andrew asked for
             # it as its own column and the reason is that these two numbers
             # are bought at completely different rates: a model is TRAINED
             # once and PREDICTED with for as long as it is deployed, so the
             # column this table ranks on is the one that matters least in
-            # production. Ranking is left on train seconds deliberately, so
-            # that this is a fact placed beside the ranking rather than a
-            # silent change to what the ranking means.
+            # production. That reason is unchanged by the rank moving to the
+            # whole fit: a fit is still paid once and a prediction for as
+            # long as the model is deployed.
             #
             # The measurement already existed in the phase table further up
             # and reached nobody who read only the frontier, which is how we
             # published a training win for weeks without noticing we were
             # last on inference against every competitor.
+            #
+            # TWO COLUMNS SINCE THE DEVICE REACHED PREDICTION, and for the
+            # reason `FIELDS` states at length: this one used to be labeled
+            # `predict s` and was a CPU number on every row including the
+            # rows whose device column said `gpu`. The cpu figure keeps the
+            # like-for-like comparison against the competitors and the gpu
+            # one sits beside it, `n/a` on every row that has none.
             predict_summary = summarise(
                 [phase_value(r, "predict_batch") for r in group_records]
+            )
+            predict_gpu_summary = summarise(
+                [phase_value(r, "predict_batch_gpu") for r in group_records]
             )
             first = group_records[0]
             metric = metric or first.get("primary_metric")
@@ -1152,7 +1722,19 @@ def _frontier(records, config, out):
                 "arm": arm,
                 "block": block,
                 "summary": summary,
+                "train_summary": train_summary,
+                # What this row's fit total is made of, one entry per distinct
+                # shape across its repeats. Carried on the row so the table
+                # can say, per row, which cells its `train s` is comparable
+                # with, without re-reading the records to find out.
+                "fit_shapes": sorted({fit_shape(r) for r in group_records}),
+                # WHERE THIS ROW'S BINNING IS, as one of three words, in the
+                # row itself and not only in a caption. A caption does not
+                # stop anybody reading one `train s` cell against the one
+                # above it; a column in the same row does.
+                "binning_where": _binning_where(group_records),
                 "predict_summary": predict_summary,
+                "predict_gpu_summary": predict_gpu_summary,
                 "speed": summary["median"] if summary else None,
                 "metric_value": (first.get("quality") or {}).get(
                     first.get("primary_metric")
@@ -1178,17 +1760,20 @@ def _frontier(records, config, out):
 
         front = _pareto(rankable, metric)
 
+        rank_column, rank_prose = RANK_LABELS[FRONTIER_RANK_FIELD]
         out(
             f"\n**{scenario} / {kind} / {device} / t{threads} / "
-            f"{trees} trees**, ranked on median train seconds, primary "
+            f"{trees} trees**, ranked on {rank_prose}, primary "
             f"metric {metric}.\n"
         )
         out(RANKING_CAVEAT + "\n")
+        out(RANK_FIELD_CAVEAT + "\n")
         out(
-            f"| rank | arm | block | train s | predict s | {metric} | "
-            "vs anchor | vs best peer | pareto |"
+            f"| rank | arm | block | {rank_column} | train s | binning | "
+            f"predict cpu s | predict gpu s | {metric} | vs anchor | "
+            f"vs best peer | pareto |"
         )
-        out("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        out("| --- " * 12 + "|")
         ordered = sorted(
             rows,
             key=lambda r: (
@@ -1217,10 +1802,71 @@ def _frontier(records, config, out):
             out(
                 f"| {row['rank']} | {row['arm']} | {row['block']} | "
                 f"{fmt_time(row['summary'], 0.25)} | "
+                f"{fmt_time(row['train_summary'], 0.25)} | "
+                f"{row['binning_where']} | "
                 f"{fmt_time(row['predict_summary'], 0.25)} | "
+                f"{fmt_time(row['predict_gpu_summary'], 0.25)} | "
                 f"{'n/a' if value is None else f'{value:.6g}'} | "
                 f"{_anchor_cell(row['anchor'], row['competitor'])} | "
                 f"{_peer_cell(row['peer'], row['competitor'])} | {pareto} |"
+            )
+
+        out(
+            "\nThe two prediction columns are the same fitted model scored "
+            "on the two backends. `predict cpu s` is the like-for-like "
+            "figure and is what the competitor rows measure too, since none "
+            "of the three can use this accelerator; a competitor row reads "
+            "`n/a` under `predict gpu s` because there is no such "
+            "measurement to make, not because it is fast. The ranking is on "
+            f"{rank_prose} and reads NEITHER prediction column. The "
+            "cpu-versus-gpu prediction crossover is unmeasured and the "
+            "accelerator is not assumed to win at any size; no automatic "
+            "device choice is wired for prediction, and `device=\"cpu\"` "
+            "remains the prediction default because the gpu answer differs "
+            "from it by roughly 1e-7 relative, so moving the default would "
+            "change outputs existing callers depend on. That difference is "
+            "recorded per run as a magnitude and gates nothing.\n"
+        )
+
+        # The composition of the ranked column, IN THIS SECTION and not only
+        # under the per-engine table, because a reader who came for the
+        # ranking never scrolls back up to the table that explains it. It is
+        # the same per-record derivation, printed where the rank is.
+        out(f"\nWhat `{rank_column}` adds up, per arm, read from the records:\n")
+        for row in ordered:
+            for shape in row["fit_shapes"]:
+                out(f"- {row['arm']}: {shape}")
+        out("")
+        # TWO DIFFERENT SILENCES, and they had to be split because conflating
+        # them prints a false sentence. A record can fail to place its
+        # binning and still have a perfectly good fit total, which is what a
+        # record with no binning phase at all looks like. Only a record whose
+        # phases cannot be added has no rank.
+        unplaced = [row for row in ordered if row["binning_where"] == "not stated"]
+        if unplaced:
+            out(
+                "Rows whose records neither time a binning phase nor say "
+                "where their binning ran: "
+                + ", ".join(f"`{row['arm']}`" for row in sorted(
+                    unplaced, key=lambda r: r["arm"]))
+                + ". Their `" + rank_column + "` is the sum of the phases "
+                "they did record and their rank is real; what cannot be said "
+                "about them is which side of the `train s` split they belong "
+                "on, so read the ranked column for them and not that one.\n"
+            )
+        unranked = [
+            row for row in ordered
+            if row["speed"] is None and not row["oracle"]
+        ]
+        if unranked:
+            out(
+                "Rows with NO RANK because their fit could not be added up: "
+                + ", ".join(f"`{row['arm']}`" for row in sorted(
+                    unranked, key=lambda r: r["arm"]))
+                + ". A phase they declare null with no reason beside it, or a "
+                "missing boosting phase, leaves the total undecidable, and a "
+                "blank is the honest cell there. That is a gap in the adapter "
+                "that wrote the record and is fixed there rather than here.\n"
             )
 
         has_oracle = any(row["oracle"] for row in rows)
@@ -1263,9 +1909,24 @@ def _frontier(records, config, out):
             # "includes the competitors" there would be a false reassurance
             # about the one comparison a reader most wants.
             has_competitor = any(r["competitor"] for r in rankable)
+            # THE WORD "FASTEST" NAMES ITS QUANTITY HERE, since 2026-08-17.
+            # This sentence used to read "fastest ... at 1.586 s" off a train
+            # column that meant boosting rounds on some rows and boosting
+            # rounds plus binning on others, which made it a claim nobody
+            # could check against the row beside it. It now says end-to-end
+            # fit, in the sentence, and carries the boosting figure after it
+            # so the two are never separated.
             out(
-                f"Fastest in this table at {trees} trees: **{fastest['arm']}** "
-                f"at {fastest['speed']:.3f} s, {metric} {shown}."
+                f"Fastest END TO END in this table at {trees} trees: "
+                f"**{fastest['arm']}** at {fastest['speed']:.3f} s of "
+                f"end-to-end fit ("
+                + (
+                    "boosting rounds "
+                    + f"{fastest['train_summary']['median']:.3f} s, binning "
+                    + fastest["binning_where"]
+                    if fastest["train_summary"] else "no boosting figure"
+                )
+                + f"), {metric} {shown}."
                 + (
                     " That includes the competitor rows, which are ranked on "
                     "speed here alongside our own arms."
@@ -1288,8 +1949,15 @@ def _frontier(records, config, out):
                 and best["anchor"].get("anchored")
             )
             line = (
-                f"Fastest of OUR arms at {trees} trees: **{best['arm']}** at "
-                f"{best['speed']:.3f} s, {metric} "
+                f"Fastest of OUR arms END TO END at {trees} trees: "
+                f"**{best['arm']}** at {best['speed']:.3f} s of end-to-end "
+                "fit ("
+                + (
+                    f"boosting rounds {best['train_summary']['median']:.3f} s, "
+                    "binning " + best["binning_where"]
+                    if best["train_summary"] else "no boosting figure"
+                )
+                + f"), {metric} "
                 + ("n/a" if best["metric_value"] is None
                    else f"{best['metric_value']:.6g}")
                 + f", {_peer_cell(best['peer'], False)}, anchor "

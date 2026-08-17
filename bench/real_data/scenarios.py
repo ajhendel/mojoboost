@@ -145,10 +145,16 @@ LightGBM dict, and it is the same kind of thing:
   work. The first keeps LightGBM's log out of the harness's stdout, which
   the backend-proof parser reads; the second makes a repeat a repeat.
 
-Threads are matched by count, not by parameter name: LightGBM reads
-`num_threads`, mojotrees reads the MOJOTREES_NUM_WORKERS environment
-variable, and the runner sets both from one number before either library
-is imported.
+Threads are matched by MEANING and not by the integer, which is a
+correction made on 2026-08-17. LightGBM reads `num_threads`, which sizes a
+pool its own scheduler then feeds; mojotrees reads MOJOTREES_NUM_WORKERS,
+which is not a thread count at all but a fixed block count that replaces
+`parallel.plan_tasks`'s rule. Exporting one integer into both therefore
+moved exactly one engine off its own defaults, and the harness called the
+result like-for-like. A cell at the machine's own core count now leaves
+MOJOTREES_NUM_WORKERS UNSET so our planner runs, which is what a user gets
+and what the peers' thread count asks of them; a cell below it pins the
+count and the record says so. See `run.mojotrees_workers`.
 
 ## What is NOT in the comparator
 
@@ -2270,9 +2276,12 @@ CATBOOST_PARAM_MAP = {
 #: `None` means the reason does not depend on the value.
 CATBOOST_PARAM_NOT_MAPPED = {
     "thread_count": {
-        "why": "set by the runner on every arm from one number. mojotrees "
-               "takes it from MOJOTREES_NUM_WORKERS in the environment rather "
-               "than as a parameter, so there is no key on our side to diff",
+        "why": "set by the runner on every peer arm from one number. "
+               "mojotrees takes it from MOJOTREES_NUM_WORKERS in the "
+               "environment rather than as a parameter, and on a whole-machine "
+               "cell that variable is deliberately unset because it is a block "
+               "count and not a thread count (run.mojotrees_workers), so there "
+               "is no key on our side to diff",
         "holds_while": None,
     },
     "allow_writing_files": {
@@ -3825,9 +3834,12 @@ def mojotrees_params(spec, device, extra=None):
     `mojotrees.train`.
 
     Thread count is deliberately absent. mojotrees takes it from
-    MOJOTREES_NUM_WORKERS, which the runner sets in the environment before
+    MOJOTREES_NUM_WORKERS, which the runner decides in the environment before
     the extension is imported, and a parameter here would suggest there are
-    two ways to set it.
+    two ways to set it. Since 2026-08-17 "decides" includes leaving it UNSET,
+    which is auto mode and is what a whole-machine cell gets: see
+    `run.mojotrees_workers` for why an integer copied from the peers' thread
+    count was not the same instruction.
 
     Nothing on this side answers the comparator's `deterministic`, and
     that is the point of the setting rather than an omission: mojotrees is

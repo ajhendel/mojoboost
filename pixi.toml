@@ -86,6 +86,11 @@ check-port-doc = "python3 tools/port_report.py --check"
 check-pixi = "python3 tools/check_pixi_tasks.py"
 check-connectivity = "python3 tools/connectivity_audit.py"
 check-integration = "python3 tools/audit_integration.py"
+# The CPU-only build guard audit. An accelerator machine cannot reproduce
+# `Unknown GPU architecture detected`, so this enumerates the reachable GPU
+# APIs instead of waiting for CI to find the next one. Reads the tree as
+# text; builds nothing. See docs/design/CPU_ONLY_BUILD_AUDIT.md.
+check-gpu-guards = "python3 tools/check_gpu_guards.py"
 # All of the above, every one run even when an earlier one fails, so the
 # report is the whole state rather than the first thing that broke.
 check-gates = "bash tools/check_gates.sh"
@@ -225,6 +230,15 @@ compare-missing = "python bench/compare_missing_lightgbm.py"
 compare-categorical = "python bench/compare_categorical_lightgbm.py"
 bench-custom-py = "python bench/bench_custom_objective.py"
 compare-ranking = "python bench/compare_ranking.py"
+# Batch prediction against block count, ours and LightGBM's, interleaved in
+# one process. Answers why our predict phases sit at 3.3 effective cores on a
+# 10-core M4 while the peers reach 8.2 to 8.5, by sweeping the block count
+# instead of reading one point: a static split and a small worker pool both
+# predict 3.33 at ten blocks and disagree everywhere else. Needs LightGBM for
+# its second half, which is the busy-wait check, hence this environment. See
+# the file's docstring for the three hypotheses and how the curve separates
+# them.
+predict-thread-sweep = "python bench/real_data/predict_thread_sweep.py"
 # The numeric differential against LightGBM for the features whose parity
 # rows say `partial` only because no differential has ever run. Needs both
 # libraries, hence this environment. See docs/DIFFERENTIAL_TESTING.md.

@@ -222,6 +222,7 @@ from std.atomic import Atomic
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import isfinite, round
 from std.memory import stack_allocation
+from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
@@ -1106,14 +1107,23 @@ def _enqueue_zero_i32[
     A free function rather than a method so a caller can pass one of its own
     fields without borrowing itself mutably at the same time.
     """
-    if n <= 0:
-        return
-    ctx.enqueue_function[_zero_i32_kernel](
-        buf,
-        Int32(n),
-        grid_dim=(n + threads - 1) // threads,
-        block_dim=threads,
-    )
+    # Guarded 2026-08-17 by the CPU-only build audit
+    # (docs/design/CPU_ONLY_BUILD_AUDIT.md). The wrap covers the whole body
+    # rather than the launch alone because the `n <= 0` EARLY RETURN below
+    # does not prune; only a `comptime if` with an `else` removes the branch
+    # at compile time, and without it a CPU-only build elaborates
+    # `_zero_i32_kernel` and dies on `Unknown GPU architecture detected`.
+    comptime if not has_accelerator():
+        raise Error("zeroing a device range needs an accelerator")
+    else:
+        if n <= 0:
+            return
+        ctx.enqueue_function[_zero_i32_kernel](
+            buf,
+            Int32(n),
+            grid_dim=(n + threads - 1) // threads,
+            block_dim=threads,
+        )
 
 
 # --- Device-resident sparse builder --------------------------------------

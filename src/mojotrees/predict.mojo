@@ -60,6 +60,7 @@ compares per level at plan time.
 
 from std.math import isnan
 from std.os import getenv
+from std.sys.info import simd_width_of
 
 from .binning import BinMapper, BinnedMatrix, POSITIVE_INF
 from .boosting import Booster, IterationRange
@@ -83,6 +84,7 @@ comptime REFUSE_CATEGORICAL_FEATURE = 3
 comptime REFUSE_NEGATIVE_THRESHOLD = 4
 comptime REFUSE_MISSING_BIN_IN_RANGE = 5
 comptime REFUSE_NODE_MISSING_BIN = 6
+comptime REFUSE_NAN_EDGE = 7
 comptime REFUSE_SWITCH_OFF = 10
 comptime REFUSE_TOO_FEW_ROWS = 11
 comptime REFUSE_EMPTY_RANGE = 12
@@ -91,6 +93,7 @@ comptime REFUSE_CTR_TABLES = 14
 comptime REFUSE_EMPTY_TREE = 15
 comptime REFUSE_BACKWARD_LINKS = 16
 comptime REFUSE_NOT_OBLIVIOUS = 17
+comptime REFUSE_TOO_MANY_NODES = 18
 
 
 def _yn(b: Bool) -> String:
@@ -124,6 +127,8 @@ def refusal_text(code: Int) -> String:
         return String("mapper missing bin is inside the ordinary bin range")
     if code == REFUSE_NODE_MISSING_BIN:
         return String("node missing bin disagrees with the mapper's")
+    if code == REFUSE_NAN_EDGE:
+        return String("split edge is NaN, so no comparison can order it")
     if code == REFUSE_SWITCH_OFF:
         return String("MOJOTREES_RAW_PREDICT=0")
     if code == REFUSE_TOO_FEW_ROWS:
@@ -140,6 +145,8 @@ def refusal_text(code: Int) -> String:
         return String("tree links do not point forward")
     if code == REFUSE_NOT_OBLIVIOUS:
         return String("no oblivious plan (ragged, too deep, or too few rows)")
+    if code == REFUSE_TOO_MANY_NODES:
+        return String("more than 2^31 - 1 nodes in the iteration range")
     return String("unknown")
 
 
@@ -311,10 +318,22 @@ struct ObliviousEnsemble(Copyable, Movable):
     `bin(v) <= lvl_threshold[s]` for every non-NaN `v`. Meaningless unless
     `raw_ready`."""
 
-    var lvl_nan_left: List[Bool]
-    """Per level slot, the direction a NaN raw value takes: a constant,
-    because a NaN's bin is a constant of the feature. Meaningless unless
-    `raw_ready`."""
+    var lvl_nan_left: List[Int32]
+    """Per level slot, 1 when a NaN raw value goes LEFT and 0 when it goes
+    right: a constant, because a NaN's bin is a constant of the feature.
+    Meaningless unless `raw_ready`.
+
+    0/1 rather than Bool, for the reason binning.mojo:1388 states in the same
+    words: the raw-pointer loads that read this in
+    `predict_oblivious_raw_batch` are defined for scalar element types only,
+    and a `List[Bool]` has no `unsafe_load`. `Int32` rather than `UInt8` or
+    `Int` so that this file carries ONE integer width across the plan
+    streams, matching `nd_feature` and `nd_child` on `RawEnsemble`.
+
+    `lvl_default_left` and `lvl_is_cat` stay `List[Bool]` on purpose. They
+    are read only by ordinary subscript in `_goes_left` and the plan
+    builders, never through a pointer, and a `Bool` that is never read
+    unsafely is the clearer type."""
 
     var raw_refuse_code: Int
     """The FIRST `REFUSE_*` reason the raw rewrite declined, or `REFUSE_NONE`.
@@ -640,11 +659,16 @@ def predict_oblivious_batch(
     var base = booster.base_score
     var lr = booster.learning_rate
     var with_base = rng.includes_base()
+    # Resolved once per call rather than once per row; see
+    # `Booster.response_is_identity`. `raw_score` folds in because it already
+    # meant "store the raw score", and for an identity link `response(raw)`
+    # IS `raw`, so the two arms below are the same store.
+    var pass_through = raw_score or booster.response_is_identity()
 
     def apply(start: Int, end: Int) {imm}:
         for r in range(start, end):
             var raw = plan.raw_from_row(data, r, base, lr, with_base)
-            if raw_score:
+            if pass_through:
                 out_p.unsafe_store(r, raw)
             else:
                 out_p.unsafe_store(r, booster.response(raw))
@@ -738,9 +762,12 @@ def predict_oblivious_batch(
 # - A NaN's bin is a CONSTANT of the feature, so the direction a NaN takes at
 #   a node is a constant of the node. `_raw_split` computes that bin exactly
 #   the way `bin_value` would, runs the node's own `goes_left` rule on it, and
-#   stores the answer as `nan_left`. The walk reads it instead of comparing,
-#   which it must: `NaN <= edge` is false in IEEE-754, so a NaN falling
-#   through to the compare would silently go right at every node.
+#   stores the answer as `nan_left`. Something has to carry it, because
+#   `NaN <= edge` is false in IEEE-754, so a NaN falling through to a lone
+#   `<=` would silently go right at every node. `RawEnsemble` carries it as
+#   the THIRD child of the node rather than as a flag the walk tests: with a
+#   NaN edge refused, "neither `v <= edge` nor `v > edge`" identifies a NaN
+#   exactly, so the walk indexes the answer instead of branching to it.
 # - A NON-NaN value can never take the missing branch, because bin(v) is in
 #   [0, k] and a reserved missing bin is k + 1. So dropping the missing test
 #   from the compare path removes a branch that could not have fired. To keep
@@ -763,6 +790,16 @@ def predict_oblivious_batch(
 # Like every other gate in this file it cannot change an output: both arms
 # reach the same leaf of the same tree and sum in the same order.
 comptime RAW_MIN_ROWS = 8
+
+
+# The most nodes `raw_plan` will flatten across one iteration range. `Int32`
+# node and feature indices are what make the plan twenty-four bytes per node
+# (see `RawEnsemble`), and this is the bound that makes the narrowing a
+# CHECKED fact rather than an assumption about how large an ensemble gets.
+# `gpu_predict._append_tree` bounds its own flatten the same way and for the
+# same reason. No ensemble this package can train comes near it; a plan that
+# somehow did is refused, not truncated, and the bins-and-walk path answers.
+comptime RAW_MAX_NODES = 2147483647
 
 
 # How much work one row's walk of one tree is worth in the histogram-op
@@ -857,6 +894,14 @@ def _raw_split(
     var edge = POSITIVE_INF
     if threshold_bin < k:
         edge = mapper.edges[lo + threshold_bin]
+    # A NaN edge would make BOTH `v <= edge` and `v > edge` false for every
+    # value, NaN and non-NaN alike, so the walk could no longer tell a missing
+    # value from an ordinary one and the rewrite would stop matching
+    # `bin(v) <= threshold_bin`. `fit_bins` never produces one; this is the
+    # same kind of structural guard as the missing-bin checks above, and it is
+    # what lets the walk read "neither below nor above" as "NaN".
+    if isnan(edge):
+        return _RawSplit(False, 0.0, False, REFUSE_NAN_EDGE)
 
     # `bin_value(feature, NaN)`, statement for statement: the reserved bin
     # when there is one, and otherwise the bin of 0.0.
@@ -877,9 +922,36 @@ struct RawEnsemble(Copyable, Movable):
     """The trees of one iteration range in flat, raw-value form.
 
     Structure of arrays, one entry per node, with child links already rebased
-    to absolute indices in the flat arrays, so a walk touches five contiguous
+    to absolute indices in the flat arrays, so a walk touches three contiguous
     tables instead of chasing a `Tree` object per tree and ten `List`s per
     node. `tree_root[t]` is tree t's root.
+
+    **Twenty-four bytes per node across three streams, and the shape of those
+    three is the point.** The first version of this struct spread one node
+    across SIX `List`s, so a single visit read `nd_feature[node]`,
+    `nd_edge[node]`, `nd_nan_left[node]` and then one of `nd_left`/`nd_right`
+    at the same index: four unrelated base pointers, four cache lines and four
+    TLB entries for one logical record, on a loop whose whole cost is the
+    dependent load chain. Three changes fold that down and none of them can
+    move a bit:
+
+    - `nd_child` is stride THREE and interleaved, so a node's three
+      destinations are 12 adjacent bytes. Slot 0 is the left child, slot 1 the
+      right, and slot 2 is the child a NaN takes, which is a CONSTANT of the
+      node (`_raw_split.nan_left` picks it at plan time). Baking it into the
+      table is what deletes `nd_nan_left` from the hot loop entirely, and it
+      turns "compare, then branch to one of two loads" into one indexed load
+      from an index the compare already computed.
+    - `nd_edge` carries the split edge at an internal node and the LEAF VALUE
+      at a leaf. They are never both live: the walk leaves the loop exactly
+      when `nd_feature` is negative, and a leaf has no edge. That is one
+      Float64 stream where there were two, and the leaf value is still the
+      same Float64 the tree stores.
+    - `nd_feature` and `nd_child` are `Int32`. A feature index is bounded by
+      the matrix and a node index by `RAW_MAX_NODES`, which `raw_plan` checks
+      rather than assumes. `nd_edge` stays **Float64**, because the whole
+      bit-identity claim is that the comparison and the sum are the same
+      Float64 operations the bins path performs.
 
     Deliberately NOT `gpu_predict.FlatEnsemble`, which was read first and does
     not fit: it stores leaf values as **Float32**, which is right for a device
@@ -894,12 +966,15 @@ struct RawEnsemble(Copyable, Movable):
     var active: Bool
     var n_trees: Int
     var tree_root: List[Int]
-    var nd_feature: List[Int]
+    var nd_feature: List[Int32]
+    """The split feature, or -1 at a leaf. Negative is the loop's exit test."""
+
     var nd_edge: List[Float64]
-    var nd_nan_left: List[Bool]
-    var nd_left: List[Int]
-    var nd_right: List[Int]
-    var nd_value: List[Float64]
+    """The split edge at an internal node, the leaf value at a leaf."""
+
+    var nd_child: List[Int32]
+    """Stride three: `[3 * i]` left, `[3 * i + 1]` right, `[3 * i + 2]` the
+    child a NaN takes. All -1 at a leaf, which the walk never reads."""
 
     var refuse_code: Int
     """The FIRST `REFUSE_*` reason the flatten declined, or `REFUSE_NONE`."""
@@ -917,10 +992,7 @@ struct RawEnsemble(Copyable, Movable):
         self.tree_root = []
         self.nd_feature = []
         self.nd_edge = []
-        self.nd_nan_left = []
-        self.nd_left = []
-        self.nd_right = []
-        self.nd_value = []
+        self.nd_child = []
         self.refuse_code = REFUSE_NONE
         self.refuse_tree = -1
         self.refuse_node = -1
@@ -1082,19 +1154,21 @@ def raw_plan(
         if n_nodes == 0:
             return RawEnsemble.refused(REFUSE_EMPTY_TREE, j, -1)
         var base = len(plan.nd_feature)
+        # What makes the `Int32` streams a checked fact. Cheap: once per tree.
+        if base + n_nodes > RAW_MAX_NODES:
+            return RawEnsemble.refused(REFUSE_TOO_MANY_NODES, j, -1)
         plan.tree_root.append(base)
         for i in range(n_nodes):
             var f = tree.feature[i]
             if f < 0:
-                # A leaf. Only `nd_value` is ever read here, but every array
-                # keeps one entry per node so a single index addresses all of
-                # them.
-                plan.nd_feature.append(-1)
-                plan.nd_edge.append(0.0)
-                plan.nd_nan_left.append(False)
-                plan.nd_left.append(-1)
-                plan.nd_right.append(-1)
-                plan.nd_value.append(tree.value[i])
+                # A leaf. The walk reads only `nd_edge` here, which carries the
+                # leaf VALUE rather than an edge, but every array keeps its
+                # per-node entry so a single index addresses all of them.
+                plan.nd_feature.append(Int32(-1))
+                plan.nd_edge.append(tree.value[i])
+                plan.nd_child.append(Int32(-1))
+                plan.nd_child.append(Int32(-1))
+                plan.nd_child.append(Int32(-1))
                 continue
             # Links must point forward and stay in range. Every grower here
             # appends a child after the node it splits, so this always holds
@@ -1115,12 +1189,17 @@ def raw_plan(
             )
             if not s.ok:
                 return RawEnsemble.refused(s.reason, j, i)
-            plan.nd_feature.append(f)
+            plan.nd_feature.append(Int32(f))
             plan.nd_edge.append(s.edge)
-            plan.nd_nan_left.append(s.nan_left)
-            plan.nd_left.append(base + l)
-            plan.nd_right.append(base + r)
-            plan.nd_value.append(tree.value[i])
+            plan.nd_child.append(Int32(base + l))
+            plan.nd_child.append(Int32(base + r))
+            # Slot 2: where a NaN goes. `s.nan_left` is `Tree.goes_left` run on
+            # this node's own missing bin, so this is the SAME destination the
+            # `isnan` branch used to look up per row, resolved once per node.
+            if s.nan_left:
+                plan.nd_child.append(Int32(base + l))
+            else:
+                plan.nd_child.append(Int32(base + r))
 
     plan.n_trees = n
     plan.active = True
@@ -1151,6 +1230,11 @@ def predict_raw_batch[
     `s += learning_rate * value` per tree in ascending range order, which is
     `Booster.predict_raw_bins_range` statement for statement; the leaf each
     tree contributes is the same leaf by the argument above this function.
+    That sentence is a CONSTRAINT and not a description: Float64 addition is
+    not associative, so reordering the tree loop would move bits. The body
+    below interleaves the WALKS of four trees and leaves the ADDS in ascending
+    order, which is the one arrangement that gets the instruction-level
+    parallelism without touching the sequence the sentence promises.
 
     `plan.active` is the caller's precondition.
     """
@@ -1166,33 +1250,156 @@ def predict_raw_batch[
     var root_p = plan.tree_root.unsafe_ptr()
     var nf_p = plan.nd_feature.unsafe_ptr()
     var ed_p = plan.nd_edge.unsafe_ptr()
-    var lf_p = plan.nd_left.unsafe_ptr()
-    var rt_p = plan.nd_right.unsafe_ptr()
-    var vl_p = plan.nd_value.unsafe_ptr()
+    var ch_p = plan.nd_child.unsafe_ptr()
+
+    # `booster.response` resolved ONCE per call instead of once per row. See
+    # `Booster.response_is_identity`: for an identity link the per-row call
+    # returns its argument unchanged, so storing `s` directly is the same
+    # Float64, and for every other link the call still happens. `raw_score`
+    # folds in here because it already meant "store `s`".
+    var pass_through = raw_score or booster.response_is_identity()
+
+    # How many trees one interleaved block walks. After the routing branch was
+    # removed, a single walk is a pure DEPENDENT chain -- load the node's
+    # feature, load the value, compare, load the child, load ITS feature --
+    # and every step waits on the one before it, so the core issues roughly
+    # one useful instruction per L1 latency. K independent walks fill those
+    # slots with each other's work. Four because the walks are independent
+    # (nothing a tree reads is written by another) and because 100 trees, the
+    # size this path is measured at, divides by four with no remainder; the
+    # remainder loop below is what makes any other count correct rather than
+    # merely uncommon.
+    comptime K = 4
+    var n_blocked = n_trees - (n_trees % K)
 
     def apply(start: Int, end: Int) {imm}:
         for r in range(start, end):
             var s = base if with_base else 0.0
-            for t in range(n_trees):
+            var t = 0
+            while t < n_blocked:
+                # Four cursors, held in registers for the whole block.
+                var a0 = root_p.unsafe_load(t)
+                var a1 = root_p.unsafe_load(t + 1)
+                var a2 = root_p.unsafe_load(t + 2)
+                var a3 = root_p.unsafe_load(t + 3)
+                var f0 = Int(nf_p.unsafe_load(a0))
+                var f1 = Int(nf_p.unsafe_load(a1))
+                var f2 = Int(nf_p.unsafe_load(a2))
+                var f3 = Int(nf_p.unsafe_load(a3))
+                # Step all four while all four are still internal. A leaf's
+                # feature is -1, whose sign bit is set, so the OR of the four
+                # is negative exactly when at least one has landed: one test
+                # rather than four, and no short-circuit branch. When the
+                # trees have equal depth -- every complete depth-limited tree,
+                # which is the shape this arm is measured on -- they land on
+                # the same step and the four tails below run zero times. When
+                # they are ragged the tails finish whichever lanes are still
+                # walking, so the ANSWER does not depend on the shape at all.
+                while (f0 | f1 | f2 | f3) >= 0:
+                    var v0 = feat_p.unsafe_load(f0 * n_rows + r)
+                    var v1 = feat_p.unsafe_load(f1 * n_rows + r)
+                    var v2 = feat_p.unsafe_load(f2 * n_rows + r)
+                    var v3 = feat_p.unsafe_load(f3 * n_rows + r)
+                    var e0 = ed_p.unsafe_load(a0)
+                    var e1 = ed_p.unsafe_load(a1)
+                    var e2 = ed_p.unsafe_load(a2)
+                    var e3 = ed_p.unsafe_load(a3)
+                    var k0 = 0 if v0 <= e0 else (1 if v0 > e0 else 2)
+                    var k1 = 0 if v1 <= e1 else (1 if v1 > e1 else 2)
+                    var k2 = 0 if v2 <= e2 else (1 if v2 > e2 else 2)
+                    var k3 = 0 if v3 <= e3 else (1 if v3 > e3 else 2)
+                    a0 = Int(ch_p.unsafe_load(3 * a0 + k0))
+                    a1 = Int(ch_p.unsafe_load(3 * a1 + k1))
+                    a2 = Int(ch_p.unsafe_load(3 * a2 + k2))
+                    a3 = Int(ch_p.unsafe_load(3 * a3 + k3))
+                    f0 = Int(nf_p.unsafe_load(a0))
+                    f1 = Int(nf_p.unsafe_load(a1))
+                    f2 = Int(nf_p.unsafe_load(a2))
+                    f3 = Int(nf_p.unsafe_load(a3))
+                # The tails. Each is the single-cursor walk, unchanged. The
+                # locals carry a lane suffix so that no two of these sibling
+                # blocks declare the same name.
+                while f0 >= 0:
+                    var tv0 = feat_p.unsafe_load(f0 * n_rows + r)
+                    var te0 = ed_p.unsafe_load(a0)
+                    var tk0 = 0 if tv0 <= te0 else (1 if tv0 > te0 else 2)
+                    a0 = Int(ch_p.unsafe_load(3 * a0 + tk0))
+                    f0 = Int(nf_p.unsafe_load(a0))
+                while f1 >= 0:
+                    var tv1 = feat_p.unsafe_load(f1 * n_rows + r)
+                    var te1 = ed_p.unsafe_load(a1)
+                    var tk1 = 0 if tv1 <= te1 else (1 if tv1 > te1 else 2)
+                    a1 = Int(ch_p.unsafe_load(3 * a1 + tk1))
+                    f1 = Int(nf_p.unsafe_load(a1))
+                while f2 >= 0:
+                    var tv2 = feat_p.unsafe_load(f2 * n_rows + r)
+                    var te2 = ed_p.unsafe_load(a2)
+                    var tk2 = 0 if tv2 <= te2 else (1 if tv2 > te2 else 2)
+                    a2 = Int(ch_p.unsafe_load(3 * a2 + tk2))
+                    f2 = Int(nf_p.unsafe_load(a2))
+                while f3 >= 0:
+                    var tv3 = feat_p.unsafe_load(f3 * n_rows + r)
+                    var te3 = ed_p.unsafe_load(a3)
+                    var tk3 = 0 if tv3 <= te3 else (1 if tv3 > te3 else 2)
+                    a3 = Int(ch_p.unsafe_load(3 * a3 + tk3))
+                    f3 = Int(nf_p.unsafe_load(a3))
+                # THE ONE THING THAT IS NOT FREE TO REORDER. This function's
+                # docstring states the sum as "one `s += learning_rate *
+                # value` per tree in ascending range order", matching
+                # `Booster.predict_raw_bins_range` statement for statement,
+                # and Float64 addition is not associative, so the ORDER of
+                # these four adds is the bit-identity claim itself. The WALKS
+                # above are interleaved; the ADDS stay strictly ascending in
+                # `t`, and no cursor reads anything another cursor writes, so
+                # nothing about the interleave can reach this sequence.
+                s += lr * ed_p.unsafe_load(a0)
+                s += lr * ed_p.unsafe_load(a1)
+                s += lr * ed_p.unsafe_load(a2)
+                s += lr * ed_p.unsafe_load(a3)
+                t += K
+            # The remainder, `n_trees % K` trees, still in ascending order and
+            # still after every blocked tree, because the blocks covered
+            # `0 .. n_blocked` exactly.
+            while t < n_trees:
                 var node = root_p.unsafe_load(t)
-                var f = nf_p.unsafe_load(node)
+                var f = Int(nf_p.unsafe_load(node))
                 while f >= 0:
                     var v = feat_p.unsafe_load(f * n_rows + r)
-                    var left: Bool
-                    if isnan(v):
-                        # Cold, and it has to be read rather than compared:
-                        # `NaN <= edge` is false, so a NaN would otherwise go
-                        # right at every node whatever the model says.
-                        left = plan.nd_nan_left[node]
-                    else:
-                        left = v <= ed_p.unsafe_load(node)
-                    if left:
-                        node = lf_p.unsafe_load(node)
-                    else:
-                        node = rt_p.unsafe_load(node)
-                    f = nf_p.unsafe_load(node)
-                s += lr * vl_p.unsafe_load(node)
-            if raw_score:
+                    var edge = ed_p.unsafe_load(node)
+                    # NO `isnan`, and NO branch on the routing decision. The
+                    # step below is two Float64 compares, a select over three
+                    # constants, and one indexed load.
+                    #
+                    # IEEE-754 makes every ordered comparison against NaN
+                    # false, so "neither at-or-below nor above" identifies a
+                    # NaN exactly. `_raw_split` refuses a NaN edge, which is
+                    # what makes that an identification and not a guess: with
+                    # an ordered edge the three cases below are exhaustive and
+                    # mutually exclusive for every Float64 `v`.
+                    #
+                    #   v <= edge  -> slot 0, the left child.  `Tree.goes_left`
+                    #     on `bin(v) <= threshold_bin`, unchanged.
+                    #   v >  edge  -> slot 1, the right child. The exact
+                    #     complement of the above on the ordered reals, so no
+                    #     non-NaN value can reach slot 2.
+                    #   neither    -> `v` is NaN -> slot 2, which `raw_plan`
+                    #     filled with the left or right child according to
+                    #     `nan_left`. That is the SAME lookup the `isnan`
+                    #     branch did per row, hoisted to plan time.
+                    #
+                    # So the leaf reached is the leaf the branching form
+                    # reached, for every value including NaN, and the sum below
+                    # is untouched. What is gone is a data-dependent branch on
+                    # a tree route, which is close to unpredictable, on the
+                    # critical path of a dependent load chain.
+                    var k = 0 if v <= edge else (1 if v > edge else 2)
+                    node = Int(ch_p.unsafe_load(3 * node + k))
+                    f = Int(nf_p.unsafe_load(node))
+                # `nd_edge` at a leaf is the leaf VALUE; the loop exits exactly
+                # when `nd_feature` says leaf, so the two never collide.
+                s += lr * ed_p.unsafe_load(node)
+                t += 1
+            if pass_through:
                 out_p.unsafe_store(r, s)
             else:
                 out_p.unsafe_store(r, booster.response(s))
@@ -1243,11 +1450,26 @@ def oblivious_raw_plan(
             plan.raw_refuse_slot = s
             return plan^
         plan.lvl_edge.append(rs.edge)
-        plan.lvl_nan_left.append(rs.nan_left)
+        # `_RawSplit.nan_left` stays a Bool, which is the right type for a
+        # direction; the ENCODING to 0/1 happens here, at the single place
+        # the stream is written, so the walker's `!= 0` is the only decode.
+        plan.lvl_nan_left.append(Int32(1) if rs.nan_left else Int32(0))
     plan.raw_ready = True
     plan.raw_refuse_code = REFUSE_NONE
     plan.raw_refuse_slot = -1
     return plan^
+
+
+comptime _OBLIVIOUS_TILE = 4 * simd_width_of[DType.float64]()
+"""Rows evaluated together in `predict_oblivious_raw_batch`.
+
+Four vectors' worth, which is `histogram.SIMD_LANES`' rule and for the same
+reason: one vector wide leaves the compare, the select and the OR on a single
+dependent chain, and four gives the core independent work to overlap while
+still fitting the tile's accumulator in one register. It resolves to 8 on a
+2-wide Float64 target such as NEON and scales with the target rather than
+being pinned to one machine.
+"""
 
 
 def predict_oblivious_raw_batch[
@@ -1286,6 +1508,25 @@ def predict_oblivious_raw_batch[
       Holding the running sum in `out` rather than in a register changes no
       bit: an IEEE-754 Float64 add is exact for its inputs either way.
 
+    THE ROW INDEX NEVER REACHES MEMORY. The first version of this loop was
+    level major over the whole block and kept the accumulating leaf index in a
+    `List[Int]` scratch, which meant a load and a store of `idx[i]` at every
+    level of every tree: at depth 6 that is twelve 8-byte touches per row per
+    tree against six loads of actual DATA. The row loop is now TILED at
+    `_OBLIVIOUS_TILE`, with the tile's index held in one SIMD register across
+    all of that tree's levels, so the only traffic left is the column reads
+    and one read-modify-write of `out` per tree. Column traffic is unchanged,
+    because a tile still reads its columns in ascending row order and the
+    tiles run in ascending order too.
+
+    Bit-identity survives the tiling for the reason above, restated in the
+    order that matters: a row's index is built from the SAME comparisons
+    against the same edges in the same level order, and the OR that packs
+    them is integer. What may not move is the ACCUMULATION order per row, and
+    it does not: the tree loop is still the outermost, so row `r` takes tree
+    0's contribution, then tree 1's, exactly as before. Tiling reorders rows
+    against each other, and rows share no accumulator.
+
     `plan.active and plan.raw_ready` is the caller's precondition.
     """
     var out = List[Float64](capacity=n_rows)
@@ -1294,66 +1535,134 @@ def predict_oblivious_raw_batch[
     var feat_p = features.unsafe_ptr()
     var lr = booster.learning_rate
     var seed = booster.base_score if rng.includes_base() else 0.0
+    # Resolved once per call rather than once per row; see
+    # `Booster.response_is_identity`. For an identity link the trailing pass
+    # below wrote back exactly what it read, one call and two compares per
+    # row, on a loop that had nothing else to do.
+    var pass_through = raw_score or booster.response_is_identity()
+
+    # Every plan array the loop reads, hoisted to a raw pointer. `leaf_value`
+    # is the one that matters: it was the last `List` subscript left in a
+    # function that hoists everything else, and it runs once per row per tree.
+    var n_trees = plan.n_trees
+    var la_p = plan.level_at.unsafe_ptr()
+    var dep_p = plan.depth.unsafe_ptr()
+    var lat_p = plan.leaf_at.unsafe_ptr()
+    var lvf_p = plan.lvl_feature.unsafe_ptr()
+    var lve_p = plan.lvl_edge.unsafe_ptr()
+    var lvn_p = plan.lvl_nan_left.unsafe_ptr()
+    var lv_p = plan.leaf_value.unsafe_ptr()
+
+    comptime W = _OBLIVIOUS_TILE
 
     def apply(start: Int, end: Int) {imm}:
         var w = end - start
         if w <= 0:
             return
-        # One block-sized index array, reused across trees; the same per-block
-        # reuse `Booster.predict_batch_range` gives its `bins` scratch.
-        var idx = List[Int](capacity=w)
-        idx.resize(w, 0)
-        var idx_p = idx.unsafe_ptr()
         for i in range(w):
             out_p.unsafe_store(start + i, seed)
-        for t in range(plan.n_trees):
-            var lo = plan.level_at[t]
-            var d = plan.depth[t]
-            for i in range(w):
-                idx_p.unsafe_store(i, 0)
-            for level in range(d):
-                var slot = lo + level
-                var col = plan.lvl_feature[slot] * n_rows + start
-                var edge = plan.lvl_edge[slot]
-                var bit = 1 << level
-                # NO `isnan` IN THE ROW LOOP, and no branch either. IEEE-754
-                # makes every ordered comparison against NaN false, and that
-                # is enough to fold the missing case into the compare itself
-                # once the level's `nan_left` -- a CONSTANT of the level, not
-                # of the row -- is hoisted out:
-                #
-                #   nan_left false: `v <= edge` is already false for NaN, so
-                #     the plain compare sends NaN right, which is what
-                #     `nan_left` false means.
-                #   nan_left true:  `v > edge` is also false for NaN, so
-                #     "right when `v > edge`" sends NaN left, which is what
-                #     `nan_left` true means.
-                #
-                # For a non-NaN value the two are the same predicate, because
-                # `<=` and `>` are exact complements on the ordered reals. So
-                # both arms below are bit-identical to the `isnan` form they
-                # replace, and each is one Float64 compare and one select over
-                # a contiguous run of a column -- the shape that vectorizes.
-                # The `isnan` version could not: a call in the loop body left
-                # the compiler a scalar loop with a branch in it.
-                if plan.lvl_nan_left[slot]:
-                    for i in range(w):
-                        var v = feat_p.unsafe_load(col + i)
-                        var right = bit if v > edge else 0
-                        idx_p.unsafe_store(i, idx_p.unsafe_load(i) | right)
-                else:
-                    for i in range(w):
-                        var v = feat_p.unsafe_load(col + i)
-                        var right = 0 if v <= edge else bit
-                        idx_p.unsafe_store(i, idx_p.unsafe_load(i) | right)
-            var lat = plan.leaf_at[t]
-            for i in range(w):
+        var w_tiled = w - (w % W)
+        for t in range(n_trees):
+            var lo = la_p.unsafe_load(t)
+            var d = dep_p.unsafe_load(t)
+            var lat = lat_p.unsafe_load(t)
+            var i = 0
+            while i < w_tiled:
+                # `acc` is the tile's leaf index, in a REGISTER for the whole
+                # tree. Int32 rather than Int because the value is bounded by
+                # `1 << OBLIVIOUS_PLAN_MAX_DEPTH`, which is 4096.
+                var acc = SIMD[DType.int32, W](0)
+                for level in range(d):
+                    var slot = lo + level
+                    var col = lvf_p.unsafe_load(slot) * n_rows + start + i
+                    var ev = SIMD[DType.float64, W](lve_p.unsafe_load(slot))
+                    var bitv = SIMD[DType.int32, W](Int32(1 << level))
+                    var zero = SIMD[DType.int32, W](0)
+                    # EXPLICIT vector width, not a hope that the scalar form
+                    # gets vectorized. `unsafe_load[width=W]` without an
+                    # `alignment` argument emits the ELEMENT alignment, which
+                    # is what an arbitrary `start + i` actually has, so this
+                    # is an unaligned vector load and not an assertion about
+                    # the caller's buffer.
+                    var v = feat_p.unsafe_load[width=W](col)
+                    # NO `isnan`, and no branch per ROW. IEEE-754 makes every
+                    # ordered comparison against NaN false, and that is enough
+                    # to fold the missing case into the compare itself once
+                    # the level's `nan_left` -- a CONSTANT of the level, not
+                    # of the row -- is hoisted out:
+                    #
+                    #   nan_left false: `v <= edge` is already false for NaN,
+                    #     so the plain compare sends NaN right, which is what
+                    #     `nan_left` false means.
+                    #   nan_left true:  `v > edge` is also false for NaN, so
+                    #     "right when `v > edge`" sends NaN left, which is
+                    #     what `nan_left` true means.
+                    #
+                    # For a non-NaN value the two are the same predicate,
+                    # because `<=` and `>` are exact complements on the
+                    # ordered reals. The two arms below are the two scalar
+                    # arms they replace, lane for lane, with `select` where
+                    # the scalar form wrote a conditional expression.
+                    #
+                    # `v.gt(ev)` AND NOT `v > ev`, which is a Mojo 1.0 spelling
+                    # worth one line so the next reader does not "simplify" it
+                    # back. The named methods `gt`, `lt`, `le` and friends
+                    # return the per-lane `SIMD[DType.bool, W]` mask, which is
+                    # the only thing carrying `.select` and `.cast`; the
+                    # comparison OPERATORS are constrained to width 1.
+                    #
+                    # This is a good constraint and not a trap, which is worth
+                    # saying because the first reading of it here was that the
+                    # operator silently reduced many lanes to one answer. It
+                    # does not. On a multi-lane SIMD `v > ev` is a COMPILE
+                    # ERROR whose own text names the remedy: "Strict
+                    # inequality is only defined for `Scalar`s; did you mean
+                    # to use `SIMD.gt(...)`?" So the wrong spelling cannot
+                    # produce a wrong answer, only a diagnostic. Verified
+                    # against the compiler: `a.gt(b)` on [1,3,1,3] against 2
+                    # gives [False, True, False, True].
+                    # The
+                    # remaining branch is on `lvn_p[slot]`, which is now once
+                    # per level per TILE and perfectly predicted, because it
+                    # repeats the same pattern for every tile of the block.
+                    if lvn_p.unsafe_load(slot) != 0:
+                        acc = acc | v.gt(ev).select(bitv, zero)
+                    else:
+                        acc = acc | v.le(ev).select(zero, bitv)
+                # The leaf gather, one lane at a time because the address is
+                # data dependent. `comptime for` so the lane index is a
+                # constant and the extract is free.
+                comptime for k in range(W):
+                    var o = start + i + k
+                    out_p.unsafe_store(
+                        o,
+                        out_p.unsafe_load(o)
+                        + lr * lv_p.unsafe_load(lat + Int(acc[k])),
+                    )
+                i += W
+            # `w % W` rows, the same predicate written scalar. The index is
+            # still a register; a tail row never touches the old scratch
+            # either, because there is no longer one to touch.
+            while i < w:
+                var idx = 0
+                for level in range(d):
+                    var tslot = lo + level
+                    var tv = feat_p.unsafe_load(
+                        lvf_p.unsafe_load(tslot) * n_rows + start + i
+                    )
+                    var tedge = lve_p.unsafe_load(tslot)
+                    var tbit = 1 << level
+                    if lvn_p.unsafe_load(tslot) != 0:
+                        idx = idx | (tbit if tv > tedge else 0)
+                    else:
+                        idx = idx | (0 if tv <= tedge else tbit)
+                var to = start + i
                 out_p.unsafe_store(
-                    start + i,
-                    out_p.unsafe_load(start + i)
-                    + lr * plan.leaf_value[lat + idx_p.unsafe_load(i)],
+                    to,
+                    out_p.unsafe_load(to) + lr * lv_p.unsafe_load(lat + idx),
                 )
-        if not raw_score:
+                i += 1
+        if not pass_through:
             for i in range(w):
                 out_p.unsafe_store(
                     start + i, booster.response(out_p.unsafe_load(start + i))

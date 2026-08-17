@@ -91,6 +91,7 @@ from .objective_registry import (
     HUBER as _HUBER,
     L1 as _L1,
     LINK_EXP,
+    LINK_IDENTITY,
     LINK_SIGMOID,
     MAPE as _MAPE,
     MULTICLASS as _MULTICLASS,
@@ -1753,6 +1754,26 @@ struct Booster(Copyable, Movable):
         if link == LINK_EXP:
             return exp(raw)
         return raw
+
+    @always_inline
+    def response_is_identity(self) -> Bool:
+        """Whether `response` is the identity function on every Float64.
+
+        A batch predictor that calls `response` once per ROW pays a call plus
+        the two compares above for every row, and for an identity link every
+        one of those calls returns its argument unchanged. This is the same
+        question hoisted to once per CALL, so the caller can skip the whole
+        pass. Nothing here decides a value; it decides whether a provably
+        value-preserving loop runs at all, which is why using it cannot move
+        a bit.
+
+        This reads `objective_link` rather than listing objectives, for the
+        reason `response` gives: the table lives in one place. Note that it is
+        NOT "true for every regression objective" -- POISSON, GAMMA, TWEEDIE
+        and SURVIVAL_AFT are regression objectives with `LINK_EXP`, and they
+        must keep paying the pass.
+        """
+        return objective_link(self.objective) == LINK_IDENTITY
 
     @always_inline
     def n_iterations(self) -> Int:

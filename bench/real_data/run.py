@@ -122,6 +122,52 @@ def default_threads():
     return cpu.get("physical_cores") or cpu.get("logical_cores") or 1
 
 
+def mojotrees_workers(threads):
+    """What to export as `MOJOTREES_NUM_WORKERS` for a cell at `threads`, or
+    None to leave it UNSET so the library plans the fan-out itself.
+
+    THE SAME INTEGER MEANT TWO DIFFERENT THINGS AND ONLY ONE ENGINE WAS
+    MOVED OFF ITS DEFAULTS BY IT. This runner exports every name in
+    `THREAD_ENV` as the cell's thread count, which for LightGBM, CatBoost and
+    XGBoost sizes a pool that their own schedulers then feed dynamically, and
+    on a machine whose core count equals the requested count it is what those
+    libraries would have chosen anyway. Passing it is a no-op for them. It was
+    not a no-op for us. `parallel.plan_tasks` says in its own docstring that an
+    explicit `MOJOTREES_NUM_WORKERS` bypasses the whole auto rule, so exporting
+    10 did not ask for ten threads, it asked for exactly ten equal row blocks,
+    statically assigned. Auto mode on the same machine plans physical cores
+    times `apple_cpu_policy.DEFAULT_TASKS_PER_CORE`, which is forty blocks over
+    ten cores. So the harness was measuring a fan-out geometry that no user of
+    the library can reach without setting the variable themselves, and calling
+    the result a like-for-like comparison.
+
+    It shows up in the numbers. Run `20260817T195323Z-predict2` reports
+    `parallel_efficiency` between 2.88 and 3.95 on every mojotrees phase --
+    binning, train and predict alike -- against 5.59 to 9.40 for the three
+    peers on the same box. Ten equal blocks over this M4's four performance
+    cores and six efficiency cores has a ceiling of ten thirds, which is 3.33,
+    because the fast cores finish their equal share and wait at the barrier.
+    Every one of our phases sat on that ceiling.
+
+    THE RULE, and it is about the value rather than about whether anybody
+    typed it. A request for the machine's own core count is a request for the
+    whole machine, which is what `default_threads` documents itself as
+    returning and what the peers receive; the instruction that means that to us
+    is auto mode, so the variable is left unset and our policy runs. A request
+    for FEWER cores has no auto-mode equivalent today -- `MOJOTREES_CPU_CORE_POOL`
+    takes `all` or `performance` and not an integer -- so the count is pinned,
+    which really does mean N static blocks, and the record says so through
+    `engines.MojotreesEngine.load`'s note rather than leaving a reader to
+    assume the two arms got the same instruction.
+
+    Both branches are ASSERTED at the far end and not trusted:
+    `MojotreesEngine.load` refuses a mismatch in either direction, a set
+    variable that disagrees with the cell and an unset one on a cell that is
+    not the whole machine.
+    """
+    return None if int(threads) == int(default_threads()) else str(int(threads))
+
+
 #: Arm rank INSIDE a round, for arms one of which should run before another.
 #:
 #: **One HARD dependency.** `mojotrees_catboost_mode` cannot be BUILT until the
@@ -775,6 +821,11 @@ def run_job(job, run_dir, run_id, timeout):
     env = dict(os.environ)
     for name_ in THREAD_ENV:
         env[name_] = str(job["threads"])
+    workers = mojotrees_workers(job["threads"])
+    if workers is None:
+        env.pop("MOJOTREES_NUM_WORKERS", None)
+    else:
+        env["MOJOTREES_NUM_WORKERS"] = workers
     if job["device"] == "cpu":
         # A cpu row must be a cpu row even on a machine with an
         # accelerator, whatever the device parameter would otherwise
@@ -900,7 +951,10 @@ CSV_COLUMNS = (
     "backend_proof", "threads",
     "histogram_builder", "repeat", "status", "primary_metric",
     "primary_value", "train_s", "train_cpu_s", "train_par_eff", "binning_s",
-    "predict_batch_s", "predict_batch_par_eff", "predict_row_s",
+    "predict_batch_s", "predict_batch_par_eff",
+    "predict_batch_t1_s", "predict_batch_t1_par_eff",
+    "predict_batch_t1_verified",
+    "predict_row_s",
     "warmup_s", "import_s", "peak_rss_bytes", "model_bytes", "num_trees",
     "num_bin", "bins_total", "bins_sha256",
     "train_rows", "train_features", "predictions_sha256", "data_sha256",
@@ -1004,6 +1058,18 @@ def _flat(record):
         "binning_s": phase("binning"),
         "predict_batch_s": phase("predict_batch"),
         "predict_batch_par_eff": phase("predict_batch", "parallel_efficiency"),
+        # The single-thread pair, beside the phase it is read against. The
+        # VERIFIED flag travels with the seconds and is not optional: an
+        # unverified figure is the threaded number wearing a single-thread
+        # label, and a spreadsheet that has the seconds without the flag
+        # cannot tell the two apart. See engines.SINGLE_THREAD_PREDICT_RULE.
+        "predict_batch_t1_s": phase("predict_batch_t1"),
+        "predict_batch_t1_par_eff": phase(
+            "predict_batch_t1", "parallel_efficiency"
+        ),
+        "predict_batch_t1_verified": (record.get("phases") or {}).get(
+            "predict_batch_t1_verified"
+        ),
         "predict_row_s": phase("predict_row"),
         "warmup_s": (record.get("warmup") or {}).get("elapsed_s"),
         "import_s": phase("import"),

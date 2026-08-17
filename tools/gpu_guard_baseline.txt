@@ -1,0 +1,70 @@
+# Hazard sites that are unguarded today, one per
+# file::owner.function::kind.  This set may SHRINK and may
+# not GROW: tools/check_gpu_guards.py fails on anything new.
+# Regenerate with --write-baseline only when REMOVING lines.
+#
+# WHY THESE ARE HERE RATHER THAN GUARDED.  Every one is a
+# method of a device-owning struct, and no test in the
+# CPU-only set constructs any of those structs outside a
+# guard, so nothing elaborates them on a CPU-only build
+# today.  That was checked by hand on 2026-08-17 and it is
+# NOT a property this file can prove; it is a property that
+# holds until somebody writes the test that breaks it, which
+# is exactly what rule R3 in the checker watches for.
+# docs/design/CPU_ONLY_BUILD_AUDIT.md carries the table and
+# the reasoning.
+#
+# Guarding an entry above one of these prunes it with the
+# entry, so the honest way to shrink this list is to guard
+# the public method a caller reaches, then regenerate.
+src/mojotrees/gpu_active_rows.mojo::GpuActiveRows._enqueue_atomic_at::launch
+src/mojotrees/gpu_active_rows.mojo::GpuActiveRows._enqueue_compact_partition::launch
+src/mojotrees/gpu_active_rows.mojo::GpuActiveRows._enqueue_partial_at::launch
+src/mojotrees/gpu_active_rows.mojo::GpuActiveRows._enqueue_scan_primitives::launch
+src/mojotrees/gpu_active_rows.mojo::GpuActiveRows._ensure_compacted::launch
+src/mojotrees/gpu_active_rows.mojo::GpuActiveRows._ensure_quantized::launch
+src/mojotrees/gpu_fused_round.mojo::GpuTreeRouter.route::launch
+src/mojotrees/gpu_gradient_stream.mojo::GpuRowSelection.apply_compensation::launch
+src/mojotrees/gpu_gradient_stream.mojo::GpuRowSelection.enqueue_importance::launch
+src/mojotrees/gpu_gradient_stream.mojo::InterleavedGradients.pack::launch
+src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher._launch_plan_hist::launch
+src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher.enqueue_batch::launch
+src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher.enqueue_device_plan_batch::launch
+src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher.enqueue_device_plan_batch_fused::launch
+src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher.enqueue_device_plan_batch_fused_subtracting::launch
+src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher.enqueue_subtract::launch
+src/mojotrees/gpu_multiclass_batch.mojo::GpuClassBatch._zero_output::launch
+src/mojotrees/gpu_multiclass_batch.mojo::GpuClassBatch.enqueue_ranged_histogram::launch
+src/mojotrees/gpu_multiclass_batch.mojo::GpuClassBatch.enqueue_shared_groups::launch
+src/mojotrees/gpu_multiclass_batch.mojo::GpuClassBatch.fill_gradients::launch
+src/mojotrees/gpu_multiclass_batch.mojo::GpuClassBatch.magnitude_sums::launch
+src/mojotrees/gpu_multiclass_batch.mojo::GpuClassBatch.scatter_slot::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuLeafEstimator.estimate::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuObjectiveState.fill_grad_hess::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuObjectiveState.fill_multi_grad_hess::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuObjectiveState.fill_softmax_grad_hess::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuObjectiveState.init_raw::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuObjectiveState.refresh_softmax::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuObjectiveState.update_raw::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuObjectiveState.update_raw_ranges::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuObjectiveState.update_raw_ranges_per_leaf::launch
+src/mojotrees/gpu_objectives_native.mojo::GpuRankingState.fill_grad_hess::launch
+src/mojotrees/gpu_predict.mojo::GpuPredictor.__init__::devctx
+src/mojotrees/gpu_predict.mojo::GpuPredictor._enqueue_scores::launch
+src/mojotrees/gpu_predict.mojo::GpuPredictor._reduce_metric::launch
+src/mojotrees/gpu_predict.mojo::GpuPredictor.leaf_indices::launch
+src/mojotrees/gpu_predict.mojo::GpuPredictor.response_scores::launch
+src/mojotrees/gpu_predict.mojo::GpuPredictor.validation_metric::launch
+src/mojotrees/gpu_runtime.mojo::GpuSession.__init__::devctx
+src/mojotrees/gpu_sparse.mojo::GpuSparseHistogramBuilder.__init__::devctx
+src/mojotrees/gpu_sparse.mojo::GpuSparseHistogramBuilder._compact_root_to_bag::launch
+src/mojotrees/gpu_sparse.mojo::GpuSparseHistogramBuilder._enqueue_entry_partition::launch
+src/mojotrees/gpu_sparse.mojo::GpuSparseHistogramBuilder.apply_split::launch
+src/mojotrees/gpu_sparse.mojo::GpuSparseHistogramBuilder.begin_tree::launch
+src/mojotrees/gpu_sparse.mojo::GpuSparseHistogramBuilder.enqueue_default_side::launch
+src/mojotrees/gpu_sparse.mojo::GpuSparseHistogramBuilder.enqueue_leaf::launch
+src/mojotrees/gpu_sparse.mojo::GpuSparseHistogramBuilder.enqueue_node_totals::launch
+src/mojotrees/gpu_split_search.mojo::GpuSplitSearcher.__init__::devctx
+src/mojotrees/gpu_split_search.mojo::GpuSplitSearcher.enqueue_pick_best::launch
+src/mojotrees/gpu_tree_tables.mojo::DeviceTreeTables.__init__::devctx
+src/mojotrees/histogram_gpu.mojo::GpuHistogramBuilder.__init__::devctx

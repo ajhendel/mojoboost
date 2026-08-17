@@ -175,6 +175,28 @@
         "encode_unavailable_reason": {"type": ["string", "null"]},
         "train": {"$ref": "#/$defs/phase"},
         "predict_batch": {"$ref": "#/$defs/samples"},
+        "predict_batch_gpu": {
+          "oneOf": [{"$ref": "#/$defs/samples"}, {"type": "null"}],
+          "description": "A second batch prediction of the same fitted model on the accelerator, mojotrees rows only, null with predict_batch_gpu_unavailable_reason beside it everywhere else. Never a substitute for predict_batch, which is the like-for-like column against engines that have no accelerator path. See engines.GPU_PREDICT_RULE."
+        },
+        "predict_batch_gpu_unavailable_reason": {"type": ["string", "null"]},
+        "predict_batch_t1": {
+          "oneOf": [{"$ref": "#/$defs/samples"}, {"type": "null"}],
+          "description": "A second batch prediction of the same fitted model over the same held-out matrix with the library held to ONE THREAD, on every arm. It is a diagnostic beside predict_batch and never instead of it: predict_batch is what a user gets and stays the headline, this is work per core, and the ratio is realized parallel speedup. Added 2026-08-17, when run 20260817T195323Z-predict2 showed mojotrees spending 0.252 CPU seconds against LightGBM's 0.409 for the same 51,630 rows and finishing 1.6x later, which a seconds column alone cannot express. See engines.SINGLE_THREAD_PREDICT_RULE."
+        },
+        "predict_batch_t1_knob": {
+          "type": ["string", "null"],
+          "description": "Which knob held this arm to one thread, in the arm's own vocabulary. There is no portable one: LightGBM takes num_threads as a prediction parameter, CatBoost takes thread_count, XGBoost has no predict-time argument and needs nthread moved on the Booster and on the DMatrix, and mojotrees reads MOJOTREES_NUM_WORKERS from the environment. Recorded so the record says what was set rather than leaving it in engines.py's history."
+        },
+        "predict_batch_t1_verified": {
+          "type": ["boolean", "null"],
+          "description": "Whether the phase's own parallel_efficiency confirms it got one thread, against engines.SINGLE_THREAD_MAX_EFFICIENCY. False is not a failed run: it is a knob that did not take, which would otherwise produce a plausible-looking number that is really the threaded one and a speedup column reading 1.0. report.py refuses to compute the ratio unless this is true."
+        },
+        "predict_batch_t1_unverified_reason": {"type": ["string", "null"]},
+        "predict_batch_t1_agreement": {
+          "oneOf": [{"type": "object"}, {"type": "null"}],
+          "description": "Row-level difference between the single-thread predictions and the threaded ones for the same model over the same matrix, as NUMBERS AND NOT A VERDICT, the same shape and the same policy as predict_device_agreement. mojotrees's row axis split is documented to be bit-identical at every block count, so a nonzero difference on our rows is a finding; a peer's thread count is not a promise about its floating-point associativity. Nothing fails on the value."
+        },
         "predict_row": {"$ref": "#/$defs/samples"}
       }
     },

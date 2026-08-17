@@ -57,6 +57,7 @@ from std.atomic import Atomic
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import round
 from std.memory import stack_allocation
+from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
@@ -614,46 +615,57 @@ def enqueue_category_stats[
 
     Does not transfer or synchronize.
     """
-    if n_bins < 1 or n_bins > CAT_MAX_BINS:
-        raise Error("category statistics need 1..256 bins")
-    if default_bin < 0 or default_bin >= n_bins:
-        raise Error("default bin out of range")
-    var threads = derive_block_threads(caps)
-    if n_entries > 0:
-        var per_tile = n_entries
-        var tiles = 1
-        # One tile per multiprocessor at most: the window is one column of
-        # one node, so oversubscribing it costs more launch overhead than the
-        # parallelism buys.
-        if n_entries > threads * caps.sm_count:
-            tiles = caps.sm_count
-            per_tile = (n_entries + tiles - 1) // tiles
-        ctx.enqueue_function[_category_stats_kernel](
-            order,
-            entry_row,
-            entry_bin,
-            grad,
-            hess,
-            ranges,
+    # Guarded 2026-08-17 by the CPU-only build audit
+    # (docs/design/CPU_ONLY_BUILD_AUDIT.md). This is a module-level launcher,
+    # so one import in a CPU-set test reaches it, and on a build with no
+    # accelerator ANY reachable `enqueue_function` fails the compile with
+    # `Unknown GPU architecture detected` whatever the kernel does. The wrap
+    # covers the whole body because an early `return` does not prune.
+    comptime if not has_accelerator():
+        raise Error(
+            "category statistics need an accelerator; this build has none"
+        )
+    else:
+        if n_bins < 1 or n_bins > CAT_MAX_BINS:
+            raise Error("category statistics need 1..256 bins")
+        if default_bin < 0 or default_bin >= n_bins:
+            raise Error("default bin out of range")
+        var threads = derive_block_threads(caps)
+        if n_entries > 0:
+            var per_tile = n_entries
+            var tiles = 1
+            # One tile per multiprocessor at most: the window is one column of
+            # one node, so oversubscribing it costs more launch overhead than
+            # the parallelism buys.
+            if n_entries > threads * caps.sm_count:
+                tiles = caps.sm_count
+                per_tile = (n_entries + tiles - 1) // tiles
+            ctx.enqueue_function[_category_stats_kernel](
+                order,
+                entry_row,
+                entry_bin,
+                grad,
+                hess,
+                ranges,
+                out_stats,
+                Int32(node),
+                Int32(n_features),
+                Int32(feature),
+                Int32(n_bins),
+                Int32(per_tile),
+                Float32(g_scale),
+                Float32(h_scale),
+                grid_dim=tiles,
+                block_dim=threads,
+            )
+        ctx.enqueue_function[_category_default_fill_kernel](
             out_stats,
-            Int32(node),
-            Int32(n_features),
-            Int32(feature),
+            totals,
             Int32(n_bins),
-            Int32(per_tile),
-            Float32(g_scale),
-            Float32(h_scale),
-            grid_dim=tiles,
+            Int32(default_bin),
+            grid_dim=1,
             block_dim=threads,
         )
-    ctx.enqueue_function[_category_default_fill_kernel](
-        out_stats,
-        totals,
-        Int32(n_bins),
-        Int32(default_bin),
-        grid_dim=1,
-        block_dim=threads,
-    )
 
 
 # --- Driving the builder --------------------------------------------------
@@ -694,47 +706,59 @@ def apply_categorical_split_pooled(
     uploaded since that push, or the device would route by whatever the
     buffer held before.
     """
-    if feature < 0 or feature >= builder.n_features:
-        raise Error("split feature out of range")
-    if not builder.cats.is_cat(feature):
-        raise Error("pooled categorical split names a numerical feature")
-    builder.check_split_ids(parent, left, right)
-    if set_offset < 0 or set_offset + CAT_BITSET_WORDS > pool.uploaded:
+    # Guarded 2026-08-17 by the CPU-only build audit
+    # (docs/design/CPU_ONLY_BUILD_AUDIT.md), for the same reason as
+    # `enqueue_category_stats` above: a module-level launcher is one import
+    # away from a CPU-set test, and on a build with no accelerator any
+    # reachable `enqueue_function` fails the compile.
+    comptime if not has_accelerator():
         raise Error(
-            "category set offset is outside the uploaded region of the pool;"
-            " call CatSetPool.upload after staging the set"
+            "a pooled categorical split needs an accelerator; this build has"
+            " none"
         )
-    check_cat_bitset(
-        pool.get(set_offset), builder.cats.n_categories(feature)
-    )
-
-    # An absent entry of a categorical column is category code 0, so the
-    # node's rows all take the side its bin lands on and only the rows with a
-    # stored entry are corrected. The host mirror of the device membership
-    # test decides it, which is why `CatSetPool.contains` exists.
-    var goes_left = pool.contains(set_offset, builder.default_bin[feature])
-    _ = builder.enqueue_default_side(parent, goes_left)
-
-    var window = builder.windows.get(parent)
-    var n_entries = window.ends[feature] - window.starts[feature]
-    if n_entries > 0:
-        var threads = builder.block_threads
-        builder.ctx.enqueue_function[_cat_pool_side_kernel](
-            builder.order_dev.unsafe_ptr(),
-            builder.entry_row_dev.unsafe_ptr(),
-            builder.entry_bin_dev.unsafe_ptr(),
-            builder.ranges_dev.unsafe_ptr(),
-            pool.pool_dev.unsafe_ptr(),
-            builder.side_dev.unsafe_ptr(),
-            Int32(parent),
-            Int32(builder.n_features),
-            Int32(feature),
-            Int32(set_offset),
-            grid_dim=(n_entries + threads - 1) // threads,
-            block_dim=threads,
+    else:
+        if feature < 0 or feature >= builder.n_features:
+            raise Error("split feature out of range")
+        if not builder.cats.is_cat(feature):
+            raise Error("pooled categorical split names a numerical feature")
+        builder.check_split_ids(parent, left, right)
+        if set_offset < 0 or set_offset + CAT_BITSET_WORDS > pool.uploaded:
+            raise Error(
+                "category set offset is outside the uploaded region of the"
+                " pool; call CatSetPool.upload after staging the set"
+            )
+        check_cat_bitset(
+            pool.get(set_offset), builder.cats.n_categories(feature)
         )
 
-    builder.finish_split(parent, left, right, expected_left)
+        # An absent entry of a categorical column is category code 0, so the
+        # node's rows all take the side its bin lands on and only the rows
+        # with a stored entry are corrected. The host mirror of the device
+        # membership test decides it, which is why `CatSetPool.contains`
+        # exists.
+        var goes_left = pool.contains(set_offset, builder.default_bin[feature])
+        _ = builder.enqueue_default_side(parent, goes_left)
+
+        var window = builder.windows.get(parent)
+        var n_entries = window.ends[feature] - window.starts[feature]
+        if n_entries > 0:
+            var threads = builder.block_threads
+            builder.ctx.enqueue_function[_cat_pool_side_kernel](
+                builder.order_dev.unsafe_ptr(),
+                builder.entry_row_dev.unsafe_ptr(),
+                builder.entry_bin_dev.unsafe_ptr(),
+                builder.ranges_dev.unsafe_ptr(),
+                pool.pool_dev.unsafe_ptr(),
+                builder.side_dev.unsafe_ptr(),
+                Int32(parent),
+                Int32(builder.n_features),
+                Int32(feature),
+                Int32(set_offset),
+                grid_dim=(n_entries + threads - 1) // threads,
+                block_dim=threads,
+            )
+
+        builder.finish_split(parent, left, right, expected_left)
 
 
 struct GpuCategoryStats(Movable):

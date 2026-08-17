@@ -528,23 +528,32 @@ def test_gpu_tiled_strategy_is_bit_identical() raises:
 
 
 def _gpu_feature_group_matches(strategy: Int, group: Int) raises:
-    var n_rows = 20_003
-    var n_features = 8
-    var n_bins = 32
-    var data = _make_data(n_rows, n_features, n_bins, UInt64(59))
-    var grad = _grads(n_rows, UInt64(970_001))
-    var hess = _ones(n_rows)
+    # Guarded for the same reason as `_gpu_leaf_matches`, and found by
+    # `tools/check_gpu_guards.py` rather than by another CI cycle:
+    # `TestSuite.discover_tests[__functions_in_module()]()` instantiates
+    # EVERY function in this module, so guarding the tests that call this
+    # helper does not prune the helper. It builds a `GpuHistogramBuilder`,
+    # which elaborates a GPU kernel and fails a CPU-only compile.
+    comptime if not has_accelerator():
+        raise Error("this helper needs an accelerator")
+    else:
+        var n_rows = 20_003
+        var n_features = 8
+        var n_bins = 32
+        var data = _make_data(n_rows, n_features, n_bins, UInt64(59))
+        var grad = _grads(n_rows, UInt64(970_001))
+        var hess = _ones(n_rows)
 
-    var three = GpuHistogramBuilder(data, strategy)
-    var two = GpuHistogramBuilder(data, strategy)
-    three.set_feature_group(group)
-    two.set_feature_group(group)
-    two.set_constant_hessian(True)
-    three.upload_gradients(grad, hess)
-    two.upload_gradients(grad, hess)
-    three.begin_tree()
-    two.begin_tree()
-    _assert_same_bits(three.build_leaf(0), two.build_leaf(0))
+        var three = GpuHistogramBuilder(data, strategy)
+        var two = GpuHistogramBuilder(data, strategy)
+        three.set_feature_group(group)
+        two.set_feature_group(group)
+        two.set_constant_hessian(True)
+        three.upload_gradients(grad, hess)
+        two.upload_gradients(grad, hess)
+        three.begin_tree()
+        two.begin_tree()
+        _assert_same_bits(three.build_leaf(0), two.build_leaf(0))
 
 
 def test_gpu_feature_group_widths_are_bit_identical() raises:
@@ -574,49 +583,58 @@ def _gpu_fused_subtraction_matches(strategy: Int) raises:
     the subtraction differently, so it is checked under both strategies, in
     the shape `test_gpu_strategies._subtraction_paths_agree` established.
     """
-    var n_rows = 30_011
-    var n_features = 5
-    var n_bins = 64
-    var data = _make_data(n_rows, n_features, n_bins, UInt64(61))
-    var grad = _grads(n_rows, UInt64(980_001))
-    var hess = _ones(n_rows)
-    var cells = 3 * n_features * n_bins
+    # Guarded for the same reason as `_gpu_leaf_matches`, and found by
+    # `tools/check_gpu_guards.py` rather than by another CI cycle:
+    # `TestSuite.discover_tests[__functions_in_module()]()` instantiates
+    # EVERY function in this module, so guarding the tests that call this
+    # helper does not prune the helper. It builds a `GpuHistogramBuilder`,
+    # which elaborates a GPU kernel and fails a CPU-only compile.
+    comptime if not has_accelerator():
+        raise Error("this helper needs an accelerator")
+    else:
+        var n_rows = 30_011
+        var n_features = 5
+        var n_bins = 64
+        var data = _make_data(n_rows, n_features, n_bins, UInt64(61))
+        var grad = _grads(n_rows, UInt64(980_001))
+        var hess = _ones(n_rows)
+        var cells = 3 * n_features * n_bins
 
-    var three = GpuHistogramBuilder(data, strategy)
-    var two = GpuHistogramBuilder(data, strategy)
-    two.set_constant_hessian(True)
-    three.upload_gradients(grad, hess)
-    two.upload_gradients(grad, hess)
-    assert_true(three.open_resident(4))
-    assert_true(two.open_resident(4))
-    three.begin_tree()
-    two.begin_tree()
+        var three = GpuHistogramBuilder(data, strategy)
+        var two = GpuHistogramBuilder(data, strategy)
+        two.set_constant_hessian(True)
+        three.upload_gradients(grad, hess)
+        two.upload_gradients(grad, hess)
+        assert_true(three.open_resident(4))
+        assert_true(two.open_resident(4))
+        three.begin_tree()
+        two.begin_tree()
 
-    var p3 = three.acquire_resident(0)
-    var p2 = two.acquire_resident(0)
-    assert_true(p3 >= 0 and p2 >= 0)
-    three.enqueue_resident_leaf(0, p3)
-    two.enqueue_resident_leaf(0, p2)
-    three.apply_split(0, n_bins // 2, 0, 1, 2)
-    two.apply_split(0, n_bins // 2, 0, 1, 2)
+        var p3 = three.acquire_resident(0)
+        var p2 = two.acquire_resident(0)
+        assert_true(p3 >= 0 and p2 >= 0)
+        three.enqueue_resident_leaf(0, p3)
+        two.enqueue_resident_leaf(0, p2)
+        three.apply_split(0, n_bins // 2, 0, 1, 2)
+        two.apply_split(0, n_bins // 2, 0, 1, 2)
 
-    var c3 = three.acquire_resident(1)
-    var c2 = two.acquire_resident(1)
-    assert_true(c3 >= 0 and c2 >= 0)
-    three.enqueue_resident_leaf_subtracting(1, c3, p3)
-    two.enqueue_resident_leaf_subtracting(1, c2, p2)
+        var c3 = three.acquire_resident(1)
+        var c2 = two.acquire_resident(1)
+        assert_true(c3 >= 0 and c2 >= 0)
+        three.enqueue_resident_leaf_subtracting(1, c3, p3)
+        two.enqueue_resident_leaf_subtracting(1, c2, p2)
 
-    var s3: List[Int] = [p3, c3]
-    var s2: List[Int] = [p2, c2]
-    var w3 = three.batcher[0].download_slots(s3)
-    var w2 = two.batcher[0].download_slots(s2)
-    assert_equal(len(w3), 2 * cells)
-    assert_equal(len(w2), 2 * cells)
-    for i in range(2 * cells):
-        assert_equal(Int(w3[i]), Int(w2[i]))
+        var s3: List[Int] = [p3, c3]
+        var s2: List[Int] = [p2, c2]
+        var w3 = three.batcher[0].download_slots(s3)
+        var w2 = two.batcher[0].download_slots(s2)
+        assert_equal(len(w3), 2 * cells)
+        assert_equal(len(w2), 2 * cells)
+        for i in range(2 * cells):
+            assert_equal(Int(w3[i]), Int(w2[i]))
 
-    three.release_resident_all()
-    two.release_resident_all()
+        three.release_resident_all()
+        two.release_resident_all()
 
 
 def test_gpu_fused_subtraction_is_bit_identical_atomic() raises:

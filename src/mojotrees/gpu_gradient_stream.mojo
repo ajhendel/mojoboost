@@ -98,6 +98,7 @@ from std.atomic import Atomic
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import isfinite, round
 from std.memory import stack_allocation
+from std.sys import has_accelerator
 
 # No `getenv` here, deliberately. This module read MOJOTREES_GPU_GRAD_LAYOUT
 # until 2026-08-17 and nothing consumed the answer; see the tombstone above
@@ -875,100 +876,115 @@ def enqueue_range_histogram_interleaved[
     come from differs. The histogram it produces is bit-identical to the
     one the split-plane path produces from the same values.
     """
-    if n_slots < 1 or n_slots > rows.n_features:
-        raise Error("active feature count out of range")
-    var window = rows.ranges.get(node)
-    var hist_size = rows.n_features * rows.n_bins
-    var threads = tiling.block_threads
-
-    # The reduction of the tiled path writes every active feature's slice,
-    # so that path only needs zeroing when some feature is inactive; the
-    # atomic path always does, and so does a node with no rows.
-    if (
-        tiling.strategy != STRATEGY_TILED
-        or n_slots < rows.n_features
-        or window.count() <= 0
-    ):
-        var cells = 3 * hist_size
-        var zero_blocks = (cells + threads - 1) // threads
-        rows.ctx.enqueue_function[_zero_int32_kernel](
-            out_hist,
-            Int32(cells),
-            grid_dim=zero_blocks,
-            block_dim=threads,
-        )
-    if window.count() <= 0:
-        return
-
-    if tiling.strategy == STRATEGY_TILED:
-        rows.ctx.enqueue_function[_range_hist_partial_gh_kernel](
-            bins,
-            rows.rows_dev.unsafe_ptr(),
-            gh,
-            feat_ids,
-            partials,
-            Int32(rows.n_rows),
-            Int32(n_slots),
-            Int32(rows.n_bins),
-            Int32(tiling.rows_per_tile),
-            Int32(window.begin),
-            Int32(window.count()),
-            g_scale,
-            h_scale,
-            grid_dim=(n_slots, tiling.n_tiles),
-            block_dim=threads,
-        )
-        var n_cells = 3 * n_slots * rows.n_bins
-        var blocks = (n_cells + threads - 1) // threads
-        # No fused subtraction here: the interleaved plane serves the
-        # gradient stream, which builds one node at a time and holds no
-        # resident sibling to derive.
-        rows.ctx.enqueue_function[_range_reduce_kernel](
-            partials,
-            feat_ids,
-            out_hist,
-            Int32(n_slots),
-            Int32(rows.n_bins),
-            Int32(hist_size),
-            Int32(tiling.n_tiles),
-            Int32(0),
-            Int32(0),
-            # `h_scale` and `const_hess`, which this call was missing: the
-            # kernel grew both when the hessian plane became elidable and
-            # this site was not updated with it. The arity error is invisible
-            # to a host build because a kernel body is elaborated when the
-            # device compiles it, not when this file does. `const_hess` is
-            # zero here and not a choice: `n_cells` above counts three
-            # planes, so this path is the three-plane layout by
-            # construction.
-            h_scale,
-            Int32(0),
-            # The histogram decomposition probes. `GpuActiveRows` refuses to
-            # set any of them on a path that grows a tree, and the gradient
-            # stream never sets one, so this is `HIST_PROBE_OFF` and is
-            # spelled out rather than passed as a bare zero.
-            Int32(HIST_PROBE_OFF),
-            grid_dim=blocks,
-            block_dim=threads,
+    # Guarded 2026-08-17 by the CPU-only build audit
+    # (docs/design/CPU_ONLY_BUILD_AUDIT.md). Four launches, and on a build
+    # with no accelerator any one of them elaborates a GPU kernel and fails
+    # the compile with `Unknown GPU architecture detected`. The wrap covers
+    # the whole body rather than each launch because the `window.count()`
+    # EARLY RETURN below does not prune; only a `comptime if` with an `else`
+    # removes the branch at compile time.
+    comptime if not has_accelerator():
+        raise Error(
+            "the interleaved range histogram needs an accelerator; this"
+            " build has none"
         )
     else:
-        rows.ctx.enqueue_function[_range_hist_atomic_gh_kernel](
-            bins,
-            rows.rows_dev.unsafe_ptr(),
-            gh,
-            feat_ids,
-            out_hist,
-            Int32(rows.n_rows),
-            Int32(rows.n_bins),
-            Int32(hist_size),
-            Int32(tiling.rows_per_tile),
-            Int32(window.begin),
-            Int32(window.count()),
-            g_scale,
-            h_scale,
-            grid_dim=(n_slots, tiling.n_tiles),
-            block_dim=threads,
-        )
+        if n_slots < 1 or n_slots > rows.n_features:
+            raise Error("active feature count out of range")
+        var window = rows.ranges.get(node)
+        var hist_size = rows.n_features * rows.n_bins
+        var threads = tiling.block_threads
+
+        # The reduction of the tiled path writes every active feature's
+        # slice, so that path only needs zeroing when some feature is
+        # inactive; the atomic path always does, and so does a node with no
+        # rows.
+        if (
+            tiling.strategy != STRATEGY_TILED
+            or n_slots < rows.n_features
+            or window.count() <= 0
+        ):
+            var cells = 3 * hist_size
+            var zero_blocks = (cells + threads - 1) // threads
+            rows.ctx.enqueue_function[_zero_int32_kernel](
+                out_hist,
+                Int32(cells),
+                grid_dim=zero_blocks,
+                block_dim=threads,
+            )
+        if window.count() <= 0:
+            return
+
+        if tiling.strategy == STRATEGY_TILED:
+            rows.ctx.enqueue_function[_range_hist_partial_gh_kernel](
+                bins,
+                rows.rows_dev.unsafe_ptr(),
+                gh,
+                feat_ids,
+                partials,
+                Int32(rows.n_rows),
+                Int32(n_slots),
+                Int32(rows.n_bins),
+                Int32(tiling.rows_per_tile),
+                Int32(window.begin),
+                Int32(window.count()),
+                g_scale,
+                h_scale,
+                grid_dim=(n_slots, tiling.n_tiles),
+                block_dim=threads,
+            )
+            var n_cells = 3 * n_slots * rows.n_bins
+            var blocks = (n_cells + threads - 1) // threads
+            # No fused subtraction here: the interleaved plane serves the
+            # gradient stream, which builds one node at a time and holds no
+            # resident sibling to derive.
+            rows.ctx.enqueue_function[_range_reduce_kernel](
+                partials,
+                feat_ids,
+                out_hist,
+                Int32(n_slots),
+                Int32(rows.n_bins),
+                Int32(hist_size),
+                Int32(tiling.n_tiles),
+                Int32(0),
+                Int32(0),
+                # `h_scale` and `const_hess`, which this call was missing:
+                # the kernel grew both when the hessian plane became
+                # elidable and this site was not updated with it. The arity
+                # error is invisible to a host build because a kernel body
+                # is elaborated when the device compiles it, not when this
+                # file does. `const_hess` is zero here and not a choice:
+                # `n_cells` above counts three planes, so this path is the
+                # three-plane layout by construction.
+                h_scale,
+                Int32(0),
+                # The histogram decomposition probes. `GpuActiveRows`
+                # refuses to set any of them on a path that grows a tree,
+                # and the gradient stream never sets one, so this is
+                # `HIST_PROBE_OFF` and is spelled out rather than passed as
+                # a bare zero.
+                Int32(HIST_PROBE_OFF),
+                grid_dim=blocks,
+                block_dim=threads,
+            )
+        else:
+            rows.ctx.enqueue_function[_range_hist_atomic_gh_kernel](
+                bins,
+                rows.rows_dev.unsafe_ptr(),
+                gh,
+                feat_ids,
+                out_hist,
+                Int32(rows.n_rows),
+                Int32(rows.n_bins),
+                Int32(hist_size),
+                Int32(tiling.rows_per_tile),
+                Int32(window.begin),
+                Int32(window.count()),
+                g_scale,
+                h_scale,
+                grid_dim=(n_slots, tiling.n_tiles),
+                block_dim=threads,
+            )
 
 
 struct InterleavedGradients(Movable):

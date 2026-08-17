@@ -62,8 +62,27 @@ import tempfile
 
 import numpy as np
 
+import envinfo
 import measure
 import scenarios
+
+
+def _physical_cores():
+    """This machine's physical core count, as `run.default_threads` reads it.
+
+    Cached, because `envinfo._cpu` shells out to `sysctl` on Darwin and this
+    is asked once per engine load rather than once per run.
+    """
+    global _PHYSICAL_CORES
+    if _PHYSICAL_CORES is None:
+        cpu = envinfo._cpu()
+        _PHYSICAL_CORES = (
+            cpu.get("physical_cores") or cpu.get("logical_cores") or 1
+        )
+    return _PHYSICAL_CORES
+
+
+_PHYSICAL_CORES = None
 
 
 #: How many per-feature bin counts a record carries in full. Every scenario
@@ -400,6 +419,254 @@ def _materialized_predictions(engine, out, n_rows):
     return out
 
 
+#: How many cores a phase that asked for ONE may report before this harness
+#: stops believing that it got one. Not 1.0: `parallel_efficiency` is
+#: `process_time` over `perf_counter` across the whole process, so a library
+#: thread pool that spins briefly at the start of a call, or a garbage
+#: collection landing inside the window, lifts a genuinely serial phase a
+#: little above unity. 1.5 is far below every threaded figure this harness has
+#: recorded (5.59 to 9.40 for the peers, 2.88 to 3.95 for us on the pinned
+#: geometry) and far above the noise, so nothing has to be judged by eye.
+SINGLE_THREAD_MAX_EFFICIENCY = 1.5
+
+#: THE SINGLE-THREAD PREDICTION COLUMN, added 2026-08-17.
+#:
+#: WHY IT EXISTS. `predict_batch` answers "what does a user get", which is the
+#: number that must stay the headline. It does not answer "is the predictor
+#: good", because those two differ by however much of the machine each library
+#: manages to use, and on run `20260817T195323Z-predict2` that difference was
+#: the whole story: our leaf-wise arm spent 0.252 CPU seconds against
+#: LightGBM's 0.409 for the same 51,630 rows and 100 trees, and finished 1.6x
+#: LATER. Our symmetric arm spent 0.030 against CatBoost's 0.054 and finished
+#: 1.37x later. A column that cannot separate those two facts sends
+#: optimization work at the wrong thing, and it sent it at the wrong thing for
+#: a day.
+#:
+#: WHAT IT IS NOT. It is not a replacement for `predict_batch` and must never
+#: become the headline. We WIN at one thread and LOSE on the machine, so
+#: publishing the single-thread figure alone would report a win in a
+#: configuration nobody deploys and hide a loss every user of the library
+#: experiences. The scaling deficit is ours and the headline has to keep
+#: showing it. `report.py` prints them side by side with the realized speedup
+#: between them for that reason.
+#:
+#: WHY ONE THREAD AND NOT ONE CORE. macOS exposes no hard CPU affinity, only
+#: advisory QoS hints, so "pin this to one core" is a request the scheduler may
+#: decline; and an unpinned single thread landing on a performance core or an
+#: efficiency core is itself worth about 3x on this M4, which is the same
+#: heterogeneity the column exists to remove. A thread COUNT is enforceable
+#: through each library's own parameter, so that is what is set.
+#:
+#: AND WHY THE KNOB IS CHECKED RATHER THAN TRUSTED. Four libraries, four
+#: different knobs, and a knob that silently does not take produces a
+#: plausible-looking number that is really the threaded one, which would make
+#: the scaling column read 1.0 and the deficit vanish. So every arm records
+#: which knob it set, and the phase's own `parallel_efficiency` is compared
+#: against `SINGLE_THREAD_MAX_EFFICIENCY` and recorded as a verdict on the
+#: row. A phase that did not get its one thread says so in the record instead
+#: of being quietly averaged into a table. This is the same discipline
+#: `PREDICT_PHASE_RULE` was written under: a number whose magnitude is
+#: implausible for the work it claims to do is a measurement bug until proven
+#: otherwise.
+SINGLE_THREAD_PREDICT_RULE = (
+    "predict_batch_t1 is a second timed batch prediction of the same fitted "
+    "model over the same held-out matrix with the library held to one thread, "
+    "under every clause of PREDICT_PHASE_RULE. It is a diagnostic beside "
+    "predict_batch and never instead of it: predict_batch is what a user gets "
+    "and stays the headline, predict_batch_t1 is work per core, and the ratio "
+    "between them is realized parallel speedup. The thread knob is named on "
+    "the row and verified against the phase's own parallel_efficiency rather "
+    "than assumed. See engines.SINGLE_THREAD_PREDICT_RULE"
+)
+
+
+def _median_efficiency(samples):
+    """The median `parallel_efficiency` of a `measure.repeat` block."""
+    values = [
+        s["parallel_efficiency"]
+        for s in (samples or {}).get("measured", ())
+        if s.get("parallel_efficiency") is not None
+    ]
+    if not values:
+        return None
+    return float(np.median(values))
+
+
+def _single_thread_predict(engine, call, repeats, knob, n_rows, reference=None):
+    """A SECOND timed batch prediction, with the library held to one thread.
+
+    `call` is the arm's own predict callable already carrying its own
+    single-thread knob, because there is no portable one: LightGBM takes
+    `num_threads` as a prediction parameter, CatBoost takes `thread_count`,
+    XGBoost has no predict-time argument and needs `nthread` moved on the
+    booster, and we read `MOJOTREES_NUM_WORKERS` out of the environment.
+    `knob` is that decision written down, so the record says what was set
+    rather than leaving it in this module's history.
+
+    Returns the same shape `_predict_on_accelerator` returns, for the same
+    reason: a second measurement that may not have been takeable is a phase
+    plus a stated reason, never a missing key and never a zero.
+
+    The predictions are compared against the threaded pass's when one is
+    handed in, as NUMBERS AND NOT A VERDICT, the same way `_prediction_agreement`
+    is used for the device pair. Our own path is documented to be bit-identical
+    at every block count, so a nonzero difference on our rows is a finding; a
+    peer's thread count is not a promise about its floating-point associativity
+    and a small difference there is expected rather than wrong. Nothing here
+    fails on the value.
+    """
+    out, phase = measure.repeat(call, repeats)
+    _materialized_predictions(engine, out, n_rows)
+    observed = _median_efficiency(phase)
+    verified = (
+        observed is not None and observed <= SINGLE_THREAD_MAX_EFFICIENCY
+    )
+    reason = None
+    if not verified:
+        reason = (
+            f"the phase reports {observed if observed is None else round(observed, 2)} "
+            f"cores busy on average, above SINGLE_THREAD_MAX_EFFICIENCY="
+            f"{SINGLE_THREAD_MAX_EFFICIENCY}, so {knob} did not hold this arm "
+            "to one thread and this figure is not a single-thread measurement"
+        )
+    return {
+        "phase": phase,
+        "knob": knob,
+        "parallel_efficiency": observed,
+        "verified": verified,
+        "unverified_reason": reason,
+        "agreement": (
+            None if reference is None else _prediction_agreement(reference, out)
+        ),
+    }
+
+
+def _single_thread_phases(single):
+    """The `phases` entries for one `_single_thread_predict` result.
+
+    One function rather than five copies of five keys, because the keys are a
+    wire format that `report.py` and `schema.json` read by name, and five
+    hand-written copies is how one arm comes to spell a key differently from
+    the four beside it.
+    """
+    return {
+        "predict_batch_t1": single["phase"],
+        "predict_batch_t1_knob": single["knob"],
+        "predict_batch_t1_verified": single["verified"],
+        "predict_batch_t1_unverified_reason": single["unverified_reason"],
+        "predict_batch_t1_agreement": single["agreement"],
+    }
+
+
+#: What the second prediction column is, what it is NOT, and the one question
+#: about it that this harness has not answered.
+#:
+#: GPU PREDICTION IS NOT BIT-IDENTICAL TO CPU PREDICTION. It accumulates leaf
+#: values in Float32 where the host accumulates in Float64 (both devices bin
+#: on the host, or compare raw values against Float64 edges, so both route
+#: every row to the SAME leaf and the divergence is the accumulation and
+#: nothing else). That single fact decides everything below.
+#:
+#: It means this column may not be switched on by a speed result. The
+#: repository's rule that a bit-identical measured win flips its default in
+#: the same session rests on such a win being unable to change any user's
+#: output; this one can, so `device="cpu"` stays the prediction default in
+#: `Booster.predict`, in the estimators, and in this file until a person
+#: decides otherwise for reasons that are not only speed.
+#:
+#: WHAT THE CPU COMPARISON IS, AND WHAT IT IS NOT. It is NOT a bar the GPU
+#: has to clear. Requiring a device answer to match Float64 host arithmetic
+#: would forbid Float32 anywhere on the device, which forecloses the entire
+#: reason to do GPU inference; the GPU is the product here and the CPU
+#: backend is a correctness ORACLE and a portability floor, not the
+#: definition of the right answer. Nothing about this measurement fails a
+#: run, blocks a report, or gates a default.
+#:
+#: What it IS: the only bug detector this path can have. The host is the only
+#: ground truth available for a device walk, so there is no other way to
+#: answer "is this GPU prediction right". The two failure magnitudes are far
+#: apart and that is what makes the comparison cheap and decisive. Float32
+#: leaf accumulation moves a prediction by something on the order of 1e-7
+#: relative. A real defect -- a wrong leaf index, a row read at the wrong
+#: offset, a stale buffer -- moves it by 1e-1 or produces garbage. So the
+#: comparison is quiet on genuine rounding and speaks up only when something
+#: is actually broken, at a cost of one comparison per run.
+#:
+#: And it is product-facing in its own right, separately from correctness. A
+#: user may train where there is an accelerator and score where there is
+#: not, or validate in one place and deploy in another. A small disagreement
+#: there is expected and fine; a large one is a real complaint. Either way we
+#: should know its size and be able to quote it, which is why it belongs in
+#: the report as a MAGNITUDE rather than as a pass or a fail.
+#:
+#: THE CROSSOVER IS UNMEASURED, AND DO NOT ASSUME WHICH WAY IT GOES. Nothing
+#: here estimates where a device walk overtakes the host, no automatic device
+#: choice is wired for prediction, and `device="auto"` resolves to the CPU
+#: for prediction on every shape. Assuming the GPU wins somewhere would be
+#: unearned: on an M4 the symmetric arm predicts 51,630 rows in about 0.008 s
+#: on the CPU, which is small enough that launch and transfer could plausibly
+#: exceed the whole computation. The GPU losing at every size a benchmark
+#: currently runs is a perfectly good result and would be worth publishing as
+#: one. When the crossover IS measured the answer needs a RUN ID recorded
+#: beside it, the way every other crossover in this repository does, and this
+#: note should be replaced by that id rather than extended.
+GPU_PREDICT_RULE = (
+    "predict_batch_gpu is the same model scored on the accelerator, timed "
+    "under PREDICT_PHASE_RULE and reported BESIDE the cpu figure, never "
+    "instead of it. predict_device_agreement carries the row-level cpu-gpu "
+    "gap as a REPORTED MAGNITUDE and not as a gate: it fails nothing and "
+    "blocks nothing. About 1e-7 relative is expected from Float32 leaf "
+    "accumulation and is not a defect; the number is carried so that a real "
+    "defect, which moves a prediction by 1e-1 or produces garbage, cannot "
+    "hide inside an expected one, and so that a user who trains on an "
+    "accelerator and scores without one can be told the size of the "
+    "difference. The cpu-versus-gpu prediction crossover is unmeasured, no "
+    "automatic device choice is wired for prediction, and the GPU is not "
+    "assumed to win at any size. See engines.GPU_PREDICT_RULE"
+)
+
+
+def _prediction_agreement(cpu, gpu):
+    """The row-level gap between a cpu prediction and its gpu twin.
+
+    Both arrays are of the SAME fitted model over the SAME held-out matrix,
+    so unlike `verify.check_device_agreement`, which compares a gpu-TRAINED
+    row against a cpu-TRAINED one and therefore compares two different
+    ensembles, every difference here is the prediction path and nothing else.
+
+    NUMBERS, NOT A VERDICT, and deliberately so. This function owns no
+    threshold, and nothing downstream of it should grow one: the CPU answer
+    is the oracle available for a device path, not the definition of the
+    right answer, and demanding a match would forbid Float32 on the device
+    and with it the whole point of GPU inference. About 1e-7 relative is the
+    expected size of the disagreement; a genuine defect is orders of
+    magnitude larger, which is what makes recording the magnitude worth more
+    than judging it. See `GPU_PREDICT_RULE`.
+    """
+    a = np.ascontiguousarray(np.asarray(cpu, dtype=np.float64))
+    b = np.ascontiguousarray(np.asarray(gpu, dtype=np.float64))
+    if a.shape != b.shape:
+        raise EngineError(
+            f"the cpu prediction is {a.shape} and the gpu prediction is "
+            f"{b.shape}; they are the same model over the same matrix, so a "
+            "shape difference is a harness bug and not a device difference"
+        )
+    diff = np.abs(b - a)
+    scale = np.maximum(np.abs(a), np.finfo(np.float64).tiny)
+    return {
+        "max_abs_diff": float(diff.max()) if diff.size else 0.0,
+        "max_rel_diff": float((diff / scale).max()) if diff.size else 0.0,
+        "mean_abs_diff": float(diff.mean()) if diff.size else 0.0,
+        "n_rows": int(a.shape[0]),
+        # Recorded rather than assumed either way. It is NOT expected to be
+        # true (Float32 leaf accumulation against Float64) and a run where it
+        # is true is worth knowing about rather than worth hiding.
+        "bit_identical": bool(not diff.any()),
+        "cpu_sha256": measure.digest(a),
+        "gpu_sha256": measure.digest(b),
+    }
+
+
 class MojoTreesEngine:
     name = "mojotrees"
 
@@ -482,20 +749,55 @@ class MojoTreesEngine:
         return type(self).params_fn(spec, device or self.device, extra)
 
     def load(self):
-        """Import the extension, having already set the thread count.
+        """Import the extension, having already settled the fan-out policy.
 
-        MOJOTREES_NUM_WORKERS is read by the Mojo side, and the runner sets
-        it before this process starts. It is asserted here rather than set
-        here, because setting it after an import that may already have
-        cached a worker count would be a silent lie in the record.
+        MOJOTREES_NUM_WORKERS is read by the Mojo side, and the runner
+        decides it before this process starts. It is asserted here rather
+        than set here, because setting it after an import that may already
+        have cached a worker count would be a silent lie in the record.
+
+        TWO LEGAL STATES SINCE 2026-08-17, and the second one is new. An
+        UNSET variable is auto mode, and it is what a cell at the machine's
+        own core count gets, because that variable is not a thread count: it
+        replaces `parallel.plan_tasks`'s whole rule with a fixed block count.
+        A SET variable must equal this cell's thread count, and it means N
+        static blocks rather than N threads. `run.mojotrees_workers` carries
+        the argument and the measurements that forced it; this end refuses
+        both mismatches so the two files cannot drift apart quietly.
         """
         want = str(self.threads)
         got = os.environ.get("MOJOTREES_NUM_WORKERS")
-        if got != want:
+        whole_machine = int(self.threads) == int(_physical_cores())
+        if got is None and not whole_machine:
+            raise EngineError(
+                f"MOJOTREES_NUM_WORKERS is unset on a {self.threads}-thread "
+                f"cell, but this machine reports {_physical_cores()} physical "
+                "cores. Unset means auto, which plans against the whole chip, "
+                "so this cell would silently measure more cores than its label "
+                "claims. The runner must pin the count below the core count"
+            )
+        if got is not None and got != want:
             raise EngineError(
                 f"MOJOTREES_NUM_WORKERS is {got!r} but this run wants {want!r}; "
                 "the runner must set it before the worker process starts"
             )
+        self.notes.append(
+            "mojotrees fan-out: "
+            + (
+                "AUTO. MOJOTREES_NUM_WORKERS is unset, so parallel.plan_tasks "
+                "planned the fan-out itself against the whole chip, which is "
+                "what a user gets and what the peers' thread count asks of "
+                "them. This is the shipped path"
+                if got is None
+                else f"PINNED to {got} blocks. MOJOTREES_NUM_WORKERS is set, "
+                "which bypasses parallel.plan_tasks's rule and cuts exactly "
+                "that many equal row blocks, statically assigned. It is a "
+                "block count and not a thread count, so this row is NOT the "
+                "same instruction the peer arms received at the same "
+                "`threads` value"
+            )
+            + ". See run.mojotrees_workers"
+        )
         phase = measure.Phase("import")
         with phase:
             import mojotrees
@@ -559,6 +861,131 @@ class MojoTreesEngine:
             params=params,
         )
 
+    def _predict_single_thread(self, call, n_rows, reference, repeats):
+        """`_single_thread_predict` for this arm, whose thread knob is an
+        environment variable rather than an argument.
+
+        `call` is the arm's own predict callable, because the dense path and
+        the CSC path reach prediction through different entry points and the
+        environment move is the only part they share.
+
+        THE VARIABLE IS MOVED AROUND THE WHOLE PHASE AND NOT INSIDE THE TIMED
+        CALL, so no measured sample contains the two dict operations, and it
+        is restored in a `finally` so that a raising prediction cannot leave
+        the rest of the cell running on one block. What it restores to is
+        whatever the runner decided, which since 2026-08-17 is usually UNSET
+        rather than a number: see `run.mojotrees_workers` and `load`.
+
+        THIS RELIES ON `parallel.plan_tasks` READING THE ENVIRONMENT ON EVERY
+        CALL, which its own docstring states is deliberate ("This form reads
+        the environment on every call, which is what lets a test change a
+        variable between two calls and see the change") and which
+        `predict.predict_batch` reaches because it dispatches through
+        `dispatch_rows` rather than through a `DispatchSettings` snapshot.
+        That is a property of code this harness does not own, so it is
+        VERIFIED rather than assumed: `_single_thread_predict` checks the
+        phase's own `parallel_efficiency` and records a verdict. If the
+        snapshot path is ever taken here, this column says it did not get its
+        one thread instead of quietly reporting the threaded number.
+        """
+        previous = os.environ.get("MOJOTREES_NUM_WORKERS")
+        os.environ["MOJOTREES_NUM_WORKERS"] = "1"
+        try:
+            return _single_thread_predict(
+                self.name,
+                call,
+                repeats,
+                "MOJOTREES_NUM_WORKERS=1 around the phase",
+                n_rows,
+                reference,
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("MOJOTREES_NUM_WORKERS", None)
+            else:
+                os.environ["MOJOTREES_NUM_WORKERS"] = previous
+
+    def _predict_on_accelerator(self, booster, test, cpu_predictions, repeats):
+        """A SECOND timed prediction of the same fitted model, on the
+        accelerator, on every mojotrees arm of an accelerator-capable run.
+
+        On every arm, including the cpu-trained ones, because the model is
+        the same object either way and the comparison this produces is
+        cpu-predict against gpu-predict rather than cpu-train against
+        gpu-train. Running it on the cpu arm too is what gives the oracle row
+        a device-agreement pair of its own.
+
+        The cpu figure above is untouched and keeps the like-for-like
+        comparison against the three competitors, none of which can use this
+        accelerator. See `GPU_PREDICT_RULE` for why this one cannot become a
+        default on its timing.
+
+        Returns a dict with a `phase` in the shape `measure.repeat` produces,
+        or a `phase` of None and an `unavailable_reason` beside it. It never
+        returns a phase it could not prove ran on the accelerator: an
+        explicit `device="gpu"` raises natively rather than falling back, and
+        the backend the call REPORTS is checked here as well, because a gpu
+        column holding a cpu number is the exact defect this measurement was
+        added to end.
+
+        THAT CHECK IS ABOUT PROVENANCE AND NOT ABOUT AGREEMENT. It asks which
+        backend ran, which has one right answer. The cpu-versus-gpu
+        difference in the returned `agreement` block is a reported magnitude
+        with no threshold on it and nothing here fails on its value: see
+        `GPU_PREDICT_RULE`.
+        """
+        empty = {
+            "phase": None,
+            "backend": None,
+            "agreement": None,
+            "unavailable_reason": None,
+        }
+        if not self.module.gpu_available():
+            empty["unavailable_reason"] = (
+                "this build or this machine has no accelerator, so there is "
+                "no gpu prediction to time"
+            )
+            return empty
+        n_rows = test["X"].shape[0]
+        try:
+            # Same shape as the cpu phase: the harness's own held-out matrix,
+            # handed to the same method, with every conversion and every
+            # transfer inside the timed call and nothing carried between
+            # repeats. See `PREDICT_PHASE_RULE`.
+            gpu_predictions, phase = measure.repeat(
+                lambda: booster.predict(test["X"], device="gpu"), repeats
+            )
+        except Exception as exc:  # pragma: no cover - shape-dependent
+            # A refusal is an ANSWER here, not a failure: the device
+            # prediction path declines shapes it does not cover and says why,
+            # and that reason belongs in the record instead of an empty cell.
+            # The cpu column is already measured, so nothing is lost.
+            empty["unavailable_reason"] = (
+                f"device='gpu' prediction was refused: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return empty
+        _materialized_predictions(self.name + " gpu", gpu_predictions, n_rows)
+        backend = getattr(booster, "predict_device_", None)
+        if backend != "gpu":
+            raise EngineError(
+                f"the gpu prediction phase reports backend {backend!r}; a "
+                "figure that did not run on the accelerator must not be "
+                "published in an accelerator column, which is the defect "
+                "this column was added to fix. Either the wrapper is older "
+                "than Booster.predict_device_ or an explicit device='gpu' "
+                "fell back silently, and both are refusals rather than "
+                "measurements"
+            )
+        return {
+            "phase": phase,
+            "backend": backend,
+            "agreement": _prediction_agreement(
+                cpu_predictions, gpu_predictions
+            ),
+            "unavailable_reason": None,
+        }
+
     def run(self, spec, train, test, repeats=1):
         if train.get("sparse"):
             return self._run_sparse(spec, train, test, repeats)
@@ -581,26 +1008,80 @@ class MojoTreesEngine:
         )
 
         # Handed the held-out matrix itself, not a Dataset. `Booster.predict`
-        # bins the matrix and then walks the ensemble over row blocks, both
-        # inside the timed call, and writes into a buffer it allocates per
-        # call, so nothing survives between repeats that could serve a
-        # previous answer. Two things a reader of this column has to know.
-        # First, the binning of the held-out matrix is inside our number and
-        # is not inside LightGBM's, because LightGBM predicts against raw
-        # thresholds. Second, the binding calls `Model.predict_batch` with an
-        # explicit CPU_DEVICE, so the `gpu` rows' predict figures are CPU
-        # predictions and are expected to equal the `cpu` rows'.
+        # walks the ensemble over row blocks inside the timed call and writes
+        # into a buffer it allocates per call, so nothing survives between
+        # repeats that could serve a previous answer.
+        #
+        # WHAT A READER OF THIS COLUMN HAS TO KNOW, and the first clause of it
+        # CHANGED. This comment used to say that the binning of the held-out
+        # matrix is inside our number and is not inside LightGBM's, which
+        # would make our figure the less comparable of the two. That stopped
+        # being true when the raw-threshold predictor landed:
+        # `Model.predict_batch` no longer bins at inference on the default
+        # path. Each node's `threshold_bin` is converted at finalize into the
+        # Float64 bin EDGE it names and the walk compares the raw feature
+        # value, which is exactly what LightGBM does. So this column is MORE
+        # comparable than the sentence it replaces claimed, and a reader who
+        # trusted that sentence was discounting our number for a cost we no
+        # longer pay. The switch is `MOJOTREES_RAW_PREDICT`, default on,
+        # spelled `!= "0"`.
+        #
+        # The conversion is BIT-IDENTICAL and the argument is short. Edges are
+        # strictly increasing and bin b is the half-open interval
+        # (e[b-1], e[b]], so `bin(v) <= T` if and only if `v <= e[T]`, both
+        # directions exact; it is the same Float64 comparison on the same pair
+        # with no rounding step introduced. Missing values are handled
+        # separately because `NaN <= edge` is false, so each node precomputes
+        # which way its NaNs go. See `predict._raw_split`.
+        #
+        # THE ASYMMETRY THAT IS LEFT, which replaces the one deleted above. A
+        # model the rewrite cannot cover still bins at inference, and the
+        # uncovered shapes are categorical splits, categorical features, CTR
+        # columns and linear leaves (`predict.refusal_text` is the full list).
+        # None of those fire on this scenario, so this column is like-for-like
+        # here; on a CATEGORICAL scenario the same column silently includes a
+        # binning pass that LightGBM's does not, and has to be read that way.
+        # `predict_row` below is one row, which is under `RAW_MIN_ROWS = 8`,
+        # so the `row ms` column bins on every arm and every scenario.
+        #
+        # AND THE DEVICE, which is why this arm now times prediction TWICE.
+        # `device="cpu"` is passed explicitly rather than left to default, so
+        # that this figure names its backend in the source and not only in a
+        # comment; it is the same call and the same native code the default
+        # reaches. It is the like-for-like number against the three
+        # competitors, none of which can use this accelerator. The GPU figure
+        # is measured below and reported beside it, never instead of it.
         predictions, predict_batch = measure.repeat(
-            lambda: booster.predict(test["X"]), repeats
+            lambda: booster.predict(test["X"], device="cpu"), repeats
         )
         _materialized_predictions(self.name, predictions, test["X"].shape[0])
-        row = np.ascontiguousarray(test["X"][:1])
-        _, predict_row = measure.repeat(lambda: booster.predict(row), 20, warmup=2)
-        self.notes.append(
-            "mojotrees predict phases: " + PREDICT_PHASE_RULE + ". Binning "
-            "the held-out matrix is inside this arm's predict phase, and "
-            "prediction runs on the CPU on every arm including the gpu ones"
+        single = self._predict_single_thread(
+            lambda: booster.predict(test["X"], device="cpu"),
+            test["X"].shape[0],
+            predictions,
+            repeats,
         )
+        row = np.ascontiguousarray(test["X"][:1])
+        _, predict_row = measure.repeat(
+            lambda: booster.predict(row, device="cpu"), 20, warmup=2
+        )
+        gpu_predict = self._predict_on_accelerator(
+            booster, test, predictions, repeats
+        )
+        self.notes.append(SINGLE_THREAD_PREDICT_RULE)
+        self.notes.append(
+            "mojotrees predict phases: " + PREDICT_PHASE_RULE + ". The "
+            "predict_batch phase is a CPU prediction on every arm including "
+            "the gpu-TRAINED ones, and is the like-for-like column against "
+            "the competitors; predict_batch_gpu is the accelerator figure "
+            "beside it and is null with a reason where there is none. "
+            "Binning the held-out matrix is NOT inside the predict_batch "
+            "phase on this scenario: the raw-threshold predictor compares "
+            "against Float64 bin edges, as LightGBM does. It IS inside it "
+            "for categorical, CTR and linear-leaf models, and inside the "
+            "one-row predict_row phase always (RAW_MIN_ROWS is 8)"
+        )
+        self.notes.append(GPU_PREDICT_RULE)
 
         with tempfile.TemporaryDirectory() as scratch:
             size = measure.model_size(booster, scratch)
@@ -611,11 +1092,27 @@ class MojoTreesEngine:
             "device_requested": self.device,
             "device_used": getattr(booster, "device_", None),
             "path": "dataset",
+            # The device this arm PREDICTED on, which is not
+            # `device_used` above: that one is the TRAINING device, and
+            # conflating the two is the defect this pair of columns
+            # exists to end. `predict_batch` is always the cpu figure.
+            "predict_device_used": "cpu",
+            "predict_device_gpu": gpu_predict["backend"],
+            # Row-level cpu-versus-gpu prediction agreement for THIS model
+            # over THIS held-out matrix, as numbers with no verdict
+            # attached. Null when no gpu figure was taken. See
+            # `_prediction_agreement` and `GPU_PREDICT_RULE`.
+            "predict_device_agreement": gpu_predict["agreement"],
             "phases": {
                 "import": self.import_phase.as_dict(),
                 "binning": binning.as_dict(),
                 "train": training.as_dict(),
                 "predict_batch": predict_batch,
+                "predict_batch_gpu": gpu_predict["phase"],
+                "predict_batch_gpu_unavailable_reason": gpu_predict[
+                    "unavailable_reason"
+                ],
+                **_single_thread_phases(single),
                 "predict_row": predict_row,
             },
             "params_used": params,
@@ -694,6 +1191,12 @@ class MojoTreesEngine:
             lambda: estimator.predict_proba(test["X"])[:, 1], repeats
         )
         _materialized_predictions(self.name, predictions, test["X"].shape[0])
+        single = self._predict_single_thread(
+            lambda: estimator.predict_proba(test["X"])[:, 1],
+            test["X"].shape[0],
+            predictions,
+            repeats,
+        )
         _, predict_row = measure.repeat(
             lambda: estimator.predict_proba(test["X"][:1])[:, 1], 20, warmup=2
         )
@@ -705,12 +1208,21 @@ class MojoTreesEngine:
             "sparse path: fit bins internally, so binning time is inside "
             "train and device is cpu whatever was requested"
         )
+        self.notes.append(SINGLE_THREAD_PREDICT_RULE)
         return {
             "engine": self.name,
             "engine_version": self.version,
             "device_requested": self.device,
             "device_used": getattr(estimator, "device_", "cpu"),
             "path": "estimator_csc",
+            # Stated rather than omitted, for the same reason the dense path
+            # states them: an absent field reads as an untaken measurement
+            # and this one is a path that does not exist. The prediction
+            # kernels read a dense binned matrix, so a sparse gpu prediction
+            # is refused natively rather than served by densifying.
+            "predict_device_used": "cpu",
+            "predict_device_gpu": None,
+            "predict_device_agreement": None,
             "phases": {
                 "import": self.import_phase.as_dict(),
                 "binning": None,
@@ -720,6 +1232,14 @@ class MojoTreesEngine:
                 ),
                 "train": training.as_dict(),
                 "predict_batch": predict_batch,
+                "predict_batch_gpu": None,
+                "predict_batch_gpu_unavailable_reason": (
+                    "the prediction kernels read a dense binned matrix, so "
+                    "there is no sparse accelerator prediction path; an "
+                    "explicit device='gpu' is refused natively rather than "
+                    "densified behind the caller"
+                ),
+                **_single_thread_phases(single),
                 "predict_row": predict_row,
             },
             "params_used": estimator_params,
@@ -864,11 +1384,25 @@ class LightGBMEngine:
             lambda: booster.predict(test["X"]), repeats
         )
         _materialized_predictions(self.name, predictions, test["X"].shape[0])
+        # `num_threads` reaches `Booster.predict` through its `**kwargs`,
+        # which `basic.py` forwards verbatim as `pred_parameter`, so this is
+        # LightGBM's own prediction parameter and not a pool resize done
+        # behind its back. See `SINGLE_THREAD_PREDICT_RULE`; the phase's
+        # parallel_efficiency is what proves it took.
+        single = _single_thread_predict(
+            self.name,
+            lambda: booster.predict(test["X"], num_threads=1),
+            repeats,
+            "num_threads=1 as a Booster.predict parameter",
+            test["X"].shape[0],
+            predictions,
+        )
         row = test["X"][:1]
         if not train.get("sparse"):
             row = np.ascontiguousarray(row)
         _, predict_row = measure.repeat(lambda: booster.predict(row), 20, warmup=2)
         self.notes.append("LightGBM predict phases: " + PREDICT_PHASE_RULE)
+        self.notes.append(SINGLE_THREAD_PREDICT_RULE)
 
         with tempfile.TemporaryDirectory() as scratch:
             size = measure.model_size(booster, scratch)
@@ -908,6 +1442,7 @@ class LightGBMEngine:
                 "binning": binning.as_dict(),
                 "train": training.as_dict(),
                 "predict_batch": predict_batch,
+                **_single_thread_phases(single),
                 "predict_row": predict_row,
             },
             "params_used": params,
@@ -1306,7 +1841,7 @@ class CatBoostEngine:
         _, phase = measure.timed(_fit)
         return phase
 
-    def _predict(self, model, task, matrix):
+    def _predict(self, model, task, matrix, thread_count=None):
         """Predictions in the same shape the other two engines return.
 
         Regression is the raw value. Binary is the positive-class
@@ -1316,10 +1851,19 @@ class CatBoostEngine:
         quality.multi_logloss reads. The conversion is inside the timed call
         on purpose: the other two engines return the probability from
         `predict` and pay for it there.
+
+        `thread_count` is passed through only when asked for, and left out
+        entirely otherwise rather than forwarded as CatBoost's own default
+        sentinel, so the threaded phase reaches the identical call it always
+        did and the single-thread phase is the only one that differs. See
+        `SINGLE_THREAD_PREDICT_RULE`.
         """
+        extra = {} if thread_count is None else {"thread_count": thread_count}
         if task == "regression":
-            return model.predict(matrix)
-        probability = model.predict(matrix, prediction_type="Probability")
+            return model.predict(matrix, **extra)
+        probability = model.predict(
+            matrix, prediction_type="Probability", **extra
+        )
         if task == "binary":
             return np.asarray(probability)[:, 1]
         return np.asarray(probability)
@@ -1455,6 +1999,18 @@ class CatBoostEngine:
             lambda: self._predict(model, task, test_matrix), repeats
         )
         _materialized_predictions(self.name, predictions, len(test["y"]))
+        # `thread_count` is a parameter of `CatBoost.predict` itself, beside
+        # `prediction_type` and `ntree_start`, so this is CatBoost's own knob
+        # and the conversion inside `_predict` is still inside the timing.
+        # See `SINGLE_THREAD_PREDICT_RULE`.
+        single = _single_thread_predict(
+            self.name,
+            lambda: self._predict(model, task, test_matrix, thread_count=1),
+            repeats,
+            "thread_count=1 as a CatBoost.predict parameter",
+            len(test["y"]),
+            predictions,
+        )
         # One row, in whatever container the batch was predicted from. A
         # model fitted with cat_features must be predicted from a frame with
         # the same columns and the same dtypes, so slicing the float64 matrix
@@ -1469,6 +2025,7 @@ class CatBoostEngine:
             lambda: self._predict(model, task, row), 20, warmup=2
         )
         self.notes.append("CatBoost predict phases: " + PREDICT_PHASE_RULE)
+        self.notes.append(SINGLE_THREAD_PREDICT_RULE)
 
         with tempfile.TemporaryDirectory() as scratch:
             size = measure.model_size(model, scratch)
@@ -1607,6 +2164,7 @@ class CatBoostEngine:
                 ),
                 "train": training.as_dict(),
                 "predict_batch": predict_batch,
+                **_single_thread_phases(single),
                 "predict_row": predict_row,
             },
             "params_used": params,
@@ -2000,7 +2558,7 @@ class XGBoostEngine:
         _, phase = measure.timed(_fit)
         return phase
 
-    def _predict(self, booster, task, matrix):
+    def _predict(self, booster, task, matrix, nthread=None):
         """Predictions for `matrix`, INCLUDING THE DMATRIX THEY NEED.
 
         The DMatrix is built here, inside the timed call, and dropped when
@@ -2042,11 +2600,69 @@ class XGBoostEngine:
         adapter beside this one does convert and pays for it inside its timed
         call.
         """
-        dmatrix = self.module.DMatrix(matrix)
+        dmatrix = (
+            self.module.DMatrix(matrix)
+            if nthread is None
+            else self.module.DMatrix(matrix, nthread=nthread)
+        )
         out = booster.predict(dmatrix)
         if task == "multiclass":
             return np.asarray(out)
         return np.asarray(out)
+
+    def _predict_single_thread(self, booster, task, matrix, n_rows, reference,
+                               repeats):
+        """`_single_thread_predict` for the arm with no predict-time thread
+        argument.
+
+        XGBoost is the odd one of the four. LightGBM takes `num_threads` as a
+        prediction parameter and CatBoost takes `thread_count`, but
+        `Booster.predict` has neither, so the count has to be moved on the
+        booster itself with `set_param` and moved back afterwards. BOTH HALVES
+        OF THE PHASE ARE HELD, and they are two halves: `_predict` builds a
+        DMatrix inside every timed call (see its docstring, and
+        `PREDICT_PHASE_RULE`), DMatrix construction is itself threaded, and
+        holding only the scoring would leave a multi-threaded conversion
+        inside a column labeled single-thread.
+
+        WHAT IT RESTORES TO IS READ BACK RATHER THAN ASSUMED. `save_config()`
+        is the same read this arm already uses to record its resolved
+        parameters, so the restore puts back the string XGBoost itself
+        reported, not this harness's idea of what it should have been. The
+        restore is in a `finally` so a raising prediction cannot leave the
+        booster on one thread for the `predict_row` phase below it.
+        """
+        try:
+            before = json.loads(booster.save_config())
+            previous = before["learner"]["generic_param"]["nthread"]
+        except Exception as exc:  # pragma: no cover - version-dependent
+            return {
+                "phase": None,
+                "knob": "nthread on the Booster, via set_param",
+                "parallel_efficiency": None,
+                "verified": False,
+                "unverified_reason": (
+                    "the phase was not taken: nthread could not be read back "
+                    f"out of Booster.save_config() to restore it "
+                    f"({type(exc).__name__}: {exc}), and moving a booster's "
+                    "thread count without being able to put it back would "
+                    "leave every phase after this one measuring one thread"
+                ),
+                "agreement": None,
+            }
+        booster.set_param({"nthread": 1})
+        try:
+            return _single_thread_predict(
+                self.name,
+                lambda: self._predict(booster, task, matrix, nthread=1),
+                repeats,
+                "nthread=1 on the Booster and on the DMatrix built inside the "
+                "timed call",
+                n_rows,
+                reference,
+            )
+        finally:
+            booster.set_param({"nthread": previous})
 
     def _model_size(self, booster):
         """Model size, computed here rather than through `measure.model_size`.
@@ -2163,6 +2779,9 @@ class XGBoostEngine:
             lambda: self._predict(booster, task, test["X"]), repeats
         )
         _materialized_predictions(self.name, predictions, test["X"].shape[0])
+        single = self._predict_single_thread(
+            booster, task, test["X"], test["X"].shape[0], predictions, repeats
+        )
         # The row is SLICED here and converted here, because choosing one row
         # out of the held-out matrix is the harness's step and not XGBoost's,
         # and the arms beside this one slice outside their timed call too.
@@ -2185,6 +2804,7 @@ class XGBoostEngine:
             "predict phases contain. Figures from before 2026-08-17 timed a "
             "cache read and are not comparable with these"
         )
+        self.notes.append(SINGLE_THREAD_PREDICT_RULE)
 
         # The library's own resolved configuration. This is the ONLY place a
         # record can say what this arm ran, because this harness deliberately
@@ -2251,6 +2871,7 @@ class XGBoostEngine:
                 ),
                 "train": training.as_dict(),
                 "predict_batch": predict_batch,
+                **_single_thread_phases(single),
                 "predict_row": predict_row,
             },
             "params_used": params,

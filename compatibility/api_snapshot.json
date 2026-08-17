@@ -1785,6 +1785,7 @@
           "num_trees": {},
           "predict": {
             "data": "required",
+            "device": null,
             "num_iteration": null,
             "raw_score": false,
             "start_iteration": 0

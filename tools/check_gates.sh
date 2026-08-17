@@ -16,7 +16,7 @@
 #   tools/check_gates.sh              # every cheap gate
 #   tools/check_gates.sh api pixi     # only the named ones
 #
-# Names: api, parity, pixi, connectivity, integration, tests
+# Names: api, parity, pixi, connectivity, integration, tests, gpu-guards
 #
 # Exit status is 0 when every selected gate passes and 1 otherwise.
 
@@ -61,11 +61,20 @@ run_gate() {
     # aborts the run rather than being counted as a failure. It does NOT
     # prove any test file compiles; `tools/run_tests.sh` is that check.
     tests)        "$PY" tools/audit_test_structure.py ;;
+    # The one class of defect the development machine physically cannot see.
+    # An Apple M4 has an accelerator, so it compiles every GPU kernel it can
+    # reach and never reports `Unknown GPU architecture detected`; CPU-only
+    # Linux CI does, as a COMPILE error, and the compiler prints one error
+    # stack and stops, so each round of guards reveals only the next site.
+    # On 2026-08-17 one symptom cost four CI cycles and three fixes. This
+    # gate enumerates the sites instead of discovering them, and like the
+    # others it reads the tree as text and never invokes `mojo`.
+    gpu-guards)   "$PY" tools/check_gpu_guards.py ;;
     *)            echo "unknown gate: $1" >&2; return 2 ;;
   esac
 }
 
-ALL="api parity pixi port connectivity integration tests"
+ALL="api parity pixi port connectivity integration tests gpu-guards"
 SELECTED="${*:-$ALL}"
 
 failed=""

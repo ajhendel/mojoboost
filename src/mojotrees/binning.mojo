@@ -525,6 +525,31 @@ a search can be handed, `+inf` included, so a padded search table cannot
 change a bin. Spelled from its bit pattern so it needs no library constant."""
 
 
+comptime BIN_SEARCH_LANES = 8
+"""How many rows `BinMapper.transform` drives through the padded descent at
+once.
+
+The descent is already branchless, so its cost is not a misprediction: it is a
+dependent load chain. Step `i + 1` cannot compute its address until step `i`'s
+load has returned `pos`, so at 255 borders it is eight strictly serial L1 hits,
+roughly four cycles apiece, for every cell of the matrix. Nothing about the
+kernel is slow; the machine simply has nothing else to do while it waits.
+
+Interleaving fixes that and only that. `BIN_SEARCH_LANES` rows carry their own
+`pos` through the same fixed number of steps in lockstep, so each step issues
+that many *independent* loads instead of one, and the wait is paid once for the
+group rather than once per row. The border table is at most 255 doubles, 2 KB,
+and is re-read by every row of the column, so all of those loads are L1 hits
+and can be in flight together.
+
+Eight, because eight `Float64` is exactly one 64-byte line (so the value load
+is one line per group), eight `pos` registers plus the value vector sit inside
+the ARM64 and x86-64 register files without spilling, and eight independent
+chains are already enough to cover a four-cycle L1 latency at the load issue
+rates of both. Sixteen would buy little and risks a spill, which would trade a
+cache wait for a stack wait."""
+
+
 # --------------------------------------------------------------------------
 # Quantile boundaries: which ones exist, and how one becomes an edge.
 # --------------------------------------------------------------------------
@@ -3120,6 +3145,7 @@ struct BinMapper(Copyable, Movable):
         var half_p = pad_half.unsafe_ptr()
         var miss_p = self.missing_bin.unsafe_ptr()
         ref cats = self.cats
+        comptime R = BIN_SEARCH_LANES
 
         def do_tile(f: Int, r_lo: Int, r_hi: Int) {imm}:
             var col = f * n_rows
@@ -3133,18 +3159,86 @@ struct BinMapper(Copyable, Movable):
             var pbase = poff_p.unsafe_load(f)
             var half = half_p.unsafe_load(f)
             var mb = miss_p.unsafe_load(f)
-            for r in range(r_lo, r_hi):
+
+            # THE BIN A NaN TAKES, resolved once per tile instead of once per
+            # row. This is what lets the row loop run in lockstep: the old
+            # shape branched on `isnan` *before* the descent and left it by
+            # `continue`, so interleaved rows would have exited at different
+            # steps and there would have been no lockstep to run.
+            #
+            # Four cases, and they collapse to one select:
+            #
+            #   mb >= 0, v not NaN -- the descent's answer.
+            #   mb >= 0, v is NaN  -- `mb`, the reserved missing bin.
+            #   mb <  0, v not NaN -- the descent's answer.
+            #   mb <  0, v is NaN  -- no bin was reserved, so LightGBM bins a
+            #       NaN as if it were `0.0` (`bin_value` above, and the
+            #       missing_type None rule it cites). That is the descent's
+            #       answer for the *constant* `0.0`, which does not depend on
+            #       the row, so it is computed here once.
+            #
+            # So a NaN's bin is a per-feature constant either way, and the two
+            # NaN cases differ only in what that constant is. The row loop
+            # therefore needs no NaN branch at all: it descends on whatever it
+            # loaded and selects `nan_bin` afterwards.
+            #
+            # And the descent is safe to run on a NaN, which is the identity
+            # the whole rewrite rests on. Every IEEE comparison against NaN is
+            # false, so `border < NaN` is false at every step, `go` is never
+            # taken, and `pos` stays 0: the search does not read out of range,
+            # does not loop differently, and takes exactly the same number of
+            # steps as any other value. Its answer is then discarded by the
+            # select, so what it computed never mattered -- only that it was
+            # bounded and took the same time.
+            var nan_bin = mb
+            if nan_bin < 0:
+                var p0 = 0
+                var s0 = half
+                while s0 > 0:
+                    var n0 = p0 + s0
+                    var g0 = pad_p.unsafe_load(pbase + n0 - 1) < 0.0
+                    p0 = n0 if g0 else p0
+                    s0 = s0 >> 1
+                nan_bin = p0
+
+            # Count the edges strictly below `v`, which is the bin
+            # `bin_value`'s search arrives at: it stops at the first edge with
+            # `v <= edge`, and the edges are strictly increasing.
+            #
+            # `BIN_SEARCH_LANES` rows at a time. The lanes share nothing: each
+            # has its own `pos`, reads only its own value, and writes only its
+            # own cell. `step` is shared because it is the same sequence for
+            # every lane by construction -- the trip count is `log2` of the
+            # padded table size, a property of the feature and not of the data.
+            #
+            # BIT-IDENTITY. Lane `k` executes, in order, the same comparisons
+            # against the same borders with the same value as the scalar loop
+            # did for that row, and arrives at `pos` by the same selects. No
+            # float arithmetic exists here to reassociate: the only float
+            # operation in the kernel is a comparison, and a comparison is
+            # exact. Grouping rows changes which cycle a compare issues on and
+            # nothing else, so every bin byte is the byte the scalar loop
+            # wrote. The tail below is that scalar loop, unchanged.
+            var r = r_lo
+            var vec_end = r_hi - R + 1
+            while r < vec_end:
+                # One 64-byte line of values, then R independent descents.
+                var v = feat_p.unsafe_load[width=R, alignment=8](col + r)
+                var pos = SIMD[DType.int, R](0)
+                var step = half
+                while step > 0:
+                    comptime for k in range(R):
+                        var cur = Int(pos[k])
+                        var nxt = cur + step
+                        var go = pad_p.unsafe_load(pbase + nxt - 1) < v[k]
+                        pos[k] = nxt if go else cur
+                    step = step >> 1
+                comptime for k in range(R):
+                    var b = nan_bin if isnan(v[k]) else Int(pos[k])
+                    bins_p.unsafe_store(col + r + k, UInt8(b))
+                r += R
+            while r < r_hi:
                 var v = feat_p.unsafe_load(col + r)
-                # NaN is routed before any comparison, so it never takes part
-                # in the quantile search (see `bin_value`).
-                if isnan(v):
-                    if mb >= 0:
-                        bins_p.unsafe_store(col + r, UInt8(mb))
-                        continue
-                    v = 0.0
-                # Count the edges strictly below `v`, which is the bin
-                # `bin_value`'s search arrives at: it stops at the first edge
-                # with `v <= edge`, and the edges are strictly increasing.
                 var pos = 0
                 var step = half
                 while step > 0:
@@ -3152,11 +3246,16 @@ struct BinMapper(Copyable, Movable):
                     var go = pad_p.unsafe_load(pbase + nxt - 1) < v
                     pos = nxt if go else pos
                     step = step >> 1
-                bins_p.unsafe_store(col + r, UInt8(pos))
+                var b = nan_bin if isnan(v) else pos
+                bins_p.unsafe_store(col + r, UInt8(b))
+                r += 1
 
         # A row costs one binary search over at most `n_bins` edges, not one
-        # accumulate: about `log2(n_bins)` dependent compares, each on a hot
-        # but data-dependent load.
+        # accumulate: about `log2(n_bins)` compares, each on a hot but
+        # data-dependent load. The op estimate below counts them, and it is
+        # unchanged by the interleave -- the same compares are done, just
+        # `BIN_SEARCH_LANES` rows' worth at a time, so the same work threshold
+        # decides the same schedule as before.
         #
         # Split by feature *and* by rows. Binning a cell reads that cell and
         # writes that cell, so tiles are independent and the bins are the same

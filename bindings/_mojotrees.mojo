@@ -9,8 +9,18 @@ matrices) and keeps them alive for the duration of each call. Copies into
 Mojo Lists happen here, so no Python buffer is retained after a call
 returns. Trained models are returned as opaque handles owned by Python.
 
-Every dense prediction entry point bins the whole matrix once and then walks
-the trees over row blocks. `predict_range` and `predict_proba_range`, which
+Every dense prediction entry point walks the trees over row blocks. It no
+longer BINS the matrix first on the default path: `Model.predict_batch`
+rewrites each node's `threshold_bin` into the Float64 bin EDGE it names and
+compares the raw feature value, which is what LightGBM and CatBoost do and
+is why this module stopped being the slowest of the three at inference. The
+rewrite is exact (edges are strictly increasing and bin b is the half-open
+interval `(e[b-1], e[b]]`, so `bin(v) <= T` if and only if `v <= e[T]`, with
+missing handled separately because `NaN <= edge` is false), and the shapes
+it cannot cover -- categorical splits, categorical features, CTR columns,
+linear leaves, and fewer rows than `predict.RAW_MIN_ROWS` -- still bin the
+whole matrix once and walk bin ids. `MOJOTREES_RAW_PREDICT=0` forces that
+older path for every model. `predict_range` and `predict_proba_range`, which
 predate the device vocabulary, do it by calling `Model.predict_batch` and
 `MulticlassModel.predict_batch` with an explicit `CPU_DEVICE`; the `_batch`
 entry points below them call the same two with the device the caller named,

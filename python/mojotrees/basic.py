@@ -1127,6 +1127,13 @@ class Booster:
         self._objective = None
         self._names = None
         self._importance_cache = None
+        #: The backend the LAST dense `predict` call ran on, or None before
+        #: the first one. Written by `_predict_batch` from what the native
+        #: entry point reports rather than from what was asked for, so a
+        #: caller timing `device="gpu"` can PROVE the accelerator ran instead
+        #: of assuming it. Not a configuration and not inherited by the next
+        #: call: `predict(device=...)` decides that, one call at a time.
+        self.predict_device_ = None
 
         sources = sum(
             x is not None for x in (train_set, model_file, model_str)
@@ -1523,8 +1530,136 @@ class Booster:
             return start, total
         return start, min(start + num, total)
 
+    # -- where one prediction call runs ------------------------------------
+    #
+    # THE SAME VOCABULARY AND THE SAME DIVISION OF LABOR AS THE ESTIMATOR
+    # SURFACE in sklearn.py, deliberately, because a device that means one
+    # thing on `MojoTreesRegressor.predict` and another on `Booster.predict`
+    # is a second policy wearing the first one's name. The device is
+    # REQUESTED here and DECIDED in Mojo: the `_batch` entry points ask
+    # gpu_predict.mojo whether the device path covers a request of that
+    # shape, resolve through the same `resolve_device` a fit resolves
+    # through, and return the backend that ran. Nothing in this file
+    # thresholds, infers, or falls back.
+    #
+    # WHAT IS NOT INHERITED, and this is the decision worth stating. A
+    # Booster trained with `device="gpu"` still predicts on the CPU unless
+    # this call says otherwise. Three reasons, and the third is the one that
+    # settles it. A Booster read back with `Booster(model_file=...)` has no
+    # training device at all, so inheritance would be defined for some
+    # boosters and undefined for others. Scoring usually happens somewhere
+    # other than where training did. And GPU prediction is NOT bit-identical
+    # to CPU prediction: it accumulates leaf values in Float32 where the host
+    # accumulates in Float64, so inheritance would silently change the
+    # numbers every existing `device="gpu"` caller already gets back. A
+    # switch that cannot change a user's output may be flipped on a
+    # measurement; this one can, so it may not.
+    #
+    # THAT IS NOT A CLAIM THAT THE CPU ANSWER IS THE CORRECT ONE. It is the
+    # one callers already have. The difference between the two backends is
+    # about 1e-7 relative and is the Float32 accumulation and nothing else:
+    # both compare against the same Float64 bin edges, so both route every
+    # row to the same leaf. Neither is wrong, and requiring the device to
+    # match the host would forbid Float32 on the device and with it the
+    # reason to predict there at all.
+
+    def _device_request(self, device):
+        """The device one prediction call asks for: "cpu", "gpu", or "auto".
+
+        `device=None` means "cpu", which is the established path and the
+        only default this surface has ever had.
+        """
+        from . import _device_name
+
+        name = _device_name(device)
+        return "cpu" if name is None else name
+
+    def _batch_params(self, device, start, stop, raw_score=False):
+        """The params dict the dense `_batch` prediction entry points read."""
+        return {
+            "device": self._device_request(device),
+            "start": int(start),
+            "stop": int(stop),
+            "raw_score": int(bool(raw_score)),
+        }
+
+    def _predict_batch(self, entry, legacy, Xb, n_rows, params, out):
+        """One dense batch prediction into `out`, through `entry`.
+
+        `entry` is a device-aware batch entry point and `legacy` the one that
+        predates it. When the build exposes `entry`, every call goes through
+        it, `device="cpu"` included, so that there is ONE dense prediction
+        path rather than a device path beside an older one; the two are the
+        same native code, because `predict_range` and `predict_proba_range`
+        are themselves `Model.predict_batch` called with an explicit
+        `CPU_DEVICE`. When the build does not expose it, `"cpu"` uses
+        `legacy` and anything else raises, because predicting on the CPU
+        while reporting an accelerator is the one outcome an explicit
+        request must not produce.
+
+        Records the backend that ran on `predict_device_` and returns it.
+        """
+        from . import _NO_DEVICE_PREDICT
+
+        hook = getattr(_mojotrees, entry, None)
+        if hook is None:
+            device = params["device"]
+            if device != "cpu":
+                raise RuntimeError(_NO_DEVICE_PREDICT % (entry, device))
+            getattr(_mojotrees, legacy)(
+                self._handle,
+                _addr(Xb),
+                n_rows,
+                self.num_feature(),
+                params["start"],
+                params["stop"],
+                params["raw_score"],
+                _addr(out),
+            )
+            self.predict_device_ = "cpu"
+            return "cpu"
+        ran = hook(
+            self._handle,
+            _addr(Xb),
+            n_rows,
+            self.num_feature(),
+            params,
+            _addr(out),
+        )
+        # `None` comes back from an empty batch, which selects no backend at
+        # all rather than naming one that did not run.
+        self.predict_device_ = (
+            params["device"] if ran is None else str(ran)
+        )
+        return self.predict_device_
+
+    def _sparse_predict_params(self, device, params):
+        """A sparse prediction params dict with the requested device in it.
+
+        A build old enough to read no device key at all would DROP the
+        request instead of refusing it, which is the silent CPU answer this
+        vocabulary exists to prevent, so on that build the refusal is made
+        here rather than natively.
+        """
+        from . import _NO_DEVICE_PREDICT
+
+        requested = self._device_request(device)
+        if requested == "cpu":
+            return params
+        if getattr(_mojotrees, "predict_batch", None) is None:
+            raise RuntimeError(
+                _NO_DEVICE_PREDICT % ("predict_batch", requested)
+            )
+        params["device"] = requested
+        return params
+
     def predict(
-        self, data, raw_score=False, start_iteration=0, num_iteration=None
+        self,
+        data,
+        raw_score=False,
+        start_iteration=0,
+        num_iteration=None,
+        device=None,
     ):
         """Predictions for `data`, which may be a matrix or a `Dataset`.
 
@@ -1542,44 +1677,57 @@ class Booster:
         Sparse input is walked without densifying, which is what the sparse
         prediction path is for; the options it cannot serve are refused
         rather than silently densified.
+
+        `device` chooses where THIS ONE CALL runs and is not inherited from
+        the device the model was trained with: `None` (the default) predicts
+        on the CPU, exactly as this method always has, `"gpu"` raises rather
+        than falling back when the accelerator cannot serve the request, and
+        `"auto"` resolves through the same native policy a fit resolves
+        through. The ensemble is the same object either way, but the ANSWER
+        is not bit-identical across the two: the device walk accumulates leaf
+        values in Float32 where the host accumulates in Float64, which moves
+        a prediction by something on the order of 1e-7 relative. Both
+        backends compare against the same Float64 bin edges, so both route
+        every row to the same leaf and the accumulation is the whole
+        difference. Neither answer is the wrong one, and if you train with an
+        accelerator and score without one, or the reverse, expect a
+        disagreement of about that size. The default is `"cpu"` because it is
+        what callers already get and not because it is more correct, and no
+        speed measurement moves it. Which backend actually ran is on
+        `predict_device_` after the call. Sparse input has no device kernel
+        and says so instead of quietly running on the CPU.
         """
         matrix = self._predict_data(data)
         if _arrays.is_sparse(matrix):
             return self._predict_sparse(
-                matrix, raw_score, start_iteration, num_iteration
+                matrix, raw_score, start_iteration, num_iteration, device
             )
         Xb, n_rows = self._check_X(matrix)
         start, stop = self._slice(start_iteration, num_iteration)
+        params = self._batch_params(device, start, stop, raw_score)
         if self._n_classes:
             out = _out_buffer(n_rows * self._n_classes)
-            _mojotrees.predict_proba_range(
-                self._handle,
-                _addr(Xb),
+            self._predict_batch(
+                "predict_proba_batch",
+                "predict_proba_range",
+                Xb,
                 n_rows,
-                self.num_feature(),
-                start,
-                stop,
-                int(bool(raw_score)),
-                _addr(out),
+                params,
+                out,
             )
             if _np is not None:
                 return out.reshape(n_rows, self._n_classes)
             k = self._n_classes
             return [list(out[r * k : (r + 1) * k]) for r in range(n_rows)]
         out = _out_buffer(n_rows)
-        _mojotrees.predict_range(
-            self._handle,
-            _addr(Xb),
-            n_rows,
-            self.num_feature(),
-            start,
-            stop,
-            int(bool(raw_score)),
-            _addr(out),
+        self._predict_batch(
+            "predict_batch", "predict_range", Xb, n_rows, params, out
         )
         return _finish(out)
 
-    def _predict_sparse(self, X, raw_score, start_iteration, num_iteration):
+    def _predict_sparse(
+        self, X, raw_score, start_iteration, num_iteration, device=None
+    ):
         """Predictions for a SciPy sparse matrix, one binary search per node
         over that row's own stored entries rather than a densified row.
 
@@ -1588,6 +1736,13 @@ class Booster:
         raw scores from a softmax model, for which there is no sparse entry
         point. Densifying behind the caller would defeat the path they chose
         by passing a sparse matrix.
+
+        There is no sparse accelerator PREDICTION kernel either (training has
+        one), so `device` travels in the params dict and the refusal for an
+        explicit `"gpu"` is the native one in `_refuse_gpu_sparse`, which
+        carries the same message the dense path gives. `"auto"` is not
+        refused: it resolves to the CPU, which is where it would resolve
+        anyway.
         """
         if start_iteration != 0 or num_iteration is not None:
             raise ValueError(
@@ -1601,7 +1756,7 @@ class Booster:
                 f"X has {n_features} features, but this Booster was trained "
                 f"on {expected}"
             )
-        params = buffers.params()
+        params = self._sparse_predict_params(device, buffers.params())
         if self._n_classes:
             if raw_score:
                 raise ValueError(

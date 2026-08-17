@@ -254,6 +254,7 @@ argued. Again: arithmetic of the declaration, not a regression.
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import exp, isfinite
 from std.memory import bitcast, stack_allocation
+from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
@@ -990,14 +991,28 @@ def enqueue_abs_sum(
     is the same launch with the same fixed grid and block counts, so both
     callers produce bit-identical partials.
     """
-    ctx.enqueue_function[_abs_sum_kernel](
-        grad_dev.unsafe_ptr(),
-        hess_dev.unsafe_ptr(),
-        part_dev.unsafe_ptr(),
-        Int32(n_rows),
-        grid_dim=SUM_BLOCKS,
-        block_dim=SUM_THREADS,
-    )
+    # Guarded 2026-08-17 by the CPU-only build audit
+    # (docs/design/CPU_ONLY_BUILD_AUDIT.md). On a build with no accelerator
+    # ANY reachable `enqueue_function` elaborates a GPU kernel and fails the
+    # compile with `Unknown GPU architecture detected`, whatever the kernel
+    # does. This is a module-level launcher, so one `from
+    # mojotrees.gpu_objectives_native import enqueue_abs_sum` in a CPU-set
+    # test is all it takes to reach it, and an Apple machine can never
+    # reproduce the failure.
+    comptime if not has_accelerator():
+        raise Error(
+            "the gradient magnitude reduction needs an accelerator; this"
+            " build has none"
+        )
+    else:
+        ctx.enqueue_function[_abs_sum_kernel](
+            grad_dev.unsafe_ptr(),
+            hess_dev.unsafe_ptr(),
+            part_dev.unsafe_ptr(),
+            Int32(n_rows),
+            grid_dim=SUM_BLOCKS,
+            block_dim=SUM_THREADS,
+        )
 
 
 def sum_abs_partials[partials_origin: MutOrigin, //](
@@ -1121,13 +1136,20 @@ def enqueue_sq_sum(
     Split from the read for the same reason `enqueue_abs_sum` is: a caller
     that wants to overlap the round trip enqueues here and waits later.
     """
-    ctx.enqueue_function[_sq_sum_kernel](
-        grad_dev.unsafe_ptr(),
-        part_dev.unsafe_ptr(),
-        Int32(n_rows),
-        grid_dim=SUM_BLOCKS,
-        block_dim=SUM_THREADS,
-    )
+    # Guarded 2026-08-17, same reason as `enqueue_abs_sum` above.
+    comptime if not has_accelerator():
+        raise Error(
+            "the squared-gradient reduction needs an accelerator; this build"
+            " has none"
+        )
+    else:
+        ctx.enqueue_function[_sq_sum_kernel](
+            grad_dev.unsafe_ptr(),
+            part_dev.unsafe_ptr(),
+            Int32(n_rows),
+            grid_dim=SUM_BLOCKS,
+            block_dim=SUM_THREADS,
+        )
 
 
 def sum_sq_partials[partials_origin: MutOrigin, //](
