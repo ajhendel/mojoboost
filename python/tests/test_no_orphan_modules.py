@@ -1,10 +1,11 @@
 """The gate that makes "built and never connected" loud instead of quiet.
 
-**UNRUN.** Written 2026-08-16; the round's test budget was closed before it
-could be executed. The `ORPHANS` list below was computed by the same walk
-this file performs, run once as an analysis script over the tree at commit
-`907b2a1`, so the numbers are real; the assertions themselves have not been
-executed by pytest.
+Written 2026-08-16, when the round's test budget was closed before it could
+be executed, and first run by pytest on 2026-08-17. The `ORPHANS` list below
+was computed by the same walk this file performs, run once as an analysis
+script over the tree at commit `907b2a1`. Its first real run reported eight
+of those thirteen rows as stale, which is the direction this file calls good
+news; the rows are gone and what remains is five.
 
 WHY THIS EXISTS. Over one round this repository merged, tested and
 documented six mechanisms that no shipped fit could reach: CatBoost mode,
@@ -55,35 +56,23 @@ _IMPORT_PATTERNS = (
 )
 
 #: Modules that ship in `src/mojotrees` and that no shipped entry point can
-#: reach, with why. Measured at commit 907b2a1: 13 of 107 modules, 12% of the
-#: package. Each row is a debt, not a permission.
+#: reach, with why. First measured at commit 907b2a1: 13 of 107 modules, 12%
+#: of the package. Eight of those thirteen were wired on 2026-08-16 and
+#: their rows are gone, which leaves 5 of 109. Each row is a debt, not a
+#: permission.
 ORPHANS = {
-    # The CatBoost objective families. All three carry complete trainers --
-    # `train_catboost_ranker`, `train_cox`, `train_survival_aft`,
-    # `train_multi_rmse` -- and their objective codes are reserved in
+    # The CatBoost objective families that are still only half wired. Both
+    # carry complete trainers -- `train_catboost_ranker`, `train_cox`,
+    # `train_survival_aft` -- and their objective codes are reserved in
     # objective_registry.mojo, which is the half that had to be right first
     # because a code is a number in a serialized model. What is missing is a
-    # binding entry point that bins the matrix and calls them.
+    # binding entry point that bins the matrix and calls them. The third
+    # family, multi_target, got exactly that entry point in
+    # bindings/catboost_reach_bindings.mojo and left this list.
     "catboost_ranking": "no binding calls train_catboost_ranker",
     "survival": "no binding calls train_cox or train_survival_aft",
-    "multi_target": "no binding calls train_multi_rmse; no Python model type "
-                    "wraps a MultiTargetBooster",
-    # `target_matrix` is orphaned only because its two consumers are:
-    # survival.mojo and multi_target.mojo both import it.
-    "target_matrix": "reachable only from survival and multi_target, which "
-                     "are themselves unreachable",
-    # CatBoost's target statistics. `max_ctr_complexity` is refused at the
-    # Python surface naming exactly this: the arithmetic is verified against
-    # CatBoost source and no binner, trainer or dataset path constructs a CTR
-    # column, so there is no arity for the parameter to bound.
-    "ctr": "reachable only from ctr_combinations, itself unreachable",
-    "ctr_combinations": "no binner or dataset path builds a CTR feature",
     # The rest, each found by this walk rather than by a lane reporting it.
-    "onnx_export": "no binding exposes the exporter",
     "langevin": "no trainer takes its noise parameters",
-    "embedding": "no fit path accepts embedding features",
-    "text_features": "no fit path accepts text features",
-    "text_processing": "reachable only from text_features",
     "backend": "superseded by device_policy and the gpu_* policy modules",
     "gpu_vendor_policy": "no GPU entry point consults it",
 }
@@ -99,10 +88,12 @@ def _imports(text):
 def _unreachable():
     """Every module in `src/mojotrees` no shipped entry point can reach.
 
-    The walk is transitive on purpose. A direct-importer check would call
-    `ctr.mojo` reachable because `ctr_combinations.mojo` imports it, and
-    `ctr_combinations.mojo` is imported by nothing, so the whole subtree is
-    dead and a direct check would report half of it.
+    The walk is transitive on purpose. When `ctr.mojo` was still an orphan a
+    direct-importer check would have called it reachable, because
+    `ctr_combinations.mojo` imported it and `ctr_combinations.mojo` was
+    imported by nothing: the whole subtree was dead and a direct check would
+    have reported half of it. That subtree is wired now; the argument is not
+    about those two files.
     """
     modules = {
         p.stem: _imports(p.read_text())
@@ -158,10 +149,12 @@ def test_no_module_becomes_unreachable_without_being_written_down():
 def test_the_orphan_list_is_a_twelfth_of_the_package():
     """A standing number, not a threshold to tune.
 
-    13 of 107 modules at commit 907b2a1. This asserts the share does not
-    grow, which is a weaker claim than the test above and a useful one: it
-    fails on a pattern of small additions that each individually looked
-    acceptable, which is how the list got to 13.
+    13 of 107 modules at commit 907b2a1, 5 of 109 once the reachability
+    lanes landed. The ceiling stays at the number it was registered with,
+    because it is a ceiling and not a record of the current share. It
+    asserts the share does not grow, which is a weaker claim than the test
+    above and a useful one: it fails on a pattern of small additions that
+    each individually looked acceptable, which is how the list got to 13.
     """
     total = len([p for p in _PKG.glob("*.mojo") if p.stem != "__init__"])
     assert len(_unreachable()) / total <= 13 / 107

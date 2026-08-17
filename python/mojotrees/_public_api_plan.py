@@ -35,6 +35,14 @@ handoffs/connect_07_python_public.md. Version 3 renames the two tables
 that still said `PROPOSED_` after their contents had shipped, adds the
 `lgbm_model_io` lazy submodule the integration round wired, and points
 at the test that now holds all of it to the code.
+
+Version 4 adds the `features` and `onnx_export` lazy submodules. Both went
+into `__init__.py` on 2026-08-16 with the reachability lane (e71e644,
+b059a6c) and neither was recorded here, so the drift this module exists to
+prevent happened to this module, and it was the first pytest run of
+`test_public_api_plan.py` rather than a reader that caught it. `port`,
+added the following night, is eager and is in `CURRENT_TOP_LEVEL`; it has
+no lazy row and is not what the lazy tables disagreed about.
 """
 
 #: Bumped when the surface below changes, so a handoff can name the version
@@ -44,7 +52,9 @@ at the test that now holds all of it to the code.
 #: 2 -- applied, plus inspection / device_selection / diagnostics
 #: 3 -- PROPOSED_* tables renamed to what they are, lgbm_model_io added,
 #:      enforced by python/tests/test_public_api_plan.py
-PLAN_VERSION = 3
+#: 4 -- features and onnx_export added to the lazy tables, which the
+#:      reachability lane had put in __init__.py without recording here
+PLAN_VERSION = 4
 
 #: `mojotrees.__all__` as it stands, sorted (the real one is grouped by
 #: topic). A stale record shows up as a set mismatch against the real
@@ -138,6 +148,33 @@ TOP_LEVEL_ADDITIONS = (
             "checks and type annotations need it where cv() is."
         ),
         "collides_with": None,
+    },
+    {
+        "name": "port",
+        "source": "mojotrees.port",
+        "kind": "function",
+        "eager": True,
+        "statement": "from .port import port",
+        "why": (
+            "The estimator already ACCEPTS every LightGBM, XGBoost and "
+            "CatBoost spelling, refuses contradictory duplicates, and "
+            "refuses unimplemented objectives with a reason. What it could "
+            "not do was tell anyone what it had done, so a user porting a "
+            "script found out by trial and error. `port(params, "
+            "source=...)` answers it in one call: honored, aliased to, "
+            "defaulted differently, or refused with the reason. Eager "
+            "because it reads only the repository's own tables and imports "
+            "no optional dependency, so it costs an import nobody pays for "
+            "twice."
+        ),
+        "collides_with": (
+            "the submodule mojotrees.port, and the collision is REAL rather "
+            "than theoretical: the eager export shadows the module, so "
+            "`import mojotrees.port as m` binds the FUNCTION and not the "
+            "module, and only `importlib.import_module` reaches the module. "
+            "That cost python/test_alias_equivalence.py two wrong spellings "
+            "before the right one, and both looked correct"
+        ),
     },
     {
         "name": "explain_device_choice",
@@ -264,6 +301,21 @@ LAZY_SUBMODULES = (
         ),
     },
     {
+        "name": "features",
+        "optional_dependency": "numpy (for the returned columns only)",
+        "owner": "lane/reachability-rest, catalog A31",
+        "note": (
+            "CatBoost's generated features, text_features() and "
+            "embedding_features(), over the entry points in "
+            "bindings/catboost_reach_bindings.mojo. A transform, not a "
+            "trainer: it hands back float64 columns to hstack onto X, and "
+            "the fitted dictionary it used is not written into a model "
+            "file. Nothing from it is at the top level, because a name "
+            "next to train() would read as a fit-time keyword and the "
+            "estimator has none."
+        ),
+    },
+    {
         "name": "inspection",
         "optional_dependency": "pandas (for the frame output only)",
         "owner": "handoffs/migration_19_model_inspection.md",
@@ -289,18 +341,38 @@ LAZY_SUBMODULES = (
             "asked for by name rather than found next to train()."
         ),
     },
+    {
+        "name": "onnx_export",
+        "optional_dependency": "onnx",
+        "owner": "catalog A31, docs/design/MODEL_EXPORT.md",
+        "note": (
+            "Transcribes the export plan written by "
+            "src/mojotrees/onnx_export.mojo into an ONNX ModelProto and "
+            "contains no arithmetic of its own. `onnx` is in neither "
+            "pixi.toml nor python/pyproject.toml, so the module must not "
+            "be reached by `import mojotrees`; a missing onnx raises with "
+            "the install line rather than degrading into something that "
+            "looks like an export. Nothing from it is at the top level."
+        ),
+    },
 )
 
 #: The shape of the code at the end of `mojotrees/__init__.py`, as a string
 #: so that reading this module cannot run it. Version 1 proposed it for
-#: `dask` alone; what landed resolves five submodules and five attributes,
+#: `dask` alone; what landed resolves seven submodules and five attributes,
 #: and the real one carries the comments explaining each. This is the
 #: mechanism, kept here so it can be read without the surrounding 4000
 #: lines -- `__init__.py` is the copy that runs, and the test compares the
 #: two tables below against it so this copy cannot rot.
 LAZY_SUBMODULE_SNIPPET = '''
 _LAZY_SUBMODULES = (
-    "dask", "device_selection", "diagnostics", "inspection", "lgbm_model_io"
+    "dask",
+    "device_selection",
+    "diagnostics",
+    "features",
+    "inspection",
+    "lgbm_model_io",
+    "onnx_export",
 )
 
 _LAZY_ATTRS = {
