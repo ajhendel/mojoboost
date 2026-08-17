@@ -56,10 +56,18 @@ per node.
 
 ## What the arms vary, and why these knobs
 
-Nothing here changes a line of `src`. Every arm is an environment setting the
-policy already reads, which is what makes the sweep a measurement rather than
-a change with a benchmark attached. The winner becomes a default afterwards,
-in a separate commit, with this transcript as its justification.
+Blocks one and two change nothing in `src`: every arm there is an environment
+setting the policy already read, which is what makes those sweeps a
+measurement rather than a change with a benchmark attached.
+
+**Block three is not like that and the difference is worth naming
+rather than discovering.** `wA_minops`, `wA_mintask` and `wA_floor0` are still
+pure environment. `wA_rowsmall` is new code -- a per-node bin-layout rule --
+behind its own off-by-default switch, so `wA_base` in that block is still byte
+for byte the program blocks one and two measured. It is bit-neutral by
+construction and the determinism section below checks it against the same
+digest every other arm produces. The winner becomes a default afterwards, in a
+separate commit, with this transcript as its justification.
 
 Ours differs from the comparator on exactly one axis: we cut the node's rows
 into private-histogram blocks and fold them, and LightGBM does not cut rows at
@@ -255,6 +263,25 @@ struct Arm(Copyable, Movable):
     var core_pool: String
     """`MOJOTREES_CPU_CORE_POOL`; empty is `all`, `performance` plans against
     the performance cores only."""
+    var min_ops: String
+    """`MOJOTREES_PARALLEL_MIN_OPS`; empty is the shipped 65,536. Raising it
+    is the per-node serial floor: every dispatch whose work estimate is below
+    it stays on one core, and because every estimate on the per-node path is
+    proportional to the node's rows, raising it is exactly "nodes below this
+    size build serially"."""
+    var min_task_ops: String
+    """`MOJOTREES_PARALLEL_MIN_TASK_OPS`; empty is the shipped 65,536. With
+    the core floor off this is the per-node *worker* floor: the task count
+    becomes `total_ops / min_task_ops` clamped to `[2, max_auto]`, so a small
+    node runs on few workers instead of all ten."""
+    var task_floor: String
+    """`MOJOTREES_CPU_TASK_FLOOR`; empty is on, `0` reverts the fan-out rule
+    to the grain alone. `min_task_ops` only bites with this off, which is why
+    they are two fields and are set together."""
+    var layout_by_node: String
+    """`MOJOTREES_CPU_LAYOUT_BY_NODE`; empty is off, `1` reads a node too
+    small to block out of the row-major record array and every other node out
+    of the feature-major column array."""
 
     def lgbm_threads(self) -> Int:
         if self.workers.byte_length() == 0:
@@ -285,6 +312,22 @@ counts, so it is a self-contained experiment and never has to be compared
 against a number from the partition block."""
 
 
+comptime BLOCK_THREE = (
+    "w1_base,w1_rowsmall,w1_lgbm,"
+    "wA_base,wA_minops,wA_mintask,wA_floor0,wA_rowsmall,wA_lgbm"
+)
+"""The small-node block. Carries its own `base` and `lgbm` cells at both
+worker counts for the same reason block two does, and carries a one-worker
+cell for the layout arm because that arm's claim is about memory traffic
+rather than about scheduling and so has to be checkable without a fan-out.
+
+Nine arms. The three scheduling arms have no one-worker cell because at one
+worker they ARE `w1_base`: `plan_tasks` returns 1 before it reads either
+grain, so an arm that only moves a grain cannot move a one-worker number, and
+an arm whose name promises a cell it cannot fill is worse than a missing
+cell."""
+
+
 def _all_arms() -> List[Arm]:
     """Every arm this file defines, in the order they run inside a repeat when
     they are selected.
@@ -302,21 +345,54 @@ def _all_arms() -> List[Arm]:
     var e = String("")
     var one = String("1")
     var arms = List[Arm]()
+
+    # A local so the ten-field constructor reads as a decision rather than a
+    # row of commas. Every field is exported on every mojotrees arm, so a
+    # knob left at `e` is "explicitly the default" and not "inherited from
+    # whichever arm ran last", which is the failure this file is built around.
+    def arm(
+        name: String,
+        workers: String,
+        blocks: String = String(""),
+        group: String = String(""),
+        tasks_per_core: String = String(""),
+        core_pool: String = String(""),
+        min_ops: String = String(""),
+        min_task_ops: String = String(""),
+        task_floor: String = String(""),
+        layout_by_node: String = String(""),
+    ) -> Arm:
+        return Arm(
+            name, False, workers, blocks, group, tasks_per_core, core_pool,
+            min_ops, min_task_ops, task_floor, layout_by_node,
+        )
+
+    def lgbm_arm(name: String, workers: String) -> Arm:
+        var b = String("")
+        return Arm(name, True, workers, b, b, b, b, b, b, b, b)
+
     # Block one: the partition shape. Row blocks against feature blocks.
-    arms.append(Arm(String("w1_base"), False, one, e, e, e, e))
-    arms.append(Arm(String("w1_noblk"), False, one, one, e, e, e))
-    arms.append(Arm(String("w1_lgbmlike"), False, one, one, one, e, e))
-    arms.append(Arm(String("w1_g16"), False, one, e, String("16"), e, e))
+    arms.append(arm(String("w1_base"), one))
+    arms.append(arm(String("w1_noblk"), one, blocks=one))
+    arms.append(arm(String("w1_lgbmlike"), one, blocks=one, group=one))
+    arms.append(arm(String("w1_g16"), one, group=String("16")))
     # Block two's one-worker knob sits here, before the LightGBM arm, so that
     # selecting either block leaves the one-worker cell contiguous and the
     # LightGBM arm at its end. The ORDER of this list is the order arms run
     # in, and it is what a paired reduction is entitled to assume is constant.
-    arms.append(Arm(String("w1_tpc1"), False, one, e, e, one, e))
-    arms.append(Arm(String("w1_lgbm"), True, one, e, e, e, e))
-    arms.append(Arm(String("wA_base"), False, e, e, e, e, e))
-    arms.append(Arm(String("wA_noblk"), False, e, one, e, e, e))
-    arms.append(Arm(String("wA_lgbmlike"), False, e, one, one, e, e))
-    arms.append(Arm(String("wA_g16"), False, e, e, String("16"), e, e))
+    arms.append(arm(String("w1_tpc1"), one, tasks_per_core=one))
+    # Block three's one-worker cells. `min_ops` and `min_task_ops` are
+    # scheduling floors and cannot bite at one worker, so the only block-three
+    # arm that has anything to say here is the layout one -- which is not a
+    # schedule at all, and whose whole claim is about memory traffic that one
+    # core pays as surely as ten. Its one-worker cell is what separates "the
+    # layout helps" from "the layout helps the fan-out".
+    arms.append(arm(String("w1_rowsmall"), one, layout_by_node=one))
+    arms.append(lgbm_arm(String("w1_lgbm"), one))
+    arms.append(arm(String("wA_base"), e))
+    arms.append(arm(String("wA_noblk"), e, blocks=one))
+    arms.append(arm(String("wA_lgbmlike"), e, blocks=one, group=one))
+    arms.append(arm(String("wA_g16"), e, group=String("16")))
     # Block two: the fan-out, which is the half of scheduling the partition
     # arms cannot reach. Both of these are pure schedule -- they change how
     # many tasks the same units are handed to and which cores are counted when
@@ -338,10 +414,70 @@ def _all_arms() -> List[Arm]:
     # instead of ten. If the accumulation is memory-bound before ten cores are
     # busy, the six efficiency cores are contributing contention rather than
     # throughput, and this arm is what says so.
-    arms.append(Arm(String("wA_tpc1"), False, e, e, e, one, e))
-    arms.append(Arm(String("wA_tpc16"), False, e, e, e, String("16"), e))
-    arms.append(Arm(String("wA_pool"), False, e, e, e, e, String("performance")))
-    arms.append(Arm(String("wA_lgbm"), True, e, e, e, e, e))
+    arms.append(arm(String("wA_tpc1"), e, tasks_per_core=one))
+    arms.append(arm(String("wA_tpc16"), e, tasks_per_core=String("16")))
+    arms.append(arm(String("wA_pool"), e, core_pool=String("performance")))
+    # Block three: the small node going parallel. The measured target is a
+    # ratio of ratios -- a (row, feature) accumulate costs 6.05x more at a
+    # small node than at the root at one worker and 11.65x more at auto, so
+    # small nodes lose 1.93x of their relative efficiency the moment the fit
+    # is parallel and the root loses none. These four arms are the three ways
+    # of attacking that which do not need the kernel rewritten, and they are
+    # separate arms because they are separate claims.
+    #
+    # `minops` is the per-node **serial** floor, and it is the crudest form of
+    # the question. `MOJOTREES_PARALLEL_MIN_OPS` is the whole-loop crossover:
+    # a dispatch whose work estimate falls below it does not fan out at all.
+    # Every estimate on the per-node path is proportional to the node's rows,
+    # so raising the crossover to 1,000,000 is exactly "a node below about
+    # 10,000 rows at 100 features builds serially" -- the small and tiny
+    # classes, and nothing above them. **The registered prediction is that
+    # this LOSES**: the small class was measured at 2.385 ns per slot serially
+    # against 1.948 at auto, so it does get 1.22x out of ten cores, and
+    # throwing that away to save the fan-out has to find 22 percent somewhere.
+    # It is run because "small nodes should go serial" is the first thing
+    # anybody reaches for and a measured refusal is worth more than an
+    # argument.
+    #
+    # `mintask` is the per-node **worker** floor, which is the same question
+    # asked without the cliff. With `MOJOTREES_CPU_TASK_FLOOR=0` the core
+    # floor stops forcing one task per core and the task count falls back to
+    # the grain, `total_ops / MOJOTREES_PARALLEL_MIN_TASK_OPS`, clamped below
+    # at 2. At 262,144 a 6,000-row node runs on 2 workers, a 34,000-row node
+    # on about 13, and the root on the full 40. `parallel.env_core_floor`'s
+    # own docstring asks for this A/B by name -- "the histogram at small nodes
+    # is the one to watch ... run the A/B, and run it early" -- and this is
+    # it.
+    #
+    # `floor0` is `mintask` with the grain left alone, so it isolates what
+    # turning the core floor off costs by itself. Without it a win or a loss
+    # on `mintask` cannot be attributed to the grain rather than to the floor.
+    #
+    # `rowsmall` is not a schedule and it is the arm with a quantitative
+    # prediction behind it. At 799,110 rows and a 128-byte line, a 6,102-row
+    # node reads each feature-major column at a row density of 0.76 percent,
+    # so it fetches about 78 MB of cache lines to use 610 KB of bin ids; the
+    # same node's row-major records are 100 contiguous bytes per row and cost
+    # about 780 KB. The per-fit layout question was already measured and
+    # feature-major won it by 1.15x, but that answer is the root's and the
+    # large nodes' -- there the column is a unit-stride stream and the record
+    # array is a strided walk with nothing gained.
+    # `MOJOTREES_CPU_LAYOUT_BY_NODE` asks it per node instead of per fit,
+    # keyed on the node's own block
+    # count, which is the grower's existing proxy for "big enough to amortize
+    # a bin sweep".
+    arms.append(arm(String("wA_minops"), e, min_ops=String("1000000")))
+    arms.append(
+        arm(
+            String("wA_mintask"),
+            e,
+            min_task_ops=String("262144"),
+            task_floor=String("0"),
+        )
+    )
+    arms.append(arm(String("wA_floor0"), e, task_floor=String("0")))
+    arms.append(arm(String("wA_rowsmall"), e, layout_by_node=one))
+    arms.append(lgbm_arm(String("wA_lgbm"), e))
     return arms^
 
 
@@ -361,6 +497,8 @@ def _select_arms(all_arms: List[Arm], words: String) raises -> List[Arm]:
         want_words = String(BLOCK_ONE)
     elif want_words == "two":
         want_words = String(BLOCK_TWO)
+    elif want_words == "three":
+        want_words = String(BLOCK_THREE)
     if want_words == "all":
         return all_arms.copy()
 
@@ -684,6 +822,18 @@ def main() raises:
     var data = mapper.transform(features, n_rows)
     var t1 = perf_counter_ns()
     print("binning_s:", Float64(t1 - t0) / 1e9)
+    # Whether the row-major view exists at all, printed rather than assumed.
+    # `MOJOTREES_CPU_LAYOUT_BY_NODE` degrades **silently** to feature-major on
+    # a matrix with no view, so an arm that names the layout and runs on a
+    # matrix that has none is a null wearing a result's label. This line is
+    # what separates "the per-node layout rule bought nothing" from "the
+    # per-node layout rule never ran".
+    print(
+        "row_major_view:",
+        String("yes") if data.has_row_major() else String("no"),
+        "row_major_bytes:",
+        data.row_major_bytes(),
+    )
 
     var arm_list = String("")
     for a in range(len(arms)):
@@ -757,6 +907,16 @@ def main() raises:
                     "MOJOTREES_CPU_TASKS_PER_CORE", arms[a].tasks_per_core
                 )
                 _ = setenv("MOJOTREES_CPU_CORE_POOL", arms[a].core_pool)
+                _ = setenv(
+                    "MOJOTREES_PARALLEL_MIN_OPS", arms[a].min_ops
+                )
+                _ = setenv(
+                    "MOJOTREES_PARALLEL_MIN_TASK_OPS", arms[a].min_task_ops
+                )
+                _ = setenv("MOJOTREES_CPU_TASK_FLOOR", arms[a].task_floor)
+                _ = setenv(
+                    "MOJOTREES_CPU_LAYOUT_BY_NODE", arms[a].layout_by_node
+                )
                 var t = perf_counter_ns()
                 var model = train(data, target, SQUARED_ERROR, params)
                 seconds = Float64(perf_counter_ns() - t) / 1e9
@@ -782,6 +942,10 @@ def main() raises:
     _ = setenv("MOJOTREES_CPU_FEATURE_GROUP", "")
     _ = setenv("MOJOTREES_CPU_TASKS_PER_CORE", "")
     _ = setenv("MOJOTREES_CPU_CORE_POOL", "")
+    _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "")
+    _ = setenv("MOJOTREES_PARALLEL_MIN_TASK_OPS", "")
+    _ = setenv("MOJOTREES_CPU_TASK_FLOOR", "")
+    _ = setenv("MOJOTREES_CPU_LAYOUT_BY_NODE", "")
 
     # The determinism contract, checked in the run that measured the arms
     # rather than in a separate one. Two claims, and they are different:
@@ -804,6 +968,7 @@ def main() raises:
     pairs.append(String("lgbmlike"))
     pairs.append(String("g16"))
     pairs.append(String("tpc1"))
+    pairs.append(String("rowsmall"))
     for p in range(len(pairs)):
         var i = _index_of(arms, String("w1_", pairs[p]))
         var j = _index_of(arms, String("wA_", pairs[p]))
@@ -876,6 +1041,10 @@ def main() raises:
     knobs.append(String("tpc1"))
     knobs.append(String("tpc16"))
     knobs.append(String("pool"))
+    knobs.append(String("minops"))
+    knobs.append(String("mintask"))
+    knobs.append(String("floor0"))
+    knobs.append(String("rowsmall"))
     for p in range(len(knobs)):
         var i = _index_of(arms, String("w1_", knobs[p]))
         var j = _index_of(arms, String("wA_", knobs[p]))

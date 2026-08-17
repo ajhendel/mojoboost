@@ -1422,6 +1422,110 @@ def _env_layout_probe() -> Bool:
     return s != "0"
 
 
+def _env_layout_by_node() -> Bool:
+    """`MOJOTREES_CPU_LAYOUT_BY_NODE=1`: choose the bin layout per node from
+    the node's size, instead of once per fit.
+
+    Off by default, so a fit that does not ask for it runs the layout that
+    shipped at every node.
+
+    **Why a per-node rule is a different question from the per-fit one, and
+    why the per-fit answer does not settle it.** The timed probe and both
+    lanes that measured a forced flip asked "which layout for the whole fit",
+    and the answer was feature-major by 1.15x. That answer is dominated by
+    the root and the large nodes, which are most of the work: there the row
+    ids are the whole dataset or a quarter of it, the feature-major column is
+    a unit-stride stream the hardware prefetcher owns outright, and the
+    row-major record forces a strided walk with nothing gained.
+
+    A small node is the opposite shape and the arithmetic is not close. At
+    799,110 rows, 100 features and a 128-byte line, a 6,102-row node reads
+    each feature's column at row ids whose density is 0.76 percent, so on the
+    order of one useful byte per line fetched: about 78 MB of line traffic for
+    610 KB of bin ids. The same node's row-major records are 100 contiguous
+    bytes per row, so it reads about 780 KB.
+
+    **Measured 2026-08-16 at 799,110 x 100, and the arithmetic held where it
+    predicted and nowhere else.** Per (row, feature) accumulate, inside one
+    profiled fit:
+
+    | class | rows | ns/slot before | after | |
+    |---|---|---|---|---|
+    | root | 799,110 | 0.460 | 0.475 | blocks, untouched |
+    | large | 208,096 | 0.639 | 0.648 | blocks, untouched |
+    | medium | 34,284 | 1.063 | 1.112 | blocks, untouched |
+    | small | 6,102 | **2.716** | **2.061** | 1.32x |
+    | tiny | 840 | **9.684** | **2.141** | 4.52x |
+
+    The two classes the rule fires on are the two that moved, by 1.32x and
+    4.52x, and the three it leaves alone did not. At auto the same two move
+    by 1.43x and 2.80x.
+
+    **What it does not do, stated because it is the more interesting half.**
+    It does not close the small class's *parallel* penalty. That penalty --
+    the class's rate against the root's, at auto over the same at one
+    worker -- goes from 1.72x to 1.55x and no further. Cutting the traffic by
+    two orders of magnitude leaves the small node still losing half its
+    relative efficiency to going parallel, which is what says the parallel
+    loss at small nodes is **not** memory traffic.
+
+    So the rule is a serial win at the two smallest classes, worth about 5
+    percent of the whole fit at one worker and indistinguishable at auto, and
+    it is off by default until a lane decides that trade.
+
+    **It cannot move a cell.** `_hist_subset`'s own docstring states the
+    contract and two tests assert it: both kernels take the same plan from
+    the same `_plan_accumulation` call, visit the same rows in the same
+    order, and add the same Float64 into the same cell. Only the address the
+    bin id is loaded from differs. A per-node choice is therefore the same
+    kind of argument as a per-fit one, made more often, and the digest at
+    both worker counts is the branch's own `222091343700048511`.
+
+    It degrades to the fit's layout when the matrix has no row-major view,
+    because `build_histogram_subset_by_layout_into_scratch` resolves the
+    request against `data.has_row_major()` and reports what it ran.
+    """
+    var s = getenv("MOJOTREES_CPU_LAYOUT_BY_NODE")
+    if s.byte_length() == 0:
+        return False
+    return s != "0"
+
+
+def _node_bin_layout(
+    fit_layout: Int,
+    by_node: Bool,
+    n_bins: Int,
+    n_active: Int,
+    count: Int,
+) raises -> Int:
+    """Which bin array one node's build reads, under `_env_layout_by_node`.
+
+    `fit_layout` is what the fit resolved once (`GrowScratch.bin_layout`) and
+    is returned unchanged when the per-node rule is off, which is the
+    default. When it is on, a node that `plan_row_block_count` says will not
+    block reads the row-major record array and every other node keeps the
+    fit's layout.
+
+    The predicate is the plan's own, called with the plan's own arguments, so
+    this cannot disagree with the block count the kernel then runs at. It
+    reads no clock, no core count and no worker count: `plan_row_block_count`
+    is a pure function of rows, bins, active features and an explicit
+    request, which is what keeps the layout choice out of the value.
+
+    **The block count is also the right predicate on its merits and not only
+    because it was to hand.** A node blocks exactly when it has enough rows
+    per block to amortize a private histogram's bin sweep, which is the same
+    threshold at which its row ids stop being sparse enough for the
+    feature-major column to be mostly wasted line traffic. The two questions
+    have the same answer for the same reason, so one number serves both.
+    """
+    if not by_node:
+        return fit_layout
+    if plan_row_block_count(0, count, n_bins, n_active, True) < 2:
+        return BIN_LAYOUT_ROW_MAJOR
+    return fit_layout
+
+
 struct GrowScratch(Movable):
     """The working memory one grower call reuses across every node, and one
     booster reuses across every tree.
@@ -1472,6 +1576,11 @@ struct GrowScratch(Movable):
     var pairs: List[Float64]
     var settings: DispatchSettings
     var bin_layout: Int
+    var layout_by_node: Bool
+    """Whether the layout is chosen per node from the node's block count
+    rather than once per fit. `_env_layout_by_node` states the rule and the
+    measured per-class effect; off by default, read once here beside the
+    other two snapshots and never again."""
     var layout_pending: Bool
     """Whether `bin_layout` is still the placeholder rather than an answer.
 
@@ -1550,6 +1659,13 @@ struct GrowScratch(Movable):
         self.layout_pending = (
             requested == BIN_LAYOUT_AUTO and _env_layout_probe()
         )
+        # The per-node layout rule, read once per fit like everything else on
+        # this struct. It is orthogonal to `bin_layout` and to the probe: it
+        # decides *when* the fit's answer applies, not what the answer is, so
+        # a fit that pins `MOJOTREES_CPU_BIN_LAYOUT=feature` and turns this on
+        # gets feature-major on every node that blocks and row-major on the
+        # rest, which is exactly the experiment it names.
+        self.layout_by_node = _env_layout_by_node()
         # The scheduling environment, read once here and then never again for
         # the life of this scratch. Every dispatch the grower makes -- the
         # histogram builds, the sibling subtractions, the split scans -- takes
@@ -3054,6 +3170,13 @@ def grow_tree_leaves_profiled(
     # class or two and make two sampling fractions incomparable.
     var n_root = len(bag) if len(bag) > 0 else data.n_rows
     var hist_cells = data.n_features * data.n_bins
+    # Active feature count for the per-node layout rule, which needs exactly
+    # the number `_plan_accumulation` derives its block count from. Hoisted
+    # once per tree because it is constant across every node of one: the
+    # tree's draw does not change as the frontier grows.
+    var tree_active = (
+        len(tree_columns) if len(tree_columns) > 0 else data.n_features
+    )
     var tree_started = profile.clock()
     profile.begin_tree(n_root, data.n_rows)
 
@@ -3138,7 +3261,14 @@ def grow_tree_leaves_profiled(
         _hist_subset(
             root_hist, bundle_scratch, scratch.pairs, data, bundling, grad,
             hess, bag, 0, len(bag), tree_features, tree_columns,
-            const_hessian, scratch.settings, const_h_env, scratch.bin_layout,
+            const_hessian, scratch.settings, const_h_env,
+            _node_bin_layout(
+                scratch.bin_layout,
+                scratch.layout_by_node,
+                data.n_bins,
+                tree_active,
+                len(bag),
+            ),
         )
         profile.note_node()
         profile.charge(
@@ -3471,13 +3601,25 @@ def grow_tree_leaves_profiled(
         profile.charge(
             PROF_HIST_ALLOC, built_rows, alloc_started, cells=2 * hist_cells
         )
+        # The layout this child reads its bin ids from. One call for both
+        # branches, because the argument is the *built* child's row count and
+        # `built_rows` already is that whichever side won. Off by default,
+        # where it returns `scratch.bin_layout` and this is one Bool test per
+        # split; see `_node_bin_layout`.
+        var built_layout = _node_bin_layout(
+            scratch.bin_layout,
+            scratch.layout_by_node,
+            data.n_bins,
+            tree_active,
+            built_rows,
+        )
         var hist_started = profile.clock()
         if len(left_rows) <= len(right_rows):
             _hist_subset(
                 left_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, left_rows, 0, len(left_rows), tree_features,
                 tree_columns, const_hessian, scratch.settings,
-                const_h_env, scratch.bin_layout,
+                const_h_env, built_layout,
             )
             profile.note_node()
             profile.charge(
@@ -3511,7 +3653,7 @@ def grow_tree_leaves_profiled(
                 right_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, right_rows, 0, len(right_rows), tree_features,
                 tree_columns, const_hessian, scratch.settings,
-                const_h_env, scratch.bin_layout,
+                const_h_env, built_layout,
             )
             profile.note_node()
             profile.charge(
