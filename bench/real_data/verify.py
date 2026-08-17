@@ -1833,6 +1833,13 @@ def propose_anchors(ok, config, path, results_path):
     anchor cannot happen by accident: there is no code path from a run to the
     live anchors.
 
+    That last sentence is enforced at the bottom of this function and was NOT
+    true until 2026-08-17, when it was only a description of intent while
+    `path` accepted the live anchors file like any other. Read the refusal
+    there before trusting this paragraph, and do not remove it: the claim and
+    the guard are the same fact stated twice, and deleting one leaves the other
+    lying.
+
     The candidate carries the full metric set and the provenance, because an
     anchor a reader cannot trace back to a run, a commit and a machine is a
     number with no argument behind it, and this file's entire purpose is to be
@@ -1918,6 +1925,27 @@ def propose_anchors(ok, config, path, results_path):
         "proposed_from": os.path.abspath(results_path),
         "anchors": anchors,
     }
+    # The guard that makes this function's docstring true. Added 2026-08-17
+    # after an audit found the claim "there is no code path from a run to the
+    # live anchors" was FALSE as written: `path` is whatever the caller typed,
+    # so `--propose-anchors bench/real_data/accuracy_anchors.json` wrote a
+    # freshly measured run straight over the fixed point it is supposed to be
+    # judged against, installing the exact ratchet that file exists to prevent
+    # and destroying the adopted values in the same stroke. Nothing warned.
+    #
+    # Refusing by resolved path rather than by string, because `./` prefixes,
+    # relative invocations and symlinked checkouts all spell the same file
+    # differently and a comparison that any of them defeats is decoration.
+    if os.path.realpath(path) == os.path.realpath(ACCURACY_ANCHORS_PATH):
+        raise SystemExit(
+            f"REFUSED: {path} resolves to the live anchors file, "
+            f"{ACCURACY_ANCHORS_PATH}. `--propose-anchors` writes a CANDIDATE "
+            "for a person to read; it is not the adoption step, and letting it "
+            "write here would overwrite the recorded fixed point with the run "
+            "being judged. Adoption is a human edit in a commit that says what "
+            "the anchors were adopted for. Write the candidate somewhere else, "
+            "read every entry, then move the entries across by hand."
+        )
     with open(path, "w") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
