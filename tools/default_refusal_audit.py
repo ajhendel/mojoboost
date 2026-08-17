@@ -214,14 +214,25 @@ ACKNOWLEDGED = {
         "to unsampled with the reason recorded, a NAMED one still refuses -- "
         "or those fits are routed. Adding a BLOCK_BOOTSTRAP is the WRONG "
         "fix: it would refuse the dense single-output path that honors MVS "
-        "today.** And these fire under device='auto' as well as an explicit "
-        "request, because there is no BLOCK_BOOTSTRAP to route them; "
-        "device='auto' reaches the CPU on the shipped default only because "
-        "BLOCK_SCORE_FUNCTION and BLOCK_RANDOM_STRENGTH fire first. So "
-        "retiring either of those two, before the yield rule lands here, "
-        "turns this from a latent raise into every multiclass and sparse "
-        "GPU fit of the shipped default. Retiring a block is not a local "
-        "change when another parameter's only protection was resting on it",
+        "today.** These fire under device='auto' as well as an explicit "
+        "request, because there is no BLOCK_BOOTSTRAP to route them. "
+        "**REACHABILITY, and the correction matters because the version of "
+        "this sentence before it was holding the other campaign for no "
+        "reason.** At head `bootstrap_type` defaults to None and CatBoost "
+        "mode supplies neither it nor `subsample` -- verified 2026-08-17 by "
+        "fitting: MojoTreesClassifier(grow_policy='symmetrictree') reports "
+        "bootstrap_type None with mode_defaults_ == {'l2_leaf_reg', "
+        "'learning_rate', 'depth'} and no bootstrap key. So `enabled()` is "
+        "false at the defaults and all four sites are UNREACHABLE until "
+        "lane/defaults-release merges. The earlier wording said retiring "
+        "BLOCK_SCORE_FUNCTION or BLOCK_RANDOM_STRENGTH would turn this into "
+        "a raise on every multiclass and sparse GPU fit of the shipped "
+        "default; that is true only AFTER the flip, and stated without the "
+        "qualifier it made a block retirement look gated on this build when "
+        "it is not. What is gated is the FLIP. Retiring a block is still not "
+        "a local change when another parameter's protection rests on it -- "
+        "the dependency is real and its trigger is the flip, not the "
+        "retirement",
     ),
     ("bootstrap_type", "src/mojotrees/model_sparse.mojo"): (
         "BLOCKING",
