@@ -180,19 +180,60 @@ ACKNOWLEDGED = {
         "the BLOCK_SCORE_FUNCTION mistake",
     ),
     ("bootstrap_type", "src/mojotrees/model.mojo"): (
-        "BLOCKING",
-        "train_gpu takes no bootstrap bundle, so MVS as a default breaks "
-        "every GPU fit. f9 owns the GPU round loop and is building the draw "
-        "and refresh; the per-row weight plane already exists there. Interim: "
-        "the default resolves to bootstrap_type=No on the GPU, recorded as "
-        "OUR divergence, never a raise",
+        "DIVERGENCE",
+        "train_gpu takes no bootstrap bundle. Andrew's ruling 2026-08-17: "
+        "DIVERGENCE while f9's routing lane is in flight, and the intended "
+        "end state is that the default resolves to bootstrap_type=No on the "
+        "accelerator, recorded as OUR divergence and never a raise. "
+        "**READ THIS BEFORE RETIRING ANY BLOCK.** The verdict describes the "
+        "intended end state and NOT what the tree does today, and the two "
+        "differ in a way that is invisible from this row alone. Today there "
+        "is no BLOCK_BOOTSTRAP in device_policy at all -- verified by "
+        "enumerating the BLOCK_ names on 2026-08-17 -- so nothing routes on "
+        "this parameter. device='auto' reaches the CPU only because "
+        "BLOCK_SCORE_FUNCTION and BLOCK_RANDOM_STRENGTH fire FIRST on the "
+        "shipped default, and device='gpu' raises. So the fallback this "
+        "verdict names is not built; it is being stood in for by two "
+        "unrelated blocks. If those two are retired before bootstrap routing "
+        "lands, this row silently becomes BLOCKING in fact while still "
+        "reading DIVERGENCE here, and the failure appears as a raise on "
+        "every GPU fit of the shipped default. The dependency is recorded "
+        "here because no gate expresses it: retiring a block is not a local "
+        "change when another parameter's fallback was resting on it",
     ),
     ("bootstrap_type", "src/mojotrees/trainset.mojo"): (
-        "BLOCKING",
-        "the sparse arm refuses the bundle by name and the multiclass trainer "
-        "takes no bundle at all, so CatBoost's own Bayesian fallback has "
-        "nowhere to land. lane/bootstrap-multiclass-sparse is building both "
-        "round loops. Interim: default resolves to No on those two paths",
+        "RESOLVED",
+        "the defaulted-bundle-yields rule covers it: a bundle the MODE "
+        "supplied yields on a path that cannot honor it, and a bundle the "
+        "user TYPED still refuses by name. VERIFIED 2026-08-17 by fitting: "
+        "MojoTreesClassifier(grow_policy='symmetrictree', ctr='off') on a "
+        "three-class target succeeds with the defaulted MVS, where the old "
+        "reason predicted a raise. ctr='off' is set in that probe only to "
+        "isolate the bootstrap question from the separate CTR refusal on the "
+        "multiclass path; it does not affect the bootstrap answer. The old "
+        "reason ALSO claimed the sparse arm as a bootstrap failure, and that "
+        "was wrong -- see the grow_policy row for this file, where it now "
+        "lives",
+    ),
+    ("grow_policy", "src/mojotrees/trainset.mojo"): (
+        "DIVERGENCE",
+        "THE SPARSE PATH HAS NO SYMMETRIC GROWER. Split out of the "
+        "bootstrap_type row for this file on 2026-08-17, where it had been "
+        "recorded as a bootstrap failure and was not one. A sparse fit under "
+        "the shipped default raises 'grow_policy=oblivious is not a frontier "
+        "order and has no GrowthSchedule: a level is searched once and the "
+        "winner is applied to every leaf of it' -- the bootstrap bundle never "
+        "comes into it, and the defaulted MVS yields there exactly as it does "
+        "on multiclass. Verified by fitting a CSR matrix under "
+        "grow_policy='symmetrictree'. THE RULING (Andrew, 2026-08-17): sparse "
+        "input under symmetrictree REFUSES, with the reason. It does NOT fall "
+        "back to lossguide, because that would make the grow policy a "
+        "function of the input CONTAINER: two fits of one configuration on "
+        "one dataset, one dense and one sparse, would grow different trees "
+        "and both would report success. A silent policy change is the cliff, "
+        "and here the difference is the whole tree shape rather than a "
+        "constant. Refusing is a divergence from CatBoost, which grows "
+        "symmetric trees on sparse input; it is a divergence we can see",
     ),
     ("score_function", "src/mojotrees/gpu_split_search.mojo"): (
         "BLOCKING",
@@ -369,30 +410,71 @@ ACKNOWLEDGED = {
         "random_strength row for this file",
     ),
     ("auto_learning_rate", "src/mojotrees/params.mojo"): (
-        "BLOCKING",
-        "the set contradicts itself and this is where it is caught. :1416 "
-        "refuses auto_learning_rate=true beside an explicit lambda_l2, :1423 "
-        "beside an explicit leaf_estimation_iterations, and the set names "
-        "auto lr AND lambda_l2=3.0 AND leaf_estimation_iterations. Both "
-        "refusals transcribe CatBoost's own gating (options_helper.cpp:279 "
-        "and :280): its derivation runs only when those are unset, so in "
-        "CatBoost the auto rate would silently be discarded. :1409 is the "
-        "same rule against an explicit learning_rate. What must be decided, "
-        "not built: drop auto lr, or drop lambda_l2=3 and the leaf iterations",
+        "RESOLVED",
+        "ALL THREE REFUSALS ARE ON THE PARAMETER-STRING SURFACE AND THE "
+        "SHIPPED DEFAULT DOES NOT TRAVEL ON IT. They are in "
+        "_enable_auto_learning_rate (:1854), called only from "
+        "parse_params(spec: String) at :1584, and each guards on a saw_* "
+        "flag that means 'this key appeared in the STRING': :1879 on "
+        "saw_learning_rate, :1886 on saw_lambda_l2, :1893 on "
+        "saw_leaf_estimation_iterations. They transcribe CatBoost's gating "
+        "(options_helper.cpp:279, :280) correctly and they are right for the "
+        "surface they are on -- a string that names both keys IS a caller "
+        "naming both. The estimator does not build a string: it sends the "
+        "value and its provenance as separate keys "
+        "(auto_learning_rate_l2_set, leaf_estimation_iterations_set), which "
+        "is how a mode-supplied value stays distinguishable from a "
+        "user-named one, mirroring CatBoost's SetDefault assigning without "
+        "raising IsSetFlag (option.h:27-33). VERIFIED 2026-08-17 by fitting "
+        "rather than by reading: MojoTreesClassifier("
+        "grow_policy='symmetrictree') at 100 and at 360 trees reports "
+        "auto_learning_rate_note_ == 'auto_lr_gate_open' with mode_defaults_ "
+        "== {'l2_leaf_reg': 3.0, 'learning_rate': 0.03, 'depth': 6}. The "
+        "mode supplied l2_leaf_reg=3.0 and the gate stayed open, which is "
+        "the whole claim. A user who NAMES either key still closes it and "
+        "the note reads auto_lr_skipped:<key>. **The line numbers in the "
+        "reason this replaces (:1409, :1416, :1423) had drifted and pointed "
+        "at cegb_tradeoff, a closing paren and linear_lambda.** That is why "
+        "this table is keyed by (parameter, file) and not by line, and it is "
+        "an argument for citing the FUNCTION as well as the line, which "
+        "these entries now do",
     ),
     ("lambda_l2", "src/mojotrees/params.mojo"): (
-        "BLOCKING",
-        "the other half of the contradiction above, at :1416. Recorded "
-        "separately so a reader who greps lambda_l2 finds it",
+        "RESOLVED",
+        "the same refusal seen from the other key, at :1886 inside "
+        "_enable_auto_learning_rate, reached only from parse_params(spec: "
+        "String). Recorded separately so a reader who greps lambda_l2 finds "
+        "it rather than inferring it from the auto lr row",
     ),
     ("leaf_estimation_iterations", "src/mojotrees/params.mojo"): (
-        "BLOCKING",
-        "the third half, at :1423, plus :1156, which refuses "
-        "leaf_estimation_iterations > 1 from a parameter STRING at all "
-        "because that string reaches the sparse, custom-objective, multiclass "
-        "and ranking trainers, none of which implement it. So even without "
-        "the auto-lr contradiction the per-objective default cannot be "
-        "expressed as a parameter string",
+        "RESOLVED",
+        ":1893, the third of the same string-surface trio, resolved for the "
+        "same reason. Worth one extra note because this parameter's "
+        "provenance is the least visible of the three: it is absent from "
+        "mode_defaults_ ON PURPOSE, and sklearn.py says why -- it and "
+        "random_strength resolve on the NATIVE side, where the entry point's "
+        "routing is known, so a record written in Python would be a guess. "
+        "What travels is leaf_estimation_iterations_set=0, which "
+        "_parse_params resolves through "
+        "boosting.catboost_leaf_estimation_iterations in CatBoost mode, "
+        "mirroring CatBoost reading TOption::NotSet() rather than comparing "
+        "against a default (option.h:80-85). A separate string-surface "
+        "limitation is tracked in its own row below and is NOT this one",
+    ),
+    ("leaf_estimation_iterations", "PARAMETER STRING SURFACE"): (
+        "DIVERGENCE",
+        "params.mojo:1156 refuses leaf_estimation_iterations > 1 from a "
+        "parameter string at all. Split out of the params.mojo row above on "
+        "2026-08-17 because the two halves have different answers and one "
+        "verdict cannot carry both. The shipped default is unaffected: it "
+        "goes through the estimator, which sends the count and "
+        "leaf_estimation_iterations_set as separate keys and lets the native "
+        "side resolve an unset one per objective. A caller who builds a "
+        "parameter string by hand gets 1 and a named refusal above it, which "
+        "is honest and is a smaller surface than CatBoost's. It becomes "
+        "BLOCKING the moment anything in the shipped path starts travelling "
+        "as a parameter string. Not a file key, because the refusal is one "
+        "site and the divergence is about a SURFACE",
     ),
     ("leaf_estimation_iterations", "src/mojotrees/boosting.mojo"): (
         "DIVERGENCE",
@@ -672,6 +754,51 @@ def _raise_blocks(text):
     return out
 
 
+#: Keys of `catboost_defaults` that CatBoost mode SUPPLIES rather than the
+#: caller naming, and which therefore travel with `IsSet` false.
+#:
+#: **This is the audit's copy of the rule the gate itself runs on, and it
+#: exists because the audit could not otherwise tell the two apart.** A
+#: refusal that reads whether a key was NAMED does not fire on a value the
+#: mode supplied. `DEFAULT_SETS` is a flat dict of values with no provenance,
+#: so the audit reads "the set names lambda_l2=3.0" where the truth is "the
+#: mode supplies lambda_l2=3.0 without recording that anyone asked for it".
+#:
+#: **This annotates; it does not rule.** The verdicts in `ACKNOWLEDGED` are
+#: human, and this flag only says which QUESTION a site is asking, so a
+#: reader can see at a glance which collisions are about a value and which
+#: are about provenance. It flagged 20 sites on 2026-08-17, and the ones it
+#: did NOT flag are the more interesting half: a message that does not use
+#: one of `PROVENANCE_WORDS` is treated as reading the value, which keeps a
+#: collision visible rather than explaining it away.
+#:
+#: CatBoost's own mechanism is `SetDefault`, which assigns a value and never
+#: raises `IsSetFlag` (`option.h:27-33`), read by `TOption::NotSet()`
+#: (`option.h:80-85`). Ours is `_Base.mode_defaults_` plus the `*_set`
+#: provenance keys in `python/mojotrees/sklearn.py`.
+#:
+#: A second copy of a rule is a liability and this one is worth its cost only
+#: because it is DATA and one line long per key. It is checkable against the
+#: estimator in a single fit: a fit whose `auto_learning_rate_note_` reads
+#: `auto_lr_gate_open` while `mode_defaults_` carries a key proves that key
+#: belongs here. Verified that way on 2026-08-17 for `lambda_l2`.
+MODE_SUPPLIED = {
+    "catboost_defaults": frozenset(
+        {
+            "lambda_l2",
+            "learning_rate",
+            "auto_learning_rate",
+            "max_depth",
+            "leaf_estimation_iterations",
+            "random_strength",
+            "bootstrap_type",
+            "subsample",
+            "score_function",
+        }
+    ),
+}
+
+
 def audit(default_set):
     params = DEFAULT_SETS[default_set]
     rows = {name: [] for name in params}
@@ -693,9 +820,41 @@ def audit(default_set):
                             "looks_like_refusal": any(
                                 w in message.lower() for w in REFUSAL_WORDS
                             ),
+                            # True when the refusal reads whether a key was
+                            # NAMED and this key is one the mode supplies, so
+                            # the site cannot fire on the shipped default.
+                            # It does not soften the verdict on its own: a
+                            # human still rules, and this only says which
+                            # question the site is asking. See MODE_SUPPLIED.
+                            "provenance_gated": (
+                                name
+                                in MODE_SUPPLIED.get(default_set, frozenset())
+                                and _reads_provenance(message)
+                            ),
                         }
                     )
     return params, rows
+
+
+#: A refusal that reads whether a key was NAMED rather than what its value is.
+#: Deliberately narrow: these are the words our own refusals use for the
+#: distinction, and a site that does not use one of them is treated as reading
+#: the value, which is the answer that keeps a collision visible. Guessing
+#: wide here would silence real collisions, and silence is the direction that
+#: reads as good news.
+PROVENANCE_WORDS = (
+    "explicit",
+    "explicitly",
+    "named",
+    "was set",
+    "is set",
+    "beside an explicit",
+)
+
+
+def _reads_provenance(message):
+    low = message.lower()
+    return any(w in low for w in PROVENANCE_WORDS)
 
 
 #: Files that only a fit which has already been routed to the accelerator
