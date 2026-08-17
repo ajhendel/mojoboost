@@ -137,6 +137,8 @@ behind `binning`. The category information arrives as two plain lists,
 already holds. That is the same rule A19 followed and for the same reason.
 """
 
+from std.math import log
+
 from .ctr import (
     CPU_PRIOR_DENOM,
     CTR_BINARIZED_TARGET_MEAN,
@@ -273,6 +275,52 @@ comptime CTR_SOURCE_RULES = 2
 
 
 # ---------------------------------------------------------------------------
+# How the target is quantized before a CTR is taken of it
+# ---------------------------------------------------------------------------
+#
+# `TCtrHelper::InitCtrHelper` (`ctr_helper.cpp:118-135`, v1.2.10) reads a border
+# COUNT and a border TYPE off the `target_binarization` option and calls
+# `BuildTargetClassifier` once per distinct pair. `BuildTargetClassifier`
+# (`target_classifier.cpp:39-118`) then switches on the LOSS, and the switch has
+# exactly two live arms: the multiclass losses take borders that read no target
+# value at all, and every other supported loss runs the ordinary border selector
+# over the raw target.
+#
+# The count and the type are the config's, not this module's, which is the whole
+# of what made a continuous target reachable: `resolve_target_borders` used to
+# hard-code "one border, and only if the target has two values", and neither
+# half of that was a caller's to change.
+
+
+comptime CTR_TARGET_BORDER_MIN_ENTROPY = 0
+"""`EBorderSelectionType::MinEntropy`, CatBoost's default for the CTR target
+(`cat_feature_options.cpp:162` and `:230`, both spelling
+`TBinarizationOptions(EBorderSelectionType::MinEntropy, 1)`).
+
+It is the EXACT binarizer, `TExactBinarizer<EPenaltyType::MinEntropy>`
+(`binarization.cpp:124`), and at one border its dynamic program does not run its
+main loop at all. `select_target_borders` carries the collapse and the A40 note
+carries the derivation."""
+
+comptime CTR_TARGET_BORDER_MULTICLASS = 1
+"""`GetMultiClassBorders` (`target_classifier.cpp:10-16`), the arm
+`BuildTargetClassifier` takes for `MultiClass` and `MultiClassOneVsAll`:
+
+    borders[i] = 0.5 + i,   i in [0, count)
+
+The target is a class code, so the borders sit between consecutive codes and no
+target value is read. It is a border TYPE here rather than a loss test because
+a `Dataset` is built before a loss is chosen and cannot see one; the estimator
+names it or it is not used."""
+
+comptime CTR_TARGET_BORDER_TYPES = 2
+"""One past the last target border type, for the range check in `validate`."""
+
+comptime DEFAULT_CTR_TARGET_BORDER_COUNT = 1
+"""CatBoost's `ctr_target_border_count`, `cat_feature_options.cpp:162`."""
+
+
+# ---------------------------------------------------------------------------
 # One CTR description
 # ---------------------------------------------------------------------------
 
@@ -381,6 +429,18 @@ struct SimpleCtrConfig(Copyable, Movable):
     (the columns the category table could not hold). Read by
     `ctr_source_features` and by nothing else."""
 
+    var target_border_count: Int
+    """CatBoost's `ctr_target_border_count`, its default of 1
+    (`cat_feature_options.cpp:162`). How many borders the target is quantized
+    into before a statistic is taken of it; the CTR sees `count + 1` classes.
+    Read only by `resolve_target_borders`, and ignored entirely when the caller
+    supplied `target_borders`."""
+
+    var target_border_type: Int
+    """`CTR_TARGET_BORDER_MIN_ENTROPY` (CatBoost's default) or
+    `CTR_TARGET_BORDER_MULTICLASS`. The `EBorderSelectionType` half of the same
+    option, and read in the same one place."""
+
     def __init__(out self):
         """Disabled, and otherwise CatBoost's verified defaults, so a ported
         configuration reads the same even where this refuses to run."""
@@ -397,6 +457,8 @@ struct SimpleCtrConfig(Copyable, Movable):
         self.prior_denom = CPU_PRIOR_DENOM
         self.seed = DEFAULT_CTR_SEED
         self.source_rule = CTR_SOURCE_ONE_HOT_MAX_SIZE
+        self.target_border_count = DEFAULT_CTR_TARGET_BORDER_COUNT
+        self.target_border_type = CTR_TARGET_BORDER_MIN_ENTROPY
 
     @staticmethod
     def disabled() -> SimpleCtrConfig:
@@ -563,14 +625,23 @@ struct SimpleCtrConfig(Copyable, Movable):
         For the default two-valued target the border is the midpoint of the two
         label values, so it carries no information beyond the label's support;
         that is why inheriting it into a fold is not the leak that inheriting
-        bin edges would be. See `default_target_borders` for the source
+        bin edges would be. See `select_target_borders` for the source
         argument.
+
+        The count and the selection type are this bundle's own
+        (`target_border_count`, `target_border_type`), which is what
+        `TCtrHelper::InitCtrHelper` reads off `target_binarization`
+        (`ctr_helper.cpp:118-135`). Before that they were hard-coded here, and
+        the hard-coded pair was "one border, and only for a two-valued target",
+        which is not a rule CatBoost has anywhere.
         """
         if not self.enabled:
             return
         if len(self.target_borders) != 0:
             return
-        self.target_borders = default_target_borders(label)
+        self.target_borders = select_target_borders(
+            label, self.target_border_count, self.target_border_type
+        )
 
     def validate(self) raises:
         """Every guard, none of them skippable by arriving through here.
@@ -608,6 +679,24 @@ struct SimpleCtrConfig(Copyable, Movable):
                 "source_rule must be CTR_SOURCE_ONE_HOT_MAX_SIZE or"
                 " CTR_SOURCE_BIN_OVERFLOW"
             )
+        # `BorderCount == 0` is CatBoost's "no target classifier at all"
+        # (`ctr_helper.cpp:123`), which here would be a bundle whose columns all
+        # vanish; the config says so rather than building nothing in silence.
+        if self.target_border_count < 1:
+            raise Error(
+                "ctr_target_border_count must be positive: CatBoost's default"
+                " is 1 (cat_feature_options.cpp:162) and 0 is its 'build no"
+                " target classifier' case, which is spelled ctr='off' here"
+            )
+        if (
+            self.target_border_type < 0
+            or self.target_border_type >= CTR_TARGET_BORDER_TYPES
+        ):
+            raise Error(
+                "ctr_target_border_type must be"
+                " CTR_TARGET_BORDER_MIN_ENTROPY or"
+                " CTR_TARGET_BORDER_MULTICLASS"
+            )
         if self.counter_calc_method == COUNTER_CALC_FULL:
             raise Error(
                 "counter_calc_method='Full' is not implemented: it counts the"
@@ -639,21 +728,28 @@ struct SimpleCtrConfig(Copyable, Movable):
 
 
 def can_derive_target_borders(label: List[Float64]) -> Bool:
-    """Whether `default_target_borders` would succeed on this label, asked
-    without raising.
+    """What the `auto()` POLICY accepts as a target, asked without raising.
 
-    The same two-distinct-values scan, answering rather than refusing. It
-    exists because `SimpleCtrConfig.auto()` is a DEFAULT: a regression target
-    has more than two distinct values, `default_target_borders` refuses one by
-    name, and a default that turns every regression fit with a wide
-    categorical column into an error would be a defect rather than a policy.
+    **This is a policy and no longer a capability, and the distinction is the
+    whole of why it still says two.** `select_target_borders` now runs
+    CatBoost's own selector over the raw target and succeeds on any non-constant
+    label, so nothing here is a limit of the mechanism. What is left is
+    `SimpleCtrConfig.auto()`'s own restriction: `auto` is
+    `CTR_SOURCE_BIN_OVERFLOW`, mojotrees' opt-in rule rather than CatBoost's,
+    live under `lossguide` where the standing rule is to mirror LightGBM and
+    LightGBM has no CTR at all. Its one published measurement -- average
+    precision from 12.02 percent worse than LightGBM to 3.63 percent better,
+    `docs/LIGHTGBM_PARITY.md` -- was taken with it declining exactly here.
+    Widening it would hand CTR columns to every regression fit with an
+    overflowing categorical column, which moves bits on a shipped default; that
+    is a real-data-gate decision and not a side effect of porting a binarizer.
+
     `trainset._build_ctr` asks this first and declines quietly when the answer
-    is no. A caller who NAMED a bundle still reaches the refusal, which is
-    where the explanation of what to pass instead lives.
+    is no. A caller who NAMED a bundle skips it entirely and gets CatBoost's
+    rule, which is the point of naming one.
 
-    It answers `False` where `default_target_borders` raises, and it takes no
-    other exit: no branch here raises, so "cannot derive" arrives as a value
-    and never as an error condition a caller has to catch.
+    No branch here raises, so "declined" arrives as a value and never as an
+    error condition a caller has to catch.
     """
     var first = 0.0
     var second = 0.0
@@ -675,64 +771,220 @@ def can_derive_target_borders(label: List[Float64]) -> Bool:
     return n_distinct == 2
 
 
-def default_target_borders(label: List[Float64]) raises -> List[Float64]:
-    """The one target border a default CTR fit needs, for a two-valued label.
+def _min_entropy_penalty(weight: Float64) -> Float64:
+    """`Penalty<EPenaltyType::MinEntropy>(w) = w * log(w + 1e-8)`
+    (`binarization.cpp:175-177`, v1.2.10).
 
-    `ctr_target_border_count` defaults to 1 and the selection is `MinEntropy`
-    (`cat_feature_options.cpp:230`), which is catalog A15's mechanism and not
-    this lane's. It does not have to be, at the default: A30's appendix reads
-    `TExactBinarizer` out and shows that at `maxBordersCount = 1` the banded DP
-    does not run its main loop at all and collapses to
+    The `1e-8` is CatBoost's and is kept rather than cleaned up: it is what
+    keeps `log` finite at a zero cumulative weight, which is reachable at
+    `i = 0` only if the first distinct value had zero rows -- impossible here,
+    since a distinct value exists because a row held it -- but it is also what
+    makes the argmin agree with CatBoost's at every OTHER index, and the
+    argument of a log is not somewhere to differ by a constant.
 
-        threshold = argmin over i in [0, k-2] of P(W[i]) + P(W[k-1] - W[i])
-        border    = (values[t] + values[t+1]) / 2
-
-    over the `k` distinct target values. At `k = 2` the argmin is over the single
-    index `i = 0`, so the border is exactly the midpoint of the two values and no
-    entropy is evaluated. That is the whole of the default case for a binary
-    target, which is the only target a default CTR comparison uses.
-
-    `k > 2` raises rather than guessing. The general case is the real DP
-    (`E_RLM2`, about seventy lines per A30's appendix) and belongs to whichever
-    lane owns border selection; a caller with a multi-valued target passes
-    `target_borders` explicitly.
+    CatBoost evaluates this in `double` over `float` weights. The weights are
+    integer counts either way, exactly representable in both, so the only
+    difference is where the counts came from and there is none.
     """
-    var first = 0.0
-    var second = 0.0
-    var n_distinct = 0
-    for i in range(len(label)):
-        var v = label[i]
-        if n_distinct == 0:
-            first = v
-            n_distinct = 1
-        elif v == first:
-            continue
-        elif n_distinct == 1:
-            second = v
-            n_distinct = 2
-        elif v == second:
-            continue
-        else:
-            raise Error(
-                "ctr target borders must be given explicitly for a target with"
-                " more than two distinct values: the default"
-                " ctr_target_border_count is 1 and its MinEntropy selection is"
-                " only a midpoint when the target is two-valued (catalog A15"
-                " owns the general case)"
-            )
-    if n_distinct != 2:
+    return weight * log(weight + 1e-8)
+
+
+struct _GroupedTarget(Copyable, Movable):
+    """`GroupAndSortValues` (`binarization.cpp:1613-1640`) for the unweighted
+    dense case: the distinct target values ascending, and the count of each.
+
+    CatBoost reaches it with `TRepeatIterator<float>(1.0f)` and
+    `normalizeWeights=false`, so a distinct value's weight is exactly the number
+    of rows holding it. `filterNans` is `false` on the target path
+    (`target_classifier.cpp:27` passes `targetValuesMayContainNans=false`), so a
+    NaN is not removed here either.
+
+    Sorted by value, so nothing here depends on row order and therefore nothing
+    depends on `MOJOTREES_NUM_WORKERS`: this loop is serial and the borders it
+    produces are a function of the multiset of label values alone.
+    """
+
+    var values: List[Float64]
+    var counts: List[Float64]
+
+    def __init__(out self, label: List[Float64]):
+        var sorted_values = List[Float64](capacity=len(label))
+        for i in range(len(label)):
+            sorted_values.append(label[i])
+        sort(sorted_values)
+        self.values = List[Float64]()
+        self.counts = List[Float64]()
+        for i in range(len(sorted_values)):
+            if i > 0 and sorted_values[i] == sorted_values[i - 1]:
+                self.counts[len(self.counts) - 1] += 1.0
+            else:
+                self.values.append(sorted_values[i])
+                self.counts.append(1.0)
+
+    def n_distinct(self) -> Int:
+        return len(self.values)
+
+
+def select_target_borders(
+    label: List[Float64],
+    target_border_count: Int = DEFAULT_CTR_TARGET_BORDER_COUNT,
+    target_border_type: Int = CTR_TARGET_BORDER_MIN_ENTROPY,
+) raises -> List[Float64]:
+    """`BuildTargetClassifier` (`target_classifier.cpp:39-118`, v1.2.10): the
+    borders a CTR quantizes the target into, from the target CatBoost was given.
+
+    **The point of this function is that it reads the target.** The version it
+    replaces implemented one shape -- a label with exactly two distinct values --
+    and refused everything else by name, so `ctr='on'` could not take a
+    regression target at all and the estimator, which exposed neither the count
+    nor the selection type, gave a caller no way to answer the refusal. CatBoost
+    has no such precondition anywhere: `SelectBorders` (`:18-37`) hands the raw
+    target straight to the ordinary border selector.
+
+    **Two arms, and they are the switch's two live arms.**
+
+    `CTR_TARGET_BORDER_MULTICLASS` is `GetMultiClassBorders` (`:10-16`),
+    `borders[i] = 0.5 + i`, which reads no target value. It is the arm
+    `MultiClass` and `MultiClassOneVsAll` take.
+
+    `CTR_TARGET_BORDER_MIN_ENTROPY` is the arm every other supported loss takes
+    (`:60-96`: RMSE, MAE, Quantile, Poisson, Logloss, PairLogit, the ranking
+    losses, both Python user-defined objectives). It is
+    `TExactBinarizer<EPenaltyType::MinEntropy>` (`binarization.cpp:124`) via
+    `SplitWithGuaranteedOptimum` (`:1150-1162`) over the distinct values and
+    their counts, with `mode = E_RLM2` (`:678`).
+
+    **At one border, which is CatBoost's default, that DP has no main loop.**
+    `bins = maxBordersCount + 1 = 2`, so `for (l = 0; l < bins - 2; ++l)`
+    (`:240`) never executes, `current_error[i]` keeps its initialization
+    `Penalty(W[i])` (`:232-234`), and everything happens in the "Last match"
+    block (`:630-667`), non-`E_Base` arm (`:645-653`), at `l = 0` and
+    `j = dsize - 1 = k - 2`:
+
+        P(w)      = w * log(w + 1e-8)
+        threshold = argmin over i in [0, k-2] of P(W[i]) + P(W[k-1] - W[i])
+        ties keep the smallest i          (the comparison at :649 is strict `<`)
+        border    = (values[t] + values[t+1]) / 2                       (:691)
+
+    with `W` the cumulative counts of the `k` distinct target values. The
+    backtrack `for (; l > 0; --l)` does not run and the `+= l` adjustment adds
+    zero.
+
+    **`k <= count + 1` is exact at any count** and is not the DP at all: the
+    `wsize <= bins` early return (`:208-216`) puts one border between every
+    pair of adjacent distinct values, which is the only assignment that gives
+    each bin a value. That covers the two-valued binary target the old code
+    handled, at `count = 1`, and it covers a K-valued class code at
+    `count = K - 1`.
+
+    **`k > count + 1` with `count >= 2` is refused by name.** That is the real
+    banded DP (`E_RLM2`'s divide-and-conquer at `:560-627`, roughly seventy
+    lines) and it has not been ported. The refusal says which DP is missing and
+    says to pass `target_borders`; it does not say anything about the shape of
+    the target, because the shape of the target is no longer the problem.
+
+    **A constant target has no border**, which is CatBoost twice over: the
+    emitter drops the only threshold because `t + 1 == values.size()` (`:683`),
+    leaving an empty set, and `SelectBorders` then fails
+    `CB_ENSURE(borders.ysize() > 0 || allowConstLabel, "0 target borders")`
+    (`:29`) -- agreeing with the `targetBounds.Min != targetBounds.Max` check
+    above it (`:55-57`). `allowConstLabel` is false on every path that reaches
+    here.
+
+    **Divergence, deliberate and the same one every other CatBoost port in this
+    repo takes.** CatBoost's target and its borders are `float`; the midpoint
+    `(values[t] + values[t+1]) / 2` is computed in single precision. This is
+    Float64 throughout. Strictly more precise, never bit-identical to CatBoost.
+    """
+    if target_border_count < 1:
         raise Error(
-            "ctr target borders need a target with exactly two distinct values,"
-            " or an explicit target_borders list"
+            "ctr_target_border_count must be positive; got ",
+            target_border_count,
         )
-    var lo = first
-    var hi = second
-    if second < first:
-        lo = second
-        hi = first
+    if target_border_type == CTR_TARGET_BORDER_MULTICLASS:
+        # `GetMultiClassBorders` reads no target value, so there is nothing to
+        # scan and nothing to refuse: a class code sits at an integer and the
+        # borders sit between consecutive integers.
+        var multi = List[Float64](capacity=target_border_count)
+        for i in range(target_border_count):
+            multi.append(0.5 + Float64(i))
+        return multi^
+    if target_border_type != CTR_TARGET_BORDER_MIN_ENTROPY:
+        raise Error(
+            "ctr_target_border_type must be CTR_TARGET_BORDER_MIN_ENTROPY or"
+            " CTR_TARGET_BORDER_MULTICLASS; got ",
+            target_border_type,
+        )
+    if len(label) == 0:
+        raise Error(
+            "ctr target borders need a label: BuildTargetClassifier refuses an"
+            " empty target (target_classifier.cpp:52)"
+        )
+    var grouped = _GroupedTarget(label)
+    ref values = grouped.values
+    ref counts = grouped.counts
+    var k = grouped.n_distinct()
+    if k < 2:
+        raise Error(
+            "ctr target borders need a target that is not constant: every"
+            " border would be dropped and a target classifier with no border"
+            " means one class, which makes GetTargetBorderCount return 0 for"
+            " Borders and every ctr column disappear"
+            " (target_classifier.cpp:29,55)"
+        )
     var out = List[Float64]()
-    out.append((lo + hi) * 0.5)
+    if k <= target_border_count + 1:
+        # `wsize <= bins` (`binarization.cpp:208-216`): one border between every
+        # adjacent pair, which is exact and needs no penalty evaluated.
+        for i in range(k - 1):
+            out.append((values[i] + values[i + 1]) * 0.5)
+        return out^
+    if target_border_count != 1:
+        raise Error(
+            "ctr_target_border_count above 1 needs the exact MinEntropy dynamic"
+            " program (binarization.cpp E_RLM2, :560-627), which is not ported."
+            " Only the one-border collapse and the at-most-(count+1)-distinct"
+            " case are exact here. Pass target_borders explicitly, or use"
+            " ctr_target_border_count=1"
+        )
+    # The cumulative counts `W`, then the single argmin. Everything below is
+    # `:645-653` transcribed, including the strict `<` that keeps the smallest
+    # index on a tie -- balanced class codes tie exactly, so the tie rule is
+    # reachable rather than theoretical.
+    var cumulative = List[Float64](capacity=k)
+    var running = 0.0
+    for i in range(k):
+        running += counts[i]
+        cumulative.append(running)
+    var total = cumulative[k - 1]
+    var best_index = 0
+    var best_error = _min_entropy_penalty(
+        cumulative[0]
+    ) + _min_entropy_penalty(total - cumulative[0])
+    for i in range(1, k - 1):
+        var err = _min_entropy_penalty(
+            cumulative[i]
+        ) + _min_entropy_penalty(total - cumulative[i])
+        if err < best_error:
+            best_error = err
+            best_index = i
+    out.append((values[best_index] + values[best_index + 1]) * 0.5)
     return out^
+
+
+def default_target_borders(label: List[Float64]) raises -> List[Float64]:
+    """`select_target_borders` at CatBoost's defaults: one border, MinEntropy.
+
+    Kept as a name because it is what `resolve_target_borders` meant before the
+    count and the type became the config's, and because a reader looking for
+    "what does a default CTR fit quantize the target with" should land on one
+    function rather than on a pair of arguments.
+    """
+    return select_target_borders(
+        label,
+        DEFAULT_CTR_TARGET_BORDER_COUNT,
+        CTR_TARGET_BORDER_MIN_ENTROPY,
+    )
 
 
 def target_classes(

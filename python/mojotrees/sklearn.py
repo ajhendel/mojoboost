@@ -152,14 +152,20 @@ _CATBOOST_DEPTH = 6
 
 #: CatBoost mode's `ctr` rule when the caller names none.
 #:
-#: `"auto"`, and that is a KNOWN GAP rather than the mirror. The rule this
-#: mode should mirror is `"on"`: CatBoost's own source rule,
-#: `uniqueValues > one_hot_max_size` at 2, which REPLACES every categorical
-#: column above the cutoff with its CTR columns. Under `lossguide` the default
-#: is `"off"`, because a CTR is CatBoost's mechanism and `lossguide` mirrors
-#: LightGBM, which has none.
+#: `"on"`: CatBoost's own source rule, `uniqueValues > one_hot_max_size` at 2,
+#: which REPLACES every categorical column above the cutoff with its CTR
+#: columns. Under `lossguide` the default is `"off"`, because a CTR is
+#: CatBoost's mechanism and `lossguide` mirrors LightGBM, which has none.
 #:
-#: **What `"auto"` costs: the mode refuses on categorical data.**
+#: **READ THE WHOLE OF THIS BEFORE CHANGING IT.** This constant was `"on"` at
+#: 1985d92 for the length of one afternoon and was reverted at 9925705 the same
+#: day. The verification behind that commit was a categorical CLASSIFICATION
+#: fit, and **a default is not verified by the case that motivated it.** What
+#: follows is both halves: why `"auto"` was wrong, and what had to be BUILT
+#: before `"on"` could be right. Everything below the second heading is the
+#: part the reverted commit did not have.
+#:
+#: **What `"auto"` cost: the mode refused on categorical data.**
 #: `"auto"` (`SimpleCtrConfig.auto()`) gives CTR columns only to the
 #: categorical columns that OVERFLOWED their category table, which is a
 #: different question and reads a different number. A column that did not
@@ -191,37 +197,59 @@ _CATBOOST_DEPTH = 6
 #: not an optimization but the mechanism by which the tree can be grown at
 #: all.
 #:
-#: **AND `"on"` CANNOT BE THE DEFAULT TODAY, because it breaks regression.**
-#: Everything above is still true and it is not sufficient. Measured on the
-#: same day, 300 rows, eight numeric columns, NO categorical column at all:
+#: **WHY `"on"` COULD NOT BE THE DEFAULT ON THE MORNING OF 2026-08-17, and
+#: what was built before it could.** Everything above was true then and was
+#: not sufficient. On the same day, 300 rows, eight numeric columns, NO
+#: categorical column at all:
 #:
 #:     MojoTreesRegressor(grow_policy="symmetrictree")   ctr="auto"   OK
-#:     MojoTreesRegressor(grow_policy="symmetrictree")   ctr="on"     RAISES
+#:     MojoTreesRegressor(grow_policy="symmetrictree")   ctr="on"     RAISED
 #:
 #: with "ctr target borders must be given explicitly for a target with more
-#: than two distinct values: the default ctr_target_border_count is 1 and its
-#: MinEntropy selection is only a midpoint when the target is two-valued".
-#: `SimpleCtrConfig.catboost_defaults()` is not inert on a dataset with no
-#: categorical columns, so this fires on ordinary regression -- the shipped
-#: default policy on the commonest task there is.
+#: than two distinct values". There is no categorical column in that matrix.
+#: Nothing would have been built. Two separate defects, and the reverted
+#: commit had neither of them fixed:
 #:
-#: There is no way to answer it from this surface: `ctr_target_border_count`
-#: is not an estimator parameter, so a caller cannot supply the borders and
-#: neither can this constant. Multiclass and sparse refuse any non-`"off"`
-#: rule too, but those refuse under `"auto"` as well and are therefore not
-#: this change's doing.
+#: **(a) the bundle was not inert with nothing to replace.**
+#: `trainset._build_ctr` resolved and validated the target borders -- three
+#: steps that raise -- before it asked which columns earned CTRs. But that
+#: question is `ctr_source_features`, and it reads the source rule, the
+#: one-hot cutoff and the level counts and NOTHING about the target. It is
+#: asked first now, and a bundle with no source column returns having read the
+#: label not at all.
 #:
-#: So the default is `"auto"` and CatBoost mode does not yet mirror
-#: CatBoost's categorical handling. What must be BUILT, and it is a real
-#: build rather than a decision: `ctr_target_border_count` reachable from the
-#: estimator, or derived in CatBoost mode from the target the way CatBoost
-#: derives it. Until then `ctr="on"` is opt-in, it works, and the two
-#: refusals it clears stay named.
+#: **(b) the target quantization refused every continuous target.** It
+#: implemented one shape, a label with exactly two distinct values.
+#: CatBoost has no such precondition anywhere: `BuildTargetClassifier`
+#: (`target_classifier.cpp:39-118`, v1.2.10) sends every non-multiclass loss
+#: to `SelectBorders`, which runs the ordinary border selector -- MinEntropy
+#: at one border, `cat_feature_options.cpp:162` -- over the raw target.
+#: `ctr_columns.select_target_borders` is that port, and
+#: `ctr_target_border_count` / `ctr_target_border_type` are estimator
+#: parameters now, which is the "no way to answer it from this surface" the
+#: reverted commit's note complained about. Catalog A40 has the derivation.
 #:
-#: This constant was `"on"` at 1985d92 for the length of one afternoon. The
-#: verification behind that commit was a categorical CLASSIFICATION fit, and
-#: a default is not verified by the case that motivated it.
-_CATBOOST_CTR = "auto"
+#: **The bar this default was held to, and every line of it must keep
+#: passing.** `python/tests/test_catboost_mode_categorical.py` is that bar and
+#: it is not decoration:
+#:
+#:     MojoTreesRegressor(grow_policy='symmetrictree'), nothing else set
+#:     the same with ctr='on', numeric columns only
+#:     the same with ctr='on' and a categorical column, continuous target
+#:     MojoTreesClassifier(...) categorical + random_strength=1.0
+#:     lossguide, both classification and regression, untouched
+#:
+#: A test that pins a defect must not outlive it, and a default that moves
+#: without the four positive fits above is the same mistake a second time.
+#:
+#: **What is still NOT the mirror.** `ctr="auto"` declines a target with more
+#: than two distinct values, and that is now a POLICY rather than a capability
+#: -- the derivation would succeed. `auto` is `lossguide`'s rule, where the
+#: standing rule is to mirror LightGBM and LightGBM has no CTR at all, and its
+#: one published measurement was taken with it declining exactly there.
+#: Widening it moves bits on a shipped default and takes the real-data gate.
+#: See `ctr_columns.can_derive_target_borders`.
+_CATBOOST_CTR = "on"
 
 #: `ctr` spellings the estimator accepts and the rule name each resolves to.
 #:
@@ -651,11 +679,16 @@ class _Base(_ParamsMixin):
     `one_hot_max_size`, this estimator's `max_cat_to_onehot` under CatBoost's
     spelling, so the CTR fork and the one-hot fork read the same number.
 
-    **The default is the mode's.** `'auto'` under
+    **The default is the mode's.** `'on'` under
     `grow_policy='symmetrictree'`, because a CTR is how CatBoost handles a
-    categorical column at all; `'off'` under `lossguide` and `depthwise`,
-    because those mirror LightGBM and LightGBM has no CTR. `ctr='off'` is
-    what every fit made before this parameter existed did, on either policy.
+    categorical column at all -- and, more sharply, because under `'auto'` a
+    categorical column that did not overflow its category table stays
+    searchable and the symmetric grower then refuses the fit outright.
+    `'off'` under `lossguide` and `depthwise`, because those mirror LightGBM
+    and LightGBM has no CTR. `ctr='off'` is what every fit made before this
+    parameter existed did, on either policy. See `_CATBOOST_CTR` for the two
+    defects that had to be built out before `'on'` could be the default, and
+    for the bar it is held to.
 
     It is honored by the dense single-output `fit` and refused by name
     everywhere else: the bundle is a property of the BINNING, so it is
@@ -665,6 +698,29 @@ class _Base(_ParamsMixin):
     it. The other door onto the same mechanism is unchanged:
     `Dataset(params={"ctr": ...})`, whose spellings this parameter resolves
     onto.
+
+    `ctr_target_border_count` and `ctr_target_border_type` are CatBoost's
+    `target_binarization` pair, which decides how the TARGET is quantized
+    before a statistic of it is taken: `TBinarizationOptions(
+    EBorderSelectionType::MinEntropy, 1)` at
+    `cat_feature_options.cpp:162`, so one border chosen by MinEntropy over
+    the actual target values. Left unset they are exactly that, which is
+    CatBoost's default on every loss it supports, and a caller who wants a
+    finer target quantization names the count. `ctr_target_border_type`
+    takes `'minentropy'` (the default) or `'multiclass'`, the latter being
+    `GetMultiClassBorders` -- `0.5, 1.5, ...` between consecutive class
+    codes, reading no target value -- which is the arm CatBoost takes for
+    `MultiClass`. It is reachable by name and is **not** selected
+    automatically from the objective: a `Dataset` is built before a loss is
+    chosen and cannot see one, and picking it here would be a behavior
+    change on a path this could not measure. See
+    `docs/design/CATBOOST_CATALOG.md` A40.
+
+    A count above 1 is served exactly only where the target has at most
+    `count + 1` distinct values, which is the case CatBoost's own DP answers
+    without running its main loop. Above that it refuses by name and points
+    at the unported exact dynamic program; pass borders through the
+    `Dataset` door if you need them.
 
     **Not wired, and refused by name with the missing piece.**
     `max_ctr_complexity` above 1: the projection enumeration exists
@@ -950,6 +1006,16 @@ class _Base(_ParamsMixin):
         # `lossguide` mirrors LightGBM, which has none.
         ctr=None,
         max_ctr_complexity=None,
+        # CatBoost's `target_binarization` pair, catalog A40. `None` means
+        # CatBoost's own defaults, `MinEntropy` and 1
+        # (`cat_feature_options.cpp:162`). They are separate keywords rather
+        # than a tuple because CatBoost spells them as two options and
+        # `ctr_target_border_count` is the one a caller reaches for; the type
+        # exists so the multiclass arm of `BuildTargetClassifier` is
+        # REACHABLE, which is the specific thing whose absence made the
+        # earlier refusal unanswerable from this surface.
+        ctr_target_border_count=None,
+        ctr_target_border_type=None,
         device="cpu",
         device_type=None,
         task_type=None,
@@ -1089,6 +1155,8 @@ class _Base(_ParamsMixin):
         self.derivative_precision = derivative_precision
         self.ctr = ctr
         self.max_ctr_complexity = max_ctr_complexity
+        self.ctr_target_border_count = ctr_target_border_count
+        self.ctr_target_border_type = ctr_target_border_type
         self.device = device
         self.device_type = device_type
         self.task_type = task_type
@@ -2330,6 +2398,54 @@ class _Base(_ParamsMixin):
             )
         return rule
 
+    def _resolve_ctr_target_binarization(self):
+        """CatBoost's `target_binarization` pair, as the two keys a fit sends.
+
+        `(count, type_name)`, both already validated. Unset means CatBoost's
+        own default, `MinEntropy` and 1 (`cat_feature_options.cpp:162`), and
+        this returns that rather than `None` so the native door reads one shape
+        whichever way the caller went.
+
+        The type is checked HERE and again in `_parse_ctr`, on purpose: this
+        one gives a `ValueError` naming the estimator keyword, which is what an
+        sklearn caller can act on, and the native one is the door the `Dataset`
+        surface comes in through and cannot rely on this having run.
+        """
+        count = self.ctr_target_border_count
+        if count is None:
+            count = 1
+        else:
+            # `bool` is an `int` in Python and `ctr_target_border_count=True`
+            # would silently mean 1. It is a count, so it is refused.
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise ValueError(
+                    "ctr_target_border_count must be a positive integer; got "
+                    f"{self.ctr_target_border_count!r}"
+                )
+            if count < 1:
+                raise ValueError(
+                    "ctr_target_border_count must be positive: CatBoost's "
+                    "default is 1 and 0 is its 'build no target classifier' "
+                    "case, which is spelled ctr='off' here; got "
+                    f"{self.ctr_target_border_count!r}"
+                )
+        name = self.ctr_target_border_type
+        if name is None:
+            name = "minentropy"
+        else:
+            if not isinstance(name, str):
+                raise ValueError(
+                    "ctr_target_border_type must be 'minentropy' or "
+                    f"'multiclass'; got {self.ctr_target_border_type!r}"
+                )
+            name = name.strip().lower().replace("_", "")
+            if name not in ("minentropy", "multiclass"):
+                raise ValueError(
+                    "ctr_target_border_type must be 'minentropy' or "
+                    f"'multiclass'; got {self.ctr_target_border_type!r}"
+                )
+        return count, name
+
     def _auto_learning_rate_knobs(self, grow_policy, boosting):
         """The four `auto_learning_rate_*` keys a fit goes out with.
 
@@ -2826,6 +2942,10 @@ class _Base(_ParamsMixin):
         # rule REQUESTED and not the columns built: `'auto'` plans nothing on
         # a dataset whose categorical columns all fit their tables.
         self.ctr_ = ctr_rule
+        (
+            ctr_target_border_count,
+            ctr_target_border_type,
+        ) = self._resolve_ctr_target_binarization()
         if int(max_cat_to_onehot) < 0:
             raise ValueError("max_cat_to_onehot must be nonnegative")
         if int(self.max_cat_threshold) < 1:
@@ -3075,6 +3195,14 @@ class _Base(_ParamsMixin):
             # policy but `symmetrictree`, and `"off"` is what every fit made
             # before this key existed did.
             "ctr": ctr_rule,
+            # CatBoost's `target_binarization` pair (catalog A40), sent on
+            # every fit whether or not a CTR is on: `_parse_ctr` reads them
+            # only on a non-`off` rule, so an off bundle pays two dict entries
+            # and nothing else, and a caller who typed neither sends CatBoost's
+            # own defaults rather than an absence the native side has to guess
+            # at.
+            "ctr_target_border_count": int(ctr_target_border_count),
+            "ctr_target_border_type": str(ctr_target_border_type),
             # CatBoost's `one_hot_max_size`, which is already this
             # estimator's `max_cat_to_onehot` under its CatBoost spelling
             # (the alias is resolved above). It is CatBoost's own fork
