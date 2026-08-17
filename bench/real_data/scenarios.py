@@ -3934,7 +3934,12 @@ def catboost_live_resolved(spec, catboost_readback):
 
 
 def mojotrees_catboost_mode_resolved(
-    spec, device="cpu", extra=None, catboost_readback=None
+    spec,
+    device="cpu",
+    extra=None,
+    catboost_readback=None,
+    arm_params=None,
+    arm_dataset_params=None,
 ):
     """The CatBoost-mode arm's resolved configuration, across both containers.
 
@@ -3945,23 +3950,81 @@ def mojotrees_catboost_mode_resolved(
     RAN, and a parity check that saw only the first would report `max_bin` and
     the tree budget as unmatched when they are matched.
 
-    **This mirrors the adapter and is therefore a coupling.** If
-    `_run_dense` stops adding `n_estimators`, or starts adding something else,
-    this function is stale and the parity table quietly checks the wrong dict.
-    There is no way to assert against a call site from here; the mitigation is
-    that both places name each other.
+    `arm_params` and `arm_dataset_params` are the frontier arm's overrides,
+    the same two dicts `engines.MojoTreesEngine` carries under those names.
+    They are applied here in the same ORDER the adapter applies them --
+    `_n_estimators` reads `arm_params`, `_dataset_params` layers
+    `arm_dataset_params` over `dataset_params(spec)` -- because the resolved
+    dict has to be what the fit ran and not what the base would have run.
+
+    **This mirrors the adapter and is therefore a coupling, and the coupling
+    has already broken once.** This docstring used to say that if `_run_dense`
+    stopped adding `n_estimators` this function would go stale and the parity
+    table would quietly check the wrong dict. That is exactly what happened
+    when the arm dimension landed: `_run_dense` moved to `self._n_estimators()`
+    and applied `arm_dataset_params`, and this function went on reading
+    `BASE_PARAMS["n_estimators"]` and the base binning. Every frontier arm on
+    the trees axis or the max_bin axis would have had its parity table checked
+    against a configuration no fit used.
+
+    The mitigation is no longer "both places name each other", because that is
+    what was in place and it did not hold. `catboost_parity_rows` now asserts
+    the tree count in this dict against the count the adapter would resolve
+    from the same arm; see `_check_resolved_matches_adapter`.
     """
     resolved = dict(
         mojotrees_catboost_mode_params(
             spec, device, extra, catboost_readback=catboost_readback
         )
     )
-    resolved["n_estimators"] = int(BASE_PARAMS["n_estimators"])
-    resolved.update(dataset_params(spec))
+    arm_params = dict(arm_params or {})
+    resolved["n_estimators"] = int(
+        arm_params.get("n_estimators", BASE_PARAMS["n_estimators"])
+    )
+    binning = dict(dataset_params(spec))
+    binning.update(dict(arm_dataset_params or {}))
+    resolved.update(binning)
     return resolved
 
 
-def catboost_parity_rows(spec, device="cpu", extra=None, catboost_readback=None):
+def _check_resolved_matches_adapter(resolved, arm_params):
+    """Raise when the parity dict's tree count is not the adapter's.
+
+    The check that would have caught the break described in
+    `mojotrees_catboost_mode_resolved`. It recomputes the count the way
+    `engines.MojoTreesEngine._n_estimators` does -- the arm's value, else
+    `BASE_PARAMS` -- and compares. It deliberately does NOT import `engines`:
+    this module is imported by `engines`, and the point is to state the rule
+    in one line that a reader can check against the other file, not to build
+    a cycle for the sake of an assertion.
+
+    It is a hard failure rather than a row, because a parity table that
+    describes a configuration nothing ran is not a table with one bad row in
+    it -- every row in it is about the wrong fit.
+    """
+    expected = int(
+        dict(arm_params or {}).get(
+            "n_estimators", BASE_PARAMS["n_estimators"]
+        )
+    )
+    got = int(resolved.get("n_estimators", -1))
+    if got != expected:
+        raise ValueError(
+            "the CatBoost-mode parity table resolved n_estimators=%d and the "
+            "adapter would run %d; a parity table for a configuration no fit "
+            "used is worse than no table (engines.MojoTreesEngine."
+            "_n_estimators is the other half of this rule)" % (got, expected)
+        )
+
+
+def catboost_parity_rows(
+    spec,
+    device="cpu",
+    extra=None,
+    catboost_readback=None,
+    arm_params=None,
+    arm_dataset_params=None,
+):
     """The key-by-key diff between the two resolved dicts, as a list of rows.
 
     One row per key CatBoost resolves, in `CATBOOST_PARAM_MAP` order, each
@@ -3986,7 +4049,12 @@ def catboost_parity_rows(spec, device="cpu", extra=None, catboost_readback=None)
     declared = catboost_resolved_declared(spec, None, extra, live)
     try:
         ours = mojotrees_catboost_mode_resolved(
-            spec, device, extra, catboost_readback=catboost_readback
+            spec,
+            device,
+            extra,
+            catboost_readback=catboost_readback,
+            arm_params=arm_params,
+            arm_dataset_params=arm_dataset_params,
         )
         ours_error = None
     except CatBoostReadbackMissing as exc:
@@ -3995,9 +4063,18 @@ def catboost_parity_rows(spec, device="cpu", extra=None, catboost_readback=None)
         # value on both sides and is checkable here. The one that is not says
         # so in its own row rather than taking the table down with it.
         ours = mojotrees_catboost_mode_resolved(
-            spec, device, extra, catboost_readback=_READBACK_STANDIN(spec)
+            spec,
+            device,
+            extra,
+            catboost_readback=_READBACK_STANDIN(spec),
+            arm_params=arm_params,
+            arm_dataset_params=arm_dataset_params,
         )
         ours_error = str(exc)
+    # Before any row is built, because a table about the wrong configuration
+    # has no good rows in it. Runs on the stand-in path too: the stand-in
+    # replaces the learning rate, not the tree count.
+    _check_resolved_matches_adapter(ours, arm_params)
 
     rows = []
     missing = object()
