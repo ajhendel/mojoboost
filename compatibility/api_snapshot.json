@@ -2197,6 +2197,8 @@
       "colsample_bynode": null,
       "colsample_bytree": null,
       "ctr": null,
+      "ctr_target_border_count": null,
+      "ctr_target_border_type": null,
       "depth": null,
       "derivative_precision": null,
       "device": "cpu",
