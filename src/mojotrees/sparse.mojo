@@ -58,9 +58,11 @@ check with its findings returned instead of discarded.
 from std.math import isnan
 
 from .binning import (
+    BIN_SEARCH_LANES,
     DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT,
     DEFAULT_DATA_RANDOM_SEED,
     DEFAULT_MIN_DATA_IN_BIN,
+    POSITIVE_INF,
     BinMapper,
     BinnedMatrix,
     _sized_missing_bins,
@@ -1068,7 +1070,9 @@ def transform_csc(
     densified matrix, because an absent entry bins exactly as the stored
     value 0.0 would. Categorical features route through the mapper's category
     tables and stored `NaN` through the reserved missing bin, both exactly as
-    the dense transform does.
+    the dense transform does -- and now by the same code shape as well, the
+    padded lockstep descent of `BIN_SEARCH_LANES`, so the two sides of that
+    identity claim can no longer drift apart by one of them being rewritten.
     """
     csc.validate()
     if csc.n_features != mapper.n_features:
@@ -1078,13 +1082,50 @@ def transform_csc(
     var bins = List[UInt8](capacity=nnz)
     bins.resize(nnz, 0)
 
+    # The same per-feature search table `BinMapper.transform` builds, for the
+    # same reason and by the same arithmetic: each numerical feature's edges
+    # padded up to a power of two with `+inf` sentinels, so a value's bin is a
+    # fixed, branch-free descent rather than a data-dependent loop. A sentinel
+    # never counts (`+inf < v` is false for every `v`, `+inf` included), so
+    # padding cannot move a bin, and `BinMapper.bin_value` keeps the plain
+    # search as the reference both descents are compared against.
+    #
+    # Built here rather than shared with `binning.mojo` because `BinMapper`
+    # does not carry the table as a field; the dense transform builds its own
+    # local copy in the same way. A shared builder belongs in `binning.mojo`
+    # beside `POSITIVE_INF` and is named in this lane's report; duplicating
+    # fifteen lines was preferred to reaching into a file this lane does not
+    # own. The two constants are imported rather than respelled so that the
+    # lane width and the sentinel cannot drift apart.
+    var pad = List[Float64](capacity=mapper.n_features * mapper.n_bins)
+    var pad_offsets = List[Int](capacity=mapper.n_features + 1)
+    var pad_half = List[Int](capacity=mapper.n_features)
+    pad_offsets.append(0)
+    for f in range(mapper.n_features):
+        var elo = mapper.edge_offsets[f]
+        var k = mapper.edge_offsets[f + 1] - elo
+        # Smallest power of two strictly greater than k, so the descent's
+        # largest reachable answer (k) is representable and a feature with no
+        # edges still gets one sentinel to point at.
+        var m = 1
+        while m <= k:
+            m += m
+        for i in range(k):
+            pad.append(mapper.edges[elo + i])
+        for _ in range(k, m):
+            pad.append(POSITIVE_INF)
+        pad_offsets.append(len(pad))
+        pad_half.append(m >> 1)
+
     var bins_p = bins.unsafe_ptr()
     var val_p = csc.values.unsafe_ptr()
     var off_p = csc.col_offsets.unsafe_ptr()
-    var edges_p = mapper.edges.unsafe_ptr()
-    var edge_offs_p = mapper.edge_offsets.unsafe_ptr()
+    var pad_p = pad.unsafe_ptr()
+    var poff_p = pad_offsets.unsafe_ptr()
+    var half_p = pad_half.unsafe_ptr()
     var miss_p = mapper.missing_bin.unsafe_ptr()
     ref cats = mapper.cats
+    comptime R = BIN_SEARCH_LANES
 
     def do_feature(f: Int) {imm}:
         var lo = off_p.unsafe_load(f)
@@ -1095,28 +1136,93 @@ def transform_csc(
                     i, UInt8(cats.bin_of(f, val_p.unsafe_load(i)))
                 )
             return
-        var elo = edge_offs_p.unsafe_load(f)
-        var ehi = edge_offs_p.unsafe_load(f + 1)
+        var pbase = poff_p.unsafe_load(f)
+        var half = half_p.unsafe_load(f)
         var mb = miss_p.unsafe_load(f)
-        for i in range(lo, hi):
-            var v = val_p.unsafe_load(i)
-            # NaN is routed before any comparison, so it never takes part in
-            # the quantile search (see `BinMapper.bin_value`).
-            if isnan(v):
-                if mb >= 0:
-                    bins_p.unsafe_store(i, UInt8(mb))
-                    continue
-                v = 0.0
-            var left = elo
-            var right = ehi
-            while left < right:
-                var mid = (left + right) // 2
-                if v <= edges_p.unsafe_load(mid):
-                    right = mid
-                else:
-                    left = mid + 1
-            bins_p.unsafe_store(i, UInt8(left - elo))
 
+        # THE BIN A STORED NaN TAKES, resolved once per column instead of once
+        # per entry. It is what lets the entry loop run in lockstep: the shape
+        # this replaces branched on `isnan` *before* the descent and left it by
+        # `continue`, so interleaved entries would have exited at different
+        # steps and there would have been no lockstep to run.
+        #
+        # `mb >= 0` gives the reserved missing bin. `mb < 0` means no bin was
+        # reserved, and LightGBM then bins a NaN as if it were `0.0`
+        # (`BinMapper.bin_value`, and the missing_type None rule it cites),
+        # which is the descent's answer for a constant and so does not depend
+        # on the entry. Either way a NaN's bin is a per-column constant.
+        #
+        # And the descent is safe to run on a NaN, which is the identity this
+        # rests on. Every IEEE comparison against NaN is false, so
+        # `border < NaN` is false at every step, `go` is never taken, `pos`
+        # stays 0, and the search reads in range and takes exactly the same
+        # number of steps as any other value. Its answer is then discarded by
+        # the select below.
+        var nan_bin = mb
+        if nan_bin < 0:
+            var p0 = 0
+            var s0 = half
+            while s0 > 0:
+                var n0 = p0 + s0
+                var g0 = pad_p.unsafe_load(pbase + n0 - 1) < 0.0
+                p0 = n0 if g0 else p0
+                s0 = s0 >> 1
+            nan_bin = p0
+
+        # Count the edges strictly below `v`, which is the bin the plain
+        # search arrived at: it stopped at the first edge with `v <= edge`,
+        # and the edges are strictly increasing.
+        #
+        # `BIN_SEARCH_LANES` stored entries at a time. A column's entries are
+        # contiguous in `csc.values` and their bins are contiguous in `bins`,
+        # exactly as a dense column's rows are, so the interleave carries over
+        # unchanged. The lanes share nothing: each has its own `pos`, reads
+        # only its own value, and writes only its own cell. `step` is shared
+        # because the trip count is `log2` of the padded table size, a
+        # property of the feature and not of the data.
+        #
+        # BIT-IDENTITY. Lane `k` executes, in order, the same comparisons
+        # against the same borders with the same value the plain loop executed
+        # for that entry, and arrives at `pos` by the same selects. No float
+        # arithmetic exists here to reassociate: the only float operation is a
+        # comparison, and a comparison is exact. So every bin byte is the byte
+        # the plain loop wrote, and `transform_csc`'s standing claim of
+        # bin-for-bin agreement with `BinMapper.transform` holds against the
+        # dense side's matching descent rather than merely alongside it. The
+        # tail below is the scalar form of the same descent.
+        var i = lo
+        var vec_end = hi - R + 1
+        while i < vec_end:
+            var v = val_p.unsafe_load[width=R, alignment=8](i)
+            var pos = SIMD[DType.int, R](0)
+            var step = half
+            while step > 0:
+                comptime for k in range(R):
+                    var cur = Int(pos[k])
+                    var nxt = cur + step
+                    var go = pad_p.unsafe_load(pbase + nxt - 1) < v[k]
+                    pos[k] = nxt if go else cur
+                step = step >> 1
+            comptime for k in range(R):
+                var b = nan_bin if isnan(v[k]) else Int(pos[k])
+                bins_p.unsafe_store(i + k, UInt8(b))
+            i += R
+        while i < hi:
+            var v = val_p.unsafe_load(i)
+            var pos = 0
+            var step = half
+            while step > 0:
+                var nxt = pos + step
+                var go = pad_p.unsafe_load(pbase + nxt - 1) < v
+                pos = nxt if go else pos
+                step = step >> 1
+            var b = nan_bin if isnan(v) else pos
+            bins_p.unsafe_store(i, UInt8(b))
+            i += 1
+
+    # Unchanged by the interleave: the same compares are done, just
+    # `BIN_SEARCH_LANES` entries' worth at a time, so the same work threshold
+    # picks the same schedule it picked before.
     dispatch_features(do_feature, csc.n_features, nnz + csc.n_features)
 
     return SparseBinnedMatrix(

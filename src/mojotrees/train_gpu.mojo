@@ -1967,6 +1967,21 @@ struct GpuSplitSearcherCache(Movable):
     var max_records: Int
     var signs: List[Int]
     var signs_staged: Bool
+    var staged_features: List[Int]
+    var records_clean: Bool
+    """Whether every record slot still holds the broadcast this cache last
+    made, so that a repeat of the same broadcast would write the words that
+    are already there.
+
+    False whenever anything else may have written a record's feature slots or
+    allow mask since. The only writers in the package are
+    `GpuSplitSearcher.set_features`, `set_allowed` and
+    `enqueue_frontier` (which calls both, per record); the per-node ones are
+    reached from `_search_leaf_device` and the frontier one from
+    `_enqueue_resident_split`, both of which serve growers other than the
+    device-owned plane. `mark_records_dirty` is how those routes say so, and
+    it is called at the route rather than at the writer because the writers
+    take a searcher and have no cache to tell."""
 
     def __init__(out self):
         """An empty cache. The first tree builds the searcher."""
@@ -1976,6 +1991,8 @@ struct GpuSplitSearcherCache(Movable):
         self.max_records = 0
         self.signs = List[Int]()
         self.signs_staged = False
+        self.staged_features = List[Int]()
+        self.records_clean = False
 
     def _same_signs(self, signs: List[Int]) -> Bool:
         if not self.signs_staged or len(self.signs) != len(signs):
@@ -1984,6 +2001,24 @@ struct GpuSplitSearcherCache(Movable):
             if self.signs[f] != signs[f]:
                 return False
         return True
+
+    def _same_staged_features(self, features: List[Int]) -> Bool:
+        """Whether the broadcast this cache last made is still on every record
+        and is the one this tree wants."""
+        if not self.records_clean:
+            return False
+        if len(self.staged_features) != len(features):
+            return False
+        for i in range(len(features)):
+            if self.staged_features[i] != features[i]:
+                return False
+        return True
+
+    def mark_records_dirty(mut self):
+        """Say that a grower is about to write record slots itself, so the
+        next `reset_for_tree` rebroadcasts rather than trusting what is
+        staged. Host bookkeeping over one Bool; it enqueues nothing."""
+        self.records_clean = False
 
     def reset_for_tree(
         mut self,
@@ -2024,11 +2059,55 @@ struct GpuSplitSearcherCache(Movable):
             self.n_bins = builder.n_bins
             self.max_records = want_records
             self.signs_staged = False
+            self.records_clean = False
         if not self._same_signs(signs):
             self.searchers[0].set_monotone(signs)
             self.signs = signs.copy()
             self.signs_staged = True
-        self.searchers[0].set_features(tree_features)
+        # ---- the record broadcast, and the arm that skips a repeat of it ----
+        #
+        # `GpuSplitSearcher.set_features(features)` with no record writes every
+        # one of `max_records` record slots twice: `_stage_features` stores
+        # `n_features` Int32 feature ids and `_stage_allowed` stores
+        # `n_features` Int32 allow flags, and the second one allocates an empty
+        # `List[Bool]` per record to say "everything". At the default budget on
+        # a 90-feature dataset that is 33 records x 90 x 2 stores plus 33 list
+        # allocations per tree, and at `feature_fraction = 1.0` -- every
+        # LightGBM-mode fit -- every one of those words is the word that is
+        # already there, because the feature set does not move between the
+        # trees of one fit.
+        #
+        # **Bit-identical when it engages, and the argument is about writers
+        # rather than about values.** Skipping a write is only sound if nothing
+        # else wrote the same words since. `records_clean` is that claim and
+        # `mark_records_dirty` is what withdraws it: the three growers that
+        # stage records themselves (`_device_search_resident` and
+        # `_device_search_incremental` through `_search_leaf_device`, and the
+        # oblivious level schedule) mark the cache before they run, so a tree
+        # after one of them rebroadcasts. The device-owned leaf-wise plane does
+        # not mark, and does not need to: its one `enqueue_frontier` call
+        # carries a single node with an EMPTY feature list, which
+        # `enqueue_frontier` reads as "leave this record on the broadcast", and
+        # it restages record 0's allow mask to the same all-allowed state the
+        # broadcast leaves.
+        #
+        # **Off by default and it is meant to stay that way unless a
+        # measurement moves it.** This is host bookkeeping in a loop whose cost
+        # is elsewhere: the estimate is a few milliseconds per fit against a
+        # control plane that spends over a second, which M0 cannot resolve. It
+        # is switched rather than shipped because the failure mode if the
+        # writer list above is ever wrong is not a slow fit, it is a tree
+        # searched over another tree's feature set with nothing to announce it,
+        # and that asymmetry is not worth three milliseconds. It is also a
+        # useful probe in its own right: if turning it on moves nothing, host
+        # bookkeeping is not where this loop's host seconds are.
+        if not (
+            getenv("MOJOTREES_GPU_SEARCH_RESTAGE_HOIST") == "1"
+            and self._same_staged_features(tree_features)
+        ):
+            self.searchers[0].set_features(tree_features)
+            self.staged_features = tree_features.copy()
+            self.records_clean = True
         # The other half of the 2026-08-17 Cosine fix. `set_score_function`
         # had NO production caller anywhere in the package, only one test, so
         # `score_function_code` stayed at its constructed `SCORE_L2` and every
@@ -2302,6 +2381,11 @@ def _grow_tree_gpu_device_search(
         # cross-check is equally unavailable here. See
         # `_check_verify_rows_reachable`.
         _check_verify_rows_reachable()
+        # The level schedule stages its own level records
+        # (`gpu_tree_tables._stage_level_search_kernel` and the searcher calls
+        # around it), so the next tree's `reset_for_tree` must rebroadcast
+        # rather than trust what is staged. See `records_clean`.
+        cache.mark_records_dirty()
         profile.begin_tree(n_root, builder.n_rows)
         var oblivious_started = profile.clock()
         var symmetric = grow_tree_device_oblivious(
@@ -2547,6 +2631,10 @@ def _grow_tree_gpu_device_search(
                 if why == RESIDENT_TABLES:
                     detail = resident_round_refusal_detail(params)
                 resident_round_report_refusal(detail)
+        # Stages a feature set and an allow mask per record through
+        # `enqueue_frontier`, so the broadcast this cache made is no longer
+        # what every record holds. See `records_clean`.
+        cache.mark_records_dirty()
         return _device_search_resident(
             profile,
             builder,
@@ -2564,6 +2652,10 @@ def _grow_tree_gpu_device_search(
     # this path reports an empty table rather than a wrong one, which is the
     # honest failure; wiring it is a small job and was left undone rather than
     # half done.
+    # `_search_leaf_device` calls `set_features` and `set_allowed` per node, so
+    # the broadcast this cache made is gone by the end of the tree. See
+    # `records_clean`.
+    cache.mark_records_dirty()
     return _device_search_incremental(
         builder,
         cache.searchers[0],

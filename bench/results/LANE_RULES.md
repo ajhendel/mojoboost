@@ -90,9 +90,23 @@ after this rule set was audited against what it actually produced. Rule 2 says
 a trade is A/B'd in the window "before it becomes a default", and nothing in
 this document ever made that second half happen, so the tree accumulated
 measured, proven wins that shipped to nobody. On the day this rule was written
-the library carried a 4.5 percent scan rewrite, an exact-integer sibling
-subtraction worth 1.78x, a skipped last-level build and a hoisted noise copy,
-all measured, all bit-identical, all default off.
+the library carried a 4.5 percent scan rewrite (20.40 s narrow against 19.49 s
+wide, quiet box, ranges fully disjoint), an exact-integer sibling subtraction
+worth **1.58x to 1.78x** (22.76 s to 14.39 s on a loaded three-cycle
+interleaved round robin, and 21.97 s to 12.34 s in an earlier window nobody
+wrote down), and a skipped last-level build worth 1.26x (22.76 s to 18.06 s,
+that same loaded round robin). All three at 799,110 rows x 100 features x 100
+trees, symmetric depth 6, on one M4, all bit-identical, all default off.
+
+**A hoisted noise copy sat beside those three and this paragraph used to count
+it as a fourth measured win. It is not one.** Nothing under `bench/results/` or
+`bench/real_data/results/` measures that arm, no commit message mentions it, and
+the only witness is a chat brief that is not a file, so its measurement is OWED
+rather than taken. Until 2026-08-17 evening this paragraph also printed "1.78x"
+alone for the subtraction, which is one end of a two-window range quoted as
+though it were the result. `bench/results/FIGURE_PROVENANCE.md` carries the
+pairs and the windows, and rule 10 below exists because of exactly this
+paragraph.
 
 So: **when an A/B resolves faster and identity holds, the default flips in the
 same session as the measurement.** The switch then inverts, surviving one round
@@ -327,6 +341,95 @@ optimizations. Accepting a loss because we happened to be ahead of a competitor
 is the failure the old peer-anchored rule permitted, which is why rule 3 anchors
 on our own recorded absolute value instead. The exchange rate exists so that
 neither of those is a judgment call made fresh each time.
+
+**10. A SPEED FIGURE TRAVELS WITH ITS RUN, OR IT DOES NOT TRAVEL.** Added
+2026-08-17, after three lanes independently flagged the same three figures and a
+forensic pass found that **not one of them was wrong**. That is what makes this
+rule necessary rather than pedantic. If the numbers had been miscopied the fix
+would be arithmetic. They were all correct, they still could not be reconciled,
+and the reason is that a ratio had been separated from the pair of times it was
+computed from.
+
+Here is what one day produced. Four absolute baselines for ONE shape, 799,110
+rows x 100 features x 100 trees, symmetric depth 6, on one M4. **17.07 s** from
+the filed run `20260817T110847Z-dense1mfixed`, **20.4 s** from a quiet box,
+**21.97 s** from a window nobody wrote down, and **22.76 s** from a loaded
+three-cycle interleaved round robin. Every published ratio was exact against one
+of those four and no site said which. So 1.78x and 1.58x for one arm, 2.08x and
+2.20x for one combination, twenty-five citation sites, zero arithmetic errors,
+and nothing checkable by anybody. **Two correct figures looked like a
+contradiction for a whole day because nobody wrote down which box they came
+from.** On a machine that `PROFILE_PROTOCOL.md` A3 records as drifting two- to
+threefold between windows, a ratio without its baseline is not a weak result, it
+is not a result at all.
+
+So:
+
+1. **The quotable unit is a RUN, not a ratio.** A speed figure may be published
+   only with a **run id** that resolves to a directory under `bench/results/` or
+   `bench/real_data/results/`, a **shape** (rows x features x trees, growth
+   policy, max depth), an **arm set** with every switch that was set resolved to
+   its value, **both absolute times**, the **M0 verdict**, and the **regime
+   label** A3 requires. Six fields. A figure missing any of them is ASSERTED
+   under rule 6 and is an open item under rule 4, however carefully it was
+   measured.
+
+2. **Stop transcribing. The generator emits the table and the documents cite the
+   run.** `bench/bench_train_gpu.mojo` already prints a `json_summary` record
+   carrying `arm`, `baseline`, `speedup_x`, `delta_pct`, `noise_floor_pct`,
+   `verdict`, `n_rows`, `n_features`, `n_trees`, `objective`, `seed` and
+   `repeats` plus every arm's samples in the order they ran, and
+   `MOJOTREES_BENCH_JSON=<path>` files it. **Every timing run sets that variable
+   before it starts**, to a path under `bench/results/<run-id>/`. A prose site
+   then cites the run id and quotes at most one number from it. All four figures
+   this rule was written about were taken with that sink available and not one of
+   them used it, which is the entire distance between a reconciliation lane and a
+   `grep`. **A rule that asks a human to remember is weaker than one that points
+   at a mechanism which already exists**, and this one already exists.
+
+3. **A chat brief is not an artifact.** Eight documents cite "the 2026-08-17 lane
+   brief" and there is no such file in this repository. A brief is how a lane
+   receives work, not how the tree records a result. **If the only witness to a
+   number is a conversation, the number is unfiled.** Cite the path or downgrade
+   the claim.
+
+4. **A commit message is write-once, so it is the last place a figure may go and
+   never the first.** `abbbf98` published 1.58x and 20.4 s to 9.8 s, the
+   documents published 1.78x and 22.76 s to 10.36 s, both are correct, and the
+   commit can never be edited to say so. Quote a figure in a message only after
+   it exists under `bench/results/`, and put the run id beside it so the message
+   stays checkable after the prose moves on. `bench_train_gpu._arm_conditions`
+   already records that this project has discarded "a pair of figures whose
+   conditions were written down only in a commit message". It has now done it
+   twice.
+
+5. **Copy the conditions line, not the number.** The worst site found was not a
+   wrong figure, it was a right figure wearing another run's clothes. 2.08x came
+   from a quiet-box 20.4 s to 9.8 s pair and is described in two places as
+   "interleaved round-robin", which is the OTHER pair. A number with a borrowed
+   provenance passes every inspection and cannot be checked by anybody, which is
+   the same pathology rule 5a names when it says a flip correct in the code and
+   wrong everywhere a reader looks is worse than being wrong in both.
+
+6. **Until a run resolves it, publish the RANGE and say why.** A3 already says to
+   report both numbers and refuse to pick one where the effect size differs by
+   regime. Rule 10 adds the enforcement. **"1.58x to 1.78x, two windows, one of
+   them unlabeled" is publishable and "1.78x" is not.** Picking the flattering
+   end of an unresolved range is not optimism, it is an unfiled claim with a
+   decimal point on it.
+
+One correction found while writing this rule, kept here rather than tidied away,
+because it is this rule failing on its own first draft. That draft attributed the
+17.07 s baseline to "the 2026-08-16 comparison run". It is not from that run. It
+is the median of the five `mojotrees_catboost_mode` gpu repeats in
+`20260817T110847Z-dense1mfixed`, taken 2026-08-17, and the 2026-08-16 large-tier
+run carries no symmetric arm at all. **A citation with no run id gets its own
+provenance wrong even when the number is right**, which is this rule in one
+sentence.
+
+The general form, worth carrying past benchmarks. **A number is a claim about a
+procedure, and a claim whose procedure is not recorded cannot be wrong, which is
+exactly why it cannot be trusted.**
 
 ## What you may run. This is a hard limit.
 

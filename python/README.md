@@ -94,7 +94,7 @@ answer to everybody who installs it, and `gpu_available()` alone returns
 ```python
 from mojotrees import MojoTreesRegressor, MojoTreesClassifier
 
-model = MojoTreesRegressor(num_leaves=31, n_estimators=100).fit(X, y)
+model = MojoTreesRegressor(max_leaves=31, n_estimators=100).fit(X, y)
 pred = model.predict(X)          # numpy in/out when numpy is available
 model.save("model.mbst")
 model = MojoTreesRegressor.load("model.mbst")
@@ -106,19 +106,51 @@ proba = clf.predict_proba(X)
 `fit` accepts `sample_weight`. numpy is optional; plain Python sequences
 work without it. Install with the `numpy` extra to pull it in.
 
-Native LightGBM names are canonical (`min_data_in_leaf`, `min_child_hess`,
-`lambda_l1`, `lambda_l2`, `bagging_fraction`, `bagging_freq`, `boosting`,
-`device`). For easy migration from `LGBMRegressor` and `LGBMClassifier`,
-their scikit-learn spellings are accepted too: `min_child_samples`,
+The scikit-learn spellings are canonical (`min_child_samples`,
 `min_child_weight`, `reg_alpha`, `reg_lambda`, `subsample`,
-`subsample_freq`, `boosting_type`, and `device_type`. Conflicting values
-raise instead of silently choosing one.
+`subsample_freq`, `colsample_bytree`, `min_split_gain`,
+`categorical_features`, `boosting_type`, `n_estimators`, `random_state`,
+`n_jobs`), because that is the vocabulary LightGBM's, XGBoost's and
+CatBoost's own scikit-learn wrappers share and it is what an estimator user
+expects. Where the wrappers do not agree on one, the clearest existing
+vendor name is canonical instead, which is where `max_leaves` (XGBoost's
+and CatBoost's, against scikit-learn's longer `max_leaf_nodes`), `max_bin`
+and `device` come from. Canonical is what every error message and every
+docstring names first, with the vendor spelling the user typed in
+parentheses after it.
 
-`boosting="goss"` trains with Gradient-based One-Side Sampling instead of
-on every row: each round keeps the `top_rate` share of rows with the
-largest gradient magnitude, samples `other_rate` of the rest, and scales
-the sampled rows to compensate. `goss_seed` makes the sample reproducible,
-`goss_warmup_rounds` overrides LightGBM's automatic
+Every vendor spelling is accepted as an alias and works either way, so a
+LightGBM, XGBoost or CatBoost script runs through this estimator unchanged
+(`num_leaves`, `min_data_in_leaf`, `min_child_hess`, `lambda_l1`,
+`lambda_l2`, `bagging_fraction`, `bagging_freq`, `feature_fraction`,
+`min_gain_to_split`, `categorical_feature`, `boosting`, `device_type`,
+`depth`, `iterations`, `eta`, `l2_leaf_reg`, `rsm`, `gamma`,
+`cat_features`, `max_iter`, `max_leaf_nodes`, and the rest of each
+vendor's set). Setting two spellings of one parameter to different
+non-default values raises instead of silently choosing one, because a
+silently dropped hyperparameter is not recoverable from the output.
+
+LightGBM's spellings are the wire format, and that is a separate layer
+from the canonical one. The native trainer, the `params` dict of
+`train()`, the `Dataset` and `Booster` argument names, the saved model
+files and `tools/check_parity.py` all use LightGBM keys, and they will
+keep using them. Growth-mode defaults mirror the vendor whose tree they
+are, so `grow_policy='symmetrictree'` mirrors CatBoost and `lossguide`
+mirrors LightGBM.
+
+LightGBM's spellings are deliberately not the canonical ones. Making them
+canonical would leave the CatBoost-mode surface reading wrong, because
+`depth`, `SymmetricTree` and `bootstrap_type` are CatBoost's words and
+LightGBM has no word to replace them with, and it would gain nothing,
+because LightGBM users are already served by aliases that work either way.
+The full table of one canonical name per parameter, with every vendor's
+spelling beside it, is `docs/PARAMETER_NAMING.md`.
+
+`boosting_type="goss"` (LightGBM's `boosting`) trains with Gradient-based
+One-Side Sampling instead of on every row. Each round keeps the `top_rate`
+share of rows with the largest gradient magnitude, samples `other_rate` of
+the rest, and scales the sampled rows to compensate. `goss_seed` makes the
+sample reproducible, `goss_warmup_rounds` overrides LightGBM's automatic
 `int(1 / learning_rate)` full-data rounds, and GOSS cannot be combined with
 row bagging.
 
@@ -166,7 +198,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 pipe = Pipeline([("scale", StandardScaler()), ("gbdt", MojoTreesRegressor())])
-search = GridSearchCV(pipe, {"gbdt__num_leaves": [15, 31]}, cv=3).fit(X, y)
+search = GridSearchCV(pipe, {"gbdt__max_leaves": [15, 31]}, cv=3).fit(X, y)
 ```
 
 Class labels may be of any single comparable type; they are sorted onto
@@ -179,21 +211,28 @@ gains.
 
 ## Categorical features
 
-`categorical_feature` names the columns whose integer codes are unordered
+`categorical_features` (LightGBM's `categorical_feature`, CatBoost's
+`cat_features`) names the columns whose integer codes are unordered
 categories. It takes column indices, column names, a mix of the two, `None`
-for no categorical feature, or LightGBM's default `"auto"`: every pandas
-`category` column of `X`, and nothing else.
+for no categorical feature, or LightGBM's default `"auto"`, which is every
+pandas `category` column of `X`, and nothing else.
 
 ```python
-model = MojoTreesRegressor(categorical_feature=["city"]).fit(df, y)
-model.categorical_feature_          # [0]
+model = MojoTreesRegressor(categorical_features=["city"]).fit(df, y)
+model.categorical_feature_          # [0], singular, see below
 ```
+
+The fitted attribute is `categorical_feature_`, singular, while the
+parameter is `categorical_features`, plural. That asymmetry is real and is
+kept for now because a fitted attribute is public API and renaming one is a
+breaking change under `docs/COMPATIBILITY_POLICY.md` section 5.2, so it
+takes a deprecation cycle.
 
 Those columns are split by category set rather than by threshold, with no
 one-hot expansion. A pandas `category` column is encoded by its labels and
 the table is kept on the fitted estimator, so the same label reaches the
 same category whatever a later frame numbers it; leaving such a column out
-of an explicit `categorical_feature` raises rather than feeding its codes to
+of an explicit `categorical_features` raises rather than feeding its codes to
 the numerical scan. Elsewhere the codes are whole numbers below 2**31, and a
 negative code or `NaN` means missing: missing, unseen, and dropped
 categories all route right. Pickling keeps the label tables;
@@ -240,7 +279,7 @@ the model kept. The base score belongs to iteration 0, so `[0, k)` and
 single-output estimators and `(n_samples, num_iteration * n_classes)` for
 the multiclass classifier, whose column `i * n_classes + k` is class k's
 tree in iteration i. Leaves are numbered per tree in node order, in
-`[0, num_leaves)`, stably across `save`/`load` and pickling; the numbering
+`[0, max_leaves)`, stably across `save`/`load` and pickling; the numbering
 is mojotrees's own, not LightGBM's leaf id.
 
 `raw_score=True` and `pred_leaf=True` together raise rather than letting one

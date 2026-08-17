@@ -114,6 +114,7 @@
       "MOJOTREES_DISTRIBUTED_PROVIDER",
       "MOJOTREES_GPU_BACKEND",
       "MOJOTREES_GPU_BACKEND_UNVALIDATED",
+      "MOJOTREES_GPU_BATCH_QUANT",
       "MOJOTREES_GPU_BATCH_SLOTS",
       "MOJOTREES_GPU_BLOCK_THREADS",
       "MOJOTREES_GPU_CLASS_BATCH",
@@ -143,6 +144,7 @@
       "MOJOTREES_GPU_ROW_COMPACTION",
       "MOJOTREES_GPU_ROW_TILE",
       "MOJOTREES_GPU_SCAN_PRIMITIVES",
+      "MOJOTREES_GPU_SEARCH_RESTAGE_HOIST",
       "MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN",
       "MOJOTREES_GPU_SPARSE_SKIP_FREQ",
       "MOJOTREES_GPU_SPECULATION",
@@ -205,6 +207,7 @@
       "MOJOTREES_GPU_PACKED_DOWNLOAD",
       "MOJOTREES_GPU_PHASE_TRACE",
       "MOJOTREES_GPU_READBACK",
+      "MOJOTREES_GPU_SEARCH_RESTAGE_HOIST",
       "MOJOTREES_GPU_SPLIT_GAIN_FORM",
       "MOJOTREES_GPU_SPLIT_PRIMITIVES",
       "MOJOTREES_GPU_SPLIT_RESIDENT",
@@ -248,6 +251,7 @@
       "MOJOTREES_DISTRIBUTED_CONNECT_TIMEOUT",
       "MOJOTREES_DISTRIBUTED_PROVIDER",
       "MOJOTREES_GPU_BACKEND_UNVALIDATED",
+      "MOJOTREES_GPU_BATCH_QUANT",
       "MOJOTREES_GPU_BATCH_SLOTS",
       "MOJOTREES_GPU_CLASS_BATCH",
       "MOJOTREES_GPU_CLASS_BATCH_BYTES",
@@ -269,6 +273,7 @@
       "MOJOTREES_GPU_QUANTIZED_GRADS",
       "MOJOTREES_GPU_READBACK",
       "MOJOTREES_GPU_SCAN_PRIMITIVES",
+      "MOJOTREES_GPU_SEARCH_RESTAGE_HOIST",
       "MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN",
       "MOJOTREES_GPU_SPARSE_SKIP_FREQ",
       "MOJOTREES_GPU_SPECULATION",
@@ -314,7 +319,6 @@
       "python.parameter_aliases.eta.fallback_default",
       "python.parameter_aliases.l2_leaf_reg.fallback_default",
       "python.parameter_aliases.l2_regularization.fallback_default",
-      "python.parameter_aliases.monotone_constraints_penalty.canonical",
       "python.parameter_aliases.reg_lambda.fallback_default",
       "python.parameter_aliases.shrinkage_rate.fallback_default"
     ]
@@ -2111,7 +2115,7 @@
         "wire": "min_child_hess"
       },
       "monotone_constraints_penalty": {
-        "canonical": null,
+        "canonical": "monotone_penalty",
         "fallback_default": 0.0,
         "sites": 1,
         "wire": "monotone_penalty"

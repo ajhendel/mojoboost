@@ -2261,12 +2261,36 @@ def _row_major_fill(
     shift_of: List[Int],
     mut rm: List[UInt8],
 ) raises:
-    """The transpose itself, into a `rm` already sized and zeroed.
+    """The transpose itself, into an `rm` that is sized and **not** zeroed.
 
     Row-tiled so the strided writes stay inside one hot window across the
     whole feature loop; see `BinnedMatrix.build_row_major` for why the window
     is sized by `ROW_MAJOR_TILE_BYTES` and why this is a second pass rather
     than a fusion into the binning tile.
+
+    WHO INITIALIZES A BYTE, which is what lets the caller hand this an
+    uninitialized array and skip a serial 41.7 MB memset on the real
+    benchmark. Every byte of a row's record has a first writer that can be
+    named without reading the data:
+
+    - An unpacked feature owns its byte outright (`byte_of` puts it in
+      `[0, whole)`, where no other feature is placed) and has `shift_of == 0`.
+    - A packed PAIR shares the byte `whole + (p >> 1)`. The pair's low-nibble
+      member has packed index `p` even, `shift_of == 0`, and -- because
+      `build_row_major` assigns packed indices in ascending feature order and
+      the loop below walks features in ascending order -- it runs BEFORE its
+      high-nibble partner, whose `shift_of` is 4.
+    - A trailing packed feature with no partner is that same low-nibble case,
+      and leaves the high nibble zero exactly as the memset did.
+
+    So `shift_of[f] == 0` is precisely "this feature is the first writer of
+    its byte", and such a feature stores rather than ORs. The stored value is
+    `v << 0 == v`, which is what `0 | v` produced before, so every byte of the
+    record is the byte it was. Only a `shift_of == 4` feature still reads, and
+    it reads a byte its partner wrote a moment ago in the same tile window.
+
+    A row's record still belongs to exactly one task, so the pairing needs no
+    atomic and the ordering above holds inside the task that owns the row.
     """
     var bins_p = bins.unsafe_ptr()
     var rm_p = rm.unsafe_ptr()
@@ -2286,18 +2310,24 @@ def _row_major_fill(
                 var col = f * n_rows
                 var bo = byte_p.unsafe_load(f)
                 var sh = shift_p.unsafe_load(f)
-                # The record starts zeroed and a byte is written by at most
-                # two features of the same row, and a row's record belongs to
-                # exactly one task, so the OR that merges a pair of nibbles
-                # needs no atomic. An unpacked feature has `sh == 0` and owns
-                # its byte outright, so one store covers both cases with no
-                # branch in the row loop.
-                for r in range(t0, t1):
-                    var v = Int(bins_p.unsafe_load(col + r))
-                    var idx = r * stride + bo
-                    rm_p.unsafe_store(
-                        idx, rm_p.unsafe_load(idx) | UInt8(v << sh)
-                    )
+                # The branch is hoisted out of the row loop, so neither arm
+                # tests anything per cell. See the docstring for why `sh == 0`
+                # is exactly "first writer of this byte": that arm stores and
+                # needs no read, which is the whole of the win here (41.7 M
+                # loads and a 41.7 MB serial memset on the real benchmark, on
+                # a matrix whose features all take a whole byte and therefore
+                # never take the OR arm at all).
+                if sh == 0:
+                    for r in range(t0, t1):
+                        var v = bins_p.unsafe_load(col + r)
+                        rm_p.unsafe_store(r * stride + bo, v)
+                else:
+                    for r in range(t0, t1):
+                        var v = Int(bins_p.unsafe_load(col + r))
+                        var idx = r * stride + bo
+                        rm_p.unsafe_store(
+                            idx, rm_p.unsafe_load(idx) | UInt8(v << sh)
+                        )
             t0 = t1
 
     dispatch_rows(fill_rows, n_rows, n_rows * n_features)
@@ -2665,7 +2695,12 @@ struct BinnedMatrix(Copyable, Movable):
             for f in range(nf):
                 offsets.append(offsets[f] + width_of[f])
 
-            rm.resize(nr * stride, UInt8(0))
+            # UNINITIALIZED. `_row_major_fill` names the first writer of every
+            # byte of every record and stores rather than ORs there, so the
+            # zero this used to be filled with was dead and the records are
+            # the same bytes. The fill is parallel and this was not, so the
+            # first touch of the array moves onto the workers that write it.
+            rm.resize(unsafe_uninit_length=nr * stride)
             _row_major_fill(
                 self.bins, nr, nf, stride, byte_of, shift_of, rm
             )
@@ -3105,8 +3140,25 @@ struct BinMapper(Copyable, Movable):
         if len(features) != n_rows * self.n_features:
             raise Error("features length must equal n_rows * n_features")
         var n_features = self.n_features
-        var bins = List[UInt8](capacity=n_rows * n_features)
-        bins.resize(n_rows * n_features, 0)
+        # UNINITIALIZED, and the zero it used to be filled with was dead.
+        #
+        # `do_tile` below stores every cell it is handed, on both arms: the
+        # categorical branch writes `[r_lo, r_hi)` and returns, and the
+        # numerical branch writes the same range through its vector body plus
+        # its scalar tail. `dispatch_feature_rows` covers `[0, n_features) x
+        # [0, n_rows)` with disjoint tiles on all three of its schedules (the
+        # serial one, the by-feature one, and the row-blocked one), so every
+        # byte of this array is written exactly once before anything reads it
+        # and no byte is ever read before it is written. The bins are
+        # therefore the same bytes they were.
+        #
+        # What it costs to fill it here is not the store traffic, it is that
+        # the fill is SERIAL: 463,715 x 90 is 41.7 MB of first-touch on the
+        # calling thread while the workers wait. Handing the pages to the
+        # tiles instead first-touches them on the thread that will write
+        # them, which is both parallel and NUMA-correct on any machine that
+        # cares.
+        var bins = List[UInt8](unsafe_uninit_length=n_rows * n_features)
 
         # A per-feature search table, built once per call: each numerical
         # feature's edges padded up to a power of two with `+inf` sentinels.

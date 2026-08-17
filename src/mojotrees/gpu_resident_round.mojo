@@ -2973,30 +2973,57 @@ def grow_tree_device_resident(
 
     # --- The one round trip ------------------------------------------------
     var snap = builder.download_desc_tables()
-    _resident_trace_emit(
-        trace,
-        String(
-            "mojotrees.resident plane=device-resident ",
-            snap.trace_line(),
-            " budget=",
-            params.num_leaves,
-            " root_rows=",
-            n_root,
-            " steps=",
-            params.num_leaves - 1,
-            # Fused copy-back-and-zero launches this tree issued, from the
-            # counter `GpuActiveRows.enqueue_desc_histogram` increments when it
-            # actually takes the fused branch. A count of launches enqueued and
-            # not a prediction of how many there should be, which is what makes
-            # it usable as the positive assertion that the arm engaged:
-            # `steps` on the fused arm and zero on the unfused one. The same
-            # tree, node for node, either way.
-            " folds=",
-            builder.rows.copy_back_folds - folds_before,
-            "\n",
-            snap.describe(),
-        ),
-    )
+    # GUARDED 2026-08-17, and the guard is the module's own rule applied to the
+    # one place that broke it: "an instrument nobody asked for costs nothing at
+    # all", which the census block below already honors and this block did not.
+    #
+    # `_resident_trace_emit` returns immediately on an empty sink, but its
+    # argument is evaluated before the call, so a default fit built the whole
+    # record and threw it away: `snap.trace_line()` is one `String`,
+    # `snap.describe()` is one `String` per live leaf (each one copying a
+    # `DeviceLeafRow` first) plus one per slot-pool entry and one per commit,
+    # and the outer `String` concatenates fourteen more pieces. At the default
+    # budget that is on the order of a hundred host allocations per tree and
+    # roughly ten thousand per fit, every one of them formatted for a reader
+    # that does not exist.
+    #
+    # **Bit-identical, and the argument is that nothing downstream can observe
+    # it.** The value built here was passed to one function, which discarded it
+    # unread whenever `trace` is empty; when `trace` is non-empty the same
+    # expression is built and the same call is made. No device state, no
+    # counter and no field of `snap` is touched by either `trace_line` or
+    # `describe` -- both are read-only formatters -- so a fit with tracing off
+    # enqueues the same launches in the same order and returns the same tree.
+    #
+    # **It is not a measurable win and is not offered as one.** Host string
+    # formatting at this scale is milliseconds per fit against a control plane
+    # that spends over a second, so M0 cannot resolve it on this machine. It is
+    # here because it is free, not because it is worth a measurement.
+    if trace != "":
+        _resident_trace_emit(
+            trace,
+            String(
+                "mojotrees.resident plane=device-resident ",
+                snap.trace_line(),
+                " budget=",
+                params.num_leaves,
+                " root_rows=",
+                n_root,
+                " steps=",
+                params.num_leaves - 1,
+                # Fused copy-back-and-zero launches this tree issued, from the
+                # counter `GpuActiveRows.enqueue_desc_histogram` increments
+                # when it actually takes the fused branch. A count of launches
+                # enqueued and not a prediction of how many there should be,
+                # which is what makes it usable as the positive assertion that
+                # the arm engaged: `steps` on the fused arm and zero on the
+                # unfused one. The same tree, node for node, either way.
+                " folds=",
+                builder.rows.copy_back_folds - folds_before,
+                "\n",
+                snap.describe(),
+            ),
+        )
     # Every check the shipping path made per split, made once here instead:
     # no two live leaves share a node id, a histogram slot, or a record slot;
     # the slot pool and the frontier agree about every owner; the live
@@ -3857,27 +3884,34 @@ def grow_tree_device_oblivious(
 
     # --- The one round trip ------------------------------------------------
     var snap = builder.download_desc_tables()
-    _resident_trace_emit(
-        trace,
-        String(
-            "mojotrees.oblivious ",
-            OBLIVIOUS_TRACE_MARK,
-            " ",
-            snap.trace_line(),
-            " depth=",
-            params.max_depth,
-            " budget=",
-            budget,
-            " root_rows=",
-            n_root,
-            " levels=",
-            params.max_depth,
-            " folds=",
-            builder.rows.copy_back_folds - folds_before,
-            "\n",
-            snap.describe(),
-        ),
-    )
+    # Guarded for the reason written out at the leaf-wise plane's copy of this
+    # block, and it costs more here than it does there: a depth-6 symmetric
+    # tree has 64 live leaves, so `describe` formats twice as many lines per
+    # tree as the default leaf-wise budget does. Bit-identical by the same
+    # argument -- the value was built and then discarded unread whenever
+    # `trace` is empty, and both formatters are read-only.
+    if trace != "":
+        _resident_trace_emit(
+            trace,
+            String(
+                "mojotrees.oblivious ",
+                OBLIVIOUS_TRACE_MARK,
+                " ",
+                snap.trace_line(),
+                " depth=",
+                params.max_depth,
+                " budget=",
+                budget,
+                " root_rows=",
+                n_root,
+                " levels=",
+                params.max_depth,
+                " folds=",
+                builder.rows.copy_back_folds - folds_before,
+                "\n",
+                snap.describe(),
+            ),
+        )
     snap.check_invariants()
     if not _growth_finished_normally(snap.status):
         raise Error(

@@ -390,3 +390,255 @@ hand-edited. Section 2.2's fix is to `tools/api_snapshot.py` and
 Every row is text. The two `params.mojo` rows change message text only and
 neither touches a parsed key, so no parameter string that works today stops
 working.
+
+---
+
+## 6. What has been applied, and what is routed
+
+Written 2026-08-17 by the documentation lane, which owns `python/README.md`,
+`docs/PARAMETER_NAMING.md`, `docs/COMPATIBILITY_POLICY.md` and this file, and
+owns no `.py` or `.mojo` file.
+
+### 6.1 Applied
+
+- **`python/README.md`**, row D1. The paragraph that said "Native LightGBM
+  names are canonical" now states the four-layer policy positively and in
+  full, names the canonical set, the alias set and the wire surfaces, and
+  records why LightGBM's spellings are deliberately not canonical.
+- **`python/README.md`**, rows D3 and D4, plus three the audit did not list.
+  The headline example is `max_leaves=31`, the `GridSearchCV` grid is
+  `gbdt__max_leaves`, the categorical section is `categorical_features` with
+  the vendor spellings on first mention, `boosting_type="goss"` replaces
+  `boosting="goss"`, and the leaf range reads `[0, max_leaves)`. The `params`
+  dicts at the `train()` and `cv()` examples and the `Dataset` field list keep
+  `num_leaves` and `categorical_feature`, because those surfaces are the wire.
+  A sentence was added under the categorical example naming the
+  `categorical_features` in, `categorical_feature_` out asymmetry of section 5
+  and pointing at the deprecation cycle it needs, so a reader does not read it
+  as a typo.
+- **`docs/COMPATIBILITY_POLICY.md` section 4.1**, which declared LightGBM's
+  names canonical everywhere and contradicted `docs/PARAMETER_NAMING.md`.
+  Resolved in favor of `PARAMETER_NAMING.md`. The section is now "Canonical
+  names and wire names" and it keeps the true claim the old sentence was
+  reaching for, that the parameter string, the `params` dict, `basic.py`'s
+  argument names, `RESETTABLE`, the model files and `tools/check_parity.py`
+  carry LightGBM keys and are guaranteed to keep carrying them. Nothing was
+  deleted; the wire claim was separated from the canonicity claim. Section 4.2
+  was adjusted in the same pass, because it described the scikit-learn
+  spellings as the aliases, which is the same inversion one paragraph later,
+  and it now says outright that the direction of its pair list is the wire
+  direction and not a statement of canonicity.
+- **`docs/PARAMETER_NAMING.md`**, the missing `monotone_penalty` row, and a
+  header rule that now states the canonical-first-with-vendor-in-parentheses
+  form rather than "canonical names only".
+
+### 6.2 The `monotone_penalty` determination
+
+Canonical is `monotone_penalty`, LightGBM's own name, and the row reads
+`monotone_penalty | monotone_penalty | - | - | -`.
+
+The evidence is that no other vendor has the parameter at all. XGBoost has no
+monotone penalty. CatBoost has `monotone_constraints` but no penalty on it.
+scikit-learn's `HistGradientBoosting*` has `monotonic_cst` and no penalty. So
+the policy's first clause, the scikit-learn spelling, does not apply because
+there is no scikit-learn spelling, and the second clause, the clearest vendor
+name, selects the only one that exists.
+
+`monotone_constraints_penalty` is **not** attributed to a vendor here, and
+row D13's parenthetical "CatBoost's `monotone_constraints_penalty`" should not
+be applied as written. LightGBM's documented aliases for `monotone_penalty`
+are `monotone_splits_penalty`, `ms_penalty` and `mc_penalty`, and no vendor
+spells it `monotone_constraints_penalty`. It is mojotrees's own long form,
+which is what the row's "why" column now says. The existing docstring at
+`sklearn.py:876` is therefore correct as written and D13 is withdrawn.
+
+The row resolves the snapshot's first lookup, "the wire name is itself an OURS
+name, so the two coincide", so `tools/api_snapshot.py` derives
+`python.parameter_aliases.monotone_constraints_penalty.canonical` as
+`monotone_penalty` on the next regeneration and the pair leaves
+`meta.underived`. `mojotrees.port` then reports the canonical name instead of
+the wire name with a NOTE.
+
+### 6.3 Line numbers in sections 3.1 and 3.2 are stale
+
+Every line number in the two violation tables was verified against head on
+2026-08-17 and most had moved, by +14 in the `sklearn.py` docstring block, by
++39 near `_resolve_device`, and by smaller amounts elsewhere. Section 7 carries
+the verified numbers. Apply from section 7, not from section 3.
+
+Sections 2.1 and 2.2 are already resolved at head and need no action. The
+snapshot now records `wire` and `canonical` as separate fields per alias, and
+`compatibility/SNAPSHOT_SCHEMA.md` documents the three-lookup derivation and
+the `meta.underived` list. Section 2.3, the `canonical_reset_key` misnaming, is
+still open and is still a deprecation rather than an edit.
+
+---
+
+## 7. Routing list for the code sites
+
+For the orchestrator and the lanes that hold these files. Ordered by how often
+a user meets the message, most often first. Line numbers verified against head
+on 2026-08-17. Message bodies are wrapped source strings, so the "current" text
+is given as the source lines to match, not as the assembled message.
+
+### 7.1 Priority 1, the `categorical_feature` cluster
+
+Ten messages in `python/mojotrees/sklearn.py`, one class docstring, and one
+docstring line. This is one mechanical change, `categorical_feature` to
+`categorical_features` in message and docstring text only. **Do not touch**
+`self.categorical_feature`, the constructor keyword at line 1131, the
+`_resolve_alias` first arguments at lines 1562 and 1565, the fitted attribute
+`categorical_feature_`, or anything in `basic.py`. Those are the wire.
+
+| # | Line | Current source | Replacement |
+|---|---|---|---|
+| 1 | 1570 | `f"unknown categorical_feature {spec!r}; expected 'auto', "` | `f"unknown categorical_features {spec!r}; expected 'auto', "` |
+| 2 | 1502 | `"categorical_feature must be 'auto', None, or a sequence of "` | `"categorical_features must be 'auto', None, or a sequence of "` |
+| 3 | 1585 to 1586 | `"not in categorical_feature; list them, cast them to a "` and `"numeric dtype, or leave categorical_feature at 'auto'"` | `"not in categorical_features; list them, cast them to a "` and `"numeric dtype, or leave categorical_features at 'auto'"` |
+| 4 | 1602 | `f"categorical_feature index {index} is out of range for "` | `f"categorical_features index {index} is out of range for "` |
+| 5 | 1522 | `f"categorical_feature name {entry!r} is not a column "` | `f"categorical_features name {entry!r} is not a column "` |
+| 6 | 1516 | `f"categorical_feature names {entry!r}, but X carries "` | `f"categorical_features names {entry!r}, but X carries "` |
+| 7 | 1531 | `f"categorical_feature entry {entry!r} is neither a "` | `f"categorical_features entry {entry!r} is neither a "` |
+| 8 | 1536 | `"categorical_feature entries must be whole feature "` | `"categorical_features entries must be whole feature "` |
+| 9 | 1510 | `f"categorical_feature entry {entry!r} is a bool, not a "` | `f"categorical_features entry {entry!r} is a bool, not a "` |
+| 10 | 1542 | `f"categorical_feature lists feature {index} twice"` | `f"categorical_features lists feature {index} twice"` |
+
+Until the alias dict of section 7.6 lands, these ten name the canonical alone.
+Site 1 has room for the vendor list and should carry it, since it is the one a
+user who typed a wrong string value hits.
+
+| # | Line | Current source | Replacement |
+|---|---|---|---|
+| 1a | 1570 to 1571 | `f"unknown categorical_feature {spec!r}; expected 'auto', "` `"None, or a sequence of feature names or indices"` | `f"unknown categorical_features {spec!r}; expected 'auto', "` `"None, or a sequence of feature names or indices. The same "` `"parameter is spelled categorical_feature by LightGBM and "` `"cat_features by CatBoost."` |
+
+### 7.2 Priority 2, the class docstring that inverts the rule
+
+`python/mojotrees/sklearn.py`, row D2, at lines **836 to 837**, not 823.
+
+Current.
+
+```
+    `categorical_feature` is LightGBM's parameter of the same name (the
+    plural `categorical_features` is accepted as an alias). It names the
+```
+
+Replacement.
+
+```
+    `categorical_features` is scikit-learn's spelling (LightGBM's singular
+    `categorical_feature` and CatBoost's `cat_features` are accepted as
+    aliases). It names the
+```
+
+And row D10, at line **852**, not 839.
+
+Current: `` column out of an explicit `categorical_feature` raises rather than ``
+Replacement: `` column out of an explicit `categorical_features` raises rather than ``
+
+### 7.3 Priority 3, the `tree_method` messages
+
+`python/mojotrees/sklearn.py`. XGBoost migrants reach these by reflex. Rows 11
+and 12, at lines **3547** and **3557**, not 3508 and 3518. Both already hold
+the typed value in `self.tree_method`, so no new machinery is needed.
+
+| # | Line | Current source | Replacement |
+|---|---|---|---|
+| 11 | 3547 | `f"tree_method={self.tree_method!r} is a different split "` | `f"device (tree_method={self.tree_method!r}) names a different split "` |
+| 12 | 3557 | `f"unknown tree_method {self.tree_method!r}; expected "` | `f"unknown device (tree_method={self.tree_method!r}); expected "` |
+
+Line 3563, which names `device` and `tree_method` together, is correct and must
+not be touched.
+
+### 7.4 Priority 4, the messages that name the wire spelling to the user
+
+| # | File | Line | Current source | Replacement |
+|---|---|---|---|---|
+| 14 | `sklearn.py` | 2243 to 2246 | `f"bagging_fraction={self.bagging_fraction} cannot be set "` … `"bagging_fraction IS CatBoost's Bernoulli bootstrap under "` | `f"subsample (bagging_fraction)={self.bagging_fraction} cannot be set "` … `"subsample IS CatBoost's Bernoulli bootstrap under "`. The guard is `float(self.bagging_fraction) != 1.0`, so the user did type `bagging_fraction` and keeping it in parentheses is correct provenance. The claim in the comment above it, that the message names the parameters the user actually typed, becomes true only with the canonical added |
+| 13 | `sklearn.py` | 1749 | `f"boosting={boosting!r} is not available {where}; it trains "` | `f"boosting_type={boosting!r} is not available {where}; it trains "`. `boosting` here is the resolved strategy string and not a typed spelling, so the typed name needs section 7.6. `_resolve_boosting` at line 1774 in the audit's numbering already holds the alias in a local, so passing it down is the cheaper alternative |
+| 17 | `sklearn.py` | 2685 to 2686 | `"auto_learning_rate=True with an explicit l2_leaf_reg "` `"(lambda_l2, reg_lambda, l2_regularization) would do "` | `"auto_learning_rate=True with an explicit reg_lambda "` `"(lambda_l2, l2_leaf_reg, l2_regularization) would do "`. The second `l2_leaf_reg` two lines down is a citation of CatBoost's `options_helper.cpp:280` gate and stays. `_l2_named()` already tests all four spellings and discards which; returning the name instead of a bool is a three-line change that lets this message name the typed one |
+| 15 | `callback.py` | 189 to 190 | `f"{key!r} cannot be reset during training; the trainer re-reads "` `"only " + ", ".join(RESETTABLE)` | Same first line, then `"only " + ", ".join(_canonical_resettable())`, where the new helper maps each `RESETTABLE` wire name to its canonical spelling and appends the wire name in parentheses. A user who typed `reg_lambda` currently gets a list containing `lambda_l2` and never their own word. `{key!r}` is already the typed spelling and is correct |
+| 16 | `_multi_target.py` | 164 | `f"{name} is not honored by a multi-target fit: "` | `f"{canonical_of(name)} ({name}) is not honored by a multi-target fit: "`. `name` is already the exact spelling the user typed, because the loop iterates `_UNHONORED` by attribute. This is the model site for the rule and the cheapest one to fix |
+
+### 7.5 Priority 5, the two parameter-string messages
+
+`src/mojotrees/params.mojo`. Both are inside the `_parse_params` token loop, so
+the typed key is the branch literal and no new machinery is needed. The wire
+exemption does not cover them, because CatBoost's spellings are neither
+canonical nor wire.
+
+| # | Line | Current source | Replacement |
+|---|---|---|---|
+| 18 | 1285 | `"one_hot_max_size is supported by the Mojo API and by the"` | `"max_cat_to_onehot (one_hot_max_size) is supported by the Mojo API and by the"`. The rest of the message, including both vendor citations, is unchanged |
+| 19 | 1150 | `"logging_level '",` | `"verbose (logging_level) '",`. The rest is unchanged |
+
+### 7.6 Remaining docstrings, verified line numbers
+
+Lower priority than every message above, because a docstring is read on
+purpose and an error is met by accident. All in `python/mojotrees/sklearn.py`.
+
+| Row | Audit said | Actually at | Change |
+|---|---|---|---|
+| D5 | 449, 451, 459 | **462, 464, 472** | `num_leaves` to `max_leaves` in the three bullets. Line 448 already introduces the pair, so no parenthetical is needed |
+| D6 | 497 | **510** | `` `bagging_fraction` `` to `` `subsample` ``. Line 481 already introduces the pair |
+| D7 | 550 to 551 | **563 to 564** | `bagging_fraction`, `bagging_freq`, `feature_fraction` to `subsample`, `subsample_freq`, `colsample_bytree` |
+| D8 | 854 | **867** | "`min_gain_to_split` (alias `min_split_gain`)" to "`min_split_gain` (LightGBM's `min_gain_to_split`)" |
+| D9 | 859 | **872** | "LightGBM needs `min_data_in_leaf` of at least 2" to "LightGBM needs `min_child_samples` (`min_data_in_leaf`) of at least 2" |
+| D11 | 6291 | **6327** | "`bagging_fraction` samples whole queries" to "`subsample` (LightGBM's `bagging_fraction`) samples whole queries". `MojoTreesRanker` has its own class docstring and does not inherit `_Base`'s introduction |
+| D12 | 811, 813 | **824, 826** | "`learning_rate` and `lambda_l2` default to `None`" to "`learning_rate` and `reg_lambda` (`lambda_l2`) default to `None`". Line 826's `l2_leaf_reg` is a citation of CatBoost's gate and stays |
+| D13 | 863 | **876** | **Withdrawn.** See section 6.2. `monotone_penalty` is canonical and the word "alias" is accurate, because `monotone_constraints_penalty` is ours rather than a vendor's |
+| D14 | 2137 onward | **2141 onward** | Unchanged recommendation. Add one sentence at the top of `_resolve_bootstrap`'s docstring, "`bagging_fraction` here is the wire member behind the canonical `subsample`", rather than renaming six accurate mentions of a private method's argument |
+| D15 | 423 | **436** | Keep the sentence. It becomes true when the rest of this list is applied |
+
+---
+
+## 8. Naming the typed spelling, the recommended fix
+
+This is section 4's open question, answered. It is code and is not implemented
+here.
+
+### 8.1 What to build
+
+One module-level dict in `python/mojotrees/sklearn.py`, primary to the tuple of
+aliases, plus the four-line `_typed_spelling` helper of section 4.2, plus one
+assertion in `tools/api_snapshot.py` that the dict equals the `parameter_aliases`
+table the AST walk already derives.
+
+The dict is hand-written rather than generated at import time. Generating it
+would mean parsing the module's own source on every import, which is a startup
+cost `docs/STARTUP_LATENCY.md` would have to price, and the whole point of the
+current design is that the alias pairs cost nothing at runtime.
+
+### 8.2 What it costs
+
+The alias pairs live in a second place. That is precisely what
+`compatibility/SNAPSHOT_SCHEMA.md` section 3.2 says the current design avoids,
+and the objection is real. The answer is that the second place is checked
+against the first by a job that already runs, so the duplication cannot drift
+silently; it can only fail CI. The residual cost is one more table a
+contributor adding an alias has to update, and the failure mode is a red build
+rather than a wrong error message.
+
+Concretely, about forty five lines of dict, four lines of helper, one assertion
+in the snapshot tool, and an entry in the schema document saying the runtime
+table exists and is guarded.
+
+### 8.3 What it buys
+
+Eleven messages that today name a spelling the user did not type start naming
+the one they did. Those are sites 1 to 10 of section 7.1 and site 13 of section
+7.4, which between them cover every way a categorical declaration or a boosting
+strategy can be refused, and they are among the most frequently hit messages in
+the estimator. A user who typed `cat_features` currently gets an error about
+`categorical_feature`, a word that appears nowhere in their script.
+
+It also gives section 2.2 option 1 the table it wants, so one structure serves
+both the runtime lookup and the snapshot's canonical field.
+
+### 8.4 What it does not buy
+
+Nothing in `_fit_args.py`, `_eval.py`, `cv.py`, `dask.py`, `_dask_runtime.py`
+or `_validation.py`, which take values rather than an estimator and would need
+the typed name passed in. Nothing after `_parse_params`'s token loop in
+`src/mojotrees/params.mojo`, where the `Bool` flags record that a spelling was
+seen and not which one; that remains the OPEN item of section 4.3, about ten
+flags and four signatures, and no row in section 7 depends on it.

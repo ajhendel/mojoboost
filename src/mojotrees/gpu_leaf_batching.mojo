@@ -719,6 +719,134 @@ def _batch_copy_back_zero_subtract_kernel(
         out_hist[unsafe_offset = left_slot * cells + r] = Int32(0)
 
 
+# --- The pre-quantized gradient source, on the batched family -------------
+#
+# WHAT THE OBLIVIOUS LEVEL BUILD WAS DOING, AND WHY IT IS THE SLOW ARM
+# --------------------------------------------------------------------
+# The three kernels below take `grad` and `hess` as Float32 planes and form
+# `Int32(round(g * g_scale))` and its hessian twin INSIDE the row loop, which
+# is once per (row, feature) visit. `grid.x` is the feature axis, so every one
+# of the `n_slots` threadgroups covering a row's tile repeats the same two
+# gathers, the same two Float32 multiplies and the same two rounds on the same
+# row. At the 90-feature real benchmark that is ninety redundant evaluations of
+# an expression whose operands do not depend on the feature.
+#
+# `gpu_active_rows` fixed this on the single-leaf range family and the fix
+# never reached here: `_quantize_grad_hess_kernel` writes one interleaved
+# `Int32` pair per row, once per round, and the range kernels gather the pair
+# instead of the two Float32 words. This section is that source, on the
+# batched family.
+#
+# WHY IT CANNOT MOVE A BIT
+# ------------------------
+# 1. **The scale is global per round on the path that matters, and it is
+#    checked rather than assumed.** `stage_device_plan` takes ONE `g_scale`
+#    and ONE `h_scale` and writes that pair into every item's row of
+#    `scales_dev`; its only caller, `histogram_gpu.stage_desc_level_plan`,
+#    passes the builder's own `g_scale`/`h_scale`, which are the round's. So
+#    within a staged plan the pair is uniform over items, uniform over
+#    features (the kernels never index scales by feature), and constant over
+#    the tree's levels, because `stage_device_plan` runs once per tree. The
+#    quantized source is offered only on the device-plan arms for exactly
+#    that reason; `enqueue_batch` stages a per-item scale list that a
+#    multiclass batch may vary, so it keeps the Float32 arm and passes
+#    `use_quant = 0`.
+# 2. **The value is the same expression.** `_batch_quantize_kernel` evaluates
+#    `Int32(round(grad[r] * g_scale))` -- the same Float32 multiply, the same
+#    `round`, the same device compiler -- and stores it. Hoisting an
+#    expression out of a loop whose other operands it does not depend on
+#    cannot change its value.
+# 3. **The accumulation is unchanged.** The same Int32 lands in the same
+#    threadgroup bin through the same atomic, and Int32 addition is
+#    associative and commutative, so nothing about ORDER was ever load
+#    bearing and nothing about it moves here.
+#
+# WHAT IT COSTS, STATED SO IT IS NOT DISCOVERED
+# ---------------------------------------------
+# One streaming launch over `n_rows` per TREE, not per level: `stage_device
+# _plan` invalidates the buffer and the first accumulation of the tree
+# rebuilds it. `gpu_resident_round.oblivious_launch_census(6)` is 62 command
+# buffers and the Metal queue on the measured machine is 64 deep, so this
+# takes a depth-6 tree to **63**, still under the knee -- but it is one of the
+# two, and it is the reason this arm is default off rather than default on
+# like its range-family twin. Folding the pass into
+# `_batch_copy_back_zero_kernel`, which already launches per level and could
+# run it on the level-zero pass alone, would take the census back to 62; that
+# is a follow-up and not this edit.
+#
+# The buffer is `2 * n_planes * n_rows` Int32, which at 463,715 rows and one
+# plane is 3.7 MB.
+
+comptime BATCH_QUANT_VAR = "MOJOTREES_GPU_BATCH_QUANT"
+"""Whether the batched family gathers the pre-quantized Int32 pairs.
+
+`1` selects it, anything else leaves the Float32 planes in force, and `0`
+additionally declines the buffer's allocation so a fit that will never use it
+does not carry 3.7 MB. Default off because it moves the launch census by one
+and no benchmark has priced either half yet; the identity argument above is
+complete, so under `bench/results/LANE_RULES.md` rule 5 a measured win flips
+this in the session that measures it."""
+
+comptime BATCH_CONST_HESSIAN_VAR = "MOJOTREES_CONST_HESSIAN"
+"""The same withdrawal switch `GpuActiveRows` reads, and it is deliberately
+the same name. Constant hessian is a DECLARATION ABOUT THE OBJECTIVE that the
+trainer owns; an environment variable may only take the permission away, never
+grant it, so `0` here refuses `set_constant_hessian(True)` and nothing else
+turns it on."""
+
+
+def _batch_quant_allowed() -> Bool:
+    """Whether this batcher allocates the quantized buffer at all."""
+    return getenv(BATCH_QUANT_VAR) != "0"
+
+
+def batch_quantized_grads_requested() -> Bool:
+    """`MOJOTREES_GPU_BATCH_QUANT=1`. The arm's initial state; a benchmark
+    holding both arms in one process moves it with
+    `GpuLeafBatcher.set_quantized_gradients` instead of re-execing, for the
+    reason `GpuActiveRows.set_feature_group` gives at length."""
+    return getenv(BATCH_QUANT_VAR) == "1"
+
+
+def _batch_quantize_kernel(
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
+    plane_base: Int32,
+    n_rows: Int32,
+    g_scale: Float32,
+    h_scale: Float32,
+):
+    """One plane's gradients and hessians, quantized once, interleaved.
+
+    `gpu_active_rows._quantize_grad_hess_kernel` plus the plane offset a
+    batched item carries in `ITEM_PLANE`. A separate symbol rather than an
+    import for the reason the header gives about `_plan_env_int`: this module
+    owns its own launches, and the scales are launch arguments rather than
+    table reads because the pair is global to the staged plan. The section
+    above carries the check that establishes that.
+
+    One thread per row of one plane, two Float32 multiplies, two rounds, two
+    stores, and no read of the item table at all, so it does not have to be
+    ordered after anything the plan writes.
+
+    `gq[2 * (plane_base + r)]` and its odd twin are exactly the two integers
+    the histogram row loop would otherwise have formed for row `r`, so a
+    histogram accumulated from this buffer is the same word for word. The
+    argument is in the section above rather than here, in one place, because
+    three kernels rest on it.
+    """
+    var r = Int(global_idx.x)
+    if r < Int(n_rows):
+        var i = Int(plane_base) + r
+        gq[unsafe_offset = 2 * i] = Int32(
+            round(grad[unsafe_offset=i][0] * g_scale)
+        )
+        gq[unsafe_offset = 2 * i + 1] = Int32(
+            round(hess[unsafe_offset=i][0] * h_scale)
+        )
+
+
 def _batch_hist_partial_kernel(
     bins: MutPointer[UInt8, MutAnyOrigin],
     rows: MutPointer[Int32, MutAnyOrigin],
@@ -839,6 +967,7 @@ def _batch_hist_atomic_kernel(
     rows: MutPointer[Int32, MutAnyOrigin],
     grad: MutPointer[Float32, MutAnyOrigin],
     hess: MutPointer[Float32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
     items: MutPointer[Int32, MutAnyOrigin],
     scales: MutPointer[Float32, MutAnyOrigin],
@@ -849,6 +978,8 @@ def _batch_hist_atomic_kernel(
     n_bins: Int32,
     hist_size: Int32,
     feat_stride: Int32,
+    use_quant: Int32,
+    const_hess: Int32,
 ):
     """The same batched accumulation, folding each partial straight into its
     item's output slice with global integer atomics.
@@ -860,6 +991,28 @@ def _batch_hist_atomic_kernel(
     kernel's, because tiles of different items fold into different slices;
     within an item it is exactly the same. Integer atomics make the result
     order-independent, so this path is bit-identical to the tiled one.
+
+    **`use_quant` selects the pre-quantized source.** With it set the row loop
+    reads the interleaved Int32 pair `_batch_quantize_kernel` wrote for the
+    round instead of the two Float32 planes, which moves two multiplies and
+    two rounds off the inner loop and halves the derivative gather. The
+    integers are the same integers; the argument is at that kernel and in the
+    section above it. `gq` is never dereferenced while `use_quant` is clear,
+    so a caller with no such buffer passes any pointer it likes.
+
+    **`const_hess` elides the hessian plane.** With it set the caller has
+    declared that every row's hessian this round is exactly
+    `histogram.CONSTANT_HESSIAN`, which is 1.0. The row loop then performs two
+    shared atomics per visit instead of three, the shared zeroing covers two
+    planes instead of three, and the flush writes the global hessian plane as
+    `hq_const * vc`. That reconstruction is exact: `1.0f * h_scale` is
+    `h_scale` because multiplying by one cannot round, so every row's hessian
+    contribution is the single value `Int32(round(h_scale))`, computed below
+    in this kernel by this device compiler from this launch argument; a bin
+    that received `vc` rows holds `vc` copies of it added together, and Int32
+    addition and multiplication agree modulo 2^32. `sh` is a comptime
+    `stack_allocation` and is still allocated, so no occupancy follows -- what
+    follows is a third fewer shared atomics and a third less shared zeroing.
     """
     var tid = thread_idx.x
     var nb = Int(n_bins)
@@ -896,10 +1049,17 @@ def _batch_hist_atomic_kernel(
         meta[unsafe_offset=5] = items[unsafe_offset = base + ITEM_PLANE][0]
         meta[unsafe_offset=6] = items[unsafe_offset = base + ITEM_OUT][0]
 
+    # Both flags are block-uniform launch scalars, so every branch below on
+    # either of them is taken by the whole threadgroup together and no
+    # barrier is reached by a subset of it.
+    var quant = Int(use_quant) != 0
+    var celide = Int(const_hess) != 0
+
     var b = tid
     while b < nb:
         sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
+        if not celide:
+            sh[unsafe_offset=b] = 0
         sc[unsafe_offset=b] = 0
         b += block_dim.x
     barrier()
@@ -915,6 +1075,11 @@ def _batch_hist_atomic_kernel(
     var f = Int(feat_ids[unsafe_offset = k * Int(feat_stride) + slot][0])
     var g_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_G][0]
     var h_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_H][0]
+    # The elided plane's one quantized value. `Float32(1.0) * h_scale` is
+    # exactly `h_scale`, so this is `Int32(round(h_scale))`, formed here by
+    # the same device compiler that would have formed the per-row value it
+    # stands in for. Never read while `celide` is clear.
+    var hq_const = Int32(round(Float32(1.0) * h_scale))
 
     var tile_begin = t * rows_per_tile
     var tile_end = tile_begin + rows_per_tile
@@ -926,10 +1091,23 @@ def _batch_hist_atomic_kernel(
     while j < tile_end:
         var r = Int(rows[unsafe_offset = begin + j][0])
         var bin = Int(bins[unsafe_offset = col + r])
-        var gq = Int32(round(grad[unsafe_offset = plane_base + r][0] * g_scale))
-        var hq = Int32(round(hess[unsafe_offset = plane_base + r][0] * h_scale))
-        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
-        _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
+        var gqv = Int32(0)
+        var hqv = Int32(0)
+        if quant:
+            gqv = gq[unsafe_offset = 2 * (plane_base + r)][0]
+            if not celide:
+                hqv = gq[unsafe_offset = 2 * (plane_base + r) + 1][0]
+        else:
+            gqv = Int32(
+                round(grad[unsafe_offset = plane_base + r][0] * g_scale)
+            )
+            if not celide:
+                hqv = Int32(
+                    round(hess[unsafe_offset = plane_base + r][0] * h_scale)
+                )
+        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gqv)
+        if not celide:
+            _ = Atomic.fetch_add(sh.unsafe_offset(bin), hqv)
         _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
         j += block_dim.x
     barrier()
@@ -937,17 +1115,20 @@ def _batch_hist_atomic_kernel(
     var slice_base = out_slot * N_PLANES * hs + f * nb
     b = tid
     while b < nb:
-        if sc[unsafe_offset=b][0] != 0:
+        var vc = sc[unsafe_offset=b][0]
+        if vc != 0:
+            # The refill: `hq_const * vc` is the sum of `vc` copies of
+            # `hq_const`, which is what the three-plane accumulation left in
+            # `sh`.
+            var vh = hq_const * vc if celide else sh[unsafe_offset=b][0]
             _ = Atomic.fetch_add(
                 out_hist.unsafe_offset(slice_base + b), sg[unsafe_offset=b][0]
             )
             _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(slice_base + hs + b),
-                sh[unsafe_offset=b][0],
+                out_hist.unsafe_offset(slice_base + hs + b), vh
             )
             _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(slice_base + 2 * hs + b),
-                sc[unsafe_offset=b][0],
+                out_hist.unsafe_offset(slice_base + 2 * hs + b), vc
             )
         b += block_dim.x
 
@@ -957,6 +1138,7 @@ def _batch_hist_atomic_subtract_kernel(
     rows: MutPointer[Int32, MutAnyOrigin],
     grad: MutPointer[Float32, MutAnyOrigin],
     hess: MutPointer[Float32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
     items: MutPointer[Int32, MutAnyOrigin],
     scales: MutPointer[Float32, MutAnyOrigin],
@@ -967,6 +1149,8 @@ def _batch_hist_atomic_subtract_kernel(
     n_bins: Int32,
     hist_size: Int32,
     feat_stride: Int32,
+    use_quant: Int32,
+    const_hess: Int32,
 ):
     """`_batch_hist_atomic_kernel` over half a level's items, folding the
     sibling subtraction into the same flush.
@@ -974,6 +1158,13 @@ def _batch_hist_atomic_subtract_kernel(
     The identical argument list, the identical row loop, the identical
     threadgroup accumulation, and the identical global fold. Two things are
     added and nothing is taken away.
+
+    `use_quant` and `const_hess` mean exactly what they mean on
+    `_batch_hist_atomic_kernel` and are argued there. The subtraction is
+    unaffected by either: it folds the NEGATION of the cells this block just
+    added, so whichever integer reached the built child's slot reaches the
+    derived sibling's with its sign flipped, and `hq_const * vc` is one such
+    integer like any other.
 
     **One: an item builds only if it is the smaller child of its pair.** Thread
     zero already resolves this block's tile to its item; it now also resolves
@@ -1101,10 +1292,15 @@ def _batch_hist_atomic_subtract_kernel(
             meta[unsafe_offset=6] = items[unsafe_offset = base + ITEM_OUT][0]
             meta[unsafe_offset=7] = Int32(sub_slot)
 
+    # Block-uniform launch scalars, exactly as on the non-subtracting twin.
+    var quant = Int(use_quant) != 0
+    var celide = Int(const_hess) != 0
+
     var b = tid
     while b < nb:
         sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
+        if not celide:
+            sh[unsafe_offset=b] = 0
         sc[unsafe_offset=b] = 0
         b += block_dim.x
     barrier()
@@ -1126,6 +1322,8 @@ def _batch_hist_atomic_subtract_kernel(
     var f = Int(feat_ids[unsafe_offset = k * Int(feat_stride) + slot][0])
     var g_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_G][0]
     var h_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_H][0]
+    # `Float32(1.0) * h_scale` is exactly `h_scale`; see the twin above.
+    var hq_const = Int32(round(Float32(1.0) * h_scale))
 
     var tile_begin = t * rows_per_tile
     var tile_end = tile_begin + rows_per_tile
@@ -1137,10 +1335,23 @@ def _batch_hist_atomic_subtract_kernel(
     while j < tile_end:
         var r = Int(rows[unsafe_offset = begin + j][0])
         var bin = Int(bins[unsafe_offset = col + r])
-        var gq = Int32(round(grad[unsafe_offset = plane_base + r][0] * g_scale))
-        var hq = Int32(round(hess[unsafe_offset = plane_base + r][0] * h_scale))
-        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
-        _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
+        var gqv = Int32(0)
+        var hqv = Int32(0)
+        if quant:
+            gqv = gq[unsafe_offset = 2 * (plane_base + r)][0]
+            if not celide:
+                hqv = gq[unsafe_offset = 2 * (plane_base + r) + 1][0]
+        else:
+            gqv = Int32(
+                round(grad[unsafe_offset = plane_base + r][0] * g_scale)
+            )
+            if not celide:
+                hqv = Int32(
+                    round(hess[unsafe_offset = plane_base + r][0] * h_scale)
+                )
+        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gqv)
+        if not celide:
+            _ = Atomic.fetch_add(sh.unsafe_offset(bin), hqv)
         _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
         j += block_dim.x
     barrier()
@@ -1151,8 +1362,8 @@ def _batch_hist_atomic_subtract_kernel(
     while b < nb:
         if sc[unsafe_offset=b][0] != 0:
             var vg = sg[unsafe_offset=b][0]
-            var vh = sh[unsafe_offset=b][0]
             var vc = sc[unsafe_offset=b][0]
+            var vh = hq_const * vc if celide else sh[unsafe_offset=b][0]
             _ = Atomic.fetch_add(out_hist.unsafe_offset(slice_base + b), vg)
             _ = Atomic.fetch_add(
                 out_hist.unsafe_offset(slice_base + hs + b), vh
@@ -1462,6 +1673,7 @@ def _plan_hist_kernel[
     rows: MutPointer[Int32, MutAnyOrigin],
     grad: MutPointer[Float32, MutAnyOrigin],
     hess: MutPointer[Float32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
     items: MutPointer[Int32, MutAnyOrigin],
     scales: MutPointer[Float32, MutAnyOrigin],
@@ -1477,6 +1689,8 @@ def _plan_hist_kernel[
     n_copies: Int32,
     group_width: Int32,
     subtract: Int32,
+    use_quant: Int32,
+    const_hess: Int32,
 ):
     """One accumulation kernel for the device-written plan, with the two
     CatBoost ideas and the sibling subtraction as knobs rather than as arms.
@@ -1565,6 +1779,15 @@ def _plan_hist_kernel[
        operations in the kernel and they are written exactly as the shipping
        kernels write them, in the same order, with no multiply moved relative
        to an add, so there is no FMA contraction difference to argue about.
+       **`use_quant` moves WHERE those two products are evaluated and not
+       WHAT they evaluate to**: `_batch_quantize_kernel` forms the identical
+       expression once per row per round instead of once per (row, feature)
+       visit, and hoisting an expression out of a loop whose other operands
+       it does not depend on cannot change its value. **`const_hess`
+       reconstructs the second of the three as `hq_const * vc`**, which is
+       exact because `1.0f * h_scale` is `h_scale` and Int32 addition and
+       multiplication agree modulo 2^32; the declaration that every hessian
+       is 1.0 belongs to the caller and `set_constant_hessian` says so.
     2. **Every visit happens exactly once.** Over the feature axis: block
        `block_idx.x` owns slots `[bx * G, bx * G + G)` clamped to `n_slots`, so
        the blocks partition the slots and a tail block owns only what remains.
@@ -1698,6 +1921,15 @@ def _plan_hist_kernel[
     var g_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_G][0]
     var h_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_H][0]
 
+    # The two sources, both block-uniform launch scalars, and the elided
+    # plane's one quantized value. `Float32(1.0) * h_scale` is exactly
+    # `h_scale`, so `hq_const` is `Int32(round(h_scale))` formed by this
+    # device compiler from this launch's own argument. Never read while
+    # `celide` is clear.
+    var quant = Int(use_quant) != 0
+    var celide = Int(const_hess) != 0
+    var hq_const = Int32(round(Float32(1.0) * h_scale))
+
     # One global feature id per owned slot, read once and spent for every row.
     # `PLAN_MAX_GROUP` and not `owned`, because a `stack_allocation` needs a
     # comptime extent; the unowned entries are never read.
@@ -1728,15 +1960,28 @@ def _plan_hist_kernel[
     var j = tile_begin + tid
     while j < tile_end:
         var r = Int(rows[unsafe_offset = begin + j][0])
-        var gq = Int32(round(grad[unsafe_offset = plane_base + r][0] * g_scale))
-        var hq = Int32(round(hess[unsafe_offset = plane_base + r][0] * h_scale))
+        var gqv = Int32(0)
+        var hqv = Int32(0)
+        if quant:
+            gqv = gq[unsafe_offset = 2 * (plane_base + r)][0]
+            if not celide:
+                hqv = gq[unsafe_offset = 2 * (plane_base + r) + 1][0]
+        else:
+            gqv = Int32(
+                round(grad[unsafe_offset = plane_base + r][0] * g_scale)
+            )
+            if not celide:
+                hqv = Int32(
+                    round(hess[unsafe_offset = plane_base + r][0] * h_scale)
+                )
         var u = ubase
         for gi in range(owned):
             var bin = Int(
                 bins[unsafe_offset = Int(fid[unsafe_offset=gi][0]) * nr + r]
             )
-            _ = Atomic.fetch_add(shm.unsafe_offset(u + bin), gq)
-            _ = Atomic.fetch_add(shm.unsafe_offset(u + stride + bin), hq)
+            _ = Atomic.fetch_add(shm.unsafe_offset(u + bin), gqv)
+            if not celide:
+                _ = Atomic.fetch_add(shm.unsafe_offset(u + stride + bin), hqv)
             _ = Atomic.fetch_add(
                 shm.unsafe_offset(u + 2 * stride + bin), Int32(1)
             )
@@ -1761,9 +2006,17 @@ def _plan_hist_kernel[
             var u = ug
             for _ in range(copies):
                 vg += shm[unsafe_offset = u + b][0]
-                vh += shm[unsafe_offset = u + stride + b][0]
+                if not celide:
+                    vh += shm[unsafe_offset = u + stride + b][0]
                 vc += shm[unsafe_offset = u + 2 * stride + b][0]
                 u += unit_cells
+            # The refill, after the copies are summed: `vc` copies of
+            # `hq_const` added together is `hq_const * vc`. The hessian plane
+            # of `shm` is still zeroed above and simply not read, because the
+            # zeroing here is one flat loop over `live_cells` and splitting it
+            # per plane would cost a division in the loop to save a store.
+            if celide:
+                vh = hq_const * vc
             if vc != 0:
                 _ = Atomic.fetch_add(
                     out_hist.unsafe_offset(slice_base + b), vg
@@ -2960,6 +3213,29 @@ struct GpuLeafBatcher(Movable):
     var plan_items: Int
     var plan_tiles_per_item: Int
     var plan_slots: Int
+    # The interleaved pre-quantized gradient buffer, `2 * n_planes * n_rows`
+    # Int32, or one word when `MOJOTREES_GPU_BATCH_QUANT=0` declined it. Only
+    # the staged plan's own plane is ever written; see `_ensure_quantized`.
+    var gq_dev: DeviceBuffer[DType.int32]
+    var quant_capacity: Int
+    # Whether the next accumulation gathers that buffer, and whether it
+    # currently holds THIS tree's round. `stage_device_plan` clears the
+    # second, which is the only invalidation there is: the gradients cannot
+    # move inside a tree and that method runs once per tree.
+    var quant_grads: Bool
+    var quant_valid: Bool
+    # The staged plan's scales and plane, kept host side so the quantization
+    # pass needs no readback. Written by `stage_device_plan` and by nothing
+    # else, which is also the proof that the pair is uniform over the plan's
+    # items: that method writes one pair into every item's row.
+    var plan_g_scale: Float32
+    var plan_h_scale: Float32
+    var plan_plane: Int
+    # The caller's declaration that every row's hessian this round is exactly
+    # `histogram.CONSTANT_HESSIAN`, and the environment's power to withdraw
+    # the permission but never to grant it. See `set_constant_hessian`.
+    var constant_hessian: Bool
+    var const_hessian_allowed: Bool
 
     def __init__(
         out self,
@@ -3008,6 +3284,16 @@ struct GpuLeafBatcher(Movable):
         self.plan_items = 0
         self.plan_tiles_per_item = 0
         self.plan_slots = 0
+        self.plan_g_scale = Float32(0.0)
+        self.plan_h_scale = Float32(0.0)
+        self.plan_plane = 0
+        self.quant_grads = batch_quantized_grads_requested()
+        self.quant_valid = False
+        # `MOJOTREES_CONST_HESSIAN=0` withdraws the permission, so a later
+        # `set_constant_hessian(True)` is refused rather than silently
+        # ignored. The same reading `GpuActiveRows` makes of the same name.
+        self.const_hessian_allowed = getenv(BATCH_CONST_HESSIAN_VAR) != "0"
+        self.constant_hessian = False
 
         var hist_size = n_features * n_bins
         self.items_dev = self.ctx.enqueue_create_buffer[DType.int32](
@@ -3026,6 +3312,16 @@ struct GpuLeafBatcher(Movable):
         if part_size < 1:
             part_size = 1
         self.part_dev = self.ctx.enqueue_create_buffer[DType.int32](part_size)
+        # One interleaved Int32 pair per row per gradient plane. Allocated
+        # unless the environment declined it outright, so a benchmark can move
+        # `set_quantized_gradients` between repeats in one process rather than
+        # re-execing; at 463,715 rows and one plane it is 3.7 MB.
+        self.quant_capacity = 1
+        if _batch_quant_allowed():
+            self.quant_capacity = 2 * n_planes * n_rows
+        self.gq_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            self.quant_capacity
+        )
         self.stage_items = self.ctx.enqueue_create_host_buffer[DType.int32](
             max_items * ITEM_WORDS
         )
@@ -3047,6 +3343,109 @@ struct GpuLeafBatcher(Movable):
 
     def synchronize(self) raises:
         self.ctx.synchronize()
+
+    def set_quantized_gradients(mut self, on: Bool) raises:
+        """Whether the device-plan accumulation gathers the pre-quantized
+        Int32 pairs instead of quantizing per (row, feature) visit.
+
+        An argument as well as an environment variable, for the reason
+        `GpuActiveRows.set_feature_group` gives: an A/B that reads its arm
+        from the environment can run one arm under the other's label, which
+        has happened in this repository once, so a benchmark holding both
+        arms in one process passes the arm in rather than re-execing.
+
+        Raises rather than silently leaving the Float32 arm selected when
+        `MOJOTREES_GPU_BATCH_QUANT=0` declined the buffer's allocation, for
+        the same reason `set_scan_primitives` raises at an unsupported width:
+        a benchmark told to run this arm must not quietly measure the other
+        one.
+
+        Takes effect on the next device-plan accumulation, and it cannot
+        change a histogram. The buffer is rebuilt on the next launch either
+        way, because turning the arm on mid-tree leaves `quant_valid` clear.
+        """
+        if on and self.quant_capacity < 2 * self.n_planes * self.n_rows:
+            raise Error(
+                "the quantized gradient buffer was not allocated;"
+                " MOJOTREES_GPU_BATCH_QUANT=0 declined it for this session"
+            )
+        self.quant_grads = on
+        self.quant_valid = False
+
+    def quantized_gradients_on(self) -> Bool:
+        """Whether the next device-plan accumulation gathers Int32 pairs."""
+        return self.quant_grads
+
+    def set_constant_hessian(mut self, on: Bool):
+        """Declare that every row's hessian this round is exactly
+        `histogram.CONSTANT_HESSIAN`, so the batched kernels may stop
+        accumulating the hessian plane and reconstruct it from the count.
+
+        **This is a declaration about the objective, and the caller owns
+        it.** `histogram.objective_has_constant_hessian` is the predicate that
+        answers it correctly, and it is false for every weighted fit and for
+        every GOSS round regardless of the objective code, because both put
+        more than one value into `hess`. Declaring it on a round where it is
+        not true produces a wrong hessian plane, silently. This is the same
+        contract `GpuActiveRows.set_constant_hessian` carries word for word,
+        and it is a second setter rather than a read of that one because this
+        module is handed pointers and never the struct that owns them.
+
+        `MOJOTREES_CONST_HESSIAN=0` wins over an argument in the one direction
+        that is always safe, off, and this reports what it actually did
+        through `constant_hessian_on`.
+
+        Takes effect on the next accumulation. When the declaration is true it
+        cannot change a histogram: the plane it stops accumulating is
+        reconstructed as the identical Int32, argued at
+        `_batch_hist_atomic_kernel`.
+
+        **No caller sets this yet, and that is a cross-file item rather than
+        an oversight.** `GpuHistogramBuilder.set_constant_hessian` in
+        `histogram_gpu` forwards the trainer's declaration to `self.rows` and
+        stops there; one line forwarding it to `self.batcher[0]` as well is
+        what reaches this, and that file belongs to another lane.
+        """
+        self.constant_hessian = on and self.const_hessian_allowed
+
+    def constant_hessian_on(self) -> Bool:
+        """Whether the next accumulation elides the hessian plane."""
+        return self.constant_hessian
+
+    def staged_gradient_bytes_per_visit(self) -> Int:
+        """Bytes of staged derivative one (row, feature) VISIT costs the
+        batched family, at the arms currently set.
+
+        `GpuActiveRows.staged_gradient_bytes_per_row` is the range family's
+        figure and the two were not comparable, because the two families do
+        not spend the derivative the same way. The range family gathers a
+        row's derivative once per threadgroup and spends it over a feature
+        GROUP, so its per-visit share is its per-row width divided by the
+        group. The batched family has no group at all on the shipping arms
+        (`grid.x` is the feature axis, one slot per threadgroup), so a visit
+        pays the whole per-row width and this number IS the per-row width,
+        divided by the lean kernel's group when that arm is selected.
+
+        Four on the Float32 arm under a constant hessian and eight otherwise;
+        the same four or eight on the quantized arm, the pair being one load
+        either way. What the quantized arm buys at equal width is the two
+        multiplies and two rounds, not the bytes -- so a trace comparing the
+        two families must read this beside
+        `_plan_hist_kernel`'s group width and not on its own.
+        """
+        var wide = 4 if self.constant_hessian else 8
+        var gw = plan_group_requested() if plan_lean_requested() else 1
+        if gw < 1:
+            gw = 1
+        return wide // gw if wide >= gw else 1
+
+    def staged_gradient_bytes_per_row(self) -> Int:
+        """The per-row width, spelled as `GpuActiveRows` spells it, so the two
+        families can be read off a trace side by side without either reader
+        recomputing the other's convention. Four under a constant hessian and
+        eight otherwise, on both the Float32 and the quantized arm; this
+        module has no Int16 staging arm."""
+        return 4 if self.constant_hessian else 8
 
     def hist_size(self) -> Int:
         return self.n_features * self.n_bins
@@ -3272,11 +3671,20 @@ struct GpuLeafBatcher(Movable):
                 block_dim=threads,
             )
         else:
+            # Both new arms are OFF on the host-staged path, and neither is an
+            # oversight. The quantized source rests on the scale pair being
+            # global to the plan, which `_stage_plan` does not guarantee -- it
+            # takes a per-item list precisely so a multiclass batch can vary
+            # it -- and the hessian elision would have to be carried through
+            # `_batch_hist_partial_kernel` and `_batch_reduce_kernel` as well
+            # to cover the tiled strategy this path can also resolve to. So
+            # this launch is the shipping one, statement for statement.
             self.ctx.enqueue_function[_batch_hist_atomic_kernel](
                 bins,
                 rows,
                 grad,
                 hess,
+                self.gq_dev.unsafe_ptr(),
                 self.feat_dev.unsafe_ptr(),
                 self.items_dev.unsafe_ptr(),
                 self.scales_dev.unsafe_ptr(),
@@ -3287,6 +3695,8 @@ struct GpuLeafBatcher(Movable):
                 Int32(self.n_bins),
                 Int32(hs),
                 Int32(self.n_features),
+                Int32(0),
+                Int32(0),
                 grid_dim=(plan.n_slots, plan.total_tiles),
                 block_dim=threads,
             )
@@ -3464,6 +3874,16 @@ struct GpuLeafBatcher(Movable):
         self.plan_items = n_items
         self.plan_tiles_per_item = tiles
         self.plan_slots = n_slots
+        # The round's scales and plane, kept host side for the quantization
+        # pass, and the invalidation that makes that pass once per tree. This
+        # is the only place the pair is written, which is what makes "the
+        # scale is global to the plan" a property of the code rather than an
+        # assumption: the loop above stores the SAME `g_scale` and `h_scale`
+        # into every item's row of `scales_dev`.
+        self.plan_g_scale = g_scale
+        self.plan_h_scale = h_scale
+        self.plan_plane = plane
+        self.quant_valid = False
         return total_tiles
 
     def device_plan_staged(self) -> Bool:
@@ -3474,6 +3894,65 @@ struct GpuLeafBatcher(Movable):
         instead of asserting that the host arm produced the right answer and
         calling that a pass."""
         return self.plan_items > 0
+
+    def _quant_flag(self) -> Int32:
+        """`use_quant` for a device-plan launch: on only when the arm is
+        selected AND the buffer holds this tree's round."""
+        var on = self.quant_grads and self.quant_valid
+        return Int32(1) if on else Int32(0)
+
+    def _const_hess_flag(self) -> Int32:
+        return Int32(1) if self.constant_hessian else Int32(0)
+
+    def _ensure_quantized[
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin, //
+    ](
+        mut self,
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+    ) raises:
+        """Rebuild the interleaved quantized buffer unless it already holds
+        this tree's round. One streaming launch over the staged plane's rows,
+        ordered before the accumulation that reads it by the queue.
+
+        **Once per tree and not once per level.** `stage_device_plan` is the
+        only invalidation and it runs once per tree, and the gradients cannot
+        move inside a tree because a round computes them once. So a depth-6
+        tree pays this on the level-zero enqueue and on no other:
+        `gpu_resident_round.oblivious_launch_census(6)` goes from 62 command
+        buffers to 63, under the measured 64-deep queue by one instead of by
+        two. That is the cost, it is the reason the arm is default off, and
+        folding the pass into `_batch_copy_back_zero_kernel` on the level-zero
+        pass would take it back to 62.
+
+        Enqueues only. Nothing here waits, because unlike the Int16 staging
+        arm in `gpu_active_rows` there is no bound to read back: Int32 holds
+        every value the Float32 arm would have formed.
+
+        Called at the top of every device-plan accumulation, so a caller that
+        never turns the arm on pays one Bool test per level.
+        """
+        if not self.quant_grads or self.quant_valid:
+            return
+        if self.plan_items < 1:
+            raise Error(
+                "the quantized gradient source needs a staged plan: its"
+                " scales and plane come from stage_device_plan"
+            )
+        var threads = self.block_threads
+        self.ctx.enqueue_function[_batch_quantize_kernel](
+            grad,
+            hess,
+            self.gq_dev.unsafe_ptr(),
+            Int32(self.plan_plane * self.n_rows),
+            Int32(self.n_rows),
+            self.plan_g_scale,
+            self.plan_h_scale,
+            grid_dim=_ceil_div(self.n_rows, threads),
+            block_dim=threads,
+        )
+        self.quant_valid = True
 
     def enqueue_device_plan_batch[
         bins_origin: MutOrigin,
@@ -3488,7 +3967,9 @@ struct GpuLeafBatcher(Movable):
         hess: MutPointer[Float32, hess_origin],
     ) raises:
         """Build every item of the device-written plan. **Two launches,
-        whatever the plan holds.** Does not stage, transfer, or synchronize.
+        whatever the plan holds**, plus the one quantization pass a tree pays
+        on its first level when the quantized source is on. Does not stage,
+        transfer, or synchronize.
 
         This is `enqueue_batch` with the staging removed and the strategy
         fixed, and it reads `items_dev` exactly as that path's kernels do, so
@@ -3521,6 +4002,9 @@ struct GpuLeafBatcher(Movable):
         var threads = self.block_threads
         var hs = self.hist_size()
 
+        # No-op unless the quantized source is on and the buffer is stale,
+        # which is once per tree; see `_ensure_quantized`.
+        self._ensure_quantized(grad, hess)
         var cells = n_items * N_PLANES * hs
         self.ctx.enqueue_function[_batch_zero_kernel](
             self.out_dev.unsafe_ptr(),
@@ -3538,6 +4022,7 @@ struct GpuLeafBatcher(Movable):
             rows,
             grad,
             hess,
+            self.gq_dev.unsafe_ptr(),
             self.feat_dev.unsafe_ptr(),
             self.items_dev.unsafe_ptr(),
             self.scales_dev.unsafe_ptr(),
@@ -3548,6 +4033,8 @@ struct GpuLeafBatcher(Movable):
             Int32(self.n_bins),
             Int32(hs),
             Int32(self.n_features),
+            self._quant_flag(),
+            self._const_hess_flag(),
             grid_dim=(self.plan_slots, total_tiles),
             block_dim=threads,
         )
@@ -3663,6 +4150,7 @@ struct GpuLeafBatcher(Movable):
                 rows,
                 grad,
                 hess,
+                self.gq_dev.unsafe_ptr(),
                 self.feat_dev.unsafe_ptr(),
                 self.items_dev.unsafe_ptr(),
                 self.scales_dev.unsafe_ptr(),
@@ -3678,6 +4166,8 @@ struct GpuLeafBatcher(Movable):
                 Int32(g[4]),
                 Int32(g[5]),
                 Int32(g[7]),
+                self._quant_flag(),
+                self._const_hess_flag(),
                 grid_dim=(g[0], g[1]),
                 block_dim=threads,
             )
@@ -3687,6 +4177,7 @@ struct GpuLeafBatcher(Movable):
                 rows,
                 grad,
                 hess,
+                self.gq_dev.unsafe_ptr(),
                 self.feat_dev.unsafe_ptr(),
                 self.items_dev.unsafe_ptr(),
                 self.scales_dev.unsafe_ptr(),
@@ -3702,6 +4193,8 @@ struct GpuLeafBatcher(Movable):
                 Int32(g[4]),
                 Int32(g[5]),
                 Int32(g[7]),
+                self._quant_flag(),
+                self._const_hess_flag(),
                 grid_dim=(g[0], g[1]),
                 block_dim=threads,
             )
@@ -3760,6 +4253,11 @@ struct GpuLeafBatcher(Movable):
         var threads = self.block_threads
         var hs = self.hist_size()
 
+        # No-op unless the quantized source is on and the buffer is stale,
+        # which is once per tree; see `_ensure_quantized`. It is ahead of the
+        # zeroing pass so that the level-zero enqueue is quantize, zero,
+        # accumulate, and the two later launches are unmoved.
+        self._ensure_quantized(grad, hess)
         var cells = n_items * N_PLANES * hs
         var blocks = _ceil_div(cells, threads)
         if copy_back_blocks > blocks:
@@ -3783,6 +4281,7 @@ struct GpuLeafBatcher(Movable):
             rows,
             grad,
             hess,
+            self.gq_dev.unsafe_ptr(),
             self.feat_dev.unsafe_ptr(),
             self.items_dev.unsafe_ptr(),
             self.scales_dev.unsafe_ptr(),
@@ -3793,6 +4292,8 @@ struct GpuLeafBatcher(Movable):
             Int32(self.n_bins),
             Int32(hs),
             Int32(self.n_features),
+            self._quant_flag(),
+            self._const_hess_flag(),
             grid_dim=(self.plan_slots, total_tiles),
             block_dim=threads,
         )
@@ -3862,6 +4363,9 @@ struct GpuLeafBatcher(Movable):
         var threads = self.block_threads
         var hs = self.hist_size()
 
+        # No-op unless the quantized source is on and the buffer is stale,
+        # which is once per tree; see `_ensure_quantized`.
+        self._ensure_quantized(grad, hess)
         var cells = n_items * N_PLANES * hs
         var blocks = _ceil_div(cells, threads)
         if copy_back_blocks > blocks:
@@ -3885,6 +4389,7 @@ struct GpuLeafBatcher(Movable):
             rows,
             grad,
             hess,
+            self.gq_dev.unsafe_ptr(),
             self.feat_dev.unsafe_ptr(),
             self.items_dev.unsafe_ptr(),
             self.scales_dev.unsafe_ptr(),
@@ -3895,6 +4400,8 @@ struct GpuLeafBatcher(Movable):
             Int32(self.n_bins),
             Int32(hs),
             Int32(self.n_features),
+            self._quant_flag(),
+            self._const_hess_flag(),
             grid_dim=(self.plan_slots, total_tiles),
             block_dim=threads,
         )

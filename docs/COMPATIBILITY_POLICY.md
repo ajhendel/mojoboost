@@ -170,26 +170,75 @@ API, in the docstring of the surviving surface.
 
 ## 4. Parameters, aliases, and defaults
 
-### 4.1 Canonical names
+### 4.1 Canonical names and wire names
 
-LightGBM's native parameter names are canonical everywhere: in the
-estimator constructors, in the `params` dict of the functional API, and in
-the parameter string that the C ABI and the CLI parse. Where mojotrees has
-its own spelling for something LightGBM also names, LightGBM's name is the
-one that is guaranteed.
+Two different things were once called canonical here, and separating them
+is what this section now does. The canonical name is what a user is told to
+type. The wire name is what the native layer, the model file and the parity
+harness carry. They coincide for most parameters and they differ for about
+a dozen, and the earlier text collapsed the two by declaring LightGBM's
+spellings canonical everywhere.
+
+**The canonical name is the scikit-learn spelling.** That is the vocabulary
+LightGBM's, XGBoost's and CatBoost's own scikit-learn wrappers share, and it
+is what an estimator user expects. Where those wrappers share no one word,
+the clearest existing vendor name is canonical instead, which is where
+`max_leaves` and `device` come from. `docs/PARAMETER_NAMING.md` is the
+determination, one canonical name per parameter in its OURS column, and
+every canonical name is a spelling some vendor already uses. Every error
+message and every docstring names the canonical spelling first and the
+vendor spelling the user typed in parentheses after it.
+
+**LightGBM's native names are the wire, and that claim survives intact.**
+The parameter string that the C ABI and the CLI parse, the `params` dict of
+the functional API, the `Dataset`, `Booster` and `train()` argument names in
+`python/mojotrees/basic.py`, the `RESETTABLE` slot names, the saved model
+files, and `tools/check_parity.py` all use LightGBM keys, and they are
+guaranteed to keep using them. A message on one of those surfaces that names
+a LightGBM key is correct rather than a naming violation, because on those
+surfaces the argument name **is** the wire. The exemption stops at CatBoost's
+and XGBoost's keys, which are neither canonical nor wire.
+
+**Growth-mode defaults mirror the vendor whose tree they are.**
+`grow_policy='symmetrictree'` mirrors CatBoost and `lossguide` mirrors
+LightGBM, per rule 9 of `bench/results/LANE_RULES.md`.
+
+Both spellings of a pair are guaranteed. Neither can be removed without the
+deprecation period of section 3, so nothing written against the earlier
+wording of this section stops working.
+
+#### Why LightGBM's spellings are not the canonical ones
+
+Recorded so that it is not relitigated. Making LightGBM's spellings
+canonical would leave the CatBoost-mode surface reading wrong, because
+`depth`, `SymmetricTree` and `bootstrap_type` are CatBoost's words and
+LightGBM has no word to replace them with. It would also gain nothing,
+because LightGBM users are already served by aliases that work either way.
+The wire keeps LightGBM's spellings for the reason it always has, which is
+that the model file and the parity harness are LightGBM's format.
 
 ### 4.2 Alias stability
 
-The scikit-learn spellings LightGBM accepts are accepted as aliases and
-are covered by this policy exactly as the canonical names are. The pairs
-in force today are `min_child_samples` for `min_data_in_leaf`,
-`min_child_weight` for `min_child_hess`, `reg_alpha` and `reg_lambda` for
-`lambda_l1` and `lambda_l2`, `subsample` and `subsample_freq` for
-`bagging_fraction` and `bagging_freq`, `device_type` for `device`,
-`boosting_type` for `boosting`, and `categorical_features` for
-`categorical_feature`. The callback reset path accepts a wider alias set,
-listed in `_RESET_ALIASES` in `python/mojotrees/callback.py`, and it is
-covered too.
+Every vendor spelling that is not the canonical one is an accepted alias,
+and an alias is covered by this policy exactly as the canonical name is. The
+pairs in force today are `min_child_samples` for LightGBM's
+`min_data_in_leaf`, `min_child_weight` for `min_child_hess`, `reg_alpha` and
+`reg_lambda` for `lambda_l1` and `lambda_l2`, `subsample` and
+`subsample_freq` for `bagging_fraction` and `bagging_freq`, `max_leaves` for
+`num_leaves`, `colsample_bytree` and `colsample_bynode` for
+`feature_fraction` and `feature_fraction_bynode`, `min_split_gain` for
+`min_gain_to_split`, `categorical_features` for `categorical_feature`,
+`boosting_type` for `boosting`, and `device` for `device_type`, together
+with the XGBoost and CatBoost spellings of the same parameters. The full set
+is `python.parameter_aliases` in `compatibility/api_snapshot.json`. The
+callback reset path accepts a wider alias set, listed in `_RESET_ALIASES` in
+`python/mojotrees/callback.py`, and it is covered too.
+
+The direction of that list is the wire direction rather than a statement of
+canonicity. The name after "for" is the one sent to the native layer, which
+is why `compatibility/api_snapshot.json` records it under
+`python.parameter_aliases.<alias>.wire`. Which of a pair is canonical is
+decided by `docs/PARAMETER_NAMING.md` and by nothing else.
 
 Three rules hold for aliases.
 

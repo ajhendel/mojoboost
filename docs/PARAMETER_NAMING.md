@@ -2,9 +2,23 @@
 
 Rule: one canonical name per parameter, always an EXISTING name from LightGBM,
 XGBoost, CatBoost, or sklearn; every other vendor's name is an accepted alias.
-Values still match LightGBM stock defaults. Internal struct fields, LightGBM
-model I/O, and check_parity keep LightGBM's names on the wire. Docs and error
-messages use canonical names only. Value strings are case-insensitive.
+Canonical is the scikit-learn spelling wherever the three vendors' own sklearn
+wrappers share one, because that is the vocabulary an estimator user expects,
+and the clearest existing vendor name otherwise (max_leaves and device are the
+latter kind). Values still match LightGBM stock defaults.
+Internal struct fields, LightGBM model I/O, and check_parity keep LightGBM's
+names on the wire. Docs and error messages name the canonical spelling FIRST
+and the vendor spelling the user typed in parentheses after it, for example
+`max_leaves (num_leaves) must be at least 2`; where the typed spelling is
+unknowable, they name the canonical alone and list the vendor spellings that
+reach it. Value strings are case-insensitive.
+
+This table is the determination. `tools/api_snapshot.py` reads the OURS column
+out of it to fill `python.parameter_aliases.<alias>.canonical`, so a parameter
+missing a row here is recorded as `null` and reported to users by its wire name
+instead. `docs/COMPATIBILITY_POLICY.md` section 4.1 states the same rule as a
+release contract and records why LightGBM's spellings are deliberately not the
+canonical ones.
 
 Behavior fix: subsample < 1 implies subsample_freq = 1 unless subsample_freq is
 set explicitly (no LightGBM silent no-op).
@@ -44,6 +58,7 @@ Legend: OURS = canonical; other columns = the vendor's name (accepted as alias);
 | categorical_features       | categorical_feature       | (enable_categorical)       | cat_features                   | categorical_features   | sklearn                               |
 | max_cat_to_onehot          | max_cat_to_onehot         | max_cat_to_onehot          | one_hot_max_size               | -                      | 2 of 4                                |
 | monotone_constraints       | monotone_constraints      | monotone_constraints       | monotone_constraints           | monotonic_cst          | unanimous                             |
+| monotone_penalty           | monotone_penalty          | -                          | -                              | -                      | LightGBM only, so its name stands; long form monotone_constraints_penalty is ours and is accepted as an alias |
 | interaction_constraints    | interaction_constraints   | interaction_constraints    | -                              | interaction_cst        | unanimous                             |
 | random_strength            | -                         | -                          | random_strength                | -                      | CatBoost only                         |
 | bootstrap_type             | -                         | -                          | bootstrap_type                 | -                      | CatBoost only (Bayesian/Bernoulli/MVS/Poisson) |

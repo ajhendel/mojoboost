@@ -507,6 +507,22 @@ the sampler." The symmetric GPU arm ran five repeats today and did not raise.
   but a mechanism that forces the host derivative arm is the obvious first
   suspect and it is a real cost.
 
+  **Both seconds carry their run and both are PRE-FLIP.** Run
+  `bench/real_data/results/20260817T110847Z-dense1mfixed/`, arm
+  `mojotrees_catboost_mode`, 799,110 rows x 100 features x 100 trees, symmetric
+  depth 6, 10 threads, five repeats, `dense_regression` tier `large`, comparator
+  `stock+det@v2`. Both figures are the medians of their five repeats, 17.0719 of
+  a 17.0322 to 17.8772 spread on the gpu and 9.0892 of an 8.8939 to 11.0279
+  spread on the cpu, and the run's quiet-box status is not established. It was
+  taken before the four symmetric GPU switches flipped to default on later the
+  same day, so the GPU side of this contrast is a stale absolute for the arm that
+  ships today. **No post-flip large-tier symmetric run has been filed**, so
+  nothing in `bench/real_data/results/` supersedes it and the honest statement is
+  that the post-flip absolute at this shape is unrecorded. The direction of the
+  argument is unaffected either way, because the flips move the GPU number
+  downward and the CPU number not at all, so the demotion this paragraph prices
+  can only be smaller than it looks here.
+
 **Cost, restated.** Negative on the CPU, roughly 20 percent fewer rows in the
 histogram accumulation per tree. **Materially positive on the GPU**, because it
 gives up the device round. Refused by entry point on multiclass and sparse.
@@ -974,11 +990,34 @@ reasons, each sufficient.
 1. **It loses on real data.** Section 4. On YearPredictionMSD at matched rate,
    symmetric is 1.24 percent worse than leaf-wise and CatBoost is 1.43 percent
    worse than LightGBM.
-2. **It costs 2.7x to 4.7x on the GPU.** From the same records that carry the
-   accuracy. Standard tier, symmetric GPU 2.238 s against leaf-wise GPU 0.839 s;
-   large tier, 17.072 s against 3.659 s. On the CPU it is 1.2x to 1.7x. These
-   are from runs whose quiet-box status is not established and should be read as
-   ratios, not as absolute seconds, but no plausible correction closes 4.7x.
+2. **It costs 2.7x to 4.7x on the GPU, PRE-FLIP.** From the same records that
+   carry the accuracy. Standard tier, symmetric GPU 2.238 s against leaf-wise GPU
+   0.839 s. Large tier, 17.072 s against 3.659 s, both medians of five repeats in
+   run `bench/real_data/results/20260817T110847Z-dense1mfixed/` at 799,110 rows x
+   100 features x 100 trees, symmetric depth 6, 10 threads, comparator
+   `stock+det@v2`. On the CPU it is 1.2x to 1.7x. These are from runs whose
+   quiet-box status is not established and should be read as ratios, not as
+   absolute seconds.
+
+   **The 4.7x is measured on a symmetric arm that no longer ships, and the
+   corrected ratio is UNRESOLVED.** Later on 2026-08-17 four GPU switches that
+   reach only the symmetric path flipped to default on, so the numerator of this
+   ratio moved and the denominator did not. **No post-flip large-tier run with
+   both arms in one window has been filed**, and the post-flip symmetric
+   absolutes in circulation, around 10.36 s and around 9.8 s, come from source
+   comments and a commit message rather than from an artifact, and were taken
+   against a different baseline in a different window, so they may not be divided
+   into 3.659 s to manufacture a new ratio. See
+   `bench/results/FIGURE_PROVENANCE.md`. What still stands is the sign, and one
+   bound. Within the single window where both arms were read together, symmetric
+   was 4.666x slower, and the largest speedup the flips have been credited with
+   anywhere is the 2.20x combined arm, so dividing one by the other leaves about
+   **2.1x, and that is an ESTIMATE across two windows rather than a measurement**,
+   offered only to show that the recorded numbers do not reach a reversal. Reason
+   1 and reason 3 do not depend on the multiple at all. **What is no longer
+   supportable is the specific figure 4.7x**, and the sentence "no plausible
+   correction closes 4.7x" was removed from this item on 2026-08-17 evening
+   because a correction of exactly that kind had already landed.
 3. **The mechanism it would buy is available more cheaply.** The gap is
    variance. R1 and R3 attack variance at zero and negative cost.
 

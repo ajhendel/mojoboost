@@ -17,7 +17,11 @@ entry range, so workers never write the same location.
 Every builder takes the same optional list of feature ids the dense builders
 take (empty means all). Under feature subsampling only those features are
 accumulated and the rest of the output stays zero, so sibling subtraction
-stays exact on either representation.
+stays exact on either representation. A repeated id in that list names the
+same slice twice and is accumulated once, on the same rule the dense builders
+follow; `_DUPLICATE_FEATURE_IDS` below carries what a surviving repeat would
+do to the accumulation, and why the "workers never write the same location"
+sentence above depends on the strip.
 
 Numerical note: the default bin is derived by subtraction, so a sparse
 histogram is not bit-identical to the dense histogram of the same data. The
@@ -25,9 +29,52 @@ two agree to floating-point rounding (counts agree exactly), the same
 trade-off the dense path already makes for sibling subtraction.
 """
 
-from .histogram import Histogram, _check_features, derivative
+from .histogram import (
+    Histogram,
+    _check_features,
+    _has_duplicate_features,
+    _unique_features,
+    derivative,
+)
 from .parallel import dispatch_features
 from .sparse import SparseBinnedMatrix
+
+
+# --- _DUPLICATE_FEATURE_IDS ------------------------------------------------
+#
+# What a repeated id in `features` does to the accumulators below, and why
+# every entry point strips one before it reaches them.
+#
+# Both accumulators dispatch over *active slots* rather than over features:
+# slot `i` resolves to `features[i]`, and its body accumulates that feature's
+# entries into `features[i] * n_bins` and then folds the node's leftover into
+# that feature's default bin. The output planes are allocated zeroed once and
+# every write is a read-modify-write, so nothing is ever overwritten. A list
+# holding one id `k` times therefore runs the same body `k` times over the
+# same cells, and the feature's whole slice -- gradient, hessian and count
+# alike -- comes out as exactly `k` times the truth. Its counts exceed the
+# node's row count, so the histogram is not a histogram of anything.
+#
+# **The sparse shape is wrong at every `k >= 2`, unlike the dense one.** The
+# dense kernels re-zero each lane's slice at the top of a feature group, so a
+# repeat there yielded the *group width* times the truth and was accidentally
+# right at a width of 1 (see `histogram._check_features`). Nothing here zeroes
+# per feature, so there is no width at which the sparse answer is right and no
+# machine on which the defect hides.
+#
+# And once the dispatch goes parallel it is worse than a factor. Two slots
+# naming the same feature can land in different workers, and the docstring
+# invariant at the top of this module -- "each feature owns the
+# `[f * n_bins, (f + 1) * n_bins)` output slice ... so workers never write the
+# same location" -- is exactly what a duplicate breaks. The reads and writes
+# are unsynchronized, so the result is not even a stable multiple.
+#
+# `gpu_sparse.SparseDeviceLayout.set_active_features` describes this same
+# arithmetic for the device mirror of these kernels, and refuses the list
+# there rather than stripping it. The CPU builders strip because they are
+# re-exported beside the dense builders, which strip; the device setter is an
+# internal wiring point with no such neighbor.
+# ---------------------------------------------------------------------------
 
 
 @fieldwise_init
@@ -273,6 +320,30 @@ def _build_histogram_sparse_node_at[
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
     _check_features(features, data.n_features)
+    # A repeated feature id is accumulated once, which is the only answer that
+    # is a histogram of anything. See `_DUPLICATE_FEATURE_IDS` above for what
+    # this accumulator does with a repeat that survives, and `_check_features`
+    # for what the dense kernels do with theirs.
+    #
+    # Strip rather than raise, matching
+    # `histogram.build_histogram_into_scratch` and for its reasons. A feature
+    # list names a *set*, the natural reading of a set given twice is the set,
+    # and this entry point is re-exported from `__init__.mojo` beside the
+    # dense builder that already strips, so a caller swapping one for the
+    # other must not meet an error the other never raised. Neither branch
+    # costs anything on the production path, because no id list this project
+    # generates can repeat.
+    #
+    # Re-entry rather than a local rebind, so the strip cannot drift out of
+    # step with the accumulation below: the second pass takes exactly the path
+    # the caller would have taken had it handed in the deduplicated list, and
+    # it terminates because `_unique_features` cannot return a list with a
+    # repeat in it.
+    if _has_duplicate_features(features, data.n_features):
+        var unique = _unique_features(features, data.n_features)
+        return _build_histogram_sparse_node_at[NARROW](
+            data, grad, hess, order, node, totals, unique
+        )
 
     var n_bins = data.n_bins
     var size = data.n_features * n_bins
@@ -402,6 +473,21 @@ def _build_histogram_sparse_subset_at[
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
     _check_features(features, data.n_features)
+    # Repeats stripped before anything reads `len(features)` as an active
+    # count; `_build_histogram_sparse_node_at` carries the argument for
+    # stripping rather than refusing, and `_DUPLICATE_FEATURE_IDS` carries what
+    # a repeat that survived would do to this accumulator.
+    #
+    # A repeated *row* below is refused rather than stripped, and the two rules
+    # are not in tension. A duplicate row is a statement about the data being
+    # summarized, and dropping it would silently change which rows the caller
+    # asked about; a duplicate feature id is a statement about which slices to
+    # fill, and naming a slice twice asks for the same slice.
+    if _has_duplicate_features(features, data.n_features):
+        var unique = _unique_features(features, data.n_features)
+        return _build_histogram_sparse_subset_at[NARROW](
+            data, grad, hess, rows, unique
+        )
 
     var member = List[UInt8](capacity=data.n_rows)
     member.resize(data.n_rows, 0)

@@ -17,7 +17,7 @@ x 100 features x 100 trees, symmetric depth 6, on one M4.
 
 | baseline | where it comes from | provenance |
 | --- | --- | --- |
-| 17.07 s | the 2026-08-16 comparison run, `mojotrees_catboost_mode` gpu row, `docs/design/GPU_GROWTH_ATTRIBUTION.md` table (17.0719) | artifact-backed, pre-flip |
+| 17.07 s | run `20260817T110847Z-dense1mfixed`, `mojotrees_catboost_mode` gpu row, median of five repeats (17.0719 of 17.0322, 17.0407, 17.0719, 17.1868, 17.8772), 10 threads, `dense_regression` tier `large`, comparator `stock+det@v2`; tabulated in `docs/design/GPU_GROWTH_ATTRIBUTION.md` section 1.1 | **artifact-backed, pre-flip**, and this row said "the 2026-08-16 comparison run" until the applying lane checked it. It is a 2026-08-17 run, and the 2026-08-16 large-tier run `20260816T181134Z-decision-1m` carries no `mojotrees_catboost_mode` arm at all. |
 | 20.4 s | 2026-08-17, quiet box, alternating passes of three repeats, narrow-scan arm (`gpu_split_search.oblivious_wide_scan_requested` flip comment, "20.40 s narrow") | source comment only |
 | 21.97 s | 2026-08-17, conditions recorded nowhere | out-of-band brief only |
 | 22.76 s | 2026-08-17, loaded box, three-cycle interleaved round robin | source comments only |
@@ -694,3 +694,178 @@ commit message. The absence of any file behind "the 2026-08-17 lane brief". The
 some other arm combination, which the arithmetic supports negatively but cannot
 prove. That the noise hoist's unrecorded window was the loaded one, which its
 three siblings' recorded regime suggests and nothing establishes.
+
+---
+
+## PART E. The applying lane, 2026-08-17 evening
+
+A second read-only lane applied Parts A through D to the files it owned. It
+built nothing, compiled nothing, ran nothing and timed nothing. No figure
+changed value anywhere in this pass.
+
+### E1. Applied
+
+- `bench/results/LANE_RULES.md` rule 5, the "on the day this rule was written"
+  paragraph. The bare "1.78x" became the range 1.58x to 1.78x with both pairs,
+  both windows and the shape; the scan rewrite and the skipped last build gained
+  their pairs; and the hoisted noise copy was removed from the list of measured
+  wins, with a sentence saying what it used to claim and why it no longer does.
+- `bench/results/LANE_RULES.md`, **rule 10 added**, from the Part D draft, with
+  the 17.07 s attribution corrected per E4 below.
+- `bench/results/RESUME_2026-08-17.md`, the `abbbf98` bullet, the "MY OWN NUMBERS
+  ARE INCONSISTENT" section and the "still owed" addendum. Items 1 and 2 record
+  their pairs and their windows, item 3 is downgraded to unmeasured with the
+  measurement stated as owed, and the ten sites replace the reported three.
+- `docs/design/ACCURACY_GAP.md`, the two sites carrying 17.072 s. Both now name
+  the run, the shape, the repeat count and the pre-flip status.
+- This file, the 17.07 s row of the baseline table. See E4.
+
+### E2. Not applied, source, exact replacement text
+
+`gpu_resident_round.mojo` was untouched by the peer pass described in the
+addendum, so all three of its 2.08x sites and all of Part C's noise-hoist sites
+stand. Part C already carries verbatim replacements for C1 through C4 and they
+are not repeated here. The two 2.08x sites are new.
+
+**E2a. `gpu_resident_round.mojo`, `OBLIVIOUS_SKIP_LAST_BUILD_VAR` docstring,
+MEASURED paragraph.** Currently reads "**Measured 2026-08-17**, 799,110 x 100,
+symmetric depth 6, M4, interleaved round-robin against a baseline arm:
+**1.26x alone**, and 2.08x in combination with the sibling-subtraction and
+wide-scan arms, every arm of every cycle returning an identical RMSE to nine
+decimals."
+
+Replace with:
+
+> **Measured 2026-08-17 at 799,110 x 100 x 100 trees, symmetric depth 6, M4, and
+> the two figures below come from TWO DIFFERENT WINDOWS.** **1.26x alone** is
+> 22.76 s to 18.06 s in a loaded three-cycle interleaved round robin, rmse
+> 2.439382420 in every arm of every cycle. **2.08x** in combination with the
+> sibling-subtraction and wide-scan arms is a different pair, 20.4 s to 9.8 s,
+> recorded only in commit `abbbf98`'s message body, on what is inferred to be a
+> quiet box and is not stated to be one. The same combination read 22.76 s to
+> 10.36 s, 2.20x, in the loaded round robin. **Both multiples are arithmetically
+> exact against their own baselines and neither supersedes the other.** This
+> paragraph applied the word "interleaved round-robin" to the 2.08x until
+> 2026-08-17 evening, which was the other pair's conditions line.
+
+**E2b. Same docstring, "WHAT IT REMOVES" close.** Currently reads "**It has been
+timed, on 2026-08-17: 1.26x alone and 2.08x with the two switches beside it,
+interleaved, bit-identical.**"
+
+Replace with:
+
+> **It has been timed on 2026-08-17. 1.26x alone, 22.76 s to 18.06 s, three
+> interleaved round-robin cycles on a loaded box, bit-identical. The combined
+> arm was read twice, 2.08x from a 20.4 s to 9.8 s pair whose window is inferred
+> rather than stated, and 2.20x from 22.76 s to 10.36 s in the interleaved round
+> robin. Quote the combined arm as the pair it came from, never as a bare
+> multiple.**
+
+**E2c. `gpu_resident_round.mojo`, `oblivious_skip_last_build_requested`
+docstring.** Currently reads "**The combined figure is quoted two ways in this
+file and neither is corrected here**, because only a run settles which is
+meant."
+
+Replace with:
+
+> **The combined figure is quoted two ways in this file and BOTH ARE CORRECT,
+> because they are two different pairs rather than two readings of one.** The
+> comment on the return calls this arm part of a **2.20x** combined arm, which is
+> 22.76 s to 10.36 s in a loaded three-cycle interleaved round robin;
+> `OBLIVIOUS_SKIP_LAST_BUILD_VAR` says **2.08x**, which is 20.4 s to 9.8 s from
+> commit `abbbf98`'s message body in an earlier and probably quieter window. No
+> run is owed here. This docstring said "only a run settles which is meant" until
+> 2026-08-17 evening, and a run would only have produced a third window. What
+> settles it is naming the pair beside every multiple, which is now done in both
+> places. The alone figure, 1.26x, is unaffected.
+
+### E3. Not applied, documents, exact replacement text
+
+Each is a CORRECTION under rule 7, not a suggestion.
+
+- **`docs/design/SWITCH_GRID.md` section 3A, `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT`
+  row, MEASURED cell.** Replace the opening "**MEASURED**, 1.78x, 21.97 s to
+  12.34 s at 799,110 x 100 x 100 trees, rmse identical to nine decimals
+  (2026-08-17 lane brief)." with "**MEASURED TWICE IN TWO WINDOWS, QUOTE THE
+  RANGE 1.58x to 1.78x.** The citable reading is **1.58x**, 22.76 s to 14.39 s at
+  799,110 x 100 x 100 trees, symmetric depth 6, M4, three interleaved
+  round-robin cycles on a loaded box, rmse 2.439382420 in every arm of every
+  cycle. An earlier reading of **1.78x**, 21.97 s to 12.34 s at the same shape,
+  has **no window, no interleaving statement and no artifact**, and is cited to a
+  2026-08-17 lane brief that is not a file in this repository, so under
+  `PROFILE_PROTOCOL.md` A3 it cannot be preferred over the labeled one." Keep the
+  rest of the cell.
+- **`docs/design/SWITCH_GRID.md` section 4, rank 1.** Replace "1.78x measured on
+  the shipped symmetric default, bit-identical by an exact integer argument.
+  Largest single number on the board" with "**1.58x to 1.78x** on the shipped
+  symmetric default, bit-identical by an exact integer argument. The labeled end
+  is 1.58x, 22.76 s to 14.39 s, three interleaved round-robin cycles on a loaded
+  box; the unlabeled end is 1.78x, 21.97 s to 12.34 s, window unrecorded. Largest
+  single number on the board at either end".
+- **`docs/design/SWITCH_GRID.md` section 3A, `SKIP_LAST_BUILD` row.** The phrase
+  "and the same figure at `oblivious_schedule_launches`'s neighbouring note" is
+  false and should be deleted. `oblivious_schedule_launches` carries no timing.
+  The 2.08x lives in the `OBLIVIOUS_SKIP_LAST_BUILD_VAR` docstring, which merely
+  mentions that function. Also replace "part of the 2.08x-to-2.20x combined arm"
+  with "part of a combined arm read twice, 2.08x from a 20.4 s to 9.8 s pair and
+  2.20x from 22.76 s to 10.36 s, two windows and two correct multiples".
+- **`docs/design/GROWTH_POLICY_REACH.md` switch table.** Replace "sibling
+  subtraction, **default ON, measured 1.78x**" with "sibling subtraction,
+  **default ON, measured 1.58x to 1.78x across two windows**, see
+  `bench/results/FIGURE_PROVENANCE.md`".
+- **`docs/design/OBLIVIOUS_WAIT_CENSUS.md`, "How this composes with sibling
+  subtraction".** Replace "1.78x, 21.97 s to 12.34 s, with a second interleaved
+  three-cycle reading of 22.76 s to 14.39 s" with "two readings in two windows,
+  **1.58x**, 22.76 s to 14.39 s, three interleaved round-robin cycles on a loaded
+  box, which is the labeled one, and **1.78x**, 21.97 s to 12.34 s, window
+  unrecorded. Quote the range".
+- **`docs/design/OBLIVIOUS_WAIT_CENSUS.md`, the "2.08x-to-2.20x combined arm"
+  phrase.** Replace with "a combined arm read twice, 2.08x from 20.4 s to 9.8 s
+  and 2.20x from 22.76 s to 10.36 s, both exact against their own baselines".
+- **`docs/design/DECLINED_OPTIMIZATIONS.md`, the pre-flip denominator note.**
+  Replace "the symmetric arm is around **10.36 s** rather than 17.07 s (2.20x
+  from `OBLIVIOUS_SUBTRACT` plus `OBLIVIOUS_SKIP_LAST_BUILD` plus
+  `OBLIVIOUS_WIDE` together)" with "the symmetric arm is around **10.36 s**
+  rather than 17.07 s. **That is 1.65x and not 2.20x.** The 2.20x those three
+  switches together were measured at is against their own 22.76 s baseline in a
+  loaded three-cycle round robin, and 22.76 s and 17.07 s are different windows
+  at the same shape, so the two numbers may not be chained. The conversion
+  factor for this document is 1.65, which the paragraph below already states
+  correctly." This is the single clearest instance of the defect this file
+  documents, and note that the note is otherwise right and its 1.65 conversion
+  needs no change.
+
+### E4. Cannot be reached at all, and where the correction lives instead
+
+- **Commit `abbbf98`, message body.** Publishes "symmetric GPU train 20.4s ->
+  9.8s (sibling subtraction 1.58x, skip-last-level-build 1.26x, wide oblivious
+  scan 1.07x)" with "All timings are standard tier on one M4". It is right, it is
+  the only witness to the 20.4 s to 9.8 s pair, and it names no window and no run
+  id. A commit message cannot be edited. The correction lives in this file, in
+  `RESUME_2026-08-17.md`'s git-state bullet, which now names the pair beside the
+  2.08x, and in rule 10 clause 4.
+- **Commit `fe1f98d`, message body.** Attaches "interleaved round-robin" to the
+  2.08x, which is the other pair's conditions line. Also uneditable. The
+  correction lives at E2a and E2b, which is where a reader who follows the commit
+  into the source will land.
+
+### E5. One correction to this file itself
+
+The baseline table attributed **17.07 s** to "the 2026-08-16 comparison run".
+That is wrong and the applying lane verified the correct provenance from the
+records. 17.07 s is the median of the five `mojotrees_catboost_mode` gpu repeats
+in `bench/real_data/results/20260817T110847Z-dense1mfixed/records.csv`
+(17.0322, 17.0407, 17.0719, 17.1868, 17.8772), a **2026-08-17** run at 799,110 x
+100 x 100 trees, 10 threads, `dense_regression` tier `large`, comparator
+`stock+det@v2`, tabulated at `GPU_GROWTH_ATTRIBUTION.md` section 1.1. The
+2026-08-16 large-tier run `20260816T181134Z-decision-1m` contains **no
+`mojotrees_catboost_mode` arm at all**, so the figure could not have come from
+it. The row is corrected. Nothing downstream of it moves, because every ratio
+quoted against 17.07 s was quoted against the value and not against the date.
+
+**Also verified while applying.** No post-flip large-tier symmetric artifact
+exists. Every `bench/real_data/results/` directory from `20260817T130309Z-lanecheck`
+onward carries zero `catboost_mode` rows at tier `large`, so **17.07 s remains
+the only filed absolute for the symmetric GPU arm at this shape**, and it is
+pre-flip. The post-flip absolutes in circulation, 10.36 s and 9.8 s, are source
+comments and a commit message.

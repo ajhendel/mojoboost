@@ -27,6 +27,7 @@ src/mojotrees/gpu_fused_round.mojo::GpuTreeRouter.route::launch
 src/mojotrees/gpu_gradient_stream.mojo::GpuRowSelection.apply_compensation::launch
 src/mojotrees/gpu_gradient_stream.mojo::GpuRowSelection.enqueue_importance::launch
 src/mojotrees/gpu_gradient_stream.mojo::InterleavedGradients.pack::launch
+src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher._ensure_quantized::launch
 src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher._launch_plan_hist::launch
 src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher.enqueue_batch::launch
 src/mojotrees/gpu_leaf_batching.mojo::GpuLeafBatcher.enqueue_device_plan_batch::launch
