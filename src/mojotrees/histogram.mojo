@@ -1212,14 +1212,112 @@ def _check_features(features: List[Int], n_features: Int) raises:
     """Feature ids must be in range; an empty list means every feature.
 
     Range **only**. This does not check that the ids are distinct or
-    ascending, and a repeated id is accepted here: `[0, 0, 0]` against three
-    features passes. Nothing downstream is unsound for it -- the accumulation
-    would simply do feature 0 three times -- but it means `len(features) ==
-    n_features` alone does not establish that the list covers every feature,
-    which is why `_zero_excluded` proves the covering separately."""
+    ascending, and a repeated id passes here: `[0, 0, 0]` against three
+    features is accepted by this function.
+
+    **A repeated id is not harmless, and the sentence that used to stand here
+    saying it was is what let the defect below live.** The old text claimed
+    "nothing downstream is unsound for it, the accumulation would simply do
+    feature 0 three times". Both halves were wrong. It *is* unsound, and the
+    number of times feature 0 is accumulated is not the number of times it
+    appears: the accumulation kernels dispatch over feature *groups* of
+    `plan.group_width` lanes, they re-zero each lane's slice at the top of the
+    group, and every lane of one group that names the same feature adds into
+    the same cells. So a list of `k` copies of one id yields that feature's
+    histogram multiplied by the group width, not by `k`, and at a width of 1
+    it yields it once. The width is machine-dependent (it reads
+    `dispatch_cores`), so the wrong answer was different on different
+    machines. Two groups that name the same feature also land in different
+    tasks, so once the dispatch goes parallel the shared slice takes
+    unsynchronized read-modify-writes from two workers as well.
+
+    So duplicates are *removed*, not merely tolerated: every entry point in
+    this module runs `_has_duplicate_features` after this check and rebuilds
+    its list through `_unique_features` when it fires. Nothing downstream ever
+    sees a repeat. This function keeps range-only validation because it is
+    also imported by `histogram_sparse.mojo`, and because the covering
+    argument in `_zero_excluded` is a separate one: `len(features) ==
+    n_features` still does not establish covering on its own for a caller
+    that reaches that helper directly.
+    """
     for i in range(len(features)):
         if features[i] < 0 or features[i] >= n_features:
             raise Error("feature index out of range")
+
+
+def _has_duplicate_features(features: List[Int], n_features: Int) -> Bool:
+    """Whether any feature id appears twice. Ids are assumed range-checked.
+
+    Two passes, and the first one is the whole point of the shape. A strictly
+    ascending list cannot repeat, that test is `len(features)` integer
+    compares with no allocation, and **every id list this project generates
+    internally is strictly ascending**: `sampling.sample_without_replacement`
+    keeps its pool's order and draws no entry twice,
+    `sampling.check_feature_pool` refuses a pool that is not ascending and
+    unique, and the unsubsampled path passes `[0, n_features)` or the empty
+    list. So the production path pays one scan and nothing else, and the
+    `List[UInt8]` mask is only ever allocated for a list that is out of order,
+    which is a hand-built one from outside this module.
+    """
+    var n = len(features)
+    if n < 2 or n_features <= 0:
+        return False
+    var ascending = True
+    for i in range(1, n):
+        if features[i] <= features[i - 1]:
+            ascending = False
+            break
+    if ascending:
+        return False
+
+    # Mojo's scalar pointer API cannot load `Bool`; a byte mask is what
+    # `_zero_excluded` uses for the same job a few lines below.
+    var seen = List[UInt8](capacity=n_features)
+    seen.resize(n_features, UInt8(0))
+    for i in range(n):
+        var f = features[i]
+        if f < 0 or f >= n_features:
+            # Unreachable after `_check_features`. Skipped rather than
+            # indexed so this helper is total on its own arguments.
+            continue
+        if seen[f] != UInt8(0):
+            return True
+        seen[f] = UInt8(1)
+    return False
+
+
+def _unique_features(features: List[Int], n_features: Int) -> List[Int]:
+    """`features` with every repeat after the first occurrence dropped.
+
+    **First-occurrence order, not sorted**, and that is a requirement rather
+    than a convenience. A caller is allowed to hand in an unordered complete
+    list and expect the same histogram an ordered one produces, which is what
+    `tests/test_feature_sampling.mojo` asserts; sorting here would still
+    satisfy that, but it would silently reorder the active-slot numbering that
+    the blocked kernel's private partials are indexed by, and reordering is
+    not this helper's job. Dropping is.
+
+    Never returns an empty list for a non-empty input. That matters because an
+    empty list means *every* feature to every builder in this module, so a
+    dedupe that emptied its input would turn a subsampled build into a full
+    one. It cannot happen: a non-empty `features` has been through
+    `_check_features`, so every id is inside `[0, n_features)` and the first
+    one is always appended.
+    """
+    var out = List[Int](capacity=len(features))
+    if n_features <= 0:
+        return out^
+    var seen = List[UInt8](capacity=n_features)
+    seen.resize(n_features, UInt8(0))
+    for i in range(len(features)):
+        var f = features[i]
+        if f < 0 or f >= n_features:
+            continue
+        if seen[f] != UInt8(0):
+            continue
+        seen[f] = UInt8(1)
+        out.append(f)
+    return out^
 
 
 def ensure_pair_capacity(mut pairs: List[Float64], n_words: Int):
@@ -1279,11 +1377,15 @@ def _zero_excluded(
     # mask below is allocated, filled, dispatched over, and zeroes nothing.
     #
     # `len(features) == n_features` is not on its own enough to conclude that:
-    # `_check_features` checks range only and accepts repeats (see its
-    # docstring), so `[0, 0, 0]` against three features would pass a length
-    # test while excluding two features. Strictly ascending is what settles
-    # it -- with every id range-checked by the caller, `n_features` strictly
-    # ascending ids inside `[0, n_features)` can only be `features[i] == i`.
+    # `_check_features` checks range only, so `[0, 0, 0]` against three
+    # features would pass a length test while excluding two features. The
+    # builders in this module no longer reach here with such a list -- their
+    # entry points strip repeats through `_unique_features` first -- but this
+    # helper is called with the caller's list rather than with a promise about
+    # it, so the shortcut proves its own precondition. Strictly ascending is
+    # what settles it -- with every id range-checked by the caller,
+    # `n_features` strictly ascending ids inside `[0, n_features)` can only be
+    # `features[i] == i`.
     # A complete but unordered list falls through and does the work, which is
     # correct, just not shortened.
     if len(features) == n_features:
@@ -1419,6 +1521,36 @@ def build_histogram_into_scratch(
     if not out.matches(data.n_features, data.n_bins):
         raise Error("output histogram shape must match the data")
     _check_features(features, data.n_features)
+    # A repeated feature id is accumulated once, which is the only answer that
+    # is a histogram of anything. See `_check_features` for what the kernels do
+    # with a repeat instead (multiply by the group width, and race), and see
+    # `_unique_features` for why the fix is here rather than in the kernel.
+    #
+    # **Why strip rather than raise.** Refusing looks cheaper and is what the
+    # first reading of this bug proposed, but the accepted contract of this
+    # entry point is that a feature list names a *set* -- an unordered one, as
+    # `tests/test_feature_sampling` asserts by building a reversed complete
+    # list -- and the natural reading of a set given twice is the set. Raising
+    # would also be a behaviour change for a caller that is asking for
+    # something well defined, and it would convert today's silently wrong
+    # number into a crash rather than into a right number. What makes the
+    # choice easy is that neither branch costs anything on the production
+    # path: no id list this project generates can repeat, and
+    # `_has_duplicate_features` names the three generators, so the strip is a
+    # scan that always says no.
+    #
+    # Re-entry rather than a local rebind so that the strip cannot drift out of
+    # step with the dispatch below: the second pass takes exactly the path the
+    # caller would have taken had it handed in the deduplicated list itself,
+    # and terminates because `_unique_features` cannot return a list with a
+    # repeat in it.
+    if _has_duplicate_features(features, data.n_features):
+        var unique = _unique_features(features, data.n_features)
+        build_histogram_into_scratch(
+            out, scratch, data, grad, hess, unique, const_hessian, settings,
+            const_hessian_env,
+        )
+        return
     var const_h = _resolve_const_hessian(const_hessian, const_hessian_env)
     if const_h and _resolve_const_hessian_verify(const_hessian_env):
         _check_constant_hessian(hess, data.n_rows)
@@ -2001,6 +2133,17 @@ def build_histogram_subset_into_scratch(
     if row_start < 0 or row_count < 0 or row_start + row_count > len(rows):
         raise Error("row window out of range")
     _check_features(features, data.n_features)
+    # Repeats stripped before anything reads `len(features)` as an active
+    # count; `build_histogram_into_scratch` carries the argument for stripping
+    # rather than refusing, and `_check_features` carries what the kernels do
+    # with a repeat that survives.
+    if _has_duplicate_features(features, data.n_features):
+        var unique = _unique_features(features, data.n_features)
+        build_histogram_subset_into_scratch(
+            out, pairs, data, grad, hess, rows, row_start, row_count, unique,
+            const_hessian, settings, const_hessian_env,
+        )
+        return
     var const_h = _resolve_const_hessian(const_hessian, const_hessian_env)
     if const_h and _resolve_const_hessian_verify(const_hessian_env):
         _check_constant_hessian(hess, data.n_rows)
@@ -3396,11 +3539,23 @@ def build_histogram_subset_replica_into[
     if len(fixed) < 3 * hist_size + 2 * row_count:
         fixed.resize(3 * hist_size + 2 * row_count, Int32(0))
 
-    var use_all = len(features) == 0
-    var n_active = n_features if use_all else len(features)
+    # Repeats stripped, as at the other three entry points and for the reason
+    # `build_histogram_into_scratch` spells out. This one rebinds a local
+    # instead of re-entering itself, because the function is parametric over
+    # the two span origins and this path runs once per elected split rather
+    # than inside a row loop, so one list copy is cheaper than making the
+    # recursion re-infer them. The replica has to match the device number for
+    # number, and a device build that named a feature twice would be wrong in
+    # its own way; both sides accumulate a set.
+    var used = features.copy()
+    if _has_duplicate_features(features, n_features):
+        used = _unique_features(features, n_features)
+
+    var use_all = len(used) == 0
+    var n_active = n_features if use_all else len(used)
     _zero_excluded(
         out._gh, out._count,
-        n_features, n_bins, features,
+        n_features, n_bins, used,
         (n_features - n_active) * n_bins,
     )
 
@@ -3411,7 +3566,7 @@ def build_histogram_subset_replica_into[
     _accumulate_replica(
         out._gh, out._count, fixed,
         data, grad_f32, hess_f32, rows, row_start, row_count,
-        g_scale, h_scale, features,
+        g_scale, h_scale, used,
         _resolve_const_hessian(const_hessian),
     )
 
@@ -4035,6 +4190,17 @@ def build_histogram_subset_row_major_into_scratch(
             " set MOJOTREES_CPU_ROW_MAJOR=1 to have fit-time binning build it"
         )
     _check_features(features, data.n_features)
+    # Repeats stripped here too, and not only for correctness: this builder is
+    # asserted bit-identical to `build_histogram_subset` on the same
+    # arguments, so it has to strip exactly what that one strips or the two
+    # would disagree on any list a caller repeated an id in.
+    if _has_duplicate_features(features, data.n_features):
+        var unique = _unique_features(features, data.n_features)
+        build_histogram_subset_row_major_into_scratch(
+            out, pairs, data, grad, hess, rows, row_start, row_count, unique,
+            const_hessian, settings, const_hessian_env,
+        )
+        return
     var const_h = _resolve_const_hessian(const_hessian, const_hessian_env)
     if const_h and _resolve_const_hessian_verify(const_hessian_env):
         _check_constant_hessian(hess, data.n_rows)
