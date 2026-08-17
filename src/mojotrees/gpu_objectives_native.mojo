@@ -1021,6 +1021,142 @@ def sum_abs_partials[partials_origin: MutOrigin, //](
     return GradMagnitudes(g_total, h_total)
 
 
+# --- CatBoost's `CalcDerivativesStDevFromZero`, on the device --------------
+#
+# `random_score_scale` wants the RMS of this round's derivatives about zero:
+# `sqrt(sum(g^2) / n_rows)`, which is `derivatives_stdev_from_zero` in
+# tree_parameters_extra.mojo. That is a plain sum of squares -- no mean, no
+# second pass, no cross terms -- so it is the same shape as the magnitude
+# reduction above and reuses its grid, its block count and its host-side
+# Float64 fold.
+#
+# **A SEPARATE KERNEL AND A SEPARATE BUFFER, NOT A THIRD PLANE ON
+# `_abs_sum_kernel`.** Adding a plane there was the obvious move and it is
+# the wrong one, for three reasons that are all about coupling rather than
+# cost:
+#
+#   1. That buffer's layout is shared. `gpu_multiclass_batch` writes the same
+#      `slot * 2 * SUM_BLOCKS + block` arithmetic from its own kernel, and
+#      `gpu_fused_round` allocates to the same shape. Widening the stride
+#      means editing three parallel implementations in step, and a
+#      slot-arithmetic mistake there produces a PLAUSIBLE scale rather than
+#      an error -- `magnitude_sums` says exactly that about its own fold.
+#   2. Those magnitudes feed the fixed-point histogram scales, so every
+#      histogram in the run depends on them. The RMS has one consumer and no
+#      histogram reads it. Putting an unrelated quantity in the same struct
+#      makes `GradMagnitudes` -- documented as "the two magnitude sums a
+#      round's fixed-point scales come from" -- mean two things, which is the
+#      one-name-two-meanings defect this campaign keeps paying for.
+#   3. It is guarded. At the shipped `random_strength = 0` nothing here is
+#      launched and nothing is read, exactly as `set_random_score` is guarded
+#      in train_gpu, so a default fit issues the launches it issued before
+#      this existed. A third plane on the magnitude kernel would be computed
+#      on every round of every fit for the one in a hundred that reads it.
+#
+# The cost of keeping them apart is one extra launch and one extra 1 KB
+# readback per ROUND (not per node) on fits that set `random_strength`, which
+# is nothing beside the ~279 launches a round already issues.
+
+
+def _sq_sum_kernel(
+    grad: MutPointer[Float32, MutAnyOrigin],
+    partials: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+):
+    """Per-threadgroup sum of `grad^2`, one entry per threadgroup.
+
+    `_abs_sum_kernel`'s shape with one plane instead of two and `g * g` in
+    place of `abs(g)`. The grid stride, the block count and the shared-memory
+    tree reduction are identical and fixed, so the partials and their
+    host-side total are bit-identical run to run -- the property the noise
+    scale needs, since it multiplies every candidate's draw.
+
+    Float32 accumulation per thread, folded in Float64 on the host, which is
+    the same split `_abs_sum_kernel` uses. Each thread accumulates
+    `n_rows / (SUM_BLOCKS * SUM_THREADS)` terms -- about 15 at a million rows
+    -- so the per-thread error stays far inside the tolerance the
+    cross-backend test asserts, and squaring cannot overflow Float32 for any
+    gradient a finite objective produces.
+    """
+    var tid = thread_idx.x
+    var sq = stack_allocation[
+        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+
+    var acc = Float32(0.0)
+    var nr = Int(n_rows)
+    var r = Int(block_idx.x) * SUM_THREADS + tid
+    var stride = SUM_BLOCKS * SUM_THREADS
+    while r < nr:
+        var g = grad[unsafe_offset=r][0]
+        acc += g * g
+        r += stride
+    sq[unsafe_offset=tid] = acc
+    barrier()
+
+    # Uniform trip count across the threadgroup, so every thread reaches
+    # every barrier. Same reduction as `_abs_sum_kernel`.
+    var active = SUM_THREADS // 2
+    while active > 0:
+        if tid < active:
+            sq[unsafe_offset=tid] = (
+                sq[unsafe_offset=tid][0] + sq[unsafe_offset = tid + active][0]
+            )
+        barrier()
+        active //= 2
+
+    if tid == 0:
+        partials[unsafe_offset = Int(block_idx.x)] = sq[unsafe_offset=0][0]
+
+
+def enqueue_sq_sum(
+    ctx: DeviceContext,
+    mut grad_dev: DeviceBuffer[DType.float32],
+    mut part_dev: DeviceBuffer[DType.float32],
+    n_rows: Int,
+) raises:
+    """Enqueue `_sq_sum_kernel` over `n_rows` rows into a caller-owned partial
+    buffer of `SUM_BLOCKS` Float32. Does not copy and does not synchronize.
+
+    Split from the read for the same reason `enqueue_abs_sum` is: a caller
+    that wants to overlap the round trip enqueues here and waits later.
+    """
+    ctx.enqueue_function[_sq_sum_kernel](
+        grad_dev.unsafe_ptr(),
+        part_dev.unsafe_ptr(),
+        Int32(n_rows),
+        grid_dim=SUM_BLOCKS,
+        block_dim=SUM_THREADS,
+    )
+
+
+def sum_sq_partials[partials_origin: MutOrigin, //](
+    partials: MutPointer[Float32, partials_origin],
+) raises -> Float64:
+    """Fold a downloaded square-partial buffer into one total.
+
+    Ascending block index, accumulated in Float64, exactly as
+    `sum_abs_partials` folds its two planes. Every caller sums in this one
+    order over partials the one kernel produced, so the total and the scale
+    derived from it agree bit for bit whichever driver enqueued the
+    reduction.
+
+    **This total will not equal the host replica's bit for bit, and that is
+    expected rather than a defect.** `derivatives_stdev_from_zero` sums in ROW
+    order in Float64; this sums Float32 per thread and folds 256 block
+    partials in Float64. Float addition is not associative, so the two are two
+    summation orders of the same quantity and neither approximates the other.
+    The cross-backend test asserts agreement to a stated relative tolerance
+    with an anti-vacuity check, never bit-identity. See the DIVERGENCE table.
+    """
+    var total = 0.0
+    for i in range(SUM_BLOCKS):
+        total += Float64(partials.unsafe_load(i))
+    if not isfinite(total):
+        raise Error("gradients must be finite")
+    return total
+
+
 def _check_weight_vector(weights: List[Float64], n_rows: Int) raises:
     """The one definition of a valid per-row weight vector on this side: one
     finite, nonnegative entry per row.
@@ -1090,6 +1226,20 @@ struct GpuObjectiveState(Movable):
     var part_dev: DeviceBuffer[DType.float32]
     var base_dev: DeviceBuffer[DType.float32]
     var host_part: HostBuffer[DType.float32]
+    var sq_part_dev: DeviceBuffer[DType.float32]
+    """`SUM_BLOCKS` Float32 of square-partials, `_sq_sum_kernel`'s output.
+
+    Its own buffer rather than a third plane on `part_dev`: that layout is
+    shared with `gpu_multiclass_batch`'s kernel and `gpu_fused_round`'s
+    allocation, and it feeds the fixed-point histogram scales, which this
+    quantity has nothing to do with. See `_sq_sum_kernel`.
+
+    One slot, not `SCALE_WINDOW_MAX` of them. The magnitude path windows
+    because it runs every round and the wait is worth amortizing; the RMS is
+    read once per tree by a fit that asked for `random_strength`, and it is
+    read immediately, so there is nothing to amortize."""
+    var sq_host_part: HostBuffer[DType.float32]
+    """Pinned destination for `sq_part_dev`, `SUM_BLOCKS` Float32 = 1 KB."""
     var host_raw: HostBuffer[DType.float32]
     var step_dev: DeviceBuffer[DType.float32]
     """The current tree's per-node steps, `learning_rate * value[node]`
@@ -1280,6 +1430,16 @@ struct GpuObjectiveState(Movable):
         # into slot j, and only then does kernel(j+1) overwrite it.
         self.host_part = ctx.enqueue_create_host_buffer[DType.float32](
             SCALE_WINDOW_MAX * 2 * SUM_BLOCKS
+        )
+        # 1 KB device and 1 KB host, allocated unconditionally on the same
+        # argument the 64 KB above is: the alternative is a second
+        # construction path keyed on a parameter this state does not carry,
+        # and `random_strength` is a tree setting the objective state never
+        # sees. Nothing is LAUNCHED unless a caller asks (see
+        # `derivative_sum_squares`), which is where the real cost is.
+        self.sq_part_dev = ctx.enqueue_create_buffer[DType.float32](SUM_BLOCKS)
+        self.sq_host_part = ctx.enqueue_create_host_buffer[DType.float32](
+            SUM_BLOCKS
         )
         self.part_pending = 0
         self.host_raw = ctx.enqueue_create_host_buffer[DType.float32](n_scores)
@@ -2014,6 +2174,44 @@ struct GpuObjectiveState(Movable):
         # passes on a small fixture and corrupts a real fit.
         ctx.synchronize()
         return sum_abs_partials(self.host_part.unsafe_ptr())
+
+    def derivative_sum_squares(
+        mut self,
+        ctx: DeviceContext,
+        mut grad_dev: DeviceBuffer[DType.float32],
+    ) raises -> Float64:
+        """`sum(g^2)` over this round's gradients, on the device.
+
+        The device half of `random_score_scale`: the caller divides by the row
+        count, takes the root, and multiplies by `model_size_decrease`, which
+        together are `tree_parameters_extra.random_score_scale_from_gradients`
+        with its `derivatives_stdev_from_zero` computed here instead of over a
+        host gradient list. Sum of squares rather than the finished RMS
+        because the division is by rows per OUTPUT DIMENSION, which this state
+        does not own -- a multiclass caller passes the flat plane and divides
+        by one dimension's row count, exactly as CatBoost does.
+
+        Independent of the magnitude path in every respect: its own kernel,
+        its own buffer, its own readback, and no interaction with the window.
+        In particular it does NOT touch `part_pending`, so it is safe to call
+        with a windowed magnitude reduction outstanding -- unlike
+        `magnitude_sums`, which refuses in that state because it would share
+        the readback buffer.
+
+        One launch and one 1 KB readback per call, and callers are expected to
+        guard it on `random_strength > 0` the way `train_gpu` guards
+        `set_random_score`, so a default fit never issues either.
+        """
+        enqueue_sq_sum(ctx, grad_dev, self.sq_part_dev, self.n_rows)
+        ctx.enqueue_copy(
+            dst_ptr=self.sq_host_part.unsafe_ptr(), src_buf=self.sq_part_dev
+        )
+        # Load-bearing, for the reason `magnitude_sums` states: the
+        # destination is pinned, and on Metal a copy into pinned memory is
+        # asynchronous. Reading without this passes on a small fixture and
+        # corrupts a real fit.
+        ctx.synchronize()
+        return sum_sq_partials(self.sq_host_part.unsafe_ptr())
 
     def enqueue_magnitudes(
         mut self,
