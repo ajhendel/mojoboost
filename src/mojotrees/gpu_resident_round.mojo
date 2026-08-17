@@ -3058,15 +3058,37 @@ def grow_tree_device_oblivious(
     # oblivious` here unconditionally, without consulting the AUTO split-search
     # decision, because no other grower on this backend builds a symmetric
     # tree. So this names the CPU backend, as the other oblivious refusals do.
+    # **THE KEYING OBJECTION THIS USED TO RAISE IS SOLVED, AND THE REFUSAL
+    # STANDS FOR A DIFFERENT REASON.** It used to say a symmetric level has no
+    # node id, and that any id this loop could supply would be a synthetic key
+    # putting the two backends on different draws. That was true when written
+    # and is now false: the draw is keyed by DEPTH in its own hash domain
+    # (`tree_parameters_extra._OBLIVIOUS_SCORE_DOMAIN`, with
+    # `gpu_oblivious_score_stream` byte for byte identical on the device), so
+    # the level's site is a principled key rather than a stand-in, and the two
+    # domains make the leaf-wise and oblivious streams disjoint as a property
+    # instead of as a sentence.
+    #
+    # What is still missing is the per-tree SCALE, which is a different kind of
+    # gap: no GPU round loop computes it, and on the device-gradient arm
+    # `GpuObjectiveState.magnitude_sums` reduces L1 where the scale needs the
+    # RMS. Supplying 0.0 would train an unregularized model that reported
+    # success, which is worse than refusing.
+    #
+    # Left standing on purpose so the merged kernel is reached by a test and
+    # not yet by a fit. Retire it when the scale is computed, not before -- and
+    # when retiring it, check that `device_policy.BLOCK_RANDOM_STRENGTH` and
+    # `ExtraTreeParams.check_random_strength` agree, because three refusals for
+    # one configuration is three places to leave a dead reason behind.
     if searcher.random_score_stdev() > 0.0:
         raise Error(
             "random_strength cannot be honored by the device oblivious"
-            " grower: its draw is keyed by node id and a symmetric level has"
-            " no node -- one candidate is scored by summing its gain over"
-            " every leaf of the level, and the level's split is one answer."
-            " Any id this loop could supply (the level's lowest node, a leaf"
-            " ordinal, the level index) would be a synthetic key and would"
-            " put the two backends on different draws while looking correct."
+            " grower: the draw is implemented here, keyed by level depth in"
+            " its own hash domain, but the per-tree scale it multiplies is"
+            " not -- no GPU round loop computes the RMS of the round's"
+            " derivatives, and on the device-gradient arm the only reduction"
+            " that exists sums magnitudes rather than squares. A defaulted"
+            " scale would train an unregularized model and report success."
             " Use grow_policy=leafwise, which honors it, or device='cpu',"
             " whose oblivious grower is the comparator"
         )

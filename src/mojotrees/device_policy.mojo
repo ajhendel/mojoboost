@@ -2453,13 +2453,51 @@ def _collect_blocks(
         # compares gains across parents, and `random_strength` adds noise in
         # units Cosine has changed. Any one of those breaks it, and this gate
         # cannot see `lambda_l2` or the growth policy.
+        #
+        # **THE REASON THIS BLOCK GIVES CHANGED ON 2026-08-17, AND THE BLOCK
+        # DID NOT.** It used to say "no accelerator path evaluates the Cosine
+        # ratio". That became FALSE when the Cosine lanes landed:
+        # `gpu_cosine_score` is defined at `gpu_split_search:986` and called
+        # at five sites, the per-node scans take it, and
+        # `_scan_slot_oblivious_kernel` carries the two cross-leaf
+        # accumulators and the single root a level's Cosine score needs --
+        # which is why `gpu_split_search:5271` records that `score_function`
+        # no longer refuses there.
+        #
+        # A capability landing falsified the stated reason while leaving the
+        # refusal correct for a DIFFERENT reason, and nothing checked the
+        # sentence because nothing ever checks a sentence. Right refusal,
+        # dead reason, is its own defect: it is what gets a block retired on
+        # the strength of an argument that is no longer the argument.
+        #
+        # What is actually left is narrow and is stated below: a Cosine fit
+        # with a categorical feature. The category partition search scores
+        # with the L2 gain (`GpuSplitSearcher.set_score_function`, and
+        # `split.find_best_split` before it), so allowing that pair puts two
+        # score functions inside one argmax. Everything else about Cosine now
+        # runs on the device.
+        #
+        # This block is therefore WIDER than its cause, deliberately and
+        # temporarily. Narrowing it to the categorical pair is item (3) and
+        # is gated on the same rule every retirement here is gated on: no
+        # downstream refusal may still fire for the same fit. Today
+        # `_device_search_semantics_supported` (train_gpu:548) still declines
+        # the device split search for any active `ExtraTreeParams`, which
+        # `score_function != L2` sets -- so narrowing this alone would route
+        # a Cosine fit to an accelerator that then scans on the host and
+        # reports device='gpu' truthfully. That gate has to ask per-parameter
+        # first.
         blocks.add(
             BLOCK_SCORE_FUNCTION,
             String(
                 "score_function selects which functional of the children's"
-                " sums is maximized, and the device split search computes"
-                " G^2/(H+lambda) only, which is score_function=L2; no"
-                " accelerator path evaluates the Cosine ratio"
+                " sums is maximized. The device evaluates the Cosine ratio"
+                " directly, per node and across a symmetric level, but the"
+                " category partition search scores with the L2 gain, so a"
+                " Cosine fit with a categorical feature would put two score"
+                " functions inside one argmax; and the device split search"
+                " is declined outright for any active extra tree parameter,"
+                " which score_function != L2 is one of"
             ),
         )
 
