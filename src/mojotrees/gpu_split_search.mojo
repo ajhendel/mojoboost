@@ -6388,7 +6388,7 @@ def _launch_oblivious_search(
                         " threads, which covers binning.MAX_BINS of 256, and"
                         " this dataset carries ",
                         n_bins,
-                        "; unset MOJOTREES_GPU_OBLIVIOUS_WIDE to use the"
+                        "; set MOJOTREES_GPU_OBLIVIOUS_WIDE=0 to use the"
                         " narrow scan, which has no per-thread bound",
                     )
                 )

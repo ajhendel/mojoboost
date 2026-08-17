@@ -107,6 +107,42 @@ proven, default off" is not a conservative position, it is an unshipped one.
 For a change that MOVES bits, rule 3 stands unchanged and the accuracy budget
 is the gate, because that one is a real trade.
 
+### 5a. A FLIP IS A SWEEP OF THE FILE, NOT AN ANNOTATION ON THE LINE
+
+Added the same day, hours later, because the first four flips made under rule 5
+all got this wrong. **Four out of four.** In every case the predicate was
+changed from `== "1"` to `!= "0"` and the reasoning was recorded as a comment on
+the `return` statement, while the DOCSTRING immediately above it went on saying
+"off unless asked for" and "nothing has measured it". Five further passages in
+other functions and files described the same switches from their pre-flip state,
+including two that labelled the arm we no longer take as "the shipped arm",
+which is the label exactly inverted.
+
+The consequence was not hypothetical. An explorer session read that tree and
+reported three shipped, measured defaults as off and unmeasured, and a peer
+built a lane ranking and a four-item work plan on top of it. All of it had to be
+withdrawn. **The switch was correct in the code and wrong in every place a
+reader would look**, which is worse than being wrong in both, because it passes
+inspection.
+
+So a flip is not complete when the predicate changes. A flip is complete when:
+
+1. the predicate is inverted, and the escape-hatch spelling is `!= "0"`;
+2. the docstring on that same function states the new default, the date, and
+   the measured figures that justified it;
+3. **the variable's name is grepped across `src/` and `docs/`**, and every
+   passage describing the old state is corrected in the same commit;
+4. any user-facing string that tells a caller how to select an arm is re-read
+   against the new default. On the day this rule was written, the wide oblivious
+   scan's bin-count refusal advised the user to "unset
+   `MOJOTREES_GPU_OBLIVIOUS_WIDE` to use the narrow scan", and after the flip
+   unset SELECTS wide, so a user following the error message reproduced the
+   error. **An error message is code, not prose, and inverting a default can
+   invert its advice.**
+
+The general form, worth carrying beyond switches: **when you change what the
+default behavior is, the code is the smallest part of the change.**
+
 **6. A DECLINE MUST CARRY A PRICE.** Also 2026-08-17, and this is the rule that
 would have caught the biggest defect in the codebase. A comment that declines an
 optimization must state what the decline costs, with the arithmetic, or be
