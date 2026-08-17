@@ -176,6 +176,39 @@ it loses the fact that somebody once believed it.
 
 ### The rule for spending this budget
 
+> **SUPERSEDED IN PART, 2026-08-17, and the part superseded is this document's
+> premise.** `bench/results/LANE_RULES.md` rule 9 establishes that **a choice a
+> user cannot reverse must not cost accuracy at all.** An internal choice has to
+> be accuracy-neutral (exact, or within `device_agreement` tolerance and verified
+> against the recorded anchor); if it would trade accuracy for speed it must be
+> EXPOSED as a knob first, and only then does an exchange rate decide which side
+> is the default; anything internal that costs accuracy today is a **defect or a
+> declared gap, never a priced trade.**
+>
+> Nearly every candidate in this document is an internal numerical choice.
+> Candidates 1, 2, 3, 3b and 4 are precision and accumulation choices that no
+> user can see or reverse. **So the correct question about them is not "is the
+> error small enough to be worth the speed", which is what the sections below
+> ask. It is "is the error zero, and if not, why is this not exposed".** Read
+> them that way.
+>
+> This is less destructive to the document than it sounds, because the analysis
+> was already pointed at exactness. Candidates 1, 3, 3b, 5 and 6 are argued to be
+> bit-identical or to move the answer toward exact, and those verdicts stand
+> unchanged and are now the ONLY acceptable verdicts for their class rather than
+> the most conservative of several. What changes is the status of any candidate
+> whose case rests on the error being small: **candidate 2 (packed int16) and
+> candidate 4 (float32 accumulation) are no longer eligible on a smallness
+> argument** and would each need to be made exact or exposed. The "+0.08 percent"
+> figure that section 5 already criticizes as over-quoted is exactly the kind of
+> number this rule removes from evidence.
+>
+> The three live violations rule 9 names are the categorical bin ceiling (a
+> defect, and the widening lane is its fix rather than its price), the multiclass
+> leaf-value mechanism at `lambda_l2 = 0` (an open item), and float32 gains near
+> a tie in the device split search (borderline, and it must be made exact or
+> exposed rather than left borderline).
+
 The budget is only a budget if there is a rule for who may draw on it. There
 is, it is short, and it is the operational form of `docs/NUMERICS.md`
 section 1.3.

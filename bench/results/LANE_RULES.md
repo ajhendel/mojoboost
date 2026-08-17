@@ -276,15 +276,44 @@ switch that is good for one is good for all unless someone can say why not.
 - A **bit-identical** win is not on this frontier at all and flips immediately
   under rule 5. It costs zero accuracy by construction, so no rate applies.
 
-**The rule reaches INTERNAL choices exactly as it reaches exposed knobs, and
-this is the half that gets forgotten.** Fixed-point precision, float32 device
-gains, the binning subsample, kernel selection, the MVS host derivative pass,
-the categorical bin ceiling: a user cannot tune any of them, which makes them
-MORE consequential than a documented parameter, not less. **A silent internal
-choice is a default.** Each one is priced and recorded in `ACCURACY_BUDGET.md`
-in the same units as everything else, and "it is an implementation detail" is
-not a reason to skip the pricing. It is a reason the pricing has to be written
-down, because nobody downstream can discover it by reading a signature.
+**The exchange rate does NOT reach internal choices, and getting this backwards
+is the most expensive mistake available here.** Corrected 2026-08-17 within
+hours of the rule being written, from Andrew, because the first draft said the
+rate applied everywhere and that is wrong.
+
+**A choice a user cannot reverse must not cost accuracy.** That is the whole
+rule and the reason is not subtle. An exchange rate is a bargain offered to
+someone who can decline it. A user who never learns that a kernel rounds
+differently, or that a bin ceiling truncates their categories, has not accepted
+1 percent for 1.5x; they have simply been given a worse model by a library that
+decided on their behalf and did not say so.
+
+So internal choices are held to a different and stricter standard:
+
+- **An internal choice must be accuracy-NEUTRAL.** Exact, or within
+  `device_agreement` tolerance and verified against the recorded anchor. That is
+  the bar, and 1 percent is not an allowance against it.
+- **If an internal choice WOULD trade accuracy for speed, it has to be EXPOSED
+  as a knob first.** Only once a user can see it and reverse it does the
+  exchange rate above decide which side of it is the default. Exposure is the
+  price of admission to the frontier, not an optional courtesy afterwards.
+- **Anything internal that costs accuracy today is a DEFECT or a declared gap.
+  It is never a priced trade.** Filing it as a priced trade launders a defect
+  into a decision, and the filing is what makes it stop being looked at.
+
+Three live cases, named so this is a test rather than a sentiment. The
+**categorical bin ceiling** costs measured average precision and no user can
+raise it, so it is a defect and the widening lane is its fix, not its price. The
+**multiclass leaf-value mechanism at `lambda_l2 = 0`** showed 3.31x worse
+logloss at unchanged accuracy, which is a leaf-VALUE signature rather than a
+leaf-assignment one, and it is an open item. **Float32 gains in the device split
+search near a tie** are the borderline case and must go one way or the other:
+made exact, or exposed and priced. Borderline is not a resting place either.
+
+What survives from the first draft is the observation that motivated it. A
+silent internal choice IS a default, in the sense that it decides what every
+user gets. The conclusion drawn from that was wrong. It does not mean such
+choices join the frontier; it means they must not be on the frontier at all.
 
 **Both directions of error are real and both happened.** Declining a free win
 because a rule said "do not change defaults" cost us four shipped-but-unshipped
