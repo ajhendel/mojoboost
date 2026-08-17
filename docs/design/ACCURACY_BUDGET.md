@@ -2000,6 +2000,40 @@ rule written after the number is a rationalization of the number, and this
 particular question is one where the speed result is expected to be large and
 the temptation to wave the accuracy through is therefore also large.
 
+### FACTUAL CORRECTION to this section's premise, 2026-08-17, same day
+
+**The paragraph below says MVS at `subsample = 0.8` is what ships today. It is
+not.** Verified by fitting rather than by reading, at the commit that shipped as
+`0.1.0a4`: `MojoTreesClassifier(grow_policy='symmetrictree')` reports
+`bootstrap_type` **None**, `subsample` **None**, and
+`mode_defaults_ == {'l2_leaf_reg': 3.0, 'learning_rate': 0.03, 'depth': 6}`
+with no bootstrap key at all. CatBoost mode supplies three parameters and the
+sampler is not one of them. MVS at 0.8 is what the unmerged
+`lane/defaults-release` branch WOULD ship, and that branch is not in `main`.
+
+**The decision rule below is left exactly as registered.** Only the premise was
+wrong, and correcting a false fact is not editing a prediction. But the
+correction makes the question CHEAPER rather than harder, and that has to be
+said plainly or the rule will be applied at the wrong price. If MVS is not a
+shipped default, then choosing Bayesian or `'No'` for the symmetric policy
+changes no existing user's output, so it is not the expensive
+user-facing-default trade rule 9 prices at 2x. It is a choice about a default
+that has never shipped. The 0.25 percent anchor veto still applies, because the
+point of the veto is to stop us adopting a sampler that is worse, and that
+argument does not depend on what shipped before.
+
+**A second consequence, and it is the reason this correction is worth its
+length.** `tools/default_refusal_audit.py --check` reports four BLOCKING sites
+where a GPU multiclass or sparse fit raises when a bootstrap bundle is active
+(`model.mojo:580`, `model_sparse.mojo:126` and `:209`, `trainset.mojo:1744`),
+guarded on `bootstrap.enabled()`, which asks whether the bundle is ACTIVE and
+not whether anyone NAMED it. A mode-supplied MVS therefore raises exactly as a
+typed one does, with no fallback. Those four are **unreachable at the shipped
+defaults precisely because `bootstrap_type` is None**, so `0.1.0a4` does not
+carry them. They become reachable the day the MVS default merges. Cell C
+(`bootstrap_type = 'No'`) is the only one of the four cells below that cannot
+wake them.
+
 ### What is being asked
 
 Our shipped symmetric (CatBoost-mode) default sets `bootstrap_type = MVS` at

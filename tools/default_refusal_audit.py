@@ -104,7 +104,25 @@ SEARCH_DIRS = (
 #: not evaluated; it is there so a reader knows what is being asked for.
 DEFAULT_SETS = {
     # Andrew, 2026-08-16: mojotrees's shipped defaults become CatBoost's CPU
-    # defaults, except n_estimators, where CatBoost's 1000 becomes **360**.
+    # defaults, except n_estimators, where CatBoost's 1000 becomes **100**.
+    #
+    # **THE COUNT WAS 360 IN THIS TABLE UNTIL 2026-08-17, AND 360 WAS NEVER A
+    # SHIPPED DEFAULT.** It was proposed and never implemented; the code has
+    # said 100 the whole time: it is a literal in the constructor signature at
+    # `python/mojotrees/sklearn.py:965`, with no module constant behind it, and
+    # the three `_resolve_alias` calls for `iterations`, `num_boost_round` and
+    # `max_iter` each repeat the same 100. Commit 273504e
+    # settled by reading the package rather than the proposal. So this is the
+    # 500-to-360 failure a second time, in the same table, for the same reason,
+    # and the paragraph below that congratulates itself on catching the 500 was
+    # sitting three lines above a wrong number while it did so. A table that
+    # records a PROPOSAL as data and is then reasoned about as though it
+    # recorded the SHIPPED set will keep doing this, so the entry is now the
+    # shipped value and the proposal survives only as this note.
+    #
+    # The live consequence, which is why this is not a comment fix. `--check`
+    # and `--removing` reason about this dict, so every audit run since the
+    # entry landed was asking what refuses at a tree count nothing ships.
     #
     # It was 500 for several hours and this table carried the 500 as DATA
     # rather than as prose, so `--check` and `--removing` were reasoning about
@@ -130,12 +148,12 @@ DEFAULT_SETS = {
     # The mistake was treating a disjunction's failure as implying the
     # opposite assignment, when it implies only the absence of one particular
     # assignment. Verified at all three sites rather than reasoned from one.
-    # The count is inert here after all; the 500-to-360 correction below still
-    # matters because this table is DATA that `--check` reasons about.
+    # The count is inert here after all; the corrections to it below still
+    # matter because this table is DATA that `--check` reasons about.
     "catboost_defaults": {
         "grow_policy": "symmetrictree",
         "max_depth": 6,
-        "n_estimators": 360,
+        "n_estimators": 100,
         "learning_rate": "auto",
         "auto_learning_rate": True,
         "boosting_type": "plain",
@@ -434,8 +452,10 @@ ACKNOWLEDGED = {
         "RESOLVED",
         "the site is :2238, which is random_strength's per-tree scale "
         "refusal; it matched here only because its message names the round "
-        "index. 360 trees cannot make a gradient standard deviation "
-        "nonpositive. See the random_strength row for this file",
+        "index. 100 trees cannot make a gradient standard deviation "
+        "nonpositive, and neither could the 360 this line said until "
+        "2026-08-17; the argument never depended on the count. See the "
+        "random_strength row for this file",
     ),
     ("n_estimators", "src/mojotrees/distributed.mojo"): (
         "RESOLVED",
