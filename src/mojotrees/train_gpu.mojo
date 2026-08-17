@@ -904,6 +904,7 @@ def device_gradients(
     goss: GossParams,
     routes_all_rows: Bool = False,
     bootstrap: BootstrapParams = BootstrapParams.disabled(),
+    random_strength: Float64 = 0.0,
 ) raises -> Bool:
     """Whether this run generates its gradients on the device.
 
@@ -951,6 +952,8 @@ def device_gradients(
         False,
         routes_all_rows,
         bootstrap.mvs.enabled,
+        bootstrap.bayesian.enabled,
+        random_strength > 0.0,
     )
     if code == ROUND_OK:
         return True
@@ -3708,26 +3711,31 @@ def _train_gpu_rounds[
             var dev_tree_params = params.tree.copy()
             var dev_noisy = params.tree.extra.random_strength > 0.0
             if dev_noisy and bootstrap.bayesian.enabled:
-                # REFUSED RATHER THAN COMPUTED WRONG. CatBoost's
-                # `CalcScoreStDev` reads the fold's `WeightedDerivatives` --
-                # the derivatives carrying the USER's `sample_weight` and
-                # nothing else. On this arm `refresh_bayesian_bootstrap` folds
-                # the per-tree draw into `weight_dev` BEFORE
-                # `fill_gradients_device`, and the derivative kernel
-                # multiplies both planes by it, so the gradients on the device
-                # by the time they can be reduced are CatBoost's
-                # `SampleWeightedDerivatives`. Their RMS is a different scale
-                # wearing the same parameter's name.
+                # DEFENSIVE, exactly like the MVS raise above it, and for the
+                # same reason: `round_eligibility` returns
+                # `ROUND_BAYESIAN_NOISE_SCALE` for this pair, so AUTO takes
+                # the host-gradient arm and no fit arrives here. If one ever
+                # does -- a caller reaching this loop directly, or that code
+                # being loosened without this arm being taught the scale --
+                # it is refused by name rather than trained on a scale taken
+                # over the wrong derivatives.
                 #
-                # The host arm has no such problem and needs no such refusal:
-                # it computes the scale from `grad` BEFORE `goss_round` and
-                # before `bootstrap_round`, which is the ordering its own
-                # comment is about.
+                # The first version of this WAS the primary refusal, and that
+                # was wrong in a way worth recording: a raise here is a cliff.
+                # `auto` selects the accelerator on shape and the fit dies,
+                # while the host-gradient arm serves the same configuration
+                # exactly. Routing is what MVS already did one branch up, and
+                # copying that pattern turns a raise into a resolution.
                 #
-                # Narrow on purpose. The Bayesian bootstrap is the only
-                # sampler that reaches this arm -- MVS is refused above by
-                # name and bagging routes elsewhere -- so this is the whole of
-                # the interaction, not a sample of it.
+                # The cause, for the reader who arrives here anyway.
+                # CatBoost's `CalcScoreStDev` reads the fold's
+                # `WeightedDerivatives`, carrying the USER's `sample_weight`
+                # and nothing else. On this arm `refresh_bayesian_bootstrap`
+                # folds the per-tree draw into `weight_dev` BEFORE
+                # `fill_gradients_device` and the derivative kernel multiplies
+                # both planes by it, so the only derivatives reducible here
+                # are `SampleWeightedDerivatives`. Their RMS is a different
+                # scale wearing the same parameter's name.
                 raise Error(
                     "random_strength cannot be scaled on the device-gradient"
                     " arm beside bootstrap_type=Bayesian: the bootstrap draw"
@@ -4278,6 +4286,7 @@ def train_gpu(
         var device_grads = device_gradients(
             objective, 1, objective_source, bagging, goss, routes_all,
             bootstrap,
+            params.tree.extra.random_strength,
         )
         var builder = GpuHistogramBuilder(data)
         # This fit's constant-hessian declaration, made once, next to where
@@ -4447,6 +4456,7 @@ def train_gpu(
         var device_grads = device_gradients(
             objective, 1, objective_source, bagging, goss, routes_all,
             bootstrap,
+            params.tree.extra.random_strength,
         )
         # The session's own fit latency: the first fit through a session
         # pays the one-time costs and every later one does not.

@@ -589,6 +589,33 @@ here: it draws from `(seed, tree, row)` alone, reads no gradient, drops no
 row, and is honored on the device round through the objective state's weight
 plane."""
 
+comptime ROUND_BAYESIAN_NOISE_SCALE = 6
+"""`random_strength` beside `bootstrap_type=Bayesian`.
+
+**A ROUTING CODE RATHER THAN A REFUSAL, WHICH IS THE WHOLE POINT.** The first
+version of this was a raise in the device-gradient loop, and a raise there is
+a cliff: `auto` selects the accelerator on shape and the fit dies, when the
+host-gradient arm serves the same configuration exactly. `ROUND_MVS_HOST_MAGNITUDES`
+already establishes the pattern -- an arm that cannot express something says
+so, and AUTO takes the arm that can.
+
+The cause. CatBoost's `CalcScoreStDev` reads the fold's `WeightedDerivatives`,
+which carry the user's `sample_weight` and nothing else. On the
+device-gradient arm `refresh_bayesian_bootstrap` folds the per-tree draw into
+`weight_dev` BEFORE `fill_gradients_device`, and the derivative kernel
+multiplies both planes by it, so the only derivatives that arm can reduce are
+CatBoost's `SampleWeightedDerivatives`. Their RMS is a different scale wearing
+the same parameter's name.
+
+The host-gradient arm has no such problem and needs no such code: it computes
+the scale from `grad` before `goss_round` and before `bootstrap_round`, which
+is the ordering its own comment is about.
+
+Narrow on purpose. The Bayesian bootstrap is the only sampler that reaches
+that arm -- MVS is already routed off it by the code above and bagging routes
+elsewhere -- so this is the whole of the interaction rather than a sample of
+it."""
+
 
 def round_eligibility(
     objective: Int,
@@ -598,6 +625,8 @@ def round_eligibility(
     allow_device_ranking: Bool = False,
     routes_all_rows: Bool = False,
     mvs_on: Bool = False,
+    bayesian_on: Bool = False,
+    noisy_on: Bool = False,
 ) raises -> Int:
     """Which reason, if any, keeps this configuration off the device
     round.
@@ -654,6 +683,13 @@ def round_eligibility(
     # would get.
     if mvs_on:
         return ROUND_MVS_HOST_MAGNITUDES
+    # After MVS, because the two are mutually exclusive at fit setup and the
+    # order between them only decides which sentence an impossible
+    # combination gets. Both send the round to the host-gradient arm; they
+    # differ in what that arm supplies, rows for one and an unsampled scale
+    # for the other.
+    if bayesian_on and noisy_on:
+        return ROUND_BAYESIAN_NOISE_SCALE
     return ROUND_OK
 
 
@@ -685,6 +721,14 @@ def round_eligibility_reason(code: Int) -> String:
             "GOSS ranks rows by |grad * hess|, and the device scores are"
             " Float32, so the sample can differ from the CPU trainer's near"
             " the threshold; pass allow_device_ranking=True to accept that"
+        )
+    if code == ROUND_BAYESIAN_NOISE_SCALE:
+        return String(
+            "random_strength's per-tree scale is the RMS of the round's"
+            " USER-weighted derivatives, and the device-gradient arm folds"
+            " the Bayesian bootstrap's draw into the weight plane before the"
+            " derivative kernel runs, so the only derivatives it can reduce"
+            " are already sample-weighted"
         )
     if code == ROUND_MVS_HOST_MAGNITUDES:
         return String(
