@@ -1,6 +1,8 @@
 # Why CatBoost is more accurate than our leaf-wise default, priced
 
-Written 2026-08-17. This is a reading and arithmetic lane. **Nothing was built,
+Written 2026-08-17, sections 1 and 2 re-measured the same day with
+`bench/real_data/decompose.py`, which replaced the hand arithmetic they were
+first built on. This is a reading and arithmetic lane. **Nothing was built,
 nothing was compiled, nothing was fitted, no benchmark was run.** Every number
 below is either read off a stored artifact in this repository, read off the
 source, or computed by arithmetic over stored predictions and the generator,
@@ -85,6 +87,20 @@ error**. Both statements are the same measurement seen through two lenses, and
 the excess lens is the one that moves when a mechanism moves. Every price in
 section 3 is quoted in it, and section 2 splits it into bias and variance.
 
+**Three numbers describe that one gap and they are all correct, so a reader who
+meets one of them alone will misquote it.** Against CatBoost at the standard
+tier our shipped arm is behind by **28.8 percent on excess RMSE**, **65.8
+percent on excess MSE measured directly as `mean((prediction - signal)**2)`**,
+and **70.4 percent on excess MSE obtained by subtracting the floor from the
+total, `rmse**2 - floor**2`**. The first two are the same quantity under a
+square root. The last two differ by the cross term `2*mean(e * noise)`, which is
+about a tenth of a percent of each arm's excess and therefore negligible per arm
+but not negligible in the RATIO, because it lands on a numerator and a
+denominator that differ by a factor of 1.7. **This document uses the direct
+measurement throughout**, which is what `decompose.py` computes and the only one
+of the three that decomposes into bias and variance. Quoting the subtraction
+figure is not wrong, but it is a different lens and must be labeled.
+
 One caution about the RMSE lens that this makes concrete. On a target with a
 0.30 noise floor, a mechanism that halves the model's error moves RMSE by about
 0.9 percent. **A 1 percent RMSE budget on this generator is a 50 percent
@@ -120,99 +136,162 @@ cells of a pure-noise residual is not zero and quoting it as bias would be
 wrong. Bin counts are chosen for about 40 to 50 rows per bin, which is 1000 bins
 at the standard tier and 4000 at the large tier.
 
-**The resolution of the decomposition changes the answer and the first pass got
-it wrong.** At 40 bins the systematic share reads 6 to 13 percent for every arm.
-That is an artifact. The bias on the step term `-2*(x4 > 0.7)` lives in a window
-about 1/255 wide, and a 0.025-wide conditional mean averages the residual's two
-opposite-signed spikes together and cancels most of it. Recomputed at four
-resolutions, the estimate rises steeply and then converges.
+**Every number in this section is now produced by `bench/real_data/decompose.py`
+rather than by hand.** Until 2026-08-17 this section was arithmetic done once in
+one session and never re-run. The tool reproduces every excess-MSE figure below
+to six significant digits from the stored predictions, which confirms it is
+reading the same models, and it **disagreed with the hand split of that excess
+into bias and variance by 27 to 38 percent at both tiers.** The tables here are
+the tool's. What the disagreement cost is set out at the end of this section: the
+conclusion survives unchanged, one headline ratio does not.
 
-Systematic part of excess MSE, our leaf-wise CPU arm, against bin width.
+**The resolution of the decomposition changes the answer, the first pass got it
+wrong, and the second pass was wrong about having fixed it.** At 40 bins the
+systematic share reads 3 to 8 percent for every arm. That is an artifact. The
+bias on the step term `-2*(x4 > 0.7)` lives in a narrow window around the bin
+edge the model actually cut at, and a wide conditional mean averages the
+residual's two opposite-signed spikes together and cancels most of it. The
+estimate therefore rises with resolution. **It does not converge, at either
+tier, at any resolution these test sets can support.**
 
-| bins per feature | bin width | systematic | share |
+Systematic part of excess MSE against resolution, our leaf-wise arm.
+
+| rows per bin | bins | standard tier, systematic | large tier, systematic |
 |---|---|---|---|
-| 40 | 0.02500 | 0.000499 | 6.5% |
-| 200 | 0.00500 | 0.001251 | 16.4% |
-| **1000** | **0.00100** | **0.002904** | **38.0%** |
-| 4000 | 0.00025 | 0.002729 | 35.7% |
+| ~1000 | 40 | 0.000424 (5.6%) | 0.000162 (3.3%) |
+| ~200 | 200 / 1004 | 0.000814 (10.6%) | 0.000320 (6.5%) |
+| 45 to 50 | 897 / 4018 | 0.002192 (28.7%) | 0.000765 (15.5%) |
+| 20 to 25 | 2018 / 8036 | 0.002587 (33.8%) | 0.000966 (19.5%) |
 
-The 1000 and 4000 readings agree within 6 percent at 40,351 test rows while the
-sampling floor between them grows fourfold, so **1000 bins is converged at the
-standard tier** and is what the next table uses. Anything coarser understates
-bias, by up to a factor of six. **Every bias figure quoted anywhere in this
-document is a lower bound**, because a conditional mean on one feature cannot see
-bias that lives in an interaction of two.
+**Non-convergence here is a property of the method against a step
+discontinuity, not a defect in it.** To resolve bias concentrated in a window of
+width `w` the bins must be narrower than `w`, and `w` is the distance between
+0.7 and the bin edge the model cut at, which is unknown and can be arbitrarily
+small. The floor is set by the test set: at 200,890 held-out rows, 25 rows per
+bin is about 1/8000 of the range and going finer makes the subtracted sampling
+term a large fraction of the raw estimate. So **every bias figure in this
+document is a lower bound and every variance figure is an upper bound**, both by
+an unknown factor, and separately a conditional mean on one feature cannot see
+bias living in an interaction of two. The tables quote 45 to 50 rows per bin,
+which is the finest resolution where the floor subtraction is still clean.
 
-**Standard tier, 159,649 rows, at 1000 bins.**
-
-| arm | excess MSE | systematic | share | of which x4 | variance |
-|---|---|---|---|---|---|
-| ours, leaf-wise CPU | 0.007642 | 0.002904 | 38.0% | **0.002242** | 0.004738 |
-| LightGBM | 0.009371 | 0.004549 | 48.5% | **0.003882** | 0.004822 |
-| CatBoost | 0.004608 | 0.002418 | 52.5% | **0.000551** | 0.002190 |
-| ours, symmetric GPU | 0.005841 | 0.004106 | 70.3% | 0.002350 | 0.001735 |
-| ours, symmetric CPU | 0.006318 | 0.004352 | 68.9% | 0.002395 | 0.001966 |
-| XGBoost | 0.016013 | 0.001176 | 7.3% | 0.000237 | 0.014837 |
-| ours, depth-wise (XGB mirror) | 0.017867 | 0.003415 | 19.1% | 0.002360 | 0.014452 |
-
-**And the large tier, 799,110 rows, at 4000 bins, which is the cleaner of the
-two and the one the conclusion rests on.**
+**Standard tier, 159,649 train and 40,351 held-out rows, at 1000 bins**, run
+`20260817T124906Z-postflip`.
 
 | arm | excess MSE | systematic | share | of which x4 | variance |
 |---|---|---|---|---|---|
-| **ours, leaf-wise (shipped)** | 0.004942 | 0.001054 | 21.3% | 0.000596 | **0.003888** |
-| ours, symmetric GPU, lr 0.5 | 0.002156 | 0.001640 | 76.1% | 0.000598 | 0.000516 |
-| ours, symmetric CPU, lr 0.1 | 0.002764 | 0.002245 | 81.2% | 0.000626 | 0.000519 |
-| **CatBoost, its own rate 0.5** | 0.002336 | 0.001804 | 77.2% | 0.000669 | **0.000532** |
-| CatBoost, matched rate 0.1 | 0.003500 | 0.002935 | 83.9% | 0.000761 | 0.000565 |
-| LightGBM | 0.007126 | 0.003211 | 45.1% | 0.002764 | 0.003915 |
-| ours, depth-wise isolation | 0.004794 | 0.001546 | 32.2% | 0.000613 | 0.003248 |
+| ours, leaf-wise CPU | 0.007642 | 0.002192 | 28.7% | **0.001540** | 0.005450 |
+| ours, leaf-wise GPU | 0.007639 | 0.002200 | 28.8% | **0.001543** | 0.005439 |
+| LightGBM | 0.009371 | 0.003528 | 37.6% | **0.002868** | 0.005843 |
+| CatBoost | 0.004608 | 0.002116 | 45.9% | **0.000261** | 0.002492 |
+| ours, symmetric GPU | 0.005841 | 0.003345 | 57.3% | 0.001588 | 0.002497 |
+| ours, symmetric CPU | 0.006318 | 0.003623 | 57.3% | 0.001651 | 0.002695 |
+| XGBoost | 0.016013 | 0.001068 | 6.7% | 0.000118 | 0.014945 |
+| ours, depth-wise (XGB mirror) | 0.017612 | 0.002517 | 14.3% | 0.001557 | 0.015096 |
+
+**And the large tier, 799,110 train and 200,890 held-out rows, at 4018 bins**,
+run `20260817T110847Z-dense1mfixed`, which is the cleaner of the two and the one
+the conclusion rests on.
+
+| arm | excess MSE | systematic | share | of which x4 | variance |
+|---|---|---|---|---|---|
+| **ours, leaf-wise (shipped)** | 0.004942 | 0.000765 | 15.5% | 0.000304 | **0.004177** |
+| ours, symmetric GPU | 0.002156 | 0.001354 | 62.8% | 0.000313 | 0.000801 |
+| ours, symmetric CPU | 0.002269 | 0.001461 | 64.4% | 0.000312 | 0.000808 |
+| **CatBoost, its own rate** | 0.002336 | 0.001480 | 63.4% | 0.000347 | **0.000856** |
+| LightGBM | 0.007126 | 0.002960 | 41.5% | 0.002513 | 0.004166 |
+| ours, depth-wise isolation | 0.004782 | 0.001271 | 26.6% | 0.000322 | 0.003511 |
+
+Two things in that table were not true of the hand version and are worth
+naming before the arithmetic. **Our leaf-wise CPU and GPU arms are identical to
+nine digits of excess MSE at the large tier**, which is what device agreement is
+supposed to mean and is here confirmed on accuracy rather than on a tolerance.
+And **our symmetric GPU arm is not merely close to CatBoost at the large tier,
+it is ahead of it on all three quantities**: lower excess (0.002156 against
+0.002336), lower variance (0.000801 against 0.000856) and lower bias (0.001354
+against 0.001480). That is the strongest single argument in this document for
+the shipped-default question, and it is an argument the hand table already
+contained without drawing it.
+
+One row of the hand version is missing here and one label is weaker. **CatBoost
+at a learning rate matched to ours (0.1), which the hand table put at 0.004608
+excess**, is not present in `dense1mfixed` and could not be re-measured; it is
+cited from the hand version and marked accordingly wherever section 3 uses it.
+The `lr 0.5` and `lr 0.1` labels are also dropped, because the stored records do
+not carry a resolved learning rate per row and the tool cannot confirm them. The
+rate each arm actually used is section 3.3's subject and is established there.
 
 **This table is the answer to the brief's question, and it is one line.**
 
 Against CatBoost at the large tier the gap is 0.002606 of excess MSE, and
 
-- the **bias** difference is 0.001054 - 0.001804 = **-0.000750. We have 42
+- the **bias** difference is 0.000765 - 0.001480 = **-0.000715. We have 48
   percent LESS bias than CatBoost.**
-- the **variance** difference is 0.003888 - 0.000532 = **+0.003356. We have 7.3
-  times CatBoost's variance.**
+- the **variance** difference is 0.004177 - 0.000856 = **+0.003321. We have 4.9
+  times CatBoost's variance** at this resolution, and see the warning below
+  about quoting that multiple at all.
 
 **CatBoost is not fitting the function better than we are. It is fitting it
 worse and averaging better, and the averaging wins by more than the fitting
 loses.** Our symmetric arm reproduces the same trade against our own leaf-wise
-arm (variance 0.000516 against 0.003888, bias 0.001640 against 0.001054), which
+arm (variance 0.000801 against 0.004177, bias 0.001354 against 0.000765), which
 means the trade is a property of the configuration and not of CatBoost's code.
+**Our symmetric arm in fact completes the trade further than CatBoost does**, to
+lower bias and lower variance than CatBoost reaches, which is why it is the
+better arm at the large tier.
 
 **Four consequences, and the first is a correction of this document's own first
 draft.**
 
-1. **It is not true that our error is all variance.** It is 21 percent bias at
-   the large tier and 38 percent at the standard tier, and most of that bias is
-   one feature, `x4`, the step. Section 3.10 is about that. The first draft said
-   7.7 percent and that number came from a 40-bin decomposition that could not
-   resolve the term.
-2. **It IS true that the gap is variance, and more so than the first draft
-   claimed.** At the large tier the variance difference is 129 percent of the
-   gap and the bias difference is minus 29 percent. **Every recommendation in
-   section 5 that reduces variance survives, and any that would reduce bias at
-   the cost of variance is pointing the wrong way.**
+1. **It is not true that our error is all variance.** It is at least 15.5
+   percent bias at the large tier and at least 28.8 percent at the standard
+   tier, and most of that bias is one feature, `x4`, the step. Section 3.10 is
+   about that. The first draft said 7.7 percent and that number came from a
+   40-bin decomposition that could not resolve the term.
+2. **It IS true that the gap is variance, and this is the one part of the
+   section that does not depend on resolution at all.** At the large tier the
+   variance difference is 127 percent of the gap and the bias difference is
+   minus 27 percent. More importantly, **at every resolution from 40 bins to
+   8036 our bias is lower than CatBoost's and our variance is higher**, a range
+   of 200x in bin width, so the sign of both differences is settled even though
+   neither magnitude is. **Every recommendation in section 5 that reduces
+   variance survives, and any that would reduce bias at the cost of variance is
+   pointing the wrong way.**
 3. **The x4 border term is NOT a CatBoost advantage at the large tier.** Every
-   arm sits between 0.000596 and 0.000761 on it, ours the lowest of the three
-   engines. Only LightGBM is an outlier, at 0.002764, four times everyone else.
+   arm sits between 0.000304 and 0.000347 on it, ours the lowest of all four
+   engines. Only LightGBM is an outlier, at 0.002513, eight times everyone else.
    Section 3.10 shows the standard tier reverses this, which is what makes it a
-   lottery rather than a mechanism.
+   lottery rather than a mechanism. **At the standard tier the reversal is
+   sharper than the hand version reported**: our three arms sit at 0.001540,
+   0.001588 and 0.001557, within 3 percent of each other despite three different
+   growth policies, against CatBoost's 0.000261 and XGBoost's 0.000118. A term
+   that is invariant to growth policy across a 3x spread in total excess is
+   upstream of the tree, and section 3.10 identifies what it is upstream of.
 4. **The room above us is bounded and it is worth knowing by how much.** If our
    leaf-wise arm kept its own bias and took CatBoost's variance, its excess MSE
-   would be 0.001586, better than CatBoost's 0.002336 and 32 percent below it.
+   would be 0.001621, better than CatBoost's 0.002336 and 31 percent below it.
    **There is more than the gap available here**, which is the strongest reason
    to attack variance rather than to copy the configuration wholesale.
 
+**And one warning about the multiple, which is the figure this section most
+invites a reader to quote.** "We have N times CatBoost's variance" is not a
+converged quantity and no single value of N is defensible. It reads 2.2 at 40
+bins, 2.8 at 1004, 4.9 at 4018 and 7.8 at 8036, rising monotonically, because
+CatBoost's bias estimate grows faster with resolution than ours does and each
+arm's variance is the remainder. The hand version quoted **7.3 times** as
+settled; that value is reachable near 8000 bins and is not what the document's
+own stated resolution of 4000 produces. **Quote the sign, the ordering and the
+share of the gap, all three of which are stable. Do not quote the multiple
+without its resolution beside it.**
+
 The step term also settles a prediction. `-2*(x4 > 0.7)` is the one term the
 growth-attribution reading names as the one leaf-wise growth should be best at.
-At the standard tier our bias there is 0.002242 against CatBoost's 0.000551,
-four times worse; at the large tier the two are level. **In neither case is
+At the standard tier our bias there is 0.001540 against CatBoost's 0.000261, **a
+factor of 5.9 worse**; at the large tier the two are level. **In neither case is
 leaf-wise growth better at it**, and section 3.10 shows the reason has nothing
-to do with growth.
+to do with growth. The re-measurement strengthens this: our leaf-wise, symmetric
+and depth-wise arms agree on the term to within 3 percent, so growth policy does
+not move it at all.
 
 A negative result, recorded because it rules a hypothesis out. Marginal
 dependence on the noise features was measured the same way, 20 features at 20
@@ -690,7 +769,9 @@ border term is inside the bundle comparison as well as outside it.
 **The one line to take away from the table.** The largest single ATTRIBUTED term
 in the standard-tier gap is border placement at 55.7 percent, and it reverses at
 the large tier, so it is a lottery rather than a mechanism. The largest DURABLE
-term is the variance the bundle buys, quantified in section 2 at 7.3 times ours.
+term is the variance the bundle buys, which section 2 puts at a factor of at
+least 2.2 and at 4.9 at its stated resolution, the sign being settled and the
+multiple not.
 The largest ACTIONABLE term is `lambda_l2`, because it is the only entry that is
 free, reaches every entry point, reduces variance, and has recorded damage on
 three scenarios.
@@ -798,10 +879,23 @@ CatBoost from lr 0.1 to lr 0.5 cut its bias from 0.002935 to 0.001804, a 39
 percent reduction, and moved its variance by 6 percent (0.000565 to 0.000532).
 Our symmetric arm shows the same signature, bias 0.002245 down to 0.001640 with
 variance flat. **The rate is buying bias reduction, which means those two arms
-were under-converged at lr 0.1 and the rate fixed it.** Our leaf-wise arm's bias
-is already 0.001054, the lowest of any arm in the table and 42 percent below
-CatBoost's at its own rate. **There is very little bias for a rate increase to
-buy on our arm, and section 2 says variance is what we cannot afford more of.**
+were under-converged at lr 0.1 and the rate fixed it.**
+
+**OPEN, 2026-08-17. That paragraph is the one part of the rate argument the
+re-measurement could not check, and it is quoted from the hand version as a
+matched pair.** The lr 0.1 arms are absent from `dense1mfixed`, so the tool
+cannot re-decompose either side, and the lr 0.5 side alone disagrees with the
+hand version enough to matter: CatBoost's bias at its own rate re-measures to
+0.001480 rather than 0.001804 and its variance to 0.000856 rather than 0.000532.
+Substituting one side and keeping the other would mix two methods and would flip
+the sign of the variance move, so **the pair stands or falls together and it
+needs a run that carries both rates before it can be relied on.** What does not
+depend on it is the conclusion drawn next.
+
+Our leaf-wise arm's bias re-measures to 0.000765, the lowest of any arm in the
+table and 48 percent below CatBoost's at its own rate. **There is very little
+bias for a rate increase to buy on our arm, and section 2 says variance is what
+we cannot afford more of.**
 
 **Expected size.** UNKNOWN, and the plausible range spans the sign. The prior
 this document ends with is that it is small and possibly negative under
