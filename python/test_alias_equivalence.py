@@ -5,16 +5,21 @@ this file sweeps it instead of hand writing a case per pair. The pairs are
 read at runtime from the derived table in `compatibility/api_snapshot.json`,
 so a pair added later is swept without anybody remembering to add it here.
 
-NAMING, AND IT IS A TRAP. The snapshot's `parameter_aliases.<name>.canonical`
-field is NOT the canonical user-facing name of docs/PARAMETER_NAMING.md. It
+NAMING. The snapshot field this file reads is `parameter_aliases.<name>.wire`,
+and until schema version 3 it was called `canonical`, which it never was. It
 is the FIRST argument of the `_resolve_alias` call site, which that function
 calls the `primary` and which its own docstring says "is not necessarily the
 canonical user-facing name", giving `num_leaves` as the primary that the
 canonical `max_leaves` resolves onto. Eleven of the forty five entries
-disagree with the naming document, so this file calls the two sides PRIMARY
-(the spelling that holds the stock default) and ALIAS (the spelling that
-defaults to None), never "canonical", and every message prints both names.
-The equivalence being asserted does not care which one is canonical.
+disagreed with docs/PARAMETER_NAMING.md, which is why the field was renamed
+and a real `canonical`, read from that document, was added beside it.
+
+This file calls the two sides PRIMARY (the spelling that holds the stock
+default, which is the `wire` field) and ALIAS (the spelling that defaults to
+None), and every message prints both names. The equivalence being asserted
+does not care which one is canonical, so the `canonical` field is read here
+only to check that the two derivations of it agree; see
+`test_port_table_agrees_with_snapshot`.
 
 Two live bugs of exactly this shape reached a tagged release candidate.
 
@@ -105,9 +110,10 @@ def alias_pairs():
     `tools/api_snapshot.py:alias_pairs` derives this table from the
     `_resolve_alias` call sites, so it is the same set of pairs the library
     actually resolves rather than a second list that can drift. The key is
-    the alias (the second argument at the call site) and the `canonical`
-    field is the primary (the first), which is the WIRE spelling and not
-    necessarily the canonical user-facing one; see the module docstring.
+    the alias (the second argument at the call site) and the `wire` field
+    is the primary (the first), which is the spelling the native layer is
+    sent and not necessarily the canonical user-facing one; see the module
+    docstring.
 
     Some entries record `fallback_default` as null, which means the third
     argument at the call site was not a literal (`learning_rate` and
@@ -120,9 +126,7 @@ def alias_pairs():
     pairs = []
     for alias in sorted(table):
         entry = table[alias]
-        pairs.append(
-            (alias, entry["canonical"], entry.get("fallback_default"))
-        )
+        pairs.append((alias, entry["wire"], entry.get("fallback_default")))
     return pairs
 
 
@@ -142,6 +146,94 @@ def test_alias_table_is_discovered():
         f"alias table ok ({len(pairs)} pairs, "
         f"{len(unresolved)} with an underived stock default)"
     )
+
+
+def test_port_table_agrees_with_snapshot():
+    """The two derivations of the alias table are one fact, not two.
+
+    `tools/api_snapshot.py:alias_pairs` and `port._alias_pairs` walk the
+    same `_resolve_alias` call sites, and both read the canonical spelling
+    out of `docs/PARAMETER_NAMING.md` the same three ways. Neither imports
+    the other, because the snapshot is not in the wheel and the tool
+    imports no part of the package, so the only thing holding them together
+    is this comparison.
+
+    A canonical the estimator does not accept as a keyword is dropped by
+    `port` and kept by the snapshot, deliberately: `port` hands back a dict
+    a caller splats into a constructor and must never name a keyword that
+    would raise. That case is printed rather than failed.
+    """
+    # THE MODULE, not the function, and getting this takes `importlib`.
+    #
+    # `__init__.py` does `from .port import port` eagerly, so the attribute
+    # `mojotrees.port` is the CALLABLE and it shadows the submodule of the
+    # same name. Both `from mojotrees import port` and
+    # `import mojotrees.port as port_module` bind that attribute, because the
+    # `as` form reads the attribute after the import rather than taking the
+    # module object, so both fail with "'function' object has no attribute
+    # '_estimator_facts'". `import_module` returns `sys.modules` entry itself
+    # and is unaffected by the shadowing.
+    #
+    # This is the same name collision `_public_api_plan.TOP_LEVEL_ADDITIONS`
+    # records for `cv` and `CVBooster`, met a third time, and it is worth the
+    # paragraph because the two wrong spellings look correct.
+    import importlib
+
+    port_module = importlib.import_module("mojotrees.port")
+
+    with open(_SNAPSHOT) as handle:
+        table = json.load(handle)["python"]["parameter_aliases"]
+    facts = port_module._estimator_facts()
+    theirs = facts["aliases"]
+    failures = []
+    notes = []
+    only_snapshot = sorted(set(table) - set(theirs))
+    only_port = sorted(set(theirs) - set(table))
+    if only_snapshot or only_port:
+        failures.append(
+            "the two derivations disagree about which aliases exist; only "
+            f"in the snapshot: {only_snapshot or 'none'}; only in port.py: "
+            f"{only_port or 'none'}"
+        )
+    for alias in sorted(set(table) & set(theirs)):
+        snap, mine = table[alias], theirs[alias]
+        if snap["wire"] != mine["wire"]:
+            failures.append(
+                f"{alias}: the snapshot resolves it onto "
+                f"{snap['wire']!r} and port.py onto {mine['wire']!r}"
+            )
+            continue
+        snap_canonical = snap.get("canonical")
+        mine_canonical = mine.get("canonical")
+        if snap_canonical is None:
+            notes.append(
+                f"{alias}: docs/PARAMETER_NAMING.md names no canonical "
+                f"spelling for the wire name {mine['wire']!r}, so the "
+                "snapshot records null and port.py reports the wire name"
+            )
+        elif snap_canonical != mine_canonical:
+            if snap_canonical not in signature_defaults(MojoTreesRegressor):
+                notes.append(
+                    f"{alias}: the naming document calls "
+                    f"{snap_canonical!r} canonical, and it is not a "
+                    "constructor keyword, so port.py keeps "
+                    f"{mine_canonical!r}"
+                )
+            else:
+                failures.append(
+                    f"{alias}: the snapshot calls {snap_canonical!r} "
+                    f"canonical and port.py calls it {mine_canonical!r}, "
+                    "from the same document"
+                )
+    for line in notes:
+        print(f"  NOTE {line}")
+    for line in failures:
+        print(f"  {line}")
+    assert not failures, (
+        f"{len(failures)} disagreements between the snapshot's alias table "
+        "and port.py's"
+    )
+    print(f"port and snapshot alias tables agree ok ({len(theirs)} pairs)")
 
 
 # ------------------------------------------------------------------ part 2
@@ -719,6 +811,7 @@ def test_provenance_is_askable():
 
 if __name__ == "__main__":
     test_alias_table_is_discovered()
+    test_port_table_agrees_with_snapshot()
     test_alias_equivalence_sweep()
     test_bagging_freq_zero_is_a_statement()
     test_explicit_none_is_not_swallowed()

@@ -56,29 +56,29 @@ computes it rather than spelling it out.
 | you pass                       | we call it                | default when neither is set | call sites |
 |--------------------------------|---------------------------|-----------------------------|------------|
 | `border_count`                 | `max_bin`                 | 255                         | 1          |
-| `cat_features`                 | `categorical_feature`     | 'auto'                      | 1          |
-| `categorical_features`         | `categorical_feature`     | 'auto'                      | 1          |
-| `colsample_bynode`             | `feature_fraction_bynode` | 1.0                         | 2          |
-| `colsample_bytree`             | `feature_fraction`        | 1.0                         | 2          |
+| `cat_features`                 | `categorical_features`    | 'auto'                      | 1          |
+| `categorical_features`         | `categorical_features`    | 'auto'                      | 1          |
+| `colsample_bynode`             | `colsample_bynode`        | 1.0                         | 2          |
+| `colsample_bytree`             | `colsample_bytree`        | 1.0                         | 2          |
 | `depth`                        | `max_depth`               | -1                          | 2          |
 | `device_type`                  | `device`                  | 'cpu'                       | 1          |
 | `early_stopping_round`         | `early_stopping_rounds`   | None                        | 1          |
 | `eta`                          | `learning_rate`           | unknown                     | 2          |
-| `gamma`                        | `min_gain_to_split`       | 0.0                         | 1          |
+| `gamma`                        | `min_split_gain`          | 0.0                         | 1          |
 | `interaction_cst`              | `interaction_constraints` | None                        | 1          |
 | `iterations`                   | `n_estimators`            | 100                         | 1          |
-| `l2_leaf_reg`                  | `lambda_l2`               | unknown                     | 2          |
-| `l2_regularization`            | `lambda_l2`               | unknown                     | 2          |
+| `l2_leaf_reg`                  | `reg_lambda`              | unknown                     | 2          |
+| `l2_regularization`            | `reg_lambda`              | unknown                     | 2          |
 | `max_bins`                     | `max_bin`                 | 255                         | 2          |
-| `max_features`                 | `feature_fraction_bynode` | 1.0                         | 2          |
+| `max_features`                 | `colsample_bynode`        | 1.0                         | 2          |
 | `max_iter`                     | `n_estimators`            | 100                         | 1          |
-| `max_leaf_nodes`               | `num_leaves`              | 31                          | 2          |
-| `max_leaves`                   | `num_leaves`              | 31                          | 2          |
-| `min_child_samples`            | `min_data_in_leaf`        | 20                          | 2          |
-| `min_child_weight`             | `min_child_hess`          | 0.001                       | 2          |
-| `min_samples_leaf`             | `min_data_in_leaf`        | 20                          | 2          |
-| `min_split_gain`               | `min_gain_to_split`       | 0.0                         | 1          |
-| `min_sum_hessian_in_leaf`      | `min_child_hess`          | 0.001                       | 2          |
+| `max_leaf_nodes`               | `max_leaves`              | 31                          | 2          |
+| `max_leaves`                   | `max_leaves`              | 31                          | 2          |
+| `min_child_samples`            | `min_child_samples`       | 20                          | 2          |
+| `min_child_weight`             | `min_child_weight`        | 0.001                       | 2          |
+| `min_samples_leaf`             | `min_child_samples`       | 20                          | 2          |
+| `min_split_gain`               | `min_split_gain`          | 0.0                         | 1          |
+| `min_sum_hessian_in_leaf`      | `min_child_weight`        | 0.001                       | 2          |
 | `monotone_constraints_penalty` | `monotone_penalty`        | 0.0                         | 1          |
 | `monotonic_cst`                | `monotone_constraints`    | None                        | 1          |
 | `n_iter_no_change`             | `early_stopping_rounds`   | None                        | 1          |
@@ -90,13 +90,13 @@ computes it rather than spelling it out.
 | `one_hot_max_size`             | `max_cat_to_onehot`       | 4                           | 1          |
 | `random_seed`                  | `random_state`            | None                        | 2          |
 | `rate_drop`                    | `drop_rate`               | 0.1                         | 1          |
-| `reg_alpha`                    | `lambda_l1`               | 0.0                         | 2          |
-| `reg_lambda`                   | `lambda_l2`               | unknown                     | 2          |
-| `rsm`                          | `feature_fraction`        | 1.0                         | 2          |
+| `reg_alpha`                    | `reg_alpha`               | 0.0                         | 2          |
+| `reg_lambda`                   | `reg_lambda`              | unknown                     | 2          |
+| `rsm`                          | `colsample_bytree`        | 1.0                         | 2          |
 | `seed`                         | `random_state`            | None                        | 2          |
 | `shrinkage_rate`               | `learning_rate`           | unknown                     | 2          |
-| `subsample`                    | `bagging_fraction`        | 1.0                         | 1          |
-| `subsample_freq`               | `bagging_freq`            | 0                           | 1          |
+| `subsample`                    | `subsample`               | 1.0                         | 1          |
+| `subsample_freq`               | `subsample_freq`          | 0                           | 1          |
 | `task_type`                    | `device`                  | 'cpu'                       | 1          |
 | `thread_count`                 | `n_jobs`                  | None                        | 1          |
 | `verbosity`                    | `verbose`                 | None                        | 1          |
@@ -116,7 +116,7 @@ an empty dict, source=lightgbm
 | parameter     | their name    | their default | our default | declared | reason                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 |---------------|---------------|---------------|-------------|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | enable_bundle | enable_bundle | True          | False       | yes      | exclusive feature bundling changes the feature space before binning, and mojotrees's EFB is not applied by every trainer yet (the ranking trainer refuses an active bundling switch by name). Off by default until it is; see the enable_bundle row of docs/LIGHTGBM_PARITY.md                                                                                                                                                                                                                          |
-| lambda_l2     | lambda_l2     | 0.0           | 1.0         | yes      | the one default in this library with recorded accuracy damage on THREE separate scenarios, and the only reason it was 0.0 is that LightGBM's is 0.0, which is a mirror and not a measurement. docs/design/ACCURACY_GAP.md section 3.4 has the artifacts: -1.6 percent of excess error on dense_regression (matched bin digest, two-point, estimate), 0.75x average precision on imbalanced_binary and 3.31x worse multiclass logloss (both measured, and both cost us more than they cost LightGBM) ... |
+| reg_lambda    | lambda_l2     | 0.0           | 1.0         | yes      | the one default in this library with recorded accuracy damage on THREE separate scenarios, and the only reason it was 0.0 is that LightGBM's is 0.0, which is a mirror and not a measurement. docs/design/ACCURACY_GAP.md section 3.4 has the artifacts: -1.6 percent of excess error on dense_regression (matched bin digest, two-point, estimate), 0.75x average precision on imbalanced_binary and 3.31x worse multiclass logloss (both measured, and both cost us more than they cost LightGBM) ... |
 
 **notes.**
 
@@ -127,6 +127,7 @@ an empty dict, source=lightgbm
 | fact                                 | read from                                                                                                  |
 |--------------------------------------|------------------------------------------------------------------------------------------------------------|
 | accepted parameters and our defaults | python/mojotrees/sklearn.py                                                                                |
+| canonical spellings                  | docs/PARAMETER_NAMING.md, the OURS column                                                                  |
 | lightgbm stock defaults              | tools/check_parity.py LIGHTGBM_STOCK, read from microsoft/LightGBM include/LightGBM/config.h at tag v4.7.0 |
 | refusal reasons                      | docs/LIGHTGBM_PARITY.md, section 7                                                                         |
 | vendor alias table                   | python/mojotrees/sklearn.py, the _Base._resolve_alias call sites                                           |
@@ -149,19 +150,19 @@ that dict, source=lightgbm
 | num_leaves    | 63    | shared |      |
 | learning_rate | 0.05  | shared |      |
 
-**aliased_to.** A vendor spelling of one of our names. The value is used as given, under the canonical name.
+**aliased_to.** A vendor spelling of one of our names. The value is used as given, under the canonical name. `we call it` is the spelling to type; `on the wire` is the spelling the native layer is sent and the model file holds, and the two differ for eleven parameters.
 
-| you passed              | we call it     | value | note |
-|-------------------------|----------------|-------|------|
-| num_iterations          | n_estimators   | 500   |      |
-| min_sum_hessian_in_leaf | min_child_hess | 0.01  |      |
+| you passed              | we call it       | on the wire    | value | note |
+|-------------------------|------------------|----------------|-------|------|
+| num_iterations          | n_estimators     | n_estimators   | 500   |      |
+| min_sum_hessian_in_leaf | min_child_weight | min_child_hess | 0.01  |      |
 
 **defaulted_differently.** You did not name these and our default is not lightgbm's, so your model will differ from lightgbm's unless you set them.
 
 | parameter     | their name    | their default | our default | declared | reason                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 |---------------|---------------|---------------|-------------|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | enable_bundle | enable_bundle | True          | False       | yes      | exclusive feature bundling changes the feature space before binning, and mojotrees's EFB is not applied by every trainer yet (the ranking trainer refuses an active bundling switch by name). Off by default until it is; see the enable_bundle row of docs/LIGHTGBM_PARITY.md                                                                                                                                                                                                                          |
-| lambda_l2     | lambda_l2     | 0.0           | 1.0         | yes      | the one default in this library with recorded accuracy damage on THREE separate scenarios, and the only reason it was 0.0 is that LightGBM's is 0.0, which is a mirror and not a measurement. docs/design/ACCURACY_GAP.md section 3.4 has the artifacts: -1.6 percent of excess error on dense_regression (matched bin digest, two-point, estimate), 0.75x average precision on imbalanced_binary and 3.31x worse multiclass logloss (both measured, and both cost us more than they cost LightGBM) ... |
+| reg_lambda    | lambda_l2     | 0.0           | 1.0         | yes      | the one default in this library with recorded accuracy damage on THREE separate scenarios, and the only reason it was 0.0 is that LightGBM's is 0.0, which is a mirror and not a measurement. docs/design/ACCURACY_GAP.md section 3.4 has the artifacts: -1.6 percent of excess error on dense_regression (matched bin digest, two-point, estimate), 0.75x average precision on imbalanced_binary and 3.31x worse multiclass logloss (both measured, and both cost us more than they cost LightGBM) ... |
 
 **refused.** We do not implement these, and why.
 
@@ -180,6 +181,7 @@ that dict, source=lightgbm
 | fact                                 | read from                                                                                                  |
 |--------------------------------------|------------------------------------------------------------------------------------------------------------|
 | accepted parameters and our defaults | python/mojotrees/sklearn.py                                                                                |
+| canonical spellings                  | docs/PARAMETER_NAMING.md, the OURS column                                                                  |
 | lightgbm stock defaults              | tools/check_parity.py LIGHTGBM_STOCK, read from microsoft/LightGBM include/LightGBM/config.h at tag v4.7.0 |
 | refusal reasons                      | docs/LIGHTGBM_PARITY.md, section 7                                                                         |
 | vendor alias table                   | python/mojotrees/sklearn.py, the _Base._resolve_alias call sites                                           |
@@ -196,14 +198,14 @@ an empty dict, source=xgboost
 
 **defaulted_differently.** You did not name these and our default is not xgboost's, so your model will differ from xgboost's unless you set them.
 
-| parameter      | their name       | their default | our default | declared | reason                                                                                                  |
-|----------------|------------------|---------------|-------------|----------|---------------------------------------------------------------------------------------------------------|
-| grow_policy    | grow_policy      | 'depthwise'   | 'lossguide' | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
-| learning_rate  | learning_rate    | '0.300000012' | 0.1         | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
-| max_bin        | max_bin          | '256'         | 255         | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
-| max_depth      | max_depth        | '6'           | -1          | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
-| num_leaves     | max_leaves       | '0'           | 31          | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
-| min_child_hess | min_child_weight | '1'           | 0.001       | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| parameter        | their name       | their default | our default | declared | reason                                                                                                  |
+|------------------|------------------|---------------|-------------|----------|---------------------------------------------------------------------------------------------------------|
+| grow_policy      | grow_policy      | 'depthwise'   | 'lossguide' | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| learning_rate    | learning_rate    | '0.300000012' | 0.1         | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| max_bin          | max_bin          | '256'         | 255         | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| max_depth        | max_depth        | '6'           | -1          | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| max_leaves       | max_leaves       | '0'           | 31          | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| min_child_weight | min_child_weight | '1'           | 0.001       | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
 
 **unsourced.** Facts this report wanted and could not read. Nothing below is a claim; each line is an absence.
 
@@ -214,8 +216,8 @@ an empty dict, source=xgboost
 | why our 'learning_rate' differs from xgboost's 'learning_rate'                        | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 | why our 'max_bin' differs from xgboost's 'max_bin'                                    | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 | why our 'max_depth' differs from xgboost's 'max_depth'                                | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
-| why our 'num_leaves' differs from xgboost's 'max_leaves'                              | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
-| why our 'min_child_hess' differs from xgboost's 'min_child_weight'                    | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'max_leaves' differs from xgboost's 'max_leaves'                              | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'min_child_weight' differs from xgboost's 'min_child_weight'                  | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 | whether our 'tree_method' matches xgboost's 'tree_method', which is 'auto'            | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 
 **fact sources.**
@@ -223,6 +225,7 @@ an empty dict, source=xgboost
 | fact                                 | read from                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 |--------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | accepted parameters and our defaults | python/mojotrees/sklearn.py                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| canonical spellings                  | docs/PARAMETER_NAMING.md, the OURS column                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | refusal reasons                      | docs/LIGHTGBM_PARITY.md, section 7                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | vendor alias table                   | python/mojotrees/sklearn.py, the _Base._resolve_alias call sites                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | xgboost stock defaults               | xgboost.Booster.save_config() on a fitted booster, xgboost 3.4.0 in the bench environment, read 2026-08-17 from a 400-row by 6-feature throwaway regression fit at reg:squarederror through the native DMatrix plus xgboost.train path this arm uses. Cross-checked against XGBRegressor().get_params(), which in 3.4.0 returns None for every tree parameter and is therefore not a source. Every value in XGBOOST_RESOLVED_DEFAULTS carries the save_config path it was read from, and every measured fit re-reads the same paths through check_xgboost_readback, so a version that moves a default is reported rather than assumed away |
@@ -243,29 +246,29 @@ that dict, source=xgboost
 | parameter   | value  | owner              | note                                                                                                                                                                     |
 |-------------|--------|--------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | max_depth   | 8      | shared             |                                                                                                                                                                          |
-| alpha       | 1.0    | MojoTreesRegressor | xgboost spells this parameter 'alpha' and means 'lambda_l1' by it; here 'alpha' is a different parameter and lands on 'alpha'. Pass 'reg_alpha' for the xgboost meaning. |
+| alpha       | 1.0    | MojoTreesRegressor | xgboost spells this parameter 'alpha' and means 'reg_alpha' by it; here 'alpha' is a different parameter and lands on 'alpha'. Pass 'reg_alpha' for the xgboost meaning. |
 | tree_method | 'hist' | shared             |                                                                                                                                                                          |
 
-**aliased_to.** A vendor spelling of one of our names. The value is used as given, under the canonical name.
+**aliased_to.** A vendor spelling of one of our names. The value is used as given, under the canonical name. `we call it` is the spelling to type; `on the wire` is the spelling the native layer is sent and the model file holds, and the two differ for eleven parameters.
 
-| you passed       | we call it       | value | note |
-|------------------|------------------|-------|------|
-| eta              | learning_rate    | 0.05  |      |
-| reg_lambda       | lambda_l2        | 2.0   |      |
-| colsample_bytree | feature_fraction | 0.8   |      |
+| you passed       | we call it       | on the wire      | value | note |
+|------------------|------------------|------------------|-------|------|
+| eta              | learning_rate    | learning_rate    | 0.05  |      |
+| reg_lambda       | reg_lambda       | lambda_l2        | 2.0   |      |
+| colsample_bytree | colsample_bytree | feature_fraction | 0.8   |      |
 
 **defaulted_differently.** You did not name these and our default is not xgboost's, so your model will differ from xgboost's unless you set them.
 
-| parameter      | their name       | their default | our default | declared | reason                                                                                                  |
-|----------------|------------------|---------------|-------------|----------|---------------------------------------------------------------------------------------------------------|
-| grow_policy    | grow_policy      | 'depthwise'   | 'lossguide' | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
-| max_bin        | max_bin          | '256'         | 255         | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
-| num_leaves     | max_leaves       | '0'           | 31          | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
-| min_child_hess | min_child_weight | '1'           | 0.001       | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| parameter        | their name       | their default | our default | declared | reason                                                                                                  |
+|------------------|------------------|---------------|-------------|----------|---------------------------------------------------------------------------------------------------------|
+| grow_policy      | grow_policy      | 'depthwise'   | 'lossguide' | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| max_bin          | max_bin          | '256'         | 255         | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| max_leaves       | max_leaves       | '0'           | 31          | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
+| min_child_weight | min_child_weight | '1'           | 0.001       | no       | no per-parameter reason for this difference is recorded in this repository; only xgboost's own value is |
 
 **notes.**
 
-- xgboost spells this parameter 'alpha' and means 'lambda_l1' by it; here 'alpha' is a different parameter and lands on 'alpha'. Pass 'reg_alpha' for the xgboost meaning.
+- xgboost spells this parameter 'alpha' and means 'reg_alpha' by it; here 'alpha' is a different parameter and lands on 'alpha'. Pass 'reg_alpha' for the xgboost meaning.
 
 **unsourced.** Facts this report wanted and could not read. Nothing below is a claim; each line is an absence.
 
@@ -274,14 +277,15 @@ that dict, source=xgboost
 | whether our 'boost_from_average' matches xgboost's 'boost_from_average', which is '1' | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | why our 'grow_policy' differs from xgboost's 'grow_policy'                            | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 | why our 'max_bin' differs from xgboost's 'max_bin'                                    | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
-| why our 'num_leaves' differs from xgboost's 'max_leaves'                              | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
-| why our 'min_child_hess' differs from xgboost's 'min_child_weight'                    | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'max_leaves' differs from xgboost's 'max_leaves'                              | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'min_child_weight' differs from xgboost's 'min_child_weight'                  | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 
 **fact sources.**
 
 | fact                                 | read from                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 |--------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | accepted parameters and our defaults | python/mojotrees/sklearn.py                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| canonical spellings                  | docs/PARAMETER_NAMING.md, the OURS column                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | refusal reasons                      | docs/LIGHTGBM_PARITY.md, section 7                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | vendor alias table                   | python/mojotrees/sklearn.py, the _Base._resolve_alias call sites                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | xgboost stock defaults               | xgboost.Booster.save_config() on a fitted booster, xgboost 3.4.0 in the bench environment, read 2026-08-17 from a 400-row by 6-feature throwaway regression fit at reg:squarederror through the native DMatrix plus xgboost.train path this arm uses. Cross-checked against XGBRegressor().get_params(), which in 3.4.0 returns None for every tree parameter and is therefore not a source. Every value in XGBOOST_RESOLVED_DEFAULTS carries the save_config path it was read from, and every measured fit re-reads the same paths through check_xgboost_readback, so a version that moves a default is reported rather than assumed away |
@@ -303,11 +307,11 @@ an empty dict, source=catboost
 | max_bin           | border_count     | 254             | 255         | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
 | max_depth         | depth            | 6               | -1          | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
 | grow_policy       | grow_policy      | 'SymmetricTree' | 'lossguide' | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
-| lambda_l2         | l2_leaf_reg      | 3               | 1.0         | yes      | the one default in this library with recorded accuracy damage on THREE separate scenarios, and the only reason it was 0.0 is that LightGBM's is 0.0, which is a mirror and not a measurement. docs/design/ACCURACY_GAP.md section 3.4 has the artifacts: -1.6 percent of excess error on dense_regression (matched bin digest, two-point, estimate), 0.75x average precision on imbalanced_binary and 3.31x worse multiclass logloss (both measured, and both cost us more than they cost LightGBM) ... |
-| num_leaves        | max_leaves       | 64              | 31          | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
-| min_data_in_leaf  | min_data_in_leaf | 1               | 20          | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
+| reg_lambda        | l2_leaf_reg      | 3               | 1.0         | yes      | the one default in this library with recorded accuracy damage on THREE separate scenarios, and the only reason it was 0.0 is that LightGBM's is 0.0, which is a mirror and not a measurement. docs/design/ACCURACY_GAP.md section 3.4 has the artifacts: -1.6 percent of excess error on dense_regression (matched bin digest, two-point, estimate), 0.75x average precision on imbalanced_binary and 3.31x worse multiclass logloss (both measured, and both cost us more than they cost LightGBM) ... |
+| max_leaves        | max_leaves       | 64              | 31          | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
+| min_child_samples | min_data_in_leaf | 1               | 20          | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
 | max_cat_to_onehot | one_hot_max_size | 2               | 4           | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
-| bagging_fraction  | subsample        | 0.8             | 1.0         | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
+| subsample         | subsample        | 0.8             | 1.0         | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is                                                                                                                                                                                                                                                                                                                                                                                                |
 
 **unsourced.** Facts this report wanted and could not read. Nothing below is a claim; each line is an absence.
 
@@ -323,20 +327,21 @@ an empty dict, source=catboost
 | whether our 'has_time' matches catboost's 'has_time', which is False                                 | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | whether our 'leaf_estimation_iterations' matches catboost's 'leaf_estimation_iterations', which is 1 | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | whether our 'max_ctr_complexity' matches catboost's 'max_ctr_complexity', which is 1                 | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
-| why our 'num_leaves' differs from catboost's 'max_leaves'                                            | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
-| why our 'min_data_in_leaf' differs from catboost's 'min_data_in_leaf'                                | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'max_leaves' differs from catboost's 'max_leaves'                                            | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'min_child_samples' differs from catboost's 'min_data_in_leaf'                               | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 | whether our 'model_shrink_mode' matches catboost's 'model_shrink_mode', which is 'Constant'          | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | whether our 'model_shrink_rate' matches catboost's 'model_shrink_rate', which is 0                   | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | why our 'max_cat_to_onehot' differs from catboost's 'one_hot_max_size'                               | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 | whether our 'random_strength' matches catboost's 'random_strength', which is 1                       | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | whether our 'score_function' matches catboost's 'score_function', which is 'Cosine'                  | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
-| why our 'bagging_fraction' differs from catboost's 'subsample'                                       | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'subsample' differs from catboost's 'subsample'                                              | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 
 **fact sources.**
 
 | fact                                 | read from                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 |--------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | accepted parameters and our defaults | python/mojotrees/sklearn.py                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| canonical spellings                  | docs/PARAMETER_NAMING.md, the OURS column                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | catboost stock defaults              | catboost.CatBoost.get_all_params() on catboost 1.2.10, read 2026-08-16 after a two-iteration RMSE fit on 20,000 rows by 20 features, task_type CPU. Cross-read against catboost/core.py's Pool.quantize docstring for border_count, feature_border_type, nan_mode and sparse_features_conflict_fraction. The categorical entries -- one_hot_max_size, max_ctr_complexity, counter_calc_method, ctr_target_border_count, store_all_simple_ctr and has_time -- were read separately on 2026-08-16 off two-iteration fits that HAD cat_features, because a fit with no categorical column is not evidence about what CatBoost resolves for one. Three shapes and two losses, agreeing on every value |
 | refusal reasons                      | docs/LIGHTGBM_PARITY.md, section 7                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | vendor alias table                   | python/mojotrees/sklearn.py, the _Base._resolve_alias call sites                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -358,24 +363,24 @@ that dict, source=catboost
 |----------------|-------|--------|------|
 | bootstrap_type | 'MVS' | shared |      |
 
-**aliased_to.** A vendor spelling of one of our names. The value is used as given, under the canonical name.
+**aliased_to.** A vendor spelling of one of our names. The value is used as given, under the canonical name. `we call it` is the spelling to type; `on the wire` is the spelling the native layer is sent and the model file holds, and the two differ for eleven parameters.
 
-| you passed       | we call it        | value | note |
-|------------------|-------------------|-------|------|
-| iterations       | n_estimators      | 500   |      |
-| depth            | max_depth         | 8     |      |
-| l2_leaf_reg      | lambda_l2         | 3.0   |      |
-| one_hot_max_size | max_cat_to_onehot | 10    |      |
+| you passed       | we call it        | on the wire       | value | note |
+|------------------|-------------------|-------------------|-------|------|
+| iterations       | n_estimators      | n_estimators      | 500   |      |
+| depth            | max_depth         | max_depth         | 8     |      |
+| l2_leaf_reg      | reg_lambda        | lambda_l2         | 3.0   |      |
+| one_hot_max_size | max_cat_to_onehot | max_cat_to_onehot | 10    |      |
 
 **defaulted_differently.** You did not name these and our default is not catboost's, so your model will differ from catboost's unless you set them.
 
-| parameter        | their name       | their default   | our default | declared | reason                                                                                                   |
-|------------------|------------------|-----------------|-------------|----------|----------------------------------------------------------------------------------------------------------|
-| max_bin          | border_count     | 254             | 255         | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
-| grow_policy      | grow_policy      | 'SymmetricTree' | 'lossguide' | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
-| num_leaves       | max_leaves       | 64              | 31          | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
-| min_data_in_leaf | min_data_in_leaf | 1               | 20          | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
-| bagging_fraction | subsample        | 0.8             | 1.0         | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
+| parameter         | their name       | their default   | our default | declared | reason                                                                                                   |
+|-------------------|------------------|-----------------|-------------|----------|----------------------------------------------------------------------------------------------------------|
+| max_bin           | border_count     | 254             | 255         | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
+| grow_policy       | grow_policy      | 'SymmetricTree' | 'lossguide' | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
+| max_leaves        | max_leaves       | 64              | 31          | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
+| min_child_samples | min_data_in_leaf | 1               | 20          | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
+| subsample         | subsample        | 0.8             | 1.0         | no       | no per-parameter reason for this difference is recorded in this repository; only catboost's own value is |
 
 **refused.** We do not implement these, and why.
 
@@ -396,19 +401,20 @@ that dict, source=catboost
 | whether our 'has_time' matches catboost's 'has_time', which is False                                 | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | whether our 'leaf_estimation_iterations' matches catboost's 'leaf_estimation_iterations', which is 1 | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | whether our 'max_ctr_complexity' matches catboost's 'max_ctr_complexity', which is 1                 | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
-| why our 'num_leaves' differs from catboost's 'max_leaves'                                            | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
-| why our 'min_data_in_leaf' differs from catboost's 'min_data_in_leaf'                                | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'max_leaves' differs from catboost's 'max_leaves'                                            | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'min_child_samples' differs from catboost's 'min_data_in_leaf'                               | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 | whether our 'model_shrink_mode' matches catboost's 'model_shrink_mode', which is 'Constant'          | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | whether our 'model_shrink_rate' matches catboost's 'model_shrink_rate', which is 0                   | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | whether our 'random_strength' matches catboost's 'random_strength', which is 1                       | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
 | whether our 'score_function' matches catboost's 'score_function', which is 'Cosine'                  | our default reads None, which is not a value this report can compare; an unset parameter is resolved at fit time |
-| why our 'bagging_fraction' differs from catboost's 'subsample'                                       | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
+| why our 'subsample' differs from catboost's 'subsample'                                              | no table here states a reason; tools/check_parity.py STOCK_DIVERGENCES covers LightGBM only                      |
 
 **fact sources.**
 
 | fact                                 | read from                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 |--------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | accepted parameters and our defaults | python/mojotrees/sklearn.py                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| canonical spellings                  | docs/PARAMETER_NAMING.md, the OURS column                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | catboost stock defaults              | catboost.CatBoost.get_all_params() on catboost 1.2.10, read 2026-08-16 after a two-iteration RMSE fit on 20,000 rows by 20 features, task_type CPU. Cross-read against catboost/core.py's Pool.quantize docstring for border_count, feature_border_type, nan_mode and sparse_features_conflict_fraction. The categorical entries -- one_hot_max_size, max_ctr_complexity, counter_calc_method, ctr_target_border_count, store_all_simple_ctr and has_time -- were read separately on 2026-08-16 off two-iteration fits that HAD cat_features, because a fit with no categorical column is not evidence about what CatBoost resolves for one. Three shapes and two losses, agreeing on every value |
 | refusal reasons                      | docs/LIGHTGBM_PARITY.md, section 7                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | vendor alias table                   | python/mojotrees/sklearn.py, the _Base._resolve_alias call sites                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |

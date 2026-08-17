@@ -300,14 +300,15 @@
     ],
     "generated_by": "tools/api_snapshot.py",
     "library_version": "0.1.0a4",
-    "schema_version": 2,
+    "schema_version": 3,
     "source_commit": null,
     "status": "generated",
-    "tool_version": 2,
+    "tool_version": 3,
     "underived": [
       "python.parameter_aliases.eta.fallback_default",
       "python.parameter_aliases.l2_leaf_reg.fallback_default",
       "python.parameter_aliases.l2_regularization.fallback_default",
+      "python.parameter_aliases.monotone_constraints_penalty.canonical",
       "python.parameter_aliases.reg_lambda.fallback_default",
       "python.parameter_aliases.shrinkage_rate.fallback_default"
     ]
@@ -1388,9 +1389,6 @@
         "evaluation_result_list"
       ],
       "factories": {
-        "canonical_reset_key": {
-          "key": "required"
-        },
         "early_stopping": {
           "first_metric_only": false,
           "min_delta": 0.0,
@@ -1411,6 +1409,9 @@
           "callbacks": "required",
           "early_stopping_rounds": "required",
           "min_delta": "required"
+        },
+        "wire_reset_key": {
+          "key": "required"
         }
       },
       "integral_slots": [
@@ -1961,227 +1962,272 @@
       "border_count": {
         "canonical": "max_bin",
         "fallback_default": 255,
-        "sites": 1
+        "sites": 1,
+        "wire": "max_bin"
       },
       "cat_features": {
-        "canonical": "categorical_feature",
+        "canonical": "categorical_features",
         "fallback_default": "auto",
-        "sites": 1
+        "sites": 1,
+        "wire": "categorical_feature"
       },
       "categorical_features": {
-        "canonical": "categorical_feature",
+        "canonical": "categorical_features",
         "fallback_default": "auto",
-        "sites": 1
+        "sites": 1,
+        "wire": "categorical_feature"
       },
       "colsample_bynode": {
-        "canonical": "feature_fraction_bynode",
+        "canonical": "colsample_bynode",
         "fallback_default": 1.0,
-        "sites": 2
+        "sites": 2,
+        "wire": "feature_fraction_bynode"
       },
       "colsample_bytree": {
-        "canonical": "feature_fraction",
+        "canonical": "colsample_bytree",
         "fallback_default": 1.0,
-        "sites": 2
+        "sites": 2,
+        "wire": "feature_fraction"
       },
       "depth": {
         "canonical": "max_depth",
         "fallback_default": -1,
-        "sites": 2
+        "sites": 2,
+        "wire": "max_depth"
       },
       "device_type": {
         "canonical": "device",
         "fallback_default": "cpu",
-        "sites": 1
+        "sites": 1,
+        "wire": "device"
       },
       "early_stopping_round": {
         "canonical": "early_stopping_rounds",
         "fallback_default": null,
-        "sites": 1
+        "sites": 1,
+        "wire": "early_stopping_rounds"
       },
       "eta": {
         "canonical": "learning_rate",
         "fallback_default": null,
-        "sites": 2
+        "sites": 2,
+        "wire": "learning_rate"
       },
       "gamma": {
-        "canonical": "min_gain_to_split",
+        "canonical": "min_split_gain",
         "fallback_default": 0.0,
-        "sites": 1
+        "sites": 1,
+        "wire": "min_gain_to_split"
       },
       "interaction_cst": {
         "canonical": "interaction_constraints",
         "fallback_default": null,
-        "sites": 1
+        "sites": 1,
+        "wire": "interaction_constraints"
       },
       "iterations": {
         "canonical": "n_estimators",
         "fallback_default": 100,
-        "sites": 1
+        "sites": 1,
+        "wire": "n_estimators"
       },
       "l2_leaf_reg": {
-        "canonical": "lambda_l2",
+        "canonical": "reg_lambda",
         "fallback_default": null,
-        "sites": 2
+        "sites": 2,
+        "wire": "lambda_l2"
       },
       "l2_regularization": {
-        "canonical": "lambda_l2",
+        "canonical": "reg_lambda",
         "fallback_default": null,
-        "sites": 2
+        "sites": 2,
+        "wire": "lambda_l2"
       },
       "max_bins": {
         "canonical": "max_bin",
         "fallback_default": 255,
-        "sites": 2
+        "sites": 2,
+        "wire": "max_bin"
       },
       "max_features": {
-        "canonical": "feature_fraction_bynode",
+        "canonical": "colsample_bynode",
         "fallback_default": 1.0,
-        "sites": 2
+        "sites": 2,
+        "wire": "feature_fraction_bynode"
       },
       "max_iter": {
         "canonical": "n_estimators",
         "fallback_default": 100,
-        "sites": 1
+        "sites": 1,
+        "wire": "n_estimators"
       },
       "max_leaf_nodes": {
-        "canonical": "num_leaves",
+        "canonical": "max_leaves",
         "fallback_default": 31,
-        "sites": 2
+        "sites": 2,
+        "wire": "num_leaves"
       },
       "max_leaves": {
-        "canonical": "num_leaves",
+        "canonical": "max_leaves",
         "fallback_default": 31,
-        "sites": 2
+        "sites": 2,
+        "wire": "num_leaves"
       },
       "min_child_samples": {
-        "canonical": "min_data_in_leaf",
+        "canonical": "min_child_samples",
         "fallback_default": 20,
-        "sites": 2
+        "sites": 2,
+        "wire": "min_data_in_leaf"
       },
       "min_child_weight": {
-        "canonical": "min_child_hess",
+        "canonical": "min_child_weight",
         "fallback_default": 0.001,
-        "sites": 2
+        "sites": 2,
+        "wire": "min_child_hess"
       },
       "min_samples_leaf": {
-        "canonical": "min_data_in_leaf",
+        "canonical": "min_child_samples",
         "fallback_default": 20,
-        "sites": 2
+        "sites": 2,
+        "wire": "min_data_in_leaf"
       },
       "min_split_gain": {
-        "canonical": "min_gain_to_split",
+        "canonical": "min_split_gain",
         "fallback_default": 0.0,
-        "sites": 1
+        "sites": 1,
+        "wire": "min_gain_to_split"
       },
       "min_sum_hessian_in_leaf": {
-        "canonical": "min_child_hess",
+        "canonical": "min_child_weight",
         "fallback_default": 0.001,
-        "sites": 2
+        "sites": 2,
+        "wire": "min_child_hess"
       },
       "monotone_constraints_penalty": {
-        "canonical": "monotone_penalty",
+        "canonical": null,
         "fallback_default": 0.0,
-        "sites": 1
+        "sites": 1,
+        "wire": "monotone_penalty"
       },
       "monotonic_cst": {
         "canonical": "monotone_constraints",
         "fallback_default": null,
-        "sites": 1
+        "sites": 1,
+        "wire": "monotone_constraints"
       },
       "n_iter_no_change": {
         "canonical": "early_stopping_rounds",
         "fallback_default": null,
-        "sites": 1
+        "sites": 1,
+        "wire": "early_stopping_rounds"
       },
       "nthread": {
         "canonical": "n_jobs",
         "fallback_default": null,
-        "sites": 1
+        "sites": 1,
+        "wire": "n_jobs"
       },
       "num_boost_round": {
         "canonical": "n_estimators",
         "fallback_default": 100,
-        "sites": 1
+        "sites": 1,
+        "wire": "n_estimators"
       },
       "num_iterations": {
         "canonical": "n_estimators",
         "fallback_default": 100,
-        "sites": 2
+        "sites": 2,
+        "wire": "n_estimators"
       },
       "num_threads": {
         "canonical": "n_jobs",
         "fallback_default": null,
-        "sites": 1
+        "sites": 1,
+        "wire": "n_jobs"
       },
       "od_wait": {
         "canonical": "early_stopping_rounds",
         "fallback_default": null,
-        "sites": 1
+        "sites": 1,
+        "wire": "early_stopping_rounds"
       },
       "one_hot_max_size": {
         "canonical": "max_cat_to_onehot",
         "fallback_default": 4,
-        "sites": 1
+        "sites": 1,
+        "wire": "max_cat_to_onehot"
       },
       "random_seed": {
         "canonical": "random_state",
         "fallback_default": null,
-        "sites": 2
+        "sites": 2,
+        "wire": "random_state"
       },
       "rate_drop": {
         "canonical": "drop_rate",
         "fallback_default": 0.1,
-        "sites": 1
+        "sites": 1,
+        "wire": "drop_rate"
       },
       "reg_alpha": {
-        "canonical": "lambda_l1",
+        "canonical": "reg_alpha",
         "fallback_default": 0.0,
-        "sites": 2
+        "sites": 2,
+        "wire": "lambda_l1"
       },
       "reg_lambda": {
-        "canonical": "lambda_l2",
+        "canonical": "reg_lambda",
         "fallback_default": null,
-        "sites": 2
+        "sites": 2,
+        "wire": "lambda_l2"
       },
       "rsm": {
-        "canonical": "feature_fraction",
+        "canonical": "colsample_bytree",
         "fallback_default": 1.0,
-        "sites": 2
+        "sites": 2,
+        "wire": "feature_fraction"
       },
       "seed": {
         "canonical": "random_state",
         "fallback_default": null,
-        "sites": 2
+        "sites": 2,
+        "wire": "random_state"
       },
       "shrinkage_rate": {
         "canonical": "learning_rate",
         "fallback_default": null,
-        "sites": 2
+        "sites": 2,
+        "wire": "learning_rate"
       },
       "subsample": {
-        "canonical": "bagging_fraction",
+        "canonical": "subsample",
         "fallback_default": 1.0,
-        "sites": 1
+        "sites": 1,
+        "wire": "bagging_fraction"
       },
       "subsample_freq": {
-        "canonical": "bagging_freq",
+        "canonical": "subsample_freq",
         "fallback_default": 0,
-        "sites": 1
+        "sites": 1,
+        "wire": "bagging_freq"
       },
       "task_type": {
         "canonical": "device",
         "fallback_default": "cpu",
-        "sites": 1
+        "sites": 1,
+        "wire": "device"
       },
       "thread_count": {
         "canonical": "n_jobs",
         "fallback_default": null,
-        "sites": 1
+        "sites": 1,
+        "wire": "n_jobs"
       },
       "verbosity": {
         "canonical": "verbose",
         "fallback_default": null,
-        "sites": 1
+        "sites": 1,
+        "wire": "verbose"
       }
     },
     "shared_estimator_parameters": {
@@ -2356,6 +2402,6 @@
     ],
     "mojo_toolchain": ">=1.0.0,<2",
     "requires_python": ">=3.14",
-    "snapshot_schema": 2
+    "snapshot_schema": 3
   }
 }

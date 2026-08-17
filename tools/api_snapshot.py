@@ -82,8 +82,18 @@ from pathlib import Path
 # reader accepts. Also resolves `frozenset({...})` and its siblings, which
 # is what `_INTEGRAL` is written as and what made `integral_slots` freeze
 # as an empty list.
-TOOL_VERSION = 2
-SCHEMA_VERSION = 2
+# 3: `python.parameter_aliases` stopped calling the wire name `canonical`.
+# The field was derived from the FIRST argument of `_resolve_alias`, which
+# that function calls `primary` and which its own docstring says "is not
+# necessarily the canonical user-facing name". It is now emitted as `wire`,
+# and a real `canonical` is read from `docs/PARAMETER_NAMING.md`. Eleven
+# parameters disagree, which is twenty one of the forty five alias rows;
+# see SNAPSHOT_SCHEMA.md sections 3.2 and 9.
+TOOL_VERSION = 3
+#: Rule 0.5 of SNAPSHOT_SCHEMA.md: adding a key is additive, REDEFINING one
+#: bumps this. `python.parameter_aliases.<alias>.canonical` was redefined in
+#: version 3, so this moved with it.
+SCHEMA_VERSION = 3
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -115,6 +125,11 @@ CAPI_HEADER = ROOT / "capi" / "mojotrees.h"
 PIXI = ROOT / "pixi.toml"
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 POLICY = ROOT / "docs" / "COMPATIBILITY_POLICY.md"
+#: The record of which spelling is canonical for each parameter. Read at
+#: generation time rather than transcribed here, so the document is the
+#: source of truth and a row nobody has written stays `null` in the
+#: snapshot instead of becoming a guess this tool invented.
+PARAMETER_NAMING = ROOT / "docs" / "PARAMETER_NAMING.md"
 
 # Directories scanned for MOJOTREES_* string literals. `tools/`, `bench/`,
 # and `packaging/` are deliberately absent: a variable only a benchmark
@@ -492,15 +507,151 @@ def python_block(d: Deriver) -> dict:
     return out
 
 
+#: Cell text this reader must not mistake for a parameter name. A markdown
+#: cell in the naming table can hold a dash for "no such parameter", a
+#: parenthesized note ("(implicit 1)", "(leaf-wise, default)"), a wildcard
+#: (`cegb_*`), or an ellipsis. Only a bare Python identifier is a name.
+_NAMING_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_NAMING_PIPE = re.compile(r"(?<!\\)\|")
+_NAMING_PAREN = re.compile(r"\([^)]*\)")
+
+
+def _naming_cell(cell: str) -> list:
+    """Every parameter name a cell of the naming table holds.
+
+    A cell may hold several (`eta / learning_rate`, `verbose /
+    logging_level`), may carry a parenthetical that is a note and not a
+    name (`device (cpu | gpu)`), and may escape the table pipe.
+    """
+    text = cell.replace("\\|", "|").strip()
+    text = _NAMING_PAREN.sub(" ", text)
+    out = []
+    for token in re.split(r"[/,]", text):
+        token = token.strip().strip("`").strip()
+        if _NAMING_IDENT.match(token):
+            out.append(token)
+    return out
+
+
+def naming_table(d: Deriver) -> tuple:
+    """`docs/PARAMETER_NAMING.md` as three lookups.
+
+    Returns `(ours, by_any_name, by_lightgbm_name)`. `ours` is the set of
+    canonical names, the OURS column. `by_lightgbm_name` maps the LightGBM
+    column to the canonical name of its row, and `by_any_name` maps every
+    vendor spelling in the row to the same. A name that two rows claim is
+    dropped from both maps rather than resolved by picking a row, because
+    an ambiguous canonical is not a canonical.
+
+    Only the first five columns are read. The sixth is the "why" prose and
+    it names values (`gbdt/dart/goss/rf`) that are not parameters. Rows
+    whose OURS cell begins with `=` are values of `grow_policy` rather than
+    parameters and are skipped for the same reason.
+    """
+    text = read(PARAMETER_NAMING, d)
+    ours: set = set()
+    by_any: dict = {}
+    by_lightgbm: dict = {}
+    ambiguous: set = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = _NAMING_PIPE.split(line)[1:-1]
+        if len(cells) < 5:
+            continue
+        first = cells[0].strip()
+        if not first or set(first) <= set("-: ") or first == "OURS":
+            continue
+        if first.startswith("="):
+            continue
+        names = _naming_cell(cells[0])
+        if not names:
+            continue
+        ours.update(names)
+        for name in names:
+            by_any[name] = name
+        if len(names) > 1:
+            # `top_rate / other_rate` and `drop_rate / skip_drop ...` are
+            # several parameters on one row, so the vendor columns cannot be
+            # attributed to one of them. Each OURS name is its own canonical
+            # and the rest of the row is not indexed.
+            continue
+        canonical = names[0]
+        for column in cells[1:5]:
+            for name in _naming_cell(column):
+                if by_any.get(name, canonical) != canonical:
+                    ambiguous.add(name)
+                by_any.setdefault(name, canonical)
+        for name in _naming_cell(cells[1]):
+            if by_lightgbm.get(name, canonical) != canonical:
+                ambiguous.add(name)
+            by_lightgbm.setdefault(name, canonical)
+    for name in ambiguous:
+        by_any.pop(name, None)
+        by_lightgbm.pop(name, None)
+        d.problem(
+            f"{rel(PARAMETER_NAMING)} gives {name!r} two different canonical "
+            "names; it is recorded as unknown rather than resolved"
+        )
+    if not ours:
+        d.gap(
+            "python.parameter_aliases.*.canonical",
+            f"{rel(PARAMETER_NAMING)} produced no rows this reader "
+            "understood",
+        )
+    return ours, by_any, by_lightgbm
+
+
+def canonical_of(alias: str, wire: str, naming: tuple):
+    """The canonical user-facing spelling for one alias pair, or None.
+
+    Three lookups, most specific first, and no fallback to the wire name.
+    A parameter the naming document does not cover comes back `None` and is
+    written as `null`, which is rule 0.4: absence is a value.
+
+    1. The wire name is itself an OURS name, so wire and canonical coincide
+       (`depth` -> `max_depth`, and `max_depth` is canonical).
+    2. The wire name is in the LightGBM column, so the row's OURS name is
+       the canonical (`bagging_fraction` -> `subsample`).
+    3. The ALIAS is somewhere in the table. This is the case where the wire
+       name is ours rather than LightGBM's: `min_child_hess` appears in no
+       column, and the pair is recovered from the alias
+       (`min_sum_hessian_in_leaf` -> `min_child_weight`).
+    """
+    ours, by_any, by_lightgbm = naming
+    if wire in ours:
+        return wire
+    if wire in by_lightgbm:
+        return by_lightgbm[wire]
+    if alias in by_any:
+        return by_any[alias]
+    if wire in by_any:
+        return by_any[wire]
+    return None
+
+
 def alias_pairs(base, consts: dict, d: Deriver) -> dict:
-    """Alias to canonical, from the `self._resolve_alias(...)` call sites.
+    """Alias to wire and canonical, from `self._resolve_alias(...)`.
 
     There is no alias table in `__init__.py`; the pairs are expressed as
     calls, and each carries a third argument that is the default used when
     neither spelling is set. That default is a second place a default
     lives, so it is recorded, and a pair whose call sites disagree about
     it is an error rather than a merge.
+
+    THE FIRST ARGUMENT IS NOT THE CANONICAL NAME. `_resolve_alias` calls it
+    `primary` and its docstring says it "is not necessarily the canonical
+    user-facing name: `num_leaves` is the primary and `max_leaves` is the
+    canonical name resolved onto it". It is the spelling that holds the
+    stock default and that the native layer is sent, which is the WIRE
+    name, so that is what it is called here. The canonical name is a
+    separate fact, read from `docs/PARAMETER_NAMING.md`, and eleven
+    parameters disagree with the wire. Until schema version 3 this
+    field was emitted as `canonical` and every consumer of the snapshot
+    inherited the confusion.
     """
+    naming = naming_table(d)
     pairs: dict = {}
     for node in ast.walk(base):
         if not isinstance(node, ast.Call):
@@ -510,10 +661,9 @@ def alias_pairs(base, consts: dict, d: Deriver) -> dict:
             continue
         if len(node.args) < 3:
             continue
-        canonical, alias = node.args[0], node.args[1]
+        wire, alias = node.args[0], node.args[1]
         if not (
-            isinstance(canonical, ast.Constant)
-            and isinstance(alias, ast.Constant)
+            isinstance(wire, ast.Constant) and isinstance(alias, ast.Constant)
         ):
             continue
         default = value_of(node.args[2], consts)
@@ -523,20 +673,31 @@ def alias_pairs(base, consts: dict, d: Deriver) -> dict:
                 "third argument of _resolve_alias is not a literal",
             )
             default = None
+        canonical = canonical_of(alias.value, wire.value, naming)
+        if canonical is None and alias.value not in pairs:
+            # Once per pair, not once per call site: two sites express the
+            # same pair and would record the same gap twice.
+            d.gap(
+                f"python.parameter_aliases.{alias.value}.canonical",
+                f"neither {alias.value!r} nor its wire name "
+                f"{wire.value!r} appears in {rel(PARAMETER_NAMING)}, so no "
+                "canonical spelling is recorded for this pair",
+            )
         entry = pairs.setdefault(
             alias.value,
             {
-                "canonical": canonical.value,
+                "wire": wire.value,
+                "canonical": canonical,
                 "fallback_default": default,
                 "sites": 0,
             },
         )
         entry["sites"] += 1
-        if entry["canonical"] != canonical.value:
+        if entry["wire"] != wire.value:
             d.problem(
                 f"alias {alias.value!r} resolves to "
-                f"{entry['canonical']!r} at one site and "
-                f"{canonical.value!r} at another"
+                f"{entry['wire']!r} at one site and "
+                f"{wire.value!r} at another"
             )
         if entry["fallback_default"] != default:
             d.problem(
@@ -1779,7 +1940,7 @@ CLASSIFY = (
     (r"^python\.estimators\.[^.]+\.methods\.", "breaking", "an argument moved, was renamed, or was retyped"),
     # `sites` is how many `_resolve_alias` calls resolve this alias, and it
     # is bookkeeping rather than surface: what policy 4.2 freezes is the
-    # canonical name and the fallback, and two sites that DISAGREE about
+    # wire name and the fallback, and two sites that DISAGREE about
     # either are invariant-checked in `alias_pairs` rather than diffed here.
     # A count that rises is a new code path honoring an existing alias; one
     # that falls may be a path that stopped honoring it, which is why this
@@ -1788,6 +1949,12 @@ CLASSIFY = (
      "the number of call sites resolving this alias moved; the pair and its "
      "fallback are what 4.2 freezes, and a fall may be a path that stopped "
      "honoring it"),
+    # A `wire` that moves is a different key on the wire and in the model
+    # file. A `canonical` that moves is a different spelling in every error
+    # message, every docstring and every porting report, which is
+    # user-facing and therefore breaking too, but for a different reason and
+    # with a different migration. Both stay under 4.2 and both make a reader
+    # open the pair.
     (r"^python\.parameter_aliases\.", "breaking", "policy 4.2"),
     (r"^parameter_string\.supported_keys", "review", "policy 4.4; accepted is additive, the reverse is breaking"),
     (r"^platforms\.", "breaking", "policy 10.4, a tier or a target moved"),
@@ -1833,6 +2000,25 @@ CLASSIFY_BY_KIND = (
         "a parameter appeared: policy 11.2, additive if it was appended "
         "with a default and breaking if it was inserted. This snapshot "
         "sorts its keys and cannot tell you which; read the signature",
+    ),
+    # The path table below calls every `parameter_aliases` difference
+    # breaking under policy 4.2, and for an appearance that is wrong in both
+    # directions. 4.2's own last paragraph says "New aliases may be added in
+    # a minor release. Adding one is additive and never changes what an
+    # existing program does", so a new ALIAS is not a break. A new FIELD on
+    # an existing pair is not a break either; it is this tool recording more
+    # about a pair that did not move, and `meta.tool_version` moves with it.
+    # The two cases are told apart by whether the alias itself is new, which
+    # a per-path rule cannot see, so this reports `review` and names both
+    # rather than promoting either to additive on the tool's own say-so.
+    (
+        r"^python\.parameter_aliases\.",
+        "added",
+        "review",
+        "something appeared under an alias: policy 4.2 makes a NEW ALIAS "
+        "additive, and a new FIELD on an existing pair is this tool "
+        "deriving more rather than the surface moving. Check "
+        "meta.tool_version and whether the alias itself is new",
     ),
 )
 

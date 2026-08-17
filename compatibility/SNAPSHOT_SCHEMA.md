@@ -5,9 +5,10 @@ The normative shape of `compatibility/api_snapshot.json`, which
 consumer of the snapshot reads; neither the tool nor any past hand-written
 draft is the authority on the shape.
 
-`schema_version` is **2**. Version 1 is
+`schema_version` is **3**. Version 1 is
 `compatibility/api_snapshot_manifest_v1.json`, hand-written and superseded;
-section 8 says what changed and why.
+section 8 says what changed and why, and section 9 says what version 3
+changed from version 2.
 
 ## 0. Rules that hold for the whole file
 
@@ -37,7 +38,7 @@ section 8 says what changed and why.
 
 | Key | Type | Source |
 |---|---|---|
-| `schema_version` | int | This document. `2` |
+| `schema_version` | int | This document. `3` |
 | `status` | str | `"generated"` always. The tool writes nothing else; a hand-written file is not a snapshot |
 | `generated_by` | str | `"tools/api_snapshot.py"` |
 | `tool_version` | int | `TOOL_VERSION` in the tool. Bumped when a parser changes what it derives, so a diff caused by the tool is separable from a diff caused by the tree |
@@ -103,16 +104,56 @@ argument names would pass a release that silently changed `num_leaves`.
 ### 3.2 `python.parameter_aliases`
 
 There is no alias table in `python/mojotrees/__init__.py`. The pairs are
-expressed as calls, `self._resolve_alias(canonical, alias, default)`, in
+expressed as calls, `self._resolve_alias(primary, alias, default)`, in
 `_Base._params` and in the continued-training path. The tool walks the
 `_Base` class body for `Call` nodes whose `func.attr` is `_resolve_alias`
 and reads the three arguments.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `canonical` | str | First argument. The guaranteed spelling |
+| `wire` | str | First argument. The spelling the native layer receives, that the model file holds, and that `tools/check_parity.py` compares. LightGBM's |
+| `canonical` | str or null | The user-facing spelling, from the OURS column of `docs/PARAMETER_NAMING.md`. scikit-learn's. `null` where that document covers neither the alias nor the wire name |
 | `fallback_default` | value | Third argument, with a module-level `Name` resolved as in 5.2. The value used when neither spelling is set |
 | `sites` | int | How many call sites express this pair |
+
+**`wire` was called `canonical` through schema version 2, and it was not
+the canonical name.** It is the first argument of the call site, which
+`_resolve_alias` itself calls `primary` and whose docstring says it "is not
+necessarily the canonical user-facing name: `num_leaves` is the primary and
+`max_leaves` is the canonical name resolved onto it". Both spellings are
+guaranteed under compatibility policy 4.2, so "the guaranteed spelling",
+which is what this section used to say, did not distinguish them either.
+Eleven parameters disagree, `max_leaves` to `num_leaves`, `subsample` to
+`bagging_fraction`, `reg_lambda` to `lambda_l2` and `categorical_features`
+to `categorical_feature` among them. Those eleven are twenty of the forty
+five alias rows, since a parameter may have several aliases, and a twenty
+first row changes because its canonical is unknown. The other twenty four
+rows coincide, which is what made the field dangerous rather than obviously
+wrong: a reader who spot checked `depth`, `seed` or `verbosity` concluded
+the field meant what it said and then trusted it on `subsample`.
+Every consumer of the table inherited that. The two are separate keys now
+so that a divergence between them is a fact the snapshot records rather
+than one it hides.
+
+Which key a consumer wants follows from what it is for. A model file, a
+`params=` dict, a parity check, or anything crossing into the native layer
+wants `wire`. An error message, a docstring, a porting report, or anything
+telling a user what to type wants `canonical`.
+
+`canonical` is read from a document rather than derived from the code
+because no spelling in the code carries that fact: the constructor accepts
+every spelling equally and the call site's first argument is the wire one.
+`docs/PARAMETER_NAMING.md` is where the determination lives, so the tool
+reads it there. Three lookups, most specific first: the wire name is itself
+an OURS name, so the two coincide; or the wire name is in the LightGBM
+column, so that row's OURS name is the canonical; or the alias is somewhere
+in the table, which is how a wire name that is ours rather than LightGBM's
+is recovered, since `min_child_hess` appears in no column and
+`min_sum_hessian_in_leaf` finds the row. A pair that none of the three
+resolves is `null` and named in `meta.underived`, per rule 0.4. One pair is
+`null` today: `monotone_constraints_penalty`, whose wire name is
+`monotone_penalty` and which `docs/PARAMETER_NAMING.md` does not carry a
+row for.
 
 `fallback_default` is recorded because it is a second place a default
 lives. If the constructor says `min_data_in_leaf=20` and the resolver says
@@ -349,3 +390,28 @@ contents now, in the ways `DRIFT_REPORT.md` lists.
 Version 1 is not migrated. The tool generates version 2 from the source
 and the old file is superseded wholesale, which is what its own handoff
 said would happen.
+
+## 9. What changed from schema version 2
+
+One block moved, `python.parameter_aliases`, and rule 0.5 is why the
+version moved with it: adding a key is additive and does not bump the
+version, but REDEFINING one does, and `canonical` was redefined.
+
+| Change | Why |
+|---|---|
+| `canonical` renamed to `wire` | It never held the canonical name. It is the first argument of the `_resolve_alias` call site, which that function calls `primary` and documents as "not necessarily the canonical user-facing name". It is the spelling the native layer receives. Section 3.2 |
+| A new `canonical`, read from `docs/PARAMETER_NAMING.md` | So that the user-facing spelling is a recorded fact rather than one every consumer had to know not to take from the field named after it. It is `null`, never guessed, where that document is silent |
+
+**A consumer written against version 2 breaks, and is meant to.** A reader
+of the old `canonical` was reading the wire name, and twenty one of the
+forty five values it gets from version 3 under that key have changed. A
+silent rename would have left that reader reading a field whose meaning had
+changed underneath it, which is the failure this file exists to prevent. The
+migration is one substitution: a consumer that wanted the native-layer
+spelling reads `wire`, and a consumer that wanted the spelling to show a
+user reads `canonical` and handles `null`.
+
+Nothing about the library moved. No alias was added or removed, no default
+changed, no wire key changed, and no estimator accepts a different set of
+keywords than it did. What changed is what this file calls two facts it was
+already recording one of.

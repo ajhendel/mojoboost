@@ -119,9 +119,11 @@ _INTEGRAL = frozenset(
     {"num_leaves", "max_depth", "min_data_in_leaf"}
 )
 
-#: LightGBM's aliases for the resettable parameters, so a schedule written
-#: against the scikit-learn spellings works. The estimator resolves the same
-#: pairs; see `_Base._resolve_alias`.
+#: Every other spelling of a resettable parameter, mapped ONTO the wire
+#: name, so a schedule written against the canonical scikit-learn spellings
+#: works. The key is what a caller types and the value is what the trainer
+#: is sent, which is why `wire_reset_key` returns the value. The estimator
+#: resolves the same pairs; see `_Base._resolve_alias`.
 _RESET_ALIASES = {
     "min_child_samples": "min_data_in_leaf",
     "min_child_weight": "min_sum_hessian_in_leaf",
@@ -162,9 +164,25 @@ class EarlyStopException(Exception):
         self.best_score = best_score
 
 
-def canonical_reset_key(key):
-    """The primary name of a resettable parameter, or a `ValueError` naming
-    the set. Aliases resolve the way the estimator resolves them."""
+def wire_reset_key(key):
+    """The wire name of a resettable parameter, or a `ValueError` naming
+    the set. Aliases resolve the way the estimator resolves them.
+
+    THE RETURN VALUE IS THE WIRE NAME AND HAS TO BE. It keys `_pending` and
+    `env.params`, both of which are the dict the trainer is handed, and it
+    is checked against `RESETTABLE`, whose order is itself a wire format
+    (compatibility policy 9.3). `_RESET_ALIASES` maps the scikit-learn
+    spellings ONTO the LightGBM ones, so `reg_lambda` comes back as
+    `lambda_l2`, which is what the native layer must receive.
+
+    This was called `canonical_reset_key` until the naming policy was
+    written down, and the name was wrong in the same way the snapshot's
+    `parameter_aliases.<alias>.canonical` field was: canonical is the
+    scikit-learn spelling, per `docs/PARAMETER_NAMING.md`, and this
+    function returns the other one. Only the name moved. What it returns is
+    unchanged, deliberately, because changing it would change what a
+    callback sends to the trainer.
+    """
     name = _RESET_ALIASES.get(key, key)
     if name not in RESETTABLE:
         raise ValueError(
@@ -203,7 +221,7 @@ class TrainingHandle:
                 "callback a truthy before_iteration attribute"
             )
         for key, value in new_parameters.items():
-            name = canonical_reset_key(key)
+            name = wire_reset_key(key)
             value = int(value) if name in _INTEGRAL else float(value)
             self._pending[name] = value
             # Visible to later callbacks in the same phase straight away,
@@ -407,7 +425,7 @@ def reset_parameter(**kwargs):
     """
     if not kwargs:
         raise ValueError("reset_parameter needs at least one parameter")
-    schedule = {canonical_reset_key(k): v for k, v in kwargs.items()}
+    schedule = {wire_reset_key(k): v for k, v in kwargs.items()}
 
     def _callback(env):
         updates = {}
