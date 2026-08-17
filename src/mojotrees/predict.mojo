@@ -68,6 +68,81 @@ from .parallel import dispatch_rows
 from .tree import Tree
 
 
+# Why a raw plan was refused. Every refusal in this file records one of these
+# and every plan carries the FIRST one it hit, because "the number did not
+# move" is not a diagnosis: the raw arms below can decline silently, and on
+# 2026-08-17 that survived a clean build, a `np.array_equal` bit-identity
+# check on two growth policies, and two full benchmark runs, with the only
+# symptom being one arm whose time did not change. A declined arm and an arm
+# that ran and was no faster are opposite findings with opposite fixes. See
+# `PredictTrace`.
+comptime REFUSE_NONE = 0
+comptime REFUSE_CATEGORICAL_SPLIT = 1
+comptime REFUSE_FEATURE_OUT_OF_MATRIX = 2
+comptime REFUSE_CATEGORICAL_FEATURE = 3
+comptime REFUSE_NEGATIVE_THRESHOLD = 4
+comptime REFUSE_MISSING_BIN_IN_RANGE = 5
+comptime REFUSE_NODE_MISSING_BIN = 6
+comptime REFUSE_SWITCH_OFF = 10
+comptime REFUSE_TOO_FEW_ROWS = 11
+comptime REFUSE_EMPTY_RANGE = 12
+comptime REFUSE_LINEAR_LEAVES = 13
+comptime REFUSE_CTR_TABLES = 14
+comptime REFUSE_EMPTY_TREE = 15
+comptime REFUSE_BACKWARD_LINKS = 16
+comptime REFUSE_NOT_OBLIVIOUS = 17
+
+
+def _yn(b: Bool) -> String:
+    """A Bool as "yes"/"no" for the trace.
+
+    Explicit rather than printing the Bool, because nothing else in this
+    package prints one and this lane could not build to check that `Bool` is
+    `Writable`. A `String` is certain.
+    """
+    return String("yes") if b else String("no")
+
+
+def refusal_text(code: Int) -> String:
+    """The refusal code as the sentence a person needs.
+
+    A code and not a `String` on the builder itself, because `_raw_split` runs
+    once per NODE and a String there would allocate per node on a path whose
+    whole point is to allocate nothing.
+    """
+    if code == REFUSE_NONE:
+        return String("none")
+    if code == REFUSE_CATEGORICAL_SPLIT:
+        return String("categorical split: no threshold to convert")
+    if code == REFUSE_FEATURE_OUT_OF_MATRIX:
+        return String("split feature is not a column of the raw matrix")
+    if code == REFUSE_CATEGORICAL_FEATURE:
+        return String("split feature is categorical in the mapper")
+    if code == REFUSE_NEGATIVE_THRESHOLD:
+        return String("threshold_bin < 0 on a numerical node")
+    if code == REFUSE_MISSING_BIN_IN_RANGE:
+        return String("mapper missing bin is inside the ordinary bin range")
+    if code == REFUSE_NODE_MISSING_BIN:
+        return String("node missing bin disagrees with the mapper's")
+    if code == REFUSE_SWITCH_OFF:
+        return String("MOJOTREES_RAW_PREDICT=0")
+    if code == REFUSE_TOO_FEW_ROWS:
+        return String("fewer rows than RAW_MIN_ROWS")
+    if code == REFUSE_EMPTY_RANGE:
+        return String("empty iteration range")
+    if code == REFUSE_LINEAR_LEAVES:
+        return String("linear leaves")
+    if code == REFUSE_CTR_TABLES:
+        return String("CTR tables attached to the mapper")
+    if code == REFUSE_EMPTY_TREE:
+        return String("tree with no nodes")
+    if code == REFUSE_BACKWARD_LINKS:
+        return String("tree links do not point forward")
+    if code == REFUSE_NOT_OBLIVIOUS:
+        return String("no oblivious plan (ragged, too deep, or too few rows)")
+    return String("unknown")
+
+
 # The deepest oblivious tree this file will plan for. Deliberately NOT
 # `growth_policy.OBLIVIOUS_MAX_DEPTH`, which is 16 and is the deepest
 # symmetric tree the grower will build; the two are different budgets on
@@ -241,6 +316,14 @@ struct ObliviousEnsemble(Copyable, Movable):
     because a NaN's bin is a constant of the feature. Meaningless unless
     `raw_ready`."""
 
+    var raw_refuse_code: Int
+    """The FIRST `REFUSE_*` reason the raw rewrite declined, or `REFUSE_NONE`.
+    Kept so `PredictTrace` can say why rather than leaving a reader to infer
+    it from a time that did not move."""
+
+    var raw_refuse_slot: Int
+    """The level slot `raw_refuse_code` was raised at, or -1."""
+
     def __init__(out self):
         """An inactive plan. The generic walker handles everything."""
         self.active = False
@@ -260,6 +343,8 @@ struct ObliviousEnsemble(Copyable, Movable):
         self.raw_ready = False
         self.lvl_edge = []
         self.lvl_nan_left = []
+        self.raw_refuse_code = REFUSE_NOT_OBLIVIOUS
+        self.raw_refuse_slot = -1
 
     @always_inline
     def _goes_left(self, slot: Int, bin: Int) -> Bool:
@@ -700,149 +785,6 @@ def raw_predict_enabled() -> Bool:
     return getenv("MOJOTREES_RAW_PREDICT") != "0"
 
 
-# Why a raw plan was refused. Every refusal in this file records one of these
-# and every plan carries the FIRST one it hit, because "the number did not
-# move" is not a diagnosis: this whole path can decline silently, survive a
-# build, survive a bit-identity check, and survive two benchmark runs without
-# anyone learning which of a dozen conditions declined it. That happened. See
-# `PredictTrace`.
-comptime REFUSE_NONE = 0
-comptime REFUSE_CATEGORICAL_SPLIT = 1
-comptime REFUSE_FEATURE_OUT_OF_MATRIX = 2
-comptime REFUSE_CATEGORICAL_FEATURE = 3
-comptime REFUSE_NEGATIVE_THRESHOLD = 4
-comptime REFUSE_MISSING_BIN_IN_RANGE = 5
-comptime REFUSE_NODE_MISSING_BIN = 6
-comptime REFUSE_SWITCH_OFF = 10
-comptime REFUSE_TOO_FEW_ROWS = 11
-comptime REFUSE_EMPTY_RANGE = 12
-comptime REFUSE_LINEAR_LEAVES = 13
-comptime REFUSE_CTR_TABLES = 14
-comptime REFUSE_EMPTY_TREE = 15
-comptime REFUSE_BACKWARD_LINKS = 16
-comptime REFUSE_NOT_OBLIVIOUS = 17
-
-
-def refusal_text(code: Int) -> String:
-    """The refusal code as the sentence a person needs.
-
-    A code and not a `String` on the hot builder because `_raw_split` runs
-    once per NODE and a String there would allocate per node on a path whose
-    whole point is to allocate nothing.
-    """
-    if code == REFUSE_NONE:
-        return String("none")
-    if code == REFUSE_CATEGORICAL_SPLIT:
-        return String("categorical split: no threshold to convert")
-    if code == REFUSE_FEATURE_OUT_OF_MATRIX:
-        return String("split feature is not a column of the raw matrix")
-    if code == REFUSE_CATEGORICAL_FEATURE:
-        return String("split feature is categorical in the mapper")
-    if code == REFUSE_NEGATIVE_THRESHOLD:
-        return String("threshold_bin < 0 on a numerical node")
-    if code == REFUSE_MISSING_BIN_IN_RANGE:
-        return String("mapper missing bin is inside the ordinary bin range")
-    if code == REFUSE_NODE_MISSING_BIN:
-        return String("node missing bin disagrees with the mapper's")
-    if code == REFUSE_SWITCH_OFF:
-        return String("MOJOTREES_RAW_PREDICT=0")
-    if code == REFUSE_TOO_FEW_ROWS:
-        return String("fewer rows than RAW_MIN_ROWS")
-    if code == REFUSE_EMPTY_RANGE:
-        return String("empty iteration range")
-    if code == REFUSE_LINEAR_LEAVES:
-        return String("linear leaves")
-    if code == REFUSE_CTR_TABLES:
-        return String("CTR tables attached to the mapper")
-    if code == REFUSE_EMPTY_TREE:
-        return String("tree with no nodes")
-    if code == REFUSE_BACKWARD_LINKS:
-        return String("tree links do not point forward")
-    if code == REFUSE_NOT_OBLIVIOUS:
-        return String("no oblivious plan (ragged, too deep, or too few rows)")
-    return String("unknown")
-
-
-@fieldwise_init
-struct PredictTrace(Copyable, Movable):
-    """`MOJOTREES_PREDICT_TRACE=1`: one line per batch predict saying which
-    arm ran and, when a fast arm declined, the FIRST reason it declined.
-
-    This exists because of a specific failure and the docstring names it
-    rather than describing a feature. The raw arms shipped, built clean, and
-    passed a `np.array_equal` bit-identity check on both growth policies; the
-    symmetric arm's time then did not move, and there was no way to tell from
-    the outside whether the arm had declined, or had run and been no faster.
-    Those are opposite findings with opposite fixes, and separating them cost
-    a measuring session. One line of output settles it.
-
-    Off by default in the `== "1"` form this repository uses for a default-off
-    switch, and off it costs one `getenv` and a Bool test per predict call.
-    """
-
-    var on: Bool
-
-    @staticmethod
-    def resolve() -> PredictTrace:
-        var s = getenv("MOJOTREES_PREDICT_TRACE")
-        return PredictTrace(s == "1" or s == "true" or s == "TRUE")
-
-    def oblivious(self, plan: ObliviousEnsemble, n_rows: Int):
-        """Report the symmetric raw arm, which is asked first."""
-        if not self.on:
-            return
-        print(
-            "predict arm=oblivious_raw rows=",
-            n_rows,
-            " active=",
-            plan.active,
-            " raw_ready=",
-            plan.raw_ready,
-            " trees=",
-            plan.n_trees,
-            " levels=",
-            plan.total_levels,
-            " refused=",
-            refusal_text(plan.raw_refuse_code),
-            " at_level_slot=",
-            plan.raw_refuse_slot,
-            sep="",
-        )
-
-    def flat(self, sym: ObliviousEnsemble, plan: RawEnsemble, n_rows: Int):
-        """Report the general raw arm, and with it the symmetric arm that
-        declined ahead of it. Both halves matter: a reader needs to know the
-        symmetric arm was ASKED and why it said no, not only what ran."""
-        if not self.on:
-            return
-        print(
-            "predict arm=flat_raw rows=",
-            n_rows,
-            " oblivious_active=",
-            sym.active,
-            " oblivious_raw_ready=",
-            sym.raw_ready,
-            " oblivious_refused=",
-            refusal_text(sym.raw_refuse_code),
-            " | flat_active=",
-            plan.active,
-            " flat_trees=",
-            plan.n_trees,
-            " flat_refused=",
-            refusal_text(plan.refuse_code),
-            " at_tree=",
-            plan.refuse_tree,
-            " at_node=",
-            plan.refuse_node,
-            sep="",
-        )
-        if not plan.active:
-            print(
-                "predict arm=binned_fallback: both raw arms declined, so this"
-                " call pays BinMapper.transform"
-            )
-
-
 @fieldwise_init
 struct _RawSplit(Copyable, Movable):
     """One node's split rewritten against raw Float64 values, or `ok` false.
@@ -874,17 +816,28 @@ def _raw_split(
     # A categorical node routes by set membership on a category CODE. There is
     # no threshold to convert.
     if cat_offset >= 0:
-        return _RawSplit(False, 0.0, False)
+        return _RawSplit(False, 0.0, False, REFUSE_CATEGORICAL_SPLIT)
     # A CTR column is not a column of the caller's matrix (see
     # `BinMapper.n_total_features`), so no raw value exists to compare.
     if feature < 0 or feature >= mapper.n_features:
-        return _RawSplit(False, 0.0, False)
+        return _RawSplit(False, 0.0, False, REFUSE_FEATURE_OUT_OF_MATRIX)
     if mapper.cats.is_cat(feature):
-        return _RawSplit(False, 0.0, False)
+        return _RawSplit(False, 0.0, False, REFUSE_CATEGORICAL_FEATURE)
     # "Always right" for every value including -inf is not something a
-    # threshold compare can express, and no grower here writes it.
+    # threshold compare can express.
+    #
+    # **This is the refusal a 2026-08-17 review expected to be the one firing
+    # on symmetric ensembles, and it is not.** The reasoning was that an
+    # oblivious tree stopping before `max_depth` would carry a sentinel level
+    # with `threshold_bin = -1`, and that one such level would disqualify the
+    # whole ensemble. `tree._grow_oblivious_levels` does not work that way: a
+    # level with no legal split, or no positive gain, `break`s out of the
+    # level loop and leaves the frontier as leaves, so the tree simply ENDS
+    # shallower. It never writes an internal node without a split. The only
+    # two writers of a -1 threshold are `Tree._add_node` (a leaf, which never
+    # reaches here) and `Tree._set_split`'s categorical arm (caught above).
     if threshold_bin < 0:
-        return _RawSplit(False, 0.0, False)
+        return _RawSplit(False, 0.0, False, REFUSE_NEGATIVE_THRESHOLD)
 
     var lo = mapper.edge_offsets[feature]
     var k = mapper.edge_offsets[feature + 1] - lo
@@ -896,9 +849,9 @@ def _raw_split(
     # SPLIT FEATURE's missing bin, so it must agree with the mapper's or be
     # the -1 that matches nothing.
     if mb >= 0 and mb <= k:
-        return _RawSplit(False, 0.0, False)
+        return _RawSplit(False, 0.0, False, REFUSE_MISSING_BIN_IN_RANGE)
     if node_missing_bin >= 0 and node_missing_bin != mb:
-        return _RawSplit(False, 0.0, False)
+        return _RawSplit(False, 0.0, False, REFUSE_NODE_MISSING_BIN)
 
     # Equation (2) of the module comment, and its `T >= k` case.
     var edge = POSITIVE_INF
@@ -917,7 +870,7 @@ def _raw_split(
         nan_left = default_left
     else:
         nan_left = nan_bin <= threshold_bin
-    return _RawSplit(True, edge, nan_left)
+    return _RawSplit(True, edge, nan_left, REFUSE_NONE)
 
 
 struct RawEnsemble(Copyable, Movable):
@@ -948,6 +901,15 @@ struct RawEnsemble(Copyable, Movable):
     var nd_right: List[Int]
     var nd_value: List[Float64]
 
+    var refuse_code: Int
+    """The FIRST `REFUSE_*` reason the flatten declined, or `REFUSE_NONE`."""
+
+    var refuse_tree: Int
+    """The range-relative tree index `refuse_code` was raised at, or -1."""
+
+    var refuse_node: Int
+    """The node index within that tree, or -1."""
+
     def __init__(out self):
         """An inactive plan. The bin-and-walk path handles everything."""
         self.active = False
@@ -959,6 +921,110 @@ struct RawEnsemble(Copyable, Movable):
         self.nd_left = []
         self.nd_right = []
         self.nd_value = []
+        self.refuse_code = REFUSE_NONE
+        self.refuse_tree = -1
+        self.refuse_node = -1
+
+    @staticmethod
+    def refused(code: Int, tree: Int, node: Int) -> RawEnsemble:
+        """An inactive plan carrying the reason. Every early return in
+        `raw_plan` goes through here, so a refusal cannot be silent."""
+        var out = RawEnsemble()
+        out.refuse_code = code
+        out.refuse_tree = tree
+        out.refuse_node = node
+        return out^
+
+
+@fieldwise_init
+struct PredictTrace(Copyable, Movable):
+    """`MOJOTREES_PREDICT_TRACE=1`: one line per batch predict saying which
+    arm ran and, when a fast arm declined, the FIRST reason it declined.
+
+    This exists because of a specific failure, and the docstring names the
+    failure rather than describing a feature. The raw arms shipped, built
+    clean, and passed a `np.array_equal` bit-identity check on both growth
+    policies; the symmetric arm's time then did not move, and there was no way
+    to tell from outside the process whether the arm had DECLINED or had RUN
+    and been no faster. Those are opposite findings with opposite fixes, and
+    separating them cost a measuring session that one line of output would
+    have ended.
+
+    Off by default in the `== "1"` form this repository uses for a default-off
+    switch, and off it costs one `getenv` and a Bool test per predict call.
+    """
+
+    var on: Bool
+
+    @staticmethod
+    def resolve() -> PredictTrace:
+        var s = getenv("MOJOTREES_PREDICT_TRACE")
+        return PredictTrace(s == "1" or s == "true" or s == "TRUE")
+
+    def oblivious(self, plan: ObliviousEnsemble, n_rows: Int):
+        """Report the symmetric raw arm, which is asked first and, when it
+        answers, is the only arm that runs."""
+        if not self.on:
+            return
+        print(
+            "predict arm=oblivious_raw rows=",
+            n_rows,
+            " active=",
+            _yn(plan.active),
+            " raw_ready=",
+            _yn(plan.raw_ready),
+            " trees=",
+            plan.n_trees,
+            " levels=",
+            plan.total_levels,
+            " refused=",
+            refusal_text(plan.raw_refuse_code),
+            " at_level_slot=",
+            plan.raw_refuse_slot,
+            sep="",
+        )
+
+    def flat(self, sym: ObliviousEnsemble, plan: RawEnsemble, n_rows: Int):
+        """Report the general raw arm, and with it the symmetric arm that
+        declined ahead of it.
+
+        Both halves matter. A reader needs to know the symmetric arm was ASKED
+        and what it said, not only what ended up running; "the oblivious arm
+        is not in this line" is exactly the ambiguity this whole struct exists
+        to remove."""
+        if not self.on:
+            return
+        print(
+            "predict arm=flat_raw rows=",
+            n_rows,
+            " oblivious_active=",
+            _yn(sym.active),
+            " oblivious_raw_ready=",
+            _yn(sym.raw_ready),
+            " oblivious_refused=",
+            refusal_text(sym.raw_refuse_code),
+            " at_level_slot=",
+            sym.raw_refuse_slot,
+            sep="",
+        )
+        print(
+            "predict flat_active=",
+            _yn(plan.active),
+            " flat_trees=",
+            plan.n_trees,
+            " flat_refused=",
+            refusal_text(plan.refuse_code),
+            " at_tree=",
+            plan.refuse_tree,
+            " at_node=",
+            plan.refuse_node,
+            sep="",
+        )
+        if not plan.active:
+            print(
+                "predict arm=binned_fallback: both raw arms declined, so this"
+                " call pays BinMapper.transform"
+            )
 
 
 def raw_plan(
@@ -967,25 +1033,45 @@ def raw_plan(
     """Flatten `booster`'s trees over `rng` into raw-value form, or return an
     inactive plan.
 
-    All or nothing across the range: one node the rewrite is not proved for
-    and the whole plan is refused, because a mixed plan would need a per-node
-    branch in the hot walk and an ensemble is grown by one policy anyway.
+    All or nothing across the range, and that is the right granularity rather
+    than a shortcut worth fixing later.
+
+    A per-TREE plan was asked for on 2026-08-17, so here is why it buys
+    nothing. What this path avoids is `BinMapper.transform`, and transform is
+    per MATRIX: it bins every cell of the scoring input in one pass. If a
+    single tree of a hundred cannot be rewritten, that tree needs bin ids,
+    so the transform has to run, so the whole avoided cost is paid anyway --
+    and once the `BinnedMatrix` exists the ninety-nine rewritten trees are
+    strictly WORSE off walking raw values, because a bin id is a UInt8 and a
+    feature value is a Float64, eight times the traffic for the same branch.
+    So a per-tree plan turns one refusal into a partial refusal that still
+    pays 100% of the cost and then makes the remainder slower. The structure
+    would allow it easily (`tree_root` already indexes trees independently);
+    the arithmetic is what refuses it.
+
+    The granularity that IS real is the one already in place: the ORDER of the
+    two raw arms. A single ragged tree costs an ensemble `oblivious_raw_plan`
+    and it still keeps `raw_plan`, because the fall-through in
+    `Model.predict_batch` asks the second arm after the first declines. That
+    is the fallback ladder doing the work a per-tree plan was meant to do,
+    at the granularity where the avoided cost actually lives.
     """
-    var plan = RawEnsemble()
     if not raw_predict_enabled():
-        return plan^
+        return RawEnsemble.refused(REFUSE_SWITCH_OFF, -1, -1)
     if n_rows < RAW_MIN_ROWS:
-        return plan^
+        return RawEnsemble.refused(REFUSE_TOO_FEW_ROWS, -1, -1)
     if rng.stop <= rng.start:
-        return plan^
+        return RawEnsemble.refused(REFUSE_EMPTY_RANGE, -1, -1)
     # `Tree.value` is not the whole leaf for a linear model; only
     # linear_tree.mojo knows what is.
     if booster.linear.is_active():
-        return plan^
+        return RawEnsemble.refused(REFUSE_LINEAR_LEAVES, -1, -1)
     # A CTR column is a statistic of the training target, not a column of the
     # matrix the caller hands in. Those models keep the transform.
     if mapper.ctr.is_active():
-        return plan^
+        return RawEnsemble.refused(REFUSE_CTR_TABLES, -1, -1)
+
+    var plan = RawEnsemble()
 
     var n = rng.stop - rng.start
     for j in range(n):
@@ -994,7 +1080,7 @@ def raw_plan(
         ref tree = booster.trees[rng.start + j]
         var n_nodes = len(tree.feature)
         if n_nodes == 0:
-            return RawEnsemble()
+            return RawEnsemble.refused(REFUSE_EMPTY_TREE, j, -1)
         var base = len(plan.nd_feature)
         plan.tree_root.append(base)
         for i in range(n_nodes):
@@ -1018,7 +1104,7 @@ def raw_plan(
             var l = tree.left[i]
             var r = tree.right[i]
             if l <= i or r <= i or l >= n_nodes or r >= n_nodes:
-                return RawEnsemble()
+                return RawEnsemble.refused(REFUSE_BACKWARD_LINKS, j, i)
             var s = _raw_split(
                 mapper,
                 f,
@@ -1028,7 +1114,7 @@ def raw_plan(
                 tree.cat_offset[i],
             )
             if not s.ok:
-                return RawEnsemble()
+                return RawEnsemble.refused(s.reason, j, i)
             plan.nd_feature.append(f)
             plan.nd_edge.append(s.edge)
             plan.nd_nan_left.append(s.nan_left)
@@ -1038,6 +1124,7 @@ def raw_plan(
 
     plan.n_trees = n
     plan.active = True
+    plan.refuse_code = REFUSE_NONE
     return plan^
 
 
@@ -1127,10 +1214,15 @@ def oblivious_raw_plan(
     """
     var plan = oblivious_plan(booster, rng, n_rows)
     if not plan.active:
+        # `raw_refuse_code` is already REFUSE_NOT_OBLIVIOUS from the
+        # constructor, which is the honest answer: the structural check said
+        # no before the rewrite was ever asked.
         return plan^
     if not raw_predict_enabled():
+        plan.raw_refuse_code = REFUSE_SWITCH_OFF
         return plan^
     if mapper.ctr.is_active():
+        plan.raw_refuse_code = REFUSE_CTR_TABLES
         return plan^
     for s in range(plan.total_levels):
         # A categorical level carries no threshold; `_raw_split` refuses it on
@@ -1147,10 +1239,14 @@ def oblivious_raw_plan(
         if not rs.ok:
             plan.lvl_edge = []
             plan.lvl_nan_left = []
+            plan.raw_refuse_code = rs.reason
+            plan.raw_refuse_slot = s
             return plan^
         plan.lvl_edge.append(rs.edge)
         plan.lvl_nan_left.append(rs.nan_left)
     plan.raw_ready = True
+    plan.raw_refuse_code = REFUSE_NONE
+    plan.raw_refuse_slot = -1
     return plan^
 
 
@@ -1219,17 +1315,37 @@ def predict_oblivious_raw_batch[
                 var slot = lo + level
                 var col = plan.lvl_feature[slot] * n_rows + start
                 var edge = plan.lvl_edge[slot]
-                var nan_left = plan.lvl_nan_left[slot]
                 var bit = 1 << level
-                for i in range(w):
-                    var v = feat_p.unsafe_load(col + i)
-                    var left: Bool
-                    if isnan(v):
-                        left = nan_left
-                    else:
-                        left = v <= edge
-                    if not left:
-                        idx_p.unsafe_store(i, idx_p.unsafe_load(i) | bit)
+                # NO `isnan` IN THE ROW LOOP, and no branch either. IEEE-754
+                # makes every ordered comparison against NaN false, and that
+                # is enough to fold the missing case into the compare itself
+                # once the level's `nan_left` -- a CONSTANT of the level, not
+                # of the row -- is hoisted out:
+                #
+                #   nan_left false: `v <= edge` is already false for NaN, so
+                #     the plain compare sends NaN right, which is what
+                #     `nan_left` false means.
+                #   nan_left true:  `v > edge` is also false for NaN, so
+                #     "right when `v > edge`" sends NaN left, which is what
+                #     `nan_left` true means.
+                #
+                # For a non-NaN value the two are the same predicate, because
+                # `<=` and `>` are exact complements on the ordered reals. So
+                # both arms below are bit-identical to the `isnan` form they
+                # replace, and each is one Float64 compare and one select over
+                # a contiguous run of a column -- the shape that vectorizes.
+                # The `isnan` version could not: a call in the loop body left
+                # the compiler a scalar loop with a branch in it.
+                if plan.lvl_nan_left[slot]:
+                    for i in range(w):
+                        var v = feat_p.unsafe_load(col + i)
+                        var right = bit if v > edge else 0
+                        idx_p.unsafe_store(i, idx_p.unsafe_load(i) | right)
+                else:
+                    for i in range(w):
+                        var v = feat_p.unsafe_load(col + i)
+                        var right = 0 if v <= edge else bit
+                        idx_p.unsafe_store(i, idx_p.unsafe_load(i) | right)
             var lat = plan.leaf_at[t]
             for i in range(w):
                 out_p.unsafe_store(

@@ -36,6 +36,7 @@ from .gpu_predict import (
 )
 from .objective import GradHessFn, train_custom
 from .predict import (
+    PredictTrace,
     oblivious_plan,
     oblivious_raw_plan,
     predict_oblivious_batch,
@@ -170,14 +171,20 @@ struct Model(Copyable, Movable, Writable):
         if len(features) != n_rows * self.mapper.n_features:
             raise Error("features length must equal n_rows * n_features")
         if resolved != GPU_DEVICE and not self.booster.linear.is_active():
+            # `MOJOTREES_PREDICT_TRACE=1` says which of the three arms below
+            # ran and, when a fast one declined, the first reason. Resolved
+            # once per call; off it is one `getenv` and a Bool test.
+            var trace = PredictTrace.resolve()
             var raw_sym = oblivious_raw_plan(
                 self.booster, self.mapper, rng, n_rows
             )
             if raw_sym.active and raw_sym.raw_ready:
+                trace.oblivious(raw_sym, n_rows)
                 return predict_oblivious_raw_batch(
                     self.booster, raw_sym, features, n_rows, rng, raw_score
                 )
             var raw_flat = raw_plan(self.booster, self.mapper, rng, n_rows)
+            trace.flat(raw_sym, raw_flat, n_rows)
             if raw_flat.active:
                 return predict_raw_batch(
                     self.booster, raw_flat, features, n_rows, rng, raw_score
