@@ -216,9 +216,30 @@ A default may change only in a major release, or in a minor release before
 1.0, and only with all four of these in the release notes: the old value,
 the new value, why, and how to pin the old behavior explicitly.
 
-Two defaults are mojotrees's own rather than LightGBM's and are called out
-because a reader may expect otherwise. `lambda_l2` defaults to 1.0, and
-`min_child_hess` defaults to 1e-3. They are frozen on the same terms.
+`min_child_hess` defaults to 1e-3, which is mojotrees's own rather than
+LightGBM's and is called out because a reader may expect otherwise. It is
+frozen on the terms above.
+
+**This paragraph used to name `lambda_l2` beside it and say it "defaults to
+1.0". That was wrong in three ways and had been for the whole life of this
+snapshot** (found 2026-08-17 by the lane rewriting the API-snapshot
+invariants, which is not where anyone was looking for it). The value is not
+1.0; there is no longer a single value; and the value there is happens to be
+LightGBM's, so it does not belong in a paragraph about defaults that are
+ours. What is true:
+
+* the estimator signature default is `None`, a sentinel meaning "unset", so
+  the resolved value depends on `grow_policy`
+* under `lossguide` and `depthwise` it resolves to `_LAMBDA_L2 = 0.0`, which
+  **is** LightGBM's default
+* under `symmetrictree` the mode supplies `_CATBOOST_L2_LEAF_REG = 3.0`,
+  which is CatBoost's, and supplies it without recording that the caller
+  named it
+
+A default that depends on another parameter cannot be frozen as a number,
+and the thing this section protects is the RESOLUTION RULE rather than the
+value: changing which policy resolves to which constant is a default change
+and owes the four release-note items above.
 
 ### 4.4 Unknown and unsupported keys
 
@@ -447,6 +468,24 @@ major versions unless a release note says otherwise.
 | v2 | Missing-value routing, optional monotone section, optional categorical sections | Yes |
 | v3 | Per-node covers, unconditional | Yes |
 | v4 | Per-node split gains, per-node covers behind a presence flag, optional feature names | Yes |
+| v5 | Linear leaf sidecar, CTR tables, and the narrowed `usable` feature pool | Yes |
+
+**v5 is written CONDITIONALLY and that is the part to read.** The other four
+rows describe a version every model of that era carries. v5 is not one:
+`serialize._model_version` returns it on any of three triggers — an active
+linear sidecar, active CTR tables, or a `usable` pool narrower than the full
+feature set — and returns the v4 base token otherwise. So a build at this
+head writes v4 for an ordinary model and v5 only for one that needs a
+section v4 has no place for, which is what keeps an older reader able to
+read everything it could read before.
+
+The guarantee in this table is unchanged and is now checked rather than
+asserted: invariant I3 in `tools/api_snapshot.py` fails if `_read_version`
+does not accept **every** token the writer can emit, not merely the newest.
+Before 2026-08-17 it asked only about the newest, and the snapshot recorded
+the readable set as `[1,2,3,4]` on a build whose reader already accepted v5
+— the scan matched `v(\d+)` as a literal and the v5 arm is spelled with a
+constant, so it was dropped silently and then compared equal on every run.
 
 An older file loads as what it is. A v1 or v2 file describes a model
 trained without covers, so asking it for feature contributions raises
