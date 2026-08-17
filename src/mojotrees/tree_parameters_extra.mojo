@@ -2012,9 +2012,17 @@ struct ExtraTreeParams(Copyable, Movable):
             return String("forced splits")
         if self.use_quantized_grad:
             return String("use_quantized_grad")
-        # **REINSTATED UNCONDITIONALLY 2026-08-17, AFTER A MEASURED
-        # SILENT DIVERGENCE.** These two were narrowed to the categorical case
-        # on the strength of the kernels existing -- `gpu_cosine_score` with
+        # **REINSTATED UNCONDITIONALLY ON 2026-08-17 AFTER A MEASURED SILENT
+        # DIVERGENCE, THEN RE-NARROWED TO THE CATEGORICAL CASE THE SAME DAY
+        # ONCE THE DEVICE MODEL WAS SHOWN TO MOVE.** The history below is why
+        # the bar is what it is; the two refusals actually in force are the
+        # categorical ones underneath, and they are what the code does. This
+        # header said only "REINSTATED UNCONDITIONALLY" until the correction,
+        # two lines above comments that recorded the re-narrowing, so the block
+        # contradicted itself and the docstring above it.
+        #
+        # These two were narrowed to the categorical case on the strength of
+        # the kernels existing -- `gpu_cosine_score` with
         # five call sites, `_scan_slot_oblivious_kernel` carrying a level's
         # two accumulators and its root, the noise plane staged and its draw
         # keyed by level depth, the per-tree scale computed on both arms. Every
@@ -2043,9 +2051,14 @@ struct ExtraTreeParams(Copyable, Movable):
         # individually sound. No amount of reading the gates would have found
         # this; one fit and one CPU comparison did, in under a minute.
         #
-        # These stay refused until a fit shows the device model MOVING when
-        # the setting moves. That is the evidence the retirement always needed
-        # and never had, and it is now the standing bar for both.
+        # The standing bar for both is now that a fit must show the device
+        # model MOVING when the setting moves. That is the evidence the
+        # retirement always needed and never had. **Both cleared it the same
+        # day**, on the evidence recorded in the two comments below, which is
+        # why the refusals that follow are narrow rather than unconditional.
+        # This paragraph read "these stay refused until a fit shows the device
+        # model MOVING" until the correction, describing a state the code two
+        # lines below had already left.
         # random_strength: allowed again 2026-08-17, on EVIDENCE. The
         # oblivious level launch now stages the level's noise plane, copies it
         # and selects the noise overload; before that it called the no-noise

@@ -989,10 +989,52 @@ def device_gradients(
     `ROUND_MVS_HOST_MAGNITUDES` there -- and under AUTO that resolves to the
     host-gradient arm, where `sampling.bootstrap_round` draws it exactly and
     the trees are still grown on the device. **So MVS is honored on a GPU fit
-    rather than dropped or refused**; what it costs is the device derivative
-    kernel, not the sampler. The Bayesian bootstrap is not consulted here at
-    all: it reads no gradient, drops no row, and the device round serves it
-    through `GpuObjectiveState`'s weight plane.
+    rather than dropped or refused.** The Bayesian bootstrap is not consulted
+    here at all: it reads no gradient, drops no row, and the device round serves
+    it through `GpuObjectiveState`'s weight plane.
+
+    **WHAT THE DOWNGRADE COSTS, and the sentence here understated it**, fixed
+    2026-08-17. It read "what it costs is the device derivative kernel, not the
+    sampler", which is the piece a reader remembers and is the smallest piece.
+    `device_grads` is one boolean over the WHOLE round, so returning False buys
+    the entire host arm of `_train_gpu_rounds`, and that arm pays per round, at
+    `n` rows:
+
+    - `boosting._fill_grad_hess`, two Float64 planes, `16 * n` bytes written.
+      Multicore (its body is a `block(start, end)` closure).
+    - the MVS draw itself, `sampling.mvs_bootstrap_weights`, **serial**: `n`
+      square roots, a magnitude buffer and its copy per 8192-row block, an
+      expected-linear threshold solve per block, `n` weight writes, and then
+      `2 * n` multiplies in `apply_bootstrap_weights`.
+    - `sampling.mvs_kept_rows`, a `List[Int]` of about `subsample * n` entries
+      built per round; the bag it produces is `8` bytes a kept row.
+    - `GpuHistogramBuilder.upload_gradients`: `n` Float64-to-Float32
+      conversions per plane and an `8 * n` byte host-to-device copy, plus the
+      staging synchronize.
+    - `GpuActiveRows.begin_tree(bag)`, which a non-empty bag forces: a full
+      `ctx.synchronize()`, `2 * subsample * n` host loop iterations to
+      bounds-check and stage the ids, and a `4 * n` byte copy of the row plane.
+      An unbagged tree seeds the root with an iota kernel and pays none of it.
+    - `_estimate_leaf_values` on the host, and `_renew_leaf_values` on a
+      renewing objective.
+    - `raw[r] += learning_rate * tree.predict_row(data, r)` for every row,
+      **serial, and a full tree walk per row against the host-resident
+      `BinnedMatrix`**. The device arm advances the scores with a kernel
+      instead.
+
+    Against all of that the device arm's per-round host traffic is the 2 KB
+    magnitude readback. One thing moves the other way and belongs in the same
+    ledger: the host arm grows each tree on `subsample * n` rows rather than
+    `n`, so its histograms accumulate about a fifth less at `subsample = 0.8`.
+    No number here is measured; these are counts, and the orchestrator owns the
+    clock.
+
+    **Two exits from the downgrade, and they are not equivalent.**
+    `bootstrap_type=No` and `bootstrap_type=Bayesian` both reach the device
+    round, but the Bayesian one reaches it only when `random_strength` is 0 as
+    well -- `ROUND_BAYESIAN_NOISE_SCALE` routes the pair back here. The third
+    exit is a device MVS draw, which does not exist; the design and its identity
+    claim are the comment block above `sampling.mvs_bootstrap_weights`.
     """
     var s = resolve_objective_source(source)
     if s == OBJECTIVE_SOURCE_HOST:
@@ -1044,6 +1086,18 @@ def gpu_bootstrap_resolution(
     able to see which one they are looking at, and this is the string that
     tells them.
 
+    **"MAY" is doing real work in that sentence and it is worth spending a
+    sentence on**, because the arm a reader assumes is not the arm a Bayesian
+    fit gets by default. A Bayesian bundle beside `random_strength > 0` is
+    `ROUND_BAYESIAN_NOISE_SCALE` and lands on the host-gradient arm, exactly as
+    MVS does -- and `random_strength` is 1.0 in the CatBoost-mode default set
+    (`params._apply_catboost_mode_defaults`), so switching a symmetric arm from
+    MVS to Bayesian and nothing else moves the round to a different sampler and
+    leaves it on the same arm. `bootstrap_type=No` has no such coupling and
+    reaches the device round with the noise on. This line reports what happened
+    rather than what was asked for, which is why it is worth reading instead of
+    reasoning about.
+
     **It is not a per-fit record, because this repository does not have one.**
     Nothing a fit returns or serializes carries what the fit resolved to:
     `Booster` holds the trees, the base score, the learning rate, the objective
@@ -1081,9 +1135,24 @@ def gpu_bootstrap_resolution(
     """The same line, for a caller that has already resolved which arm it is
     on. `_train_gpu_rounds` takes this one: it is handed `device_grads` and
     never sees `objective_source`, and re-deriving the answer from a second
-    set of arguments is how the record and the run come to disagree."""
+    set of arguments is how the record and the run come to disagree.
+
+    **`derivatives=` is on every arm now, including the unbootstrapped one**,
+    2026-08-17, and the reason is LANE_RULES rule 8: a line that says
+    `plane=none` names what the SAMPLER did and leaves the thing a timing
+    comparison actually turns on -- whether this fit computed its derivatives on
+    the device or on the host -- unsaid, and an arm nobody can read off the
+    output is an arm nobody can attribute a number to. The caller's guard was
+    widened in the same pass so the line is emitted whenever the split trace is
+    on, rather than only on a bootstrapped fit."""
+    var derivatives = String("host-float64")
+    if device_grads:
+        derivatives = String("device-float32")
     if not bootstrap.enabled():
-        return String("bootstrap_type=no honored=yes plane=none")
+        return String(
+            "bootstrap_type=no honored=yes plane=none derivatives=",
+            derivatives,
+        )
     var kind = String("mvs") if bootstrap.mvs.enabled else String("bayesian")
     var plane = String("host-gradients")
     if device_grads:
@@ -1099,7 +1168,14 @@ def gpu_bootstrap_resolution(
             " derivatives=host-float64 reason=",
             round_eligibility_reason(ROUND_MVS_HOST_MAGNITUDES),
         )
-    return String("bootstrap_type=", kind, " honored=yes plane=", plane)
+    return String(
+        "bootstrap_type=",
+        kind,
+        " honored=yes plane=",
+        plane,
+        " derivatives=",
+        derivatives,
+    )
 
 
 struct _GpuRecordLeafState(Movable):
@@ -4103,8 +4179,19 @@ def _train_gpu_rounds[
         #
         # On the trainer's existing "why is this fit taking this path" channel
         # (`MOJOTREES_GPU_SPLIT_TRACE`), beside the split-search decision it
-        # already prints, and silent on a fit that configured no bootstrap so
-        # that an existing trace's output is byte for byte what it was.
+        # already prints.
+        #
+        # **IT USED TO BE SILENT ON A FIT THAT CONFIGURED NO BOOTSTRAP**, so
+        # that an existing trace's output stayed byte for byte what it was. That
+        # cost more than it bought and was widened 2026-08-17. The line's most
+        # useful field is which plane produced the round's derivatives, and the
+        # unbootstrapped fit is exactly the arm somebody times against a
+        # bootstrapped one -- so the case where the reader most needs to know
+        # whether AUTO took the device round was the one case that printed
+        # nothing, and a trace that emits nothing is indistinguishable from a
+        # trace that confirms the arm (LANE_RULES rule 8). Nothing prints unless
+        # the trace is asked for, which is what makes the byte-for-byte argument
+        # the wrong one to have applied here.
         #
         # This is a trace line and not a per-fit record, because this
         # repository has no per-fit record; `gpu_bootstrap_resolution` says so
@@ -4113,7 +4200,7 @@ def _train_gpu_rounds[
         # loop and therefore compute their derivatives at different
         # precisions, and a reader comparing two results has to be able to
         # tell which one they are holding.
-        if bootstrap.enabled() and split_trace_enabled():
+        if split_trace_enabled():
             print(
                 "split_trace fit",
                 gpu_bootstrap_resolution(bootstrap, device_grads),

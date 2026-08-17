@@ -99,18 +99,42 @@ def phase_value(record, name, field="elapsed_s"):
 
 
 def cell_key(record):
-    """The cell a record belongs to: scenario, ARM, device, threads.
+    """The cell a record belongs to: scenario, TIER, DATA KIND, ARM, device,
+    threads.
 
-    The second field was the engine name until 2026-08-17, and on an
+    The ARM field was the engine name until 2026-08-17, and on an
     `--arms` run that folded every arm of one engine into a single table
     row: forty frontier cells at different tree counts and bin counts
     rendered as one `mojotrees` row with `reps 40` and a median taken
     ACROSS ARMS, which is not a measurement of anything. `verify._arm_of`
     is the engine name on a run without `--arms`, so that shape of report
     renders exactly what it always did.
+
+    **THE TIER AND THE DATA KIND JOINED IT LATER THE SAME DAY, and their
+    absence was the same defect one level out.** A run may hold one scenario at
+    two tiers, or its generator and its real dataset, in one records file:
+    `frontier.py` schedules `dense_regression` as `dense_synthetic` and
+    `dense_real`, and `pairs.py` schedules it at the standard tier, the large
+    tier and on UCI YearPredictionMSD. With neither field in this key those
+    cells shared one row, and the row printed a median across three different
+    datasets over nine repeats as though it were a measurement of one thing.
+    Every other keying function in the harness already carried both --
+    `verify._oracle_cell_key`, `verify._budget_cell`, `verify._anchor_key` and
+    `report._frontier_group` -- so this was the one reader that could average
+    across them.
+
+    It escaped notice because the two plans that span a scenario embed the row
+    in the ARM ID, which made the arm field accidentally sufficient. That is a
+    naming convention holding an identity together, which `LANE_RULES.md` rule 8
+    says is exactly where to look. A default-matrix run resolves one tier and
+    one variant, so those runs are keyed identically to before and their tables
+    are unchanged.
     """
+    data = record.get("data") or {}
     return (
         record["scenario"],
+        record.get("tier"),
+        data.get("data_kind"),
         verify._arm_of(record),
         record.get("device_used") or record.get("device_requested"),
         record["threads"],
@@ -257,11 +281,19 @@ def render(records, config, out):
         if state.get("thermal_pressure") and "Nominal" not in str(state["thermal_pressure"]):
             out(f"\nThermal state during the run: {state['thermal_pressure']}\n")
 
-        for scenario in sorted({key[0] for key in group}):
-            rows = {k: v for k, v in group.items() if k[0] == scenario}
+        # One SECTION per (scenario, tier, data kind), not per scenario, since
+        # 2026-08-17 and for the reason `cell_key` records. A section prints its
+        # row count, its feature count and its dataset name off ONE of its
+        # cells, so a section spanning two tiers or a generator and a real
+        # dataset describes itself with whichever cell sorted first and
+        # misdescribes the rest. `_frontier_group` was already keyed this way;
+        # this is the plain table catching up.
+        for section in sorted({key[0:3] for key in group}, key=str):
+            scenario, tier, kind = section
+            rows = {k: v for k, v in group.items() if k[0:3] == section}
             first = next(iter(rows.values()))
             data = first["data"] or {}
-            out(f"\n### {scenario}\n")
+            out(f"\n### {scenario} / {tier} / {kind}\n")
             out(
                 f"{data.get('data_kind')} data, `{data.get('dataset')}`, "
                 f"{(data.get('train') or {}).get('rows')} train rows x "
@@ -277,7 +309,7 @@ def render(records, config, out):
             # its engine name, which is every `--arms` run and no other, so a
             # plain run's table is byte-for-byte what it was before the cell
             # key grew the arm dimension.
-            show_arm = any(key[1] != cell["engine"] for key, cell in rows.items())
+            show_arm = any(key[3] != cell["engine"] for key, cell in rows.items())
             out("\n| engine | " + ("arm | " if show_arm else "")
                 + "device | role | threads | reps | " + " | ".join(
                 label for _, label, _ in FIELDS
@@ -285,7 +317,7 @@ def render(records, config, out):
             out("| --- " * (8 + int(show_arm) + len(FIELDS)) + "|")
             for key in sorted(rows):
                 cell = rows[key]
-                _, arm, device, threads = key
+                _, _, _, arm, device, threads = key
                 values = " | ".join(
                     fmt_time(cell["summary"][name], warn_spread) for name, _, _ in FIELDS
                 )
@@ -336,7 +368,7 @@ def _oracle_caption(rows, out):
     in. Printed only when a row carries it, so a cpu-only run reads exactly as
     it always did."""
     oracles = sorted(
-        {f"{key[1]} on {key[2]}" for key, cell in rows.items() if cell["oracle"]}
+        {f"{key[3]} on {key[4]}" for key, cell in rows.items() if cell["oracle"]}
     )
     if not oracles:
         return
@@ -385,7 +417,7 @@ def _builders(rows, out):
                 )
             else:
                 shown = f"`{resolved}`"
-            lines.append(f"- {key[1]} on {key[2]}: {shown}")
+            lines.append(f"- {key[3]} on {key[4]}: {shown}")
     if lines:
         out("\nHistogram construction:\n")
         for line in sorted(set(lines)):
@@ -410,12 +442,12 @@ def _bins(rows, out):
                 continue
             if "total" not in bins:
                 lines.append(
-                    f"- {key[1]} on {key[2]}: not read "
+                    f"- {key[3]} on {key[4]}: not read "
                     f"({bins.get('unavailable_reason')})"
                 )
                 continue
             lines.append(
-                f"- {key[1]} on {key[2]}: {bins['total']} bins over "
+                f"- {key[3]} on {key[4]}: {bins['total']} bins over "
                 f"{bins['n_features']} features, per feature "
                 f"min {bins['min']} / mean {bins['mean']:.1f} / "
                 f"max {bins['max']}, vector sha256 {bins['sha256'][:12]}"
@@ -533,11 +565,11 @@ def _ratios(rows, min_repeats, out):
     # the engine and, on such a run, `comparator[threads]` was whichever
     # lightgbm arm was written last.
     comparator = {}
-    for (scenario, arm, device, threads), cell in rows.items():
+    for (scenario, _tier, _kind, arm, device, threads), cell in rows.items():
         if arm == "lightgbm" and device == "cpu":
             comparator[threads] = cell
     pairs = []
-    for (scenario, arm, device, threads), cell in rows.items():
+    for (scenario, _tier, _kind, arm, device, threads), cell in rows.items():
         if arm != "mojotrees":
             continue
         other = comparator.get(threads)
@@ -768,6 +800,15 @@ def _anchor_cell(check, is_competitor):
         return "no verdict"
     if check["status"] == verify.SKIP:
         return "not compared"
+    # A stale anchor reads differently from a missing one, because the two need
+    # different actions: a missing anchor needs an adoption and a stale one
+    # needs a RUN, and `NO ANCHOR` on a row that has one would send the reader
+    # to the wrong remedy.
+    if check.get("stale"):
+        if check.get("stale_reason") == "unknown":
+            return "ANCHOR CURRENCY UNKNOWN"
+        parameter = check.get("stale_parameter")
+        return f"STALE ANCHOR ({parameter})" if parameter else "STALE ANCHOR"
     if not check.get("anchored"):
         return "NO ANCHOR"
     worse = check.get("worse_relative") or 0.0
@@ -778,6 +819,76 @@ def _anchor_cell(check, is_competitor):
     if check["status"] == verify.WARN:
         return f"CHECK THIS, {size}"
     return f"held, {size}"
+
+
+def _block_vocabulary():
+    """Every `block` id any plan in this directory declares, with its meaning.
+
+    The `block` column has been printed since the arm dimension landed and
+    NOTHING has ever said what its values mean. A one-word label in a table with
+    no legend is the same failure as a seconds column with no metric: the reader
+    supplies a meaning and it is not necessarily the one the plan intended. This
+    is why it matters here in particular: `pairs.py` uses `block` to carry which
+    COMPARISON CLASS a row belongs to, and reading a Class A mirror row as a
+    product row is the single most consequential misreading available in that
+    table.
+
+    Read from the plan modules rather than restated, so there is one definition
+    per block. Both imports are cheap and pull in no engine library. A plan that
+    grows a block gets a legend entry with no edit here.
+    """
+    vocabulary = {}
+    for module_name in ("pairs", "frontier"):
+        try:
+            module = __import__(module_name)
+        except ImportError:
+            continue
+        for attribute in ("CLASSES", "BLOCKS"):
+            vocabulary.update(getattr(module, attribute, {}) or {})
+    vocabulary.setdefault(
+        "competitor",
+        "a competitor library's row, written by a plan that labels its peer "
+        "rows this way rather than by class",
+    )
+    vocabulary.setdefault(
+        "arm",
+        "no block was declared for this row. It is one of our arms and nothing "
+        "more specific is known about its role in the plan",
+    )
+    return vocabulary
+
+
+def _block_legend(records, out):
+    """Say what the `block` column means, above the tables that print it.
+
+    Printed only for the blocks a run actually contains, and skipped entirely
+    when every row is `arm` or `competitor`, so a default-matrix report reads
+    exactly as it did.
+    """
+    present = {
+        r.get("frontier_block") or r.get("arm_block")
+        for r in records
+        if r.get("status") == "ok"
+    }
+    present = {block for block in present if block}
+    if not present:
+        return
+    vocabulary = _block_vocabulary()
+    out("\n### What the `block` column means\n")
+    out(
+        "A `block` is the KIND of row, declared by the plan that scheduled it. "
+        "Rows of different blocks answer different questions and are not "
+        "interchangeable even when they sit in one table at one tree count. "
+        "Read this before reading a rank.\n"
+    )
+    for block in sorted(present):
+        meaning = vocabulary.get(
+            block,
+            "UNDECLARED. No plan module in bench/real_data declares this block, "
+            "so nothing here can say what the row is for. Treat the rank as "
+            "unattributed",
+        )
+        out(f"- **`{block}`** -- {meaning}\n")
 
 
 def _pareto(rows, metric):
@@ -966,6 +1077,7 @@ def _frontier(records, config, out):
         "the portability floor rather than something we optimize. Its accuracy "
         "columns are filled in like everybody else's.\n"
     )
+    _block_legend(records, out)
 
     recommendations = []
     for group in sorted(groups, key=str):

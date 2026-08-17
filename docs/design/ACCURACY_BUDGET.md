@@ -1976,3 +1976,92 @@ which the zero was load-bearing without anyone intending it: it silently
 neutralized a scoring option this library advertises, and the same day's bug
 list already contained "`score_function='Cosine'` was silently ignored on every
 leaf-wise GPU fit". Two independent paths to the same nothing.
+
+---
+
+## 14. PRE-REGISTERED, before any number is read: the bootstrap default question
+
+Written 2026-08-17, **before the measurement it governs was taken.** That is the
+whole point of it. The reason to register a decision rule in advance is that a
+rule written after the number is a rationalization of the number, and this
+particular question is one where the speed result is expected to be large and
+the temptation to wave the accuracy through is therefore also large.
+
+### What is being asked
+
+Our shipped symmetric (CatBoost-mode) default sets `bootstrap_type = MVS` at
+`subsample = 0.8`. MVS solves its keep threshold from per-row gradient
+MAGNITUDES, which the device round does not have, so under AUTO the round
+resolves to the host-gradient arm and **every round computes its derivatives on
+the host in Float64 while the tree grows on the device**
+(`train_gpu::device_gradients`, `ROUND_MVS_HOST_MAGNITUDES`). CatBoost's own GPU
+default is Bayesian, not MVS, which is verified from their source, so switching
+is not a departure from the engine we mirror; it is agreement with it.
+
+### The four cells, and why four
+
+- **D, control.** MVS 0.8, `random_strength = 1.0`. Host arm, two hessian
+  planes, split noise on. This is what ships today.
+- **A.** MVS 0.8, `random_strength = 0.0`. Host arm, two planes, noise off.
+- **B.** Bayesian, `random_strength = 0.0`, `subsample` DELETED. Device arm, two
+  planes. **B minus A is the clean price of the host round** and it is a LOWER
+  bound on it, because A grows each tree on about 80 percent of the rows and B
+  touches all of them.
+- **C, ship candidate.** `bootstrap_type = 'No'`, `subsample` DELETED,
+  `random_strength = 1.0`. Device arm, ONE plane.
+
+Four rather than two because **C changes two things at once.** Dropping the
+bootstrap re-enables `round_has_constant_hessian`, so the builder stops
+accumulating the hessian plane entirely. A single number from C cannot say
+whether the device round or the dropped plane paid, and A and B are what make
+the attribution survive.
+
+Two traps, both found by reading and both able to make a cell silently measure
+the wrong thing. **`subsample` must be DELETED and not set to 1.0**, or a fixup
+in the estimator turns it into row bagging every tree and lands the cell right
+back on the host arm. And **Bayesian forces `random_strength` off**
+(`ROUND_BAYESIAN_NOISE_SCALE`), so changing the sampler and nothing else leaves
+the round on the host arm and measures nothing. Every cell runs with
+`MOJOTREES_GPU_OBJECTIVE=device` so a mis-specified cell RAISES instead of
+silently downgrading, which is rule 8 applied in advance rather than after.
+
+### THE DECISION RULE, fixed now
+
+`bootstrap_type` is an EXPOSED knob, so this is a legitimate default question
+under rule 9 and not an internal choice. The rate therefore applies, and it
+applies in this order:
+
+1. **The anchor gate comes FIRST and it is a veto, not a contribution.** A
+   candidate must be within the accuracy anchor's **0.25 percent per scenario**
+   before it is a candidate at all. **A cell that fails this is not eligible no
+   matter what it does to the clock**, and no speed figure may be quoted in its
+   favor. This is the condition Andrew asked to be registered in advance, and it
+   is stricter than the 1 percent frontier deliberately: the frontier prices a
+   trade a user chose, and a default is a trade nobody chose.
+2. **Then the exchange rate.** At most about 1 percent of accuracy on the
+   primary metric for at least about **2x** speed, read on the **excess-error
+   lens** where a floor exists, because raw RMSE on a 0.30-noise target
+   compresses a 50 percent model-error change into under 1 percent.
+3. **A costlier accuracy move needs a bigger multiple and a written price**, in
+   this document, before it lands.
+4. **If a cell is accuracy-neutral it is not on the frontier at all** and rule 5
+   takes it immediately.
+
+**What would make us keep MVS even if B and C are much faster.** Either failing
+the 0.25 percent anchor on any scenario, or passing it on `dense_regression`
+while failing on `imbalanced_binary` or `multiclass`, which are the two
+scenarios where this library's accuracy has historically been worst and where a
+sampler change is most likely to bite. Neither of those is a close call to be
+argued at the time; both are registered here as disqualifying now.
+
+### What this does NOT authorize
+
+It does not authorize a device MVS draw as a default. That is a separate thing
+and it is **not bit-identical** to the host draw, because the host solves in
+Float64 over Float64-derived magnitudes while a device round holds Float32
+derivatives, so the magnitudes differ before any solve runs and a different
+threshold puts different rows across it. Even at matched precision the sorted
+partial sums are formed in a different order and float addition is not
+associative. So it is equivalent in distribution and per-row reproducible, not
+exact, **rule 5's same-session flip does not reach it**, and it takes this
+document's gate under rule 3. The precedent is `ROUND_GOSS_RANK_PRECISION`.

@@ -370,8 +370,9 @@ unchanged, which is the leaf-wise gate where the `0` remains benign.
 
 ---
 
-## 3. Is the `random_strength` device path reached? No, and both sides of the
-argument were wrong about why
+## 3. Is the `random_strength` device path reached? YES at head, and both sides of the
+argument were wrong about why. (This heading read "No", which was this section's
+answer and was overturned later the same day; see the note directly below)
 
 > **SUPERSEDED 2026-08-17, LATER THE SAME DAY. THE ANSWER IS NOW YES, AND
 > EDITS 8 THROUGH 11 BELOW MUST NOT BE APPLIED.**

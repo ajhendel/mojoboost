@@ -35,8 +35,12 @@ from what I read.
 Both come from the brief and both are measured on this machine.
 
 **Ruler A, the symmetric plane's whole launch budget.** The oblivious schedule
-is 56 command buffers per tree, confirmed launch by launch. A launch is 10 to
-20 microseconds. So
+is 56 command buffers per tree, confirmed launch by launch. (Since 2026-08-17
+the shipped default is **55**, because `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD`
+became the default and drops the last level's two batch launches while paying
+one back for its partition's copy-back. One launch does not move this ruler, and
+the ruler is quoted at 56 below so the arithmetic reads as it was taken.) A
+launch is 10 to 20 microseconds. So
 
     56 launches x 100 trees x 15 us = 84 ms
 
@@ -56,7 +60,21 @@ plane they are on.
 
 Supporting anchors used below, all from the brief or from the repository.
 Symmetric GPU 17.07 s, symmetric CPU 9.09 s, leaf-wise GPU 3.659 s, depth-wise
-GPU 3.245 s, CatBoost 3.269 s, at 799,110 x 100, 100 trees, depth 6. Histogram
+GPU 3.245 s, CatBoost 3.269 s, at 799,110 x 100, 100 trees, depth 6.
+
+**THE SYMMETRIC AND LEAF-WISE DENOMINATORS ARE PRE-FLIP, AND EVERY PERCENTAGE IN
+THIS DOCUMENT IS AGAINST THEM. Added 2026-08-17.** Later that day four GPU
+performance switches were measured and became defaults, so at the same shape the
+symmetric arm is around **10.36 s** rather than 17.07 s (2.20x from
+`OBLIVIOUS_SUBTRACT` plus `OBLIVIOUS_SKIP_LAST_BUILD` plus `OBLIVIOUS_WIDE`
+together) and the leaf-wise arm is around **3.2 s** rather than 3.659 s (1.21x
+from `SPLIT_WIDE`). The anchors above are deliberately left as they were taken,
+because the prices below were computed against them and a half-renumbered
+register would be worse than a uniformly stale one. What a reader has to do is
+mechanical: a decline priced at X percent of 17.07 s is roughly 1.65 X percent of
+the fit that ships today, and one priced against 3.659 s is roughly 1.14 X. The
+ORDERING of the register is unaffected, since every item scales by the same
+factor within a plane. Nothing about which declines survive changes. Histogram
 construction is 86 percent of a symmetric fit. GPU idle 76.5 percent, compute
 22.9 percent. A Metal `enqueue_copy` is a synchronous full-queue drain. Host
 wait about 126 us, enqueue about 6 to 7 us through queue depth 64 and 14 to 17
@@ -233,7 +251,14 @@ are not exclusive and the trade as stated was badly priced."*
 
 **Class.** Originally ASSERTED. The correction and the arm both landed;
 `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1` selects it and the docstring now says
-*"Default off, because no benchmark has priced it."*
+*"Default off, because no benchmark has priced it."* (That quoted fragment is
+still in `histogram_gpu.enqueue_desc_level_children`'s docstring, but it is no
+longer where the default is stated: since 2026-08-17 the default lives in the
+code comment beneath `gpu_leaf_batching.oblivious_subtract_requested`, which
+reads DEFAULT ON and carries the measurement, and the predicate there is
+`!= "0"`. So the quoted docstring line is stale at head and the two are worth
+reading together. The conclusion of this row is unchanged, and strengthened: the
+arm is not merely switchable now, it ships.)
 
 **Price, estimate.** Histogram is 86 percent of 17.07 s, so 14.7 s. Subtraction
 halves the rows read per level, so the ceiling is about **7 s** less the
@@ -252,8 +277,14 @@ UNDER-PRICED IT"*.
 **Declined.** Skipping a build whose output nothing reads, on the grounds that
 *"skipping it would move the cost rather than remove it"*.
 
-**Class.** Originally ASSERTED. Now counted in source and switched, still
-default off. *"Counted, not measured ... Nothing has timed it."*
+**Class.** Originally ASSERTED. Now counted in source, switched, **measured, and
+the default since 2026-08-17.** This line read "still default off" and quoted
+*"Counted, not measured ... Nothing has timed it."*, which is superseded: the
+flip comment at `gpu_resident_round.oblivious_skip_last_build_requested` records
+22.76 s to 18.06 s at 799,110 x 100 x 100 trees, **1.26x**, three interleaved
+round-robin cycles, rmse 2.439382420 unchanged, and the predicate is now
+`!= "0"`. The launch count moves 56 to 55 at depth 6, which is the least
+interesting part of it.
 
 **Price, estimate.** `train_gpu.mojo`'s four-combination table is the arithmetic
 and it is correct. Row-read child builds at depth 6 go 126 to 62. One of six
@@ -270,8 +301,14 @@ ms**. The trade is 2,450 ms against 4 ms.
 `OBLIVIOUS_NOISE_HOIST_VAR`, *"The count is read from the source; the time is
 unmeasured, which is why this is off."*
 
-**Class.** ASSERTED as to time. The count, six drains per depth-6 tree, is
-verified from source.
+**Class.** ASSERTED as to time when this row was written; **MEASURED as of
+2026-08-17, and the result is a null.** The arm was run that day on a fit that
+sets `random_strength > 0` and came in **indistinguishable** in the registered
+M0 sense (2026-08-17 lane brief), which is why it is the one of the four
+symmetric arms whose default did not flip. The quoted docstring at
+`OBLIVIOUS_NOISE_HOIST_VAR` still says the time is unmeasured and is stale on
+that point. The count, six drains per depth-6 tree, is verified from source and
+is untouched by the null.
 
 **Price, estimate.** Floor is 6 x 100 x 126 us = **76 ms**, 0.44 percent. The
 real cost is the lost run-ahead, since each drain sits between a level's build
@@ -301,6 +338,16 @@ is the one the code calls.
 bit-identical, sitting behind an environment variable.
 
 **Survives.** No. The reason is false as written.
+
+**RESOLVED 2026-08-17, later the same day.** The arm is now the shipped default:
+the predicate at `oblivious_wide_scan_requested` is `!= "0"` and the flip comment
+beneath it carries both readings, 20.40 s narrow against 19.49 s wide with
+disjoint ranges on a quiet box, and 22.76 s against 21.28 s in a loaded
+three-cycle round robin, with rmse 2.439382420 throughout. So it is no longer
+"sitting behind an environment variable"; the variable restores the narrow scan.
+The STALE finding stands as a finding, because the quoted docstring paragraph
+above the flip comment still reads "Off unless asked for", which is a correction
+owed in that file.
 
 ### A5. `set_shared_features` never called on the oblivious plane
 
@@ -383,9 +430,16 @@ about 280 us and the scan is a small share of it. If the leaf-wise wide scan
 were worth what the oblivious one is, 4.5 percent of 3.659 s = **0.16 s**. The
 honest expectation from the docstring's own reasoning is less.
 
-**Survives.** Yes, as a decline. It should be near the top of the run queue
-anyway, because the arm is built, tested bit-identical, and costs one
-interleaved pair to resolve.
+**Survives.** Yes, as a decline, and **it was then resolved on 2026-08-17 by
+exactly the one interleaved pair this row asked for.** The arm is the shipped
+default now: three round-robin cycles at 799,110 x 100 continuous features,
+leaf-wise at the shared defaults, 100 trees, M4, narrow 3.922 / 3.874 / 3.932 s
+against wide 3.220 / 3.196 / 3.231 s, disjoint ranges so M0 resolved, rmse
+6.116601511 in all six runs. **1.21x**, which is four times the oblivious arm
+and well above this row's "the honest expectation is less" and above the 0.16 s
+priced above. The predicate at `wide_scan_requested` is `!= "0"` and the flip
+comment beneath it holds the numbers. The decline was defensible and the estimate
+was low, which is the useful thing to record.
 
 ### B4. K=1 speculative prebuild. ASSERTED, and probably correct
 
@@ -875,13 +929,13 @@ the row.
 
 | # | Decline | Class | Estimated value | One sentence that falsifies it |
 |---|---|---|---|---|
-| 1 | **A4.** Wide oblivious level scan stays off | STALE | **0.77 s of 17.07 s (4.5 percent), resolved and bit-identical** | The 4.5 percent quoted in `wide_scan_requested` was measured on a different kernel than the one `oblivious_wide_scan_requested` selects. |
+| 1 | **A4.** Wide oblivious level scan stays off. **CLOSED 2026-08-17, it is the default now** | STALE | **0.77 s of 17.07 s (4.5 percent), resolved and bit-identical** | The 4.5 percent quoted in `wide_scan_requested` was measured on a different kernel than the one `oblivious_wide_scan_requested` selects. |
 | 2 | **C1.** Row compaction | ASSERTED | **0 to +5.7 s on the symmetric plane, and probably 0 as currently plumbed** | `GpuLeafBatcher` can already read a compacted plane, so the oblivious level build does collect the gather saving. |
 | 3 | **C3.** Int16 packed gradient staging | ASSERTED | **up to 1.2 s of 17.07 s** | The pair load is already fully hidden behind the bin gather, so halving it changes no wall time. |
 | 4 | **B2.** Removing the partition copy-back launch | ASSERTED | **about 90 ms of 3.659 s (2.5 percent)** | `snapshot_rows` and `download_rows` cannot be made to gather across two buffers without breaking host replica bit-equivalence, which the audit already suspects. |
 | 5 | **B1.** Folding the cross-slot reduction into record filing | ASSERTED | **about 45 ms of 3.659 s (1.2 percent)** | The enqueue cost at this queue depth is 6 us rather than 15, which puts it under half a percent. |
-| 6 | **B3.** Wide leaf-wise scan | ASSERTED | **up to 0.16 s of 3.659 s** | The leaf-wise scan is two children per launch rather than a level, so there is no serialization for the width to remove. |
-| 7 | **A3.** Per-level noise copy drain | ASSERTED (KNOWN) | **floor 76 ms, ceiling unknown** | The queue is empty at each of the six drain points, so each drain costs a wait and no lost overlap. |
+| 6 | **B3.** Wide leaf-wise scan. **CLOSED 2026-08-17, measured and now the default** | ASSERTED | **up to 0.16 s of 3.659 s**, and this estimate was **LOW by about four times**: the measured win is 1.21x, roughly 0.68 s of 3.659 s | The falsifier as written ("there is no serialization for the width to remove") was tested and refuted; the width removed more on this plane than on the oblivious one, not less. |
+| 7 | **A3.** Per-level noise copy drain. **CLOSED 2026-08-17 on a MEASURED NULL, and the default stays off** | ASSERTED (KNOWN) | **floor 76 ms, ceiling unknown**; the hoist was run and came in M0 indistinguishable, so the realized value is 0 at the shape measured | The falsifier as written is now the reading that survives: the collapse bought nothing measurable, so whatever those six drains cost, removing them did not show up in wall time. |
 | 8 | **C8.** Group 2 against group 4 at real bin capacity | STALE | **0 at 255 bins, up to 0.5 s at 64 bins** | No published or planned shape bins below 255. |
 | 9 | **C2.** `compact_flag_read` | ASSERTED | **tens of ms, and inert without C1** | It is inert without C1, so it has no standalone value at all. |
 | 10 | **B5.** Batching independent trees or classes | STALE | **cannot price** | The 465,000-row null result still holds after the round-trip removal, because dispatch was never the cost. |

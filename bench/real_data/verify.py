@@ -1336,6 +1336,214 @@ def _anchor_key(record):
     )
 
 
+#: THE STALE-ANCHOR MECHANISM, registered 2026-08-17.
+#:
+#: An anchor is an absolute recorded value and rule 3 of `LANE_RULES.md` says a
+#: later run may not become its own baseline. That rule is what makes an anchor
+#: worth having and it creates one problem it does not solve: **an anchor can
+#: stop describing the model we ship without any number in it changing.**
+#:
+#: The case that produced this. On 2026-08-17 our `lambda_l2` under every
+#: non-symmetric growth policy moved from 0.0 to 1.0
+#: (`sklearn.py::_LAMBDA_L2`, declared in `check_parity.py::STOCK_DIVERGENCES`,
+#: priced in `ACCURACY_BUDGET.md` section 13). Any anchor for an arm that LEFT
+#: THAT KEY UNSET was recorded on a model nobody ships any more. The anchor's
+#: value is still a correct record of what that run produced; what is no longer
+#: true is that it is the reference for this arm.
+#:
+#: **The wrong fix, and it is the tempting one: recompute the anchor.** Editing
+#: an anchor to match a model nobody measured installs exactly the ratchet the
+#: file exists to prevent. So a stale anchor is neither edited nor deleted. It is
+#: MARKED, it stops gating, and it says so on every run until a run replaces it.
+#:
+#: **How staleness is decided, and it is not a date.** A date-based rule needs
+#: somebody to remember to write the date down. This rule is a comparison:
+#:
+#:   an anchor is STALE when the arm it was recorded from LEFT a parameter
+#:   UNSET, and the value that parameter RESOLVED TO in the anchored run is not
+#:   the value it resolves to now.
+#:
+#: Both halves come off the anchor entry's own `configuration` block, which
+#: `propose_anchors` writes from the record, and the live half is read from the
+#: package source. Nothing has to be maintained: an anchor adopted from a run
+#: taken after a default moves records the new value and is not stale, so **the
+#: run clears the staleness by existing**. That is the design requirement,
+#: because the alternative is a hand-maintained list that goes stale about
+#: staleness.
+#:
+#: An anchor with no `configuration` block cannot be judged either way. That is
+#: an UNKNOWN and it WARNS, on the precedent of C10's missing-cpu-twin and
+#: C11's missing anchor: a check that cannot run is dangerous precisely because
+#: it is silent, so it says so rather than passing.
+STALE_ANCHOR_PARAMETERS = {
+    "lambda_l2": {
+        "constant": "_LAMBDA_L2",
+        "why": (
+            "the L2 leaf regularizer, and the denominator of every leaf value "
+            "and every split gain. It moved from 0.0 to 1.0 on 2026-08-17 under "
+            "every non-symmetric growth policy, so an anchor recorded from an "
+            "arm that did not name it describes a different model. A change to "
+            "this value reorders which candidate split wins, so it is not a "
+            "small movement in a metric, it is a different tree"
+        ),
+    },
+    "learning_rate": {
+        "constant": "_LEARNING_RATE",
+        "why": (
+            "the shrinkage rate. An arm that does not name it follows the "
+            "policy's default, so a change to that default changes how much "
+            "fitting the anchored budget bought"
+        ),
+    },
+}
+
+#: Where the live shipped value of each of those parameters is read from.
+#: The Python surface, because that is the surface `bench/real_data` fits
+#: through: `basic.py::_Config` forwards a training dict into
+#: `sklearn.py::MojoTreesRegressor`, so what an unset key resolves to is that
+#: module's constant and not `tree.mojo::TreeParams.default`.
+SHIPPED_CONSTANTS_SOURCE = os.path.join(
+    HERE, "..", "..", "python", "mojotrees", "sklearn.py"
+)
+
+
+def shipped_constant(name):
+    """The value of a module-level numeric constant in `sklearn.py`, or None.
+
+    Read from the SOURCE TEXT and not by importing, because
+    `python/mojotrees/sklearn.py` imports the compiled extension and every tool
+    in this directory must run with nothing built. A constant that stops being a
+    bare numeric literal returns None, which the callers treat as "cannot
+    determine" rather than as a value, because an expression is not something a
+    gate may guess at.
+    """
+    import re
+
+    try:
+        with open(os.path.abspath(SHIPPED_CONSTANTS_SOURCE)) as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    found = re.search(
+        r"^" + re.escape(name) + r"\s*=\s*(-?[0-9][0-9._eE+-]*)\s*$",
+        text,
+        re.MULTILINE,
+    )
+    if found is None:
+        return None
+    try:
+        return float(found.group(1))
+    except ValueError:
+        return None
+
+
+def anchor_configuration(record):
+    """The part of an arm's resolved configuration an anchor's validity depends
+    on, plus which of it the arm NAMED.
+
+    `followed_default` is the load-bearing half. A value the arm typed is a
+    property of the arm and moving a package default cannot invalidate it; a
+    value the arm left unset is a property of the DEFAULT, and moving the default
+    replaces the model under the anchor's name. So staleness is decided on the
+    unset keys alone, which is why this records both.
+    """
+    resolved = (record.get("params") or {}).get("engine") or {}
+    named = set((record.get("arm_overrides") or {}).get("params") or {})
+    shared = (record.get("params") or {}).get("shared") or {}
+    tracked = {}
+    followed = []
+    for name in sorted(STALE_ANCHOR_PARAMETERS):
+        value = resolved.get(name, shared.get(name))
+        tracked[name] = None if value is None else float(value)
+        # The arm NAMED it when its own override dict names it with a value.
+        # `None` in an override dict is how this harness says "unset" (see
+        # `pairs.py`'s unset-key section), so a `None` there is not a naming.
+        override = ((record.get("arm_overrides") or {}).get("params") or {})
+        if name not in named or override.get(name) is None:
+            followed.append(name)
+    return {
+        "resolved": tracked,
+        "followed_default": followed,
+        "grow_policy": resolved.get("grow_policy"),
+        "note": (
+            "`resolved` is what the fit ran at, off the record's resolved "
+            "engine parameters. `followed_default` names the subset the ARM did "
+            "not set, which is the subset a package default change can "
+            "invalidate. verify.anchor_staleness compares those against the "
+            "live value in python/mojotrees/sklearn.py"
+        ),
+    }
+
+
+def anchor_staleness(anchor):
+    """Why this anchor no longer describes what we ship, or None.
+
+    Three outcomes and they are deliberately different:
+
+    - `None`: the anchor's unset parameters still resolve to what they resolved
+      to, so the anchor describes the model it was recorded from.
+    - a dict with `"unknown": True`: the anchor carries no `configuration`
+      block, so nothing here can tell. WARNs.
+    - a dict naming the parameter: STALE. WARNs and does not gate.
+
+    An explicit `"stale"` block on the entry is authoritative and wins over the
+    comparison, so a person can retire an anchor for a reason no comparison can
+    see. It is read but never written by any code path in this harness.
+    """
+    declared = anchor.get("stale")
+    if declared:
+        detail = dict(declared)
+        detail.setdefault("parameter", None)
+        detail.setdefault("declared", True)
+        return detail
+
+    configuration = anchor.get("configuration")
+    if not configuration:
+        return {
+            "unknown": True,
+            "why": (
+                "this anchor carries no `configuration` block, so nothing here "
+                "can tell whether the parameters its arm left UNSET still "
+                "resolve to the values it was recorded at. Anchors proposed "
+                "before 2026-08-17 have none. Re-propose from a run to give it "
+                "one; until then this anchor cannot be shown to describe the "
+                "model we ship, and an anchor that cannot be shown to be "
+                "current does not gate"
+            ),
+        }
+
+    resolved = configuration.get("resolved") or {}
+    for name in configuration.get("followed_default") or ():
+        rule = STALE_ANCHOR_PARAMETERS.get(name)
+        if rule is None:
+            continue
+        was = resolved.get(name)
+        now = shipped_constant(rule["constant"])
+        if was is None or now is None:
+            continue
+        if float(was) != float(now):
+            return {
+                "parameter": name,
+                "recorded_at_value": float(was),
+                "shipped_value": float(now),
+                "why": (
+                    f"the arm this anchor was recorded from left `{name}` "
+                    f"UNSET, it resolved to {was:g} in the anchored run, and it "
+                    f"resolves to {now:g} now "
+                    f"(sklearn.py::{rule['constant']}). {rule['why']}"
+                ),
+                "cleared_by": (
+                    "a run of this arm on the current default, then "
+                    "`verify.py <run> --propose-anchors <path>` and a "
+                    "deliberate adoption. The anchor is NOT recomputed by "
+                    "arithmetic: editing a recorded value to match a model "
+                    "nobody measured is how the ratchet LANE_RULES rule 3 "
+                    "designs out gets installed"
+                ),
+            }
+    return None
+
+
 def load_accuracy_anchors(path=None):
     """The recorded anchors, or an empty set when the file has none.
 
@@ -1441,6 +1649,37 @@ def check_accuracy_anchor(ok, config, verdict, anchors=None):
                 metric=metric, value=float(mine), anchored=False,
             )
             continue
+        # STALENESS IS TESTED BEFORE THE VALUE IS USED, and never after it.
+        # An anchor that no longer describes what we ship must not be able to
+        # produce a PASS or a FAIL, because both of those are statements about
+        # this arm against its own reference and a stale anchor is not that
+        # arm's reference any more. See the STALE ANCHOR block above for why the
+        # remedy is a run rather than an edit.
+        stale = anchor_staleness(anchor)
+        if stale is not None:
+            uncovered.append(key)
+            if stale.get("unknown"):
+                verdict.add(
+                    WARN, "accuracy_anchor", scope,
+                    f"ANCHOR CURRENCY UNKNOWN, so it does not gate. Measured "
+                    f"{metric} {mine:.6g} against a recorded "
+                    f"{anchor.get('value')}. {stale['why']}",
+                    metric=metric, value=float(mine), anchored=False,
+                    stale=True, stale_reason="unknown",
+                )
+            else:
+                verdict.add(
+                    WARN, "accuracy_anchor", scope,
+                    f"STALE ANCHOR, so it does not gate. Measured {metric} "
+                    f"{mine:.6g} against a recorded {anchor.get('value')}, "
+                    f"which is NOT compared. {stale['why']}. "
+                    f"Cleared by: {stale.get('cleared_by', 'a fresh run')}",
+                    metric=metric, value=float(mine), anchored=False,
+                    stale=True,
+                    stale_parameter=stale.get("parameter"),
+                    stale_reason="parameter_default_moved",
+                )
+            continue
         if anchor.get("primary_metric") != metric:
             verdict.add(
                 WARN, "accuracy_anchor", scope,
@@ -1524,7 +1763,8 @@ def check_accuracy_anchor(ok, config, verdict, anchors=None):
     if uncovered:
         verdict.add(
             NOTE, "accuracy_anchor", "run",
-            f"{len(uncovered)} arm-cell(s) have no recorded accuracy anchor, "
+            f"{len(uncovered)} arm-cell(s) have no USABLE accuracy anchor "
+            "(missing, stale, or of unknown currency), "
             "so the accuracy gate covers nothing for them. To adopt anchors "
             "from a run you trust: `python bench/real_data/verify.py <run> "
             "--propose-anchors <path>`, read the file it writes, then move the "
@@ -1585,6 +1825,15 @@ def propose_anchors(ok, config, path, results_path):
                 for name, v in (record.get("quality") or {}).items()
             },
             "environment": _accuracy_environment(record),
+            # THE BLOCK THAT MAKES STALENESS MACHINE-CHECKABLE, added
+            # 2026-08-17. Without it an anchor can stop describing what we ship
+            # with no number in it changing, and nothing can tell. With it,
+            # `anchor_staleness` compares the parameters this arm left UNSET
+            # against what they resolve to now, so **an anchor proposed from a
+            # run taken after a default moves is current by construction** and
+            # the run is what clears the staleness. An anchor without this block
+            # is judged UNKNOWN and does not gate.
+            "configuration": anchor_configuration(record),
             "recorded_from": {
                 "run_id": os.path.basename(os.path.normpath(results_path)),
                 "git_commit": (environment.get("git") or {}).get("commit"),
@@ -1607,6 +1856,13 @@ def propose_anchors(ok, config, path, results_path):
             "An anchor adopted without reading it is worse than no anchor, "
             "because a gate measured from a number nobody looked at reports "
             "green about nothing.",
+            "",
+            "KEEP THE `configuration` BLOCK. It records what the arm ran at and "
+            "which parameters the arm left UNSET, and verify.anchor_staleness "
+            "reads both to decide whether the anchor still describes the model "
+            "we ship. An entry adopted without it is judged UNKNOWN and does "
+            "not gate. A stale anchor is never recomputed by arithmetic: it is "
+            "marked, it stops gating, and a fresh run replaces it.",
         ],
         "version": 1,
         "proposed_from": os.path.abspath(results_path),

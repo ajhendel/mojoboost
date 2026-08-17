@@ -421,6 +421,24 @@ BASES = {
             "subsample": 0.8,
             "n_estimators": SHIPPED_N_ESTIMATORS["symmetrictree"],
             "auto_learning_rate": True,
+            # THE TWO KEYS THIS BASE MUST LEAVE UNSET, and they have to be
+            # NAMED AS `None` to be unset. Added 2026-08-17; see
+            # `RESOLVED_SINCE['auto_rate_needed_explicit_none']`. `not_set`
+            # below states the requirement and this dict could not meet it by
+            # omission, because `scenarios.mojotrees_params` copies both keys
+            # out of `BASE_PARAMS` onto every mojotrees arm whether an arm
+            # names them or not. `None` is the only value
+            # `sklearn.py::_Base._learning_rate_named` and
+            # `sklearn.py::_Base._l2_named` read as "the caller did not name
+            # it", and `_auto_learning_rate_knobs` RAISES rather than degrading
+            # when `auto_learning_rate=True` meets either one named. So without
+            # these two lines every `auto`-rate arm in this plan was an
+            # infrastructure failure waiting for a run, and `lambda_l2` was
+            # LightGBM's 0.0 rather than CatBoost's mode-supplied 3.0 --
+            # which is the exact condition `RESOLVED_SINCE`'s first entry
+            # believed it had disproved.
+            "learning_rate": None,
+            "lambda_l2": None,
         },
         "dataset_params": {"max_bin": 254},
         "env": {"MOJOTREES_DERIVATIVE_PRECISION": "float32"},
@@ -789,10 +807,43 @@ def _base_point(base):
 
 
 def _apply_trees(base, params, n_estimators, rate):
+    """Apply a (tree count, rate) point to an arm's parameters.
+
+    **`learning_rate = None`, not a pop, and the difference is a fit that runs
+    against a fit that raises.** Corrected 2026-08-17; see
+    `RESOLVED_SINCE['auto_rate_needed_explicit_none']`.
+    `scenarios.mojotrees_params` copies `learning_rate` out of `BASE_PARAMS`
+    onto every mojotrees arm unconditionally, so removing the key from an
+    override dict does not leave the rate unset: it leaves it at 0.1. The
+    estimator's provenance test is `self.learning_rate is not None`
+    (`sklearn.py::_Base._learning_rate_named`), and
+    `sklearn.py::_Base._auto_learning_rate_knobs` RAISES on
+    `auto_learning_rate=True` beside a named rate rather than degrading, so
+    `None` is both necessary and the only value that works.
+    """
     params["n_estimators"] = int(n_estimators)
     if rate == "auto":
         params["auto_learning_rate"] = True
-        params.pop("learning_rate", None)
+        params["learning_rate"] = None
+        # AND `lambda_l2` UNSET, which changes what a Base B `auto` arm IS and
+        # is recorded rather than done quietly. `auto_learning_rate=True` is an
+        # explicit request here, not a mode default, so a NAMED `lambda_l2`
+        # raises beside it (`sklearn.py::_Base._auto_learning_rate_knobs`, the
+        # `l2_named` branch, mirroring CatBoost's gate at
+        # `options_helper.cpp`). `BASE_PARAMS` names `lambda_l2` since
+        # 2026-08-17, so every `auto` arm in this plan was going to raise.
+        #
+        # The consequence for Base B, stated plainly: its `auto` arms no longer
+        # carry LightGBM's pinned 0.0. They carry whatever the grow policy's own
+        # default supplies, which under `lossguide` is our shipped 1.0 and under
+        # `symmetrictree` is CatBoost's mode-supplied 3.0. So a Base B `auto`
+        # arm is "leaf-wise at a derived rate AND at our own regularizer" and it
+        # is not comparable, key for key, with a Base B pinned-rate arm. That
+        # was ALREADY a hybrid -- a derived rate is CatBoost's mechanism and
+        # pinning LightGBM's regularizer beside it was never one library's
+        # configuration -- and the alternative is not an arm at all, because the
+        # two requests are refused together by design.
+        params["lambda_l2"] = None
     else:
         params["auto_learning_rate"] = False
         params["learning_rate"] = float(rate)
@@ -1414,6 +1465,51 @@ RESOLVED_SINCE = {
             "the tree it had. The check that would have caught it is `git "
             "log --oneline -5` before re-deriving anything, which is now the "
             "first line of this lane's rebase routine"
+        ),
+    },
+    "auto_rate_needed_explicit_none": {
+        "claimed": (
+            "that `not_set` was satisfied by OMITTING `learning_rate`, "
+            "`lambda_l2` and `leaf_estimation_iterations` from an arm's "
+            "override dict, and that `_apply_trees` popping `learning_rate` for "
+            "an `auto` point was therefore enough to leave the rate unset"
+        ),
+        "wrong_because": (
+            "`scenarios.mojotrees_params` copies `learning_rate` out of "
+            "`BASE_PARAMS` onto EVERY mojotrees arm unconditionally, and from "
+            "2026-08-17 it copies `lambda_l2` too, so an omitted key is not an "
+            "unset key: it is `BASE_PARAMS`'s value. The estimator's provenance "
+            "test is `is not None` "
+            "(`sklearn.py::_Base._learning_rate_named`, "
+            "`sklearn.py::_Base._l2_named`), and "
+            "`sklearn.py::_Base._auto_learning_rate_knobs` RAISES rather than "
+            "degrading when `auto_learning_rate=True` meets either key named. "
+            "So every `auto`-rate arm in this plan -- all of Base A and three "
+            "of Base B's trees points -- was an infrastructure failure waiting "
+            "for a run, and Base A was additionally at LightGBM's `lambda_l2 = "
+            "0.0` rather than CatBoost's mode-supplied 3.0, which is exactly "
+            "the condition `RESOLVED_SINCE['l2_3_with_auto_rate']` above "
+            "believed it had disproved. That entry's reasoning about the "
+            "mode-defaults layer is correct; what it missed is that this "
+            "harness reaches the estimator through a translator that names the "
+            "keys for you"
+        ),
+        "now": (
+            "`BASES['A']['params']` names `learning_rate: None` and "
+            "`lambda_l2: None`, and `_apply_trees` sets both to `None` on every "
+            "`auto` point. `None` is the only value that means unset here. The "
+            "consequence for Base B's `auto` arms is at the assignment: they "
+            "carry the grow policy's own regularizer rather than LightGBM's "
+            "pinned 0.0, because the two requests are refused together"
+        ),
+        "how_it_happened": (
+            "the same shape as the entry above and one level further out. Both "
+            "reasoned about what the PACKAGE does with an unnamed key and "
+            "neither checked what the HARNESS names on the way there. Found "
+            "2026-08-17 by evaluating `scenarios.mojotrees_params(spec, 'cpu', "
+            "dict(BASES['A']['params']))` and reading `lambda_l2` and "
+            "`learning_rate` off the result, which is one line and had never "
+            "been done"
         ),
     },
     "selfcheck_pandas": {

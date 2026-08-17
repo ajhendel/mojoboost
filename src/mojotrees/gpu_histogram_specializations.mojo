@@ -257,6 +257,15 @@ struct SharedHistogramLayout(Copyable, Movable):
     is equivalent; this describes the one-allocation form a specialized
     kernel would use, so the offsets are stated once here rather than
     recomputed at each of the three use sites (zero, accumulate, flush).
+
+    "A specialized kernel WOULD use" became "one does" on 2026-08-17:
+    `gpu_leaf_batching._plan_hist_kernel` takes one flat allocation of
+    `units * 3 * (n_bins + 1)` cells so that a threadgroup can hold several
+    feature slots and several private copies of each. Its plane stride carries
+    a PAD word this struct does not, which is deliberate rather than a
+    divergence: without it the copies of one bin all land in one memory bank.
+    So this layout still describes the single-copy case exactly and is not the
+    replicated one.
     """
 
     var capacity: Int
@@ -613,7 +622,23 @@ struct KernelFeatures(Copyable, Movable):
     var batched_leaf_kernel: Bool
     """The batched histogram kernels in `gpu_leaf_batching.mojo` are compiled
     in and validated: several leaves in one launch, their row tiles packed
-    onto one `grid.y` axis, each leaf writing its own output slice."""
+    onto one `grid.y` axis, each leaf writing its own output slice.
+
+    **IT GATES ONE OF THE TWO CALLERS AND NOT THE OTHER, which is worth
+    knowing before this flag is trusted as a reach test.**
+    `gpu_leaf_batching.admit_frontier_batch` refuses a HOST-staged frontier
+    batch without it. The DEVICE-written plan the oblivious level build runs
+    (`GpuLeafBatcher.enqueue_device_plan_batch_fused` and its subtracting and
+    lean arms, reached from `histogram_gpu.enqueue_desc_level_children`) does
+    not consult it at all, so `batched_leaf_kernel = False` does not mean a fit
+    ran no batched kernel. Recorded 2026-08-17 by the GPU histogram lane rather
+    than corrected, because making the device path consult the flag would
+    change what a symmetric fit can run and is not a docstring's decision.
+
+    `gpu_leaf_batching.plan_lean_requested` selects a third accumulation kernel
+    on that same device-plan path, default off behind
+    `MOJOTREES_GPU_HIST_LEAN`, `..._PRIVATE`, `..._ROW_SPLIT` and `..._GROUP`.
+    It is the same family and is not separately flagged here."""
 
     @staticmethod
     def none() -> KernelFeatures:

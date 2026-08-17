@@ -156,6 +156,28 @@ bundle.
 bare denominator, its default is derived from the data rather than being a
 number, and setting it to 0 in CatBoost can silently train a tree on no rows.
 
+**CatBoost's GPU default is the BAYESIAN bootstrap, and their MVS still has a
+device kernel.** Both halves matter and they are easy to collapse into one
+wrong sentence. Verified in CatBoost source on 2026-08-17:
+`private/libs/options/bootstrap_options.h` declares
+`BootstrapType("type", EBootstrapType::Bayesian)`, and the MVS default in
+`private/libs/options/catboost_options.cpp::SetNotSpecifiedOptionsToDefaults`
+is gated on `TaskType == ETaskType::CPU`, under a
+`// TODO(nikitxskv): Support MVS for GPU.` comment. So a `task_type=GPU` fit
+that names nothing lands on Bayesian at `bagging_temperature = 1.0`, one kernel
+whose product folds into the derivative array with no host pass at all
+(`cuda/cuda_util/kernel/bootstrap.cu::BayesianBootstrapImpl`). But the TODO is
+about the DEFAULT, not the capability: a user who names `bootstrap_type=MVS` on
+their GPU reaches a real device draw,
+`cuda/cuda_util/kernel/mvs.cu::MvsBootstrapRadixSortImpl`, which sorts and
+prefix-scans each 8192-row block in registers to solve the same threshold this
+module solves, and then compacts the zero-weight rows out with a `Gather`
+(`cuda/gpu_data/bootstrap.h::BootstrapAndFilter`). Their greedy-subsets
+searcher asserts MVS is absent (`cuda/methods/greedy_subsets_searcher.h`), so
+on their side it is the oblivious device trainer that carries it. That kernel is
+the reference for a mojotrees device draw; see the block above
+`mvs_bootstrap_weights` for what a transcription would and would not preserve.
+
 Row sets and the GPU
 --------------------
 A sampled row set is an ascending, duplicate-free list of row indices, and
@@ -1543,6 +1565,95 @@ struct MvsAudit(Copyable, Movable):
         return MvsAudit(0, 0, 0, 0)
 
 
+# ---------------------------------------------------------------------------
+# The MVS draw on a device round: the design, and what it can and cannot claim.
+# ---------------------------------------------------------------------------
+#
+# Written 2026-08-17, NOT BUILT, and recorded here rather than in a plan file
+# because the three hard parts are all properties of the function below.
+#
+# Why it is wanted. On a GPU fit an MVS bundle routes the whole round to the
+# host-gradient arm (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`), and that arm
+# costs far more than the device derivative kernel it replaces --
+# `train_gpu.device_gradients` enumerates the per-round passes. A device draw is
+# what lets the shipped symmetric arm keep MVS and keep the device round.
+#
+# The three pieces, in order.
+#
+# 1. THE MAGNITUDES are free: `g_r = sqrt(grad_r^2 + lambda)` is one pass over a
+#    plane that is already device-resident. Do NOT write it as
+#    `sqrt(fma(g, g, lambda))`, which is what CatBoost's own kernel does; a
+#    fused multiply-add is a different number in the last bits and this project
+#    has lost two results to FMA contraction.
+#
+# 2. THE THRESHOLD is the whole difficulty, and it is a SOLVE and not a
+#    quantile. `_mvs_threshold` finds `mu` with `sum_r min(1, g_r / mu) == S`
+#    over one 8192-row block, by pivoting and walking into one side. Three
+#    device shapes exist for it, and they are not equally honest:
+#
+#    (a) SORT AND SCAN, which is CatBoost's. Sort the block's magnitudes, take
+#        an inclusive prefix sum, and find the first sorted position whose
+#        implied sample size drops to `S`; `mu` is that prefix over
+#        `S - n_large`. Mojo 1.0 has no `cub`, no warp primitives and no block
+#        radix sort, so both the sort and the scan would be hand-written for one
+#        block of 8192 in shared memory. Largest piece of work of the three.
+#    (b) FIXED-POINT ITERATION, no sort. Iterate
+#        `mu <- (sum of g below mu) / (S - count of g at or above mu)` from
+#        `mu_0 = (sum of all g) / S`. Each step is two block reductions over
+#        8192 values, the iterate is monotone, and it lands on the same
+#        `(small set, large set)` partition the pivot walk lands on, at which
+#        point the two compute the same quotient from the same two aggregates.
+#        Perhaps ten launches' worth of reductions per block instead of a sort.
+#        **The iteration count is data dependent and that is the open risk**: a
+#        kernel that must run to a fixed point has no launch budget known ahead
+#        of time, and one that stops early has silently changed the sampler.
+#    (c) HISTOGRAM AND HOST SOLVE. Accumulate per-block bin counts and bin sums
+#        of the magnitudes on the device, read back a few KB, and solve on the
+#        host. This finds the bin `mu` lies in exactly and `mu` itself only to
+#        that bin, because the exact quotient needs the sum of the elements
+#        strictly below `mu` and a bin does not carry them. Cheapest by a wide
+#        margin and the only one of the three that is not bit-exact even in
+#        principle.
+#
+# 3. THE KEEP DECISION AND THE WEIGHT are cheap and can be exact. Every row's
+#    draw here is `uniform(stream + row)` for a stream fixed by
+#    `(seed, tree_index)` alone, and `splitmix64` is four integer operations, so
+#    a device kernel can reproduce the identical uniform per row -- there is no
+#    per-thread RNG state to diverge, which is exactly the property CatBoost's
+#    device kernel does not have (it seeds per thread and advances). A cheaper
+#    staging step exists and needs no device RNG at all: the uniforms depend on
+#    nothing the round computes, so the host can draw the whole plane before the
+#    gradients exist and upload `4 * n_rows` bytes once per tree, which is the
+#    cadence and the traffic `GpuObjectiveState.refresh_weights` already pays
+#    for the Bayesian bootstrap.
+#
+# WHERE THE WEIGHT LANDS, and the one structural simplification. Do not compact.
+# A zero weight in `GpuObjectiveState.weight_dev` produces an exactly zero
+# gradient and an exactly zero hessian for that row, so a dropped row
+# contributes nothing to any histogram without being removed from the row plane
+# -- the "kernel that multiplied gradients by a per-row vector" this module's
+# header says nobody has written. Keeping every row in the plane also keeps
+# `update_raw_ranges` covering every row, so the device round needs no
+# `GpuTreeRouter` and does not inherit `ROUND_BAGGING_OUT_OF_BAG`. What it does
+# NOT reproduce is the row COUNT: `min_data_in_leaf` counts rows and not mass,
+# so an uncompacted device draw and a compacted host draw can disagree about
+# whether a leaf is legal. At the shipped symmetric `min_data_in_leaf = 1` that
+# rule binds only on an empty leaf; it is not inert in general and it is not a
+# detail to discover later.
+#
+# THE IDENTITY CLAIM, stated plainly because rule 5 turns on it. **No device
+# design here is bit-identical to the host draw, and (a) is not either.** The
+# host solves in Float64 over magnitudes built from Float64 derivatives; a
+# device round holds Float32 derivatives, so the magnitudes differ before any
+# solve runs and a different `mu` puts different rows across the threshold. Even
+# at matched precision, (a) sums the small side in ascending sorted order while
+# `_mvs_threshold` sums it in pivot-partition order, and floating-point addition
+# is not associative. So a device draw is EQUIVALENT IN DISTRIBUTION and
+# per-row-reproducible, not bit-identical: it moves bits, it takes the
+# `bench/real_data` accuracy gate under rule 3, and rule 5's same-session
+# default flip does not apply to it. The precedent is
+# `ROUND_GOSS_RANK_PRECISION`, which gates on exactly this: ranking Float32
+# scores can put a different row across a threshold.
 def mvs_bootstrap_weights(
     params: MvsBootstrapParams,
     gradients: List[Float64],
@@ -1601,6 +1712,29 @@ def mvs_bootstrap_weights(
         raise Error("mvs lambda must be nonnegative and not NaN")
     var stream = _mvs_stream(params.seed, tree_index)
 
+    # Both block buffers, allocated ONCE for the call rather than once per
+    # block, 2026-08-17. They used to be built inside the loop below --
+    # `List[Float64](capacity=block_size)` plus a `.copy()` of it -- which is
+    # two allocations of up to `8 * MVS_BLOCK_SIZE` = 64 KiB **per 8192-row
+    # block per tree**. At 800,000 rows that is 98 blocks, so 196 allocations
+    # per tree and 70,560 over a 360-tree fit, all of them the same two sizes.
+    # Hoisting them is strictly less work for the identical result and takes no
+    # measurement gate (LANE_RULES rule 1): every slot below `block_size` is
+    # written before it is read, `_mvs_threshold` is handed `begin=0, end=
+    # block_size` and its three-way partition swaps only inside `[lo, hi)`, and
+    # `magnitudes[r - block_start]` never indexes past `block_size` either. So
+    # a short final block leaves the tail slots untouched and unread, and the
+    # values, their order and the sums taken over them are the ones the
+    # per-block allocation produced.
+    #
+    # Sized to the smaller of the dataset and the block, so a 10-row fit
+    # allocates 80 bytes rather than 128 KiB.
+    var buf_len = MVS_BLOCK_SIZE if n_rows > MVS_BLOCK_SIZE else n_rows
+    var magnitudes = List[Float64]()
+    magnitudes.resize(buf_len, 0.0)
+    var candidates = List[Float64]()
+    candidates.resize(buf_len, 0.0)
+
     var block_start = 0
     while block_start < n_rows:
         var block_end = block_start + MVS_BLOCK_SIZE
@@ -1620,12 +1754,18 @@ def mvs_bootstrap_weights(
         # at the ceiling, and removes `n_rows` square roots and
         # `n_rows * n_outputs` multiply-adds per tree. Strictly less work for
         # the identical result.
-        var magnitudes = List[Float64](capacity=block_size)
+        #
+        # `+ lam` is a separate multiply and add, deliberately. CatBoost's own
+        # GPU kernel writes `sqrtf(fmaf(d, d, lambda))`
+        # (`cuda/cuda_util/kernel/mvs.cu`), which is a different number in the
+        # last bits, so a device transcription of this loop must not reach for
+        # the fused form if it wants to match this one.
         for r in range(block_start, block_end):
-            magnitudes.append(
-                sqrt(_row_magnitude_squared(gradients, r, n_outputs) + lam)
+            magnitudes[r - block_start] = sqrt(
+                _row_magnitude_squared(gradients, r, n_outputs) + lam
             )
-        var candidates = magnitudes.copy()
+        for j in range(block_size):
+            candidates[j] = magnitudes[j]
 
         var target = params.subsample * Float64(block_size)
         var mu = _mvs_threshold(candidates, 0, block_size, target)
@@ -1735,8 +1875,17 @@ def mvs_kept_rows(weights: List[Float64]) raises -> List[Int]:
     **No timing claim attaches to this.** A sampler that visits fewer rows
     looks faster for reasons that have nothing to do with whether the sampler
     is any good, and this lane measured nothing.
+
+    The capacity hint is `len(weights)` rather than the kept count, which is not
+    known until the walk finishes, 2026-08-17. Without it the list grows
+    geometrically and copies about `n_rows` Int words in total on the way up,
+    once per tree; with it there is one allocation of `8 * n_rows` bytes and no
+    copy. At `subsample = 0.8` the hint over-reserves a fifth of the buffer,
+    6.4 MB at 800,000 rows, for one tree at a time -- and the list is handed
+    straight to the grower as the bag, so it is not a copy anybody else pays
+    for. Strictly less work, identical contents (LANE_RULES rule 1).
     """
-    var rows = List[Int]()
+    var rows = List[Int](capacity=len(weights))
     for r in range(len(weights)):
         if weights[r] != 0.0:
             rows.append(r)

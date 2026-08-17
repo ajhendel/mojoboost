@@ -1531,10 +1531,25 @@ struct GpuObjectiveState(Movable):
         product is formed, and it is formed on the host, in Float64, because
         the draw is a `splitmix64` stream the device has no image of. What
         crosses to the device is the finished product, one Float32 per row,
-        once per tree. (MVS is refused by name in
+        once per tree.
+
+        **THE PARENTHETICAL THAT STOOD HERE WAS STALE AND NAMED THE WRONG
+        MECHANISM**, corrected 2026-08-17. It read "MVS is refused by name in
         `sampling.canonical_bootstrap_type` and produces no weights to carry;
-        when it does, it produces them the same way and arrives here
-        unchanged.)
+        when it does, it produces them the same way and arrives here unchanged."
+        The first clause was true before MVS landed and is not true now:
+        `canonical_bootstrap_type` accepts `"mvs"`, refusing only `Bernoulli`
+        and `Poisson`, and an MVS bundle is honored on a GPU fit today. What
+        keeps MVS out of THIS method is narrower and is a routing fact rather
+        than a refusal -- `gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES` sends an
+        MVS round to `train_gpu._train_gpu_rounds`'s host-gradient arm, where
+        `sampling.bootstrap_round` scales the host derivatives in place and no
+        weight plane is involved at all. The second clause still holds and is
+        the design a device MVS draw would take: the product would arrive here
+        unchanged, and the comment block above `sampling.mvs_bootstrap_weights`
+        is what the rest of it would cost. One difference worth stating, since
+        it is the reason `_check_weight_vector` admits zero: an MVS draw carries
+        exact ZEROS, where a Bayesian draw is positive with probability one.
 
         Where the weight lands, and where it deliberately does not
         ----------------------------------------------------------

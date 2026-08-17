@@ -34,6 +34,25 @@ at rather than resting on a line number.
 > wiring. A symmetric reading of the by-node switch recorded as "neutral" is
 > a null by construction and not a result.
 
+> **FOUR GPU PERFORMANCE SWITCHES WERE MEASURED AND THEIR DEFAULTS FLIPPED ON
+> 2026-08-17, later the same day, and this grid described none of the flips
+> until now.** `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT`,
+> `MOJOTREES_GPU_OBLIVIOUS_WIDE`, `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` and
+> `MOJOTREES_GPU_SPLIT_WIDE` are all spelled `!= "0"` at head and are therefore
+> **ON unless refused**. Every one of their four rows previously stated the
+> opposite predicate (`== "1"`), stated that unset behaves as off, and carried a
+> verdict of SHOULD BE THE DEFAULT or NEEDS MEASURING. All of that was true when
+> the grid was built in the morning and false by the evening. The rows in
+> sections 3A and 3B, the polarity note in section 2, the counts and ranks 1
+> through 4 in section 4, and interaction A in section 7 are edited in place and
+> say what they used to say. `docs/design/GROWTH_POLICY_REACH.md` records the
+> same four flips and agrees with this grid at head.
+>
+> The fifth arm of that group, `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST`, did NOT
+> flip, and the reason is that it was measured and came in indistinguishable.
+> Its predicate is still `== "1"` and its default is still off. A measured null
+> is not an unmeasured switch and its row now says which it is.
+
 ---
 
 ## 1. The population, and how it reconciles
@@ -61,6 +80,13 @@ call, in an `_env_int(name, default)` call, or as a `comptime` alias that a
 `getenv` then takes. Every one of the 85 was traced to the function that
 reads it.
 
+**The population has moved twice since, both on 2026-08-17, and the arithmetic
+above is the as-audited one.** Nine names were deleted (section 5) and one was
+added: `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`, read by
+`train_gpu.skip_terminal_children_enabled`, which has a row in section 3B
+marked as postdating the grid. Re-derive the counts from the grep rather than
+from the table above if the exact number matters.
+
 An earlier audit, `bench/results/INSTRUCTION_AUDIT.md` section 9, works from a
 different population of 68. That list is `compatibility/api_snapshot.json`'s
 `environment.observed`, which is a literal scan over a wider tree, so it
@@ -85,6 +111,15 @@ against `"1"` means the arm is **OFF** unless asked for and is how an unproven
 arm is spelled. A parsed word or integer means the switch **selects** among
 named arms and unset picks a stated one.
 
+Since 2026-08-17 the inequality also carries a second meaning that the sentence
+above did not cover, and four rows of this grid now use it. Under LANE_RULES
+rule 5 a proven arm's default flips in the session that measures it, and the
+variable then survives one round spelled `!= "0"` as an escape hatch that turns
+the new behavior OFF before it is deleted. So an inequality is no longer only "a
+default the authors did not think needed arguing"; it is also "an arm that was
+argued, measured, and shipped", and the two are told apart by the flip comment
+beside the `getenv`.
+
 **Kind.** PERFORMANCE means same answer, different speed. BEHAVIOR means the
 model or the numbers move. DIAGNOSTIC means trace, census, or profile output.
 CONFIGURATION means it picks a backend, a worker count, a role, or a geometry.
@@ -93,12 +128,20 @@ CONFIGURATION means it picks a backend, a worker count, a role, or a geometry.
 shape), and CPU or GPU. `ALL` means all three policies on that backend.
 
 **Verdict.** The five assigned values, plus one convention the assignment did
-not cover. Fourteen switches are already default ON, so "should it be the
-default" is answered by the shipped state. Those carry
+not cover. Fourteen switches were already default ON when this grid was built,
+so "should it be the default" is answered by the shipped state. Those carry
 **SHOULD BE THE DEFAULT (already is)** and are excluded from the ranked
 candidate list in section 4, because there is nothing to flip. Where such a
 switch's off arm has never been priced that is said in the Measured column,
 not laundered into the verdict.
+
+**Four more joined them later on 2026-08-17**, by being measured and flipped
+rather than by having shipped that way, so the shipped population of default-ON
+switches is eighteen and not fourteen. Those four carry
+**SHOULD BE THE DEFAULT, AND IS SINCE 2026-08-17** so that the verdict records
+the movement instead of reading as though it always said this, and they stay
+listed at ranks 1 through 4 of section 4 as closed items rather than being
+deleted from it.
 
 ---
 
@@ -111,16 +154,17 @@ in, or dispatched from, code that only `grow_tree_device_oblivious` reaches.
 
 | name | read at | default | kind | reaches | measured? | verdict |
 |---|---|---|---|---|---|---|
-| `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT` | `gpu_leaf_batching.oblivious_subtract_requested`, `return getenv("MOJOTREES_GPU_OBLIVIOUS_SUBTRACT") == "1"`. Dispatched at `histogram_gpu.enqueue_desc_level_children`, `if oblivious_subtract_requested():` | unset behaves as off | PERFORMANCE | SYM GPU only. The branch is placed in `histogram_gpu` and not inside the batcher "so that a two-item leaf-wise plan cannot reach the subtracting arm by having the environment set" | **MEASURED**, 1.78x, 21.97 s to 12.34 s at 799,110 x 100 x 100 trees, rmse identical to nine decimals (2026-08-17 lane brief). Bit-identity is an exact integer argument at `_batch_hist_atomic_subtract_kernel`. `docs/design/OBLIVIOUS_WAIT_CENSUS.md` tabulates the row-build counts, 126 to 63 at depth 6 | **SHOULD BE THE DEFAULT** |
-| `MOJOTREES_GPU_OBLIVIOUS_WIDE` | `gpu_split_search.oblivious_wide_scan_requested`, `return getenv("MOJOTREES_GPU_OBLIVIOUS_WIDE") == "1"`. Dispatched in the oblivious launch, `if oblivious_wide_scan_requested():`, which then refuses a bin count above `OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD * OBLIVIOUS_WIDE_THREADS` | unset behaves as off | PERFORMANCE | SYM GPU only | **MEASURED**, 4.5 percent, resolved, bit-identical (2026-08-17 lane brief). No results file under `bench/results/` names this variable, so the measurement is not yet filed | **SHOULD BE THE DEFAULT** |
-| `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` | `gpu_resident_round.oblivious_skip_last_build_requested`, `return getenv(OBLIVIOUS_SKIP_LAST_BUILD_VAR) == "1"`. Consumed at `var skip_last_build = oblivious_skip_last_build_requested()` above the level loop, and again in `train_gpu` to size the profile's launch count | unset behaves as off | PERFORMANCE | SYM GPU only | **MEASURED**, about 1.20x, direction solid, magnitude a lower bound because the box drifted upward during the run (2026-08-17 lane brief). `OBLIVIOUS_WAIT_CENSUS.md` still reads "Off by default because the time is unmeasured", which is now stale | **SHOULD BE THE DEFAULT** |
-| `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST` | `gpu_resident_round.oblivious_noise_hoist_requested`, `return getenv(OBLIVIOUS_NOISE_HOIST_VAR) == "1"`. Also read in `train_gpu._search_record_slots`, `if oblivious_noise_hoist_requested(): want = oblivious_leaf_budget(params) + params.max_depth` | unset behaves as off | PERFORMANCE | SYM GPU only, **and only when `random_strength > 0`**. `_copy_noise` returns immediately at zero. The CatBoost-mode default set does set it, `params.CATBOOST_RANDOM_STRENGTH` is 1.0 | **UNRESOLVED.** Measured slower on 2026-08-17 in a run confounded by drift, so neither result stands. The count behind it is read from source, six `enqueue_copy` drains per depth-6 tree, each between a level's child build and the next level's search | **NEEDS MEASURING** |
+| `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT` | `gpu_leaf_batching.oblivious_subtract_requested`, `return getenv("MOJOTREES_GPU_OBLIVIOUS_SUBTRACT") != "0"`. Dispatched at `histogram_gpu.enqueue_desc_level_children`, `if oblivious_subtract_requested():` | **unset behaves as ON since 2026-08-17.** This cell read "unset behaves as off" against a predicate spelled `== "1"`, which was the state the grid audited and is not the state at head | PERFORMANCE | SYM GPU only. The branch is placed in `histogram_gpu` and not inside the batcher "so that a two-item leaf-wise plan cannot reach the subtracting arm by having the environment set" | **MEASURED**, 1.78x, 21.97 s to 12.34 s at 799,110 x 100 x 100 trees, rmse identical to nine decimals (2026-08-17 lane brief). The flip comment at `oblivious_subtract_requested` records a second interleaved reading the same day, three round-robin cycles at the same shape, 22.76 s to 14.39 s alone and 10.36 s with the wide scan and the skipped last build, **2.20x combined**, rmse 2.439382420 in every arm of every cycle. Bit-identity is an exact integer argument at `_batch_hist_atomic_subtract_kernel`. `docs/design/OBLIVIOUS_WAIT_CENSUS.md` tabulates the row-build counts, 126 to 63 at depth 6 | **SHOULD BE THE DEFAULT, AND IS SINCE 2026-08-17.** Flipped in the session that measured it, under LANE_RULES rule 5. The variable survives one round as an escape hatch turning the subtraction OFF and is then deleted |
+| `MOJOTREES_GPU_OBLIVIOUS_WIDE` | `gpu_split_search.oblivious_wide_scan_requested`, `return getenv("MOJOTREES_GPU_OBLIVIOUS_WIDE") != "0"`. Dispatched in the oblivious launch, `if oblivious_wide_scan_requested():`, which then refuses a bin count above `OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD * OBLIVIOUS_WIDE_THREADS` | **unset behaves as ON since 2026-08-17.** This cell read "unset behaves as off" against a predicate spelled `== "1"`, which was the state the grid audited and is not the state at head | PERFORMANCE | SYM GPU only | **MEASURED**, 4.5 percent, resolved, bit-identical (2026-08-17 lane brief). The flip comment at `oblivious_wide_scan_requested` holds both readings of that day, 20.40 s narrow against 19.49 s wide with disjoint ranges on a quiet box, and 22.76 s against 21.28 s, 1.07x, in a loaded three-cycle round robin that also produced the 2.20x combined arm. rmse 2.439382420 throughout. No results file under `bench/results/` names this variable, so the measurement is still filed only in source and in the brief | **SHOULD BE THE DEFAULT, AND IS SINCE 2026-08-17.** Flipped in the session that measured it, under LANE_RULES rule 5, and the variable now restores the narrow `block_dim=1` scan |
+| `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` | `gpu_resident_round.oblivious_skip_last_build_requested`, `return getenv(OBLIVIOUS_SKIP_LAST_BUILD_VAR) != "0"`. Consumed at `var skip_last_build = oblivious_skip_last_build_requested()` above the level loop, and again in `train_gpu` to size the profile's launch count | **unset behaves as ON since 2026-08-17.** This cell read "unset behaves as off" against a predicate spelled `== "1"`, which was the state the grid audited and is not the state at head | PERFORMANCE | SYM GPU only | **MEASURED**, **1.26x** alone, 22.76 s to 18.06 s at 799,110 x 100 x 100 trees over three interleaved round-robin cycles, and part of the 2.08x-to-2.20x combined arm; rmse 2.439382420 unchanged in every cycle (flip comment at `oblivious_skip_last_build_requested`, and the same figure at `oblivious_schedule_launches`'s neighbouring note). An earlier reading of "about 1.20x, a lower bound because the box drifted" is superseded by it. The launch count moves 56 to **55** at depth 6, which `oblivious_schedule_launches(6, skip_last_build=True)` returns and which is deliberately the least interesting part of the change | **SHOULD BE THE DEFAULT, AND IS SINCE 2026-08-17.** Flipped in the session that measured it, under LANE_RULES rule 5. Nothing reads the histograms it skips, so building them was a defect rather than a trade |
+| `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST` | `gpu_resident_round.oblivious_noise_hoist_requested`, `return getenv(OBLIVIOUS_NOISE_HOIST_VAR) == "1"`. Also read in `train_gpu._search_record_slots`, `if oblivious_noise_hoist_requested(): want = oblivious_leaf_budget(params) + params.max_depth` | unset behaves as off | PERFORMANCE | SYM GPU only, **and only when `random_strength > 0`**. `_copy_noise` returns immediately at zero. The CatBoost-mode default set does set it, `params.CATBOOST_RANDOM_STRENGTH` is 1.0 | **MEASURED, AND THE RESULT IS A NULL.** It was run on 2026-08-17 and came in **indistinguishable** in the registered M0 sense (`PROFILE_PROTOCOL.md` M0), which is why it is the one arm of the four that did not flip (2026-08-17 lane brief). This cell previously read "UNRESOLVED, measured slower in a run confounded by drift, so neither result stands"; the standing reading is a measured null rather than a withdrawn one. The count behind it is still read from source, six `enqueue_copy` drains per depth-6 tree, each between a level's child build and the next level's search. Not yet filed under `bench/results/`, and the docstring at `gpu_resident_round.OBLIVIOUS_NOISE_HOIST_VAR` still says the time is unmeasured, which is stale | **CORRECTLY OFF on a measured null**, not on an absent measurement. Re-measuring is optional rather than owed, and only on a fit that sets `random_strength > 0` |
 
 ### 3B. GPU split search, shared and leaf-wise
 
 | name | read at | default | kind | reaches | measured? | verdict |
 |---|---|---|---|---|---|---|
-| `MOJOTREES_GPU_SPLIT_WIDE` | `gpu_split_search.wide_scan_requested`, `return getenv("MOJOTREES_GPU_SPLIT_WIDE") == "1"`, reached through `wide_scan_for(has_categorical)`, which ANDs it with "no categorical feature", and stored once at construction as `self.wide_scan = wide_scan_for(any_cat)` | unset behaves as off | PERFORMANCE | LEAF GPU (device split search). Not SYM, which runs the separate oblivious kernel. Not DEPTH in practice, because the device-resident plane refuses non-leaf-wise growth (section 6) | **ASSERTED.** The docstring says so and names the sibling result, "the shipped leaf-wise default is now the only scan in this file still running one lane per (leaf, feature) while its own sibling has a measured win" | **NEEDS MEASURING** |
+| `MOJOTREES_GPU_SPLIT_WIDE` | `gpu_split_search.wide_scan_requested`, `return getenv("MOJOTREES_GPU_SPLIT_WIDE") != "0"`, reached through `wide_scan_for(has_categorical)`, which ANDs it with "no categorical feature", and stored once at construction as `self.wide_scan = wide_scan_for(any_cat)` | **unset behaves as ON since 2026-08-17.** This cell read "unset behaves as off" against a predicate spelled `== "1"`, which was the state the grid audited and is not the state at head | PERFORMANCE | **LEAF and DEPTH GPU (device split search), corrected 2026-08-17.** This cell read "Not DEPTH in practice, because the device-resident plane refuses non-leaf-wise growth", and that inference does not hold: the refusal is about the device-owned growth plane, not about the searcher. `self.wide_scan` is set once at the single `GpuSplitSearcher` construction in `train_gpu` and both entry points pass it to `_launch` (`enqueue` for one record, `enqueue_frontier` for a batch), so a depth-wise fit scans wide too. This is what `docs/design/GROWTH_POLICY_REACH.md` already recorded, and section 8 item 1 asked for exactly this trace. Not SYM, which runs the separate oblivious kernel | **MEASURED**, and this cell used to read ASSERTED and NEEDS MEASURING. The interleaved pair the docstring asked for was run the same day, three round-robin cycles at 799,110 x 100 continuous features, leaf-wise at the shared defaults, 100 trees, M4: narrow 3.922 / 3.874 / 3.932 s against wide 3.220 / 3.196 / 3.231 s, disjoint ranges so M0 **resolved**, rmse 6.116601511 in all six runs. **1.21x**, four times what the oblivious arm got, on a plane where the scan is a larger share because it scans two children rather than a whole level. `wide_scan_for` ANDs the request with "no categorical", so a categorical dataset measures the narrow kernel on both arms and reports a null | **SHOULD BE THE DEFAULT, AND IS SINCE 2026-08-17.** Flipped in the session that measured it, under LANE_RULES rule 5, and the variable now restores the narrow kernel |
+| `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN` **(ADDED TO THE TREE AFTER THIS GRID WAS BUILT, 2026-08-17)** | `train_gpu.skip_terminal_children_enabled`, `return getenv(SKIP_TERMINAL_CHILDREN_VAR) == "1"`, over `comptime SKIP_TERMINAL_CHILDREN_VAR`, read once per tree | unset behaves as off, and the docstring gives the reason as "nothing has measured it" | PERFORMANCE | **LEAF and DEPTH GPU, in `_device_search_resident` only**, so leaf-wise reaches it only when the fit falls back off the device-owned plane. Not SYM: `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` is its level-shaped twin and is the shipped default | **ASSERTED**, with a counted case and no run. `docs/design/GROWTH_POLICY_REACH.md` records the arithmetic, roughly a 14 percent cut in histogram row traffic plus one round trip under depth-wise growth at 31 leaves with a binding depth, and the three legs of the bit-identity argument are written at `SKIP_TERMINAL_CHILDREN_VAR` | **NEEDS MEASURING.** Its symmetric twin was measured at 1.26x and this one removes strictly more work, since it drops the search as well as the build |
 | `MOJOTREES_GPU_SPLIT_PRIMITIVES` | `gpu_split_search.split_primitives_requested`, `return getenv("MOJOTREES_GPU_SPLIT_PRIMITIVES") != "0"`, stored as `self.use_primitives` | unset behaves as **ON** | PERFORMANCE | LEAF and SYM GPU, one searcher serves both | **ASSERTED** for speed. Bit-equality is asserted field for field by `tests/test_gpu_split_scan.mojo` | SHOULD BE THE DEFAULT (already is) |
 | `MOJOTREES_GPU_SPLIT_TABLE_PACK` | `gpu_split_search.table_upload_hoisting_requested`, `return getenv("MOJOTREES_GPU_SPLIT_TABLE_PACK") != "0"`, stored as `self.hoist_tables` | unset behaves as **ON** | PERFORMANCE | LEAF and SYM GPU | **ASSERTED.** "the packed arm writes the device exactly the bytes the four-copy arm writes ... and differs only in how many times the host blocks" | SHOULD BE THE DEFAULT (already is) |
 | `MOJOTREES_GPU_NOISE_STAGE_PARALLEL` | `gpu_split_search.noise_stage_parallel_requested`, `return getenv("MOJOTREES_GPU_NOISE_STAGE_PARALLEL") != "0"`, consumed as `if not noise_stage_parallel_requested():` inside `stage_random_score_level` | unset behaves as **ON**. This is the switch a grid that assumed off would get wrong | PERFORMANCE | LEAF and SYM GPU, only where a noise plane is staged, so only at `random_strength > 0`. Under the CatBoost-mode default that is every symmetric fit | **ASSERTED** in seconds, argued in work. The docstring counts 15.3M serial draws with a `log` and a `sqrt` each at the shipped symmetric default, moved across workers. Exactness is argued from `host_random_score_noise` being a pure function of six arguments | SHOULD BE THE DEFAULT (already is) |
@@ -278,17 +322,34 @@ highest expected value first, with the single measurement that would settle
 it. The fourteen "already is" rows are excluded, because there is nothing to
 flip.
 
+**Ranks 1 through 4 are CLOSED as of 2026-08-17.** All four were measured that
+day and their defaults flipped in the same session under LANE_RULES rule 5, so
+the "one measurement that settles it" column on those four rows records a
+measurement that has been taken rather than one that is owed. They are kept in
+the list, annotated, because the ranking is the record of how they were judged
+and a silently shortened list would not show that the top of it resolved. Rank 5
+is closed too, on a null rather than on a win.
+
 Counts over the 85. By kind, CONFIGURATION 43, PERFORMANCE 25, DIAGNOSTIC 12,
-BEHAVIOR 5. By verdict, CORRECTLY OFF 33, NEEDS MEASURING 14, SHOULD BE THE
-DEFAULT (already is) 14, DIAGNOSTIC 13, DEAD 8, SHOULD BE THE DEFAULT 3.
+BEHAVIOR 5. By verdict, as the grid was built: CORRECTLY OFF 33, NEEDS
+MEASURING 14, SHOULD BE THE DEFAULT (already is) 14, DIAGNOSTIC 13, DEAD 8,
+SHOULD BE THE DEFAULT 3.
+
+**The verdict counts moved later on 2026-08-17 and the line above is the
+as-audited tally, kept for that reason.** All three SHOULD BE THE DEFAULT rows
+flipped (`OBLIVIOUS_SUBTRACT`, `OBLIVIOUS_WIDE`, `OBLIVIOUS_SKIP_LAST_BUILD`),
+and one NEEDS MEASURING row was measured and flipped with them
+(`SPLIT_WIDE`), so default-ON is 18 rather than 14, SHOULD BE THE DEFAULT is 0,
+and NEEDS MEASURING is 12 once `OBLIVIOUS_NOISE_HOIST` is also removed from it
+on a measured null. The by-kind counts are unaffected; nothing changed kind.
 
 | rank | switch | why here | the one measurement that settles it |
 |---|---|---|---|
-| 1 | `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT` | 1.78x measured on the shipped symmetric default, bit-identical by an exact integer argument. Largest single number on the board | None to settle the win. What is left is a **regression gate**, an interleaved on/off pair at a second shape, ideally 250k x 50, confirming direction and rmse identity before the default flips |
-| 2 | `MOJOTREES_GPU_OBLIVIOUS_WIDE` | 4.5 percent, resolved, bit-identical, on the same plane. It composes with rank 1 on a different axis, scan width against accumulation width | An interleaved pair with **`SUBTRACT=1` already on**, to confirm the 4.5 percent survives the halved accumulation. Rank 1 changes what fraction of the level is scan |
-| 3 | `MOJOTREES_GPU_SPLIT_WIDE` | The same widening of the same `block_dim=1` scan on the leaf-wise plane, still off, while its oblivious sibling measured 4.5 percent. The shipped leaf-wise search runs two hundred single-lane threadgroups | One interleaved `bench-train-gpu` pair, wide against narrow, on a **non-categorical** dataset, at 1M x 100 leaf-wise. `wide_scan_for` ANDs the request with "no categorical", so a categorical arm silently measures the narrow kernel twice |
-| 4 | `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` | About 1.20x, direction solid, magnitude a lower bound. Independent axis from rank 1, so the two compose to 31 row builds per depth-6 tree against 126 | A **repeat** of the interleaved pair on a settled box, with `SUBTRACT=1` on, to recover the magnitude the drift ate. Direction does not need re-establishing |
-| 5 | `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST` | Six full-queue drains per depth-6 tree, each sitting in the worst position a drain can occupy, and the CatBoost-mode default set puts them there. One run said slower and was confounded | An interleaved pair on a fit that **actually sets `random_strength > 0`** and no categorical column, so `_copy_noise` is live. A fit at `random_strength = 0` measures nothing, which is how this became invisible in the first place |
+| 1 | `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT` **CLOSED, DEFAULT ON 2026-08-17** | 1.78x measured on the shipped symmetric default, bit-identical by an exact integer argument. Largest single number on the board | Settled. The interleaved on/off pair was run, three round-robin cycles, and the combined arm with ranks 2 and 4 came in at 2.20x with rmse identical to nine decimals in every cycle. What is left is a **regression gate** at a second shape, ideally 250k x 50. This cell used to end "before the default flips"; it has flipped |
+| 2 | `MOJOTREES_GPU_OBLIVIOUS_WIDE` **CLOSED, DEFAULT ON 2026-08-17** | 4.5 percent, resolved, bit-identical, on the same plane. It composes with rank 1 on a different axis, scan width against accumulation width | Settled. The pair was run with the subtracting arm on as well, 22.76 s to 21.28 s in the loaded round robin and 20.40 s to 19.49 s with disjoint ranges on the quiet box, so the win survives the halved accumulation. The smallness is the finding: the scan was never this plane's bottleneck |
+| 3 | `MOJOTREES_GPU_SPLIT_WIDE` **CLOSED, DEFAULT ON 2026-08-17** | The same widening of the same `block_dim=1` scan on the leaf-wise plane. This cell read "still off, while its oblivious sibling measured 4.5 percent"; it was measured that evening and is on | Settled by exactly the run this cell asked for. Interleaved, non-categorical, 799,110 x 100 leaf-wise, three cycles: 3.922 / 3.874 / 3.932 s narrow against 3.220 / 3.196 / 3.231 s wide, disjoint, rmse 6.116601511 throughout. 1.21x, four times the oblivious arm rather than the small win the docstring predicted |
+| 4 | `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` **CLOSED, DEFAULT ON 2026-08-17** | This cell read "about 1.20x, magnitude a lower bound". The repeat was taken and the figure is **1.26x**, 22.76 s to 18.06 s. Independent axis from rank 1, so the two compose to 31 row builds per depth-6 tree against 126 | Settled. The launch side moves 56 to 55 at depth 6 and is the least interesting part of it; the accumulation pass and the largest zeroing pass in the tree are what the 1.26x is |
+| 5 | `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST` **CLOSED ON A NULL, STILL OFF** | Six full-queue drains per depth-6 tree, each sitting in the worst position a drain can occupy, and the CatBoost-mode default set puts them there. This cell read "one run said slower and was confounded"; the standing reading is that it was measured and came in **indistinguishable** | Taken, on a fit that does set `random_strength > 0`. An M0-indistinguishable result is a null and not a pending item, so this is the one arm of the five that did not flip and did not need to. Re-measuring is optional. A fit at `random_strength = 0` still measures nothing, which is how this became invisible in the first place |
 | 6 | `MOJOTREES_GPU_SPECULATION` | 66.8 percent census hit rate at 1M rows against 964 wasted builds per fit. The condition to judge it is already registered in `session3_2026-08-16/RESULTS.md`, "the launch-shape gain has to beat the wasted work in a whole fit, not in a phase" | Two interleaved end-to-end pairs, at **50,000 and at 1,000,000 rows**, leaf-wise, as the registered protocol demands. Do not run it against a symmetric fit; it refuses the plane |
 | 7 | `MOJOTREES_GPU_HIST_SPECIALIZATION=batched` | Preregistered in `PHASE2_PREREGISTRATION.md`, never reported. It is the only rung of that ladder the histogram file points at | One interleaved pair, `baseline` against `batched`, at the shape the preregistration names |
 | 8 | `MOJOTREES_GPU_STAGING_SLOTS` | Default 2, unmeasured, and it is the host-gradient upload ring, which is on the critical path of every host-gradient arm | A sweep of 1, 2, 4 in one process on a host-gradient fit |
@@ -392,12 +453,19 @@ These are the column-5 findings that a name alone would not surface.
    `derivative_precision` is float32, so the default path does not execute
    the `getenv` at all.
 
-5. **Four symmetric-GPU switches have no leaf-wise twin and one leaf-wise
-   switch has no symmetric twin.** `OBLIVIOUS_SUBTRACT`, `OBLIVIOUS_WIDE`,
-   `OBLIVIOUS_SKIP_LAST_BUILD` and `OBLIVIOUS_NOISE_HOIST` are SYM only;
-   `SPLIT_WIDE` is LEAF only. `OBLIVIOUS_SUBTRACT`'s placement in
+5. **Four symmetric-GPU switches have no leaf-wise twin.**
+   `OBLIVIOUS_SUBTRACT`, `OBLIVIOUS_WIDE`, `OBLIVIOUS_SKIP_LAST_BUILD` and
+   `OBLIVIOUS_NOISE_HOIST` are SYM only. `OBLIVIOUS_SUBTRACT`'s placement in
    `histogram_gpu` rather than in the batcher is deliberate, so that a
    two-item leaf-wise plan cannot reach the subtracting arm.
+
+   **Corrected 2026-08-17 on two counts.** This item also said "one leaf-wise
+   switch has no symmetric twin, `SPLIT_WIDE` is LEAF only". `SPLIT_WIDE`
+   reaches DEPTH as well, through the shared searcher field (section 8 item 1),
+   and it does have a symmetric twin, which is `OBLIVIOUS_WIDE` in the same
+   file. And `OBLIVIOUS_SKIP_LAST_BUILD` now has a general twin,
+   `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`, built the same day for
+   `_device_search_resident`.
 
 6. **`MOJOTREES_OBLIVIOUS_TRACE` is the CPU symmetric grower's trace and
    nothing else.** The GPU symmetric plane traces through
@@ -437,12 +505,20 @@ footnote. Row builds per tree at depth 6:
     on        on          2^(d-1) - 1        31
 
 `SKIP_LAST` truncates whichever series is running one level early; `SUBTRACT`
-halves the width of every level that runs. **They compose exactly and have
-never been measured on together.** `OBLIVIOUS_WIDE` acts on a third axis, the
-scan's threads per (leaf, feature), and `NOISE_HOIST` on a fourth, the number
-of drains per tree. None of the four adds a launch, so
+halves the width of every level that runs. **They compose exactly, and as of
+2026-08-17 they have been measured on together**, which is the correction this
+paragraph needed: it read "have never been measured on together", and the
+combined arm of `SUBTRACT`, `SKIP_LAST` and `OBLIVIOUS_WIDE` came in at 22.76 s
+to 10.36 s, 2.20x, with rmse 2.439382420 in every arm of every cycle. Three of
+the four are the shipped default now, so the bottom row of that table, 31 row
+builds at depth 6, is what a symmetric fit does today. `OBLIVIOUS_WIDE` acts on
+a third axis, the scan's threads per (leaf, feature), and `NOISE_HOIST` on a
+fourth, the number of drains per tree. None of the four adds a launch, so
 `oblivious_launch_census(6)` is 62 in all sixteen combinations except that
-`SKIP_LAST` removes the last level's build.
+`SKIP_LAST` removes the last level's build. On the schedule the code actually
+enqueues, `oblivious_schedule_launches(6)` is 56 with everything off and **55
+under the shipped default**, since `SKIP_LAST` drops the last level's two batch
+launches and pays one back for the partition's own copy-back.
 
 **B. `MOJOTREES_GPU_SPECULATION` plus `grow_policy=oblivious` is a refusal,
 not a combination.** `_oblivious_route_reason` contains
@@ -538,13 +614,15 @@ the per-level path rather than indexing past its tables".
 
 Stated plainly, with what would have to be read to close each.
 
-1. **`MOJOTREES_GPU_SPLIT_WIDE` on the depth-wise plane.** Marked LEAF, and
-   the reasoning is that depth-wise cannot take the resident plane. What was
-   not traced is whether `_device_search_incremental` constructs the same
-   `GpuSplitSearcher` and therefore also honors `self.wide_scan`. Reading
-   `train_gpu._device_search_incremental` end to end would settle it. If it
-   does, the row becomes LEAF and DEPTH and rank 3's measurement should be
-   taken leaf-wise anyway, since that is the default policy.
+1. **`MOJOTREES_GPU_SPLIT_WIDE` on the depth-wise plane. CLOSED 2026-08-17:
+   it reaches.** This item marked the row LEAF on the reasoning that depth-wise
+   cannot take the resident plane, and asked whether the same
+   `GpuSplitSearcher` is constructed and therefore honors `self.wide_scan`. It
+   is. There is exactly one `GpuSplitSearcher(` construction in the tree, in
+   `train_gpu`, `self.wide_scan = wide_scan_for(any_cat)` is set there once, and
+   both search entry points pass it down to `_launch`, `enqueue` for a single
+   record and `enqueue_frontier` for a batch. The row is now LEAF and DEPTH.
+   Rank 3's measurement was taken leaf-wise, which is the default policy.
 
 2. **Whether any of the four symmetric arms was filed to `bench/results/`.** A
    grep for `MOJOTREES_GPU_OBLIVIOUS_WIDE` and
@@ -572,15 +650,17 @@ Stated plainly, with what would have to be read to close each.
    open, so the answer is almost certainly yes; it was inferred from the
    constructor's placement rather than traced to a leaf-wise call site.
 
-6. **A conflict in `train_gpu.mojo` that this lane could not resolve and did
-   not try to.** Two comments in `_grow_tree_gpu_device_search` say the
+6. **A conflict in `train_gpu.mojo`, RESOLVED 2026-08-17 in this grid's
+   favor.** As audited, two comments in `_grow_tree_gpu_device_search` said the
    `random_strength` line is "NOT REACHED BY ANY FIT TODAY" because
-   `_check_device_search_supported` refuses `params.extra.is_active()`.
-   `_device_search_unsupported_reason`, in the same file, says the opposite,
-   that the `random_strength` blanket refusal is retired and is now
-   conditional on there being no categorical column, and
-   `OBLIVIOUS_WAIT_CENSUS.md` builds its whole six-drain finding on the
-   refusal having been retired. The reason-function is the one the check
-   actually calls, so this grid follows it and marks `NOISE_HOIST` reachable.
-   The two stale comments should be corrected by whoever owns that file. If
-   they turn out to be right, rank 5 is unreachable and drops off the list.
+   `_check_device_search_supported` refuses `params.extra.is_active()`, while
+   `_device_search_unsupported_reason` in the same file said the opposite and
+   `OBLIVIOUS_WAIT_CENSUS.md` built its whole six-drain finding on the blanket
+   refusal having been retired. The grid followed the reason-function, because
+   that is the one the check calls, and marked `NOISE_HOIST` reachable. **That
+   was right.** At head there is one comment at that site and it begins
+   "REACHED. The 'NOT REACHED BY ANY FIT TODAY' note that stood here was WRONG",
+   with the call graph traced link by link;
+   `docs/design/GROWTH_POLICY_REACH.md` carries the same trace. So rank 5 is
+   reachable, it was measured, and it came in indistinguishable. Nothing here
+   is owed to another lane any longer.

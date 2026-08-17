@@ -263,7 +263,10 @@ rate is stated rather than felt.** One rule for every growth policy, because a
 switch that is good for one is good for all unless someone can say why not.
 
 - A change is ADOPTED if it costs at most about **1 percent of accuracy on the
-  primary metric** and buys at least about **1.5x speed**.
+  primary metric** and buys at least about **2x speed**. The multiple was 1.5x
+  for a few hours on 2026-08-17 and Andrew raised it to 2x the same day. Take
+  the higher number; a 1.5x that costs a real percent of accuracy is not a
+  trade worth making on a library whose pitch is both.
 - Accuracy is read on the **excess-error lens wherever a floor exists**, not on
   raw RMSE. On a target with a 0.30 noise floor a mechanism that halves the
   model's own error moves RMSE by under 1 percent, so a raw-RMSE budget of 1
@@ -290,9 +293,12 @@ decided on their behalf and did not say so.
 
 So internal choices are held to a different and stricter standard:
 
-- **An internal choice must be accuracy-NEUTRAL.** Exact, or within
-  `device_agreement` tolerance and verified against the recorded anchor. That is
-  the bar, and 1 percent is not an allowance against it.
+- **There is NO exchange rate for an internal choice. None, at any speed.** It
+  must be exact or accuracy-neutral, meaning within `device_agreement` tolerance
+  and clean against the recorded anchor. A MEASURABLE accuracy cost in a place a
+  user cannot reach is a **defect regardless of what it buys**, so "it is only
+  0.3 percent and it doubles throughput" is not an argument here, it is a
+  description of a defect with a benchmark attached.
 - **If an internal choice WOULD trade accuracy for speed, it has to be EXPOSED
   as a knob first.** Only once a user can see it and reverse it does the
   exchange rate above decide which side of it is the default. Exposure is the

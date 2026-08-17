@@ -228,11 +228,18 @@ mojotrees is **GPU-first**. On Apple silicon the GPU owns the data plane
 the device); the CPU owns the control plane, one core, roughly two host waits
 per tree.
 
-In the recorded comparison (Apple M4, 100 trees, 799,110 x 100 synthetic
-regression, five interleaved repeats, **on battery**, **canary uncalibrated**)
-the GPU backend trained in **3.62 s** against LightGBM's **4.75 s**, faster and
-more accurate with ranges disjoint, and against CatBoost's **3.76 s**, which is
-indistinguishable rather than a win. Because the tree lives on the GPU,
+In the recorded comparison of **2026-08-16** (Apple M4, 100 trees, **799,110 x
+100** synthetic regression, five interleaved repeats, **on battery**, **canary
+uncalibrated**) the GPU backend trained in **3.62 s** against LightGBM's
+**4.75 s**, faster and more accurate with ranges disjoint, and against
+CatBoost's **3.76 s**, which is indistinguishable rather than a win. The date
+and the shape both belong beside those three numbers, because this repository
+quotes several other shapes and its measurements drift two- to threefold between
+time windows, so a figure without both is not comparable to anything. These
+three are block A of
+[bench/results/COMPARISON_RUN_2026-08-16.md](bench/results/COMPARISON_RUN_2026-08-16.md),
+where they read 3.619 [3.580, 3.701], 4.749 [4.508, 5.698] and 3.755 [3.139,
+4.428]. Because the tree lives on the GPU,
 training leaves the other CPU cores free; LightGBM and CatBoost use all of
 them.
 
@@ -1003,14 +1010,18 @@ tests that must force one path, matching the `MOJOTREES_` contract in
 | `MOJOTREES_GPU_HIST_STRATEGY` | `atomic` or `tiled` forces that strategy; `auto` or unset lets the policy decide |
 | `MOJOTREES_GPU_ROW_TILE` | rows per tile, still clamped to the memory budget |
 | `MOJOTREES_GPU_BLOCK_THREADS` | threads per threadgroup, still clamped to the device maximum and rounded to a warp |
-| `MOJOTREES_GPU_SPLIT_WIDE` | `1` scans each feature's bins on a threadgroup rather than on one thread; unset keeps the one-thread scan. Ignored for a dataset with any categorical feature, whose search the wide kernel does not implement |
+| `MOJOTREES_GPU_SPLIT_WIDE` | **`0` restores the one-thread scan; unset scans each feature's bins on a whole threadgroup, which is the default since 2026-08-17.** This row said the opposite until then, that `1` selects the wide scan and unset keeps the one-thread one. Ignored for a dataset with any categorical feature, whose search the wide kernel does not implement, so a categorical fit takes the one-thread scan either way |
 
 These are tuning and test knobs rather than model parameters: they change
 how a histogram is computed, never what it equals, so they are deliberately
 absent from the Python API and from the serialization format. The same is
 true of the wide scan: it returns the one-thread scan's records bit for bit,
-which `tests/test_gpu_split_search.mojo` asserts, and it is off by default
-only because no benchmark has priced it.
+which `tests/test_gpu_split_search.mojo` asserts. **It is ON by default since
+2026-08-17.** This sentence used to end "and it is off by default only because
+no benchmark has priced it"; a benchmark priced it that day at 1.21x on
+799,110 x 100 continuous features, leaf-wise, with the two arms' ranges disjoint
+and rmse identical, so the reason for the default being off went away and the
+default went with it.
 
 `pixi run bench-hist-scaling` reports the two strategies side by side with
 kernel time separated from conversion, upload, download, and setup time. Every

@@ -26,8 +26,19 @@ This file exists because three counts were in circulation and they disagreed:
 launches per tree that nothing in the source produces). The third is the
 node-histogram count, `(1 << (max_depth + 1)) - 2`, charged at
 `train_gpu.mojo:2058` and correct as a count of histograms; it is not a launch
-count and never was. **56 is the launch count and it is confirmed below,
-launch by launch.**
+count and never was. **56 is the launch count with every switch off and it is
+confirmed below, launch by launch.**
+
+**Since 2026-08-17 the shipped default is 55, not 56**, and both numbers are
+live rather than one superseding the other.
+`MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` became the default that day, and
+`oblivious_schedule_launches(6, skip_last_build=True)` returns **55** where
+`oblivious_schedule_launches(6)` returns 56. So: **56 is the all-off count, 55
+is the count a symmetric depth-6 fit enqueues today.** The single launch is the
+last level's two batch launches dropped and one paid back, because that
+level's partition can no longer defer its copy-back into a batch that does not
+run. Every table below is counted at all-off, which is why they still sum to
+56, and the shipped-default deltas are stated where they arise.
 
 ## What a command buffer is counted as
 
@@ -99,6 +110,14 @@ Note 5. `GpuLeafBatcher.enqueue_device_plan_batch_fused`
 two launches whatever the level's width, and the zeroing pass carries the
 partition's deferred copy-back.
 
+**Note 5b, added 2026-08-17. The sixth level does not do this under the shipped
+default.** `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` is on unless refused, so at
+`max_depth = 6` the last level enqueues no batch at all: these two launches
+become zero and note 4's partition becomes 3 rather than 2, because with no
+following batch to discharge the debt the partition runs unfused and issues
+`_copy_back_kernel` itself. Net one launch fewer per tree, 56 to 55. The rest of
+this table is unaffected, and so is every level but the last.
+
 ## Per tree, after the last level
 
 | what | site | launches | copies | syncs |
@@ -115,12 +134,21 @@ that proved it, a pinned copy read without one returning 64 of 64 stale words.
 ## The totals
 
     launches   7 + 6 * 6 + 1 + 2 * 6 = 56    matches oblivious_schedule_launches(6, 64)
+                                             ALL SWITCHES OFF
+               7 + 6 * 6 + 1 + 2 * 5 + 1 = 55
+                                             SHIPPED DEFAULT since 2026-08-17,
+                                             matches oblivious_schedule_launches(
+                                                 6, skip_last_build=True)
     copies     4 with random_strength = 0
               10 with random_strength > 0
     syncs      1, plus 1 more when the round bags
 
-The launch count is confirmed. The intended one host synchronization per tree
-is confirmed as the only `synchronize()` on the shipped default arm.
+Both launch counts are confirmed against the schedule function. **56 is the
+all-off count and 55 is the shipped one**, the difference being the last
+level's batched child build, which is two launches, minus the one launch its
+partition then has to spend on its own copy-back. The intended one host
+synchronization per tree is confirmed as the only `synchronize()` on the shipped
+default arm, and no switch of the four adds or removes a `synchronize()`.
 
 ## The finding: six drains per tree that are not in anyone's count
 
@@ -181,10 +209,27 @@ holding nothing; these drain a queue holding a whole level.
 
 `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST=1` collapses the six to one, above the
 loop, by giving each level its own search record so that every plane can be
-resident at once. Off by default because the time is unmeasured. The
-bit-identity argument is at `gpu_resident_round.OBLIVIOUS_NOISE_HOIST_VAR`.
+resident at once. The bit-identity argument is at
+`gpu_resident_round.OBLIVIOUS_NOISE_HOIST_VAR`.
 
-## The second finding: one sixth of the histogram work is discarded
+**Off by default, and as of 2026-08-17 that is a MEASURED NULL rather than an
+absent measurement.** This paragraph read "Off by default because the time is
+unmeasured", and the docstring at `OBLIVIOUS_NOISE_HOIST_VAR` still says the
+same thing, which is stale in that file too. The arm was run that day, on a fit
+that does set `random_strength > 0`, and it came in **indistinguishable** in the
+registered M0 sense (`bench/results/PROFILE_PROTOCOL.md` M0), which is why it is
+the one of the four symmetric arms whose default did not flip while the other
+three did. It is not filed under `bench/results/`, so the citation is the
+2026-08-17 lane brief.
+
+That null does not withdraw the count, and the distinction matters because the
+count is what this section asserts. Six drains per tree, each sitting between a
+level's build and the next level's search, is still what the source does. What
+the null says is that collapsing them to one did not show up in wall time at the
+shape measured, which is a fact about how much of the level's tail those drains
+were actually costing and not a fact about how many there are.
+
+## The second finding: one sixth of the histogram work WAS discarded, and is not any more since 2026-08-17
 
 The last level's `enqueue_desc_level_children` builds `2^max_depth` child
 histograms that nothing reads, because a leaf at `max_depth` is never split.
@@ -206,20 +251,42 @@ about half of all the zeroing traffic and one sixth of all the accumulation,
 against a copy-back that is one pass over the row permutation. The trade the
 note declined is one extra command buffer for that.
 
-`MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD=1` takes it. The level's partition
+`MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` takes it. The level's partition
 still runs, because `_publish_level_row_ranges` and `update_raw_device` both
 read the final leaves' windows, and it runs unfused so that it pays its own
-copy-back. Off by default because the time is unmeasured. The argument that it
-cannot change a bit is at
+copy-back. The argument that it cannot change a bit is at
 `gpu_resident_round.OBLIVIOUS_SKIP_LAST_BUILD_VAR`.
+
+**ON BY DEFAULT SINCE 2026-08-17, and this paragraph said "Off by default
+because the time is unmeasured".** Both halves of that sentence are gone. The
+time was measured that day: 22.76 s to 18.06 s at 799,110 x 100 x 100 trees,
+symmetric depth 6, three interleaved round-robin cycles on an M4, **1.26x**
+alone and part of a 2.08x-to-2.20x combined arm with the sibling subtraction and
+the wide scan, with rmse 2.439382420 unchanged to nine decimals in every cycle
+of every arm. The default was then flipped in the same session under
+LANE_RULES rule 5, so the variable is now an escape hatch that restores the
+discarded build, spelled `!= "0"`, and it is scheduled for deletion after one
+round. The counted prediction in this section and the measured result agree in
+direction and roughly in size, which is the point worth keeping: the note this
+section corrected had declined the trade on a command-buffer argument that was
+true and irrelevant.
 
 ## How this composes with sibling subtraction
 
-`MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1` (`gpu_leaf_batching.mojo:456`) makes the
-level build accumulate only the smaller child of each pair and derive the
-sibling by exact Int32 subtraction. **It adds no launch**, so every count in
+`MOJOTREES_GPU_OBLIVIOUS_SUBTRACT` (`gpu_leaf_batching.oblivious_subtract_requested`)
+makes the level build accumulate only the smaller child of each pair and derive
+the sibling by exact Int32 subtraction. **It adds no launch**, so every count in
 this file is unchanged by it: the level is two launches either way and
 `oblivious_launch_census(6)` is still 62.
+
+**ON BY DEFAULT SINCE 2026-08-17.** This paragraph was written when the arm was
+opt-in and spelled the switch `=1`; at head the predicate is `!= "0"` and the
+subtraction is what a symmetric fit does unless refused. Measured that day at
+799,110 x 100 x 100 trees on an M4: 1.78x, 21.97 s to 12.34 s, with a second
+interleaved three-cycle reading of 22.76 s to 14.39 s alone and 10.36 s combined
+with the wide scan and the skipped last build, 2.20x. rmse identical to nine
+decimals in every arm of every cycle, as the exact-integer identity argument at
+`_batch_hist_atomic_subtract_kernel` requires.
 
 What it changes is how many children a row is read for, which is the axis
 `SKIP_LAST_BUILD` does not act on, so the two compose exactly. Row builds per
@@ -233,8 +300,12 @@ tree, tabulated at `train_gpu.mojo`'s `node_hists` block, which is what
     on        on          2^(d-1) - 1        31
 
 `skip_last` truncates whichever series is running one level early; `subtract`
-halves the width of every level that runs. The two have never been measured on
-together.
+halves the width of every level that runs. **Both are the shipped default since
+2026-08-17, so the bottom row, 31 row builds at depth 6, is what a symmetric fit
+does today.** This sentence read "The two have never been measured on together";
+they were measured together that day, in the same interleaved round robin, and
+the combined arm with the wide scan came in at 2.20x against the all-off
+baseline.
 
 ## Two arms that add a wait, recorded so nobody rediscovers them
 

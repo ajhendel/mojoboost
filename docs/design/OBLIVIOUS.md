@@ -33,7 +33,11 @@
 > `oblivious_open_blockers()` is empty. **B5's first kill criterion is
 > answered**: `oblivious_schedule_launches(6)` is **56** command buffers at
 > `max_items >= 64`, against the registered census's 62 and a queue that is 64
-> deep; the six-launch gap is one record-filing phase per level that a level
+> deep. (**Since 2026-08-17 the shipped default enqueues 55**, not 56:
+> `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` became the default and
+> `oblivious_schedule_launches(6, skip_last_build=True)` returns 55. Both counts
+> are under the 64-deep queue, so the kill criterion is answered either way, and
+> 56 stays quoted here as the all-off figure this paragraph was written about.) the six-launch gap is one record-filing phase per level that a level
 > does not need, and the census is deliberately left unedited. **The
 > `max_items >= 64` precondition is enforced rather than documented** -- a
 > builder holding the leaf-wise default of 32 refuses by name

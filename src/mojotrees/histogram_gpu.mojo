@@ -3091,16 +3091,38 @@ struct GpuHistogramBuilder(Movable):
         at 170 to 312 ms, and histogram construction is 86 percent of a
         symmetric fit (`bench/results`, the Aug 17 symmetric diagnosis).
 
-        `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1` selects the subtracting arm, which
-        accumulates only the smaller child of each pair and derives the sibling
-        inside the same two launches:
+        The subtracting arm accumulates only the smaller child of each pair and
+        derives the sibling inside the same two launches:
         `GpuLeafBatcher.enqueue_device_plan_batch_fused_subtracting`, whose
         kernels fold the subtraction into the accumulation and the lopsided
-        case's parent copy into the zeroing. Default off, because no benchmark
-        has priced it; the numbers above say where the loss is, not that this
-        removes it. The two arms leave the pool holding the same words, and the
-        argument is written leg by leg at
+        case's parent copy into the zeroing. The two arms leave the pool holding
+        the same words, and the argument is written leg by leg at
         `gpu_leaf_batching._batch_hist_atomic_subtract_kernel`.
+
+        **IT IS THE DEFAULT, and `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=0` is the
+        escape hatch that turns it off.** This paragraph read
+        "`MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1` selects the subtracting arm ...
+        Default off, because no benchmark has priced it; the numbers above say
+        where the loss is, not that this removes it." Both halves stopped being
+        true on 2026-08-17: the predicate at
+        `gpu_leaf_batching.oblivious_subtract_requested` is `!= "0"`, and the arm
+        was priced at 1.78x and then at 22.76 s to 14.39 s over three
+        interleaved round-robin cycles at 799,110 x 100 x 100 trees, rmse
+        identical to nine decimals. Corrected 2026-08-17 by the GPU histogram
+        lane; the measurement is recorded at that function's flip comment and in
+        `docs/design/SWITCH_GRID.md`.
+
+        **A third arm exists behind its own switches and is default off.**
+        `gpu_leaf_batching.plan_lean_requested` routes the accumulation to
+        `_plan_hist_kernel` instead of either kernel above, which is the same
+        integer accumulation with private threadgroup accumulators
+        (`MOJOTREES_GPU_HIST_PRIVATE`), a per-item row split
+        (`MOJOTREES_GPU_HIST_ROW_SPLIT`), and a feature group
+        (`MOJOTREES_GPU_HIST_GROUP`) as knobs, plus three unconditional
+        strictly-less-work removals reachable on their own with
+        `MOJOTREES_GPU_HIST_LEAN=1`. It is still two launches per level, so the
+        census does not move. Nothing it does can move a bit and the argument is
+        leg by leg at that kernel.
 
         The copy-back is carried inside the zeroing pass the batch has to launch
         anyway (`gpu_leaf_batching._batch_copy_back_zero_kernel`, or

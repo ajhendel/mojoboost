@@ -246,18 +246,20 @@ far it is not the scan kernel's shape. Packing feature slots a SIMD group
 at a time instead of one threadgroup each, and moving the categorical sort
 scratch out of threadgroup memory to lift the occupancy that allocation
 caps, were both measured on an M4 at 50000 x 100 and both came back inside
-noise of the one-thread-per-threadgroup launch this module still defaults
+noise of the one-thread-per-threadgroup launch this module defaulted
 to. Whatever the per-split overhead is, those two did not touch it.
 
-`_scan_slot_wide_kernel` is a third attempt at the same target and it is
-off by default for that reason and not for any doubt about the result: it
-splits one feature's bins across a threadgroup and returns the serial
-kernel's record bit for bit, which `tests/test_gpu_split_search.mojo`
-asserts against the serial kernel on the same histograms. It is reached
-only through `MOJOTREES_GPU_SPLIT_WIDE=1`, and the two measurements above
-are what it has to be read against: a run that cannot separate it from the
-serial scan is the expected outcome, not a surprise. The default flips when
-an interleaved benchmark resolves it and not before.
+`_scan_slot_wide_kernel` is a third attempt at the same target and it is **ON
+by default since 2026-08-17**. It splits one feature's bins across a
+threadgroup and returns the serial kernel's record bit for bit, which
+`tests/test_gpu_split_search.mojo` asserts against the serial kernel on the
+same histograms, and the interleaved pair resolved **1.21x with disjoint
+ranges**. `MOJOTREES_GPU_SPLIT_WIDE=0` restores the serial scan. Until that
+day this paragraph said the arm was off by default, reached only through
+`MOJOTREES_GPU_SPLIT_WIDE=1`, and that a run unable to separate it from the
+serial scan was the expected outcome. Read against the two measurements above,
+that expectation was wrong, and the reason is that this scan is a larger share
+of a leaf-wise split than the two earlier attempts targeted.
 """
 
 from std.gpu import block_idx, thread_idx
@@ -1858,10 +1860,13 @@ def split_primitives_requested() -> Bool:
     """`MOJOTREES_GPU_SPLIT_PRIMITIVES=0`, the switch back to the
     hand-rolled reductions.
 
-    On unless refused, which is the opposite posture from
-    `MOJOTREES_GPU_SPLIT_WIDE` and for a reason: the wide scan changes which
-    kernel shape does the scanning, while the collectives change only how a
-    reduction is spelled. Both arms return the same record by construction
+    On unless refused, which since 2026-08-17 is the same posture
+    `MOJOTREES_GPU_SPLIT_WIDE` takes. Until that day this paragraph called the
+    two postures opposite, and the reason it gave still holds even though the
+    conclusion no longer does. The wide scan changes which kernel shape does
+    the scanning and so had to be measured before it could default on, while
+    the collectives change only how a reduction is spelled. Both arms return
+    the same record by construction
     (integer sums and float maxima are both associative), and
     `tests/test_gpu_split_scan.mojo` asserts field for field that they do,
     so what the switch preserves is a measurement handle and an escape
@@ -2524,39 +2529,40 @@ comptime WIDE_SCAN_SHARED_BYTES = 12 * WIDE_SCAN_THREADS * 4
 
 
 def wide_scan_requested() -> Bool:
-    """`MOJOTREES_GPU_SPLIT_WIDE=1`, the switch for the wide scan.
+    """`MOJOTREES_GPU_SPLIT_WIDE=0`, the escape hatch back to the narrow
+    `block_dim=1` scan.
 
-    Off unless asked for, which is this package's rule for a path no
-    benchmark has priced rather than a doubt about the result: the wide
-    kernel returns the serial kernel's records bit for bit (see
-    `_scan_slot_wide_kernel`) and `tests/test_gpu_split_search.mojo`
-    asserts that, so what is unmeasured is only whether it is faster. The
-    scan is a small share of a split's cost on the one device this
-    repository has run on -- `bench-launch-cost` prices a split's fixed
-    overhead at roughly 280us -- so the honest expectation is a small win,
-    and the default flips when a run says so and not before.
+    On unless refused, and unset has meant ON since 2026-08-17. The wide kernel
+    returns the serial kernel's records bit for bit (see
+    `_scan_slot_wide_kernel`) and `tests/test_gpu_split_search.mojo` asserts
+    that, so identity was never the open question. Only speed was, and the
+    interleaved pair that settled it is recorded in the comment on the return
+    below, at **1.21x, resolved, rmse unchanged**.
 
-    **The prior moved on 2026-08-17 and this arm is still the one that has not
-    been run.** `oblivious_wide_scan_requested` is the same widening of the
-    same `block_dim=1` scan on the oblivious plane, and it measured **4.5
-    percent, resolved and bit-identical**. So the shipped leaf-wise default is
-    now the only scan in this file still running one lane per (leaf, feature)
-    while its own sibling has a measured win. The two shapes are not the same
-    workload -- the oblivious launch scans a level at once and this one scans
-    two children -- so the number does not transfer, and this stays off until
-    an interleaved pair says so. What has changed is that "unmeasured" is no
-    longer the same thing as "unpromising".
+    The arm exists because the narrow scan runs one lane per (leaf, feature)
+    and leaves the rest of a threadgroup idle. `wide_scan_for` ANDs this
+    request with "no categorical features", so a categorical dataset runs the
+    narrow kernel on both arms and reports a null.
+
+    **What this docstring said before 2026-08-17.** It read "off unless asked
+    for, which is this package's rule for a path no benchmark has priced", and
+    it predicted a small win on the grounds that `bench-launch-cost` puts a
+    split's fixed overhead at roughly 280us, which makes the scan a small share
+    of a split's cost. The prediction was wrong by about fourfold, because this
+    plane's scan covers two children rather than a whole level and so is a
+    larger share of the work than `oblivious_wide_scan_requested`'s 4.5
+    percent suggested. The default flipped the same day the pair was run.
     """
     # MEASURED AND FLIPPED THE SAME DAY, 2026-08-17. The interleaved pair the
-    # docstring above asked for was run, three round-robin cycles, 799,110 x 100
-    # continuous features, leaf-wise at the shared defaults (31 leaves,
-    # unbounded depth, learning rate 0.1), 100 trees, M4. Narrow 3.922 / 3.874 /
-    # 3.932 seconds, wide 3.220 / 3.196 / 3.231. The ranges are DISJOINT, so it
-    # is M0 resolved rather than consistent, and rmse was 6.116601511 in all six
-    # runs. 1.21x, and the paragraph above was wrong to expect a small win: this
-    # is four times what the oblivious arm got, on a plane where the scan is a
-    # larger share of the work because it scans two children rather than a whole
-    # level.
+    # pre-flip docstring asked for was run, three round-robin cycles,
+    # 799,110 x 100 continuous features, leaf-wise at the shared defaults
+    # (31 leaves, unbounded depth, learning rate 0.1), 100 trees, M4.
+    # Narrow 3.922 / 3.874 / 3.932 seconds, wide 3.220 / 3.196 / 3.231.
+    # The ranges are DISJOINT, so it is M0 resolved rather than consistent, and
+    # rmse was 6.116601511 in all six runs. 1.21x, and the pre-flip docstring
+    # was wrong to expect a small win. This is four times what the oblivious
+    # arm got, on a plane where the scan is a larger share of the work because
+    # it scans two children rather than a whole level.
     #
     # So the default is ON and this variable is now an escape hatch restoring
     # the narrow kernel. Flipped under LANE_RULES rule 5, and per that rule it
@@ -4381,26 +4387,31 @@ comptime OBLIVIOUS_WIDE_MAX_CANDIDATES = 2 * OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD
 
 
 def oblivious_wide_scan_requested() -> Bool:
-    """`MOJOTREES_GPU_OBLIVIOUS_WIDE=1`, the switch for the wide oblivious scan.
+    """`MOJOTREES_GPU_OBLIVIOUS_WIDE=0`, the escape hatch back to the narrow
+    `block_dim=1` oblivious scan.
 
-    Off unless asked for, which is this package's rule for a path no benchmark
-    has priced, and the rule is being followed here even though the expected
-    win is large. `_scan_slot_oblivious_wide_kernel` returns the narrow
-    kernel's records bit for bit and the argument for each step is written at
-    that kernel, but "bit-identical" and "faster" are different claims and only
-    the first has been established by reading. The measured 312 ms per tree
-    against a leaf-wise 77 says where the loss is; it does not say this removes
-    it, because this kernel trades roughly 65,000 sequential arithmetic steps
-    for roughly 1,000 per thread plus `3 * n_leaves` block collectives per
-    feature slot, and the collectives are barriers. **The collective count is
-    the honest risk in this change** and is the first thing a measurement
-    should look at: at 64 leaves that is 192 `block.prefix_sum` calls per slot
-    per level. If they dominate, the fix is to tile the leaves and amortize the
-    prefix over a tile, which costs threadgroup memory the design note at
-    `OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD` deliberately avoids spending.
+    On unless refused, and unset has meant ON since 2026-08-17.
+    `_scan_slot_oblivious_wide_kernel` returns the narrow kernel's records bit
+    for bit and the argument for each step is written at that kernel, so
+    identity was settled by reading. Speed was settled by the two interleaved
+    measurements recorded in the comment on the return below, at **a resolved
+    4.5 percent** with rmse unchanged.
 
-    The default flips when a run says so and not before, which is the same
-    sentence `wide_scan_requested` carries for the leaf-wise plane.
+    The arm exists because this kernel trades roughly 65,000 sequential
+    arithmetic steps for roughly 1,000 per thread plus `3 * n_leaves` block
+    collectives per feature slot, and the collectives are barriers. **The
+    collective count was the honest risk in this change** and is what the 4.5
+    percent prices. At 64 leaves that is 192 `block.prefix_sum` calls per slot
+    per level. If they dominate on some other device, the fix is to tile the
+    leaves and amortize the prefix over a tile, which costs threadgroup memory
+    the design note at `OBLIVIOUS_WIDE_MAX_BINS_PER_THREAD` deliberately avoids
+    spending.
+
+    **What this docstring said before 2026-08-17.** It read "off unless asked
+    for, which is this package's rule for a path no benchmark has priced", and
+    it drew the distinction that "bit-identical" and "faster" are different
+    claims with only the first established. Both are now established, so the
+    default flipped.
     """
     # DEFAULT ON since 2026-08-17, so this variable now restores the narrow
     # `block_dim=1` scan rather than selecting the wide one. Measured twice that

@@ -687,10 +687,16 @@ def resident_round_enabled() -> Bool:
 
     Spelling
     --------
-    An inequality against "0", which is how `MOJOTREES_GPU_SPLIT_RESIDENT`
-    is spelled for the same polarity, so that an unset variable and a
-    variable set to something unrecognized both land on the **default**
-    rather than on whatever a permissive parser makes of them. The name
+    An inequality against "0", so that an unset variable and a variable set to
+    something unrecognized both land on the **default** rather than on whatever
+    a permissive parser makes of them. That property is the convention, and it
+    is what a reader should carry away, because there are two spellings of it
+    in this tree and until 2026-08-17 this paragraph named the wrong one.
+    `MOJOTREES_GPU_SPLIT_RESIDENT` carries the same default-on polarity but
+    spells it the other way, as `== "0"` inside the negatively named
+    `train_gpu.resident_frontier_disabled`, whose two call sites read it as
+    `if resident_frontier_disabled()` and `not resident_frontier_disabled()`,
+    so the same "unset lands on the default" property holds there too. The name
     changed with the polarity: this used to be `resident_round_requested`,
     and a predicate that means "was not opted out of" must not keep a name
     that means "was asked for".
@@ -907,10 +913,14 @@ def speculative_build_enabled() -> Bool:
     An equality against "1", which is how an *unproven* arm is spelled in
     this repository, so that an unset variable and a variable set to
     something unrecognized both land on off. The measured arms
-    (`MOJOTREES_GPU_TREE_RESIDENT`, `MOJOTREES_GPU_SPLIT_RESIDENT`) are
-    spelled as inequalities against "0" instead, and the difference between
-    the two spellings is exactly the difference between a default that has
-    been measured and one that has not.
+    (`MOJOTREES_GPU_TREE_RESIDENT`, and `MOJOTREES_GPU_SPLIT_RESIDENT` through
+    the negatively named `train_gpu.resident_frontier_disabled`) default on
+    instead, and the difference in DEFAULT is exactly the difference between a
+    default that has been measured and one that has not. Until 2026-08-17 this
+    paragraph said the difference was in the spelling and that both measured
+    arms were inequalities against "0", which
+    `train_gpu.resident_frontier_disabled` is not; it is `== "0"` on an
+    inverted name. The polarity is what carries the meaning, not the operator.
 
     Reachable at run time in one binary, in the style of
     `GpuActiveRows.set_row_unroll`, and that is a standing requirement rather
@@ -1106,6 +1116,21 @@ the next tree rather than corrupt a permutation."""
 def oblivious_skip_last_build_requested() -> Bool:
     """Whether the last level's child histograms are skipped.
 
+    **They are, unless `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD=0` refuses
+    it.** Spelled as an inequality against "0", so unset means the histograms
+    are skipped, and has since 2026-08-17. Measured that day at **1.26x alone,
+    22.76 s to 18.06 s, bit-identical**, with the run conditions in the comment
+    on the return below and the whole argument at
+    `OBLIVIOUS_SKIP_LAST_BUILD_VAR`. Until that day it was spelled as an
+    equality against "1" and defaulted off.
+
+    **The combined figure is quoted two ways in this file and neither is
+    corrected here**, because only a run settles which is meant. The comment on
+    the return calls this arm part of a **2.20x** combined arm, which is
+    22.76 s to 10.36 s; `OBLIVIOUS_SKIP_LAST_BUILD_VAR` says **2.08x** in
+    combination with the same two arms. The alone figure, 1.26x, is the one
+    both agree on and is the one to cite.
+
     Read once per tree, next to the trace and census sinks, for the reason
     stated at `resident_trace_sink`: a variable does not change inside a fit,
     and reading one inside a loop that is supposed to contain no host work at
@@ -1122,9 +1147,11 @@ def oblivious_skip_last_build_requested() -> Bool:
     # trade, and the switch was always about the strength of the proof rather
     # than about a cost worth paying. Per that rule the variable survives ONE
     # round as an off switch and is then deleted, and the way to retire it for
-    # good is stated in this function's docstring: state the invariant beside
-    # the refusals it currently rests on, then prove the two arms produce
-    # byte-identical models.
+    # good is the WHAT IT CANNOT CHANGE section of
+    # `OBLIVIOUS_SKIP_LAST_BUILD_VAR`'s docstring, not this function's. State
+    # the invariant beside the refusals it currently rests on, then prove the
+    # two arms produce byte-identical models. (Pointer corrected 2026-08-17; it
+    # named this function's docstring, which never carried that recipe.)
     return getenv(OBLIVIOUS_SKIP_LAST_BUILD_VAR) != "0"
 
 
@@ -1133,8 +1160,20 @@ comptime OBLIVIOUS_NOISE_HOIST_VAR = "MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST"
 tree instead of once per level. Anything else, including unset, keeps the
 per-level staging that ships.
 
-**Off by default and an equality against "1", because nothing has measured
-it.**
+**Off by default and an equality against "1", and as of 2026-08-17 it is off on
+a MEASURED NULL rather than on an absent measurement.** It was run that day, on
+a fit that does set `random_strength > 0`, and came in **indistinguishable** in
+the registered M0 sense (`bench/results/PROFILE_PROTOCOL.md` M0). This header
+read "because nothing has measured it" until the correction, and one
+intermediate reading called the result unresolved on the grounds that a slower
+run had been confounded by drift. The standing reading is a null, not a
+withdrawal and not a
+pending item. So this arm is the one of the four flipped-switch candidates of
+that day that did not flip and did not need to, re-measuring it is optional
+rather than owed, and the switch stays because an indistinguishable result is
+not a reason to move a default. See `docs/design/SWITCH_GRID.md` row
+`MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST`. The result is not yet filed under
+`bench/results/`.
 
 WHAT IT REMOVES
 ---------------
@@ -1167,8 +1206,12 @@ That is a different claim from the one section 6.1.1 withdrew. What 6.1.1
 took back was the reading that made each of thirteen **per-tree** copies
 worth a synchronization constant; those drained a queue that held nothing,
 and draining a queue that holds nothing costs nothing. These six drain a
-queue holding a whole level of work. The count is read from the source; the
-**time** is unmeasured, which is why this is off.
+queue holding a whole level of work. The count is read from the source, and the
+**time** was taken on 2026-08-17 and came in indistinguishable, so the count
+above is real and does not convert into a clock at this shape. Until that
+correction this paragraph ended "the time is unmeasured, which is why this is
+off", which was the reason the switch was created and is no longer the reason
+it stays off.
 
 WHAT IT CANNOT CHANGE
 ---------------------
@@ -1233,6 +1276,10 @@ pays MORE of exactly the drain this removes and has no arm to remove it with.
 
 def oblivious_noise_hoist_requested() -> Bool:
     """Whether every level's noise plane is drawn and uploaded once per tree.
+
+    **Off unless `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST=1` asks for it**, and off
+    on a measured null rather than on an absent measurement. See
+    `OBLIVIOUS_NOISE_HOIST_VAR`, whose header carries the 2026-08-17 result.
 
     Read once per tree, next to the trace and census sinks, for the reason
     stated at `resident_trace_sink`."""
@@ -3151,8 +3198,16 @@ def oblivious_schedule_launches(
     batched build is also what pays the partition's deferred copy-back and a
     schedule without it has to pay that debt in a launch of its own.
 
-    `skip_last_build = True` is that schedule and is what
-    `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` selects. The count moves by one,
+    **`skip_last_build = True` is the SHIPPED schedule since 2026-08-17**, and
+    the parameter's `False` default is the pre-flip one, kept because the
+    census pair above is stated at it. Unset now selects the skipping
+    schedule and `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD=0` restores the
+    other, where this paragraph read "is what
+    `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` selects" while the variable
+    still had to be set. A caller that wants the schedule a fit actually runs
+    passes `oblivious_skip_last_build_requested()` rather than relying on the
+    parameter default, which `train_gpu._grow_tree_gpu_device_search` does.
+    The count moves by one,
     56 to **55** at depth 6, which is deliberately the least interesting thing
     about it: the reason to take it is the accumulation pass and the zeroing
     pass the two dropped buffers were carrying, which this function does not
@@ -3373,12 +3428,14 @@ def grow_tree_device_oblivious(
     `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` is the arm that takes the other
     side: the copy-back is one `O(n_active)` pass and the batch is the largest
     zeroing pass of the tree plus a full `O(n_active * n_features)`
-    accumulation. Off by default and unmeasured. See
+    accumulation. **On by default since 2026-08-17, measured at 1.26x**, where
+    this paragraph read "off by default and unmeasured" until that day. See
     `OBLIVIOUS_SKIP_LAST_BUILD_VAR` and `oblivious_schedule_launches`.
 
     Six of the per-tree copies are the `random_strength` noise planes, one per
     level, and `MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST` collapses them to one.
-    Also off by default. See `OBLIVIOUS_NOISE_HOIST_VAR`.
+    That one is off by default, and unlike the arm above it stayed off on
+    evidence rather than for want of it. See `OBLIVIOUS_NOISE_HOIST_VAR`.
 
     Not instrumented, traceable
     ---------------------------
@@ -3475,7 +3532,10 @@ def grow_tree_device_oblivious(
     # is the guard that keeps it from indexing past the tables.
     #
     # Three conditions and every one of them is necessary. The switch, because
-    # the arm is unmeasured. A positive standard deviation, because with the
+    # the arm measured M0-indistinguishable on 2026-08-17 and so stays off.
+    # This line said "because the arm is unmeasured" until that result was
+    # recorded at `OBLIVIOUS_NOISE_HOIST_VAR`.
+    # A positive standard deviation, because with the
     # noise off there is no copy to hoist and no reason to move a record
     # index. And the capacity, because a level record must sit above the leaf
     # records `[leaf_base, leaf_base + budget)` that the scan reads while it
@@ -3729,13 +3789,15 @@ def grow_tree_device_oblivious(
         # Every child of the level, in two launches, with the deferred
         # copy-back paid inside the first of them.
         #
-        # "Each from its own rows" is the SHIPPED ARM only, and this line said
-        # it unqualified until `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=1` existed.
-        # Under that switch the level accumulates only the smaller child of
-        # each pair from rows and derives its sibling from the parent by exact
-        # Int32 subtraction. Still two launches, so nothing here or in
-        # `oblivious_schedule_launches` moves, and still the same histograms
-        # bit for bit; what changes is how many rows are read per level.
+        # "Each from its own rows" is the `MOJOTREES_GPU_OBLIVIOUS_SUBTRACT=0`
+        # arm only. THE SHIPPED ARM SUBTRACTS, and has since 2026-08-17. The
+        # level accumulates only the smaller child of each pair from rows and
+        # derives its sibling from the parent by exact Int32 subtraction. This
+        # comment carried the labels the other way round until the correction,
+        # which read the shipped arm as the one nothing takes. Still two
+        # launches, so nothing here or in `oblivious_schedule_launches` moves,
+        # and still the same histograms bit for bit; what changes is how many
+        # rows are read per level.
         # `gpu_leaf_batching.oblivious_subtract_requested` owns that decision
         # and this call site does not ask, which is why the switch is invisible
         # here and has to be named instead.
@@ -3743,8 +3805,10 @@ def grow_tree_device_oblivious(
         # It composes with `skip_last_build` on a different axis: this switch
         # halves the width of every level that runs, that one removes the last
         # level's generation entirely. `train_gpu.mojo`'s `node_hists` block
-        # tabulates all four combinations, because the two have never been
-        # measured on together.
+        # tabulates all four combinations. Both are now on by default and the
+        # two HAVE been measured on together, at 2.20x combined with the wide
+        # scan in the same round-robin, which is the sentence that replaced
+        # "the two have never been measured on together".
         if build_children:
             builder.enqueue_desc_level_children()
         if trace_steps:

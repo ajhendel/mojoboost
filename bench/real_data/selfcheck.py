@@ -2522,6 +2522,19 @@ def check_accuracy_axes():
     good = {anchor_key: {
         "primary_metric": "rmse", "value": 0.40,
         "environment": {"arch": "arm64", "cpu_model": "Test"},
+        # CURRENT by construction: the one parameter this fixture's arm left
+        # unset is recorded at whatever the package ships today, so
+        # `verify.anchor_staleness` returns None and the anchor gates. Added
+        # 2026-08-17 with the staleness mechanism; without this block the
+        # anchor is ANCHOR CURRENCY UNKNOWN and cannot pass or fail anything,
+        # which is the behavior `check_stale_anchors` asserts separately.
+        "configuration": {
+            "resolved": {
+                "lambda_l2": verify.shipped_constant("_LAMBDA_L2"),
+                "learning_rate": verify.shipped_constant("_LEARNING_RATE"),
+            },
+            "followed_default": ["lambda_l2", "learning_rate"],
+        },
         "recorded_from": {"run_id": "fixture", "git_commit": "0" * 40,
                           "recorded_at": "2026-08-17"},
     }}
@@ -2589,6 +2602,358 @@ def check_accuracy_axes():
         ),
         "a peer scoreboard line came back as PASS. Reporting green for one arm "
         "and yellow for another is a gate wearing a different word",
+    )
+
+
+def check_pair_plan():
+    """The pair run's own invariants, plus the two things a reader of its table
+    must not be able to get wrong. Added 2026-08-17 with `pairs.py`.
+
+    `pairs.check` already raises on an inconsistent plan and is called by
+    `pairs.plan` and by `run.py`, so this runs it. What this adds on top is the
+    two assertions that are about MEANING rather than about structure, and both
+    are ones a plan can satisfy structurally while being wrong:
+
+    THE TWO CLASSES MUST BE DISTINGUISHABLE IN THE OUTPUT. Class A's `mojotrees`
+    arm is our leaf-wise implementation at LightGBM's regularizer and Class B's
+    `shipped.lossguide` is our product. Reading the first as the second is the
+    single most consequential misreading available in that table, and the only
+    thing preventing it is that the two rows carry different `block` values and
+    that the report prints a legend for them.
+
+    THE TWO ARMS MUST ACTUALLY DIFFER. If `BASE_PARAMS['lambda_l2']` ever equals
+    the shipped value again, the mirror arm and the product arm are the same fit
+    and the run pays for two copies of one number while presenting them as a
+    comparison. `pairs.check_shipped_is_default` raises on that; this asserts the
+    resolved dicts differ, which is the same claim read off the translator rather
+    than off the constants.
+    """
+    import pairs
+    import report
+    import scenarios
+    import verify
+
+    try:
+        all_arms = pairs.arms()
+        pairs.check(all_arms)
+    except AssertionError as exc:
+        FAILURES.append(f"pairs.check failed: {exc}")
+        return
+
+    blocks = {arm["block"] for arm in all_arms}
+    check(
+        blocks <= set(pairs.CLASSES),
+        f"pairs emits blocks {sorted(blocks - set(pairs.CLASSES))} that "
+        "pairs.CLASSES does not describe, so report._block_legend would print "
+        "them as UNDECLARED",
+    )
+    check(
+        any(b.startswith("A") for b in blocks)
+        and any(b.startswith("B") for b in blocks),
+        "the pair run does not carry both classes. Both were asked for in one "
+        "table so that neither can be read as the other",
+    )
+    vocabulary = report._block_vocabulary()
+    for block in sorted(blocks):
+        check(
+            block in vocabulary,
+            f"report._block_vocabulary does not know pairs block {block!r}, so "
+            "the frontier table would print the label with no legend and the "
+            "reader supplies the meaning",
+        )
+
+    # The two arms must resolve to different models, through the translator that
+    # actually builds them.
+    spec = scenarios.resolve("dense_regression", "standard", "synthetic")
+    mirror = scenarios.mojotrees_params(spec, "cpu")
+    product = scenarios.mojotrees_params(spec, "cpu", dict(pairs.SHIPPED_LOSSGUIDE))
+    check(
+        mirror.get("lambda_l2") != product.get("lambda_l2"),
+        "the Class A mirror arm and the Class B product arm resolve the same "
+        f"lambda_l2 ({mirror.get('lambda_l2')!r}). They are then the same fit, "
+        "the run pays twice for one number, and the table presents two "
+        "identical rows as a comparison between a mirror and a product",
+    )
+    check(
+        product.get("lambda_l2") is None,
+        "the Class B product arm resolves a lambda_l2 VALUE rather than None. "
+        "None is the only thing sklearn.py::_Base._l2_named reads as unset, and "
+        "an arm that names the key does not get the package default it claims "
+        f"to be measuring. Got {product.get('lambda_l2')!r}",
+    )
+    # Every key the two share must otherwise be equal, or the pair's headline
+    # claim -- that they differ in exactly one parameter -- is false.
+    differing = sorted(
+        key for key in set(mirror) | set(product)
+        if mirror.get(key) != product.get(key)
+    )
+    check(
+        differing == ["lambda_l2"],
+        "the Class A mirror arm and the Class B product arm differ in "
+        f"{differing} rather than in lambda_l2 alone. pairs.py's headline claim "
+        "is that one parameter separates them, and a reader who takes that "
+        "claim while a second parameter moved is attributing the whole "
+        "difference to the wrong thing",
+    )
+    # The symmetric arm must leave both automatic-rate gate keys unset, or it
+    # RAISES at fit rather than degrading, and every one of its cells is an
+    # infrastructure failure that withholds the whole run's quality verdict.
+    symmetric = scenarios.mojotrees_params(
+        spec, "cpu", dict(pairs.SHIPPED_SYMMETRIC)
+    )
+    check(
+        symmetric.get("auto_learning_rate") is True
+        and symmetric.get("learning_rate") is None
+        and symmetric.get("lambda_l2") is None,
+        "the symmetric shipped arm resolves auto_learning_rate=True beside a "
+        f"named learning_rate ({symmetric.get('learning_rate')!r}) or a named "
+        f"lambda_l2 ({symmetric.get('lambda_l2')!r}). "
+        "sklearn.py::_Base._auto_learning_rate_knobs RAISES on either, so every "
+        "cell of this arm would be an infrastructure failure and run.py "
+        "withholds the quality verdict for the WHOLE matrix on one of those",
+    )
+    # And frontier's own auto-rate arms, which had exactly this defect at head.
+    import frontier
+
+    for arm in frontier.arms():
+        if arm["skip"]:
+            continue
+        resolved = scenarios.mojotrees_params(
+            spec, arm["device"], dict(arm["params"])
+        )
+        if not resolved.get("auto_learning_rate"):
+            continue
+        check(
+            resolved.get("learning_rate") is None
+            and resolved.get("lambda_l2") is None,
+            f"frontier arm {arm['id']} resolves auto_learning_rate=True beside "
+            "a named learning_rate or lambda_l2 and would RAISE at fit. "
+            "Omitting a key from an arm's overrides does not unset it: "
+            "scenarios.mojotrees_params copies both out of BASE_PARAMS. Pass "
+            "None. See frontier.RESOLVED_SINCE"
+            "['auto_rate_needed_explicit_none']",
+        )
+    check(
+        float(verify.shipped_constant("_LAMBDA_L2") or -1.0)
+        in [float(v) for v in pairs.L2_AXIS],
+        "the lambda_l2 we ship is not a point on pairs.L2_AXIS, so the run "
+        "cannot tell whether the value we ship is the value the registered "
+        "decision rule would pick",
+    )
+
+
+def check_stale_anchors():
+    """A STALE ANCHOR CANNOT GATE. Added 2026-08-17.
+
+    An accuracy anchor is an absolute recorded value and the harness will not
+    recompute one, which is the whole ratchet defence (`LANE_RULES.md` rule 3).
+    That leaves one hole the rule does not close: an anchor can stop describing
+    the model we ship without any number in it changing, because an arm that
+    leaves a parameter UNSET follows a package default, and a default can move.
+    It did, on 2026-08-17, when `lambda_l2` went from 0.0 to 1.0 under every
+    non-symmetric growth policy.
+
+    **The failure mode this guards is silence, not a wrong number.** A stale
+    anchor produces a perfectly well-formed PASS. Nothing about the verdict looks
+    unusual; it is simply a comparison against a model nobody ships, presented as
+    this arm's accuracy gate holding. So the assertion here is not "the number is
+    right", it is that a stale anchor may produce NEITHER a PASS NOR a FAIL. Both
+    of those are statements about an arm against its own reference and a stale
+    anchor is not that reference.
+
+    Four things are asserted and they fail in different directions:
+
+    1. an anchor whose unset parameter moved is detected as stale;
+    2. it produces a WARN and never a PASS or a FAIL;
+    3. an anchor with no `configuration` block is UNKNOWN, also WARNs, and also
+       does not gate, on the precedent of C10's missing cpu twin;
+    4. `propose_anchors` WRITES the `configuration` block, so the run a person
+       adopts from is current by construction and the staleness clears itself.
+
+    The fourth is the one that makes the mechanism maintainable. Without it,
+    staleness would be a hand-kept list, and a hand-kept list about staleness
+    goes stale.
+    """
+    import verify
+
+    shipped = verify.shipped_constant("_LAMBDA_L2")
+    check(
+        shipped is not None,
+        "verify.shipped_constant cannot read _LAMBDA_L2 out of "
+        "python/mojotrees/sklearn.py, so nothing can tell whether an anchor "
+        "still describes the lambda_l2 we ship and every anchor is UNKNOWN",
+    )
+    if shipped is None:
+        return
+    check(
+        "lambda_l2" in verify.STALE_ANCHOR_PARAMETERS,
+        "verify.STALE_ANCHOR_PARAMETERS does not track lambda_l2, which is the "
+        "parameter whose default moved on 2026-08-17 and the reason this "
+        "mechanism exists",
+    )
+
+    def anchor(followed, recorded, value=0.40):
+        return {
+            "primary_metric": "rmse", "value": value,
+            "environment": {"arch": "arm64", "cpu_model": "Test"},
+            "configuration": {
+                "resolved": {"lambda_l2": recorded},
+                "followed_default": list(followed),
+            },
+            "recorded_from": {"run_id": "fixture", "git_commit": "0" * 40,
+                              "recorded_at": "2026-08-16"},
+        }
+
+    moved = shipped + 1.0
+    stale = verify.anchor_staleness(anchor(["lambda_l2"], moved))
+    check(
+        stale is not None and stale.get("parameter") == "lambda_l2",
+        "an anchor whose arm left lambda_l2 UNSET, recorded at a value the "
+        "package no longer resolves to, was not detected as stale. That anchor "
+        "describes a model we do not ship and it would gate as though it were "
+        f"this arm's reference. Got: {stale!r}",
+    )
+    if stale is not None:
+        check(
+            "cleared_by" in stale and "propose-anchors" in stale["cleared_by"],
+            "the stale verdict does not say how it is cleared. The remedy is a "
+            "RUN and a deliberate adoption, and a reader told only that "
+            "something is stale will reach for the edit that installs the "
+            "ratchet",
+        )
+    # NAMED, not unset: a value the arm typed is a property of the arm, and
+    # moving a package default cannot invalidate it. If this came back stale the
+    # mechanism would condemn every pinned arm in the harness, which is most of
+    # them.
+    check(
+        verify.anchor_staleness(anchor([], moved)) is None,
+        "an anchor whose arm NAMED lambda_l2 was reported stale because the "
+        "package default moved. A named value does not follow the default, so "
+        "this would invalidate every pinned arm in the harness for a change "
+        "that cannot have touched them",
+    )
+    check(
+        verify.anchor_staleness(anchor(["lambda_l2"], shipped)) is None,
+        "an anchor recorded at exactly the value we ship was reported stale, so "
+        "no anchor could ever be current and the gate would never run",
+    )
+    unknown = verify.anchor_staleness(
+        {"primary_metric": "rmse", "value": 0.40}
+    )
+    check(
+        unknown is not None and unknown.get("unknown"),
+        "an anchor with no `configuration` block was treated as current. "
+        "Nothing can tell whether it describes what we ship, and a check that "
+        "cannot run must say so rather than pass",
+    )
+    declared = verify.anchor_staleness({
+        "primary_metric": "rmse", "value": 0.40,
+        "configuration": {"resolved": {"lambda_l2": shipped},
+                          "followed_default": ["lambda_l2"]},
+        "stale": {"since": "2026-08-17", "why": "retired by hand",
+                  "cleared_by": "a run"},
+    })
+    check(
+        declared is not None and declared.get("declared"),
+        "an explicit `stale` block on an anchor entry was ignored. A person "
+        "must be able to retire an anchor for a reason no comparison can see, "
+        "and that declaration has to win over the comparison",
+    )
+
+    # Now the gate itself, on a record whose anchor is stale.
+    record = {
+        "status": "ok", "scenario": "dense_regression", "tier": "standard",
+        "engine": "mojotrees", "arm": "mojotrees", "threads": 4,
+        "device_used": "cpu", "device_requested": "cpu",
+        "cell_role": "measured",
+        "primary_metric": "rmse", "quality": {"rmse": 0.40},
+        "params": {"num_boost_round": 100},
+        "data": {"data_kind": "synthetic", "dataset": "generated:x"},
+        "phases": {"train": {"elapsed_s": 1.0}},
+        "environment": {"cpu": {"arch": "arm64", "model": "Test"}},
+    }
+    config = json.load(open(os.path.join(HERE, "thresholds.json")))
+    key = verify._anchor_key(record)
+    for label, entry, worse in (
+        # Same value as the anchor, which would have PASSED.
+        ("matching", anchor(["lambda_l2"], moved, value=0.40), False),
+        # Far worse than the anchor, which would have FAILED.
+        ("regressed", anchor(["lambda_l2"], moved, value=0.20), True),
+        # No configuration block at all: UNKNOWN, and equally ungating.
+        ("unknown", {"primary_metric": "rmse", "value": 0.20,
+                     "environment": {"arch": "arm64", "cpu_model": "Test"}},
+         True),
+    ):
+        verdict = verify.Verdict()
+        verify.check_accuracy_anchor(
+            [record], config, verdict, anchors={key: entry}
+        )
+        rows = [
+            c for c in verdict.checks
+            if c["check"] == "accuracy_anchor" and c["scope"] == key
+        ]
+        check(
+            len(rows) == 1 and rows[0]["status"] == verify.WARN,
+            f"a stale or uncheckable anchor ({label}) produced "
+            f"{[r['status'] for r in rows]!r} rather than exactly one WARN. A "
+            "stale anchor must not be able to PASS, because that reports this "
+            "arm's accuracy gate as holding against a model nobody ships, and "
+            "it must not be able to FAIL, because that stops a run on a "
+            "comparison it was not entitled to make",
+        )
+        if rows:
+            check(
+                rows[0].get("stale") is True and not rows[0].get("anchored"),
+                f"the {label} anchor row does not carry `stale` and "
+                "`anchored: False`, so report.py cannot tell a stale anchor "
+                "from a held one and would print a percentage against it",
+            )
+        check(
+            not verdict.failed,
+            f"a {label} anchor moved the run's exit code. Staleness is a "
+            "reporting state, not a run failure: the run is what CLEARS it, so "
+            "failing the run would make the remedy unreachable",
+        )
+        if worse:
+            # And the run must not read as clean either. The uncovered note is
+            # what says the gate covered nothing for this cell.
+            check(
+                any(
+                    c["check"] == "accuracy_anchor" and c["scope"] == "run"
+                    and c["status"] == verify.NOTE
+                    for c in verdict.checks
+                ),
+                f"a {label} anchor left no run-level note, so a reader of the "
+                "verdict summary sees no failures and concludes the accuracy "
+                "gate ran. A gate that emits nothing is indistinguishable from "
+                "a gate that passes (LANE_RULES rule 8)",
+            )
+
+    # And the writer. `propose_anchors` must emit the block, or every anchor a
+    # person adopts is UNKNOWN and the gate is permanently unarmed.
+    source = open(os.path.join(HERE, "verify.py")).read()
+    proposer = source.split("def propose_anchors")[1]
+    check(
+        '"configuration": anchor_configuration(record)' in proposer,
+        "verify.propose_anchors does not write the `configuration` block. "
+        "Every anchor adopted from it would then be ANCHOR CURRENCY UNKNOWN "
+        "and would never gate, which is a silently unarmed gate rather than a "
+        "loud one",
+    )
+    # The report has to render the two states differently, because the remedies
+    # differ: a missing anchor needs an adoption and a stale one needs a run.
+    import report
+
+    check(
+        "STALE ANCHOR" in report._anchor_cell(
+            {"status": verify.WARN, "stale": True,
+             "stale_reason": "parameter_default_moved",
+             "stale_parameter": "lambda_l2"},
+            False,
+        ),
+        "report._anchor_cell does not render a stale anchor as STALE. Printed "
+        "as `NO ANCHOR` it sends the reader to the wrong remedy, and printed as "
+        "`held` it is a false green",
     )
 
 
@@ -2727,9 +3092,23 @@ def check_arm_keying():
 
     cells = report.build_cells(records, 0.2)
     check(
-        len(cells) == 6 and cells[("dense_regression", big, "gpu", 4)]["repeats"] == 2,
+        len(cells) == 6
+        and cells[
+            ("dense_regression", "standard", "synthetic", big, "gpu", 4)
+        ]["repeats"] == 2,
         "report.build_cells did not produce one cell PER ARM. An engine key "
         f"prints one row with the arms as its repeats: {sorted(cells)}",
+    )
+    # And the two fields `cell_key` grew on 2026-08-17, asserted by POSITION so
+    # that a reader of this test can see the key's shape. Their absence let one
+    # scenario at two tiers, or its generator beside its real dataset, share a
+    # table row and print a median across both.
+    check(
+        all(key[1] == "standard" and key[2] == "synthetic" for key in cells),
+        "report.cell_key no longer carries the tier and the data kind in "
+        f"positions 1 and 2: {sorted(cells)[0]}. Without both, a run holding "
+        "dense_regression at two tiers, or its generator and UCI "
+        "YearPredictionMSD, averages them into one row",
     )
     lines = []
     report._frontier(records, config, lines.append)
@@ -3385,6 +3764,8 @@ def main():
         check_correctness_arms()
         check_oracle_cells()
         check_accuracy_axes()
+        check_stale_anchors()
+        check_pair_plan()
         check_arm_keying()
         check_arm_keying_writer()
         check_coverage_guard()

@@ -204,18 +204,30 @@ measured inside the noise on the oblivious plane and reverted, and
 all -- only `block` -- so there is no sub-block cooperation to reach for, and
 both the Modular docs page and the docs MCP server are wrong about this.
 
-**The bigger finding about the scan is that the shipped leaf-wise default does
-not use it.** `wide_scan_requested()` is `MOJOTREES_GPU_SPLIT_WIDE == "1"`,
-default off, so `_launch_search` takes the `_scan_slot_kernel` branch at
-`block_dim=1`: one lane per (leaf, feature), 200 single-lane threadgroups at
-the reference shape. That is the same shape the oblivious lane replaced today
-and measured at 4.5 percent, resolved and bit-identical. The leaf-wise arm is
-built, tested for bit-identity in `tests/test_gpu_split_search.mojo`,
-reachable from the resident loop (`_launch_child_search` passes
-`searcher.wide_scan`), and **has never been run**. Zero code is needed to price
-it. Given section 2's bound of under 0.08 s of search device time per fit, the
-honest expectation is under 2 percent, and the reason to take it anyway is that
-it costs one pair of processes.
+**The bigger finding about the scan was that the shipped leaf-wise default did
+not use it. THAT WAS FIXED LATER ON 2026-08-17 and this paragraph is corrected
+rather than deleted, because its prediction was wrong and that is the useful
+part.** As written it said `wide_scan_requested()` is
+`MOJOTREES_GPU_SPLIT_WIDE == "1"`, default off, and that the wide leaf-wise arm
+"has never been run". At head the predicate is
+`getenv("MOJOTREES_GPU_SPLIT_WIDE") != "0"`, **default ON**, so `_launch_search`
+takes the wide branch and the variable is now the escape hatch back to
+`_scan_slot_kernel` at `block_dim=1`, which was one lane per (leaf, feature) and
+200 single-lane threadgroups at the reference shape.
+
+The pair this section asked for was run: three interleaved round-robin cycles,
+799,110 x 100 continuous features, leaf-wise at the shared defaults, 100 trees,
+M4, narrow 3.922 / 3.874 / 3.932 s against wide 3.220 / 3.196 / 3.231 s, ranges
+disjoint so M0 resolved, rmse 6.116601511 in all six runs. **1.21x**, and the
+default flipped the same session under LANE_RULES rule 5. The arm remains built
+and tested for bit-identity in `tests/test_gpu_split_search.mojo` and reachable
+from the resident loop (`_launch_child_search` passes `searcher.wide_scan`).
+
+**The honest expectation stated here, "under 2 percent" from section 2's bound of
+under 0.08 s of search device time per fit, was wrong by roughly a factor of
+ten**, and it is left standing above so the miss is visible. Whatever the wide
+scan removed on this plane, section 2's search-time attribution did not contain
+it, which is a reason to distrust that bound rather than to adjust this sentence.
 
 **Is the final reduce a bubble? Yes.** `_reduce_slots_block_kernel` is launched
 at `grid_dim = n_records`, and on the leaf-wise resident plane `n_records` is
@@ -300,7 +312,10 @@ Verify the arm engaged rather than assuming the variable was spelled right.
 arm was on and how many launches it had issued; an off arm reports zero for the
 whole fit.
 
-The leaf-wise wide scan, section 5:
+The leaf-wise wide scan, section 5. **This pair has been run and the default has
+flipped**, so the commands below are now a regression check rather than the
+measurement that decides it, and the `=1` arm is what an unset environment
+already does:
 
     MOJOTREES_GPU_SPLIT_WIDE=1 pixi run -e bench bench-train-gpu 799110 100 reg 5 gpu-device
     MOJOTREES_GPU_SPLIT_WIDE=0 pixi run -e bench bench-train-gpu 799110 100 reg 5 gpu-device
