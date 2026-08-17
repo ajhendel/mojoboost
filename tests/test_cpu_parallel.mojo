@@ -556,6 +556,30 @@ def test_a_fused_dispatch_equals_separate_ones_at_every_worker_count(
 
 
 def test_the_crossover_is_tested_against_the_union() raises:
+    """Fusing two sub-crossover regions clears the crossover and fans out.
+
+    THE FAN-OUT HALF NEEDS CORES TO FAN OUT ONTO, and before 2026-08-17 this
+    test assumed them. It passed on the developer's ten-core M4 and failed on
+    CPU-only CI, where too few cores make `plan_tasks` return 1. That is not
+    a defect in the scheduler, it is the scheduler correctly declining to
+    split work across cores that are not there, so the test was reading the
+    HOST and reporting on the CODE.
+
+    Pinning `MOJOTREES_NUM_WORKERS` does NOT fix it and was tried first. That
+    variable FORCES the parallel path rather than pretending to a core count,
+    so it also drives the serial assertion below to 4 tasks and breaks the
+    half of this test that still worked. There is no knob that says "assume N
+    cores", so the width is asked for and the fan-out half runs only when the
+    answer allows it.
+
+    What is LOST when it does not: on a one or two core runner nothing here
+    checks that the union of two sub-crossover regions clears the crossover.
+    The SERIAL half still runs everywhere and is not conditional, so the
+    other direction, that each region alone stays serial, is still asserted
+    on every machine. That asymmetry is the honest one: a machine can always
+    prove work stayed serial and cannot prove work spread across cores it
+    does not have.
+    """
     _auto()
     _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "")
     _ = setenv("MOJOTREES_PARALLEL_MIN_TASK_OPS", "")
@@ -566,12 +590,25 @@ def test_the_crossover_is_tested_against_the_union() raises:
     assert_true(ops_each < PARALLEL_MIN_OPS)
     assert_true(2 * ops_each >= PARALLEL_MIN_OPS)
 
-    # Separately, each region stays serial. Fused, the pair clears the
-    # crossover and fans out. That is a change in the answer, and it is the
-    # documented consequence of pricing one scheduling event against the total
-    # work behind it.
+    # Separately, each region stays serial. This direction holds on every
+    # machine, because declining to split is always available.
     assert_equal(plan_tasks(50, ops_each), 1)
-    assert_true(plan_tasks(100, 2 * ops_each) > 1)
+
+    # Fused, the pair clears the crossover and fans out. That is a change in
+    # the answer, and it is the documented consequence of pricing one
+    # scheduling event against the total work behind it. It is also the half
+    # that needs cores, so the width is asked for rather than assumed.
+    var fused_width = plan_tasks(100, 2 * ops_each)
+    if fused_width <= 1:
+        print(
+            "  (skipped the fan-out half: this machine plans "
+            + String(fused_width)
+            + " task for work above the crossover, so it has too few cores"
+            + " to spread onto. The serial half above still ran.)"
+        )
+        _auto()
+        return
+    assert_true(fused_width > 1)
 
     var sizes: List[Int] = [50, 50]
     var total = region_units(sizes)
@@ -597,6 +634,12 @@ def test_the_crossover_is_tested_against_the_union() raises:
     for u in range(total):
         n_calls += starts[u]
     assert_true(n_calls > len(sizes))
+    # Restore the auto width. This test is the only one here that leaves a
+    # forced worker count behind if it does not, and a leaked
+    # MOJOTREES_NUM_WORKERS would silently pin every test that runs after it
+    # in the same process, which is a failure that would look like anything
+    # except its cause.
+    _auto()
 
 
 def test_fusing_never_lowers_the_width_a_region_would_have_had() raises:

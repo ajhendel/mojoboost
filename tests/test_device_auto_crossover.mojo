@@ -335,7 +335,30 @@ def test_reported_path_parses_a_real_arch_string() raises:
 
 def test_an_open_context_still_outranks_the_build_target() raises:
     """`PROFILE_REPORTED` is unchanged and still authoritative, and now it
-    reaches the rule from the strings a real device hands over."""
+    reaches the rule from the strings a real device hands over.
+
+    SPLIT IN TWO ON 2026-08-17, and the split is the point rather than a way
+    to make CI quiet. The first half, that a reported profile is read as
+    `PROFILE_REPORTED` and parses to the right generation, is a property of
+    the STRINGS a device hands over and holds on every build. It stays
+    unconditional and is what this test mostly exists to assert.
+
+    The second half asks `decide_device` to actually SELECT the accelerator,
+    and that can only hold where the binary can use one: `gpu_available` is
+    `build_has_accelerator()`, so a CPU-only build refuses the GPU no matter
+    what profile it is handed, and refusing is correct rather than a defect.
+    A binary compiled with no GPU support cannot run a GPU kernel however
+    good the device in front of it is. Asserting otherwise asks the product
+    to promise something it must not.
+
+    What is LOST by the guard, stated because a skip that hides its cost is
+    how the nine failures got here. On CPU-only CI nothing checks that a
+    reported profile OUTRANKS the build target in the selection, which is the
+    behavior the test is named for. That half runs only on an accelerator
+    build. The naming half above still runs everywhere, and
+    `test_build_target_is_present_exactly_when_an_accelerator_is` is the
+    assertion about CPU-only builds that cannot be skipped into vacuity.
+    """
     var caps = capabilities_from_reported(
         String("metal"),
         OBSERVED_M4_ARCH_NAME,
@@ -345,6 +368,8 @@ def test_an_open_context_still_outranks_the_build_target() raises:
     )
     assert_equal(caps.profile_source, PROFILE_REPORTED)
     assert_equal(caps.profile.apple_generation, APPLE_GEN_M4)
+    if not _on_the_measured_build():
+        return
     var decision = decide_device(
         _auto(AUTO_GPU_MIN_ROWS, M4_TRAINING_MIN_FEATURES), caps
     )

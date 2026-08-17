@@ -1091,6 +1091,22 @@ def _frontier(records, config, out):
             summary = summarise(
                 [phase_value(r, FRONTIER_RANK_FIELD) for r in group_records]
             )
+            # Inference, beside training, since 2026-08-17. Andrew asked for
+            # it as its own column and the reason is that these two numbers
+            # are bought at completely different rates: a model is TRAINED
+            # once and PREDICTED with for as long as it is deployed, so the
+            # column this table ranks on is the one that matters least in
+            # production. Ranking is left on train seconds deliberately, so
+            # that this is a fact placed beside the ranking rather than a
+            # silent change to what the ranking means.
+            #
+            # The measurement already existed in the phase table further up
+            # and reached nobody who read only the frontier, which is how we
+            # published a training win for weeks without noticing we were
+            # last on inference against every competitor.
+            predict_summary = summarise(
+                [phase_value(r, "predict_batch") for r in group_records]
+            )
             first = group_records[0]
             metric = metric or first.get("primary_metric")
             peer_scope = f"{scenario}/{arm}/{device}/t{threads}/n{trees}"
@@ -1136,6 +1152,7 @@ def _frontier(records, config, out):
                 "arm": arm,
                 "block": block,
                 "summary": summary,
+                "predict_summary": predict_summary,
                 "speed": summary["median"] if summary else None,
                 "metric_value": (first.get("quality") or {}).get(
                     first.get("primary_metric")
@@ -1168,10 +1185,10 @@ def _frontier(records, config, out):
         )
         out(RANKING_CAVEAT + "\n")
         out(
-            f"| rank | arm | block | train s | {metric} | vs anchor | "
-            "vs best peer | pareto |"
+            f"| rank | arm | block | train s | predict s | {metric} | "
+            "vs anchor | vs best peer | pareto |"
         )
-        out("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        out("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         ordered = sorted(
             rows,
             key=lambda r: (
@@ -1200,6 +1217,7 @@ def _frontier(records, config, out):
             out(
                 f"| {row['rank']} | {row['arm']} | {row['block']} | "
                 f"{fmt_time(row['summary'], 0.25)} | "
+                f"{fmt_time(row['predict_summary'], 0.25)} | "
                 f"{'n/a' if value is None else f'{value:.6g}'} | "
                 f"{_anchor_cell(row['anchor'], row['competitor'])} | "
                 f"{_peer_cell(row['peer'], row['competitor'])} | {pareto} |"
