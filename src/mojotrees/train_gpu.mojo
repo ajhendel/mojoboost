@@ -438,7 +438,71 @@ from .growth_policy import (
 )
 from .gpu_leaf_batching import OBLIVIOUS_MAX_ITEMS
 from .tree import Tree, TreeParams, _leaf_value, _search, node_bounds
-from .tree_parameters_extra import ExtraTreeParams
+from .tree_parameters_extra import ExtraTreeParams, model_size_decrease
+from std.math import sqrt
+
+
+def _device_round_random_score_scale(
+    extra: ExtraTreeParams,
+    sum_squares: Float64,
+    n_rows: Int,
+    round: Int,
+    learning_rate: Float64,
+) raises -> Float64:
+    """`boosting._round_random_score_scale` for the device-gradient arm.
+
+    Same quantity, same refusal, different source for one factor. The host
+    twin walks a `List[Float64]` of derivatives; this takes the sum of squares
+    `GpuObjectiveState.derivative_sum_squares` reduced on the device, because
+    on this arm no host gradient vector exists to walk.
+
+    Kept as a separate function rather than an overload that takes either,
+    because the two differ in a way a shared body would hide: the host twin's
+    total is summed in row order and this one's is folded from 256
+    threadgroup partials, so the two scales agree to a tolerance and not bit
+    for bit. Two names for two summation orders is the same discipline
+    `oblivious_score_stream` applies to its two domains.
+
+    `sum_squares` is `sum(g^2)` over the WHOLE gradient plane and `n_rows` is
+    the row count of ONE output dimension, matching
+    `derivatives_stdev_from_zero`, which divides by the latter and not by the
+    vector length.
+
+    The zero refusal is the host twin's, verbatim in effect: a scale of
+    exactly 0.0 is indistinguishable from a caller that never computed one,
+    and `split.find_best_split` refuses that pair, so it is refused here where
+    the cause can be named.
+    """
+    if not (extra.random_strength > 0.0):
+        return 0.0
+    if n_rows <= 0:
+        raise Error(
+            "random_strength needs at least one row: its scale is the RMS of"
+            " the round's derivatives"
+        )
+    if not (sum_squares >= 0.0):
+        raise Error(
+            "the device reduction returned a non-finite sum of squared"
+            " derivatives on round ",
+            round,
+        )
+    var scale = sqrt(sum_squares / Float64(n_rows)) * model_size_decrease(
+        n_rows, Float64(round) * learning_rate
+    )
+    if not (scale > 0.0):
+        raise Error(
+            "random_strength's per-tree scale came out as ",
+            scale,
+            " on round ",
+            round,
+            " of the device-gradient arm, and the split search refuses a"
+            " positive random_strength beside a non-positive scale because"
+            " that is indistinguishable from a caller that never computed"
+            " one. Either this round's derivatives are all zero, or the"
+            " model length has passed the point where the size-decrease"
+            " factor underflows",
+        )
+    return scale
 
 
 struct _GpuLeafState(Movable):
@@ -1734,11 +1798,28 @@ def _grow_tree_gpu_device_search(
     # earnable, because a gate that stops declining before the plane is staged
     # trains every default GPU fit with no split noise while the CPU trains
     # with it -- no error, no record, two different models under one default.
-    # There is a second link still missing, and it is named here so the gate is
-    # not removed against a half-wired path: no GPU round loop computes
-    # `ExtraTreeParams.random_score_scale`, and `check_scalars` says in so many
-    # words that "the device loops do not compute it and this refusal is
-    # correct for them". Until one does, this product is zero on every fit.
+    # The second link this used to name as missing is now wired, and the note
+    # is kept rather than deleted because the ORDER it states is still the
+    # live constraint. It said no GPU round loop computes
+    # `ExtraTreeParams.random_score_scale`, so the product was zero on every
+    # fit. Both arms of `_train_gpu_rounds` compute it now: the host-gradient
+    # arm through `boosting._round_random_score_scale` from the round's
+    # user-weighted derivatives before any sampler rewrites them, and the
+    # device-gradient arm through `_device_round_random_score_scale` from
+    # `GpuObjectiveState.derivative_sum_squares`, reduced on the device.
+    #
+    # So the product reaching this line is nonzero for a fit that sets
+    # `random_strength` -- but this line is STILL not reached, because
+    # `_check_device_search_supported` above refuses `params.extra.is_active()`
+    # and that gate has not been split yet. The plane is staged and the scale
+    # exists; what remains is the gate, which is the order this note demanded
+    # and the order that is now satisfiable rather than blocking.
+    #
+    # `ExtraTreeParams.check_scalars` still says "the device loops do not
+    # compute it and this refusal is correct for them". That sentence is now
+    # false and is on the list to correct with the gate split, not before:
+    # correcting a refusal's stated reason while the refusal still fires is
+    # what this file did twice today.
     if params.extra.random_score_stdev() > 0.0:
         cache.searchers[0].set_random_score(
             params.extra.random_score_stdev(),
@@ -3523,6 +3604,48 @@ def _train_gpu_rounds[
             # EMPTY on every fit that configured no bootstrap -- the plane is
             # never touched and no bits move on the default path.
             var boot_w = List[Float64]()
+            # ---- CatBoost's `random_strength`, on the device-gradient arm --
+            #
+            # The round loop's own copy of the tree bundle, for the reason the
+            # host arm below keeps one: `random_score_scale` is per-tree
+            # ENSEMBLE STATE rather than user configuration, so it is written
+            # onto a copy and never onto `params`, which stays borrowed and
+            # describes the fit the user asked for.
+            var dev_tree_params = params.tree.copy()
+            var dev_noisy = params.tree.extra.random_strength > 0.0
+            if dev_noisy and bootstrap.bayesian.enabled:
+                # REFUSED RATHER THAN COMPUTED WRONG. CatBoost's
+                # `CalcScoreStDev` reads the fold's `WeightedDerivatives` --
+                # the derivatives carrying the USER's `sample_weight` and
+                # nothing else. On this arm `refresh_bayesian_bootstrap` folds
+                # the per-tree draw into `weight_dev` BEFORE
+                # `fill_gradients_device`, and the derivative kernel
+                # multiplies both planes by it, so the gradients on the device
+                # by the time they can be reduced are CatBoost's
+                # `SampleWeightedDerivatives`. Their RMS is a different scale
+                # wearing the same parameter's name.
+                #
+                # The host arm has no such problem and needs no such refusal:
+                # it computes the scale from `grad` BEFORE `goss_round` and
+                # before `bootstrap_round`, which is the ordering its own
+                # comment is about.
+                #
+                # Narrow on purpose. The Bayesian bootstrap is the only
+                # sampler that reaches this arm -- MVS is refused above by
+                # name and bagging routes elsewhere -- so this is the whole of
+                # the interaction, not a sample of it.
+                raise Error(
+                    "random_strength cannot be scaled on the device-gradient"
+                    " arm beside bootstrap_type=Bayesian: the bootstrap draw"
+                    " is folded into the weight plane before the derivative"
+                    " kernel runs, so the only derivatives this arm can"
+                    " reduce are already sample-weighted, and CatBoost's"
+                    " scoreStDev is taken over the user-weighted ones. Use"
+                    " objective_source=OBJECTIVE_SOURCE_HOST (or"
+                    " MOJOTREES_GPU_OBJECTIVE=host), which computes the scale"
+                    " before either sampler and still grows the trees on the"
+                    " device"
+                )
             for i in range(params.n_estimators):
                 life.begin_round()
                 # Same sampler, same schedule, same seed as the host path
@@ -3550,6 +3673,32 @@ def _train_gpu_rounds[
                 var dev_grad_started = profile.clock()
                 var scale_reads_before = builder.scale_readback_count()
                 builder.fill_gradients_device(state, objective, alpha)
+                # ---- this round's `random_score_scale`, from the device ----
+                #
+                # Placed immediately after the fill and before anything that
+                # could rewrite the plane, which is the same position the host
+                # arm's call holds relative to `goss_round`. On this arm there
+                # is nothing between the two: GOSS and MVS do not reach here
+                # (both route to the host arm), and the Bayesian bootstrap is
+                # refused above because its draw lands BEFORE the fill rather
+                # than after it.
+                #
+                # Guarded, so a default fit issues neither the launch nor the
+                # readback -- `derivative_sum_squares` costs one kernel and
+                # one 1 KB copy per ROUND, and at `random_strength = 0` this
+                # branch is not taken at all.
+                if dev_noisy:
+                    dev_tree_params.extra.random_score_scale = (
+                        _device_round_random_score_scale(
+                            params.tree.extra,
+                            state.derivative_sum_squares(
+                                builder.ctx, builder.grad_dev
+                            ),
+                            n,
+                            i,
+                            params.learning_rate,
+                        )
+                    )
                 # Charged from the builder's own readback counter rather than
                 # from the constant 1 that used to sit here.
                 # `GpuHistogramBuilder.set_scale_refresh` lets a fit fold the
@@ -3590,7 +3739,12 @@ def _train_gpu_rounds[
                     profile,
                     builder,
                     searcher_cache,
-                    params.tree,
+                    # The round's own copy, not `params.tree`: it is the only
+                    # thing carrying this round's `random_score_scale`, and
+                    # the grower is where `set_random_score` reads it. At
+                    # `random_strength = 0` it is a copy of `params.tree` and
+                    # every field is the one that was passed before.
+                    dev_tree_params,
                     dev_bag,
                     i,
                     split_search,
