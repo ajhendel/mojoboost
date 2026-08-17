@@ -2022,8 +2022,14 @@ struct ExtraTreeParams(Copyable, Movable):
         # These stay refused until a fit shows the device model MOVING when
         # the setting moves. That is the evidence the retirement always needed
         # and never had, and it is now the standing bar for both.
-        if self.random_strength > 0.0:
-            return String("random_strength")
+        # random_strength: allowed again 2026-08-17, on EVIDENCE. The
+        # oblivious level launch now stages the level's noise plane, copies it
+        # and selects the noise overload; before that it called the no-noise
+        # one and the plane was never read. Measured device movement is in the
+        # commit. Still refused beside a categorical column, where only the
+        # partition search's winner would be noised.
+        if has_categorical and self.random_strength > 0.0:
+            return String("random_strength beside a categorical feature")
         # score_function: allowed again 2026-08-17, on EVIDENCE this time.
         # The oblivious level launch now passes it instead of defaulting it
         # (gpu_resident_round), and the measurement below is the bar this

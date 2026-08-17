@@ -2527,7 +2527,7 @@ def _collect_blocks(
     #          cliff this block was covering.
     #
     # ONE CONDITION SURVIVES.
-    if request.random_strength > 0.0:
+    if request.random_strength > 0.0 and request.categorical:
         # `gpu_split_search` refuses the noise beside a categorical feature by
         # name: a categorical candidate is a category SET chosen by a
         # partition search, so only that search's winner would be noised

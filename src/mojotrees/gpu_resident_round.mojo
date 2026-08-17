@@ -3186,6 +3186,28 @@ def grow_tree_device_oblivious(
         # bypasses `enqueue_frontier`: the per-record histogram base was written
         # on the device a launch ago and copying the host's stale mirror over it
         # would aim the scan at the previous level's slots.
+        # ---- this level's noise plane, drawn before the search reads it ----
+        #
+        # `stage_random_score_level(record, depth)` rather than
+        # `stage_random_score(record, node)`: a symmetric level has no node,
+        # it has a DEPTH, and the draw is keyed by it in its own hash domain.
+        # One plane per level and not per leaf -- the level is one candidate
+        # set electing one split, so the draw is per (feature, bin) and the
+        # kernel adds it after the cross-leaf sum and, under Cosine, after the
+        # single ratio.
+        #
+        # Guarded, so a fit at the default `random_strength = 0` draws
+        # nothing, stages nothing and uploads nothing.
+        #
+        # **WITHOUT THIS THE PLANE IS NEVER UPLOADED AND THE NOISE IS SILENTLY
+        # ZERO.** Measured before it existed: `random_strength=1` on the
+        # device produced a model bit-identical to an unnoised one while the
+        # same fit on the CPU moved by 1.078. `_check_noise_staged` below is
+        # what turns that silence into a refusal if this is ever skipped.
+        if searcher.random_score_stdev() > 0.0:
+            searcher.stage_random_score_level(level_record, level)
+        searcher._check_noise_staged(level_record, 1)
+        searcher._copy_noise(level_record, 1)
         _launch_oblivious_search(
             searcher.ctx,
             builder.batcher[0].out_dev,
@@ -3196,6 +3218,9 @@ def grow_tree_device_oblivious(
             searcher.catn_dev,
             searcher.mono_dev,
             searcher.fparam_dev,
+            # The NOISE overload from here on: this site called the no-noise
+            # one, which is why the staged plane above went unread.
+            searcher.noise_dev,
             searcher.slot_i_dev,
             searcher.slot_f_dev,
             searcher.rec_i_dev,
@@ -3220,6 +3245,7 @@ def grow_tree_device_oblivious(
             # model bit-identical to the plain one while the same fit on the
             # CPU moved by 1.14.
             params.extra.score_function,
+            searcher.noise_stdev > 0.0,
         )
         if level == 0:
             # The root's own Newton value. Level 0's record is a level of one
