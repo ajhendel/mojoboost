@@ -104,6 +104,7 @@ someone decides to gate on it.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -1149,6 +1150,101 @@ def binding_exports():
 QUOTED_NAME = re.compile(r"[\"']([A-Za-z_][A-Za-z_0-9]*)[\"']")
 
 
+def _attribute_reads(tree):
+    """`_mojotrees.name` and `ext.name` as the PARSER sees them.
+
+    An `ast` walk rather than `NATIVE_ATTR.findall`, and the difference is
+    the point: a comment is not in the tree at all and a docstring is a
+    `Constant`, so neither can contribute a name. The regex read the file as
+    text and could not tell a call from a sentence about a call.
+
+    **It had already invented one.** `python/mojotrees/basic.py:111` and two
+    lines of `sklearn.py` mention `` `_mojotrees._parse_ctr` `` while
+    explaining which vocabulary the `ctr` parameter speaks, and nothing in
+    the package calls it -- the rule name crosses as a string in a params
+    dict. The integration gate reported `_parse_ctr` as a native name Python
+    reaches for that no binding registers, which is a real category and was
+    the wrong member of it. Three prose mentions, one phantom finding, and it
+    sat in a gate whose whole job is to find disconnections.
+
+    That is the third tool in this repository to count prose as code. The
+    other two were `tools/default_argument_audit.py`, which counted a comment
+    as a Python door, and the same script's parameter regex. The shape is
+    always the same: a scan over `read(path)` cannot distinguish the code
+    from the writing about the code, and writing about the code is exactly
+    what a well-documented file is full of.
+
+    A `SyntaxError` is raised rather than skipped. Returning an empty set for
+    an unparseable module would make this audit report FEWER disconnections,
+    which is the direction that reads as good news.
+    """
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        value = node.value
+        if isinstance(value, ast.Name) and value.id in ("_mojotrees", "ext"):
+            if node.attr != "mojo":
+                names.add(node.attr)
+    return names
+
+
+def _getattr_reads(tree):
+    """`getattr(_mojotrees, "name")`, also from the tree.
+
+    Same reason as `_attribute_reads`, and the same regex would have had the
+    same problem the moment somebody wrote the call out in a docstring to
+    explain it.
+    """
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Name) and func.id == "getattr"):
+            continue
+        if len(node.args) < 2:
+            continue
+        target, attr = node.args[0], node.args[1]
+        if not (isinstance(target, ast.Name) and target.id == "_mojotrees"):
+            continue
+        if isinstance(attr, ast.Constant) and isinstance(attr.value, str):
+            names.add(attr.value)
+    return names
+
+
+def _quoted_strings(tree):
+    """Every string constant that is not a docstring.
+
+    The quoted-string rule below is already guarded -- a string counts only
+    when it names a real export -- so it cannot invent a name the way the
+    attribute scan could. Dropping docstrings is still right: a docstring
+    naming an export is describing it, and if that export is registered the
+    string adds nothing, while if it is not, the guard already dropped it.
+    """
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                   ast.ClassDef)
+        ):
+            body = getattr(node, "body", None)
+            if not body:
+                continue
+            first = body[0]
+            if isinstance(first, ast.Expr) and isinstance(
+                first.value, ast.Constant
+            ):
+                if isinstance(first.value.value, str):
+                    docstrings.add(id(first.value))
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) not in docstrings:
+                out.add(node.value)
+    return out
+
+
 def python_native_reads(exports=None):
     """Native names Python reaches for, whether or not they exist.
 
@@ -1156,16 +1252,22 @@ def python_native_reads(exports=None):
     only when `exports` (the binding table) is given and the string, or the
     string plus `_multiclass`, names an export; a plain scan of every string
     literal would otherwise invent reads.
+
+    All three are read out of the parsed module rather than out of its text,
+    so a comment or a docstring mentioning a native name contributes nothing.
+    See `_attribute_reads` for the finding that made this necessary.
     """
     names = set()
     quoted = set()
     for name in sorted(set(python_modules()) | {"__init__"}):
-        text = read(os.path.join(PY_PKG, name + ".py"))
+        path = os.path.join(PY_PKG, name + ".py")
+        text = read(path)
         if text is None:
             continue
-        names |= set(NATIVE_ATTR.findall(text))
-        names |= set(NATIVE_GETATTR.findall(text))
-        quoted |= set(QUOTED_NAME.findall(text))
+        tree = ast.parse(text, filename=path)
+        names |= _attribute_reads(tree)
+        names |= _getattr_reads(tree)
+        quoted |= _quoted_strings(tree)
     if exports:
         for q in quoted:
             if q in exports:
@@ -1300,7 +1402,12 @@ def audit_missing_bindings():
     findings = []
     exports = set(binding_exports())
     # Names that are attributes of the extension module for other reasons.
-    not_functions = {"so", "__file__", "__name__", "__doc__"}
+    # `"so"` used to be here and is gone: it was never an attribute read at
+    # all, it was the text scan matching `_mojotrees.so` inside prose about
+    # the built file. The entry was a symptom of the bug `_attribute_reads`
+    # fixes, patched one layer too low -- and it worked, which is why the
+    # same bug went on producing `_parse_ctr` unnoticed.
+    not_functions = {"__file__", "__name__", "__doc__"}
     for name in sorted(python_native_reads()):
         if name in exports or name in not_functions:
             continue
