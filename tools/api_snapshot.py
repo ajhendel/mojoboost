@@ -11,6 +11,17 @@ one implementation of that document and not a second definition of it.
 kind of difference is breaking and which is additive, and section 2 is
 what "public" means.
 
+**`SNAPSHOT_SCHEMA.md` is behind this file as of 2026-08-17**, in four
+places, and is not this lane's to edit. Its section 2 says
+`model_format_writer_token` "must equal `"v" + model_format_writer`" and
+does not list `model_format_base` or `model_format_writer_tokens`; its
+parsing rule 7 says the readable set is a chain of `if token == "vN"`,
+which stopped being true when the v5 arm was spelled with a constant; and
+its section 6 states I2, I3 and I4 in the one-literal-against-one-constant
+form they had before `_model_version` made the written version a function
+of the model's contents. `check_model_format` below carries the rewritten
+statements and says what each one replaced.
+
 Modeled on `tools/check_parity.py`, and constrained the same three ways,
 for the same reason. A check that needs a build gets skipped the first day
 it is inconvenient.
@@ -63,7 +74,15 @@ from pathlib import Path
 # by this tool is separable from a diff caused by the tree. It is not the
 # snapshot's schema version; that is SCHEMA_VERSION and it lives in
 # compatibility/SNAPSHOT_SCHEMA.md.
-TOOL_VERSION = 1
+# 2: the model format block stopped comparing one literal against one
+# constant. `_model_version` in serialize.mojo chooses the token from the
+# model's CONTENTS, and `_read_version` spells its newest arm with a
+# constant rather than a literal, so the old `"v(\d+)"` scan silently
+# dropped that arm and froze a readable set that excluded a version the
+# reader accepts. Also resolves `frozenset({...})` and its siblings, which
+# is what `_INTEGRAL` is written as and what made `integral_slots` freeze
+# as an empty list.
+TOOL_VERSION = 2
 SCHEMA_VERSION = 2
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -188,19 +207,62 @@ def module_constants(tree) -> dict:
         target = node.targets[0]
         if not isinstance(target, ast.Name):
             continue
-        try:
-            out[target.id] = ast.literal_eval(node.value)
-        except (ValueError, TypeError, SyntaxError):
-            continue
+        # Resolved against what has been seen so far, in source order, so a
+        # constant written in terms of an earlier one resolves and a forward
+        # reference stays unresolved rather than resolving to the wrong
+        # thing. `value_of` also handles the container calls literal_eval
+        # will not.
+        value = value_of(node.value, out)
+        if value is not UNDERIVED:
+            out[target.id] = value
     return out
 
 
+#: Container constructors whose single argument is a literal. Parsing rule
+#: 10: `ast.literal_eval` evaluates a set DISPLAY, `{"a", "b"}`, and not a
+#: set CALL, `frozenset({"a", "b"})`, so `_INTEGRAL` in callback.py -- the
+#: three reset slots that are integer-typed -- resolved to UNDERIVED and was
+#: written to the snapshot as `[]`. That is the failure this file worries
+#: about most: `[]` is a value a `--check` compares against and passes, so a
+#: fourth integral slot would have produced no diff at all, while the path
+#: sitting in `meta.underived` made it look declared. A named gap is honest
+#: only when the value beside it is not a lie.
+_COLLECTION_CALLS = ("set", "frozenset", "tuple", "list")
+
+
 def value_of(node, consts: dict):
-    """A literal, a module-level constant by name, or UNDERIVED."""
+    """A literal, a module-level constant by name, or UNDERIVED.
+
+    A `set`/`frozenset`/`tuple`/`list` call over a literal resolves to a
+    list, sorted for the unordered two so that the snapshot stays
+    byte-identical across runs.
+    """
     if node is None:
         return None
     if isinstance(node, ast.Name) and node.id in consts:
         return consts[node.id]
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _COLLECTION_CALLS
+        and not node.keywords
+        and len(node.args) <= 1
+    ):
+        if not node.args:
+            return []
+        inner = value_of(node.args[0], consts)
+        if inner is UNDERIVED or inner is None:
+            return UNDERIVED
+        try:
+            items = list(inner)
+        except TypeError:
+            return UNDERIVED
+        if node.func.id in ("set", "frozenset"):
+            try:
+                items = sorted(items)
+            except TypeError:
+                return UNDERIVED
+        return items
     try:
         return ast.literal_eval(node)
     except (ValueError, TypeError, SyntaxError):
@@ -807,14 +869,23 @@ def mojo_objective_code_pin(d: Deriver) -> dict:
     return out
 
 
-def registry_body(text: str, fn: str) -> str:
-    """The source text of one top-level `def` in the registry, from its
+def mojo_def_body(text: str, fn: str) -> str:
+    """The source text of one top-level `def` in a Mojo file, from its
     header to the next top-level `def` or `comptime`. Shared by the metric
-    block and the objective block, which parse the same file the same way."""
+    block, the objective block and the model format block, which parse
+    three files the same way."""
     m = re.search(
-        rf"^def {fn}\(.*?\n(?=^def |^comptime |\Z)", text, re.S | re.M
+        rf"^def {re.escape(fn)}\(.*?\n(?=^def |^comptime |\Z)",
+        text,
+        re.S | re.M,
     )
     return m.group(0) if m else ""
+
+
+#: Kept as the old name because the two registry parsers read better with
+#: it, and because a second spelling of one function is what invariant I11
+#: exists to catch elsewhere in this file.
+registry_body = mojo_def_body
 
 
 #: One `if name == "a" or name == "b": return X` arm of a resolver chain in
@@ -927,22 +998,150 @@ def mojo_reset_slot_order(d: Deriver) -> list:
     return [slots[i] for i in sorted(slots)]
 
 
-def model_format_block(d: Deriver) -> dict:
-    """Five constants in three files, recorded separately rather than
-    reconciled. A schema with one "model format version" field would have
-    hidden the four-way disagreement findings F1 and F2 describe."""
-    text = read(MOJO_SERIALIZE, d)
-    readable = sorted(
-        int(v) for v in re.findall(r'token\s*==\s*"v(\d+)"', text)
-    )
-    if not readable:
+def mojo_comptime_strings(path: Path, d: Deriver) -> dict:
+    """Every `comptime NAME = "..."` in one Mojo file, as a name -> value
+    map. A version token is as likely to be spelled by its constant as by
+    its literal, and a parser that reads only the literal drops the arm --
+    which is exactly what happened to `v5`."""
+    return {
+        name: value
+        for name, value in re.findall(
+            r'comptime\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"',
+            read(path, d),
+        )
+    }
+
+
+def _token_of(expr: str, strings: dict):
+    """The string one token expression stands for, or None if this parser
+    cannot say. `expr` is either a double-quoted literal or the name of a
+    `comptime` string in the same file, optionally wrapped in `String(...)`.
+
+    Returning None rather than a guess is the whole point. The failure this
+    replaces was a silent drop, not a wrong value, and a silent drop froze a
+    `readable` set that excluded a version the reader accepts.
+    """
+    expr = expr.strip()
+    m = re.fullmatch(r"String\(\s*(.*?)\s*\)", expr, re.S)
+    if m:
+        expr = m.group(1).strip()
+    m = re.fullmatch(r'"([^"]*)"', expr)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expr):
+        return strings.get(expr)
+    return None
+
+
+def _writer_tokens(text: str, strings: dict, d: Deriver):
+    """Every version token `_model_version` can return.
+
+    **The written version is a function of the model's CONTENTS, not a
+    constant.** `_model_version(mapper, linear)` returns `_VERSION_5` when
+    the model carries a linear sidecar, fitted CTR tables, or a narrowed
+    `usable` pool, and `_VERSION` when it carries none of the three; a v4
+    file is one an older reader can still take. Two invariants used to
+    compare the single constant `_VERSION` against the single constant
+    `CURRENT_FORMAT_VERSION` and reported the fork as a defect, which was
+    right until commit 2be5949, which introduced `_model_version` together
+    with `_BASE_FORMAT_VERSION`, and wrong afterwards. cc5fee9 then added
+    the third trigger, the narrowed `usable` pool.
+
+    UNDERIVED for the whole key if any `return` in that function cannot be
+    reduced to a token, because a partial list is a false record and this
+    field is compared for equality.
+    """
+    body = mojo_def_body(text, "_model_version")
+    if not body:
+        d.gap(
+            "versions.model_format_writer_tokens",
+            "serialize.mojo has no _model_version; the writer's token is no "
+            "longer a function this can read",
+        )
+        return UNDERIVED
+    returns = re.findall(r"^\s*return\s+(.+?)\s*$", body, re.M)
+    if not returns:
+        d.gap(
+            "versions.model_format_writer_tokens",
+            "_model_version returns nothing this parser recognized",
+        )
+        return UNDERIVED
+    tokens = set()
+    for expr in returns:
+        token = _token_of(expr, strings)
+        if token is None:
+            d.gap(
+                "versions.model_format_writer_tokens",
+                f"_model_version returns {expr!r}, which is neither a string "
+                "literal nor a comptime string in the same file",
+            )
+            return UNDERIVED
+        tokens.add(token)
+    return sorted(tokens)
+
+
+def _readable_versions(text: str, strings: dict, d: Deriver):
+    """The versions `_read_version` accepts, from its `if token == X` chain.
+
+    X is a literal for v1 through v4 and the constant `_VERSION_5` for v5,
+    which is why this resolves names. Parsing rule 7 said "a chain of
+    `if token == "vN"`" and the chain stopped being spelled that way.
+
+    UNDERIVED for the whole key if any arm is unreadable, for the same
+    reason `_writer_tokens` is: the previous parser dropped the arm it could
+    not read and froze `[1, 2, 3, 4]` on a build whose reader accepts v5.
+    """
+    body = mojo_def_body(text, "_read_version")
+    if not body:
+        d.gap("versions.model_format_readable", "no _read_version found")
+        return UNDERIVED
+    arms = re.findall(r"if\s+token\s*==\s*(.+?)\s*:", body)
+    if not arms:
         d.gap("versions.model_format_readable", "no version chain matched")
+        return UNDERIVED
+    versions = set()
+    for expr in arms:
+        token = _token_of(expr, strings)
+        if token is None:
+            d.gap(
+                "versions.model_format_readable",
+                f"_read_version compares token against {expr!r}, which this "
+                "parser cannot resolve to a version token",
+            )
+            return UNDERIVED
+        m = re.fullmatch(r"v(\d+)", token)
+        if m is None:
+            d.gap(
+                "versions.model_format_readable",
+                f"_read_version accepts the token {token!r}, which is not "
+                "spelled vN",
+            )
+            return UNDERIVED
+        versions.add(int(m.group(1)))
+    return sorted(versions)
+
+
+def model_format_block(d: Deriver) -> dict:
+    """Seven constants in three files, recorded separately rather than
+    reconciled. A schema with one "model format version" field would have
+    hidden the four-way disagreement findings F1 and F2 describe, and a
+    schema with one writer token hid the v4/v5 fork the same way."""
+    text = read(MOJO_SERIALIZE, d)
+    strings = mojo_comptime_strings(MOJO_SERIALIZE, d)
     return {
         "writer": mojo_comptime_int(
             MOJO_SERIALIZE, "CURRENT_FORMAT_VERSION", d
         ),
+        "base": mojo_comptime_int(
+            MOJO_SERIALIZE, "_BASE_FORMAT_VERSION", d
+        ),
+        # `comptime _VERSION`, the token a model with no optional section
+        # declares. Kept under its old name and its old source because it
+        # still names one constant; what changed is that it is no longer the
+        # only token the writer emits, which `writer_tokens` is for.
         "writer_token": mojo_comptime_str(MOJO_SERIALIZE, "_VERSION", d),
-        "readable": readable,
+        "writer_tokens": _writer_tokens(text, strings, d),
+        "readable": _readable_versions(text, strings, d),
         "dump_reports": mojo_comptime_int(
             MOJO_DUMP, "MODEL_FORMAT_VERSION", d
         ),
@@ -1109,7 +1308,9 @@ def versions_block(d: Deriver, inspection: dict) -> dict:
         "library_locations": locations,
         "c_abi": None,  # filled from the c_abi block, which owns the parse
         "model_format_writer": fmt["writer"],
+        "model_format_base": fmt["base"],
         "model_format_writer_token": fmt["writer_token"],
+        "model_format_writer_tokens": fmt["writer_tokens"],
         "model_format_readable": fmt["readable"],
         "model_format_dump_reports": fmt["dump_reports"],
         "model_format_python_reads": inspection.get(
@@ -1183,6 +1384,108 @@ def deprecations_block(d: Deriver) -> dict:
 # -- Invariants ----------------------------------------------------------
 
 
+def check_model_format(v: dict, d: Deriver) -> None:
+    """I2 through I5, over the seven numbers that describe the model format.
+
+    **These four were rewritten on 2026-08-17, because the design they
+    checked changed and they did not.** Until commit 2be5949 the writer
+    emitted one token and the four invariants could each compare one literal
+    against one constant. `_model_version` now chooses the token from the
+    model's CONTENTS -- v5 for a model carrying a linear sidecar, fitted CTR
+    tables, or a narrowed `usable` pool, v4 for a model carrying none of the
+    three, so that a file an older reader can take still says so. The old I2
+    and I3 read that fork as two defects and reported them on a correct
+    tree, which is the failure mode that gets a gate switched off.
+
+    What is checked now is the rule the design actually states:
+
+    - **I2**, the writer's tokens are a function of the model's contents and
+      they span the two constants that name the ends of that range: the
+      lowest is `v{_BASE_FORMAT_VERSION}`, the highest is
+      `v{CURRENT_FORMAT_VERSION}`, and `comptime _VERSION` is the base one.
+      A version bumped in the constant and not in the function fails here,
+      which is the drift the old I2 was really for.
+    - **I3**, `_read_version` accepts EVERY token the writer can emit. The
+      old I3 asked only about the newest, which is weaker, and it was being
+      answered from a `readable` set that silently omitted `v5` because that
+      arm is spelled with a constant.
+    - **I4**, `model_dump.MODEL_FORMAT_VERSION` equals `_BASE_FORMAT_VERSION`
+      and NOT `CURRENT_FORMAT_VERSION`. serialize.mojo says so in as many
+      words where the two constants are defined: the dump's constant is the
+      base, and `linear_model_format_version` raises it per model. The old
+      I4 compared it against the writer's maximum and so fired on the
+      correct value.
+    - **I5** is unchanged in substance and moved here to sit with the rest.
+    """
+    writer = v.get("model_format_writer")
+    base = v.get("model_format_base")
+    token = v.get("model_format_writer_token")
+    tokens = v.get("model_format_writer_tokens")
+    readable = v.get("model_format_readable")
+
+    if tokens is not None and writer is not None and base is not None:
+        numbered = {}
+        for t in tokens:
+            m = re.fullmatch(r"v(\d+)", str(t))
+            if m is None:
+                d.problem(
+                    f"I2: _model_version can emit the token {t!r}, which is "
+                    "not spelled vN; the version a file declares is the one "
+                    "fact a reader has before it parses anything"
+                )
+            else:
+                numbered[int(m.group(1))] = t
+        if numbered:
+            if max(numbered) != writer:
+                d.problem(
+                    f"I2: the highest token _model_version can emit is "
+                    f"{numbered[max(numbered)]!r} and CURRENT_FORMAT_VERSION "
+                    f"is {writer}; the build declares a format it never "
+                    "writes, or writes one it does not declare"
+                )
+            if min(numbered) != base:
+                d.problem(
+                    f"I2: the lowest token _model_version can emit is "
+                    f"{numbered[min(numbered)]!r} and _BASE_FORMAT_VERSION "
+                    f"is {base}; the base version is what a model with no "
+                    "optional section declares, so the two cannot disagree"
+                )
+        if token is not None and token != f"v{base}":
+            d.problem(
+                f"I2: comptime _VERSION is {token!r} and "
+                f"_BASE_FORMAT_VERSION is {base}; _VERSION is the base "
+                "token, not the newest one"
+            )
+
+    if tokens is not None and readable is not None:
+        accepted = {f"v{n}" for n in readable}
+        missing = sorted(set(tokens) - accepted)
+        if missing:
+            d.problem(
+                f"I3: _model_version can emit {missing} and _read_version "
+                f"accepts {sorted(accepted)}; the build cannot read what it "
+                "writes"
+            )
+
+    reports = v.get("model_format_dump_reports")
+    if base is not None and reports is not None and reports != base:
+        d.problem(
+            f"I4: model_dump.mojo reports model_format_version {reports} and "
+            f"serialize._BASE_FORMAT_VERSION is {base}; the dump's constant "
+            "is the BASE version, raised per model by "
+            "linear_model_format_version, and a dump consumer branches on "
+            "that number to know which optional facts a model can carry"
+        )
+
+    py_reads = v.get("model_format_python_reads") or []
+    if writer is not None and py_reads and max(py_reads) < writer:
+        d.problem(
+            f"I5: inspection.py reads {py_reads} and the writer emits "
+            f"v{writer}; the pure-Python parser rejects a model this build "
+            f"just saved"
+        )
+
+
 def check_invariants(snap: dict, d: Deriver) -> None:
     """Facts about the tree, not about the file. A violation is reported
     and exits non-zero even when the snapshot itself matches, because the
@@ -1198,33 +1501,7 @@ def check_invariants(snap: dict, d: Deriver) -> None:
             + ", ".join(f"{k}={value!r}" for k, value in locations.items())
         )
 
-    writer = v.get("model_format_writer")
-    token = v.get("model_format_writer_token")
-    if writer is not None and token is not None and token != f"v{writer}":
-        d.problem(
-            f"I2: serialize.mojo writes {token!r} but "
-            f"CURRENT_FORMAT_VERSION is {writer}"
-        )
-    readable = v.get("model_format_readable") or []
-    if writer is not None and readable and writer not in readable:
-        d.problem(
-            f"I3: the writer emits v{writer} and the reader accepts "
-            f"{readable}; the build cannot read what it writes"
-        )
-    reports = v.get("model_format_dump_reports")
-    if writer is not None and reports is not None and reports != writer:
-        d.problem(
-            f"I4: model_dump.mojo reports model_format_version {reports} "
-            f"and serialize.mojo writes v{writer}; a dump consumer branches "
-            f"on that number to know which optional facts a model can carry"
-        )
-    py_reads = v.get("model_format_python_reads") or []
-    if writer is not None and py_reads and max(py_reads) < writer:
-        d.problem(
-            f"I5: inspection.py reads {py_reads} and the writer emits "
-            f"v{writer}; the pure-Python parser rejects a model this build "
-            f"just saved"
-        )
+    check_model_format(v, d)
 
     resettable = cb.get("resettable") or []
     slots = cb.get("reset_slots")
@@ -1500,6 +1777,17 @@ CLASSIFY = (
     (r"^python\.shared_estimator_parameters\.", "breaking", "policy 4.3, a default changed"),
     (r"^python\.estimators\.[^.]+\.own_parameters\.", "breaking", "policy 4.3"),
     (r"^python\.estimators\.[^.]+\.methods\.", "breaking", "an argument moved, was renamed, or was retyped"),
+    # `sites` is how many `_resolve_alias` calls resolve this alias, and it
+    # is bookkeeping rather than surface: what policy 4.2 freezes is the
+    # canonical name and the fallback, and two sites that DISAGREE about
+    # either are invariant-checked in `alias_pairs` rather than diffed here.
+    # A count that rises is a new code path honoring an existing alias; one
+    # that falls may be a path that stopped honoring it, which is why this
+    # is `review` and not `ignore`.
+    (r"^python\.parameter_aliases\.[^.]+\.sites$", "review",
+     "the number of call sites resolving this alias moved; the pair and its "
+     "fallback are what 4.2 freezes, and a fall may be a path that stopped "
+     "honoring it"),
     (r"^python\.parameter_aliases\.", "breaking", "policy 4.2"),
     (r"^parameter_string\.supported_keys", "review", "policy 4.4; accepted is additive, the reverse is breaking"),
     (r"^platforms\.", "breaking", "policy 10.4, a tier or a target moved"),
@@ -1507,6 +1795,45 @@ CLASSIFY = (
     (r"^environment\.", "review", "an undeclared variable appeared or went"),
     (r"^numerical_contracts", "breaking", "policy 8.3"),
     (r"^meta\.", "ignore", "bookkeeping"),
+)
+
+
+#: Rules that depend on WHICH KIND of difference it is, consulted before
+#: the path table above and returning their severity verbatim.
+#:
+#: There is one case, and it is the one the table above got wrong. Policy
+#: 11.2 has two rows about a parameter: "a default value changes" is
+#: breaking under 4.3, and "an argument is appended with a default" is
+#: additive. `^python\.shared_estimator_parameters\.` returned the first
+#: reason for both, so a parameter that had just APPEARED was reported as a
+#: default that had changed -- a sentence about a value that has no previous
+#: value at all, printed on nine rows in one round.
+#:
+#: The honest severity for an appearance is `review`, not `additive`,
+#: because the two 11.2 rows are told apart by WHERE the argument landed and
+#: **this snapshot cannot see that**. `signature()` derives declaration
+#: order and then `json.dump(..., sort_keys=True)` alphabetizes it away, so
+#: an argument appended at the end and an argument inserted at position 44
+#: produce the identical row. Appended is additive; inserted shifts every
+#: positional caller after it and is breaking. A reader has to open the
+#: signature, which is what `review` asks them to do.
+CLASSIFY_BY_KIND = (
+    (
+        r"^python\.shared_estimator_parameters\.",
+        "added",
+        "review",
+        "a parameter appeared: policy 11.2, additive if it was appended "
+        "with a default and breaking if it was inserted. This snapshot "
+        "sorts its keys and cannot tell you which; read the signature",
+    ),
+    (
+        r"^python\.estimators\.[^.]+\.own_parameters\.",
+        "added",
+        "review",
+        "a parameter appeared: policy 11.2, additive if it was appended "
+        "with a default and breaking if it was inserted. This snapshot "
+        "sorts its keys and cannot tell you which; read the signature",
+    ),
 )
 
 
@@ -1520,6 +1847,9 @@ def classify(path: str, kind: str) -> tuple:
     end, and a new `RESETTABLE` entry is additive only if the slot count
     moved with it, which invariant I6 is what actually checks.
     """
+    for pattern, only_kind, severity, why in CLASSIFY_BY_KIND:
+        if kind == only_kind and re.match(pattern, path):
+            return severity, why
     for pattern, severity, why in CLASSIFY:
         if re.match(pattern, path):
             if severity == "ignore":
