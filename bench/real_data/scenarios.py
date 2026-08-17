@@ -216,6 +216,24 @@ BASE_PARAMS = {
     "min_data_in_leaf": 20,
     "min_child_hess": 1e-3,
     "lambda_l1": 0.0,
+    # `lambda_l2` is named here, at LightGBM's stock 0.0, as of 2026-08-17.
+    # It was ABSENT before that, and absence was correct for exactly as long
+    # as our own default was also 0.0: both engines then resolved their own
+    # stock value and landed on the same number.
+    #
+    # On 2026-08-17 our default moved to 1.0 (a declared divergence, see
+    # `python/mojotrees/sklearn.py` `_LAMBDA_L2` and `STOCK_DIVERGENCES` in
+    # `tools/check_parity.py`). From that moment an absent key stops meaning
+    # "both at stock" and starts meaning "each at its own different value",
+    # which would have made the lightgbm/mojotrees MIRROR PAIR quietly stop
+    # being a mirror while still being labelled one. That is the same defect
+    # found on 2026-08-16, in the same parameter, running the other
+    # direction, and it is why this key is now explicit rather than implied.
+    #
+    # So this pair measures growth policy and implementation at a MATCHED
+    # regularizer. Our shipped default is a separate row, and the two must
+    # not be read as the same arm.
+    "lambda_l2": 0.0,
     "max_bin": 255,
     "use_missing": True,
 }
@@ -234,7 +252,20 @@ COMPARATOR_ID = "stock+det"
 #: every leaf value and some split choices on both engines, which is the
 #: definition of non-comparable, so a v1 number and a v2 number are not the
 #: same measurement.
-COMPARATOR_VERSION = 2
+#: v3 as of 2026-08-17, and this bump is unlike v2. `lambda_l2` was ADDED to
+#: `BASE_PARAMS` at 0.0, which is the value LightGBM already resolved it to
+#: from its own stock config, so **the comparator's resolved configuration is
+#: unchanged and a v2 LightGBM number and a v3 LightGBM number are the same
+#: measurement.** The bump is required anyway by the rule above, which names
+#: "which keys it holds", and the rule is right to be that conservative: what
+#: actually changed is not the comparator but the RELATIONSHIP between this
+#: arm and our shipped default. Until 2026-08-17 our mojotrees arm on
+#: `BASE_PARAMS` was also our shipped default. It is not any more, because the
+#: shipped `lambda_l2` is 1.0 and this arm pins 0.0 to stay a mirror. Anyone
+#: reading a v2 table as "this is what mojotrees ships" was right then and
+#: would be wrong now, and that is exactly the confusion a version exists to
+#: prevent.
+COMPARATOR_VERSION = 3
 COMPARATOR_LABEL = "LightGBM at stock defaults plus deterministic=true"
 COMPARATOR_REGISTERED = (
     "bench/results/PROFILE_PROTOCOL.md section C9, as amended 2026-08-16"
@@ -1391,10 +1422,14 @@ CATBOOST_DETERMINISM = {
 #:   CatBoost's: at a matched tree count, two arms at different rates are doing
 #:   different amounts of fitting. The last-figure difference is declared in
 #:   XGBOOST_UNMATCHABLE['learning_rate_precision'].
-#: - `lambda_l2=1.0`. XGBoost's resolved `lambda` is 1 where ours and
-#:   LightGBM's stock is 0.0. `mojotrees_params` does not pass `lambda_l2` at
-#:   all, so this dict is where it enters, which is the same route
-#:   `MOJOTREES_CATBOOST_MODE` uses for its 3.0.
+#: - `lambda_l2=1.0`. XGBoost's resolved `lambda` is 1 where LightGBM's stock
+#:   is 0.0. As of 2026-08-17 it is also OUR default, so this pin and our
+#:   shipped value coincide at 1.0 and this mirror arm no longer has to
+#:   override anything to hold. It is still passed explicitly, because a
+#:   mirror that holds by coincidence is one default change away from not
+#:   holding, and because `mojotrees_params` now passes `lambda_l2` from
+#:   `BASE_PARAMS` at LightGBM's 0.0, which this dict must override. That
+#:   override is the same route `MOJOTREES_CATBOOST_MODE` uses for its 3.0.
 #: - `min_child_hess=1.0`. XGBoost's resolved `min_child_weight` is 1 and it is
 #:   a SUM OF HESSIANS, which is the quantity `min_child_hess` holds. The
 #:   mapping is not a guess: `min_child_weight` is an ALIAS of `min_child_hess`
@@ -2531,9 +2566,13 @@ SHARED_PARAM_ROUTING = {
         ("train", "min_child_hess"),
     ),
     "lambda_l1": (("train", "lambda_l1"), ("train", "lambda_l1")),
-    # No `lambda_l2` row: it left BASE_PARAMS on 2026-08-16 and neither
-    # engine is handed it any more. A row here with no BASE_PARAMS key
-    # would describe a route nothing travels.
+    # `lambda_l2` is routed again as of 2026-08-17. It left BASE_PARAMS on
+    # 2026-08-16, when both engines defaulted it to 0.0 and handing it to
+    # neither was the same fit as handing 0.0 to both. Our default moved to
+    # 1.0 on 2026-08-17, so those two stopped being the same fit and the key
+    # came back at LightGBM's 0.0 to keep this pair a mirror. Both engines
+    # take it under the same name.
+    "lambda_l2": (("train", "lambda_l2"), ("train", "lambda_l2")),
     "max_bin": (("train", "max_bin"), ("dataset", "max_bin")),
     "use_missing": (("train", "use_missing"), ("dataset", "use_missing")),
 }
@@ -3705,16 +3744,22 @@ def lightgbm_params(spec, threads, extra=None):
                 f"{COMPARATOR_LABEL} and pinning either compares two "
                 "different binnings: see LIGHTGBM_STOCK_DEFAULTS and C9."
             )
-    # `lambda_l2` joins them as of 2026-08-16. It was pinned to 1.0 on both
-    # sides for as long as mojotrees's default was 1.0, and the pin came out
-    # with the default. Setting it here again puts the comparator back on a
-    # non-stock regularizer under a label that says stock.
+    # `lambda_l2` joins them as of 2026-08-16, and the reason narrowed on
+    # 2026-08-17. It was pinned to 1.0 on both sides for as long as
+    # mojotrees's default was 1.0, and the pin came out with the default.
+    # `BASE_PARAMS` now supplies LightGBM's stock 0.0 to both engines, which
+    # is what keeps this a mirror pair while our own default is 1.0. What
+    # this refusal still guards is a SCENARIO reaching in through `extra` to
+    # pin some other value on the comparator, which would put the arm
+    # labelled stock on a regularizer no default produces.
     if "lambda_l2" in (extra or {}):
         raise ValueError(
-            "lambda_l2 was passed to the comparator. It is stock (0.0) in "
-            f"{COMPARATOR_LABEL} and in mojotrees, and pinning it compares "
-            "an arm labelled stock against a regularizer no default "
-            "produces: see LIGHTGBM_STOCK_DEFAULTS and the module docstring."
+            "lambda_l2 was passed to the comparator through `extra`. It is "
+            f"stock (0.0) in {COMPARATOR_LABEL}, it is supplied to both "
+            "engines from BASE_PARAMS at that stock value, and mojotrees's "
+            "own default is 1.0 as of 2026-08-17, so a scenario-level pin "
+            "here would silently move the comparator rather than align it: "
+            "see LIGHTGBM_STOCK_DEFAULTS and the module docstring."
         )
     shared = shared_params(spec, extra)
     params = {
@@ -3724,8 +3769,12 @@ def lightgbm_params(spec, threads, extra=None):
         "learning_rate": shared["learning_rate"],
         "min_data_in_leaf": shared["min_data_in_leaf"],
         "min_sum_hessian_in_leaf": shared["min_child_hess"],
-        # No `lambda_l2`: stock on both sides since 2026-08-16, so it is
-        # recorded in LIGHTGBM_STOCK_DEFAULTS rather than passed.
+        # `lambda_l2` is passed again since 2026-08-17. It was "stock on both
+        # sides" from 2026-08-16, which made passing it redundant; our stock
+        # moved to 1.0, which makes passing it the only thing keeping this
+        # pair a mirror. It is LightGBM's own 0.0, so this restates
+        # LightGBM's default and overrides ours.
+        "lambda_l2": shared["lambda_l2"],
         "lambda_l1": shared["lambda_l1"],
         "max_bin": shared["max_bin"],
         "use_missing": shared["use_missing"],
@@ -3785,9 +3834,13 @@ def mojotrees_params(spec, device, extra=None):
         # `_resolve_bootstrap` reads it for `bootstrap_seed`, which is the one
         # that is live on the CatBoost-mode arm.
         "random_state": SHARED_SEED,
-        # No `lambda_l2`, for the same reason as on the LightGBM side: the
-        # estimator's own default is LightGBM's 0.0 now, so passing it
-        # would restate a default rather than align anything.
+        # `lambda_l2` is passed again, for the same reason as on the LightGBM
+        # side and with the opposite effect. Until 2026-08-17 the estimator's
+        # own default WAS LightGBM's 0.0, so passing it restated a default.
+        # The shipped default is 1.0 now, so passing 0.0 here OVERRIDES ours
+        # to hold the mirror. This arm is therefore no longer "mojotrees at
+        # its defaults"; the shipped-defaults arm is a separate row.
+        "lambda_l2": shared["lambda_l2"],
         "lambda_l1": shared["lambda_l1"],
         "device": device,
     }

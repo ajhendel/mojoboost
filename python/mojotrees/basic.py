@@ -1393,7 +1393,12 @@ class Booster:
                 return default
             return float(base._resolve_alias(name, alias, default))
 
-        lambda_l2 = _leaf("lambda_l2", "reg_lambda", 0.0)
+        # 1.0 is a declared departure from LightGBM's stock 0.0, gated in
+        # `tools/check_parity.py`'s STOCK_DIVERGENCES and explained on
+        # `sklearn.py`'s `_LAMBDA_L2`. This is the THIRD copy of the value,
+        # here rather than imported because `sklearn.py` imports this module
+        # and not the other way round. It must move with the other two.
+        lambda_l2 = _leaf("lambda_l2", "reg_lambda", 1.0)
         lambda_l1 = _leaf("lambda_l1", "reg_alpha", 0.0)
         max_delta_step = float(getattr(base, "max_delta_step", 0.0) or 0.0)
         path_smooth = float(getattr(base, "path_smooth", 0.0) or 0.0)

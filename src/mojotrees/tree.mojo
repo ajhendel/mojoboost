@@ -263,18 +263,25 @@ struct TreeParams(Copyable, Movable):
 
     @staticmethod
     def default() -> TreeParams:
-        # LightGBM's stock defaults, every one of them, read from
-        # include/LightGBM/config.h at v4.7.0: num_leaves 31,
-        # min_data_in_leaf 20, lambda_l2 0.0 (`lambda_reg` here),
-        # min_sum_hessian_in_leaf 1e-3 (`min_child_hess`), lambda_l1 0.0.
-        # The remaining fields default in the signature above, also to
-        # LightGBM's values: max_depth -1, both feature fractions 1.0,
-        # interaction and monotonic constraints none.
+        # LightGBM's stock defaults, read from include/LightGBM/config.h at
+        # v4.7.0, with ONE declared departure: num_leaves 31,
+        # min_data_in_leaf 20, `lambda_reg` (lambda_l2) 1.0 where LightGBM
+        # ships 0.0, min_sum_hessian_in_leaf 1e-3 (`min_child_hess`),
+        # lambda_l1 0.0. The remaining fields default in the signature
+        # above, also to LightGBM's values: max_depth -1, both feature
+        # fractions 1.0, interaction and monotonic constraints none.
+        #
+        # `lambda_reg` is 1.0 as of 2026-08-17 and the departure is declared
+        # in `tools/check_parity.py`'s STOCK_DIVERGENCES with its reason and
+        # its exit condition. `lambda_l2 = 0` is the one default in this
+        # library with recorded accuracy damage on three separate scenarios
+        # (docs/design/ACCURACY_GAP.md section 3.4), and it was 0.0 because
+        # LightGBM's is, which is a mirror and not a measurement.
         #
         # `tools/check_parity.py` asserts every number on this line against
         # LightGBM's, so a default cannot drift off stock without failing a
         # gate. Changing one is a change to every fit that did not set it.
-        return TreeParams(31, 20, 0.0, 1e-3, 0.0)
+        return TreeParams(31, 20, 1.0, 1e-3, 0.0)
 
 
 struct Tree(Copyable, Movable):

@@ -1848,3 +1848,98 @@ synthetic histograms, and it is the load-bearing number in this document.
 Nobody has tested it against the code. If one thing here is going to turn out
 wrong, the honest bet is that it is that curve, and candidate 3b is where the
 consequences would land.
+
+---
+
+## 13. Shipped 2026-08-17: `lambda_l2` restored to 1.0 under `lossguide`
+
+This section is not a candidate. It records a default that MOVED, because the
+rest of this document prices accuracy the library might spend for speed and
+this is the opposite trade: accuracy taken back at no speed cost at all.
+
+**The change.** `lambda_l2` under every non-symmetric growth policy goes from
+0.0 to 1.0, in all three literals that carry it: `_LAMBDA_L2` in
+`python/mojotrees/sklearn.py`, the `lambda_reg` positional in
+`tree.mojo::TreeParams.default`, and the `_leaf` fallback in
+`python/mojotrees/basic.py::Booster.refit`. It is declared in
+`tools/check_parity.py`'s `STOCK_DIVERGENCES` with its reason and its exit
+condition, so the departure from LightGBM's stock 0.0 is an argument on the
+page rather than an absence from a list.
+
+**Why, in one line.** `lambda_l2 = 0` is the only default in this library with
+recorded accuracy damage on three separate scenarios, and the only reason it
+was 0.0 is that LightGBM's is 0.0. `docs/design/ACCURACY_GAP.md` section 3.4
+carries the artifacts: -1.6 percent of excess error on `dense_regression` from
+a matched-bin-digest two-point comparison, 0.75x average precision on
+`imbalanced_binary`, and 3.31x worse multiclass logloss, the last two measured
+and both costing us more than they cost LightGBM.
+
+### The speed cost is zero, and the reason is better than "it is one addition"
+
+**Verified in the source, not asserted.** `lambda_l2` appears in the
+denominator of the gain,
+`GL**2/(HL + lambda_l2) + GR**2/(HR + lambda_l2) - G**2/(H + lambda_l2)`
+(`src/mojotrees/split.mojo`), and in the Newton leaf value,
+`-T(G)/(H + lambda_l2)` (`src/mojotrees/tree_parameters_extra.mojo`). **Both
+additions are unconditional.** At `lambda_l2 = 0` the add is still issued, the
+same register is still read, the same divide still runs. So a nonzero value
+changes **no instruction count, no pass, no kernel and no allocation**, on
+either device. There is nothing that is skipped at zero and paid for at one.
+
+**One second-order effect, and it points the cheap way.** Because lambda is in
+the gain and not only in the leaf value, it changes which candidate wins, so it
+CAN change the tree. `ACCURACY_GAP.md` section R1 asserted the opposite ("it
+does not change the tree shape") and that clause is now corrected there. The
+effect is bounded and favorable: a positive lambda penalizes small-hessian
+candidates, the `num_leaves` cap fixes the leaf count regardless, and under
+`min_gain_to_split` a few marginal splits may now be rejected, which is fewer
+nodes rather than more. **Expect zero, and expect any residual to be inside
+noise and signed the right way.**
+
+### Two consequences that are NOT free, recorded because they are the cost
+
+**1. Every recorded accuracy anchor for a `lossguide` arm now describes a model
+we do not ship.** `bench/real_data/accuracy_anchors.json` and the `lossguide`
+rows of `bench/results/COMPARISON_RUN_2026-08-16.md` were measured at
+`lambda_l2 = 0`. They are stale, and **they must not be re-recorded by
+arithmetic.** Rule 3 of `LANE_RULES.md` anchors accuracy on an absolute
+recorded value precisely so that a later run cannot quietly become its own
+baseline, and editing an anchor to match a model nobody measured is how that
+ratchet gets installed. The anchors stay stale, and visibly so, until a run
+replaces them.
+
+**2. The `lightgbm`/`mojotrees` mirror pair stopped being a mirror, and had to
+be repinned.** `BASE_PARAMS` did not name `lambda_l2`, which was correct for
+exactly as long as both engines defaulted it to the same 0.0. The moment ours
+moved, an absent key meant "each at its own different value" while the label
+still said mirror. `bench/real_data/scenarios.py` now names `lambda_l2: 0.0` in
+`BASE_PARAMS`, routes it in `SHARED_PARAM_ROUTING`, passes it on both sides,
+and bumps `COMPARATOR_VERSION` to 3. **This is the same defect found on
+2026-08-16, in the same parameter, running the other direction**, and the
+harness caught it: `selfcheck.py` refused the new key until it was routed and
+then refused the routing until both engines were handed it. That gate worked.
+
+**The consequence for reading tables.** The `mojotrees` arm on `BASE_PARAMS` is
+no longer "mojotrees at its defaults". It is our leaf-wise implementation at a
+regularizer matched to LightGBM's, which is what makes the pair a measurement
+of growth and implementation. The shipped default is a separate row.
+
+### Exit condition
+
+`ACCURACY_GAP.md` section 5 R1 registers the experiment: `lambda_l2` in
+`{0, 1, 2, 3}` as an arm axis over `dense_regression` at both tiers,
+`imbalanced_binary` and `multiclass`, with the decision rule fixed in advance.
+**1.0 is the measured point; 2.0 and 3.0 are unmeasured on our leaf-wise arm
+and are carried as arms of the pending run rather than guessed at as a
+default.** If that run picks another value the declaration moves with it; if it
+picks 0.0 the declaration is deleted.
+
+### One interaction that was invisible at zero
+
+`src/mojotrees/split.mojo` proves that at `lambda_l2 = 0` the Cosine and L2
+score functions have the **same argmax**. Cosine was therefore provably inert
+at our old default and becomes a live choice at 1.0. That is a second sense in
+which the zero was load-bearing without anyone intending it: it silently
+neutralized a scoring option this library advertises, and the same day's bug
+list already contained "`score_function='Cosine'` was silently ignored on every
+leaf-wise GPU fit". Two independent paths to the same nothing.

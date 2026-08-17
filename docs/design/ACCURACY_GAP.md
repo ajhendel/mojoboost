@@ -840,8 +840,29 @@ is CatBoost's and is unmeasured on our leaf-wise arm.
 **Why first.** It is the only candidate with recorded accuracy damage on
 **three** scenarios rather than one. It costs nothing at any tier, on any
 device, in any trainer. It reaches every entry point, unlike `bootstrap_type`.
-It does not change the tree shape, so no speed argument touches it. And the
-reason it is 0.0 is not a measurement, it is the mirror.
+And the reason it is 0.0 is not a measurement, it is the mirror.
+
+**A correction to this recommendation's own first draft, 2026-08-17.** It said
+"it does not change the tree shape, so no speed argument touches it." The first
+clause is false. `lambda_l2` sits in the denominator of the gain,
+`GL**2/(HL + lambda_l2) + GR**2/(HR + lambda_l2) - G**2/(H + lambda_l2)`
+(`src/mojotrees/split.mojo`), so it changes which candidate wins and therefore
+can change the tree. The conclusion survives on a better argument: **the
+`+ lambda_l2` term is unconditional in both the gain and the leaf value, so a
+nonzero value changes no instruction count, adds no pass and adds no kernel.**
+At `lambda_l2 = 0` that addition is still executed. Nothing is skipped at zero
+that has to be paid for at one. The shape effect is real but bounded and points
+the cheap way: a positive lambda makes small-hessian candidates less
+attractive, so under a `num_leaves` cap the leaf count is unchanged and under
+`min_gain_to_split` a few marginal splits may be rejected, which is fewer nodes
+rather than more.
+
+**And one interaction worth naming, because it was invisible at zero.**
+`src/mojotrees/split.mojo` proves that at `lambda_l2 = 0` the Cosine and L2
+score functions have the same argmax. Cosine is therefore **provably inert at
+our old default** and becomes a live choice at a positive lambda. That is a
+second reason the zero was load-bearing in a way nobody intended: it silently
+neutralized a scoring option this library advertises.
 
 **Expected size.** -1.6 percent of excess error on dense regression at 1.0
 (measured), plus the recorded recovery of 0.75x to 1.00x on

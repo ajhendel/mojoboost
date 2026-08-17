@@ -68,15 +68,33 @@ _LEARNING_RATE = 0.1
 # Defaults of the two regularization parameters, named so the constructor
 # signature and the alias resolution in `_params` cannot drift apart.
 _LAMBDA_L1 = 0.0
-_LAMBDA_L2 = 0.0
-"""LightGBM's stock `lambda_l2`.
+_LAMBDA_L2 = 1.0
+"""Our `lambda_l2`, which is a DECLARED departure from LightGBM's stock 0.0.
 
 This literal, not `TreeParams.default()`, is what a Python fit resolves an
 unset `lambda_l2` from, and it is therefore what `bench/real_data` fits.
-It read 1.0 until 2026-08-16, so the arm labelled `stock+det` was running a
-non-stock regularizer on our side while the comparator ran LightGBM's 0.0.
-Three independent literals carried the old value; `tools/check_parity.py`
-now asserts every stock default across all of them.
+
+The history matters, because this value has now moved twice and the two moves
+are not symmetric. It read 1.0 until 2026-08-16, when it was found and removed
+as a **comparator defect**: the arm labelled `stock+det` was running a
+non-stock regularizer on our side while the comparator ran LightGBM's 0.0, and
+the divergence was undeclared, unmeasured and unmentioned. Three independent
+literals carried it and none was gated.
+
+It reads 1.0 again as of 2026-08-17, and the difference is that the departure
+is now measured and declared. `lambda_l2 = 0` is the single default in this
+library with recorded accuracy damage on THREE separate scenarios: -1.6 percent
+of excess error on dense regression, 0.75x average precision on
+`imbalanced_binary`, and 3.31x worse multiclass logloss, all in
+`docs/design/ACCURACY_GAP.md` section 3.4 with the artifacts named. It was 0.0
+because LightGBM's is 0.0, which is a mirror rather than a measurement, and the
+standing rule that `lossguide` mirrors LightGBM is what this departure spends.
+
+`tools/check_parity.py` asserts every stock default across all three literals
+and carries this one in `STOCK_DIVERGENCES` with its reason and its exit
+condition, so the divergence is an argument on the page rather than an absence
+from a list. **Do not "fix" this back to 0.0 to make the gate quieter.** The
+gate is already quiet; it is quiet because the departure is declared.
 """
 
 # ---------------------------------------------------------------------------

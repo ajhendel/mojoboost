@@ -1495,6 +1495,27 @@ LIGHTGBM_STOCK = {
 #: the second column is what the code says today and what the
 #: documentation is written against.
 STOCK_DIVERGENCES = {
+    "lambda_l2": (
+        0.0,
+        1.0,
+        "the one default in this library with recorded accuracy damage on "
+        "THREE separate scenarios, and the only reason it was 0.0 is that "
+        "LightGBM's is 0.0, which is a mirror and not a measurement. "
+        "docs/design/ACCURACY_GAP.md section 3.4 has the artifacts: -1.6 "
+        "percent of excess error on dense_regression (matched bin digest, "
+        "two-point, estimate), 0.75x average precision on imbalanced_binary "
+        "and 3.31x worse multiclass logloss (both measured, and both cost us "
+        "more than they cost LightGBM). Costs no time: the `+ lambda_l2` term "
+        "is unconditional in the gain and leaf-value expressions, so a "
+        "nonzero value changes no instruction count, adds no pass and adds no "
+        "kernel. EXIT CONDITION: the R1 experiment of ACCURACY_GAP section 5 "
+        "runs lambda_l2 in {0, 1, 2, 3} as an arm axis over dense_regression "
+        "at both tiers, imbalanced_binary and multiclass, and ships the "
+        "winner under the decision rule registered there. Until that run, 1.0 "
+        "is the measured point and 2.0 and 3.0 are unmeasured on our "
+        "leaf-wise arm. If the run picks another value, this entry's declared "
+        "value moves with it; if it picks 0.0, this entry is deleted",
+    ),
     "enable_bundle": (
         True,
         False,
@@ -1896,9 +1917,31 @@ def _same(got, want):
 #: above is a checklist rather than a wish list.
 _STOCK_PROBED: set[str] = set()
 
+#: Also filled in by `_check_stock`. A divergence has to be ENFORCED by every
+#: path that reads a default, not only by the comptime-constant path that
+#: happened to be written first. `lambda_l2` lives in three literals across
+#: two languages and is read by three different readers here, and when the
+#: divergence was declared only one of them consulted the declaration, so the
+#: other two reported the declared value as drift. That is the shape of defect
+#: LANE_RULES rule 8 is about: the gate was internally consistent and wrong.
+_DIVERGENCES_PROBED: set[str] = set()
+
 
 def _check_stock(problems, where, mojo_name, lgbm_name, got):
     _STOCK_PROBED.add(lgbm_name)
+    if lgbm_name in STOCK_DIVERGENCES:
+        _DIVERGENCES_PROBED.add(lgbm_name)
+        stock, declared, why = STOCK_DIVERGENCES[lgbm_name]
+        if not _same(got, declared):
+            fail(
+                problems,
+                f"stock defaults: {where} defaults {mojo_name} to {got!r}, "
+                f"and STOCK_DIVERGENCES declares {lgbm_name} as {declared!r} "
+                f"against LightGBM's {stock!r} because {why}. Either the "
+                "declaration is stale or this copy of the default moved "
+                "without the others; settle which, in one commit",
+            )
+        return
     want = LIGHTGBM_STOCK[lgbm_name]
     if not _same(got, want):
         fail(
@@ -1947,6 +1990,7 @@ def stock_defaults(problems):
     constants = _mojo_constants(problems)
     src = ROOT / "src" / "mojotrees"
     _STOCK_PROBED.clear()
+    _DIVERGENCES_PROBED.clear()
     divergences_probed = set()
 
     # 1. the package's DEFAULT_* constants.
@@ -2179,7 +2223,9 @@ def stock_defaults(problems):
             "from LIGHTGBM_STOCK; an entry nothing reads looks like "
             "coverage and is not",
         )
-    stale = sorted(set(STOCK_DIVERGENCES) - divergences_probed)
+    stale = sorted(
+        set(STOCK_DIVERGENCES) - divergences_probed - _DIVERGENCES_PROBED
+    )
     if stale:
         fail(
             problems,
