@@ -3,7 +3,7 @@ authors = ["Andrew Hendel <ajhendel@gmail.com>"]
 channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "mojotrees"
 platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
-version = "0.1.0"
+version = "0.1.0a4"
 
 [tasks]
 # Build flags, and why this file sets none of them.
