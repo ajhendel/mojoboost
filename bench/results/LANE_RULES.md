@@ -243,6 +243,56 @@ and it is the only backend our CI can execute at all. What changed is where
 engineering effort goes, not whether the path exists: speed lanes are GPU
 lanes, and a CPU speed lane needs a reason beyond the number being improvable.
 
+**9. TWO KINDS OF DEFAULT, AND AN EXPLICIT EXCHANGE RATE FOR ONE OF THEM.**
+Added 2026-08-17, from Andrew, and it settles a confusion that produced real
+mistakes in both directions on the day it was written.
+
+**A MIRROR arm mirrors a peer's resolved defaults and never moves.** Its whole
+purpose is that everything is held constant except the thing being compared, so
+"our arm would score better with a different value here" is not an argument for
+changing a mirror, it is an argument for a separate row. When our own default
+moves, a mirror must be REPINNED to the peer's value to stay a mirror, and the
+sharpest instance is `lambda_l2`, which had to be named explicitly in
+`bench/real_data/scenarios.py`'s `BASE_PARAMS` the moment our shipped value
+diverged, because an absent key had silently meant "both at the same 0.0" and
+began meaning "each at its own different value" under a label that still said
+mirror.
+
+**A USER DEFAULT is chosen on the speed-accuracy frontier, and the exchange
+rate is stated rather than felt.** One rule for every growth policy, because a
+switch that is good for one is good for all unless someone can say why not.
+
+- A change is ADOPTED if it costs at most about **1 percent of accuracy on the
+  primary metric** and buys at least about **1.5x speed**.
+- Accuracy is read on the **excess-error lens wherever a floor exists**, not on
+  raw RMSE. On a target with a 0.30 noise floor a mechanism that halves the
+  model's own error moves RMSE by under 1 percent, so a raw-RMSE budget of 1
+  percent is a 50 percent model-error budget and would wave through almost
+  anything. `bench/real_data/decompose.py` computes the lens.
+- A change costing MORE accuracy than that needs a bigger speed multiple and a
+  written price in `docs/design/ACCURACY_BUDGET.md`. There is no threshold above
+  which the answer is automatically no, and none below which it is automatically
+  yes.
+- A **bit-identical** win is not on this frontier at all and flips immediately
+  under rule 5. It costs zero accuracy by construction, so no rate applies.
+
+**The rule reaches INTERNAL choices exactly as it reaches exposed knobs, and
+this is the half that gets forgotten.** Fixed-point precision, float32 device
+gains, the binning subsample, kernel selection, the MVS host derivative pass,
+the categorical bin ceiling: a user cannot tune any of them, which makes them
+MORE consequential than a documented parameter, not less. **A silent internal
+choice is a default.** Each one is priced and recorded in `ACCURACY_BUDGET.md`
+in the same units as everything else, and "it is an implementation detail" is
+not a reason to skip the pricing. It is a reason the pricing has to be written
+down, because nobody downstream can discover it by reading a signature.
+
+**Both directions of error are real and both happened.** Declining a free win
+because a rule said "do not change defaults" cost us four shipped-but-unshipped
+optimizations. Accepting a loss because we happened to be ahead of a competitor
+is the failure the old peer-anchored rule permitted, which is why rule 3 anchors
+on our own recorded absolute value instead. The exchange rate exists so that
+neither of those is a judgment call made fresh each time.
+
 ## What you may run. This is a hard limit.
 
 **You may run ONLY:**

@@ -74,10 +74,20 @@ from .tree import Tree
 # The leaf table is `2 ** depth` Float64 per tree and costs
 # `2 ** depth * depth` steps to build, so the plan's cost is exponential in
 # the depth while the saving per row is only linear in it. Twelve is 4,096
-# leaves, 32 KB per tree, and 12 MB across a 360-tree CatBoost-mode ensemble;
-# sixteen would be 512 KB per tree and 184 MB across the same ensemble, which
-# is why the grower's cap is not this one. CatBoost's default depth is 6,
-# where the table is 512 bytes per tree.
+# leaves and 32 KB per tree, which is 3.2 MB across a 100-tree CatBoost-mode
+# ensemble; sixteen would be 512 KB per tree and 51 MB across the same
+# ensemble, which is why the grower's cap is not this one. CatBoost's default
+# depth is 6, where the table is 512 bytes per tree.
+#
+# **Corrected 2026-08-17: this said "a 360-tree CatBoost-mode ensemble" and
+# 360 is not a tree count this library has ever shipped.** `n_estimators`
+# defaults to 100 (`python/mojotrees/sklearn.py`), which is LightGBM's
+# `num_iterations` and is gated against it by `tools/check_parity.py`, and
+# CatBoost mode does NOT raise it: the mode supplies CatBoost's depth, rate,
+# bootstrap, scoring and `l2_leaf_reg` and leaves the tree count alone. A
+# 2026-08-16 decision to ship symmetric growth at 360 trees was recorded and
+# never implemented, and 360 leaked out of that decision into arithmetic here
+# as though it were the default. The figures above are recomputed at 100.
 #
 # A deeper symmetric model is not refused, it simply keeps the generic walker.
 # Not measured. It is a budget on the plan, not a statement about where the
