@@ -449,8 +449,21 @@ run_one() {
     echo "  FAIL $name ($((SECONDS - start))s wall, $(suite_ms "$log")ms in tests)"
   fi
 }
-export -f run_one extra_includes suite_ms
-export RESULTS PKG_INCLUDE ROOT
+# Everything `run_one` touches has to cross into the `bash -c` subshell that
+# xargs spawns per test, and a shell variable that is merely SET does not.
+#
+# `run_with_deadline` and the two timeout variables were missing from these two
+# lines when the timeout was first added, and the failure was silent in the
+# worst way: in the subshell `TEST_TIMEOUT` expanded to the empty string, so
+# `[ "" -gt 0 ]` failed, the `2>/dev/null` swallowed the error, and every test
+# took the untimed branch. The suite reported zero timeouts while five tests
+# sat in futex_wait_queue for twenty-five minutes against a 420s cap, on the
+# very run that was supposed to prove the timeout worked.
+#
+# A safety mechanism that silently does nothing is worse than none, because it
+# is trusted. Anything run_one needs goes here.
+export -f run_one extra_includes suite_ms run_with_deadline
+export RESULTS PKG_INCLUDE ROOT TEST_TIMEOUT TIMEOUT_CMD
 
 printf '%s\n' "${SELECTED[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {}
 
