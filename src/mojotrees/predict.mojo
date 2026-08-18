@@ -822,6 +822,74 @@ def raw_predict_enabled() -> Bool:
     return getenv("MOJOTREES_RAW_PREDICT") != "0"
 
 
+def predict_tile_enabled() -> Bool:
+    """Whether `predict_raw_batch` runs the tree-outer, row-tiled loop nest.
+
+    `MOJOTREES_PREDICT_TILE=0` forces the row-outer nest it replaced. Default
+    ON, in the `!= "0"` form this repository uses for a default-on switch
+    (compare `raw_predict_enabled` above), because the two nests perform the
+    same Float64 operations on the same values in the same per-row order and
+    there is nothing for a user to choose between.
+
+    IT EXISTS FOR ONE MEASUREMENT AND IS DELETED BY IT. A loop interchange is
+    a claim about the cache and nothing else, so it has to be timed against
+    the nest it replaces, and on this machine a benchmark drifts two to three
+    times across time windows, which makes a before-build against an
+    after-build not a comparison at all. One process that predicts the same
+    matrix under both settings resolves it. **The measurement that deletes
+    this function is one interleaved run on the real held-out split, 51,630
+    rows by 90 features, 100 trees, leaf-wise and depth-wise arms, reporting
+    the tiled arm faster at a maximum absolute difference of exactly 0.0.**
+    On that result this function, the `MOJOTREES_PREDICT_TILE` name, and the
+    whole `apply_row_major` closure below go, and `predict_raw_batch` keeps
+    one body. On the opposite result the tiled closure goes instead.
+    """
+    return getenv("MOJOTREES_PREDICT_TILE") != "0"
+
+
+# The L1 budget one row TILE of the scoring matrix is allowed to hold in
+# `predict_raw_batch`, in bytes.
+#
+# The tile is the whole point of the tiled nest and this is the number that
+# sizes it. Walking `B` rows through one tree at a time touches, across the
+# tree loop, at most one Float64 per used column per row of the tile, so the
+# feature working set is `B * n_features * 8` bytes and it wants to stay in
+# L1 across all `n_trees` passes. Sixty-four kilobytes is half of an Apple M4
+# performance core's 128 KB L1D, which leaves the other half for the tree's
+# own node records (a depth-6 complete tree is 127 nodes, three kilobytes)
+# and the tile's slice of `out`.
+#
+# NOT MEASURED, and it cannot change an output. Rows share no accumulator and
+# each row still takes its trees in ascending order at every tile size, so
+# this number is free to move; see `predict_raw_batch`.
+comptime RAW_TILE_BYTES = 65536
+
+comptime RAW_TILE_MIN_ROWS = 8
+"""Smallest tile. Below this the four row cursors have nothing to
+interleave."""
+
+comptime RAW_TILE_MAX_ROWS = 256
+"""Largest tile. Past this the node records are re-read so rarely per tile
+that a wider one buys nothing, and `out`'s slice starts to matter."""
+
+
+def _raw_row_tile(n_features: Int) -> Int:
+    """Rows per tile for a matrix of `n_features` columns, a multiple of four.
+
+    A multiple of four so the four-cursor group below divides the tile with
+    no remainder on the common shapes; the remainder loop is what makes any
+    other count correct rather than merely uncommon.
+    """
+    if n_features <= 0:
+        return RAW_TILE_MIN_ROWS
+    var rows = RAW_TILE_BYTES // (8 * n_features)
+    if rows < RAW_TILE_MIN_ROWS:
+        return RAW_TILE_MIN_ROWS
+    if rows > RAW_TILE_MAX_ROWS:
+        return RAW_TILE_MAX_ROWS
+    return rows - (rows % 4)
+
+
 @fieldwise_init
 struct _RawSplit(Copyable, Movable):
     """One node's split rewritten against raw Float64 values, or `ok` false.
@@ -1231,10 +1299,25 @@ def predict_raw_batch[
     `Booster.predict_raw_bins_range` statement for statement; the leaf each
     tree contributes is the same leaf by the argument above this function.
     That sentence is a CONSTRAINT and not a description: Float64 addition is
-    not associative, so reordering the tree loop would move bits. The body
-    below interleaves the WALKS of four trees and leaves the ADDS in ascending
-    order, which is the one arrangement that gets the instruction-level
-    parallelism without touching the sequence the sentence promises.
+    not associative, so reordering the tree loop would move bits. Both nests
+    below hold to it, and neither gets its instruction-level parallelism from
+    the tree axis for that reason.
+
+    TWO NESTS, ONE ANSWER, and the switch between them is
+    `predict_tile_enabled`.
+
+    - `apply_tiled`, the default, holds a TILE of rows and runs the trees
+      outside it, four row cursors at a time. It exists because the row-outer
+      nest sweeps the whole flat node table for every row and the table does
+      not fit in L1; the comment above the closure carries the measurement
+      and the arithmetic.
+    - `apply_row_major` holds one row and interleaves the WALKS of four trees,
+      leaving the ADDS in ascending order. It is the nest the tiled one has to
+      be timed against, and it goes when that timing lands.
+
+    Every row takes the same trees in the same order in either nest, and no
+    row shares an accumulator with another, so the two produce the same
+    Float64 bit for bit at every tile size and every block count.
 
     `plan.active` is the caller's precondition.
     """
@@ -1272,7 +1355,16 @@ def predict_raw_batch[
     comptime K = 4
     var n_blocked = n_trees - (n_trees % K)
 
-    def apply(start: Int, end: Int) {imm}:
+    # The tile the DEFAULT nest walks. `n_features` is recovered from the span
+    # rather than passed, because `Model.predict_batch` has already checked
+    # `len(features) == n_rows * mapper.n_features` and a second parameter
+    # saying the same thing is a second thing that can disagree.
+    var n_features = 0
+    if n_rows > 0:
+        n_features = len(features) // n_rows
+    var tile = _raw_row_tile(n_features)
+
+    def apply_row_major(start: Int, end: Int) {imm}:
         for r in range(start, end):
             var s = base if with_base else 0.0
             var t = 0
@@ -1404,7 +1496,218 @@ def predict_raw_batch[
             else:
                 out_p.unsafe_store(r, booster.response(s))
 
-    dispatch_rows(apply, n_rows, n_rows * n_trees * _RAW_WALK_OPS)
+    # THE DEFAULT NEST, and the measurement that produced it.
+    #
+    # Real held-out split, 51,630 rows by 90 features, 100 trees, ten threads,
+    # one round-interleaved run, `20260818T113255Z-obl`, CPU SECONDS rather
+    # than wall clock so the four-performance-core dispatch pool cancels:
+    #
+    #     oblivious (`predict_oblivious_raw_batch`)   0.0215 s
+    #     depth-wise (this function)                  0.0735 s
+    #     leaf-wise (this function)                   0.130  s
+    #
+    # The depth-wise arm and the oblivious arm do the SAME amount of tree
+    # work: `max_depth=6, num_leaves=64` is a complete depth-6 tree, so both
+    # answer six questions per row per tree, 31.0 million level evaluations
+    # over the matrix. One of them takes 3.4 times as long as the other for
+    # the identical count. That factor is not the shape of the tree. It is
+    # where the two nests put their loops.
+    #
+    # WHAT THE ROW-OUTER NEST COSTS. `apply_row_major` above holds one row and
+    # walks the whole ensemble through it. The flat node table is 24 bytes per
+    # node across `nd_feature`, `nd_edge` and `nd_child`, which is 146 KB for
+    # a 61-node leaf-wise ensemble and 305 KB for a 127-node depth-wise one.
+    # Both are larger than the 128 KB L1D these rows are scored on, and the
+    # nest sweeps the WHOLE table for every row, so essentially every one of
+    # the three loads a node visit makes is an L1 miss served by L2. The walk
+    # is a pure dependent chain -- load the feature index, load the value,
+    # compare, load the child, load ITS feature index -- so an L2 hit is not
+    # bandwidth, it is chain latency: roughly 40 cycles a level against the 15
+    # an L1-resident chain costs, and the four interleaved cursors divide it
+    # rather than removing it. 0.0735 s over 31.0 million level evaluations is
+    # 2.4 ns, about 10 cycles a level, which is what a chain of L2 hits over
+    # four cursors predicts and about seven times the throughput floor of the
+    # eleven or so instructions a level actually issues.
+    #
+    # The scoring matrix pays the same tax a second time. It is column major,
+    # so the cells one row reads are 8 * n_rows bytes apart, one cache line
+    # each, and the node sweep evicts them between one row and the next. That
+    # turns a 37 MB matrix into roughly 300 MB of line fetches.
+    #
+    # WHAT THE TILE FIXES, AND WHAT IT CANNOT. Interchanging the loops so that
+    # a TILE of rows is held and the trees run outside it changes both working
+    # sets and nothing else. Per tree the nest now touches only that tree's
+    # own nodes, 1.5 KB leaf-wise and 3.0 KB depth-wise, which is L1 resident
+    # for every row of the tile after the first; the ensemble's table is read
+    # once per TILE instead of once per row. The tile's feature cells are
+    # `tile * n_features * 8` bytes, sized by `RAW_TILE_BYTES` to stay in L1
+    # across all `n_trees` passes, so the matrix is fetched once rather than
+    # eight times. What the tile does NOT buy is the oblivious walker's other
+    # advantage: an oblivious level asks every row the same question, so it
+    # loads a whole vector of rows from one column and compares them in one
+    # instruction. Rows in a ragged tree stand at different nodes and read
+    # different columns, so the compare here stays scalar. That half of the
+    # 3.4x is the SHAPE and it does not port.
+    #
+    # BIT-IDENTITY, which is the whole permission for this. Every row's sum is
+    # still `seed`, then one `+= learning_rate * value` per tree in ascending
+    # range order, which is `Booster.predict_raw_bins_range` statement for
+    # statement and is the sentence `apply_row_major`'s docstring promises.
+    # The interchange moves the ROW loop, and rows share no accumulator: tile
+    # `p` never reads or writes a slot tile `q` touches, and within a tile the
+    # four cursors are four different rows. The one thing that moved is WHERE
+    # a row's running sum is kept, a register in the old nest and its slot in
+    # `out` here, and an IEEE-754 double add is exact for its operands in
+    # either place. `predict_oblivious_raw_batch` already accumulates in `out`
+    # for the same reason and under the same argument.
+    def apply_tiled(start: Int, end: Int) {imm}:
+        var seed = base if with_base else 0.0
+        var pos = start
+        while pos < end:
+            var stop = pos + tile
+            if stop > end:
+                stop = end
+            # The tile's accumulators, seeded once. This is the `s = base if
+            # with_base else 0.0` of the old nest, one row later in the
+            # program and identical in value.
+            for i in range(pos, stop):
+                out_p.unsafe_store(i, seed)
+            # Where the four-cursor group stops. Constant across the tree
+            # loop, so it is computed once per tile rather than once per tree.
+            var quad_stop = stop - ((stop - pos) % 4)
+            for t in range(n_trees):
+                var root = root_p.unsafe_load(t)
+                # Every row of the tile enters this tree at the same node, so
+                # the root's record is read once for the whole tile instead of
+                # once per row.
+                var f_root = Int(nf_p.unsafe_load(root))
+                var r = pos
+                while r < quad_stop:
+                    # Four cursors as before, and the axis they run on is the
+                    # only change: four ROWS of one tree rather than one row
+                    # of four trees. Independent for the same reason -- no
+                    # cursor reads anything another writes -- and better
+                    # placed, because all four now read the one small node
+                    # table this tree owns.
+                    var a0 = root
+                    var a1 = root
+                    var a2 = root
+                    var a3 = root
+                    var f0 = f_root
+                    var f1 = f_root
+                    var f2 = f_root
+                    var f3 = f_root
+                    # Step all four while all four are still internal. A
+                    # leaf's feature is -1, whose sign bit is set, so the OR
+                    # is negative exactly when at least one lane has landed:
+                    # one test, no short circuit, and no lane can reach the
+                    # loads below with a negative feature index.
+                    while (f0 | f1 | f2 | f3) >= 0:
+                        var v0 = feat_p.unsafe_load(f0 * n_rows + r)
+                        var v1 = feat_p.unsafe_load(f1 * n_rows + r + 1)
+                        var v2 = feat_p.unsafe_load(f2 * n_rows + r + 2)
+                        var v3 = feat_p.unsafe_load(f3 * n_rows + r + 3)
+                        var e0 = ed_p.unsafe_load(a0)
+                        var e1 = ed_p.unsafe_load(a1)
+                        var e2 = ed_p.unsafe_load(a2)
+                        var e3 = ed_p.unsafe_load(a3)
+                        var k0 = 0 if v0 <= e0 else (1 if v0 > e0 else 2)
+                        var k1 = 0 if v1 <= e1 else (1 if v1 > e1 else 2)
+                        var k2 = 0 if v2 <= e2 else (1 if v2 > e2 else 2)
+                        var k3 = 0 if v3 <= e3 else (1 if v3 > e3 else 2)
+                        a0 = Int(ch_p.unsafe_load(3 * a0 + k0))
+                        a1 = Int(ch_p.unsafe_load(3 * a1 + k1))
+                        a2 = Int(ch_p.unsafe_load(3 * a2 + k2))
+                        a3 = Int(ch_p.unsafe_load(3 * a3 + k3))
+                        f0 = Int(nf_p.unsafe_load(a0))
+                        f1 = Int(nf_p.unsafe_load(a1))
+                        f2 = Int(nf_p.unsafe_load(a2))
+                        f3 = Int(nf_p.unsafe_load(a3))
+                    # The tails, the single-cursor walk unchanged. A complete
+                    # depth-limited tree lands all four rows on the same step
+                    # and runs these zero times; a leaf-wise tree is ragged in
+                    # the ROW axis exactly as the old nest was ragged in the
+                    # tree axis, and finishes whichever lanes are still going.
+                    while f0 >= 0:
+                        var qv0 = feat_p.unsafe_load(f0 * n_rows + r)
+                        var qe0 = ed_p.unsafe_load(a0)
+                        var qk0 = 0 if qv0 <= qe0 else (1 if qv0 > qe0 else 2)
+                        a0 = Int(ch_p.unsafe_load(3 * a0 + qk0))
+                        f0 = Int(nf_p.unsafe_load(a0))
+                    while f1 >= 0:
+                        var qv1 = feat_p.unsafe_load(f1 * n_rows + r + 1)
+                        var qe1 = ed_p.unsafe_load(a1)
+                        var qk1 = 0 if qv1 <= qe1 else (1 if qv1 > qe1 else 2)
+                        a1 = Int(ch_p.unsafe_load(3 * a1 + qk1))
+                        f1 = Int(nf_p.unsafe_load(a1))
+                    while f2 >= 0:
+                        var qv2 = feat_p.unsafe_load(f2 * n_rows + r + 2)
+                        var qe2 = ed_p.unsafe_load(a2)
+                        var qk2 = 0 if qv2 <= qe2 else (1 if qv2 > qe2 else 2)
+                        a2 = Int(ch_p.unsafe_load(3 * a2 + qk2))
+                        f2 = Int(nf_p.unsafe_load(a2))
+                    while f3 >= 0:
+                        var qv3 = feat_p.unsafe_load(f3 * n_rows + r + 3)
+                        var qe3 = ed_p.unsafe_load(a3)
+                        var qk3 = 0 if qv3 <= qe3 else (1 if qv3 > qe3 else 2)
+                        a3 = Int(ch_p.unsafe_load(3 * a3 + qk3))
+                        f3 = Int(nf_p.unsafe_load(a3))
+                    # One tree's contribution to four different rows. Not four
+                    # contributions to one accumulator: these are four
+                    # disjoint slots, so unlike the old nest's four adds there
+                    # is no order among them to preserve. What IS preserved is
+                    # each slot's own sequence, which the enclosing `t` loop
+                    # keeps strictly ascending.
+                    out_p.unsafe_store(
+                        r, out_p.unsafe_load(r) + lr * ed_p.unsafe_load(a0)
+                    )
+                    out_p.unsafe_store(
+                        r + 1,
+                        out_p.unsafe_load(r + 1) + lr * ed_p.unsafe_load(a1),
+                    )
+                    out_p.unsafe_store(
+                        r + 2,
+                        out_p.unsafe_load(r + 2) + lr * ed_p.unsafe_load(a2),
+                    )
+                    out_p.unsafe_store(
+                        r + 3,
+                        out_p.unsafe_load(r + 3) + lr * ed_p.unsafe_load(a3),
+                    )
+                    r += 4
+                # The tile's last `(stop - pos) % 4` rows, one cursor each and
+                # still inside this tree, so they keep the tile's locality.
+                while r < stop:
+                    var node = root
+                    var f = f_root
+                    while f >= 0:
+                        var v = feat_p.unsafe_load(f * n_rows + r)
+                        var edge = ed_p.unsafe_load(node)
+                        # The same three-way select the old nest documents at
+                        # length: `v <= edge` is slot 0, `v > edge` is slot 1,
+                        # and neither identifies a NaN, which takes slot 2.
+                        # `_raw_split` refusing a NaN edge is what makes the
+                        # three exhaustive and mutually exclusive.
+                        var k = 0 if v <= edge else (1 if v > edge else 2)
+                        node = Int(ch_p.unsafe_load(3 * node + k))
+                        f = Int(nf_p.unsafe_load(node))
+                    out_p.unsafe_store(
+                        r, out_p.unsafe_load(r) + lr * ed_p.unsafe_load(node)
+                    )
+                    r += 1
+            # The link, applied once the tile's sums are final, which is the
+            # same point in each row's arithmetic the old nest applied it at.
+            if not pass_through:
+                for j in range(pos, stop):
+                    out_p.unsafe_store(
+                        j, booster.response(out_p.unsafe_load(j))
+                    )
+            pos = stop
+
+    var total_ops = n_rows * n_trees * _RAW_WALK_OPS
+    if predict_tile_enabled():
+        dispatch_rows(apply_tiled, n_rows, total_ops)
+    else:
+        dispatch_rows(apply_row_major, n_rows, total_ops)
     return out^
 
 
