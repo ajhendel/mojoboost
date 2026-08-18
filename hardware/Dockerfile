@@ -1,13 +1,27 @@
 # hardware/Dockerfile - a hermetic box for one validation run, any vendor.
 #
-# STATUS: NEVER BUILT. This file has not been built, has not been run, and no
-# image from it has ever seen a GPU. It follows this project's own rule that
-# support and validation are different claims, so it is committed as a
-# `designed` artifact and nothing here should be quoted as working. The first
-# person to build it should say so in a hardware result, and this header should
-# then say what happened instead of saying this. The base image tags below are
-# plausible rather than verified; if one does not resolve, pick the nearest tag
-# your provider offers and record which one you used.
+# STATUS. The image assembles. It has never seen a GPU. Those are different
+# claims and this project keeps them apart, so both are written down.
+#
+#   BUILT      2026-08-18, linux/arm64, default BASE, on an Apple M4 under
+#              Docker Desktop 4.x. Verified in the built image: the user is
+#              uid 1000 validator and not root, `pixi 0.76.2` resolves on PATH
+#              at /opt/pixi/bin/pixi, a bind-mounted checkout at /work is
+#              writable, and `sh hardware/run_validation.sh --commands-only`
+#              runs to completion inside the container and reads the mounted
+#              tree's commit and dirty state correctly.
+#   VERIFIED   all four base tags named in this file resolve on Docker Hub.
+#              The nvidia/cuda tags publish amd64 and arm64; the rocm tags are
+#              amd64 only, so an arm64 host needs --platform linux/amd64 and
+#              emulation to build the AMD variant.
+#   NOT RUN    against any GPU, on any backend, ever. No image from this file
+#              has seen a device. GPU passthrough, the --gpus and --device
+#              invocations below, and the validation procedure itself are all
+#              still unexercised here, and the ROCm base has not been built.
+#
+# So this file is evidence that the image assembles and that the non-GPU half
+# of the runner works inside it. It is evidence of nothing else. The first
+# person to run it on hardware should replace this block with what happened.
 #
 # WHY THIS EXISTS. `hardware/run_validation.sh` already needs no root and
 # installs nothing but pixi's own environment, so on a machine whose driver
@@ -20,7 +34,13 @@
 # BUILD
 #   docker build -f hardware/Dockerfile -t mojotrees-validate .
 #   docker build -f hardware/Dockerfile -t mojotrees-validate \
-#       --build-arg BASE=rocm/dev-ubuntu-24.04:6.3.3-complete .
+#       --build-arg BASE=rocm/dev-ubuntu-24.04:6.3.3 .
+#
+# The plain rocm `dev` tag is the one to reach for. pixi brings the Mojo
+# toolchain itself, so all this image owes the run is ROCm userspace, and the
+# `-complete` variant is very large for what it adds here. Both tags resolve;
+# use `-complete` only if the lighter one turns out to be missing something,
+# and record which you used.
 #
 # RUN, from a checkout, which is mounted rather than baked in so the image
 # never pins a stale commit.

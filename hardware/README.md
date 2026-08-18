@@ -28,7 +28,7 @@ hardware/
     result_amd.json       empty record, AMD
   results/                accepted records and their raw output
   run_validation.sh       the whole procedure, one paste, any vendor
-  Dockerfile              optional hermetic runner, NEVER BUILT
+  Dockerfile              optional hermetic runner, never run on a GPU
 ```
 
 ## The capture scripts
@@ -61,8 +61,13 @@ Three properties worth knowing before you run one:
 
 ## `Dockerfile`, and what it is not
 
-Optional, secondary, and **never built**. The file's own header says so and
-should keep saying so until somebody builds it and records what happened.
+Optional and secondary. The image **assembles and has never seen a GPU**, which
+are two claims and both are in the file's own header along with what was checked.
+What is verified is the non-GPU half. The image builds on arm64 against the
+default CUDA base, runs as a non-root user, puts pixi on `PATH`, can write to a
+bind-mounted checkout, and carries `run_validation.sh` far enough to read the
+mounted tree's commit and dirty state. What is unverified is everything that
+involves a device, plus the ROCm base, which has not been built at all.
 
 The bare path is the recommended one. `run_validation.sh` needs no root and
 installs nothing but pixi's own environment, so on a machine whose driver
