@@ -365,11 +365,15 @@ made.
 
 ### 6.1 Python
 
-**Interpreter support.** `requires-python = ">=3.14"` today, and that is a
-hard floor rather than a preference. The extension module is built by the
-Mojo toolchain against a specific CPython, links no libpython, and carries
-a `cp314-cp314` tag. There is no `abi3` build, so a wheel serves exactly
-one CPython minor version.
+**Interpreter support.** `requires-python = ">=3.10"` today, and that is a
+hard floor rather than a preference: below it the extension aborts during
+module initialization on `Py_NewRef`, a CPython 3.10 addition, and the pinned
+`mojo 1.0.0` and `mojo-python 1.0.0` both require `python >=3.10`. The
+extension module is built by the Mojo toolchain against a specific CPython,
+links no libpython, and the wheel published today carries a `cp314-cp314`
+tag. There is no `abi3` build, so a wheel serves exactly one CPython minor
+version, which means the declared floor is currently wider than the set of
+interpreters an index can serve.
 
 The policy from the first release onward:
 

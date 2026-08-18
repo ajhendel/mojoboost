@@ -35,7 +35,7 @@ name = "mojotrees"
 version = "0.1.0a4"
 description = "Gradient boosted decision trees in Mojo, with a scikit-learn style Python API"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Andrew Hendel" }]
@@ -58,12 +58,29 @@ keywords = [
 # `<3.15` would add nothing and would have to be edited on every release
 # the toolchain permits.
 #
-# The value itself is under review and is not settled. docs/PYTHON_SUPPORT.md
-# is the authority: it finds that the pinned toolchain publishes builds for
-# CPython 3.10 through 3.14 and that this project pinned none of them, so
-# 3.14 is the interpreter the solver chose rather than one the toolchain
-# requires. It stays here until the experiment in section 10 of that
-# document has run. Do not lower it on the strength of the audit alone.
+# The floor is 3.10, and it is measured rather than inferred.
+# docs/PYTHON_SUPPORT.md is the authority. Section 10 run M1a took one
+# unmodified extension, built under CPython 3.14.6, and imported it under
+# 3.14, 3.13, 3.12, 3.11 and 3.10; `test_python_api.py` passed on all five,
+# and `gpu_available()` returned true on each, so the Metal path is not
+# 3.14-specific either. Run M1b puts the floor exactly here: 3.9 aborts
+# during module initialization on `symbol not found: Py_NewRef`, a CPython
+# 3.10 addition, and `mojo 1.0.0` and `mojo-python 1.0.0` independently
+# require `python >=3.10`. Section 9 records 3.10 through 3.14 as `proven`
+# on osx-arm64.
+#
+# This line read `>=3.14` until 2026-08-18. That was the interpreter pixi's
+# solver chose, not one the toolchain imposes, and it outlived the
+# measurement that cleared it, which is the defect LANE_RULES rule 6 names.
+# python/mojotrees/_compat.py already carried `EXTENSION_FLOOR = (3, 10)`
+# for the runtime guard, so the metadata was inconsistent with the code
+# shipped beside it as well as with the evidence.
+#
+# What this does not do, stated so no user-visible change is read into it:
+# the only wheel that exists is `cp314-cp314`, per section 9, and pip
+# matches the tag first. A 3.10 caller still cannot install from an index
+# until the release workflow builds one wheel per interpreter, which needs
+# max's 3.10 through 3.13 variants and is the open question in run M2.
 #
 # The per-minor classifier rows below move with it. Every minor version at
 # or above the floor gets a row and no excluded version gets one;
@@ -90,6 +107,10 @@ classifiers = [
     # `-manylinux` rows are `designed` with empty evidence.
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3 :: Only",
     # The extension is compiled by the Mojo toolchain against CPython and

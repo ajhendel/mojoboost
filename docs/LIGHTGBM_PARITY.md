@@ -633,7 +633,7 @@ HIP, and no NVIDIA or AMD device has run this code.
 | Linux wheel, x86-64 and ARM64 | partial | `packaging/linux/build_wheel_linux.sh` builds both, with ELF inspection and a wheel-metadata check, under a release workflow with a runner per architecture. The default tag policy is plain `linux_x86_64` / `linux_aarch64`. Same gap as the macOS row: no per-change job, and `docs/PLATFORM_MATRIX.md` still says `designed` |
 | manylinux wheel | deferred | The manylinux tag is a glibc promise, and the Linux release workflow makes promoting to it a deliberate input with a floor you have to have measured, rather than the default. Nothing has measured it |
 | Windows wheel | deferred | Task 18 |
-| Python version range | different | `requires-python = ">=3.14"`, one interpreter, because MAX 26.5.0 ships as a 3.14 build and pins `python 3.14.*`. LightGBM ships 3.9 through 3.13 |
+| Python version range | different | `requires-python = ">=3.10"`, matching LightGBM's floor, but only one wheel is published (`cp314`, because MAX 26.5.0 ships as a 3.14 build and pins `python 3.14.*`), so an index install serves one interpreter where LightGBM serves 3.9 through 3.13 |
 | conda package | deferred | Task 18 |
 | R package | deferred | Not started in this repository |
 | C API | partial | `capi/mojotrees.h` is a stable, versioned C ABI over dense training, prediction, save, load, and the three model accessors, with an error object and an ownership table (`capi/README.md`). It is mojotrees's own interface and deliberately narrower than LightGBM's `c_api.h`, which it does not implement and is not source compatible with. `tests/test_capi.mojo` runs in CI; the C-side test (`pixi run test-c`) does not, and no release artifact carries the library |
