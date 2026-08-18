@@ -390,6 +390,21 @@ def _derivative_precision_code(value):
     return 1  # anything else, including float64: the policy blocks it
 
 
+def _resolved_max_depth_for_policy(est):
+    """The `max_depth` a fit will actually run at, for the device gate.
+
+    Separate from the estimator's own resolution because the gate runs before
+    `_resolve_params` and must not depend on it, and because a gate that reads
+    the raw parameter describes a different fit than the one that runs.
+    Symmetric mode is the only place the two differ today: an unset depth
+    becomes CatBoost's 6.
+    """
+    depth = int(est._resolve_alias("max_depth", "depth", -1))
+    if depth < 0 and est._resolve_grow_policy() == "symmetrictree":
+        return _CATBOOST_DEPTH
+    return depth
+
+
 def _score_function_code(value):
     """`score_function` as the integer the device policy gates on.
 
@@ -3866,6 +3881,27 @@ class _Base(_ParamsMixin):
                 random_strength=float(
                     getattr(self, "random_strength", None) or 0.0
                 ),
+                # Added 2026-08-18, and their absence was a shipping defect.
+                # `device_policy` implements BLOCK_GROW_POLICY and
+                # BLOCK_MAX_DEPTH so that `auto` falls back to the CPU with a
+                # message while an explicit `device="gpu"` raises. Neither
+                # field crossed the boundary, so the native request took its
+                # defaults, both blocks were unreachable, and
+                # `grow_policy="symmetrictree", max_depth=8, device="auto"`
+                # raised out of `train_gpu` instead of falling back. Read
+                # through the same resolvers the fit uses, not off the
+                # attribute, so an alias spelling reaches the same block.
+                grow_policy=_policy.grow_policy_code(
+                    self._resolve_grow_policy()
+                ),
+                # The depth the FIT will use, not the one the user typed.
+                # Symmetric mode substitutes `_CATBOOST_DEPTH` for an unset
+                # depth (see `_resolve_params`), so passing the raw -1 here
+                # would describe to the policy a fit that does not exist, and
+                # a depth block would then match or miss on the wrong number.
+                # This mirrors that resolution rather than repeating the
+                # constant, so the two cannot drift apart silently.
+                max_depth=_resolved_max_depth_for_policy(self),
             )
             # DeviceUnavailableError is a RuntimeError subclass carrying the
             # native refusal text, so it propagates as what this method has

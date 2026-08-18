@@ -94,8 +94,22 @@ def decide_device_workload(
     | `score_function` | `split.SCORE_L2` (0) or `split.SCORE_COSINE` (1) |
     | `random_strength` | CatBoost's per-candidate split noise (float) |
     | `derivative_precision` | `DERIV_PRECISION_FLOAT32` (0) or `..._FLOAT64` (1) |
+    | `grow_policy` | `GROW_LEAFWISE` (0), `GROW_DEPTHWISE` (1), `GROW_OBLIVIOUS` (2) |
+    | `max_depth` | the resolved depth bound; `<= 0` means unlimited |
 
-    The last four are required keys, not optional ones, and that is the same
+    **`grow_policy` AND `max_depth` WERE ADDED 2026-08-18, AND THEIR ABSENCE
+    WAS A SHIPPING DEFECT RATHER THAN AN OMISSION.** `device_policy` has
+    carried `BLOCK_GROW_POLICY` and `BLOCK_MAX_DEPTH` since the oblivious
+    device path landed, and the ruling they implement is that `auto` falls
+    back to the CPU with a message while an explicit `device="gpu"` raises.
+    Neither field crossed this boundary, so `DeviceRequest` took its defaults
+    of `GROW_LEAFWISE` and `0`, both blocks were unreachable from Python, and
+    a user asking for `grow_policy="symmetrictree", max_depth=8,
+    device="auto"` got a hard exception out of `train_gpu` instead of the CPU
+    fit the policy layer implements and tests. The graceful path existed, was
+    correct, and was disconnected at this call.
+
+    The last six are required keys, not optional ones, and that is the same
     convention every other key here follows: `device_selection.py` is the only
     sender and it always sends the whole mapping. A key read with a default
     would let a stale sender silently mean "L2, plain boosting", which is the
@@ -160,6 +174,8 @@ def decide_device_workload(
             score_function=Int(py=workload["score_function"]),
             random_strength=Float64(py=workload["random_strength"]),
             derivative_precision=Int(py=workload["derivative_precision"]),
+            grow_policy=Int(py=workload["grow_policy"]),
+            max_depth=Int(py=workload["max_depth"]),
         )
     )
 

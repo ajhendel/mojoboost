@@ -112,6 +112,45 @@ DEVICES = ("cpu", "gpu", "auto")
 SCORE_L2 = 0
 SCORE_COSINE = 1
 
+#: Growth policy codes, mirroring `src/mojotrees/growth_policy.mojo`. Sent so
+#: `BLOCK_GROW_POLICY` and `BLOCK_MAX_DEPTH` can match; before 2026-08-18
+#: neither field crossed the boundary, the native `DeviceRequest` fell to its
+#: own defaults, and both blocks were unreachable from Python.
+GROW_LEAFWISE = 0
+GROW_DEPTHWISE = 1
+GROW_OBLIVIOUS = 2
+
+#: Estimator `grow_policy` spellings to the codes above. The aliases are the
+#: ones `sklearn.py` already accepts, so a user who writes CatBoost's or
+#: XGBoost's word for a policy reaches the same block a user who writes ours
+#: does.
+_GROW_POLICY_CODES = {
+    "lossguide": GROW_LEAFWISE,
+    "leafwise": GROW_LEAFWISE,
+    "leaf-wise": GROW_LEAFWISE,
+    "lossguided": GROW_LEAFWISE,
+    "depthwise": GROW_DEPTHWISE,
+    "depth-wise": GROW_DEPTHWISE,
+    "levelwise": GROW_DEPTHWISE,
+    "level-wise": GROW_DEPTHWISE,
+    "symmetrictree": GROW_OBLIVIOUS,
+    "symmetric": GROW_OBLIVIOUS,
+    "oblivious": GROW_OBLIVIOUS,
+}
+
+
+def grow_policy_code(name):
+    """The code for a `grow_policy` spelling, or leaf-wise when unset.
+
+    An unrecognized spelling maps to leaf-wise rather than raising, because
+    this function feeds a ROUTING decision and the estimator's own validation
+    is what refuses a bad policy. Failing closed here would turn a typo into
+    a device refusal instead of into the parameter error it is.
+    """
+    if name is None:
+        return GROW_LEAFWISE
+    return _GROW_POLICY_CODES.get(str(name).strip().lower(), GROW_LEAFWISE)
+
 
 class DeviceUnavailableError(RuntimeError):
     """An explicit `device="gpu"` cannot run this workload.
@@ -297,6 +336,8 @@ class Workload:
         score_function=SCORE_L2,
         random_strength=0.0,
         derivative_precision=0,
+        grow_policy=GROW_LEAFWISE,
+        max_depth=0,
     ):
         self.n_rows = int(n_rows)
         self.n_features = int(n_features)
@@ -326,6 +367,8 @@ class Workload:
         # the policy blocks on `!= DERIV_PRECISION_FLOAT32`: a third precision must
         # refuse rather than be squeezed into a boolean about float64.
         self.derivative_precision = int(derivative_precision)
+        self.grow_policy = int(grow_policy)
+        self.max_depth = int(max_depth)
         if self.n_rows < 1 or self.n_features < 1:
             raise ValueError(
                 "a workload needs at least one row and one feature; got "
@@ -707,6 +750,16 @@ class _FullNativePolicy:
                 "score_function": int(workload.score_function),
                 "random_strength": float(workload.random_strength),
                 "derivative_precision": int(workload.derivative_precision),
+                # Added 2026-08-18. Without these two the native
+                # `DeviceRequest` took its own defaults of GROW_LEAFWISE and
+                # 0, so `BLOCK_GROW_POLICY` and `BLOCK_MAX_DEPTH` could never
+                # match and the `auto` fallback they implement was
+                # unreachable from Python. A symmetric fit above the device
+                # depth bound raised out of the trainer instead of falling
+                # back to the CPU, which is the opposite of the shipped
+                # ruling.
+                "grow_policy": int(workload.grow_policy),
+                "max_depth": int(workload.max_depth),
             },
         )
         return _parse_decision(str(text))
