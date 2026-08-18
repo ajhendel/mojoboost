@@ -168,6 +168,8 @@ probe-readback = "bash tools/with_timeout.sh auto mojo run -I src probes/readbac
 # narrower than we thought". See docs/GPU_VALIDATION.md.
 probe-cuda-alloc = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_alloc.mojo"
 probe-cuda-launch = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_launch.mojo"
+probe-cuda-subbuffer = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_subbuffer.mojo"
+probe-cuda-parallel = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_parallel.mojo"
 
 [dependencies]
 mojo = ">=1.0.0,<2"
