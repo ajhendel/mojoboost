@@ -489,7 +489,32 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # and raising in the grower on `ExtraTreeParams.is_active()`. The capability
 # landing is not sufficient grounds to remove the gate; the absence of every
 # other reason to refuse the same fit is.
-comptime POLICY_VERSION = 9
+# The deepest oblivious tree the device plane grows, and the ONE place this
+# bound is written down.
+#
+# **IT WAS WRITTEN DOWN TWICE, AND THAT IS WHY RAISING IT ON 2026-08-18 DID
+# NOT WORK THE FIRST TIME.** `gpu_resident_round.oblivious_device_supported`
+# carried `max_depth > 6` and so did the predicate below, and a lane raised
+# the first to 8, built clean, corrected two user-visible messages, and
+# shipped. Symmetric fits at depth 7 and 8 still refused, because this copy
+# was untouched.
+#
+# It was worse than a missed edit. `grow_policy` and `max_depth` had just been
+# wired across the Python boundary in the same session, which made
+# `BLOCK_MAX_DEPTH` reachable for the first time. So the two changes composed
+# into a block that now WORKS and still refuses, and the lane's own commit
+# message said the ceiling was gone. "It builds" is the same class of evidence
+# as "the switch is set": neither says the code was reached. What caught it
+# was one fit at each depth on each backend, which is four seconds of work.
+#
+# 8 rather than 6 because the wide oblivious scan's twelve shared arrays are
+# 12,300 bytes at 256 leaves against a conservative 16,384-byte threadgroup
+# budget. 9 is where that genuinely binds, at 24,588 bytes. See
+# `gpu_split_search.OBLIVIOUS_MAX_LEAVES`, which holds the arithmetic and the
+# account of the three justifications that turned out not to bind.
+comptime OBLIVIOUS_DEVICE_MAX_DEPTH = 8
+
+comptime POLICY_VERSION = 10
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -607,7 +632,8 @@ comptime BLOCK_RANDOM_STRENGTH = 19
 #
 # TWO CODES, ONE CONDITION, DELIBERATELY. Both of these fire only under
 # `grow_policy=oblivious`: the depth bound at `gpu_resident_round:1645`
-# (`params.max_depth < 1 or params.max_depth > 6 -> OBLIVIOUS_DEPTH`) exists
+# (`params.max_depth < 1 or params.max_depth > OBLIVIOUS_DEVICE_MAX_DEPTH ->
+# OBLIVIOUS_DEPTH`) exists
 # because the oblivious plane sizes every table from `1 << max_depth`, and
 # there is no depth bound at all on the leaf-wise or depth-wise device paths.
 # So `BLOCK_MAX_DEPTH` is a SUB-REASON of `BLOCK_GROW_POLICY` and not a
@@ -2623,7 +2649,7 @@ def _collect_blocks(
     # So each block below mirrors ONE named reason from that predicate, and
     # only the reasons a `DeviceRequest` actually carries.
     if request.grow_policy == GROW_OBLIVIOUS and (
-        request.max_depth < 1 or request.max_depth > 6
+        request.max_depth < 1 or request.max_depth > OBLIVIOUS_DEVICE_MAX_DEPTH
     ):
         # `gpu_resident_round:1645`, `OBLIVIOUS_DEPTH`. The oblivious plane
         # sizes every table it owns from `1 << max_depth` -- the slot pool,
