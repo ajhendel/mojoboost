@@ -21,6 +21,7 @@ benchmarking and for tests that must force one path:
   nothing changes nothing. It exists as a separate name because the two are
   separate questions and only the first of them has ever been measured; see
   "Two grains, not one" below.
+  and moves no output.
 
 `binning.mojo` adds one more of the same kind:
 `MOJOTREES_BINNING_SELECT_MIN_ROWS` chooses between the two ways a quantile
@@ -315,6 +316,7 @@ from .apple_cpu_policy import (
     DEFAULT_TASKS_PER_CORE,
     ResolvedCpuPolicy,
     cpu_profile,
+    env_tasks_per_core,
 )
 
 # Serial-vs-parallel crossover measured at 25k-50k ops on Apple M4, AMD
@@ -601,6 +603,74 @@ def _effective_cores(dispatch_cores: Int, floor_on: Bool) -> Int:
     return dispatch_cores if floor_on else MIN_TASKS_ABOVE_GRAIN
 
 
+@always_inline
+def _forced_chunks(
+    workers: Int, total_ops: Int, per_worker: Int, min_task_ops: Int
+) -> Int:
+    """Chunks an explicit worker count is cut into. The one copy of the rule,
+    so the live and snapshot paths cannot drift, and pure, so the snapshot
+    path calling it touches no environment.
+
+    `workers * per_worker`, which is the multiplication auto mode already
+    applies to the core count, clamped down by the per-task grain so a small
+    phase is not cut into pieces smaller than a scheduling event is worth,
+    and clamped **up** to `workers` so this can only ever raise a chunk count.
+
+    Never applied to auto mode, which already multiplies by the same factor
+    in `CpuProfile.max_auto_tasks`. `plan_tasks` clamps the result to the item
+    count afterwards, as it does for every other answer this module produces.
+
+    WHY THIS IS UNCONDITIONAL, and the measurement that made it so
+    --------------------------------------------------------------
+
+    It shipped on 2026-08-18 behind `MOJOTREES_CPU_OVERSUBSCRIBE`, default
+    off, whose docstring named the measurement that would delete it in either
+    direction. That measurement ran the same day. Batch prediction, real data,
+    51,630 rows by 90 features, 100 trees, four configurations interleaved in
+    ONE process against one fitted model, medians of five:
+
+        arm          1 worker   forced 10   forced 10   auto
+                                10 chunks   40 chunks   (shipped)
+        leaf-wise    105.99 ms    34.07       28.97      28.91
+        depth-wise    40.77 ms    13.77       12.06      11.83
+
+    Every prediction was bit-identical across all four, which is the gate this
+    change is held to and not a tolerance.
+
+    Two things follow and both are recorded because the second is the one a
+    later reader needs. The switched arm is faster, 1.18x and 1.14x, so the
+    forced path's equal split was really costing something and the fix is
+    kept. And the switched arm lands on TOP of auto, 28.97 against 28.91 and
+    12.06 against 11.83, which says the multiplication reproduces the shipped
+    geometry exactly rather than inventing a third one.
+
+    **What this does NOT fix, so nobody re-opens it as if it might.** Auto
+    mode already cut 40 chunks before this change, so no user on a default
+    fit gains anything here; the gain is confined to callers who set
+    `MOJOTREES_NUM_WORKERS` to their core count and were silently getting the
+    worst geometry. And 40 chunks still converts only about 3.5x of ten cores.
+    That remaining ceiling is NOT chunk geometry, it reproduces in a
+    standalone probe with no mojotrees code in it, and it is recorded as an
+    external limit in `docs/design/DECLINED_OPTIMIZATIONS.md` rather than as
+    an open lane.
+    """
+    var per = per_worker if per_worker > 0 else DEFAULT_TASKS_PER_CORE
+    if per < 1:
+        per = 1
+    var chunks = workers * per
+    if chunks < workers:
+        # Non-positive product: the multiplication overflowed or `workers` is
+        # not a sane count. Fall back to the unswitched answer.
+        return workers
+    if min_task_ops > 0:
+        var by_grain = total_ops // min_task_ops
+        if chunks > by_grain:
+            chunks = by_grain
+    if chunks < workers:
+        chunks = workers
+    return chunks
+
+
 def plan_tasks_with(
     settings: DispatchSettings, n_items: Int, total_ops: Int
 ) -> Int:
@@ -633,6 +703,16 @@ def plan_tasks_with(
                 settings.policy.dispatch_cores(), settings.core_floor
             ),
             settings.policy.max_auto_tasks(),
+        )
+    else:
+        # The forced path. `policy.tasks_per_core` is the same number
+        # `env_tasks_per_core()` returns on the live path, read once at
+        # `resolve()` instead of here.
+        n_tasks = _forced_chunks(
+            settings.num_workers,
+            total_ops,
+            settings.policy.tasks_per_core,
+            settings.min_task_ops,
         )
     if n_tasks < 1:
         n_tasks = 1
@@ -669,7 +749,13 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
     the module docstring, and it is the reason the grain alone -- which for
     the split scan answers 3 at every node size in a fit -- is not the whole
     rule. An explicit `MOJOTREES_NUM_WORKERS` bypasses all of it, so tests can
-    force the parallel path at any size.
+    force the parallel path at any size. It used to ALSO return the worker
+    count verbatim, making the chunk count equal the worker count, which is a
+    perfectly even split and the worst shape for a machine whose cores are not
+    all the same speed. Since 2026-08-18 a forced count is multiplied by
+    `TASKS_PER_CORE` exactly as auto mode multiplies the core count; see
+    `_forced_chunks` for the rule and for the measurement that made it
+    unconditional.
 
     The per-core ceiling comes from `apple_cpu_policy`, which decides how many
     cores to count on a machine whose cores are not all the same speed. Its
@@ -701,6 +787,15 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
             env_parallel_min_task_ops(),
             _effective_cores(profile.dispatch_cores(), env_core_floor()),
             profile.max_auto_tasks(),
+        )
+    else:
+        # The forced path. Unconditional since 2026-08-18; see `_forced_chunks`
+        # for the measurement that retired the switch that used to guard it.
+        n_tasks = _forced_chunks(
+            workers,
+            total_ops,
+            env_tasks_per_core(),
+            env_parallel_min_task_ops(),
         )
     if n_tasks < 1:
         n_tasks = 1

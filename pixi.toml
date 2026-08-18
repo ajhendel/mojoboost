@@ -46,7 +46,15 @@ print-target = "mojo build --print-effective-target"
 # instead of recompiling all sixty modules of `src/mojotrees` inside its own
 # process, and precompiling is a stricter check than the suite is: it
 # elaborates every module, including the ones no test imports.
-build-pkg = "mojo precompile -I src src/mojotrees -o build/mojotrees.mojopkg"
+# `mkdir -p build` is not decoration: `build/` is gitignored and `mojo
+# precompile` will not create its own output directory, so on a fresh clone
+# this task failed with "cannot open output file
+# 'build/mojotrees.mojopkg': No such file or directory". It survived because
+# every development machine already had the directory lying around from an
+# earlier run. Found on a clean RunPod clone, 2026-08-18.
+# `tools/run_tests.sh` already does this at its own precompile site, which is
+# why `test` and `test-gpu` never hit it.
+build-pkg = "mkdir -p build && mojo precompile -I src src/mojotrees -o build/mojotrees.mojopkg"
 
 # One package build, then a bounded pool of test processes, with every
 # failure reported rather than the first one aborting the run.  These were
