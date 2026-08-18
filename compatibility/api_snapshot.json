@@ -88,6 +88,7 @@
     "observed": [
       "MOJOTREES_AUTO_MIN_CELLS",
       "MOJOTREES_BINNING_SELECT_MIN_ROWS",
+      "MOJOTREES_BINNING_SORTED_TIE_REPAIR",
       "MOJOTREES_CONST_HESSIAN",
       "MOJOTREES_CONST_HESSIAN_VERIFY",
       "MOJOTREES_CPU_BIN_LAYOUT",
@@ -172,6 +173,7 @@
       "MOJOTREES_PARALLEL_MIN_OPS",
       "MOJOTREES_PARALLEL_MIN_TASK_OPS",
       "MOJOTREES_PHASE_PROFILE",
+      "MOJOTREES_PREDICT_TILE",
       "MOJOTREES_PREDICT_TRACE",
       "MOJOTREES_RAW_PREDICT",
       "MOJOTREES_STARTUP_REPORT_FD",
@@ -179,6 +181,7 @@
     ],
     "read_directly": [
       "MOJOTREES_AUTO_MIN_CELLS",
+      "MOJOTREES_BINNING_SORTED_TIE_REPAIR",
       "MOJOTREES_CPU_BIN_LAYOUT",
       "MOJOTREES_CPU_BIN_LAYOUT_PROBE",
       "MOJOTREES_CPU_CORE_POOL",
@@ -225,6 +228,7 @@
       "MOJOTREES_LEAF_SCORE_UPDATE",
       "MOJOTREES_OBLIVIOUS_TRACE",
       "MOJOTREES_PHASE_PROFILE",
+      "MOJOTREES_PREDICT_TILE",
       "MOJOTREES_PREDICT_TRACE",
       "MOJOTREES_RAW_PREDICT",
       "MOJOTREES_STARTUP_TRACE"
@@ -232,6 +236,7 @@
     "stale": [],
     "undeclared": [
       "MOJOTREES_BINNING_SELECT_MIN_ROWS",
+      "MOJOTREES_BINNING_SORTED_TIE_REPAIR",
       "MOJOTREES_CPU_BIN_LAYOUT",
       "MOJOTREES_CPU_BIN_LAYOUT_PROBE",
       "MOJOTREES_CPU_CORE_POOL",
@@ -295,6 +300,7 @@
       "MOJOTREES_OBLIVIOUS_TRACE",
       "MOJOTREES_PARALLEL_MIN_TASK_OPS",
       "MOJOTREES_PHASE_PROFILE",
+      "MOJOTREES_PREDICT_TILE",
       "MOJOTREES_PREDICT_TRACE",
       "MOJOTREES_RAW_PREDICT",
       "MOJOTREES_STARTUP_REPORT_FD",
@@ -1487,7 +1493,7 @@
             "min_delta": 0.0,
             "primary_metric": 0,
             "sample_weight": null,
-            "y": "required"
+            "y": null
           },
           "load": {
             "cls": "required",
@@ -1556,7 +1562,7 @@
             "position": null,
             "primary_metric": 0,
             "sample_weight": null,
-            "y": "required"
+            "y": null
           },
           "load": {
             "cls": "required",
@@ -1621,7 +1627,7 @@
             "min_delta": 0.0,
             "primary_metric": 0,
             "sample_weight": null,
-            "y": "required"
+            "y": null
           },
           "load": {
             "cls": "required",
@@ -1970,19 +1976,19 @@
       "border_count": {
         "canonical": "max_bin",
         "fallback_default": 255,
-        "sites": 1,
+        "sites": 2,
         "wire": "max_bin"
       },
       "cat_features": {
         "canonical": "categorical_features",
         "fallback_default": "auto",
-        "sites": 1,
+        "sites": 2,
         "wire": "categorical_feature"
       },
       "categorical_features": {
         "canonical": "categorical_features",
         "fallback_default": "auto",
-        "sites": 1,
+        "sites": 2,
         "wire": "categorical_feature"
       },
       "colsample_bynode": {
@@ -2054,7 +2060,7 @@
       "max_bins": {
         "canonical": "max_bin",
         "fallback_default": 255,
-        "sites": 2,
+        "sites": 3,
         "wire": "max_bin"
       },
       "max_features": {

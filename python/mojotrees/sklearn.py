@@ -22,7 +22,7 @@ from . import _multi_target
 from . import preflight as _preflight
 from ._sklearn import NotFittedError, ParamsMixin as _ParamsMixin
 from ._sklearn import estimator_tags as _estimator_tags
-from .basic import Booster
+from .basic import Booster, Dataset
 
 _mojotrees = _compat.import_extension()
 _np = _arrays.np
@@ -1724,6 +1724,254 @@ class _Base(_ParamsMixin):
                     f"group has {n_queries} queries but X has only {n_rows} "
                     "rows, and every query needs at least one row"
                 )
+
+    # -- fitting on a prepared Dataset ------------------------------------
+    #
+    # `fit(dataset)` trains on a `mojotrees.Dataset` that is already binned,
+    # which is what every peer's estimator surface takes (CatBoost's `Pool`,
+    # and LightGBM's and XGBoost's through their functional APIs). The
+    # binning is the expensive part of starting a run, so a matrix that is
+    # fitted more than once (a hyperparameter search, seed averaging, one
+    # quantile per fit) pays for it once instead of once per fit.
+    #
+    # The model must be the model the raw matrix would have produced, so
+    # this path reaches `train_dataset`, `train_dataset_multiclass` and
+    # `train_dataset_ranker`, which are `model.fit`'s counterparts for an
+    # already binned matrix. Both sides fit their bins with
+    # `binning.fit_bins` from `(max_bin, use_missing, categorical_features)`
+    # and grow with `boosting.train` or `train_gpu.train_gpu`, so an
+    # agreeing Dataset gives a bit-identical model and a disagreeing one is
+    # refused below rather than quietly re-binned or trained on bins that
+    # mean something else.
+
+    def _dataset_contract(self, dataset, y, sample_weight):
+        """Check a prepared `Dataset` against this estimator's parameters.
+
+        Returns `(n_rows, n_features, feature_names, categorical_indices)`.
+
+        **The reusability contract, and all of it.** A `Dataset` may be
+        fitted by an estimator when every one of these holds, and each is
+        checked here by reading the estimator and the dataset rather than
+        by trusting the caller.
+
+        1. `max_bin` (aliases `max_bins`, `border_count`) resolves to the
+           `max_bin` the dataset was binned with. Bin edges are fitted from
+           this number, so a disagreement is two different matrices.
+        2. `use_missing` matches the dataset's. It decides whether NaN gets
+           a bin of its own or is binned as 0.0.
+        3. The resolved `ctr` rule matches the dataset's. Ordered target
+           statistics are extra columns, built while the dataset is binned.
+        4. The declared categorical features match the dataset's. A
+           categorical column is split by category set and is binned as a
+           category table, so the declaration shapes the bins as much as it
+           shapes the search. `categorical_feature="auto"` (the default)
+           declares nothing here and the dataset's declaration stands,
+           since there is no pandas frame at this door to read dtypes off.
+        5. The label is the dataset's, and `y` is None. See `fit`.
+        6. The weights are the dataset's, and `sample_weight` is None.
+        7. The feature count and the feature names are the dataset's, and
+           become `n_features_in_` and `feature_names_in_`.
+
+        What is deliberately NOT checked, because a `Dataset` is the only
+        one of the two that holds it, is `init_score` and, for a ranker,
+        `group` and `position`. The estimator has no such parameter to
+        disagree with, so the dataset's is used and there is no raw-matrix
+        fit that these have a twin in.
+
+        A dataset read back with `load_binned`, or handed over by
+        `subset`, reports `ctr="off"` because a prepared table does not
+        record the source rule it was built under (see
+        `basic.Dataset._from_handle`). Fitting one of those with a
+        CTR-bearing estimator is refused on that reading, which is the
+        conservative direction.
+        """
+        if y is not None:
+            raise ValueError(
+                "a Dataset carries its own label, so fit(dataset) takes no "
+                "y; build it with mojotrees.Dataset(X, label=y) and call "
+                "fit(dataset). This is CatBoost's rule for fit(Pool), and "
+                "it is a refusal rather than a preference because two "
+                "labels leave a fit picking one of them silently"
+            )
+        if sample_weight is not None:
+            raise ValueError(
+                "a Dataset carries its own weights, so fit(dataset) takes "
+                "no sample_weight; build it with "
+                "mojotrees.Dataset(X, label=y, weight=w). The weights are "
+                "read from the binned dataset by the trainer, so one passed "
+                "here would be dropped"
+            )
+        if dataset.get_label() is None:
+            raise ValueError(
+                f"this Dataset has no label, so {type(self).__name__} has "
+                "nothing to fit; build it with "
+                "mojotrees.Dataset(X, label=y)"
+            )
+        n_rows = dataset.num_data()
+        n_features = dataset.num_feature()
+        _validation.check_shape(n_rows, n_features)
+
+        binning = dict(dataset.params)
+        max_bin = self._resolve_alias("max_bin", "max_bins", 255)
+        max_bin = self._resolve_alias("max_bin", "border_count", 255, max_bin)
+        if int(max_bin) != int(binning["max_bin"]):
+            raise ValueError(
+                f"max_bin disagrees. {type(self).__name__} asks for "
+                f"{int(max_bin)} and this Dataset was binned with "
+                f"{int(binning['max_bin'])}. Bin edges are fitted from that "
+                "number, so this fit would not be the fit the estimator "
+                f"describes; pass max_bin={int(binning['max_bin'])} to the "
+                "estimator, or rebuild the Dataset with "
+                f"params={{'max_bin': {int(max_bin)}}}"
+            )
+        if bool(self.use_missing) != bool(binning["use_missing"]):
+            raise ValueError(
+                f"use_missing disagrees. {type(self).__name__} asks for "
+                f"{bool(self.use_missing)} and this Dataset was binned with "
+                f"{bool(binning['use_missing'])}. It decides whether a NaN "
+                "gets a bin of its own or is binned as 0.0, so the two "
+                "settings are two different matrices"
+            )
+        ctr_rule = self._resolve_ctr(
+            self._resolve_grow_policy() == "symmetrictree"
+        )
+        dataset_ctr = str(binning.get("ctr", "off"))
+        if ctr_rule != dataset_ctr:
+            raise ValueError(
+                f"the ctr rule disagrees. {type(self).__name__} resolves to "
+                f"{ctr_rule!r} and this Dataset was built with "
+                f"{dataset_ctr!r}. Ordered target statistics are columns, "
+                "built while the dataset is binned, so the rule cannot be "
+                "changed by a fit that arrives afterwards. Pass "
+                f"params={{'ctr': {ctr_rule!r}}} to mojotrees.Dataset, or "
+                f"ctr={dataset_ctr!r} to the estimator. An unset ctr "
+                "resolves to 'catboost' under "
+                "grow_policy='symmetrictree' and to 'off' otherwise"
+            )
+        if ctr_rule != "off":
+            raise ValueError(
+                "a CTR-bearing Dataset is not fitted through the estimator "
+                "surface yet. The CTR columns are built while the dataset "
+                "is binned, from one_hot_max_size and the two "
+                "target_binarization settings, and mojotrees.Dataset takes "
+                "the rule name alone, so this estimator cannot state that "
+                "the columns it would train on are the ones its own "
+                "parameters describe. Train it through "
+                "mojotrees.train(params, dataset), which is the door that "
+                "owns the bundle and compares the two rules natively, or "
+                "fit the raw matrix"
+            )
+
+        declared = sorted(dataset.categorical_feature)
+        spec = self._resolve_alias(
+            "categorical_feature", "categorical_features", "auto"
+        )
+        spec = self._resolve_alias(
+            "categorical_feature", "cat_features", "auto", spec
+        )
+        names = dataset._names
+        if isinstance(spec, str):
+            if spec != "auto":
+                raise ValueError(
+                    f"unknown categorical_feature {spec!r}; expected 'auto',"
+                    " None, or a sequence of feature names or indices"
+                )
+            indices = declared
+        else:
+            indices = self._categorical_positions(
+                () if spec is None else spec, names
+            )
+            if indices != declared:
+                raise ValueError(
+                    "the categorical declaration disagrees. "
+                    f"{type(self).__name__} declares features {indices} and "
+                    f"this Dataset was binned with {declared}. A declared "
+                    "column is binned as a category table rather than by "
+                    "quantile, so the declaration is part of the binning "
+                    "and cannot be changed afterwards; declare the same "
+                    "features on both, or leave categorical_feature at "
+                    "'auto' and let the Dataset's stand"
+                )
+        for index in indices:
+            if not 0 <= index < n_features:
+                raise ValueError(
+                    f"categorical_feature index {index} is out of range for "
+                    f"{n_features} features"
+                )
+        return n_rows, n_features, names, list(indices)
+
+    def _refuse_dataset_unreachable(self, **validation):
+        """Refuse the fit arguments and parameters the `Dataset` door does
+        not reach, by name.
+
+        Everything here is refused rather than dropped, because the model
+        that came back would be a different model from the one asked for
+        and nothing in the result would say so. The per-round validation
+        arguments are refused because `_fit_with_metrics` takes raw
+        matrices (the metrics are scored by predicting through the model on
+        the host), and `linear_tree` because `trainset.train_dataset` grows
+        constant leaves and, unlike `model.fit`, has no
+        `check_linear_tree_unconnected` of its own to say so.
+
+        `boosting` (dart, rf, ordered) is refused by
+        `_refuse_alternate_boosting`, which the callers run, and again
+        natively by `_parse_params(entry="a Dataset fit")`.
+        """
+        named = sorted(key for key, value in validation.items() if value)
+        if named:
+            raise ValueError(
+                f"{', '.join(named)} is not available when fitting a "
+                "Dataset. Per-round metrics are scored by predicting the "
+                "validation rows through the model, which takes the raw "
+                "matrices this door does not have; fit the raw matrix with "
+                "eval_set=, or cross-validate with mojotrees.cv"
+            )
+        if self.linear_tree:
+            raise ValueError(
+                "linear_tree=True is not available when fitting a Dataset. "
+                "Linear leaves are fitted on the raw rows by the "
+                "metric-path trainer, and the Dataset trainer grows "
+                "constant leaves, so this fit would return a model that is "
+                "not the one asked for; fit the raw matrix"
+            )
+
+    def _dataset_params(self, dataset, device, objective_code, n_classes=0):
+        """`(params, keep)` for a fit on `dataset`, the low-level parameter
+        dict and the buffers whose addresses it holds.
+
+        The same dict `fit` sends, with two differences that are both the
+        dataset's doing. `sample_weight_addr` is 0 and `categorical_addr`
+        is empty, because the weights and the categorical declaration are
+        read from the binned dataset by the trainer rather than from the
+        params; and `objective` and `n_classes` ride in the dict, because
+        the Dataset entry points take one argument and read them from it.
+        This mirrors `basic._Config.binding_params`, which is the same
+        bridge for `mojotrees.train`.
+        """
+        n_features = dataset.num_feature()
+        ic_flat, ic_offsets = self._interaction_buffers(n_features)
+        mono_buf, mono_addr = self._monotone_buffer(n_features)
+        contri_buf, contri_addr = self._feature_contri_buffer(n_features)
+        params = self._params(
+            0, device, ic_flat, ic_offsets, mono_addr, None, contri_addr
+        )
+        params["objective"] = int(objective_code)
+        params["n_classes"] = int(n_classes)
+        return params, [ic_flat, ic_offsets, mono_buf, contri_buf]
+
+    def _record_dataset_fit(self, n_features, names, device, indices):
+        """The fitted state a Dataset fit records.
+
+        `_cat_encoders` stays empty on purpose. A `Dataset` holds a numeric
+        matrix, so a categorical column arrives as integer codes and there
+        are no pandas labels to encode a prediction frame through; the same
+        state a model read back from disk has (`_restore_categorical`).
+        """
+        self._cat_indices = list(indices)
+        self._cat_encoders = {}
+        self.categorical_feature_ = list(indices)
+        self._record_fit(n_features, names, device)
+        return self
 
     def _refuse_alternate_boosting(self, where):
         """Raise when `boosting` is dart, rf or ordered and `where` names a
@@ -5110,7 +5358,7 @@ class MojoTreesRegressor(_Base):
     def fit(
         self,
         X,
-        y,
+        y=None,
         sample_weight=None,
         eval_set=None,
         eval_names=None,
@@ -5124,6 +5372,16 @@ class MojoTreesRegressor(_Base):
         callbacks=None,
     ):
         """Fit on `X` (n_samples, n_features) and a numeric target `y`.
+
+        `X` may also be a `mojotrees.Dataset`, which is a matrix that has
+        already been binned. `y` must then be None, because the dataset
+        carries the label (CatBoost's rule for `fit(Pool)`), and so must
+        `sample_weight`. Binning is what a run pays for before it can
+        start, so a matrix that is fitted more than once is worth building
+        a `Dataset` from once. `_dataset_contract` states what has to agree
+        for a dataset to be reusable by a given estimator and refuses the
+        rest; an agreeing dataset gives the model the raw matrix would have
+        given, tree for tree.
 
         `X` may contain NaN, which is the missing-value marker, but not
         infinities; `y` and `sample_weight` must be finite throughout.
@@ -5145,6 +5403,20 @@ class MojoTreesRegressor(_Base):
 
         Returns self.
         """
+        if isinstance(X, Dataset):
+            return self._fit_dataset(
+                X,
+                y,
+                sample_weight,
+                eval_set=eval_set,
+                eval_names=eval_names,
+                eval_metric=eval_metric,
+                early_stopping_rounds=early_stopping_rounds,
+                eval_sample_weight=eval_sample_weight,
+                eval_X=eval_X,
+                eval_y=eval_y,
+                callbacks=callbacks,
+            )
         if _multi_target.is_multi_target(y, self.num_targets):
             return self._fit_multi_target(
                 X, y, sample_weight, eval_set, eval_X, eval_y, callbacks
@@ -5266,6 +5538,59 @@ class MojoTreesRegressor(_Base):
             )
         self._record_fit(n_features, names, device)
         return self
+
+    def _fit_dataset(self, dataset, y, sample_weight, **validation):
+        """`fit` on a `mojotrees.Dataset`, through `train_dataset`.
+
+        `model.fit` bins the raw matrix with `binning.fit_bins` and grows
+        with `boosting.train` or `train_gpu.train_gpu`;
+        `trainset.train_dataset` grows with the same two from bins that
+        `binning.fit_bins` already fitted. So the only thing between this
+        and the raw-matrix fit is whether the two binnings agree, which is
+        what `_dataset_contract` is.
+        """
+        self._refuse_dataset_unreachable(**validation)
+        objective = self._objective_code()
+        if objective == _CUSTOM:
+            raise ValueError(
+                "a callable objective is not available when fitting a "
+                "Dataset; `fit_custom` takes the raw matrix, and the "
+                "Dataset trainer takes a built-in objective code"
+            )
+        if _multi_target.is_multi_target(None, self.num_targets):
+            raise ValueError(
+                "num_targets above 1 is not available when fitting a "
+                "Dataset; a mojotrees.Dataset holds one label column, and "
+                "MultiRMSE takes a 2-D target through the raw matrix"
+            )
+        self._refuse_alternate_boosting("when fitting a Dataset")
+        if self._distributed_world() > 1:
+            raise ValueError(
+                "tree_learner other than 'serial' is not available when "
+                "fitting a Dataset; the distributed trainer takes the raw "
+                "matrix and bins its own shard"
+            )
+        self._reset_fitted()
+        self.__dict__.pop("_multi_model", None)
+        n_rows, n_features, names, indices = self._dataset_contract(
+            dataset, y, sample_weight
+        )
+        device = self._resolve_device(
+            n_rows,
+            n_features,
+            1,
+            objective_code=objective,
+            sparse=bool(dataset.is_sparse),
+            categorical=bool(indices),
+        )
+        params, keep = self._dataset_params(dataset, device, objective)
+        _preflight.native_preflight(params, n_features, device)
+        self._model = _mojotrees.train_dataset(
+            dataset._constructed(), params
+        )
+        # The constraint buffers had to outlive the call above.
+        del keep
+        return self._record_dataset_fit(n_features, names, device, indices)
 
     def _fit_multi_target(
         self, X, y, sample_weight, eval_set, eval_X, eval_y, callbacks
@@ -5876,7 +6201,7 @@ class MojoTreesClassifier(_Base):
     def fit(
         self,
         X,
-        y,
+        y=None,
         sample_weight=None,
         eval_set=None,
         eval_names=None,
@@ -5890,6 +6215,13 @@ class MojoTreesClassifier(_Base):
         callbacks=None,
     ):
         """Fit on `X` (n_samples, n_features) and labels `y`.
+
+        `X` may also be a `mojotrees.Dataset`, with `y` and `sample_weight`
+        None; see `MojoTreesRegressor.fit` and `_dataset_contract`. A
+        dataset's label is a numeric column, so a classifier fitted from
+        one needs it already encoded as 0, 1, ... n_classes-1, and
+        `classes_` comes back as those codes rather than as the labels they
+        stood for.
 
         `X` may contain NaN, the missing-value marker, but not infinities.
         `y` needs at least 2 distinct labels, and `sample_weight` must be
@@ -5906,6 +6238,20 @@ class MojoTreesClassifier(_Base):
 
         Returns self.
         """
+        if isinstance(X, Dataset):
+            return self._fit_dataset(
+                X,
+                y,
+                sample_weight,
+                eval_set=eval_set,
+                eval_names=eval_names,
+                eval_metric=eval_metric,
+                early_stopping_rounds=early_stopping_rounds,
+                eval_sample_weight=eval_sample_weight,
+                eval_X=eval_X,
+                eval_y=eval_y,
+                callbacks=callbacks,
+            )
         eval_set = _eval_pairs(eval_set, eval_X, eval_y)
         _check_eval_arguments(
             eval_set,
@@ -6030,6 +6376,87 @@ class MojoTreesClassifier(_Base):
         self.n_classes_ = n_classes
         self._record_fit(n_features, names, device)
         return self
+
+    def _fit_dataset(self, dataset, y, sample_weight, **validation):
+        """`fit` on a `mojotrees.Dataset`, through `train_dataset` for two
+        classes and `train_dataset_multiclass` beyond.
+
+        The class count comes from the label column, which a `Dataset`
+        holds as float64. `_arrays.encode_labels` cannot run here, because
+        the labels it would encode are already a numeric column and
+        encoding them a second time would silently renumber a fit whose
+        codes the caller chose. So the codes are required to be the ones
+        the trainer reads, 0 through n_classes-1, and a label column that
+        is not says so.
+        """
+        self._refuse_dataset_unreachable(**validation)
+        if self.class_weight is not None:
+            raise ValueError(
+                "class_weight is not available when fitting a Dataset. It "
+                "becomes ordinary row weights before the trainer sees it, "
+                "and a Dataset's weights are binned into it; fold the "
+                "class weights into mojotrees.Dataset(weight=...), or fit "
+                "the raw matrix"
+            )
+        self._reset_fitted()
+        n_rows, n_features, names, indices = self._dataset_contract(
+            dataset, y, sample_weight
+        )
+        labels = dataset.get_label()
+        seen = sorted({float(value) for value in labels})
+        n_classes = len(seen)
+        if n_classes < 2:
+            raise ValueError(
+                "a classifier needs at least 2 distinct labels; this "
+                f"Dataset's label column holds {seen}"
+            )
+        if seen != [float(k) for k in range(n_classes)]:
+            raise ValueError(
+                "a Dataset's label is a numeric column, so a classifier "
+                "fitted from one takes class codes 0 through "
+                f"n_classes-1; this label column holds {seen}. Encode the "
+                "labels before building the Dataset (scikit-learn's "
+                "LabelEncoder is one way), or fit the raw matrix, which "
+                "encodes them for you and keeps the original labels in "
+                "classes_"
+            )
+        self._check_objective(n_classes)
+        self._multiclass = n_classes > 2
+        if self._multiclass:
+            self._refuse_alternate_boosting("for a multiclass classifier")
+        else:
+            self._refuse_alternate_boosting("when fitting a Dataset")
+        objective = self._objective_code(n_classes)
+        device = self._resolve_device(
+            n_rows,
+            n_features,
+            1 if n_classes == 2 else n_classes,
+            objective_code=objective,
+            sparse=bool(dataset.is_sparse),
+            categorical=bool(indices),
+        )
+        # `objective` is the real code on both arms, as
+        # `basic._Config.binding_params` writes it. The softmax trainer
+        # takes the class count and reads the key nowhere, but the device
+        # policy is asked with it, and a key that says binary while the fit
+        # is softmax is a false declaration whether or not it is read.
+        params, keep = self._dataset_params(
+            dataset, device, objective, n_classes
+        )
+        _preflight.native_preflight(params, n_features, device)
+        handle = dataset._constructed()
+        if self._multiclass:
+            self._model = _mojotrees.train_dataset_multiclass(handle, params)
+        else:
+            self._model = _mojotrees.train_dataset(handle, params)
+        # The constraint buffers had to outlive the call above.
+        del keep
+        codes = list(range(n_classes))
+        self.classes_ = (
+            _np.asarray(codes) if _np is not None else list(codes)
+        )
+        self.n_classes_ = n_classes
+        return self._record_dataset_fit(n_features, names, device, indices)
 
     def _fit_sparse(self, X, y, sample_weight):
         """`fit` for SciPy sparse input. Same model, same semantics; the
@@ -6458,7 +6885,7 @@ class MojoTreesRanker(_Base):
     def fit(
         self,
         X,
-        y,
+        y=None,
         group=None,
         sample_weight=None,
         eval_set=None,
@@ -6487,8 +6914,30 @@ class MojoTreesRanker(_Base):
         estimator's `ndcg_eval_at`. `eval_sample_weight` is rejected here,
         because NDCG has no weighted definition in LightGBM to match.
 
+        `X` may also be a `mojotrees.Dataset`, with `y`, `group`,
+        `position` and `sample_weight` all None, because a dataset carries
+        every one of them; see `MojoTreesRegressor.fit` and
+        `_dataset_contract`.
+
         Returns self.
         """
+        if isinstance(X, Dataset):
+            return self._fit_dataset(
+                X,
+                y,
+                sample_weight,
+                group,
+                position,
+                eval_set=eval_set,
+                eval_group=eval_group,
+                eval_names=eval_names,
+                eval_metric=eval_metric,
+                early_stopping_rounds=early_stopping_rounds,
+                eval_sample_weight=eval_sample_weight,
+                eval_X=eval_X,
+                eval_y=eval_y,
+                callbacks=callbacks,
+            )
         eval_set = _eval_pairs(eval_set, eval_X, eval_y)
         _check_eval_arguments(
             eval_set,
@@ -6582,6 +7031,72 @@ class MojoTreesRanker(_Base):
         del position_buffer
         self._record_fit(n_features, names, device)
         return self
+
+    def _fit_dataset(
+        self, dataset, y, sample_weight, group, position, **validation
+    ):
+        """`fit` on a `mojotrees.Dataset`, through `train_dataset_ranker`.
+
+        The query counts and the position column are the dataset's, for the
+        reason the label and the weights are. A ranking subset must take
+        whole queries, which is a rule `basic.Dataset.subset` keeps
+        natively, so the dataset is also the only place the two can stay in
+        step with the rows.
+        """
+        self._refuse_dataset_unreachable(**validation)
+        if group is not None:
+            raise ValueError(
+                "a Dataset carries its own query counts, so fit(dataset) "
+                "takes no group; build it with "
+                "mojotrees.Dataset(X, label=y, group=counts)"
+            )
+        if position is not None:
+            raise ValueError(
+                "a Dataset carries its own position column, so "
+                "fit(dataset) takes no position; build it with "
+                "mojotrees.Dataset(X, label=y, group=counts, "
+                "position=slots)"
+            )
+        self._check_objective()
+        self._refuse_alternate_boosting("for a ranker")
+        self._reset_fitted()
+        n_rows, n_features, names, indices = self._dataset_contract(
+            dataset, y, sample_weight
+        )
+        if dataset.get_group() is None:
+            raise ValueError(
+                "a ranker needs a Dataset with group: the number of rows "
+                "in each query, in row order"
+            )
+        _check_relevance(dataset.get_label(), n_rows)
+        device = self._resolve_device(
+            n_rows,
+            n_features,
+            1,
+            objective_code=self._objective_code(),
+            sparse=bool(dataset.is_sparse),
+            categorical=bool(indices),
+        )
+        # Backstop; BLOCK_RANKING_OBJECTIVE is what refuses this on a build
+        # whose native policy can be asked. See `_gpu_unsupported`.
+        self._gpu_unsupported(device, "lambdarank trains on the CPU")
+        params, keep = self._dataset_params(dataset, device, _LAMBDARANK)
+        # The group the ranker writes into the params is the dataset's, and
+        # the trainer reads the dataset's own; this keeps the two the same
+        # buffer rather than two copies that could differ.
+        params = self._rank_params(params, dataset._group)
+        _preflight.native_preflight(params, n_features, device)
+        position_buffer = self._position_params(
+            params, getattr(dataset, "_position", None), n_rows
+        )
+        self._model = _mojotrees.train_dataset_ranker(
+            dataset._constructed(), params
+        )
+        # The constraint, group and position buffers had to outlive the
+        # call above.
+        del keep
+        del position_buffer
+        return self._record_dataset_fit(n_features, names, device, indices)
 
     def predict(
         self,
