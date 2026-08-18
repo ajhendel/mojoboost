@@ -52,7 +52,58 @@ last bits, so it is not done anywhere here.
 from std.os import abort
 from std.sys import has_accelerator
 from std.python import Python, PythonObject
+from std.python._cpython import GILReleased
 from std.python.bindings import PythonModuleBuilder
+
+# THE GIL, and the one rule that governs every `with GILReleased(...)` below.
+#
+# CPython enters this module holding the interpreter lock and does not let it
+# go, so before this existed a fit held it for the whole fit: 5 s of training
+# during which no other thread in the process could run a single bytecode.
+# That is not slowness, it is a freeze. It breaks a server that fits in a
+# background thread, it breaks joblib's and scikit-learn's threading backend,
+# and it makes an async process unusable. LightGBM, XGBoost and CatBoost all
+# release it around training and prediction; this now does too.
+#
+# `GILReleased` is `std.python._cpython`'s RAII wrapper over CPython's
+# `PyEval_SaveThread` / `PyEval_RestoreThread`. The shape at every site is
+# the same three steps and is not negotiable:
+#
+#   1. WITH THE GIL HELD, turn every Python input into a native value: an
+#      `Int(py=...)`, a `Float64(py=...)`, a `List`, a `Span` over a buffer
+#      the caller keeps alive, a parsed `BoosterParams`. Nothing may be left
+#      to read later.
+#   2. RELEASE, and run pure Mojo. Inside the block NOTHING may touch a
+#      Python object: no `PythonObject` read, no refcount change, no
+#      `Int(py=...)`, no `PythonObject(...)` construction. A refcount touched
+#      here is a torn refcount under concurrency, which is a segfault rather
+#      than a wrong number.
+#   3. REACQUIRE, then build the Python result.
+#
+# Mojo destroys a value at its LAST USE, so a `PythonObject` whose last use
+# is above a released region is decref'd above it, with the lock held, and
+# one whose last use is below is decref'd below it, with the lock held again.
+# Neither can land inside. That is why the pattern is a plain
+# `var result: T` declared above the block and assigned inside it: the
+# assignment moves a Mojo value, and the `PythonObject(alloc=...)` that wraps
+# it is written after the block.
+#
+# WHAT IS DELIBERATELY NOT WRAPPED. Every entry point that can run a Python
+# callback keeps the lock for its whole duration, because the callback needs
+# it and reacquiring around each one would be a lock handoff per round rather
+# than per fit. Those are `fit_custom` (`py_grad_hess` calls the caller's
+# `bridge`), `fit_with_metrics`, `fit_multiclass_with_metrics` and
+# `fit_ranker_with_metrics` (`py_metric` and `py_callback` call the caller's
+# metric and iteration callbacks), and `fit`'s `linear_tree` fork, which
+# routes through the same metric trainer. `m[].downcast_value_ptr[...]()`
+# taken before a release IS safe to dereference inside one: it reads Mojo
+# memory inside a Python object the caller's own frame keeps alive, and
+# touches no refcount.
+#
+# The pair costs a lock handoff, so it is spent only where the work is
+# unbounded: training, whole-batch prediction, binning, and the parallel
+# ingest passes. No accessor is wrapped; a getter would pay more for the
+# release than it spends inside it.
 
 # `Dataset` construction beyond the dense case, and the reads that answer
 # from a constructed one. They live in their own module because they are a
@@ -657,12 +708,14 @@ def ingest_column_major(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var n = nr * nf
-    var found = transpose_to_column_major(
-        f64_view(Int(py=src_addr), n),
-        f64_view_mut(Int(py=dst_addr), n),
-        nr,
-        nf,
-    )
+    var src = f64_view(Int(py=src_addr), n)
+    var dst = f64_view_mut(Int(py=dst_addr), n)
+    # Released: a parallel tiled pass over the whole matrix, reading and
+    # writing two buffers the caller keeps alive. No Python object is touched
+    # between here and the reacquire.
+    var found: Bool
+    with GILReleased(Python()):
+        found = transpose_to_column_major(src, dst, nr, nf)
     return PythonObject(1 if found else 0)
 
 
@@ -677,9 +730,13 @@ def buffer_has_infinite(
     infinity. Parallel, and it allocates nothing, which is the difference
     from `np.isinf(buf).any()`.
     """
-    return PythonObject(
-        1 if has_infinite(f64_view(Int(py=addr), Int(py=n))) else 0
-    )
+    var buf = f64_view(Int(py=addr), Int(py=n))
+    # Released for the reason `ingest_column_major` is: a parallel pass over
+    # the whole matrix, touching nothing but the caller's buffer.
+    var found: Bool
+    with GILReleased(Python()):
+        found = has_infinite(buf)
+    return PythonObject(1 if found else 0)
 
 
 def _row[
@@ -2296,22 +2353,30 @@ def fit(
                 " (alternate_boosting.fit_boosting)"
             ),
         )
-        var routed = fit_boosting(
-            features,
-            nr,
-            nf,
-            target,
-            Int(py=objective),
-            bp,
-            boosting,
-            Int(py=params["max_bin"]),
-            weights,
-            Float64(py=params["alpha"]),
-            _parse_bagging(params),
-            GossParams.disabled(),
-            use_missing=_parse_use_missing(params),
-            categorical_features=_parse_categorical(params),
-        )
+        var routed_objective = Int(py=objective)
+        var routed_max_bin = Int(py=params["max_bin"])
+        var routed_alpha = Float64(py=params["alpha"])
+        var routed_bagging = _parse_bagging(params)
+        var routed_use_missing = _parse_use_missing(params)
+        var routed_categorical = _parse_categorical(params)
+        var routed: Model
+        with GILReleased(Python()):
+            routed = fit_boosting(
+                features,
+                nr,
+                nf,
+                target,
+                routed_objective,
+                bp,
+                boosting,
+                routed_max_bin,
+                weights,
+                routed_alpha,
+                routed_bagging,
+                GossParams.disabled(),
+                use_missing=routed_use_missing,
+                categorical_features=routed_categorical,
+            )
         return PythonObject(alloc=routed^)
     if bp.linear.is_active():
         # linear_tree=True: the leaves are fitted on the raw rows, which
@@ -2396,49 +2461,72 @@ def fit(
         # No group and no init_score: `fit` reads neither, so passing empty
         # lists is what this entry point already means, not a capability
         # dropped on the way through.
-        var ctr_dataset = Dataset(
+        var ctr_categorical = _parse_categorical(params)
+        var ctr_max_bin = Int(py=params["max_bin"])
+        var ctr_use_missing = _parse_use_missing(params)
+        var ctr_objective = Int(py=objective)
+        var ctr_alpha = Float64(py=params["alpha"])
+        var ctr_bagging = _parse_bagging(params)
+        var ctr_goss = _parse_goss(params)
+        # Released across BOTH halves: the binning that builds the dataset
+        # and the training that reads it are one unbounded stretch of Mojo,
+        # and reacquiring between them would hand the lock back for nothing.
+        var ctr_model: Model
+        with GILReleased(Python()):
+            var ctr_dataset = Dataset(
+                features,
+                nr,
+                nf,
+                target.copy(),
+                weights.copy(),
+                List[Int](),
+                List[Float64](),
+                List[String](),
+                ctr_categorical^,
+                ctr_max_bin,
+                ctr_use_missing,
+                False,
+                ctr^,
+            )
+            ctr_model = mojo_train_dataset(
+                ctr_dataset,
+                ctr_objective,
+                bp,
+                ctr_alpha,
+                device,
+                ctr_bagging,
+                ctr_goss,
+                bootstrap,
+            )
+        return PythonObject(alloc=ctr_model^)
+    var fit_objective = Int(py=objective)
+    var fit_max_bin = Int(py=params["max_bin"])
+    var fit_alpha = Float64(py=params["alpha"])
+    var fit_bagging = _parse_bagging(params)
+    var fit_goss = _parse_goss(params)
+    var fit_use_missing = _parse_use_missing(params)
+    var fit_categorical = _parse_categorical(params)
+    # The plain dense fit, and the call the GIL defect was measured on:
+    # 5 s of training that held the interpreter lock for every one of them.
+    var model: Model
+    with GILReleased(Python()):
+        model = mojo_fit(
             features,
             nr,
             nf,
-            target.copy(),
-            weights.copy(),
-            List[Int](),
-            List[Float64](),
-            List[String](),
-            _parse_categorical(params),
-            Int(py=params["max_bin"]),
-            _parse_use_missing(params),
-            False,
-            ctr^,
-        )
-        var ctr_model = mojo_train_dataset(
-            ctr_dataset,
-            Int(py=objective),
+            target,
+            fit_objective,
             bp,
-            Float64(py=params["alpha"]),
+            fit_max_bin,
+            weights,
+            fit_alpha,
             device,
-            _parse_bagging(params),
-            _parse_goss(params),
-            bootstrap,
+            fit_bagging,
+            fit_goss,
+            use_missing=fit_use_missing,
+            categorical_features=fit_categorical,
+            bootstrap=bootstrap,
         )
-        return PythonObject(alloc=ctr_model^)
-    var model = mojo_fit(
-        features,
-        nr,
-        nf,
-        target,
-        Int(py=objective),
-        bp,
-        Int(py=params["max_bin"]),
-        weights,
-        Float64(py=params["alpha"]),
-        device,
-        _parse_bagging(params),
-        _parse_goss(params),
-        use_missing=_parse_use_missing(params),
-        categorical_features=_parse_categorical(params),
-        bootstrap=bootstrap,
-    )
     return PythonObject(alloc=model^)
 
 
@@ -2491,20 +2579,31 @@ def distributed_train_local(
         String("distributed_train_local (tree_learner other than 'serial')"),
     )
     var weights = _parse_weights(params, nr)
-    var model = train_local_world(
-        features,
-        nr,
-        nf,
-        target,
-        Int(py=objective),
-        bp,
-        Int(py=params["max_bin"]),
-        weights,
-        Float64(py=params["alpha"]),
-        Int(py=params["num_machines"]),
-        String(py=params["tree_learner"]),
-        Int(py=params["top_k"]),
-    )
+    var world_objective = Int(py=objective)
+    var world_max_bin = Int(py=params["max_bin"])
+    var world_alpha = Float64(py=params["alpha"])
+    var world_machines = Int(py=params["num_machines"])
+    var world_learner = String(py=params["tree_learner"])
+    var world_top_k = Int(py=params["top_k"])
+    # The world is hosted in this process and trains in Mojo throughout;
+    # `String(py=...)` above has already copied the learner name out, so the
+    # released region holds a Mojo `String` rather than a Python `str`.
+    var model: Model
+    with GILReleased(Python()):
+        model = train_local_world(
+            features,
+            nr,
+            nf,
+            target,
+            world_objective,
+            bp,
+            world_max_bin,
+            weights,
+            world_alpha,
+            world_machines,
+            world_learner,
+            world_top_k,
+        )
     return PythonObject(alloc=model^)
 
 
@@ -3199,22 +3298,30 @@ def fit_multiclass(
         device == CPU_DEVICE
     )
     var weights = _parse_weights(params, nr)
-    var model = mojo_fit_multiclass(
-        features,
-        nr,
-        nf,
-        labels,
-        Int(py=n_classes),
-        bp,
-        Int(py=params["max_bin"]),
-        weights,
-        device,
-        _parse_bagging(params),
-        _parse_goss(params),
-        use_missing=_parse_use_missing(params),
-        categorical_features=_parse_categorical(params),
-        bootstrap=bootstrap,
-    )
+    var nc = Int(py=n_classes)
+    var mc_max_bin = Int(py=params["max_bin"])
+    var mc_bagging = _parse_bagging(params)
+    var mc_goss = _parse_goss(params)
+    var mc_use_missing = _parse_use_missing(params)
+    var mc_categorical = _parse_categorical(params)
+    var model: MulticlassModel
+    with GILReleased(Python()):
+        model = mojo_fit_multiclass(
+            features,
+            nr,
+            nf,
+            labels,
+            nc,
+            bp,
+            mc_max_bin,
+            weights,
+            device,
+            mc_bagging,
+            mc_goss,
+            use_missing=mc_use_missing,
+            categorical_features=mc_categorical,
+            bootstrap=bootstrap,
+        )
     return PythonObject(alloc=model^)
 
 
@@ -3254,21 +3361,32 @@ def fit_csc(
         device == CPU_DEVICE
     )
     var weights = _parse_weights(params, nr)
-    var model = mojo_fit_csc(
-        csc,
-        target,
-        Int(py=objective),
-        bp,
-        Int(py=params["max_bin"]),
-        weights,
-        Float64(py=params["alpha"]),
-        _parse_bagging(params),
-        _parse_goss(params),
-        _parse_use_missing(params),
-        _parse_categorical(params),
-        device=device,
-        bootstrap=bootstrap,
-    )
+    var csc_objective = Int(py=objective)
+    var csc_max_bin = Int(py=params["max_bin"])
+    var csc_alpha = Float64(py=params["alpha"])
+    var csc_bagging = _parse_bagging(params)
+    var csc_goss = _parse_goss(params)
+    var csc_use_missing = _parse_use_missing(params)
+    var csc_categorical = _parse_categorical(params)
+    # `csc_from_params` above already COPIED the SciPy arrays into Mojo lists,
+    # so the released region reads no caller memory at all here.
+    var model: Model
+    with GILReleased(Python()):
+        model = mojo_fit_csc(
+            csc,
+            target,
+            csc_objective,
+            bp,
+            csc_max_bin,
+            weights,
+            csc_alpha,
+            csc_bagging,
+            csc_goss,
+            csc_use_missing,
+            csc_categorical,
+            device=device,
+            bootstrap=bootstrap,
+        )
     return PythonObject(alloc=model^)
 
 
@@ -3302,19 +3420,26 @@ def fit_multiclass_csc(
         device == CPU_DEVICE
     )
     var weights = _parse_weights(params, nr)
-    var model = mojo_fit_multiclass_csc(
-        csc,
-        labels,
-        Int(py=n_classes),
-        bp,
-        Int(py=params["max_bin"]),
-        weights,
-        _parse_bagging(params),
-        _parse_use_missing(params),
-        _parse_categorical(params),
-        device=device,
-        bootstrap=bootstrap,
-    )
+    var mcsc_classes = Int(py=n_classes)
+    var mcsc_max_bin = Int(py=params["max_bin"])
+    var mcsc_bagging = _parse_bagging(params)
+    var mcsc_use_missing = _parse_use_missing(params)
+    var mcsc_categorical = _parse_categorical(params)
+    var model: MulticlassModel
+    with GILReleased(Python()):
+        model = mojo_fit_multiclass_csc(
+            csc,
+            labels,
+            mcsc_classes,
+            bp,
+            mcsc_max_bin,
+            weights,
+            mcsc_bagging,
+            mcsc_use_missing,
+            mcsc_categorical,
+            device=device,
+            bootstrap=bootstrap,
+        )
     return PythonObject(alloc=model^)
 
 
@@ -3503,20 +3628,30 @@ def fit_ranker(
             categorical_features=_parse_categorical(params),
         )
         return PythonObject(alloc=fitted.model.copy())
-    var model = mojo_fit_ranker(
-        features,
-        nr,
-        nf,
-        labels,
-        _group_counts(params),
-        bp,
-        advanced.base,
-        Int(py=params["max_bin"]),
-        weights,
-        _parse_bagging(params),
-        use_missing=_parse_use_missing(params),
-        categorical_features=_parse_categorical(params),
-    )
+    var rank_groups = _group_counts(params)
+    var rank_max_bin = Int(py=params["max_bin"])
+    var rank_bagging = _parse_bagging(params)
+    var rank_use_missing = _parse_use_missing(params)
+    var rank_categorical = _parse_categorical(params)
+    # Only the PLAIN LambdaRank fork is released. The advanced fork above
+    # keeps the lock: it is the rarer path and its result is a record rather
+    # than a `Model`, so releasing it is a separate change with its own risk.
+    var model: Model
+    with GILReleased(Python()):
+        model = mojo_fit_ranker(
+            features,
+            nr,
+            nf,
+            labels,
+            rank_groups,
+            bp,
+            advanced.base,
+            rank_max_bin,
+            weights,
+            rank_bagging,
+            use_missing=rank_use_missing,
+            categorical_features=rank_categorical,
+        )
     return PythonObject(alloc=model^)
 
 
@@ -3653,7 +3788,14 @@ def predict_range(
     # `decide_device` answers an explicit CPU request with CPU at every shape
     # on every machine, so routing through `predict_batch` cannot move a
     # legacy caller onto an accelerator behind its back.
-    _store(m[].predict_batch(features, nr, rng, raw, CPU_DEVICE), out_addr)
+    #
+    # Released around the binning and the walk, which is the whole cost.
+    # `_store` stays outside it: it reads `out_addr`, which is a Python
+    # object, and copying `n_rows` doubles is not worth a second handoff.
+    var values: List[Float64]
+    with GILReleased(Python()):
+        values = m[].predict_batch(features, nr, rng, raw, CPU_DEVICE)
+    _store(values, out_addr)
     return PythonObject(None)
 
 
@@ -3687,7 +3829,11 @@ def predict_proba_range(
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
     var raw = Int(py=raw_score) != 0
     var features = f64_view(Int(py=x_addr), nr * nf)
-    _store(m[].predict_batch(features, nr, rng, raw, CPU_DEVICE), out_addr)
+    # Released on `predict_range`'s terms.
+    var values: List[Float64]
+    with GILReleased(Python()):
+        values = m[].predict_batch(features, nr, rng, raw, CPU_DEVICE)
+    _store(values, out_addr)
     return PythonObject(None)
 
 
@@ -4084,12 +4230,14 @@ def predict_batch(
     )
     var device = _predict_device(params, nr, nf, 1, m[].mapper.n_bins)
     var features = f64_view(Int(py=x_addr), nr * nf)
-    _store(
-        m[].predict_batch(
-            features, nr, rng, Int(py=params["raw_score"]) != 0, device
-        ),
-        out_addr,
-    )
+    var raw = Int(py=params["raw_score"]) != 0
+    # Released around the whole batch walk, host or device. The GPU arm is
+    # released too: `predict_batch` dispatches, uploads, launches and waits
+    # in Mojo, and none of that reads a Python object.
+    var values: List[Float64]
+    with GILReleased(Python()):
+        values = m[].predict_batch(features, nr, rng, raw, device)
+    _store(values, out_addr)
     return PythonObject(mojo_device_name(device))
 
 
@@ -4121,12 +4269,12 @@ def predict_proba_batch(
     )
     var device = _predict_device(params, nr, nf, k, m[].mapper.n_bins)
     var features = f64_view(Int(py=x_addr), nr * nf)
-    _store(
-        m[].predict_batch(
-            features, nr, rng, Int(py=params["raw_score"]) != 0, device
-        ),
-        out_addr,
-    )
+    var raw = Int(py=params["raw_score"]) != 0
+    # Released on `predict_batch`'s terms.
+    var values: List[Float64]
+    with GILReleased(Python()):
+        values = m[].predict_batch(features, nr, rng, raw, device)
+    _store(values, out_addr)
     return PythonObject(mojo_device_name(device))
 
 
@@ -4876,21 +5024,32 @@ def dataset_create(
         for i in range(n_names):
             names.append(String(py=given[i]))
 
-    var dataset = Dataset(
-        features,
-        nr,
-        nf,
-        label^,
-        weight^,
-        group^,
-        init_score^,
-        names^,
-        _parse_categorical(params),
-        Int(py=params["max_bin"]),
-        _parse_use_missing(params),
-        Int(py=params["keep_raw"]) != 0,
-        _parse_ctr(params),
-    )
+    var ds_categorical = _parse_categorical(params)
+    var ds_max_bin = Int(py=params["max_bin"])
+    var ds_use_missing = _parse_use_missing(params)
+    var ds_keep_raw = Int(py=params["keep_raw"]) != 0
+    var ds_ctr = _parse_ctr(params)
+    # Binning is what a Dataset costs, and it is the second-longest call at
+    # this boundary after training. Everything the constructor reads has been
+    # copied or parsed above; `features` is the caller's buffer, which the
+    # wrapper holds for the whole call.
+    var dataset: Dataset
+    with GILReleased(Python()):
+        dataset = Dataset(
+            features,
+            nr,
+            nf,
+            label^,
+            weight^,
+            group^,
+            init_score^,
+            names^,
+            ds_categorical^,
+            ds_max_bin,
+            ds_use_missing,
+            ds_keep_raw,
+            ds_ctr^,
+        )
     return PythonObject(alloc=dataset^)
 
 
@@ -5039,76 +5198,88 @@ def train_dataset(
                 " you want to mojotrees.Dataset(params={'ctr': ...}), or drop"
                 " it from the train params and let the dataset's stand",
             )
-    var model = mojo_train_dataset(
-        d[],
-        Int(py=params["objective"]),
-        _parse_params(
-            params,
-            d[].num_feature(),
-            cpu=device == CPU_DEVICE,
-            entry=String("a Dataset fit"),
-            ctr_ok=ctr_on_dataset,
-            score_function_ok=True,
-            random_strength_ok=scale_is_computed,
-            # CatBoost's `leaf_estimation_iterations` and, on the same flag,
-            # `boost_from_average`. **`not is_sparse`, which is WIDER than
-            # `scale_is_computed` right above, and the difference is the
-            # device.** `trainset.train_dataset` forks three ways: the dense
-            # CPU arm is `boosting.train` and the GPU arm is
-            # `train_gpu.train_gpu`, and both implement the extra Newton steps
-            # and both thread `boost_from_average` into
-            # `boosting._base_score`. Only the sparse arm
-            # (`boosting_sparse.train_sparse`) implements neither, so only it
-            # is refused. The per-tree noise scale one line up is narrower
-            # because it is computed by the dense CPU round loops alone.
-            #
-            # This is the entry point the whole item is for.
-            # `mojotrees.train(params, Dataset)` is what `bench/real_data`
-            # trains through, so until this argument existed every
-            # CatBoost-mode Logloss cell had CatBoost taking ten Newton steps
-            # per leaf and mojotrees taking one, under a parity table that had
-            # been transcribed from an RMSE fit where both take one.
-            leaf_estimation_ok=not d[].is_sparse,
-            # The same condition and the same three-way fork:
-            # `boosting.train` and `train_gpu.train_gpu` both thread the value
-            # into `boosting._base_score`, `boosting_sparse.train_sparse` does
-            # not.
-            boost_from_average_ok=not d[].is_sparse,
-            catboost_defaults_objective=Int(py=params["objective"]),
-            # Honored, and this is the entry point that makes the capability
-            # worth having: `mojotrees.train(params, Dataset)` is what
-            # `bench/real_data` trains through, and a CatBoost-mode arm whose
-            # rate is not CatBoost's rate is not a comparison of defaults.
-            # No fork to settle, unlike `random_strength_ok` right above:
-            # all three of the sparse, dense-CPU and dense-GPU arms shrink by
-            # `BoosterParams.learning_rate`.
-            auto_lr_ok=True,
-            auto_lr_rows=d[].num_data(),
-            auto_lr_objective=Int(py=params["objective"]),
-            # UNCONDITIONAL, and WIDER than either flag beside it. Every fork of
-            # trainset.train_dataset honors the wide derivative or refuses it: the
-            # dense CPU arm is boosting.train, the sparse arm is
-            # boosting_sparse.train_sparse -- which DOES pass the flag, unlike
-            # leaf_estimation_iterations -- and the GPU arm raises in
-            # histogram.check_device_derivative_precision. This is the entry point
-            # bench/real_data trains through, and a flag that was True at `fit`
-            # alone would lose the parameter here, which is the defect
-            # random_strength_ok and leaf_estimation_ok have each been once.
-            derivative_precision_ok=True,
-        ),
-        Float64(py=params["alpha"]),
-        device,
-        _parse_bagging(params),
-        _parse_goss(params),
-        # The second reachable path, and the one `bench/real_data`'s dense
-        # arm actually takes: `mojotrees.train(params, Dataset)` never
-        # touches `model.fit`. `trainset.train_dataset` honors the bundle on
-        # BOTH CPU arms now, dense and sparse, and refuses only the GPU arm --
-        # by name, which is why this defers rather than restating the routing.
-        _parse_bootstrap_request(params).resolve_or_defer(
-            device == CPU_DEVICE
-        ),
+    var td_objective = Int(py=params["objective"])
+    var td_params = _parse_params(
+        params,
+        d[].num_feature(),
+        cpu=device == CPU_DEVICE,
+        entry=String("a Dataset fit"),
+        ctr_ok=ctr_on_dataset,
+        score_function_ok=True,
+        random_strength_ok=scale_is_computed,
+        # CatBoost's `leaf_estimation_iterations` and, on the same flag,
+        # `boost_from_average`. **`not is_sparse`, which is WIDER than
+        # `scale_is_computed` right above, and the difference is the
+        # device.** `trainset.train_dataset` forks three ways: the dense
+        # CPU arm is `boosting.train` and the GPU arm is
+        # `train_gpu.train_gpu`, and both implement the extra Newton steps
+        # and both thread `boost_from_average` into
+        # `boosting._base_score`. Only the sparse arm
+        # (`boosting_sparse.train_sparse`) implements neither, so only it
+        # is refused. The per-tree noise scale one line up is narrower
+        # because it is computed by the dense CPU round loops alone.
+        #
+        # This is the entry point the whole item is for.
+        # `mojotrees.train(params, Dataset)` is what `bench/real_data`
+        # trains through, so until this argument existed every
+        # CatBoost-mode Logloss cell had CatBoost taking ten Newton steps
+        # per leaf and mojotrees taking one, under a parity table that had
+        # been transcribed from an RMSE fit where both take one.
+        leaf_estimation_ok=not d[].is_sparse,
+        # The same condition and the same three-way fork:
+        # `boosting.train` and `train_gpu.train_gpu` both thread the value
+        # into `boosting._base_score`, `boosting_sparse.train_sparse` does
+        # not.
+        boost_from_average_ok=not d[].is_sparse,
+        catboost_defaults_objective=Int(py=params["objective"]),
+        # Honored, and this is the entry point that makes the capability
+        # worth having: `mojotrees.train(params, Dataset)` is what
+        # `bench/real_data` trains through, and a CatBoost-mode arm whose
+        # rate is not CatBoost's rate is not a comparison of defaults.
+        # No fork to settle, unlike `random_strength_ok` right above:
+        # all three of the sparse, dense-CPU and dense-GPU arms shrink by
+        # `BoosterParams.learning_rate`.
+        auto_lr_ok=True,
+        auto_lr_rows=d[].num_data(),
+        auto_lr_objective=Int(py=params["objective"]),
+        # UNCONDITIONAL, and WIDER than either flag beside it. Every fork of
+        # trainset.train_dataset honors the wide derivative or refuses it: the
+        # dense CPU arm is boosting.train, the sparse arm is
+        # boosting_sparse.train_sparse -- which DOES pass the flag, unlike
+        # leaf_estimation_iterations -- and the GPU arm raises in
+        # histogram.check_device_derivative_precision. This is the entry point
+        # bench/real_data trains through, and a flag that was True at `fit`
+        # alone would lose the parameter here, which is the defect
+        # random_strength_ok and leaf_estimation_ok have each been once.
+        derivative_precision_ok=True,
     )
+    var td_alpha = Float64(py=params["alpha"])
+    var td_bagging = _parse_bagging(params)
+    var td_goss = _parse_goss(params)
+    # The second reachable path, and the one `bench/real_data`'s dense
+    # arm actually takes: `mojotrees.train(params, Dataset)` never
+    # touches `model.fit`. `trainset.train_dataset` honors the bundle on
+    # BOTH CPU arms now, dense and sparse, and refuses only the GPU arm --
+    # by name, which is why this defers rather than restating the routing.
+    var td_bootstrap = _parse_bootstrap_request(params).resolve_or_defer(
+        device == CPU_DEVICE
+    )
+    # Released: the dense CPU, dense GPU and sparse arms behind
+    # `trainset.train_dataset` are all pure Mojo, and this is the entry
+    # point `mojotrees.train(params, Dataset)` and `bench/real_data` train
+    # through, so it is the second place a held lock froze a whole process.
+    var model: Model
+    with GILReleased(Python()):
+        model = mojo_train_dataset(
+            d[],
+            td_objective,
+            td_params,
+            td_alpha,
+            device,
+            td_bagging,
+            td_goss,
+            td_bootstrap,
+        )
     return PythonObject(alloc=model^)
 
 
@@ -5129,30 +5300,37 @@ def train_dataset_multiclass(
     var bootstrap = _parse_bootstrap_request(params).resolve_or_defer(
         device == CPU_DEVICE
     )
-    var model = mojo_train_dataset_multiclass(
-        d[],
-        Int(py=params["n_classes"]),
-        _parse_params(
-            params,
-            d[].num_feature(),
-            cpu=device == CPU_DEVICE,
-            entry=String("a Dataset fit"),
-            score_function_ok=True,
-            # Honored. The objective key on a multiclass Dataset fit is not
-            # read by the trainer (it takes the class count instead), so the
-            # code is named here rather than taken from the mapping.
-            auto_lr_ok=True,
-            auto_lr_rows=d[].num_data(),
-            auto_lr_objective=_MULTICLASS_OBJECTIVE,
-            # boosting._boost_rounds_multiclass passes the flag; the GPU multiclass
-            # trainer refuses float64 by name.
-            derivative_precision_ok=True,
-        ),
-        device,
-        _parse_bagging(params),
-        _parse_goss(params),
-        bootstrap,
+    var tdm_classes = Int(py=params["n_classes"])
+    var tdm_params = _parse_params(
+        params,
+        d[].num_feature(),
+        cpu=device == CPU_DEVICE,
+        entry=String("a Dataset fit"),
+        score_function_ok=True,
+        # Honored. The objective key on a multiclass Dataset fit is not
+        # read by the trainer (it takes the class count instead), so the
+        # code is named here rather than taken from the mapping.
+        auto_lr_ok=True,
+        auto_lr_rows=d[].num_data(),
+        auto_lr_objective=_MULTICLASS_OBJECTIVE,
+        # boosting._boost_rounds_multiclass passes the flag; the GPU multiclass
+        # trainer refuses float64 by name.
+        derivative_precision_ok=True,
     )
+    var tdm_bagging = _parse_bagging(params)
+    var tdm_goss = _parse_goss(params)
+    # Released on `train_dataset`'s terms.
+    var model: MulticlassModel
+    with GILReleased(Python()):
+        model = mojo_train_dataset_multiclass(
+            d[],
+            tdm_classes,
+            tdm_params,
+            device,
+            tdm_bagging,
+            tdm_goss,
+            bootstrap,
+        )
     return PythonObject(alloc=model^)
 
 
@@ -5166,24 +5344,33 @@ def train_dataset_ranker(
         False,
         String("a Dataset ranker fit (trainset.train_dataset_ranker)"),
     )
-    var model = mojo_train_dataset_ranker_advanced(
-        d[],
-        _parse_params(
-            params,
-            d[].num_feature(),
-            unbundled="train_dataset_ranker",
-            score_function_ok=True,
-            # `True` for the reason `fit_ranker` passes True: the inputs are
-            # all here, and it is the coefficient table that has no
-            # LambdaRank row, which is the module's judgement to make.
-            auto_lr_ok=True,
-            auto_lr_rows=d[].num_data(),
-            auto_lr_objective=_LAMBDARANK_OBJECTIVE,
-        ),
-        _parse_advanced_rank_params(params),
-        _parse_positions(params, d[].num_data()),
-        _parse_bagging(params),
+    var tdr_params = _parse_params(
+        params,
+        d[].num_feature(),
+        unbundled="train_dataset_ranker",
+        score_function_ok=True,
+        # `True` for the reason `fit_ranker` passes True: the inputs are
+        # all here, and it is the coefficient table that has no
+        # LambdaRank row, which is the module's judgement to make.
+        auto_lr_ok=True,
+        auto_lr_rows=d[].num_data(),
+        auto_lr_objective=_LAMBDARANK_OBJECTIVE,
     )
+    var tdr_rank = _parse_advanced_rank_params(params)
+    var tdr_positions = _parse_positions(params, d[].num_data())
+    var tdr_bagging = _parse_bagging(params)
+    # Released on `train_dataset`'s terms. Unlike `fit_ranker` the advanced
+    # fork is released too, because `trainset.train_dataset_ranker_advanced`
+    # returns a `Model` on both of its branches rather than a record.
+    var model: Model
+    with GILReleased(Python()):
+        model = mojo_train_dataset_ranker_advanced(
+            d[],
+            tdr_params,
+            tdr_rank,
+            tdr_positions,
+            tdr_bagging,
+        )
     return PythonObject(alloc=model^)
 
 
@@ -5210,63 +5397,77 @@ def booster_update(
     var boot_can_continue = not d[].is_sparse and not (
         boot_req.params.mvs.enabled and not boot_req.params.mvs.reg_is_set
     )
-    var added = mojo_update_dataset(
-        m[],
-        d[],
-        _parse_params(
-            params,
-            d[].num_feature(),
-            entry=String("a Dataset fit"),
-            score_function_ok=True,
-            # `trainset.update_dataset` has no fork to settle: it refuses a
-            # sparse dataset by name ("continued training has no sparse
-            # path"), takes no device argument at all, and calls
-            # `boosting.train_more`, which is `_boost_rounds` with a
-            # `round_offset`. So the scale IS computed, once per tree, at the
-            # absolute round index -- which is the reason `_boost_rounds`
-            # takes the offset: a continued run computes the model length an
-            # uninterrupted run would have had. Unconditional True rather
-            # than a sparse test, so a sparse continued fit gets
-            # `update_dataset`'s own message about continued training instead
-            # of a message about random_strength, which is not its problem.
-            random_strength_ok=True,
-            # CatBoost's `leaf_estimation_iterations`. Unconditional for the
-            # reason `random_strength_ok` is unconditional here:
-            # `trainset.update_dataset` refuses a sparse dataset by name,
-            # takes no device argument, and calls `boosting.train_more`, which
-            # is `_boost_rounds` with a round offset and reads the field at
-            # boosting.mojo:2345. A sparse continued fit should hear about
-            # continued training, not about leaf estimation.
-            leaf_estimation_ok=True,
-            # No `catboost_defaults_objective`. Continued training resolves no
-            # mode default, and the reason is the one
-            # `_AUTO_LR_CONTINUED_REASON` gives for the learning rate: the
-            # trees already in the model were grown under whatever this
-            # resolved on the first fit, and resolving it again here could
-            # append ten-step leaves to a one-step ensemble without either
-            # half being wrong on its own.
-            #
-            # And no `boost_from_average_ok`, which is the one place its
-            # verdict parts company with `leaf_estimation_ok`'s.
-            # `boosting.train_more` reads `leaf_estimation_iterations`, so the
-            # extra steps are honest here; it starts from the base score
-            # already stored on the model and never calls
-            # `boosting._base_score`, so a `false` would be accepted and
-            # ignored. Left at its refusing default, so a continued fit that
-            # names the parameter hears that the original fit decided it.
-            auto_lr_reason=String(_AUTO_LR_CONTINUED_REASON),
-            # boosting.train_more is boosting._boost_rounds with a round offset, and
-            # that loop passes the flag. A top-up at a different precision from the
-            # original fit is a caveat about the ensemble and not an ignored
-            # parameter: the rounds this call adds really are computed at the
-            # precision named here.
-            derivative_precision_ok=True,
-        ),
-        Float64(py=params["alpha"]),
-        _parse_bagging(params),
-        _parse_goss(params),
-        boot_req.resolve_or_defer(boot_can_continue),
+    var bu_params = _parse_params(
+        params,
+        d[].num_feature(),
+        entry=String("a Dataset fit"),
+        score_function_ok=True,
+        # `trainset.update_dataset` has no fork to settle: it refuses a
+        # sparse dataset by name ("continued training has no sparse
+        # path"), takes no device argument at all, and calls
+        # `boosting.train_more`, which is `_boost_rounds` with a
+        # `round_offset`. So the scale IS computed, once per tree, at the
+        # absolute round index -- which is the reason `_boost_rounds`
+        # takes the offset: a continued run computes the model length an
+        # uninterrupted run would have had. Unconditional True rather
+        # than a sparse test, so a sparse continued fit gets
+        # `update_dataset`'s own message about continued training instead
+        # of a message about random_strength, which is not its problem.
+        random_strength_ok=True,
+        # CatBoost's `leaf_estimation_iterations`. Unconditional for the
+        # reason `random_strength_ok` is unconditional here:
+        # `trainset.update_dataset` refuses a sparse dataset by name,
+        # takes no device argument, and calls `boosting.train_more`, which
+        # is `_boost_rounds` with a round offset and reads the field at
+        # boosting.mojo:2345. A sparse continued fit should hear about
+        # continued training, not about leaf estimation.
+        leaf_estimation_ok=True,
+        # No `catboost_defaults_objective`. Continued training resolves no
+        # mode default, and the reason is the one
+        # `_AUTO_LR_CONTINUED_REASON` gives for the learning rate: the
+        # trees already in the model were grown under whatever this
+        # resolved on the first fit, and resolving it again here could
+        # append ten-step leaves to a one-step ensemble without either
+        # half being wrong on its own.
+        #
+        # And no `boost_from_average_ok`, which is the one place its
+        # verdict parts company with `leaf_estimation_ok`'s.
+        # `boosting.train_more` reads `leaf_estimation_iterations`, so the
+        # extra steps are honest here; it starts from the base score
+        # already stored on the model and never calls
+        # `boosting._base_score`, so a `false` would be accepted and
+        # ignored. Left at its refusing default, so a continued fit that
+        # names the parameter hears that the original fit decided it.
+        auto_lr_reason=String(_AUTO_LR_CONTINUED_REASON),
+        # boosting.train_more is boosting._boost_rounds with a round offset, and
+        # that loop passes the flag. A top-up at a different precision from the
+        # original fit is a caveat about the ensemble and not an ignored
+        # parameter: the rounds this call adds really are computed at the
+        # precision named here.
+        derivative_precision_ok=True,
     )
+    var bu_alpha = Float64(py=params["alpha"])
+    var bu_bagging = _parse_bagging(params)
+    var bu_goss = _parse_goss(params)
+    var bu_bootstrap = boot_req.resolve_or_defer(boot_can_continue)
+    # Released: appending rounds is `boosting._boost_rounds` with an offset
+    # and reads no Python object. It MUTATES the model in place through
+    # `m[]`, which is Mojo memory inside a Python object, so a caller that
+    # predicts from the same model on another thread while this runs races
+    # on it. That is the caller's serialization to make and is the same
+    # contract LightGBM's `Booster.update` carries; a released lock does not
+    # create the race, it stops hiding it.
+    var added: Int
+    with GILReleased(Python()):
+        added = mojo_update_dataset(
+            m[],
+            d[],
+            bu_params,
+            bu_alpha,
+            bu_bagging,
+            bu_goss,
+            bu_bootstrap,
+        )
     return PythonObject(added)
 
 
@@ -5284,24 +5485,31 @@ def booster_update_multiclass(
     # continue is a sparse dataset, which `trainset.update_dataset_multiclass`
     # refuses by name.
     var boot_req = _parse_bootstrap_request(params)
-    var added = mojo_update_dataset_multiclass(
-        m[],
-        d[],
-        _parse_params(
-            params,
-            d[].num_feature(),
-            entry=String("a Dataset fit"),
-            score_function_ok=True,
-            auto_lr_reason=String(_AUTO_LR_CONTINUED_REASON),
-            # trainset.update_dataset_multiclass reaches
-            # boosting.train_multiclass_more, i.e. _boost_rounds_multiclass, which
-            # passes the flag.
-            derivative_precision_ok=True,
-        ),
-        _parse_bagging(params),
-        _parse_goss(params),
-        boot_req.resolve_or_defer(not d[].is_sparse),
+    var bum_params = _parse_params(
+        params,
+        d[].num_feature(),
+        entry=String("a Dataset fit"),
+        score_function_ok=True,
+        auto_lr_reason=String(_AUTO_LR_CONTINUED_REASON),
+        # trainset.update_dataset_multiclass reaches
+        # boosting.train_multiclass_more, i.e. _boost_rounds_multiclass, which
+        # passes the flag.
+        derivative_precision_ok=True,
     )
+    var bum_bagging = _parse_bagging(params)
+    var bum_goss = _parse_goss(params)
+    var bum_bootstrap = boot_req.resolve_or_defer(not d[].is_sparse)
+    # Released on `booster_update`'s terms, in-place mutation included.
+    var added: Int
+    with GILReleased(Python()):
+        added = mojo_update_dataset_multiclass(
+            m[],
+            d[],
+            bum_params,
+            bum_bagging,
+            bum_goss,
+            bum_bootstrap,
+        )
     return PythonObject(added)
 
 

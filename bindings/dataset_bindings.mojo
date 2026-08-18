@@ -28,7 +28,8 @@ every buffer address travels inward: a column leaves as a Python list, or
 is written into a buffer the caller preallocated and sized.
 """
 
-from std.python import PythonObject
+from std.python import Python, PythonObject
+from std.python._cpython import GILReleased
 
 from binding_support import (
     csc_from_params,
@@ -134,18 +135,34 @@ def dataset_create_csc(params: PythonObject) raises -> PythonObject:
     rather than a densifying branch of the dense one.
     """
     var n_rows = Int(py=params["n_rows"])
-    var dataset = Dataset.from_csc(
-        csc_from_params(params),
-        _optional_column(params, "label_addr", n_rows),
-        _optional_column(params, "weight_addr", n_rows),
-        _group_counts(params),
-        _optional_column(params, "init_score_addr", n_rows),
-        _feature_names(params),
-        _categorical(params),
-        Int(py=params["max_bin"]),
-        flag(params["use_missing"], "use_missing"),
-        flag(params["keep_raw"], "keep_raw"),
-    )
+    var csc = csc_from_params(params)
+    var label = _optional_column(params, "label_addr", n_rows)
+    var weight = _optional_column(params, "weight_addr", n_rows)
+    var group = _group_counts(params)
+    var init_score = _optional_column(params, "init_score_addr", n_rows)
+    var names = _feature_names(params)
+    var categorical = _categorical(params)
+    var max_bin = Int(py=params["max_bin"])
+    var use_missing = flag(params["use_missing"], "use_missing")
+    var keep_raw = flag(params["keep_raw"], "keep_raw")
+    # Sparse binning is unbounded work over the caller's matrix and touches
+    # no Python object once the six sparse buffers have been copied above,
+    # so the interpreter lock goes back to the rest of the process for it.
+    # See the rule at the top of `bindings/_mojotrees.mojo`.
+    var dataset: Dataset
+    with GILReleased(Python()):
+        dataset = Dataset.from_csc(
+            csc^,
+            label^,
+            weight^,
+            group^,
+            init_score^,
+            names^,
+            categorical^,
+            max_bin,
+            use_missing,
+            keep_raw,
+        )
     return PythonObject(alloc=dataset^)
 
 
@@ -179,16 +196,27 @@ def dataset_create_reference(
     var ref_dataset = reference.downcast_value_ptr[Dataset]()
     var nr = Int(py=n_rows)
     var nf = ref_dataset[].num_feature()
-    var dataset = Dataset.from_reference_dense(
-        ref_dataset[],
-        f64_view(Int(py=x_addr), nr * nf),
-        nr,
-        _optional_column(params, "label_addr", nr),
-        _optional_column(params, "weight_addr", nr),
-        _group_counts(params),
-        _optional_column(params, "init_score_addr", nr),
-        flag(params["keep_raw"], "keep_raw"),
-    )
+    var features = f64_view(Int(py=x_addr), nr * nf)
+    var label = _optional_column(params, "label_addr", nr)
+    var weight = _optional_column(params, "weight_addr", nr)
+    var group = _group_counts(params)
+    var init_score = _optional_column(params, "init_score_addr", nr)
+    var keep_raw = flag(params["keep_raw"], "keep_raw")
+    # Released on `dataset_create_csc`'s terms. `ref_dataset[]` reads Mojo
+    # memory inside a Python object the caller's frame keeps alive, which
+    # touches no refcount and is safe with the lock down.
+    var dataset: Dataset
+    with GILReleased(Python()):
+        dataset = Dataset.from_reference_dense(
+            ref_dataset[],
+            features,
+            nr,
+            label^,
+            weight^,
+            group^,
+            init_score^,
+            keep_raw,
+        )
     return PythonObject(alloc=dataset^)
 
 
@@ -219,10 +247,17 @@ def dataset_subset(
     """
     var d = dataset.downcast_value_ptr[Dataset]()
     var rows = int_buffer(Int(py=rows_addr), Int(py=n_rows))
+    # Both arms re-bin, which is the same unbounded work `dataset_create`
+    # does, so both release. `rows` was copied out of the caller's buffer
+    # above.
     if flag(shared_binning, "shared_binning"):
-        var shared = d[].subset_shared_binning(rows)
+        var shared: Dataset
+        with GILReleased(Python()):
+            shared = d[].subset_shared_binning(rows)
         return PythonObject(alloc=shared^)
-    var own = d[].subset(rows)
+    var own: Dataset
+    with GILReleased(Python()):
+        own = d[].subset(rows)
     return PythonObject(alloc=own^)
 
 

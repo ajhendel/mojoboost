@@ -36,7 +36,8 @@ uint8 bins and whose entry point is native; this module is the Python
 side's row-at-a-time ingestion, not that.
 """
 
-from std.python import PythonObject
+from std.python import Python, PythonObject
+from std.python._cpython import GILReleased
 
 from binding_support import f64_buffer, flag, int_buffer_from_f64, str_sequence
 
@@ -227,18 +228,30 @@ def dataset_chunks_finish(
     var init_score = a[].init_score.copy()
     if not a[].has_init_score and Int(py=params["init_score_addr"]) != 0:
         init_score = f64_buffer(Int(py=params["init_score_addr"]), n_rows)
-    var dataset = Dataset(
-        features,
-        n_rows,
-        a[].n_features,
-        label^,
-        weight^,
-        _group_counts(params),
-        init_score^,
-        _feature_names(params),
-        _categorical(params),
-        Int(py=params["max_bin"]),
-        flag(params["use_missing"], "use_missing"),
-        flag(params["keep_raw"], "keep_raw"),
-    )
+    var n_features = a[].n_features
+    var group = _group_counts(params)
+    var names = _feature_names(params)
+    var categorical = _categorical(params)
+    var max_bin = Int(py=params["max_bin"])
+    var use_missing = flag(params["use_missing"], "use_missing")
+    var keep_raw = flag(params["keep_raw"], "keep_raw")
+    # Released for the binning, on the rule at the top of
+    # `bindings/_mojotrees.mojo`: every Python read is above this line and
+    # `features` is the accumulator's own Mojo buffer.
+    var dataset: Dataset
+    with GILReleased(Python()):
+        dataset = Dataset(
+            features,
+            n_rows,
+            n_features,
+            label^,
+            weight^,
+            group^,
+            init_score^,
+            names^,
+            categorical^,
+            max_bin,
+            use_missing,
+            keep_raw,
+        )
     return PythonObject(alloc=dataset^)
