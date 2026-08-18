@@ -4876,10 +4876,25 @@ struct LeafRangeTable(Copyable, Movable):
            given check 2 and a device frontier that tiles, a non-live node
            holding rows would have to overlap a leaf that already matched, so
            check 4 would also refuse it. What this buys is the error message.
-           A snapshot whose frontier does not tile -- which
+           A snapshot whose frontier does not tile fails here naming the node
+           and the commit that should have split it, rather than downstream as
+           "ranges overlap".
+
+           **This item said such a snapshot is "which
            `TreeTablesSnapshot.check_invariants` is supposed to have refused
-           upstream -- fails here naming the node and the commit that should
-           have split it, rather than downstream as "ranges overlap".
+           upstream". IT IS NOT REFUSED UPSTREAM AND NEVER WAS.** Corrected
+           2026-08-18, by reading that function. It tests nonnegativity,
+           pairwise disjointness, distinct node, slot and record ids, the live
+           leaf count, and `next_node == 2 * n_live - 1`. It tests no total, no
+           bound against the active prefix, and no coverage of any kind, and it
+           could not: `TreeTablesSnapshot` has no `n_active` field, so the
+           snapshot never carries the length a tiling claim would be about. A
+           frontier whose windows account for a fraction of the prefix passes
+           every one of those tests. So a non-tiling frontier arrives here
+           unrefused, and checks 2, 3 and 4 are the first thing it meets rather
+           than a second line behind an upstream gate. Whether check 3 or check
+           4 speaks first is a question about error messages; neither is
+           optional, because there is nothing in front of them.
 
         4. `_check_invariants()`. The check that owns the relationship to
            `n_active`, which nothing above mentions: a publish onto a table
@@ -7954,8 +7969,18 @@ struct GpuActiveRows(Movable):
         the default.** The third, `_copy_back_kernel`, is then not issued here
         at all: the debt is recorded and the next `enqueue_desc_histogram`
         discharges it in the same command buffer as its slot zeroing, which is
-        one fewer command buffer per growth step on a queue that is 64 deep and
-        past its knee. See `set_partition_fusion` for the pairing contract and
+        one fewer command buffer per growth step. This clause read "on a queue
+        that is 64 deep and past its knee" and the second half is retired as of
+        2026-08-18: the depth is a price per launch and not a hazard to be past,
+        since `MTLCommandQueue.commandBuffer` blocks rather than dropping work
+        (`docs/GPU_PORTABILITY.md` 6.2, `docs/design/SWITCH_GRID.md` section 6
+        item 8). The price is what carries this. The leaf-wise grower this entry
+        point serves enqueues 8 + 9 * (num_leaves - 1) buffers a tree, 2,303 at
+        256 leaves, and was measured backpressured with `device_wait` at exactly
+        0 calls, so every buffer it drops is bought at the over-depth enqueue
+        cost of 14 to 17 microseconds rather than the 6 to 7 under it. One fewer
+        per growth step is a real saving at that rate and it is not a rescue from
+        anything. See `set_partition_fusion` for the pairing contract and
         `_copy_back_zero_slot_kernel` for why the fold is exact and why the
         other two launches here cannot be folded into anything.
         """

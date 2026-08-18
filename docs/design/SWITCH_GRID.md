@@ -627,7 +627,7 @@ These are the column-5 findings that a name alone would not surface.
    profile at commit 1d77414 measured that arm backpressured, `device_wait` at
    exactly 0 calls with `encode` at 85.74 percent of host time
    (`bench/results/RESUME_2026-08-18.md`). So the repository refused one grower
-   at 63 to 73 launches on queue-depth grounds while routing the same fit to a
+   at 63 to 71 launches on queue-depth grounds while routing the same fit to a
    grower measured running five to thirty-six times past the same limit. Section
    6.2 had already recorded the leaf-wise plane at "on the order of 315
    launches between waits, which is nearly five times the depth", as a derived
@@ -639,8 +639,14 @@ These are the column-5 findings that a name alone would not surface.
    function's own docstring says it models a schedule that does not exist yet
    and is kept frozen as a registered prediction. The BUILT schedule is
    `oblivious_schedule_launches`, and at head, under the shipped
-   `skip_last_build` and `OBLIVIOUS_MAX_ITEMS = 64`, it returns **63 at depth 7
-   and 73 at depth 8**. Depth 7 is under 64 on the schedule that actually runs
+   `skip_last_build` and `OBLIVIOUS_MAX_ITEMS = 256`, it returns **63 at depth 7
+   and 71 at depth 8**. This paragraph read "`OBLIVIOUS_MAX_ITEMS = 64`" and
+   "73 at depth 8" until 2026-08-18, when `OBLIVIOUS_MAX_LEAVES` rose to 256 and
+   `OBLIVIOUS_MAX_ITEMS` became derived from it. The depth-8 count fell by two
+   because that level's 128 children are now one batch of at most 256 items
+   instead of two batches of 64, and the schedule charges two command buffers a
+   batch. Depth 7 is unchanged at 63, since a depth-7 level was already one
+   batch. Depth 7 is under 64 on the schedule that actually runs
    and is refused anyway, by a number the code stopped producing on 2026-08-17.
    This is a distinct defect from the first two, a stale citation rather than a
    bad model, and fixing one does not fix the other.

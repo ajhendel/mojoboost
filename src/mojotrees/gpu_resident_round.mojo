@@ -1932,7 +1932,7 @@ def oblivious_launch_census(
 
 comptime OBLIVIOUS_OK = 0
 comptime OBLIVIOUS_DEPTH = 1
-"""`max_depth` outside `[1, 7]`, which is what `oblivious_device_supported` and
+"""`max_depth` outside `[1, 8]`, which is what `oblivious_device_supported` and
 `grow_tree_device_oblivious` test.
 
 **THIS DOCSTRING SAID `[1, 6]` AND GAVE TWO REASONS FOR IT. ONE IS DEAD AND THE
@@ -2121,7 +2121,7 @@ def oblivious_reason_name(reason: Int) -> String:
     if reason == OBLIVIOUS_OK:
         return String("ok")
     if reason == OBLIVIOUS_DEPTH:
-        return String("max_depth outside 1..7")
+        return String("max_depth outside 1..8")
     if reason == OBLIVIOUS_LEVEL_HISTOGRAM:
         return String("the histogram batcher cannot hold a whole level")
     if reason == OBLIVIOUS_ROW_RANGES:
@@ -2185,7 +2185,7 @@ def oblivious_device_supported(
     """
     if params.grow_policy != GROW_OBLIVIOUS:
         return OBLIVIOUS_TABLES
-    if params.max_depth < 1 or params.max_depth > 7:
+    if params.max_depth < 1 or params.max_depth > 8:
         return OBLIVIOUS_DEPTH
     if builder.cats.any_categorical():
         return OBLIVIOUS_CATEGORICAL
@@ -4004,10 +4004,10 @@ def grow_tree_device_oblivious(
     # reading a limit the code stopped enforcing. The 6 came from the retired
     # queue-depth argument (see `OBLIVIOUS_DEPTH`); the 8 is the threadgroup
     # allocation the scan sizes at compile time.
-    if params.max_depth < 1 or params.max_depth > 7:
+    if params.max_depth < 1 or params.max_depth > 8:
         raise Error(
             "grow_policy=oblivious on the device is implemented for max_depth"
-            " in [1, 7]; see OBLIVIOUS_DEPTH"
+            " in [1, 8]; see OBLIVIOUS_DEPTH"
         )
     if speculative_build_enabled():
         raise Error(

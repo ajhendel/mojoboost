@@ -785,6 +785,21 @@ size would force.
 Sixty-four threads over a frontier that is 31 leaves by default is a thread
 per leaf and then some, which is deliberate: the reduction is not the cost
 here, the launch is, and a narrower block would not make the launch cheaper.
+
+**One consumer needs this to be at least the level width and this constant no
+longer is.** Every kernel in this file that reduces over the frontier strides
+by `PICK_THREADS` and is correct at any width, except `_commit_level_kernel`'s
+per-leaf phase, which is a bare `if tid < n_live`. `OBLIVIOUS_LEVEL_LEAVES` rose
+from 64 to 256 on 2026-08-18 and this 64 was not raised with it, so a level of
+more than 64 parents commits from shared memory no thread wrote. Unreachable
+today, because the oblivious device grower refuses `max_depth > 7` and depth 7's
+widest level is exactly 64.
+
+**Do not fix that by raising this constant.** It is the compile-time
+`block_size` of the `block.max` and `block.min` collectives in
+`_pick_and_commit_kernel`, so raising it changes a shape that has nothing to do
+with the level commit. The fix is a stride in phase 2 of
+`_commit_level_kernel`, whose docstring sets it out.
 """
 
 
@@ -1011,15 +1026,39 @@ struct TreeTablesSnapshot(Copyable, Movable):
         return -1
 
     def check_invariants(self) raises:
-        """The live windows must tile `[0, n_active)` and the leaves must
-        hold distinct node ids, distinct histogram slots, and distinct record
-        slots.
+        """The live windows must be nonnegative and pairwise disjoint, and the
+        leaves must hold distinct node ids, distinct histogram slots and
+        distinct record slots, with the leaf count and the node counter
+        agreeing.
 
-        The host mirror of this check is `LeafFrontier.check_invariants`, and
-        holding both is what makes a disagreement between the device tables
-        and the host frontier detectable instead of silent. Growth here is a
-        few hundred leaves at most, so the quadratic form is cheaper than
-        sorting and is what a test wants to read.
+        **THE COVERAGE HALF OF THIS CHECK DOES NOT EXIST, AND THIS DOCSTRING
+        USED TO CLAIM IT DID.** The first line read "The live windows must tile
+        `[0, n_active)`", and nothing below tests a total, an upper bound
+        against the active prefix, or coverage of any kind. Corrected
+        2026-08-18. It is absent here rather than delegated somewhere else, so
+        a reader must not take this function as the place tiling is
+        established. It cannot be, either, because `TreeTablesSnapshot` has no
+        `n_active` field: the download brings home the frontier and the
+        counters and never the prefix length the windows would have to cover.
+
+        What that gap lets through, concretely. A level whose per-leaf row
+        counts are wrong but internally consistent passes every test below.
+        The windows stay nonnegative, stay disjoint, stay distinct in every id,
+        and `next_node == 2 * n_live - 1` still holds, while the windows
+        together account for a fraction of the active rows. That is exactly the
+        shape `_commit_level_kernel` produces above 64 parents, and the check
+        that does catch it is
+        `gpu_active_rows.LeafRangeTable._check_invariants`, which compares a
+        total against `n_active` because it holds one, and which is reached
+        only after `gpu_resident_round._publish_level_row_ranges` has replayed
+        the frontier onto the host table.
+
+        The host mirror of what this function does check is
+        `LeafFrontier.check_invariants`, and holding both is what makes a
+        disagreement between the device tables and the host frontier
+        detectable instead of silent. Growth here is a few hundred leaves at
+        most, so the quadratic form is cheaper than sorting and is what a test
+        wants to read.
         """
         for i in range(len(self.leaves)):
             var a = self.leaves[i].copy()
@@ -1741,7 +1780,13 @@ indexes a histogram, and a bare 3 next to a bare 2 is exactly the kind of
 constant that gets read as an off-by-one."""
 
 comptime OBLIVIOUS_LEVEL_LEAVES = OBLIVIOUS_MAX_LEAVES
-"""Leaves in one level this commit will apply a split to, which is `2 ** 6`.
+"""Leaves in one level this commit will apply a split to, which is `2 ** 8`.
+
+This line read "which is `2 ** 6`" until 2026-08-18, when
+`gpu_split_search.OBLIVIOUS_MAX_LEAVES` rose from 64 to 256. The constant itself
+never carried the 64, since it has always been the import, so only the sentence
+was wrong. Written as a power of two because a level width is one, and 256
+leaves is the bottom level of a depth-8 tree.
 
 The same bound `gpu_split_search.OBLIVIOUS_MAX_LEAVES` puts on the cross-leaf
 scan, imported rather than restated so the two cannot drift: a level this
@@ -1753,10 +1798,25 @@ comptime OBLIVIOUS_PLAN_ITEMS = 2 * OBLIVIOUS_MAX_LEAVES
 
 A level of `L` parents makes `2L` children and the plan carries an item row for
 every one of them, so the plan is twice as wide as the level. The widest level a
-depth-6 tree commits is `L = 32`, giving 64 items -- which is exactly
+depth-8 tree commits is `L = 128`, giving 256 items, which is exactly
 `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`, and that agreement is the sizing
-precondition of the whole census rather than a coincidence. The constant here
-is `2 * 64` because it bounds the *scratch* plan a caller may hand this struct
+precondition of the whole census rather than a coincidence. What the sizing
+permits and what the device reaches are two different bounds:
+`device_policy.OBLIVIOUS_DEVICE_MAX_DEPTH` is 7, so the widest level a fit
+actually commits today is `L = 64` at 128 items, and the top of this range is
+headroom rather than a path anything runs.
+
+**Those three numbers were 32, 64 and `2 * 64` until 2026-08-18.** This
+paragraph read "The widest level a depth-6 tree commits is `L = 32`, giving 64
+items", and "The constant here is `2 * 64`". Both stopped being true when
+`gpu_split_search.OBLIVIOUS_MAX_LEAVES` rose from 64 to 256 and
+`OBLIVIOUS_MAX_ITEMS` became derived from it rather than a literal. The
+expression here is `2 * OBLIVIOUS_MAX_LEAVES` and always was, so it moved with
+the raise and evaluates to 512 today. The argument did not move: the agreement
+between a level's item count and `OBLIVIOUS_MAX_ITEMS` is still the precondition
+the census is sized against, and it is now guaranteed by construction rather
+than by two literals happening to match. The factor of two is why 512 rather
+than 256: this constant bounds the *scratch* plan a caller may hand this struct
 without a batcher, and a caller that hands in a real batcher's `items_dev` is
 bounded by that batcher's own `max_items`.
 
@@ -1816,10 +1876,67 @@ def _commit_level_kernel(
     """One oblivious level, committed entirely on the device.
 
     Launched as a single threadgroup of `PICK_THREADS` threads over a grid of
-    one block, exactly as `_pick_and_commit_kernel` is, and for a reason that is
-    now even more direct: `PICK_THREADS` is 64 and so is
-    `OBLIVIOUS_LEVEL_LEAVES`, so the level's per-leaf work is one thread per
-    leaf and the block is neither too small nor too large by construction.
+    one block, exactly as `_pick_and_commit_kernel` is.
+
+    **THE BLOCK WIDTH AND THE LEVEL WIDTH NO LONGER AGREE, AND THAT IS A LIVE
+    DEFECT.** This paragraph read "and for a reason that is now even more
+    direct: `PICK_THREADS` is 64 and so is `OBLIVIOUS_LEVEL_LEAVES`, so the
+    level's per-leaf work is one thread per leaf and the block is neither too
+    small nor too large by construction". The first half of that is still true
+    and the second half stopped being true on 2026-08-18, when
+    `gpu_split_search.OBLIVIOUS_MAX_LEAVES` went from 64 to 256 and
+    `OBLIVIOUS_LEVEL_LEAVES` followed it there while `PICK_THREADS` stayed at
+    64. Phase 2 below is `if tid < n_live` over one block of 64 threads, with no
+    strided loop, so it fills the six shared arrays for leaves 0 through 63 and
+    for no leaf above that. The serial phase then reads `s_nleft`, `s_nright`,
+    `s_lval` and `s_rval` for every `j` in `range(n_live)`. At `n_live > 64`
+    those reads return whatever the shared allocation held, which no thread in
+    this launch wrote, so the per-leaf counts above 63 are junk and the windows
+    the commit lays out from them cannot be expected to sum to `n_active`.
+
+    **Derived, not measured.** What is read off the source is the width
+    mismatch and the unwritten slots. That a wrong count surfaces as
+    `gpu_active_rows.LeafRangeTable._check_invariants` raising "active-row
+    ranges do not cover the active prefix" is the mechanism this predicts, and
+    it is the message a depth-8 fit does raise, measured 2026-08-18 and
+    recorded at `device_policy.OBLIVIOUS_DEVICE_MAX_DEPTH`. The widths line up
+    with that measurement exactly. A depth-7 tree's widest committed level is
+    `L = 64`, which is the last width this block covers, and depth 8's is
+    `L = 128`, which is the first it does not. Depth 8 is unreachable today
+    because `gpu_resident_round.grow_tree_device_oblivious` refuses
+    `max_depth > 7`, so nothing in a shipped fit reaches the hole; that guard
+    read `> 8` when the depth-8 fit was measured, which is how the fit got
+    there at all. The comment at `OBLIVIOUS_DEVICE_MAX_DEPTH` says "The
+    constants are already sized", and this one is not.
+
+    **AND THE RAISE DISARMED THE GUARD THAT WAS HOLDING THE LINE.** The
+    overflow test below includes `n_live > OBLIVIOUS_LEVEL_LEAVES`. While that
+    constant was 64 it was, by coincidence and not by intent, exactly the
+    block-coverage check, so a 128-parent level refused with `TREE_OVERFLOW`
+    and said so. Raising the constant to 256 removed that refusal and left the
+    kernel to run the same level silently and wrongly. **A loud refusal became
+    silent corruption, and the raise is what did it.** The general lesson, and
+    the reason it is written here rather than in a commit message: a constant
+    can be load bearing for a reason nobody wrote down, and raising it removes
+    a check nobody knew existed. A raise is not safe merely because the tables
+    it sizes are big enough.
+
+    **The fix is a stride over the block, and it is NOT a wider block.** Phase 2
+    becomes `var l = tid` and `while l < n_live:` with `l += PICK_THREADS` at
+    the end, and the `tid` indices inside phase 2 become `l`. The barrier stays
+    outside the loop and the `if tid != 0: return` below is unchanged. That
+    costs no launches, runs two iterations instead of one at depth 8, and is
+    bit-identical at every width at or below 64 because the thread-to-leaf map
+    is the identity there. Raising `PICK_THREADS` is the wrong fix: it is the
+    compile-time `block_size` parameter of the `block.max` and `block.min`
+    collectives in the leaf-wise pick kernel, so widening it changes a shape
+    that has nothing to do with this bug.
+
+    Status when this paragraph was written, 2026-08-18. The defect was live at
+    head, the stride was assigned to the lane that diagnosed it, and this
+    docstring is the record of the mechanism rather than the change. A reader
+    who finds phase 2 already strided should read everything above as history
+    and this paragraph as spent.
 
     The three phases, in order:
 
@@ -1960,7 +2077,12 @@ def _commit_level_kernel(
             _kill_level_plan(plan, write_plan, Int(plan_items))
         return
 
-    # Phase 2: each leaf's own split statistics, one thread per leaf.
+    # Phase 2: each leaf's own split statistics, one thread per leaf, and as
+    # written below that means the first `PICK_THREADS` leaves and no others.
+    # That is 64 threads against an `OBLIVIOUS_LEVEL_LEAVES` of 256 since
+    # 2026-08-18. See this kernel's docstring for what a level wider than 64
+    # parents does, why the overflow guard no longer catches it, and the stride
+    # that fixes it.
     var feature = rec_i[unsafe_offset = ri + IREC_FEATURE][0]
     var threshold = rec_i[unsafe_offset = ri + IREC_BIN][0]
     var default_left = (flags & Int32(FLAG_DEFAULT_LEFT)) != Int32(0)
@@ -2005,10 +2127,53 @@ def _commit_level_kernel(
         address_space = AddressSpace.SHARED,
     ]()
 
-    if tid < n_live:
-        var fo = tid * FRONT_WORDS
-        s_parent[unsafe_offset=tid] = front[unsafe_offset = fo + FRONT_NODE][0]
-        s_begin[unsafe_offset=tid] = front[
+    # LEAVES STRIDED ACROSS THE BLOCK. This was `if tid < n_live:` with one
+    # leaf per thread until 2026-08-18, and that line silently corrupted
+    # every oblivious tree deeper than 7.
+    #
+    # The launch is `grid_dim=1, block_dim=PICK_THREADS` and `PICK_THREADS`
+    # is 64. Phase 2 fills six shared arrays one slot per leaf, so it filled
+    # leaves 0 through 63 and no others. Phase 3 below then runs serially on
+    # thread 0 over `range(n_live)` and reads all six for every `j`. Above 64
+    # those reads were uninitialized threadgroup memory.
+    #
+    # A depth-7 tree's widest committed level is 64 parents, the last width
+    # the block covers, which is why depth 7 is correct and was measured
+    # bit-identical between backends at rmse 0.322253. Depth 8's widest is
+    # 128, so the surviving windows summed to about half the active prefix
+    # and surfaced downstream as `LeafRangeTable`'s "active-row ranges do not
+    # cover the active prefix".
+    #
+    # **AND THE RAISE DISARMED THE GUARD THAT WAS HOLDING THE LINE.** This
+    # kernel's overflow test includes `n_live > OBLIVIOUS_LEVEL_LEAVES`.
+    # While that constant was 64 it was, by coincidence, EXACTLY the
+    # block-coverage check, so a 128-parent level returned `TREE_OVERFLOW`
+    # and said so. `OBLIVIOUS_LEVEL_LEAVES` became `OBLIVIOUS_MAX_LEAVES` at
+    # 256 on 2026-08-18 to lift the depth ceiling, and that raise turned a
+    # loud refusal into silent corruption. The general lesson is worth more
+    # than the fix: a constant can be load bearing for a reason nobody wrote
+    # down, and raising it removes a check nobody knew existed.
+    #
+    # THE STRIDE IS THE FIX AND RAISING `PICK_THREADS` IS NOT. That constant
+    # is the compile-time `block_size` of `block.max` and `block.min` in
+    # `_pick_and_commit_body`, so widening it re-instantiates those
+    # collectives and changes the launch shape of the leaf-wise
+    # device-resident grower, which is the fastest arm this package ships.
+    # This kernel uses no block collective, only `barrier()`, so its own
+    # width is free and a stride costs nothing: zero extra launches, two
+    # iterations instead of one at depth 8.
+    #
+    # Bit-identical at every width at or below 64, because there the
+    # thread-to-leaf map is the identity. Each leaf reads only its own
+    # histogram slice and writes only its own shared slot, and no thread
+    # accumulates across leaves here, so which thread runs which leaf cannot
+    # move a bit. Phase 3 is where order matters and it is untouched: still
+    # serial on thread 0, still ascending over `range(n_live)`.
+    var l = tid
+    while l < n_live:
+        var fo = l * FRONT_WORDS
+        s_parent[unsafe_offset=l] = front[unsafe_offset = fo + FRONT_NODE][0]
+        s_begin[unsafe_offset=l] = front[
             unsafe_offset = fo + FRONT_ROW_BEGIN
         ][0]
         var slot = Int(front[unsafe_offset = fo + FRONT_HIST_SLOT][0])
@@ -2039,20 +2204,21 @@ def _commit_level_kernel(
                 lg += g
                 lh += h
                 lc += c
-        s_nleft[unsafe_offset=tid] = lc
-        s_nright[unsafe_offset=tid] = tc - lc
+        s_nleft[unsafe_offset=l] = lc
+        s_nright[unsafe_offset=l] = tc - lc
         var lgf = lg.cast[DType.float32]() * g_inv
         var lhf = lh.cast[DType.float32]() * h_inv
         var tgf = tg.cast[DType.float32]() * g_inv
         var thf = th.cast[DType.float32]() * h_inv
         var rgf = gpu_right_sum(tgf, lgf, tg, lg, g_inv, form)
         var rhf = gpu_right_sum(thf, lhf, th, lh, h_inv, form)
-        s_lval[unsafe_offset=tid] = gpu_leaf_value(
+        s_lval[unsafe_offset=l] = gpu_leaf_value(
             lgf, lhf, lambda_l1, lambda_l2
         )
-        s_rval[unsafe_offset=tid] = gpu_leaf_value(
+        s_rval[unsafe_offset=l] = gpu_leaf_value(
             rgf, rhf, lambda_l1, lambda_l2
         )
+        l += PICK_THREADS
     barrier()
 
     if tid != 0:
@@ -2259,8 +2425,13 @@ def _stage_level_search_kernel(
     those reads in-bounds and meaningless, which is what they should be -- the
     commit that follows returns on `CTR_STATUS` before it reads any record.
 
-    One thread. The work is at most 64 stores and a launch of one block of one
-    thread is what the leaf-wise counterpart already costs."""
+    One thread. The work is at most `OBLIVIOUS_LEVEL_LEAVES` stores, which is
+    what `enqueue_stage_level_search` bounds `max_leaves` by, and a launch of one
+    block of one thread is what the leaf-wise counterpart already costs. This
+    sentence read "at most 64 stores" until 2026-08-18, when
+    `gpu_split_search.OBLIVIOUS_MAX_LEAVES` rose to 256; the loop is over
+    `max_leaves` and needed no change, so the count and not the kernel was
+    wrong."""
     if thread_idx.x != 0:
         return
     var n_live = Int(ctr[unsafe_offset=CTR_N_LIVE][0])
@@ -3310,11 +3481,18 @@ struct DeviceTreeTables(Movable):
             STEP_WORDS
         )
         # Wide enough for a level commit as well as a leaf-wise one. A level of
-        # `L` parents fills `2L` item rows and the widest level a depth-6 tree
-        # commits is `L = 32`, so this is `OBLIVIOUS_PLAN_ITEMS` and not
-        # `PLAN_ITEMS`. Two hundred and fifty-six Int32; the buffer is never
-        # read by any other kernel and exists so that the overloads which write
-        # no plan still have a legal pointer to hand one.
+        # `L` parents fills `2L` item rows and the widest level a depth-8 tree
+        # commits is `L = 128`, so this is `OBLIVIOUS_PLAN_ITEMS` and not
+        # `PLAN_ITEMS`. This comment read "the widest level a depth-6 tree
+        # commits is `L = 32`" and "Two hundred and fifty-six Int32", and both
+        # were corrected on 2026-08-18: the depth bound rose with
+        # `gpu_split_search.OBLIVIOUS_MAX_LEAVES` going to 256, and the byte
+        # count never matched the expression on the next line even before that,
+        # since `OBLIVIOUS_PLAN_ITEMS * ITEM_WORDS` was 128 * 8 at the old bound
+        # and is 512 * 8 = 4,096 Int32 now. The allocation follows the constants
+        # and needed no edit here. The buffer is never read by any other kernel
+        # and exists so that the overloads which write no plan still have a
+        # legal pointer to hand one.
         self.plan_scratch = self.ctx.enqueue_create_buffer[DType.int32](
             OBLIVIOUS_PLAN_ITEMS * ITEM_WORDS
         )

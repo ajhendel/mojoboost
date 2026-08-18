@@ -126,9 +126,17 @@ reduction", and that the gate a future cross-lane specialization would pass,
 `require_subgroup_width_known`, is called by nothing. A cross-thread reduction
 must use `block` operations.
 
-**Queue depth 64, unraisable**, `bench/results/PHASE2_PREREGISTRATION.md:597`,
-which also records that enqueue cost lands "exactly where a 64-deep queue
-predicts". A design that adds launches per node pays here.
+**Queue depth 64, unraisable, and it is a PRICE and not a constraint.**
+`bench/results/PHASE2_PREREGISTRATION.md:597` records the depth and that enqueue
+cost lands "exactly where a 64-deep queue predicts", which is 6 to 7 microseconds
+a launch under the depth and 14 to 17 over it. A design that adds launches per
+node pays that rate, per launch, without limit. It is listed under hard
+constraints because the rate is real and unavoidable, not because 64 is a number
+a design may not exceed. A full queue blocks the enqueueing thread rather than
+dropping work, and the fastest arm this package ships runs 2,303 buffers a tree
+(`docs/GPU_PORTABILITY.md` 6.2, `docs/design/SWITCH_GRID.md` section 6 item 8).
+This bullet ended "A design that adds launches per node pays here" with no such
+qualification, and a reader took the depth for a ceiling in the ranking below.
 
 ## The options, ranked
 
@@ -159,8 +167,11 @@ What makes this the recommendation rather than a dodge:
 
 **Kernel and memory shape: none.** That is the point. The replaced column is a
 float column and the existing numerical device histogram, level scan and
-routing handle it. Launches per tree are unchanged, so the 64-deep queue is
-unaffected. Engineering price is *zero new kernels* and one lane of
+routing handle it. Launches per tree are unchanged, so this option adds no
+enqueue cost at all. That sentence read "so the 64-deep queue is unaffected",
+which credited (c) with clearing a bar there is no bar at; the real credit is that
+it adds no launches, and a launch is priced per launch (see the queue-depth
+constraint above). Engineering price is *zero new kernels* and one lane of
 integration and verification, mostly proving the replaced fit agrees with the
 CPU.
 
@@ -205,10 +216,20 @@ argument still applies under Cosine, and the shipped default carries Cosine.
 This is the option that looks like the real answer and is not. It requires a
 per-node sort by `sum_grad / (sum_hess + cat_smooth)` on the device with no
 cross-lane primitives available, then a two-ended prefix accumulation, then a
-set write, per categorical feature per node. It adds launches per node against
-a 64-deep queue on a path whose symmetric variant is *already* 2.4x slower
-than our own CPU. And after all of it, the two inherent blocks still stand, so
-the shipped default configuration still could not use it.
+set write, per categorical feature per node. It adds launches per node, at 14 to
+17 microseconds each once the stream is past the queue's depth, on a path whose
+symmetric variant is *already* 2.4x slower than our own CPU. And after all of it,
+the two inherent blocks still stand, so the shipped default configuration still
+could not use it.
+
+**One of the four reasons above was retired on 2026-08-18 and the ranking does
+not move.** The launch sentence read "It adds launches per node against a 64-deep
+queue", which read as a hazard cleared or not cleared. It is a price, so it is
+stated as one here, and it is a price on a path already losing to our own CPU.
+The three reasons that carried this refusal never touched the queue: there are no
+cross-lane primitives to sort with, the two inherent blocks mean the shipped
+default could not use the result, and the byte ceiling below caps what a partition
+search could even see. **NOT RECOMMENDED** stands on those, unchanged.
 
 It is also the option most exposed to the byte ceiling: a partition search
 over a column truncated to 254 categories is a search over data we already

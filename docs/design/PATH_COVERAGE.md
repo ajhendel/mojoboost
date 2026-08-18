@@ -261,10 +261,23 @@ there, because `GpuActiveRows.__init__` reads that variable for every fit. An
 oblivious tree paid one rebuild plus two launches per level, 1 + 12 = 13
 command buffers, while 62 of the 63 histograms it builds read the dataset's own
 matrix. `gpu_resident_round.oblivious_schedule_launches(6, 64, True)` is 55,
-and 55 + 13 is 68 against a Metal queue that is 64 deep on the measured machine
-and **does not raise when it is overrun**. Since the failure mode is a silent
-overrun rather than a slow fit,
-`histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` now **raises** on
+and 55 + 13 is 68 command buffers a tree.
+
+This paragraph read "68 against a Metal queue that is 64 deep on the measured
+machine and **does not raise when it is overrun**. Since the failure mode is a
+silent overrun rather than a slow fit", and **that clause is retired as of
+2026-08-18**. A full Metal queue blocks the thread enqueueing into it rather than
+dropping a buffer, so there is no silent overrun to be anyone's failure mode, and
+the leaf-wise plane in the column beside this one runs 2,303 buffers a tree
+measured backpressured and is the fastest arm here (`docs/GPU_PORTABILITY.md`
+6.2, `docs/design/SWITCH_GRID.md` section 6 item 8).
+
+**The refusal keeps its other two grounds and needs no third.** 13 of those
+buffers are maintenance for a plane where 62 of 63 histograms read the raw
+matrix, which is waste countable from the source and independent of any queue
+depth; and the consumer that would have justified them was built and **measured
+0.757x**, the loss this whole section is about. On those,
+`histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` **raises** on
 `self.rows.row_compaction_requested()`, once per tree, off a host field. The
 switch does not reach this plane inertly. It errors.
 

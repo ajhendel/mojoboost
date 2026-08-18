@@ -587,9 +587,27 @@ after `stage_desc_level_plan`) plus two launches per level from
 `_maintain_compaction` on the descriptor partition, so 1 + 12 = 13 command
 buffers a tree, while 62 of the 63 histograms it builds read the dataset's own
 matrix. `gpu_resident_round.oblivious_schedule_launches(6, 64, True)` is 55, and
-55 + 13 is 68 against a Metal queue that is 64 deep on the measured machine and
+55 + 13 is 68 command buffers a tree.
+
+**The queue clause in this paragraph is RETIRED, 2026-08-18, and the refusal is
+not.** It read "against a Metal queue that is 64 deep on the measured machine and
 **does not raise when it is overrun**. Since the failure mode is a silently
-overrun queue rather than a slow fit, `stage_desc_level_plan` now raises on
+overrun queue rather than a slow fit". There is no silent overrun to be the
+failure mode of. `MTLCommandQueue.commandBuffer` blocks the enqueueing thread
+when the queue is full rather than dropping a buffer, so 68 buffers run as 64 in
+and then one in and one out, and the leaf-wise plane this package ships as its
+fastest arm runs 2,303 a tree measured backpressured (`docs/GPU_PORTABILITY.md`
+6.2, `docs/design/SWITCH_GRID.md` section 6 item 8). 68 is a price and never a
+cliff.
+
+**What the refusal stands on instead, both of it measured or countable.** The 13
+buffers buy exactly one of the 63 histograms an oblivious tree builds, so they
+are maintenance nothing on that plane reads, which is countable from the source
+above and does not depend on how deep the queue is. And the consumer that would
+have made them worth paying was built later the same day and **measured 0.757x**,
+a 24 percent loss on the device-MVS arm and 0.949x on the host-MVS one, in the
+table at the top of this row. A refusal with a measured loss behind it does not
+need a queue argument. `stage_desc_level_plan` therefore still raises on
 `self.rows.row_compaction_requested()`, once per tree, off a host field.
 `docs/design/GROWTH_POLICY_REACH.md` lists this reach as SUSPECTED ACCIDENTAL
 and can now record it as verified accidental and closed.
@@ -933,10 +951,19 @@ launch census by one and no benchmark has priced either half yet."*
 derivative gather from every (row, feature) visit, and it bought 1.8 percent,
 which is inside drift. The inner loop's derivative arithmetic is therefore not
 what the level build is waiting on. It also cost one command buffer per tree,
-taking `oblivious_launch_census(6)` from 62 to 63 against a 64-deep queue, and
-a `2 * n_planes * n_rows` Int32 buffer, 3.7 MB at 463,715 rows.
+taking `oblivious_launch_census(6)` from 62 to 63, priced at the measured enqueue
+cost of 6 to 7 microseconds a launch below the Metal queue's 64-buffer depth and
+14 to 17 above it, and a `2 * n_planes * n_rows` Int32 buffer, 3.7 MB at 463,715
+rows. This line read "from 62 to 63 against a 64-deep queue" and the "against"
+is retired as of 2026-08-18, because one more buffer is one more enqueue and never
+a boundary crossed (`docs/GPU_PORTABILITY.md` 6.2, `docs/design/SWITCH_GRID.md`
+section 6 item 8). Nothing in this row turned on it, since a launch this arm
+adds was always a cost and not a limit.
 
-**Survives.** Yes, and the arm is gone. Do not rebuild it without a new reason.
+**Survives.** Yes, on the measurement and not on the launch count. The arm bought
+1.018x, which is inside drift, and cost 3.7 MB; the queue clause was decoration
+on a refusal that a null already settles. The arm is gone. Do not rebuild it
+without a new reason.
 
 ### E11. `MOJOTREES_GPU_HIST_LEAN`, `..._PRIVATE`, `..._GROUP`, the lean device-plan kernel. MEASURED null, removed
 

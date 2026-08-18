@@ -541,7 +541,7 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # depth 8 on both backends in the same commit. The constants are already
 # sized. See `gpu_split_search.OBLIVIOUS_MAX_LEAVES` for the account of the
 # three justifications that turned out not to bind.
-comptime OBLIVIOUS_DEVICE_MAX_DEPTH = 7
+comptime OBLIVIOUS_DEVICE_MAX_DEPTH = 8
 
 comptime POLICY_VERSION = 10
 
