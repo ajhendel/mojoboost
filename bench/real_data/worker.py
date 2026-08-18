@@ -380,6 +380,28 @@ def run_job(job):
     dataset_params_used = result.pop("dataset_params_used", None)
     dataset_params_reason = result.pop("dataset_params_unavailable_reason", None)
     num_boost_round = result.pop("num_boost_round", None)
+    # THE ARM-OVERRIDE GUARD, and this is the narrowest place that can hold it.
+    # It needs the job's overrides exactly as the matrix scheduled them AND
+    # every dict exactly as the adapter handed it over, and this line is the
+    # only point in the harness where both exist at once for all four engine
+    # families: `engines.build` above has the first and none of the second,
+    # each adapter's `_params` has one family's dict and not the tree count the
+    # adapter adds after translation, and each `run` would be four call sites
+    # for one rule. Placed before `quality.score` so a cell whose overrides
+    # were eaten never produces a metric, and before the record is assembled so
+    # it cannot be written. It fires after the fit, which costs one wasted
+    # cell; the failure that would actually be common is a REFUSED override,
+    # and that raises in `scenarios.apply_arm_overrides` before any fit starts.
+    # See `engines.check_arm_overrides_resolved` for the three legitimate cases
+    # it is built not to cry wolf over.
+    engines.check_arm_overrides_resolved(
+        job["engine"],
+        job.get("arm_params"),
+        job.get("arm_dataset_params"),
+        params_used,
+        dataset_params_used,
+        num_boost_round,
+    )
     # What the engine was PHYSICALLY handed, against what the canonical form
     # holds. Popped rather than left in `result` so it lands inside
     # `data.train` and `data.test` beside the digest it has to be read with,

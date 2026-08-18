@@ -71,6 +71,14 @@ to three-fold drift `bench/results/PROFILE_PROTOCOL.md` documents between
 time windows. It is not zero, and the record says the profile was on so a
 reader can see that it was.
 
+The host-span axis added on 2026-08-18 does not change that order. On a
+device-resident fit it brackets about four launch groups per growth step plus
+a dozen per tree, so a 31-leaf tree charges of order 130 host spans and a
+hundred-round fit performs of order 10^4 more clock reads, which lands in the
+same sub-millisecond band as the arithmetic above. It adds no fence either;
+every bracket on that axis closes over a host call the schedule already makes,
+which is the property `phase_profile`'s host-span section is written around.
+
 `fenced` mode is never used here. It inserts real waits and changes the
 schedule, and a timing taken under it would be a different measurement.
 

@@ -3829,6 +3829,197 @@ def lightgbm_params(spec, threads, extra=None):
     return params
 
 
+#: Every vendor spelling that `python/mojotrees/sklearn.py::_Base._resolve_alias`
+#: folds onto one of our own parameter names, as `{alias: wire}`.
+#:
+#: Derived from that file's `self._resolve_alias("wire", "alias", ...)` call
+#: sites, which is the same derivation `tools/api_snapshot.py::alias_pairs`
+#: performs, and transcribed here so this module reads no source at run time.
+#: `selfcheck.check_arm_override_guard` re-derives it from the AST and fails on
+#: any difference, so a new alias pair cannot arrive in the package without
+#: this table learning about it.
+#:
+#: **WHY A BENCHMARK HARNESS NEEDS AN ALIAS TABLE.** `_resolve_alias` RAISES
+#: when a parameter and one of its aliases arrive with different values
+#: ("max_depth=4 and depth=6 are aliases with different values; set only one"),
+#: and this harness builds one training dict by merging four independent
+#: sources: `BASE_PARAMS`, the scenario's own `params`, the arm dimension's
+#: override, and a variant arm's mode dict. None of the four knows what the
+#: others spelled. `MOJOTREES_CATBOOST_MODE` already carries `subsample`, which
+#: is the ALIAS side of `bagging_fraction`, so "the dicts are all in the wire
+#: spelling" is not a property this file has.
+#:
+#: The wire name is the first argument of `_resolve_alias` and is NOT always
+#: the canonical user-facing name; `num_leaves` is the wire name and
+#: `max_leaves` is the canonical one that resolves onto it. What matters here
+#: is only that the two spellings name one quantity.
+MOJOTREES_PARAM_ALIASES = {
+    "bagging_fraction": "bagging_fraction",
+    "border_count": "max_bin",
+    "cat_features": "categorical_feature",
+    "categorical_features": "categorical_feature",
+    "colsample_bynode": "feature_fraction_bynode",
+    "colsample_bytree": "feature_fraction",
+    "depth": "max_depth",
+    "device_type": "device",
+    "early_stopping_round": "early_stopping_rounds",
+    "eta": "learning_rate",
+    "gamma": "min_gain_to_split",
+    "interaction_cst": "interaction_constraints",
+    "iterations": "n_estimators",
+    "l2_leaf_reg": "lambda_l2",
+    "l2_regularization": "lambda_l2",
+    "loss": "objective",
+    "loss_function": "objective",
+    "max_bins": "max_bin",
+    "max_features": "feature_fraction_bynode",
+    "max_iter": "n_estimators",
+    "max_leaf_nodes": "num_leaves",
+    "max_leaves": "num_leaves",
+    "min_child_samples": "min_data_in_leaf",
+    "min_child_weight": "min_child_hess",
+    "min_samples_leaf": "min_data_in_leaf",
+    "min_split_gain": "min_gain_to_split",
+    "min_sum_hessian_in_leaf": "min_child_hess",
+    "monotone_constraints_penalty": "monotone_penalty",
+    "monotonic_cst": "monotone_constraints",
+    "n_iter_no_change": "early_stopping_rounds",
+    "nthread": "n_jobs",
+    "num_boost_round": "n_estimators",
+    "num_iterations": "n_estimators",
+    "num_threads": "n_jobs",
+    "od_wait": "early_stopping_rounds",
+    "one_hot_max_size": "max_cat_to_onehot",
+    "random_seed": "random_state",
+    "rate_drop": "drop_rate",
+    "reg_alpha": "lambda_l1",
+    "reg_lambda": "lambda_l2",
+    "rsm": "feature_fraction",
+    "seed": "random_state",
+    "shrinkage_rate": "learning_rate",
+    "subsample": "bagging_fraction",
+    "subsample_freq": "bagging_freq",
+    "task_type": "device",
+    "thread_count": "n_jobs",
+    "verbosity": "verbose",
+}
+#: `bagging_fraction` maps to itself above and is the one entry that is not a
+#: `_resolve_alias` pair. It is here because `subsample` is an alias OF it, so
+#: the wire name has to be a key of this table for the reverse lookup below to
+#: find the pair when the arm writes the wire spelling and the mode dict wrote
+#: the alias. `selfcheck.check_arm_override_guard` knows about this one entry
+#: by name rather than treating it as drift.
+
+
+#: The spelling an arm override must be written in, stated once, because the
+#: alternative is a silent rewrite.
+#:
+#: An arm override is applied to the dict the translators below build, and it
+#: is applied VERBATIM: nothing in this file translates the key. So an override
+#: has to be written in the spelling that dict already uses, which is the
+#: LightGBM-spelled wire name for everything `mojotrees_params` emits
+#: (`max_depth`, never `depth`; `min_child_hess`, never `min_child_weight`).
+#:
+#: The rule is GUARDED rather than merely documented. `check_alias_collision`
+#: refuses a dict that holds one parameter under two spellings, so an override
+#: in the wrong spelling fails here, by name, naming both spellings, instead of
+#: raising out of the estimator halfway through a matrix with a message that
+#: names neither the arm nor the layer that supplied each half.
+#:
+#: TRANSLATING INSTEAD OF REFUSING WAS CONSIDERED AND REJECTED. The record
+#: carries the arm's request in `arm_overrides.params` and the dict the trainer
+#: was handed in `params.engine`. A silent rewrite makes those two disagree,
+#: and a reader then cannot tell a rewrite from a drop, which is the same
+#: invisibility this whole change removes. It would also need the guard in
+#: `engines.check_arm_overrides_resolved` to carry a second copy of this table
+#: to avoid reporting the rewrite as a drop.
+ARM_OVERRIDE_SPELLING = (
+    "An arm override must be written in the spelling the translated dict "
+    "already uses, which is the wire name in MOJOTREES_PARAM_ALIASES: "
+    "max_depth not depth, min_child_hess not min_child_weight, "
+    "feature_fraction not colsample_bytree"
+)
+
+
+def check_alias_collision(params, where):
+    """Raise when `params` names one parameter under two spellings.
+
+    Refuses even when the two values AGREE, which is stricter than the
+    estimator, whose `_resolve_alias` raises only on a disagreement. Two
+    spellings of one quantity in a merged harness dict is a merge no reader can
+    follow, and the next edit to any of the four contributing dicts is what
+    makes them disagree; catching it while it is still harmless is the only
+    time the message can name which layer put each spelling there.
+
+    Returns `params` so it can be the tail of a translator.
+    """
+    collisions = []
+    for alias, wire in sorted(MOJOTREES_PARAM_ALIASES.items()):
+        if alias == wire or alias not in params or wire not in params:
+            continue
+        collisions.append(
+            f"{wire}={params[wire]!r} beside {alias}={params[alias]!r}"
+        )
+    if not collisions:
+        return params
+    raise ValueError(
+        f"{where}: the parameter dict holds one parameter under two "
+        "spellings, "
+        + "; ".join(collisions)
+        + ". This dict reaches python/mojotrees/sklearn.py::_Base through "
+        "mojotrees.train, and _resolve_alias raises 'aliases with different "
+        f"values; set only one' on it. {ARM_OVERRIDE_SPELLING}"
+    )
+
+
+def apply_arm_overrides(params, extra, where, refused=None):
+    """Re-apply the caller's overrides over an arm's own mode dict.
+
+    **THE DEFECT THIS EXISTS FOR, found by measurement on 2026-08-17.** Three
+    arms scheduled on `mojotrees_catboost_mode` differing only in
+    `arm_params={"max_depth": 4/5/6}` produced three models with the SAME
+    `model.size.file_sha256` and identical rmse to six decimals. The override
+    reached the harness -- every record carried it in `arm_overrides.params` --
+    and died in the parameter merge. `mojotrees_params` applies `extra` LAST,
+    so an override beats everything the base translator supplies; each variant
+    translator then applied its MODE DICT over that result, which put the mode
+    ahead of the caller and silently discarded any override of a key the mode
+    also sets. All four variant translators had it.
+
+    **WHY THE ARM WINS.** The arm dimension exists to vary parameters within
+    one engine. A mode default the dimension cannot move is a mode default that
+    makes the dimension useless for that arm, and the arm dimension is what a
+    frontier sweep is built out of. This is the same class as the defect
+    recorded in `engines.MojoTreesEngine._n_estimators`, where the one
+    parameter a frontier moves first was the one parameter no caller could
+    override; that one was fixed for one key, and this is the rule that makes
+    the class impossible rather than the fourth instance of the fix.
+
+    **WHAT THE ARM MAY NOT MOVE** is `refused`, a mapping of key to the reason,
+    and it is a REFUSAL rather than a quiet loss. See the call site in
+    `mojotrees_catboost_mode_params` for the argument.
+
+    `num_class` and `n_classes` are skipped for the same reason
+    `mojotrees_params` skips them: they are the ADAPTER telling the translator
+    the shape of the data, not the arm asking for anything, and the translator
+    has already emitted `num_class` as an int.
+    """
+    refused = dict(refused or {})
+    for key, value in (extra or {}).items():
+        if key in ("num_class", "n_classes"):
+            continue
+        if key in refused:
+            raise ValueError(
+                f"{where} was asked to override {key}={value!r} and refuses. "
+                f"{refused[key]} Silently losing the override is the defect "
+                "this merge was fixed for and silently winning breaks what "
+                "the arm claims, so the third answer is the only honest one: "
+                "put the sweep on an arm that makes no such claim."
+            )
+        params[key] = value
+    return check_alias_collision(params, where)
+
+
 def mojotrees_params(spec, device, extra=None):
     """`shared_params` translated into a mojotrees parameter dict for
     `mojotrees.train`.
@@ -3894,7 +4085,13 @@ def mojotrees_params(spec, device, extra=None):
         if key in ("num_class", "n_classes"):
             continue
         params[key] = value
-    return params
+    # The plain arm has no mode dict, so `extra` already wins and there is
+    # nothing here to re-apply. What there IS is the alias question: an arm
+    # override spelled `depth` lands beside the `max_depth` this dict always
+    # emits, and the estimator raises on the pair. Refused here rather than
+    # only on the variant arms, because the plain arm reaches the same
+    # `_resolve_alias`.
+    return check_alias_collision(params, "the mojotrees parameter translator")
 
 
 def dataset_params(spec):
@@ -5034,6 +5231,10 @@ def mojotrees_catboost_mode_params(
     resolution, silently wrong by a factor of four at 100 iterations, in the
     single parameter that moves a metric most.
     """
+    # Read first, so that a missing read-back still raises
+    # `CatBoostReadbackMissing` before anything else can, and so that the
+    # refusal table below can quote the value that would have won.
+    readback = catboost_readback_values(spec, catboost_readback)
     params = mojotrees_params(spec, device, extra)
     params.update(MOJOTREES_CATBOOST_MODE)
     # Removals before additions, and removals at all, because `update` can
@@ -5043,8 +5244,53 @@ def mojotrees_catboost_mode_params(
     # MOJOTREES_CATBOOST_MODE_UNSET and CATBOOST_LEARNING_RATE_TRANSITION.
     for key in MOJOTREES_CATBOOST_MODE_UNSET:
         params.pop(key, None)
-    params.update(catboost_readback_values(spec, catboost_readback))
-    return params
+    # THE ARM DIMENSION, RE-APPLIED OVER THE MODE DICT. Until 2026-08-17 this
+    # line did not exist and `MOJOTREES_CATBOOST_MODE` above was the last word
+    # on every key it names, so an arm scheduled at three depths ran the mode's
+    # 6 three times: see `apply_arm_overrides` for the measurement.
+    #
+    # TWO KEYS THE ARM MAY NOT MOVE, and neither is a mode DEFAULT.
+    #
+    #   `MOJOTREES_CATBOOST_MODE_FROM_READBACK` -- today `learning_rate` and
+    #   only that -- is not a value this file chose. It is CatBoost's own
+    #   resolved rate, measured on the CatBoost cell of this same scenario,
+    #   tier and variant, in this same run, and the arm's entire product is the
+    #   sentence "mojotrees ran at CatBoost's shape and CatBoost's rate". An
+    #   override that WON would keep the label and stop the sentence being
+    #   true, which is a worse failure than the one being fixed here because it
+    #   is invisible in the record: `arm_overrides.params` and `params.engine`
+    #   would agree with each other and disagree with the heading. An override
+    #   that LOST silently is exactly the defect being fixed. So it is refused,
+    #   and a learning-rate sweep goes on the plain `mojotrees` arm, which
+    #   claims nothing about CatBoost. Derived from the table rather than
+    #   written as a key name, so a second read-back key inherits the rule.
+    #
+    #   `MOJOTREES_CATBOOST_MODE_UNSET` is the opposite direction and the same
+    #   argument: those keys are DELETED so that mojotrees's own gate sees them
+    #   unset, and an arm that sets one closes the gate the arm exists to open.
+    #   Empty today, refused anyway, because the day it is not empty is the day
+    #   nobody is looking at this function.
+    refused = {
+        key: (
+            f"{key} on this arm is CatBoost's own resolved value for this "
+            f"cell ({value!r}), read out of the CatBoost row's "
+            "get_all_params() and not chosen here; the arm's whole claim is "
+            "that it ran CatBoost's rate. See "
+            "MOJOTREES_CATBOOST_MODE_FROM_READBACK."
+        )
+        for key, value in sorted(readback.items())
+    }
+    for key in MOJOTREES_CATBOOST_MODE_UNSET:
+        refused[key] = (
+            f"{key} is deliberately UNSET on this arm so that mojotrees's own "
+            "defaulting gate fires; setting it closes the gate the arm exists "
+            "to open. See MOJOTREES_CATBOOST_MODE_UNSET."
+        )
+    apply_arm_overrides(
+        params, extra, "the mojotrees_catboost_mode arm", refused
+    )
+    params.update(readback)
+    return check_alias_collision(params, "the mojotrees_catboost_mode arm")
 
 
 def mojotrees_depthwise_params(spec, device, extra=None):
@@ -5073,7 +5319,18 @@ def mojotrees_depthwise_params(spec, device, extra=None):
     """
     params = mojotrees_params(spec, device, extra)
     params.update(MOJOTREES_DEPTHWISE)
-    return params
+    # The arm dimension, re-applied over the mode dict. Nothing on this arm is
+    # refused: every key in `MOJOTREES_DEPTHWISE` is a STATIC default read out
+    # of `XGBOOST_RESOLVED_DEFAULTS`, so an arm that moves one is asking a
+    # legible question -- "the mirror, but at depth 4" -- and the record says
+    # so in `arm_overrides.params`. There is no read-back and no unset gate
+    # here, which is exactly the difference this docstring's last paragraph
+    # describes. A row that moves a mirror key is of course no longer the
+    # mirror; that is the arm's own claim to answer for and it is recorded,
+    # not silently corrected.
+    return apply_arm_overrides(
+        params, extra, "the mojotrees_depthwise arm"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5418,7 +5675,16 @@ def mojotrees_symmetric_colsample_params(spec, device, extra=None):
     """
     params = mojotrees_params(spec, device, extra)
     params.update(MOJOTREES_SYMMETRIC_COLSAMPLE)
-    return params
+    # The arm dimension, re-applied over the mode dict. Nothing is refused
+    # here, and one key deserves a word anyway: `max_depth` is REQUIRED rather
+    # than preferred on this arm (`tree.mojo::_check_oblivious` raises at
+    # max_depth <= 0 under an oblivious policy), so an arm that overrides it to
+    # -1 does not run. That is a refusal by the trainer, at the trainer, with
+    # the trainer's own message, which is where it belongs; restating it here
+    # would be a second copy of a rule that already fails loudly.
+    return apply_arm_overrides(
+        params, extra, "the mojotrees_symmetric_colsample arm"
+    )
 
 
 def mojotrees_cosine_leafwise_params(spec, device, extra=None):
@@ -5429,7 +5695,17 @@ def mojotrees_cosine_leafwise_params(spec, device, extra=None):
     """
     params = mojotrees_params(spec, device, extra)
     params.update(MOJOTREES_COSINE_LEAFWISE)
-    return params
+    # The arm dimension, re-applied over the mode dict, same as above. Read
+    # `MOJOTREES_COSINE_LEAFWISE_CLAIMS` before moving `lambda_l2` on this arm:
+    # at lambda_l2=0 the Cosine score degenerates to sqrt of the L2 score and
+    # cannot move the argmax within a node, so an override to 0 leaves the arm
+    # running but destroys the only thing it detects. That is a real trap and
+    # it is still not a refusal, because it is a property of the VALUE and not
+    # of the key, and this file has no business deciding which values of a
+    # regularizer a sweep may ask for.
+    return apply_arm_overrides(
+        params, extra, "the mojotrees_cosine_leafwise arm"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5745,12 +6021,29 @@ def mojotrees_catboost_mode_resolved(
     the tree count in this dict against the count the adapter would resolve
     from the same arm; see `_check_resolved_matches_adapter`.
     """
+    arm_params = dict(arm_params or {})
+    # The arm's TRAINING overrides fold into `extra`, which is the hook the
+    # adapter uses (`engines.MojoTreesEngine._arm_extra`) and the only way they
+    # reach the translator at all. This function used to pass `extra` on its
+    # own and read `arm_params` for `n_estimators` and nothing else, so a
+    # frontier arm on any OTHER key -- max_depth, feature_fraction, lambda_l2 --
+    # had its parity table built from the base configuration while the fit ran
+    # the override. That is the same defect the translator itself carried, one
+    # level up in the reporting path, and it survived the fix that added
+    # `_check_resolved_matches_adapter` because that check reads the tree count
+    # alone. `n_estimators` is excluded here for the reason `_arm_extra` gives:
+    # the count is also `num_boost_round` and the record's own field, so it is
+    # decided once, below.
+    merged = dict(extra or {})
+    for key, value in arm_params.items():
+        if key == "n_estimators":
+            continue
+        merged[key] = value
     resolved = dict(
         mojotrees_catboost_mode_params(
-            spec, device, extra, catboost_readback=catboost_readback
+            spec, device, merged or None, catboost_readback=catboost_readback
         )
     )
-    arm_params = dict(arm_params or {})
     resolved["n_estimators"] = int(
         arm_params.get("n_estimators", BASE_PARAMS["n_estimators"])
     )

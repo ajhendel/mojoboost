@@ -3023,3 +3023,147 @@ def build(
     built.arm_params = dict(arm_params or {})
     built.arm_dataset_params = dict(arm_dataset_params or {})
     return built
+
+
+class ArmOverrideDropped(RuntimeError):
+    """An arm asked for a parameter value and the fit ran a different one.
+
+    **Deliberately NOT an `EngineError`.** That class means "this engine cannot
+    run this scenario", and its docstring says the runner turns it into a
+    recorded skip with a reason. This is the opposite kind of event: the cell
+    ran, produced a number, and the number answers a question nobody asked.
+    A skip loses a row; this loses the meaning of a row that is still there.
+    """
+
+
+def _same_param_value(asked, won):
+    """Whether the value that reached the trainer is the value the arm asked
+    for, at the tolerance the surface itself has.
+
+    Numeric spellings are compared as floats, because `20` and `20.0` are the
+    same leaf rule and one of them is what a JSON matrix file produces. Strings
+    are compared case-folded, because value strings are case-insensitive on
+    both surfaces (docs/PARAMETER_NAMING.md; `SymmetricTree` and
+    `symmetrictree` are one policy, which `scenarios._parity_equal` already
+    relies on). `bool` is handled FIRST and separately on purpose: `True == 1`
+    and `True == 1.0` are both true in Python, so a plain equality test reads
+    a count of 1 as the boolean answer to `use_missing`. A boolean and a
+    number are different values here even when Python says they are equal.
+    """
+    if isinstance(asked, bool) != isinstance(won, bool):
+        return False
+    if asked == won:
+        return True
+    if isinstance(asked, bool) or isinstance(won, bool):
+        return False
+    if isinstance(asked, (int, float)) and isinstance(won, (int, float)):
+        return float(asked) == float(won)
+    if isinstance(asked, str) and isinstance(won, str):
+        return asked.strip().lower() == won.strip().lower()
+    return False
+
+
+def check_arm_overrides_resolved(
+    engine,
+    arm_params,
+    arm_dataset_params,
+    params_used,
+    dataset_params_used=None,
+    num_boost_round=None,
+):
+    """Every value the arm asked for is a value the trainer was handed.
+
+    **THE GUARD, and it matters more than the fix it backs.** On 2026-08-17
+    three arms on `mojotrees_catboost_mode` differing only in
+    `arm_params={"max_depth": 4/5/6}` produced three models with one
+    `file_sha256`: `scenarios.mojotrees_catboost_mode_params` applied the arm's
+    override and then applied `MOJOTREES_CATBOOST_MODE` over it. Four
+    translators had that shape. The same class had been found once before, in
+    the tree count, and fixed for that one parameter (see
+    `MojoTreesEngine._n_estimators`). Fixing four more instances would leave
+    the class alive for the fifth, so this exists to make the class impossible:
+    ANY future mode dict, translator, adapter or estimator that eats an
+    override fails here by name instead of publishing a row.
+
+    WHAT IT COMPARES. `arm_params` and `arm_dataset_params` are what the matrix
+    scheduled, straight off the job, and `params_used` plus
+    `dataset_params_used` are what the adapter physically handed the trainer.
+    `num_boost_round` joins the resolved view as `n_estimators` because on the
+    XGBoost arm the tree count is an ARGUMENT to `xgboost.train` rather than a
+    member of the parameter dict (`scenarios.xgboost_params` skips it by name
+    and `scenarios.xgboost_rounds` resolves it), so a count that is honored
+    would otherwise read as a count that vanished.
+
+    THE EXCEPTIONS ARE ENUMERATED, NOT LOOSENED. Three kinds of override do not
+    survive verbatim into a training dict and none of them is a drop:
+
+    1. A binning override. `arm_dataset_params` lands in `dataset_params_used`
+       on the mojotrees dense path and in the TRAINING dict on the LightGBM arm
+       and the mojotrees sparse path, because those two surfaces take the
+       binning settings in the same dict. Both containers are searched, so
+       either landing counts.
+    2. An override the estimator will ALIAS-TRANSLATE. It is not dropped and
+       needs no exception here: aliasing happens inside the estimator, after
+       `params_used` is built, so the key the arm wrote is still literally in
+       the dict. What a two-spelling dict WOULD do is raise out of
+       `_resolve_alias`, and that is refused earlier and by name in
+       `scenarios.check_alias_collision`, before the fit.
+    3. An override that is REFUSED. `scenarios.apply_arm_overrides` raises at
+       translation time, before any fit, with its own message saying refused
+       rather than dropped -- today that is `learning_rate` on
+       `mojotrees_catboost_mode`, which is CatBoost's read-back and not a mode
+       default. A refused job never reaches this function.
+
+    WHERE IT RUNS, and why one call site. `worker.run_job` is the only caller
+    of `engines.build` in this harness, and it is the only place that holds
+    BOTH the job's overrides as scheduled AND every dict as handed over, for
+    all four engine families, after every translator, mode dict, read-back, and
+    the `n_estimators` the adapter adds post-translation. `build` sees the
+    overrides and no resolved dict; `_params` sees one family's dict and not
+    the tree count; each `run` is four call sites instead of one. The cost is
+    that it fires AFTER the fit, so a dropped override wastes one cell. That is
+    the right trade: the alternative it replaces is a published number that
+    silently answers a different question, and the failure mode that would
+    actually be common -- a refusal -- is raised pre-fit in the translator.
+    """
+    resolved = dict(params_used or {})
+    for key, value in (dataset_params_used or {}).items():
+        resolved.setdefault(key, value)
+    if num_boost_round is not None:
+        resolved.setdefault("n_estimators", num_boost_round)
+
+    dropped = []
+    for which, requested in (
+        ("arm_params", dict(arm_params or {})),
+        ("arm_dataset_params", dict(arm_dataset_params or {})),
+    ):
+        for key in sorted(requested):
+            asked = requested[key]
+            if key not in resolved:
+                dropped.append(
+                    f"{which}[{key!r}] asked for {asked!r} and the fit was "
+                    f"handed no {key} at all"
+                )
+                continue
+            won = resolved[key]
+            if not _same_param_value(asked, won):
+                dropped.append(
+                    f"{which}[{key!r}] asked for {asked!r} and the fit ran "
+                    f"{won!r}"
+                )
+    if not dropped:
+        return
+    raise ArmOverrideDropped(
+        f"the {engine} arm's overrides did not survive into the parameters "
+        "the trainer was handed, so this cell measured a configuration "
+        "nothing asked for: "
+        + "; ".join(dropped)
+        + ". The record would still carry the request in "
+        "arm_overrides.params, which is what made the last instance of this "
+        "invisible: three depths, one file_sha256. Find the layer that ate "
+        "it -- a mode dict applied after scenarios.apply_arm_overrides, an "
+        "adapter that rebuilt the dict, or a key the translator drops by "
+        "name -- rather than removing the override. A key that MUST NOT be "
+        "moved belongs in the translator's `refused` table, which fails "
+        "before the fit and says refused rather than dropped."
+    )

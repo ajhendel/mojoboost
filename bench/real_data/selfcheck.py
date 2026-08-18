@@ -3839,6 +3839,513 @@ def check_bayes_floor():
     )
 
 
+def check_report_pairing():
+    """The per-scenario table groups its rows into `pairs.MIRROR_PAIRS`.
+
+    The table is read for ONE question, how each of our arms did against the
+    competitor it is a mirror of, and until 2026-08-18 it answered a different
+    one: the rows came out in a flat sort on the arm id, which put the two
+    halves of every comparison apart with unrelated engines between them.
+
+    What is asserted here, and each of these is a way the grouping can be
+    wrong rather than merely unpretty:
+
+    - the order is the pair table's, competitor first and ours under it, and it
+      is read OFF `pairs.MIRROR_PAIRS` rather than restated in this test, so a
+      pair that moves moves this check with it;
+    - an ORACLE row stays with its own arm, directly under that arm's
+      accelerator row, rather than sorting off into another engine's group;
+    - an extra arm of a paired engine (`..._mvs_device`) lands under the
+      baseline arm it varies, which is the comparison it exists for;
+    - an engine in no pair still renders, in a labelled trailing group;
+    - a pair with one half absent still renders the half that ran;
+    - AND NO ROW IS LOST. The count guard inside `report.mirror_groups` is
+      given a grouping that drops a row and must raise. A row that leaves a
+      results table silently is the worst failure this change could have, so
+      the guard is tested for teeth and not merely for existing.
+
+    Trains nothing. The records are dicts and the engine libraries are never
+    imported.
+    """
+    import report
+    import pairs
+
+    def row(engine, arm, device, role, rmse):
+        return {
+            "status": "ok", "scenario": "dense_regression", "tier": "standard",
+            "engine": engine, "arm": arm, "threads": 10, "repeat": 0,
+            "device_used": device, "device_requested": device,
+            "cell_role": role, "primary_metric": "rmse",
+            "quality": {"rmse": rmse}, "params": {"num_boost_round": 100},
+            "predictions_sha256": f"{arm}-{device}",
+            "data": {"data_kind": "real", "dataset": "year_prediction_msd",
+                     "train": {"digest": "d1", "rows": 10, "features": 3},
+                     "test": {"digest": "d2"}},
+            "phases": {"train": {"elapsed_s": 1.0}},
+            "environment": {"cpu": {"arch": "arm64", "model": "Test"}},
+            "backend_proof": None,
+        }
+
+    # No xgboost row: the depthwise pair is one sided on purpose. One engine
+    # named by no pair: `lightgbm_dart` stands in for a peer nobody has added
+    # to `MIRROR_PAIRS` yet, which is the case that must not vanish.
+    records = [
+        row("lightgbm", "lightgbm", "cpu", "measured", 0.52),
+        row("mojotrees", "mojotrees", "gpu", "measured", 0.50),
+        row("mojotrees", "mojotrees", "cpu", "oracle", 0.50),
+        row("catboost", "catboost", "cpu", "measured", 0.51),
+        row("mojotrees_catboost_mode", "mojotrees_catboost_mode", "gpu",
+            "measured", 0.51),
+        row("mojotrees_catboost_mode", "mojotrees_catboost_mode", "cpu",
+            "oracle", 0.51),
+        row("mojotrees_catboost_mode", "mojotrees_catboost_mode_mvs_device",
+            "gpu", "measured", 0.52),
+        row("mojotrees_depthwise", "mojotrees_depthwise", "gpu", "measured", 0.53),
+        row("lightgbm_dart", "lightgbm_dart", "cpu", "measured", 0.55),
+    ]
+    cells = report.build_cells(records, 0.2)
+    groups = report.mirror_groups(cells)
+
+    flat = [(key[3], key[4]) for group in groups for key in group["keys"]]
+    check(
+        len(flat) == len(cells) and set(flat) == {
+            (r["arm"], r["device_used"]) for r in records
+        },
+        "report.mirror_groups did not return every cell exactly once: "
+        f"{len(cells)} in, {len(flat)} out, {flat}",
+    )
+    expected = [
+        ("lightgbm", "cpu"),
+        ("mojotrees", "gpu"),
+        ("mojotrees", "cpu"),
+        ("xgboost", "cpu"),
+        ("mojotrees_depthwise", "gpu"),
+        ("catboost", "cpu"),
+        ("mojotrees_catboost_mode", "gpu"),
+        ("mojotrees_catboost_mode", "cpu"),
+        ("mojotrees_catboost_mode_mvs_device", "gpu"),
+        ("lightgbm_dart", "cpu"),
+    ]
+    # The peer half of the depthwise pair did not run in this fixture, so it is
+    # dropped from the expectation rather than written out of it: the ORDER is
+    # the assertion and the absent row is a separate one below.
+    expected = [item for item in expected if item[0] != "xgboost"]
+    check(
+        flat == expected,
+        "the per-scenario table is not in mirror-pair order. Expected the "
+        "competitor first and our mirror under it, with each oracle beside "
+        "its own accelerator row and the mvs_device arm under the baseline "
+        f"arm it varies:\n  got  {flat}\n  want {expected}",
+    )
+    check(
+        [group["pair"] for group in groups]
+        == [pair["pair"] for pair in pairs.MIRROR_PAIRS] + [None],
+        "the groups are not the pairs of pairs.MIRROR_PAIRS followed by the "
+        f"unpaired group: {[g['pair'] for g in groups]}",
+    )
+    one_sided = [g for g in groups if g["pair"] == "xgboost"]
+    check(
+        len(one_sided) == 1 and one_sided[0]["missing"] == ["xgboost"]
+        and "`xgboost`" in report._group_caption(one_sided[0])
+        and "one sided" in report._group_caption(one_sided[0]),
+        "a pair whose competitor did not run must still render our arm and "
+        f"say which half is absent: {one_sided}",
+    )
+    trailing = groups[-1]
+    check(
+        trailing["pair"] is None
+        and [key[3] for key in trailing["keys"]] == ["lightgbm_dart"]
+        and report.UNPAIRED_GROUP_LABEL in report._group_caption(trailing),
+        "an engine in no mirror pair was dropped, or was smuggled into a pair "
+        f"it is not half of: {[(g['pair'], [k[3] for k in g['keys']]) for g in groups]}",
+    )
+    check(
+        all(
+            "**" in report._group_caption(group)
+            for group in groups
+        ),
+        "the group captions are not visible in plain markdown. Row order "
+        "alone does not tell a reader that two rows are the two halves of one "
+        "comparison",
+    )
+
+    # THE GUARD, TESTED FOR TEETH. A grouping that drops a row must raise.
+    original = report._engine_block
+    try:
+        report._engine_block = lambda rows, engine: [
+            key for key in original(rows, engine) if not rows[key]["oracle"]
+        ]
+        try:
+            report.mirror_groups(cells)
+            raised = None
+        except AssertionError as error:
+            raised = str(error)
+    finally:
+        report._engine_block = original
+    check(
+        raised is not None and "lost rows" in raised and "dropped" in raised,
+        "report.mirror_groups accepted a grouping that dropped two oracle "
+        "rows. Its count check is the only thing standing between an ordering "
+        f"pass and a silent filter: {raised!r}",
+    )
+
+
+def check_arm_override_guard():
+    """An arm override beats its own arm's mode dict, and an override that does
+    not survive is a hard error naming the key and both values.
+
+    WHY THIS CHECK EXISTS. On 2026-08-17 three arms scheduled on
+    `mojotrees_catboost_mode` differing only in `arm_params={"max_depth":
+    4/5/6}` produced three models with the SAME `model.size.file_sha256` and
+    identical rmse to six decimals. `scenarios.mojotrees_catboost_mode_params`
+    applied the override and then applied `MOJOTREES_CATBOOST_MODE` over it, so
+    the arm dimension could not move any key the mode dict names. All four
+    variant translators had that shape. The same class had been found once
+    before, in the tree count, and fixed for that one parameter
+    (`engines.MojoTreesEngine._n_estimators`), which is why this check is about
+    the CLASS and not about `max_depth`: it walks every variant translator and
+    every key of every mode dict rather than asserting one value.
+
+    It trains nothing. Every call here is a dict merge.
+    """
+    import ast
+
+    import engines
+    import scenarios
+
+    # --- the alias table cannot drift from the estimator's -----------------
+    #
+    # `scenarios.MOJOTREES_PARAM_ALIASES` is a transcription, and a
+    # transcription nothing re-derives is a comment. Re-derived here from the
+    # `self._resolve_alias("wire", "alias", ...)` call sites, which is the same
+    # derivation `tools/api_snapshot.py::alias_pairs` performs. AST only: the
+    # package is never imported, so this needs no built extension.
+    sklearn_py = os.path.join(
+        os.path.abspath(os.path.join(HERE, "..", "..")),
+        "python", "mojotrees", "sklearn.py",
+    )
+    if not check(
+        os.path.isfile(sklearn_py),
+        f"check_arm_override_guard cannot find {sklearn_py}, so nothing "
+        "re-derives scenarios.MOJOTREES_PARAM_ALIASES and an alias pair added "
+        "to the estimator would silently stop being refused here",
+    ):
+        return
+    with open(sklearn_py, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    derived = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not isinstance(fn, ast.Attribute) or fn.attr != "_resolve_alias":
+            continue
+        if len(node.args) < 2:
+            continue
+        wire, alias = node.args[0], node.args[1]
+        if isinstance(wire, ast.Constant) and isinstance(alias, ast.Constant):
+            derived[alias.value] = wire.value
+    check(derived, "no _resolve_alias pairs were derived from sklearn.py")
+    table = dict(scenarios.MOJOTREES_PARAM_ALIASES)
+    # The one entry that is not a `_resolve_alias` pair, known by name rather
+    # than tolerated as drift: `bagging_fraction` maps to itself so that the
+    # wire name is a key of the table, which is what lets the collision scan
+    # find the pair when an arm writes `bagging_fraction` and
+    # `MOJOTREES_CATBOOST_MODE` already wrote `subsample`.
+    check(
+        table.pop("bagging_fraction", None) == "bagging_fraction",
+        "MOJOTREES_PARAM_ALIASES lost its bagging_fraction self-entry, so a "
+        "collision between an arm's bagging_fraction and the CatBoost-mode "
+        "arm's subsample is no longer detected",
+    )
+    check(
+        table == derived,
+        "scenarios.MOJOTREES_PARAM_ALIASES has drifted from "
+        "python/mojotrees/sklearn.py::_Base._resolve_alias. Only in the "
+        f"table: {sorted(set(table) - set(derived))}; only in the estimator: "
+        f"{sorted(set(derived) - set(table))}; disagreeing: "
+        f"{sorted(k for k in set(table) & set(derived) if table[k] != derived[k])}. "
+        "An alias pair the table does not know is a pair this harness will "
+        "merge into one dict and hand to an estimator that raises on it",
+    )
+
+    spec = scenarios.resolve("dense_regression", "standard", "synthetic")
+    stand_in = scenarios._READBACK_STANDIN(spec)
+
+    def build(fn, extra):
+        if fn is scenarios.mojotrees_catboost_mode_params:
+            return fn(spec, "cpu", extra, catboost_readback=stand_in)
+        return fn(spec, "cpu", extra)
+
+    # --- PART 1: an arm override beats its own arm's mode dict -------------
+    #
+    # Every key of every mode dict, not one sample of one arm, because the
+    # defect was one key of one arm being noticed and four translators having
+    # it. `refused` keys are excluded and checked separately below; they are
+    # the arm's own contract rather than a default it offers.
+    arms = (
+        ("mojotrees_catboost_mode", scenarios.mojotrees_catboost_mode_params,
+         scenarios.MOJOTREES_CATBOOST_MODE),
+        ("mojotrees_depthwise", scenarios.mojotrees_depthwise_params,
+         scenarios.MOJOTREES_DEPTHWISE),
+        ("mojotrees_symmetric_colsample",
+         scenarios.mojotrees_symmetric_colsample_params,
+         scenarios.MOJOTREES_SYMMETRIC_COLSAMPLE),
+        ("mojotrees_cosine_leafwise",
+         scenarios.mojotrees_cosine_leafwise_params,
+         scenarios.MOJOTREES_COSINE_LEAFWISE),
+    )
+    refused_keys = set(scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK) | set(
+        scenarios.MOJOTREES_CATBOOST_MODE_UNSET
+    )
+    for name, fn, mode in arms:
+        for key, mode_value in sorted(mode.items()):
+            if key in refused_keys:
+                continue
+            # A value that is not the mode's, of the mode's own type, so the
+            # override cannot pass by accident.
+            if isinstance(mode_value, bool):
+                asked = not mode_value
+            elif isinstance(mode_value, (int, float)):
+                asked = mode_value + 1
+            else:
+                asked = str(mode_value) + "_ARM"
+            try:
+                got = build(fn, {key: asked}).get(key)
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                FAILURES.append(
+                    f"{name}: overriding {key} raised {type(exc).__name__}: "
+                    f"{exc}"
+                )
+                continue
+            check(
+                got == asked,
+                f"{name}: an arm override of {key}={asked!r} resolved to "
+                f"{got!r}. The mode dict is applied over the arm's override, "
+                "which is the defect measured on 2026-08-17: three depths, "
+                "one file_sha256. See scenarios.apply_arm_overrides",
+            )
+
+    # --- PART 1b: the learning_rate decision, which is REFUSE --------------
+    #
+    # Not "the override wins" and not "the read-back wins silently". The value
+    # is CatBoost's own resolved rate for this cell, and the arm's product is
+    # the sentence "mojotrees ran at CatBoost's rate"; an override that won
+    # would keep the label and make the sentence false, and one that lost
+    # silently is the bug being fixed. So the arm refuses and the sweep goes on
+    # the plain arm. Derived from the table, so a second read-back key inherits
+    # the rule without a second check.
+    for key in sorted(scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK):
+        try:
+            scenarios.mojotrees_catboost_mode_params(
+                spec, "cpu", {key: 0.123}, catboost_readback=stand_in
+            )
+            message = None
+        except ValueError as exc:
+            message = str(exc)
+        check(
+            message is not None
+            and key in message
+            and "refuses" in message,
+            f"the CatBoost-mode arm accepted an override of {key}, which is "
+            "read out of CatBoost's own get_all_params() for this cell. It "
+            "must refuse by name rather than winning or losing: "
+            f"{message!r}",
+        )
+
+    # --- PART 1c: the alias question, and the spelling an arm must use -----
+    #
+    # `depth` is CatBoost's spelling of `max_depth`, which every mojotrees dict
+    # here already carries, so re-applying an override by raw key would leave
+    # BOTH in the dict and `sklearn.py::_Base._resolve_alias` would raise
+    # "aliases with different values; set only one" out of the fit. Refused
+    # here instead, before the fit, naming both spellings.
+    for name, fn, _mode in arms:
+        try:
+            build(fn, {"depth": 4})
+            message = None
+        except ValueError as exc:
+            message = str(exc)
+        check(
+            message is not None and "depth" in message and "max_depth" in message,
+            f"{name}: an arm override spelled `depth` was accepted beside the "
+            "`max_depth` the translator emits. The fit would raise inside the "
+            f"estimator with no mention of the arm: {message!r}",
+        )
+    # And the reverse direction, which is the one a wire-spelled override
+    # produces: `MOJOTREES_CATBOOST_MODE` carries `subsample`, whose wire name
+    # is `bagging_fraction`, so an arm that writes the wire spelling collides
+    # with the mode dict rather than with the base translator.
+    try:
+        scenarios.mojotrees_catboost_mode_params(
+            spec, "cpu", {"bagging_fraction": 0.5}, catboost_readback=stand_in
+        )
+        message = None
+    except ValueError as exc:
+        message = str(exc)
+    check(
+        message is not None
+        and "bagging_fraction" in message
+        and "subsample" in message,
+        "the CatBoost-mode arm accepted bagging_fraction beside the mode "
+        f"dict's subsample, which are one parameter: {message!r}",
+    )
+
+    # --- PART 2: THE GUARD, tested for teeth and for silence ---------------
+    #
+    # A guard that never fires and a guard that always fires are the same
+    # guard. Both directions are asserted, and the silent cases are the exact
+    # three the docstring enumerates rather than a loosened comparison.
+    def guard(**kw):
+        kw.setdefault("engine", "mojotrees_catboost_mode")
+        kw.setdefault("arm_params", None)
+        kw.setdefault("arm_dataset_params", None)
+        kw.setdefault("params_used", {})
+        try:
+            engines.check_arm_overrides_resolved(**kw)
+            return None
+        except engines.ArmOverrideDropped as exc:
+            return str(exc)
+
+    # TEETH. The 2026-08-17 defect itself: the arm asked for 4 and the mode
+    # dict's 6 reached the trainer.
+    fired = guard(
+        arm_params={"max_depth": 4},
+        params_used={"max_depth": 6, "num_leaves": 64},
+    )
+    check(
+        fired is not None
+        and "max_depth" in fired
+        and "4" in fired
+        and "6" in fired,
+        "engines.check_arm_overrides_resolved accepted a fit that ran "
+        "max_depth=6 for an arm that asked for 4. That is the exact defect it "
+        f"exists for: {fired!r}",
+    )
+    # TEETH. The key vanished entirely, which is what a translator that drops
+    # a key by name produces.
+    fired = guard(
+        arm_params={"feature_fraction": 0.5},
+        params_used={"max_depth": 6},
+    )
+    check(
+        fired is not None and "feature_fraction" in fired and "0.5" in fired,
+        "an override that reached no container at all was accepted: "
+        f"{fired!r}",
+    )
+    # SILENCE. The override survived. This is every ordinary arm cell in every
+    # matrix, so a false positive here stops the harness.
+    check(
+        guard(
+            arm_params={"max_depth": 4},
+            params_used={"max_depth": 4, "num_leaves": 64},
+        )
+        is None,
+        "the guard fired on an override that survived verbatim, which would "
+        "fail every arm cell in the matrix",
+    )
+    # SILENCE. Exception 1: a binning override lands in `dataset_params_used`
+    # on the mojotrees dense path and in the TRAINING dict on the LightGBM arm
+    # and the mojotrees sparse path. Both containers count.
+    check(
+        guard(
+            arm_dataset_params={"max_bin": 63},
+            params_used={"max_depth": 6},
+            dataset_params_used={"max_bin": 63},
+        )
+        is None,
+        "the guard called a binning override dropped because it landed in "
+        "dataset_params_used, which is where the mojotrees dense path puts it",
+    )
+    check(
+        guard(
+            engine="lightgbm",
+            arm_dataset_params={"max_bin": 63},
+            params_used={"max_bin": 63},
+        )
+        is None,
+        "the guard called a binning override dropped because it landed in the "
+        "TRAINING dict, which is where LightGBM takes it",
+    )
+    # SILENCE. Exception 2: on the XGBoost arm the tree count is an ARGUMENT to
+    # xgboost.train, so it is honored while being absent from params_used. The
+    # record's own num_boost_round is what says so.
+    check(
+        guard(
+            engine="xgboost",
+            arm_params={"n_estimators": 40},
+            params_used={"max_depth": 6},
+            num_boost_round=40,
+        )
+        is None,
+        "the guard called an XGBoost tree-count override dropped. It travels "
+        "as num_boost_round rather than inside the parameter dict: see "
+        "scenarios.xgboost_rounds",
+    )
+    check(
+        guard(
+            engine="xgboost",
+            arm_params={"n_estimators": 40},
+            params_used={"max_depth": 6},
+            num_boost_round=100,
+        )
+        is not None,
+        "the guard accepted an XGBoost arm that asked for 40 trees and grew "
+        "100. num_boost_round is folded into the resolved view so the count "
+        "is CHECKED there, not exempted",
+    )
+    # SILENCE. Spelling of the value, not the value. `20` and `20.0` are one
+    # leaf rule and a JSON matrix file produces the second; `SymmetricTree` and
+    # `symmetrictree` are one policy (docs/PARAMETER_NAMING.md).
+    check(
+        guard(
+            arm_params={"min_data_in_leaf": 20, "grow_policy": "SymmetricTree"},
+            params_used={"min_data_in_leaf": 20.0, "grow_policy": "symmetrictree"},
+        )
+        is None,
+        "the guard fired on a numeric or case difference that both surfaces "
+        "treat as the same value",
+    )
+    # And `True` is not `1`, which the numeric branch would say it was.
+    check(
+        guard(
+            arm_params={"use_missing": True},
+            params_used={"use_missing": 1.0},
+        )
+        is not None,
+        "the guard read use_missing=1.0 as the boolean True. bool is excluded "
+        "from the numeric comparison for exactly this reason",
+    )
+
+    # --- PART 3: the guard is wired, and to the one place that sees both ---
+    with open(os.path.join(HERE, "worker.py"), encoding="utf-8") as handle:
+        worker_src = handle.read()
+    check(
+        "engines.check_arm_overrides_resolved(" in worker_src,
+        "worker.py does not call engines.check_arm_overrides_resolved. It is "
+        "the only caller of engines.build and the only place that holds both "
+        "the job's overrides and every dict the trainer was handed, so an "
+        "unwired guard is no guard",
+    )
+
+    # --- PART 4: the parity table is built from the arm that ran -----------
+    #
+    # Same class, one level up in the reporting path.
+    # `mojotrees_catboost_mode_resolved` used to read `arm_params` for
+    # `n_estimators` and nothing else, so a frontier arm on any other key had
+    # its parity table built from the base configuration while the fit ran the
+    # override.
+    resolved = scenarios.mojotrees_catboost_mode_resolved(
+        spec, "cpu", None, stand_in, arm_params={"max_depth": 4}
+    )
+    check(
+        resolved.get("max_depth") == 4,
+        "scenarios.mojotrees_catboost_mode_resolved reports max_depth="
+        f"{resolved.get('max_depth')!r} for an arm that runs 4, so the parity "
+        "table describes a configuration no fit used",
+    )
+
+
 def main():
     check_compiles()
     documents = check_json()
@@ -3859,6 +4366,8 @@ def main():
         check_pair_plan()
         check_arm_keying()
         check_arm_keying_writer()
+        check_arm_override_guard()
+        check_report_pairing()
         check_coverage_guard()
         check_bayes_floor()
         check_citations()

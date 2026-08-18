@@ -84,6 +84,19 @@ import envinfo  # noqa: E402
 import quality  # noqa: E402
 import verify  # noqa: E402
 
+# THE MIRROR MAP IS READ, NEVER RESTATED. `pairs.MIRROR_PAIRS` is this
+# harness's one statement of which competitor each of our arms is a mirror of,
+# and `pairs.check_plan` already fails when an arm names an engine that table
+# does not know. This file orders its table by that map rather than carrying a
+# second copy of it, because a mapping with two homes is a mapping whose two
+# homes disagree the first time a mirror moves. Nothing is added to `pairs.py`
+# for this: the map it already publishes is enough to order a table with.
+#
+# Aliased because `pairs` is already a local name inside `_ratios` and a
+# parameter name on `_fit_comparability`, and a module shadowed by a local is
+# a trap for whoever edits those two next.
+import pairs as pair_plan  # noqa: E402
+
 
 def load(target):
     if os.path.isdir(target):
@@ -481,6 +494,150 @@ def build_cells(records, warn_spread):
     return out
 
 
+#: The label on the trailing group, for engines this run holds that
+#: `pairs.MIRROR_PAIRS` names no partner for. It says what it is rather than
+#: what it is not, because "other" invites a reader to assume the rows above it
+#: were the important ones.
+UNPAIRED_GROUP_LABEL = "In this run, in no mirror pair"
+
+
+def mirror_engine_order():
+    """Engine name to (pair index, half), read off `pairs.MIRROR_PAIRS`.
+
+    Half 0 is the competitor and half 1 is our mirror of it, which is the order
+    the pair is read in: the row a reader is comparing against comes first and
+    ours sits directly under it.
+    """
+    order = {}
+    for index, pair in enumerate(pair_plan.MIRROR_PAIRS):
+        order[pair["peer"]] = (index, 0)
+        order[pair["ours"]] = (index, 1)
+    return order
+
+
+def _engine_block(rows, engine):
+    """Every cell key of one ENGINE, in the order they should be read.
+
+    Three sort levels, and each of them answers a way a row can end up in the
+    wrong place:
+
+    - THE BASELINE ARM FIRST, then its variants by name. An `--arms` run can
+      carry several arms of one engine, `mojotrees_catboost_mode_mvs_device`
+      beside `mojotrees_catboost_mode`, and the whole point of such an arm is
+      the comparison against the arm it varies, so it belongs directly under
+      it and not in a group of its own.
+    - THE ORACLE ROW AFTER THE ACCELERATOR ROW OF THE SAME ARM. An oracle is
+      one of our own arms on the cpu in a run that also ran that arm on the
+      accelerator (`verify.py`'s ORACLE CELL block), so it is not a third
+      party to the pair: it is the second leg of a row already in it. Sorting
+      it after its own accelerator row keeps the product row in the position
+      the eye lands on and keeps the two legs adjacent, which is the same
+      choice `_ratios` already makes with `cell["oracle"]` in its sort key.
+    - device, then threads, so the remaining ties are ordered by something and
+      not by dictionary insertion.
+    """
+    keys = [key for key, cell in rows.items() if cell["engine"] == engine]
+    return sorted(
+        keys,
+        key=lambda key: (key[3] != engine, key[3], rows[key]["oracle"], key[4], key[5]),
+    )
+
+
+def mirror_groups(rows):
+    """The section's cells, grouped into mirror pairs, in reading order.
+
+    Returns a list of groups, each `{"pair", "peer", "ours", "missing",
+    "keys"}`, where `pair` is None on the trailing unpaired group.
+
+    THE GROUPING IS BY ENGINE AND THE ENGINE ORDER COMES FROM THE PAIR TABLE,
+    which is what makes this rule survive an arm nobody has invented yet. An
+    arm is placed by the engine it ran, an engine by the pair it is half of, so
+    a future arm id lands under the engine it belongs to instead of sorting
+    itself into the middle of somebody else's comparison.
+
+    A pair with one half missing still renders the half that ran, because
+    partial runs are the normal case here rather than the exception. A pair
+    with neither half is not printed at all.
+
+    EVERY INPUT ROW COMES OUT EXACTLY ONCE OR THIS RAISES. A row that silently
+    leaves a results table is worse than an ugly table, and an ordering pass is
+    exactly the kind of code that loses one: a set of engines that does not
+    cover the run, a filter that matches nothing, a group that is built and
+    never appended. The check below costs nothing and is the reason this
+    function may be trusted to be an ordering rather than a filter.
+    """
+    groups = []
+    paired = set()
+    for pair in pair_plan.MIRROR_PAIRS:
+        keys, missing = [], []
+        for role in ("peer", "ours"):
+            engine = pair[role]
+            paired.add(engine)
+            block = _engine_block(rows, engine)
+            keys.extend(block)
+            if not block:
+                missing.append(engine)
+        if not keys:
+            continue
+        groups.append({
+            "pair": pair["pair"], "peer": pair["peer"], "ours": pair["ours"],
+            "missing": missing, "keys": keys,
+        })
+
+    leftovers = sorted(
+        {cell["engine"] for cell in rows.values() if cell["engine"] not in paired}
+    )
+    if leftovers:
+        keys = []
+        for engine in leftovers:
+            keys.extend(_engine_block(rows, engine))
+        groups.append({
+            "pair": None, "peer": None, "ours": None,
+            "missing": [], "keys": keys,
+        })
+
+    ordered = [key for group in groups for key in group["keys"]]
+    if sorted(ordered) != sorted(rows):
+        seen = {}
+        for key in ordered:
+            seen[key] = seen.get(key, 0) + 1
+        dropped = sorted(key for key in rows if key not in seen)
+        twice = sorted(key for key, count in seen.items() if count > 1)
+        stray = sorted(key for key in seen if key not in rows)
+        raise AssertionError(
+            "report.mirror_groups is an ORDERING and it lost rows. "
+            f"{len(rows)} cells in, {len(ordered)} out. "
+            f"dropped {dropped}, printed twice {twice}, invented {stray}. "
+            "Every cell must reach exactly one group: an engine in no pair "
+            "goes to the trailing unpaired group and nothing is filtered here"
+        )
+    return groups
+
+
+#: How a group announces itself. A one-line bold caption above a table block
+#: of its own, and NOT an extra leading column, for two reasons. The column set
+#: of this table is fixed and a pair label is not a property of the cell, it is
+#: a property of the group, so a column would repeat the same word down every
+#: row of it. And markdown tables cannot nest or carry a spanning row, so a
+#: caption between blocks is the only grouping that survives being pasted into
+#: a plain markdown viewer, a diff, or a terminal. The header is repeated per
+#: block unchanged, which is what makes each block readable on its own.
+def _group_caption(group):
+    if group["pair"] is None:
+        return (
+            f"**{UNPAIRED_GROUP_LABEL}.** `pairs.MIRROR_PAIRS` names no "
+            "competitor these rows are a mirror of, so they are not half of "
+            "any comparison above and must not be read as one."
+        )
+    caption = (
+        f"**Mirror pair `{group['peer']}` and `{group['ours']}`.** The "
+        "competitor first, our mirror of it underneath."
+    )
+    for engine in group["missing"]:
+        caption += f" This run has no `{engine}` row, so the pair is one sided."
+    return caption
+
+
 def render(records, config, out):
     perf = config["performance"]["reporting"]
     warn_spread = perf["instability_warning_iqr_over_median"]
@@ -539,27 +696,40 @@ def render(records, config, out):
             # plain run's table is byte-for-byte what it was before the cell
             # key grew the arm dimension.
             show_arm = any(key[3] != cell["engine"] for key, cell in rows.items())
-            out("\n| engine | " + ("arm | " if show_arm else "")
-                + "device | role | threads | reps | " + " | ".join(
-                label for _, label, _ in FIELDS
-            ) + " | peak rss | model | metric |")
-            out("| --- " * (8 + int(show_arm) + len(FIELDS)) + "|")
-            for key in sorted(rows):
-                cell = rows[key]
-                _, _, _, arm, device, threads = key
-                values = " | ".join(
-                    fmt_time(cell["summary"][name], warn_spread) for name, _, _ in FIELDS
-                )
-                metric = cell["quality"].get(cell["primary_metric"]) if cell["quality"] else None
-                peak = cell["summary"]["peak_rss"]
-                shown = "n/a" if metric is None else f"{metric:.6g}"
-                out(
-                    f"| {cell['engine']} | " + (f"{arm} | " if show_arm else "")
-                    + f"{device} | {cell['role']} | {threads} | "
-                    f"{cell['repeats']} | "
-                    f"{values} | {fmt_bytes(peak['median'] if peak else None)} | "
-                    f"{fmt_bytes(cell['model_bytes'])} | {shown} |"
-                )
+            header = ("| engine | " + ("arm | " if show_arm else "")
+                      + "device | role | threads | reps | " + " | ".join(
+                          label for _, label, _ in FIELDS
+                      ) + " | peak rss | model | metric |")
+            rule = "| --- " * (8 + int(show_arm) + len(FIELDS)) + "|"
+            # ONE BLOCK PER MIRROR PAIR, competitor row first, ours under it.
+            # This table used to be one flat `sorted(rows)` list, which put the
+            # two halves of every comparison apart from each other with
+            # unrelated engines between them: the one question this table is
+            # read for is how each of our arms did against the competitor it
+            # mirrors, and a sort on the arm id answers a question nobody asked.
+            # The columns, the numbers and every caption below are untouched;
+            # only the order and the block boundaries changed. `mirror_groups`
+            # raises rather than let a row fall out of the grouping.
+            for group in mirror_groups(rows):
+                out("\n" + _group_caption(group))
+                out("\n" + header)
+                out(rule)
+                for key in group["keys"]:
+                    cell = rows[key]
+                    _, _, _, arm, device, threads = key
+                    values = " | ".join(
+                        fmt_time(cell["summary"][name], warn_spread) for name, _, _ in FIELDS
+                    )
+                    metric = cell["quality"].get(cell["primary_metric"]) if cell["quality"] else None
+                    peak = cell["summary"]["peak_rss"]
+                    shown = "n/a" if metric is None else f"{metric:.6g}"
+                    out(
+                        f"| {cell['engine']} | " + (f"{arm} | " if show_arm else "")
+                        + f"{device} | {cell['role']} | {threads} | "
+                        f"{cell['repeats']} | "
+                        f"{values} | {fmt_bytes(peak['median'] if peak else None)} | "
+                        f"{fmt_bytes(cell['model_bytes'])} | {shown} |"
+                    )
 
             out("\nMedian across repeats, with [min, max]. A `!` marks a cell whose "
                 f"spread exceeds {warn_spread:.0%} of its median.\n")
