@@ -88,6 +88,247 @@
     "mechanism above is built for the anchors the pending run will produce, and",
     "for the next time a default moves."
   ],
-  "version": 1,
-  "anchors": {}
+  "anchors": {
+    "dense_regression|standard|real|year_prediction_msd|mojotrees_catboost_mode|cpu|n100": {
+      "arm": "mojotrees_catboost_mode",
+      "configuration": {
+        "followed_default": [],
+        "grow_policy": "symmetrictree",
+        "note": "`passed` is what the harness handed the estimator, where None means UNSET. `followed_default` is that subset, and it is the only subset a package default change can invalidate. `shipped_at_record` is what the matching sklearn.py constant held when this run was taken, chosen per grow policy because symmetrictree resolves an unset key from CatBoost's constant and every other policy from LightGBM's. verify.anchor_staleness compares the two",
+        "passed": {
+          "lambda_l2": 3.0,
+          "learning_rate": 0.5
+        },
+        "shipped_at_record": {
+          "lambda_l2": 3.0,
+          "learning_rate": null
+        }
+      },
+      "data_kind": "real",
+      "dataset": "year_prediction_msd",
+      "device": "cpu",
+      "environment": {
+        "arch": "arm64",
+        "cpu_model": "Apple M4"
+      },
+      "primary_metric": "rmse",
+      "quality": {
+        "mae": 6.40217885326284,
+        "r2": 0.29761608298180686,
+        "rmse": 9.094806331456201
+      },
+      "recorded_from": {
+        "git_commit": "fed4ed79fc285e4a5cbfd535053c004301dc7dda",
+        "recorded_at": "2026-08-17",
+        "recorded_by": "Andrew Hendel, adopted by instruction in session cascadeprojects-49bb",
+        "run_id": "20260817T205811Z-e2e"
+      },
+      "scenario": "dense_regression",
+      "tier": "standard",
+      "trees": 100,
+      "value": 9.094806331456201,
+      "why": "Adopted 2026-08-17 as the FIRST anchors this repository has ever held. Until this commit `anchors` was empty, which meant the accuracy gate covered nothing and, worse, that `check_differential`'s deliberate narrowing to the mojotrees/cpu pair handed every variant arm and every GPU row to a gate that held nothing at all. Adopted from run 20260817T205811Z-e2e, which verifies 49 pass and 0 fail, and which is the first run taken after the prediction rewrite, so its numbers describe the code that ships rather than the code that preceded it. Adopted so that ACCURACY_BUDGET section 14's 0.25 percent per-scenario veto, and every pricing decision behind it including device-side MVS, has a fixed point to measure against. NOTE that every parameter in this arm's `configuration.passed` was named by the harness and none was left unset, so `followed_default` is empty and no package default change can make this entry stale. It goes stale only when the run is superseded deliberately."
+    },
+    "dense_regression|standard|real|year_prediction_msd|mojotrees_catboost_mode|gpu|n100": {
+      "arm": "mojotrees_catboost_mode",
+      "configuration": {
+        "followed_default": [],
+        "grow_policy": "symmetrictree",
+        "note": "`passed` is what the harness handed the estimator, where None means UNSET. `followed_default` is that subset, and it is the only subset a package default change can invalidate. `shipped_at_record` is what the matching sklearn.py constant held when this run was taken, chosen per grow policy because symmetrictree resolves an unset key from CatBoost's constant and every other policy from LightGBM's. verify.anchor_staleness compares the two",
+        "passed": {
+          "lambda_l2": 3.0,
+          "learning_rate": 0.5
+        },
+        "shipped_at_record": {
+          "lambda_l2": 3.0,
+          "learning_rate": null
+        }
+      },
+      "data_kind": "real",
+      "dataset": "year_prediction_msd",
+      "device": "gpu",
+      "environment": {
+        "arch": "arm64",
+        "cpu_model": "Apple M4"
+      },
+      "primary_metric": "rmse",
+      "quality": {
+        "mae": 6.4023690420374955,
+        "r2": 0.2972992233400207,
+        "rmse": 9.096857526018562
+      },
+      "recorded_from": {
+        "git_commit": "fed4ed79fc285e4a5cbfd535053c004301dc7dda",
+        "recorded_at": "2026-08-17",
+        "recorded_by": "Andrew Hendel, adopted by instruction in session cascadeprojects-49bb",
+        "run_id": "20260817T205811Z-e2e"
+      },
+      "scenario": "dense_regression",
+      "tier": "standard",
+      "trees": 100,
+      "value": 9.096857526018562,
+      "why": "Adopted 2026-08-17 as the FIRST anchors this repository has ever held. Until this commit `anchors` was empty, which meant the accuracy gate covered nothing and, worse, that `check_differential`'s deliberate narrowing to the mojotrees/cpu pair handed every variant arm and every GPU row to a gate that held nothing at all. Adopted from run 20260817T205811Z-e2e, which verifies 49 pass and 0 fail, and which is the first run taken after the prediction rewrite, so its numbers describe the code that ships rather than the code that preceded it. Adopted so that ACCURACY_BUDGET section 14's 0.25 percent per-scenario veto, and every pricing decision behind it including device-side MVS, has a fixed point to measure against. NOTE that every parameter in this arm's `configuration.passed` was named by the harness and none was left unset, so `followed_default` is empty and no package default change can make this entry stale. It goes stale only when the run is superseded deliberately."
+    },
+    "dense_regression|standard|real|year_prediction_msd|mojotrees_depthwise|cpu|n100": {
+      "arm": "mojotrees_depthwise",
+      "configuration": {
+        "followed_default": [],
+        "grow_policy": "depthwise",
+        "note": "`passed` is what the harness handed the estimator, where None means UNSET. `followed_default` is that subset, and it is the only subset a package default change can invalidate. `shipped_at_record` is what the matching sklearn.py constant held when this run was taken, chosen per grow policy because symmetrictree resolves an unset key from CatBoost's constant and every other policy from LightGBM's. verify.anchor_staleness compares the two",
+        "passed": {
+          "lambda_l2": 1.0,
+          "learning_rate": 0.3
+        },
+        "shipped_at_record": {
+          "lambda_l2": 1.0,
+          "learning_rate": 0.1
+        }
+      },
+      "data_kind": "real",
+      "dataset": "year_prediction_msd",
+      "device": "cpu",
+      "environment": {
+        "arch": "arm64",
+        "cpu_model": "Apple M4"
+      },
+      "primary_metric": "rmse",
+      "quality": {
+        "mae": 6.390350981650623,
+        "r2": 0.29629008858073336,
+        "rmse": 9.103387091667798
+      },
+      "recorded_from": {
+        "git_commit": "fed4ed79fc285e4a5cbfd535053c004301dc7dda",
+        "recorded_at": "2026-08-17",
+        "recorded_by": "Andrew Hendel, adopted by instruction in session cascadeprojects-49bb",
+        "run_id": "20260817T205811Z-e2e"
+      },
+      "scenario": "dense_regression",
+      "tier": "standard",
+      "trees": 100,
+      "value": 9.103387091667798,
+      "why": "Adopted 2026-08-17 as the FIRST anchors this repository has ever held. Until this commit `anchors` was empty, which meant the accuracy gate covered nothing and, worse, that `check_differential`'s deliberate narrowing to the mojotrees/cpu pair handed every variant arm and every GPU row to a gate that held nothing at all. Adopted from run 20260817T205811Z-e2e, which verifies 49 pass and 0 fail, and which is the first run taken after the prediction rewrite, so its numbers describe the code that ships rather than the code that preceded it. Adopted so that ACCURACY_BUDGET section 14's 0.25 percent per-scenario veto, and every pricing decision behind it including device-side MVS, has a fixed point to measure against. NOTE that every parameter in this arm's `configuration.passed` was named by the harness and none was left unset, so `followed_default` is empty and no package default change can make this entry stale. It goes stale only when the run is superseded deliberately."
+    },
+    "dense_regression|standard|real|year_prediction_msd|mojotrees_depthwise|gpu|n100": {
+      "arm": "mojotrees_depthwise",
+      "configuration": {
+        "followed_default": [],
+        "grow_policy": "depthwise",
+        "note": "`passed` is what the harness handed the estimator, where None means UNSET. `followed_default` is that subset, and it is the only subset a package default change can invalidate. `shipped_at_record` is what the matching sklearn.py constant held when this run was taken, chosen per grow policy because symmetrictree resolves an unset key from CatBoost's constant and every other policy from LightGBM's. verify.anchor_staleness compares the two",
+        "passed": {
+          "lambda_l2": 1.0,
+          "learning_rate": 0.3
+        },
+        "shipped_at_record": {
+          "lambda_l2": 1.0,
+          "learning_rate": 0.1
+        }
+      },
+      "data_kind": "real",
+      "dataset": "year_prediction_msd",
+      "device": "gpu",
+      "environment": {
+        "arch": "arm64",
+        "cpu_model": "Apple M4"
+      },
+      "primary_metric": "rmse",
+      "quality": {
+        "mae": 6.381790959365682,
+        "r2": 0.29664145330932334,
+        "rmse": 9.101114131992517
+      },
+      "recorded_from": {
+        "git_commit": "fed4ed79fc285e4a5cbfd535053c004301dc7dda",
+        "recorded_at": "2026-08-17",
+        "recorded_by": "Andrew Hendel, adopted by instruction in session cascadeprojects-49bb",
+        "run_id": "20260817T205811Z-e2e"
+      },
+      "scenario": "dense_regression",
+      "tier": "standard",
+      "trees": 100,
+      "value": 9.101114131992517,
+      "why": "Adopted 2026-08-17 as the FIRST anchors this repository has ever held. Until this commit `anchors` was empty, which meant the accuracy gate covered nothing and, worse, that `check_differential`'s deliberate narrowing to the mojotrees/cpu pair handed every variant arm and every GPU row to a gate that held nothing at all. Adopted from run 20260817T205811Z-e2e, which verifies 49 pass and 0 fail, and which is the first run taken after the prediction rewrite, so its numbers describe the code that ships rather than the code that preceded it. Adopted so that ACCURACY_BUDGET section 14's 0.25 percent per-scenario veto, and every pricing decision behind it including device-side MVS, has a fixed point to measure against. NOTE that every parameter in this arm's `configuration.passed` was named by the harness and none was left unset, so `followed_default` is empty and no package default change can make this entry stale. It goes stale only when the run is superseded deliberately."
+    },
+    "dense_regression|standard|real|year_prediction_msd|mojotrees|cpu|n100": {
+      "arm": "mojotrees",
+      "configuration": {
+        "followed_default": [],
+        "grow_policy": null,
+        "note": "`passed` is what the harness handed the estimator, where None means UNSET. `followed_default` is that subset, and it is the only subset a package default change can invalidate. `shipped_at_record` is what the matching sklearn.py constant held when this run was taken, chosen per grow policy because symmetrictree resolves an unset key from CatBoost's constant and every other policy from LightGBM's. verify.anchor_staleness compares the two",
+        "passed": {
+          "lambda_l2": 0.0,
+          "learning_rate": 0.1
+        },
+        "shipped_at_record": {
+          "lambda_l2": 1.0,
+          "learning_rate": 0.1
+        }
+      },
+      "data_kind": "real",
+      "dataset": "year_prediction_msd",
+      "device": "cpu",
+      "environment": {
+        "arch": "arm64",
+        "cpu_model": "Apple M4"
+      },
+      "primary_metric": "rmse",
+      "quality": {
+        "mae": 6.37848432816052,
+        "r2": 0.2962216985931342,
+        "rmse": 9.103829436868983
+      },
+      "recorded_from": {
+        "git_commit": "fed4ed79fc285e4a5cbfd535053c004301dc7dda",
+        "recorded_at": "2026-08-17",
+        "recorded_by": "Andrew Hendel, adopted by instruction in session cascadeprojects-49bb",
+        "run_id": "20260817T205811Z-e2e"
+      },
+      "scenario": "dense_regression",
+      "tier": "standard",
+      "trees": 100,
+      "value": 9.103829436868983,
+      "why": "Adopted 2026-08-17 as the FIRST anchors this repository has ever held. Until this commit `anchors` was empty, which meant the accuracy gate covered nothing and, worse, that `check_differential`'s deliberate narrowing to the mojotrees/cpu pair handed every variant arm and every GPU row to a gate that held nothing at all. Adopted from run 20260817T205811Z-e2e, which verifies 49 pass and 0 fail, and which is the first run taken after the prediction rewrite, so its numbers describe the code that ships rather than the code that preceded it. Adopted so that ACCURACY_BUDGET section 14's 0.25 percent per-scenario veto, and every pricing decision behind it including device-side MVS, has a fixed point to measure against. NOTE that every parameter in this arm's `configuration.passed` was named by the harness and none was left unset, so `followed_default` is empty and no package default change can make this entry stale. It goes stale only when the run is superseded deliberately."
+    },
+    "dense_regression|standard|real|year_prediction_msd|mojotrees|gpu|n100": {
+      "arm": "mojotrees",
+      "configuration": {
+        "followed_default": [],
+        "grow_policy": null,
+        "note": "`passed` is what the harness handed the estimator, where None means UNSET. `followed_default` is that subset, and it is the only subset a package default change can invalidate. `shipped_at_record` is what the matching sklearn.py constant held when this run was taken, chosen per grow policy because symmetrictree resolves an unset key from CatBoost's constant and every other policy from LightGBM's. verify.anchor_staleness compares the two",
+        "passed": {
+          "lambda_l2": 0.0,
+          "learning_rate": 0.1
+        },
+        "shipped_at_record": {
+          "lambda_l2": 1.0,
+          "learning_rate": 0.1
+        }
+      },
+      "data_kind": "real",
+      "dataset": "year_prediction_msd",
+      "device": "gpu",
+      "environment": {
+        "arch": "arm64",
+        "cpu_model": "Apple M4"
+      },
+      "primary_metric": "rmse",
+      "quality": {
+        "mae": 6.381157374445314,
+        "r2": 0.29587600345733034,
+        "rmse": 9.10606505792536
+      },
+      "recorded_from": {
+        "git_commit": "fed4ed79fc285e4a5cbfd535053c004301dc7dda",
+        "recorded_at": "2026-08-17",
+        "recorded_by": "Andrew Hendel, adopted by instruction in session cascadeprojects-49bb",
+        "run_id": "20260817T205811Z-e2e"
+      },
+      "scenario": "dense_regression",
+      "tier": "standard",
+      "trees": 100,
+      "value": 9.10606505792536,
+      "why": "Adopted 2026-08-17 as the FIRST anchors this repository has ever held. Until this commit `anchors` was empty, which meant the accuracy gate covered nothing and, worse, that `check_differential`'s deliberate narrowing to the mojotrees/cpu pair handed every variant arm and every GPU row to a gate that held nothing at all. Adopted from run 20260817T205811Z-e2e, which verifies 49 pass and 0 fail, and which is the first run taken after the prediction rewrite, so its numbers describe the code that ships rather than the code that preceded it. Adopted so that ACCURACY_BUDGET section 14's 0.25 percent per-scenario veto, and every pricing decision behind it including device-side MVS, has a fixed point to measure against. NOTE that every parameter in this arm's `configuration.passed` was named by the harness and none was left unset, so `followed_default` is empty and no package default change can make this entry stale. It goes stale only when the run is superseded deliberately."
+    }
+  },
+  "version": 1
 }

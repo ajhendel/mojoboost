@@ -1824,6 +1824,21 @@ def check_accuracy_anchor(ok, config, verdict, anchors=None):
         )
 
 
+def _run_id_of(results_path):
+    """The run id, whichever of the two accepted spellings the caller used.
+
+    `verify.py` takes either the run directory or the `records.json` inside
+    it, and its usage line shows the second first, so a naive basename gets
+    the run id right only when the caller happened to pass the directory.
+    Peels a trailing file component, so both spellings give the directory's
+    name, which IS the run id.
+    """
+    trimmed = os.path.normpath(results_path)
+    if os.path.isfile(trimmed) or trimmed.endswith(".json"):
+        trimmed = os.path.dirname(trimmed)
+    return os.path.basename(os.path.normpath(trimmed))
+
+
 def propose_anchors(ok, config, path, results_path):
     """Write a CANDIDATE anchor file for a person to read and move into place.
 
@@ -1892,7 +1907,20 @@ def propose_anchors(ok, config, path, results_path):
             # is judged UNKNOWN and does not gate.
             "configuration": anchor_configuration(record),
             "recorded_from": {
-                "run_id": os.path.basename(os.path.normpath(results_path)),
+                # The run DIRECTORY's name, which is the run id, and not
+                # whatever leaf the caller happened to type. `verify.py`
+                # accepts either `results/<run-id>` or
+                # `results/<run-id>/records.json`, and the second spelling is
+                # the one its own usage line shows first, so the naive
+                # basename recorded `run_id: "records.json"` on every anchor
+                # proposed the documented way. An anchor is a fixed point that
+                # a later reader has to be able to trace back to the run that
+                # produced it, so a provenance field that says "records.json"
+                # is the one field that cannot be allowed to be wrong. Caught
+                # on 2026-08-17 while adopting the first anchors this
+                # repository has ever held, which is the first time the field
+                # was ever read.
+                "run_id": _run_id_of(results_path),
                 "git_commit": (environment.get("git") or {}).get("commit"),
                 "recorded_at": None,
                 "recorded_by": None,
