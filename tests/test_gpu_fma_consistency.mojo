@@ -14,9 +14,16 @@ ways in that module and reached from three different arms of a GPU round:
   `_update_raw_kernel`        `node` comes per-thread from the leaf-assignment
                               array. Reached from the bagging and all-rows
                               arms (`train_gpu.mojo`, `gpu_fused_round.mojo`).
-  `_range_add_raw_kernel`     `node` is a launch argument, so the product is
-                              uniform across the launch. Reached only from
-                              `update_raw_ranges_per_leaf`, the reference arm.
+  `_range_add_raw_kernel`     no multiply either, since 2026-08-18. It used
+                              to take `node` as a launch argument and
+                              multiply in the kernel, on the argument that a
+                              product uniform across the launch is hoisted
+                              and rounded on its own. NVIDIA disproved that:
+                              NVPTX contracted it and this arm became the
+                              only one of the three to disagree, by one ulp
+                              on 1841 and 2225 of 3000 rows. Reached only
+                              from `update_raw_ranges_per_leaf`, the
+                              reference arm, which is why it mattered.
   `_range_table_add_raw_kernel`  no multiply at all: the host computes
                               `Float32(lr) * Float32(value)` and ships the
                               step. Reached from the device-resident path.

@@ -718,13 +718,22 @@ def _update_raw_kernel(
     It used to compute `raw[i] + learning_rate * value[node]` inline, and
     because `node` is read per-thread out of `leaf_ids` the product varied
     across the launch and the device compiler contracted it into the add.
-    The two range kernels below do not contract: the per-leaf one takes
-    `node` as a launch argument, so its product is uniform and gets hoisted
-    and rounded on its own, and the range-table one has no multiply left in
-    it at all. So the same arithmetic on the same tree produced one answer
-    from this kernel and a different one, by one unit in the last place,
-    from either range kernel, and which one a fit got depended on nothing
-    but whether it was bagged.
+    So the same arithmetic on the same tree produced one answer from this
+    kernel and a different one, by one unit in the last place, from either
+    range kernel, and which one a fit got depended on nothing but whether it
+    was bagged.
+
+    **THE ORIGINAL VERSION OF THIS PARAGRAPH ALSO EXPLAINED WHY THE PER-LEAF
+    RANGE KERNEL WAS SAFE, AND THAT EXPLANATION WAS WRONG.** It said the
+    per-leaf kernel takes `node` as a launch argument, so its product is
+    uniform and "gets hoisted and rounded on its own". Uniformity is not a
+    reason an LLVM-based backend declines to emit `fma.rn.f32`, and NVPTX
+    did not decline: on the first NVIDIA run this package ever had, the
+    per-leaf arm was the only one of the three that disagreed. The argument
+    was an observation about Metal's compiler stated as a property of
+    compilers, and it survived review because the one device available
+    agreed with it. All three arms now multiply on the host, so the claim
+    below is a structural one rather than a prediction about an optimizer.
 
     The multiply now happens on the host, exactly as
     `_range_table_add_raw_kernel` documents at length: `Float32(lr) *
@@ -748,17 +757,15 @@ def _update_raw_kernel(
 def _range_add_raw_kernel(
     rows: MutPointer[Int32, MutAnyOrigin],
     raw: MutPointer[Float32, MutAnyOrigin],
-    values: MutPointer[Float32, MutAnyOrigin],
     begin: Int32,
     count: Int32,
-    node: Int32,
     n_classes: Int32,
     k: Int32,
-    learning_rate: Float32,
+    step: Float32,
 ):
     """`_update_raw_kernel` for one leaf of a compacted tree: every row in
     the leaf's contiguous slice of the active-row permutation advances by
-    `learning_rate * value[node]`.
+    `step`, the already-shrunk value of the leaf the range belongs to.
 
     Under active-row compaction (gpu_active_rows.mojo) there is no per-row
     leaf-assignment array to look a value up in; instead each live leaf owns
@@ -766,15 +773,60 @@ def _range_add_raw_kernel(
     exactly that leaf's rows. A row outside every range (out of bag) is
     never touched, the same contract `_update_raw_kernel` has for unrouted
     rows.
+
+    Why this takes a step and not a value buffer and a learning rate
+    ----------------------------------------------------------------
+    **THIS KERNEL USED TO COMPUTE `raw[i] + learning_rate * values[node]`
+    INLINE, AND ON NVIDIA THAT WAS A DIFFERENT ANSWER.** It was believed
+    safe on a stated argument, which this docstring and
+    `_update_raw_kernel`'s both carried: `node` is a launch argument, so the
+    product is uniform across the launch, so it "gets hoisted and rounded on
+    its own" rather than contracting into the add.
+
+    That argument was an observation about one device compiler written down
+    as a property of compilers. Metal's declined the fusion. NVPTX takes it.
+    Mojo's `--fp-mode` defaults to `contract=fast`, which permits `a + b*c`
+    to fuse across statements, and uniformity is not a reason an LLVM-based
+    backend would decline to emit `fma.rn.f32`. On the first NVIDIA run this
+    package ever had, this arm disagreed with the other two by one unit in
+    the last place on 1841 of 3000 rows in one comparison and 2225 of 3000
+    in another, while the two arms that multiply on the host agreed with
+    each other to the bit.
+
+    One ulp is not the problem. Both roundings are valid IEEE 754 results
+    and neither answer is wrong in absolute terms. The problem is that these
+    three arms are asserted EQUAL, in `tests/test_gpu_fma_consistency.mojo`,
+    precisely so that a trained model cannot depend on which arm ran, and
+    that equality is what the determinism guarantee and the bit-identical
+    host replica both rest on. An arm that agrees on Metal and disagrees on
+    CUDA has not got a small error, it has lost the property it exists to
+    provide.
+
+    So the multiply moves to the host, which is fix (a) of the two portable
+    fixes this package uses for contraction. It is the right one here rather
+    than an explicit `fma` because the product is loop-invariant: `node` was
+    already a launch argument, so the value being multiplied is one number
+    per launch and computing it per thread was wasted work as well as a
+    hazard. `update_raw_ranges_per_leaf` now evaluates `lr32 *
+    Float32(values[node])`, which is the identical expression, in the
+    identical form, that `update_raw_ranges` evaluates for `SEG_STEP`. The
+    two arms are therefore equal by construction on every backend at every
+    optimization level, which is the guarantee the old argument only
+    approximated. The other portable fix, writing the contraction out as an
+    explicit `fma`, is used at `gpu_split_search.mojo` where the product is
+    genuinely per-element and cannot be hoisted.
+
+    There is no multiply left in this kernel and nothing for any compiler to
+    fuse, on any backend, at any release. That sentence was already true of
+    `_update_raw_kernel` and of `_range_table_add_raw_kernel`; it is now
+    true of the third arm, and the three-way equality no longer depends on
+    three compilers making the same discretionary choice.
     """
     var j = global_idx.x
     if j < Int(count):
         var r = Int(rows[unsafe_offset = Int(begin) + j][0])
         var i = r * Int(n_classes) + Int(k)
-        raw[unsafe_offset=i] = (
-            raw[unsafe_offset=i][0]
-            + learning_rate * values[unsafe_offset = Int(node)][0]
-        )
+        raw[unsafe_offset=i] = raw[unsafe_offset=i][0] + step
 
 
 # One device-side range descriptor, in Int32 words. `SEG_START` is where this
@@ -857,17 +909,22 @@ def _range_table_add_raw_kernel(
 
     Why this takes a step and not a value and a learning rate
     ---------------------------------------------------------
-    The per-leaf kernel computes `raw[i] + learning_rate * value[node]`.
-    Writing the same expression here produced a different last bit, and the
-    reason is instructive: in the per-leaf kernel `node` is a launch
-    argument, so `learning_rate * value[node]` is uniform across the launch
-    and is computed and rounded to Float32 on its own; here the leaf a
-    thread lands on is per-thread, so the product varied across the launch
-    and the device compiler contracted the multiply and the add into a
-    single fused multiply-add, which rounds once instead of twice.
-    Both are legitimate Float32 evaluations of the same expression and they
-    differ by one unit in the last place, which is enough to make a model
-    not byte-identical to the one this lane started from.
+    The per-leaf kernel used to compute `raw[i] + learning_rate *
+    value[node]`. Writing the same expression here produced a different last
+    bit, because here the leaf a thread lands on is per-thread, so the
+    product varied across the launch and the device compiler contracted the
+    multiply and the add into a single fused multiply-add, which rounds once
+    instead of twice. Both are legitimate Float32 evaluations of the same
+    expression and they differ by one unit in the last place, which is
+    enough to make a model not byte-identical to the one this lane started
+    from.
+
+    This paragraph used to go on to say that the per-leaf kernel was exempt
+    because its `node` is a launch argument, making the product uniform
+    across the launch and so hoisted and rounded on its own. **That was
+    false on NVIDIA**, where the per-leaf arm contracted and became the only
+    one of the three to disagree. It multiplies on the host now too, for the
+    reasons written out at `_range_add_raw_kernel`.
 
     Rather than fight the contraction, the multiply is moved to the host,
     where `Float32(learning_rate) * Float32(value)` is the same IEEE 754
@@ -1248,11 +1305,6 @@ struct GpuObjectiveState(Movable):
     """Softmax probabilities in the same layout, or a placeholder when
     `n_classes == 1` and on a `multi_output` state, whose outputs are
     uncoupled and so have nothing to normalize over."""
-    var value_dev: DeviceBuffer[DType.float32]
-    """The current tree's node values, the lookup table the per-leaf range
-    kernel reads. It is the only kernel that still applies the learning rate
-    itself, and it may because its `node` is a launch argument; every other
-    update arm reads `step_dev` instead."""
     var seg_dev: DeviceBuffer[DType.int32]
     """The current tree's live-range descriptors, `SEG_WORDS` Int32 apiece,
     which is what lets `update_raw_ranges` close a whole tree in one launch
@@ -1288,19 +1340,6 @@ struct GpuObjectiveState(Movable):
     plane survives here because `_update_raw_kernel`'s node ids arrive
     per-row out of a leaf-assignment array and there is no descriptor to
     hang a step on."""
-    var stage_value: HostBuffer[DType.float32]
-    """Pinned staging for the node-value table. `map_to_host` copies in both
-    directions on every use and blocks (the reasoning is written out in
-    histogram_gpu.mojo), so the per-tree upload goes through an ordinary
-    one-way copy out of this buffer instead.
-
-    One-way, not asynchronous. On Metal `enqueue_copy` is a synchronous
-    full-queue drain in both directions, **measured** by disassembly and
-    recorded in `docs/GPU_PORTABILITY.md` section 6.1, so what this buys over
-    the mapping is the second direction's bytes and not the drain. The drain
-    is still there, once per tree, and under section 6.1.1 it is an ordering
-    point rather than a time: nothing is queued behind it and no host decision
-    reads a device answer through it."""
     var stage_seg: HostBuffer[DType.int32]
     """Pinned staging for `seg_dev`, on the same grounds. Since the step
     moved into the descriptor this is the whole of what
@@ -1311,7 +1350,7 @@ struct GpuObjectiveState(Movable):
     mapping, which is a per-tree bidirectional transfer this lane counted
     and deliberately did not touch."""
     var stage_weight: HostBuffer[DType.float32]
-    """Pinned staging for `weight_dev`, on the same grounds as `stage_value`,
+    """Pinned staging for `weight_dev`, on the same grounds as `stage_seg`,
     and allocated by the first `refresh_weights` rather than at construction:
     an unbootstrapped fit never refreshes its weights and must not pay
     `4 * n_rows` of pinned memory for a buffer it will not write.
@@ -1448,7 +1487,6 @@ struct GpuObjectiveState(Movable):
         self.prob_dev = ctx.enqueue_create_buffer[DType.float32](
             n_scores if (n_classes > 1 and not multi_output) else 1
         )
-        self.value_dev = ctx.enqueue_create_buffer[DType.float32](max_nodes)
         self.seg_dev = ctx.enqueue_create_buffer[DType.int32](
             max_nodes * SEG_WORDS
         )
@@ -1478,9 +1516,6 @@ struct GpuObjectiveState(Movable):
         )
         self.part_pending = 0
         self.host_raw = ctx.enqueue_create_host_buffer[DType.float32](n_scores)
-        self.stage_value = ctx.enqueue_create_host_buffer[DType.float32](
-            max_nodes
-        )
         self.stage_seg = ctx.enqueue_create_host_buffer[DType.int32](
             max_nodes * SEG_WORDS
         )
@@ -1598,15 +1633,16 @@ struct GpuObjectiveState(Movable):
 
         Cost and cadence
         ----------------
-        `4 * n_rows` host to device per tree, plus one drain. That is the
-        same shape and the same cadence as `_stage_values`, and a third of
-        the traffic a host-gradient round already pays; it is not on the
-        default path at all, because nothing calls this unless a bootstrap is
-        configured.
+        `4 * n_rows` host to device per tree, plus one drain. That is a
+        third of the traffic a host-gradient round already pays; it is not on
+        the default path at all, because nothing calls this unless a
+        bootstrap is configured.
 
-        The drain is the difference from `_stage_values`, which argues it can
-        skip one because the round's magnitude reduction synchronizes before
-        the staging arena is rewritten. This cannot borrow that argument:
+        The drain is the difference from the node-value upload that used to
+        sit beside this one (`_stage_values`, deleted 2026-08-18 with the
+        last kernel that read it). That upload argued it could skip a drain,
+        because the round's magnitude reduction synchronizes before the
+        staging arena is rewritten. This cannot borrow that argument:
         `GpuHistogramBuilder.set_scale_refresh` can defer that reduction by up
         to `SCALE_WINDOW_MAX` rounds, so on a windowed fit there is no
         guaranteed drain between two calls here and the pinned buffer could be
@@ -1949,47 +1985,6 @@ struct GpuObjectiveState(Movable):
             if not isfinite(values[i]):
                 raise Error("node values must be finite")
 
-    def _stage_values(mut self, ctx: DeviceContext, values: List[Float64]
-    ) raises:
-        """Upload the tree's node values through pinned staging.
-
-        This replaces a `map_to_host` on `value_dev`. The two are not the
-        same transfer: a mapping is bidirectional, so it moved the buffer
-        both ways every time it was opened. A staged copy is one-way, which
-        is the convention histogram_gpu.mojo documents and the split
-        searcher already follows for its per-node tables.
-
-        One-way is the whole difference on Metal, and the earlier version of
-        this docstring claimed more. It said the staged copy was
-        asynchronous where the mapping blocked. It is not: on Metal
-        `enqueue_copy` is a synchronous full-queue drain in both directions,
-        **measured** by disassembly of the shipped runtime and recorded in
-        `docs/GPU_PORTABILITY.md` section 6.1. So this call still drains once
-        per tree, exactly as the mapping did, and a round's **hazard** budget
-        has to carry it.
-
-        Its **time** budget does not, and section 6.1.1 is why. A drain of a
-        queue holding nothing costs nothing; this upload blocks on no device
-        answer and nothing enqueued is waiting behind it, so it is an ordering
-        point and not a round trip. The two counts are separate and only the
-        round-trip count predicts seconds.
-
-        The staging contract is the usual one and is kept for the backend
-        where the copy really is asynchronous: the pinned buffer must not be
-        rewritten while a copy out of it is in flight. It is rewritten once
-        per tree, and the next tree's growth blocks on the device well
-        before it reaches this point (the round's magnitude reduction alone
-        synchronizes), so the copy has long retired.
-
-        Words past `len(values)` are whatever the previous tree left, which
-        is exactly what the mapping left there too: no kernel reads a node
-        id at or beyond the current tree's node count.
-        """
-        var dst = self.stage_value.unsafe_ptr()
-        for i in range(len(values)):
-            dst.unsafe_store(i, Float32(values[i]))
-        ctx.enqueue_copy(dst_buf=self.value_dev, src_ptr=dst)
-
     def update_raw_ranges(
         mut self,
         ctx: DeviceContext,
@@ -2142,15 +2137,29 @@ struct GpuObjectiveState(Movable):
         """The launch-per-leaf range update, kept as the reference arm.
 
         This is what `update_raw_ranges` issued before the range table
-        existed, minus the `map_to_host` on the node-value buffer, which the
-        staged copy replaces here as well so that the only difference
-        between the two arms is the launch shape. Nothing in the trainer
-        calls it; it exists so a test can run both over the same state and
-        compare the resulting raw scores bit for bit, which is a stronger
-        statement about the rewrite than any argument about it.
+        existed. Nothing in the trainer calls it; it exists so a test can run
+        both over the same state and compare the resulting raw scores bit for
+        bit, which is a stronger statement about the rewrite than any
+        argument about it.
+
+        Being the oracle is exactly why the contraction here mattered. A
+        reference arm that rounds differently from the arm it certifies does
+        not weaken the test, it inverts it: the equality still passes on the
+        backend both were written on and fails on the first backend that
+        chooses otherwise, which is what NVIDIA did. See
+        `_range_add_raw_kernel` for the full account.
+
+        `lr32 * Float32(values[node])` below is character for character the
+        expression `update_raw_ranges` evaluates for `SEG_STEP`, in the same
+        form and in the same place, so the two arms ship the same bits to
+        their kernels and neither kernel contains a multiply. The node-value
+        staging that used to precede this loop is gone with the buffer read
+        that justified it; the host already holds `values`, so copying it to
+        the device to read one entry per launch was a device round trip to
+        recover a number that never left.
         """
         self._check_range_update(values, learning_rate, k)
-        self._stage_values(ctx, values)
+        var lr32 = Float32(learning_rate)
         for node in range(rows.ranges.n_nodes()):
             if node >= len(values):
                 break
@@ -2164,13 +2173,11 @@ struct GpuObjectiveState(Movable):
             ctx.enqueue_function[_range_add_raw_kernel](
                 rows.rows_dev.unsafe_ptr(),
                 self.raw_dev.unsafe_ptr(),
-                self.value_dev.unsafe_ptr(),
                 Int32(window.begin),
                 Int32(n),
-                Int32(node),
                 Int32(self.n_classes),
                 Int32(k),
-                Float32(learning_rate),
+                lr32 * Float32(values[node]),
                 grid_dim=blocks,
                 block_dim=self.block_threads,
             )
@@ -3960,7 +3967,7 @@ struct GpuRankingState(Movable):
     var stage_off: HostBuffer[DType.int32]
     var stage_pair: HostBuffer[DType.int32]
     """Pinned staging for the two pair planes, on the same grounds as
-    `GpuObjectiveState.stage_value`: `map_to_host` copies in both directions on
+    `GpuObjectiveState.stage_seg`: `map_to_host` copies in both directions on
     every use, so a per-round upload goes through a one-way copy instead.
     Allocated by the first `refresh_pairs`, never at construction, so a
     QueryRMSE fit pays nothing for a buffer it will not write."""

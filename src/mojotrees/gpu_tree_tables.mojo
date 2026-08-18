@@ -174,14 +174,32 @@ product to a local does not stop it, and that the only stable fix is to move
 a multiply out of a kernel entirely. Two incidents in this optimization round
 came from a multiply moving relative to an add.
 
-This kernel is therefore built so that the question does not arise. **It
-introduces no floating-point arithmetic of any kind.** Gains are compared,
-never combined. Leaf values, the split gain, and the child statistics are
-copied word for word out of the split record that
-`gpu_split_search._reduce_slots_block_kernel` already wrote, so every float
-this module stores was produced by an expression this module does not
-contain. There is no multiply and no add on the gain path here, so there is
-nothing for the optimizer to fuse.
+`_pick_and_commit_kernel` is therefore built so that the question does not
+arise. It introduces no floating-point arithmetic of any kind: gains are
+compared, never combined, and the leaf values, the split gain and the child
+statistics are copied word for word out of the split record that
+`gpu_split_search._reduce_slots_block_kernel` already wrote. There is no
+multiply and no add on that kernel's gain path, so there is nothing for the
+optimizer to fuse there.
+
+**THAT SENTENCE USED TO BE WRITTEN ABOUT THE WHOLE MODULE, AND AS A MODULE
+CLAIM IT IS FALSE.** It said "every float this module stores was produced by
+an expression this module does not contain", which was true when the module
+held one commit kernel and stopped being true when `_commit_level_kernel`
+arrived for the oblivious path. That kernel dequantizes with four Float32
+multiplies (`:2026-2029`) and feeds the products straight into
+`gpu_leaf_value`, whose `h + lambda_l2` is a contractable multiply-add
+producing a **stored leaf value**. So this module both contains float
+arithmetic and stores the results of it.
+
+The correction is worth more than the sentence. On 2026-08-18 NVIDIA ran
+this package for the first time and NVPTX contracted a multiply Metal had
+declined to contract, which is exactly the divergence the paragraph above
+warns about; the arm it bit had its own comment explaining why it was exempt.
+A scope claim like the old one is worse than no claim, because it is the
+reason a contributor does not read the kernel underneath it. Anyone adding a
+kernel here inherits the contraction rule and gets no exemption from this
+docstring.
 
 All of the kernel's own arithmetic is integer and exact: `begin + n_left` for
 the right child's window, `depth + 1` for the children's depth,
