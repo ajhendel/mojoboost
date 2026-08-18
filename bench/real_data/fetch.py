@@ -74,7 +74,34 @@ def _download(url, destination):
                 sys.stderr.write(f"\r  {done >> 20} MiB")
             sys.stderr.flush()
     sys.stderr.write(f"\r  {done >> 20} MiB in {time.time() - started:.1f}s\n")
-    shutil.move(partial, destination)
+    try:
+        shutil.move(partial, destination)
+    except PermissionError:
+        # THE DESTINATION IS PROBABLY FLAGGED IMMUTABLE, AND THAT IS
+        # DELIBERATE. On 2026-08-18 the cached datasets were flagged with the
+        # macOS `uchg` bit, because this directory defaults to
+        # `bench/real_data/data`, which is INSIDE the git repository, and
+        # `git clean -xfd` deletes gitignored files. In a checkout shared by
+        # three concurrent sessions that put 227 MB of benchmark corpus one
+        # routine command away from gone, including covertype and year, which
+        # every performance number of that day came from.
+        #
+        # Reading a flagged file is unaffected. Replacing one is not: a rename
+        # over an immutable destination fails with EPERM before the filesystem
+        # is touched, which is exactly the protection working. The download
+        # itself succeeded and is kept, so nothing has to be re-fetched.
+        raise SystemExit(
+            f"fetch: downloaded {destination} but could not replace the "
+            f"existing file, which is flagged immutable.\n\n"
+            f"That flag is deliberate; see tools/protect_datasets.sh. To "
+            f"replace this dataset:\n\n"
+            f"    tools/protect_datasets.sh unlock\n"
+            f"    <re-run this fetch>\n"
+            f"    tools/protect_datasets.sh lock\n\n"
+            f"The download is kept at {partial}, so nothing is lost. If you "
+            f"did NOT mean to replace a pinned dataset, delete that file and "
+            f"leave the flag alone."
+        )
     return destination
 
 
