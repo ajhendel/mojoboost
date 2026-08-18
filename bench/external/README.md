@@ -70,6 +70,33 @@ Report all three. The honest sentence is that we beat or lose to stock
 LightGBM by X and to reproducible LightGBM by Y, and that we are reproducible
 in both cases.
 
+## Two tiers, and when a cached competitor number is allowed
+
+Running the competitor arms every time is not always worth it, and running
+them never is not an option. The line between those falls in a specific
+place.
+
+**Their published numbers are unusable.** gbm-bench's posted results are
+NVIDIA GPUs and Linux server CPUs. Nothing in them constrains a MacBook, so
+every competitor number we quote has to be measured here at least once.
+
+**Tier 1, development loop.** Run the mojotrees arms only and read them
+against `competitor_baselines.json` in the results directory, which holds
+competitor medians measured on this machine. Fast, and honest as long as the
+gap is wide. This box drifts up to about 22% between thermal windows (`year`
+lgbm-cpu ranged 24.152 to 29.553 across three repeats in one sitting), so a
+cached comparison is meaningful only when the gap is much larger than that.
+At the 4.5x we currently sit behind on covtype, cached is fine.
+
+**Tier 2, anything anyone else will read.** Every arm interleaved inside one
+process, repeated, spread reported. No exceptions, and in particular no
+comparison inside 25% is ever settled from a cached number.
+
+The saving is smaller than it looks, which is worth knowing before optimizing
+for it. On the covtype pass the four competitor arms cost 41.2s together
+while our two cost 68.97s. Dropping the competitors saves about 37% of a run.
+We are the expensive part.
+
 ## Conditions on any number that leaves this machine
 
 These are the same rules the internal harness already follows, and they apply

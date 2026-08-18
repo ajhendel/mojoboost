@@ -68,6 +68,46 @@ Apple M4, 10 cores, 16 GB, macOS 26.5.2, AC power, no thermal warning.
 Python 3.14.6, mojotrees 0.1.0a4, LightGBM 4.7.0, NumPy 2.5.2.
 Raw harness output in `run_1.json`, `run_2.json`, `run_3.json`.
 
+## covtype, and a worse loss with an explanation
+
+`covtype` = 581,012 x 54, 7 classes, 100 rounds, so 700 trees. Six arms
+interleaved, three repeats.
+
+| arm | median s | min | max | accuracy |
+| --- | --- | --- | --- | --- |
+| lgbm-cpu | 9.024 | 7.93 | 9.33 | 0.8849 |
+| lgbm-cpu-det | 9.677 | 8.04 | 10.85 | 0.8849 |
+| xgb-cpu | 9.679 | 7.40 | 10.12 | 0.8560 |
+| cat-cpu | 12.826 | 9.18 | 13.92 | 0.7948 |
+| mojotrees-cpu | 28.077 | 25.85 | 35.41 | 0.8832 |
+| **mojotrees-gpu** | **40.894** | 40.21 | 41.38 | 0.8804 |
+
+4.5x behind LightGBM, 4.2x behind XGBoost, 3.2x behind CatBoost, and 1.45x
+slower than our own CPU arm. Our spread is 2.9%, so nothing here is noise.
+Accuracy is second best in the field, so this is a speed result and not a
+quality one.
+
+**The GPU arm losing to our own CPU arm is the finding.** It also contradicts
+the 1.63x multiclass GPU win in our own records at a similar shape
+(465,000 x 54 x 7), which means the difference is the parameters, not the
+data.
+
+**The parameters are the explanation, and it is checkable.** gbm-bench sets
+`num_leaves=256` with `max_depth=8`, and two to the eighth is 256, so that
+is a complete depth-8 tree. Leaf-wise growth has no freedom at those
+settings: it must build the full shape anyway, while paying 255 sequential
+leaf elections to produce what 8 level elections would produce. At 700 trees
+that is about 178,500 elected splits against 40.894s, roughly 228
+microseconds per elected split. The host-step profile from 1d77414 puts
+encode at 85.7% of host time with `device_wait` at exactly zero, so the
+prediction is that this shape is host-bound on per-split encode and not
+waiting on the device at all. That is falsifiable by running the profile on
+this shape, which costs minutes.
+
+**Why `higgs` is not the next run.** It costs hours and would return another
+number without an explanation. The per-split host cost is what both losses
+have in common, and it is measurable on a shape already on disk.
+
 ## Next
 
 The open question this raises is where the crossover actually sits in the

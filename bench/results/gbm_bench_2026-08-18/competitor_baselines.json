@@ -1,0 +1,80 @@
+{
+  "note": "Competitor baselines measured on THIS machine. Valid for steering a development loop, NOT for publication: this box drifts up to ~22% between thermal windows, so any comparison inside 25% must be re-measured with the arms interleaved in one process.",
+  "machine": "Apple M4, 10 cores, 16GB, macOS 26.5.2, AC power",
+  "harness": "NVIDIA/gbm-bench 73a976b",
+  "measured": "2026-08-18",
+  "datasets": {
+    "covtype": {
+      "ntrees": 100,
+      "repeats": 3,
+      "arms": {
+        "cat-cpu": {
+          "median": 12.826,
+          "min": 9.179,
+          "max": 13.918,
+          "spread_pct": 51.6
+        },
+        "lgbm-cpu": {
+          "median": 9.024,
+          "min": 7.93,
+          "max": 9.33,
+          "spread_pct": 17.7
+        },
+        "lgbm-cpu-det": {
+          "median": 9.677,
+          "min": 8.045,
+          "max": 10.852,
+          "spread_pct": 34.9
+        },
+        "mojotrees-cpu": {
+          "median": 28.077,
+          "min": 25.846,
+          "max": 35.412,
+          "spread_pct": 37.0
+        },
+        "mojotrees-gpu": {
+          "median": 40.894,
+          "min": 40.206,
+          "max": 41.376,
+          "spread_pct": 2.9
+        },
+        "xgb-cpu": {
+          "median": 9.679,
+          "min": 7.4,
+          "max": 10.118,
+          "spread_pct": 36.7
+        }
+      }
+    },
+    "year": {
+      "ntrees": 500,
+      "repeats": 3,
+      "arms": {
+        "lgbm-cpu": {
+          "median": 28.941,
+          "min": 24.152,
+          "max": 29.553,
+          "spread_pct": 22.4
+        },
+        "lgbm-cpu-det": {
+          "median": 29.18,
+          "min": 26.231,
+          "max": 29.257,
+          "spread_pct": 11.5
+        },
+        "mojotrees-cpu": {
+          "median": 47.175,
+          "min": 39.564,
+          "max": 49.037,
+          "spread_pct": 23.9
+        },
+        "mojotrees-gpu": {
+          "median": 34.407,
+          "min": 31.228,
+          "max": 36.298,
+          "spread_pct": 16.2
+        }
+      }
+    }
+  }
+}

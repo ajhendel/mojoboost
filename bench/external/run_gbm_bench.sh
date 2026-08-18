@@ -18,7 +18,16 @@ DATA="${GBM_BENCH_DATA:-$REPO_ROOT/bench/external/.gbm-datasets}"
 
 DATASET="${1:?dataset required (airline, year, higgs, epsilon, football, fraud, bosch, url)}"
 NTREES="${2:?ntrees required}"
-ALGOS="${3:-mojotrees-cpu,mojotrees-gpu,lgbm-cpu,cat-cpu,xgb-cpu}"
+# Tier 1 (ours only, read against competitor_baselines.json) is what a
+# development loop wants; tier 2 (every arm interleaved) is what anything
+# publishable requires. See bench/external/README.md.
+if [ "${3:-}" = "ours" ]; then
+  ALGOS="mojotrees-cpu,mojotrees-gpu"
+elif [ "${3:-}" = "full" ] || [ -z "${3:-}" ]; then
+  ALGOS="mojotrees-cpu,mojotrees-gpu,lgbm-cpu,lgbm-cpu-det,cat-cpu,xgb-cpu"
+else
+  ALGOS="$3"
+fi
 
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 OUT="$REPO_ROOT/bench/results/gbm_bench_${DATASET}_${STAMP}.json"
