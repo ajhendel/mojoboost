@@ -931,6 +931,98 @@ def core_pool_name(pool: Int) -> String:
     return String("all")
 
 
+def _parse_first_two_ints(text: String) -> Tuple[Int, Int]:
+    """The first two whitespace-separated integers, or (0, 0)."""
+    var vals = List[Int]()
+    var cur = 0
+    var have = False
+    for i in range(text.byte_length()):
+        var b = Int(text.as_bytes()[i])
+        if b >= 48 and b <= 57:
+            cur = cur * 10 + (b - 48)
+            have = True
+        else:
+            if have:
+                vals.append(cur)
+                if len(vals) == 2:
+                    return (vals[0], vals[1])
+                cur = 0
+                have = False
+    if have:
+        vals.append(cur)
+    if len(vals) >= 2:
+        return (vals[0], vals[1])
+    if len(vals) == 1:
+        return (vals[0], 0)
+    return (0, 0)
+
+
+def cgroup_cpu_limit() -> Int:
+    """CPUs this process is actually allowed, or 0 when there is no limit.
+
+    **NOTHING IN THIS REPOSITORY READ A CGROUP QUOTA BEFORE 2026-08-18, AND
+    THAT IS A DEFECT ON EVERY CONTAINER RATHER THAN AN EXOTIC ONE.**
+    `num_physical_cores()` reports the HOST's topology. A cgroup limit is
+    enforced by the scheduler and is invisible to it. So in Docker, in
+    Kubernetes, on GitHub Actions, and on any customer cluster with a CPU
+    limit, every count derived from that number describes a machine we do not
+    have.
+
+    It was found on an NVIDIA container where `nproc` returned **256** against
+    a quota of **27.2 CPUs**, a factor of nine. Every task count, every grain
+    size, and every crossover threshold in this file was being computed against
+    that 256.
+
+    Cgroup v2 puts `"<quota> <period>"` in `/sys/fs/cgroup/cpu.max`, with the
+    literal `max` for no limit. v1 splits it across `cpu.cfs_quota_us` and
+    `cpu.cfs_period_us`, with `-1` for no limit. Both are microseconds, so the
+    allowance is `quota / period`.
+
+    **Rounds DOWN, and never below 1.** A quota of 27.2 CPUs becomes 27 rather
+    than 28, because rounding up asks the scheduler for more than it will give
+    and the whole point is to stop oversubscribing. A quota under one full CPU
+    still gets 1, since a pool of zero cannot run anything.
+
+    Returns 0 on macOS, on any unlimited cgroup, on a missing or unreadable
+    file, and on anything it cannot parse. **0 means "no opinion" and the
+    caller keeps the topology**, which is the right failure: a misparse must
+    not silently shrink a real machine's pool to nothing.
+
+    WHAT THIS DOES NOT DO. It does not resize MAX's own runtime pool, which
+    `sync_parallelize` dispatches into and which this package does not own.
+    `docs/design/DECLINED_OPTIMIZATIONS.md` F6 measured that pool converting
+    about 3.5x on a 10-core M4 and FLAT from 4 to 16 tasks, with six
+    environment variables changing nothing. So this fixes OUR arithmetic and
+    the question of whether `MOJOTREES_NUM_WORKERS` can reach MAX's pool at all
+    is separate and still open.
+    """
+    # v2 first: one file, and it is the modern layout.
+    try:
+        var v2 = open("/sys/fs/cgroup/cpu.max", "r").read()
+        var qp = _parse_first_two_ints(v2)
+        # `max <period>` parses as (period, 0) because `max` yields no digits,
+        # so a zero period is how "unlimited" arrives here.
+        if qp[1] > 0 and qp[0] > 0:
+            var n = qp[0] // qp[1]
+            return 1 if n < 1 else n
+        return 0
+    except:
+        pass
+    try:
+        var q = _parse_first_two_ints(
+            open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r").read()
+        )
+        var pr = _parse_first_two_ints(
+            open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r").read()
+        )
+        if q[0] > 0 and pr[0] > 0:
+            var n = q[0] // pr[0]
+            return 1 if n < 1 else n
+    except:
+        pass
+    return 0
+
+
 @fieldwise_init
 struct CpuProfile(Copyable, Movable):
     """Everything the CPU policy is allowed to know about the machine.
@@ -955,6 +1047,7 @@ struct CpuProfile(Copyable, Movable):
     var cache_line_bytes: Int
     var l1d_bytes: Int
 
+
     @staticmethod
     def detect() -> CpuProfile:
         """The running machine, with every count sanitized. A machine that
@@ -966,6 +1059,19 @@ struct CpuProfile(Copyable, Movable):
         var perf = _positive_or(num_performance_cores(), physical)
         if perf > physical:
             perf = physical
+        # THE CGROUP QUOTA CLAMPS THE TOPOLOGY, and see `cgroup_cpu_limit` for
+        # why this was a defect on every container. A limit of 0 means no
+        # opinion and leaves all three counts alone. A real limit clamps
+        # physical, and then logical and perf are re-clamped against it,
+        # because a machine that reports 256 cores behind a 27-CPU quota must
+        # not end up with more performance cores than physical ones.
+        var allowed = cgroup_cpu_limit()
+        if allowed > 0 and allowed < physical:
+            physical = allowed
+            if logical > physical:
+                logical = physical
+            if perf > physical:
+                perf = physical
         return CpuProfile(
             physical,
             logical,
