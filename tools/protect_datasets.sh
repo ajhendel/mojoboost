@@ -37,6 +37,27 @@ set -eu
 DATA="${GBM_DATASETS:-$HOME/gbm-datasets}"
 VAULT="${GBM_DATASETS_VAULT:-$HOME/gbm-datasets-vault}"
 
+# THE SECOND DATASET DIRECTORY, AND IT IS INSIDE THE GIT REPOSITORY.
+#
+# Added 2026-08-18. `bench/real_data/loaders.py::cache_dir` defaults to
+# `bench/real_data/data` when MOJOTREES_BENCH_DATA is unset, and on this
+# machine that directory held 227 MB of real datasets, unprotected, in a
+# SHARED CHECKOUT: adult, bank_marketing, covertype, rcv1_train_binary and
+# year_prediction_msd. Covertype and year are the two datasets every
+# performance number of 2026-08-18 came from.
+#
+# `git clean -xfd` deletes gitignored files. So the default location for the
+# benchmark corpus was the one place a routine command run by any of three
+# concurrent sessions could vaporize it, and it had been that way the whole
+# time we were worrying about `rm -rf`.
+#
+# It is covered here rather than moved, because moving it would orphan a cache
+# every existing result record was measured against. Point
+# MOJOTREES_BENCH_DATA outside the repository for new work and this directory
+# stops growing.
+REPO_DATA="${MOJOTREES_BENCH_DATA:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." \
+    && pwd)/bench/real_data/data}"
+
 usage() {
     cat <<USAGE
 usage: protect_datasets.sh <command>
@@ -58,6 +79,13 @@ flagged() { ls -lO "$1" 2>/dev/null | awk '{print $5}' | grep -q uchg; }
 cmd_lock() {
     [ -d "$DATA" ] || { echo "no dataset directory at $DATA"; exit 1; }
     find "$DATA" -type f -exec chflags uchg {} + 2>/dev/null || true
+    # The in-repo cache is flagged but NOT vaulted. Flagging stops rm and
+    # git clean, which is the whole exposure; mirroring it would double 227 MB
+    # of files that are re-downloadable from a pinned checksum, which the
+    # manual datasets in $DATA are not.
+    if [ -d "$REPO_DATA" ]; then
+        find "$REPO_DATA" -type f -exec chflags uchg {} + 2>/dev/null || true
+    fi
     mkdir -p "$VAULT"
     chflags nouchg "$VAULT" 2>/dev/null || true
     # -n never overwrites, so a corrupted working copy cannot poison the vault.
@@ -73,6 +101,9 @@ cmd_lock() {
 
 cmd_unlock() {
     find "$DATA" -type f -exec chflags nouchg {} + 2>/dev/null || true
+    if [ -d "$REPO_DATA" ]; then
+        find "$REPO_DATA" -type f -exec chflags nouchg {} + 2>/dev/null || true
+    fi
     find "$DATA" -type d -exec chflags nouchg {} + 2>/dev/null || true
     echo "unlocked $DATA (vault untouched).  Run 'lock' when the download finishes."
 }
@@ -90,6 +121,15 @@ cmd_status() {
         done || rc=1
     else
         echo "  (missing)"; rc=1
+    fi
+    echo "in-repo cache: $REPO_DATA"
+    if [ -d "$REPO_DATA" ]; then
+        find "$REPO_DATA" -type f | while read -r f; do
+            if flagged "$f"; then echo "  PROTECTED   $f"
+            else echo "  UNPROTECTED $f"; rc=1; fi
+        done
+    else
+        echo "  (none, MOJOTREES_BENCH_DATA points elsewhere or nothing cached)"
     fi
     echo "vault: $VAULT"
     if [ -d "$VAULT" ]; then
