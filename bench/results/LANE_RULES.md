@@ -431,6 +431,58 @@ The general form, worth carrying past benchmarks. **A number is a claim about a
 procedure, and a claim whose procedure is not recorded cannot be wrong, which is
 exactly why it cannot be trusted.**
 
+### 11. THE CPU PATH IS NOT AN ORACLE THAT MAY NOT BE OPTIMIZED. RETIRED 2026-08-18.
+
+The standing convention was that the CPU path exists to certify the GPU path
+and is therefore never optimized. It was never written in this file, which is
+part of why it outlived its premise for two days after the premise died.
+
+**The premise was that the GPU path is the fast one.** On 2026-08-18, in
+NVIDIA's gbm-bench on this M4, interleaved arms and three repeats: covtype
+581,012 x 54 over 7 classes, our CPU 28.077 s against our own GPU's 40.894 s.
+The CPU arm is 1.45x faster than our accelerator and it is 3.1x behind
+LightGBM's 9.024 s. **The oracle is the product.** A rule that forbids
+optimizing the fastest thing we ship costs the headline number and protects
+nothing.
+
+It also protected the wrong thing. The oracle's job is to certify that the
+device produces the right numbers, and it does that by being A correct
+implementation whose results are checked against the device's. It does not do
+that by being slow, and it does not do that by being frozen. The property that
+matters is that the two arms AGREE, not that either is unchanged since some
+past date.
+
+**The replacement is a classification, not a freeze.**
+
+**Tier 1, bit-identical, land freely.** A change that provably keeps the same
+Float64 additions in the same order is not an oracle question at all. It
+changes which address a byte loads from, how many features share a walk, how
+many fan-outs a node pays, or how wide an integer is. The gate is the digest,
+not a review: `bench/bench_serial_kernel.mojo` already prints a bitwise model
+digest per kernel arm and refuses to call two arms equal without it, and
+`tests/test_row_major_bins.mojo` and `tests/test_grow_bin_layout.mojo` already
+assert layout bit-identity through a whole grown tree. That harness exists;
+use it. Rule 5 then applies unchanged, so a bit-identical measured win flips
+the default in the same session.
+
+**Tier 2, arithmetic-changing, RE-ANCHOR rather than fork.** When a change
+moves CPU bits, do not keep the old kernel beside the new one. Record the
+absolute accuracy anchor and the CPU/GPU agreement figure at the pinned shapes
+BEFORE landing; land the change; regenerate the goldens in the same commit
+with the pre and post agreement figures both in the message; and keep the OFF
+SWITCH rather than the old code, because a bisection switch costs one branch
+and a duplicate kernel costs a maintainer forever.
+
+**Do not keep a slow reference implementation as a second path.** This
+repository has already tried that shape and priced it twice. The four
+`SERIAL_KERNEL_*` arms keep a pre-optimization scatter alive as `base` at the
+cost of ninety duplicated lines that must stay correct forever while nothing
+ships them. And `_env_layout_by_node` is the warning about what goes wrong: the
+switch did not reach the symmetric grower until 2026-08-17, so an earlier
+measurement of it recorded "neutral", and **neutral is what a switch that does
+not reach the code always measures.** An unexercised reference arm does not
+fail loudly, it rots into confident nulls.
+
 ## What you may run. This is a hard limit.
 
 **You may run ONLY:**
