@@ -639,6 +639,36 @@ rule 7. A stale refusal message is worse than a stale comment because a user
 obeys it. It is the one piece of prose in this repository that people act on
 without reading anything else.
 
+### 16a. THE RUN BAN IS FOR SUBAGENTS. THE ORCHESTRATOR MEASURES.
+
+Clarified by Andrew on 2026-08-18, and it replaces the reading everyone had
+been operating under.
+
+**Subagents run LOCAL TESTS ONLY.** A targeted test file, a build, a fit small
+enough to prove a claim. Never the suite, never a benchmark, never a timing,
+never a profile.
+
+**The orchestrator runs the suite and the measurements**, without asking per
+run. The old default of "run nothing until asked" was read as covering the
+orchestrator too, and the cost of that reading is on the record: 45 commits
+landed on 2026-08-18 including a default flip, a lifted depth bound, five
+refusal blocks that now fire where they previously could not, POLICY_VERSION
+from 8 to 10, a new refusal on rankers and a kernel rewrite in the oblivious
+commit path, and **the suite did not run against a single one of them.**
+
+Two of that day's bugs were caused by exactly that gap. A depth bound was
+raised, the build was green, and the commit message said the ceiling was gone
+while it still refused. And raising a constant disarmed a guard nobody knew
+was load bearing, which silently corrupted every oblivious tree deeper than 7
+for an hour. Both were caught by a targeted fit, which is a weaker instrument
+than the suite and happened to be enough.
+
+**Why the split is the right shape rather than a compromise.** A subagent
+cannot see whether another lane is mid-measurement, so a subagent that
+benchmarks is a subagent that corrupts somebody's numbers without knowing. The
+orchestrator can, because it declared the window. The restriction was never
+about trust or about compilers, it was about who holds the schedule.
+
 ### 16. WHEN A MEASUREMENT IS PENDING, THE BOX IS THE INSTRUMENT AND EXACTLY ONE PROCESS TOUCHES IT.
 
 Added 2026-08-18, and it REPLACES the older blanket rule that subagents never
