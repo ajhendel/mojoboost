@@ -46,6 +46,32 @@ project ran it there. The one column that has been exercised is Metal, and
 `gpu_backend_policy.backend_support` is where that difference is recorded so
 a reader cannot confuse the two.
 
+### 1.1 The contract has two counterparties
+
+The six rows above read as a contract between this project and a device API,
+and nothing in this tree talks to a device API. MAX does. So each row is
+really two claims. The API specifies the primitive, which is what the table
+records and what a specification can settle, and MAX lowers that primitive
+for that backend, which the table does not record and which no amount of
+reading this source can establish.
+
+The second claim is the load-bearing one on CUDA and HIP, and it is
+inherited. If MAX does not lower a threadgroup Int32 atomic add on HIP, or
+lowers a 2D grid onto a limit this code has never seen, the defect is
+upstream. This repository owns the reproduction and the bug report; it does
+not own the fix, and it has no per-backend code path to patch around one.
+Metal is the only backend where the pairing has been observed to hold, and it
+has been observed on exactly one M4.
+
+The practical reading for anyone looking at a status table in these docs.
+`portable-untested` never meant "this will work". It means no vendor-specific
+work stands between this source and that backend, which is a claim about
+design surface and a strong one. The residual risk does not live in the
+design surface. It lives in a compiler this project depends on and does not
+control, and the only instrument that can measure it is hardware. The
+procedure is in `docs/GPU_VALIDATION.md` and the cost is about an hour on a
+rented device.
+
 `gpu_portability.required_primitives(strategy)` returns this list per
 resolved histogram strategy. The two strategies differ by exactly one entry:
 `STRATEGY_TILED` writes each partial to a slot nothing else writes and

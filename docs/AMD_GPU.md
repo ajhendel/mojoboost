@@ -25,6 +25,14 @@ Training is not blocked by that level. Specialization is, through
 `parse_api` recognizes both spellings, `hip` and `rocm`, so
 `MOJOTREES_GPU_BACKEND=rocm` and `=hip` both name this backend.
 
+One thing that level does not cover. MAX compiles this source for HIP and
+this repository has no HIP code path of its own, so a lowering gap on this
+backend is an upstream defect and the work available here is a reproduction
+and a bug report rather than a patch. Section 1.1 of
+`docs/GPU_PORTABILITY.md` carries the full statement, and it applies with
+more force here than on CUDA, because HIP is the backend where the fewest
+people have exercised the toolchain ahead of you.
+
 ## CDNA and RDNA are two targets, not one
 
 The single most important thing on this page. A result from an MI210 or

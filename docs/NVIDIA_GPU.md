@@ -25,6 +25,13 @@ is specialization, through
 `gpu_portability.require_specializations_allowed`, and the refusal names
 `MOJOTREES_GPU_BACKEND_UNVALIDATED=1` as the acknowledged override.
 
+The other half of that sentence, and the reason "will run them" is a design
+claim rather than an observation. MAX compiles this source for CUDA; this
+repository has no CUDA code path of its own. Section 1.1 of
+`docs/GPU_PORTABILITY.md` carries the full statement. The short form is that
+a lowering gap on this backend is an upstream defect, and the work available
+here is a reproduction and a bug report rather than a patch.
+
 ## What the contract says here
 
 | Contract field | Value on CUDA | Why |

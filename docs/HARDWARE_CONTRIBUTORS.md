@@ -30,6 +30,74 @@ below is currently empty.
 | Apple M4 Pro, Max, Ultra | Whether the policy scales with GPU core count on Metal. Same generation as the recorded M4, so core count is the only variable. |
 | A machine where it does not work | The most under-supplied evidence there is. See [failures are results](#failures-and-unsupported-are-results). |
 
+## Which device, and how to get one
+
+This section answers two questions the rest of this document assumed you had
+already settled. Which board is worth an hour, and what to do if you do not own
+one.
+
+### Mojo has to support it first
+
+A device this project has never run is one question. A device the *compiler*
+does not target is a different one, and it is upstream of everything here.
+mojotrees has no per-backend code path, so a lowering gap in MAX is an upstream
+defect rather than a bug in this tree. See section 1.1 of
+[GPU_PORTABILITY.md](GPU_PORTABILITY.md).
+
+Modular publishes the list at
+[the Mojo system requirements page](https://mojolang.org/docs/requirements),
+which is authoritative and moves. `docs.modular.com/mojo/requirements` redirects
+there. As read on 2026-08-18:
+
+| Vendor | Continuously tested by Modular | Known compatible | Not supported |
+|---|---|---|---|
+| NVIDIA | B200 | B300, B100, DGX Spark, H200, H100, L4, L40, A100, A10, T4, RTX 30/40/50 series | pre-Turing |
+| AMD | MI355X, MI300X | MI325X, MI250X, Radeon RX 9070 (RDNA4), Radeon RX 7900 (RDNA3) | |
+| Apple | | M1 through M5 | Intel Macs |
+
+Driver floors from the same page. NVIDIA 580 or later, AMD 6.3.3 or later, with
+ROCm 7.0 or later for MI355X. Apple needs macOS Sequoia 15 or newer and Xcode 16
+or newer.
+
+A `known compatible` board is a perfectly good record. The tier only tells you
+how likely a failure is to be someone else's.
+
+### Picking a board when you have a choice
+
+| You want to produce | Rent or use | Why |
+|---|---|---|
+| A first record on a backend, which is what we most want | any mainstream `known compatible` part, an L4 or A10 on NVIDIA, an MI300X on AMD | correctness, determinism, and the device attribute header do not care how fast the board is, and a boring part means a failure is about this code rather than about the edge of the toolchain |
+| A second AMD record that is not a duplicate | a Radeon RX 7900 or RX 9070 | CDNA and RDNA differ in wavefront width, and `gpu_tiling.WARP_GRANULARITY` is 64 specifically so one launch shape is legal on both. Nobody has tested that assumption |
+| A timing anyone will quote | MI300X, H100, or B200 | nothing measured on a small board belongs beside a LightGBM or CatBoost number |
+| A deliberate probe at the support floor | a T4, which is Turing and `sm_75` | the oldest NVIDIA part Mojo targets. Valuable, and a poor choice for a first record, because a failure there is ambiguous |
+
+### If you do not own one
+
+An hour of a rented GPU is enough for the correctness path, and none of this
+needs a cloud account with a sales conversation behind it.
+
+- **AMD, free.** The
+  [AMD AI Developer Program](https://developer.amd.com/ai-developer-program/)
+  grants AMD Developer Cloud credits on sign-up with no approval step, which is
+  worth tens of hours on a single MI300X. That is twenty times what a first
+  record costs. See
+  [AMD's instructions for claiming them](https://www.amd.com/en/developer/resources/technical-articles/2026/how-to-claim-amd-cloud-credits.html).
+- **Both vendors, one account.** RunPod carries NVIDIA and AMD parts on a credit
+  card with no quota request.
+- **AMD specialists.** [TensorWave](https://tensorwave.com/) and
+  [Hot Aisle](https://hotaisle.xyz/) are AMD-only clouds with on-demand MI300X,
+  Hot Aisle offering bare metal as well as VMs.
+- **Comparing price.** [getdeploying.com](https://getdeploying.com/gpus/amd-mi300x)
+  and similar trackers stay current. This document deliberately quotes no hourly
+  rate, because a stale one here would be trusted anyway. Small `known
+  compatible` boards run well under a dollar an hour and the flagships run a few
+  dollars.
+
+The hyperscalers are the slow path rather than the fast one. A new AWS, GCP, or
+Azure account has no GPU quota, the request takes days and is often refused
+without billing history, and the flagship SKUs are frequently whole eight-GPU
+nodes. None of that buys anything a rented single board does not.
+
 ## The three paths
 
 Pick by how much time you have. Each one is complete in itself, and a shorter

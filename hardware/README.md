@@ -27,6 +27,8 @@ hardware/
     result_nvidia.json    empty record, NVIDIA
     result_amd.json       empty record, AMD
   results/                accepted records and their raw output
+  run_validation.sh       the whole procedure, one paste, any vendor
+  Dockerfile              optional hermetic runner, NEVER BUILT
 ```
 
 ## The capture scripts
@@ -56,6 +58,24 @@ Three properties worth knowing before you run one:
   wholesale environment dump, no GPU UUID or serial, no git remote URL. Each
   script's header says exactly what it skips and why. Absolute paths in tool
   output can still carry your username, so read the file before attaching it.
+
+## `Dockerfile`, and what it is not
+
+Optional, secondary, and **never built**. The file's own header says so and
+should keep saying so until somebody builds it and records what happened.
+
+The bare path is the recommended one. `run_validation.sh` needs no root and
+installs nothing but pixi's own environment, so on a machine whose driver
+userspace is already in place the container buys nothing and adds a failure mode.
+Reach for it only when the userspace is missing, which in practice means a rented
+box with a bare OS image and no ROCm or CUDA libraries, where installing them on
+the host is the one step in the procedure that wants root.
+
+The consequence that matters for a result. A failure inside the container is not
+automatically a mojotrees failure, because GPU passthrough is its own failure
+mode and this file has no evidence behind it. Re-run on the bare host before
+reporting. If the host and the container disagree, that disagreement is the
+finding and is worth filing on its own.
 
 ## The record templates
 
