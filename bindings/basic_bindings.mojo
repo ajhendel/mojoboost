@@ -96,6 +96,24 @@ def decide_device_workload(
     | `derivative_precision` | `DERIV_PRECISION_FLOAT32` (0) or `..._FLOAT64` (1) |
     | `grow_policy` | `GROW_LEAFWISE` (0), `GROW_DEPTHWISE` (1), `GROW_OBLIVIOUS` (2) |
     | `max_depth` | the resolved depth bound; `<= 0` means unlimited |
+    | `bundling` | `enable_bundle=True` (0/1) |
+    | `linear_tree` | `linear_tree=True` (0/1) |
+    | `forced_splits` | the fit declares forced splits (0/1) |
+
+    **THE LAST THREE WERE THE COMMENT BELOW COMING TRUE, AND THEY WERE ADDED
+    2026-08-18.** This module used to say, of `bundling`, `linear_tree` and
+    `forced_splits`, that they "are NOT sent from Python", and it was right.
+    `device_policy` carried BLOCK_FEATURE_BUNDLING, BLOCK_LINEAR_TREE and
+    BLOCK_FORCED_SPLITS with keyword defaults of False, so the native request
+    always saw False, all three silently never matched, and a user got a raise
+    out of the trainer rather than the CPU fallback the policy layer
+    implements and tests.
+    
+    The forced-splits case was the sharpest instance of the class: its raise
+    text advised "device='auto', which routes around this", and `auto` did
+    not, because the field it would route on never arrived. **The error
+    message advertised the disconnected path.** A user following its advice
+    reproduced the error.
 
     **`grow_policy` AND `max_depth` WERE ADDED 2026-08-18, AND THEIR ABSENCE
     WAS A SHIPPING DEFECT RATHER THAN AN OMISSION.** `device_policy` has
@@ -109,7 +127,7 @@ def decide_device_workload(
     fit the policy layer implements and tests. The graceful path existed, was
     correct, and was disconnected at this call.
 
-    The last six are required keys, not optional ones, and that is the same
+    The last nine are required keys, not optional ones, and that is the same
     convention every other key here follows: `device_selection.py` is the only
     sender and it always sends the whole mapping. A key read with a default
     would let a stale sender silently mean "L2, plain boosting", which is the
@@ -176,6 +194,9 @@ def decide_device_workload(
             derivative_precision=Int(py=workload["derivative_precision"]),
             grow_policy=Int(py=workload["grow_policy"]),
             max_depth=Int(py=workload["max_depth"]),
+            bundling=flag(workload["bundling"], "bundling"),
+            linear_tree=flag(workload["linear_tree"], "linear_tree"),
+            forced_splits=flag(workload["forced_splits"], "forced_splits"),
         )
     )
 

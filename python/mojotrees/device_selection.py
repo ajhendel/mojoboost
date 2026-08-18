@@ -338,6 +338,9 @@ class Workload:
         derivative_precision=0,
         grow_policy=GROW_LEAFWISE,
         max_depth=0,
+        bundling=False,
+        linear_tree=False,
+        forced_splits=False,
     ):
         self.n_rows = int(n_rows)
         self.n_features = int(n_features)
@@ -369,6 +372,9 @@ class Workload:
         self.derivative_precision = int(derivative_precision)
         self.grow_policy = int(grow_policy)
         self.max_depth = int(max_depth)
+        self.bundling = bool(bundling)
+        self.linear_tree = bool(linear_tree)
+        self.forced_splits = bool(forced_splits)
         if self.n_rows < 1 or self.n_features < 1:
             raise ValueError(
                 "a workload needs at least one row and one feature; got "
@@ -760,6 +766,24 @@ class _FullNativePolicy:
                 # ruling.
                 "grow_policy": int(workload.grow_policy),
                 "max_depth": int(workload.max_depth),
+                # Added 2026-08-18, the last three blocks that existed and
+                # could not fire. `device_policy` has carried
+                # BLOCK_FEATURE_BUNDLING, BLOCK_LINEAR_TREE and
+                # BLOCK_FORCED_SPLITS with keyword defaults of False, and
+                # `basic_bindings` said so in its own comment: these three
+                # "are NOT sent from Python". So the native request always saw
+                # False, every one of the three silently never matched, and a
+                # user got a raise out of the trainer instead of the CPU
+                # fallback the policy implements.
+                #
+                # The forced-splits case was the worst of the three, because
+                # its raise text advised "device='auto', which routes around
+                # this" and auto did not, since the field it would route on
+                # never arrived. The error message advertised the disconnected
+                # path.
+                "bundling": 1 if workload.bundling else 0,
+                "linear_tree": 1 if workload.linear_tree else 0,
+                "forced_splits": 1 if workload.forced_splits else 0,
             },
         )
         return _parse_decision(str(text))

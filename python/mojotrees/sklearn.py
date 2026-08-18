@@ -3975,6 +3975,15 @@ class _Base(_ParamsMixin):
                 # This mirrors that resolution rather than repeating the
                 # constant, so the two cannot drift apart silently.
                 max_depth=_resolved_max_depth_for_policy(self),
+                # The last three blocks that existed and could not fire, wired
+                # 2026-08-18. Read the same way the params dict below reads
+                # them, so the gate sees the fit that will run: `enable_bundle`
+                # and `linear_tree` as plain flags, and forced splits as
+                # whether `_forced_splits_text()` produced anything, which is
+                # the same test the wire key uses.
+                bundling=bool(self.enable_bundle),
+                linear_tree=bool(self.linear_tree),
+                forced_splits=bool(self._forced_splits_text()),
             )
             # DeviceUnavailableError is a RuntimeError subclass carrying the
             # native refusal text, so it propagates as what this method has
