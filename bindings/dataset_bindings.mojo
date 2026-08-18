@@ -19,7 +19,7 @@ Why the constructors matter: three real capabilities land in
 dataset that stays sparse; `reference=`, whose absence today means a
 validation set is silently binned over its own rows and then scored as if
 it were not; and `subset`, which is what would let cross-validation build
-folds natively. `handoffs/connect_12_dataset_cv.md` section 6.2 asked for
+folds natively. `handoffs/connect_12_dataset_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_12_dataset_cv.md)` section 6.2 asked for
 exactly these, and section 6.3 has the Python half.
 
 No binning rule, no validation rule, and no fold policy is written here.
@@ -276,7 +276,7 @@ def dataset_metadata(dataset: PythonObject) raises -> PythonObject:
 
     One call rather than fourteen, because the Python `Dataset` builds its
     repr and its `get_field` answers from all of them at once. This is
-    also the answer to §6.2(e) of `handoffs/connect_12_dataset_cv.md`,
+    also the answer to §6.2(e) of `handoffs/connect_12_dataset_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_12_dataset_cv.md)`,
     which asked for `dataset_is_sparse`, `dataset_nnz`, and
     `dataset_has_raw` as three entry points: they are three keys here
     instead, so there is one way to ask rather than two.

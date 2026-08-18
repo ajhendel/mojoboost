@@ -356,7 +356,7 @@ struct GpuProfile(Copyable, Movable):
 
         The caller does the querying. Keeping `DeviceContext` out of this
         module is what lets the whole policy be tested without an
-        accelerator; handoffs/apple_a6_policy.md gives the four-line call
+        accelerator; handoffs/apple_a6_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a6_policy.md) gives the four-line call
         site that reads the attributes and hands them here.
         """
         var api = parse_api(reported_api)

@@ -295,8 +295,8 @@ What is not here
 This module owns no dataset, gradients, or histogram output. Those live in
 `GpuHistogramBuilder`, and the range-histogram entry points below take them
 as pointers so the builder can call in without a second copy of anything.
-See `handoffs/apple_a1_active_rows.md` for the step-by-step replacement of
-the leaf-id filtering path and `handoffs/connect_02_gpu_dataflow.md` for the
+See `handoffs/apple_a1_active_rows.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a1_active_rows.md)` for the step-by-step replacement of
+the leaf-id filtering path and `handoffs/connect_02_gpu_dataflow.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_02_gpu_dataflow.md)` for the
 frontier seam (`begin_tree_with`, `apply_commit`, `check_frontier`) this
 module offers a grower.
 """

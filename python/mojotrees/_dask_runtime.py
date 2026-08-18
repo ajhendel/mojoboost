@@ -51,7 +51,7 @@ Nothing here second-guesses it, and nothing here reads
 a distributed fit and this module will not present it as one.
 
 The worker half does not exist yet. These are the entry points a rank
-task calls, and `handoffs/connect_15_dask.md` carries the exact request
+task calls, and `handoffs/connect_15_dask.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_15_dask.md)` carries the exact request
 for them:
 
     provider.distributed_worker_open(config)     -> session handle (int)
@@ -89,7 +89,7 @@ assembles here exactly the way it does for a single-machine fit:
      best_score, stopped_early)
 
 A rank other than the root returns 0 as the model handle. See
-handoffs/connect_15_dask.md for the exact patch requests behind those
+handoffs/connect_15_dask.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_15_dask.md) for the exact patch requests behind those
 names.
 
 Import safety
@@ -146,7 +146,7 @@ ADAPTER_VERSION = 1
 #: The entry points a rank task calls on the worker. Listed once so the
 #: "what is missing" message can name them individually rather than saying
 #: that something, somewhere, is absent. None of them exists yet; the
-#: request for them is in handoffs/connect_15_dask.md.
+#: request for them is in handoffs/connect_15_dask.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_15_dask.md).
 WORKER_ENTRY_POINTS = (
     "distributed_worker_open",
     "distributed_worker_train",
@@ -327,7 +327,7 @@ def _status_from_provider(provider, source):
                 "there is nothing to ask what it can do. The transport in "
                 "src/mojotrees/distributed_transport.mojo is not finished "
                 "(it has no socket endpoint) and its bindings are not "
-                "registered in this build. See handoffs/connect_15_dask.md "
+                "registered in this build. See handoffs/connect_15_dask.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_15_dask.md) "
                 "for the entry points it owes"
             ),
         )
@@ -475,7 +475,7 @@ def _status_from_capability(get, source, missing):
                 "worker entry points a rank task calls are missing from "
                 f"{source}: {', '.join(missing)}. The transport is "
                 "finished and its worker side is not wired to Python; see "
-                "handoffs/connect_15_dask.md"
+                "handoffs/connect_15_dask.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_15_dask.md)"
             ),
         )
     names = tuple(str(name) for name in (get("capabilities") or ()))

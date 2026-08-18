@@ -218,7 +218,7 @@ quantized training gets `check_supported`'s error rather than a silent
 downgrade, which is the same rule `unified_memory_policy` applies to a
 transfer route it cannot honor. Nothing here is exported from
 `src/mojotrees/__init__.mojo`; see
-`handoffs/remaining_06_quantized_gradients.md` for the ordered patch set
+`handoffs/remaining_06_quantized_gradients.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_06_quantized_gradients.md)` for the ordered patch set
 that connects it, and `docs/QUANTIZED_GRADIENTS.md` for the numerical
 policy in prose.
 """
@@ -2397,7 +2397,7 @@ def decide_cpu_histogram(
     asserting the wider claim.
 
     Flipping `CONNECTED` remains the last step of the connection sequence in
-    `handoffs/remaining_06_quantized_gradients.md`, and this function is not
+    `handoffs/remaining_06_quantized_gradients.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_06_quantized_gradients.md)`, and this function is not
     it.
     """
     params.validate()

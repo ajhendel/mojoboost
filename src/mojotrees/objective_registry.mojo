@@ -146,7 +146,7 @@ the duplicate is spelled out rather than hidden:
 
 `LAMBDARANK` is also still spelled in ranking.mojo. Both are now definitions
 of the same number in two files; ranking.mojo should bind this one, which is
-the deletion listed in handoffs/migration_21_objective_metric_registry.md
+the deletion listed in handoffs/migration_21_objective_metric_registry.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_21_objective_metric_registry.md)
 section 3.3.
 
 Each mirror is listed in that handoff with the exact deletion that removes

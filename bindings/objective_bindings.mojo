@@ -7,7 +7,7 @@ copy of most of it today (`_METRICS`, `_ALIASES`, `_DEFAULTS` and
 `_TASK_DEFAULTS` in `python/mojotrees/_eval.py`, `_OBJECTIVES` and
 `_UNIMPLEMENTED_OBJECTIVES` in `python/mojotrees/__init__.py`). These
 functions are the seam that lets those tables be deleted:
-`handoffs/migration_21_objective_metric_registry.md` section 4 specified
+`handoffs/migration_21_objective_metric_registry.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_21_objective_metric_registry.md)` section 4 specified
 them and this module implements that specification.
 
 Read this once, at `_eval` import, and cache the result. Not once per

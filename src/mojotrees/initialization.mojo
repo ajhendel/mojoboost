@@ -710,7 +710,7 @@ struct WarmupPlan(Copyable, Movable):
     homogeneous list of them does not exist. A real handle cache is one
     typed field per kernel on whichever struct owns the context, which is
     a change to `GpuHistogramBuilder` or `GpuSession` and therefore not
-    this lane's to make. See handoffs/performance_15_startup.md.
+    this lane's to make. See handoffs/performance_15_startup.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_15_startup.md).
     """
 
     var level: Int

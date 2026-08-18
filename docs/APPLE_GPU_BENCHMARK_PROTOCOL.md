@@ -275,7 +275,7 @@ prints, so a record and a Mojo driver run can be read side by side.
 Three sources, and the record says which one it used:
 
 - `instrumentation`, counters exported from the training run itself. This
-  does not exist yet. `handoffs/apple_a8_benchmarks.md` describes the hook
+  does not exist yet. `handoffs/apple_a8_benchmarks.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a8_benchmarks.md)` describes the hook
   it is waiting on.
 - `mojo_driver`, a separate run of `pixi run gpu-validate` or
   `pixi run bench-hist-scaling` on the same shape. That is a different run
@@ -437,7 +437,7 @@ Named here so the gaps are visible rather than implied.
 - No run has been performed. Every cell of the status table is empty.
 - No phase counters are exported to Python, so `device_phases` is
   `unavailable` on every measurement the suite can currently produce.
-  `handoffs/apple_a8_benchmarks.md` describes the hook.
+  `handoffs/apple_a8_benchmarks.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a8_benchmarks.md)` describes the hook.
 - `resolved_threads` is null for every engine, because none of the three
   libraries exposes what it actually used. Thread matching is therefore
   requested and not verified.

@@ -4,7 +4,7 @@ Status (Aug 15 2026), measured on `Mojo 1.0.0 (ed45d567)`, macOS arm64, M4.
 
 ## The claim, and the answer
 
-`handoffs/consolidation_round.md` records this, from the session that shipped
+`handoffs/consolidation_round.md (deleted, recover with git log --all --diff-filter=D -- handoffs/consolidation_round.md)` records this, from the session that shipped
 the sparse GPU path.
 
 > Known: `tests/test_gpu_sparse.mojo` takes about twenty minutes under

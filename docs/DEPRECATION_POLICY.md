@@ -273,7 +273,7 @@ against it.
 
 These are additions to section 12 of the compatibility policy, in its
 numbering scheme, and they are requested rather than made: that document
-is not this lane's to edit. `handoffs/remaining_13_compatibility.md`
+is not this lane's to edit. `handoffs/remaining_13_compatibility.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_13_compatibility.md)`
 carries them as a ready-to-apply patch.
 
 - **C6.** `tools/api_snapshot.py --check` green. The public surface matches

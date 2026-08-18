@@ -866,7 +866,7 @@ def render_sh(plan, out_path):
             # The per-class lock path travels in an environment variable the
             # current wrapper does not read, so this changes nothing today and
             # separates the classes the moment the wrapper honors it. Patch P1
-            # in handoffs/remaining_14_validation_plan.md.
+            # in handoffs/remaining_14_validation_plan.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_14_validation_plan.md).
             lock_name = man.lock_env()
             if lock_name:
                 exports += f"    {lock_name}={shlex.quote(man.lock_file_for(klass))}\n"
@@ -1133,7 +1133,7 @@ def self_check(man):
                 f"{lock_env} is exported by the emitted script and {wrapper} "
                 "does not read it, so every exclusion class still shares "
                 f"{man.locks.get('lock_file', 'one lock')}. Inert, not broken. "
-                "Patch P1 in handoffs/remaining_14_validation_plan.md"
+                "Patch P1 in handoffs/remaining_14_validation_plan.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_14_validation_plan.md)"
             )
 
     # subsystems and gaps

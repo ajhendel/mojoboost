@@ -60,7 +60,7 @@ them. A build without them raises `LightGBMInteropUnavailable` naming the
 missing entry point rather than falling back to a Python conversion, because
 a Python conversion is the thing this module exists not to be. The exact
 signatures the bindings owe are recorded in
-`handoffs/connect_16_lgbm_interop.md`.
+`handoffs/connect_16_lgbm_interop.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_16_lgbm_interop.md)`.
 """
 
 import os as _os
@@ -124,7 +124,7 @@ def _require(name):
             "model files cannot be converted. It binds "
             f"{_ENTRY_POINTS.get(name, name)} from "
             "src/mojotrees/lgbm_model_io.mojo; see "
-            "handoffs/connect_16_lgbm_interop.md for the binding contract. "
+            "handoffs/connect_16_lgbm_interop.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_16_lgbm_interop.md) for the binding contract. "
             "There is no Python fallback: converting a LightGBM model in "
             "Python would be a second implementation of the converter."
         )

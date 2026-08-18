@@ -1,6 +1,6 @@
 # Upstream report to Modular: expose the host-visible pointer of a shared-storage DeviceBuffer on Metal
 
-Moved here from `handoffs/upstream_max_metal_gaps.md` on 2026-08-18, unchanged.
+Moved here from `handoffs/upstream_max_metal_gaps.md (deleted, recover with git log --all --diff-filter=D -- handoffs/upstream_max_metal_gaps.md)` on 2026-08-18, unchanged.
 It is a live open item, not a record of finished work, so it belongs with the
 other design documents rather than in the retired handoff directory.
 

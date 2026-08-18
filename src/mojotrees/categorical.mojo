@@ -101,7 +101,7 @@ from .metrics import _argsort
 
 # The arithmetic below used to be written inline here. It now lives in one
 # place so the category partition search and the ordinal scan score, filter,
-# and cap through the same formulas; `handoffs/task12_tree_parameters.md`
+# and cap through the same formulas; `handoffs/task12_tree_parameters.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task12_tree_parameters.md)`
 # asks for exactly this substitution, and no parameter moves with it -- this
 # module still owns every categorical hyperparameter.
 from .tree_parameters_extra import (

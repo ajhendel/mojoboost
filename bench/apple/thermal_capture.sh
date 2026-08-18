@@ -16,7 +16,7 @@
 # printed so a person can read it, decide, and run the parts they want by
 # hand. `--execute` is parsed and refused; the exact commands a human may
 # deliberately run later are listed in
-# handoffs/performance_17_thermal_energy.md.
+# handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md).
 #
 # Usage:
 #   bash bench/apple/thermal_capture.sh --list-phases
@@ -43,7 +43,7 @@ REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
 SCHEMA_PATH="${HERE}/thermal_schema.json"
 PROTOCOL_PATH="${REPO_ROOT}/docs/APPLE_THERMAL_ENERGY.md"
 PARENT_PROTOCOL_PATH="${REPO_ROOT}/docs/APPLE_GPU_BENCHMARK_PROTOCOL.md"
-HANDOFF_PATH="${REPO_ROOT}/handoffs/performance_17_thermal_energy.md"
+HANDOFF_PATH="${REPO_ROOT}/handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)"
 
 # Phase catalog. Fields are id, default window in seconds, and a one-line
 # description. The ids must match the phase enum in thermal_schema.json; the
@@ -288,7 +288,7 @@ What to do instead:
 
   1. Run this script without --execute and read the plan it prints.
   2. Run the parts you want by hand, from
-     handoffs/performance_17_thermal_energy.md, which lists them with the
+     handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md), which lists them with the
      privileged ones marked.
 
 Nothing was measured and no file was written.
@@ -606,7 +606,7 @@ for p in "${SELECTED_PHASES[@]}"; do
             esac
             emit "    workload: ${fitspec}, ${WORKLOAD} on ${DEVICE}."
             emit_todo "fit driver for phase ${p}"
-            emit "    No driver exists. See handoffs/performance_17_thermal_energy.md,"
+            emit "    No driver exists. See handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md),"
             emit "    section \"The measurement path\", for the two candidate homes for it"
             emit "    and why neither belongs to this lane."
             emit "    Environment the driver would set before importing anything."

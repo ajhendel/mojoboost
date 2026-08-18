@@ -92,7 +92,7 @@ shows four cases where one was filed without naming what produced it.
 
 ### The three worst offenders
 
-1. **`handoffs/performance_17_thermal_energy.md` does not exist**, and eight
+1. **`handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)` does not exist**, and eight
    live places delegate to it, including the script whose self-check fails on
    its absence and the two documents that cite it as the fix for the thermal
    problem. It is the repository's only complete listing of its privileged
@@ -147,7 +147,7 @@ measurement path".
    **4**, on one problem:
 
    ```
-   FAIL missing handoffs/performance_17_thermal_energy.md
+   FAIL missing handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)
    ```
 
 Finding 3 is new and is not recorded anywhere in the four documents.
@@ -160,11 +160,11 @@ Both `PROFILE_PROTOCOL.md:727-729` and `MACHINE_LOCK.md:82` resolve the thermal
 problem by pointing the reader somewhere else:
 
 > The script stays where it is, because the plan it prints is a real plan and
-> `handoffs/performance_17_thermal_energy.md` lists the privileged commands for
+> `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)` lists the privileged commands for
 > a human
 
 > The real commands are listed for a human to run by hand in
-> `handoffs/performance_17_thermal_energy.md`.
+> `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)`.
 
 **That file does not exist.** `ls handoffs/` returns five files and it is not
 among them. It was deleted on 2026-08-14 in `21ff9fa`, "Remove obsolete handoff
@@ -246,7 +246,7 @@ that the mood was not a control.
 | `pmset -g therm` (`:733`) | **RUN**, and it returns nothing useful | **Verified by execution**: returns "No thermal warning level has been recorded / No performance warning level has been recorded / No CPU power status has been recorded". The protocol's claim that it "returns nothing useful on Apple silicon" is correct. It is recorded as a thermal condition in `sweep2_2026-08-15/header.txt:3` and `sweep2_2026-08-15/RESULTS.md:5` ("No thermal warning recorded"), where it reads as a thermal measurement and is not one. |
 | S1's node-identity condition, `tests/test_gpu_tree_resident.mojo` (`:281`) | **RUN** | File exists; `session3_2026-08-16/RESULTS.md:280` records it satisfied with no tolerance. |
 | C6: determinism across `MOJOTREES_NUM_WORKERS` (1, 3, 8) (`:638`) | **RUN**, as a contract | Eight test files pin `MOJOTREES_NUM_WORKERS`: `test_cpu_feature_group`, `test_round_overhead`, `test_cpu_dispatch`, `test_cpu_parallel`, `test_binning`, `test_const_hessian`, `test_histogram_reference`, `test_sparse`. |
-| `handoffs/performance_17_thermal_energy.md` (`:727`) | **NOT EXECUTABLE** | Section 1a. Does not exist. |
+| `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)` (`:727`) | **NOT EXECUTABLE** | Section 1a. Does not exist. |
 | C-ops: "`/tmp/mojotrees-bench.lock` is deleted and neither session recreates it" (`:465-472`) | **CONTRADICTED BY FACT** | The lock exists and is held. `MACHINE_LOCK.md` and checklist item 1 both instruct sessions to take it. See section 6. |
 
 ---
@@ -258,7 +258,7 @@ that the mood was not a control.
 | `/tmp/mojotrees-bench.lock`, `mode: timing` only (`:55-64`) | **RUN** | **Verified by execution**: read the live lock. Its fields are exactly the ones this section specifies — holder as an addressable `ListAgents` name, mode, since, what, eta, and the rule restated. This is the best-followed instruction in the four documents. |
 | Every lane in its own worktree under `.claude/worktrees/`, gitignored (`:46-49`) | **RUN** | `.gitignore:45-46` carries the rule with the reason. **Verified by execution**: this lane is running in `/Users/andrewhendel/CascadeProjects/mojotrees/.claude/worktrees/agent-a3a5f318d4b5043e7`, and `git worktree list` shows some forty lanes doing the same. |
 | `bench/apple/thermal_capture.sh` "has never been followable and no session has ever followed it" (`:73-82`) | **FACTUALLY WRONG** in its second half | Section 1. `profile_2026-08-15/header.txt:9-20` is a session having followed it. The script cannot measure — that half stands — but the claim that nobody ran it is refuted by a committed artifact. |
-| `handoffs/performance_17_thermal_energy.md` (`:82`) | **NOT EXECUTABLE** | Section 1a. |
+| `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)` (`:82`) | **NOT EXECUTABLE** | Section 1a. |
 | `pmset -g therm` (`:84-85`) | **RUN** | **Verified by execution**. The recorded answer matches. |
 | `uptime` and `ps -Ao pcpu,comm \| sort -rn \| head` "captured before and after every arm... That is what both orchestrators now use" (`:87-91`) | **`uptime` partially RUN; `ps` NEVER RUN** | Section 3. The claim "that is what both orchestrators now use" is not evidenced in any results file written since it was made. |
 | `bench-train-gpu rows feats obj N arm1,arm2` as the contention answer (`:113`) | **RUN** | Section 3. |
@@ -380,7 +380,7 @@ starts from a list.
 
 Swept in section 9h, after the environment surface, because the two share a
 finding. The one result that outranks everything else in this directory is
-negative: **`handoffs/performance_17_thermal_energy.md` is cited by eight live
+negative: **`handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)` is cited by eight live
 places and does not exist** (section 1a).
 
 ---
@@ -510,12 +510,12 @@ site. `src/` and `bench/`, so left for the orchestrator.
   instead. **Verified by execution**: `python3 tools/validation_plan.py
   --self-check` prints the note itself — "`MOJOTREES_BUILD_LOCK` is exported by
   the emitted script and `tools/with_build_lock.sh` does not read it". Setting
-  it does nothing. `handoffs/remaining_14_validation_plan.md:56` carries the
+  it does nothing. `handoffs/remaining_14_validation_plan.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_14_validation_plan.md):56` carries the
   patch (P1) and it has not been applied. Note the lock file **is** used in
   anger: `apple_m4_unified_memory_2026-08-15.md:32` records runs serialized
   under `tools/with_build_lock.sh`. Only the variable is inert.
 - **`MOJOTREES_BINNING_SELECT_MIN_ROWS` — read but undocumented.**
-  `src/mojotrees/binning.mojo:357`. `handoffs/remaining_14_validation_plan.md:238`
+  `src/mojotrees/binning.mojo:357`. `handoffs/remaining_14_validation_plan.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_14_validation_plan.md):238`
   (P5) is a patch to document it in `README.md` and has not been applied;
   **verified by execution**, the name appears nowhere in `README.md`.
 
@@ -583,7 +583,7 @@ deletion invisible from `handoffs/` alone.
 
 | what | verdict | evidence |
 |---|---|---|
-| `handoffs/performance_17_thermal_energy.md` | **NOT EXECUTABLE** — deleted | Section 1a. Cited by eight live places: `thermal_capture.sh:19,46,291,609`, `MACHINE_LOCK.md:82`, `PROFILE_PROTOCOL.md:727`, `docs/APPLE_THERMAL_ENERGY.md:448`, and `validation/manifests/handoffs.toml:123`. **The last one is why nobody noticed**: it lists the file in the `[archive]` retired table, so the validation planner does not flag it as missing while four other files still delegate to it. **Recoverable — see section 10.** |
+| `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)` | **NOT EXECUTABLE** — deleted | Section 1a. Cited by eight live places: `thermal_capture.sh:19,46,291,609`, `MACHINE_LOCK.md:82`, `PROFILE_PROTOCOL.md:727`, `docs/APPLE_THERMAL_ENERGY.md:448`, and `validation/manifests/handoffs.toml:123`. **The last one is why nobody noticed**: it lists the file in the `[archive]` retired table, so the validation planner does not flag it as missing while four other files still delegate to it. **Recoverable — see section 10.** |
 | `tools/connectivity_audit.py` (`INDEX.md:5`) | **RUN** | **Verified by execution**: 12 findings, 7 EXPERIMENTAL, 5 PENDING, 0 DEAD. Wired into CI at `.github/workflows/ci.yml:124`. Note the drift: `consolidation_round.md:532` claims 6 findings and its table at `:490-496` logs 292 → 136 → 45. It is 12 today. |
 | `tools/audit_integration.py` (`INDEX.md:7`) | **RUN** | **Verified by execution**: "docs/INTEGRATION_INVENTORY.md agrees with the tree". CI `ci.yml:126`. |
 | `tools/api_snapshot.py --check` (`INDEX.md:25`) | **RUN** | **Verified by execution**: `ok`. CI `ci.yml:102`, pixi `check-api`. |
@@ -597,7 +597,7 @@ deletion invisible from `handoffs/` alone.
 | P3: add `pixi run test-c` to CI (`remaining_14:149`) | **NEVER RUN / not applied** | No `test-c` anywhere in `.github/workflows/ci.yml`. `validation/manifests/jobs.toml:565` still carries `provenance = "documented"` and "no CI job runs it". The task exists at `pixi.toml:92`, not `:35` as the handoff says. |
 | P4: insert `tests/parallel/test_gpu_split_policy.mojo` into the `test` chain (`remaining_14:206`) | **SUPERSEDED, and discharged** | Obsolete twice over: the path is now `tests/test_gpu_split_policy.mojo`, and there is no `&&` chain to insert into — `pixi.toml:21` is `bash tools/run_tests.sh all`, glob discovery. `pixi.toml:20` names this exact file as the reason the glob exists. `jobs.toml:659-660` now reads `provenance = "ci"`, "First run 2026-08-15: 6 passed". |
 | P5: document `MOJOTREES_BINNING_SELECT_MIN_ROWS` in README (`remaining_14:238`) | **NEVER RUN / not applied** | Section 9d. |
-| `git show 21ff9fa^:handoffs/migration_20_device_policy.md` (`migration_20:6`) | **RUN**, works | **Verified by execution**: the commit exists and the blob prints. The only recovery command in any handoff, and it points at the same commit that ate `performance_17`. |
+| `git show 21ff9fa^:handoffs/migration_20_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_20_device_policy.md)` (`migration_20:6`) | **RUN**, works | **Verified by execution**: the commit exists and the blob prints. The only recovery command in any handoff, and it points at the same commit that ate `performance_17`. |
 | "Run `tests/test_device.mojo` once that lane lands" (`migration_20:43`) | **DISCHARGED**, doc stale | The file exists and `tools/run_tests.sh` discovers it by glob, so it runs under `pixi run test`. The blocker it waited on is long past. |
 | `connect_22:17`, "Nothing else under `tools/` is run by CI or by a pixi task" | **FACTUALLY WRONG today** | CI now runs four of them (`ci.yml:102,113,124,126`) and pixi defines six gates (`pixi.toml:40,46,47,48,51,56`). This is the document's central claim. |
 | `connect_22:52`, "Recommendation for the coordinator (**not implemented**)" | **IMPLEMENTED, essentially verbatim** | `.github/workflows/ci.yml:118-126`, including the `continue-on-error: true` and the comment. |
@@ -626,7 +626,7 @@ Neither is in this lane's file boundary. Both are recorded for the orchestrator.
 
 | what | what happened |
 |---|---|
-| `bash bench/apple/thermal_capture.sh --self-check` | **FAILED**, exit 4, on `missing handoffs/performance_17_thermal_energy.md`. New finding; not recorded anywhere before this file. |
+| `bash bench/apple/thermal_capture.sh --self-check` | **FAILED**, exit 4, on `missing handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)`. New finding; not recorded anywhere before this file. |
 | `bash bench/apple/thermal_capture.sh --execute --phase cold_fit` | Refused, exit **3**, as documented. The refusal is real. |
 | `bash bench/apple/thermal_capture.sh --print-plan --phase sustained` | Printed a plan with `"executed": false` and `"measurement_path": "absent"`. Confirms it is a plan printer. |
 | `bash bench/apple/metal_capture.sh --self-check` | **PASSED**. All eleven checks green: `xctrace` 16.0 present, the `Metal System Trace` template installed, `python3` 3.14.6, the reader imports the standard library only, "no privileged command anywhere in this script". |
@@ -643,7 +643,7 @@ Neither is in this lane's file boundary. Both are recorded for the orchestrator.
 | `python3 tools/validation_plan.py --self-check` | `ok`. 9 tiers, 121 jobs, 46 subsystems, 6 gaps, 42 handoffs, 15 lanes. Discharges the registered worry at `remaining_14:41`. Still emits the P1 note, which is how P1 is known to be unapplied. |
 | `python3 tools/model_fixture_manifest.py --check` | **49 problems**, correctly — `compatibility/fixtures/checksums.json` does not exist and the script says the failure is the correct state. |
 | `python3 tools/audit_python_compat.py` | "no contradictions found in 3 note(s)". |
-| `git show 21ff9fa^:handoffs/performance_17_thermal_energy.md` | **Recovers the deleted file, all 452 lines, with the privileged commands intact.** This is the remedy for section 1a. |
+| `git show 21ff9fa^:handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)` | **Recovers the deleted file, all 452 lines, with the privileged commands intact.** This is the remedy for section 1a. |
 
 Nothing was timed. No benchmark, training run, or `sudo` command was executed.
 
@@ -664,7 +664,7 @@ and no rule was relaxed.
    what actually happened, naming `profile_2026-08-15/header.txt` and its
    `thermal-PENDING` plan, and stating why a followed-but-inert instruction is
    worse than an unfollowed one.
-3. A1 — the dangling `handoffs/performance_17_thermal_energy.md` pointer
+3. A1 — the dangling `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)` pointer
    replaced by `docs/APPLE_THERMAL_ENERGY.md`, the `git show` recovery command,
    and this file, with the deletion commit and the failing self-check named.
 4. A1 — the "both campaigns now do this" claim qualified to what the results
@@ -711,8 +711,8 @@ and no rule was relaxed.
 ### Requires human action, with the exact commands
 
 Nothing here should be attempted by a session. These are recovered verbatim
-from the deleted `handoffs/performance_17_thermal_energy.md`, lines 335-396,
-via `git show 21ff9fa^:handoffs/performance_17_thermal_energy.md`. They are the
+from the deleted `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)`, lines 335-396,
+via `git show 21ff9fa^:handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)`. They are the
 only complete listing that exists, and they exist only in git history.
 
 First, the unprivileged question that should be answered before any of the
@@ -776,16 +776,16 @@ Ordered by how much a reader is currently misled.
 
 | what | where | why it is not mine |
 |---|---|---|
-| **Restore `handoffs/performance_17_thermal_energy.md`.** One command recovers it intact: `git show 21ff9fa^:handoffs/performance_17_thermal_energy.md > handoffs/performance_17_thermal_energy.md`. That fixes `thermal_capture.sh`'s self-check, the `--execute` refusal message, and three documents' dangling pointers at once, and it restores the repository's only complete listing of its privileged commands. If it is instead meant to stay deleted, then `validation/manifests/handoffs.toml:123` must stop archiving it silently and the four delegating citations must be rewritten | `handoffs/`, `validation/manifests/handoffs.toml` | outside my boundary; the highest-value single fix in this audit |
+| **Restore `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)`.** One command recovers it intact: `git show 21ff9fa^:handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md) > handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)`. That fixes `thermal_capture.sh`'s self-check, the `--execute` refusal message, and three documents' dangling pointers at once, and it restores the repository's only complete listing of its privileged commands. If it is instead meant to stay deleted, then `validation/manifests/handoffs.toml:123` must stop archiving it silently and the four delegating citations must be rewritten | `handoffs/`, `validation/manifests/handoffs.toml` | outside my boundary; the highest-value single fix in this audit |
 | `validation/manifests/handoffs.toml:123` lists the deleted file in the `[archive]` retired table, which is **why nobody noticed**: the validation planner treats it as intentionally gone while four live artifacts still delegate to it | `validation/manifests/handoffs.toml` | outside my boundary |
 | The resident plane is still `getenv(...) == "1"`, opt-in, after `session3` closed S1 and declared it the default | `src/mojotrees/gpu_resident_round.mojo:329` | `src/`, three lanes working there |
 | `bench/apple/thermal_capture.sh --self-check` fails on the missing handoff (`:320`). Restoring the file per row 1 fixes it; failing that, repoint `HANDOFF_PATH` (`:46`) and the two refusal messages (`:19`, `:291`, `:609`) at `docs/APPLE_THERMAL_ENERGY.md` | `bench/apple/thermal_capture.sh` | a script, not a doc |
 | `MOJOTREES_STARTUP_REPORT_FD` is read by nothing. Delete it or implement it | `compatibility/api_snapshot.json`, `compatibility/DRIFT_REPORT.md:218`, `python/mojotrees/diagnostics.py:225` | `src/`-adjacent |
-| `MOJOTREES_BUILD_LOCK` is inert: `tools/with_build_lock.sh:7` hard-codes the path. Patch P1 in `handoffs/remaining_14_validation_plan.md:56` is written and unapplied | `tools/with_build_lock.sh` | a script |
+| `MOJOTREES_BUILD_LOCK` is inert: `tools/with_build_lock.sh:7` hard-codes the path. Patch P1 in `handoffs/remaining_14_validation_plan.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_14_validation_plan.md):56` is written and unapplied | `tools/with_build_lock.sh` | a script |
 | `docs/STARTUP_LATENCY.md:260,261,262,280` invoke `pixi run bench-startup`, which is not a task. Either define it or rewrite the four commands onto the reachable form the same file already uses at `:272` | `docs/`, `pixi.toml` | outside my boundary |
 | Results files record arm labels, never the environment that produced them (section 9c). Emitting the resolved `MOJOTREES_*` values into `json_summary` would close it at one site | `bench/bench_train_gpu.mojo` | `bench/` driver, not a doc |
-| `handoffs/connect_22_audit.md:17` ("Nothing else under `tools/` is run by CI or by a pixi task") and `:52` ("not implemented") are both false today; `:37` and `remaining_14:283` say the API snapshot is not in the tree, and it is | `handoffs/` | outside my boundary |
-| `handoffs/remaining_14_validation_plan.md` P2 is already applied with a better rationale than the patch proposes. A reader working the list top to bottom would regress it | `handoffs/` | outside my boundary |
+| `handoffs/connect_22_audit.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_22_audit.md):17` ("Nothing else under `tools/` is run by CI or by a pixi task") and `:52` ("not implemented") are both false today; `:37` and `remaining_14:283` say the API snapshot is not in the tree, and it is | `handoffs/` | outside my boundary |
+| `handoffs/remaining_14_validation_plan.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_14_validation_plan.md)` P2 is already applied with a better rationale than the patch proposes. A reader working the list top to bottom would regress it | `handoffs/` | outside my boundary |
 | Every `tests/parallel/...` path in `handoffs/` is dead (the Mojo side was flattened; `python/tests/parallel/` still lives, which is the trap). Every `pixi.toml:NN` citation in `handoffs/` is off, because `f2644e8` restructured the file | `handoffs/` | outside my boundary |
 | Ten distributed environment variables are read and have no test and no measurement (section 9g) | `src/mojotrees/distributed_transport.mojo`, `python/mojotrees/_dask_runtime.py` | `src/` |
 | `session3_2026-08-16/RESULTS.md:403` lists M2.5 as "untaken" while `:157-171` of the same file reports its three pairs and its null verdict | `bench/results/session3_2026-08-16/RESULTS.md` | outside the four documents I may edit |
@@ -826,7 +826,7 @@ confirmation.
   invoked: it reads Mach-O and it was not clear whether it needs a build, and a
   build on a box under a timing lock is not mine to start. Recorded as NEVER
   RUN on the CI and pixi evidence alone.
-- **The five suites and six Python suites that `handoffs/consolidation_round.md`
+- **The five suites and six Python suites that `handoffs/consolidation_round.md (deleted, recover with git log --all --diff-filter=D -- handoffs/consolidation_round.md)`
   counts as evidence.** `validation_plan.py --self-check` reports that no
   manifest job runs 33 of the Mojo suites and six of the pytest files. Whether
   they pass today needs a build. The handoff's recorded counts are from runs

@@ -219,7 +219,7 @@ def take_rows(data, rows, name="X"):
 
     Sparse input is refused rather than sliced, because the `Dataset` the
     selection would be handed does not accept it yet (see
-    handoffs/connect_12_dataset_cv.md); scipy would slice it happily, and the
+    handoffs/connect_12_dataset_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_12_dataset_cv.md)); scipy would slice it happily, and the
     failure would then surface two calls later with a worse message.
     """
     if _is_sparse(data):

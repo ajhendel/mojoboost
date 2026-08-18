@@ -14,7 +14,7 @@ document, and it costs the reader an afternoon to find out.
 of `python/mojotrees` and against `docs/LIGHTGBM_PARITY.md`. It has not
 been executed end to end as one script by the pass that wrote it, so treat
 it as a careful reading rather than as a transcript. Turning it into a
-script that CI runs is tracked in `handoffs/task20_compatibility.md`.
+script that CI runs is tracked in `handoffs/task20_compatibility.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task20_compatibility.md)`.
 Anything you find that disagrees with the code is a bug in this file.
 
 Compatibility rules for everything shown here, including which of it is

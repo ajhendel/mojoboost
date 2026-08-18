@@ -353,9 +353,9 @@ variable of its own.
 
 None of these were applied. Each one is another lane's file. The handoff
 that held the mechanically applicable form of each, with signatures and
-call sites, was `handoffs/remaining_11_gpu_backends.md`, deleted in
+call sites, was `handoffs/remaining_11_gpu_backends.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_11_gpu_backends.md)`, deleted in
 21ff9fa with the rest of that round's handoffs; `git show
-21ff9fa^:handoffs/remaining_11_gpu_backends.md` is where it lives now, and
+21ff9fa^:handoffs/remaining_11_gpu_backends.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_11_gpu_backends.md)` is where it lives now, and
 its symbol names predate the mojoboost -> mojotrees rename.
 
 ### Shared kernels and the GPU dataflow lane

@@ -6,7 +6,7 @@ builder, split search, parameter surface, binding, or Python entry point
 reaches it, `quantized_gradient.CONNECTED` is `False`, and every decision
 procedure in the module returns the float path while it is. Nothing in this
 document describes behavior a user can obtain today. The ordered patch set
-that would change that is `handoffs/remaining_06_quantized_gradients.md`.
+that would change that is `handoffs/remaining_06_quantized_gradients.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_06_quantized_gradients.md)`.
 
 This document is the numerical contract. It says what a quantized round
 would compute, what it would bound, where it would lose accuracy, and what
@@ -417,5 +417,5 @@ unverified:
 
 That row is still accurate and must not be upgraded by this lane. The
 capability is `implemented` and nothing more: not integrated, not publicly
-reachable, not tested. `handoffs/remaining_06_quantized_gradients.md` names
+reachable, not tested. `handoffs/remaining_06_quantized_gradients.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_06_quantized_gradients.md)` names
 the exact wording change and the exact patch that would earn it.

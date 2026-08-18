@@ -70,7 +70,7 @@ Where the leaves come from
 --------------------------
 The primitives here are worth exactly as much as the grower above them can
 feed them. `gpu_frontier.leaves_per_launch` computes the number for each of the
-four growers, and `handoffs/algorithm_22_leaf_batching.md` states the
+four growers, and `handoffs/algorithm_22_leaf_batching.md (deleted, recover with git log --all --diff-filter=D -- handoffs/algorithm_22_leaf_batching.md)` states the
 consequence plainly rather than burying it: batching is a change to the
 *grower*, and these kernels are the half of it that can be built and reasoned
 about first. The three growers that can offer more than one leaf are the

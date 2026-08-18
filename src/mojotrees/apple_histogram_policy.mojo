@@ -384,7 +384,7 @@ def profile_from_caps(caps: DeviceCaps) -> GpuProfile:
     only the partial-budget fraction, and that fraction applies only to a
     reported memory budget, which is zero here, so the plan is identical
     either way. Once a budget accessor exists (see
-    handoffs/apple_a6_policy.md step 3), a call site that knows it is on
+    handoffs/apple_a6_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a6_policy.md) step 3), a call site that knows it is on
     Metal should build the profile with `GpuProfile.from_reported` instead of
     this.
 

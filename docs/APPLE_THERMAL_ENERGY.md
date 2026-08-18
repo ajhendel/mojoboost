@@ -303,7 +303,7 @@ What a given number in a record is permitted to be about.
 | Mean power over a window | The whole machine during that window | mojotrees |
 | Energy above idle | The workload plus whatever else was running, bounded by what the idle gate saw | A process |
 | Energy impact score | Which process dominated the window | Joules, watts, or any comparison across machines |
-| Cold minus warm | One-time cost paid in this process on this machine, including compilation and device setup | A breakdown of that cost, which needs the native phase counters described in `handoffs/apple_a8_benchmarks.md` and separately specified by the startup-latency lane |
+| Cold minus warm | One-time cost paid in this process on this machine, including compilation and device setup | A breakdown of that cost, which needs the native phase counters described in `handoffs/apple_a8_benchmarks.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a8_benchmarks.md)` and separately specified by the startup-latency lane |
 
 A throughput decline is attributed to thermal state only when all three hold.
 The thermal series showed a limit change, the idle gate stayed clean through
@@ -445,7 +445,7 @@ rather than a condition.
 
 What a human may deliberately run later, once the measurement path exists and
 has been reviewed, is listed with exact command lines in
-`handoffs/performance_17_thermal_energy.md`. They are kept there rather than
+`handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)`. They are kept there rather than
 here so that this document cannot be copied out of context into a terminal.
 
 ## Open items

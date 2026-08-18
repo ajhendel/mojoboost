@@ -1572,7 +1572,7 @@ struct BoosterParams(Copyable, Movable):
     `train_multiclass_with_valid`. Every other trainer that takes a
     `BoosterParams` should refuse an active setting with
     `efb.check_bundling_honored` rather than ignore it; see
-    `handoffs/connect_09_algorithms.md`.
+    `handoffs/connect_09_algorithms.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_09_algorithms.md)`.
     """
 
     var n_estimators: Int

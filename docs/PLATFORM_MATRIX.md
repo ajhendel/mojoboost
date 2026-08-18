@@ -145,7 +145,7 @@ match it. The easy path follows directly:
 `macos-arm64-cp314-lowered` is the row for the result. Its target floor is
 macOS 12.0 rather than 11.0 to leave the bundled libraries a margin, and the
 number moves to whatever step 2 measures. The exact edits are in
-[`handoffs/task18_platform.md`](../handoffs/task18_platform.md).
+[`handoffs/task18_platform.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task18_platform.md)`](../handoffs/task18_platform.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task18_platform.md)).
 
 Two things this path does not buy:
 

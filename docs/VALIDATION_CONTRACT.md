@@ -11,7 +11,7 @@ set of call sites: the modules that own the current fragments have not been
 edited, so at the time of writing every rule below is stated once in the
 validation layer and still enforced from its old home as well. The list of
 call-site edits, each one mechanical, is in
-[handoffs/remaining_12_validation.md](../handoffs/remaining_12_validation.md).
+[handoffs/remaining_12_validation.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_12_validation.md)](../handoffs/remaining_12_validation.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_12_validation.md)).
 
 Read the tables below as the contract that lands when those edits do. Where
 a rule is currently enforced somewhere else, the table says so.

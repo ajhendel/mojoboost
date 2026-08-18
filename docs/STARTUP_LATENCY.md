@@ -13,7 +13,7 @@ That is a deliberate state, not an oversight. The lane that wrote this was
 not permitted to execute Mojo, pixi, Python, a build, or a benchmark, so
 what exists is the vocabulary, the structures, the artifact inspector, and
 the commands. Filling in the tables is the next lane's work, and
-[the handoff](../handoffs/performance_15_startup.md) says exactly how.
+[the handoff](../handoffs/performance_15_startup.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_15_startup.md)) says exactly how.
 
 ## Status
 
@@ -561,7 +561,7 @@ checked. They are the first thing to test.
   formats a report from measured values.
 - [`tools/inspect_startup_artifacts.py`](../tools/inspect_startup_artifacts.py)
   reads the artifacts that fix `ext_load`.
-- [`handoffs/performance_15_startup.md`](../handoffs/performance_15_startup.md)
+- [`handoffs/performance_15_startup.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_15_startup.md)`](../handoffs/performance_15_startup.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_15_startup.md))
   is the integration and measurement plan.
 - [`docs/PLATFORM_MATRIX.md`](PLATFORM_MATRIX.md) is where install kinds and
   their evidence live.

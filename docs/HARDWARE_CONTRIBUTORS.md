@@ -315,7 +315,7 @@ more. Acceptance commits the record and its raw output to
 `docs/GPU_VALIDATION.md`, and moves the matching row in
 `packaging/matrix/accelerators/index.toml`. The full review procedure, including
 what happens when two records disagree, is in
-[`handoffs/release_11_hardware_network.md`](../handoffs/release_11_hardware_network.md).
+[`handoffs/release_11_hardware_network.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_11_hardware_network.md)`](../handoffs/release_11_hardware_network.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_11_hardware_network.md)).
 
 Two things that will not happen to your result:
 

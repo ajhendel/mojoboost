@@ -8,7 +8,7 @@ growers (`tree.grow_tree`, `train_gpu.grow_tree_gpu`,
 share `tree._search` and `tree._leaf_value`; a rule expressed here as a
 function of numbers can be dropped into those two shared entry points once and
 be live on every backend at once, which is what
-`handoffs/task12_tree_parameters.md` specifies.
+`handoffs/task12_tree_parameters.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task12_tree_parameters.md)` specifies.
 
 What is wired up, and where
 ---------------------------
@@ -55,7 +55,7 @@ tier is a property of what the rule needs rather than of the backend:
 `distributed.grow_tree_distributed` keeps private copies of `_search` and
 `_leaf_value` and so honors none of this; `train_gpu`'s device split search
 scores candidates in a kernel and honors none of it either. Both are recorded
-in `handoffs/integration_08_algorithms.md` as edits this integration could not
+in `handoffs/integration_08_algorithms.md (deleted, recover with git log --all --diff-filter=D -- handoffs/integration_08_algorithms.md)` as edits this integration could not
 make from the files it owns.
 
 What is here, with LightGBM's name and default
@@ -2382,7 +2382,7 @@ struct ExtraTreeParams(Copyable, Movable):
         training a float model would be exactly the silent-downgrade failure
         the package refuses everywhere else, so this says so where the
         parameter was set. The wiring that lifts the refusal is the ordered
-        patch set in `handoffs/remaining_06_quantized_gradients.md`.
+        patch set in `handoffs/remaining_06_quantized_gradients.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_06_quantized_gradients.md)`.
         """
         if self.num_grad_quant_bins < 2 or self.num_grad_quant_bins > 1048576:
             raise Error(

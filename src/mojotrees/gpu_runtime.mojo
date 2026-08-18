@@ -106,7 +106,7 @@ train_gpu.mojo, and nothing here has been measured. It is the model and the
 instrumentation that a removal has to be argued from, plus
 `audit_round`, which replays the current per-round operation sequence
 through the model so the argument is executable rather than prose. The
-handoff (`handoffs/apple_a5_runtime.md`) lists which of today's
+handoff (`handoffs/apple_a5_runtime.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a5_runtime.md)`) lists which of today's
 synchronizations the model marks removable and what has to be proven first.
 
 Environment contract, matching the `MOJOTREES_` convention in parallel.mojo:
@@ -786,7 +786,7 @@ def readback_transport(transport: Int) raises -> ReadbackTransport:
         )
     if transport == READBACK_PLAIN_PAIR:
         return ReadbackTransport(
-            transport, 3, 2, False, False, True, True,
+            transport, 3, 2, False, False, True, False,
             String(
                 "two enqueue_copy calls into ordinary heap memory and no"
                 " synchronize at all. That destination kind takes MAX's"
@@ -796,7 +796,7 @@ def readback_transport(transport: Int) raises -> ReadbackTransport:
         )
     if transport == READBACK_PLAIN_ONE:
         return ReadbackTransport(
-            transport, 2, 1, False, True, True, True,
+            transport, 2, 1, False, True, True, False,
             String(
                 "one enqueue_copy into ordinary heap memory. The whole"
                 " readback is the kernel's command buffer and the copy's: the"
@@ -807,7 +807,7 @@ def readback_transport(transport: Int) raises -> ReadbackTransport:
         )
     if transport == READBACK_MAP:
         return ReadbackTransport(
-            transport, 3, 2, False, False, True, True,
+            transport, 3, 2, False, False, True, False,
             String(
                 "map_to_host(). Documented as a host-accessible view; on"
                 " Metal it is a fresh host allocation with a copy in on entry"
@@ -818,7 +818,7 @@ def readback_transport(transport: Int) raises -> ReadbackTransport:
         )
     if transport == READBACK_PINNED_PAIR_NOSYNC:
         return ReadbackTransport(
-            transport, 3, 0, True, False, False, True,
+            transport, 3, 0, True, False, False, False,
             String(
                 "the pinned pair with the trailing synchronize removed, which"
                 " docs/GPU_PORTABILITY.md 6.1 licensed. WRONG on Metal: the"
@@ -828,13 +828,44 @@ def readback_transport(transport: Int) raises -> ReadbackTransport:
         )
     if transport == READBACK_PINNED_ONE_NOSYNC:
         return ReadbackTransport(
-            transport, 2, 0, True, True, False, True,
+            transport, 2, 0, True, True, False, False,
             String(
                 "the packed shape with the same edit, and wrong for the same"
                 " reason: 34 of 34 words"
             ),
         )
     raise Error("unknown readback transport ", transport)
+
+
+def default_readback_for(api_is_metal: Bool) -> Int:
+    """The shipped transport for a backend, rather than for Metal only.
+
+    `READBACK_DEFAULT` is `READBACK_PLAIN_ONE`, and that choice is a
+    measurement: 124.85 us a trip against the pinned pair's 202.14, taken on
+    an M4 with every arm interleaved in one process. It is the right default
+    **there**, and the reason it is safe there is that MAX's Metal runtime
+    lowers a copy into ordinary heap memory as commit-wait-memcpy, so the
+    copy drains inside itself and supplies the ordering.
+
+    That is a disassembled implementation detail of one vendor's runtime, not
+    an API guarantee. On a backend where the copy is asynchronous the same
+    arm reads the *previous* record: the split's feature, bin, gain,
+    `default_left` and child row counts all come back stale, and every launch
+    geometry and allocation downstream is sized from them.
+
+    So the default is now a function of the backend. Metal keeps the fast arm
+    it earned. Anything else gets `READBACK_PINNED_ONE_SYNC`, the cheapest
+    arm whose correctness rests on queue ordering alone -- one wait it
+    performs itself rather than one it inherits. It costs a wait per trip and
+    it is correct everywhere.
+
+    This is not a permanent verdict on other backends. It is what holds until
+    someone runs `pixi run probe-readback` there and records the result, at
+    which point that backend can earn the faster arm the same way Metal did.
+    """
+    if api_is_metal:
+        return READBACK_DEFAULT
+    return READBACK_PINNED_ONE_SYNC
 
 
 def env_readback_transport() raises -> Int:
@@ -844,6 +875,12 @@ def env_readback_transport() raises -> Int:
     because the identifiers above are an implementation detail and a benchmark
     row reading `MOJOTREES_GPU_READBACK=3` says nothing to the person reading
     it a month later.
+
+    Prefer `env_readback_transport_for(api_is_metal)` at any site that knows
+    which device it is talking to. This spelling keeps `READBACK_DEFAULT` and
+    is retained for callers that have no context, but it hands back the Metal
+    default on every backend, which is what shipped a stale-read hazard to
+    CUDA in the first place.
     """
     var raw = getenv("MOJOTREES_GPU_READBACK")
     if raw == "":
@@ -858,6 +895,20 @@ def env_readback_transport() raises -> Int:
     )
 
 
+def env_readback_transport_for(api_is_metal: Bool) raises -> Int:
+    """`MOJOTREES_GPU_READBACK`, or the backend's own default.
+
+    An explicit environment request still wins, because a probe has to be
+    able to run an arm the shipped default would not choose. What changes is
+    the fallback: with nothing set, a non-Metal device gets an arm whose
+    correctness does not rest on a Metal implementation detail.
+    """
+    var raw = getenv("MOJOTREES_GPU_READBACK")
+    if raw == "":
+        return default_readback_for(api_is_metal)
+    return env_readback_transport()
+
+
 def require_readback_correct(transport: Int, api_is_metal: Bool) raises:
     """Refuse a transport this backend is known to get wrong.
 
@@ -866,6 +917,28 @@ def require_readback_correct(transport: Int, api_is_metal: Bool) raises:
     not be reachable from a fit, and this is the gate that keeps them out. It
     fires on the measured column, so it cannot drift away from what the probe
     reports without someone editing the row the probe wrote.
+
+    Why there are two columns and not one
+    -------------------------------------
+    `correct_on_metal` is a **measurement**: `probes/readback_cost.mojo` ran
+    every arm on an M4 and recorded which ones delivered the record.
+    `correct_elsewhere` is a **weaker structural claim**: that the arm's
+    correctness rests only on queue ordering, which every backend provides,
+    rather than additionally on the copy being synchronous inside itself.
+
+    Until 2026-08-18 this function read only the first column, and only when
+    the running backend was Metal. `correct_elsewhere` had **zero readers in
+    the entire codebase**. The consequence, found the first time this code
+    ever ran on NVIDIA: the shipped default is `READBACK_PLAIN_ONE`, whose
+    safety argument is "that destination kind takes MAX's synchronous path,
+    so each copy drains inside itself" -- a disassembled fact about Metal's
+    runtime, not a portable guarantee -- and on CUDA this gate waved it
+    through without a word.
+
+    A guard that only checks the one backend that was already known to work
+    is not a guard. So on any non-Metal backend the weaker column now has to
+    hold, and an arm whose correctness needs the copy to be self-draining is
+    refused rather than assumed.
     """
     var row = readback_transport(transport)
     if api_is_metal and not row.correct_on_metal:
@@ -874,6 +947,19 @@ def require_readback_correct(transport: Int, api_is_metal: Bool) raises:
             readback_transport_name(transport),
             " does not deliver the record on Metal: ",
             row.note,
+        )
+    if not api_is_metal and not row.correct_elsewhere:
+        raise Error(
+            "readback transport ",
+            readback_transport_name(transport),
+            " is only known correct on Metal, and this is not Metal. Its",
+            " correctness depends on the copy draining inside itself, which",
+            " was measured by disassembling Metal's runtime and is",
+            " unestablished on this backend: ",
+            row.note,
+            ". Use a transport whose correctness rests on queue ordering",
+            " alone, or establish this one here first with",
+            " `pixi run probe-readback` and record the result.",
         )
 
 
@@ -893,6 +979,11 @@ def require_readback_table_consistent() raises:
       correct only if it carries a wait. A pinned row with zero waits is the
       edit `docs/GPU_PORTABILITY.md` 6.1 licensed and 6.5.1 refuted, and it
       must be marked wrong on Metal so `require_readback_correct` refuses it.
+    - An **unpinned** row may not claim `correct_elsewhere`. Added 2026-08-18,
+      after the first NVIDIA run: every unpinned row carried
+      `correct_elsewhere = True` while its only wait was the Metal copy's own
+      drain, and nothing in the codebase read the field, so the claim was both
+      wrong and unchecked. Two defects that concealed each other.
 
     Called by `tests/test_gpu_readback_transport.mojo`, and cheap enough to
     call anywhere; it reads seven rows and allocates no device memory. It
@@ -917,6 +1008,18 @@ def require_readback_table_consistent() raises:
                     " has an unpinned destination and is marked wrong on"
                     " Metal; section 6.5.1 measured 0 of 64 stale words on"
                     " that path",
+                )
+            if row.correct_elsewhere:
+                raise Error(
+                    "readback transport ",
+                    readback_transport_name(t),
+                    " has an unpinned destination and claims correctness off"
+                    " Metal. It cannot. Its wait IS the copy's own drain, and"
+                    " that drain is a disassembled property of MAX's Metal"
+                    " runtime, not an API guarantee. An arm earns"
+                    " correct_elsewhere by carrying a wait it performs"
+                    " itself, or by someone running probes/readback_cost.mojo"
+                    " on the other backend and recording the result",
                 )
         elif row.host_waits < 1 and row.correct_on_metal:
             raise Error(
@@ -1656,7 +1759,7 @@ struct GpuSession(RoundLifecycle, Movable):
     and residency ledgers can actually skip an upload rather than only
     record that they could have. That, and routing the builder's drains
     through `sync_for_host_read` / `sync_for_host_write` instead of
-    `ctx.synchronize()`, are described in `handoffs/apple_a5_runtime.md`.
+    `ctx.synchronize()`, are described in `handoffs/apple_a5_runtime.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a5_runtime.md)`.
 
     Teardown is explicit. `close()` drains the queue once, releases the
     pooled slots, clears residency, and moves the lifecycle to `closed`; it
@@ -1729,7 +1832,7 @@ struct GpuSession(RoundLifecycle, Movable):
         # first launch of a planned kernel is attributed to warm-up instead
         # of disappearing into the first round. Front-loading the creation
         # itself needs typed `DeviceFunction` fields on whichever struct
-        # owns the context; see handoffs/performance_15_startup.md.
+        # owns the context; see handoffs/performance_15_startup.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_15_startup.md).
         self.warmup = WarmupPlan.from_env()
         if self.warmup.level >= WARMUP_TRAIN:
             _ = self.warmup.include(KERNEL_HIST_ATOMIC)

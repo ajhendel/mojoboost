@@ -18,7 +18,7 @@ with a dozen fields, and they cross as a Python mapping the way
 dozen positional arguments. Eight positional arguments are proven to
 register (`predict_range`); more is untested, and a mapping also lets a
 field be added without every caller's call site moving.
-`handoffs/performance_15_startup.md` states a six-argument cap on
+`handoffs/performance_15_startup.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_15_startup.md)` states a six-argument cap on
 `def_function`, which the eight-argument entry points already in the
 module contradict; treat the number above six as unverified either way.
 
@@ -67,7 +67,7 @@ def decide_device_workload(
 
     **This is the one device decision entry point.** It is registered as
     `decide_device`, which is the name `device_selection.py` looks for.
-    `handoffs/connect_05_device_policy.md` section 5.1 asked for a
+    `handoffs/connect_05_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_05_device_policy.md)` section 5.1 asked for a
     ten-argument version written directly in `_mojotrees.mojo` instead;
     this form was taken over it because a workload has a dozen fields and
     sending them positionally would fix their order in two languages and

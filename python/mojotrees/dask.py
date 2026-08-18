@@ -59,7 +59,7 @@ way to expose `mojotrees.dask` without tripping over it is a module-level
 `__getattr__` (PEP 562) in the package, which resolves the submodule on
 first attribute access and costs nothing on `import mojotrees`. The exact
 code is in `mojotrees/_public_api_plan.py` and
-handoffs/integration_06_python_api.md.
+handoffs/integration_06_python_api.md (deleted, recover with git log --all --diff-filter=D -- handoffs/integration_06_python_api.md).
 
 The backend protocol, version 0
 -------------------------------
@@ -132,8 +132,8 @@ See also
 --------
 
 docs/distributed.md for the algorithm and its refusal list,
-handoffs/task17_dask.md for the original contract, and
-handoffs/connect_15_dask.md for the native entry points the runtime still
+handoffs/task17_dask.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task17_dask.md) for the original contract, and
+handoffs/connect_15_dask.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_15_dask.md) for the native entry points the runtime still
 owes and the state of each connection made here.
 """
 

@@ -362,7 +362,7 @@ struct CegbLedger(Copyable, Movable):
     limitation for `boosting.fit_more` after a round trip through disk -- a
     resumed run starts with an empty ledger and recharges every first-use
     cost, growing a different ensemble from the one an uninterrupted run would
-    have grown. `handoffs/remaining_04_cegb.md` carries the serialization
+    have grown. `handoffs/remaining_04_cegb.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_04_cegb.md)` carries the serialization
     request that fixes it; until then `check_cegb_continued_training` refuses
     the combination rather than letting it silently diverge.
     """

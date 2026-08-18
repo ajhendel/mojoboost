@@ -287,6 +287,7 @@ from .gpu_runtime import (
     READBACK_PLAIN_ONE,
     READBACK_PLAIN_PAIR,
     env_readback_transport,
+    env_readback_transport_for,
     readback_transport,
     readback_transport_name,
     require_readback_correct,
@@ -7230,7 +7231,13 @@ struct GpuSplitSearcher(Movable):
         # and the readback is on the per-split path, where a device context's
         # API cannot change under it.
         self.api_is_metal = parse_api(ctx.api()) == API_METAL
-        self.readback = env_readback_transport()
+        # Backend-aware, not Metal-aware. `env_readback_transport()` returns
+        # READBACK_PLAIN_ONE on every device, and that arm's correctness rests
+        # on MAX's Metal runtime lowering a copy into heap memory as
+        # commit-wait-memcpy. On a backend where that copy is asynchronous the
+        # host decodes the PREVIOUS split record and sizes the next launch and
+        # the next allocation from it. See gpu_runtime.default_readback_for.
+        self.readback = env_readback_transport_for(self.api_is_metal)
         require_readback_correct(self.readback, self.api_is_metal)
         _require_readback_implemented(self.readback)
         self.mono_host = List[Int32](capacity=n_features)

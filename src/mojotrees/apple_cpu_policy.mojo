@@ -15,7 +15,7 @@ inner loop interleaves. The kernels in `histogram.mojo` and the dispatch
 shapes in `parallel.mojo` keep each feature's summation inside one task and
 each row block in ascending order whatever this module answers, so the output
 is bit-identical at every one of those settings (see the invariants in
-`handoffs/performance_13_apple_cpu.md`).
+`handoffs/performance_13_apple_cpu.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_13_apple_cpu.md)`).
 
 `AccumulationPlan.row_blocks` is the exception. A blocked accumulation folds
 per-block partial sums, and Float64 addition is not associative, so the block

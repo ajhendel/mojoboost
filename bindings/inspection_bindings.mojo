@@ -10,7 +10,7 @@ That parser is a second implementation of facts Mojo already knows: how a
 tree is laid out, what a split bin's upper edge means, how a category set
 maps back to codes, and how a row routes. It is marked in that file as the
 compatibility path, with a deletion point; these functions are what it is
-waiting for. `handoffs/migration_19_model_inspection.md` sections 4 and 8
+waiting for. `handoffs/migration_19_model_inspection.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_19_model_inspection.md)` sections 4 and 8
 specified the entry points and the deletion, and this module implements
 that specification.
 
