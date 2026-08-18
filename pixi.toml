@@ -302,7 +302,66 @@ test-estimators = { cmd = "pytest -q python/tests", depends-on = [
     "build-python",
 ] }
 
+# Per-interpreter build environments, so one source can ship one wheel per
+# CPython minor version instead of one wheel for whichever interpreter the
+# solver happened to pick.
+#
+# WHY THESE EXIST. `[dependencies]` above pins no python, so pixi resolved
+# `max` to its newest per-interpreter variant and the project inherited 3.14 by
+# accident. That accident reached PyPI: 0.1.0a2 and 0.1.0a3 are published as
+# `cp314-cp314-macosx_26_0_arm64` and nothing else, so every caller on 3.10
+# through 3.13 is refused by tag before `requires-python` is ever consulted.
+#
+# WHY IT IS SAFE TO ASK FOR. Verified against the channel on 2026-08-18, not
+# assumed: `max` 26.5.0 publishes exactly five builds, `3.10release` through
+# `3.14release`, on each of osx-arm64, linux-64 and linux-aarch64. Pinning
+# python here selects among builds that already exist; it does not ask the
+# channel for something it does not have.
+#
+# 3.10 is the floor and it is measured, not chosen. Below it the extension
+# aborts during module initialization on `symbol not found: Py_NewRef`, a
+# CPython 3.10 addition, and `mojo` and `mojo-python` both require
+# `python >=3.10` independently. docs/PYTHON_SUPPORT.md section 10, run M1b.
+#
+# There is no free-threaded row and there cannot be one from here: every `max`
+# 26.5.0 variant depends on `python-gil`. Only Modular can change that; do not
+# work around it.
+[feature.py310.dependencies]
+python = "3.10.*"
+
+[feature.py311.dependencies]
+python = "3.11.*"
+
+[feature.py312.dependencies]
+python = "3.12.*"
+
+[feature.py313.dependencies]
+python = "3.13.*"
+
+# Named for symmetry rather than necessity. Without it the release matrix would
+# have four explicit rows and one implicit one, and the implicit one is exactly
+# the accident this block exists to end.
+[feature.py314.dependencies]
+python = "3.14.*"
+
 [environments]
 bench = ["bench"]
 pkg = ["pkg"]
 pytest = ["pytest"]
+
+# One per interpreter, each carrying the `pkg` build tooling. The release
+# workflow iterates these; `packaging/macos/build_release_wheel.sh` selects one
+# through MOJOTREES_PKG_ENV, which defaults to plain `pkg` so a laptop build is
+# unchanged.
+#
+# NOT YET SOLVED. Adding an environment requires `pixi.lock` to be regenerated,
+# and this checkout is shared with lanes that are mid-measurement against the
+# `bench` environment. Run `pixi lock` at a quiet moment, on purpose, and read
+# the diff for movement in the environments that already existed before
+# committing it. Until then these rows are declared and unusable, which is the
+# honest state and is why no workflow is marked ready by the same change.
+pkg-py310 = ["pkg", "py310"]
+pkg-py311 = ["pkg", "py311"]
+pkg-py312 = ["pkg", "py312"]
+pkg-py313 = ["pkg", "py313"]
+pkg-py314 = ["pkg", "py314"]

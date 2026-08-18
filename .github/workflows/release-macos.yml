@@ -27,8 +27,14 @@
 #
 #   runner labels expected:
 #     [self-hosted, macos, arm64, metal]
-#       an Apple silicon Mac with Xcode, the Metal toolchain, a Python 3.14 that
-#       did not come from this repository's pixi environment, and no `mojo` on
+#       an Apple silicon Mac with Xcode, the Metal toolchain, and no `mojo` on
+#       the runner account's PATH. It also needs python3.10 through python3.14
+#       on PATH, none of them from this repository's pixi environment: the
+#       matrix builds one wheel per interpreter and the clean-install fixture
+#       for each leg runs under the matching one. A leg whose interpreter is
+#       missing fails at the runner check rather than after a 90 minute build,
+#       and `fail-fast: false` keeps the other four going.
+#       The remaining requirement is no `mojo` on
 #       the runner account's PATH. The last one is a requirement of the
 #       clean-install fixture, which refuses to certify a wheel next to the
 #       toolchain the wheel must not need.
@@ -64,11 +70,14 @@ on:
         default: '["self-hosted","macos","arm64","metal"]'
       macos_deployment_target:
         description: >-
-          macOS deployment target for the extension, for example 12.0. Empty
-          means the SDK default, which today produces a macosx_26_0 tag.
+          macOS deployment target for the extension. Empty falls through to
+          the build script default of 12.0; pass `sdk` for the SDK default,
+          which on a macOS 26 runner tags the wheel macosx_26_0 and refuses
+          to install on every older Mac. 0.1.0a2 and 0.1.0a3 are published
+          that way, and this default is what stops the next one being.
         required: false
         type: string
-        default: ""
+        default: "12.0"
       publish_testpypi:
         description: Publish the built wheel to TestPyPI after every check passes
         required: false
@@ -92,7 +101,34 @@ defaults:
 
 jobs:
   build:
-    name: Build and verify (macOS arm64)
+    name: Build and verify (macOS arm64, py${{ matrix.python }})
+    strategy:
+      # One wheel per interpreter. There is no abi3 build and one wheel serves
+      # exactly one CPython minor version, so this matrix IS the support
+      # claim: an interpreter absent here cannot install from an index no
+      # matter what `requires-python` says, because pip matches the tag first.
+      #
+      # Floor measured rather than chosen. docs/PYTHON_SUPPORT.md section 10
+      # run M1b: 3.9 aborts on `Py_NewRef`.
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - python: "3.10"
+            tag: cp310
+            pyenv: pkg-py310
+          - python: "3.11"
+            tag: cp311
+            pyenv: pkg-py311
+          - python: "3.12"
+            tag: cp312
+            pyenv: pkg-py312
+          - python: "3.13"
+            tag: cp313
+            pyenv: pkg-py313
+          - python: "3.14"
+            tag: cp314
+            pyenv: pkg-py314
     # On a push of a tag there are no inputs, so the expression falls back to
     # the default label set. Confirm that fallback on the first tag push; it is
     # the one line here that behaves differently between the two triggers.
@@ -146,7 +182,7 @@ jobs:
             exit 1
           }
         env:
-          RELEASE_PYTHON: python3.14
+          RELEASE_PYTHON: python${{ matrix.python }}
 
       - name: The commit is a tag and the tag matches the version
         id: commit
@@ -167,7 +203,7 @@ jobs:
       - uses: prefix-dev/setup-pixi@REPLACE_WITH_SHA # v0.10.1
         with:
           cache: true
-          environments: default pkg
+          environments: default ${{ matrix.pyenv }}
 
       - name: Toolchain versions
         run: |
@@ -191,6 +227,9 @@ jobs:
           # M4 that means +bf16, +i8mm and +sme2, none of which exists on an M1.
           MOJOTREES_BUILD_TARGET: baseline
           MOJOTREES_MACOS_TARGET: ${{ inputs.macos_deployment_target }}
+          # Selects the per-interpreter pixi environment; pixi.toml defines
+          # pkg-py310 through pkg-py314 in its [environments] block.
+          MOJOTREES_PKG_ENV: ${{ matrix.pyenv }}
         run: packaging/macos/build_release_wheel.sh
 
       - name: Identify the artifact
@@ -220,7 +259,7 @@ jobs:
       # packaging/matrix, not something this lane changes.
       - name: Clean install on a toolchain-free environment
         env:
-          PYTHON: python3.14
+          PYTHON: python${{ matrix.python }}
         run: |
           env -u CONDA_PREFIX PYTHON="$PYTHON" \
             bash packaging/matrix/smoke/clean_install_macos.sh \
@@ -250,7 +289,10 @@ jobs:
       - name: Upload the wheel
         uses: actions/upload-artifact@REPLACE_WITH_SHA # v4.4.3
         with:
-          name: wheel
+          # Per interpreter, because five legs cannot share one artifact name.
+          # THIS BREAKS A CONTRACT: release-provenance.yml downloads `wheel`
+          # and `release-metadata` verbatim. See the publish job note below.
+          name: wheel-${{ matrix.tag }}
           path: python/dist/*.whl
           if-no-files-found: error
           retention-days: 90
@@ -259,7 +301,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@REPLACE_WITH_SHA # v4.4.3
         with:
-          name: release-metadata
+          name: release-metadata-${{ matrix.tag }}
           path: |
             python/dist/*.provenance.json
             python/dist/SHA256SUMS
@@ -269,12 +311,35 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+  # BROKEN BY THE MATRIX, AND LEFT VISIBLY SO.
+  #
+  # This job predates the interpreter matrix and assumes one build producing
+  # one artifact named `wheel` with single-valued outputs. Against five legs it
+  # is wrong three specific ways, none of which the change that introduced the
+  # matrix should paper over:
+  #
+  #   1. `needs.build.outputs.*` from a matrixed job is last-writer-wins, so
+  #      the sha256 it verifies belongs to whichever leg finished last.
+  #   2. It downloads `wheel`, which no longer exists. The legs now publish
+  #      `wheel-cp310` through `wheel-cp314`.
+  #   3. Its `count == 1` check encodes the single-wheel assumption directly.
+  #
+  # A version publishes all five files or it publishes a partial release that
+  # cannot be completed later, since a filename cannot be reused on an index.
+  # Gathering every leg, verifying each against its own manifest, and
+  # uploading the set is a real decision about release atomicity and belongs
+  # with the cross-lane reconciliation named at the top of this file.
+  #
+  # Until then it must not run, so its condition fails closed rather than
+  # uploading the wrong artifact.
+  #
   # Opt in, per run, and never on a tag push. A release that publishes because a
   # tag was pushed is a release nobody decided to make.
   publish-testpypi:
     name: Publish to TestPyPI
     needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_testpypi }}
+    # Gated off by the leading `false`. See the block above this job.
+    if: ${{ false && github.event_name == 'workflow_dispatch' && inputs.publish_testpypi }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # A protected environment is where the owner puts a required reviewer and

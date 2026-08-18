@@ -49,7 +49,12 @@ die() { printf 'refusing: %s\n' "$*" >&2; exit 2; }
 # `python3` resolves to on the host. packaging/matrix/validate_artifact.py needs
 # tomllib, so a macOS system python3 is not sufficient, and the pixi environment
 # is the one interpreter this repository actually pins.
-py() { pixi run -e pkg python3 "$@"; }
+# Which pixi environment builds the wheel. Defaults to `pkg`, so a laptop build
+# and every existing caller behave exactly as before. The release matrix sets
+# it to `pkg-py310` .. `pkg-py314` to produce one wheel per interpreter; see
+# the [environments] block in pixi.toml.
+: "${MOJOTREES_PKG_ENV:=pkg}"
+py() { pixi run -e "$MOJOTREES_PKG_ENV" python3 "$@"; }
 
 # --- 1. The host ------------------------------------------------------------
 
@@ -182,7 +187,7 @@ export MOJOTREES_MACOS_DEPLOYMENT_TARGET="$MOJOTREES_MACOS_TARGET"
 # where the Mojo runtime is on the library path whether the wheel bundles it or
 # not, which is why it cannot be the last word on self-containment. The
 # clean-install fixture is, and it runs outside pixi in the release workflow.
-pixi run -e pkg test-wheel
+pixi run -e "$MOJOTREES_PKG_ENV" test-wheel
 
 shopt -s nullglob
 WHEELS=("$DIST"/mojotrees-*.whl)
