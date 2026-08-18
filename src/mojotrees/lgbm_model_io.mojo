@@ -132,12 +132,28 @@ records which of the two tables each conversion used.
 Experimental status
 -------------------
 `LGBM_INTEROP_STATUS` is the one place that says how far this has been
-checked, and the answer today is: hand-written fixtures only. No file
-LightGBM wrote has been read, and no file this writer produced has been fed
-to LightGBM. Until that changes, this is an experiment with a narrow surface
-(`import_lgbm_file`, `export_lgbm_file`, `lgbm_unsupported_reason`, and the
-lower-level parse/dump pairs they are built from), and the public Python and
-C surfaces are expected to carry the same word.
+checked, and the answer changed on 2026-08-18.
+
+It used to say "hand-written fixtures only. No file LightGBM wrote has been
+read." That sentence stood for as long as nobody tried, and it was retired
+by trying: fourteen models were trained by LightGBM 4.7.0, saved by
+LightGBM, and read back here, and **thirteen of them predicted bit-identically
+on every row** against LightGBM's own `raw_score` output. Not close, not
+within a tolerance. Exactly equal, on binary, regression, regression_l1,
+poisson, five-class multiclass, depth-12, depth-1 stumps, 1023 bins, 15
+bins, L1 plus L2 regularization, categorical features, ninety-percent-sparse
+input, and a single-tree model.
+
+The fourteenth is the honest half and it is why the word "experimental"
+stays. A model LightGBM trained on data containing NaNs carries a
+**non-finite threshold**, which this reader rejects by name rather than
+guessing a direction for it. Missing-value models are unsupported, and that
+is a refusal rather than a silent misprediction, which is the right failure
+but is still a hole.
+
+Still unchecked, and the reason the status is not "supported": no file this
+writer produced has been fed back to LightGBM. The export direction has the
+measurement the import direction now has, and it does not yet have it.
 
 Node vocabulary
 ---------------
@@ -249,10 +265,15 @@ comptime _MAX_CAT_WORDS = 1 << 16
 # to surface verbatim rather than paraphrase (see
 # handoffs/connect_16_lgbm_interop.md).
 comptime LGBM_INTEROP_STATUS = String(
-    "experimental: converted against hand-written fixtures only. No file"
-    " written by a real LightGBM build has been read, and no file produced"
-    " here has been read back by LightGBM. mojotrees's own format"
-    " (serialize.mojo) remains the only supported persistence format."
+    "experimental: reads files written by a real LightGBM build. Measured"
+    " 2026-08-18 against LightGBM 4.7.0 on 14 model variants; 13 imported"
+    " and predicted BIT-IDENTICALLY on every row (binary, regression,"
+    " regression_l1, poisson, 5-class multiclass, depth-12, depth-1 stumps,"
+    " 1023 bins, 15 bins, L1+L2, categorical, 90-percent-sparse,"
+    " single-tree). MISSING VALUES ARE REFUSED: a model trained on data"
+    " with NaNs carries a non-finite threshold and is rejected by name."
+    " No file produced here has been read back by LightGBM. mojotrees's own"
+    " format (serialize.mojo) remains the only supported persistence format."
 )
 
 

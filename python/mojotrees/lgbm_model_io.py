@@ -25,11 +25,20 @@ reason -- an import's product is a native file, which is also what forces
 every converted model through native serialization before anything can use
 it.
 
-**Experimental** means what `interop_status()` says it means: the converter
-has been exercised against hand-written fixtures only, and no file a real
-LightGBM build wrote has ever been read by it. Treat a conversion as
-something to check, not something to rely on. The first use in a process
-warns, once.
+**Experimental** means what `interop_status()` says it means, and what it
+means changed on 2026-08-18. The converter now reads files a real LightGBM
+build wrote: fourteen models trained and saved by LightGBM 4.7.0 were read
+back here and thirteen predicted **bit-identically** on every row against
+LightGBM's own `raw_score`, across binary, regression, regression_l1,
+poisson, five-class multiclass, depth-12, stumps, 1023 bins, 15 bins, L1
+plus L2, categorical, ninety-percent-sparse and single-tree models.
+
+Two things keep the word. A model LightGBM trained on data with NaNs carries
+a non-finite threshold and is **refused by name** rather than mispredicted,
+so missing-value models are unsupported. And nothing produced by the export
+direction has been read back by LightGBM, so only half the round trip has
+evidence. Treat a conversion as something to check, not something to rely
+on. The first use in a process warns, once.
 
 Two caveats survive every conversion and are worth repeating wherever this
 is surfaced:
