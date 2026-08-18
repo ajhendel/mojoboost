@@ -138,14 +138,43 @@ say "build"
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --pretty=%ct HEAD)}
 echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
 
-if [ -n "${MOJOTREES_MACOS_TARGET:-}" ]; then
-    echo "requested deployment target: $MOJOTREES_MACOS_TARGET"
-    echo "(a request. C1 below checks what the compiler actually emitted.)"
-    export MACOSX_DEPLOYMENT_TARGET="$MOJOTREES_MACOS_TARGET"
-    export MOJOTREES_MACOS_DEPLOYMENT_TARGET="$MOJOTREES_MACOS_TARGET"
-else
-    echo "deployment target: SDK default (expect macosx_26_0 on a current Xcode)"
-fi
+# THE DEPLOYMENT TARGET NOW DEFAULTS TO 12.0 RATHER THAN TO THE SDK, AND THAT
+# IS A USABILITY FIX RATHER THAN A PREFERENCE.
+#
+# Without an explicit target the compiler stamps the SDK of whatever machine
+# ran the build. This project builds on an M4 running macOS 26, so the wheel
+# came out tagged `macosx_26_0_arm64`, which pip reads as "needs macOS 26 or
+# newer". That is not a requirement of Mojo or of this library. It is a
+# fingerprint of the build machine, and it made the wheel installable only on
+# the newest macOS for no reason anybody chose.
+#
+# **AND THE FLOOR IS THE HALF THAT MATTERS, BECAUSE `requires-python` DOES NOT
+# HELP.** `python/pyproject.toml` already declares `>=3.10`, correctly, and its
+# own comment says why that buys nothing on its own: pip matches the WHEEL TAG
+# before it consults `requires-python`. A wheel tagged
+# `cp314-macosx_26_0_arm64` is invisible to a user on 3.12 or on macOS 14 no
+# matter how permissive the metadata is. The tag is the gate.
+#
+# WHY 12.0 AND NOT SOMETHING OLDER. Monterey is the oldest release that runs on
+# every Apple Silicon Mac ever shipped, so it costs nothing in reach, and
+# `docs/PLATFORM_MATRIX.md` already carries a `macos-arm64-cp314-lowered` row
+# targeting exactly `macosx_12_0_arm64`.
+#
+# VERIFIED BY BUILDING IT ON 2026-08-18, not assumed. The open question was
+# whether anything in the build genuinely needs a macOS 26 API, and the only
+# way to answer it is to lower the target and compile. Result: the extension
+# builds clean, `vtool -show-build` reports `minos 12.0` against `sdk 26.5`,
+# and both backends train on it, CPU and GPU agreeing at rmse 0.323278. So
+# nothing here needed macOS 26 and the tag was pure accident.
+#
+# Set MOJOTREES_MACOS_TARGET to override, including to the SDK default by
+# passing the current major, and C1 below still checks what the compiler
+# actually emitted rather than trusting the request.
+: "${MOJOTREES_MACOS_TARGET:=12.0}"
+echo "requested deployment target: $MOJOTREES_MACOS_TARGET"
+echo "(a request. C1 below checks what the compiler actually emitted.)"
+export MACOSX_DEPLOYMENT_TARGET="$MOJOTREES_MACOS_TARGET"
+export MOJOTREES_MACOS_DEPLOYMENT_TARGET="$MOJOTREES_MACOS_TARGET"
 
 # Builds through packaging/build_wheel.sh (test-wheel depends on build-wheel),
 # then installs the wheel into a bare venv and a full one and runs the suites
