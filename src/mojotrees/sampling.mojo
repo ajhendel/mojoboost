@@ -272,9 +272,28 @@ comptime DEFAULT_MVS_SUBSAMPLE = 0.8
 # make every weight in the fit follow it too.
 comptime MVS_BLOCK_SIZE = 8192
 
+# The same number as a shift, so a device kernel can map a row to its block
+# with `r >> MVS_BLOCK_SHIFT` instead of an integer division.
+#
+# It exists because a per-row GPU kernel does that division once per row per
+# tree and 8192 is a power of two, not because the host loop needs it -- the
+# host walks blocks and never divides. **The two must stay equal**, and
+# `gpu_objectives_native.GpuMvsSampler.__init__` raises if they ever drift,
+# because a device draw that blocked its rows differently from the host draw
+# would solve a different threshold per row and nothing else would notice.
+comptime MVS_BLOCK_SHIFT = 13
+
 # `std::numeric_limits<double>::epsilon()`, the literal constant CatBoost tests
 # the keep probability against in `GenSampleWeights`.
 comptime _MVS_PROBABILITY_EPS = 2.220446049250313e-16
+
+# The same epsilon at the width a device round carries. NOT the same number:
+# `_MVS_PROBABILITY_EPS` is `2^-52` exactly and its Float32 image is the
+# nearest Float32 to it, so a keep probability between the two is admitted on
+# one side of the split and refused on the other. One more entry on the list
+# of reasons a device draw is not the host draw; see the design block above
+# `mvs_bootstrap_weights`.
+comptime MVS_PROBABILITY_EPS_F32 = Float32(2.220446049250313e-16)
 
 # Separates the MVS stream from the Bayesian bootstrap's: both are keyed by
 # (seed, tree index), both default their seed to 0, and a caller may well set
@@ -1356,6 +1375,18 @@ def _mvs_stream(seed: Int, tree_index: Int) -> UInt64:
     return splitmix64(h ^ (UInt64(tree_index & 0x7FFFFFFFFFFFFFFF) * GOLDEN))
 
 
+def mvs_stream(seed: Int, tree_index: Int) -> UInt64:
+    """`_mvs_stream` under a name a caller outside this module may use.
+
+    A forwarder and not a second implementation, which is the whole point: the
+    device draw in `gpu_objectives_native.GpuMvsSampler` keys its per-row
+    uniforms off this exact word, and a device stream derived from a copied
+    expression would drift from the host's the first time either was edited.
+    One definition, two readers.
+    """
+    return _mvs_stream(seed, tree_index)
+
+
 def _row_magnitude_squared(
     gradients: List[Float64], row: Int, n_outputs: Int
 ) -> Float64:
@@ -1569,8 +1600,41 @@ struct MvsAudit(Copyable, Movable):
 # The MVS draw on a device round: the design, and what it can and cannot claim.
 # ---------------------------------------------------------------------------
 #
-# Written 2026-08-17, NOT BUILT, and recorded here rather than in a plan file
-# because the three hard parts are all properties of the function below.
+# Written 2026-08-17 as a design, and BUILT the same day. What shipped is
+# shape (b) below, and it lives in `gpu_objectives_native.GpuMvsSampler`
+# behind `MOJOTREES_GPU_MVS_DEVICE=1`, DEFAULT OFF. Everything the design
+# said about identity survived the implementation and none of it was
+# softened: read `THE IDENTITY CLAIM` at the bottom before quoting a number
+# taken with the switch on.
+#
+# WHAT THE BUILT VERSION SETTLED, since a design that is now code should say
+# which of its open questions closed and which did not.
+#
+#   - The iteration count is bounded by `MVS_SOLVE_MAX_ITERS`, a constant, and
+#     the kernel records the count it actually used per block so the bound can
+#     be shown to be slack rather than assumed to be. The launch budget is
+#     therefore known ahead of time (three kernels per tree, no readback), and
+#     the "stops early has silently changed the sampler" risk is converted
+#     into a countable audit rather than argued away.
+#   - The keep decision is exact against the host's, GIVEN THE SAME `p`: the
+#     device compares the same 53-bit `splitmix64` integer the host draws
+#     against `p * 2^53` formed in integers out of the Float32 `p`, so no
+#     Float64 is needed and no second uniform exists. `p` itself still differs,
+#     which is the whole of the identity claim below.
+#   - Compaction is not done, as designed. A dropped row keeps its slot with
+#     weight 0, so `min_data_in_leaf` counts it and the host draw does not.
+#
+# WHAT IT DID NOT SETTLE. The scale a round's fixed-point histogram is
+# quantized by is derived from the magnitude sums of whatever is in the
+# gradient plane when `histogram_gpu._refresh_scales` runs, so the draw must
+# land BEFORE that reduction or the overflow check would be run against a
+# plane no histogram was built from. The device draw therefore folds itself
+# into the objective state's weight plane and the derivative kernel is run a
+# SECOND time, rather than the draw scaling the gradient plane in place. That
+# costs one extra derivative pass per round and no extra round trip, and it is
+# the price of `fill_gradients_device` having no seam between its fill and its
+# scale refresh. A seam there would remove the second pass; see the report on
+# `train_gpu._train_gpu_rounds`'s device arm.
 #
 # Why it is wanted. On a GPU fit an MVS bundle routes the whole round to the
 # host-gradient arm (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`), and that arm

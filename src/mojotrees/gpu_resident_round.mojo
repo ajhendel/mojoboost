@@ -1000,6 +1000,99 @@ def partition_fusion_enabled() -> Bool:
     return getenv(PARTITION_FUSION_VAR) != "0"
 
 
+comptime STEP_STAGE_FUSION_VAR = "MOJOTREES_GPU_FUSE_STEP_STAGE"
+"""`1` folds each step's search staging into the same command buffer as the
+pick and commit that decided it. Default OFF.
+
+**What it removes.** `enqueue_desc_stage_search` is one launch of one block of
+one thread whose entire body is two Int32 writes derived from three words the
+pick-and-commit kernel wrote one launch earlier. At the benchmark shape it is
+one of the nine per-step launches, so folding it removes 30 command buffers a
+tree and 3,000 a fit, an 11 percent cut in the fit's launch count.
+
+**Why it is the half of the fusion with no memory-model question in it.** Both
+the words it reads and the words it writes belong to thread 0: the commit's
+third phase is explicitly one thread, and the staging is two writes. Fusing
+them makes the seam program order inside one thread, which needs no barrier and
+no fence on any backend. See `gpu_tree_tables._fused_step_kernel`.
+
+**It is not the whole of the fusion the accounting lane proposed**, which was
+three kernels rather than two. The third, the previous step's record filing,
+is behind `COPY_STEP_FUSION_VAR` because it is the one that has a cross-thread
+dependency in it and therefore the one whose risk is not the same. Two
+mechanisms behind one switch cannot be told apart.
+
+**PRICED LOW, AND HERE IS THE ARITHMETIC BEFORE THE NUMBER ARRIVES.** Both
+switches together remove 6,000 command buffers from a 27,900-launch fit. At
+this repository's registered launch-encode figures -- 6 to 7 microseconds below
+queue depth 64, 14 to 17 above -- that is 0.036 to 0.102 seconds against a 1.97
+second fit, so somewhere between 2 and 5 percent. A few percent, not a
+transformation.
+
+**And the reason it may come back null anyway.** The controlled experiment that
+funded this lane found roughly 1.2 seconds of the 1.57 second training phase to
+be fixed with respect to row count. Divided over 27,900 launches that is 43
+microseconds each, SIX TIMES the registered encode figure. Only two readings
+are available and they predict different outcomes:
+
+- The registered figure is understated and the real marginal cost of a dispatch
+  on this machine is nearer 43 microseconds. Then 6,000 launches are worth
+  about 0.26 seconds and this is the biggest lever of the round.
+- Or most of that fixed 1.2 seconds is per-STEP host work that is not
+  proportional to the launch count at all -- descriptor bookkeeping, argument
+  marshalling, the Mojo-side call path -- in which case removing two of nine
+  launches removes almost none of it and the measurement resolves null.
+
+The second reading is the one to expect, because the first would require the
+registered figure to be wrong by 6x, and it was itself measured. If the arm
+measures null, THIS is the explanation and it was written down before the
+number arrived rather than after."""
+
+
+def step_stage_fusion_enabled() -> Bool:
+    """Whether each step's search staging shares a command buffer with the
+    commit that decided it.
+
+    Read once per tree, next to the trace and census sinks, for the reason
+    stated at `resident_trace_sink`."""
+    return getenv(STEP_STAGE_FUSION_VAR) == "1"
+
+
+comptime COPY_STEP_FUSION_VAR = "MOJOTREES_GPU_FUSE_COPY_STEP"
+"""`1` additionally folds the previous step's record filing into the front of
+the fused step kernel. Default OFF, and inert unless
+`MOJOTREES_GPU_FUSE_STEP_STAGE=1` is also set.
+
+**What it removes.** `enqueue_desc_copy_records` is the last launch of a growth
+step and the fused commit is the first launch of the next one, so filing the
+records at the head of that kernel removes a second command buffer per step:
+another 30 a tree and 3,000 a fit. With both switches on the per-step launch
+count goes from nine to seven and the fit's from 27,900 to 22,000, which is the
+21 percent the accounting lane predicted.
+
+**Why it is a separate switch from the staging fold.** The copy writes the two
+children's frontier records and the commit's reduction reads two words out of
+every live leaf's record, so a word written by one thread here is read by a
+different thread there. The fused kernel closes that with `barrier()`, which is
+a threadgroup barrier and is sufficient only because both stages run in one
+threadgroup -- which they do, `grid_dim = 1` in both. That is a correctness
+argument that rests on `barrier()` ordering DEVICE memory between threads of
+one block, and this package has so far never asked it to: every other
+`barrier()` in it publishes a shared-memory word. The API contract says it does
+("memory operations before the barrier are visible to all threads after the
+barrier") and the portability guide's Apple sentence maps it to
+`threadgroup_barrier(mem_flags::mem_threadgroup)`, which does not. The two
+disagree, so this arm is the one that has to be proved by a node-for-node
+comparison rather than by reading, and it is separately switchable so that a
+null or a wrong tree lands on the right mechanism."""
+
+
+def copy_step_fusion_enabled() -> Bool:
+    """Whether the previous step's record filing shares a command buffer with
+    the next step's commit."""
+    return getenv(COPY_STEP_FUSION_VAR) == "1"
+
+
 comptime OBLIVIOUS_SKIP_LAST_BUILD_VAR = (
     "MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD"
 )
@@ -2682,6 +2775,25 @@ def grow_tree_device_resident(
     var trace_steps = trace != "" and resident_trace_steps_requested()
     var census_sink = speculation_census_sink()
     var spec = speculative_build_enabled()
+    # The two step fusions, resolved once and here rather than at each launch.
+    #
+    # Both are REFUSED under the K=1 speculation, and that is a correctness
+    # refusal rather than a preference: the speculation puts
+    # `enqueue_spec_consume` between the commit and the search staging and puts
+    # the runner-up publication and its two launches between the record filing
+    # and the next commit, so on that arm the three kernels this fuses are not
+    # adjacent and folding them would reorder work against a descriptor that
+    # another launch rewrites in between. See `STEP_STAGE_FUSION_VAR`.
+    #
+    # The copy fold is additionally refused under the per-step trace, which
+    # downloads the tables between the record filing and the next commit. That
+    # one is not a correctness refusal -- the tree would be the same -- it is
+    # that a trace printed after the next step has already committed is a trace
+    # of a different moment than the one it labels.
+    var fuse_stage = step_stage_fusion_enabled() and not spec
+    var fuse_copy = (
+        fuse_stage and copy_step_fusion_enabled() and not trace_steps
+    )
     # One fewer command buffer per growth step, and the arm that puts it back.
     # Applied here rather than left to whoever constructed the builder, because
     # the pairing the fusion depends on -- a descriptor partition followed
@@ -2817,16 +2929,62 @@ def grow_tree_device_resident(
         # with it because a fit's hit rate is a sum over trees of counts, and
         # a counter carried across trees would be the wrong denominator.
         builder.rows.enqueue_spec_reset()
-    for step in range(params.num_leaves - 1):
-        # Pick the leaf, commit the split, write the tree, move the slot
-        # pool, and publish the step descriptor. One block, one launch.
-        builder.enqueue_desc_step(
+    if fuse_copy:
+        # The head of the rotated loop. With the record filing folded in, the
+        # fused kernel sits at the END of the body rather than at the start of
+        # it -- it files the step the body just searched and commits the step
+        # the NEXT body will partition -- so step 0's commit has to be issued
+        # before the loop is entered. `do_copy` is False here and only here:
+        # there is no previous step to file.
+        builder.resident_tables[0].enqueue_fused_step(
             searcher.rec_i_dev,
             searcher.rec_f_dev,
+            step_handle,
+            searcher.node_dev,
             params.num_leaves,
             params.max_depth,
             params.min_data_in_leaf,
+            slot_cells,
+            scratch_l,
+            scratch_r,
+            do_copy=False,
+            do_stage=True,
         )
+    for step in range(params.num_leaves - 1):
+        # Pick the leaf, commit the split, write the tree, move the slot
+        # pool, and publish the step descriptor. One block, one launch.
+        #
+        # Under `fuse_copy` this launch is not here at all: the head above
+        # issued step 0's and the tail of this body issues every other one.
+        if fuse_copy:
+            pass
+        elif fuse_stage:
+            # The commit and the search staging in one command buffer. The
+            # staging reads only words the commit's thread 0 wrote, so the
+            # seam is program order inside one thread. `do_copy` is False:
+            # the record filing keeps its own launch on this arm.
+            builder.resident_tables[0].enqueue_fused_step(
+                searcher.rec_i_dev,
+                searcher.rec_f_dev,
+                step_handle,
+                searcher.node_dev,
+                params.num_leaves,
+                params.max_depth,
+                params.min_data_in_leaf,
+                slot_cells,
+                scratch_l,
+                scratch_r,
+                do_copy=False,
+                do_stage=True,
+            )
+        else:
+            builder.enqueue_desc_step(
+                searcher.rec_i_dev,
+                searcher.rec_f_dev,
+                params.num_leaves,
+                params.max_depth,
+                params.min_data_in_leaf,
+            )
         if spec:
             # Was the split this step just committed the split the previous
             # step prebuilt? The answer goes into `build_dev`, which the
@@ -2844,9 +3002,13 @@ def grow_tree_device_resident(
         # The only per-record word this loop writes on the device. Reads
         # `step_dev` whatever the speculation decided, because a consumed step
         # still searches both of its children and still files both records.
-        builder.enqueue_desc_stage_search(
-            searcher.node_dev, slot_cells, scratch_l, scratch_r
-        )
+        #
+        # Folded into the commit on both fusion arms, which is what those arms
+        # ARE; see `STEP_STAGE_FUSION_VAR`.
+        if not fuse_stage:
+            builder.enqueue_desc_stage_search(
+                searcher.node_dev, slot_cells, scratch_l, scratch_r
+            )
         # Reassign the parent's rows to its two children. Three launches at a
         # grid sized for the whole active prefix. Skipped on a consumed step,
         # where the previous step's speculative partition already produced
@@ -2881,9 +3043,33 @@ def grow_tree_device_resident(
             resident_child_node_base(step),
         )
         # File the two answers in the frontier slots that own them.
-        builder.enqueue_desc_copy_records(
-            searcher.rec_i_dev, searcher.rec_f_dev, scratch_l, scratch_r
-        )
+        #
+        # Under `fuse_copy` this is the head of the next step's commit instead
+        # of a launch of its own, and the same launch also stages that step's
+        # child search -- so one command buffer stands where three did. The
+        # last iteration's fused launch is the step that ends growth rather
+        # than performing it, which is why the trailing `enqueue_desc_step`
+        # below is skipped on this arm and why `do_stage` is False there: a
+        # step that cannot commit has no children to point a search at.
+        if fuse_copy:
+            builder.resident_tables[0].enqueue_fused_step(
+                searcher.rec_i_dev,
+                searcher.rec_f_dev,
+                step_handle,
+                searcher.node_dev,
+                params.num_leaves,
+                params.max_depth,
+                params.min_data_in_leaf,
+                slot_cells,
+                scratch_l,
+                scratch_r,
+                do_copy=True,
+                do_stage=(step < params.num_leaves - 2),
+            )
+        else:
+            builder.enqueue_desc_copy_records(
+                searcher.rec_i_dev, searcher.rec_f_dev, scratch_l, scratch_r
+            )
         if spec:
             # Name the leaf the *next* step is most likely to pick, and build
             # its smaller child now. The runner-up kernel excludes the two
@@ -2963,13 +3149,22 @@ def grow_tree_device_resident(
     #
     # The cost is one launch of one threadgroup per tree, and no wait: this
     # goes into the same queue as everything above it.
-    builder.enqueue_desc_step(
-        searcher.rec_i_dev,
-        searcher.rec_f_dev,
-        params.num_leaves,
-        params.max_depth,
-        params.min_data_in_leaf,
-    )
+    #
+    # On the `fuse_copy` arm this step is not free-standing: the loop's last
+    # fused launch IS it, filing the last search's records and then running the
+    # same pick and commit against them with the staging turned off. The kernel
+    # executed and the state it reads are identical; only the command buffer it
+    # shares changes. Issuing it again here would be a second terminal step,
+    # which would still commit nothing but would leave `CTR_STATUS` written
+    # twice and would put the launch back that the arm removed.
+    if not fuse_copy:
+        builder.enqueue_desc_step(
+            searcher.rec_i_dev,
+            searcher.rec_f_dev,
+            params.num_leaves,
+            params.max_depth,
+            params.min_data_in_leaf,
+        )
 
     # --- The one round trip ------------------------------------------------
     var snap = builder.download_desc_tables()

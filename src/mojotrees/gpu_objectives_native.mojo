@@ -252,7 +252,7 @@ argued. Again: arithmetic of the declaration, not a regression.
 """
 
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
-from std.math import exp, isfinite
+from std.math import exp, isfinite, sqrt
 from std.memory import bitcast, stack_allocation
 from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
@@ -291,6 +291,19 @@ from .ranking_pairwise import (
     describe_rank_kind,
     rank_kind_is_pairwise,
     rank_kind_regenerates_pairs,
+)
+from .rng import splitmix64
+
+# sampling.mojo imports nothing from `max.gpu.*` and nothing from any GPU file
+# -- only `std`, `bagging`, `rng` and `objective_registry` -- so naming it here
+# adds no cycle and no accelerator dependency to a CPU-only build. The three
+# names are the MVS block geometry and the keep-probability epsilon; taking
+# them from the sampler rather than restating them is what keeps the device
+# draw blocked exactly as the host draw blocks.
+from .sampling import (
+    MVS_BLOCK_SHIFT,
+    MVS_BLOCK_SIZE,
+    MVS_PROBABILITY_EPS_F32,
 )
 
 # Clamp on every `exp` argument. exp(60) is 1.1e26, four orders of magnitude
@@ -2393,6 +2406,721 @@ struct GpuObjectiveState(Movable):
         for r in range(self.n_rows):
             g.append(Float64(src.unsafe_load(r)))
         return g^
+
+
+# ---------------------------------------------------------------------------
+# CatBoost's MVS bootstrap, solved on the device.
+# ---------------------------------------------------------------------------
+#
+# Built 2026-08-17 to the design recorded above `sampling.mvs_bootstrap_weights`,
+# which is where the reasoning lives; this header states only what the code
+# does and what it may be claimed to be.
+#
+# WHY IT EXISTS. An MVS bundle routes a GPU fit to the host-gradient arm
+# (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`), because MVS solves its keep
+# threshold from the round's own per-row gradient magnitudes and the device
+# round does not hand those to the host. That arm computes every round's
+# derivatives on the host in Float64 while the tree grows on the device, and
+# it was measured on 2026-08-17 to cost 1.62x against the same symmetric fit
+# with no sampler -- the single largest named line item in the CatBoost-mode
+# default set, with every other member of that set inside a tenth. Solving the
+# threshold here is what removes it.
+#
+# **IT IS NOT BIT-IDENTICAL TO THE HOST DRAW AND MUST NEVER BE CALLED ONE.**
+# Five separate reasons, none of which is a rounding to be tightened away:
+#
+#   1. The host solves over magnitudes built from FLOAT64 derivatives; a device
+#      round holds Float32 ones. The magnitudes differ before any solve runs.
+#   2. `sqrt(g * g + lambda)` is written unfused here on purpose, but a
+#      compiler is free to contract it into an fma anyway, and the host
+#      expression and this one are not the same source text.
+#   3. The host sums the small side in pivot-partition order; this sums it in
+#      grid-stride order and folds it through a shared-memory tree. Float
+#      addition is not associative.
+#   4. The threshold is solved in Float32 here and in Float64 there, so a row
+#      within an ulp of the threshold can land on either side.
+#   5. `MVS_PROBABILITY_EPS_F32` is not `_MVS_PROBABILITY_EPS`.
+#
+# So this is EQUIVALENT IN DISTRIBUTION, not exact. `LANE_RULES` rule 5's
+# same-session default flip does NOT reach it, it takes the accuracy gate in
+# `docs/design/ACCURACY_BUDGET.md`, and it is therefore behind a DEFAULT-OFF
+# switch (`train_gpu.device_mvs_enabled`, `MOJOTREES_GPU_MVS_DEVICE=1`). The
+# precedent is `gpu_fused_round.ROUND_GOSS_RANK_PRECISION`, which gates on
+# exactly this class of difference: ranking Float32 scores can put a different
+# row across a threshold.
+#
+# WHAT *IS* EXACT, stated separately so the two are not blurred together.
+#
+#   - The SOLVE IS NOT AN APPROXIMATION. It is not a bisection to a tolerance
+#     and it is not a quantile read off a histogram. `_mvs_threshold_kernel`
+#     iterates `mu <- (sum of g below mu) / (S - count of g at or above mu)`
+#     from `mu_0 = (sum of all g) / S` and stops when the partition repeats.
+#     A repeated partition IS the fixed point: at that point `mu` solves
+#     `sum_r min(1, g_r / mu) = S` exactly for the partition it induces, which
+#     is the same equation and the same partition `sampling._mvs_threshold`
+#     lands on by pivoting. The two differ in arithmetic, not in what they
+#     compute.
+#   - The KEEP DRAW IS THE HOST'S DRAW, given the same `p`. Row `r` reads
+#     `splitmix64(stream + r) >> 11`, the identical 53-bit integer
+#     `rng.uniform` divides by `2^53`, and `_mvs_keep_draw` compares it against
+#     `p * 2^53` formed in exact integer arithmetic from the Float32 `p`. There
+#     is no device RNG state, no per-thread seeding, and no second uniform: the
+#     decision is a pure function of `(seed, tree_index, row)`, so it is
+#     independent of worker count, of block size, of grid shape, and of how
+#     many other rows were drawn. **CatBoost's own device MVS does not have
+#     this property** -- `MvsBootstrapRadixSortImpl` seeds per thread and
+#     advances -- and it is the one thing this implementation keeps that theirs
+#     gives up.
+#
+# WHAT IT DELIBERATELY DOES NOT DO: COMPACT. A dropped row keeps its slot with
+# weight 0, which the derivative kernel turns into an exactly zero gradient and
+# an exactly zero hessian, so it contributes to no histogram. The host draw
+# instead hands `mvs_kept_rows` to `GpuActiveRows` as a bag. The two agree on
+# every sum and disagree on one thing: `min_data_in_leaf` counts ROWS, not
+# mass, so an uncompacted device draw and a compacted host draw can disagree
+# about whether a leaf is legal. At the shipped symmetric `min_data_in_leaf`
+# of 1 that binds only on an empty leaf. It is not inert in general.
+#
+# THE CATBOOST CITATION, and what could not be verified. The comments in
+# `sampling.mojo` attribute a CUDA MVS bootstrap to
+# `cuda/cuda_util/kernel/mvs.cu::MvsBootstrapRadixSortImpl` with an 8192 block
+# size. **There is no CatBoost source in this checkout to verify that
+# against.** `.pixi/envs/bench` carries the `catboost` 1.2.10 *wheel*, which is
+# a compiled binary and no `.cu`, `.cpp` or `.h` file; a repository-wide search
+# for `mvs.cu` finds only our own two comments quoting it. Those attributions
+# were made by a lane that had the source open and are left standing as that
+# lane's record; nothing in THIS file depends on them, and no claim here should
+# be read as verified from CatBoost's tree. The only CatBoost fact this code
+# needs is the 8192 block size, and that one is independently pinned by
+# `sampling.MVS_BLOCK_SIZE`, whose own comment cites `TMvsSampler::BlockSize`
+# on the CPU side.
+
+# Threads per threadgroup in the threshold solve. Fixed rather than derived,
+# for `SUM_THREADS`'s reason: the shared-memory tree reduction needs a
+# compile-time size. One threadgroup handles one whole `MVS_BLOCK_SIZE` block
+# and grid-strides over it, so this is independent of the block size and of the
+# row count.
+comptime MVS_SOLVE_THREADS = 256
+
+# Hard ceiling on the fixed-point iteration.
+#
+# **THE ITERATION COUNT IS DATA DEPENDENT AND THIS IS THE ANSWER TO THAT**, the
+# one open risk the design block in sampling.mojo named. The iterate is
+# monotone decreasing and the large set it induces is monotone growing, so the
+# sequence of partitions is nested and strictly grows until it stops; the loop
+# can therefore run at most once per distinct magnitude in the block, and in
+# practice stops in single digits. Sixty-four is slack by construction, not a
+# tuned number.
+#
+# What happens if it is ever hit, said plainly because a silent cap would be a
+# silently different sampler: the kernel keeps the last iterate, which is an
+# UPPER bound on the true threshold (the sequence decreases toward it), so a
+# capped block keeps slightly fewer rows than it should rather than producing
+# nonsense. `GpuMvsSampler.iterations` is what shows whether the cap was
+# approached; a test that wants to prove the bound slack reads it.
+comptime MVS_SOLVE_MAX_ITERS = 64
+
+# Largest threshold the weight kernel will divide by. Anything above this is
+# an infinity produced by a degenerate quotient, and it is rejected on the same
+# grounds `sampling._mvs_threshold_is_usable` rejects a non-finite one.
+#
+# A comparison rather than an `isfinite` call, so the kernel needs nothing from
+# `std.math` beyond `sqrt`: `inf > 3.0e38` is true and every finite Float32
+# below the maximum is not.
+comptime MVS_MU_MAX = Float32(3.0e38)
+
+
+def _mvs_magnitude_kernel(
+    grad: MutPointer[Float32, MutAnyOrigin],
+    mag: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+    lam: Float32,
+):
+    """`thresholdCandidates[r] = sqrt(lambda + grad_r^2)`, one thread per row.
+
+    The device image of the magnitude loop in `sampling.mvs_bootstrap_weights`,
+    at `n_outputs == 1`, which is the only shape `GpuMvsSampler` admits.
+
+    `g * g + lam` is written as a separate multiply and add, deliberately and
+    for the reason the host loop's comment gives: CatBoost's own kernel writes
+    `sqrtf(fmaf(d, d, lambda))` and that is a different number in the last
+    bits. **This cannot be guaranteed** -- a compiler is free to contract the
+    expression anyway -- and that is one of the five reasons listed in the
+    section header for why the device draw is not the host draw.
+
+    Written once per round into a plane of its own rather than recomputed,
+    which is the same trade the host loop takes and for a stronger reason
+    here: the solve reads the magnitudes once per iteration, so recomputing
+    them would multiply the square roots by the iteration count.
+    """
+    var r = Int(global_idx.x)
+    if r >= Int(n_rows):
+        return
+    var g = grad[unsafe_offset=r][0]
+    var sq = g * g
+    mag[unsafe_offset=r] = sqrt(sq + lam)
+
+
+def _mvs_restore_kernel(
+    base: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+):
+    """Put the user's own `sample_weight` back into the round's weight plane.
+
+    **THIS IS NOT TIDYING AND LEAVING IT OUT IS A SILENT WRONG MODEL.** The
+    weight plane is `GpuMvsSampler`'s output, so at the top of round `i` it
+    still holds round `i - 1`'s draw. The pre-pass that gives the draw its
+    magnitudes runs the derivative kernel, which multiplies by that plane, so
+    without this the round would solve its threshold over derivatives already
+    scaled by the previous tree's draw -- and every row dropped once would
+    carry an exactly zero gradient forever after and never be drawn again. The
+    fit would train on a monotonically shrinking row set and report nothing.
+
+    One launch and `4 * n_rows` of device-to-device traffic per tree, which is
+    a fifth of what the pre-pass beside it costs.
+    """
+    var r = Int(global_idx.x)
+    if r >= Int(n_rows):
+        return
+    weight[unsafe_offset=r] = base[unsafe_offset=r][0]
+
+
+def _mvs_threshold_kernel(
+    mag: MutPointer[Float32, MutAnyOrigin],
+    mu: MutPointer[Float32, MutAnyOrigin],
+    iters: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    subsample: Float32,
+):
+    """One threadgroup solves one `MVS_BLOCK_SIZE` block's threshold.
+
+    The equation is `sampling._mvs_threshold`'s:
+    `sum_i min(1, g_i / mu) == subsample * m` over the block's `m` rows. The
+    method is not: this iterates rather than pivoting, because a pivot walk
+    permutes its input and a threadgroup cannot permute 8192 Float32 without
+    32 KB of shared memory it does not have on this device.
+
+    THE ITERATION, and why its fixed point is the exact solution rather than an
+    approximation of it. Let `L(t) = {i : g_i >= t}` and
+    `S_small(t) = sum of g_i over the complement`. If `mu` were known, it would
+    satisfy `mu = S_small(mu) / (target - |L(mu)|)` -- that is the equation
+    restated, with the saturated rows contributing 1 apiece. So iterate exactly
+    that map from `t_0 = total / target`, which is an upper bound because
+    `min(1, x) <= x` makes `F(t_0) <= target` and `F` is decreasing. Each step
+    lowers `t`, so `L` grows, so the partitions are NESTED and the count
+    `|L|` alone identifies the partition. When the count repeats, the map has
+    reproduced its own input partition, and the `mu` computed from that
+    partition solves the equation on it. That is a fixed point, not a
+    tolerance, and no epsilon appears anywhere in this kernel.
+
+    DEGENERATE CASES, matched to the host's guard rather than invented here.
+    `target - |L|` at or below zero means the block already saturates its own
+    sample size, and a NaN magnitude poisons the sums; both write a threshold
+    the weight kernel rejects, and rejection there means "keep this block
+    whole at weight 1", which is `sampling.mvs_bootstrap_weights`'s
+    `blocks_guarded` branch. CatBoost drops every row instead; we do not, and
+    that difference predates this kernel.
+
+    Every barrier is reached by every thread. The two grid-stride sweeps have
+    per-thread trip counts but contain no barrier; the tree reductions have a
+    uniform trip count; and the outer loop's exit conditions are read out of
+    shared memory or off loop counters, so they are the same for every thread
+    in the group.
+    """
+    # Declared first, before any conditional return, which is where
+    # `_abs_sum_kernel` declares its own and is the shape to copy: threadgroup
+    # memory is a static allocation and a reader should not have to work out
+    # whether a branch above it changes that. 2 KB, well inside the 32 KB an
+    # Apple threadgroup gets -- and the reason the block's 8192 magnitudes are
+    # NOT cached here is that they would be exactly 32 KB on their own, with
+    # nothing left for the reduction.
+    var ss = stack_allocation[
+        MVS_SOLVE_THREADS,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var sn = stack_allocation[
+        MVS_SOLVE_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var tid = Int(thread_idx.x)
+    var b = Int(block_idx.x)
+    var nr = Int(n_rows)
+    var begin = b * MVS_BLOCK_SIZE
+    if begin >= nr:
+        # Uniform across the whole threadgroup, so no barrier is skipped by
+        # some threads and reached by others.
+        return
+    var end = begin + MVS_BLOCK_SIZE
+    if end > nr:
+        end = nr
+    var m = end - begin
+
+    # `t_0 = total / target`: one sweep and one tree reduction.
+    var acc = Float32(0.0)
+    var i = begin + tid
+    while i < end:
+        acc += mag[unsafe_offset=i][0]
+        i += MVS_SOLVE_THREADS
+    ss[unsafe_offset=tid] = acc
+    barrier()
+    var active = MVS_SOLVE_THREADS // 2
+    while active > 0:
+        if tid < active:
+            ss[unsafe_offset=tid] = (
+                ss[unsafe_offset=tid][0] + ss[unsafe_offset = tid + active][0]
+            )
+        barrier()
+        active //= 2
+    var total = ss[unsafe_offset=0][0]
+    barrier()
+
+    var target = subsample * Float32(m)
+    var t = Float32(0.0)
+    if target > 0.0:
+        t = total / target
+
+    var prev_large = Int32(-1)
+    var used = 0
+    while used < MVS_SOLVE_MAX_ITERS:
+        var s_acc = Float32(0.0)
+        var n_acc = Int32(0)
+        var j = begin + tid
+        while j < end:
+            var v = mag[unsafe_offset=j][0]
+            # `>=` puts an exact tie on the large side, which is the side the
+            # host's keep rule puts it on too (`if g > mu: p = 1` leaves a tie
+            # at `p = g / mu == 1`). A NaN fails both comparisons and falls
+            # into the small sum, which is how it reaches the guard.
+            if v >= t:
+                n_acc += 1
+            else:
+                s_acc += v
+            j += MVS_SOLVE_THREADS
+        ss[unsafe_offset=tid] = s_acc
+        sn[unsafe_offset=tid] = n_acc
+        barrier()
+        var a = MVS_SOLVE_THREADS // 2
+        while a > 0:
+            if tid < a:
+                ss[unsafe_offset=tid] = (
+                    ss[unsafe_offset=tid][0] + ss[unsafe_offset = tid + a][0]
+                )
+                sn[unsafe_offset=tid] = (
+                    sn[unsafe_offset=tid][0] + sn[unsafe_offset = tid + a][0]
+                )
+            barrier()
+            a //= 2
+        var sum_small = ss[unsafe_offset=0][0]
+        var n_large = sn[unsafe_offset=0][0]
+        barrier()
+        used += 1
+        if n_large == prev_large:
+            # The map reproduced its own partition: `t` already solves the
+            # equation on it. Stop, and keep `t` as it stands.
+            break
+        prev_large = n_large
+        var denom = target - Float32(Int(n_large))
+        if not (denom > 0.0):
+            t = Float32(0.0)
+            break
+        t = sum_small / denom
+
+    if tid == 0:
+        mu[unsafe_offset=b] = t
+        iters[unsafe_offset=b] = Int32(used)
+
+
+@always_inline
+def _mvs_keep_draw(counter: UInt64, p: Float32) -> Bool:
+    """The host's keep test, decided in integers so it needs no Float64.
+
+    `sampling.mvs_bootstrap_weights` asks `uniform(stream + r) < p`, and
+    `rng.uniform` is `Float64(splitmix64(counter) >> 11) * 2^-53`. That left
+    side is EXACT: a 53-bit integer converts to Float64 without rounding and
+    scaling by a power of two is exact. So the host's test is, in exact real
+    arithmetic, `u < p * 2^53` for the integer `u`, and this evaluates that
+    same inequality without ever forming a Float64 -- which matters because
+    Apple GPUs have none.
+
+    `p` is a normal Float32 in `(0, 1)` by the caller's guards, so
+    `p = m * 2^(e - 23)` with `m` a 24-bit integer, and `p * 2^53` is
+    `m * 2^(e + 30)`. Left shift when that exponent is non-negative; when it is
+    negative, compare `u * 2^k < m` instead, which is the same inequality
+    cleared of its denominator. Both sides are bounded well inside 64 bits
+    under the caller's guards, and the two early rejections below are what
+    keep them bounded when they are not.
+
+    The counter is `stream + r` and nothing advances, so this is a pure
+    function of `(seed, tree_index, row)` and reproduces on any grid, at any
+    worker count, on either backend. That is the per-row reproducibility the
+    host draw has and CatBoost's device draw gives up.
+    """
+    var u = splitmix64(counter) >> 11
+    var bits = bitcast[DType.uint32, 1](p)
+    var ex = Int((bits >> 23) & 0xFF)
+    if ex == 0:
+        # Subnormal: below 2^-126, far under any epsilon the caller admits.
+        return False
+    var m = UInt64(Int((bits & 0x7FFFFF) | 0x800000))
+    var shift = ex - 127 + 30
+    if shift >= 0:
+        if shift >= 40:
+            # `p * 2^53 >= 2^63 > u`. Unreachable for `p < 1`; kept so the
+            # shift below can never overflow whatever the caller passes.
+            return True
+        return u < (m << UInt64(shift))
+    var k = -shift
+    if u == 0:
+        # `p * 2^53 > 0`, so the strict inequality holds.
+        return True
+    if k >= 40:
+        return False
+    if u >= (UInt64(1) << 24):
+        # `p * 2^53 < 2^24 <= u`.
+        return False
+    return (u << UInt64(k)) < m
+
+
+def _mvs_weight_kernel(
+    mag: MutPointer[Float32, MutAnyOrigin],
+    mu: MutPointer[Float32, MutAnyOrigin],
+    base: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+    s0: Int32,
+    s1: Int32,
+    s2: Int32,
+    s3: Int32,
+):
+    """One thread per row: the keep decision, the amplification, and the
+    product with the user's own `sample_weight`.
+
+    This is `sampling.mvs_bootstrap_weights`'s weight loop followed by
+    `refresh_mvs_bootstrap`'s `weights[r] * base_weight[r]`, in one pass. The
+    product is formed in that order because that is the order the host forms
+    it in and the two factors do not commute in floating point.
+
+    The counter stream arrives as four 16-bit limbs rather than as one UInt64,
+    and that is not fussiness. Every kernel in this package passes its scalars
+    as `Int32` or `Float32`, and no kernel here has ever taken a 64-bit scalar
+    argument; sixteen bits at a time is a split that is certainly a
+    non-negative `Int32` on every backend, and
+    reassembling it here costs three shifts and three ors once per row against
+    a `splitmix64` that costs more than that. `GpuMvsSampler.draw` is the one
+    place the split is made.
+    """
+    var r = Int(global_idx.x)
+    if r >= Int(n_rows):
+        return
+    var b = r >> MVS_BLOCK_SHIFT
+    var t = mu[unsafe_offset=b][0]
+    var w0 = base[unsafe_offset=r][0]
+    if not (t > 0.0) or t > MVS_MU_MAX:
+        # `sampling._mvs_threshold_is_usable` said no: keep the block whole.
+        # `not (t > 0.0)` covers NaN and the negative zero the undershoot
+        # branch can produce, exactly as the host guard does.
+        weight[unsafe_offset=r] = w0
+        return
+    var g = mag[unsafe_offset=r][0]
+    var p = Float32(1.0)
+    if not (g > t):
+        p = g / t
+    var w = Float32(0.0)
+    if p > MVS_PROBABILITY_EPS_F32:
+        if p >= 1.0:
+            # Certain keep, and no draw is burned: the stream is keyed by row,
+            # so skipping a row's draw cannot shift any other row's.
+            w = Float32(1.0)
+        else:
+            var stream = (
+                (UInt64(Int(s3) & 0xFFFF) << UInt64(48))
+                | (UInt64(Int(s2) & 0xFFFF) << UInt64(32))
+                | (UInt64(Int(s1) & 0xFFFF) << UInt64(16))
+                | UInt64(Int(s0) & 0xFFFF)
+            )
+            if _mvs_keep_draw(stream + UInt64(r), p):
+                w = Float32(1.0) / p
+    weight[unsafe_offset=r] = w * w0
+
+
+struct GpuMvsSampler(Movable):
+    """CatBoost's MVS draw, solved and applied entirely on the device.
+
+    One per fit, constructed beside the `GpuObjectiveState` and from the same
+    `DeviceContext`; call `draw` once per tree, before the round's derivatives
+    are filled for the histogram.
+
+    HOW IT LANDS IN A ROUND, because the ordering is the whole design and it is
+    not obvious. The draw needs the round's gradient magnitudes, and the
+    round's fixed-point histogram scale is derived from the magnitude sums of
+    whatever the gradient plane holds when `histogram_gpu._refresh_scales`
+    runs. Those two want opposite orders. Applying the draw to the gradient
+    plane AFTER `fill_gradients_device` would leave the scale derived from an
+    unsampled plane and, worse, would leave the window overflow check
+    measuring a plane no histogram was ever built from -- a silent wrong
+    answer rather than a loud one. So the draw goes into the WEIGHT plane
+    instead, which the derivative kernel already multiplies both derivatives
+    by, and the trainer's round reads:
+
+        sampler.restore_base_weights(...)  # undo the PREVIOUS tree's draw
+        state.fill_grad_hess(...)          # unsampled, magnitudes only
+        sampler.draw(...)                  # writes state.weight_dev
+        builder.fill_gradients_device(...) # sampled, and the scale with it
+
+    All four steps are required and the first is the one that looks optional
+    and is not: the weight plane is this sampler's output, so without the
+    restore the pre-pass would read the previous tree's draw and every dropped
+    row would stay dropped for the rest of the fit.
+
+    One extra derivative pass and one copy kernel per round, and NO extra round
+    trip. The extra pass would disappear if `fill_gradients_device` had a seam
+    between its fill and its scale refresh; it does not, and adding one is an
+    edit to histogram_gpu.mojo rather than to this file.
+
+    WHAT IT OWNS. Four device planes: the magnitudes, the per-block threshold,
+    the per-block iteration count, and a private copy of the user's own
+    `sample_weight` -- private because `state.weight_dev` is this sampler's
+    OUTPUT every tree and would otherwise be squared into itself by the second
+    tree. `4 * n_rows` bytes twice, plus a few bytes per 8192 rows.
+
+    Single output only. A multiclass or multi-target state has `n_outputs`
+    derivatives per row and a magnitude that reduces across them, and the
+    device round refuses a bootstrap on those shapes for reasons that predate
+    this file; rather than half-implement it, `draw` raises.
+    """
+
+    var mag_dev: DeviceBuffer[DType.float32]
+    var mu_dev: DeviceBuffer[DType.float32]
+    var iter_dev: DeviceBuffer[DType.int32]
+    var base_dev: DeviceBuffer[DType.float32]
+    """The user's `sample_weight`, or ones, uploaded once at construction.
+
+    Read every tree and never written, so the round's weight plane is always
+    `draw(tree) * sample_weight` and never `draw(tree) * draw(tree - 1) *
+    sample_weight`. This is the buffer whose absence would make an MVS fit
+    silently collapse its own weights over a hundred rounds."""
+    var host_iter: HostBuffer[DType.int32]
+    var n_rows: Int
+    var n_blocks: Int
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        n_rows: Int,
+        base_weight: List[Float64],
+    ) raises:
+        """Allocate the planes and upload the base weights.
+
+        `base_weight` is the user's own `sample_weight`, or empty for the
+        unweighted convention this package uses everywhere, in which case the
+        plane is filled with ones. It is uploaded here rather than copied off
+        `state.weight_dev` because a device-to-device copy of a plane this
+        sampler is about to overwrite is the kind of aliasing that reads
+        correct and is not.
+        """
+        if n_rows < 1:
+            raise Error("GpuMvsSampler needs at least one row")
+        if (1 << MVS_BLOCK_SHIFT) != MVS_BLOCK_SIZE:
+            raise Error(
+                "MVS_BLOCK_SHIFT and MVS_BLOCK_SIZE have drifted apart; the"
+                " device draw maps a row to its block with a shift and would"
+                " solve a different threshold per row than the host draw"
+            )
+        if len(base_weight) != 0 and len(base_weight) != n_rows:
+            raise Error("sample_weight length must match the row count")
+        self.n_rows = n_rows
+        self.n_blocks = (n_rows + MVS_BLOCK_SIZE - 1) // MVS_BLOCK_SIZE
+        self.mag_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        self.base_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        self.mu_dev = ctx.enqueue_create_buffer[DType.float32](self.n_blocks)
+        self.iter_dev = ctx.enqueue_create_buffer[DType.int32](self.n_blocks)
+        self.host_iter = ctx.enqueue_create_host_buffer[DType.int32](
+            self.n_blocks
+        )
+        # Validate before the mapping opens, so a bad weight raises without
+        # leaving a half-written plane behind it.
+        if len(base_weight) != 0:
+            for r in range(n_rows):
+                if not isfinite(base_weight[r]) or base_weight[r] < 0.0:
+                    raise Error("sample_weight must be finite and nonnegative")
+        # Written through the mapping rather than staged, which is what
+        # `GpuObjectiveState.__init__` does with its own one-time uploads and
+        # for the same reason: this runs once per fit and the mapping is the
+        # shorter path. A temporary `HostBuffer` would be the other way to do
+        # it and is the wrong one -- the buffer's last use would be the
+        # `unsafe_ptr()` call, so nothing would keep it alive across the copy
+        # that reads through that pointer.
+        with self.base_dev.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            if len(base_weight) == 0:
+                for r in range(n_rows):
+                    dst.unsafe_store(r, Float32(1.0))
+            else:
+                for r in range(n_rows):
+                    dst.unsafe_store(r, Float32(base_weight[r]))
+
+    def restore_base_weights(
+        mut self, ctx: DeviceContext, mut state: GpuObjectiveState
+    ) raises:
+        """Undo the previous tree's draw, leaving the plane at the user's own
+        `sample_weight`.
+
+        **Call this immediately before the pre-pass that fills the gradients
+        the draw will read**, every round, including the first. `draw`'s own
+        docstring says why; `_mvs_restore_kernel`'s says what it costs if it is
+        skipped, which is a fit that trains on a row set that can only shrink.
+
+        Separate from `draw` rather than folded into it because the two land on
+        opposite sides of the caller's derivative fill, and a method that had
+        to be called twice with a fill in between would be one method with two
+        meanings.
+        """
+        if state.n_rows != self.n_rows:
+            raise Error(
+                "GpuMvsSampler was built for a different row count than this"
+                " objective state carries"
+            )
+        if not state.weighted:
+            raise Error(
+                "the device MVS draw writes into the objective state's weight"
+                " plane, and this state still carries the unweighted"
+                " placeholder; call refresh_weights once before the round"
+                " loop so the plane is allocated at full width"
+            )
+        comptime if not has_accelerator():
+            raise Error(
+                "the device MVS draw needs an accelerator; this build has none"
+            )
+        else:
+            ctx.enqueue_function[_mvs_restore_kernel](
+                self.base_dev.unsafe_ptr(),
+                state.weight_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                grid_dim=state._row_blocks(),
+                block_dim=state.block_threads,
+            )
+
+    def draw(
+        mut self,
+        ctx: DeviceContext,
+        mut state: GpuObjectiveState,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        subsample: Float64,
+        lam: Float64,
+        stream: UInt64,
+    ) raises:
+        """One tree's draw, written into `state.weight_dev`.
+
+        `grad_dev` must hold THIS round's derivatives already, carrying the
+        user's `sample_weight` and NO earlier draw -- in the trainer that is
+        the histogram builder's own gradient buffer, filled by
+        `GpuObjectiveState.fill_grad_hess` immediately before this call, which
+        is itself preceded by `restore_base_weights`. That ordering is a
+        correctness condition and not a convention; see the restore kernel.
+
+        `lam` is `MvsBootstrapParams.resolve_reg(auto_lambda)`, resolved by the
+        caller because the auto branch reads the previous tree's leaf values
+        and neither this file nor sampling.mojo can see the ensemble.
+
+        `stream` is `sampling._mvs_stream(seed, tree_index)`. It is a stream
+        START and nothing advances it, which is what makes row `r`'s decision
+        a pure function of `(seed, tree_index, r)`.
+
+        Three launches, no readback, no synchronize. The caller's next call
+        into the builder is what orders this work against the derivative
+        kernel that reads the plane.
+        """
+        if state.n_rows != self.n_rows:
+            raise Error(
+                "GpuMvsSampler was built for a different row count than this"
+                " objective state carries"
+            )
+        if state.n_classes != 1 or state.multi_output:
+            raise Error(
+                "the device MVS draw serves single-output rounds only: a"
+                " multiclass or multi-target row has one magnitude per output"
+                " and reduces across them, and the device round refuses a"
+                " bootstrap on those shapes anyway"
+            )
+        if not state.weighted:
+            raise Error(
+                "the device MVS draw writes into the objective state's weight"
+                " plane, and this state still carries the unweighted"
+                " placeholder; call refresh_weights once before the round"
+                " loop so the plane is allocated at full width"
+            )
+        if not (subsample > 0.0) or subsample > 1.0:
+            raise Error("mvs subsample must be in (0, 1]")
+        if not (lam >= 0.0) or not isfinite(lam):
+            raise Error("mvs lambda must be finite and nonnegative")
+        # Guarded 2026-08-17, same reason as `enqueue_abs_sum`: on a build
+        # with no accelerator ANY reachable `enqueue_function` elaborates a
+        # GPU kernel and fails the compile with "Unknown GPU architecture",
+        # whatever the kernel does, and an Apple machine never reproduces it.
+        comptime if not has_accelerator():
+            raise Error(
+                "the device MVS draw needs an accelerator; this build has none"
+            )
+        else:
+            ctx.enqueue_function[_mvs_magnitude_kernel](
+                grad_dev.unsafe_ptr(),
+                self.mag_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                Float32(lam),
+                grid_dim=state._row_blocks(),
+                block_dim=state.block_threads,
+            )
+            ctx.enqueue_function[_mvs_threshold_kernel](
+                self.mag_dev.unsafe_ptr(),
+                self.mu_dev.unsafe_ptr(),
+                self.iter_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                Float32(subsample),
+                grid_dim=self.n_blocks,
+                block_dim=MVS_SOLVE_THREADS,
+            )
+            ctx.enqueue_function[_mvs_weight_kernel](
+                self.mag_dev.unsafe_ptr(),
+                self.mu_dev.unsafe_ptr(),
+                self.base_dev.unsafe_ptr(),
+                state.weight_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                # `.cast[DType.int32]()` off a masked UInt64, which is the
+                # spelling `gpu_split_search._random_score_key_kernel` already
+                # uses to move 64-bit words across this boundary in the other
+                # direction. Sixteen bits a limb, so every limb is a
+                # non-negative Int32 and the kernel's reassembly is the same
+                # `UInt64(Int(word) & mask)` that module's host side uses.
+                (stream & UInt64(0xFFFF)).cast[DType.int32](),
+                ((stream >> UInt64(16)) & UInt64(0xFFFF)).cast[DType.int32](),
+                ((stream >> UInt64(32)) & UInt64(0xFFFF)).cast[DType.int32](),
+                ((stream >> UInt64(48)) & UInt64(0xFFFF)).cast[DType.int32](),
+                grid_dim=state._row_blocks(),
+                block_dim=state.block_threads,
+            )
+
+    def iterations(mut self, ctx: DeviceContext) raises -> List[Int]:
+        """How many fixed-point steps each block's solve took on the last
+        `draw`, one entry per `MVS_BLOCK_SIZE` block.
+
+        Not on any training path: it costs a readback and a synchronize, and
+        it exists so `MVS_SOLVE_MAX_ITERS` can be shown to be slack rather
+        than asserted to be. A test that reads this and finds a block at the
+        cap has found a real defect, not a tuning opportunity.
+        """
+        ctx.enqueue_copy(
+            dst_ptr=self.host_iter.unsafe_ptr(), src_buf=self.iter_dev
+        )
+        ctx.synchronize()
+        var out = List[Int](capacity=self.n_blocks)
+        var src = self.host_iter.unsafe_ptr()
+        for b in range(self.n_blocks):
+            out.append(Int(src.unsafe_load(b)))
+        return out^
 
 
 # ---------------------------------------------------------------------------

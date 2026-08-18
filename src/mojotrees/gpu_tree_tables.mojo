@@ -1156,7 +1156,8 @@ def _kill_plan(plan: MutPointer[Int32, MutAnyOrigin], write_plan: Int32):
             _write_plan_item(plan, i, Int32(0), Int32(ITEM_DEAD), Int32(0))
 
 
-def _pick_and_commit_kernel(
+@always_inline
+def _pick_and_commit_body(
     front: MutPointer[Int32, MutAnyOrigin],
     node_i: MutPointer[Int32, MutAnyOrigin],
     node_f: MutPointer[Float32, MutAnyOrigin],
@@ -1177,6 +1178,14 @@ def _pick_and_commit_kernel(
     node_capacity: Int32,
 ):
     """One leaf-wise growth step, entirely on the device.
+
+    **The body, and the only copy of it.** `_pick_and_commit_kernel` is a
+    one-line wrapper around this and `_fused_step_kernel` calls it directly, so
+    the two launch shapes cannot drift into two answers to one question. It is
+    `@always_inline` and not a call: a kernel that calls another kernel entry
+    point SEGFAULTED the Mojo front end on 2026-08-17, with no diagnostic and
+    no source location, which is what this shape exists to avoid. Do not
+    transcribe it into a second body.
 
     Launched as a single threadgroup of `PICK_THREADS` threads over a grid of
     one block. One block and not more, for two reasons that are both about
@@ -1603,6 +1612,56 @@ def _pick_and_commit_kernel(
     ctr[unsafe_offset=CTR_PICK_NODE] = Int32(parent)
     ctr[unsafe_offset=CTR_STATUS] = Int32(TREE_RUNNING)
     ctr[unsafe_offset=CTR_COMMITS] = Int32(commits + 1)
+
+
+def _pick_and_commit_kernel(
+    front: MutPointer[Int32, MutAnyOrigin],
+    node_i: MutPointer[Int32, MutAnyOrigin],
+    node_f: MutPointer[Float32, MutAnyOrigin],
+    ctr: MutPointer[Int32, MutAnyOrigin],
+    slot_owner: MutPointer[Int32, MutAnyOrigin],
+    missing: MutPointer[Int32, MutAnyOrigin],
+    rec_i: MutPointer[Int32, MutAnyOrigin],
+    rec_f: MutPointer[Float32, MutAnyOrigin],
+    step: MutPointer[Int32, MutAnyOrigin],
+    order: MutPointer[Int32, MutAnyOrigin],
+    plan: MutPointer[Int32, MutAnyOrigin],
+    write_plan: Int32,
+    num_leaves: Int32,
+    max_depth: Int32,
+    min_data_in_leaf: Int32,
+    pool_capacity: Int32,
+    leaf_capacity: Int32,
+    node_capacity: Int32,
+):
+    """The standalone launch of `_pick_and_commit_body`. See that function for
+    everything: this is the entry point and not the logic.
+
+    A wrapper and not the body itself so that `_fused_step_kernel` has
+    something to call that is not a kernel entry point. It is the whole of the
+    difference between the two launch shapes, and it means the fused arm
+    executes the same instructions in the same order as the unfused one rather
+    than a transcription of them."""
+    _pick_and_commit_body(
+        front,
+        node_i,
+        node_f,
+        ctr,
+        slot_owner,
+        missing,
+        rec_i,
+        rec_f,
+        step,
+        order,
+        plan,
+        write_plan,
+        num_leaves,
+        max_depth,
+        min_data_in_leaf,
+        pool_capacity,
+        leaf_capacity,
+        node_capacity,
+    )
 
 
 # --- grow_policy = oblivious: the level commit ----------------------------
@@ -2668,6 +2727,185 @@ def _copy_records_kernel(
             unsafe_offset = src_r * SPLIT_FWORDS + w
         ][0]
         w += PICK_THREADS
+
+
+def _fused_step_kernel(
+    front: MutPointer[Int32, MutAnyOrigin],
+    node_i: MutPointer[Int32, MutAnyOrigin],
+    node_f: MutPointer[Float32, MutAnyOrigin],
+    ctr: MutPointer[Int32, MutAnyOrigin],
+    slot_owner: MutPointer[Int32, MutAnyOrigin],
+    missing: MutPointer[Int32, MutAnyOrigin],
+    rec_i: MutPointer[Int32, MutAnyOrigin],
+    rec_f: MutPointer[Float32, MutAnyOrigin],
+    step: MutPointer[Int32, MutAnyOrigin],
+    order: MutPointer[Int32, MutAnyOrigin],
+    plan: MutPointer[Int32, MutAnyOrigin],
+    node_tbl: MutPointer[Int32, MutAnyOrigin],
+    num_leaves: Int32,
+    max_depth: Int32,
+    min_data_in_leaf: Int32,
+    pool_capacity: Int32,
+    leaf_capacity: Int32,
+    node_capacity: Int32,
+    slot_cells: Int32,
+    left_record: Int32,
+    right_record: Int32,
+    do_copy: Int32,
+    do_stage: Int32,
+):
+    """`_copy_records_kernel`, `_pick_and_commit_body` and
+    `_stage_child_search_kernel`, in that order, in one command buffer.
+
+    **Why these three and not some other three.** They are adjacent in the
+    growth loop with the speculation off -- the previous step's record filing
+    is the last launch of iteration `k`, and the next step's commit and its
+    search staging are the first two of iteration `k + 1` -- and all three are
+    launched at `grid_dim = 1`. The whole of the work is therefore done by ONE
+    threadgroup in all three cases, which is the property that makes the fusion
+    a question about a threadgroup barrier rather than about a device-wide one
+    that Mojo does not offer.
+
+    **Bit-identity, stage by stage.** Nothing here computes anything the three
+    kernels did not compute. The copy is the same word-for-word assignment loop
+    over the same strided share; the commit is `_pick_and_commit_body`, the one
+    function the standalone kernel also wraps, so the two arms cannot drift;
+    the staging is the same two Int32 writes. What changes is only when the
+    work happens.
+
+    **The two ordering seams, and the argument for each.**
+
+    - *Copy before commit, and the one soft spot in the whole change.* The copy
+      writes the two children's frontier records and the commit's reduction
+      reads `IREC_FLAGS` and `FREC_GAIN` out of every live leaf's record, so a
+      write here is read by a DIFFERENT thread there: thread
+      `s % PICK_THREADS` owns frontier slot `s`, and the thread that wrote a
+      given record's words is whichever one the copy's stride handed that word
+      to. That is a genuine cross-thread dependency and it is what the
+      `barrier()` is for.
+
+      The barrier is reached uniformly: it sits outside the liveness test and
+      inside `do_copy`, and both conditions are uniform across the block --
+      `do_copy` is a launch argument and `STEP_LIVE` is one word every thread
+      reads -- so every thread reaches it or no thread does.
+
+      **What is NOT established is that `barrier()` orders DEVICE memory
+      between threads of a block on this backend.** Both sides of the seam are
+      global buffers, not shared memory. The API reference says the barrier
+      covers it ("memory operations before the barrier are visible to all
+      threads after the barrier"); the portability guide's Apple sentence maps
+      `barrier()` to `threadgroup_barrier(mem_flags::mem_threadgroup)`, which
+      by the Metal specification does not. The two disagree and this package
+      has never before asked the question: every other `barrier()` in it
+      publishes a shared-memory word, and `gpu_leaf_batching`'s fused copy-back
+      explicitly arranges that "no thread reads a cell another thread writes"
+      rather than relying on the barrier to make one visible. So this seam is
+      proved by a node-for-node comparison or it is not proved.
+
+      **Moving the commit into an `@always_inline` body changes nothing about
+      this.** Inlining removes a call, not a memory ordering: the same threads
+      write the same global words before the barrier and read them after it,
+      and `@always_inline` does not add or remove a fence. If anything it makes
+      the question sharper, because the compiler may now schedule the copy's
+      stores and the reduction's loads in one region and the barrier is the
+      only thing forbidding it from sinking a store past a load.
+
+      This is why the copy fold is behind its own switch
+      (`gpu_resident_round.COPY_STEP_FUSION_VAR`) and the staging fold is not.
+
+    - *Commit before staging.* The staging reads `STEP_LIVE`,
+      `STEP_LEFT_SLOT` and `STEP_RIGHT_SLOT`, and every one of those words is
+      written by thread 0 inside the commit's third phase. The staging runs on
+      thread 0 as well, so this seam is program order inside one thread and
+      needs no barrier and no fence. That is why the staging is guarded by
+      `tid == 0` rather than by the `block_dim = 1` the standalone kernel is
+      launched with.
+
+    `do_copy` and `do_stage` are the two ends of the loop. The first fused
+    launch of a tree has no previous step to file, and the last one is the
+    step that ends growth rather than performing it, which has no children to
+    stage a search for. Both are host constants, uniform across the block.
+
+    `plan` is `plan_scratch` and the plan is never written from here:
+    `_pick_and_commit_body` is called with `write_plan = 0`, which is what
+    both `enqueue_step` overloads pass. A caller that wants the batched plan
+    wants `enqueue_step_with_plan`, and that is the oblivious path, which does
+    not use this loop.
+    """
+    var tid = Int(thread_idx.x)
+
+    # Stage one: file the PREVIOUS step's two scratch records into the
+    # frontier slots that own them. `_copy_records_kernel`'s body, with its
+    # early return turned into the positive test so that the barrier below is
+    # reached on both arms.
+    if do_copy != Int32(0):
+        if step[unsafe_offset=STEP_LIVE][0] != Int32(0):
+            var dst_l = Int(step[unsafe_offset=STEP_LEFT_REC][0])
+            var dst_r = Int(step[unsafe_offset=STEP_RIGHT_REC][0])
+            var src_l = Int(left_record)
+            var src_r = Int(right_record)
+            var w = tid
+            while w < SPLIT_IWORDS:
+                rec_i[unsafe_offset = dst_l * SPLIT_IWORDS + w] = rec_i[
+                    unsafe_offset = src_l * SPLIT_IWORDS + w
+                ][0]
+                rec_i[unsafe_offset = dst_r * SPLIT_IWORDS + w] = rec_i[
+                    unsafe_offset = src_r * SPLIT_IWORDS + w
+                ][0]
+                w += PICK_THREADS
+            w = tid
+            while w < SPLIT_FWORDS:
+                rec_f[unsafe_offset = dst_l * SPLIT_FWORDS + w] = rec_f[
+                    unsafe_offset = src_l * SPLIT_FWORDS + w
+                ][0]
+                rec_f[unsafe_offset = dst_r * SPLIT_FWORDS + w] = rec_f[
+                    unsafe_offset = src_r * SPLIT_FWORDS + w
+                ][0]
+                w += PICK_THREADS
+        barrier()
+
+    # Stage two: THIS step's pick and commit, the shared body and not a
+    # transcription of it. `_pick_and_commit_kernel` is a wrapper around the
+    # same function, so the fused and unfused arms run the same instructions
+    # in the same order rather than two copies that can drift.
+    #
+    # It is the BODY and not the kernel because calling a kernel entry point
+    # from inside another kernel segfaulted the Mojo front end on 2026-08-17 --
+    # no diagnostic, no source location, just the crash handler. Every thread
+    # reaches this call, which is what the two block collectives inside it
+    # require.
+    _pick_and_commit_body(
+        front,
+        node_i,
+        node_f,
+        ctr,
+        slot_owner,
+        missing,
+        rec_i,
+        rec_f,
+        step,
+        order,
+        plan,
+        Int32(0),
+        num_leaves,
+        max_depth,
+        min_data_in_leaf,
+        pool_capacity,
+        leaf_capacity,
+        node_capacity,
+    )
+
+    # Stage three: point the two scratch search records at the children's
+    # pool slots. `_stage_child_search_kernel`'s body on thread 0, reading
+    # only words thread 0 wrote a few lines above.
+    if do_stage != Int32(0) and tid == 0:
+        if step[unsafe_offset=STEP_LIVE][0] != Int32(0):
+            node_tbl[
+                unsafe_offset = Int(left_record) * NODE_WORDS + NODE_HIST_BASE
+            ] = (step[unsafe_offset=STEP_LEFT_SLOT][0] * slot_cells)
+            node_tbl[
+                unsafe_offset = Int(right_record) * NODE_WORDS + NODE_HIST_BASE
+            ] = (step[unsafe_offset=STEP_RIGHT_SLOT][0] * slot_cells)
 
 
 def _pack_tables_kernel(
@@ -3951,6 +4189,84 @@ struct DeviceTreeTables(Movable):
                 step,
                 Int32(left_record),
                 Int32(right_record),
+                grid_dim=1,
+                block_dim=PICK_THREADS,
+            )
+
+    def enqueue_fused_step(
+        mut self,
+        mut rec_i: DeviceBuffer[DType.int32],
+        mut rec_f: DeviceBuffer[DType.float32],
+        mut step: DeviceBuffer[DType.int32],
+        mut node_tbl: DeviceBuffer[DType.int32],
+        num_leaves: Int,
+        max_depth: Int,
+        min_data_in_leaf: Int,
+        slot_cells: Int,
+        left_record: Int,
+        right_record: Int,
+        do_copy: Bool,
+        do_stage: Bool,
+    ) raises:
+        """`enqueue_copy_records`, `enqueue_step` and
+        `enqueue_stage_child_search` in one command buffer instead of three.
+
+        One launch, one block, `PICK_THREADS` threads, which is the shape all
+        three had separately. See `_fused_step_kernel` for the ordering
+        argument, which is the whole content of the change: every stage is one
+        threadgroup, so the device-wide barrier the three dispatches supplied
+        between them is replaced by a threadgroup barrier where a cross-thread
+        dependency exists and by program order where it does not.
+
+        `do_copy` is False on a tree's first fused launch, which has no
+        previous step to file, and `do_stage` is False on its last, which is
+        the step that ends growth and has no children to search.
+
+        `step` and the record buffers cross as `DeviceBuffer` handles rather
+        than as pointers for the reason `enqueue_runner_up` states: the caller
+        holds the descriptor on one field of its builder and reaches these
+        tables through another, and a pointer derived from one field may not
+        cross a call that mutably borrows a sibling.
+
+        Enqueues only: no transfer and no synchronization.
+        """
+        self._check_step_args(num_leaves, min_data_in_leaf)
+        if slot_cells < 1:
+            raise Error("the pool slot stride must be positive")
+        if left_record < 0 or right_record < 0:
+            raise Error("record indices must be nonnegative")
+        if left_record == right_record:
+            raise Error("the two scratch records must differ")
+        comptime if not has_accelerator():
+            raise Error(
+                "the device tree tables need an accelerator; this binary was"
+                " built without one"
+            )
+        else:
+            self.ctx.enqueue_function[_fused_step_kernel](
+                self.front_dev.unsafe_ptr(),
+                self.node_i_dev.unsafe_ptr(),
+                self.node_f_dev.unsafe_ptr(),
+                self.ctr_dev.unsafe_ptr(),
+                self.slot_dev.unsafe_ptr(),
+                self.missing_dev.unsafe_ptr(),
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                step.unsafe_ptr(),
+                self.order_dev.unsafe_ptr(),
+                self.plan_scratch.unsafe_ptr(),
+                node_tbl.unsafe_ptr(),
+                Int32(num_leaves),
+                Int32(max_depth),
+                Int32(min_data_in_leaf),
+                Int32(self.pool_capacity),
+                Int32(self.leaf_capacity),
+                Int32(self.node_capacity),
+                Int32(slot_cells),
+                Int32(left_record),
+                Int32(right_record),
+                Int32(1) if do_copy else Int32(0),
+                Int32(1) if do_stage else Int32(0),
                 grid_dim=1,
                 block_dim=PICK_THREADS,
             )

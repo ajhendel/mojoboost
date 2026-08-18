@@ -332,7 +332,11 @@ from .gpu_fused_round import (
     round_eligibility_reason,
 )
 from .gpu_multiclass_batch import GpuClassBatch, MulticlassRoundGuard
-from .gpu_objectives_native import GpuLeafEstimator, GpuObjectiveState
+from .gpu_objectives_native import (
+    GpuLeafEstimator,
+    GpuMvsSampler,
+    GpuObjectiveState,
+)
 from .gpu_output_planes import BatchEligibility
 from .gpu_predict import (
     DEVICE_METRIC_L1,
@@ -427,6 +431,7 @@ from .sampling import (
     check_feature_fractions,
     mvs_auto_lambda_from_gradients,
     mvs_auto_lambda_from_leaf_values,
+    mvs_stream,
     refresh_bayesian_bootstrap,
     select_node_features,
     select_split_features,
@@ -876,6 +881,41 @@ def split_trace_enabled() -> Bool:
     )
 
 
+def device_mvs_enabled() -> Bool:
+    """Whether `bootstrap_type=MVS` may be drawn on the device round.
+
+    **DEFAULT OFF, and the default keeps the host solve.** Off, an MVS bundle
+    routes the whole round to the host-gradient arm exactly as it always has
+    (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`), every bit of every MVS fit
+    is the bit it was, and nothing in this file behaves differently.
+
+    On, `GpuMvsSampler` solves the keep threshold on the device and folds the
+    draw into the objective state's weight plane, and the round becomes
+    eligible for the device-gradient arm. That is what removes the 1.62x this
+    sampler was measured to cost on 2026-08-17 (symmetric, 200,000 x 90, 30
+    trees, GPU: 0.696 s plain against 1.129 s with MVS 0.8), and it is the
+    only member of the CatBoost-mode default set that costs more than a tenth.
+
+    **WHY IT IS A SWITCH AND NOT A FLIP.** The device draw is NOT bit-identical
+    to the host draw and never can be: the host solves in Float64 over
+    Float64-derived magnitudes while a device round holds Float32 derivatives,
+    so the magnitudes differ before any solve runs and a different threshold
+    puts different rows across it. It is equivalent in distribution and
+    per-row reproducible, not exact. `LANE_RULES` rule 5's same-session flip
+    reaches only changes that cannot move a user's output, so it does not
+    reach this one; this takes `docs/design/ACCURACY_BUDGET.md`'s gate under
+    rule 3, and section 14 of that document registered the 0.25 percent
+    per-scenario anchor veto and named `imbalanced_binary` and `multiclass` as
+    the disqualifying cases BEFORE any of it was measured.
+
+    The precedent for the shape is `ROUND_GOSS_RANK_PRECISION`, which is
+    opt-in for the same reason: a Float32 comparison can put a different row
+    across a threshold, which changes which rows a tree grows on rather than
+    the last bits of a value.
+    """
+    return getenv("MOJOTREES_GPU_MVS_DEVICE") == "1"
+
+
 def resolve_split_search_for(
     builder: GpuHistogramBuilder, params: TreeParams
 ) raises -> Int:
@@ -1046,7 +1086,16 @@ def device_gradients(
         goss.enabled,
         False,
         routes_all_rows,
-        bootstrap.mvs.enabled,
+        # `MOJOTREES_GPU_MVS_DEVICE=1` is the caller saying it accepts a draw
+        # that need not match the host's row for row, which is precisely what
+        # `allow_device_ranking` is for GOSS one argument up. The switch is
+        # read HERE and not inside `round_eligibility`, because that function
+        # belongs to gpu_fused_round.mojo and states which configurations the
+        # device round can serve; whether this process is willing to take an
+        # equivalent-in-distribution sampler is the trainer's question, and
+        # answering it here keeps the two callers of `device_gradients` --
+        # the round loop and `gpu_bootstrap_resolution` -- on one answer.
+        bootstrap.mvs.enabled and not device_mvs_enabled(),
         bootstrap.bayesian.enabled,
         random_strength > 0.0,
     )
@@ -1160,6 +1209,23 @@ def gpu_bootstrap_resolution(
     if bootstrap.mvs.enabled:
         # The one resolution a reader must be able to see, spelled out rather
         # than left to be inferred from `plane`.
+        #
+        # **THE `derivatives=` FIELD USED TO BE THE LITERAL `host-float64`
+        # HERE**, because until 2026-08-17 an MVS bundle could reach only the
+        # host-gradient arm and the literal was the truth on every path. It is
+        # not any more: `MOJOTREES_GPU_MVS_DEVICE=1` solves the threshold on
+        # the device and the round takes the device-gradient arm, at Float32,
+        # over a draw that is equivalent in distribution to the host's and not
+        # identical to it. A trace line that kept asserting Float64 would be
+        # the one line in the fit claiming the two runs are the same run.
+        if device_grads:
+            return String(
+                "bootstrap_type=",
+                kind,
+                " honored=yes plane=device-weight-plane derivatives=",
+                derivatives,
+                " solve=device-fixed-point identical-to-host=no",
+            )
         return String(
             "bootstrap_type=",
             kind,
@@ -4370,15 +4436,19 @@ def _train_gpu_rounds[
             var dev_bag = List[Int]()
             # ---- CatBoost's `bootstrap_type` on the device round ----
             #
-            # MVS cannot be here and is not silently dropped: `device_gradients`
-            # returns False for it (`ROUND_MVS_HOST_MAGNITUDES`), so an MVS fit
-            # took the host-gradient arm below and drew the sampler exactly. If
-            # it ever arrives anyway -- a caller reaching this loop directly,
-            # or that blocker being loosened without this arm being taught the
-            # draw -- it is refused by name rather than trained unsampled,
-            # because an unsampled fit reporting a sampled one is the failure
-            # `sampling.check_bootstrap_honored` exists for.
-            if bootstrap.mvs.enabled:
+            # MVS reaches here only under `MOJOTREES_GPU_MVS_DEVICE=1`, which
+            # is the only thing that lets `device_gradients` return True for it
+            # (`ROUND_MVS_HOST_MAGNITUDES` otherwise), and it is never silently
+            # dropped either way. Off, an MVS fit took the host-gradient arm
+            # below and drew the sampler exactly. On, `dev_mvs` below solves
+            # the threshold on the device and folds the draw into the weight
+            # plane. If one arrives with the switch off -- a caller reaching
+            # this loop directly, or that blocker being loosened without this
+            # arm being taught the draw -- it is refused by name rather than
+            # trained unsampled, because an unsampled fit reporting a sampled
+            # one is the failure `sampling.check_bootstrap_honored` exists for.
+            var dev_mvs = List[GpuMvsSampler]()
+            if bootstrap.mvs.enabled and not device_mvs_enabled():
                 raise Error(
                     "bootstrap_type=mvs cannot be drawn on the device"
                     " gradient round: the keep threshold is solved from this"
@@ -4389,6 +4459,41 @@ def _train_gpu_rounds[
                     " MOJOTREES_GPU_OBJECTIVE=host), which draws it exactly"
                     " and still grows the trees on the device"
                 )
+            # ---- the device MVS draw, one sampler per fit ----
+            #
+            # Built only when the switch is on AND the bundle can actually move
+            # a number: `samples_rows` is False at `subsample == 1.0` even when
+            # MVS is enabled, which is CatBoost's own
+            # `if (SampleRate == 1.0f) Fill(SampleWeights, 1.0f)` early return,
+            # and a sampler that would write ones every round is four launches
+            # and a whole extra derivative pass a round for nothing.
+            #
+            # `state.refresh_weights` immediately after is not optional and is
+            # the reason this block is several statements rather than one. An
+            # unweighted fit constructed a ONE-ELEMENT weight placeholder, and
+            # the device draw writes `n_rows` Float32 into that plane; without
+            # this call it would write off the end of a buffer of length 1.
+            # The call grows the plane, allocates its pinned staging, and flips
+            # `weighted` so the derivative kernel actually reads it. It runs
+            # ONCE per fit, not per tree -- the per-tree write is the device
+            # kernel's, and `GpuMvsSampler` keeps its own private copy of the
+            # user's `sample_weight` so the product is `draw(tree) *
+            # sample_weight` every round rather than a draw compounding into
+            # itself.
+            if bootstrap.mvs.enabled and bootstrap.mvs.samples_rows():
+                var seed_w = List[Float64]()
+                seed_w.resize(n, 1.0)
+                if len(sample_weight) == n:
+                    for r in range(n):
+                        seed_w[r] = sample_weight[r]
+                state.refresh_weights(builder.ctx, seed_w)
+                dev_mvs.append(GpuMvsSampler(builder.ctx, n, sample_weight))
+            # The previous tree's leaf values, for MVS's derived lambda, and
+            # the twin of the host arm's pair below. Empty on the first round,
+            # which is the branch `TMvsSampler::GetLambda` takes when
+            # `leafValues` is empty.
+            var dev_last_leaves = List[Float64]()
+            var dev_n_last_leaves = 0
             # One buffer for the whole fit, as the gradient buffers are, and
             # EMPTY on every fit that configured no bootstrap -- the plane is
             # never touched and no bits move on the default path.
@@ -4466,22 +4571,143 @@ def _train_gpu_rounds[
                     builder.refresh_objective_weights(state, boot_w)
                 var dev_grad_started = profile.clock()
                 var scale_reads_before = builder.scale_readback_count()
+                # ---- the device MVS draw, and why it needs a pre-pass ----
+                #
+                # MVS reads this round's gradient magnitudes and writes a
+                # per-row weight, and the derivative kernel is what applies a
+                # weight. So the round's derivatives have to exist before the
+                # draw and be recomputed after it, which is one extra pass over
+                # `n` rows on the device.
+                #
+                # **THE ALTERNATIVE IS WRONG, NOT MERELY SLOWER, AND THAT IS
+                # WHY THE PASS IS HERE.** Scaling the gradient plane in place
+                # after `fill_gradients_device` would be one pass, but that
+                # method derives this round's fixed-point histogram scale from
+                # the magnitude sums of the plane as it stands, and the window
+                # overflow check in `histogram_gpu._close_scale_window` tests a
+                # later round's magnitudes against it. Draw after the fill and
+                # both the scale and its check are taken over a plane no
+                # histogram was ever built from: the histograms would quantize
+                # amplified `1/p` gradients against a scale derived from
+                # unamplified ones, and the check that exists to catch exactly
+                # that would be looking at the wrong numbers. A silent wrong
+                # answer instead of a loud one.
+                #
+                # Nothing here waits. `fill_grad_hess` is the bare kernel --
+                # `fill_gradients_device` minus the scale refresh -- and the
+                # restore and the draw are four launches between them with no
+                # readback, so the round still pays the one round trip it paid
+                # before. The exception is round zero of a fit that left
+                # `mvs_reg` unset, which reads one magnitude sum to derive the
+                # first tree's lambda; that readback is not counted by
+                # `scale_readback_count` and so does not appear in the `syncs`
+                # column below.
+                if len(dev_mvs) > 0:
+                    # Undo the PREVIOUS tree's draw first. The weight plane is
+                    # the sampler's output, so without this the pre-pass would
+                    # read last round's draw, solve its threshold over
+                    # derivatives already sampled once, and leave every row
+                    # dropped once at an exactly zero gradient for the rest of
+                    # the fit -- a fit training on a row set that can only
+                    # shrink, reporting nothing.
+                    dev_mvs[0].restore_base_weights(builder.ctx, state)
+                    state.fill_grad_hess(
+                        builder.ctx,
+                        objective,
+                        alpha,
+                        builder.grad_dev,
+                        builder.hess_dev,
+                    )
+                    # `random_strength`'s scale, taken HERE on this arm rather
+                    # than after the fill below, and this is the one place
+                    # where the MVS arm is better off than the Bayesian one.
+                    # CatBoost's `CalcScoreStDev` reads the fold's
+                    # user-weighted derivatives, and the Bayesian arm cannot
+                    # supply them because its draw is folded into the weight
+                    # plane before the only fill it does. The MVS arm has a
+                    # fill that predates its own draw, so the plane reduced
+                    # here carries `sample_weight` and nothing else, which is
+                    # exactly CatBoost's quantity. That is why
+                    # `ROUND_BAYESIAN_NOISE_SCALE`'s refusal has no twin for
+                    # MVS and why `random_strength = 1.0` -- a member of the
+                    # CatBoost-mode default set -- stays on the device round
+                    # here.
+                    if dev_noisy:
+                        dev_tree_params.extra.random_score_scale = (
+                            _device_round_random_score_scale(
+                                params.tree.extra,
+                                state.derivative_sum_squares(
+                                    builder.ctx, builder.grad_dev
+                                ),
+                                n,
+                                i,
+                                params.learning_rate,
+                            )
+                        )
+                    # `TMvsSampler::GetLambda`'s two branches, the same pair
+                    # the host arm below computes. The first branch is the
+                    # squared mean leaf-value norm of the previous tree and is
+                    # host state either way. The second is the squared mean
+                    # gradient magnitude, which on this arm is NOT
+                    # `mvs_auto_lambda_from_gradients` -- that function wants
+                    # the whole Float64 gradient vector on the host, which is
+                    # the download this arm exists to avoid. `magnitude_sums`
+                    # already reduces `sum |grad|` on the device, and at
+                    # `n_outputs == 1` the mean of `sqrt(g^2)` IS the mean of
+                    # `|g|`, so the two compute the same quantity in different
+                    # summation orders and different widths. **Not the same
+                    # bits**, and it is the first tree's lambda only. It costs
+                    # one extra readback on round zero of a fit that left
+                    # `mvs_reg` unset, and none on any other round.
+                    var dev_lambda = 0.0
+                    if not bootstrap.mvs.reg_is_set:
+                        if dev_n_last_leaves > 0:
+                            dev_lambda = mvs_auto_lambda_from_leaf_values(
+                                dev_last_leaves, dev_n_last_leaves, 1
+                            )
+                        else:
+                            var mags = state.magnitude_sums(
+                                builder.ctx,
+                                builder.grad_dev,
+                                builder.hess_dev,
+                            )
+                            var mean_g = mags.grad / Float64(n)
+                            dev_lambda = mean_g * mean_g
+                    dev_mvs[0].draw(
+                        builder.ctx,
+                        state,
+                        builder.grad_dev,
+                        bootstrap.mvs.subsample,
+                        bootstrap.mvs.resolve_reg(dev_lambda),
+                        mvs_stream(bootstrap.mvs.seed, i),
+                    )
                 builder.fill_gradients_device(state, objective, alpha)
                 # ---- this round's `random_score_scale`, from the device ----
                 #
                 # Placed immediately after the fill and before anything that
                 # could rewrite the plane, which is the same position the host
                 # arm's call holds relative to `goss_round`. On this arm there
-                # is nothing between the two: GOSS and MVS do not reach here
-                # (both route to the host arm), and the Bayesian bootstrap is
-                # refused above because its draw lands BEFORE the fill rather
-                # than after it.
+                # is nothing between the two: GOSS still routes to the host
+                # arm, the Bayesian bootstrap is refused above because its draw
+                # lands BEFORE the fill rather than after it, and MVS -- which
+                # CAN reach here now, under `MOJOTREES_GPU_MVS_DEVICE=1` --
+                # took its scale in the pre-pass block above and is excluded
+                # from this one by name.
                 #
                 # Guarded, so a default fit issues neither the launch nor the
                 # readback -- `derivative_sum_squares` costs one kernel and
                 # one 1 KB copy per ROUND, and at `random_strength = 0` this
                 # branch is not taken at all.
-                if dev_noisy:
+                #
+                # `len(dev_mvs) == 0` is the second half of the guard and it is
+                # a correctness condition, not a saving. On the device MVS arm
+                # the plane at this point has the draw multiplied in, so
+                # reducing it here would give CatBoost's
+                # `SampleWeightedDerivatives` under the name of its
+                # `WeightedDerivatives` -- the exact substitution
+                # `ROUND_BAYESIAN_NOISE_SCALE` refuses. That arm took its scale
+                # off the unsampled plane above, before its own draw.
+                if dev_noisy and len(dev_mvs) == 0:
                     dev_tree_params.extra.random_score_scale = (
                         _device_round_random_score_scale(
                             params.tree.extra,
@@ -4622,6 +4848,17 @@ def _train_gpu_rounds[
                 else:
                     builder.update_raw_device(
                         state, tree.value, params.learning_rate
+                    )
+                # MVS's derived lambda for the NEXT round, read off the tree
+                # the ensemble just kept -- `leafValues.back()` in
+                # `TMvsSampler::GetLambda`. The host arm's identical block sits
+                # in the identical position and its comment is the argument:
+                # after the degenerate-tree test, so a dropped round does not
+                # leave its leaf values as the next round's lambda, and walked
+                # only when the derivation is actually used.
+                if len(dev_mvs) > 0 and not bootstrap.mvs.reg_is_set:
+                    dev_n_last_leaves = _tree_leaf_values(
+                        tree, params.learning_rate, dev_last_leaves
                     )
                 trees.append(tree^)
                 life.end_round()
