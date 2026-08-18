@@ -4,7 +4,7 @@
   "status": "unmeasured",
   "description": "A plan, not a record. Nothing in this file is a measurement: it states what the CPU changes in src/mojotrees/{histogram,binning,parallel,apple_cpu_policy}.mojo are expected to do, the command that would show each one, and what result would falsify it. Run records for the Apple GPU suite live under bench/apple/ against schema.json; this file deliberately does not claim that schema, because it describes work to be done rather than a run that happened. When these are measured, the numbers belong in a run record or in docs, not here.",
   "owner_lane": "performance_13_apple_cpu",
-  "handoff": "handoffs/performance_13_apple_cpu.md",
+  "handoff": "handoffs/performance_13_apple_cpu.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_13_apple_cpu.md)",
   "semantic_invariant": "Every knob below is a scheduling or memory-traffic decision. Trees, splits, gains, and predictions must be bit-identical across every cell of every sweep. Any cell that changes a model output is a bug in this lane, not a tuning result, and stops the sweep.",
 
   "environment_contract": {

@@ -3,7 +3,7 @@
 
     python3 tools/validation_plan.py                       # the working tree
     python3 tools/validation_plan.py --paths src/mojotrees/split.mojo
-    python3 tools/validation_plan.py --handoff handoffs/task16_distributed.md
+    python3 tools/validation_plan.py --handoff handoffs/task16_distributed.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task16_distributed.md)
     python3 tools/validation_plan.py --subsystem gpu-training --explain
     python3 tools/validation_plan.py --allow differential --budget-seconds 900
     python3 tools/validation_plan.py --format sh --out /tmp/plan.sh

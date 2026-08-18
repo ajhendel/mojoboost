@@ -113,7 +113,7 @@ somebody a minute or an hour.* This section led with seven `pixi run -e bench
 real-data*` commands and then said the tasks "are not wired yet", which is still
 true -- `pixi.toml` has no such task -- but a reader who copied the first block
 got "task not found" before reaching the sentence, so the block that works is
-now the only block. It pointed at `handoffs/task19_real_data.md` for the entries
+now the only block. It pointed at `handoffs/task19_real_data.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task19_real_data.md)` for the entries
 to add, and **that file does not exist**, which is the same dangling-pointer
 defect `PROFILE_PROTOCOL.md`'s amendment A1 records for the thermal script. And
 it showed `--device cpu gpu`, which **does not parse**: `--device` is

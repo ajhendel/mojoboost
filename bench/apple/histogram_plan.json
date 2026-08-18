@@ -11,7 +11,7 @@
     "policy_source": "src/mojotrees/apple_histogram_policy.mojo",
     "primitives_source": "src/mojotrees/gpu_histogram_specializations.mojo",
     "baseline_source": "src/mojotrees/gpu_tiling.mojo",
-    "handoff": "handoffs/performance_14_gpu_histogram.md"
+    "handoff": "handoffs/performance_14_gpu_histogram.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_14_gpu_histogram.md)"
   },
 
   "verification": {
