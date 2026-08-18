@@ -434,7 +434,22 @@ def test_dead_steps_fold_without_touching_anything() raises:
         var shallow = BoosterParams(6, 0.1, TreeParams(31, 20, 1.0, 1e-3))
         shallow.tree.max_depth = 3
         var by_depth = _both_arms(data, target, shallow)
-        _assert_arms_agree(by_depth, 30, "max_depth 3")
+        # SEVEN, NOT THIRTY, SINCE 2026-08-18. This expected 30, which was
+        # `num_leaves - 1`, because the resident grower used to enqueue a step
+        # per leaf of the BUDGET regardless of what the depth allowed. It now
+        # enqueues `min(num_leaves, 1 << max_depth) - 1`, which at 31 leaves
+        # and depth 3 is 7. See `gpu_resident_round.grow_tree_device_resident`,
+        # where the bound carries the reasoning: a tree with max_depth = d
+        # cannot commit more than `2^d - 1` splits, so the steps above that
+        # were enqueued for nothing at nine command buffers each.
+        #
+        # The change is why this test is worth keeping rather than relaxing.
+        # Its own docstring above says the fused arm folds on every step "dead
+        # steps included", and the dead steps are what got deleted, so the
+        # premise moved rather than the fusion breaking. A test that had
+        # asserted "at least one fold" would have passed through the change
+        # and told us nothing; the two-sided exact count is what caught it.
+        _assert_arms_agree(by_depth, min(31, 1 << 3) - 1, "max_depth 3")
         assert_equal(
             by_depth.fused_trace.count("status=no_candidate"),
             len(by_depth.fused),

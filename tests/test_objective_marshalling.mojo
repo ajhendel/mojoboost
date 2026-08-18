@@ -294,6 +294,36 @@ def _workload(objective: Int, n_outputs: Int) raises -> PythonObject:
     w["random_strength"] = PythonObject(0.0)  # CatBoost's split noise, off
     # tree_parameters_extra.DERIV_PRECISION_FLOAT32
     w["derivative_precision"] = PythonObject(0)
+    # **AND IT HAPPENED A THIRD TIME, ON 2026-08-18, TO THE SAME THREE TESTS.**
+    # 60e82b9 added `grow_policy` and `max_depth` to the required set so that
+    # BLOCK_GROW_POLICY and BLOCK_MAX_DEPTH could fire at all, and ae2df6d
+    # added `bundling`, `linear_tree` and `forced_splits` for the same reason
+    # on the last three blocks that existed and could not fire. Five keys in
+    # one day, and the suite is what said so, four hours later.
+    #
+    # Every value below is the NEUTRAL one as well as the sender's default,
+    # for the reason the paragraph above gives: a fixture that sent something
+    # interesting would add a blocking reason to every workload here and the
+    # assertions would be about a run the policy had already refused for an
+    # unrelated cause. GROW_LEAFWISE is 0 and an unlimited depth is 0, and all
+    # three flags are off.
+    w["grow_policy"] = PythonObject(0)  # growth_policy.GROW_LEAFWISE
+    w["max_depth"] = PythonObject(0)  # 0 or below means unlimited
+    w["bundling"] = PythonObject(0)
+    w["linear_tree"] = PythonObject(0)
+    w["forced_splits"] = PythonObject(0)
+    #
+    # THE STANDING WEAKNESS IS NOW NAMED WITH ITS FIX RATHER THAN JUST NAMED.
+    # Three occurrences in one file is not bad luck, it is a missing source of
+    # truth: the sender builds its mapping as a dict literal inline inside
+    # `_FullNativePolicy.decide`, so there is nothing for this fixture to
+    # import and agreement can only be maintained by hand. The fix is to
+    # extract that literal into a named function in `device_selection.py` that
+    # both the sender and this fixture call, at which point drift becomes
+    # impossible rather than merely detectable. Until that lands, a lane that
+    # adds a required key to `basic_bindings.decide_device_workload` must edit
+    # this helper in the same commit, and the reason it keeps not happening is
+    # that nothing makes the omission fail until the suite runs.
     return w^
 
 
