@@ -483,6 +483,208 @@ measurement of it recorded "neutral", and **neutral is what a switch that does
 not reach the code always measures.** An unexercised reference arm does not
 fail loudly, it rots into confident nulls.
 
+### 12. A PEER'S DEFAULT MAY SET OUR DEFAULT AND MAY NEVER SET OUR CEILING.
+
+Added 2026-08-18, from an audit of `src/mojotrees/gpu_split_search.mojo`. This
+is a defect class the rule set had nothing against, which is why it shipped.
+
+`gpu_split_search.OBLIVIOUS_MAX_LEAVES` was 64, and its own docstring said
+what 64 was. It read "which is `2 ** 6` and therefore CatBoost's default depth
+exactly." It was not a default. It was a HARD CEILING, and above it the device
+oblivious grower refused to run and raised. **There is no citation anywhere in
+this repository for CatBoost's own GPU depth LIMIT**, and there could not be,
+because a default is not a limit. The ceiling turned users away at exactly the
+depth every third-party benchmark harness sets, and it cost a day.
+
+**Mirroring a peer's default is the POINT of this library. Mirroring it as a
+refusal is the defect, and the two are one keystroke apart.** Defaulting
+`num_leaves` to 31 because LightGBM does is the whole promise, since a user who
+ports a configuration gets the model they ported. Refusing to RUN above 31
+leaves because LightGBM defaults there would be a defect on the same fact. A
+default says "this is what you get if you say nothing". A ceiling says "this is
+what you get instead of what you asked for". The first is a service and the
+second is a refusal, and **a refusal may only be sized from OUR kernel, OUR
+allocation, OUR measured data, or OUR portability floor.**
+
+The test, and it fits on one line. **If the peer moved their default tomorrow,
+would this number move?** If yes, it is not a constraint. It is a coincidence
+with an argument attached, and the argument was written after the number.
+
+Three things the audit established, each of which the ceiling failed.
+
+**A ceiling carries its arithmetic on the line, the way a crossover threshold
+carries its `evidence_id`.** `device_policy.CrossoverEvidence` will not let a
+performance rule exist without a run and a machine, and its constructor refuses
+a rule with no `evidence_id`. A capacity refusal is held to that same standard,
+because it decides more than a route does. `OBLIVIOUS_MAX_LEAVES` claimed a
+threadgroup-memory bound. The shipped wide kernel's twelve shared arrays are
+12,300 bytes at depth 8 against a conservative 16,384 byte budget, and the
+ceiling sat at depth 6. **One subtraction would have shown it**, and nobody had
+to do the subtraction because the number already had a story.
+
+**A second justification is not corroboration, it is two chances to be wrong.**
+That ceiling carried three. A memory bound with room for two more doublings. A
+launch count taken from `gpu_resident_round.oblivious_launch_census`, a function
+whose own docstring calls itself a frozen prediction of a schedule that does not
+exist, while the built `oblivious_schedule_launches` returns 63 at depth 7 where
+the refusal quoted 71. And a table-sizing claim standing in front of three
+capacity tests that already measure the real allocation and decline gracefully.
+**Three reasons that agree are ONE reason if they were all reverse-engineered
+from the same number**, and a reader counting reasons rather than checking them
+finds a ceiling more credible the more often it is wrong.
+
+**A knee is a price, a wall is a wall, and you do not refuse at a price.** Past
+64 command buffers Metal backpressures. The queue blocks, it does not drop, and
+nothing fails. The shipped leaf-wise plane runs 278 command buffers a tree at 31
+leaves and 2,303 at 256 and is the fastest arm we have, which is the measurement
+that settles what that knee costs. A slower run is a number the user can read.
+A raise is a run they do not get.
+
+**The one-line version was already written correctly once in this repository**,
+in `embedding.LdaParams.resolved_components`, and it is the model to copy. "The
+cap is only the default. An explicit larger `components` is accepted here as it
+is there ... It is a legal request and a bad one." **A legal request we think is
+bad gets a default and a docstring. It does not get a raise.**
+
+### 13. A REFUSAL THE USER CANNOT SEE IS NOT A POLICY, IT IS A SILENT MODEL CHANGE.
+
+Added 2026-08-18, fixed the same day in
+`python/mojotrees/sklearn.py::_warn_about_device_decision`.
+
+`device_policy.decide_device` built a full decision for every fit, carrying the
+reason, the blocks, the memory estimate and the evidence id. It was serialized
+across the boundary and parsed back. Then `_resolve_device` ended `return
+select_device(...).resolved` and discarded all of it, and there was no
+`warnings.warn` anywhere in the device-selection path. **Thirteen distinct
+blocks could move a fit to the CPU and say nothing.**
+
+That is not cosmetic, and the reason it is not is a measurement.
+`bench/results/COMPARISON_RUN_2026-08-16.md` records 51,630 of 51,630 test rows
+differing between the CPU and GPU arms on real year data, median absolute
+difference 0.4601, maximum 9.67, traced to the shared fixed-point Int32
+histogram rather than to the split search. **The two backends do not produce the
+same model. Therefore every route decision is a model decision**, and a route
+decision the user cannot read is an unreported change to their numbers.
+
+**The counter-lesson is half the rule, because the first fix was wrong in the
+other direction.** Emitting every warning the decision carries produced SEVEN
+per fit, six of them provenance caveats. The hardware identity came from the
+build target, the capabilities are synthetic, no memory budget was reported, the
+session is cold, the objective was not declared. All true, all belonging in
+`explain_device_choice`, none actionable. **A library that raises seven warnings
+per fit teaches people to filter its warnings, which costs more than the silence
+it replaced.** The shipped emitter is a whitelist for exactly that reason.
+
+So the rule has two halves and neither stands alone. **Warn on what the user can
+act on, and put the rest in the report they can ask for.** An `auto` request
+that was BLOCKED is warned, because the accelerator refused a parameter rather
+than the CPU being predicted faster. An `auto` request that landed on the CPU
+because no crossover rule covers the shape is the normal quiet answer and is not
+warned.
+
+### 14. A REFUSAL MUST BE REACHABLE FROM THE SURFACE THAT TRIGGERS IT, AND THE TEST IS A CALL, NOT A READ.
+
+Added 2026-08-18, fixed the same day in `bindings/basic_bindings.mojo`.
+
+`device_policy.BLOCK_GROW_POLICY` and `BLOCK_MAX_DEPTH` shipped implemented,
+documented and tested, and were unreachable. `bindings/basic_bindings.mojo`
+never sent `grow_policy` or `max_depth` across the boundary, so the native
+request took its own defaults and both blocks silently never matched. A user
+asking for symmetric trees at depth 8 with `device="auto"` got a hard exception
+out of `train_gpu` instead of the CPU fallback the policy layer implements, and
+every layer in that path was individually correct.
+
+**Three more are unreachable today and are named here so they are not
+rediscovered as new**, which this project has now done twice with the same
+shape. `bundling`, `linear_tree`, and `forced_splits` are all refused by
+`device_policy` and none of the three fields crosses the boundary. The sharpest
+instance of the harm is the forced-splits raise, which advises the caller to use
+`device='auto'`, "which routes around this". **It does not, because the field it
+would route on is not sent. The error message advertises the disconnected
+path**, which is rule 5a's failure mode arriving from a direction rule 5a does
+not cover.
+
+The rule. **A block is not shipped until one call from the TOP surface reaches
+it.** Not a unit test of the predicate, which is what all four of these had.
+Not a reading of the code that would call it. A call through the estimator, in a
+test, asserting the block fired, per the correctness contract's requirement that
+a gated path prove the gate opened.
+
+And note the second way a gate can be unreachable, because it does not look like
+this one at all. **A gate can be a tautology.**
+`device_policy.gpu_supports_outputs` is `return n_outputs >= 1`, its docstring
+explains that it is kept as the one place to reject a future workload, and its
+block cannot fire for any input the vocabulary can present. That is a defensible
+thing to keep and an indefensible thing to count, so it is not coverage and must
+not be reported as any.
+
+### 15. A REFUSAL'S MESSAGE IS AN API, AND EVERY "THE DEVICE CANNOT" IS A CLAIM WITH A DATE ON IT.
+
+Added 2026-08-18. Rule 5a established that inverting a default can invert an
+error message's advice. The same thing happens, from the opposite direction,
+when a capability LANDS. The default does not move, the code the message
+describes does, and the message keeps describing the code that used to be there.
+
+Four found in one pass on 2026-08-18. `BLOCK_VALIDATION_SET` says validation
+forces the CPU while a complete GPU eval-set trainer exists.
+`BLOCK_RANKING_OBJECTIVE` says ranking trains on the CPU only while a device
+ranking gradient path exists. And two Python-side comments still say the policy
+blocks every non-L2 `score_function` selector, which stopped being true on
+2026-08-17 when the narrowing landed and Cosine became a device capability.
+
+The rule. **When a lane lands a capability, it greps the claims.** Every
+refusal message, every block docstring, and every comment that says the device
+cannot do the thing that just landed, in the same commit that lands it, under
+rule 7. A stale refusal message is worse than a stale comment because a user
+obeys it. It is the one piece of prose in this repository that people act on
+without reading anything else.
+
+### 16. WHEN A MEASUREMENT IS PENDING, THE BOX IS THE INSTRUMENT AND EXACTLY ONE PROCESS TOUCHES IT.
+
+Added 2026-08-18, and it REPLACES the older blanket rule that subagents never
+build. That rule was right about its consequence and wrong about its reason.
+It was protecting the instrument, not the compiler, and stating it as a ban on
+compiling made it look like a rule about subagents.
+
+**The incident.** Three implementation lanes were authorized to build at once,
+in the same window as a queued three-arm timing A/B that an advisor had
+correctly asked to be run FIRST, because a GPU arm's ratio to the comparator
+had moved 18 percent across two runs with twenty commits between them. The
+compiles took the box out of any state where a timing is valid. The A/B did
+not run. The regression question stayed open for the rest of the session, and
+the covtype profile behind it stayed blocked, because the one thing that could
+have settled both was the thing the box could no longer do.
+
+Nobody did anything forbidden. The orchestrator changed the subagent-build
+rule on an explicit instruction to let lanes fix and test things, and did not
+notice that the instruction and the pending measurement were in conflict. The
+conflict is invisible if you think the rule is about subagents.
+
+**The rule, in two halves.**
+
+Subagents may build when no measurement is pending. Building is not the
+hazard and never was.
+
+When a measurement IS pending, the box is the instrument. Exactly one process
+touches it, the orchestrator DECLARES the quiet window, and nothing else
+builds, fits, benchmarks or profiles inside it. That includes the
+orchestrator's own convenience builds, which is the half most likely to be
+forgotten, because they do not feel like someone else's work.
+
+**Declaring the window is the orchestrator's job and it is explicit.** Say it
+to every live lane. A lane that has not been told a window is open has no way
+to know, and "I assumed nobody was building" is the same shape of evidence as
+"it builds" and "the switch is set": it is a belief about reach, not a check.
+
+**Why this file cares, given that it otherwise cares about correctness.** This
+machine drifts two to three times across thermal windows, which is why the
+interleaved-arms protocol exists at all. Interleaving defends against drift
+BETWEEN windows. It does not defend against load INSIDE one, because a
+compiler running through half a repeat moves that repeat and not its
+neighbors, and the spread then reports a difference that is a compile. A run
+contaminated that way is worse than no run, because it produces a number with
+a spread attached and both are wrong.
+
 ## What you may run. This is a hard limit.
 
 **You may run ONLY:**

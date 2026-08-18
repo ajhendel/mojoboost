@@ -611,9 +611,47 @@ build to the CPU.
 
 ## Status
 
-This module is the policy and report layer. It is not yet wired into the
-estimators; `MojoTreesRegressor(device="auto")` still resolves through
-`_resolve_device`, which calls the native `resolve_device` directly. The
-exact wiring, including why the estimators must keep passing a resolved
-concrete device name to the native layer rather than `"auto"`, is in
-`handoffs/apple_a9_device_selection.md`.
+**Corrected 2026-08-18. This section used to say the module was not wired in,
+and it had not been true for some time.** It read "This module is the policy
+and report layer. It is not yet wired into the estimators;
+`MojoTreesRegressor(device="auto")` still resolves through `_resolve_device`,
+which calls the native `resolve_device` directly." It also pointed at
+`handoffs/apple_a9_device_selection.md` for the wiring, and no such file exists
+in this repository, so the pointer was dangling as well.
+
+What is true now. `_resolve_device` in `python/mojotrees/sklearn.py` imports
+`mojotrees.device_selection`, builds a `Workload`, calls `select_device`, and
+returns `decision.resolved`, so every fit goes through the full native
+decision with its reasons, blocks, memory estimate and evidence id. The
+narrow `_mojotrees.resolve_device` call is still in the file and is now only
+the fallback for a build whose `device_selection` cannot be imported. That
+branch answers on shape alone and cannot see `boosting_type` or
+`score_function`, which is why the callers keep their own guards
+(`_gpu_unsupported`).
+
+Two things were added on 2026-08-18 and both change answers.
+
+The workload now carries `grow_policy` and `max_depth`, through
+`device_selection.grow_policy_code(self._resolve_grow_policy())` and
+`_resolved_max_depth_for_policy(self)`. Before that neither field crossed the
+boundary, the native request took its own defaults, and `BLOCK_GROW_POLICY` and
+`BLOCK_MAX_DEPTH` could never match, so `grow_policy="symmetrictree",
+max_depth=8, device="auto"` raised out of `train_gpu` instead of falling back to
+the CPU. `max_depth` is the depth the FIT will use rather than the one the user
+typed, because symmetric mode substitutes `_CATBOOST_DEPTH` for an unset depth
+and a gate reading the raw value would describe a fit that does not exist.
+
+The decision now raises warnings, through `_warn_about_device_decision`, which
+is a WHITELIST of two cases rather than a dump of the report. An `auto` request
+that was blocked is warned, because the accelerator refused a parameter rather
+than the CPU being predicted faster, and the two backends do not produce
+identical models. An explicit `gpu` request the policy cannot vouch for carries
+the native `WARN_EXPLICIT_GPU_UNMEASURED` text. Nothing else warns. `auto`
+landing on the CPU because no crossover rule covers the shape is the normal
+quiet answer, and the six provenance caveats an ordinary decision carries belong
+in `explain_device_choice`, which is what that function is for.
+
+The reason the estimators still pass a resolved concrete device name to the
+native trainer entry points, rather than `"auto"`, is unchanged. The trainers
+take a backend, not a request, and `"gpu"` never falls back, so the resolution
+has to happen once, in one place, where the report can be built.
