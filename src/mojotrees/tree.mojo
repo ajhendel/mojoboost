@@ -1370,9 +1370,18 @@ struct _RowPool(Movable):
     """
 
     var free: List[List[Int]]
+    var made: Int
+    """Buffers this pool has had to allocate. Reach evidence: on a fit of
+    many trees it must stop rising, and if it equals the take count the pool
+    is inert. It was inert when first written, twice over, and neither the
+    prediction digest nor a timing said so."""
+    var served: Int
+    """Takes satisfied from the free list."""
 
     def __init__(out self):
         self.free = List[List[Int]]()
+        self.made = 0
+        self.served = 0
 
     def take(mut self) -> List[Int]:
         """An empty list, reusing a returned buffer's capacity when there is
@@ -1380,7 +1389,9 @@ struct _RowPool(Movable):
         if len(self.free) > 0:
             var buf = self.free.pop()
             buf.clear()
+            self.served += 1
             return buf^
+        self.made += 1
         return List[Int]()
 
     def give(mut self, var rows: List[Int]):
@@ -1828,7 +1839,11 @@ struct GrowScratch(Movable):
         of any other shape."""
         if self.pool.n_features != n_features or self.pool.n_bins != n_bins:
             self.pool = _HistPool(n_features, n_bins)
-        self.rows_pool = _RowPool()
+        # NOT reset. `prepare` runs once per tree, so assigning a fresh
+        # `_RowPool` here dropped every recycled buffer thirty lines before
+        # the root took one, which made the pool inert. Row buffers carry no
+        # shape, so unlike the histogram pool there is nothing here for them
+        # to be invalidated by.
 
     def resolve_layout_timed(
         mut self,
@@ -3670,17 +3685,14 @@ def grow_tree_leaves_profiled(
             tree_index,
         )
         tree.n_leaves = n_leaves
+        # BEFORE `leaves.clear()`, and the order is the whole point:
+        # `clear()` destroys the elements, so a recycle loop after it always
+        # saw an empty list and returned nothing.
+        while len(leaves.rows) > 0:
+            scratch.rows_pool.give(leaves.rows.pop())
         leaves.clear()
         leaves.covers_all_rows = len(bag) == 0
         leaves.node = List[Int](capacity=len(frontier))
-        # The previous tree's membership lists go back to the pool before
-        # this tree's replace them. `LeafMembership` is held for a whole fit,
-        # so without this the lists a tree hands out are dropped when the
-        # next tree overwrites them and every tree allocates its own set.
-        # The recycling runs one tree behind: two trees of allocation at the
-        # start of a fit, none after.
-        while len(leaves.rows) > 0:
-            scratch.rows_pool.give(leaves.rows.pop())
         leaves.rows = List[List[Int]](capacity=len(frontier))
         for i in range(len(frontier)):
             leaves.node.append(frontier[i].node)
@@ -3758,11 +3770,12 @@ def grow_tree_leaves_profiled(
             data.missing_bin[split.feature]
         )
         # Each child's rows are handed to its `_LeafState` below, so the two
-        # lists cannot be recycled across splits; the `_into` form is used
-        # anyway because it sizes them exactly in one shot instead of growing
-        # them by doubling.
-        var left_rows = List[Int]()
-        var right_rows = List[Int]()
+        # lists cannot be recycled across splits WITHIN a tree; they can and
+        # now do come from the pool, which holds the previous tree's lists and
+        # therefore their capacity. The `_into` form still sizes them exactly
+        # in one shot instead of growing them by doubling.
+        var left_rows = scratch.rows_pool.take()
+        var right_rows = scratch.rows_pool.take()
         # Charged at the *parent's* row count, because that is the work: the
         # routing walks the parent's list once and the two child lists it
         # allocates hold exactly those rows between them. Filing it under the
@@ -4145,6 +4158,14 @@ def grow_tree_leaves_profiled(
             cells=_scan_cells(right_features, data.n_features, data.n_bins),
         )
 
+        # The parent's row list, back to the pool. It is dead the moment its
+        # two children exist, and reclaiming it here is what makes the pool
+        # break even: a tree takes one list for the root and two per split,
+        # 61 at 31 leaves, and returns only its 31 final leaves at the drain.
+        # Without this the pool covered half the takes and allocated the rest
+        # forever, which a counter said and a digest could not.
+        scratch.rows_pool.give(frontier[best_i].take_rows())
+
         frontier[best_i] = _LeafState(
             left_node,
             left_rows^,
@@ -4177,17 +4198,15 @@ def grow_tree_leaves_profiled(
     # are moved out rather than copied, and its histograms go back to the pool
     # here rather than being freed with the states, which is what lets a
     # booster-scoped scratch keep serving the next tree.
+    # The previous tree's membership lists go back to the pool BEFORE
+    # `leaves.clear()`, and the order is the whole point: `clear()` destroys
+    # the elements, so a recycle loop after it always saw an empty list and
+    # returned nothing. That was the bug that made this pool inert.
+    while len(leaves.rows) > 0:
+        scratch.rows_pool.give(leaves.rows.pop())
     leaves.clear()
     leaves.covers_all_rows = len(bag) == 0
     leaves.node = List[Int](capacity=len(frontier))
-    # The previous tree's membership lists go back to the pool before this
-    # tree's replace them. `LeafMembership` is held for a whole fit, so
-    # without this the lists a tree hands out are dropped when the next
-    # tree overwrites them and every tree allocates its own set. The
-    # recycling runs one tree behind, which costs two trees of allocation
-    # at the start of a fit and none after.
-    while len(leaves.rows) > 0:
-        scratch.rows_pool.give(leaves.rows.pop())
     leaves.rows = List[List[Int]](capacity=len(frontier))
     for i in range(len(frontier)):
         leaves.node.append(frontier[i].node)
