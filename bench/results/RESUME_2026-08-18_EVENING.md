@@ -342,3 +342,51 @@ failure, eight of them, and the day's best work was finding places where this
 repository disagreed with itself: twelve contradictions, three of which were
 live bugs. Hunt contradictions, verify reach with a call, and never trust "it
 builds."
+
+## Closed on the evening of 2026-08-18
+
+Worked down group C and group D. Commits `904ebe2` through this one.
+
+**NVIDIA (group B): both items that can be done WITHOUT the hardware are
+done.** FMA prescale (`d01bf56`, verified their side) and the cgroup quota read
+(`8b131a0`, six tests). Everything else in group B needs the 5090 and belongs
+to the CUDA session: hypothesis 2 (`MOJOTREES_GPU_TREE_RESIDENT=0`), the suite
+at a valid job count, the determinism row, the split-search arm bench, the
+48 KiB shared-memory path. **Deliberately did NOT bound the resident grower's
+in-flight work as a speculative fix for the deadlock.** It would regress the
+measured Metal path, whose whole design is one synchronize per tree, and
+hypothesis 2 is still unrun. Fix after the diagnostic, not before it.
+
+**Correctness, and four were live defects:**
+- `_score_function_code` had silently become FAIL-OPEN. It mapped an
+  unrecognized selector to `SCORE_COSINE` because the policy blocked cosine;
+  the 2026-08-17 narrowing admitted cosine and inverted the guarantee with no
+  edit here. Now sends `SCORE_UNRECOGNIZED`, refused by construction. Verified
+  by call.
+- `objective_backends` claimed a GPU trainer for `QUERY_RMSE`, `PAIR_LOGIT`
+  and `YETI_RANK`. There is none. Now keyed on `objective_needs_groups`.
+- Non-M4 Metal users were silently routed to the host split scan, 1.29x to
+  1.85x slower AND a different model. Now warned (`904ebe2`).
+- `bench/apple/thermal_capture.sh --self-check` was FAILING on a deleted
+  companion file, and `tools/validation_plan.py --self-check` on
+  `histogram_cache_policy.mojo`, deleted in `6e19a47`. Both pass.
+
+**D1 is done and is the structural one.** `device_selection.workload_mapping`
+is now the single source of the native mapping, called by the sender and by
+the fixture, so the drift that hit four times cannot recur.
+
+**All 151 dead `handoffs/` citations are gone from code, docs, bench and
+tools**, seven of them from shipped error messages. Six references remain and
+each is history (the deletion commit, the `git show 21ff9fa^:` recovery
+command, the record of a move).
+
+**C1 is closed as MY MISREADING**, see below.
+
+### Still open from these groups
+Group D: EFB's `:70` vs `:1899` contradiction and its 3-pass probe,
+`predict_tile_enabled`'s stale docstring and deletion, the five class-batch
+docstrings, `HOST_HIST_DISPATCHES = 2`, `HOST_STEP_SLOTS = 32`, pixi.toml's
+unpriced `--fp-mode` claim. Group C: the packed accumulate (38 percent of the
+CPU round, still the biggest single prize), device-first compaction, the
+fan-out fusion with zero callers, the eval-set GPU route, `AUTO_GPU_MIN_ROWS`,
+depth 9, the two in-kernel silent clamps, switch deletion.
