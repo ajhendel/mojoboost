@@ -390,6 +390,79 @@ def _derivative_precision_code(value):
     return 1  # anything else, including float64: the policy blocks it
 
 
+def _warn_about_device_decision(decision):
+    """Tell the user when the device answer is not the one they asked for.
+
+    **THE REPORT WAS BEING BUILT AND DROPPED.** `decide_device` constructs a
+    full decision for every fit, with the reason, the blocks, the memory
+    estimate and the evidence id, it is serialized across the boundary and
+    parsed back, and `_resolve_device` used to end `return
+    select_device(...).resolved` and discard all of it. There was no
+    `warnings.warn` anywhere in the device-selection path.
+
+    That is not a cosmetic gap, and this is why. The CPU and GPU arms DO NOT
+    PRODUCE THE SAME MODEL. On real year data, 51,630 of 51,630 test rows
+    differ between them, median absolute difference 0.4601, maximum 9.67,
+    traced to the shared fixed-point Int32 histogram rather than to the split
+    search (`bench/results/COMPARISON_RUN_2026-08-16.md`). So every route
+    decision is a MODEL decision, and a route decision the user cannot read
+    is an unreported change to their numbers. Thirteen distinct blocks could
+    silently move a fit to the CPU and say nothing.
+
+    Two cases are worth a warning and nothing else is.
+
+    An `auto` request that was BLOCKED got the CPU because the device refused
+    a parameter, not because a crossover rule preferred the host. The user
+    asked the library to choose and it chose against their accelerator for a
+    reason they would want to know. `auto` landing on the CPU merely because
+    no rule covers the shape is the normal, quiet answer and is not warned
+    about; it is what `explain_device_choice` is for.
+
+    An explicit `gpu` request that the policy accepted but cannot vouch for
+    carries the native `WARN_EXPLICIT_GPU_UNMEASURED` text, which says the
+    run rests on no crossover measurement and may be slower than the CPU.
+    That warning has been correct and unheard: on covertype an explicit
+    `device="gpu"` is 1.45x slower than our own CPU arm and slightly less
+    accurate, and the library already knew enough to say so.
+
+    Nothing here refuses anything. An explicit request is a request.
+    """
+    if decision is None:
+        return
+    reported = getattr(decision, "decision", "") or ""
+    message = getattr(decision, "message", "") or ""
+    if reported == "auto-cpu-blocked":
+        _warnings.warn(
+            "device='auto' selected the CPU because the accelerator refused "
+            "this workload, not because the CPU was predicted faster. The "
+            "two backends do not produce identical models, so this changes "
+            "your numbers. Reason: " + message,
+            UserWarning,
+            stacklevel=3,
+        )
+        return
+    # A WHITELIST, and the reason is that the first version of this was
+    # warning spam. The decision carries seven reasons on an ordinary fit, and
+    # six of them are provenance caveats: the hardware identity came from the
+    # build target, the capabilities are synthetic, no memory budget was
+    # reported, the session is cold, the objective was not declared. Every one
+    # is true, every one belongs in `explain_device_choice`, and none of them
+    # is something a user can act on. A library that raises seven warnings per
+    # fit teaches people to filter its warnings, which costs more than the
+    # silence it replaced.
+    #
+    # `explicit-gpu-unmeasured` is the one that survives, because it is the
+    # one with a consequence. It says the run rests on no crossover
+    # measurement and may be slower than the CPU, and on covertype an explicit
+    # device="gpu" is 1.45x slower than our own CPU arm and slightly less
+    # accurate. The library computed that warning correctly and nobody ever
+    # heard it.
+    for text in getattr(decision, "warnings", ()) or ():
+        code = getattr(text, "code", None) or str(text)
+        if "explicit-gpu-unmeasured" in str(code):
+            _warnings.warn(str(text), UserWarning, stacklevel=3)
+
+
 def _resolved_max_depth_for_policy(est):
     """The `max_depth` a fit will actually run at, for the device gate.
 
@@ -3906,7 +3979,9 @@ class _Base(_ParamsMixin):
             # DeviceUnavailableError is a RuntimeError subclass carrying the
             # native refusal text, so it propagates as what this method has
             # always raised, with the report attached.
-            return _policy.select_device(device, workload).resolved
+            decision = _policy.select_device(device, workload)
+            _warn_about_device_decision(decision)
+            return decision.resolved
         # The narrow contract answers on shape alone, so it cannot see
         # `boosting_type` or `score_function` any more than it sees
         # `enable_bundle` or `linear_tree`. That is not a hole this branch can
