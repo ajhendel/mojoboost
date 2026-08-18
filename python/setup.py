@@ -72,6 +72,30 @@ class BinaryDistribution(Distribution):
         return True
 
 
+try:
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+except ImportError:  # setuptools >= 70 vendors it
+    from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
+
+
+class bdist_wheel(_bdist_wheel):
+    """`bdist_wheel` that tags the interpreter `py3` rather than `cp3xx`.
+
+    A `python_tag` in the options dict is not enough. `has_ext_modules`
+    returning True makes `bdist_wheel` derive the implementation tag from the
+    running interpreter, and it overwrites the option. Overriding `get_tag` is
+    the only place the decision is actually made.
+
+    The platform half is deliberately left as the base class computed it, so
+    `--plat-name` and `macos_plat_name` above keep working. Only the
+    interpreter and ABI halves are widened.
+    """
+
+    def get_tag(self):
+        _, _, plat = _bdist_wheel.get_tag(self)
+        return ("py3", "none", plat)
+
+
 def macos_plat_name():
     """The macOS wheel platform tag, or a hard stop for an arch that has
     no artifact."""
@@ -102,8 +126,46 @@ def macos_plat_name():
 # The bare `linux_x86_64` tag that results from no override is refused by
 # PyPI, which is correct. A Linux wheel becomes publishable by being
 # repaired into a manylinux tag, not by being named one.
+# THE INTERPRETER TAG, AND WHY IT IS `py3` RATHER THAN `cp3xx`.
+#
+# `bdist_wheel` derives the interpreter tag from whichever CPython is running
+# the build, so a build on 3.14 emitted `cp314` and the wheel became invisible
+# to every user on 3.10 through 3.13. **Nobody chose 3.14.** Nothing in this
+# project pinned an interpreter, so pixi's solver took the newest available,
+# the extension was compiled against it, and the tag recorded the accident.
+#
+# `requires-python` cannot fix it and already does not: `pyproject.toml`
+# declares `>=3.10`, correctly, and its own comment gives the reason that buys
+# nothing. **pip matches the wheel TAG before it consults `requires-python`.**
+# The tag is the gate.
+#
+# AND A BUILD MATRIX IS NOT NEEDED, WHICH IS THE USEFUL PART.
+# `docs/PYTHON_SUPPORT.md` section 7 establishes it and `otool -L` confirms it:
+# this extension LINKS NO LIBPYTHON. It resolves CPython by name at runtime.
+# abi3 exists so that one binary can serve many interpreters DESPITE being
+# linked against libpython, so it is not the mechanism this needs; a binary
+# that was never linked can already serve them. Section 4 records the
+# measurement, one artifact importing, fitting, predicting and round-tripping
+# on 3.10 through 3.14, run M1a.
+#
+# So the honest tag is the one that admits every interpreter the artifact was
+# proven on. `py3-none-<platform>` says exactly that: any Python 3, this
+# platform, not pure Python. The platform half stays specific because the
+# object genuinely is architecture and OS bound, which is the whole reason
+# `macos_plat_name` above exists.
+#
+# WHAT WOULD FALSIFY THIS. An interpreter in 3.10 through 3.14 on which the
+# same artifact fails to import or produces a different prediction. That is
+# what `docs/PYTHON_SUPPORT.md`'s `proven` label rests on, and if a future
+# CPython breaks the by-name resolution this tag becomes a lie and the floor
+# has to move. It is a claim with a date on it, like every other "cannot" in
+# this repository.
 options = {}
 if sys.platform == "darwin":
     options["bdist_wheel"] = {"plat_name": macos_plat_name()}
 
-setup(distclass=BinaryDistribution, options=options)
+setup(
+    distclass=BinaryDistribution,
+    options=options,
+    cmdclass={"bdist_wheel": bdist_wheel},
+)
