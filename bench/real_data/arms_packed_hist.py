@@ -68,7 +68,13 @@ DEFAULT_SHAPE = {"num_leaves": 31, "max_depth": -1}
 
 PACKED_ENV = {"MOJOTREES_CPU_PACKED_HIST": "1"}
 
-#: THE CONTROL THE FIRST RUN LACKED, added 2026-08-18 after
+#: KEPT FOR THE THIRD RUN AS A PRICE ON BLOCKING, not as the packing control
+#: any more. Since 2026-08-18 the switch packs the UNBLOCKED ROW-MAJOR kernel
+#: and leaves the plan alone, so `packed` is bit-identical to `baseline` and
+#: is compared directly against it. This arm now only answers "what is row
+#: blocking worth", which the second run put at 12 to 15 percent.
+#:
+#: ORIGINALLY: THE CONTROL THE FIRST RUN LACKED, added 2026-08-18 after
 #: `20260818T185452Z-packed` came back a loss with different covertype
 #: digests. Packing forces row blocking off, and `MOJOTREES_CPU_ROW_BLOCKS`
 #: is documented as one that MOVES BITS, because a block count is a summation

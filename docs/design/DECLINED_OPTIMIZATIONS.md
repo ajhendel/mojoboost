@@ -1445,3 +1445,80 @@ under `src/mojotrees/`, `bindings/`, `bench/results/` and `docs/`. Every price
 in this document is an estimate produced by arithmetic over figures published
 elsewhere in this repository or supplied in the audit brief, and every one of
 them is labeled as an estimate at the point it is made.
+
+## The compact histogram accumulator. DECLINED 2026-08-18, measured twice.
+
+**Do not rebuild this without a new mechanism.** It was implemented in two
+different kernels, measured in three interleaved runs on real data, and never
+produced a win against a baseline it was bit-identical to.
+
+### The argument, which was arithmetic over a profile
+
+The 2026-08-18 phase profile put 62.0 percent of the covertype CPU round in
+the histogram accumulate, with the per-slot rate degrading **19.4x** from root
+nodes to tiny ones. At 24 bytes a cell a rectangular 54 x 255 histogram is
+13,770 cells and **322.7 KB against a 64 KB L1**, while the cells any row can
+reach number `sum_f feature_bins[f]`, about 2,400, or **56.2 KB, which fits**.
+Forty-four of covertype's columns are binary, so packed they sit four to a
+cache line where rectangular they are 4,080 bytes apart. Predicted prize:
+22.3 ms of a 36.8 ms phase, 38 percent of the CPU round.
+
+### What was measured
+
+Run `20260818T185452Z-packed`, packing `_accumulate_subset_at` (feature-major):
+
+    covertype  deep       32.157 -> 44.855   0.717x
+    covertype  31 leaves  18.848 -> 22.860   0.824x
+    year       deep        9.836 -> 10.029   0.981x
+    year       31 leaves    4.875 ->  5.054   0.965x
+
+CONFOUNDED, and the digests said so: identical on year, DIFFERENT on
+covertype. Packing forced row blocking off, and `MOJOTREES_CPU_ROW_BLOCKS` is
+documented as one that moves bits because a block count is a summation order.
+
+Run `20260818T192444Z-packed2` added a no-blocking control. Packed against it
+read 1.124x deep and 1.206x at 31 leaves, and blocking itself was worth 12 to
+15 percent. But that control was confounded too: `MOJOTREES_CPU_ROW_BLOCKS=1`
+changes the PLAN, and `MOJOTREES_CPU_LAYOUT_BY_NODE` keys the row-major layout
+decision off whether a node will be blocked, so the two arms took different
+kernels.
+
+Run `20260818T204508Z-packed3`, packing the unblocked arm of
+`_accumulate_subset_row_major_at` instead, which is where
+`MOJOTREES_CPU_LAYOUT_BY_NODE` actually routes the degraded small nodes, and
+which changes no plan, no layout and no block count:
+
+    covertype  deep       37.31 -> 37.09   1.006x   digests DIFFER
+    covertype  31 leaves  22.32 -> 22.52   0.991x   digests DIFFER
+    year       deep        9.77 -> 10.82   0.903x   bit-identical
+    year       31 leaves    4.73 ->  4.83   0.980x   bit-identical
+
+**A null on covertype and a 10 percent loss on year**, against a baseline the
+year cells prove it is bit-identical to. The predicted 38 percent did not
+appear at 1 percent.
+
+### What this retires
+
+**The footprint-by-address explanation of the 19.4x degradation.** Packing
+does not change which cells a row touches, only where they live, and moving
+the working set from 322.7 KB to 56.2 KB bought nothing measurable. Whatever
+degrades the small and tiny node classes, it is not the address span of the
+histogram. The 22.3 ms estimate rested on that model and should not be quoted.
+
+### One loose end, recorded rather than fixed
+
+The row-major version is bit-identical on year and NOT on covertype, which it
+should be: same summation order, same plan, only the addresses differ. A
+synthetic check at 200,000 rows x 54 columns with 44 binary, the shape chosen
+specifically to exercise both the blocked and unblocked arms, agreed exactly,
+and a sabotage test proved the packed path executed. So something about real
+covertype multiclass reaches a path that check did not. Since the change is
+being declined on its timing, the discrepancy is left as a warning: if anyone
+rebuilds this, that is the first thing to explain.
+
+### What is kept
+
+`BinnedMatrix.build_packed_offsets()` and `has_packed_offsets()` stay. They
+fill the width table without also building the row-major copy of every bin id,
+which is a reasonable thing to want, and the row-major blocked kernel's
+private partials already use the same table.

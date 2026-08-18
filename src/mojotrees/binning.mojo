@@ -2855,8 +2855,6 @@ def _rebuild_row_major(mut matrix: BinnedMatrix, build_view: Bool) raises:
         matrix.build_row_major(0)
     elif mode == ROW_MAJOR_AUTO:
         matrix.build_row_major(row_major_budget_bytes())
-    if getenv("MOJOTREES_CPU_PACKED_HIST") == "1":
-        matrix.build_packed_offsets()
 
 
 def append_ctr_columns(
@@ -3495,12 +3493,6 @@ struct BinMapper(Copyable, Movable):
             out.build_row_major(0)
         elif mode == ROW_MAJOR_AUTO:
             out.build_row_major(row_major_budget_bytes())
-        # The compact histogram wants the width table and not the second copy
-        # of every bin id, so it is built separately and only when asked for.
-        # `build_row_major` fills the same two fields on its way past, and
-        # this is idempotent, so the order of the two does not matter.
-        if getenv("MOJOTREES_CPU_PACKED_HIST") == "1":
-            out.build_packed_offsets()
         return out^
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
