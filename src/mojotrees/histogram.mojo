@@ -2823,7 +2823,7 @@ def float64_gather_arm() -> Bool:
       `else` arm at all, so under `float64` its `use_pairs` is unconditionally
       False. Setting this variable together with
       `MOJOTREES_CPU_BIN_LAYOUT=row`, or with
-      `MOJOTREES_CPU_LAYOUT_BY_NODE=1` on a node that does not block, changes
+      the per-node layout rule (default ON) on a node that does not block, changes
       nothing about that node's build. Nothing is wrong with those histograms;
       the switch is simply inert there.
     - **The whole-dataset builder.** `_accumulate_full` never gathers on

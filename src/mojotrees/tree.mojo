@@ -1442,11 +1442,12 @@ def _env_layout_probe() -> Bool:
 
 
 def _env_layout_by_node() -> Bool:
-    """`MOJOTREES_CPU_LAYOUT_BY_NODE=1`: choose the bin layout per node from
-    the node's size, instead of once per fit.
+    """`MOJOTREES_CPU_LAYOUT_BY_NODE=0`: stop choosing the bin layout per
+    node from the node's size, and go back to choosing it once per fit.
 
-    Off by default, so a fit that does not ask for it runs the layout that
-    shipped at every node.
+    **ON by default since 2026-08-18.** The variable is the escape hatch back
+    to the per-fit layout, not the way to ask for the per-node one. See the
+    measurement that flipped it, below the 2026-08-16 table.
 
     **Why a per-node rule is a different question from the per-fit one, and
     why the per-fit answer does not settle it.** The timed probe and both
@@ -1489,8 +1490,54 @@ def _env_layout_by_node() -> Bool:
     loss at small nodes is **not** memory traffic.
 
     So the rule is a serial win at the two smallest classes, worth about 5
-    percent of the whole fit at one worker and indistinguishable at auto, and
-    it is off by default until a lane decides that trade.
+    percent of the whole fit at one worker and indistinguishable at auto.
+
+    **THE LANE DECIDED THAT TRADE ON 2026-08-18, AND THE ANSWER WAS LARGER
+    AND IN A DIFFERENT PLACE THAN THE TABLE ABOVE PREDICTED.** Run
+    `20260818T143944Z-cpuloc`, `bench/real_data/arms_cpu_locality.py`, four
+    arms interleaved, three whole-process repeats, real data, two shapes:
+
+    | scenario | shape | baseline s | with the rule | |
+    |---|---|---|---|---|
+    | year, 463,715 x 90 | 256 leaves, depth 8 | 11.86 | 9.35 | **1.269x** |
+    | year, 463,715 x 90 | 31 leaves | 4.77 | 3.90 | **1.224x** |
+    | covertype, 464,809 x 54 x 7 | 256 leaves, depth 8 | 36.90 | 34.37 | 1.074x |
+    | covertype, 464,809 x 54 x 7 | 31 leaves | 19.61 | 19.58 | 1.001x |
+
+    Baseline spreads were 0.9 and 3.6 percent on the two year cells, so those
+    two resolve. The covertype deep cell's baseline spread was 19.6 percent
+    and it does not resolve; the covertype default cell is a null.
+
+    **The prediction was wrong about WHERE, and the control block is what
+    caught it.** The table above says this rule fires on the small and tiny
+    node classes, so it should have been loudest on covertype's complete
+    depth-8 tree, where row blocking stops below 8,160 rows and 192 of every
+    255 splits land in those classes. Instead it is loudest on 90 dense
+    continuous columns at EVERY shape, including 31 leaves where the
+    small-node classes barely appear, and it does nothing on 54 mostly-binary
+    columns at either shape. Whatever this switch is doing, it is not
+    primarily a small-node effect; it is a wide-dense-feature-major-read
+    effect. That reading is not yet mechanistic and should not be quoted as
+    though it were.
+
+    **Bit-identity was measured rather than argued.** Across all twelve
+    switched cells the run recorded ONE distinct `predictions_sha256` per
+    (scenario, shape), shared with the baseline and with both other switched
+    arms. Not one distinct metric value: one distinct digest over the
+    predictions themselves.
+
+    So under `bench/results/LANE_RULES.md` rule 5, a bit-identical measured
+    win flips the default in the session that measured it, and under rule 11
+    a bit-identical CPU change lands on the digest rather than on a review.
+    Both conditions are met and the default is now ON.
+
+    **What did NOT flip, measured in the same run.** The sibling switch
+    `MOJOTREES_CPU_FEATURE_GROUP`, set to the cache-derived width the
+    schedule clamp throws away, read 1.002x on year deep and 0.967x on
+    covertype default. And setting BOTH is worse than this switch alone at
+    every cell that resolved (1.201x against 1.269x on year deep, 1.142x
+    against 1.224x on year default), so the two interact negatively and the
+    group clamp is not the thing to attack next.
 
     **It cannot move a cell.** `_hist_subset`'s own docstring states the
     contract and two tests assert it: both kernels take the same plan from
@@ -1530,10 +1577,9 @@ def _env_layout_by_node() -> Bool:
     two levels in. What is genuinely different about a symmetric tree is
     which SPLIT each level takes, and this switch decides no split.
     """
-    var s = getenv("MOJOTREES_CPU_LAYOUT_BY_NODE")
-    if s.byte_length() == 0:
-        return False
-    return s != "0"
+    # `!= "0"`, the spelling this repository reserves for an arm that was
+    # argued, measured and shipped. Unset behaves as ON.
+    return getenv("MOJOTREES_CPU_LAYOUT_BY_NODE") != "0"
 
 
 def _node_bin_layout(
@@ -2064,7 +2110,7 @@ def _hist_full(
     missing parameter. `histogram` has no whole-dataset row-major builder to
     call, because the only by-layout entry is
     `build_histogram_subset_by_layout_into_scratch`. So
-    `MOJOTREES_CPU_BIN_LAYOUT=row` and `MOJOTREES_CPU_LAYOUT_BY_NODE=1` reach
+    `MOJOTREES_CPU_BIN_LAYOUT=row` and the default-on per-node rule reach
     every node of a fit EXCEPT the root of a tree grown without bagging,
     which is this call. That is one build per tree against the thousands
     `_hist_subset` makes, and it is the one node where the question is least
