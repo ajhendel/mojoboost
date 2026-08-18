@@ -250,3 +250,49 @@ needs an anchor and regenerated goldens, not a flip. And the 3.5x estimate is
 in doubt: `expand_bundled_histogram` writes the full rectangular output per
 node, serially, so the honest prediction is a large win on the top levels and
 possibly a loss on the leaf frontier.
+
+## 7. The multiclass serial passes. CLOSED, 1.21x, and it is the evening's only win.
+
+Run `20260818T230849Z-postfix`, covertype and year, three repeats, LightGBM in
+every cell as the drift canary.
+
+**Compared by RATIO TO THE CANARY, not by seconds.** The two changes are
+unconditional rather than switched, so they cannot be interleaved against
+their own baseline in one process, and raw seconds across windows are
+worthless on a box that drifts 2 to 3x. The ratio is what survives.
+
+    covertype, 31 leaves, mojotrees / LightGBM
+
+    earlier tonight, four runs   4.14x  4.39x  4.45x  4.57x
+    after the two changes        3.62x
+
+    absolute: 16.93 s against 18.85, 19.88, 21.75, 22.32 earlier
+
+**1.21x, and the control holds.** `dense_regression` reads 1.36x against a
+prior range of 1.31x to 1.51x, unchanged, which is what it must be: the
+parallel softmax is multiclass-only. A run where year had also improved would
+have been a window effect rather than a change effect.
+
+**WHAT WAS ACTUALLY WRONG.** A softmax round has two whole-dataset passes and
+both ran on one core while the rest of the round used the pool: the
+probability pass (`n_classes` exponentials per row, 325 M `exp` per covertype
+fit) and the per-class derivative fill (a `List.append` loop run seven times
+per round, 700 times per fit).
+
+They were not disabled for multiclass. They were UNREACHABLE from it:
+`_fill_softmax_grad_hess` took no `DispatchSettings`, so there was nothing to
+dispatch with, while the single-output twin had been parallel for a long time.
+Both functions were correct, so nothing failed and nothing said so.
+
+The audit predicted 16 to 27 percent of the fit. Measured 21 percent.
+
+**`_RowPool` is in this number and cannot be separated from it.** It landed in
+the same window and is bit-identical, and on a 56-tree synthetic it read
+inside noise. Whether it contributes at 700 trees is not established by this
+run; the multiclass passes are sufficient to explain the whole 1.21x.
+
+**WHAT THIS SAYS ABOUT THE THREE NULLS BEFORE IT.** Compact histogram
+addresses, compact addresses in the right kernel, and the 16-byte cell all
+measured nothing. This one, which removed no bytes and moved no cells and only
+put existing work on the pool, is worth 21 percent. The evening's lesson is
+that the time was not where the phase profile's 62 percent pointed.
