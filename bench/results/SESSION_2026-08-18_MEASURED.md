@@ -133,6 +133,76 @@ accelerator gets much weaker.
 
 ---
 
+## 6. The covertype CPU round, per phase. CLOSED, AND IT REVERSED TWICE.
+
+`MOJOTREES_PHASE_PROFILE=async`, covertype shape 464,809 x 54 x 7 classes,
+`num_leaves=256 max_depth=8`, CPU arm, ten rounds.
+
+    histogram (accumulate)   62.0 pct
+    split_search             15.1
+    partition                15.0
+    subtract                  7.7
+    hist_alloc                0.2
+
+    histogram ns per thousand slots, by node class
+      root      234.1     large 311.1     medium 653.8
+      small    1705.0     tiny 4544.3       degradation 19.4x
+
+Our own prior note had that degradation at 8.7x. Nobody had measured it on
+this dataset.
+
+**THE PRIZE.** 57,706,074 slots at the root rate of 0.2521 ns per slot would
+cost 14.5 ms. The measured histogram phase is 36.8 ms. So **22.3 ms is
+addressable, 61 percent of the phase and 38 percent of the whole CPU round.**
+
+**FIRST READING, AND IT WAS WRONG.** The accumulate is proportional to SLOTS,
+not cells, so a packed histogram cannot touch it and compaction only attacks
+the 7.7 percent subtract plus part of the scan. That is correct about the PASS
+COUNT and wrong about the MECHANISM, and I published it before checking the
+mechanism.
+
+**WHAT ACTUALLY DEGRADES: histogram WRITE REUSE, and it tracks the cost
+exactly.** Updates per histogram cell per node, against ns per thousand slots:
+
+    class    updates/cell   ns/kslot
+    root           1822.8        252
+    large           295.2        290
+    medium           71.3        653
+    small             9.1       1257
+    tiny              1.4       3240
+
+At 1.4 updates per cell there is no reuse at all; every update is a cold
+access. The bin READ is not the story, which is independently confirmed by the
+per-node row-major layout switch measuring 1.074x and 1.001x on this exact
+dataset while winning 1.269x on year.
+
+**AND THE BYTES ARE DECISIVE.** At 24 bytes per cell:
+
+    rectangular   54 x 255 = 13,770 cells = 322.7 KB   SPILLS L1 BY 5.0x
+    packed          ~2,400 cells          =  56.2 KB   FITS L1
+
+The M4 has 64 KB of L1 data cache per core. **The rectangular histogram does
+not fit and the packed one does.** So compaction reaches the 62 percent after
+all, not by doing fewer passes but by giving every cell 5.7x more reuse and
+moving the working set from L2 into L1.
+
+**WHAT THIS RETIRES.** My own claim, made an hour earlier in this same session,
+that the cell-count theory was dead. It is not. It was the right refutation of
+the wrong mechanism. Anyone quoting "compaction cannot touch the accumulate"
+should read this row instead.
+
+**STILL NOT MEASURED**, and this is arithmetic over a profile rather than an
+A/B: nobody has built a packed histogram and timed it. The prediction is
+specific enough to falsify, which is the point of writing it down: if a packed
+accumulate does not move the small and tiny classes toward the root rate, the
+reuse model is wrong too.
+
+**AND THE INSTRUMENT HAS A HOLE.** Every per-cell row on the GPU arm reads
+ZERO. The instrumentation is CPU-path only and the device reports host-step
+spans instead. So this discriminates for the CPU arm only, and the GPU's 4.5x
+still has no per-phase attribution. Claiming otherwise, which I did for several
+hours, was wrong.
+
 ## Questions this session OPENED and did not close
 
 Listed so they are not mistaken for answered.
