@@ -143,9 +143,18 @@ says so. Ranked inside each group.
 
 ### C. Mine, ranked, and the first two are cheap
 
-1. **The compile cache.** CI takes the suite from 519 s to 78 s. If
-   `tools/run_tests.sh` misses that cache locally we pay seven times over on
-   every run. Biggest available win, deletes no test.
+1. ~~**The compile cache.**~~ **CLOSED 2026-08-18, AND IT WAS MY MISREADING.**
+   The 519 s to 78 s figure is CI gaining a cache that LOCAL ALREADY HAS.
+   `tools/run_tests.sh`'s own comment says it: the cache "survives locally and
+   CI throws it away every run", and `.github/workflows/ci.yml` already has the
+   restore step. Measured: **23 GB and 22,240 files** in
+   `.pixi/envs/default/share/max/cache`. There is no local win here.
+   The suite's seventeen minutes is not caching. It is GPU correctness tests
+   doing real fits: `test_gpu_launch_fusion` alone is 690 s standalone and
+   2,239 s under the suite's own contention, for seven tests that grow six real
+   forests and compare two arms bit for bit. That file earns its time. **If
+   suite duration is ever the target, the lever is the GPU tests' parallelism
+   and the 4-job GPU cap, not a cache and not test deletion.**
 2. **The cgroup quota read.** `MOJOTREES_NUM_WORKERS` may never reach MAX's pool,
    and `nproc` reports the host's cores against a container limit. Every derived
    task count, grain size and crossover threshold is computed against a machine

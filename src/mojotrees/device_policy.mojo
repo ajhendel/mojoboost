@@ -2821,6 +2821,52 @@ def _collect_warnings(
     if not caps.gpu_available or request.requested_device == CPU_DEVICE:
         return warnings^
 
+    # THE SPLIT SEARCH FALLS BACK ON HARDWARE THAT IS NOT THE VALIDATED M4,
+    # AND UNTIL 2026-08-18 NOBODY WAS TOLD.
+    #
+    # `gpu_split_policy._is_observed_m4` gates the device-resident split search
+    # on an Apple M4, because that is the only device whose crossover has been
+    # measured. Every other GPU is routed to the host scan, and that route
+    # costs twice over: it is measured 1.29x to 1.85x SLOWER at every shape
+    # tested, and it does NOT produce the same model, because
+    # `gpu_split_search` records that the device scan and the host scan differ,
+    # Float32 against Float64 and once-dequantized against
+    # summed-from-dequantized.
+    #
+    # So a user on any other GPU got a slower AND numerically different fit,
+    # for a reason about OUR EVIDENCE rather than about their hardware, and the
+    # only record of it was a trace sink behind an opt-in. The evidence policy
+    # is defensible. The silence was not.
+    #
+    # It is warned HERE rather than at the split policy because the split reason
+    # is a per-fit trace that never crosses the Python boundary, while the
+    # hardware identity is known at decision time and this function's warnings
+    # already reach the user through `sklearn._warn_about_device_decision`.
+    # Surfacing the trace itself is the same size of job as binding the eval-set
+    # trainer; this is the part that is one warning.
+    #
+    # Scoped to Metal deliberately. On CUDA and HIP the split-search route has
+    # never been measured at all, so a claim about which arm is faster there
+    # would be the kind of one-backend fact stated as a general property that
+    # this repository has paid for three times.
+    if (
+        caps.profile.api == API_METAL
+        and caps.profile.apple_generation != APPLE_GEN_M4
+    ):
+        warnings.add(
+            WARN_UNKNOWN_HARDWARE,
+            String(
+                "this is a Metal device that is not the Apple M4 the split"
+                " search has been measured on, so the device-resident split"
+                " search declines and the fit takes the host scan instead."
+                " That is measured 1.29x to 1.85x slower at every shape"
+                " tested, and it does not produce the same model as the"
+                " device scan: the two differ in precision and in when they"
+                " dequantize. Set MOJOTREES_GPU_SPLIT_STRATEGY=device to"
+                " override the evidence gate and take the device arm anyway"
+            ),
+        )
+
     if caps.built_with_accelerator:
         warnings.add(
             WARN_BUILD_TIME_AVAILABILITY,
