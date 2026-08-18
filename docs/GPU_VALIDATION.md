@@ -15,10 +15,19 @@ of it that do not exist yet.
 | Backend | Device | Correctness | Determinism | Phase timings | Profiler trace |
 |---|---|---|---|---|---|
 | Metal | Apple M4 (10 core) | pass | pass | partial | not run |
-| CUDA | none available | **not run** | **not run** | **not run** | **not run** |
+| CUDA | NVIDIA RTX 5090 (Blackwell, sm_120) | **partial** | **not run** | **partial** | **not run** |
 | HIP | none available | **not run** | **not run** | **not run** | **not run** |
 
-No NVIDIA or AMD hardware has executed this code. Not once, not on a laptop,
+NVIDIA hardware executed this code for the first time on 2026-08-18, on a
+leased RunPod RTX 5090. It builds and it runs. Correctness is **partial**
+rather than pass because the GPU suite has one unexplained failure
+(`test_gpu_raw_update_packing`) and determinism has not been attempted at
+all, so no row above may be read as a support claim. The full record is in
+[NVIDIA RTX 5090, CUDA, 2026-08-18](#nvidia-rtx-5090-cuda-2026-08-18).
+
+AMD is unchanged and the sentence below still holds for it in full.
+
+No AMD hardware has executed this code. Not once, not on a laptop,
 not in CI. The development machine is an Apple M4, GitHub-hosted runners have
 no GPU, and no self-hosted runner is registered. Every CUDA and HIP row above
 stays **not run** until someone executes the procedure below and pastes real
@@ -515,6 +524,178 @@ Notes worth carrying into the CUDA and HIP runs:
 - At 255 bins the shared reservation is 3072 bytes against 3060 used, so the
   reserve-by-`MAX_BINS` gap is invisible at the default bin count. It only
   opens up at smaller `max_bin`, which is where to look for it.
+
+### NVIDIA RTX 5090, CUDA, 2026-08-18
+
+The first non-Metal execution in this project's history. Recorded from a
+leased RunPod pod, driven over SSH. **This is a partial record and is not a
+support claim**: see "What is not established" below before citing anything
+here.
+
+```text
+Host        RunPod secure cloud, EU-CZ-1, Ubuntu 24.04.3, glibc 2.39
+CPU         256 vCPU (x86-64), AVX2 present, so the x86-64-v3 floor is met
+GPU         NVIDIA GeForce RTX 5090, Blackwell, compute capability 12.0
+VRAM        32607 MiB
+Driver      580.159.03
+Toolchain   Mojo 1.0.0 (ed45d567), pixi 0.76.2, from this repo's pixi.lock
+Commit      7aefb7f
+```
+
+Two facts about that hardware belong in the record rather than in a reader's
+head:
+
+- **The driver clears Mojo's floor by one patch release.** MAX requires
+  NVIDIA driver 580 or later; this host reports 580.159.03. RunPod assigns
+  both old and new hosts for the same GPU model, and two earlier pods in this
+  same session landed on CUDA 12.4 machines where the container refused to
+  start at all (`nvidia-container-cli: requirement error: unsatisfied
+  condition: cuda>=12.8`). A slightly older host would have produced no
+  record, not a worse one. The `cudaVersion` field is visible at pod creation
+  and is the cheap way to check before paying.
+- **This part is "known compatible", not "continuously tested".** In
+  Modular's compatibility table the RTX 50XX series is listed under *Known
+  compatible for development*; B200 is the only NVIDIA part under *Tested for
+  serving*. That does not weaken what passed, but it shifts the prior on what
+  a failure means: a lowering or codegen failure here is more likely to be
+  upstream than in this repository. See `docs/GPU_PORTABILITY.md` section 1.1
+  for the frame, and `docs/HARDWARE_CONTRIBUTORS.md` for the tier table.
+
+#### 1. Build
+
+**Pass.** This is a real result rather than a formality, because
+`has_accelerator()` is a compile-time query: the CUDA path had never been
+compiled in anywhere, by anyone, before this run.
+
+```text
+pixi run build-pkg    exit 0, 28 s, build/mojotrees.mojopkg = 7,124,190 bytes
+```
+
+All 110 modules in `src/mojotrees` elaborated. Warnings only, no errors. Two
+warnings are worth a follow-up rather than a shrug, because both name a
+branch that compiles out on this backend and neither is obviously intended
+to:
+
+```text
+src/mojotrees/distributed_gpu.mojo:315   'if HAS_DEVICE_COLLECTIVE:' is unreachable
+src/mojotrees/gpu_objectives_native.mojo:2927
+        'if (1 << MVS_BLOCK_SHIFT) != MVS_BLOCK_SIZE:' is unreachable
+```
+
+#### 2. Correctness
+
+**Partial.** GPU tests execute on the device and the majority pass, including
+`test_gpu_scan_primitives`, `test_gpu_partition_launches`, `test_gpu_tiling`,
+`test_gpu_level_batcher`, `test_gpu_portability` and `test_gpu_vendor_policy`.
+
+One failure is open and **unexplained**: `test_gpu_raw_update_packing`. It is
+recorded here rather than omitted, and it is not yet attributable, because
+the run that produced it was itself invalid (see the job-count defect below).
+Nothing in this repository should treat CUDA correctness as established until
+that test is re-run under a valid configuration and either passes or is
+diagnosed.
+
+#### 3. Determinism
+
+**Not run.** Repeat-run bit-identity was never attempted on this device. This
+is the property this document has always flagged as most likely to differ on
+a backend whose atomics and scheduling differ, so its absence is the single
+biggest hole in this record.
+
+#### 4. Phase timings
+
+**Partial.** One shape completed.
+
+```text
+== shape: 10000 rows x 20 features ==   n_bins 255, rounds 20
+  binning_s              0.009621961
+  setup_s                0.671638688
+  strategy               tiled
+  grid_dim               20 x 5          block_dim 256
+  rows_per_tile          2000            partial_cells 25500
+  stage_s                0.000030966
+  grad_h2d_s             0.000010296
+  hist_kernel_root_s     0.000152939
+  hist_d2h_s             0.000007812
+  hist_decode_s          0.000059369
+  partition_kernel_s     0.000112909
+  hist_kernel_child_s    0.000025298
+  hist_cells 5100        hist_child_rows 5019
+```
+
+Device capabilities as reported, which are the numbers the tiling policy
+keys on:
+
+```text
+  multiprocessor_count             170
+  max_threads_per_block           1024
+  max_threads_per_multiprocessor  1536
+  max_blocks_per_multiprocessor     24
+  max_shared_memory_per_block    49152
+  max_registers_per_block        65536
+  max_grid_dim_x            2147483647
+  max_grid_dim_y                 65535
+  clock_rate_khz               2407000
+```
+
+#### The result that matters most
+
+```text
+  blocks_per_sm_at_launch          0.5882352941176471
+  shared_memory_resident_block_limit   16
+  global_atomics_per_launch_upper       0
+```
+
+**The launch fills less than six tenths of one block per SM on a 170-SM
+device.** Occupancy is not the issue; the grid is simply too small for the
+part. `gpu_tiling.mojo` says in its own comments that `target_blocks` is 80
+"on the 10-core Apple M4 this project is developed on", and that is the
+geometry this run inherited on a device with 17x the multiprocessor count.
+
+This is precisely the evidence this document requires before any
+device-specific tuning is allowed ("a phase breakdown from `pixi run
+gpu-validate` on the target device"). It is a launch-geometry finding, not a
+kernel-efficiency finding, and the two should not be conflated: nothing here
+says the kernels are slow, only that most of the machine was never given
+work. No tuning change is justified by one shape at 10,000 rows.
+
+#### 5. Profiler
+
+**Not run.**
+
+#### What is not established
+
+State plainly, because a partial record is easy to over-read:
+
+- Determinism, on any shape. Not attempted.
+- Correctness, while `test_gpu_raw_update_packing` is open.
+- Any comparison against the Apple M4 numbers elsewhere in this repository.
+  Different vendor, different architecture, different host CPU (x86-64 with
+  256 threads against 10-core ARM). Nothing here is a like-for-like speed
+  claim and no number here should be placed beside an M4 number.
+- Anything at all about AMD.
+
+#### Two defects this run found in the harness, not in the library
+
+Both were found by running on a machine unlike the development laptop, which
+is the point of doing this.
+
+1. **`pixi run build-pkg` failed on a fresh clone.** `build/` is gitignored
+   and `mojo precompile` will not create its output directory, so the task
+   only ever worked on a machine where an earlier run had left the directory
+   behind. Every development machine here had one. Fixed in `pixi.toml` by
+   `mkdir -p build &&`. `tools/run_tests.sh` was never affected; it already
+   did this at its own precompile site.
+
+2. **The test pool over-subscribed the GPU by two orders of magnitude.**
+   `tools/run_tests.sh` sized its pool as `NCPU - 2`, which is 8 on the M4
+   and **254** on this host, so 254 processes each opened a device context
+   against one card. Measured consequence: GPU utilization 0% with 7.1 GB of
+   VRAM consumed by contexts alone, one test killed at 503 s by MAX's own
+   watchdog reporting a bare `Alarm clock`, and no forward progress. This is
+   what invalidated the first correctness run. Fixed by clamping the default
+   in `gpu` mode via `GPU_MAX_JOBS`, and by giving `run_one` an actual
+   wall-clock timeout, which it never had.
 
 ### Failures and unsupported capabilities
 

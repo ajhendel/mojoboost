@@ -21,7 +21,12 @@ Mac is the one that has actually run it.
 > **Every performance number in this repository was measured on one Apple M4
 > laptop and on no other machine**, and that section opens with what the
 > single machine, its shared memory bus, and its thermal budget leave
-> confounded. No NVIDIA or AMD device has ever executed this code.
+> confounded. On 2026-08-18 an NVIDIA device executed this code for the
+> first time: it compiles and runs on CUDA, and the recorded phase timings
+> and the open failures are in
+> [docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md). That run does not make
+> any performance number here portable, and no AMD device has ever executed
+> this code.
 
 mojotrees is a from-scratch GBDT library in the LightGBM family. It uses
 histogram-based split finding and leaf-wise (best-first) tree growth. Its
