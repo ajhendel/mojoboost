@@ -50,7 +50,6 @@ compacted-bin-read = _ensure_compacted
   gpu_active_rows.mojo::GpuActiveRows.enqueue_desc_histogram
   gpu_active_rows.mojo::GpuActiveRows.enqueue_range_histogram
 
-compacted-bin-read-oblivious = oblivious_compacted_bins_requested
 
 const-hessian-declaration = set_constant_hessian
   gpu_active_rows.mojo::GpuActiveRows.set_constant_hessian

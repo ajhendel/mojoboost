@@ -21,7 +21,6 @@ benchmarking and for tests that must force one path:
   nothing changes nothing. It exists as a separate name because the two are
   separate questions and only the first of them has ever been measured; see
   "Two grains, not one" below.
-  and moves no output.
 
 `binning.mojo` adds one more of the same kind:
 `MOJOTREES_BINNING_SELECT_MIN_ROWS` chooses between the two ways a quantile

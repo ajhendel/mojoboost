@@ -909,7 +909,7 @@ def _batch_hist_atomic_kernel(
     GPU, it measured 3.270 s against a 2.476 s baseline, which is 0.757x, with a
     bit-identical model. The arm, its launch scalar and the compact-plane
     ping-pong it needed were removed on 2026-08-18 under
-    `docs/design/LANE_RULES.md` rule 6. See
+    `bench/results/LANE_RULES.md` rule 6. See
     `docs/design/DECLINED_OPTIMIZATIONS.md` row C1; the scattered bin read is
     not what this kernel spends its time on, so do not rebuild it on that
     reasoning.

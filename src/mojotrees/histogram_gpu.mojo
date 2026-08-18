@@ -195,13 +195,6 @@ from .gpu_active_rows import (
     GpuActiveRows,
     LeafRange,
     RowRouting,
-    # The origin widener, imported rather than restated. The oblivious level
-    # build has to hold either this builder's `bins_dev` or the row state's
-    # `cbins_dev` in ONE variable and hand it to the batcher, and those two
-    # carry different origins that nothing widens implicitly; the function's
-    # own docstring is the argument for why that is safe and why the two
-    # alternatives to it are worse.
-    _any_origin_u8,
 )
 from .gpu_binned_layout import check_layout_support
 from .gpu_frontier import LeafWorkItem
@@ -3248,7 +3241,7 @@ struct GpuHistogramBuilder(Movable):
         2.476 s baseline on the device-MVS arm and 6.329 s against 6.009 s on
         the host-MVS one, bit-identical models on both pairs. The switch, the
         launch scalar it set, and the compact-plane ping-pong it needed were
-        removed on 2026-08-18 under `docs/design/LANE_RULES.md` rule 6, and
+        removed on 2026-08-18 under `bench/results/LANE_RULES.md` rule 6, and
         `docs/design/DECLINED_OPTIMIZATIONS.md` C1 closes MEASURED NEGATIVE.
         This level build indexes the dataset's own matrix by row id and has no
         other option.
@@ -3274,7 +3267,7 @@ struct GpuHistogramBuilder(Movable):
         var rows_ptr = self.rows.rows_dev.copy()
         var scratch_ptr = self.rows.scratch_dev.copy()
         var desc_ptr = self.rows.step_dev.copy()
-        var level_bins = _any_origin_u8(self.bins_dev.unsafe_ptr())
+        var level_bins = self.bins_dev.unsafe_ptr()
         # The branch is here rather than inside the batcher, so that only an
         # oblivious level plan can reach the subtracting arm. A leaf-wise
         # two-item plan also goes through `enqueue_device_plan_batch_fused`,
