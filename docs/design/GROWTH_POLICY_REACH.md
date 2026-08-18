@@ -69,7 +69,8 @@ it, which is a defect.
 | `MOJOTREES_GPU_HIST_STRATEGY`, `_MIN_TILES`, `_HIST_SPECIALIZATION` | `gpu_tiling.mojo`, `apple_histogram_policy.mojo` | REACHES | REACHES | partially: the batched level build resolves its own geometry |
 | `MOJOTREES_GPU_VERIFY_ROWS` | `train_gpu.mojo:1397` | STRUCTURAL, refused by name (`_check_verify_rows_reachable`) | REACHES, through `apply_split(expected_left=...)` | STRUCTURAL, refused by name |
 | `random_strength` device noise | `train_gpu.mojo`, `gpu_split_search.mojo` | REACHES | **WAS A HARD FAILURE.** Fixed; see below | REACHES |
-| `PhaseProfile` instrumentation | `phase_profile.mojo` | STRUCTURAL absence, stated: fences would measure the instrument | REACHES, fully | STRUCTURAL absence, one opaque phase |
+| `PhaseProfile` phase axis (device phases) | `phase_profile.mojo` | STRUCTURAL absence, stated: fences would measure the instrument | REACHES, fully | STRUCTURAL absence, one opaque phase |
+| `PhaseProfile` host-span axis | `phase_profile.mojo`, `gpu_resident_round.mojo` | REACHES, fully (2026-08-18): host clocks around host calls add no fence, so the refusal above does not cover them | DOES NOT REACH. `_device_search_resident` and `_device_search_incremental` are not bracketed on this axis; they are the fully instrumented loops on the PHASE axis, which is the instrument for them, and a host-span table from a `MOJOTREES_GPU_TREE_RESIDENT=0` run is empty rather than partial | REACHES, fully, with the level index as the step axis |
 
 ## The `random_strength` contradiction, settled
 

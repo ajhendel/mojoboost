@@ -2044,6 +2044,15 @@ def _compact_scatter_kernel(
     ascending from `begin + carry`, because the partition is stable. So both
     sides of the move coalesce, where the gather this exists to remove does
     not.
+
+    **A dead step writes nothing.** The kernel returns at the descriptor's
+    `STEP_LIVE` word, which is right, because the copy-back beside it also
+    returns and `cbins` is left holding the plane it already held. A `swap`
+    parameter used to make a dead step copy the window identically instead, so
+    that the whole-buffer ping-pong `_enqueue_compact_partition` describes
+    stayed a pure renaming in both cases; that ping-pong was removed with the
+    compacted level read on 2026-08-18 and this parameter went with it. See
+    `docs/design/DECLINED_OPTIMIZATIONS.md` row C1.
     """
     var tid = thread_idx.x
     var nthreads = block_dim.x
@@ -2116,9 +2125,9 @@ def _compact_scatter_kernel(
     for t in range(Int(tiles)):
         var j = first + t * nthreads + tid
         if j < n:
+            var dst: Int
             var packed = offsets[unsafe_offset=j][0]
             var p = Int(mine) + (Int(packed) >> 1)
-            var dst: Int
             if (packed & Int32(1)) != 0:
                 dst = p
             else:
@@ -5893,7 +5902,6 @@ struct GpuActiveRows(Movable):
         self.compact_flag_read = (
             _env_int("MOJOTREES_GPU_COMPACT_FLAG_READ", 0) != 0
         )
-
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
         # rather than left as whatever the allocation held. No kernel reads
@@ -6990,7 +6998,7 @@ struct GpuActiveRows(Movable):
         back_blocks: Int,
         use_desc: Int32,
     ) raises:
-        """Maintain the invariant across one partition. Two launches.
+        """Maintain the invariant across one partition, in two launches.
 
         Enqueued from inside both partition entry points, after the flag pass
         that wrote `offsets` and `block_sums` and beside the row scatter that
@@ -7005,6 +7013,18 @@ struct GpuActiveRows(Movable):
         candidate for it, because the second launch here reads what the first
         writes and a fold would have to preserve that order across a command
         buffer boundary the fusion exists to remove.
+
+        **A WHOLE-BUFFER PING-PONG REPLACED THE SECOND LAUNCH AND WAS REMOVED
+        WITH THE ARM THAT NEEDED IT.** `set_compact_swap(True)` used to
+        exchange the two allocations here instead of enqueuing the copy-back,
+        which is legal only for a caller whose every partition covers the whole
+        live prefix, and the one such caller was the oblivious level schedule
+        reading the compacted plane. That read measured 0.757x on real data and
+        was removed on 2026-08-18, so the swap had no caller left and went with
+        it; see `docs/design/DECLINED_OPTIMIZATIONS.md` row C1. A leaf-wise
+        partition moves ONE leaf's window, and swapping the buffers under it
+        would strand every other live leaf's compacted rows in the plane that
+        was swapped out, which is why the copy-back is the only arm here.
         """
         var desc = self._desc_buffer()
         self.ctx.enqueue_function[_compact_scatter_kernel](

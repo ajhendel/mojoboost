@@ -157,8 +157,12 @@ asserted:
   guarded case is the device launch count, which costs a policy derivation,
   and it is guarded at its call site in `train_gpu.mojo`.
 - The buckets are allocated in `__init__` whether or not the profile is on:
-  `10 * 5` integers seven times over, 350 words, once per fit or per tree.
-  That and one `getenv` is the entire cost of an off profile.
+  `11 * 5` integers seven times over for the phase axis, which is 385 words,
+  plus `6 * 35` three times over for the host-span axis, which is 630, once
+  per fit or per tree. That and one `getenv` is the entire cost of an off
+  profile. (This clause read "`10 * 5` ... 350 words" until 2026-08-18; it
+  was written when there were ten phases and was never moved when
+  `PROF_DEVICE_PLANE` made eleven.)
 
 `tests/test_gpu_phase_profile.mojo` asserts the counter half of that
 directly, by charging an off profile a large duration and a large count and
@@ -248,6 +252,112 @@ Metal timeline captured from outside the process.
 `PROF_DEVICE_PLANE` is the consequence of that limit made explicit rather than
 left as a remainder. See its own docstring, and the two brackets in
 `train_gpu.mojo` that charge it.
+
+The host-span axis: what the HOST THREAD was doing inside that plane
+---------------------------------------------------------------------
+Everything above divides a round by PHASE and by NODE SIZE. That axis answers
+"which part of the algorithm", and on a device-resident fit it answers with
+one word, `device_plane`, because the host does not step the nodes. The
+host-span axis is a different question asked of the same interval: of the wall
+time the host thread spent inside the plane, HOW MUCH WENT TO WHAT KIND OF
+HOST OPERATION. Six spans, defined at `HOST_WAIT` and below, cut by step index
+as well as summed.
+
+The rule the whole axis is built on, and the reason it may exist inside a loop
+whose docstring refuses instrumentation:
+
+    A HOST-SIDE WALL CLOCK AROUND A HOST-SIDE OPERATION ADDS NO
+    SYNCHRONIZATION. Two `perf_counter_ns` reads around a call the schedule
+    already makes change no launch, no order, and no wait.
+
+`grow_tree_device_resident` refuses "an instrument that adds two
+synchronizations per level", and that refusal is upheld here rather than
+routed around. Nothing on this axis inserts a drain, consults
+`PhaseProfile.fenced`, or asks the device a question. Which is exactly why
+this axis reports no device time and never claims to.
+
+Free, costly, and impossible, decided per span before any of it was written
+---------------------------------------------------------------------------
+FREE, meaning a bracket perturbs nothing because the operation is pure host
+work or is already synchronous:
+
+- `HOST_ALLOC`, `HOST_PLAN`, `HOST_ENCODE`. Pure host calls. A bracket is two
+  clock reads and nothing else exists to disturb.
+- `HOST_WAIT`. The measurand IS a drain the schedule already performs. Timing
+  a wait costs nothing extra, because the wait is the thing being timed.
+- `HOST_READBACK` and `HOST_UPLOAD`. On Metal `enqueue_copy` is a synchronous
+  full-queue drain in BOTH directions (`docs/GPU_PORTABILITY.md` section 6.1,
+  measured by disassembly), so every copy in this repository is already a
+  drain and a bracket around one adds no second drain. On a backend where a
+  copy is genuinely asynchronous these two brackets still cost nothing; they
+  merely stop absorbing device time, which changes what the number MEANS and
+  not what it costs.
+
+COSTLY, and therefore NOT DONE:
+
+- Per-kernel device time. It wants a fence per kernel and this backend has no
+  fence to give: section 1 of the same document records `create_event`,
+  `create_stream` and `DeviceGraph.create` all raising on an M4. The only
+  device-time instrument that exists here is `PROFILE_FENCED`, which buys
+  per-phase device time for two host synchronizations per split, and neither
+  device plane reaches it.
+
+IMPOSSIBLE THIS WAY, which is a different statement from costly and is
+recorded rather than approximated:
+
+- Splitting an already-synchronous copy into "the bytes" and "the queue
+  backlog it drained". Knowing how much of a copy's clock was backlog means
+  draining BEFORE the copy, which is a synchronization this instrument would
+  have added, and the number it then reported would be one it manufactured.
+  So `HOST_READBACK` and `HOST_UPLOAD` are honest as HOST OCCUPANCY and are
+  not bandwidth, and a `ns_per_call` on either is not a per-copy price. Same
+  withdrawal section 6.1.1 records for the copy counts.
+- Separating argument binding from command-buffer commit inside
+  `enqueue_function`. There is no seam on this side of that call to bracket
+  and no handle on the queue to hook, so `HOST_ENCODE` is the pair,
+  undivided.
+- Device idle. A host span says the host was busy. It says nothing about
+  whether the device was, and no arrangement of host clocks will.
+
+The one reading a reader will get wrong, and the two columns that catch it
+--------------------------------------------------------------------------
+`HOST_ENCODE` is not purely encoding. Section 6 of the portability document
+records that a launch stream deeper than 64 command buffers backpressures
+inside `objc_msgSend`, so an `enqueue_function` issued against a full queue
+BLOCKS, and a host clock around it charges that block to encoding. That is a
+device wait wearing an encode costume, and on a plane that enqueues a whole
+tree before it reads anything it is the single most likely large number on
+this axis.
+
+It is separable with no fence at all, by SHAPE rather than by total, which is
+why every bucket carries `max_ns` beside `nanos` and why the axis is cut by
+step index:
+
+- Encode that is really encoding is FLAT in the step index, and its `max_ns`
+  sits within a small factor of its mean, because every step enqueues the same
+  launches in the same order.
+- Encode that is really backpressure is LOW for the first few steps, while the
+  queue is still filling, then STEPS UP to a plateau, and its `max_ns` runs far
+  above its mean because one call in the step blocks and its neighbors do not.
+
+At roughly ten launches a step a 64-buffer queue fills in about seven steps,
+so the two shapes are distinguishable inside a single default tree. Nothing
+here predicts which one a run will show.
+
+Free when off, on this axis too
+--------------------------------
+The same structural argument the section above makes, with one added clause.
+`charge_host` returns on the mode test before it validates, indexes or adds,
+and its `started` argument comes from `clock()`, which returns 0 without
+reading a clock when the mode is off. So an off run performs no clock read and
+no counter update on this axis either.
+
+The one instrument outside this module is the pair of brackets in
+`gpu_tree_tables.DeviceTreeTables.download`, which exist because the wait and
+the host decode behind one call cannot be told apart from the outside. They
+sit behind that struct's own `host_timing` Bool, which the planes set from
+`PhaseProfile.enabled()` once per tree, so an off run pays one Bool test on a
+call it makes once per tree.
 """
 
 from std.os import getenv
@@ -327,11 +437,20 @@ therefore the one phase that is deliberately NOT a breakdown.
 **Read this before reading a report that has a large number on this line.**
 `gpu_resident_round.grow_tree_device_oblivious` and
 `grow_tree_device_resident` enqueue an entire tree and wait once at the end.
-They take no `PhaseProfile` and, per the argument at `train_gpu.mojo`'s two
-brackets, they should not: their internal phases are device phases, and
-separating device phases needs fences, which on this backend would measure the
-instrument rather than the plane. So the host has no vantage point from which
-to divide that time up.
+Their internal phases are DEVICE phases, and separating device phases needs
+fences, which on this backend would measure the instrument rather than the
+plane. So the host has no vantage point from which to divide THIS number up,
+and it is not divided.
+
+**They do take a `PhaseProfile` since 2026-08-18, and this line said they take
+none until that day.** What they take it for is the host-span axis, which is a
+different question over the same interval: not which device phase the time
+went to, but what the HOST THREAD was doing while it passed. Every bracket on
+that axis is a host clock around a host call and none of them is a fence, so
+the refusal above is untouched by it. A reader who wants this number divided
+still has only the two instruments the last paragraph names; a reader who
+wants to know why the host thread was busy has `phase_profile host` and
+`hoststep`.
 
 Before this phase existed, that time went into the report's `unattributed_ns`
 remainder, and the practical consequence was a wrong conclusion rather than a
@@ -476,6 +595,163 @@ def classify_node(node_rows: Int, root_rows: Int) -> Int:
     if node_rows * SMALL_MIN_INVERSE > root_rows:
         return CLASS_SMALL
     return CLASS_TINY
+
+
+# ---------------------------------------------------------------------------
+# Host spans: what the host thread itself was doing
+# ---------------------------------------------------------------------------
+#
+# The second axis. Read the module docstring's "host-span axis" section first;
+# it states which of these six are free to measure, which would cost a
+# synchronization and are therefore not measured, and which are not reachable
+# by any arrangement of host clocks. Nothing below adds a drain.
+
+comptime HOST_WAIT = 0
+"""Blocking on a drain that carries no bytes: a bare
+`DeviceContext.synchronize`, a queue drain a grower performs on its own
+account, a completion wait.
+
+Free to time, because the wait is already in the schedule and the bracket is
+two clock reads around it.
+
+**Expected to be zero on both device planes, and that zero is a fact rather
+than a gap.** Neither `gpu_resident_round.grow_tree_device_resident` nor
+`grow_tree_device_oblivious` calls `synchronize` anywhere; their one wait per
+tree is carried inside a readback and is charged to `HOST_READBACK`. A nonzero
+number on this line from either plane means someone added a drain."""
+
+comptime HOST_READBACK = 1
+"""Host reading device memory: `enqueue_copy` in the device-to-host direction,
+and the wait it carries.
+
+**Occupancy, not bandwidth.** On Metal the copy is itself a full-queue drain,
+so this bucket fuses the bytes, the drain, and whatever device work the queue
+still held when the copy was issued. Splitting those needs a drain BEFORE the
+copy, which is a synchronization this instrument will not add, so the split is
+not available and is not faked. `ns_per_call` here is not a per-copy price.
+
+On a device-resident plane this is where the tree's whole device execution
+lands, because the plane enqueues everything and reads once."""
+
+comptime HOST_UPLOAD = 2
+"""Host writing device memory: `enqueue_copy` in the host-to-device direction.
+The searcher's staged per-record tables, the `random_strength` noise planes,
+the gradient upload.
+
+Drains on Metal exactly as the download does, so the same occupancy-not-
+bandwidth reading applies for the same reason."""
+
+comptime HOST_ALLOC = 3
+"""Buffer and sub-buffer creation, slot-pool acquisition, and the host heap
+traffic a unit of work performs to describe itself: the `List` a batched
+request is built out of, the handles a loop copies out of a struct to end a
+borrow.
+
+Pure host, so the bracket is free. Named apart from `HOST_PLAN` because
+allocation is the one host cost that a redesign removes outright rather than
+makes cheaper."""
+
+comptime HOST_ENCODE = 4
+"""Setting kernel arguments and enqueuing: one `enqueue_function` plus the
+argument marshalling in front of it, undivided, because there is no seam on
+this side of that call to bracket.
+
+**Read `max_ns` and the step curve before reading this total as encoding.** A
+queue deeper than 64 command buffers backpressures inside `objc_msgSend`, and
+a host clock around a blocking enqueue charges the block here. The module
+docstring gives the two shapes that tell encoding from backpressure apart with
+no fence: flat with a tight `max_ns` is encoding, a step up after the first
+few steps with a wide `max_ns` is backpressure."""
+
+comptime HOST_PLAN = 5
+"""Everything the host computes for itself: staging arithmetic, frontier and
+row-range maintenance, tree-table writes, snapshot decode, invariant checks,
+and the `Tree` a snapshot is transcribed into.
+
+Pure host, and the residual of the six, so a large number here is a positive
+claim that the host is COMPUTING rather than waiting or enqueuing."""
+
+comptime N_HOST_SPANS = 6
+
+
+def host_span_name(span: Int) -> String:
+    if span == HOST_WAIT:
+        return String("device_wait")
+    if span == HOST_READBACK:
+        return String("readback")
+    if span == HOST_UPLOAD:
+        return String("upload")
+    if span == HOST_ALLOC:
+        return String("allocation")
+    if span == HOST_ENCODE:
+        return String("encode")
+    if span == HOST_PLAN:
+        return String("host_plan")
+    return String("unknown")
+
+
+# The step axis. A span is filed under the growth step (leaf-wise) or level
+# (symmetric) that was executing when it happened, or under one of the two
+# bookends for the work a tree does before its first step and after its last.
+#
+# Cut by step INDEX and not by node size, deliberately and unlike the phase
+# axis: on a device plane the host does not know a node's row count, and the
+# question this axis answers -- does the host's cost per step rise as the
+# queue deepens -- is a question about ORDER. Filing by a size the host would
+# have had to ask the device for would also make the instrument a round trip.
+
+comptime HOST_SLOT_PROLOGUE = 0
+"""Per-tree work before the first growth step: staging, the root histogram,
+the table reset, the root search, the one upload."""
+
+comptime HOST_SLOT_EPILOGUE = 1
+"""Per-tree work after the last growth step: the terminal commit, the one
+readback, the snapshot decode, the invariant checks, the row-range publish,
+and the transcription into a `Tree`."""
+
+comptime HOST_SLOT_STEP_BASE = 2
+"""Step 0 lands here and step `k` at `HOST_SLOT_STEP_BASE + k`."""
+
+comptime HOST_STEP_SLOTS = 32
+"""Steps that get a slot of their own. The default leaf budget is 31 leaves,
+so 30 steps, and the deepest symmetric tree this repository grows on the
+device is 6 levels; both fit with room. Anything past this piles into
+`HOST_SLOT_OVERFLOW` rather than widening the report."""
+
+comptime N_HOST_STEP_SLOTS = HOST_SLOT_STEP_BASE + HOST_STEP_SLOTS + 1
+comptime HOST_SLOT_OVERFLOW = N_HOST_STEP_SLOTS - 1
+"""Every step at or beyond `HOST_STEP_SLOTS`, summed. A nonzero line here says
+the per-step curve is truncated and the tail must not be read off it."""
+
+
+def host_step_slot(step: Int) -> Int:
+    """Which slot growth step `step` files under.
+
+    A negative step is the prologue, which is how a caller with no step in
+    hand spells "before growth". Out of range above is the overflow slot
+    rather than a raise, on the same principle `classify_node` states: an
+    instrument that can abort a fit is worse than one that mis-files a row.
+    """
+    if step < 0:
+        return HOST_SLOT_PROLOGUE
+    if step >= HOST_STEP_SLOTS:
+        return HOST_SLOT_OVERFLOW
+    return HOST_SLOT_STEP_BASE + step
+
+
+def host_slot_name(slot: Int) -> String:
+    if slot == HOST_SLOT_PROLOGUE:
+        return String("prologue")
+    if slot == HOST_SLOT_EPILOGUE:
+        return String("epilogue")
+    if slot == HOST_SLOT_OVERFLOW:
+        return String("step32plus")
+    if slot > HOST_SLOT_EPILOGUE and slot < HOST_SLOT_OVERFLOW:
+        var i = slot - HOST_SLOT_STEP_BASE
+        if i < 10:
+            return String("step0", i)
+        return String("step", i)
+    return String("unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +911,18 @@ def _per_thousand(nanos: Int, units: Int) -> Float64:
     return Float64(Int(scaled + 0.5)) / 1000.0
 
 
+def _per_unit(nanos: Int, units: Int) -> Float64:
+    """Nanoseconds per unit, three decimal places, or 0.0 when no units were
+    counted. Per ONE and not per thousand, unlike `_per_thousand`, because the
+    host-span axis divides by calls rather than by rows and a per-call figure
+    that a reader has to divide by a thousand in their head is a per-call
+    figure a reader gets wrong."""
+    if units == 0:
+        return 0.0
+    var scaled = Float64(nanos) * 1000.0 / Float64(units)
+    return Float64(Int(scaled + 0.5)) / 1000.0
+
+
 struct PhaseProfile(Copyable, Movable):
     """Wall time and counts per (phase, node size class), for one tree or one
     fit.
@@ -692,6 +980,25 @@ struct PhaseProfile(Copyable, Movable):
     Float64 gradient, a Float64 hessian, and an Int count, so `cells * 24` is
     the bytes a full pass writes."""
 
+    # -- the host-span axis, `N_HOST_SPANS * N_HOST_STEP_SLOTS` = 210 cells --
+    #
+    # Parallel to the phase buckets and independent of them. A charge on one
+    # axis never touches the other, and the two are not two views of one
+    # number: the phase axis divides a round by ALGORITHM and the host axis
+    # divides the host thread's occupancy by KIND OF CALL. On a device plane
+    # the phase axis holds one opaque total and this one holds the breakdown.
+
+    var host_nanos: List[Int]
+    var host_calls: List[Int]
+
+    var host_max_nanos: List[Int]
+    """The longest single bracket charged to a cell.
+
+    Carried because a mean alone cannot tell encoding from backpressure. Ten
+    enqueues a step at two microseconds each and nine at two plus one at
+    forty are the same total and are different findings, and only the second
+    is a host thread blocked on a full command queue. See `HOST_ENCODE`."""
+
     def __init__(
         out self,
         mode: Int = PROFILE_OFF,
@@ -722,6 +1029,14 @@ struct PhaseProfile(Copyable, Movable):
             self.rows.append(0)
             self.slots.append(0)
             self.cells.append(0)
+        var h = N_HOST_SPANS * N_HOST_STEP_SLOTS
+        self.host_nanos = List[Int](capacity=h)
+        self.host_calls = List[Int](capacity=h)
+        self.host_max_nanos = List[Int](capacity=h)
+        for _ in range(h):
+            self.host_nanos.append(0)
+            self.host_calls.append(0)
+            self.host_max_nanos.append(0)
 
     @staticmethod
     def from_env(
@@ -854,6 +1169,117 @@ struct PhaseProfile(Copyable, Movable):
             if elapsed > 0:
                 self.nanos[i] += elapsed
 
+    # -- the host-span axis -----------------------------------------------
+
+    def charge_host(
+        mut self, span: Int, slot: Int, started: Int
+    ) raises:
+        """Charge one host-side interval to `span`, filed under step slot
+        `slot`.
+
+        `started` came from `clock()`. **No synchronization is performed here
+        and none may be added by a caller to make a span measurable**; a span
+        that needs a drain to be separated is one this instrument declines,
+        and the module docstring names all three of those.
+
+        A `started` of 0 charges the call and no time, matching `charge`: a
+        caller that counted a host operation without holding a stopwatch is
+        still telling the truth about the count.
+        """
+        if self.mode == PROFILE_OFF:
+            return
+        var elapsed = 0
+        if started > 0:
+            elapsed = Int(perf_counter_ns()) - started
+        self._charge_host_nanos(span, slot, elapsed)
+
+    def charge_host_nanos(
+        mut self, span: Int, slot: Int, nanos: Int
+    ) raises:
+        """Charge an interval somebody else already measured.
+
+        For the one case a bracket cannot reach from outside: a call that
+        performs a wait and then a decode behind one signature, where the
+        seam between them exists only inside the callee. `DeviceTreeTables`
+        times its own two halves and hands the numbers back on the snapshot,
+        and this is where they land. Not a general-purpose door -- a caller
+        who can bracket should bracket, because a number computed somewhere
+        else is a number that can be computed wrong somewhere else.
+        """
+        if self.mode == PROFILE_OFF:
+            return
+        self._charge_host_nanos(span, slot, nanos)
+
+    def _charge_host_nanos(
+        mut self, span: Int, slot: Int, nanos: Int
+    ) raises:
+        if span < 0 or span >= N_HOST_SPANS:
+            raise Error("unknown host span ", span)
+        if slot < 0 or slot >= N_HOST_STEP_SLOTS:
+            raise Error("unknown host step slot ", slot)
+        var i = span * N_HOST_STEP_SLOTS + slot
+        self.host_calls[i] += 1
+        if nanos > 0:
+            self.host_nanos[i] += nanos
+            if nanos > self.host_max_nanos[i]:
+                self.host_max_nanos[i] = nanos
+
+    def _host_at(self, values: List[Int], span: Int, slot: Int) -> Int:
+        if span < 0 or span >= N_HOST_SPANS:
+            return 0
+        if slot < 0 or slot >= N_HOST_STEP_SLOTS:
+            return 0
+        return values[span * N_HOST_STEP_SLOTS + slot]
+
+    def host_nanos_of(self, span: Int, slot: Int) -> Int:
+        return self._host_at(self.host_nanos, span, slot)
+
+    def host_calls_of(self, span: Int, slot: Int) -> Int:
+        return self._host_at(self.host_calls, span, slot)
+
+    def host_max_of(self, span: Int, slot: Int) -> Int:
+        return self._host_at(self.host_max_nanos, span, slot)
+
+    def span_nanos(self, span: Int) -> Int:
+        var total = 0
+        for s in range(N_HOST_STEP_SLOTS):
+            total += self._host_at(self.host_nanos, span, s)
+        return total
+
+    def span_calls(self, span: Int) -> Int:
+        var total = 0
+        for s in range(N_HOST_STEP_SLOTS):
+            total += self._host_at(self.host_calls, span, s)
+        return total
+
+    def span_max(self, span: Int) -> Int:
+        """The longest single bracket this span ever took, over every slot.
+        A maximum and not a sum, so merging two profiles keeps the larger."""
+        var worst = 0
+        for s in range(N_HOST_STEP_SLOTS):
+            var v = self._host_at(self.host_max_nanos, span, s)
+            if v > worst:
+                worst = v
+        return worst
+
+    def slot_host_nanos(self, slot: Int) -> Int:
+        var total = 0
+        for p in range(N_HOST_SPANS):
+            total += self._host_at(self.host_nanos, p, slot)
+        return total
+
+    def slot_host_calls(self, slot: Int) -> Int:
+        var total = 0
+        for p in range(N_HOST_SPANS):
+            total += self._host_at(self.host_calls, p, slot)
+        return total
+
+    def host_total_nanos(self) -> Int:
+        return self._total_of(self.host_nanos)
+
+    def host_total_calls(self) -> Int:
+        return self._total_of(self.host_calls)
+
     # -- reading ----------------------------------------------------------
 
     def _at(self, values: List[Int], phase: Int, cls: Int) -> Int:
@@ -957,6 +1383,14 @@ struct PhaseProfile(Copyable, Movable):
             self.rows[i] += other.rows[i]
             self.slots[i] += other.slots[i]
             self.cells[i] += other.cells[i]
+        # The host axis merges the same way with one exception: a maximum
+        # folds by comparison and not by addition, and adding two worsts
+        # would report a bracket that never happened.
+        for i in range(len(self.host_nanos)):
+            self.host_nanos[i] += other.host_nanos[i]
+            self.host_calls[i] += other.host_calls[i]
+            if other.host_max_nanos[i] > self.host_max_nanos[i]:
+                self.host_max_nanos[i] = other.host_max_nanos[i]
         self.trees += other.trees
         self.nodes += other.nodes
         self.wall_nanos += other.wall_nanos
@@ -974,6 +1408,10 @@ struct PhaseProfile(Copyable, Movable):
             self.rows[i] = 0
             self.slots[i] = 0
             self.cells[i] = 0
+        for i in range(len(self.host_nanos)):
+            self.host_nanos[i] = 0
+            self.host_calls[i] = 0
+            self.host_max_nanos[i] = 0
         self.trees = 0
         self.nodes = 0
         self.wall_nanos = 0
@@ -999,9 +1437,28 @@ struct PhaseProfile(Copyable, Movable):
         is 0.0 where nothing was counted, and a 0.0 there is an absence rather
         than a measured zero. `pct` is the cell's share of attributed time.
 
-        The last line names what no phase claimed. A large unattributed share
-        means the phases do not cover the round and the reader must not divide
-        the ones that do into the whole.
+        The last line of the phase table names what no phase claimed. A large
+        unattributed share means the phases do not cover the round and the
+        reader must not divide the ones that do into the whole.
+
+        Three more record kinds carry the host-span axis, and they are a
+        SEPARATE TABLE over the same interval rather than a subdivision of the
+        one above. `host` is the six spans summed over steps, `hoststep` is one
+        line per step slot with the six spans as columns, and `hosttotals`
+        closes it with `unbracketed_ns`, which is the host wall time no bracket
+        claimed and is this table's equivalent of `unattributed_ns`.
+
+        **Read the `hoststep` block down a column, not across a row.** The
+        question it exists for is whether a span's cost per step RISES with the
+        step index, which is the signature of a host thread blocking on a full
+        command queue rather than encoding into an empty one; `HOST_ENCODE`
+        gives both shapes. Reading across one row says only what one step cost,
+        which the `host` block already says better.
+
+        No number in the host table is device time and none of them may be
+        added to a phase-table number. They are two measurements of one
+        interval taken along two axes, so their totals are comparable and their
+        cells are not.
         """
         var attributed = self.attributed_nanos()
         var out = String("phase_profile begin label=")
@@ -1105,6 +1562,67 @@ struct PhaseProfile(Copyable, Movable):
         out += (
             " note=time_inside_a_device_plane_the_host_does_not_step;"
             "_not_a_breakdown;_set_MOJOTREES_GPU_TREE_RESIDENT=0_for_one\n"
+        )
+        # -- the host-span axis, which IS a breakdown ------------------------
+        #
+        # And is the answer to the line above it. `device_plane` refuses to say
+        # which part of the plane the time went to, because that would need
+        # device timestamps this backend does not have. This table does not
+        # answer that question either; it answers the other one, which is what
+        # the HOST THREAD was doing for that same interval, and every span in
+        # it was measured with a host clock around a call that was already
+        # there. See the module docstring for which spans are free to measure,
+        # which would have cost a synchronization and are therefore absent, and
+        # which are unreachable by any arrangement of host clocks.
+        var host_total = self.host_total_nanos()
+        out += (
+            "phase_profile hostcolumns kind span calls nanos max_ns"
+            " ns_per_call ns_per_tree pct_of_host\n"
+        )
+        for hp in range(N_HOST_SPANS):
+            var sn = self.span_nanos(hp)
+            var sc = self.span_calls(hp)
+            out += "phase_profile host " + host_span_name(hp)
+            out += " " + String(sc)
+            out += " " + String(sn)
+            out += " " + String(self.span_max(hp))
+            out += " " + String(_per_unit(sn, sc))
+            out += " " + String(_per_unit(sn, self.trees))
+            out += " " + String(_pct(sn, host_total)) + "\n"
+        out += (
+            "phase_profile hoststepcolumns kind slot calls device_wait"
+            " readback upload allocation encode host_plan total_ns\n"
+        )
+        # Emitted in full, all thirty-five slots, zeros included, for the
+        # reason the row block above is: a curve read off a table that drops
+        # its empty rows is a curve whose x axis moved between two runs.
+        for hk in range(N_HOST_STEP_SLOTS):
+            out += "phase_profile hoststep " + host_slot_name(hk)
+            out += " " + String(self.slot_host_calls(hk))
+            for hs in range(N_HOST_SPANS):
+                out += " " + String(self._host_at(self.host_nanos, hs, hk))
+            out += " " + String(self.slot_host_nanos(hk)) + "\n"
+        # What the host was doing that no bracket names. On a fully bracketed
+        # device plane this should be small, and if it is not then the brackets
+        # do not cover the plane and no percentage in the table above may be
+        # read as a share of the fit. It is the same discipline
+        # `unattributed_ns` enforces one table up, applied to the axis that
+        # claims to be a breakdown.
+        var unbracketed = self.wall_nanos - host_total
+        if unbracketed < 0:
+            unbracketed = 0
+        out += "phase_profile hosttotals host_ns=" + String(host_total)
+        out += " wall_ns=" + String(self.wall_nanos)
+        out += " host_pct=" + String(_pct(host_total, self.wall_nanos))
+        out += " unbracketed_ns=" + String(unbracketed)
+        out += " unbracketed_pct=" + String(
+            _pct(unbracketed, self.wall_nanos)
+        )
+        out += " host_calls=" + String(self.host_total_calls())
+        out += " ns_per_tree=" + String(_per_unit(host_total, self.trees))
+        out += (
+            " note=host_thread_occupancy_only;_no_span_is_device_time;"
+            "_encode_absorbs_queue_backpressure_see_HOST_ENCODE\n"
         )
         out += "phase_profile end\n"
         return out^

@@ -79,9 +79,24 @@ from mojotrees.phase_profile import (
     SCOPE_FIT,
     SCOPE_TREE,
     SMALL_MIN_INVERSE,
+    HOST_ALLOC,
+    HOST_ENCODE,
+    HOST_PLAN,
+    HOST_READBACK,
+    HOST_SLOT_EPILOGUE,
+    HOST_SLOT_OVERFLOW,
+    HOST_SLOT_PROLOGUE,
+    HOST_STEP_SLOTS,
+    HOST_UPLOAD,
+    HOST_WAIT,
+    N_HOST_SPANS,
+    N_HOST_STEP_SLOTS,
     PhaseProfile,
     classify_node,
     env_profile_mode,
+    host_slot_name,
+    host_span_name,
+    host_step_slot,
     node_class_name,
     profile_phase_name,
 )
@@ -548,6 +563,134 @@ def test_predictions_are_byte_identical_across_the_modes() raises:
         var want = plain.predict_row(data, r)
         assert_equal(traced.predict_row(data, r), want)
         assert_equal(fenced.predict_row(data, r), want)
+
+
+def test_host_step_slots_are_total_and_disjoint() raises:
+    """Every step index lands in exactly one slot and no step lands in a
+    bookend.
+
+    Asserted exhaustively over the whole in-range domain rather than sampled,
+    the same way `classify_node`'s partition is, because a slot map that
+    quietly aliases step 0 onto the prologue would put per-tree setup and the
+    first step's launches on one line and nobody reading the curve would see
+    it.
+    """
+    assert_equal(host_step_slot(-1), HOST_SLOT_PROLOGUE)
+    assert_equal(host_step_slot(HOST_STEP_SLOTS), HOST_SLOT_OVERFLOW)
+    assert_equal(host_step_slot(HOST_STEP_SLOTS + 1000), HOST_SLOT_OVERFLOW)
+    var seen = List[Int]()
+    for _ in range(N_HOST_STEP_SLOTS):
+        seen.append(0)
+    for step in range(HOST_STEP_SLOTS):
+        var slot = host_step_slot(step)
+        assert_true(slot != HOST_SLOT_PROLOGUE)
+        assert_true(slot != HOST_SLOT_EPILOGUE)
+        assert_true(slot != HOST_SLOT_OVERFLOW)
+        seen[slot] += 1
+    for step in range(HOST_STEP_SLOTS):
+        assert_equal(seen[host_step_slot(step)], 1)
+    # Every slot names itself, so a parser keyed on names finds every line.
+    for slot in range(N_HOST_STEP_SLOTS):
+        assert_true(host_slot_name(slot) != String("unknown"))
+    for span in range(N_HOST_SPANS):
+        assert_true(host_span_name(span) != String("unknown"))
+
+
+def test_an_off_profile_charges_no_host_span() raises:
+    """The counter half of "free when off", on the host axis.
+
+    The clock half is structural and is visible in `clock` in four lines: it
+    tests the mode and returns 0 without reading `perf_counter_ns`. This is
+    the half a test can hold, and it is held the same way the phase axis's is
+    -- charge an off profile a large duration and a large count, and require
+    every bucket to stay zero.
+    """
+    var off = PhaseProfile(PROFILE_OFF, SCOPE_FIT, String("off"))
+    for span in range(N_HOST_SPANS):
+        for slot in range(N_HOST_STEP_SLOTS):
+            off.charge_host(span, slot, 1)
+            off.charge_host_nanos(span, slot, 1_000_000)
+    assert_equal(off.host_total_nanos(), 0)
+    assert_equal(off.host_total_calls(), 0)
+    for span in range(N_HOST_SPANS):
+        assert_equal(off.span_nanos(span), 0)
+        assert_equal(off.span_calls(span), 0)
+        assert_equal(off.span_max(span), 0)
+
+
+def test_host_spans_accumulate_and_keep_the_worst_bracket() raises:
+    """A charge adds to its own cell, a maximum folds by comparison, and a
+    merge does both.
+
+    The maximum is what tells encoding from queue backpressure apart, so a
+    merge that summed two worsts would report a bracket that never happened
+    and would turn a null into a finding.
+    """
+    var a = PhaseProfile(PROFILE_ASYNC, SCOPE_FIT, String("a"))
+    a.charge_host_nanos(HOST_ENCODE, HOST_SLOT_PROLOGUE, 100)
+    a.charge_host_nanos(HOST_ENCODE, HOST_SLOT_PROLOGUE, 300)
+    assert_equal(a.host_nanos_of(HOST_ENCODE, HOST_SLOT_PROLOGUE), 400)
+    assert_equal(a.host_calls_of(HOST_ENCODE, HOST_SLOT_PROLOGUE), 2)
+    assert_equal(a.host_max_of(HOST_ENCODE, HOST_SLOT_PROLOGUE), 300)
+
+    var b = PhaseProfile(PROFILE_ASYNC, SCOPE_FIT, String("b"))
+    b.charge_host_nanos(HOST_ENCODE, HOST_SLOT_PROLOGUE, 50)
+    b.charge_host_nanos(HOST_READBACK, HOST_SLOT_EPILOGUE, 7000)
+    a.merge(b)
+    assert_equal(a.host_nanos_of(HOST_ENCODE, HOST_SLOT_PROLOGUE), 450)
+    assert_equal(a.host_calls_of(HOST_ENCODE, HOST_SLOT_PROLOGUE), 3)
+    # 300 and not 350: a worst folds by comparison.
+    assert_equal(a.host_max_of(HOST_ENCODE, HOST_SLOT_PROLOGUE), 300)
+    assert_equal(a.span_nanos(HOST_READBACK), 7000)
+    assert_equal(a.host_total_nanos(), 7450)
+
+    a.reset()
+    assert_equal(a.host_total_nanos(), 0)
+    assert_equal(a.host_total_calls(), 0)
+    assert_equal(a.span_max(HOST_ENCODE), 0)
+
+    # An unknown span or slot is a call-site error and is refused, on the same
+    # principle `charge` refuses an unknown phase. Refused only on an ENABLED
+    # profile, because the mode test comes first, which is the whole of the
+    # free-when-off claim.
+    with assert_raises():
+        a.charge_host(N_HOST_SPANS, HOST_SLOT_PROLOGUE, 0)
+    with assert_raises():
+        a.charge_host(HOST_WAIT, N_HOST_STEP_SLOTS, 0)
+
+
+def test_the_host_table_is_emitted_in_full() raises:
+    """Six span lines and all thirty-five slot lines, zeros included, so a
+    per-step curve read off two reports has the same x axis in both."""
+    var profile = PhaseProfile(PROFILE_ASYNC, SCOPE_FIT, String("arm"))
+    profile.begin_tree(1000, 1000)
+    profile.charge_host_nanos(HOST_UPLOAD, HOST_SLOT_PROLOGUE, 25)
+    profile.charge_host_nanos(HOST_ALLOC, HOST_SLOT_EPILOGUE, 25)
+    profile.charge_host_nanos(HOST_PLAN, host_step_slot(3), 50)
+    var text = profile.report()
+
+    assert_equal(len(text.split("phase_profile host ")) - 1, N_HOST_SPANS)
+    assert_equal(
+        len(text.split("phase_profile hoststep ")) - 1, N_HOST_STEP_SLOTS
+    )
+    assert_true(text.find("phase_profile hostcolumns kind span calls") >= 0)
+    assert_true(text.find("phase_profile hosttotals host_ns=100") >= 0)
+    assert_true(text.find("phase_profile hoststep step03 ") >= 0)
+    assert_true(text.find("phase_profile hoststep prologue ") >= 0)
+    assert_true(text.find("phase_profile hoststep step32plus ") >= 0)
+
+    # The host block must not disturb the phase block's own shape, which an
+    # existing test counts by splitting on these three prefixes. Held here as
+    # well so that a future line whose kind starts with one of them is caught
+    # by the test that added it rather than by the one it broke.
+    assert_equal(
+        len(text.split("phase_profile row ")) - 1,
+        N_PROFILE_PHASES * N_NODE_CLASSES,
+    )
+    assert_equal(
+        len(text.split("phase_profile phase ")) - 1, N_PROFILE_PHASES
+    )
+    assert_equal(len(text.split("phase_profile class ")) - 1, N_NODE_CLASSES)
 
 
 def main() raises:

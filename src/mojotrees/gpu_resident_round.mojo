@@ -633,6 +633,17 @@ from .gpu_tree_tables import (
 )
 from .histogram_gpu import GpuHistogramBuilder
 from .monotone import OutputBounds
+from .phase_profile import (
+    HOST_ALLOC,
+    HOST_ENCODE,
+    HOST_PLAN,
+    HOST_READBACK,
+    HOST_SLOT_EPILOGUE,
+    HOST_SLOT_PROLOGUE,
+    HOST_UPLOAD,
+    PhaseProfile,
+    host_step_slot,
+)
 from .tree import Tree, TreeParams
 
 
@@ -2514,6 +2525,7 @@ def grow_tree_device_resident(
     params: TreeParams,
     tree_features: List[Int],
     n_root: Int,
+    mut profile: PhaseProfile,
 ) raises -> Tree:
     """Grow one tree with the device owning the frontier, the tree, and the
     slot pool, and the host waiting once.
@@ -2731,16 +2743,42 @@ def grow_tree_device_resident(
     a caller has named a census sink, and then only after
     `download_desc_tables` has already drained the queue.
 
-    **Not instrumented.** `PhaseProfile` is not threaded through this loop and
-    a profiled run of a fit that takes this plane will report an empty table
-    rather than a wrong one. That is the same honest failure
-    `_device_search_incremental` has, and it is a deliberate omission rather
-    than an oversight: the profile's three phases are separated by inserting
-    fences, and a loop whose entire claim is that it makes one round trip
-    cannot be measured by an instrument that adds two synchronizations per
-    split without measuring something other than itself. What this plane
-    needs instead is the Metal timeline that motivated it, which counts
-    serialization points from outside the process.
+    **Instrumented on the HOST axis only, and the refusal that stood here is
+    narrowed rather than withdrawn.** This paragraph read "Not instrumented"
+    until 2026-08-18 and gave the reason as: the profile's phases are
+    separated by inserting fences, and a loop whose entire claim is that it
+    makes one round trip cannot be measured by an instrument that adds two
+    synchronizations per split without measuring something other than itself.
+    **That argument is correct and it still stands, for device phases.** What
+    it does not cover is the question a control-plane lane actually asks,
+    which is what the HOST THREAD was doing while all of this was in flight.
+
+    A host-side wall clock around a host-side call adds no synchronization.
+    So `profile` is threaded through this loop and every bracket in it closes
+    over a call the schedule already makes: an `enqueue_function`, an
+    `enqueue_copy` that on Metal was already a drain, a `List` allocation, a
+    host loop over a snapshot. Nothing here inserts a fence, consults
+    `PhaseProfile.fenced`, or reads a device answer that was not already being
+    read. `MOJOTREES_PHASE_PROFILE` off costs one Bool test per bracket and no
+    clock read at all.
+
+    What that buys is the `phase_profile host` and `hoststep` tables: the six
+    host spans (`phase_profile.HOST_WAIT` and below) summed and cut by step
+    index. What it still does NOT buy, and what would need the fences this
+    plane refuses, is any statement about which device kernel took how long.
+    `PROF_DEVICE_PLANE` remains one opaque number for exactly that reason, and
+    the Metal timeline that motivated this plane, counting serialization
+    points from outside the process, remains the only instrument that would
+    divide it.
+
+    One reading to guard against, written here because this is where it will
+    be misread. The whole tree's device execution is waited on inside the
+    single `download_desc_tables` at the bottom, so `readback` on this plane
+    is not a transfer cost; it is where the device shows up in a host table.
+    And a queue deeper than 64 command buffers backpressures inside the
+    enqueue, so part of that same device time can appear under `encode`
+    instead. `HOST_ENCODE` gives the two shapes that tell those apart with no
+    fence.
 
     **Traceable, though.** `MOJOTREES_GPU_TREE_RESIDENT_TRACE` writes one
     record per tree, and with `MOJOTREES_GPU_TREE_RESIDENT_TRACE_STEPS` one
@@ -2759,6 +2797,13 @@ def grow_tree_device_resident(
         raise Error("a tree needs at least one active feature")
     if not builder.desc_tables_open():
         raise Error("open_resident_tables has not run on this builder")
+    # The host-span axis opens here. Every `profile.clock()` below returns 0
+    # without reading a clock when `MOJOTREES_PHASE_PROFILE` is unset, and
+    # every `charge_host` returns on the same Bool before it indexes anything,
+    # so an unprofiled fit pays one Bool test per bracket. Nothing in any
+    # bracket is a synchronization this function would not otherwise make; see
+    # the docstring's host-axis paragraph and `phase_profile`'s own.
+    var t_setup = profile.clock()
     var scratch_l = searcher.max_records - RESIDENT_SCRATCH_RECORDS
     var scratch_r = searcher.max_records - 1
     if scratch_l < params.num_leaves:
@@ -2828,6 +2873,15 @@ def grow_tree_device_resident(
     # speculative alike. An upper bound and not a length: no live window can
     # exceed the active prefix, and the geometry never reaches the answer.
     var row_bound = n_root if n_root > 0 else 1
+    # The one instrument that lives outside `phase_profile`, armed once per
+    # tree from the profile that will read it. `download_desc_tables` performs
+    # a wait and then a host decode behind one signature, and a bracket around
+    # the call from here cannot see the seam between them; the tables time
+    # their own two halves instead and hand the numbers back on the snapshot.
+    # No wait is added by this: the drain it times at is the one the fetch
+    # already performs. See `DeviceTreeTables.set_host_timing`.
+    builder.resident_tables[0].set_host_timing(profile.enabled())
+    profile.charge_host(HOST_PLAN, HOST_SLOT_PROLOGUE, t_setup)
 
     # --- Per-tree staging, all of it, before any split ---------------------
     #
@@ -2838,6 +2892,7 @@ def grow_tree_device_resident(
     # everywhere, so one block is broadcast to every slot. Staging only, no
     # copy: the root's `enqueue_frontier` below carries all of it across in
     # the one table copy it makes.
+    var t_stage = profile.clock()
     for r in range(searcher.max_records):
         searcher._stage_params(
             split_params,
@@ -2846,6 +2901,10 @@ def grow_tree_device_resident(
             OutputBounds.unbounded(),
             r,
         )
+    # `HOST_PLAN` and not `HOST_UPLOAD`: this writes the pinned host mirror and
+    # nothing crosses the bus here. The copy that carries all of it is
+    # `enqueue_frontier` below, and that is where the upload is charged.
+    profile.charge_host(HOST_PLAN, HOST_SLOT_PROLOGUE, t_stage)
 
     # The root's histogram, into pool slot 0. Slot 0 and not "whatever the
     # pool hands out", because the device pool's own acquire scans upward for
@@ -2857,12 +2916,14 @@ def grow_tree_device_resident(
     # pool never acquires anything, because the device's `slot_owner` vector
     # is the authority. That is the second holdout closed, and
     # `GpuHistogramBuilder.enqueue_desc_child` says what is lost with it.
+    var t_root_enc = profile.clock()
     builder.enqueue_leaf(0, resident_slot=0)
 
     # The tables, reset to a one-leaf frontier owning every active row. This
     # has to be enqueued before the root value is seeded, since the reset
     # zeroes the node table the seed writes into.
     builder.enqueue_desc_begin_tree(n_root)
+    profile.charge_host(HOST_ENCODE, HOST_SLOT_PROLOGUE, t_root_enc)
 
     # The root's search, into record 0, which is the record frontier slot 0
     # reads. This is the one call that copies the searcher's per-record
@@ -2870,6 +2931,7 @@ def grow_tree_device_resident(
     # first. An empty feature list leaves each record on the tree-level set
     # the caller broadcast, which is what every node uses under these
     # refusals.
+    var t_batch = profile.clock()
     var root_batch = List[SplitNodeRequest]()
     root_batch.append(
         SplitNodeRequest(
@@ -2887,6 +2949,11 @@ def grow_tree_device_resident(
             0,
         )
     )
+    # Three host `List` allocations for one request, once per tree. Charged
+    # apart from the copy below because allocation is the one host cost a
+    # redesign removes outright rather than makes cheaper.
+    profile.charge_host(HOST_ALLOC, HOST_SLOT_PROLOGUE, t_batch)
+    var t_frontier = profile.clock()
     searcher.enqueue_frontier(
         builder.batcher[0].out_dev,
         root_batch,
@@ -2894,10 +2961,21 @@ def grow_tree_device_resident(
         builder.g_scale,
         builder.h_scale,
     )
+    # `HOST_UPLOAD` for a call that also enqueues two kernels, and the choice
+    # is deliberate rather than sloppy: the copy inside it is on Metal a
+    # synchronous full-queue drain (`docs/GPU_PORTABILITY.md` section 6.1) and
+    # the two enqueues beside it are microseconds, so filing this under encode
+    # would put a drain in the encode column. It is the only upload this plane
+    # makes per tree at the default `random_strength = 0`, which is a fact the
+    # upload row's `calls` column reports rather than one a reader has to
+    # take on trust.
+    profile.charge_host(HOST_UPLOAD, HOST_SLOT_PROLOGUE, t_frontier)
     # The root's own Newton value, which the host path writes as
     # `tree.value[root] = root_rec.parent_value` once the record is home. Here
     # the record never comes home, so a kernel copies it where it is.
+    var t_seed = profile.clock()
     builder.enqueue_desc_seed_root(searcher.rec_f_dev, 0)
+    profile.charge_host(HOST_ENCODE, HOST_SLOT_PROLOGUE, t_seed)
 
     # --- Growth ------------------------------------------------------------
     #
@@ -2923,6 +3001,7 @@ def grow_tree_device_resident(
     # in place rather than split into a helper, because the *order* of the
     # eleven launches is the only thing keeping it correct and an order is
     # read, not called.
+    var t_head = profile.clock()
     if spec:
         # `spec_dev` has to start dead: step 0's consume kernel reads it
         # before any runner-up kernel has written it. The counters are zeroed
@@ -2950,7 +3029,17 @@ def grow_tree_device_resident(
             do_copy=False,
             do_stage=True,
         )
+    profile.charge_host(HOST_ENCODE, HOST_SLOT_PROLOGUE, t_head)
     for step in range(params.num_leaves - 1):
+        # Four brackets a step, one per launch group, all of them `HOST_ENCODE`
+        # and all of them filed under this step's slot. Four rather than one so
+        # that `ns_per_call` is a per-group figure and `max_ns` catches a
+        # single group that blocked while its neighbors did not, which is the
+        # signature of queue backpressure and not of encoding. Four rather than
+        # ten so that the loop stays readable; the grid does not say WHICH
+        # group, only that one of them was long. See `HOST_ENCODE`.
+        var slot = host_step_slot(step)
+        var t_commit = profile.clock()
         # Pick the leaf, commit the split, write the tree, move the slot
         # pool, and publish the step descriptor. One block, one launch.
         #
@@ -3009,11 +3098,15 @@ def grow_tree_device_resident(
             builder.enqueue_desc_stage_search(
                 searcher.node_dev, slot_cells, scratch_l, scratch_r
             )
+        profile.charge_host(HOST_ENCODE, slot, t_commit)
+        var t_part = profile.clock()
         # Reassign the parent's rows to its two children. Three launches at a
         # grid sized for the whole active prefix. Skipped on a consumed step,
         # where the previous step's speculative partition already produced
         # this exact permutation.
         builder.enqueue_desc_partition(row_bound)
+        profile.charge_host(HOST_ENCODE, slot, t_part)
+        var t_child = profile.clock()
         # Accumulate the smaller child from its own rows and derive the larger
         # by subtracting inside the same kernel. Two launches: the slot
         # zeroing the atomic strategy needs, and the accumulation. Both
@@ -3028,6 +3121,8 @@ def grow_tree_device_resident(
             # destroy the histogram the next pick reads on a miss. On a miss
             # this launch reads one word and returns.
             builder.rows.enqueue_spec_subtract(pool_handle, slot_cells)
+        profile.charge_host(HOST_ENCODE, slot, t_child)
+        var t_search = profile.clock()
         # Search both children in one launch pair, into the scratch records.
         # `resident_child_node_base(step)` is the left child's node id, which
         # `random_strength` keys its draw by and which is derivable on the
@@ -3096,11 +3191,19 @@ def grow_tree_device_resident(
             builder.enqueue_desc_partition(row_bound)
             builder.enqueue_desc_child(row_bound)
             builder.rows.set_descriptor_target(DESC_STEP)
+        profile.charge_host(HOST_ENCODE, slot, t_search)
         if trace_steps:
             # A download inside the loop, which is the wait this plane exists
             # to remove, taken deliberately and only when asked for. See
             # `RESIDENT_TRACE_STEPS_VAR`.
+            #
+            # Charged, because a profile taken with the step trace on is a
+            # profile of a different schedule and the readback row is where
+            # that shows. It is off by default and a default run charges it
+            # nothing, which the row's zero `calls` reports.
+            var t_trace = profile.clock()
             var mid = builder.download_desc_tables()
+            profile.charge_host(HOST_READBACK, slot, t_trace)
             _resident_trace_emit(
                 trace,
                 String(
@@ -3157,6 +3260,7 @@ def grow_tree_device_resident(
     # shares changes. Issuing it again here would be a second terminal step,
     # which would still commit nothing but would leave `CTR_STATUS` written
     # twice and would put the launch back that the arm removed.
+    var t_term = profile.clock()
     if not fuse_copy:
         builder.enqueue_desc_step(
             searcher.rec_i_dev,
@@ -3165,9 +3269,36 @@ def grow_tree_device_resident(
             params.max_depth,
             params.min_data_in_leaf,
         )
+    profile.charge_host(HOST_ENCODE, HOST_SLOT_EPILOGUE, t_term)
 
     # --- The one round trip ------------------------------------------------
+    #
+    # **THE MOST IMPORTANT ROW IN THE HOST TABLE, AND THE EASIEST ONE TO
+    # MISREAD.** Every launch this tree enqueued that the device has not yet
+    # finished is waited on inside this call, so `readback` here is not the
+    # price of moving a few kilobytes; it is where the device's execution
+    # becomes visible to a host clock. A large number on this row is the plane
+    # working as designed, not a transfer to optimize, and the transfer inside
+    # it cannot be separated from the wait around it without a drain before the
+    # copy, which is the synchronization this instrument will not add.
+    #
+    # The split that IS available is the wait from the host decode behind it,
+    # and it comes from inside: the tables timed their own two halves at the
+    # seam the fetch already creates. `fetch_nanos` is the copies plus the
+    # drain; `decode_nanos` is the pure host arithmetic that follows and is
+    # charged to `host_plan`. The `else` reports the undivided call and is
+    # reached only if `set_host_timing` above did not take.
+    var t_down = profile.clock()
     var snap = builder.download_desc_tables()
+    if snap.fetch_nanos > 0:
+        profile.charge_host_nanos(
+            HOST_READBACK, HOST_SLOT_EPILOGUE, snap.fetch_nanos
+        )
+        profile.charge_host_nanos(
+            HOST_PLAN, HOST_SLOT_EPILOGUE, snap.decode_nanos
+        )
+    else:
+        profile.charge_host(HOST_READBACK, HOST_SLOT_EPILOGUE, t_down)
     # GUARDED 2026-08-17, and the guard is the module's own rule applied to the
     # one place that broke it: "an instrument nobody asked for costs nothing at
     # all", which the census block below already honors and this block did not.
@@ -3226,6 +3357,7 @@ def grow_tree_device_resident(
     # together. That is `LeafFrontier.check_invariants` and
     # `HistogramSlotPool.check_live` combined, at one thirty-first of the
     # frequency and at the only point where checking is free.
+    var t_check = profile.clock()
     snap.check_invariants()
     if not _growth_finished_normally(snap.status):
         raise Error(
@@ -3275,9 +3407,18 @@ def grow_tree_device_resident(
                 params.num_leaves,
             )
         )
+    # Every check above is host arithmetic over a snapshot already in host
+    # memory: quadratic in the live leaf count and touching no device. It is
+    # bracketed because "the invariant sweep costs more than the tree" is a
+    # sentence this repository could only ever have discovered by measuring,
+    # and because at one thirty-first of the shipping loop's frequency it is
+    # the sort of cost nobody suspects.
+    profile.charge_host(HOST_PLAN, HOST_SLOT_EPILOGUE, t_check)
     # The host state the rest of the trainer reads back out of the builder.
     # Not optional and not cosmetic; see `_publish_row_ranges`.
+    var t_publish = profile.clock()
     _publish_row_ranges(builder, snap)
+    profile.charge_host(HOST_PLAN, HOST_SLOT_EPILOGUE, t_publish)
     # What a K=1 speculative prebuild would have consumed on this tree, from
     # the commit log that is already in host memory. One loop over about
     # thirty integers, no launch, no transfer, and no effect on anything above
@@ -3317,7 +3458,11 @@ def grow_tree_device_resident(
             # the queue has already drained at `download_desc_tables`. It
             # happens only because an instrument was named, so no measured run
             # pays it.
+            var t_stats = profile.clock()
             var stats = builder.rows.download_spec_stats()
+            profile.charge_host(
+                HOST_READBACK, HOST_SLOT_EPILOGUE, t_stats
+            )
             line += String(
                 " spec=on device_builds=",
                 stats[SPEC_STAT_BUILDS],
@@ -3341,7 +3486,16 @@ def grow_tree_device_resident(
                 "\n",
             ),
         )
-    return tree_from_snapshot(snap)
+    # `HOST_ALLOC` and not `HOST_PLAN`, because this is a transcription whose
+    # cost is the `List` growth behind it rather than the arithmetic in front:
+    # one node row, one value and one gain per node, plus a categorical pool,
+    # all appended into freshly grown host lists once per tree. If host heap
+    # traffic is what the control plane is losing to, this is the line it shows
+    # up on and mixing it into the plan column would have hidden it.
+    var t_tree = profile.clock()
+    var grown = tree_from_snapshot(snap)
+    profile.charge_host(HOST_ALLOC, HOST_SLOT_EPILOGUE, t_tree)
+    return grown^
 
 
 # --- grow_policy = oblivious: the level schedule ---------------------------
@@ -3544,6 +3698,7 @@ def grow_tree_device_oblivious(
     params: TreeParams,
     tree_features: List[Int],
     n_root: Int,
+    mut profile: PhaseProfile,
 ) raises -> Tree:
     """Grow one symmetric (CatBoost `SymmetricTree`) tree with the device
     owning the frontier, the tree and the slot pool, and the host waiting once.
@@ -3659,11 +3814,29 @@ def grow_tree_device_oblivious(
     That one is off by default, and unlike the arm above it stayed off on
     evidence rather than for want of it. See `OBLIVIOUS_NOISE_HOIST_VAR`.
 
-    Not instrumented, traceable
-    ---------------------------
-    `PhaseProfile` is not threaded through this loop, for the reason
-    `grow_tree_device_resident` states: an instrument that adds two
-    synchronizations per level would measure itself. `OBLIVIOUS_TRACE_MARK` is
+    Instrumented on the host axis, traceable on the device one
+    -----------------------------------------------------------
+    This heading read "Not instrumented, traceable" until 2026-08-18 and the
+    reason it gave was `grow_tree_device_resident`'s: an instrument that adds
+    two synchronizations per level would measure itself. **That argument holds
+    for device phases and is unchanged**; what it never covered is the host
+    thread, and a host-side clock around a host-side call adds no
+    synchronization at all. So `profile` is threaded through this loop for the
+    `phase_profile host` and `hoststep` tables and for nothing else: no bracket
+    below inserts a drain, consults `PhaseProfile.fenced`, or reads a device
+    answer this loop was not already reading. The step axis here is the LEVEL
+    index, `max_depth` of them rather than `num_leaves - 1`.
+
+    Two spans this plane holds that the leaf-wise one does not, and they are
+    the reason instrumenting it separately was worth the lines. It uploads
+    inside the level loop -- `_copy_noise` once a level whenever
+    `random_strength` is on, and on Metal a copy is a full-queue drain -- so
+    its `upload` row is per level and not per tree. And its per-tree prologue
+    stages `budget` plan items and every record's parameter block before the
+    first launch, which is host arithmetic proportional to the leaf budget and
+    lands on `host_plan` at the prologue slot.
+
+    `OBLIVIOUS_TRACE_MARK` is
     written once per tree to the resident trace sink, and that is what a test
     asserts on to prove this function ran at all -- which matters more than it
     sounds, because a caller that refuses this mode falls back to a CPU grower
@@ -3739,6 +3912,11 @@ def grow_tree_device_oblivious(
     # has no `min_data_in_leaf`, so the illegal-leaf rule is ours rather than
     # CatBoost's, and this is the one place the two functionals differ rather
     # than merely rounding differently.
+    # The host-span axis opens here, on the same terms the leaf-wise plane
+    # states: every clock read is behind the profile's mode test, no bracket
+    # is a synchronization this function would not otherwise make, and the
+    # step axis is the LEVEL index.
+    var t_setup = profile.clock()
     var budget = oblivious_leaf_budget(params)
     # The level record sits outside the leaf records it reads, because the scan
     # reads the leaf records while writing the level record's per-feature slots
@@ -3816,6 +3994,10 @@ def grow_tree_device_oblivious(
     builder.rows.set_partition_fusion(True)
     var folds_before = builder.rows.copy_back_folds
     var row_bound = n_root if n_root > 0 else 1
+    # See the leaf-wise plane's copy of this line. Adds no wait; splits the one
+    # readback into its drain and its decode from inside, where the seam is.
+    builder.resident_tables[0].set_host_timing(profile.enabled())
+    profile.charge_host(HOST_PLAN, HOST_SLOT_PROLOGUE, t_setup)
 
     # --- Per-tree staging, all of it, before any growth --------------------
     #
@@ -3828,20 +4010,31 @@ def grow_tree_device_oblivious(
     # `budget` items and not the first level's two: every level fills or kills
     # the same staged width, because an item some earlier and narrower level
     # filled still names a histogram slot that is now another leaf's.
+    # `HOST_UPLOAD`, though the name says stage. `stage_desc_level_plan` ends
+    # in `set_shared_features`, which copies, and on Metal a copy is a
+    # full-queue drain; the plan arithmetic in front of it is host work folded
+    # into the same bracket because the call has no seam to split at. Filed
+    # where the drain is, for the reason the leaf-wise plane files
+    # `enqueue_frontier` under upload.
+    var t_plan = profile.clock()
     _ = builder.stage_desc_level_plan(budget, row_bound)
+    profile.charge_host(HOST_UPLOAD, HOST_SLOT_PROLOGUE, t_plan)
 
     # The root's histogram, into pool slot 0. Slot 0 because the level commit
     # pins slot index to leaf index and the root is leaf index 0.
+    var t_root_enc = profile.clock()
     builder.enqueue_leaf(0, resident_slot=0)
 
     # The tables, reset to a one-leaf frontier owning every active row. Before
     # the root value is seeded, since the reset zeroes the node table.
     builder.enqueue_desc_begin_tree(n_root)
+    profile.charge_host(HOST_ENCODE, HOST_SLOT_PROLOGUE, t_root_enc)
 
     # The searcher's per-record tables. Every record carries this tree's
     # fixed-point scales, and every record's histogram base starts at slot 0;
     # the level's own bases are written on the device from the frontier before
     # each search. One copy for all of it, and it is the only upload here.
+    var t_stage = profile.clock()
     for r in range(searcher.max_records):
         searcher._stage_params(
             split_params,
@@ -3851,7 +4044,13 @@ def grow_tree_device_oblivious(
             r,
         )
         searcher._stage_hist_base(r, Int32(0))
+    # Host writes into the pinned mirror, then the one copy that carries them.
+    # Split so that a prologue that is expensive because it stages many records
+    # reads differently from one that is expensive because it drains.
+    profile.charge_host(HOST_PLAN, HOST_SLOT_PROLOGUE, t_stage)
+    var t_tables = profile.clock()
     searcher._copy_tables()
+    profile.charge_host(HOST_UPLOAD, HOST_SLOT_PROLOGUE, t_tables)
 
     # Every level's noise plane, drawn and uploaded here instead of one per
     # level, when the hoist is armed. `level_records > 1` is exactly the
@@ -3870,10 +4069,17 @@ def grow_tree_device_oblivious(
     # flight, and the copy's drain waits on a queue holding one histogram
     # rather than on a queue holding a whole level.
     if level_records > 1:
+        var t_draw = profile.clock()
         for l in range(params.max_depth):
             searcher.stage_random_score_level(level_record_base + l, l)
         searcher._check_noise_staged(level_record_base, params.max_depth)
+        # The draw is host arithmetic over `max_depth * n_features * n_bins`
+        # Float32 and the copy is a drain. Charging both to upload would credit
+        # the bus with a random number generator's time.
+        profile.charge_host(HOST_PLAN, HOST_SLOT_PROLOGUE, t_draw)
+        var t_hoist = profile.clock()
         searcher._copy_noise(level_record_base, params.max_depth)
+        profile.charge_host(HOST_UPLOAD, HOST_SLOT_PROLOGUE, t_hoist)
 
     # --- Growth, one level at a time ---------------------------------------
     for level in range(params.max_depth):
@@ -3885,11 +4091,17 @@ def grow_tree_device_oblivious(
         var this_record = level_record_base + (
             level if level_records > 1 else 0
         )
+        # Three brackets a level, and the step axis here is the level index.
+        # See the leaf-wise loop for why the encode brackets are split rather
+        # than lumped.
+        var slot = host_step_slot(level)
         # Point this level's leaf records at this level's pool slots. Reads the
         # device frontier, so it is right on a level the host never saw.
+        var t_stage_level = profile.clock()
         builder.enqueue_desc_stage_level_search(
             searcher.node_dev, slot_cells, leaf_base, budget
         )
+        profile.charge_host(HOST_ENCODE, slot, t_stage_level)
         # The level search: the cross-leaf scan and the ordinary cross-feature
         # reduction, two launches, into `this_record`.
         # `_launch_oblivious_search` directly rather than
@@ -3922,13 +4134,25 @@ def grow_tree_device_oblivious(
         # noise is off, it is the guard that turns a missing plane into a
         # refusal rather than a silent zero, and a hoist that staged the wrong
         # record is exactly the mistake it exists to catch.
+        var t_noise = profile.clock()
         if level_records == 1:
             if searcher.random_score_stdev() > 0.0:
                 searcher.stage_random_score_level(this_record, level)
             searcher._check_noise_staged(this_record, 1)
+            profile.charge_host(HOST_PLAN, slot, t_noise)
+            # The one upload INSIDE a growth step anywhere on either device
+            # plane, and it is a drain per level. At the shipped default of
+            # `random_strength = 0` `_copy_noise` returns at its first line and
+            # this bracket measures a function call, which is why the upload
+            # row on a default symmetric fit reads a handful of nanoseconds
+            # against `max_depth` calls per tree rather than zero calls.
+            var t_noise_up = profile.clock()
             searcher._copy_noise(this_record, 1)
+            profile.charge_host(HOST_UPLOAD, slot, t_noise_up)
         else:
             searcher._check_noise_staged(this_record, 1)
+            profile.charge_host(HOST_PLAN, slot, t_noise)
+        var t_level_enc = profile.clock()
         _launch_oblivious_search(
             searcher.ctx,
             builder.batcher[0].out_dev,
@@ -4033,8 +4257,11 @@ def grow_tree_device_oblivious(
         # "the two have never been measured on together".
         if build_children:
             builder.enqueue_desc_level_children()
+        profile.charge_host(HOST_ENCODE, slot, t_level_enc)
         if trace_steps:
+            var t_trace = profile.clock()
             var mid = builder.download_desc_tables()
+            profile.charge_host(HOST_READBACK, slot, t_trace)
             _resident_trace_emit(
                 trace,
                 String(
@@ -4053,6 +4280,7 @@ def grow_tree_device_oblivious(
     # to anything else is not left holding this schedule's exception. Cannot
     # raise here: the last level either paid its debt through its batch or ran
     # unfused and incurred none, so nothing is outstanding either way.
+    var t_term = profile.clock()
     if skip_last_build:
         builder.rows.set_partition_fusion(True)
 
@@ -4076,9 +4304,24 @@ def grow_tree_device_oblivious(
         params.max_depth,
         searcher.gain_form_code,
     )
+    profile.charge_host(HOST_ENCODE, HOST_SLOT_EPILOGUE, t_term)
 
     # --- The one round trip ------------------------------------------------
+    #
+    # Read the leaf-wise plane's note at its copy of this line before reading
+    # a large `readback` here as a transfer cost. Every launch this tree
+    # enqueued is waited on inside this call.
+    var t_down = profile.clock()
     var snap = builder.download_desc_tables()
+    if snap.fetch_nanos > 0:
+        profile.charge_host_nanos(
+            HOST_READBACK, HOST_SLOT_EPILOGUE, snap.fetch_nanos
+        )
+        profile.charge_host_nanos(
+            HOST_PLAN, HOST_SLOT_EPILOGUE, snap.decode_nanos
+        )
+    else:
+        profile.charge_host(HOST_READBACK, HOST_SLOT_EPILOGUE, t_down)
     # Guarded for the reason written out at the leaf-wise plane's copy of this
     # block, and it costs more here than it does there: a depth-6 symmetric
     # tree has 64 live leaves, so `describe` formats twice as many lines per
@@ -4107,6 +4350,7 @@ def grow_tree_device_oblivious(
                 snap.describe(),
             ),
         )
+    var t_check = profile.clock()
     snap.check_invariants()
     if not _growth_finished_normally(snap.status):
         raise Error(
@@ -4168,7 +4412,18 @@ def grow_tree_device_oblivious(
                 budget,
             )
         )
+    # A depth-6 symmetric tree has 64 live leaves where the default leaf-wise
+    # budget has 31, and `check_invariants` is quadratic in that count, so this
+    # bracket is expected to read about four times the leaf-wise plane's. That
+    # is a prediction the report can refute, which is the reason for saying it
+    # here rather than after the run.
+    profile.charge_host(HOST_PLAN, HOST_SLOT_EPILOGUE, t_check)
     # The host state the rest of the trainer reads back out of the builder.
     # Not optional and not cosmetic; see `_publish_level_row_ranges`.
+    var t_publish = profile.clock()
     _publish_level_row_ranges(builder, snap)
-    return tree_from_snapshot(snap)
+    profile.charge_host(HOST_PLAN, HOST_SLOT_EPILOGUE, t_publish)
+    var t_tree = profile.clock()
+    var grown = tree_from_snapshot(snap)
+    profile.charge_host(HOST_ALLOC, HOST_SLOT_EPILOGUE, t_tree)
+    return grown^

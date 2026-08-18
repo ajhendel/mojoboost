@@ -486,12 +486,13 @@ the withdrawn measurement.
 
 ## Group C. Data layout and traffic
 
-### C1. Row compaction. ASSERTED, and it is the largest unpriced item in the codebase
+### C1. Row compaction, and the compacted level read it was waiting for. MEASURED NEGATIVE, removed
 
 **Where.** `src/mojotrees/gpu_active_rows.mojo`, module docstring, *"Row
 compaction, and what it is a trade against"*, and `set_row_compaction`.
 *"**It is off by default and it must be argued into the default by a window,
-not by this paragraph.**"*
+not by this paragraph.**"* The window was opened on 2026-08-18 and it closed
+this row negative.
 
 **Declined.** CatBoost's physical reorder of the binned matrix and the
 quantized gradient pair at every split, so a leaf's rows are contiguous in
@@ -501,40 +502,102 @@ memory rather than only in the index.
 every split to do it, which is exactly the shape of change this repository has
 been burned by: the row-tile floor raised occupancy as designed and measured 22
 percent slower at 50 features. What is claimed here is arithmetic, not a
-measurement."*
+measurement."* That caution was right.
 
-**Class.** ASSERTED as to time. The 56.7 percent gather fraction of the
-histogram phase at 1M x 50 is MEASURED and is quoted in the same docstring.
+**Class.** MEASURED NEGATIVE. This row was ASSERTED and ranked second in Part 3
+at "0 to +5.7 s on the symmetric plane". Its falsifier as written was
+*"`GpuLeafBatcher` can already read a compacted plane, so the oblivious level
+build does collect the gather saving."* A lane built exactly that, as
+`MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS`, default off, pointing the level build at
+the permutation-ordered plane `GpuActiveRows` already maintains. It is a loss.
 
-**Price, estimate, both sides.** The reorder cost is stated in source as
-`4 * L * (nf + 8)` bytes for a window of length `L`. At `nf = 100` that is
-432 bytes a row. Summing `L` over a level is `n_active`, so a level moves
-432 x 799,110 = **345 MB**, a depth-6 tree moves **2.07 GB**, a 100-tree fit
-moves **207 GB**, and at 80 GB/s that is **2.6 s**. Against that, the histogram
-phase of the symmetric fit is 86 percent of 17.07 s = 14.7 s, of which the
-measured gather share is 56.7 percent = **8.3 s**. Compaction does not remove
-all of that, because the bytes still have to be read, but it converts a
-strided read into a contiguous one. So the plausible net is somewhere between
-zero and **+5.7 s**, and the sign is more likely positive than not.
+**The measurement.** Real data, `year_prediction_msd`, 463,715 x 90, 100 trees,
+symmetric depth 6, Apple M4, both arms interleaved inside ONE run, three
+repeats, run tag `compact`.
 
-**A composition gap this lane found and the docstring does not mention.**
-Verified. `gpu_leaf_batching.mojo` contains no compaction parameter at all;
-the only two occurrences of the word "compact" in that file are in prose. The
-oblivious level build runs entirely through `GpuLeafBatcher`. Inferred, and I
-am confident but did not trace every argument. **Row compaction is maintained
-on the descriptor partition path (`enqueue_partition_desc` calls
-`_maintain_compaction`) but cannot be consumed by the oblivious level
-histogram**, so on the symmetric plane it would pay the whole 2.6 s reorder and
-collect none of the 8.3 s. It reaches `enqueue_desc_histogram` and the
-range histograms, which is the leaf-wise plane, where the fit is 3.659 s and
-there is less absolute time to win.
+| arm | train s | ms per tree | model sha256 | ratio |
+|---|---|---|---|---|
+| host MVS, compact off | 6.009 | 60.09 | `2504284d1efa` | baseline |
+| host MVS, compact on | 6.329 | 63.29 | `2504284d1efa` | **0.949x** |
+| device MVS, compact off | 2.476 | 24.76 | `7614c64f8ca3` | baseline |
+| device MVS, compact on | 3.270 | 32.70 | `7614c64f8ca3` | **0.757x** |
 
-**Survives.** The caution survives. The *framing* does not. Presenting this as
-one switch obscures that the arm and its beneficiary are on two different
-planes, which is the same "two options presented as mutually exclusive" shape
-the brief warned about, in a different dress. The third option here is to teach
-`GpuLeafBatcher` the compacted read, which is the same parameter
-`_range_hist_atomic_kernel` already takes.
+**It is a loss on both configurations and a large one on the configuration that
+matters.** The device-solve arm is where the level build is about 85 percent of
+the tree, which is the arm the switch was aimed at, and it is the arm that lost
+24 percent.
+
+**The models are bit-identical on both sides of each pair**, same sha256 within
+each MVS configuration, which is what the arm's own gate demanded. So the
+implementation was correct and it is simply slower. It also plainly engaged,
+because a switch that did nothing would have read 1.00x rather than 0.757x.
+
+**The lane's registered refutation condition was met, and by more than its own
+worst case.** It priced the compaction maintenance at 14 matrix passes, about
+5.8 ms per tree, and wrote *"SLOWER than baseline and the maintenance costs more
+than the 14 passes it is priced at, which would mean the scatter kernel runs
+under 40 GB/s"*. The measured regression is 7.9 ms per tree on the device-solve
+arm, which is worse than the worst case it named. The switch and every line
+behind it were deleted the same day under `docs/design/LANE_RULES.md` rule 6.
+
+**THIS RESULT KILLS A MODEL AND NOT ONLY AN ARM, AND THAT IS THE REASON TO READ
+THIS ROW.** The reasoning behind the arm was that a strided row index makes one
+child's read of one feature cost a full column pass, so that at a 128-byte line
+and one byte per cell a child at gap 32 still touches 98 percent of every line
+of its column, which implied that the level build was throwing away more than
+half of the memory bandwidth it consumed. If that had been true, removing the
+gather would have been a large win. It was a loss. So the gather is not what the
+level build spends its time on, and any future proposal resting on "the
+scattered bin read is the cost" is refuted in advance by this row.
+
+**What survives, so that the row does not overshoot.** The depth sweep at 8, 16
+and 32 passes (44.78, 53.80 and 60.44 ms per tree) still fits
+`time = 3.8 + 0.65 x passes`, and that model still predicts the
+sibling-subtraction arm at 63 passes to within 2 percent. So per-tree cost
+really does scale with the number of children built, and a change that builds
+fewer children is still worth proposing. What is now unknown is WHY it scales,
+because it is not the gather, and it is not the zeroing grid either, since E13
+measured the pair-indexed grid at 0.992x after removing 9.32 dead threadgroups
+out of every 10.32. **Name that as the open question rather than assuming the
+next plausible mechanism.** Three separately diagnosed, arithmetically
+reproduced defects in this loop (E10's per-visit quantization, E13's dispatched
+dead threadgroups, and now the gather) have each measured null or negative, and
+the per-pass slope is still there.
+
+**What was removed.** `gpu_leaf_batching.oblivious_compacted_bins_requested`;
+the `compacted` launch scalar on `_batch_hist_atomic_kernel` and
+`_batch_hist_atomic_subtract_kernel` and the `dense` branch it selected; the
+`compacted` parameter on `enqueue_device_plan_batch_fused` and
+`..._subtracting`; the arming block in `histogram_gpu.stage_desc_level_plan`;
+the pointer-and-flag resolution in `histogram_gpu.enqueue_desc_level_children`;
+and, on `GpuActiveRows`, the compact-plane ping-pong the arm needed to stay
+under the launch knee (`compact_swap`, `set_compact_swap`,
+`compact_swap_requested`, the swap branch in `_enqueue_compact_partition`, and
+the `swap` parameter with its dead-step identity copy in
+`_compact_scatter_kernel`). Row compaction itself stays, on the leaf-wise plane,
+where `enqueue_desc_histogram` and `enqueue_range_histogram` do consume it.
+
+**A latent bug this lane found, and it is now refused.** With the level read
+gone, nothing on the symmetric plane consumes a compacted plane except the root
+build, yet `MOJOTREES_GPU_ROW_COMPACTION=1` still armed the maintenance there,
+because `GpuActiveRows.__init__` reads that variable for every fit.
+Verified from source. An oblivious tree paid one rebuild
+(`_ensure_compacted`, one launch, through the `enqueue_leaf(0)` the grower makes
+after `stage_desc_level_plan`) plus two launches per level from
+`_maintain_compaction` on the descriptor partition, so 1 + 12 = 13 command
+buffers a tree, while 62 of the 63 histograms it builds read the dataset's own
+matrix. `gpu_resident_round.oblivious_schedule_launches(6, 64, True)` is 55, and
+55 + 13 is 68 against a Metal queue that is 64 deep on the measured machine and
+**does not raise when it is overrun**. Since the failure mode is a silently
+overrun queue rather than a slow fit, `stage_desc_level_plan` now raises on
+`self.rows.row_compaction_requested()`, once per tree, off a host field.
+`docs/design/GROWTH_POLICY_REACH.md` lists this reach as SUSPECTED ACCIDENTAL
+and can now record it as verified accidental and closed.
+
+**Survives.** No. The caution in the stated reason survives and is vindicated.
+The price and the rank do not. The composition gap this row recorded, that
+compaction was maintained on the symmetric plane and consumed by nothing there,
+was real, was closed by building the missing consumer, and the consumer lost.
 
 ### C2. `set_compact_flag_read`, the partition's own flag pass. ASSERTED
 
@@ -1012,6 +1075,55 @@ only if a caller sets it directly, and no caller in this package does.
 
 **Survives.** Yes, as a decline of the forward and not of the elision.
 
+### E15. Fanning out the `random_strength` noise draw. MEASURED null, removed, and it closes a class
+
+**What it was.** `gpu_split_search::random_score_plane` passes its raw DRAW
+COUNT to `parallel.plan_tasks`, which takes an op count in histogram-op
+equivalents and documents that a stage with dearer per-op work must scale its
+own estimate. A shipped symmetric level is 100 features by 255 bins, so the
+count is 25,500 against a `PARALLEL_MIN_OPS` of 65,536. `plan_tasks` therefore
+answered ONE, and the default-on parallel arm had **never fanned out on a
+shipped symmetric fit**. A draw is five chained `splitmix64` folds plus an
+expected 1.27 Marsaglia polar iterations carrying a `log`, a `sqrt` and a
+divide, so the unit really is wrong.
+
+**Measured 2026-08-18**, real data, 463,715 x 90, 100 trees, symmetric depth 6,
+both arms carrying the device MVS solve, interleaved in one run:
+
+| arm | train wall | host CPU | rmse | model sha256 |
+| --- | --- | --- | --- | --- |
+| device MVS | 2.461 s | 0.475 s | 9.093742 | 7614c64f8ca3 |
+| device MVS + draw weighted 32 | 2.458 s | 1.011 s | 9.093742 | 7614c64f8ca3 |
+
+**1.001x. Model bit-identical.**
+
+**The host CPU column is why this row is worth reading.** It more than
+doubled, so the pool was genuinely engaged and this is not a switch that
+failed to take effect. The draws are real work, worth roughly 536 ms of
+CPU-seconds, and parallelizing them moved the wall clock by nothing.
+
+**WHAT THIS CLOSES, and it is larger than the switch.** After the device MVS
+solve the symmetric arm runs at `parallel_efficiency` 0.19: the host is idle
+81 percent of the wall and the GPU sets the pace. **No host-side optimization
+on that arm can move its wall clock.** That covers the noise draw, the staging
+copy and allocations (removed the same day as a correctness-of-description
+change, correctly predicted by its own lane to be indistinguishable), the
+`MOJOTREES_GPU_OBLIVIOUS_NOISE_HOIST` null which now reads as the same result
+rather than as a puzzle, and the whole Tier 3 device-side noise generator
+design, whose win was also host-side. Do not spend a run on any of them
+without first showing that the host is on the critical path again.
+
+**The generalizable mistake**, recorded because this session made it twice:
+both this arm and the compacted bin read (entry C1) were argued from a correct
+estimate of how much WORK a thing did, without first establishing that the
+resource being optimized was the SCARCE one. The estimates were roughly right
+both times. The conclusions were wrong both times.
+
+**One number worth keeping.** In the same run CatBoost spent 16.365 CPU-seconds
+against our 0.475 for a comparable tree, at 1.780 s wall against our 2.461 s.
+We are 1.4x behind on wall clock using **34x less CPU**, which is an energy per
+fit result and, on a laptop, a thermal headroom result.
+
 ## Group F. CPU
 
 ### F1. `MOJOTREES_CPU_CORE_POOL=performance`. KNOWN
@@ -1081,6 +1193,70 @@ justifies a different number."*
 group width, which the symmetric diagnosis already found is not where the CPU
 loses.
 
+### F6. CPU parallel scaling above about 3.5x on a 10-core M4. MEASURED EXTERNAL, closed
+
+**Class.** MEASURED, and closed as a limit of the runtime rather than of this
+package. This row exists so nobody opens a seventh lane on it.
+
+**What was believed.** That our CPU phases convert far less of the machine
+than the peers do because `plan_tasks` cuts a loop into exactly as many equal
+chunks as there are workers, and an equal split across four performance and
+six efficiency cores finishes when the slow pieces finish. On an M4 that
+ceiling is `10 / k` for an efficiency core `k` times slower, which for
+`k = 3` is 3.33 and matched the measured cap almost exactly.
+
+**What was measured, 2026-08-18, batch prediction, real data, 51,630 x 90,
+100 trees, four configurations interleaved in ONE process against one fitted
+model, medians of five, every prediction bit-identical across all four:**
+
+| arm | 1 worker | forced 10, 10 chunks | forced 10, 40 chunks | auto (shipped) |
+| --- | --- | --- | --- | --- |
+| leaf-wise | 105.99 ms | 34.07 | 28.97 | 28.91 |
+| depth-wise | 40.77 ms | 13.77 | 12.06 | 11.83 |
+
+**The diagnosis was half right and the half that was right was already
+fixed.** The equal split really does cost about 1.15x, and auto mode has
+multiplied by `TASKS_PER_CORE` since long before this measurement, so the
+shipped path was already cutting 40 chunks. Against shipped, the fix measures
+**1.00x**. It was taken anyway, unconditionally and with its switch deleted,
+because it removes a trap where a caller setting `MOJOTREES_NUM_WORKERS` to
+their own core count silently asked for the worst geometry. See
+`parallel::_forced_chunks`.
+
+**What remains, and why it is external.** Forty chunks over ten cores still
+converts only about 3.5x. That is not chunk geometry, and the reason it is
+not is that **the same ceiling reproduces in a standalone probe containing no
+mojotrees code at all**: the MAX `sync_parallelize` pool measures about 3.5
+wide on this machine and is FLAT from 4 tasks to 16 tasks, with six different
+environment variables changing nothing. A pure-ALU probe capping at four wide
+on a chip with four performance cores and six efficiency cores is a statement
+about where the runtime puts its worker threads, not about how this package
+divides work.
+
+**Two hypotheses survive and this repository is not going to pick between
+them.** Either the runtime's worker threads are created at a QoS class that
+parks them on efficiency cores, which no scheduling change here can reach, or
+the phase is near a memory floor. The second would be a compliment rather
+than a defect: single-threaded we are 2.35x faster than LightGBM on this
+phase, and an engine that does more work per byte has less left to
+parallelize, so LightGBM's 6.12x scaling ratio would be a slower kernel with
+more headroom rather than better engineering.
+
+**Read the absolute column, not the ratio.** Leaf-wise predict is 29 ms
+against LightGBM's 47 ms on the same box. The ratio column is the one place
+our own speed makes us look worse.
+
+**What would settle it, for somebody else.** One probe comparing a pure ALU
+loop against a streaming loop at the same task counts separates placement
+from bandwidth in a single measurement. It is a question for Modular about
+`sync_parallelize`, not a lane here, and under the speed mandate the CPU path
+is an oracle and the portability floor rather than a competitor, so it does
+not earn a run.
+
+**Do not retry:** widening the pool, more chunks, a different chunk shape, or
+any further environment variable. All four are priced above or in the pool
+probe beside this row.
+
 ## Group G. Policy declines
 
 Recorded briefly. These decline the *device*, not an optimization, and each one
@@ -1115,7 +1291,7 @@ the row.
 | # | Decline | Class | Estimated value | One sentence that falsifies it |
 |---|---|---|---|---|
 | 1 | **A4.** Wide oblivious level scan stays off. **CLOSED 2026-08-17, it is the default now** | STALE | **0.77 s of 17.07 s (4.5 percent), resolved and bit-identical** | The 4.5 percent quoted in `wide_scan_requested` was measured on a different kernel than the one `oblivious_wide_scan_requested` selects. |
-| 2 | **C1.** Row compaction | ASSERTED | **0 to +5.7 s on the symmetric plane, and probably 0 as currently plumbed** | `GpuLeafBatcher` can already read a compacted plane, so the oblivious level build does collect the gather saving. |
+| 2 | **C1.** Row compaction. **CLOSED 2026-08-18, MEASURED NEGATIVE, removed** | MEASURED | **negative. 0.757x on the device-solve arm and 0.949x on the host-solve one at 463,715 x 90, bit-identical models** | The falsifier as written was built and run: `GpuLeafBatcher` was taught the compacted plane, the oblivious level build did collect the gather saving, and it lost. The estimate above was wrong in sign, and the model behind it is dead. |
 | 3 | **C3.** Int16 packed gradient staging | ASSERTED | **up to 1.2 s of 17.07 s** | The pair load is already fully hidden behind the bin gather, so halving it changes no wall time. |
 | 4 | **B2.** Removing the partition copy-back launch | ASSERTED | **about 90 ms of 3.659 s (2.5 percent)** | `snapshot_rows` and `download_rows` cannot be made to gather across two buffers without breaking host replica bit-equivalence, which the audit already suspects. |
 | 5 | **B1.** Folding the cross-slot reduction into record filing | ASSERTED | **about 45 ms of 3.659 s (1.2 percent)** | The enqueue cost at this queue depth is 6 us rather than 15, which puts it under half a percent. |
@@ -1139,8 +1315,12 @@ the row.
 
 **The top of this list is short and it should be read that way.** One STALE row
 worth 0.77 s that needs no measurement to act on, and one ASSERTED row worth up
-to several seconds that needs a plumbing change before it can even be measured.
-Everything below rank 5 is under 1.5 percent of the arm it lives on.
+to several seconds that needed a plumbing change before it could even be
+measured. **That second row is C1, the plumbing was built, and the measurement
+came back negative**, which is the single most useful thing this ranking has
+produced and is an argument for measuring the top of a list rather than
+reordering it. Everything below rank 5 is under 1.5 percent of the arm it lives
+on.
 
 ---
 
@@ -1200,10 +1380,14 @@ written on the same day as this audit, so the rule is younger than most of the
 text it governs.
 
 **3. Two options presented as exclusive usually are not, and the third option
-is in the same file.** The fused-subtraction case is the archetype. C1 is the
-same shape wearing different clothes, a switch whose beneficiary is on a
+is in the same file.** The fused-subtraction case is the archetype. C1 was the
+same shape wearing different clothes, a switch whose beneficiary was on a
 different plane from the switch, where teaching `GpuLeafBatcher` the compacted
-read is the third option and is thirty lines of parameter passing.
+read was the third option and was about thirty lines of parameter passing.
+**That third option was built on 2026-08-18, measured 0.757x, and removed**; see
+C1. The pattern is unchanged and is why the option was worth finding. What the
+outcome adds is the other half of it, which is that finding the third option
+tells you what to measure and never what the measurement will say.
 
 **4. A default is verified only by the case that breaks it.** The batcher's
 identity feature table is *correct* at `feature_fraction = 1.0`, which is the

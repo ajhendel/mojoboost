@@ -292,6 +292,7 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.memory import bitcast, stack_allocation
 from std.os import getenv
 from std.sys import has_accelerator
+from std.time import perf_counter_ns
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.primitives import block
@@ -946,6 +947,28 @@ struct TreeTablesSnapshot(Copyable, Movable):
     var status: Int
     var commits: Int
 
+    var fetch_nanos: Int
+    """Host nanoseconds `download` spent bringing the tables home: the copies,
+    the drain they carry, and on the packed arm the scatter behind them.
+
+    Zero unless `DeviceTreeTables.set_host_timing(True)` was called, which is
+    what a `PhaseProfile` on a device plane does once per tree. It is measured
+    HERE rather than by the caller because the wait and the decode sit behind
+    one signature and the seam between them exists only inside `download`; a
+    bracket around the call gets their sum and cannot split it.
+
+    **No synchronization was added to obtain this.** The drain is the one the
+    fetch already performs. See `phase_profile`'s host-span section, and note
+    that this number therefore fuses transfer with whatever device work the
+    queue still held, which is not separable without a drain nobody is willing
+    to add."""
+
+    var decode_nanos: Int
+    """Host nanoseconds `download` spent turning the pinned words into this
+    snapshot. Pure host arithmetic over `n_live` leaves and `next_node` nodes,
+    after every wait is over, so it is host occupancy with nothing fused into
+    it. Zero under the same condition `fetch_nanos` is."""
+
     def __init__(out self):
         self.leaves = List[DeviceLeafRow]()
         self.nodes = List[DeviceNodeRow]()
@@ -957,6 +980,8 @@ struct TreeTablesSnapshot(Copyable, Movable):
         self.pick_node = -1
         self.status = TREE_RUNNING
         self.commits = 0
+        self.fetch_nanos = 0
+        self.decode_nanos = 0
 
     def slot_of_owner(self, owner: Int) -> Int:
         """The pool slot `owner` holds, or -1. Node ids are unique and a node
@@ -3060,6 +3085,11 @@ struct DeviceTreeTables(Movable):
     var packed_download: Bool
     """Which arm `download` takes. See `set_packed_download`."""
 
+    var host_timing: Bool
+    """Whether `download` reports how its own time divided. See
+    `set_host_timing`. False by default, and while it is False `download`
+    reads no clock at all."""
+
     var front_dev: DeviceBuffer[DType.int32]
     var node_i_dev: DeviceBuffer[DType.int32]
     var node_f_dev: DeviceBuffer[DType.float32]
@@ -3219,6 +3249,11 @@ struct DeviceTreeTables(Movable):
         # already said `!= "0"`, so the file disagreed with itself.
         self.reset_on_device = getenv("MOJOTREES_GPU_TABLE_RESET") != "0"
         self.packed_download = getenv("MOJOTREES_GPU_PACKED_DOWNLOAD") != "0"
+        # Not read from the environment, and deliberately not: this is not a
+        # switch a user picks, it is a caller telling the tables that somebody
+        # is going to read the two numbers. `MOJOTREES_PHASE_PROFILE` is the
+        # variable, one layer up, and the plane sets this from it once a tree.
+        self.host_timing = False
 
         # The packed download's layout. One prefix sum, here, over the same
         # six regions in the same order `_pack_tables_kernel` writes them and
@@ -3415,6 +3450,30 @@ struct DeviceTreeTables(Movable):
         Takes effect on the next `download`.
         """
         self.packed_download = on
+
+    def set_host_timing(mut self, on: Bool):
+        """Whether `download` records how its own host time divided, into
+        `TreeTablesSnapshot.fetch_nanos` and `decode_nanos`.
+
+        Off by default and off in every run nobody asked to profile. On, the
+        cost is two `perf_counter_ns` reads on a call a device plane makes
+        once per tree; off, it is one Bool test on that same call, which is the
+        "free when off" rule `phase_profile` states applied to the one
+        instrument that lives outside that module.
+
+        **This adds no synchronization in either state, and could not be
+        allowed to.** The seam it times at is the one the fetch already
+        creates: the copy drains, and only then does the decode begin. What it
+        buys is the split between the wait and the host arithmetic behind it,
+        which a caller bracketing `download` from outside cannot see because
+        both happen behind one call. What it does NOT buy, and what would need
+        a drain before the copy and is therefore refused, is the split of
+        `fetch_nanos` itself into bytes moved and queue backlog absorbed.
+
+        Set from `PhaseProfile.enabled()` by whichever plane owns the tree.
+        Takes effect on the next `download`.
+        """
+        self.host_timing = on
 
     def _enqueue_reset(
         mut self, n_active: Int, root_slot: Int, root_value: Float32
@@ -4418,11 +4477,24 @@ struct DeviceTreeTables(Movable):
         six-copy arm copies into, so the decode has one implementation and a
         snapshot cannot depend on which arm produced it.
         """
+        # The two clocks, and the argument that they are honest. `t_fetch`
+        # closes over a drain this function performs anyway, and `t_decode`
+        # closes over host arithmetic with no device in it. Neither adds a
+        # wait, neither reorders anything, and with `host_timing` off neither
+        # is read at all. See `set_host_timing`.
+        var t_fetch = 0
+        if self.host_timing:
+            t_fetch = Int(perf_counter_ns())
         if self.packed_download:
             self._fetch_packed()
         else:
             self._fetch_six()
             self.ctx.synchronize()
+        var t_decode = 0
+        var fetch_ns = 0
+        if self.host_timing:
+            t_decode = Int(perf_counter_ns())
+            fetch_ns = t_decode - t_fetch
 
         var out = TreeTablesSnapshot()
         var c = self.host_ctr.unsafe_ptr()
@@ -4478,6 +4550,9 @@ struct DeviceTreeTables(Movable):
             n_commits = self.leaf_capacity
         for k in range(n_commits):
             out.commit_order.append(Int(o.unsafe_load(k)))
+        if self.host_timing:
+            out.fetch_nanos = fetch_ns
+            out.decode_nanos = Int(perf_counter_ns()) - t_decode
         return out^
 
 

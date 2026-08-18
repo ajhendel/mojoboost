@@ -900,6 +900,19 @@ def _batch_hist_atomic_kernel(
     addition and multiplication agree modulo 2^32. `sh` is a comptime
     `stack_allocation` and is still allocated, so no occupancy follows -- what
     follows is a third fewer shared atomics and a third less shared zeroing.
+
+    **A COMPACTED BIN READ WAS BUILT HERE AND MEASURED A LOSS.** The row loop
+    below gathers `bins[f * n_rows + rows[begin + j]]`, and
+    `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS=1` used to point `bins` at
+    `GpuActiveRows.cbins_dev` and read `cbins[f * n_rows + begin + j]`, the same
+    byte at a contiguous address. At 463,715 x 90, 100 trees, symmetric depth 6,
+    GPU, it measured 3.270 s against a 2.476 s baseline, which is 0.757x, with a
+    bit-identical model. The arm, its launch scalar and the compact-plane
+    ping-pong it needed were removed on 2026-08-18 under
+    `docs/design/LANE_RULES.md` rule 6. See
+    `docs/design/DECLINED_OPTIMIZATIONS.md` row C1; the scattered bin read is
+    not what this kernel spends its time on, so do not rebuild it on that
+    reasoning.
     """
     var tid = thread_idx.x
     var nb = Int(n_bins)
@@ -1036,6 +1049,10 @@ def _batch_hist_atomic_subtract_kernel(
     The identical argument list, the identical row loop, the identical
     threadgroup accumulation, and the identical global fold. Two things are
     added and nothing is taken away.
+
+    The compacted bin read that used to compose with this arm was measured a
+    loss and removed; see the twin's docstring and
+    `docs/design/DECLINED_OPTIMIZATIONS.md` row C1.
 
     `const_hess` means exactly what it means on `_batch_hist_atomic_kernel` and
     is argued there. The subtraction is unaffected by it: it folds the NEGATION
@@ -3136,6 +3153,13 @@ struct GpuLeafBatcher(Movable):
         lives in a struct this module does not own and is checked by four
         refusals there. A schedule wiring this up marks the debt paid on the
         rows object in the same place it enqueues this.
+
+        **`bins` is the dataset's own matrix and there is no longer a choice
+        about that.** A `compacted` flag used to let the caller point this at
+        `GpuActiveRows.cbins_dev` and index by POSITION rather than by row; it
+        was measured 0.757x on real data and removed, so this entry point takes
+        one matrix and reads it one way. See
+        `docs/design/DECLINED_OPTIMIZATIONS.md` row C1.
         """
         if self.plan_items < 1:
             raise Error(
@@ -3226,6 +3250,9 @@ struct GpuLeafBatcher(Movable):
         selects this arm at the one oblivious call site rather than the
         environment selecting it inside the shipping one. See
         `oblivious_subtract_requested`.
+
+        The compacted-matrix flag the non-subtracting twin used to carry is
+        gone from both; see that twin's docstring.
 
         What reaches the pool afterwards is bit-for-bit what the shipping arm
         would have left there; the argument is at the accumulation kernel.

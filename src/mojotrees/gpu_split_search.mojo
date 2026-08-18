@@ -1522,12 +1522,90 @@ def random_score_plane(
     a default of 0 standing in for a node id is exactly the failure it exists
     to prevent.
 
-    THE ONE LINE THAT MOVES WHEN THE HOST LANE MERGES. The body calls
+    THE ONE LINE THAT MOVES WHEN THE HOST LANE MERGES. The draw is
     `host_random_score_noise`, this module's copy of the host's draw. When
     `tree_parameters_extra.random_score_noise` is on the same branch, that
     call becomes a call to it and this module stops holding a second copy of
     stage B. Nothing else changes: the key is already the same construction,
-    the layout is this function's, and the plane is the same numbers.
+    the layout is this function's, and the plane is the same numbers. The
+    call itself now lives one level down, in `random_score_plane_into`.
+
+    RETURNING A LIST IS THE SECONDARY FORM AS OF 2026-08-18. The plane is
+    built by `random_score_plane_into`, which writes into a destination the
+    caller already owns; this wrapper allocates a destination of exactly the
+    plane's size and hands it back, for callers that want the plane as a
+    value rather than as a region of a larger buffer. Every test in
+    `tests/test_random_score_noise.mojo`,
+    `tests/test_gpu_random_score_noise.mojo` and
+    `tests/test_gpu_oblivious_noise.mojo` reaches the draw through here, so
+    this is the form the pinned values are pinned against, and it is one
+    `List` allocation away from the form the stager uses. The two produce the
+    same numbers at the same indices because there is only one body: this one
+    calls the other.
+    """
+    if n_bins < 1:
+        raise Error("a noise plane needs at least one bin")
+    if node < 0:
+        raise Error(
+            "random_strength keys its draw by node id, which must be"
+            " nonnegative; a grower that cannot supply one cannot use it"
+        )
+    # Validated before the allocation, not after, so a bad `n_bins` cannot
+    # reach a `List` length computation. The same two refusals are made again
+    # inside `random_score_plane_into`, where they guard the callers that do
+    # not come through here; a check made twice on a per-plane path is free
+    # and a check made in only one of two entry points is a hole.
+    var out = List[Float32](
+        length=len(features) * n_bins, fill=Float32(0.0)
+    )
+    random_score_plane_into(
+        out, 0, stdev, seed, tree_index, node, features, n_bins, domain
+    )
+    return out^
+
+
+def random_score_plane_into(
+    mut dst: List[Float32],
+    offset: Int,
+    stdev: Float64,
+    seed: Int,
+    tree_index: Int,
+    node: Int,
+    features: List[Int],
+    n_bins: Int,
+    domain: UInt64 = RANDOM_SCORE_DOMAIN,
+) raises:
+    """One node's noise plane written STRAIGHT INTO `dst` at `offset`:
+    `len(features) * n_bins` Float32 in (slot-major, bin-minor) order, which
+    is the layout the scan kernels index.
+
+    This is the body `random_score_plane` used to hold, with the destination
+    made a parameter. It exists because the destination was never the fresh
+    list: `GpuSplitSearcher.stage_random_score` wanted the plane inside
+    `noise_stage` at `record * n_features * n_bins`, and until 2026-08-18 it
+    got there by allocating a plane, filling it, and copying it in entry by
+    entry. `noise_stage_parallel_requested` had already said in as many words
+    that the draw went "straight into the staging buffer", which was a
+    description of a saving the code did not take; this is the function that
+    makes the sentence true. See that docstring for the accounting.
+
+    WHY THE PLANE IS UNCHANGED, WHICH IS THE ONLY THING THAT MATTERS HERE.
+    Every entry is `host_random_score_noise(stdev, seed, tree_index, node,
+    features[slot], b, domain)` and nothing else -- a pure function of its
+    seven arguments, reading no accumulator and no running generator, since
+    stage A (`gpu_score_stream_in`) is a keyed splitmix fold with no counter
+    in it. None of those seven arguments depends on where the entry is
+    stored. So moving the destination from a fresh list at index
+    `slot * n_bins + b` to a caller's buffer at index
+    `offset + slot * n_bins + b` changes the ADDRESS of every write and the
+    VALUE of none, and the entry that lands at a given index is the entry that
+    landed at the corresponding index before. That is bit-identity in the only
+    form available for a float: the same draws, keyed the same way, in the
+    same layout, rounded to Float32 once in the same place.
+
+    `offset` is checked against `len(dst)` before anything is written. The
+    check is new, it cannot fire on either shipped caller, and it is here
+    because the alternative to a raise is a silent write past a `List`.
     """
     if n_bins < 1:
         raise Error("a noise plane needs at least one bin")
@@ -1537,67 +1615,125 @@ def random_score_plane(
             " nonnegative; a grower that cannot supply one cannot use it"
         )
     var n_slots = len(features)
+    var cells = n_slots * n_bins
+    if offset < 0 or offset + cells > len(dst):
+        raise Error(
+            "a noise plane of ",
+            cells,
+            " entries does not fit at offset ",
+            offset,
+            " of a destination holding ",
+            len(dst),
+        )
     if not noise_stage_parallel_requested():
-        # The serial path, kept verbatim as the A/B arm and as the definition
-        # the parallel arm is checked against. `MOJOTREES_GPU_NOISE_STAGE_
+        # The serial path, kept as the A/B arm and as the definition the
+        # parallel arm is checked against. `MOJOTREES_GPU_NOISE_STAGE_
         # PARALLEL=0` selects it.
-        var serial_out = List[Float32](capacity=n_slots * n_bins)
+        #
+        # It appended into a fresh list until 2026-08-18 and now stores by
+        # index into the caller's. `append` on a list of exactly the right
+        # capacity, walked slot-major then bin-minor, put entry `k` at index
+        # `k`; this puts it at `k` too, and writes the identical Float32 there
+        # because the value never depended on the container. The feature id is
+        # read as `features[slot]`, the bounds-checked read this arm has always
+        # made, since this arm is the definition and not the fast path.
+        var plane_p = dst.unsafe_ptr().unsafe_offset(offset)
         for slot in range(n_slots):
             var f = features[slot]
+            var row = slot * n_bins
             for b in range(n_bins):
-                serial_out.append(
+                plane_p.unsafe_store(
+                    row + b,
                     host_random_score_noise(
                         stdev, seed, tree_index, node, f, b, domain
-                    )
+                    ),
                 )
-        return serial_out^
+        return
 
     # PARALLEL OVER FEATURE SLOTS, AND THE PLANE IS IDENTICAL, NOT MERELY
     # EQUIVALENT. Every entry is `host_random_score_noise` of its own six
     # arguments and nothing else, so an entry cannot observe the order the
-    # others were written in. See `noise_stage_parallel_requested` for the full
-    # argument and for why `MOJOTREES_NUM_WORKERS` is therefore not an input to
-    # the model.
+    # others were written in, or which buffer it is being written into. See
+    # `noise_stage_parallel_requested` for the full argument and for why
+    # `MOJOTREES_NUM_WORKERS` is therefore not an input to the model.
     #
     # The slot is the parallel dimension rather than the bin because a slot
     # owns a contiguous `n_bins` run of the plane, so two workers never touch
     # the same cache line at a boundary, and because `dispatch_features` is
     # already the dispatch shaped for a per-feature body.
     #
-    # Written by index into a pre-sized list rather than appended, because
-    # `append` is a running length and two workers appending is a data race on
-    # exactly the state this function no longer needs to keep.
-    var out = List[Float32](length=n_slots * n_bins, fill=Float32(0.0))
-    var dst = out.unsafe_ptr()
+    # Written by index rather than appended, because `append` is a running
+    # length and two workers appending is a data race on exactly the state
+    # this function does not need to keep. Since 2026-08-18 the index is into
+    # the caller's buffer, so there is no intermediate list to be appended to
+    # in the first place.
+    #
+    # `offset` is folded into the base pointer once, outside the closure, so
+    # the per-entry arithmetic is the `row + b` it always was and no worker
+    # re-adds a constant 25,500 times.
+    var plane_p = dst.unsafe_ptr().unsafe_offset(offset)
     # A pointer rather than a copy of the list. `var feats = features` is an
     # implicit `List` copy, which Mojo 1.0 refuses outright
     # (`List[Int]` does not conform to `ImplicitlyCopyable`), and `.copy()`
     # would allocate an `n_slots` list per plane, which is per level per tree.
-    # The body only READS the feature ids, and `dst` two lines up is already a
-    # borrowed pointer into a list that outlives this closure, so this is the
-    # same lifetime argument the destination already relies on: `features` is
-    # the caller's and outlives `dispatch_features` returning.
+    # The body only READS the feature ids, and `plane_p` two lines up is
+    # already a borrowed pointer into a list that outlives this closure, so
+    # this is the same lifetime argument the destination already relies on:
+    # both `features` and `dst` are the caller's and outlive
+    # `dispatch_features` returning.
     var feats = features.unsafe_ptr()
 
     def draw_slot(slot: Int) {imm}:
         var f = feats[slot]
         var row = slot * n_bins
         for b in range(n_bins):
-            dst.unsafe_store(
+            plane_p.unsafe_store(
                 row + b,
                 host_random_score_noise(
                     stdev, seed, tree_index, node, f, b, domain
                 ),
             )
 
-    # The op estimate is the number of draws, and a draw is a splitmix fold
-    # plus a `log` and a `sqrt`, so it is a much heavier op than the row copies
-    # `PARALLEL_MIN_OPS` was calibrated on. Reporting the true count is the
-    # conservative direction: it under-claims the work per op, so the auto rule
-    # keeps a small plane serial, which is right, since a level with a handful
-    # of active features cannot repay a pool wake.
-    dispatch_features(draw_slot, n_slots, n_slots * n_bins)
-    return out^
+    # THE OP ESTIMATE IS THE NUMBER OF DRAWS, AND THAT IS WHY THIS ARM DOES
+    # NOT FAN OUT AT THE SHIPPED SYMMETRIC SHAPE. Read off the source on
+    # 2026-08-18, not measured. `plan_tasks` returns 1 whenever
+    # `total_ops < min_ops`, and `parallel.PARALLEL_MIN_OPS` is `1 << 16` =
+    # 65,536. A shipped symmetric level is 100 active features x 255 bins =
+    # 25,500 draws, so `cells` is 25,500, so `plan_tasks` returns 1 and every
+    # plane of the reference fit is drawn on ONE thread. The switch is on and
+    # the fan-out never happens; the arm reaches the pool only above 65,536
+    # cells, which at 255 bins needs 257 or more active features.
+    #
+    # This comment used to end "which is right, since a level with a handful
+    # of active features cannot repay a pool wake". A hundred features is not
+    # a handful, and the sentence was reasoning about the intent of the
+    # threshold rather than about the number being compared against it.
+    #
+    # The estimate itself is the thing to question, and it is questioned in
+    # the unit rather than in the constant. `plan_tasks` asks for
+    # HISTOGRAM-OP EQUIVALENTS -- one scattered accumulate of a gradient, a
+    # hessian and a count -- and says in as many words that a stage whose per
+    # op work is dearer than that scales its estimate accordingly. A draw
+    # here is five chained `splitmix64` folds for the key plus a rejection
+    # loop with a `log`, a `sqrt` and a divide in it, which is worth many
+    # histogram ops and not one. So passing the raw draw count under-states
+    # the work by whatever that factor is, and it under-states it by enough
+    # to sit on the wrong side of the crossover at the shape that ships.
+    #
+    # LEFT AS THE RAW DRAW COUNT, and since 2026-08-18 that is a MEASURED
+    # decision rather than an oversight. Weighting a draw at 32 histogram-ops
+    # clears the crossover and really does fan the draw out: host CPU on the
+    # symmetric arm went 0.475 s to 1.011 s, so the pool was genuinely engaged.
+    # The wall clock moved 1.001x. The draws were never on the critical path,
+    # because after the device MVS solve that arm runs at par_eff 0.19 and the
+    # GPU sets the wall while the host sits 81 percent idle. Fanning out work
+    # that was not blocking anything buys nothing.
+    #
+    # So the unit here is still wrong in the abstract and correcting it is
+    # still worth nothing on this arm. If a future arm makes the host the
+    # critical path again, the correction is one multiply and the measurement
+    # is recorded in `docs/design/DECLINED_OPTIMIZATIONS.md` entry E15.
+    dispatch_features(draw_slot, n_slots, cells)
 
 
 def oblivious_score_plane(
@@ -1624,6 +1760,44 @@ def oblivious_score_plane(
             "an oblivious level sits at a nonnegative depth, got ", depth
         )
     return random_score_plane(
+        stdev,
+        seed,
+        tree_index,
+        depth,
+        features,
+        n_bins,
+        OBLIVIOUS_SCORE_DOMAIN,
+    )
+
+
+def oblivious_score_plane_into(
+    mut dst: List[Float32],
+    offset: Int,
+    stdev: Float64,
+    seed: Int,
+    tree_index: Int,
+    depth: Int,
+    features: List[Int],
+    n_bins: Int,
+) raises:
+    """`oblivious_score_plane` written straight into `dst` at `offset`:
+    `random_score_plane_into` in `OBLIVIOUS_SCORE_DOMAIN`, with the level
+    depth in the site position.
+
+    The relationship to `oblivious_score_plane` is exactly the relationship
+    `random_score_plane_into` has to `random_score_plane`, and it is the same
+    one line of difference: the domain constant. The depth refusal is made
+    here and in the same place in the order, before any store and before the
+    plane's own two refusals, so a caller that reaches the level draw through
+    either function is refused by the identical error.
+    """
+    if depth < 0:
+        raise Error(
+            "an oblivious level sits at a nonnegative depth, got ", depth
+        )
+    random_score_plane_into(
+        dst,
+        offset,
         stdev,
         seed,
         tree_index,
@@ -1884,9 +2058,21 @@ def split_primitives_requested() -> Bool:
 
 
 def noise_stage_parallel_requested() -> Bool:
-    """Whether a noise plane is drawn straight into the staging buffer, in
-    parallel over feature slots, rather than into a fresh `List[Float32]` that
-    is then copied in serially.
+    """Whether a noise plane's slots are drawn in parallel over feature
+    slots rather than serially on one thread.
+
+    **THIS FIRST LINE WAS WRONG AND IS CORRECTED 2026-08-18.** It read
+    "whether a noise plane is drawn straight into the staging buffer, in
+    parallel over feature slots, rather than into a fresh `List[Float32]`
+    that is then copied in serially", which described a saving the code did
+    not take: the switch parallelized the DRAW and left the allocation and
+    the copy exactly where they were, as the paragraph under WHAT IT REMOVES
+    said further down and this line did not. The allocation and the copy are
+    now gone from both arms (`random_score_plane_into`), so the sentence has
+    become true of the code and false of the switch, which is why it is no
+    longer the summary: what this variable selects is the parallel dimension
+    and nothing else. Both arms write the same entries into the same
+    destination at the same indices.
 
     `MOJOTREES_GPU_NOISE_STAGE_PARALLEL=0` forces the old path. Default on,
     because this is the category of change that gets built rather than gated:
@@ -1907,24 +2093,40 @@ def noise_stage_parallel_requested() -> Bool:
     usual float-reassociation caveat and it holds because nothing here is
     summed: every entry is an independent draw stored once.
 
-    WHAT IT REMOVES, MEASURED IN WORK RATHER THAN IN SECONDS. The old path
-    allocated a `slots * n_bins` `List[Float32]` per level, filled it serially
-    on one thread, then copied it element by element into `noise_stage`. At the
-    shipped symmetric default that is 100 trees x 6 levels = 600 planes of
-    25,500 entries: 15.3M serial draws, each with a `log` and a `sqrt`, plus
-    15.3M staging copies, plus 600 allocations, all on one thread sitting
-    between each level and the launch that searches it.
+    WHAT IT REMOVES, MEASURED IN WORK RATHER THAN IN SECONDS. The original
+    path allocated a `slots * n_bins` `List[Float32]` per level, filled it
+    serially on one thread, then copied it element by element into
+    `noise_stage`. At the shipped symmetric default that is 100 trees x 6
+    levels = 600 planes of 25,500 entries: 15.3M serial draws, each with a
+    `log` and a `sqrt`, plus 15.3M staging copies, plus 600 allocations, all
+    on one thread sitting between each level and the launch that searches it.
 
     This switch moves the 15.3M DRAWS across workers, which is the part that
-    carries the `log` and the `sqrt` and therefore the part worth moving. Be
-    precise about what it does not do: the intermediate list still exists and
-    the staging copy still happens, it is merely a pointer copy now rather than
-    a bounds-checked `List.__setitem__` per entry. Writing the draw straight
-    into `noise_stage` would remove the list too, and is not done here because
-    the stager holds `mut self` and handing a closure a pointer into a field of
-    it is a bigger change than this switch is asking for. The remaining copy is
-    a Float32 move per entry with no libm call in it, so it is not the cost the
-    profile pointed at.
+    carries the `log` and the `sqrt` and therefore the part worth moving.
+
+    WHAT REMOVED THE REST, AND WHY IT IS NOT THIS SWITCH. Until 2026-08-18
+    this paragraph read "be precise about what it does not do: the
+    intermediate list still exists and the staging copy still happens", and
+    it was right about the code and wrong about the first line of this
+    docstring, which had already promised the opposite. The 15.3M copies and
+    the 600 allocations are now gone, on BOTH arms and under no switch,
+    because `random_score_plane_into` takes the destination as a parameter
+    and both `GpuSplitSearcher.stage_random_score` and
+    `stage_random_score_level` hand it `noise_stage` and the record's base
+    offset. The reason given for not doing it -- that the stager holds
+    `mut self` and handing a closure a pointer into a field of it is a
+    bigger change than this switch was asking for -- turned out to cost four
+    locals at each call site: read `noise_stdev`, `noise_seed`, `noise_tree`,
+    `n_bins` and the feature list out of `self` first, and the only argument
+    still touching `self` at the call is the `mut` borrow of `noise_stage`
+    itself, which nothing contends with.
+
+    That change is not gated, because there is nothing for a gate to choose
+    between. A gated arm has two behaviors; this has one. Every entry is
+    `host_random_score_noise` of six arguments, none of which is the buffer
+    it is stored in, so the plane that lands in `noise_stage` is the plane
+    that used to be copied into it, entry for entry, at the same indices.
+    See `random_score_plane_into`.
 
     WHAT IT DOES NOT FIX, STATED SO THE NEXT READER DOES NOT OVERCREDIT IT.
     Stage B still runs on the host, and it has to; see the stage A / stage B
@@ -1932,8 +2134,15 @@ def noise_stage_parallel_requested() -> Bool:
     gain` section header, under WHAT IS BIT-IDENTICAL, AND WHAT CANNOT BE.
     (Named rather than numbered on 2026-08-17; the pointer read `:1239`, which
     had drifted into an unrelated docstring.) This makes the host draw parallel
-    and single-pass. It
+    and, with `random_score_plane_into`, single-pass. It
     does not move the draw to the device, and it does not touch the upload.
+    The upload is `GpuSplitSearcher._copy_noise`, one `enqueue_copy` of
+    `n_features * n_bins` Float32 per record per launch, and on Metal an
+    `enqueue_copy` is a synchronous full-queue drain in both directions
+    (**measured** by disassembly, `docs/GPU_PORTABILITY.md` section 6.1).
+    Nothing on the host side of the draw can remove it; only generating the
+    plane on the device can, and that waits on a cross-backend bit check of
+    stage B.
     """
     return getenv("MOJOTREES_GPU_NOISE_STAGE_PARALLEL") != "0"
 
@@ -7393,24 +7602,40 @@ struct GpuSplitSearcher(Movable):
                 "random_strength keys its draw by node id, which must be"
                 " nonnegative"
             )
-        var slots = self.active_len[record]
-        var plane = random_score_plane(
-            self.noise_stdev,
-            self.noise_seed,
-            self.noise_tree,
+        # DRAWN STRAIGHT INTO `noise_stage`, with no plane in between, since
+        # 2026-08-18. This called `random_score_plane`, which allocated a
+        # `slots * n_bins` list, and then copied that list into `noise_stage`
+        # entry by entry. Both are gone: `random_score_plane_into` writes the
+        # same entries at the same indices of the same buffer, because the
+        # value of an entry is a pure function of
+        # (stdev, seed, tree, node, global feature id, bin) and of nothing
+        # about where it is stored. Old plane index `i` was copied to
+        # `base + i`; new plane index `i` IS `base + i`. See
+        # `random_score_plane_into` for the argument and
+        # `noise_stage_parallel_requested` for what it removes.
+        #
+        # The arguments are read into locals first, and this is a requirement
+        # rather than a style: `self.noise_stage` crosses as a `mut` borrow of
+        # a field, so any other argument that read `self` in the same call
+        # expression would be a second borrow of the same value and Mojo
+        # rejects the pair. `_record_features` in particular is a method call
+        # on `self` and cannot sit in the argument list.
+        var feats = self._record_features(record)
+        var stdev = self.noise_stdev
+        var seed = self.noise_seed
+        var tree_index = self.noise_tree
+        var n_bins = self.n_bins
+        var base = record * self.n_features * n_bins
+        random_score_plane_into(
+            self.noise_stage,
+            base,
+            stdev,
+            seed,
+            tree_index,
             node,
-            self._record_features(record),
-            self.n_bins,
+            feats,
+            n_bins,
         )
-        var base = record * self.n_features * self.n_bins
-        # Pointer copy rather than `self.noise_stage[base + i] = plane[i]`.
-        # Same bytes; what goes away is a bounds-checked `List.__setitem__` per
-        # entry on a path that runs `slots * n_bins` times per node or level.
-        # At the shipped symmetric default that loop ran 15.3M times per fit.
-        var stage_p = self.noise_stage.unsafe_ptr()
-        var plane_p = plane.unsafe_ptr()
-        for i in range(slots * self.n_bins):
-            stage_p.unsafe_store(base + i, plane_p.unsafe_load(i))
         self.noise_node[record] = node
 
     def stage_random_score_level(
@@ -7448,24 +7673,28 @@ struct GpuSplitSearcher(Movable):
             raise Error(
                 "an oblivious level sits at a nonnegative depth, got ", depth
             )
-        var slots = self.active_len[record]
-        var plane = oblivious_score_plane(
-            self.noise_stdev,
-            self.noise_seed,
-            self.noise_tree,
+        # Drawn straight into `noise_stage` since 2026-08-18, for the reasons
+        # `stage_random_score` states above and with the same locals-first
+        # argument-list requirement. This is the twin, so it is the same
+        # change twice: the level's plane lands at
+        # `record * n_features * n_bins + slot * n_bins + b`, which is exactly
+        # where the allocate-and-copy pair used to put it.
+        var feats = self._record_features(record)
+        var stdev = self.noise_stdev
+        var seed = self.noise_seed
+        var tree_index = self.noise_tree
+        var n_bins = self.n_bins
+        var base = record * self.n_features * n_bins
+        oblivious_score_plane_into(
+            self.noise_stage,
+            base,
+            stdev,
+            seed,
+            tree_index,
             depth,
-            self._record_features(record),
-            self.n_bins,
+            feats,
+            n_bins,
         )
-        var base = record * self.n_features * self.n_bins
-        # Pointer copy rather than `self.noise_stage[base + i] = plane[i]`.
-        # Same bytes; what goes away is a bounds-checked `List.__setitem__` per
-        # entry on a path that runs `slots * n_bins` times per node or level.
-        # At the shipped symmetric default that loop ran 15.3M times per fit.
-        var stage_p = self.noise_stage.unsafe_ptr()
-        var plane_p = plane.unsafe_ptr()
-        for i in range(slots * self.n_bins):
-            stage_p.unsafe_store(base + i, plane_p.unsafe_load(i))
         self.noise_node[record] = depth
 
     def _record_features(self, record: Int) -> List[Int]:

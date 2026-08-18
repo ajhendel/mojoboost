@@ -190,7 +190,19 @@ from .apple_histogram_policy import (
 )
 from .binning import BinnedMatrix
 from .categorical import CatBitset, CategoricalSpec, cat_empty
-from .gpu_active_rows import MAX_ROWS, GpuActiveRows, LeafRange, RowRouting
+from .gpu_active_rows import (
+    MAX_ROWS,
+    GpuActiveRows,
+    LeafRange,
+    RowRouting,
+    # The origin widener, imported rather than restated. The oblivious level
+    # build has to hold either this builder's `bins_dev` or the row state's
+    # `cbins_dev` in ONE variable and hand it to the batcher, and those two
+    # carry different origins that nothing widens implicitly; the function's
+    # own docstring is the argument for why that is safe and why the two
+    # alternatives to it are worse.
+    _any_origin_u8,
+)
 from .gpu_binned_layout import check_layout_support
 from .gpu_frontier import LeafWorkItem
 from .gpu_tree_tables import DeviceTreeTables, TreeTablesSnapshot
@@ -3033,6 +3045,50 @@ struct GpuHistogramBuilder(Movable):
         # anything is in flight, so the drain inside `set_shared_features` costs
         # a wait that is already paid.
         self.batcher[0].set_shared_features(self.active)
+        # --- row compaction does not belong on this plane --------------------
+        #
+        # REFUSED, once per tree, and this is the only place that can refuse
+        # it. `MOJOTREES_GPU_ROW_COMPACTION=1` arms `set_row_compaction` from
+        # the environment inside `GpuActiveRows.__init__`, so the arm reaches
+        # every fit including this one, and `docs/design/GROWTH_POLICY_REACH.md`
+        # lists that reach as SUSPECTED ACCIDENTAL. It is accidental, it was
+        # traced, and the trace is below.
+        #
+        # **What an oblivious tree pays.** One rebuild at the root build
+        # (`GpuActiveRows._ensure_compacted`, one `_compact_build_kernel`
+        # launch, reached through the `enqueue_leaf(0)` that
+        # `grow_tree_device_oblivious` makes immediately after this call), plus
+        # two launches per level from `GpuActiveRows._maintain_compaction`, the
+        # scatter and the copy-back, on the descriptor partition every level
+        # enqueues. Six levels, so 1 + 12 = 13 command buffers a tree.
+        #
+        # **What it collects.** The root build alone. Every other histogram a
+        # symmetric tree builds comes from `enqueue_desc_level_children` into
+        # `gpu_leaf_batching.enqueue_device_plan_batch_fused`, which indexes the
+        # dataset's own matrix by row id and has indexed nothing else since the
+        # compacted level read was measured 0.757x and removed; see
+        # `docs/design/DECLINED_OPTIMIZATIONS.md` row C1. So 62 of the 63
+        # histograms a depth-6 tree builds pay the maintenance and read none of
+        # it.
+        #
+        # **Why that is a refusal rather than a slow arm.**
+        # `gpu_resident_round.oblivious_schedule_launches(6, 64, True)` is 55,
+        # and 55 + 13 is 68 against a Metal queue that is 64 deep on the
+        # measured machine and DOES NOT RAISE when it is overrun. The failure
+        # mode is therefore not a slower fit, it is an overrun queue that says
+        # nothing, which is not a state to leave reachable from an environment
+        # variable. Raising here costs one host field read per tree.
+        if self.rows.row_compaction_requested():
+            raise Error(
+                "row compaction is not supported under"
+                " grow_policy=oblivious: nothing in the level build reads the"
+                " compacted planes, so the arm costs one rebuild plus two"
+                " maintenance launches per level (13 on a depth-6 tree) and"
+                " collects nothing but the root build, which puts the tree at"
+                " 68 command buffers against a 64-deep queue that does not"
+                " raise when it is overrun. Unset MOJOTREES_GPU_ROW_COMPACTION,"
+                " or grow leaf-wise."
+            )
         return self.batcher[0].stage_device_plan(
             n_items,
             max_rows,
@@ -3182,6 +3238,21 @@ struct GpuHistogramBuilder(Movable):
         called after the launch, never before: four refusals on that struct read
         the flag this clears.
 
+        **A THIRD SWITCH USED TO DECIDE WHICH MATRIX THE ACCUMULATION INDEXES
+        AND IT MEASURED A LOSS.** `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS=1`
+        pointed the bin read at the permutation-ordered copy `GpuActiveRows`
+        maintains, so a child read `cbins[f * n_rows + begin + j]` instead of
+        gathering `bins[f * n_rows + rows[begin + j]]`, which is the same byte
+        at a contiguous address. At 463,715 x 90, 100 trees, symmetric depth 6,
+        Apple M4, three interleaved repeats, it measured 3.270 s against a
+        2.476 s baseline on the device-MVS arm and 6.329 s against 6.009 s on
+        the host-MVS one, bit-identical models on both pairs. The switch, the
+        launch scalar it set, and the compact-plane ping-pong it needed were
+        removed on 2026-08-18 under `docs/design/LANE_RULES.md` rule 6, and
+        `docs/design/DECLINED_OPTIMIZATIONS.md` C1 closes MEASURED NEGATIVE.
+        This level build indexes the dataset's own matrix by row id and has no
+        other option.
+
         No `max_rows` argument, and that is not an omission. The batch's grid
         comes from the geometry `stage_desc_level_plan` fixed for the tree, so
         there is no per-level bound left for a caller to get wrong.
@@ -3203,6 +3274,7 @@ struct GpuHistogramBuilder(Movable):
         var rows_ptr = self.rows.rows_dev.copy()
         var scratch_ptr = self.rows.scratch_dev.copy()
         var desc_ptr = self.rows.step_dev.copy()
+        var level_bins = _any_origin_u8(self.bins_dev.unsafe_ptr())
         # The branch is here rather than inside the batcher, so that only an
         # oblivious level plan can reach the subtracting arm. A leaf-wise
         # two-item plan also goes through `enqueue_device_plan_batch_fused`,
@@ -3212,7 +3284,7 @@ struct GpuHistogramBuilder(Movable):
         # `gpu_leaf_batching.oblivious_subtract_requested`.
         if oblivious_subtract_requested():
             self.batcher[0].enqueue_device_plan_batch_fused_subtracting(
-                self.bins_dev.unsafe_ptr(),
+                level_bins,
                 rows_ptr.unsafe_ptr(),
                 scratch_ptr.unsafe_ptr(),
                 desc_ptr.unsafe_ptr(),
@@ -3222,7 +3294,7 @@ struct GpuHistogramBuilder(Movable):
             )
         else:
             self.batcher[0].enqueue_device_plan_batch_fused(
-                self.bins_dev.unsafe_ptr(),
+                level_bins,
                 rows_ptr.unsafe_ptr(),
                 scratch_ptr.unsafe_ptr(),
                 desc_ptr.unsafe_ptr(),

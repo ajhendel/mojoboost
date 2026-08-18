@@ -1073,8 +1073,13 @@ def device_gradients(
     `bootstrap_type=No` and `bootstrap_type=Bayesian` both reach the device
     round, but the Bayesian one reaches it only when `random_strength` is 0 as
     well -- `ROUND_BAYESIAN_NOISE_SCALE` routes the pair back here. The third
-    exit is a device MVS draw, which does not exist; the design and its identity
-    claim are the comment block above `sampling.mvs_bootstrap_weights`.
+    exit is a device MVS draw. It EXISTS as of the device-MVS lane and is
+    reached only under `MOJOTREES_GPU_MVS_DEVICE=1`, which is default off; this
+    sentence read "which does not exist" until 2026-08-18, when it was the last
+    place in this file still describing the state before that lane landed. The
+    design and its identity claim are the comment block above
+    `sampling.mvs_bootstrap_weights`, and that claim is that a device draw is
+    equivalent in distribution and per-row reproducible, NOT bit-identical.
     """
     var s = resolve_objective_source(source)
     if s == OBJECTIVE_SOURCE_HOST:
@@ -2461,6 +2466,7 @@ def _grow_tree_gpu_device_search(
             params,
             tree_features,
             n_root,
+            profile,
         )
         # Counted, not timed, exactly as the leaf-wise plane's bracket is: one
         # round trip per tree, `download_desc_tables` at the end, and no clock
@@ -2579,13 +2585,18 @@ def _grow_tree_gpu_device_search(
         # falls through to the loop below rather than being approximated.
         # See gpu_resident_round.mojo.
         #
-        # **It is not timed, and it is now counted.** `profile` is not
-        # threaded into it and should not be: it has no per-node host phases
-        # to time, because the whole point of it is that the host does not
-        # see the nodes, and separating device phases needs fences that would
-        # measure the instrument. So a `PhaseProfile` of a device-search fit
-        # attributes none of the tree's time to a phase, which is the honest
-        # failure rather than a wrong one.
+        # **Its device phases are not timed; its HOST spans now are.** The
+        # standing refusal, which this comment stated as "`profile` is not
+        # threaded into it and should not be", was right about device phases
+        # and covered a question nobody was asking. Separating device phases
+        # needs fences and the fences would measure the instrument, so
+        # `PROF_DEVICE_PLANE` stays one opaque number. But a host-side clock
+        # around a host-side call adds no synchronization, so since 2026-08-18
+        # `profile` IS threaded in, for the `phase_profile host` and `hoststep`
+        # tables alone. A `PhaseProfile` of a device-search fit still
+        # attributes none of the tree's DEVICE time to a phase, which is the
+        # honest failure rather than a wrong one, and now says where the host
+        # thread spent the same interval.
         #
         # What changed on 2026-08-16 is that it no longer comes back *empty*.
         # The bracket below opens and closes the tree and charges the plane's
@@ -2643,6 +2654,7 @@ def _grow_tree_gpu_device_search(
                     params,
                     tree_features,
                     n_root,
+                    profile,
                 )
                 profile.charge(PROF_TRANSFER, n_root, 0, syncs=1)
                 # Timed as one opaque phase, for the reason written at the
@@ -4251,9 +4263,13 @@ def _train_gpu_rounds[
     `goss_round`, before growth -- and does exactly what it does there: MVS
     scales the derivatives and writes its kept rows into `bag`, the Bayesian
     bootstrap scales the derivatives and leaves `bag` alone. The trees are
-    still grown on the device. This is the arm an MVS fit lands on, because
-    `device_gradients` reports `ROUND_MVS_HOST_MAGNITUDES` for it and AUTO
-    resolves that by taking the arm that works.
+    still grown on the device. This is the arm an MVS fit lands on BY DEFAULT,
+    because `device_gradients` reports `ROUND_MVS_HOST_MAGNITUDES` for it and
+    AUTO resolves that by taking the arm that works. Under
+    `MOJOTREES_GPU_MVS_DEVICE=1`, default off, it does not land here at all:
+    the threshold is solved on the device and no row compaction happens, so
+    `min_data_in_leaf`, which counts rows rather than mass, sees a different
+    leaf population than it sees on this arm.
 
     On the device-gradient arm there is no host gradient vector to scale, and
     there does not need to be one for the Bayesian bootstrap: its draw is a
@@ -5119,12 +5135,14 @@ def train_gpu(
     Which of this loop's two arms runs it depends on which sampler it is:
     the Bayesian draw reads no gradient and is served by the device round
     through `GpuObjectiveState`'s weight plane, while MVS solves its keep
-    threshold from the round's gradient magnitudes and drops rows, so it
-    resolves to the host-gradient arm, where `sampling.bootstrap_round` runs
-    exactly as it does in `boosting.train` and the trees are still grown on
-    the device. See `_train_gpu_rounds` for both, and
-    `gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES` for why the second is not a
-    permanent property of MVS on this backend.
+    threshold from the round's gradient magnitudes and drops rows, so BY
+    DEFAULT it resolves to the host-gradient arm, where
+    `sampling.bootstrap_round` runs exactly as it does in `boosting.train` and
+    the trees are still grown on the device. See `_train_gpu_rounds` for both,
+    and `gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES` for why the second is not a
+    permanent property of MVS on this backend. It has already stopped being
+    one: `MOJOTREES_GPU_MVS_DEVICE=1`, default off, solves the threshold on the
+    device and takes neither the host arm nor a row compaction.
 
     `row_unroll` is a launch shape rather than a numeric option and defaults
     to the shape this trainer ships. It is an argument at all so that a
@@ -5204,8 +5222,11 @@ def train_gpu(
             resolve_objective_source(objective_source)
             == OBJECTIVE_SOURCE_DEVICE
         )
-        # `bootstrap` reaches this decision because MVS cannot be drawn on
-        # the device round (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`), and
+        # `bootstrap` reaches this decision because MVS is not drawn on the
+        # device round BY DEFAULT (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`).
+        # It CAN be, under `MOJOTREES_GPU_MVS_DEVICE=1`, which is default off;
+        # this comment said "cannot" until 2026-08-18. Under that switch the
+        # routing described below is not the one taken. And
         # the resolution AUTO makes is the arm that CAN draw it rather than a
         # dropped sampler: the host-gradient arm of `_train_gpu_rounds` runs
         # `sampling.bootstrap_round` exactly as `boosting.train` does and
@@ -5349,12 +5370,14 @@ def train_gpu(
     Which of this loop's two arms runs it depends on which sampler it is:
     the Bayesian draw reads no gradient and is served by the device round
     through `GpuObjectiveState`'s weight plane, while MVS solves its keep
-    threshold from the round's gradient magnitudes and drops rows, so it
-    resolves to the host-gradient arm, where `sampling.bootstrap_round` runs
-    exactly as it does in `boosting.train` and the trees are still grown on
-    the device. See `_train_gpu_rounds` for both, and
-    `gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES` for why the second is not a
-    permanent property of MVS on this backend.
+    threshold from the round's gradient magnitudes and drops rows, so BY
+    DEFAULT it resolves to the host-gradient arm, where
+    `sampling.bootstrap_round` runs exactly as it does in `boosting.train` and
+    the trees are still grown on the device. See `_train_gpu_rounds` for both,
+    and `gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES` for why the second is not a
+    permanent property of MVS on this backend. It has already stopped being
+    one: `MOJOTREES_GPU_MVS_DEVICE=1`, default off, solves the threshold on the
+    device and takes neither the host arm nor a row compaction.
 """
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
@@ -5374,8 +5397,11 @@ def train_gpu(
             resolve_objective_source(objective_source)
             == OBJECTIVE_SOURCE_DEVICE
         )
-        # `bootstrap` reaches this decision because MVS cannot be drawn on
-        # the device round (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`), and
+        # `bootstrap` reaches this decision because MVS is not drawn on the
+        # device round BY DEFAULT (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`).
+        # It CAN be, under `MOJOTREES_GPU_MVS_DEVICE=1`, which is default off;
+        # this comment said "cannot" until 2026-08-18. Under that switch the
+        # routing described below is not the one taken. And
         # the resolution AUTO makes is the arm that CAN draw it rather than a
         # dropped sampler: the host-gradient arm of `_train_gpu_rounds` runs
         # `sampling.bootstrap_round` exactly as `boosting.train` does and
