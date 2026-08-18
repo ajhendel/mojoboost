@@ -489,7 +489,7 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # and raising in the grower on `ExtraTreeParams.is_active()`. The capability
 # landing is not sufficient grounds to remove the gate; the absence of every
 # other reason to refuse the same fit is.
-comptime POLICY_VERSION = 8
+comptime POLICY_VERSION = 9
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -2135,30 +2135,50 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
             0,
         )
     )
-    rules.append(
-        CrossoverEvidence(
-            M4_MULTICLASS_RULE_NAME,
-            M4_MULTICLASS_EVIDENCE_ID,
-            M4_MULTICLASS_MEASURED_ON,
-            API_METAL,
-            APPLE_GEN_M4,
-            # objective: unconstrained. `n_outputs >= 2` below is the
-            # multiclass scope, and it is the exact one; see item 1 in the
-            # docstring for why scoping on the objective code as well would
-            # narrow nothing and would make the rule unreachable from the
-            # three Mojo entry points that declare no objective.
-            OBJECTIVE_UNSPECIFIED,
-            AUTO_GPU_MIN_ROWS,
-            M4_MULTICLASS_MIN_FEATURES,
-            # min_cells: 0, for the same reason as above.
-            0,
-            # max_outputs: 0, which does not constrain. Item 2 in the
-            # docstring is why the class count is bounded below and not
-            # above, and what measurement would close it.
-            0,
-            M4_MULTICLASS_MIN_OUTPUTS,
-        )
-    )
+    # THE MULTICLASS RULE WAS WITHDRAWN ON 2026-08-18. Its constants stay
+    # below this comment so the record of what was claimed survives the
+    # claim, and so a future sweep can reinstate it by restoring one
+    # `rules.append` rather than by reconstructing a scope from prose.
+    #
+    # WHAT FALSIFIED IT. The clause above asked for "an interleaved CPU/GPU
+    # pair at 465,000 x 54 over 7 classes on an M4 where the GPU is not
+    # faster, run in one window on an idle machine".
+    # `bench/results/gbm_bench_2026-08-18/RESULTS.md` is an interleaved
+    # six-arm run at 581,012 x 54 over 7 classes on an M4, three repeats,
+    # 2.9 percent spread, and the GPU arm took 40.894 s against the CPU
+    # arm's 28.077 s. The GPU is not faster. It is 1.45x slower.
+    #
+    # WHY WITHDRAWN RATHER THAN NARROWED. Two differences from the clause
+    # invite narrowing instead: the falsifying run used a leaf budget of 256
+    # where the record used 31, and it used real covertype where the record
+    # used a synthetic imitation of it. Narrowing on the leaf budget would
+    # keep the rule alive on the strength of the same single synthetic
+    # record, and that record is the whole of the rule's evidence. Every
+    # real-data multiclass number this project has ever taken at this shape
+    # has the GPU behind, and there is no measured real-data multiclass GPU
+    # win to lose by withdrawing. The docstring's own standing instruction
+    # is "do not add a rule from reasoning, add one from a recorded sweep",
+    # and narrowing this one to survive its own falsification would be
+    # adding it back from reasoning.
+    #
+    # WHAT THIS COST A USER WHILE IT STOOD. `n_outputs >= 2` and
+    # `n_rows >= 250,000` and `n_features >= 54` are all satisfied by
+    # covertype, which clears the feature bound exactly. So
+    # `MojoTreesClassifier(device="auto")` on that dataset resolved to the
+    # GPU and handed back the slower of the two arms we ship, silently, with
+    # no prompt to check. `auto` was worse than `device="cpu"` on a real,
+    # named, public dataset.
+    #
+    # WHAT WOULD REINSTATE IT. One interleaved CPU/GPU pair on REAL
+    # covertype, 464,958 x 54 over 7 classes, at the leaf budget the record
+    # claims (`num_leaves=31`, `max_depth=-1`, 100 rounds), three or five
+    # repeats in one window. That configuration already exists as the
+    # `multiclass` scenario in `bench/real_data`, so it needs no new code,
+    # no new dataset and no new arm. It holds the leaf budget fixed and
+    # swaps synthetic data for real, which is the one variable the
+    # falsification clause above did not consider. If the GPU wins it, the
+    # rule comes back with a `max_leaves` bound. If it loses, the rule was
+    # never right at any leaf budget and these constants should be deleted.
     return rules^
 
 

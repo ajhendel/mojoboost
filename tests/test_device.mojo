@@ -288,10 +288,14 @@ def _m3_profile() -> GpuProfile:
 
 def test_crossover_rules_carry_their_evidence() raises:
     var rules = crossover_rules()
-    # Two rules: one single output, one multiclass. A third arriving without
-    # this test being edited means somebody installed a threshold and did not
-    # think about its scope.
-    assert_equal(len(rules), 2)
+    # ONE rule, single output. It was two until 2026-08-18, when the
+    # multiclass rule was withdrawn after an interleaved six-arm run on real
+    # covertype (581,012 x 54 over 7 classes, three repeats, 2.9 percent
+    # spread) put the GPU arm at 40.894 s against the CPU arm's 28.077 s.
+    # That is the pair the rule's own falsification clause asked for. A
+    # second rule arriving without this test being edited means somebody
+    # installed a threshold and did not think about its scope.
+    assert_equal(len(rules), 1)
 
     var rule = rules[0].copy()
     assert_equal(rule.name, M4_TRAINING_RULE_NAME)
@@ -320,46 +324,25 @@ def test_crossover_rules_carry_their_evidence() raises:
     assert_true(rule.cite().find(M4_TRAINING_EVIDENCE_ID) >= 0)
     assert_true(rule.cite().find("Apple M4") >= 0)
 
-    # The multiclass rule, pinned the same way. Its evidence is one record
-    # (`bench/results/profile_2026-08-15/RESULTS.md`, 465,000 x 54 over 7
-    # classes, GPU 15.30 s against CPU 25.47 s), and its scope differs from
-    # the rule above in three places, each of which is a decision:
+    # THE MULTICLASS RULE IS GONE, AND THIS IS THE ASSERTION THAT KEEPS IT
+    # GONE. Its constants survive in device_policy.mojo so the record of
+    # what was claimed outlives the claim, which means a reinstatement is
+    # one `rules.append` away and would otherwise be silent. Nothing may
+    # match a multiclass request on evidence.
     #
-    #   - `objective` does not constrain, and `min_outputs` does. Trees per
-    #     round is what the trainers branch on and it is what every
-    #     multiclass entry point declares; three of the four declare no
-    #     objective at all, so an objective-scoped rule would have been
-    #     unreachable from them.
-    #   - `max_outputs` does not constrain, so the class count is bounded
-    #     below and not above. Capping it at the measured seven would send a
-    #     ten-class fit to the CPU while a seven-class fit of the same shape
-    #     went to the device.
-    #   - `min_features` is 54, the feature count the record was taken at,
-    #     and deliberately not rounded down to the other rule's 50.
+    # Why it was withdrawn rather than narrowed to its measured leaf budget:
+    # the falsifying run differed from the record in two ways at once, the
+    # leaf budget (256 against 31) and the data (real covertype against a
+    # synthetic imitation of it), and that single synthetic record was the
+    # whole of the rule's evidence. Narrowing would have kept it alive on
+    # the strength of the record its own falsification called into question.
     #
-    # Any of the three changing without this test being edited is a rule
-    # quietly widening or narrowing past its record.
-    var mc = rules[1].copy()
-    assert_equal(mc.name, M4_MULTICLASS_RULE_NAME)
-    assert_equal(mc.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
-    assert_equal(mc.measured_on, M4_MULTICLASS_MEASURED_ON)
-    assert_equal(mc.api, API_METAL)
-    assert_equal(mc.apple_generation, APPLE_GEN_M4)
-    assert_equal(mc.objective, OBJECTIVE_UNSPECIFIED)
-    assert_equal(mc.min_outputs, M4_MULTICLASS_MIN_OUTPUTS)
-    assert_equal(mc.max_outputs, 0)
-    assert_equal(mc.min_rows, AUTO_GPU_MIN_ROWS)
-    assert_equal(mc.min_features, M4_MULTICLASS_MIN_FEATURES)
-    assert_equal(mc.min_cells, 0)
-    assert_equal(M4_MULTICLASS_MIN_FEATURES, 54)
-    assert_equal(M4_MULTICLASS_MIN_OUTPUTS, 2)
-    assert_true(mc.cite().find(M4_MULTICLASS_EVIDENCE_ID) >= 0)
-    assert_true(mc.cite().find("Apple M4") >= 0)
-
-    # The two rules are complementary on trees per round, which is what
-    # makes them disjoint: no request can match both, so installing the
-    # multiclass rule cannot move a single-output fit.
-    assert_true(rule.max_outputs < mc.min_outputs)
+    # What reinstates it: an interleaved CPU/GPU pair on REAL covertype at
+    # num_leaves=31, which is the `multiclass` scenario already in
+    # bench/real_data. If the GPU wins that, the rule returns with a leaf
+    # budget bound. Restoring it without that run must fail here.
+    for i in range(len(rules)):
+        assert_true(rules[i].min_outputs < 2)
 
     # And the constructor still refuses a rule with nothing under it.
     with assert_raises():
@@ -500,9 +483,15 @@ def test_auto_declines_beside_the_measured_shape() raises:
         ),
         caps,
     )
-    # The control for both: same fixture, same class count, at the shape the
-    # multiclass rule does cover. Without this the two declines above could
-    # both be passing because no multiclass request ever reaches a rule.
+    # The control, INVERTED on 2026-08-18. This used to assert that the same
+    # fixture at the shape the multiclass rule covered reached the GPU, and
+    # it existed so the two declines above could not both be passing for the
+    # trivial reason that no multiclass request ever reached a rule. With
+    # the rule withdrawn there is no covered shape, so the assertion becomes
+    # its opposite: a multiclass request that clears every bound the
+    # withdrawn rule had must now stay on the CPU. That is exactly the
+    # request `MojoTreesClassifier(device="auto")` made on covertype while
+    # the rule stood, and it was handed the slower of the two arms we ship.
     var covered = decide_device(
         _request(
             AUTO_DEVICE,
@@ -512,7 +501,7 @@ def test_auto_declines_beside_the_measured_shape() raises:
         ),
         caps,
     )
-    assert_equal(covered.selected_device, GPU_DEVICE)
+    assert_equal(covered.selected_device, CPU_DEVICE)
     assert_equal(covered.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
     # Another objective, and an undeclared one.
     _declines(
