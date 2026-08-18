@@ -3767,8 +3767,30 @@ def _subtract_histogram_arrays(
     size: Int,
     const_h: Bool,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    widths: List[Int] = [],
+    n_bins: Int = 0,
 ) raises:
     """Parallel SIMD sibling subtraction over independent array borrows.
+
+    **`widths` STORES ZERO in the cells no row can occupy instead of
+    subtracting there.** `widths[f]` is feature f's realized bin count. On
+    covertype 44 of 54 features have two bins against a 255-bin rectangle, so
+    81 percent of the cells this pass touches are padding, and today each of
+    them costs six streams -- read parent gh and count, read child gh and
+    count, write out gh and count -- to compute `0.0 - 0.0`. With a width
+    table they cost two.
+
+    The zero must still be STORED. `out` is a pooled buffer whose contents are
+    undefined, which is exactly why this function's contract is that it writes
+    every element; skipping a cell would leave another node's statistics in it
+    and the split scan reads all `n_bins` of every feature.
+
+    Bit-identical under one invariant: every histogram in circulation holds
+    zero in its trailing cells. That holds by construction, since the
+    accumulate kernels zero the full rectangle before scattering and
+    `Histogram.zeroed` starts there, so the arithmetic being replaced is
+    `0.0 - 0.0`, whose result is the `+0.0` the store writes. An empty
+    `widths` keeps the whole-rectangle path.
 
     Keeping this worker outside `Histogram` field access gives each buffer a
     stable origin that Mojo's ownership checker can carry into the parallel
@@ -3887,6 +3909,54 @@ def _subtract_histogram_arrays(
     var ops = subtract_ops_for_planes(size, 2) if const_h else subtract_ops(
         size
     )
+
+    # Dispatched over FEATURES, because a feature's realized bins are a
+    # contiguous run and its padding is the rest of its stride.
+    #
+    # Self-contained rather than reusing `subtract_block`: a closure calling
+    # another closure that writes the same buffers is an aliasing error Mojo
+    # refuses. The arithmetic is repeated literally -- same operands, same
+    # order, same `const_h` elision -- because the extent is the only thing
+    # meant to change.
+    if n_bins > 0 and len(widths) * n_bins == size:
+        var n_feat = len(widths)
+        var wp = widths.unsafe_ptr()
+
+        def subtract_features(fstart: Int, fend: Int) {imm}:
+            for f in range(fstart, fend):
+                var base = f * n_bins
+                var w = wp.unsafe_load(f)
+                if w > n_bins:
+                    w = n_bins
+                if w < 0:
+                    w = 0
+                for j in range(base, base + w):
+                    var dc = pc.unsafe_load(j) - cc.unsafe_load(j)
+                    oc.unsafe_store(j, dc)
+                    if const_h:
+                        ogh.unsafe_store(
+                            2 * j,
+                            SIMD[DType.float64, 2](
+                                pgh.unsafe_load(2 * j)
+                                - cgh.unsafe_load(2 * j),
+                                Float64(dc),
+                            ),
+                        )
+                    else:
+                        ogh.unsafe_store(
+                            2 * j,
+                            pgh.unsafe_load[width=2](2 * j)
+                            - cgh.unsafe_load[width=2](2 * j),
+                        )
+                for j in range(base + w, base + n_bins):
+                    ogh.unsafe_store(2 * j, SIMD[DType.float64, 2](0.0))
+                    oc.unsafe_store(j, 0)
+
+        dispatch_feature_ranges_with(
+            settings, subtract_features, n_feat, ops
+        )
+        return
+
     dispatch_rows_with(settings, subtract_block, size, ops)
 
 
@@ -3897,6 +3967,7 @@ def subtract_histogram_into(
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
     const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
+    widths: List[Int] = [],
 ) raises:
     """`subtract_histogram` into a caller-owned buffer. Every element is
     written, so unlike the accumulating builders this one needs no zeroing
@@ -3944,6 +4015,8 @@ def subtract_histogram_into(
         parent.n_features * parent.n_bins,
         _resolve_const_hessian(const_hessian, const_hessian_env),
         settings,
+        widths,
+        parent.n_bins,
     )
 
 

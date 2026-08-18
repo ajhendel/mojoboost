@@ -74,7 +74,7 @@ from .apple_cpu_policy import (
     env_bin_layout,
     plan_row_block_count,
 )
-from .binning import BinnedMatrix
+from .binning import BinnedMatrix, histogram_widths
 from .cegb import (
     CegbLedger,
     CegbNodeCosts,
@@ -1723,6 +1723,11 @@ struct GrowScratch(Movable):
 
     var pool: _HistPool
     var rows_pool: _RowPool
+    var widths: List[Int]
+    """Per-feature bin widths, computed once per fit and empty until asked
+    for. `histogram_widths` costs a pass over the whole binned matrix, so it
+    is cached here rather than derived per node; `GrowScratch` is fit-scoped
+    and `prepare` deliberately does not clear it."""
     var pairs: List[Float64]
     var settings: DispatchSettings
     var bin_layout: Int
@@ -1750,6 +1755,7 @@ struct GrowScratch(Movable):
     def __init__(out self, n_features: Int, n_bins: Int) raises:
         self.pool = _HistPool(n_features, n_bins)
         self.rows_pool = _RowPool()
+        self.widths = List[Int]()
         self.pairs = List[Float64]()
         # Which copy of the bin ids the node builds read, resolved here for
         # the same reason `settings` is: `MOJOTREES_CPU_BIN_LAYOUT` is read
@@ -1833,6 +1839,13 @@ struct GrowScratch(Movable):
         # is constructed rather than at the first histogram build. Earlier,
         # and with the same message.
         self.settings = DispatchSettings.resolve()
+
+    def ensure_widths(mut self, data: BinnedMatrix) raises:
+        """Fill `widths` once per fit. Idempotent and cheap after the first
+        call; the first costs one pass over the binned matrix."""
+        if len(self.widths) == data.n_features:
+            return
+        self.widths = histogram_widths(data)
 
     def prepare(mut self, n_features: Int, n_bins: Int) raises:
         """Point this scratch at a histogram shape, discarding pooled buffers
@@ -2779,6 +2792,7 @@ def _grow_oblivious_levels(
                 subtract_histogram_into(
                     right_hist, level_hists[k], left_hist, const_hessian,
                     scratch.settings, const_h_env,
+                    scratch.widths,
                 )
                 profile.note_node()
                 profile.charge(
@@ -2810,6 +2824,7 @@ def _grow_oblivious_levels(
                 subtract_histogram_into(
                     left_hist, level_hists[k], right_hist, const_hessian,
                     scratch.settings, const_h_env,
+                    scratch.widths,
                 )
                 profile.note_node()
                 profile.charge(
@@ -3461,6 +3476,10 @@ def grow_tree_leaves_profiled(
     # pooled buffer, so sibling subtraction, leaf values, and split search all
     # read the shape they always read.
     scratch.prepare(data.n_features, data.n_bins)
+    # Once per fit: `GrowScratch` is fit-scoped and `ensure_widths` returns
+    # immediately after the first call. The sibling subtraction uses it to skip
+    # the cells no row can occupy, which on covertype is 81 percent of them.
+    scratch.ensure_widths(data)
     var bundle_scratch = Histogram.zeroed(0, 0)
     if bundling.active:
         bundle_scratch = Histogram.zeroed(
@@ -3918,6 +3937,7 @@ def grow_tree_leaves_profiled(
             subtract_histogram_into(
                 right_hist, parent_hist, left_hist, const_hessian,
                 scratch.settings, const_h_env,
+                scratch.widths,
             )
             # Filed at the *derived* child's size: it is that child's
             # histogram that comes out, and the point of the trick is that a
@@ -3952,6 +3972,7 @@ def grow_tree_leaves_profiled(
             subtract_histogram_into(
                 left_hist, parent_hist, right_hist, const_hessian,
                 scratch.settings, const_h_env,
+                scratch.widths,
             )
             profile.note_node()
             profile.charge(

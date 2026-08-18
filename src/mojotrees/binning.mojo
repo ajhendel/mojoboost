@@ -2300,6 +2300,42 @@ def row_major_fits_budget(n_rows: Int, row_stride: Int, max_bytes: Int) -> Bool:
     return n_rows * row_stride <= max_bytes
 
 
+def histogram_widths(data: BinnedMatrix) raises -> List[Int]:
+    """Per-feature bin width a histogram consumer may bound itself by.
+
+    `max(observed_bins[f], missing_bin[f] + 1)` and **the second term is not
+    optional**. `_row_major_widths` reports the highest bin id present in the
+    data plus one, but a numeric feature reserves its missing-value bin from
+    the BINNING SAMPLE, so a matrix transformed later with the same mapper can
+    carry a reserved missing bin at an index above every value it actually
+    holds. Bounding by the observed width alone would then put the split
+    scan's missing-bin read one cell past the feature and into the next one.
+    Reachable through `train_more`, a validation matrix, `external_memory`
+    and `model_editing.refit`.
+
+    A width is an UPPER BOUND on the cells a feature can occupy, so every
+    consumer may skip past it and none may assume a cell inside it is
+    non-empty.
+
+    Costs one pass over `bins`. Intended to be computed once per fit and
+    cached, not per node: `GrowScratch` is what holds it.
+    """
+    var widths = List[Int]()
+    var nf = data.n_features
+    if nf <= 0 or data.n_rows <= 0 or len(data.bins) != data.n_rows * nf:
+        return widths^
+    widths.resize(nf, 1)
+    _row_major_widths(data.bins, data.n_rows, nf, widths)
+    for f in range(nf):
+        if f < len(data.missing_bin):
+            var m = data.missing_bin[f] + 1
+            if m > widths[f]:
+                widths[f] = m
+        if widths[f] > data.n_bins:
+            widths[f] = data.n_bins
+    return widths^
+
+
 def _row_major_widths(
     bins: List[UInt8], n_rows: Int, n_features: Int, mut width_of: List[Int]
 ) raises:
