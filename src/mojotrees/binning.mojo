@@ -1357,6 +1357,80 @@ def first_above_sorted(col: List[Float64], lo: Int, hi: Int, w: Float64) -> Int:
     return left
 
 
+def env_sorted_tie_repair() -> Bool:
+    """`MOJOTREES_BINNING_SORTED_TIE_REPAIR=1`: repair tied quantile
+    boundaries with `first_above_sorted` on a column that is ALREADY in
+    ascending order, instead of with `resolve_above_unsorted`.
+
+    Default OFF, so the fit is instruction-for-instruction the fit it was.
+
+    WHY IT EXISTS. `resolve_ranks` sorts the whole column outright whenever
+    its buckets gather more than a quarter of what they were given (the
+    "quarter rule" in the module docstring). On year_prediction_msd's
+    463,715 x 90 that fires on 89 of the 90 columns, because the columns
+    straddle zero: `order_key` puts the negatives and the positives at
+    opposite ends of the 64-bit key line, so `kmax - kmin` is near the full
+    line, `_bucket_shift` picks a shift of 48, and only about 500 of the
+    65,536 buckets are ever populated. With 508 requested ranks over ~500
+    populated buckets, nearly every bucket holds a rank, so `gathered`
+    approaches `n` and the fallback sorts. The column is therefore ascending
+    when the tie repair runs -- and `resolve_above_unsorted` then rediscovers
+    by brute force what a sorted column already answers with a binary search.
+
+    THE ARITHMETIC, on that dataset. 59 of the 90 columns have at least one
+    tied boundary (170 tied boundaries in total, out of 22,860). Each of
+    those 59 columns runs `resolve_above_unsorted` over all 200,000 sampled
+    values at an 8-step data-dependent binary search apiece: 94.4 million
+    mispredicting compares, to repair 170 numbers. `first_above_sorted` over
+    the same 254 boundaries is 254 * 18 = 4,572 compares, plus the 200,000
+    perfectly-predicted compares this switch pays to VERIFY that the column
+    really is ascending. That is about 350x less work in the repair and a
+    40x cheaper probe than the pass it replaces.
+
+    BIT-IDENTITY, and it is a proof rather than a hope. The probe accepts a
+    column only when `col[i] < col[i - 1]` holds nowhere, so every value
+    above rank `idx` is at least `col[idx - 1] == below[j]`, and
+    `first_above_sorted` returns the first rank whose value is strictly
+    greater -- which is exactly `min {v in col : v > below[j]}`, the value
+    `resolve_above_unsorted` computes. The two also agree on the SIGN OF
+    ZERO, which is the only way two doubles can be one value and two bit
+    patterns: `resolve_above_unsorted` keeps the first of the equal minima in
+    scan order, and on an array the probe has accepted the equal minima are
+    contiguous, so the first in scan order is the one at the rank
+    `first_above_sorted` returns. Neither can pick `-0.0` over `+0.0` when
+    the boundary itself is a zero, because `0.0 > -0.0` is false and the
+    whole run is skipped by both.
+
+    THE MEASUREMENT THAT DELETES THIS SWITCH. One interleaved A/B of the
+    binning phase on the 463,715 x 90 real cell, this variable `1` against
+    unset, with the fitted edges compared byte for byte between the arms. A
+    win with identical edges makes this the only behavior and the variable
+    goes; a loss, or one edge that moves, deletes the code instead.
+    """
+    return getenv("MOJOTREES_BINNING_SORTED_TIE_REPAIR") == "1"
+
+
+def is_ascending(col: List[Float64], n: Int) -> Bool:
+    """Whether `col[0, n)` is non-decreasing under `<`.
+
+    One streaming, perfectly-predicted compare per value, and it reads the
+    same buffer the caller has just finished writing, so it is L2-resident.
+    It exists so that `env_sorted_tie_repair`'s fast path is VERIFIED rather
+    than inferred from which branch `resolve_ranks` happened to take: the
+    proof of bit-identity in that docstring rests on this predicate and on
+    nothing else about how the column got that way.
+
+    `-0.0` and `+0.0` are equal under `<`, so a run of both in either order
+    passes. That is deliberate and is what the sign-of-zero paragraph in
+    `env_sorted_tie_repair` argues about.
+    """
+    var p = col.unsafe_ptr()
+    for i in range(1, n):
+        if p.unsafe_load(i) < p.unsafe_load(i - 1):
+            return False
+    return True
+
+
 def resolve_above_unsorted(
     col: List[Float64],
     below: List[Float64],
@@ -3533,6 +3607,11 @@ def fit_bins[
     var missing_p = missing_bin.unsafe_ptr()
     var feat_p = features.unsafe_ptr()
     var select_min_rows = env_select_min_rows()
+    # Read ONCE, here, for the reason `select_min_rows` is: a per-column
+    # environment read inside the dispatched loop would price 90 `getenv`
+    # calls into the phase this switch exists to shorten, and a variable that
+    # changed mid-fit would give two columns two rules.
+    var sorted_tie_repair = env_sorted_tie_repair()
     ref spec = cats
 
     # Drawn once, before any feature is dispatched, so every feature is fit
@@ -3769,7 +3848,27 @@ def fit_bins[
                     # the extra pass; one of distinct values already has its
                     # answer.
                     if tied:
-                        resolve_above_unsorted(col, below, above, cand, found)
+                        # AND `resolve_ranks` may have sorted the column on
+                        # its way to those ranks -- the quarter rule fires on
+                        # 89 of the 90 columns of the 463,715 x 90 real cell
+                        # -- in which case the answer is a binary search per
+                        # boundary rather than a search per row. The probe is
+                        # what makes that a fact about this buffer instead of
+                        # an inference about which branch ran; see
+                        # `env_sorted_tie_repair` for the proof that the two
+                        # spellings agree bit for bit, sign of zero included.
+                        if sorted_tie_repair and is_ascending(col, n_valid):
+                            above.clear()
+                            for j in range(len(idxs)):
+                                var w = below[j]
+                                var e = first_above_sorted(
+                                    col, idxs[j], n_valid, w
+                                )
+                                above.append(col[e] if e < n_valid else w)
+                        else:
+                            resolve_above_unsorted(
+                                col, below, above, cand, found
+                            )
                 else:
                     sort(col)
                     for j in range(len(idxs)):
