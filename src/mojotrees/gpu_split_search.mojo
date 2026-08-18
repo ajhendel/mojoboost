@@ -3682,16 +3682,63 @@ def _scan_slot_wide_primitive_kernel(
 # already runs, and the launch count is unchanged at two -- this scan, then
 # `_reduce_slots_kernel` over one record instead of over a frontier.
 
-comptime OBLIVIOUS_MAX_LEAVES = 64
-"""Leaves in one oblivious level this kernel will scan, which is `2 ** 6` and
-therefore CatBoost's default depth exactly.
+comptime OBLIVIOUS_MAX_LEAVES = 256
+"""Leaves in one oblivious level this kernel will scan, which is `2 ** 8`.
 
-A bound rather than a preference: the per-leaf scan state below lives in a
-threadgroup allocation sized at compile time, and at fifteen words a leaf that
-is 3,840 bytes, against the 3,072 `WIDE_SCAN_SHARED_BYTES` already reserves.
-Depth 7 would double it and also lands at 71 command buffers per tree, over
-the queue's knee whatever this kernel does, so the two limits agree about
-where to stop.
+**RAISED FROM 64 ON 2026-08-18, AND THE OLD VALUE IS WHY THIS DOCSTRING IS
+WORTH READING TWICE.** It used to read: "which is `2 ** 6` and therefore
+CatBoost's default depth exactly. A bound rather than a preference: the
+per-leaf scan state below lives in a threadgroup allocation sized at compile
+time, and at fifteen words a leaf that is 3,840 bytes, against the 3,072
+`WIDE_SCAN_SHARED_BYTES` already reserves. Depth 7 would double it and also
+lands at 71 command buffers per tree, over the queue's knee whatever this
+kernel does, so the two limits agree about where to stop."
+
+Every load-bearing clause in that paragraph was wrong, and the ceiling turned
+users away for two days on the strength of it.
+
+**It was anchored to a competitor's default parameter.** "CatBoost's default
+depth exactly" is the reason the number is 64, and there is no citation
+anywhere in this repository for CatBoost's own GPU depth LIMIT. A default is
+not a limit. We hardened somebody else's parameter choice into our own
+refusal.
+
+**The memory arithmetic described the wrong kernel and added a term that does
+not belong.** Fifteen words is `_scan_slot_oblivious_kernel`, the narrow form,
+which has been the escape hatch since the wide form became the default on
+2026-08-17 (`oblivious_wide_scan_requested`, spelled `!= "0"`). The wide form
+allocates TWELVE shared arrays, because `run_g`/`run_h`/`run_c` moved into
+registers, and its own docstring says it "uses strictly LESS threadgroup
+memory than the narrow one". And `WIDE_SCAN_SHARED_BYTES` belongs to
+`_scan_slot_wide_kernel`, a different kernel and a different launch;
+threadgroup memory is per launch, so nothing adds. The real budget:
+
+    depth 6:  64 leaves    3,084 bytes
+    depth 7: 128 leaves    6,156 bytes
+    depth 8: 256 leaves   12,300 bytes   <- fits, 4 KB spare
+    depth 9: 512 leaves   24,588 bytes   <- this is where it binds
+
+against `FALLBACK_SHARED_MEMORY_PER_BLOCK` of 16,384, which is the
+CONSERVATIVE number; `apple_gpu_policy.OBSERVED_M4_SHARED_BYTES` reads 32,768
+from hardware. So depth 8 needed no device query and no specialization.
+
+**And the 71 was from a superseded function.** It is
+`oblivious_launch_census(7)`, whose own docstring calls itself a frozen
+registered prediction for a schedule that did not exist yet. The built
+schedule, `oblivious_schedule_launches`, returns 63 at depth 7 and 73 at
+depth 8. Depth 7 was already under the knee and was refused anyway. The knee
+is in any case a throttle and not a cliff (`docs/GPU_PORTABILITY.md` 6.2),
+and the fastest arm this package ships runs 2,303 command buffers per tree
+past it.
+
+**What actually bound, and what nobody wrote down**, was one leaf per thread
+in step 1 of the wide kernel against `OBLIVIOUS_WIDE_THREADS = 64`. That is
+now a strided loop and the comment there carries the account.
+
+Depth 9 is the next real bound and it is threadgroup memory this time, at
+24,588 bytes against the 16,384 conservative budget. Reaching it wants either
+a device capability query or comptime-specializing the two Cosine
+accumulators out of an L2 level, which would take twelve words to ten.
 
 Thirteen of the fifteen words are the L2 scan's and were there before Cosine.
 The two Cosine adds -- `un_num` and `un_den`, a leaf's unsplit accumulator
@@ -4925,12 +4972,33 @@ def _scan_slot_oblivious_wide_kernel(
         out_i[unsafe_offset = io + IREC_BIN] = Int32(-1)
         out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(-1)
 
-    # Step 1: one leaf per thread. Int32 sums over that leaf's own bins in
-    # ascending order, then the Float32 constants that are pure functions of
-    # them. `nl <= OBLIVIOUS_MAX_LEAVES == OBLIVIOUS_WIDE_THREADS`, so a level
-    # is covered exactly and wider threads idle here.
-    if tid < nl:
-        var l = tid
+    # Step 1: leaves strided across threads. Int32 sums over each leaf's own
+    # bins in ascending order, then the Float32 constants that are pure
+    # functions of them.
+    #
+    # **THIS WAS `if tid < nl` WITH ONE LEAF PER THREAD UNTIL 2026-08-18, AND
+    # THAT IDENTITY WAS THE REAL DEPTH CEILING.** The comment here read "`nl
+    # <= OBLIVIOUS_MAX_LEAVES == OBLIVIOUS_WIDE_THREADS`, so a level is
+    # covered exactly and wider threads idle here", and it was correct: at 64
+    # leaves and 64 threads one leaf per thread covers a level and nothing
+    # more. Above 64 it silently covers only the first 64.
+    #
+    # Three docstrings blamed the ceiling on threadgroup memory and on the
+    # command queue, and NONE of them named this line. Both of those bounds
+    # turned out not to bind: the wide kernel's twelve shared arrays are
+    # 12,300 bytes at 256 leaves against a 16,384 conservative budget, and
+    # the queue is a throttle rather than a cliff (GPU_PORTABILITY 6.2). The
+    # thing that actually stopped depth 7 was this `if`.
+    #
+    # A stride preserves the arithmetic exactly, which is why it is the
+    # right shape rather than a wider block. Each leaf's sums are private to
+    # that leaf: the loop reads only that leaf's own bin range and writes
+    # only that leaf's own slot in each shared table. No thread accumulates
+    # across leaves here, so which thread runs which leaf cannot move a bit.
+    # The cross-leaf fold in step 2 is where order matters, and it is
+    # unchanged: still ascending over `range(nl)`, still on every thread.
+    var l = tid
+    while l < nl:
         var lnt = (Int(leaf_base) + l) * NODE_WORDS
         var lb = (
             Int(node_tab[unsafe_offset = lnt + NODE_HIST_BASE][0]) + f * nb
@@ -4977,6 +5045,7 @@ def _scan_slot_oblivious_wide_kernel(
             mis_g[unsafe_offset=l] = Int32(0)
             mis_h[unsafe_offset=l] = Int32(0)
             mis_c[unsafe_offset=l] = Int32(0)
+        l += OBLIVIOUS_WIDE_THREADS
     barrier()
 
     # Step 2: the level's cross-leaf Float32 sums, folded ascending by EVERY
@@ -6578,8 +6647,10 @@ def _launch_oblivious_search(
                     " leaves is past the ",
                     OBLIVIOUS_MAX_LEAVES,
                     " this scan reserves per-leaf state for, which is depth"
-                    " 6 and CatBoost's default; depth 7 is over the measured"
-                    " 64-buffer queue knee whatever this kernel does",
+                    " 8. Above that the twelve shared arrays exceed the"
+                    " conservative 16,384-byte threadgroup budget; raising it"
+                    " needs a device capability query or the Cosine"
+                    " accumulators specialized out of an L2 level",
                 )
             )
         check_score_function(score_function)

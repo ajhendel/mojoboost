@@ -2047,7 +2047,7 @@ def oblivious_reason_name(reason: Int) -> String:
     if reason == OBLIVIOUS_OK:
         return String("ok")
     if reason == OBLIVIOUS_DEPTH:
-        return String("max_depth outside 1..6")
+        return String("max_depth outside 1..8")
     if reason == OBLIVIOUS_LEVEL_HISTOGRAM:
         return String("the histogram batcher cannot hold a whole level")
     if reason == OBLIVIOUS_ROW_RANGES:
@@ -2111,7 +2111,7 @@ def oblivious_device_supported(
     """
     if params.grow_policy != GROW_OBLIVIOUS:
         return OBLIVIOUS_TABLES
-    if params.max_depth < 1 or params.max_depth > 6:
+    if params.max_depth < 1 or params.max_depth > 8:
         return OBLIVIOUS_DEPTH
     if builder.cats.any_categorical():
         return OBLIVIOUS_CATEGORICAL
@@ -3901,7 +3901,7 @@ def grow_tree_device_oblivious(
         raise Error("a tree needs at least one active feature")
     if not builder.desc_tables_open():
         raise Error("open_resident_tables has not run on this builder")
-    if params.max_depth < 1 or params.max_depth > 6:
+    if params.max_depth < 1 or params.max_depth > 8:
         raise Error(
             "grow_policy=oblivious on the device is implemented for max_depth"
             " in [1, 6]; see OBLIVIOUS_DEPTH"
