@@ -647,17 +647,101 @@ keys on:
 ```
 
 **The launch fills less than six tenths of one block per SM on a 170-SM
-device.** Occupancy is not the issue; the grid is simply too small for the
-part. `gpu_tiling.mojo` says in its own comments that `target_blocks` is 80
-"on the 10-core Apple M4 this project is developed on", and that is the
-geometry this run inherited on a device with 17x the multiprocessor count.
+device.** The dataset is too small for the part. This is NOT a geometry
+defect, and an earlier revision of this record said it was. The correction
+is kept in full below because the mistake is more instructive than the
+number.
 
-This is precisely the evidence this document requires before any
-device-specific tuning is allowed ("a phase breakdown from `pixi run
-gpu-validate` on the target device"). It is a launch-geometry finding, not a
-kernel-efficiency finding, and the two should not be conflated: nothing here
-says the kernels are slow, only that most of the machine was never given
-work. No tuning change is justified by one shape at 10,000 rows.
+**What actually happened, arithmetically.** The policy did scale with the
+device. `target_blocks_for` (`gpu_tiling.mojo:851`) is
+`sm_count * blocks_per_sm_for(...)`, which on this part is `170 * 8 = 1360`,
+seventeen times the M4's 80. It asked for 1360 blocks and got 100. The
+binding term was `tiles_by_rows` (`gpu_tiling.mojo:582`):
+
+```text
+min_rows_per_tile = max(8 * 255 bins, 4 * 256 threads) = 2040
+tiles_by_rows     = ceil(10000 / 2040)                 = 5
+by_occupancy      = ceil(1360 / 20 features)           = 68
+n_tiles           = min(68, 5)                         = 5
+grid_dim          = 20 x 5 = 100 blocks / 170 SMs      = 0.588
+```
+
+The device asked for 68 tiles per feature and the row supply granted 5. The
+term that clamped it, `MIN_ROWS_PER_TILE_BIN_FACTOR = 8`
+(`gpu_tiling.mojo:147`) times the dataset's own 255 bins, **contains no
+device input whatsoever**. Multiprocessor count, shared memory, the partial
+budget and `MAX_GRID_DIM_Y` all bound nothing here.
+
+**The shape was labeled as this case before the run.** The default sweep in
+`bench_gpu_validation.mojo:394-403` describes its four shapes as "Small
+(launch-overhead bound), square, wide, and tall". 10,000 x 20 is the one
+designated launch-overhead bound. It is the corner built to starve, and it
+is the only shape that completed.
+
+The same arithmetic on the other three, on these caps, predicts they fill
+the device with no code change: 100,000 x 100 gives 8.24 blocks/SM,
+50,000 x 400 gives 9.41, and 1,000,000 x 20 gives 8.00. Those are
+predictions from the shipped rule and are **not yet measured**; measuring
+them is the cheapest way to close this question.
+
+Note also that 8 blocks/SM is arithmetically incoherent at 10,000 rows: it
+would need 68 tiles, so 148 rows per tile against a 256-wide block, leaving
+40% of every block's lanes with no row at all. Under the current rules the
+device-wide target first becomes reachable at roughly **137k rows** at 20
+features, one block per SM at about **16.3k**.
+
+For contrast, this identical shape fills the M4 exactly: `ceil(80/20) = 4`
+tiles, 80 blocks on 10 cores, 8.0 blocks per core. The device grew 17x and
+the dataset did not.
+
+#### The finding that survived, and it points the other way
+
+```text
+  max_threads_per_multiprocessor  1536
+  max_blocks_per_multiprocessor     24
+  block_dim                        256
+```
+
+At 256 threads this device admits `1536 / 256 = 6` co-resident blocks per
+SM. `TARGET_BLOCKS_PER_SM = 8` (`gpu_tiling.mojo:130`) therefore asks for
+**33% more blocks than one wave can hold**. The correct rule already exists
+in this repository, at `gpu_vendor_policy.resident_blocks_from_reported`
+(`gpu_vendor_policy.mojo:460-524`), which would return `min(24, 6) = 6` and
+a target of 1020. It is gated off behind `SUPPORT_PORTABLE`
+(`gpu_backend_policy.mojo:95-109`) and did not run.
+
+This is the safe direction of change: it makes the target *smaller*, it
+reads reported device attributes rather than branching on a vendor, and it
+is the portable-change-first path this document already prefers over a
+branch.
+
+#### A reporting defect in this harness, not in the library
+
+```text
+  shared_memory_resident_block_limit   16      <- overstates by 2.7x
+```
+
+`bench_gpu_validation.mojo:222-223` computes that as
+`49152 / 3072`, from shared memory alone. The device also reported a
+thread-slot limiter of 6, which the bench ignored. The real residency bound
+at this block width is 6, not 16. Any reader of this record would otherwise
+conclude there was 16-block headroom that does not exist.
+
+Similarly, `global_atomics_per_launch_upper: 0` is a **definition, not a
+measurement**. `bench_gpu_validation.mojo:236-242` sets it to zero whenever
+the tiled strategy is selected. It records which branch was taken, not what
+the device did, and no profiler counter was collected to confirm it.
+
+#### What this does not justify
+
+No tuning change. The one lever that would raise occupancy here is lowering
+`MIN_ROWS_PER_TILE_BIN_FACTOR`, and deleting it entirely would buy 200
+blocks instead of 100, taking 0.59 to 1.18 blocks/SM on a 170-SM device
+while doubling how often each tile pays a 255-bin zero and flush. The only
+measurement this repository holds on that exact trade
+(`gpu_tiling.mojo:743-769`) says raising the tile count lost 22 to 36
+percent and concludes the factor is if anything too *low*. The available
+lever has been measured pointing the wrong way.
 
 #### 5. Profiler
 
