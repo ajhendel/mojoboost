@@ -15,14 +15,23 @@ of it that do not exist yet.
 | Backend | Device | Correctness | Determinism | Phase timings | Profiler trace |
 |---|---|---|---|---|---|
 | Metal | Apple M4 (10 core) | pass | pass | partial | not run |
-| CUDA | NVIDIA RTX 5090 (Blackwell, sm_120) | **partial** | **not run** | **partial** | **not run** |
+| CUDA | NVIDIA RTX 5090 (Blackwell, sm_120) | **fail** | **not run** | **partial** | **not run** |
 | HIP | none available | **not run** | **not run** | **not run** | **not run** |
 
 NVIDIA hardware executed this code for the first time on 2026-08-18, on a
-leased RunPod RTX 5090. It builds and it runs. Correctness is **partial**
-rather than pass because the GPU suite has one unexplained failure
-(`test_gpu_raw_update_packing`) and determinism has not been attempted at
-all, so no row above may be read as a support claim. The full record is in
+leased RunPod RTX 5090. It builds, it runs, and **it is not correct yet**.
+
+Correctness reads **fail**, not partial. The device compiler contracts a
+multiply and an add into an FMA in `_range_add_raw_kernel`
+(`gpu_objectives_native.mojo:774-777`) where Metal's compiler did not, so
+two score-update arms that are asserted bit-identical differ by 1 ulp on
+1841 of 3000 rows. Both roundings are valid IEEE results, so nothing here is
+wrong in an absolute sense, but bit-identity between the arms is the
+property the determinism and host-replica guarantees rest on, and on CUDA it
+does not hold. Determinism was never attempted at all.
+
+No row above may be read as a support claim. The full record, including the
+elimination argument that identifies the kernel, is in
 [NVIDIA RTX 5090, CUDA, 2026-08-18](#nvidia-rtx-5090-cuda-2026-08-18).
 
 AMD is unchanged and the sentence below still holds for it in full.
@@ -588,12 +597,77 @@ src/mojotrees/gpu_objectives_native.mojo:2927
 `test_gpu_scan_primitives`, `test_gpu_partition_launches`, `test_gpu_tiling`,
 `test_gpu_level_batcher`, `test_gpu_portability` and `test_gpu_vendor_policy`.
 
-One failure is open and **unexplained**: `test_gpu_raw_update_packing`. It is
-recorded here rather than omitted, and it is not yet attributable, because
-the run that produced it was itself invalid (see the job-count defect below).
-Nothing in this repository should treat CUDA correctness as established until
-that test is re-run under a valid configuration and either passes or is
-diagnosed.
+One failure is **real, reproducible, and now explained**:
+`test_gpu_raw_update_packing`, together with `test_gpu_fma_consistency`.
+**The device compiler contracts a multiply and an add into an FMA on CUDA
+where Metal's compiler did not, and it moves the bits of every
+device-resident model.**
+
+The evidence, from the test logs themselves:
+
+```text
+test_gpu_raw_update_packing
+  PASS  test_step_bits_survive_the_descriptor_round_trip     (host only)
+  FAIL  test_packed_table_arm_matches_the_per_leaf_arm
+        packed and per-leaf arms disagree at row 2:
+            packed 0xbfa2bec6   per-leaf 0xbfa2bec5
+        assert left == right:  left 1841, right 0
+
+test_gpu_fma_consistency
+  raw update arms disagree at row 0 node 5:
+      per-thread 0xbe04c2f0  per-leaf 0xbe04c2f1  table 0xbe04c2f0
+      ulps(per-thread, table) 0
+  rows disagreeing: 2225 of 3000, worst 0 ulp;
+  per-thread matched the unfused host answer on 3000 rows and the fused
+  one on 0
+```
+
+Read those together and the mechanism is settled by elimination rather than
+inferred. Three arms compute the same score update:
+
+| arm | multiply location | result |
+|---|---|---|
+| per-thread (`_update_raw_kernel`) | host | matches unfused, 3000/3000 |
+| table (`_range_table_add_raw_kernel`) | host, packed into `SEG_STEP` | matches per-thread, 0 ulp |
+| per-leaf (`_range_add_raw_kernel`) | **in the kernel** | differs by 1 ulp |
+
+`gpu_objectives_native.mojo:774-777` is
+`raw[i] = raw[i] + learning_rate * values[node]`, the only surviving
+multiply adjacent to an add among the three arms. It is the only arm that
+differs. The two arms that multiply on the host and hand the kernel a
+finished Float32 agree with each other and with the unfused host answer
+exactly.
+
+The cause is a build default this repository already documents. `pixi.toml`
+records that Mojo's `--fp-mode` defaults to `contract=fast`, which "fuses
+`a + b*c` into an FMA across statements". Metal's compiler declined that
+fusion; NVPTX takes it. The code's own justification for believing the
+per-leaf arm was safe is at `gpu_objectives_native.mojo:720-724` and
+`:862-878`, and it is explicitly an empirical observation about **one
+device compiler**: that the product is "uniform and gets hoisted and rounded
+on its own". Thread-uniformity is not a reason an LLVM-based NVPTX backend
+would decline to emit `fma.rn.f32`, and it did not decline.
+
+Three things follow, and the third is the one that matters.
+
+1. This is **not** contention damage. The producing run was the invalid
+   254-job one, but the failure is not an artifact of it: the disagreement
+   is a deterministic 1-ulp arithmetic difference on 1841 and 2225 rows
+   respectively, the host-only half of the same file passed, and a starved
+   process does not produce self-consistent ULP accounting.
+2. The magnitude is 1 ulp, so no result here is "wrong" in any absolute
+   sense. Both roundings are defensible IEEE outcomes.
+3. **But bit-identity is the property this project's determinism and
+   host-replica guarantees are built on**, and the arms are asserted equal
+   precisely because a model must not depend on which arm ran. On CUDA they
+   are not equal, so that guarantee does not currently hold on NVIDIA.
+
+The fix that the codebase has already applied twice elsewhere is to move the
+multiply to the host so the kernel has nothing to fuse
+(`_update_raw_kernel` had exactly this done to it), or to write the
+contraction explicitly as `fma`, as `gpu_split_search.mojo:851-874` does.
+Both are portable changes rather than vendor branches. Neither is applied
+here, and applying one is not this document's call.
 
 #### 3. Determinism
 
