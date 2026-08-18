@@ -75,6 +75,7 @@ from mojotrees.device import (
 )
 from mojotrees.device_policy import (
     AUTO_GPU_MIN_ROWS,
+    EVIDENCE_NONE,
     BLOCK_NO_ACCELERATOR,
     DECISION_AUTO_CPU_BELOW_EVIDENCE,
     DECISION_AUTO_CPU_BLOCKED,
@@ -549,6 +550,17 @@ def test_auto_reaches_the_gpu_for_multiclass_at_the_measured_shape() raises:
     reason: `DeviceCapabilities.detect()`, not a fixture, and three
     assertions past the device code so that "a rule fired" is separated from
     "something returned a value meaning GPU".
+
+    THE MULTICLASS RULE WAS WITHDRAWN ON 2026-08-18 AND THIS TEST WAS
+    INVERTED WITH IT. `bench/results/gbm_bench_2026-08-18/RESULTS.md` is an
+    interleaved six-arm run at 581,012 x 54 over 7 classes on an M4, three
+    repeats, 2.9 percent spread, and the GPU took 40.894 s against the CPU's
+    28.077 s. That is the falsifier the rule's own docstring asked for, so
+    `crossover_rules()` no longer installs it and every multiclass request
+    under `auto` stays on the CPU carrying no evidence.
+
+    The assertion is kept rather than deleted because it is the thing that
+    would notice the rule coming back without a measurement behind it.
     """
     _clear_env()
     if not _on_the_measured_build():
@@ -557,11 +569,8 @@ def test_auto_reaches_the_gpu_for_multiclass_at_the_measured_shape() raises:
     var decision = decide_device(
         _auto_multiclass(_MULTICLASS_MEASURED_ROWS, 7, MULTICLASS), caps
     )
-    assert_equal(decision.selected_device, GPU_DEVICE)
-    assert_equal(decision.decision_code, DECISION_AUTO_GPU_EVIDENCE)
-    assert_true(decision.validated())
-    assert_equal(decision.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
-    assert_true(decision.crossover_citation.find("7 classes") >= 0)
+    assert_equal(decision.selected_device, CPU_DEVICE)
+    assert_equal(decision.evidence_id, EVIDENCE_NONE)
     # And it is not the single-output rule that fired: the two rules are
     # disjoint and a report that named the wrong one would be citing a
     # squared-error measurement for a softmax fit.
@@ -584,6 +593,17 @@ def test_multiclass_reaches_the_rule_with_or_without_a_declared_objective(
 
     It is also the test that fails if somebody "tightens" the rule by adding
     an objective scope to it.
+
+    THE MULTICLASS RULE WAS WITHDRAWN ON 2026-08-18 AND THIS TEST WAS
+    INVERTED WITH IT. `bench/results/gbm_bench_2026-08-18/RESULTS.md` is an
+    interleaved six-arm run at 581,012 x 54 over 7 classes on an M4, three
+    repeats, 2.9 percent spread, and the GPU took 40.894 s against the CPU's
+    28.077 s. That is the falsifier the rule's own docstring asked for, so
+    `crossover_rules()` no longer installs it and every multiclass request
+    under `auto` stays on the CPU carrying no evidence.
+
+    The assertion is kept rather than deleted because it is the thing that
+    would notice the rule coming back without a measurement behind it.
     """
     _clear_env()
     if not _on_the_measured_build():
@@ -598,10 +618,10 @@ def test_multiclass_reaches_the_rule_with_or_without_a_declared_objective(
         ),
         caps,
     )
-    assert_equal(declared.selected_device, GPU_DEVICE)
-    assert_equal(undeclared.selected_device, GPU_DEVICE)
-    assert_equal(declared.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
-    assert_equal(undeclared.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
+    assert_equal(declared.selected_device, CPU_DEVICE)
+    assert_equal(undeclared.selected_device, CPU_DEVICE)
+    assert_equal(declared.evidence_id, EVIDENCE_NONE)
+    assert_equal(undeclared.evidence_id, EVIDENCE_NONE)
 
 
 def test_resolve_device_reaches_multiclass_without_an_objective() raises:
@@ -612,6 +632,17 @@ def test_resolve_device_reaches_multiclass_without_an_objective() raises:
     call, so the test cannot pass while the shipped path stays on the CPU --
     which is precisely the shape of the single-output defect this file's
     `test_resolve_device_reaches_the_gpu_only_with_an_objective` records.
+
+    THE MULTICLASS RULE WAS WITHDRAWN ON 2026-08-18 AND THIS TEST WAS
+    INVERTED WITH IT. `bench/results/gbm_bench_2026-08-18/RESULTS.md` is an
+    interleaved six-arm run at 581,012 x 54 over 7 classes on an M4, three
+    repeats, 2.9 percent spread, and the GPU took 40.894 s against the CPU's
+    28.077 s. That is the falsifier the rule's own docstring asked for, so
+    `crossover_rules()` no longer installs it and every multiclass request
+    under `auto` stays on the CPU carrying no evidence.
+
+    The assertion is kept rather than deleted because it is the thing that
+    would notice the rule coming back without a measurement behind it.
     """
     _clear_env()
     if not _on_the_measured_build():
@@ -623,7 +654,7 @@ def test_resolve_device_reaches_multiclass_without_an_objective() raises:
             M4_MULTICLASS_MIN_FEATURES,
             3,
         ),
-        GPU_DEVICE,
+        CPU_DEVICE,
     )
     # Below the floor it is still the CPU, so what the class count bought is
     # a rule and not a bypass of the row floor.
@@ -680,6 +711,17 @@ def test_the_two_rules_are_disjoint() raises:
     the multiclass one are complementary, so a request matches at most one,
     and a single-output request at a shape well past both floors must still
     cite the squared-error record.
+
+    THE MULTICLASS RULE WAS WITHDRAWN ON 2026-08-18 AND THIS TEST WAS
+    INVERTED WITH IT. `bench/results/gbm_bench_2026-08-18/RESULTS.md` is an
+    interleaved six-arm run at 581,012 x 54 over 7 classes on an M4, three
+    repeats, 2.9 percent spread, and the GPU took 40.894 s against the CPU's
+    28.077 s. That is the falsifier the rule's own docstring asked for, so
+    `crossover_rules()` no longer installs it and every multiclass request
+    under `auto` stays on the CPU carrying no evidence.
+
+    The assertion is kept rather than deleted because it is the thing that
+    would notice the rule coming back without a measurement behind it.
     """
     _clear_env()
     if not _on_the_measured_build():
@@ -692,7 +734,7 @@ def test_the_two_rules_are_disjoint() raises:
     )
     assert_equal(single.selected_device, GPU_DEVICE)
     assert_equal(single.evidence_id, M4_TRAINING_EVIDENCE_ID)
-    assert_not_equal(single.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
+    assert_not_equal(single.evidence_id, EVIDENCE_NONE)
 
     # A single-output request declaring an objective the single-output rule
     # does not cover reaches neither rule, which is the check that the
@@ -716,8 +758,8 @@ def test_the_two_rules_are_disjoint() raises:
     var many = decide_device(
         _auto_multiclass(_MULTICLASS_MEASURED_ROWS, 20, MULTICLASS), caps
     )
-    assert_equal(many.selected_device, GPU_DEVICE)
-    assert_equal(many.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
+    assert_equal(many.selected_device, CPU_DEVICE)
+    assert_equal(many.evidence_id, EVIDENCE_NONE)
 
 
 # --- Degrading on a machine that has no accelerator --------------------

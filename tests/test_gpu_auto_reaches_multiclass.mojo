@@ -1,4 +1,12 @@
-"""`device='auto'` reaches the multiclass GPU trainer: proved by the model.
+"""`device='auto'` reaches the multiclass CPU trainer: proved by the model.
+
+INVERTED ON 2026-08-18. This file used to prove `auto` reached the GPU. The
+multiclass crossover rule was withdrawn that day, because
+`bench/results/gbm_bench_2026-08-18/RESULTS.md` measured the GPU at 40.894 s
+against the CPU's 28.077 s on real covertype, 1.45x slower, which is exactly
+the falsifier the rule's own docstring had asked for. So the claim under test
+flipped and the method did not: the model still decides it, because a returned
+enum is not a backend in either direction.
 
 WHY THIS FILE EXISTS, AND WHAT IT IS NOT. `tests/test_device_auto_crossover.
 mojo` proves the *policy* answers GPU for a softmax workload: `resolve_device`
@@ -212,30 +220,37 @@ def test_auto_actually_trains_multiclass_on_the_accelerator() raises:
         # backends. That is not hypothetical -- byte-identical multiclass
         # arms is exactly what the discarded-device bug looked like on the
         # benchmark record.
-        assert_false(
+        # INVERTED 2026-08-18 with the rule's withdrawal. The two halves are
+        # the same two halves and neither is sufficient alone: the first says
+        # `auto` produced the CPU trainer's model, the second says the two
+        # backends still differ at this shape, so the first is a real match
+        # and not a comparison that separates nothing.
+        assert_true(
             _identical(auto, cpu),
             String(
-                "device='auto' produced the CPU trainer's softmax model bit"
-                " for bit at ",
-                _ROWS,
-                " x ",
-                _FEATURES,
-                " over ",
-                _CLASSES,
-                " classes, so it did not reach the accelerator",
-            ),
-        )
-        assert_true(
-            _identical(auto, gpu),
-            String(
-                "device='auto' produced neither the CPU model nor the GPU"
+                "device='auto' did NOT produce the CPU trainer's softmax"
                 " model at ",
                 _ROWS,
                 " x ",
                 _FEATURES,
                 " over ",
                 _CLASSES,
-                " classes",
+                " classes. The multiclass crossover rule was withdrawn on"
+                " 2026-08-18 because the GPU measured 1.45x SLOWER on real"
+                " covertype, so auto must now stay on the CPU",
+            ),
+        )
+        assert_false(
+            _identical(auto, gpu),
+            String(
+                "the CPU and GPU multiclass trainers agree bit for bit at ",
+                _ROWS,
+                " x ",
+                _FEATURES,
+                " over ",
+                _CLASSES,
+                " classes, so the assertion above separates nothing and this"
+                " test can no longer tell which backend auto reached",
             ),
         )
 

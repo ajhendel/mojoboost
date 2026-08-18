@@ -831,13 +831,22 @@ def test_a_snapshot_is_a_snapshot_and_a_live_read_is_live() raises:
     # The snapshot still says what it said.
     assert_equal(snapshot.num_workers, 1)
     assert_equal(plan_tasks_with(snapshot, 1_000_000, 99 * PARALLEL_MIN_OPS), 1)
-    # The live read has moved.
-    assert_equal(plan_tasks(1_000_000, 99 * PARALLEL_MIN_OPS), 4)
+    # The live read has moved. FOUR WORKERS, SIXTEEN TASKS: 9facf1d stopped
+    # `plan_tasks` returning an explicit `MOJOTREES_NUM_WORKERS` verbatim,
+    # because N equal pieces on a chip with four performance and six
+    # efficiency cores is the worst shape a barrier-synchronized fan-out can
+    # have. An explicit count now multiplies by TASKS_PER_CORE, which is what
+    # `auto` had always done. This assertion is about the snapshot being
+    # stale, not about the geometry, so it takes the new number.
+    assert_equal(plan_tasks(1_000_000, 99 * PARALLEL_MIN_OPS), 16)
 
     # Resolving again is the whole of the invalidation story.
     var again = DispatchSettings.resolve()
+    # The pool is still the four that was asked for; the CHUNK COUNT is the
+    # sixteen that pool now gets cut into. The two numbers stopped being the
+    # same at 9facf1d and asserting both is what keeps them distinguishable.
     assert_equal(again.num_workers, 4)
-    assert_equal(plan_tasks_with(again, 1_000_000, 99 * PARALLEL_MIN_OPS), 4)
+    assert_equal(plan_tasks_with(again, 1_000_000, 99 * PARALLEL_MIN_OPS), 16)
     _auto()
 
 
@@ -1095,8 +1104,13 @@ def test_a_snapshot_ignores_a_setenv_of_every_scheduling_variable() raises:
     assert_equal(snapshot.min_ops, PARALLEL_MIN_OPS)
     assert_equal(snapshot.policy.tasks_per_core, 1)
     assert_equal(snapshot.policy.core_pool, CORE_POOL_ALL)
-    # The live read moved, which is what says the flips landed at all.
-    assert_equal(plan_tasks(1_000_000, 99 * PARALLEL_MIN_OPS), 8)
+    # The live read moved, which is what says the flips landed at all. Eight
+    # workers times the sixteen tasks per core set just above, for the reason
+    # given in `test_a_snapshot_is_a_snapshot_and_a_live_read_is_live`: since
+    # 9facf1d an explicit worker count is a pool size and not a chunk count.
+    # That both variables reach the product is the stronger assertion here
+    # anyway, since this test is about a snapshot ignoring every one of them.
+    assert_equal(plan_tasks(1_000_000, 99 * PARALLEL_MIN_OPS), 128)
 
     _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "")
     _ = setenv("MOJOTREES_CPU_TASKS_PER_CORE", "")

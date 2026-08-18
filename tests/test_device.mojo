@@ -48,6 +48,7 @@ from mojotrees.device import (
     resolve_device,
 )
 from mojotrees.device_policy import (
+    EVIDENCE_NONE,
     AUTO_GPU_MIN_ROWS,
     AUTO_MIN_CELLS,
     BLOCK_DERIVATIVE_PRECISION,
@@ -398,7 +399,9 @@ def test_a_selected_gpu_says_what_measured_it() raises:
     var wire = decision.serialize()
     assert_true(wire.find("decision=auto-gpu-evidence\n") >= 0)
     assert_true(wire.find("validated=true\n") >= 0)
-    assert_true(wire.find("crossover_rules_installed=2\n") >= 0)
+    # One, not two: the multiclass rule was withdrawn on 2026-08-18 and its
+    # `rules.append` went with it. This count is the observable that says so.
+    assert_true(wire.find("crossover_rules_installed=1\n") >= 0)
     assert_true(
         wire.find(String("crossover_rule=", decision.crossover_citation, "\n"))
         >= 0
@@ -502,7 +505,13 @@ def test_auto_declines_beside_the_measured_shape() raises:
         caps,
     )
     assert_equal(covered.selected_device, CPU_DEVICE)
-    assert_equal(covered.evidence_id, M4_MULTICLASS_EVIDENCE_ID)
+    # And it carries NO evidence, which is the other half of the inversion
+    # and was left behind when the prose above was rewritten. A withdrawn
+    # rule must not still be cited: `evidence_id` is what a decision reports
+    # as the record behind it, and reporting the multiclass record here
+    # would say the CPU was chosen ON that record when the record is the
+    # thing that was withdrawn.
+    assert_equal(covered.evidence_id, EVIDENCE_NONE)
     # Another objective, and an undeclared one.
     _declines(
         _request(
