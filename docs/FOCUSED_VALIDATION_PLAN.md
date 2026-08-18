@@ -301,9 +301,8 @@ which of these guesses have gone stale into outright wrong.
 
 These were observed statically while building the map. Where the fix falls
 inside this lane's ownership it was applied and is described as applied. Where
-it does not, nothing was edited and there is a ready-to-apply patch in
-`handoffs/remaining_14_validation_plan.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_14_validation_plan.md)`, identified below by its patch
-number.
+it does not, nothing was edited, and the change is identified below by its
+patch number.
 
 **The sparse tests skip themselves in the only environment that runs them.**
 `python/tests/test_contrib.py:504` and `python/tests/test_validation.py:64`
@@ -393,8 +392,7 @@ an escalation somebody has to remember to ask for.
 
 It did not run the planner, any suite, any build, any benchmark, or any CI job.
 It did not commit. It did not edit any file outside `tools/validation_plan.py`,
-`docs/FOCUSED_VALIDATION_PLAN.md`, `validation/manifests/`, and
-`handoffs/remaining_14_validation_plan.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_14_validation_plan.md)`.
+`docs/FOCUSED_VALIDATION_PLAN.md` and `validation/manifests/`.
 
 That holds for the 2026-08-14 revision too, and it is the load-bearing caveat on
 everything that revision claims. The audit behind it checked the manifests

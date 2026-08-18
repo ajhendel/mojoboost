@@ -615,9 +615,9 @@ build to the CPU.
 and it had not been true for some time.** It read "This module is the policy
 and report layer. It is not yet wired into the estimators;
 `MojoTreesRegressor(device="auto")` still resolves through `_resolve_device`,
-which calls the native `resolve_device` directly." It also pointed at
-`handoffs/apple_a9_device_selection.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a9_device_selection.md)` for the wiring, and no such file exists
-in this repository, so the pointer was dangling as well.
+which calls the native `resolve_device` directly." It also pointed at a
+handoff for the wiring, and no such file exists, so the pointer was dangling
+as well.
 
 What is true now. `_resolve_device` in `python/mojotrees/sklearn.py` imports
 `mojotrees.device_selection`, builds a `Workload`, calls `select_device`, and

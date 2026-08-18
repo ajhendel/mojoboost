@@ -956,9 +956,8 @@ break note under section 3.4.
 ### 11.3 What has to be built
 
 The manifest is only worth its storage if a tool regenerates it and CI
-compares. Neither exists. `handoffs/task20_compatibility.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task20_compatibility.md)` carries the
-specification for `tools/api_snapshot.py`, the pixi task, the CI job, and
-the small number of exports the tool needs from surfaces that do not
+compares. Neither exists. What is needed is `tools/api_snapshot.py`, a pixi
+task, a CI job, and a small number of exports from surfaces that do not
 currently expose them.
 
 ## 12. The release gate

@@ -618,8 +618,7 @@ void if it was not.
 Nothing in `histogram_gpu.mojo` changes on the strength of this driver alone.
 The integration seam, the pointer and buffer lifetimes it would need, the
 invalidation rules, the measurable hypotheses, and the required external edits
-are written up in `handoffs/performance_18_unified_memory.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_18_unified_memory.md)`. That file is a
-proposal contingent on evidence that does not exist yet, and it says so.
+are all contingent on evidence that does not exist yet.
 
 ## Capacity, the claim this experiment does not reach
 

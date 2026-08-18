@@ -57,8 +57,7 @@ is the shape any batching must keep: batch the histogram builds of a level
 can feed) underneath the existing order, rather than adding a growth loop.
 Sections 1, 2, 6, and 10 remain the design for that; references below to
 `gpu_levelwise.*` names describe the removed prototype and are kept as the
-record of what was proposed. `handoffs/consolidation_round.md (deleted, recover with git log --all --diff-filter=D -- handoffs/consolidation_round.md)` (K8) records the
-disposition.
+record of what was proposed.
 
 This is a proposal for a **second growth algorithm**, not a faster route to
 the trees mojotrees already grows. A level-wise tree and a leaf-wise tree
@@ -531,9 +530,7 @@ Not implemented, and required before any of this trains a tree:
 - Tests. This lane wrote none by instruction.
 
 Nothing here is registered in `src/mojotrees/__init__.mojo`, on purpose:
-nothing should be able to reach this mode by accident. The integration
-steps, in order, are recorded in `handoffs/consolidation_round.md (deleted, recover with git log --all --diff-filter=D -- handoffs/consolidation_round.md)` under
-K8.
+nothing should be able to reach this mode by accident.
 
 ## 12. Open questions
 

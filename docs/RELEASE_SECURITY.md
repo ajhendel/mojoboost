@@ -24,9 +24,8 @@ smoothed over.
 The configuration this document specifies lives in
 [.github/workflows/release-provenance.yml](../.github/workflows/release-provenance.yml),
 [.github/dependabot.yml](../.github/dependabot.yml), and
-[packaging/security/](../packaging/security/). The settings it depends on, which
-are not files, are listed in
-[handoffs/release_10_security.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_10_security.md)](../handoffs/release_10_security.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_10_security.md)).
+[packaging/security/](../packaging/security/). The settings it depends on are
+not files and are not tracked here.
 
 ## 1. What is actually at risk
 
@@ -454,14 +453,12 @@ Known limits, so nobody reads more into the file than is there:
 digest, the commit, the build host, and the compile time accelerator answer.
 None of that survives in the wheel, so it is written at build time or lost.
 `packaging/matrix/validate_artifact.py` rule R7 is the authority on which
-fields are required, and the sidecar was specified in
-[handoffs/task18_platform.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task18_platform.md)](../handoffs/task18_platform.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task18_platform.md)) edit 4.
+fields are required.
 
 The release workflow treats its absence as a hard stop rather than filling the
 fields itself, because two places writing the same facts differently is how
 they end up disagreeing. Which script writes it is a packaging question rather
-than a security one; see the cross-lane note in
-[handoffs/release_10_security.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_10_security.md)](../handoffs/release_10_security.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_10_security.md)).
+than a security one.
 
 ## 9. When a release is compromised
 

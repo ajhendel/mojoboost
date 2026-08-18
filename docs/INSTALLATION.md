@@ -721,6 +721,5 @@ and platform tags were read out of
 [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) and
 `packaging/matrix/platform_matrix.toml`. The pip and dynamic-loader messages
 are shapes rather than transcripts, because their exact wording depends on
-the pip and operating system versions involved. The unrun commands that would
-turn any of this into a record are listed in
-[handoffs/release_04_install_ux.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_04_install_ux.md)](../handoffs/release_04_install_ux.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_04_install_ux.md)).
+the pip and operating system versions involved. The commands that would turn
+any of this into a record have not been run.

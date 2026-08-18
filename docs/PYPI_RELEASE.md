@@ -102,7 +102,7 @@ ships under the section 12 release gate.
 | What a release promises, and what has to be true before one is cut | [COMPATIBILITY_POLICY.md](COMPATIBILITY_POLICY.md), especially the release gate in section 12 |
 | What the package says about itself | `python/pyproject.toml` |
 | Which CPython versions are supported, and whether the floor is real | [PYTHON_SUPPORT.md](PYTHON_SUPPORT.md) |
-| Repository and workflow security posture, and the full owner setup list | [RELEASE_SECURITY.md](RELEASE_SECURITY.md) and `handoffs/release_10_security.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_10_security.md)` |
+| Repository and workflow security posture, and the full owner setup list | [RELEASE_SECURITY.md](RELEASE_SECURITY.md) |
 
 Where this document and the platform matrix disagree about an artifact,
 the matrix wins. Where it and the compatibility policy disagree about
@@ -165,9 +165,8 @@ buys is that when you do claim the name, you claim it through OIDC with no
 token in existence, and there is never a window in which a long-lived
 credential could have published as you.
 
-This is step 6 of the owner-action list in
-`handoffs/release_10_security.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_10_security.md)`, which is the complete sequence and the
-one to work through. Repeated here because the reasoning below is about
+This is one step of the owner-action list. Repeated here because the
+reasoning below is about
 claiming a name rather than about security posture, and because getting
 the workflow filename wrong is the one mistake that produces a publisher
 which silently never matches.
@@ -563,8 +562,8 @@ and yank anything you cannot account for.
 
 `.github/workflows/release-provenance.yml` is the only thing that may
 publish. It is owned by the release-security lane, not by this document,
-and its own reasoning lives in `docs/RELEASE_SECURITY.md` and
-`handoffs/release_10_security.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_10_security.md)`. What matters here is the handful of
+and its own reasoning lives in `docs/RELEASE_SECURITY.md`. What matters
+here is the handful of
 facts a publisher has to know.
 
 - **`workflow_dispatch` only.** No `push`, no `release`, and above all no

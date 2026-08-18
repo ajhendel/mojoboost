@@ -16,7 +16,7 @@ one added rule, which is the reason this document exists:
 > rather than offered with a warning.
 
 Nothing in this document has been executed. The module is uncompiled and
-untested; see `handoffs/remaining_08_model_editing.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_08_model_editing.md)`.
+untested.
 
 ## What a fitted model claims
 

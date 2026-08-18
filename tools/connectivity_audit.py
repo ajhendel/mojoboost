@@ -80,7 +80,7 @@ Every finding is one of three kinds, and the distinction is the point:
 - `PENDING` - implemented and meant to be reachable, blocked on a named edit
   in a file its own lane does not own. This is the interesting one: every
   `PENDING` finding should appear in the cross-lane patch queue in
-  `handoffs/connect_22_audit.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_22_audit.md)` with an owner.
+  an owner.
 
 The classification table `CLASSIFICATION` below is the only place that
 judgment lives; everything above it is mechanical. An unclassified finding
@@ -339,7 +339,7 @@ CLASSIFICATION = {
         "CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / "
         "gpu_amd_policy twins (f23bd1b). Reached only from its test until a "
         "discrete-GPU trainer consults it; that is the same status the twins "
-        "had. handoffs/migration_20_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_20_device_policy.md).",
+        "had.",
     ),
     # -- Python modules ----------------------------------------------------
     "mojotrees.features": (

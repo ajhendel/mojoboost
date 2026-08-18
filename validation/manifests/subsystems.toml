@@ -65,7 +65,6 @@ title = "CPU histogram construction and the parallel runtime"
 paths = [
     "src/mojotrees/histogram.mojo",
     "src/mojotrees/parallel.mojo",
-    "src/mojotrees/histogram_cache_policy.mojo",
 ]
 jobs = ["native:histogram-reference", "native:cpu-parallel", "native:binning"]
 escalate = ["differential:threads-1", "differential:threads-max", "broad:bench-threshold"]
@@ -537,7 +536,6 @@ paths = [
     "src/mojotrees/gpu_leaf_batching.mojo",
     "src/mojotrees/gpu_multiclass_batch.mojo",
     "src/mojotrees/growth_policy.mojo",
-    "src/mojotrees/histogram_cache_policy.mojo",
 ]
 fallback = ["native:compile-package"]
 reason = "Scheduling policies. Pure arithmetic over device limits, imported by no suite. This entry named `gpu_levelwise.mojo` and `levelwise_policy.mojo` until 2026-08-15, two filenames a plan predicted and nobody created: the level-wise work landed in `growth_policy.mojo` and in `gpu_frontier.mojo`, which another gap already covers. A gap naming a file that does not exist is the one thing --self-check will not let through, and it had been failing on these two."

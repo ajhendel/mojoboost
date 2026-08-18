@@ -34,7 +34,7 @@ list, sitting between two bullets that describe switches that genuinely work
 (`MOJOTREES_STARTUP_TRACE` and `MOJOTREES_GPU_WARMUP`), which is the position
 that makes a reader believe it. The bullet read "reserved, unread here. See
 the handoff; emitting the report is a call-site decision, not this module's."
-No handoff file in `handoffs/` mentions the name. No call site exists.
+No handoff mentioned the name. No call site exists.
 
 **Why not wired.** There is nothing to wire it to. `initialization.mojo`
 measures phases and renders no report; it has no serializer for

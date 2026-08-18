@@ -7,8 +7,7 @@
   "owns": [
     "src/mojotrees/gpu_binned_layout.mojo",
     "src/mojotrees/gpu_bin_packing.mojo",
-    "bench/apple/bin_layout_plan.json",
-    "handoffs/algorithm_25_binned_layout.md (deleted, recover with git log --all --diff-filter=D -- handoffs/algorithm_25_binned_layout.md)"
+    "bench/apple/bin_layout_plan.json"
   ],
   "relates_to": {
     "protocol": "docs/APPLE_GPU_BENCHMARK_PROTOCOL.md",

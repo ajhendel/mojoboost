@@ -313,9 +313,7 @@ two disagree on, and then either accepts it, accepts it with notes, or asks for
 more. Acceptance commits the record and its raw output to
 [`hardware/results/`](../hardware/results/), appends a prose record to
 `docs/GPU_VALIDATION.md`, and moves the matching row in
-`packaging/matrix/accelerators/index.toml`. The full review procedure, including
-what happens when two records disagree, is in
-[`handoffs/release_11_hardware_network.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_11_hardware_network.md)`](../handoffs/release_11_hardware_network.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_11_hardware_network.md)).
+`packaging/matrix/accelerators/index.toml`.
 
 Two things that will not happen to your result:
 

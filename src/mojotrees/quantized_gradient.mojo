@@ -601,8 +601,7 @@ struct QuantGradParams(Copyable, Movable):
         This is what `histogram_gpu.mojo` does today. Naming it here is what
         lets the device path and a quantized CPU path be described by one
         policy instead of two, and it is the setting a CPU replica of a GPU
-        histogram has to use to reproduce it (see
-        `histogram_cache_policy.ORIGIN_CPU_REPLICA`).
+        histogram has to use to reproduce it.
         """
         return QuantGradParams(
             True,
@@ -1974,8 +1973,7 @@ def check_same_lattice(a: QuantScales, b: QuantScales) raises:
     number that means nothing, and the failure is silent: the arithmetic
     succeeds and the gains are wrong. The scale moves every round, so this
     is the check that catches a stale histogram surviving into the next
-    round, which is exactly the failure
-    `histogram_cache_policy` describes for its own cached planes.
+    round.
     """
     if (
         a.grad_units != b.grad_units

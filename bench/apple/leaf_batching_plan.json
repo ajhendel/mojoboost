@@ -5,7 +5,6 @@
     "src/mojotrees/gpu_frontier.mojo",
     "src/mojotrees/gpu_leaf_batching.mojo"
   ],
-  "handoff": "handoffs/algorithm_22_leaf_batching.md (deleted, recover with git log --all --diff-filter=D -- handoffs/algorithm_22_leaf_batching.md)",
   "status": "planned",
   "carries_measurements": false,
   "note": "This file is a plan, not a record. It holds no timings and must never be read as one. Nothing in this lane was built, run, benchmarked, or profiled; the numbers below are shapes to measure and predictions to refute, and every one of them is currently unmeasured. Records produced by running this plan belong in files validated against bench/apple/schema.json, which is the only schema in this directory that describes results.",

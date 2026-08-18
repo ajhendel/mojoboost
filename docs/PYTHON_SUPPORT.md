@@ -11,8 +11,7 @@ imports and passes the full Python API suite on 3.10, 3.11, 3.12, 3.13, and
 verbatim runs are in section 10.
 
 This document still does not change `requires-python`. Applying the value to
-`python/pyproject.toml` is Task 01's step and is written out in
-[`handoffs/release_05_python_versions.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_05_python_versions.md)`](../handoffs/release_05_python_versions.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_05_python_versions.md)).
+`python/pyproject.toml` is a separate step.
 
 What has been run, in full: the existing built extension was imported under
 five interpreters and `python/test_python_api.py` was run against it under
@@ -599,9 +598,8 @@ never on reasoning. Section 9.1 is the worked example of why.
 ## 12. Corrections owed to other documents
 
 Three statements elsewhere in the repository do not survive this audit. None
-of the files involved is this lane's to edit, so each is written out with its
-replacement in
-[`handoffs/release_05_python_versions.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_05_python_versions.md)`](../handoffs/release_05_python_versions.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_05_python_versions.md)).
+of the files involved is this lane's to edit, so each is listed below with
+its replacement.
 
 1. `packaging/matrix/platform_matrix.toml`, the `cp313` row: "No MAX build
    for these interpreters in the pinned channel." Five variants of
@@ -632,5 +630,4 @@ reasoning should be replaced.
 
 Corrections 1, 2, and the `abi3` row have been applied to
 `packaging/matrix/platform_matrix.toml` and `validate_matrix.py`. Corrections
-3 and 4, and the prose restatements, are written out in
-[`handoffs/release_05_python_versions.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_05_python_versions.md)`](../handoffs/release_05_python_versions.md (deleted, recover with git log --all --diff-filter=D -- handoffs/release_05_python_versions.md)).
+3 and 4, and the prose restatements, are still owed.

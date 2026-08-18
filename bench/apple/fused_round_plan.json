@@ -10,14 +10,12 @@
   "owner_files": [
     "src/mojotrees/gpu_fused_round.mojo",
     "src/mojotrees/gpu_gradient_stream.mojo",
-    "bench/apple/fused_round_plan.json",
-    "handoffs/algorithm_23_fused_round.md (deleted, recover with git log --all --diff-filter=D -- handoffs/algorithm_23_fused_round.md)"
+    "bench/apple/fused_round_plan.json"
   ],
   "related": {
     "protocol": "docs/APPLE_GPU_BENCHMARK_PROTOCOL.md",
     "thermal_protocol": "docs/APPLE_THERMAL_ENERGY.md",
     "record_schema": "bench/apple/schema.json",
-    "handoff": "handoffs/algorithm_23_fused_round.md (deleted, recover with git log --all --diff-filter=D -- handoffs/algorithm_23_fused_round.md)",
     "code_under_test": [
       "src/mojotrees/gpu_objectives_native.mojo",
       "src/mojotrees/histogram_gpu.mojo",

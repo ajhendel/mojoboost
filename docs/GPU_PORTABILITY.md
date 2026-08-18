@@ -123,8 +123,7 @@ profile this tree constructs, so `partial_budget_bytes` returns the portable
 ceiling either way. `gpu_portability.contract_from_profile` takes
 `unified_memory` from the profile rather than from the API, so the value has
 one place to be corrected. The correction itself belongs to the module that
-builds profiles, and is filed as a patch request in
-`handoffs/connect_20_gpu_portability.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_20_gpu_portability.md)`.
+builds profiles.
 
 ### 3.2 Float32 gradients and no Float64 on device
 
@@ -817,8 +816,7 @@ before it launches and `MOJOTREES_GPU_BACKEND` is unset on an ordinary run,
 so an unidentified device is indistinguishable here from the Apple part this
 repository was developed on. Refusing it would refuse every run that ships,
 including every Metal one. A CUDA device therefore escapes the gate until
-the reported API name reaches the policy layer, which is filed as a patch
-request in `handoffs/connect_20_gpu_portability.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_20_gpu_portability.md)` and is the single change
+the reported API name reaches the policy layer, which is the single change
 that turns this gate from a declaration into an enforcement.
 
 | Variable | Effect |

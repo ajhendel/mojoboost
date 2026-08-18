@@ -10,8 +10,7 @@
     "note": "Every number below was derived by reading the policy source, not by running it. The lane that wrote this file was not permitted to run Mojo, Pixi, Python, builds, benchmarks, or profilers. Treat each plan as a claim about what the policy computes, to be confirmed by the emitter named under `verification` before anything is built on it.",
     "policy_source": "src/mojotrees/apple_histogram_policy.mojo",
     "primitives_source": "src/mojotrees/gpu_histogram_specializations.mojo",
-    "baseline_source": "src/mojotrees/gpu_tiling.mojo",
-    "handoff": "handoffs/performance_14_gpu_histogram.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_14_gpu_histogram.md)"
+    "baseline_source": "src/mojotrees/gpu_tiling.mojo"
   },
 
   "verification": {

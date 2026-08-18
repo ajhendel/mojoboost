@@ -1186,9 +1186,7 @@ def run_worker(spec):
             "device_phases": {
                 "source": "unavailable",
                 "reason": (
-                    "no phase counters are exported to Python; see "
-                    "handoffs/apple_a8_benchmarks.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a8_benchmarks.md) for the instrumentation "
-                    "hook this field is waiting on"
+                    "no phase counters are exported to Python"
                 ),
             },
         })
