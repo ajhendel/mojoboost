@@ -2206,6 +2206,23 @@ shapes. It is the driver the cross-vendor procedure in
 run on Apple Metal; no NVIDIA or AMD numbers exist, and none should be quoted
 until that document's status table says otherwise.
 
+## Citing mojotrees
+
+If mojotrees contributes to work you publish, please cite it. GitHub renders
+[CITATION.cff](CITATION.cff) into a ready-made citation behind the **Cite this
+repository** button, and that file is the machine-readable source.
+
+    Hendel, A. (2026). mojotrees: Native gradient-boosted trees in Mojo
+    (Version 0.1.0) [Computer software].
+    https://github.com/mojotrees/mojotrees
+
+There is no DOI yet. When a release is archived one goes here and
+`CITATION.cff` gains a matching `doi:` field; until then the repository URL is
+the citable identifier.
+
 ## License
 
-Apache-2.0
+Apache-2.0, which carries an attribution obligation rather than waiving one.
+Section 4 requires anyone redistributing this code, modified or not, to retain
+the copyright and attribution notices, include the license, and reproduce the
+contents of [NOTICE](NOTICE). [AUTHORS.md](AUTHORS.md) records who holds what.
