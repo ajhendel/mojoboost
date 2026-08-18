@@ -1341,6 +1341,53 @@ def partition_arena_span_inplace(
     )
 
 
+struct _RowPool(Movable):
+    """Free-list of row-id buffers, the twin of `_HistPool`.
+
+    Every leaf owns a `List[Int]` of its rows, and growth creates two child
+    lists per split and drops the parent's, so the live count is bounded the
+    same way the histogram count is. Until 2026-08-18 all of them were fresh
+    allocations: at depth 6 that is 126 `List[Int]` per tree plus the root's,
+    and the root's alone is `n_rows * 8` bytes -- 3.7 MB on covertype,
+    allocated, faulted in and freed 700 times in a seven-class hundred-round
+    fit.
+
+    The root is the worst of them because it is the largest and because it is
+    the one list a partition never produces: with no bagging it is always
+    `[0, n)`, rebuilt from scratch every tree.
+
+    **Contents are undefined on `take` and length is reset to zero**, which is
+    the same contract `_HistPool` has. Every consumer either fills the list
+    through `partition_rows_into` (which appends) or through
+    `fill_identity_rows` (which resizes and writes every slot), so nothing
+    reads a recycled element.
+
+    No cap, for the reason spelled out on `_HistPool`: the free list is
+    self-bounding at the number of buffers one tree holds live, and a cap
+    below that would refuse buffers the next tree immediately needs again.
+    Capacity is what is being recycled here, so a returned buffer keeps its
+    allocation and a later `take` of a similar size pays no growth.
+    """
+
+    var free: List[List[Int]]
+
+    def __init__(out self):
+        self.free = List[List[Int]]()
+
+    def take(mut self) -> List[Int]:
+        """An empty list, reusing a returned buffer's capacity when there is
+        one."""
+        if len(self.free) > 0:
+            var buf = self.free.pop()
+            buf.clear()
+            return buf^
+        return List[Int]()
+
+    def give(mut self, var rows: List[Int]):
+        """Return a buffer so its capacity survives into the next node."""
+        self.free.append(rows^)
+
+
 struct _HistPool(Movable):
     """Free-list of histogram buffers of one shape.
 
@@ -1664,6 +1711,7 @@ struct GrowScratch(Movable):
     """
 
     var pool: _HistPool
+    var rows_pool: _RowPool
     var pairs: List[Float64]
     var settings: DispatchSettings
     var bin_layout: Int
@@ -1690,6 +1738,7 @@ struct GrowScratch(Movable):
 
     def __init__(out self, n_features: Int, n_bins: Int) raises:
         self.pool = _HistPool(n_features, n_bins)
+        self.rows_pool = _RowPool()
         self.pairs = List[Float64]()
         # Which copy of the bin ids the node builds read, resolved here for
         # the same reason `settings` is: `MOJOTREES_CPU_BIN_LAYOUT` is read
@@ -1779,6 +1828,7 @@ struct GrowScratch(Movable):
         of any other shape."""
         if self.pool.n_features != n_features or self.pool.n_bins != n_bins:
             self.pool = _HistPool(n_features, n_bins)
+        self.rows_pool = _RowPool()
 
     def resolve_layout_timed(
         mut self,
@@ -2595,8 +2645,8 @@ def _grow_oblivious_levels(
             var parent_ix = leaf_ix[i]
             var parent_rows = len(frontier[i].rows)
 
-            var left_rows = List[Int]()
-            var right_rows = List[Int]()
+            var left_rows = scratch.rows_pool.take()
+            var right_rows = scratch.rows_pool.take()
             if parent_rows > 0:
                 var part_started = profile.clock()
                 partition_rows_into(
@@ -3425,7 +3475,7 @@ def grow_tree_leaves_profiled(
     )
     if len(bag) == 0:
         var root_list_started = profile.clock()
-        root_rows = List[Int]()
+        root_rows = scratch.rows_pool.take()
         fill_identity_rows(root_rows, data.n_rows, scratch.settings)
         # The identity permutation is row-list construction, which is the same
         # kind of work a split's two child lists are, so it goes to the same
@@ -3623,6 +3673,14 @@ def grow_tree_leaves_profiled(
         leaves.clear()
         leaves.covers_all_rows = len(bag) == 0
         leaves.node = List[Int](capacity=len(frontier))
+        # The previous tree's membership lists go back to the pool before
+        # this tree's replace them. `LeafMembership` is held for a whole fit,
+        # so without this the lists a tree hands out are dropped when the
+        # next tree overwrites them and every tree allocates its own set.
+        # The recycling runs one tree behind: two trees of allocation at the
+        # start of a fit, none after.
+        while len(leaves.rows) > 0:
+            scratch.rows_pool.give(leaves.rows.pop())
         leaves.rows = List[List[Int]](capacity=len(frontier))
         for i in range(len(frontier)):
             leaves.node.append(frontier[i].node)
@@ -4122,6 +4180,14 @@ def grow_tree_leaves_profiled(
     leaves.clear()
     leaves.covers_all_rows = len(bag) == 0
     leaves.node = List[Int](capacity=len(frontier))
+    # The previous tree's membership lists go back to the pool before this
+    # tree's replace them. `LeafMembership` is held for a whole fit, so
+    # without this the lists a tree hands out are dropped when the next
+    # tree overwrites them and every tree allocates its own set. The
+    # recycling runs one tree behind, which costs two trees of allocation
+    # at the start of a fit and none after.
+    while len(leaves.rows) > 0:
+        scratch.rows_pool.give(leaves.rows.pop())
     leaves.rows = List[List[Int]](capacity=len(frontier))
     for i in range(len(frontier)):
         leaves.node.append(frontier[i].node)
