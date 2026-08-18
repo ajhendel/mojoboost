@@ -43,9 +43,20 @@ and that part holds. What does not:
   `ranking_advanced.train_ranker_advanced`, `fit_ranker_advanced`, and
   `custom_metric`'s three ranker entry points) take a `bagging` parameter
   that samples whole QUERIES, not rows, and take no `goss`;
-  `ranking.check_query_bagging` is the validator and
+  `ranking_advanced.check_query_bagging` (line 1664) is the validator and
   `ranking_advanced.refresh_query_bag` the draw, neither of which is
-  `bagging.refresh_bag`.
+  `bagging.refresh_bag`. **The validator used to be cited here as
+  `ranking.check_query_bagging`, which does not exist** (corrected
+  2026-08-18): `ranking.mojo` holds `_refresh_query_bag`, the one draw
+  implementation, and `ranking_advanced.mojo` holds both the query-count
+  validator and the named re-export of the draw. The behavioral claim was
+  right and only the module attribution was wrong; `grep -n 'def
+  check_query_bagging' src/mojotrees/*.mojo` falsifies it if it moves again.
+- **The three ranker entry points in `bindings/_mojotrees.mojo` used to accept
+  an enabled `goss` bundle and discard it.** They now call
+  `check_goss_honored` (below), so `boosting_type='goss'` on a
+  `MojoTreesRanker` is refused by name instead of training an unsampled
+  ranker under a GOSS label.
 - **The custom-objective trainers take neither, which is the one half of the
   old sentence that was right.** `objective.train_custom`,
   `objective.train_custom_with_valid`, `train_gpu.train_custom_gpu`,
@@ -143,6 +154,62 @@ struct GossParams(Copyable, Movable):
 
     def active(self, round: Int, learning_rate: Float64) -> Bool:
         return self.enabled and round >= self.warmup(learning_rate)
+
+
+def check_goss_honored(params: GossParams, where: String) raises:
+    """Refuse an enabled GOSS bundle on an entry point that never samples.
+
+    The shape `sampling.check_bootstrap_honored`,
+    `efb.check_bundling_honored` and
+    `ordered_boosting.check_ordered_honored` already take, and it is here for
+    the same reason. **What this used to do, until 2026-08-18**: the three
+    ranker entry points in `bindings/_mojotrees.mojo` (`fit_ranker`,
+    `fit_ranker_with_metrics`, `train_dataset_ranker`) accepted the `goss`
+    wire key that `python/mojotrees/sklearn.py` sets for every fit, validated
+    its rates in Python, and then never called `_parse_goss` at all. The
+    LambdaRank trainers take no `GossParams` argument, so a user who wrote
+    `MojoTreesRanker(boosting_type="goss").fit(...)` trained a plain
+    unsampled ranker and read the result as a GOSS one. An unsampled ranker
+    is a valid model; the label on it was false, which is the failure worth
+    raising for.
+
+    Why `enabled` alone is the right test, with no `named_by_user` twin like
+    the one `sampling.BootstrapRequest` carries. The `goss` key is
+    `int(boosting == "goss")` (`sklearn.py:3370` and `:3492`) and
+    `boosting` defaults to `"gbdt"` (`sklearn.py:1187`), so the flag can only
+    be True because the user typed `boosting_type`/`boosting`/`booster`
+    themselves. A defaulted GOSS does not exist, and an unset one resolves
+    quietly here, which is the distinction that keeps an out-of-the-box
+    `MojoTreesRanker().fit(...)` working.
+
+    **What would falsify that**: any surface that sets the `goss` wire key
+    True without the user naming it, for instance a CatBoost-mode or
+    `mojotrees defaults` resolver that picks GOSS on its own. The day such a
+    default lands, this predicate starts refusing a fit nobody configured,
+    and the fix is then to carry the asked-for bit alongside the bundle the
+    way `BootstrapRequest.named` / `.defaulted` does, not to weaken the
+    refusal.
+    """
+    if params.enabled:
+        raise Error(
+            "boosting_type='goss' (GOSS gradient sampling, top_rate ",
+            params.top_rate,
+            " / other_rate ",
+            params.other_rate,
+            ") is not implemented by ",
+            where,
+            ". The LambdaRank trainers take no GossParams argument at all,"
+            " because a ranking round samples whole QUERIES rather than rows"
+            " -- dropping the low-gradient rows out of a query changes the"
+            " maxDCG its survivors are normalized against. The ranker's"
+            " sampler is therefore group-aware bagging, and bagging is the"
+            " sampler every ranking round loop is wired for"
+            " (ranking._refresh_query_bag runs each round and no-ops while it"
+            " is off, so it is never bypassed). Pass subsample (LightGBM's"
+            " bagging_fraction) with subsample_freq (bagging_freq) to sample"
+            " a ranking fit, or drop boosting_type='goss' to train on every"
+            " row",
+        )
 
 
 @fieldwise_init

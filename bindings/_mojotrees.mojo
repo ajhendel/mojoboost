@@ -333,7 +333,7 @@ from mojotrees.gpu_predict import (
     response_for_objective,
     validation_host_metric,
 )
-from mojotrees.goss import GossParams
+from mojotrees.goss import GossParams, check_goss_honored
 from mojotrees.sampling import (
     BootstrapParams,
     BootstrapRequest,
@@ -3085,6 +3085,13 @@ def fit_ranker_with_metrics(
         False,
         String("fit_ranker_with_metrics (a LambdaRank eval_set fit)"),
     )
+    # See the note at `fit_ranker`. `mojo_fit_ranker_with_metrics` takes a
+    # `bagging` argument and no `goss` one, so an enabled bundle here was
+    # accepted, never parsed, and reported as a GOSS fit.
+    check_goss_honored(
+        _parse_goss(params),
+        String("fit_ranker_with_metrics (a LambdaRank eval_set fit)"),
+    )
     var advanced = _parse_advanced_rank_params(params)
     var positions = _parse_positions(params, nr)
     var weights = _parse_weights(params, nr)
@@ -3603,6 +3610,20 @@ def fit_ranker(
     )
     _ = _parse_bootstrap_request(params).resolve(
         False,
+        String("fit_ranker (the LambdaRank trainers)"),
+    )
+    # GOSS, refused beside the bootstrap refusal above and for the same
+    # reason. Until 2026-08-18 this call was missing: `_parse_goss` is called
+    # at eleven other sites in this file and at none of the three ranker
+    # entry points, so the `goss` wire key that `sklearn.py:3492` sets on
+    # EVERY fit was read by nobody here and `boosting_type='goss'` on a
+    # ranker trained a plain unsampled LambdaRank model with no warning.
+    # `mojo_fit_ranker` and `mojo_fit_ranker_advanced` below take no
+    # `GossParams` argument, which is what makes this unhonorable rather
+    # than merely unwired; the refusal will need revisiting the day either
+    # signature grows one.
+    check_goss_honored(
+        _parse_goss(params),
         String("fit_ranker (the LambdaRank trainers)"),
     )
     var weights = _parse_weights(params, nr)
@@ -5342,6 +5363,14 @@ def train_dataset_ranker(
     var d = dataset.downcast_value_ptr[Dataset]()
     _ = _parse_bootstrap_request(params).resolve(
         False,
+        String("a Dataset ranker fit (trainset.train_dataset_ranker)"),
+    )
+    # See the note at `fit_ranker`. `mojo_train_dataset_ranker_advanced`
+    # takes `tdr_bagging` and no `goss` bundle, so this entry point had the
+    # same silent discard: `train_dataset` beside it parses one
+    # (`td_goss`) and this one did not.
+    check_goss_honored(
+        _parse_goss(params),
         String("a Dataset ranker fit (trainset.train_dataset_ranker)"),
     )
     var tdr_params = _parse_params(

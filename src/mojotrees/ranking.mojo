@@ -65,7 +65,19 @@ INTENTIONAL DIFFERENCES FROM LightGBM
   against a "zero trees" baseline, because the NDCG of an all-zero score
   vector reflects nothing but the order the rows were handed in.
 - Positional/unbiased-lambdarank extensions and LightGBM's `kMinScore`
-  filtering of dropped documents are not implemented.
+  filtering of dropped documents are not implemented **in this file**. The
+  scope word was added on 2026-08-18 because the sentence read as a statement
+  about the library and, for position bias, the library does implement it:
+  `ranking_advanced.mojo` holds `update_position_bias` and
+  `advanced_lambdarank_gradients`, `MojoTreesRanker.fit(position=)` plus
+  `lambdarank_position_bias_regularization` reach them through
+  `bindings/_mojotrees.mojo`, `tests/test_ranking_advanced.mojo` trains one,
+  and `docs/LIGHTGBM_PARITY.md` carries the rows as `supported` and
+  `partial`. `kMinScore` filtering is implemented nowhere, so that half of
+  the sentence is a library statement and stays one. What would falsify the
+  scoping: `advanced_ranking_requested` returning False for a position column,
+  which is the one predicate that decides whether a fit reaches the advanced
+  loop at all.
 
 Numerics
 --------

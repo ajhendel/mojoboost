@@ -13,23 +13,44 @@ evidence** for anything.
 
 ## 0. Status, in one place
 
-**Nothing in `ranking_advanced.mojo` has been run.** No test, no benchmark,
-no differential comparison against LightGBM, no build. Static inspection
-only. Concretely, as of this document:
+**Corrected 2026-08-18. Four of the six status claims that stood here were
+wrong, and all four under-claimed: they argued that something is not
+implemented when it is.** Each row below quotes what it used to say and then
+says what the code says, so the correction can be checked rather than taken.
+
+The bolded headline was the first of the four. It read:
+
+> **Nothing in `ranking_advanced.mojo` has been run.** No test, no benchmark,
+> no differential comparison against LightGBM, no build. Static inspection
+> only.
+
+`tests/test_ranking_advanced.mojo` exists and holds five tests
+(`test_default_is_not_advanced_and_matches_train_ranker`,
+`test_custom_label_gain_changes_the_ensemble_and_still_ranks`,
+`test_metric_trainer_honors_the_advanced_parameters`,
+`test_position_column_learns_a_bias_and_trains`,
+`test_pair_sampling_and_cutoff_are_validated`), each of which trains an
+ensemble, so the module builds and runs. What is still absent is the
+*differential comparison against LightGBM*, and that is the only half of the
+sentence worth keeping.
 
 | Claim | Status |
 | --- | --- |
-| mojotrees implements unbiased LambdaRank | **No.** Not claimed, not supported, and `docs/LIGHTGBM_PARITY.md` keeps `lambdarank_position_bias_regularization` and `Dataset.position` at `deferred` |
-| The position-bias update matches LightGBM's `UpdatePositionBiasFactors` | Transcribed from it, term for term, and argued in section 2. **Unverified** |
-| The generalized pair loop reduces to `ranking._fill_query_lambdas` | Argued in section 3. **Unverified**, and the check that would verify it is listed UNRUN in `handoffs/remaining_05_ranking.md` |
-| `ndcg_eval` agrees with `ranking.ndcg_at_cutoffs` | Argued in section 5. **Unverified** |
-| The module is reachable from Python, the C API, or the CLI | No. It is not exported from `src/mojotrees/__init__.mojo` and no binding names it |
+| mojotrees implements unbiased LambdaRank | **Yes, and reported as such.** This row used to read "**No.** Not claimed, not supported, and `docs/LIGHTGBM_PARITY.md` keeps `lambdarank_position_bias_regularization` and `Dataset.position` at `deferred`", which is false in the parity document it cites: `Dataset.position` is `supported` there and `lambdarank_position_bias_regularization` is `partial`, the `partial` being that it is refused together with `eval_set` and that no LightGBM differential exists, so numeric parity is not claimed |
+| The position-bias update matches LightGBM's `UpdatePositionBiasFactors` | Transcribed from it, term for term, and argued in section 2. **Still unverified against LightGBM**, and this row was right. `test_position_column_learns_a_bias_and_trains` proves the update runs, learns a per-position bias that moves off zero, and leaves a ranking NDCG above 0.9; it does not compare a single factor against LightGBM's, and nothing does |
+| The generalized pair loop reduces to `ranking._fill_query_lambdas` | **Verified, in-tree.** This row used to read "**Unverified**, and the check that would verify it is listed UNRUN in `handoffs/remaining_05_ranking.md`". `test_default_is_not_advanced_and_matches_train_ranker` is that check and it has run: on the default `AdvancedRankParams`, `train_ranker_advanced` and `train_ranker` produce the same tree count and bit-identical `predict_row` over every row. The handoff file it cited no longer exists (`ls handoffs/` lists five files and that is not one of them), so the UNRUN pointer was dangling as well as stale |
+| `ndcg_eval` agrees with `ranking.ndcg_at_cutoffs` | Argued in section 5. **Still unverified**, and this row was right. `ndcg_eval` (`src/mojotrees/ranking_advanced.mojo:1487`) is named by no test in `tests/` and by no binding; the ranking tests call `ranking.ndcg` instead |
+| The module is reachable from Python, the C API, or the CLI | **Yes, from Python.** This row used to read "No. It is not exported from `src/mojotrees/__init__.mojo` and no binding names it". The second half is false: `bindings/_mojotrees.mojo:370-377` imports six symbols from this module by name (`AdvancedRankParams`, `LabelGain`, `PositionMap`, `advanced_ranking_requested`, `fit_ranker_advanced`, `positions_from_codes`) and `fit_ranker` calls `fit_ranker_advanced` at :3636 whenever `advanced_ranking_requested` is true. Only the first half survives: the module is still not re-exported from `src/mojotrees/__init__.mojo`, so the Mojo package namespace does not carry it |
 
-The module is deliberately unexported. `tools/check_parity.py` resolves
-*public symbols* to decide whether a `deferred` row has gone stale, and a
-file that exists but is exported by nobody resolves to nothing, which is the
-correct answer: the feature is written, not delivered. It becomes public
-when the evidence in the handoff exists, and not before.
+What the surviving `__init__.mojo` half means, and it is narrower than the
+old text made it sound. `tools/check_parity.py` resolves *public symbols* to
+decide whether a `deferred` row has gone stale, so a module that is exported
+by nobody resolves to nothing there. That was the right answer while the
+feature was written and not delivered. It is no longer the state of the
+world: the Python surface reaches this file through the binding, and
+`docs/LIGHTGBM_PARITY.md` already carries the rows as `supported` and
+`partial` on that evidence. The remaining gap is the Mojo-side re-export and
+the LightGBM differential, not reachability.
 
 ## 1. Ownership decision
 
@@ -39,7 +60,10 @@ anything was written:
 
 - `src/mojotrees/ranking.mojo` - LambdaRank, NDCG, MAP, the ranker trainers.
   Its own docstring lists "positional/unbiased-lambdarank extensions" under
-  *INTENTIONAL DIFFERENCES FROM LightGBM*, i.e. as something it does not do.
+  *INTENTIONAL DIFFERENCES FROM LightGBM*, i.e. as something **that file**
+  does not do. That docstring was corrected on 2026-08-18 to say so
+  explicitly, because as written it read as a statement about the library and
+  the library does implement position bias, here.
 - `src/mojotrees/custom_metric.mojo` - `train_ranker_with_metrics`, a
   metric-callback trainer that imports `ranking`'s internals and adds no
   ranking mathematics of its own.
@@ -360,20 +384,45 @@ Connected today, inside the owned file:
 - every entry point validates through `check_advanced_rank_params`, which
   calls `ranking.check_ranker_params`, so there is one set of rules
 
-Not connected, because the files are owned by other lanes. Each is a
-ready-to-apply patch in `handoffs/remaining_05_ranking.md`, with the target
-symbol, the signature, the call site, the state flow, the errors, the
-fallback, the serialization effect, the public API effect, the dependency
-order, and a minimal later validation marked UNRUN:
+**This list was a ten-item handoff and four of its items have since
+landed. Rechecked item by item on 2026-08-18.** It used to open "Each is a
+ready-to-apply patch in `handoffs/remaining_05_ranking.md`", and that file
+does not exist any more (`ls handoffs/` lists `INDEX.md`,
+`connect_22_audit.md`, `consolidation_round.md`,
+`migration_20_device_policy.md`, `performance_17_thermal_energy.md`,
+`remaining_14_validation_plan.md`), so the pointer is dropped rather than
+repeated.
 
-1. `ranking.mojo` - fold `train_ranker_advanced` back into `train_ranker`
-2. `trainset.mojo` - a `position` field on `Dataset`, and
-   `train_dataset_ranker_advanced`
-3. `boosting.mojo` / `basic.py` - refuse continuation of a positioned ranker
-4. `distributed.mojo` - `partition_rows_at`
-5. `params.mojo` - the parameter names, still Mojo-API-only
-6. `objective_registry.mojo` - `eval_at` as a `NEEDS_CUTOFF` list
-7. `bindings/_mojotrees.mojo` - `position_addr` / `n_positions` / `eval_at`
-8. `python/mojotrees/__init__.py` - `MojoTreesRanker(position=...)`
-9. `python/mojotrees/cv.py` - point the ranking folds at `query_folds`
-10. `docs/LIGHTGBM_PARITY.md` - and **only after** the evidence exists
+Landed:
+
+2. `trainset.mojo` - **done.** `train_dataset_ranker_advanced` is at
+   `src/mojotrees/trainset.mojo:1873` and takes a `PositionMap`;
+   `basic.Dataset` carries `_position` (`python/mojotrees/basic.py:513`) and
+   `_Config.binding_params` passes it through `_position_params`.
+7. `bindings/_mojotrees.mojo` - **done.** `_parse_positions` reads
+   `position_addr`, and all three ranker entry points parse the advanced
+   rank params.
+8. The Python surface - **done**, though at
+   `python/mojotrees/sklearn.py:7013` rather than in `__init__.py`:
+   `MojoTreesRanker.fit(position=...)`.
+10. `docs/LIGHTGBM_PARITY.md` - **done**, on the evidence that now exists:
+   `Dataset.position` is `supported` and
+   `lambdarank_position_bias_regularization` is `partial`.
+
+Still open, and verified still open rather than assumed:
+
+1. `ranking.mojo` - fold `train_ranker_advanced` back into `train_ranker`.
+   `ranking.mojo` still defines only `train_ranker` and
+   `train_ranker_with_valid`; the advanced loop is a separate trainer.
+3. `boosting.mojo` / `basic.py` - refuse continuation of a positioned
+   ranker. No such refusal exists; the learned biases are training state
+   that no model file holds, so a continued fit restarts them silently.
+4. `distributed.mojo` - `partition_rows_at`. The symbol exists nowhere in
+   `src/`; only `ranking_advanced.mojo:122` mentions the request.
+5. `params.mojo` - partly. The names are in the parameter table
+   (`src/mojotrees/params.mojo:182` carries `label_gain` and `eval_at`), so
+   this item is narrower than it reads.
+6. `objective_registry.mojo` - `eval_at` as a `NEEDS_CUTOFF` list.
+   `NEEDS_CUTOFF` is a flag (`:433`, set at `:1834`), not a list.
+9. `python/mojotrees/cv.py` - point the ranking folds at `query_folds`.
+   `cv.py:386` still chunks queries with its own `_chunk_folds`.
