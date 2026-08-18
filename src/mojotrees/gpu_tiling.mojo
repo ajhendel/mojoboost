@@ -307,6 +307,59 @@ def shared_bytes_for(n_bins: Int) -> Int:
 # deliberately short: every rung is a kernel instantiation the whole matrix
 # pays compile time for on every backend.
 
+# --- THE KERNEL MATRIX, and why it is one constant ---
+#
+# The two histogram families are parameterized on (GROUP, BIN_CAP), and every
+# reachable pair is a SEPARATE KERNEL the whole build pays compile time for.
+# Five GROUP rungs times four BIN_CAP rungs times two families is FORTY
+# kernels from `enqueue_range_histogram` alone.
+#
+# On Metal the JIT absorbs that. On CUDA, 2026-08-18, it does not: a fit wedges
+# with `libKGENCompilerRTShared` blocked inside a `libcuda` call, 14 threads on
+# futexes and the GPU idle, and `~/.nv/ComputeCache` holds zero files after a
+# run so every process recompiles the whole matrix from scratch. Four MAX-only
+# probes cleared allocation, pinned buffers, copies, launches, queue depth and
+# sub-buffers individually; the matrix is what is left.
+#
+# `MOJOTREES_KERNEL_MATRIX_FULL = False` collapses each ladder onto fewer
+# distinct values. The dispatch structure does not change: the rungs are still
+# tested in the same order and still pick a capacity at or above the bin count.
+# What changes is that several rungs now name the SAME constant, so the
+# compiler emits one kernel where it used to emit four. Twelve instead of
+# forty.
+#
+# **A REDUCED MATRIX IS SLOWER, NOT WRONG.** A node with 40 bins gets a 64-wide
+# shared plane instead of a 64-wide one it would have anyway, but a node with
+# 20 bins that used to get 32 now gets 64, and a 3-slot group that used to get
+# a 4-wide kernel now gets 2 and launches more blocks. Correctness is
+# unaffected because every rung's capacity is still >= the bins it serves;
+# occupancy and launch count are not.
+#
+# It defaults to the full matrix, so Metal is bit-for-bit what it was. This
+# exists so the CUDA arm can be REBUILT with a smaller matrix and the JIT
+# hypothesis falsified in one run, rather than guessed at. An environment
+# variable cannot do this: the rungs are resolved at compile time, which is
+# exactly why `MOJOTREES_GPU_FEATURE_GROUP=1` did not help.
+comptime MOJOTREES_KERNEL_MATRIX_FULL = True
+
+comptime HIST_CAP_R0 = 32 if MOJOTREES_KERNEL_MATRIX_FULL else 64
+"""First BIN_CAP rung. Collapses onto the second when the matrix is reduced."""
+comptime HIST_CAP_R1 = 64
+"""Second BIN_CAP rung. Present in both matrices."""
+comptime HIST_CAP_R2 = 128 if MOJOTREES_KERNEL_MATRIX_FULL else 256
+"""Third BIN_CAP rung. Collapses onto the fourth when reduced."""
+comptime HIST_CAP_R3 = 256
+"""Widest BIN_CAP rung, the bin ceiling itself. Present in both."""
+
+comptime HIST_GROUP_R0 = 16
+"""Widest GROUP rung. Present in both matrices."""
+comptime HIST_GROUP_R1 = 8 if MOJOTREES_KERNEL_MATRIX_FULL else 16
+comptime HIST_GROUP_R2 = 4 if MOJOTREES_KERNEL_MATRIX_FULL else 1
+comptime HIST_GROUP_R3 = 2 if MOJOTREES_KERNEL_MATRIX_FULL else 1
+comptime HIST_GROUP_R4 = 1
+"""Narrowest GROUP rung. Present in both."""
+
+
 comptime HIST_BIN_CAP_MIN = 32
 """Narrowest shared plane a histogram kernel is instantiated at. Below 32
 bins the threadgroup memory saved is already small next to the launch, and
@@ -338,9 +391,19 @@ def histogram_bin_capacity(n_bins: Int) -> Int:
     shape rather than quietly pricing it as a 256-bin one.
     `require_bins_supported` is the check that names the limit.
     """
-    var capacity = HIST_BIN_CAP_MIN
+    var capacity = HIST_CAP_R0
     while capacity < n_bins:
         capacity *= 2
+    # A reduced matrix has no kernel at the intermediate rungs, so a bin count
+    # that would have selected one is rounded UP to the rung that exists. The
+    # shared-memory estimate must agree with the kernel that will actually run
+    # or `derive_tiling`'s budget guard prices a block it never launches.
+    if capacity > HIST_CAP_R0 and capacity < HIST_CAP_R1:
+        capacity = HIST_CAP_R1
+    if capacity > HIST_CAP_R1 and capacity < HIST_CAP_R2:
+        capacity = HIST_CAP_R2
+    if capacity > HIST_CAP_R2 and capacity < HIST_CAP_R3:
+        capacity = HIST_CAP_R3
     return capacity
 
 
