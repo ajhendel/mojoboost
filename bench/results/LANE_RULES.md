@@ -6,6 +6,45 @@ not advice.
 This section is identical in every lane brief and is not negotiable. Read it
 before the lane-specific section below it.
 
+## THE RULES, AS TESTS. Read this section; the rest is the evidence.
+
+Compressed 2026-08-18 from 862 lines. Sixteen rules had accumulated across
+four days and in practice a lane was running on about four of them, because
+862 lines does not fit in anyone's head. Every rule below is one question you
+can answer about a change. The sections after this one hold the incident behind
+each, and they are kept rather than trimmed: on 2026-08-18 twelve
+self-contradictions were found in this repository and THREE pointed at real
+bugs, so the evidence is the finding mechanism and deleting it would be the
+error these rules exist to prevent.
+
+| # | The question to ask | If the answer is |
+|---|---|---|
+| 1-4 | Is this item CARRIED, DELIBERATE, or UNCARRIED, and what closes it? | see the classification section |
+| 5 | Is the win bit-identical AND measured? | then the default flips THIS session |
+| 5a | Did I sweep the whole file, or annotate one line? | a flip is a sweep |
+| 6 | Does this switch still have a measurement owed? | one that outlives its measurement is a defect |
+| 9 | Is this a MIRROR default or a USER default? | a user default trades at most ~1 pct accuracy for at least 2x |
+| 10 | Does this number travel with its run id, shape and arm set? | otherwise it is not quotable |
+| 11 | Does this CPU change move bits? | no, land on the digest. yes, re-anchor and re-golden in one commit |
+| 12 | If the peer moved their default tomorrow, would this number move? | then it is a coincidence, not a constraint. A default may set our default and never our ceiling |
+| 13 | Can the user SEE this route decision? | the two backends differ on 100 pct of rows, so an unseen route is an unreported model change. Warn on what they can act on, nothing else |
+| 14 | Has ONE CALL from the top surface reached this refusal? | a predicate test proves nothing; five blocks shipped documented, tested and unreachable |
+| 15 | Does this message still describe what the device cannot do? | every "the device cannot" is a claim with a date on it |
+| 16 | Is a measurement pending? | then the box is the instrument and exactly ONE process touches it, orchestrator's own builds included |
+| 16a | Am I a subagent? | local tests only. Never the suite, a benchmark, a timing or a profile. The orchestrator measures without asking |
+
+**The four that have actually caught things**, so you know which to hold if you
+hold only some: 12 found a constant doing two jobs, whose raise disarmed a
+guard nobody knew existed and silently corrupted every oblivious tree deeper
+than 7. 14 found five refusal blocks that could not fire. 11's digest caught
+two changes argued as bit-identical that were not. 16a is why the suite ran
+against 45 unverified commits and found two failures a build could not.
+
+**And one standing instruction about this file itself.** No new rule without a
+new incident. Six were written on 2026-08-18 alone, which is the shape of a
+team producing governance instead of results. If a seventh arrives without a
+bug behind it, refuse it.
+
 ## What you are
 
 You are one lane of a CPU performance campaign on mojotrees. An orchestrator
