@@ -72,23 +72,32 @@ What it requires today.
 
 | Requirement | Value today | Where it is decided |
 |---|---|---|
-| Python | 3.14 | `requires-python` in `python/pyproject.toml`, which follows the interpreter the environment was solved against |
+| Python | 3.10 | `requires-python` in `python/pyproject.toml`, measured in [docs/PYTHON_SUPPORT.md](PYTHON_SUPPORT.md) section 10 |
 | Platform | macOS on Apple silicon first, Linux x86_64 and aarch64 after that | [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) |
 | numpy | optional | plain Python sequences work without it; `pip install "mojotrees[numpy]"` pulls it in |
 
-The Python floor is likely to broaden in a future release, and it is worth
-knowing why it reads the way it does.
-[docs/PYTHON_SUPPORT.md](PYTHON_SUPPORT.md) takes the question apart and
-finds that 3.14 is not a toolchain requirement at all: the pinned MAX
-publishes builds for CPython 3.10 through 3.14, and the wheel is labeled
-`cp314` because a 3.14 compiled it, not because anything in it is
-3.14-specific. What actually blocks going lower today is one entry point in
-the extension's table, `Py_GetConstantBorrowed`, added in CPython 3.13, which
-leaves 3.13 **expected but unproven** and 3.12 and earlier **blocked**.
+The Python floor is 3.10, and [docs/PYTHON_SUPPORT.md](PYTHON_SUPPORT.md)
+is where it was established rather than assumed. Run M1a there took one
+unmodified extension, built under CPython 3.14.6, and imported it under
+3.14, 3.13, 3.12, 3.11 and 3.10. `test_python_api.py` passed on all five,
+and `gpu_available()` returned true on each, so the Metal path is not
+3.14-specific either. Run M1b puts the floor exactly at 3.10: 3.9 aborts
+during module initialization on `symbol not found: Py_NewRef`, which CPython
+added in 3.10, and `mojo 1.0.0` and `mojo-python 1.0.0` independently
+require `python >=3.10`.
 
-Nothing has run on any interpreter other than 3.14, so `>=3.14` stays until
-an experiment says otherwise. Treat it as the current declared value with a
-reason behind it, not as a settled decision and not as a permanent one.
+Two things that measurement did not change. The wheel published today is
+labeled `cp314` because a 3.14 compiled it, there is no `abi3` build, and one
+wheel serves exactly one CPython minor version, so **an index install on 3.10
+through 3.13 needs a wheel that does not exist yet**; pip matches the tag
+before it reads `requires-python`. And every interpreter above was exercised
+on osx-arm64 only.
+
+An earlier version of this section said `Py_GetConstantBorrowed`, a CPython
+3.13 addition present in the extension's entry point table, left 3.12 and
+earlier blocked. That was a static prediction, and M1a contradicted it.
+Section 9.1 of PYTHON_SUPPORT.md records why the entry point table is not
+the floor.
 
 ### What `pip install mojotrees` does right now
 

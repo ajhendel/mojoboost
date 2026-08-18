@@ -504,7 +504,7 @@ using the instructions above.
 | What you see | What it means |
 |---|---|
 | `No matching distribution found for mojotrees` | PyPI has no wheel matching your Python, operating system, and architecture. Use the supported target or build from source |
-| `Requires-Python >=3.14` in pip's output | Your interpreter is older than the declared floor |
+| `Requires-Python >=3.10` in pip's output | Your interpreter is older than the declared floor |
 | `... is not a supported wheel on this platform` | The wheel's tags do not describe your machine. Do not force it |
 | `ImportError: cannot import name '_mojotrees' from 'mojotrees'` | Source checkout without a built extension. Run `pixi run build-python` |
 | `ImportError: ... Library not loaded: @rpath/libKGENCompilerRTShared.dylib` | The MAX runtime libraries were not found. Run through `pixi run`, or install a self-contained wheel |

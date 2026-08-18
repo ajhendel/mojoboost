@@ -199,19 +199,29 @@ is published, not before. A classifier is a claim like any other.
 
 
 def check_requires_python(data: dict, rep: Report) -> None:
-    """C5. Is requires-python consistent with the cp314-only toolchain?"""
+    """C5. Is requires-python the measured floor, and do the wheels follow?"""
     req = data.get("project", {}).get("requires-python", "")
-    if req.replace(" ", "") == ">=3.14":
-        rep.ok("C5", f"requires-python {req!r} matches the cp314 toolchain pin")
+    if req.replace(" ", "") == ">=3.10":
+        rep.ok(
+            "C5",
+            f"requires-python {req!r} is the floor measured in "
+            "docs/PYTHON_SUPPORT.md section 10; the wheel matrix does not "
+            "cover it yet (run M2)",
+        )
     else:
         rep.warn(
             "C5",
-            f"requires-python is {req!r}",
+            f"requires-python is {req!r}, not the measured floor '>=3.10'",
             """
-The Linux wheel is tagged for whatever interpreter builds it, and max 26.5.0
-pins python 3.14.*. If Task 05 lowers this bound, the Linux wheel tags do not
-follow automatically: one wheel is built per interpreter series and the release
-workflow's matrix has to grow a row for each.
+Section 10 of docs/PYTHON_SUPPORT.md establishes 3.10 by measurement: run M1a
+imports one unmodified extension under 3.10 through 3.14 and passes on all
+five, and run M1b aborts on 3.9 at `Py_NewRef`. A floor above 3.10 is the
+interpreter pixi's solver chose, not one the toolchain imposes.
+
+Note that the floor and the wheel tags are separate facts. One wheel is built
+per interpreter series and max 26.5.0 pins python 3.14.*, so the release
+workflow's matrix has to grow a row per interpreter before an index can serve
+3.10 through 3.13. pip matches the tag before it reads requires-python.
 """,
         )
 
