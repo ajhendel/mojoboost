@@ -109,15 +109,15 @@ check-gates = "bash tools/check_gates.sh"
 install-hooks = "bash tools/install_hooks.sh"
 
 bench = "mojo run -I src bench/bench_train.mojo"
-bench-canary = "mojo run -I src bench/bench_canary.mojo"
+bench-canary = "bash tools/with_timeout.sh auto mojo run -I src bench/bench_canary.mojo"
 bench-hist = "mojo run -I src bench/bench_histogram.mojo"
 bench-hist-scaling = "mojo run -I src bench/bench_histogram_scaling.mojo"
-bench-train-gpu = "mojo run -I src bench/bench_train_gpu.mojo"
+bench-train-gpu = "bash tools/with_timeout.sh auto mojo run -I src bench/bench_train_gpu.mojo"
 # The sparse crossover (w4_sparse), interleaved the same way. Separate from
 # bench-train-gpu because the sparse arms take a SparseBinnedMatrix and have
 # no split-search strategy to choose. See bench/README.md for the protocol.
-bench-train-gpu-sparse = "mojo run -I src bench/bench_train_gpu_sparse.mojo"
-gpu-validate = "mojo run -I src bench/bench_gpu_validation.mojo"
+bench-train-gpu-sparse = "bash tools/with_timeout.sh auto mojo run -I src bench/bench_train_gpu_sparse.mojo"
+gpu-validate = "bash tools/with_timeout.sh auto mojo run -I src bench/bench_gpu_validation.mojo"
 bench-threshold = "mojo run -I src bench/bench_threshold.mojo"
 # The CPU bin-layout A/B: feature-major against row-major against the timed
 # `auto` rule, with LightGBM as the in-process anchor, arms interleaved.
@@ -138,7 +138,7 @@ bench-goss = "mojo run -I src bench/bench_goss.mojo"
 # What one kernel launch and one host wait cost here. Read this before
 # proposing any GPU change whose whole benefit is fewer launches or fewer
 # synchronizations; see train_gpu.mojo's `_device_search_resident`.
-bench-launch-cost = "mojo run -I src bench/bench_launch_cost.mojo"
+bench-launch-cost = "bash tools/with_timeout.sh auto mojo run -I src bench/bench_launch_cost.mojo"
 bench-unified-memory = "mojo run -I src bench/apple/unified_memory.mojo"
 build-python = "bindings/build.sh"
 test-python = { cmd = "python python/test_python_api.py", depends-on = [
@@ -159,7 +159,7 @@ test-c = "capi/run_c_tests.sh"
 # readback of a 136-byte split record against a bare command-buffer completion,
 # and reports which transports this MAX version and this backend can reach at
 # all. Takes optional `trips trials`.
-probe-readback = "mojo run -I src probes/readback_cost.mojo"
+probe-readback = "bash tools/with_timeout.sh auto mojo run -I src probes/readback_cost.mojo"
 
 [dependencies]
 mojo = ">=1.0.0,<2"
