@@ -3030,7 +3030,59 @@ def grow_tree_device_resident(
             do_stage=True,
         )
     profile.charge_host(HOST_ENCODE, HOST_SLOT_PROLOGUE, t_head)
-    for step in range(params.num_leaves - 1):
+
+    # HOW MANY STEPS THIS TREE CAN POSSIBLY COMMIT, which is not always the
+    # leaf budget.
+    #
+    # This loop ran `num_leaves - 1` times unconditionally until 2026-08-18.
+    # The trailing-step argument below (see the comment at the terminal
+    # `enqueue_desc_step`) establishes that a step past the end of growth is
+    # a no-op: every kernel in it reads `STEP_LIVE == 0` or returns on the
+    # budget before it reads a record, and the search pair reduces over
+    # device memory nothing has written since, so it reaches the same answer
+    # by bit equality rather than by probability. That argument is correct
+    # and it is why the extra steps were harmless. It is an argument about
+    # CORRECTNESS, and it was quietly doing duty as an argument about COST.
+    #
+    # The cost is not nothing. A step is nine command buffers, and the
+    # profile taken on 2026-08-18 (`phase_profile.mojo`, commit 1d77414)
+    # found the host blocked inside the enqueue call on a full queue, with
+    # `device_wait` at exactly 0 calls and `encode` at 85.74 percent of host
+    # time. So a step that commits nothing still pays the full encode price
+    # of a step that does, and pays it into a queue that is already the
+    # binding constraint.
+    #
+    # A tree with `max_depth = d > 0` cannot commit more than `2^d - 1`
+    # splits, by the same rule the pick kernel applies against `FRONT_DEPTH`:
+    # a node at depth `d` offers no split, so the deepest complete tree has
+    # `2^d` leaves. Anything the leaf budget allows above that is
+    # unreachable, statically, before a single row is read. At
+    # `num_leaves=31, max_depth=3` that is 30 steps enqueued for 7 that can
+    # commit, 207 command buffers spent to encode nothing; at `max_depth=1`
+    # it is 30 for 1. `max_depth` as the primary regularizer with the leaf
+    # budget left at its default is a common shape, because it is XGBoost's
+    # idiom and scikit-learn's.
+    #
+    # `max_depth <= 0` means unlimited (`TreeParams.max_depth` defaults to
+    # -1 and `validation.check_depth_budget` agrees), so the bound does not
+    # apply and the guard is load-bearing rather than defensive: unlimited
+    # is the common case, not the edge case. The `<= 23` clause is exact and
+    # not arbitrary: `validation.check_num_leaves` caps the budget at
+    # `2^23`, so at `max_depth >= 24` the minimum is always the budget and
+    # the shift would be undefined for nothing.
+    #
+    # Bit-identical, by the trailing-step argument above read in the
+    # direction it already ran. This removes encode work and removes no
+    # outcome, so there is no switch and nothing to measure before shipping
+    # it. It does NOT help the `num_leaves=256, max_depth=8` shape a
+    # third-party benchmark uses, where 2^8 is exactly 256 and the bound
+    # binds at the budget; that shape is a different problem.
+    var max_commits = params.num_leaves
+    if params.max_depth > 0 and params.max_depth <= 23:
+        var depth_leaves = 1 << params.max_depth
+        if depth_leaves < max_commits:
+            max_commits = depth_leaves
+    for step in range(max_commits - 1):
         # Four brackets a step, one per launch group, all of them `HOST_ENCODE`
         # and all of them filed under this step's slot. Four rather than one so
         # that `ns_per_call` is a per-group figure and `max_ns` catches a
