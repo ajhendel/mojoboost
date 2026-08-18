@@ -1596,7 +1596,16 @@ def objective_backends(objective: Int) -> Int:
 
     Do not treat the three as the same predicate. See the handoff.
     """
-    if objective == LAMBDARANK:
+    # Every ranking objective is CPU-only. `QUERY_RMSE`, `PAIR_LOGIT` and
+    # `YETI_RANK` reach exactly one entry point,
+    # `catboost_ranking.train_catboost_ranker`, which has no device variant.
+    #
+    # Spelled as `objective_needs_groups` rather than four comparisons because
+    # the two questions share an answer for a reason: an objective whose
+    # gradients are defined within a query group is one our device gradient
+    # path does not implement. A fifth ranking loss cannot then be added to
+    # one list and forgotten in the other.
+    if objective_needs_groups(objective):
         return SUPPORTS_CPU
     return SUPPORTS_CPU | SUPPORTS_GPU
 

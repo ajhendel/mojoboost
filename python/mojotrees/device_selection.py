@@ -106,11 +106,21 @@ DEVICES = ("cpu", "gpu", "auto")
 #:
 #: These are transport, exactly like the sentinels below: no rule in this
 #: module reads them, and the native layer decides what a selector means. The
-#: device policy blocks anything that is not `SCORE_L2`, so a value added to
+#: device policy blocks anything that is neither `SCORE_L2` nor
+#: `SCORE_COSINE` (narrowed 2026-08-17), so a value added to
 #: `split.mojo` and not to this pair refuses the accelerator rather than
 #: reaching it with the wrong functional.
 SCORE_L2 = 0
 SCORE_COSINE = 1
+#: Not a selector. The code `_score_function_code` sends for a spelling it
+#: does not recognize, whose only job is to be refused.
+#:
+#: `device_policy` blocks any code that is neither `SCORE_L2` nor
+#: `SCORE_COSINE`, because the scan kernels test for Cosine and treat
+#: everything else as L2, so an unknown selector would get an L2 answer under
+#: its own name. Sending this fails closed by construction rather than by
+#: depending on which real code is currently blocked.
+SCORE_UNRECOGNIZED = 2
 
 #: Growth policy codes, mirroring `src/mojotrees/growth_policy.mojo`. Sent so
 #: `BLOCK_GROW_POLICY` and `BLOCK_MAX_DEPTH` can match; before 2026-08-18

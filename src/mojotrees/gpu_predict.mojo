@@ -725,8 +725,10 @@ def gpu_predict_support(
         return GpuPredictSupport.blocked(
             BLOCK_OUTPUT_LIMIT,
             String(
-                "the GPU prediction path does not cover this many trees per"
-                " boosting round"
+                "n_outputs must be at least 1. The GPU prediction kernels"
+                " index i * n_outputs + k and have no upper bound, so this"
+                " rejects a malformed ensemble shape rather than an"
+                " unsupported one"
             ),
         )
     return GpuPredictSupport.ok()

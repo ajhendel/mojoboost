@@ -931,12 +931,16 @@ def gpu_supports_outputs(n_outputs: Int) -> Bool:
     boosting round. `n_outputs` is 1 for single-output training and for
     binary classification, and the class count beyond that.
 
-    Every workload the device vocabulary routes is covered: multiclass
-    grows one tree per class per round through `train_multiclass_gpu`, on
-    the same device-resident builder the single-output trainer uses. The
-    check stays as the one place to reject a future workload the GPU path
-    does not implement, which is why the engine still consults it rather
-    than assuming coverage."""
+    **There is no upper limit here, and `BLOCK_OUTPUT_LIMIT` is a block CODE
+    rather than a bound.** Multiclass grows one tree per class per round
+    through `train_multiclass_gpu`, and the prediction kernels index
+    `i * n_outputs + k`, so neither path has a ceiling to enforce.
+
+    What this enforces is `n_outputs >= 1`. It is the boundary check on a
+    field two paths index arrays with, not a reservation against some future
+    unsupported workload: a predicate that answers True for every valid input
+    is not a gate, and listing it as one hides that nothing is being
+    checked."""
     return n_outputs >= 1
 
 
@@ -2734,9 +2738,11 @@ def _collect_blocks(
         blocks.add(
             BLOCK_OUTPUT_LIMIT,
             String(
-                "the GPU path does not cover ",
+                "n_outputs must be at least 1, and this request carries ",
                 request.n_outputs,
-                " trees per boosting round",
+                ". The GPU path covers every output count it is given, so"
+                " this rejects a malformed request rather than an"
+                " unsupported workload",
             ),
         )
 
@@ -3411,7 +3417,7 @@ def decide_device(
     var selected: Int = CPU_DEVICE
     var blocked: Bool = False
     var code: Int = DECISION_EXPLICIT_CPU
-    var message = String("")
+    var message: String
     var evidence: String = EVIDENCE_NONE
     var citation = String("")
 

@@ -538,7 +538,7 @@ worst case.** It priced the compaction maintenance at 14 matrix passes, about
 than the 14 passes it is priced at, which would mean the scatter kernel runs
 under 40 GB/s"*. The measured regression is 7.9 ms per tree on the device-solve
 arm, which is worse than the worst case it named. The switch and every line
-behind it were deleted the same day under `docs/design/LANE_RULES.md` rule 6.
+behind it were deleted the same day under `bench/results/LANE_RULES.md` rule 6.
 
 **THIS RESULT KILLS A MODEL AND NOT ONLY AN ARM, AND THAT IS THE REASON TO READ
 THIS ROW.** The reasoning behind the arm was that a strided row index makes one

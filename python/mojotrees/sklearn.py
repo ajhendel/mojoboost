@@ -486,22 +486,27 @@ def _score_function_code(value):
     unknown one; this function's whole job is to answer, before a backend has
     been chosen, "is this the one functional the accelerator implements".
 
-    **It fails closed, and that is the design.** Anything that is not
-    recognizably `L2` maps to `SCORE_COSINE`, which the policy blocks, rather
-    than to `SCORE_L2`, which it allows. A selector this function has not been
-    taught therefore keeps the fit on the CPU, where every selector is
-    implemented, instead of reaching a device that computes `G^2/(H+lambda)`
-    whatever it was asked for. Mapping the unknown case to L2 would be the
-    silent-wrong-answer defect the block exists to close, reintroduced one
-    layer up.
-    """
-    from .device_selection import SCORE_COSINE, SCORE_L2
+    **It fails closed.** L2 and Cosine map to their codes; anything else maps
+    to `SCORE_UNRECOGNIZED`, which the policy refuses through the arm it keeps
+    for unknown codes. So a selector this function has not been taught keeps
+    the fit on the CPU, where every selector is implemented, instead of
+    reaching a device that computes `G^2/(H+lambda)` whatever it was asked
+    for.
 
-    if value is None:
+    The refusal must not depend on which real selector is currently blocked.
+    An earlier version mapped the unknown case to `SCORE_COSINE` because the
+    policy blocked cosine; when the device gained a cosine scan and the block
+    narrowed, this function silently became fail-OPEN without an edit here.
+    That is why the sentinel exists.
+    """
+    from .device_selection import SCORE_COSINE, SCORE_L2, SCORE_UNRECOGNIZED
+
+    name = "l2" if value is None else str(value).strip().lower()
+    if name == "l2":
         return SCORE_L2
-    if str(value).strip().lower() == "l2":
-        return SCORE_L2
-    return SCORE_COSINE
+    if name == "cosine":
+        return SCORE_COSINE
+    return SCORE_UNRECOGNIZED
 
 
 class _Base(_ParamsMixin):
@@ -3932,14 +3937,10 @@ class _Base(_ParamsMixin):
                 # fit. `_resolve_boosting` is where the three spellings
                 # already become one word.
                 ordered_boosting=(self._resolve_boosting() == "ordered"),
-                # `getattr` with a default, and deliberately, because the
-                # CPU campaign is landing the field that carries a non-L2
-                # choice; until it does, `self.score_function` exists but no
-                # value other than L2 gets past the refusal below it. Written
-                # this way the gate is correct before and after that lands,
-                # and it fails closed: an unrecognized spelling maps to
-                # SCORE_COSINE, which the device policy blocks, rather than
-                # to SCORE_L2, which it waves through.
+                # `getattr` with a default, because the field that carries a
+                # non-L2 choice is not on every estimator yet. L2 and Cosine
+                # both reach the accelerator; an unrecognized spelling maps to
+                # SCORE_UNRECOGNIZED and is refused.
                 score_function=_score_function_code(
                     getattr(self, "score_function", None)
                 ),

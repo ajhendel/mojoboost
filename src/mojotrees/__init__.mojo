@@ -51,6 +51,7 @@ from .goss import (
     GossParams,
     GossSelection,
     apply_goss_scaling,
+    check_goss_honored,
     goss_importance,
     goss_round,
     goss_select,
