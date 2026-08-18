@@ -15,20 +15,24 @@ of it that do not exist yet.
 | Backend | Device | Correctness | Determinism | Phase timings | Profiler trace |
 |---|---|---|---|---|---|
 | Metal | Apple M4 (10 core) | pass | pass | partial | not run |
-| CUDA | NVIDIA RTX 5090 (Blackwell, sm_120) | **fail** | **not run** | **partial** | **not run** |
+| CUDA | NVIDIA RTX 5090 (Blackwell, sm_120) | **partial** | **not run** | **partial** | **not run** |
 | HIP | none available | **not run** | **not run** | **not run** | **not run** |
 
 NVIDIA hardware executed this code for the first time on 2026-08-18, on a
-leased RunPod RTX 5090. It builds, it runs, and **it is not correct yet**.
+leased RunPod RTX 5090. **It builds, it runs, and one real cross-vendor
+defect was found and fixed here.** It is not yet validated.
 
-Correctness reads **fail**, not partial. The device compiler contracts a
-multiply and an add into an FMA in `_range_add_raw_kernel`
-(`gpu_objectives_native.mojo:774-777`) where Metal's compiler did not, so
-two score-update arms that are asserted bit-identical differ by 1 ulp on
-1841 of 3000 rows. Both roundings are valid IEEE results, so nothing here is
-wrong in an absolute sense, but bit-identity between the arms is the
-property the determinism and host-replica guarantees rest on, and on CUDA it
-does not hold. Determinism was never attempted at all.
+Correctness reads **partial**. One real defect was found, fixed and
+re-verified on this device: NVPTX contracted a multiply and an add into an
+FMA in `_range_add_raw_kernel` where Metal's compiler did not, breaking
+bit-identity between two score-update arms on 1841 of 3000 rows. Moving the
+multiply to the host closed it, and the test now passes on the same card.
+
+It is **not** `pass`, for two reasons. 36 GPU tests do not finish inside a
+300s cap and the reason is not yet established -- the two obvious
+explanations were tested and neither survived, see section 2b. And
+determinism has never been measured on this device at all, because the
+harness that would measure it is among the things that do not finish.
 
 No row above may be read as a support claim. The full record, including the
 elimination argument that identifies the kernel, is in
@@ -597,10 +601,30 @@ src/mojotrees/gpu_objectives_native.mojo:2927
 `test_gpu_scan_primitives`, `test_gpu_partition_launches`, `test_gpu_tiling`,
 `test_gpu_level_batcher`, `test_gpu_portability` and `test_gpu_vendor_policy`.
 
-One failure is **real, reproducible, and now explained**:
+> **FIXED AND RE-VERIFIED, 2026-08-18.** The defect described below was
+> real. It was fixed by moving the multiply to the host so the kernel has a
+> plain add and nothing left to fuse, and the fix was re-run on the same RTX
+> 5090 that exhibited the bug:
+>
+> ```text
+> before:  FAIL test_gpu_raw_update_packing  1841 of 3000 rows disagree
+> after:   ok   test_gpu_raw_update_packing  (3s wall, 863.348ms in tests)
+> ```
+>
+> Host-prescale was chosen over writing an explicit `fma`, and the reason
+> matters: an explicit `fma` would make CUDA and Metal agree by making
+> **Metal fuse too**, which moves every M4 bit, every recorded model digest
+> and every accuracy anchor in one commit. Prescaling leaves Metal
+> bit-identical to what it already produced. Two portable fixes existed and
+> only one of them was free.
+>
+> The account below is kept because the diagnosis method is the reusable
+> part.
+
+One failure was **real, reproducible, and explained**:
 `test_gpu_raw_update_packing`, together with `test_gpu_fma_consistency`.
 **The device compiler contracts a multiply and an add into an FMA on CUDA
-where Metal's compiler did not, and it moves the bits of every
+where Metal's compiler did not, and it moved the bits of every
 device-resident model.**
 
 The evidence, from the test logs themselves:
@@ -669,11 +693,49 @@ contraction explicitly as `fma`, as `gpu_split_search.mojo:851-874` does.
 Both are portable changes rather than vendor branches. Neither is applied
 here, and applying one is not this document's call.
 
+#### 2b. The open question: 36 tests do not finish
+
+With a working per-test timeout, the GPU suite at `MOJOTREES_TEST_JOBS=12`
+reported:
+
+```text
+13 ok      (including real device work: 1892ms, 1505ms, 961ms, 867ms)
+ 2+ FAIL   test_gpu_objectives, test_gpu_tree_resident,
+           test_host_replica, test_gpu_tree_tables
+36 TIMEOUT killed at 300s, no result reported
+```
+
+**Neither of the two obvious explanations survived contact with evidence, and
+both are recorded here so nobody re-runs them.**
+
+*Rejected: CPU oversubscription from a mis-read core count.* The container
+advertises 256 CPUs (`nproc`, `cpuset.cpus.effective = 0-255`) while its
+cgroup quota is `cpu.max = 2720000 100000`, i.e. **27.2 CPUs** — a 9.4x gap
+that would plausibly wedge a barrier-synchronised pool. It does not explain
+this: pinning `MOJOTREES_NUM_WORKERS=8` changed nothing, both arms timed out
+identically.
+
+*Unresolved: slow CUDA codegen rather than a hang.* Both arms above were
+still emitting **compiler diagnostics** when the cap fired, not runtime
+output. `test_gpu_auto_reaches_gpu` spends 56s wall for 867ms of test time,
+so ~55s is compilation, and a heavier GPU test plausibly needs more than
+300s of NVPTX codegen on a host throttled to 27 effective cores. If that is
+what this is, these are not failures at all — they are a cap set below the
+compile time. A single test run under a 900s cap would settle it and has not
+completed yet.
+
+Until one of those is closed, **no count above should be quoted as a CUDA
+correctness result.** A `TIMEOUT` here means "we do not know", not "it is
+broken".
+
+Both suite runs were also terminated by an external 60-minute kill
+(`RC=137`), so the counts are lower bounds on a truncated run, not totals.
+
 #### 3. Determinism
 
-**Not run.** Repeat-run bit-identity was never attempted on this device. This
-is the property this document has always flagged as most likely to differ on
-a backend whose atomics and scheduling differ, so its absence is the single
+**Not run.** Repeat-run bit-identity was never attempted on this device. Every
+attempt was consumed by the unresolved item above: the harness that would
+measure it is one of the things that does not finish. This remains the single
 biggest hole in this record.
 
 #### 4. Phase timings
